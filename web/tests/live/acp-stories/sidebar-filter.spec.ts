@@ -10,11 +10,7 @@ import { join } from "node:path";
 import { test as base, expect } from "@playwright/test";
 import { spawnAoeServe, resolveAoeBinary } from "../../helpers/aoeServe";
 
-function seedTwoSessions(): (seedEnv: {
-  home: string;
-  shimBin: string;
-  env: NodeJS.ProcessEnv;
-}) => void {
+function seedTwoSessions(): (seedEnv: { home: string; shimBin: string; env: NodeJS.ProcessEnv }) => void {
   return ({ home, env }) => {
     for (const [title, subdir] of [
       ["alpha-search", "project-a"],
@@ -33,56 +29,47 @@ function seedTwoSessions(): (seedEnv: {
           GIT_COMMITTER_EMAIL: "t@t",
         },
       });
-      const res = spawnSync(
-        resolveAoeBinary(),
-        ["add", projectDir, "-t", title, "-c", "claude"],
-        { env },
-      );
+      const res = spawnSync(resolveAoeBinary(), ["add", projectDir, "-t", title, "-c", "claude"], { env });
       if (res.status !== 0) {
-        throw new Error(
-          `aoe add ${title} failed: status=${res.status} stderr=${res.stderr?.toString() ?? "<none>"}`,
-        );
+        throw new Error(`aoe add ${title} failed: status=${res.status} stderr=${res.stderr?.toString() ?? "<none>"}`);
       }
     }
   };
 }
 
-base(
-  "sidebar filter input narrows session rows",
-  async ({ page }, testInfo) => {
-    const serve = await spawnAoeServe({
-      authMode: "none",
-      workerIndex: testInfo.workerIndex,
-      parallelIndex: testInfo.parallelIndex,
-      seedFn: seedTwoSessions(),
+base("sidebar filter input narrows session rows", async ({ page }, testInfo) => {
+  const serve = await spawnAoeServe({
+    authMode: "none",
+    workerIndex: testInfo.workerIndex,
+    parallelIndex: testInfo.parallelIndex,
+    seedFn: seedTwoSessions(),
+  });
+
+  try {
+    await page.goto(serve.baseUrl);
+
+    await expect(page.getByText("alpha-search")).toBeVisible({
+      timeout: 10_000,
+    });
+    await expect(page.getByText("bravo-other")).toBeVisible();
+
+    await page.getByRole("button", { name: "Filter sessions" }).click();
+    const filter = page.locator('[data-testid="sidebar-filter-input"]');
+    await expect(filter).toBeVisible();
+    await filter.fill("alpha");
+
+    await expect(page.getByText("alpha-search")).toBeVisible({
+      timeout: 5_000,
+    });
+    await expect(page.getByText("bravo-other")).toBeHidden({
+      timeout: 5_000,
     });
 
-    try {
-      await page.goto(serve.baseUrl);
-
-      await expect(page.getByText("alpha-search")).toBeVisible({
-        timeout: 10_000,
-      });
-      await expect(page.getByText("bravo-other")).toBeVisible();
-
-      await page.getByRole("button", { name: "Filter sessions" }).click();
-      const filter = page.locator('[data-testid="sidebar-filter-input"]');
-      await expect(filter).toBeVisible();
-      await filter.fill("alpha");
-
-      await expect(page.getByText("alpha-search")).toBeVisible({
-        timeout: 5_000,
-      });
-      await expect(page.getByText("bravo-other")).toBeHidden({
-        timeout: 5_000,
-      });
-
-      await filter.fill("");
-      await expect(page.getByText("bravo-other")).toBeVisible({
-        timeout: 5_000,
-      });
-    } finally {
-      await serve.stop();
-    }
-  },
-);
+    await filter.fill("");
+    await expect(page.getByText("bravo-other")).toBeVisible({
+      timeout: 5_000,
+    });
+  } finally {
+    await serve.stop();
+  }
+});

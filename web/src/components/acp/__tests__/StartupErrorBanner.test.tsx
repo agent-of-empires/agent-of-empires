@@ -37,9 +37,7 @@ describe("StartupErrorBanner native-binary branch", () => {
   });
 
   it("renders arch/loader remediation copy, not the doctor --fix fallback", () => {
-    const { container } = render(
-      <StartupErrorBanner sessionId="s-1" message={NATIVE_BINARY_MSG} />,
-    );
+    const { container } = render(<StartupErrorBanner sessionId="s-1" message={NATIVE_BINARY_MSG} />);
     expect(container.textContent).toContain("Architecture mismatch");
     expect(container.textContent).toContain("dynamic loader");
     expect(container.textContent).toContain("bind-mounted into a container");
@@ -47,14 +45,10 @@ describe("StartupErrorBanner native-binary branch", () => {
   });
 
   it("links the native-binary docs anchor", () => {
-    const { container } = render(
-      <StartupErrorBanner sessionId="s-1" message={NATIVE_BINARY_MSG} />,
-    );
+    const { container } = render(<StartupErrorBanner sessionId="s-1" message={NATIVE_BINARY_MSG} />);
     const anchor = container.querySelector("a[href*='structured-view']");
     expect(anchor).not.toBeNull();
-    expect(anchor?.getAttribute("href")).toContain(
-      "native-binary-launch-failure",
-    );
+    expect(anchor?.getAttribute("href")).toContain("native-binary-launch-failure");
   });
 });
 
@@ -67,9 +61,7 @@ describe("StartupErrorBanner fallback branch (unchanged)", () => {
         json: async () => ({ exists: false, tail: "" }),
       }),
     );
-    const { container } = render(
-      <StartupErrorBanner sessionId="s-1" message="some unknown failure" />,
-    );
+    const { container } = render(<StartupErrorBanner sessionId="s-1" message="some unknown failure" />);
     expect(container.textContent).toContain("aoe acp doctor --fix");
   });
 });
@@ -105,16 +97,12 @@ describe("AgentLogDisclosure", () => {
       }),
     });
     vi.stubGlobal("fetch", fetchSpy);
-    const { getByTestId } = render(
-      <StartupErrorBanner sessionId="abc-123" message={NATIVE_BINARY_MSG} />,
-    );
+    const { getByTestId } = render(<StartupErrorBanner sessionId="abc-123" message={NATIVE_BINARY_MSG} />);
     fireEvent.click(getByTestId("acp-agent-log-toggle"));
     await waitFor(() => {
       expect(fetchSpy).toHaveBeenCalledTimes(1);
     });
-    expect(fetchSpy.mock.calls[0]?.[0]).toContain(
-      "/api/sessions/abc-123/acp/worker-log?tail=200",
-    );
+    expect(fetchSpy.mock.calls[0]?.[0]).toContain("/api/sessions/abc-123/acp/worker-log?tail=200");
     await waitFor(() => {
       expect(getByTestId("acp-agent-log-pre").textContent).toContain("ENOEXEC");
     });
@@ -133,9 +121,7 @@ describe("AgentLogDisclosure", () => {
       }),
     });
     vi.stubGlobal("fetch", fetchSpy);
-    const { getByTestId, container } = render(
-      <StartupErrorBanner sessionId="s-1" message={NATIVE_BINARY_MSG} />,
-    );
+    const { getByTestId, container } = render(<StartupErrorBanner sessionId="s-1" message={NATIVE_BINARY_MSG} />);
     fireEvent.click(getByTestId("acp-agent-log-toggle"));
     await waitFor(() => {
       expect(container.textContent).toContain("No log output yet");
@@ -149,9 +135,7 @@ describe("AgentLogDisclosure", () => {
       text: async () => "boom",
     });
     vi.stubGlobal("fetch", fetchSpy);
-    const { getByTestId, container } = render(
-      <StartupErrorBanner sessionId="s-1" message={NATIVE_BINARY_MSG} />,
-    );
+    const { getByTestId, container } = render(<StartupErrorBanner sessionId="s-1" message={NATIVE_BINARY_MSG} />);
     fireEvent.click(getByTestId("acp-agent-log-toggle"));
     await waitFor(() => {
       expect(container.textContent).toContain("Could not load log");
@@ -172,9 +156,7 @@ describe("AgentLogDisclosure", () => {
       }),
     });
     vi.stubGlobal("fetch", fetchSpy);
-    const { getByTestId, container } = render(
-      <StartupErrorBanner sessionId="s-1" message={NATIVE_BINARY_MSG} />,
-    );
+    const { getByTestId, container } = render(<StartupErrorBanner sessionId="s-1" message={NATIVE_BINARY_MSG} />);
     fireEvent.click(getByTestId("acp-agent-log-toggle"));
     await waitFor(() => {
       expect(container.textContent).toContain("Log file exists but is empty");
@@ -194,9 +176,7 @@ describe("AgentLogDisclosure", () => {
       }),
     });
     vi.stubGlobal("fetch", fetchSpy);
-    const { getByTestId, container } = render(
-      <StartupErrorBanner sessionId="s-1" message={NATIVE_BINARY_MSG} />,
-    );
+    const { getByTestId, container } = render(<StartupErrorBanner sessionId="s-1" message={NATIVE_BINARY_MSG} />);
     fireEvent.click(getByTestId("acp-agent-log-toggle"));
     await waitFor(() => {
       expect(container.textContent).toContain("Log is large; showing the tail");
@@ -216,9 +196,7 @@ describe("AgentLogDisclosure", () => {
       }),
     });
     vi.stubGlobal("fetch", fetchSpy);
-    const { getByTestId, queryByTestId } = render(
-      <StartupErrorBanner sessionId="s-1" message={NATIVE_BINARY_MSG} />,
-    );
+    const { getByTestId, queryByTestId } = render(<StartupErrorBanner sessionId="s-1" message={NATIVE_BINARY_MSG} />);
     const toggle = getByTestId("acp-agent-log-toggle");
     fireEvent.click(toggle);
     await waitFor(() => {
@@ -241,9 +219,7 @@ describe("AgentLogDisclosure", () => {
       }),
     });
     vi.stubGlobal("fetch", fetchSpy);
-    const { getByTestId } = render(
-      <StartupErrorBanner sessionId="s-1" message={NATIVE_BINARY_MSG} />,
-    );
+    const { getByTestId } = render(<StartupErrorBanner sessionId="s-1" message={NATIVE_BINARY_MSG} />);
     fireEvent.click(getByTestId("acp-agent-log-toggle"));
     await waitFor(() => {
       expect(fetchSpy).toHaveBeenCalledTimes(1);

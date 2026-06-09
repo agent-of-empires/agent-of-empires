@@ -338,14 +338,10 @@ describe("applyEvent / UserPromptSent", () => {
         },
       },
     });
-    const startRow = state.activity.find(
-      (a) => a.kind === "tool_start" && a.toolCallId === "tc-bash",
-    );
+    const startRow = state.activity.find((a) => a.kind === "tool_start" && a.toolCallId === "tc-bash");
     expect(startRow?.tool?.args_preview).toBe('{"command":"git log -n 10"}');
     expect(startRow?.tool?.name).toBe("Terminal");
-    expect(state.inFlightTool?.args_preview).toBe(
-      '{"command":"git log -n 10"}',
-    );
+    expect(state.inFlightTool?.args_preview).toBe('{"command":"git log -n 10"}');
   });
 
   it("patches a Codex diff onto the edit card when it arrives via ToolCallUpdated, and preserves it on a later text-only update", () => {
@@ -387,9 +383,7 @@ describe("applyEvent / UserPromptSent", () => {
         },
       },
     });
-    const row = state.activity.find(
-      (a) => a.kind === "tool_start" && a.toolCallId === "tc-edit",
-    );
+    const row = state.activity.find((a) => a.kind === "tool_start" && a.toolCallId === "tc-edit");
     expect(row?.tool?.diffs?.length).toBe(1);
     expect(row?.tool?.diffs?.[0].path).toBe("src/foo.rs");
     expect(state.inFlightTool?.diffs?.length).toBe(1);
@@ -407,9 +401,7 @@ describe("applyEvent / UserPromptSent", () => {
         },
       },
     });
-    const rowAfter = state.activity.find(
-      (a) => a.kind === "tool_start" && a.toolCallId === "tc-edit",
-    );
+    const rowAfter = state.activity.find((a) => a.kind === "tool_start" && a.toolCallId === "tc-edit");
     expect(rowAfter?.tool?.diffs?.length).toBe(1);
   });
 
@@ -450,9 +442,7 @@ describe("applyEvent / UserPromptSent", () => {
       },
     });
 
-    const startRow = state.activity.find(
-      (a) => a.kind === "tool_start" && a.toolCallId === "tc-todos",
-    );
+    const startRow = state.activity.find((a) => a.kind === "tool_start" && a.toolCallId === "tc-todos");
     expect(startRow?.tool?.name).toBe("1 todos");
     expect(startRow?.tool?.args_preview).toBe(todos);
     expect(state.inFlightTool?.name).toBe("1 todos");
@@ -499,10 +489,7 @@ describe("applyEvent / UserPromptSent", () => {
         event: { AgentMessageChunk: { text: "Anytime." } },
       },
     ];
-    const final = replay.reduce(
-      (state, f) => applyEvent(state, f),
-      emptyAcpState(),
-    );
+    const final = replay.reduce((state, f) => applyEvent(state, f), emptyAcpState());
     const userPrompts = final.activity.filter((a) => a.kind === "user_prompt");
     const messages = final.activity.filter((a) => a.kind === "message");
     expect(userPrompts.map((u) => u.text)).toEqual(["hi", "thanks"]);
@@ -637,9 +624,7 @@ describe("applyEvent / AvailableCommandsUpdated", () => {
       seq: 1,
       event: {
         AvailableCommandsUpdated: {
-          commands: [
-            { name: "help", description: "Show help", accepts_input: false },
-          ],
+          commands: [{ name: "help", description: "Show help", accepts_input: false }],
         },
       },
     };
@@ -664,10 +649,7 @@ describe("applyEvent / AvailableCommandsUpdated", () => {
       },
     };
     const s2 = applyEvent(s1, f2);
-    expect(s2.availableCommands.map((c) => c.name)).toEqual([
-      "review",
-      "clear",
-    ]);
+    expect(s2.availableCommands.map((c) => c.name)).toEqual(["review", "clear"]);
     expect(s2.availableCommands[0].accepts_input).toBe(true);
   });
 });
@@ -856,9 +838,7 @@ describe("applyEvent / Stopped empty-output fallback", () => {
       seq: 3,
       event: { Stopped: {} },
     });
-    expect(
-      state.activity.find((r) => r.kind === "empty_output"),
-    ).toBeUndefined();
+    expect(state.activity.find((r) => r.kind === "empty_output")).toBeUndefined();
   });
 
   it("does not append the notice when a tool call ran during the turn", () => {
@@ -887,9 +867,7 @@ describe("applyEvent / Stopped empty-output fallback", () => {
       seq: 3,
       event: { Stopped: {} },
     });
-    expect(
-      state.activity.find((r) => r.kind === "empty_output"),
-    ).toBeUndefined();
+    expect(state.activity.find((r) => r.kind === "empty_output")).toBeUndefined();
   });
 });
 
@@ -1189,9 +1167,7 @@ describe("applyEvent / SessionCleared", () => {
   it("resets per-turn state but preserves capability caches (#1128)", () => {
     const seeded: AcpState = {
       ...emptyAcpState(),
-      availableCommands: [
-        { name: "foo", description: "", accepts_input: false },
-      ],
+      availableCommands: [{ name: "foo", description: "", accepts_input: false }],
       availableModes: [{ id: "m1", name: "Mode One" }],
       currentModeId: "m1",
       plan: {
@@ -1730,9 +1706,7 @@ describe("applyEvent / AgentSwitched", () => {
       },
       thinking: true,
       sessionUsage: { used: 100, size: 200_000 },
-      availableCommands: [
-        { name: "/clear", description: "wipe context", accepts_input: false },
-      ],
+      availableCommands: [{ name: "/clear", description: "wipe context", accepts_input: false }],
       availableModes: [{ id: "m1", name: "Default" }],
       currentModeId: "m1",
       mode: "Plan",
@@ -1817,15 +1791,9 @@ describe("turnActive derivation from prompt/stop counters (#1170)", () => {
   // are the source of truth a late `Stopped` cannot clobber.
 
   it("isTurnActive flips on / off when counters cross", () => {
-    expect(isTurnActive({ pendingUserPromptSeq: 2, lastStoppedSeq: 1 })).toBe(
-      true,
-    );
-    expect(isTurnActive({ pendingUserPromptSeq: 1, lastStoppedSeq: 1 })).toBe(
-      false,
-    );
-    expect(isTurnActive({ pendingUserPromptSeq: 0, lastStoppedSeq: 0 })).toBe(
-      false,
-    );
+    expect(isTurnActive({ pendingUserPromptSeq: 2, lastStoppedSeq: 1 })).toBe(true);
+    expect(isTurnActive({ pendingUserPromptSeq: 1, lastStoppedSeq: 1 })).toBe(false);
+    expect(isTurnActive({ pendingUserPromptSeq: 0, lastStoppedSeq: 0 })).toBe(false);
   });
 
   it("Stopped advances lastStoppedSeq by one and recomputes turnActive", () => {
@@ -2078,9 +2046,7 @@ describe("applyEvent / ModeSwitchFailed", () => {
     });
     expect(next.modeSwitchFailed).not.toBeNull();
     expect(next.modeSwitchFailed?.modeId).toBe("bypassPermissions");
-    expect(next.modeSwitchFailed?.reason).toBe(
-      "Mode bypassPermissions is not available.",
-    );
+    expect(next.modeSwitchFailed?.reason).toBe("Mode bypassPermissions is not available.");
   });
 
   it("clears when a subsequent CurrentModeChanged lands", () => {
@@ -2299,8 +2265,7 @@ describe("applyEvent / IncompatibleAgent (claude-agent-acp v0.39.0)", () => {
             package_name: "@agentclientprotocol/claude-agent-acp",
             installed: "0.32.0",
             required: "0.39.0",
-            install_command:
-              "npm install -g @agentclientprotocol/claude-agent-acp@latest",
+            install_command: "npm install -g @agentclientprotocol/claude-agent-acp@latest",
           },
         },
       },
@@ -2324,8 +2289,7 @@ describe("applyEvent / IncompatibleAgent (claude-agent-acp v0.39.0)", () => {
             package_name: "@agentclientprotocol/claude-agent-acp",
             installed: "0.32.0",
             required: "0.39.0",
-            install_command:
-              "npm install -g @agentclientprotocol/claude-agent-acp@latest",
+            install_command: "npm install -g @agentclientprotocol/claude-agent-acp@latest",
           },
         },
       },
@@ -2638,13 +2602,9 @@ describe("applyEvent / start-less tool flows (#1713)", () => {
         },
       },
     });
-    const start = state.activity.find(
-      (r) => r.kind === "tool_start" && r.toolCallId === "orphan-1",
-    );
+    const start = state.activity.find((r) => r.kind === "tool_start" && r.toolCallId === "orphan-1");
     expect(start).toBeDefined();
-    const done = state.activity.find(
-      (r) => r.kind === "tool_complete" && r.toolCallId === "orphan-1",
-    );
+    const done = state.activity.find((r) => r.kind === "tool_complete" && r.toolCallId === "orphan-1");
     expect(done?.text).toBe("done output");
     // A synthesized card counts as turn output, so the turn-end logic
     // must not append "Command produced no output."
@@ -2663,9 +2623,7 @@ describe("applyEvent / start-less tool flows (#1713)", () => {
         },
       },
     });
-    const start = state.activity.find(
-      (r) => r.kind === "tool_start" && r.toolCallId === "orphan-2",
-    );
+    const start = state.activity.find((r) => r.kind === "tool_start" && r.toolCallId === "orphan-2");
     expect(start).toBeDefined();
     expect(start?.tool?.name).toBe("run_shell_command");
     expect(start?.tool?.args_preview).toBe('{"command":"ls"}');
@@ -2693,9 +2651,7 @@ describe("applyEvent / start-less tool flows (#1713)", () => {
         },
       },
     });
-    const rows = state.activity.filter(
-      (r) => r.kind === "tool_start" && r.toolCallId === "dup-1",
-    );
+    const rows = state.activity.filter((r) => r.kind === "tool_start" && r.toolCallId === "dup-1");
     expect(rows).toHaveLength(1);
     expect(rows[0]?.tool?.args_preview).toBe('{"command":"ls -la"}');
     expect(rows[0]?.tool?.kind).toBe("execute");
@@ -2723,9 +2679,7 @@ describe("applyEvent / start-less tool flows (#1713)", () => {
         },
       },
     });
-    const rows = state.activity.filter(
-      (r) => r.kind === "tool_start" && r.toolCallId === "dup-2",
-    );
+    const rows = state.activity.filter((r) => r.kind === "tool_start" && r.toolCallId === "dup-2");
     expect(rows).toHaveLength(1);
     expect(rows[0]?.tool?.args_preview).toBe('{"command":"pwd"}');
     expect(rows[0]?.tool?.kind).toBe("execute");
@@ -2758,9 +2712,7 @@ describe("applyEvent / start-less tool flows (#1713)", () => {
         },
       },
     });
-    const row = state.activity.find(
-      (r) => r.kind === "tool_start" && r.toolCallId === "dup-3",
-    );
+    const row = state.activity.find((r) => r.kind === "tool_start" && r.toolCallId === "dup-3");
     expect(row?.tool?.started_at).toBe("2026-01-01T00:00:05Z");
     expect(row?.at).toBe("2026-01-01T00:00:05Z");
   });

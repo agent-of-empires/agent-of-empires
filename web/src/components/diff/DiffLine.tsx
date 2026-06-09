@@ -65,10 +65,7 @@ function DiffLineImpl({
     if (tokens && tokens.length > 0) {
       const opacity = line.type === "equal" ? 1 : 0.7;
       return tokens.map((tok, i) => (
-        <span
-          key={i}
-          style={tok.color ? { color: tok.color, opacity } : { opacity }}
-        >
+        <span key={i} style={tok.color ? { color: tok.color, opacity } : { opacity }}>
           {tok.content}
         </span>
       ));
@@ -77,11 +74,7 @@ function DiffLineImpl({
   };
 
   const showPlus =
-    plusEnabled === true &&
-    plusSide != null &&
-    plusLineNum != null &&
-    plusHunkIndex != null &&
-    onPlusClick != null;
+    plusEnabled === true && plusSide != null && plusLineNum != null && plusHunkIndex != null && onPlusClick != null;
 
   return (
     <div
@@ -93,9 +86,7 @@ function DiffLineImpl({
             {showPlus && (
               <button
                 type="button"
-                onClick={() =>
-                  onPlusClick(plusHunkIndex, plusSide, plusLineNum)
-                }
+                onClick={() => onPlusClick(plusHunkIndex, plusSide, plusLineNum)}
                 aria-label={`Add comment on ${plusSide} line ${plusLineNum}`}
                 // `tabIndex={-1}` keeps the hover-revealed button out of
                 // the tab order; otherwise keyboard users would land on
@@ -119,14 +110,8 @@ function DiffLineImpl({
           </span>
         </>
       )}
-      <span
-        className={`shrink-0 w-4 text-center font-mono text-[12px] ${textClass} select-none`}
-      >
-        {prefix}
-      </span>
-      <span
-        className={`flex-1 font-mono text-[12px] whitespace-pre${tokens ? "" : ` ${textClass}`}`}
-      >
+      <span className={`shrink-0 w-4 text-center font-mono text-[12px] ${textClass} select-none`}>{prefix}</span>
+      <span className={`flex-1 font-mono text-[12px] whitespace-pre${tokens ? "" : ` ${textClass}`}`}>
         {renderContent()}
       </span>
     </div>

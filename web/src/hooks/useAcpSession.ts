@@ -7,14 +7,7 @@
 // cancelPrompt are surfaced via state.lastError so the user gets a
 // dismissible banner instead of a silently-lost action.
 
-import {
-  useCallback,
-  useEffect,
-  useReducer,
-  useRef,
-  useState,
-  useSyncExternalStore,
-} from "react";
+import { useCallback, useEffect, useReducer, useRef, useState, useSyncExternalStore } from "react";
 import {
   applyEvent,
   emptyAcpState,
@@ -42,11 +35,7 @@ import {
   type PersistedEntry,
 } from "../lib/acpStateStorage";
 import { getToken } from "../lib/token";
-import {
-  reportAcpInteraction,
-  setSessionArchive,
-  setSessionSnooze,
-} from "../lib/api";
+import { reportAcpInteraction, setSessionArchive, setSessionSnooze } from "../lib/api";
 
 /** Outcome of an immediate prompt POST, used by the drain effect to
  *  decide whether to retire queued items (delivered or permanently
@@ -138,11 +127,7 @@ function evictOldestPersistedAcpState(currentKey: string): boolean {
       if (raw === null) continue;
       try {
         const parsed = JSON.parse(raw) as PersistedEntry | null;
-        if (
-          !parsed ||
-          typeof parsed.savedAt !== "number" ||
-          Number.isNaN(parsed.savedAt)
-        ) {
+        if (!parsed || typeof parsed.savedAt !== "number" || Number.isNaN(parsed.savedAt)) {
           if (firstCorruptKey === null) firstCorruptKey = k;
           continue;
         }
@@ -214,12 +199,7 @@ function loadPersistedState(sessionId: string): AcpState | undefined {
     const raw = window.localStorage.getItem(storageKey(sessionId));
     if (!raw) return undefined;
     const parsed = JSON.parse(raw) as PersistedEntry | null;
-    if (
-      !parsed ||
-      typeof parsed.savedAt !== "number" ||
-      typeof parsed.state !== "object" ||
-      parsed.state === null
-    ) {
+    if (!parsed || typeof parsed.savedAt !== "number" || typeof parsed.state !== "object" || parsed.state === null) {
       return undefined;
     }
     if (Date.now() - parsed.savedAt > STATE_TTL_MS) {
@@ -227,11 +207,7 @@ function loadPersistedState(sessionId: string): AcpState | undefined {
       return undefined;
     }
     const state = parsed.state as Partial<AcpState>;
-    if (
-      typeof state.lastSeq !== "number" ||
-      !Array.isArray(state.activity) ||
-      !Array.isArray(state.queuedPrompts)
-    ) {
+    if (typeof state.lastSeq !== "number" || !Array.isArray(state.activity) || !Array.isArray(state.queuedPrompts)) {
       window.localStorage.removeItem(storageKey(sessionId));
       return undefined;
     }
@@ -285,11 +261,7 @@ function sweepExpiredStorage(): void {
       }
       try {
         const parsed = JSON.parse(raw) as PersistedEntry | null;
-        if (
-          !parsed ||
-          typeof parsed.savedAt !== "number" ||
-          now - parsed.savedAt > STATE_TTL_MS
-        ) {
+        if (!parsed || typeof parsed.savedAt !== "number" || now - parsed.savedAt > STATE_TTL_MS) {
           toRemove.push(k);
         }
       } catch {
@@ -378,9 +350,7 @@ export function acpHookReducer(state: AcpState, action: Action): AcpState {
  *  idle with a non-empty queue. Joins every queued entry's text with a
  *  blank line so the agent sees them as one batch follow-up. Extracted
  *  for testability; consumed by the drain effect below. See #1031. */
-export function combineQueuedPrompts(
-  queue: ReadonlyArray<QueuedPrompt>,
-): string {
+export function combineQueuedPrompts(queue: ReadonlyArray<QueuedPrompt>): string {
   // Skip empty entries: an attachment-only queued prompt carries no
   // text, and gluing its "" in would leave stray blank-line separators.
   return queue
@@ -392,9 +362,7 @@ export function combineQueuedPrompts(
 /** Outcome of an approval-resolve POST: the card should clear, or an
  *  error banner should show. Pure so it can be unit-tested without the
  *  full hook. See #1821. */
-export type ApprovalResolveOutcome =
-  | { kind: "resolved" }
-  | { kind: "error"; message: string };
+export type ApprovalResolveOutcome = { kind: "resolved" } | { kind: "error"; message: string };
 
 /** Classify an approval-resolve response. A 204 (ok) or a 404 whose body
  *  names *this* nonce both mean "this card is done" and clear it; any other
@@ -408,11 +376,7 @@ export function classifyApprovalResolveResponse(
   nonce: string,
 ): ApprovalResolveOutcome {
   if (ok) return { kind: "resolved" };
-  if (
-    status === 404 &&
-    /no pending approval/i.test(detail) &&
-    detail.includes(nonce)
-  ) {
+  if (status === 404 && /no pending approval/i.test(detail) && detail.includes(nonce)) {
     return { kind: "resolved" };
   }
   return {
@@ -445,9 +409,7 @@ export function reducer(state: AcpState, action: Action): AcpState {
     // the decision (204) or reports the nonce already gone (404), instead
     // of waiting on the ApprovalResolved broadcast, which the seq dedupe
     // can swallow and leave the card stuck. See #1821.
-    const pendingApprovals = state.pendingApprovals.filter(
-      (a) => a.nonce !== action.nonce,
-    );
+    const pendingApprovals = state.pendingApprovals.filter((a) => a.nonce !== action.nonce);
     // Only clear the error banner when a card was actually removed, so a
     // duplicate or stale action can't quietly hide an unrelated error.
     const removed = pendingApprovals.length !== state.pendingApprovals.length;
@@ -474,10 +436,7 @@ export function reducer(state: AcpState, action: Action): AcpState {
         id: `user-${Date.now()}-${state.activity.length}`,
         kind: "user_prompt",
         text: action.text,
-        attachments:
-          action.attachments && action.attachments.length > 0
-            ? action.attachments
-            : undefined,
+        attachments: action.attachments && action.attachments.length > 0 ? action.attachments : undefined,
         at: new Date().toISOString(),
       }),
       assistantMessage: "",
@@ -498,10 +457,7 @@ export function reducer(state: AcpState, action: Action): AcpState {
     // attachments), retire exactly one pending turn so Stop unlocks and
     // the composer returns to idle without waiting for a Stopped frame
     // that will never arrive.
-    const lastStoppedSeq = Math.min(
-      state.lastStoppedSeq + 1,
-      state.pendingUserPromptSeq,
-    );
+    const lastStoppedSeq = Math.min(state.lastStoppedSeq + 1, state.pendingUserPromptSeq);
     return {
       ...state,
       inFlightTool: null,
@@ -517,9 +473,7 @@ export function reducer(state: AcpState, action: Action): AcpState {
       id: `q-${Date.now()}-${state.queuedPrompts.length}`,
       text: action.text,
       queuedAt: new Date().toISOString(),
-      ...(action.attachments && action.attachments.length > 0
-        ? { attachments: action.attachments }
-        : {}),
+      ...(action.attachments && action.attachments.length > 0 ? { attachments: action.attachments } : {}),
     };
     return { ...state, queuedPrompts: state.queuedPrompts.concat(entry) };
   }
@@ -540,9 +494,7 @@ export function reducer(state: AcpState, action: Action): AcpState {
   if (action.kind === "edit_queued_prompt") {
     return {
       ...state,
-      queuedPrompts: state.queuedPrompts.map((q) =>
-        q.id === action.id ? { ...q, text: action.text } : q,
-      ),
+      queuedPrompts: state.queuedPrompts.map((q) => (q.id === action.id ? { ...q, text: action.text } : q)),
     };
   }
   if (action.kind === "clear_queue") {
@@ -574,10 +526,7 @@ export function reducer(state: AcpState, action: Action): AcpState {
     return { ...state, pendingConfigOption: null };
   }
   if (action.kind === "clear_pending_config_option_if_match") {
-    if (
-      state.pendingConfigOption?.configId === action.configId &&
-      state.pendingConfigOption?.value === action.value
-    ) {
+    if (state.pendingConfigOption?.configId === action.configId && state.pendingConfigOption?.value === action.value) {
       return { ...state, pendingConfigOption: null };
     }
     return state;
@@ -600,10 +549,7 @@ const ACP_MAX_RETRIES = 7;
 const ACP_RETRY_BASE_MS = 1000;
 const ACP_RETRY_CAP_MS = 30000;
 export function acpRetryDelayMs(attempt: number): number {
-  return Math.min(
-    ACP_RETRY_CAP_MS,
-    ACP_RETRY_BASE_MS * 2 ** Math.max(0, attempt - 1),
-  );
+  return Math.min(ACP_RETRY_CAP_MS, ACP_RETRY_BASE_MS * 2 ** Math.max(0, attempt - 1));
 }
 export const ACP_MAX_RETRIES_EXPORT = ACP_MAX_RETRIES;
 
@@ -806,11 +752,7 @@ export function useAcpSession(
     };
   }, []);
   const getVisibilitySnapshot = useCallback(() => visCounterRef.current, []);
-  const visCounter = useSyncExternalStore(
-    subscribeVisibility,
-    getVisibilitySnapshot,
-    () => 0,
-  );
+  const visCounter = useSyncExternalStore(subscribeVisibility, getVisibilitySnapshot, () => 0);
 
   const isOnline = useSyncExternalStore(
     (cb: () => void) => {
@@ -1108,28 +1050,20 @@ export function useAcpSession(
         ws.onmessage = (ev) => {
           if (!isCurrentDial()) return;
           try {
-            const data = JSON.parse(ev.data) as
-              | AcpFrame
-              | { kind: "lagged"; skipped?: number };
+            const data = JSON.parse(ev.data) as AcpFrame | { kind: "lagged"; skipped?: number };
             if (
               typeof data === "object" &&
               data !== null &&
               "kind" in data &&
               (data as { kind?: unknown }).kind === "lagged"
             ) {
-              const skipped =
-                (data as unknown as { skipped?: number }).skipped ?? 0;
+              const skipped = (data as unknown as { skipped?: number }).skipped ?? 0;
               dispatch({ kind: "lagged", skipped });
               // Try to recover via the snapshot endpoint.
               fetchReplay(sessionId);
               return;
             }
-            if (
-              typeof data === "object" &&
-              data !== null &&
-              "session_id" in data &&
-              "event" in data
-            ) {
+            if (typeof data === "object" && data !== null && "session_id" in data && "event" in data) {
               // Every incoming live frame is an "activity" tick for the
               // force-end-turn watchdog: as long as the agent is
               // streaming, the spinner stays "honest" and the escape
@@ -1178,12 +1112,7 @@ export function useAcpSession(
           },
         );
         const detail = res.ok ? "" : await safeText(res);
-        const outcome = classifyApprovalResolveResponse(
-          res.ok,
-          res.status,
-          detail,
-          nonce,
-        );
+        const outcome = classifyApprovalResolveResponse(res.ok, res.status, detail, nonce);
         if (outcome.kind === "resolved") {
           // 204, or a 404 that names the missing nonce: the decision was
           // accepted or already resolved server-side (a concurrent
@@ -1217,10 +1146,7 @@ export function useAcpSession(
   //   - "retryable_failure": a transient disconnect / 5xx / network error,
   //     so keep the queue intact for the next turn-end retry.
   const dispatchPromptNow = useCallback(
-    async (
-      text: string,
-      attachments?: PromptAttachmentInput[],
-    ): Promise<PromptSendResult> => {
+    async (text: string, attachments?: PromptAttachmentInput[]): Promise<PromptSendResult> => {
       if (!sessionId) return "retryable_failure";
       if (statusRef.current !== "open") {
         dispatch({
@@ -1264,14 +1190,11 @@ export function useAcpSession(
             name: a.name,
           })),
         };
-        const res = await fetch(
-          `/api/sessions/${encodeURIComponent(sessionId)}/acp/prompt`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(body),
-          },
-        );
+        const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/acp/prompt`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
         if (!res.ok) {
           const detail = await safeText(res);
           // 4xx means the server rejected the prompt (validation,
@@ -1291,16 +1214,14 @@ export function useAcpSession(
           // Attachments are now re-queued on this transient (the queue
           // carries them in memory; see sendPrompt + the drain effect), so
           // suppress the banner for attachment sends too. See #1833.
-          const workerNotReady =
-            res.status === 503 && detail.startsWith("worker_not_ready");
+          const workerNotReady = res.status === 503 && detail.startsWith("worker_not_ready");
           if (rejected) {
             dispatch({ kind: "prompt_send_rejected" });
           }
           if (!workerNotReady) {
             dispatch({
               kind: "error",
-              message:
-                `Could not send prompt (${res.status}). ${detail}`.trim(),
+              message: `Could not send prompt (${res.status}). ${detail}`.trim(),
             });
           }
           return rejected ? "non_retryable_failure" : "retryable_failure";
@@ -1354,8 +1275,7 @@ export function useAcpSession(
           // existing `InteractionErrorBanner` renders it. See #1581.
           dispatch({
             kind: "error",
-            message:
-              "Could not wake this session. Please retry, or unarchive / unsnooze from the sidebar.",
+            message: "Could not wake this session. Please retry, or unarchive / unsnooze from the sidebar.",
           });
           return;
         }
@@ -1370,11 +1290,7 @@ export function useAcpSession(
       // "absent" until the respawn lands); parking would leave it in the
       // local queue forever and the worker would never come back. Only a
       // non-dormant cold worker (genuine mid-resume) still parks. See #1689.
-      const blockedAsideFromWorker =
-        wsClosed ||
-        state.turnActive ||
-        state.workerStopped ||
-        state.workerRestarting;
+      const blockedAsideFromWorker = wsClosed || state.turnActive || state.workerStopped || state.workerRestarting;
       const shouldEnqueue = state.workerIdleStopped
         ? blockedAsideFromWorker
         : blockedAsideFromWorker || workerNotRunning;
@@ -1444,8 +1360,7 @@ export function useAcpSession(
     // dormancy and `send_prompt`'s `wait_for_worker` holds the POST
     // until the respawned worker is ready. Without this, a prompt the
     // user queued while the worker was dormant would never drain. #1689.
-    if (workerStateRef.current !== "running" && !state.workerIdleStopped)
-      return;
+    if (workerStateRef.current !== "running" && !state.workerIdleStopped) return;
     // Reconnect race: connect() awaits fetchReplay BEFORE opening the
     // WS, and replay can dispatch a Stopped frame that flips turnActive
     // off. If we drain here while the WS is still in "connecting",
@@ -1476,14 +1391,10 @@ export function useAcpSession(
       // next Stopped retries.
       const queue = state.queuedPrompts;
       const aliases = clearAliasesRef.current;
-      const headIsClear =
-        aliases.length > 0 && isClearAlias(queue[0]!.text, aliases);
+      const headIsClear = aliases.length > 0 && isClearAlias(queue[0]!.text, aliases);
       let batchEnd = 1;
       if (!headIsClear && aliases.length > 0) {
-        while (
-          batchEnd < queue.length &&
-          !isClearAlias(queue[batchEnd]!.text, aliases)
-        ) {
+        while (batchEnd < queue.length && !isClearAlias(queue[batchEnd]!.text, aliases)) {
           batchEnd += 1;
         }
       } else if (aliases.length === 0) {
@@ -1497,10 +1408,7 @@ export function useAcpSession(
       // below, same as any other rejected combined send. See #1833.
       const combinedAttachments = snapshot.flatMap((q) => q.attachments ?? []);
       const sentIds = snapshot.map((q) => q.id);
-      void dispatchPromptNow(
-        combined,
-        combinedAttachments.length > 0 ? combinedAttachments : undefined,
-      )
+      void dispatchPromptNow(combined, combinedAttachments.length > 0 ? combinedAttachments : undefined)
         .then((result) => {
           // Retire on success and on non-retryable rejection; only a
           // transient failure keeps the batch queued for the next retry.
@@ -1573,14 +1481,11 @@ export function useAcpSession(
       if (!sessionId) return;
       dispatch({ kind: "set_pending_config_option", configId, value });
       try {
-        const res = await fetch(
-          `/api/sessions/${encodeURIComponent(sessionId)}/acp/config-option`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ config_id: configId, value }),
-          },
-        );
+        const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/acp/config-option`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ config_id: configId, value }),
+        });
         if (!res.ok) {
           const detail = await safeText(res);
           // Guard against the user clicking a second option before this
@@ -1593,8 +1498,7 @@ export function useAcpSession(
           });
           dispatch({
             kind: "error",
-            message:
-              `Could not set ${configId} (${res.status}). ${detail}`.trim(),
+            message: `Could not set ${configId} (${res.status}). ${detail}`.trim(),
           });
         }
       } catch (e) {
@@ -1627,10 +1531,7 @@ export function useAcpSession(
   const cancelPrompt = useCallback(async () => {
     if (!sessionId) return;
     try {
-      const res = await fetch(
-        `/api/sessions/${encodeURIComponent(sessionId)}/acp/cancel`,
-        { method: "POST" },
-      );
+      const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/acp/cancel`, { method: "POST" });
       if (!res.ok) {
         const detail = await safeText(res);
         dispatch({
@@ -1656,10 +1557,7 @@ export function useAcpSession(
     if (!sessionId) return;
     lastActivityRef.current = Date.now();
     try {
-      const res = await fetch(
-        `/api/sessions/${encodeURIComponent(sessionId)}/acp/force_end_turn`,
-        { method: "POST" },
-      );
+      const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/acp/force_end_turn`, { method: "POST" });
       if (!res.ok) {
         const detail = await safeText(res);
         dispatch({

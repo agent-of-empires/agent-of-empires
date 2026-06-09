@@ -21,9 +21,7 @@ base("Cmd/Ctrl+B toggles the workspace sidebar", async ({ page }, testInfo) => {
   try {
     await page.goto(serve.baseUrl);
 
-    const sessionRow = page
-      .locator('[data-testid="sidebar-session-row"]')
-      .first();
+    const sessionRow = page.locator('[data-testid="sidebar-session-row"]').first();
     await expect(sessionRow).toBeVisible({ timeout: 10_000 });
 
     await page.keyboard.press(`${MOD}+B`);

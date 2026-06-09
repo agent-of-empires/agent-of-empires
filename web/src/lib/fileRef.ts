@@ -28,8 +28,7 @@ export interface FileRefSession {
 
 // Web/app URL schemes that are never local file references. Anything
 // matching here keeps default (new-tab) anchor behavior.
-const NON_FILE_SCHEME =
-  /^(?:https?|mailto|tel|data|javascript|ftp|vscode|vscode-insiders|blob):/i;
+const NON_FILE_SCHEME = /^(?:https?|mailto|tel|data|javascript|ftp|vscode|vscode-insiders|blob):/i;
 
 /**
  * Classify an anchor href as a local file reference and split off any
@@ -106,9 +105,7 @@ export function parseFileRef(href: string): FileRef | null {
 // drive prefix is stripped from the returned relative path anyway, so
 // folding it never leaks into output.
 function normalizePathForMatch(p: string): string {
-  return p
-    .replace(/\\/g, "/")
-    .replace(/^([a-zA-Z]):\//, (_, d) => `${d.toLowerCase()}:/`);
+  return p.replace(/\\/g, "/").replace(/^([a-zA-Z]):\//, (_, d) => `${d.toLowerCase()}:/`);
 }
 
 function normalizeRoot(root: string): string {

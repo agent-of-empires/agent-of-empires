@@ -16,30 +16,20 @@
 
 import { test, expect } from "../helpers/liveTest";
 
-test("SIGTERM surfaces the alert; restart() clears it and flashes reconnected", async ({
-  serve,
-  page,
-}) => {
+test("SIGTERM surfaces the alert; restart() clears it and flashes reconnected", async ({ serve, page }) => {
   // Narrow role queries by text content. The dashboard has an unrelated
   // dnd-kit live region (`<div role="status" aria-live="assertive">`)
   // that would otherwise match `getByRole("status")` and false-trigger
   // the reconnected assertion.
-  const alertBanner = page
-    .getByRole("alert")
-    .filter({ hasText: /server unreachable/i });
-  const reconnectedBanner = page
-    .getByRole("status")
-    .filter({ hasText: /reconnected/i });
+  const alertBanner = page.getByRole("alert").filter({ hasText: /server unreachable/i });
+  const reconnectedBanner = page.getByRole("status").filter({ hasText: /reconnected/i });
 
   await page.goto(serve.baseUrl, { waitUntil: "domcontentloaded" });
 
   // Let the first /api/sessions poll land so `useSessions` has set
   // serverDown = false. Without this gate, the SIGTERM can race the
   // initial fetch and the "Reconnected" assertion comes too early.
-  await page.waitForResponse(
-    (r) => r.url().endsWith("/api/sessions") && r.status() === 200,
-    { timeout: 10_000 },
-  );
+  await page.waitForResponse((r) => r.url().endsWith("/api/sessions") && r.status() === 200, { timeout: 10_000 });
 
   await expect(alertBanner).toBeHidden();
   await expect(reconnectedBanner).toBeHidden();

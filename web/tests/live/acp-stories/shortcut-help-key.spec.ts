@@ -15,16 +15,12 @@ base("? key opens the Help overlay", async ({ page }, testInfo) => {
 
   try {
     await page.goto(serve.baseUrl);
-    await expect(
-      page.getByRole("button", { name: "Go to dashboard" }),
-    ).toBeVisible({ timeout: 10_000 });
+    await expect(page.getByRole("button", { name: "Go to dashboard" })).toBeVisible({ timeout: 10_000 });
     // Make sure focus is on body so the input-gated shortcut fires.
     await page.locator("body").click();
 
     await page.keyboard.press("Shift+?");
-    await expect(
-      page.getByRole("heading", { name: "Help", exact: true }),
-    ).toBeVisible({ timeout: 5_000 });
+    await expect(page.getByRole("heading", { name: "Help", exact: true })).toBeVisible({ timeout: 5_000 });
   } finally {
     await serve.stop();
   }

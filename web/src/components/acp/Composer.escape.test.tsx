@@ -29,13 +29,7 @@ afterEach(() => {
   cleanup();
 });
 
-function Harness({
-  onCancel,
-  cancelOnEscape,
-}: {
-  onCancel: () => void | Promise<void>;
-  cancelOnEscape?: boolean;
-}) {
+function Harness({ onCancel, cancelOnEscape }: { onCancel: () => void | Promise<void>; cancelOnEscape?: boolean }) {
   const runtime = useExternalStoreRuntime<ThreadMessageLike>({
     messages: [],
     isRunning: true,
@@ -46,10 +40,7 @@ function Harness({
   return (
     <AssistantRuntimeProvider runtime={runtime}>
       <ComposerPrimitive.Root>
-        <ComposerPrimitive.Input
-          data-testid="composer-input"
-          cancelOnEscape={cancelOnEscape}
-        />
+        <ComposerPrimitive.Input data-testid="composer-input" cancelOnEscape={cancelOnEscape} />
       </ComposerPrimitive.Root>
     </AssistantRuntimeProvider>
   );
@@ -60,17 +51,13 @@ function pressEscape(target: HTMLElement) {
   // @radix-ui/react-use-escape-keydown, which uses a capture-phase
   // document listener. Dispatch from the textarea so the listener's
   // `textareaRef.current.contains(e.target)` guard passes.
-  target.dispatchEvent(
-    new KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
-  );
+  target.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
 }
 
 describe("ComposerPrimitive.Input + cancelOnEscape contract", () => {
   it("does not invoke onCancel when cancelOnEscape={false}", async () => {
     const onCancel = vi.fn();
-    const { getByTestId } = render(
-      <Harness onCancel={onCancel} cancelOnEscape={false} />,
-    );
+    const { getByTestId } = render(<Harness onCancel={onCancel} cancelOnEscape={false} />);
     const input = getByTestId("composer-input");
     input.focus();
     pressEscape(input);

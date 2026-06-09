@@ -33,31 +33,19 @@ function mkComment(overrides: Partial<DiffComment>): DiffComment {
 
 describe("anchorComments", () => {
   it("marks comments active when the range resolves", () => {
-    const [a] = anchorComments([mkComment({})], "src/foo.rs", undefined, [
-      mkHunk(),
-    ]);
+    const [a] = anchorComments([mkComment({})], "src/foo.rs", undefined, [mkHunk()]);
     expect(a.status).toBe("active");
     expect(a.hunkIndex).toBe(0);
     expect(a.contentChanged).toBe(false);
   });
 
   it("marks comments stale when the range is missing", () => {
-    const [a] = anchorComments(
-      [mkComment({ startLine: 99, endLine: 99 })],
-      "src/foo.rs",
-      undefined,
-      [mkHunk()],
-    );
+    const [a] = anchorComments([mkComment({ startLine: 99, endLine: 99 })], "src/foo.rs", undefined, [mkHunk()]);
     expect(a.status).toBe("stale");
   });
 
   it("flags contentChanged when current snippet differs from captured", () => {
-    const [a] = anchorComments(
-      [mkComment({ capturedSnippet: "STALE" })],
-      "src/foo.rs",
-      undefined,
-      [mkHunk()],
-    );
+    const [a] = anchorComments([mkComment({ capturedSnippet: "STALE" })], "src/foo.rs", undefined, [mkHunk()]);
     expect(a.status).toBe("active");
     expect(a.contentChanged).toBe(true);
   });

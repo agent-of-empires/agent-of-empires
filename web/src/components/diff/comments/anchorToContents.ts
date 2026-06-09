@@ -19,19 +19,9 @@ export function anchorCommentsToContents(
   newContent: string,
 ): AnchoredComment[] {
   return comments
-    .filter(
-      (c) =>
-        c.filePath === filePath &&
-        (c.repoName ?? undefined) === (repoName ?? undefined),
-    )
+    .filter((c) => c.filePath === filePath && (c.repoName ?? undefined) === (repoName ?? undefined))
     .map((c) => {
-      const snippet = extractSnippetFromContents(
-        oldContent,
-        newContent,
-        c.side,
-        c.startLine,
-        c.endLine,
-      );
+      const snippet = extractSnippetFromContents(oldContent, newContent, c.side, c.startLine, c.endLine);
       if (snippet == null) {
         return { comment: c, status: "stale", contentChanged: false };
       }

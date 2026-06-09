@@ -50,11 +50,7 @@ export default defineConfig([
     // Test specs match ANSI escape codes in regexes by design (terminal output).
     // Playwright fixture callbacks use `use(value)`; eslint-plugin-react-hooks v7
     // misidentifies these as the React `use` hook.
-    files: [
-      "tests/**/*.{ts,tsx}",
-      "src/**/*.test.{ts,tsx}",
-      "src/**/__tests__/**",
-    ],
+    files: ["tests/**/*.{ts,tsx}", "src/**/*.test.{ts,tsx}", "src/**/__tests__/**"],
     rules: {
       "no-control-regex": "off",
       "react-hooks/rules-of-hooks": "off",
@@ -74,16 +70,13 @@ export default defineConfig([
       "no-restricted-syntax": [
         "error",
         {
-          selector:
-            "CallExpression[callee.object.name='localStorage'][callee.property.name='setItem']",
-          message:
-            "Use safeSetItem from src/lib/safeStorage.ts instead of bare localStorage.setItem.",
+          selector: "CallExpression[callee.object.name='localStorage'][callee.property.name='setItem']",
+          message: "Use safeSetItem from src/lib/safeStorage.ts instead of bare localStorage.setItem.",
         },
         {
           selector:
             "CallExpression[callee.object.object.name='window'][callee.object.property.name='localStorage'][callee.property.name='setItem']",
-          message:
-            "Use safeSetItem from src/lib/safeStorage.ts instead of bare window.localStorage.setItem.",
+          message: "Use safeSetItem from src/lib/safeStorage.ts instead of bare window.localStorage.setItem.",
         },
       ],
     },

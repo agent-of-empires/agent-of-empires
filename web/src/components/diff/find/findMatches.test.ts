@@ -26,9 +26,7 @@ describe("findMatches", () => {
   });
 
   it("assigns a contiguous global index in match order", () => {
-    expect(findMatches(LINES, "beta").map((x) => x.index)).toEqual([
-      0, 1, 2, 3, 4,
-    ]);
+    expect(findMatches(LINES, "beta").map((x) => x.index)).toEqual([0, 1, 2, 3, 4]);
   });
 
   it("respects caseSensitive", () => {
@@ -49,21 +47,12 @@ describe("findMatches", () => {
 
   it("only searches the lines it is given (changed lines)", () => {
     // A line not in the set is never matched.
-    const m = findMatches(
-      [{ side: "new", lineNumber: 5, text: "needle here" }],
-      "needle",
-    );
-    expect(m).toEqual([
-      { side: "new", lineNumber: 5, startCol: 0, endCol: 6, index: 0 },
-    ]);
+    const m = findMatches([{ side: "new", lineNumber: 5, text: "needle here" }], "needle");
+    expect(m).toEqual([{ side: "new", lineNumber: 5, startCol: 0, endCol: 6, index: 0 }]);
   });
 
   it("supports regex search", () => {
-    const m = findMatches(
-      [{ side: "old", lineNumber: 1, text: "foo123bar" }],
-      "\\d+",
-      { regex: true },
-    );
+    const m = findMatches([{ side: "old", lineNumber: 1, text: "foo123bar" }], "\\d+", { regex: true });
     expect(m.map((x) => [x.startCol, x.endCol])).toEqual([[3, 6]]);
   });
 

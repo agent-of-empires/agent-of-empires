@@ -11,11 +11,7 @@
 
 import { createContext, useContext, type ReactNode } from "react";
 
-import {
-  DEFAULT_AGENT_PROFILE,
-  resolveAgentProfile,
-  type AgentProfile,
-} from "./agentProfiles";
+import { DEFAULT_AGENT_PROFILE, resolveAgentProfile, type AgentProfile } from "./agentProfiles";
 
 const AgentProfileContext = createContext<AgentProfile>(DEFAULT_AGENT_PROFILE);
 
@@ -27,11 +23,7 @@ export function AgentProfileProvider({
   children: ReactNode;
 }) {
   const profile = resolveAgentProfile(toolKey);
-  return (
-    <AgentProfileContext.Provider value={profile}>
-      {children}
-    </AgentProfileContext.Provider>
-  );
+  return <AgentProfileContext.Provider value={profile}>{children}</AgentProfileContext.Provider>;
 }
 
 export function useAgentProfile(): AgentProfile {

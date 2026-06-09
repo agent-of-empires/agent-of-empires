@@ -15,11 +15,7 @@
 // store without going through the prompt path.
 
 import { test, expect } from "@playwright/test";
-import {
-  spawnAoeServe,
-  listSessions,
-  seedSessionViaAoeAdd,
-} from "../helpers/aoeServe";
+import { spawnAoeServe, listSessions, seedSessionViaAoeAdd } from "../helpers/aoeServe";
 
 const SEED_EVENTS = 5;
 
@@ -41,10 +37,7 @@ test("structured view/replay surfaces seeded events and signals lost frames", as
     });
 
     for (let i = 0; i < SEED_EVENTS; i++) {
-      const r = await fetch(
-        `${serve.baseUrl}/api/sessions/${sessionId}/acp/force_end_turn`,
-        { method: "POST" },
-      );
+      const r = await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/acp/force_end_turn`, { method: "POST" });
       expect(r.status).toBe(202);
     }
 
@@ -61,9 +54,7 @@ test("structured view/replay surfaces seeded events and signals lost frames", as
     await expect
       .poll(
         async () => {
-          const res = await fetch(
-            `${serve.baseUrl}/api/sessions/${sessionId}/acp/replay?since=0`,
-          );
+          const res = await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/acp/replay?since=0`);
           if (!res.ok) return -1;
           body = await res.json();
           return JSON.stringify(body!.frames).split('"user_forced"').length - 1;
@@ -84,9 +75,9 @@ test("structured view/replay surfaces seeded events and signals lost frames", as
     // since=highest_seq returns an empty frames array, still reports the
     // current head.
     const highest = body!.highest_seq!;
-    const tail = await fetch(
-      `${serve.baseUrl}/api/sessions/${sessionId}/acp/replay?since=${highest}`,
-    ).then((r) => r.json());
+    const tail = await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/acp/replay?since=${highest}`).then((r) =>
+      r.json(),
+    );
     expect(tail.frames.length).toBe(0);
     expect(tail.highest_seq).toBe(highest);
     expect(tail.lost).toBe(false);

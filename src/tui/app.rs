@@ -230,6 +230,7 @@ impl App {
         available_tools: AvailableTools,
         suppress_first_run_dialogs: bool,
         mosh_active: bool,
+        file_watch: std::sync::Arc<crate::file_watch::FileWatchService>,
     ) -> Result<Self> {
         let no_agents = !available_tools.any_available();
         let active_profile = if profile.is_empty() {
@@ -237,7 +238,7 @@ impl App {
         } else {
             Some(profile.to_string())
         };
-        let mut home = HomeView::new(active_profile, available_tools)?;
+        let mut home = HomeView::new(active_profile, available_tools, file_watch)?;
 
         // Check if we need to show welcome or changelog dialogs
         let mut config = Config::load_or_warn();
@@ -1185,31 +1186,67 @@ impl App {
                 needs_full_refresh = true;
             }
 
-            // Defer the 5s disk reload while the user is in live-send.
-            // The reload is on the UI thread and rebuilds the sidebar
-            // tree from disk, which causes a visible hitch in the
-            // preview. The user can't change session config from inside
-            // live mode anyway. Leaving `last_disk_refresh` un-advanced
-            // when we skip means the first tick outside live-send
-            // re-checks the interval and reloads immediately if it's
-            // been ≥5s since the last successful reload (so a change
-            // on disk during a long live-send session is picked up on
-            // exit instead of sitting stale for another 5s window).
-            if last_disk_refresh.elapsed() >= DISK_REFRESH_INTERVAL && self.home.live_send.is_none()
-            {
-                self.home.reload()?;
-                // Pick up a Settings > Interaction > Mouse Capture toggle from
-                // disk and apply it now, so capture turns on/off within the
-                // reload window instead of waiting for a restart.
-                let profile = self.home.active_profile.as_deref().unwrap_or("default");
-                let mouse_capture_allowed = crate::session::resolve_config(profile)
-                    .map(|c| crate::tui::mouse_capture_requested(&c.session))
-                    .unwrap_or(self.mouse_capture_allowed);
-                if mouse_capture_allowed != self.mouse_capture_allowed {
-                    self.mouse_capture_allowed = mouse_capture_allowed;
-                    self.sync_mouse_capture(terminal)?;
+            // Disk reload: heartbeat (defense-in-depth) plus the
+            // file-watch-driven kick. Both gate on `live_send.is_none()`
+            // so reloads never interrupt a paste-in-progress; the dirty
+            // flag stays latched (Acquire pairs with the forwarder/adapter
+            // Release) until the next eligible tick. The watcher is scoped
+            // to `sessions.json` / `groups.json`, so the watcher path calls
+            // `reload_storage_only` (storage + profile rediscovery only);
+            // the heartbeat path calls full `reload()` to refresh the
+            // status-hook config cache and mouse-capture toggle.
+            let live_idle = self.home.live_send.is_none();
+            let heartbeat_due = last_disk_refresh.elapsed() >= DISK_REFRESH_INTERVAL;
+            // Only consume the dirty latch when we're eligible to act on
+            // it (`live_idle`). When live-send is on, the latch must
+            // persist for the next eligible tick so a watcher kick that
+            // arrived during live-send is not silently lost.
+            let dirty = if live_idle {
+                self.home
+                    .disk_dirty
+                    .swap(false, std::sync::atomic::Ordering::Acquire)
+            } else {
+                false
+            };
+            let refresh_decision = decide_disk_refresh(live_idle, heartbeat_due, dirty);
+
+            match refresh_decision {
+                DiskRefreshDecision::Heartbeat => {
+                    let reload_result = self.home.reload();
+                    let reload_ok = reload_result.is_ok();
+                    handle_tick_reload_storage(reload_result, &mut self.home.reload_failure_state);
+                    if reload_ok {
+                        let profile = self.home.active_profile.as_deref().unwrap_or("default");
+                        let mouse_capture_allowed = crate::session::resolve_config(profile)
+                            .map(|c| crate::tui::mouse_capture_requested(&c.session))
+                            .unwrap_or(self.mouse_capture_allowed);
+                        if mouse_capture_allowed != self.mouse_capture_allowed {
+                            self.mouse_capture_allowed = mouse_capture_allowed;
+                            self.sync_mouse_capture(terminal)?;
+                        }
+                    }
+                    last_disk_refresh = std::time::Instant::now();
+                    refresh_needed = true;
+                    needs_full_refresh = true;
                 }
-                last_disk_refresh = std::time::Instant::now();
+                DiskRefreshDecision::Watcher => {
+                    let reload_result = self.home.reload_storage_only();
+                    handle_tick_reload_storage(reload_result, &mut self.home.reload_failure_state);
+                    refresh_needed = true;
+                    needs_full_refresh = true;
+                }
+                DiskRefreshDecision::None => {}
+            }
+
+            if self.home.reload_failure_state.has_unacknowledged_failure()
+                && self.home.info_dialog.is_none()
+            {
+                let body = self.home.reload_failure_state.build_dialog_body();
+                self.home.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
+                    "Watcher Warning",
+                    &body,
+                ));
+                self.home.reload_failure_state.acknowledge_dialog();
                 refresh_needed = true;
                 needs_full_refresh = true;
             }
@@ -1753,6 +1790,50 @@ fn poll_update_receiver(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiskRefreshDecision {
+    Heartbeat,
+    Watcher,
+    None,
+}
+
+/// Pure refresh-policy decision. Inputs are plain values so this helper
+/// is side-effect free; callers are responsible for actually consuming
+/// the watcher latch (`AtomicBool::swap`) before invoking it. Keeping
+/// decision and mutation separate lets the unit tests below be
+/// table-driven without owning an atomic.
+fn decide_disk_refresh(live_idle: bool, heartbeat_due: bool, dirty: bool) -> DiskRefreshDecision {
+    if !live_idle {
+        return DiskRefreshDecision::None;
+    }
+    if heartbeat_due {
+        DiskRefreshDecision::Heartbeat
+    } else if dirty {
+        DiskRefreshDecision::Watcher
+    } else {
+        DiskRefreshDecision::None
+    }
+}
+
+/// Catches reload errors so the tick loop never propagates them. A
+/// malformed `sessions.json` or `groups.json` written by a peer process
+/// is logged, recorded in `ReloadFailureState` for one-shot dialog
+/// surfacing, and the tick loop continues with the previous in-memory
+/// state. The next successful reload clears the recorded failure.
+fn handle_tick_reload_storage(
+    result: anyhow::Result<()>,
+    state: &mut crate::tui::home::ReloadFailureState,
+) {
+    if let Err(ref e) = result {
+        tracing::warn!(
+            target: "tui.file_watch",
+            error = %e,
+            "tick storage reload failed; preserving in-memory state, will retry on next tick"
+        );
+    }
+    state.record_storage(&result);
+}
+
 /// What a `q` key press at the home screen should do. Factored out of the
 /// key handler so the quit policy is unit-testable.
 #[derive(Debug, PartialEq, Eq)]
@@ -1916,7 +1997,7 @@ impl App {
         for cand in candidates {
             match crate::session::idle_reap::claim_idle_stop(
                 &cand.profile,
-                crate::file_watch::FileWatchService::noop(),
+                self.home.file_watch.clone(),
                 &cand.session_id,
                 now,
                 cand.threshold_secs,
@@ -2578,6 +2659,66 @@ mod tests {
         assert_eq!(
             quit_intent(KeyModifiers::NONE, true, false),
             QuitIntent::ConfirmDuringCreation,
+        );
+    }
+
+    #[test]
+    fn heartbeat_wins_when_both_disk_paths_are_ready() {
+        assert_eq!(
+            decide_disk_refresh(true, true, true),
+            DiskRefreshDecision::Heartbeat,
+            "when live-idle and both heartbeat and watcher are ready, the full reload wins"
+        );
+        assert_eq!(
+            decide_disk_refresh(true, true, false),
+            DiskRefreshDecision::Heartbeat,
+            "heartbeat fires even without a watcher kick"
+        );
+        assert_eq!(
+            decide_disk_refresh(true, false, true),
+            DiskRefreshDecision::Watcher,
+            "watcher kick alone fires the storage-only path"
+        );
+        assert_eq!(
+            decide_disk_refresh(true, false, false),
+            DiskRefreshDecision::None,
+            "no inputs ready yields no refresh"
+        );
+    }
+
+    #[test]
+    fn live_send_blocks_every_decision_branch() {
+        // The pure helper must return None for every (heartbeat_due,
+        // dirty) combination when live-send is on. Latch preservation is
+        // the caller's responsibility (see
+        // `caller_gating_preserves_dirty_latch_during_live_send`).
+        for &heartbeat in &[false, true] {
+            for &dirty in &[false, true] {
+                assert_eq!(
+                    decide_disk_refresh(false, heartbeat, dirty),
+                    DiskRefreshDecision::None,
+                    "live_send must block refresh (heartbeat={heartbeat}, dirty={dirty})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn caller_gating_preserves_dirty_latch_during_live_send() {
+        // Mirrors the gating logic in the tick loop: only consume the
+        // latch when live_idle is true. A watcher kick that arrived
+        // during live-send must remain observable on the next eligible
+        // tick.
+        let dirty_atomic = std::sync::atomic::AtomicBool::new(true);
+        let live_idle = false;
+        let _dirty = if live_idle {
+            dirty_atomic.swap(false, std::sync::atomic::Ordering::Acquire)
+        } else {
+            false
+        };
+        assert!(
+            dirty_atomic.load(std::sync::atomic::Ordering::Acquire),
+            "live_send tick must NOT consume the dirty latch; it must persist for the next tick"
         );
     }
 

@@ -5,14 +5,9 @@
 // silently (#1419).
 
 import { test, expect } from "./helpers/mockedTest";
-import {
-  installSidebarMocks,
-  threeSessionsInOneRepo,
-} from "./helpers/sidebarMocks";
+import { installSidebarMocks, threeSessionsInOneRepo } from "./helpers/sidebarMocks";
 
-test("stationary click on a row navigates without reordering", async ({
-  page,
-}) => {
+test("stationary click on a row navigates without reordering", async ({ page }) => {
   const handle = await installSidebarMocks(page, {
     sessions: threeSessionsInOneRepo(),
   });
@@ -20,9 +15,7 @@ test("stationary click on a row navigates without reordering", async ({
   await page.setViewportSize({ width: 1280, height: 720 });
   await page.goto("/");
 
-  const wrappers = page.locator(
-    "[aria-roledescription='Press and hold to reorder']",
-  );
+  const wrappers = page.locator("[aria-roledescription='Press and hold to reorder']");
   await expect(wrappers).toHaveCount(3);
 
   const box = await wrappers.nth(1).boundingBox();

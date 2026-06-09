@@ -5,13 +5,7 @@ import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import type { SessionResponse } from "../../lib/types";
 
 vi.mock("../TerminalView", () => ({
-  TerminalView: ({
-    session,
-    active,
-  }: {
-    session: SessionResponse;
-    active: boolean;
-  }) => (
+  TerminalView: ({ session, active }: { session: SessionResponse; active: boolean }) => (
     <div data-testid={`terminal-${session.id}`} data-active={String(active)}>
       {session.title}
     </div>
@@ -62,24 +56,12 @@ function makeSession(id: string): SessionResponse {
 describe("TerminalSessionStack", () => {
   it("renders only the active session when persistence is disabled", () => {
     const sessions = [makeSession("s1"), makeSession("s2")];
-    const { rerender } = render(
-      <TerminalSessionStack
-        activeSessionId="s1"
-        sessions={sessions}
-        persistent={false}
-      />,
-    );
+    const { rerender } = render(<TerminalSessionStack activeSessionId="s1" sessions={sessions} persistent={false} />);
 
     expect(screen.getByTestId("terminal-s1").dataset.active).toBe("true");
     expect(screen.queryByTestId("terminal-s2")).toBeNull();
 
-    rerender(
-      <TerminalSessionStack
-        activeSessionId="s2"
-        sessions={sessions}
-        persistent={false}
-      />,
-    );
+    rerender(<TerminalSessionStack activeSessionId="s2" sessions={sessions} persistent={false} />);
 
     expect(screen.queryByTestId("terminal-s1")).toBeNull();
     expect(screen.getByTestId("terminal-s2").dataset.active).toBe("true");
@@ -87,24 +69,12 @@ describe("TerminalSessionStack", () => {
 
   it("keeps recent inactive sessions mounted when persistence is enabled", async () => {
     const sessions = [makeSession("s1"), makeSession("s2")];
-    const { rerender } = render(
-      <TerminalSessionStack
-        activeSessionId="s1"
-        sessions={sessions}
-        persistent={true}
-      />,
-    );
+    const { rerender } = render(<TerminalSessionStack activeSessionId="s1" sessions={sessions} persistent={true} />);
     await waitFor(() => {
       expect(screen.getByTestId("terminal-s1").dataset.active).toBe("true");
     });
 
-    rerender(
-      <TerminalSessionStack
-        activeSessionId="s2"
-        sessions={sessions}
-        persistent={true}
-      />,
-    );
+    rerender(<TerminalSessionStack activeSessionId="s2" sessions={sessions} persistent={true} />);
 
     await waitFor(() => {
       expect(screen.getByTestId("terminal-s1").dataset.active).toBe("false");
@@ -115,24 +85,14 @@ describe("TerminalSessionStack", () => {
   it("evicts older inactive sessions beyond the configured limit", async () => {
     const sessions = [makeSession("s1"), makeSession("s2"), makeSession("s3")];
     const { rerender } = render(
-      <TerminalSessionStack
-        activeSessionId="s1"
-        sessions={sessions}
-        persistent={true}
-        maxPersistentTerminals={2}
-      />,
+      <TerminalSessionStack activeSessionId="s1" sessions={sessions} persistent={true} maxPersistentTerminals={2} />,
     );
     await waitFor(() => {
       expect(screen.getByTestId("terminal-s1")).toBeDefined();
     });
 
     rerender(
-      <TerminalSessionStack
-        activeSessionId="s2"
-        sessions={sessions}
-        persistent={true}
-        maxPersistentTerminals={2}
-      />,
+      <TerminalSessionStack activeSessionId="s2" sessions={sessions} persistent={true} maxPersistentTerminals={2} />,
     );
     await waitFor(() => {
       expect(screen.getByTestId("terminal-s1")).toBeDefined();
@@ -140,12 +100,7 @@ describe("TerminalSessionStack", () => {
     });
 
     rerender(
-      <TerminalSessionStack
-        activeSessionId="s3"
-        sessions={sessions}
-        persistent={true}
-        maxPersistentTerminals={1}
-      />,
+      <TerminalSessionStack activeSessionId="s3" sessions={sessions} persistent={true} maxPersistentTerminals={1} />,
     );
     await waitFor(() => {
       expect(screen.queryByTestId("terminal-s1")).toBeNull();
@@ -157,24 +112,14 @@ describe("TerminalSessionStack", () => {
   it("counts the configured limit as the total mounted terminal count", async () => {
     const sessions = [makeSession("s1"), makeSession("s2"), makeSession("s3")];
     const { rerender } = render(
-      <TerminalSessionStack
-        activeSessionId="s1"
-        sessions={sessions}
-        persistent={true}
-        maxPersistentTerminals={2}
-      />,
+      <TerminalSessionStack activeSessionId="s1" sessions={sessions} persistent={true} maxPersistentTerminals={2} />,
     );
     await waitFor(() => {
       expect(screen.getByTestId("terminal-s1")).toBeDefined();
     });
 
     rerender(
-      <TerminalSessionStack
-        activeSessionId="s2"
-        sessions={sessions}
-        persistent={true}
-        maxPersistentTerminals={2}
-      />,
+      <TerminalSessionStack activeSessionId="s2" sessions={sessions} persistent={true} maxPersistentTerminals={2} />,
     );
     await waitFor(() => {
       expect(screen.getByTestId("terminal-s1")).toBeDefined();
@@ -182,12 +127,7 @@ describe("TerminalSessionStack", () => {
     });
 
     rerender(
-      <TerminalSessionStack
-        activeSessionId="s3"
-        sessions={sessions}
-        persistent={true}
-        maxPersistentTerminals={2}
-      />,
+      <TerminalSessionStack activeSessionId="s3" sessions={sessions} persistent={true} maxPersistentTerminals={2} />,
     );
     await waitFor(() => {
       expect(screen.queryByTestId("terminal-s1")).toBeNull();

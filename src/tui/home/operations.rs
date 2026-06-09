@@ -73,7 +73,7 @@ impl HomeView {
         if !self.storages.contains_key(&target_profile) {
             self.storages.insert(
                 target_profile.clone(),
-                Storage::new_unwatched(&target_profile)?,
+                Storage::new(&target_profile, self.file_watch.clone())?,
             );
         }
 
@@ -221,7 +221,7 @@ impl HomeView {
                 if !self.storages.contains_key(target_profile) {
                     self.storages.insert(
                         target_profile.to_string(),
-                        Storage::new_unwatched(target_profile)?,
+                        Storage::new(target_profile, self.file_watch.clone())?,
                     );
                 }
                 if !self.group_trees.contains_key(target_profile) {
@@ -592,7 +592,7 @@ impl HomeView {
         if let Some(tp) = new_profile {
             if tp != ctx.old_profile && !self.storages.contains_key(tp) {
                 self.storages
-                    .insert(tp.to_string(), Storage::new_unwatched(tp)?);
+                    .insert(tp.to_string(), Storage::new(tp, self.file_watch.clone())?);
             }
         }
 
@@ -814,10 +814,7 @@ impl HomeView {
                     if !self.storages.contains_key(target_profile) {
                         self.storages.insert(
                             target_profile.to_string(),
-                            Storage::new(
-                                target_profile,
-                                crate::file_watch::FileWatchService::noop(),
-                            )?,
+                            Storage::new(target_profile, self.file_watch.clone())?,
                         );
                     }
 

@@ -7,46 +7,36 @@
 // exercised separately by the Ctrl+C interrupt story.
 
 import { test as base, expect, devices } from "@playwright/test";
-import {
-  spawnAoeServe,
-  listSessions,
-  seedSessionViaAoeAdd,
-} from "../../helpers/aoeServe";
+import { spawnAoeServe, listSessions, seedSessionViaAoeAdd } from "../../helpers/aoeServe";
 
 base.use({ ...devices["iPhone 13"] });
 
-base(
-  "mobile toolbar Ctrl button latches and unlatches",
-  async ({ page }, testInfo) => {
-    const serve = await spawnAoeServe({
-      authMode: "none",
-      workerIndex: testInfo.workerIndex,
-      parallelIndex: testInfo.parallelIndex,
-      seedFn: seedSessionViaAoeAdd({ title: "story-mobile-ctrl" }),
-    });
+base("mobile toolbar Ctrl button latches and unlatches", async ({ page }, testInfo) => {
+  const serve = await spawnAoeServe({
+    authMode: "none",
+    workerIndex: testInfo.workerIndex,
+    parallelIndex: testInfo.parallelIndex,
+    seedFn: seedSessionViaAoeAdd({ title: "story-mobile-ctrl" }),
+  });
 
-    try {
-      const sessions = await listSessions(serve.baseUrl);
-      const seeded = sessions.find((s) => s.title === "story-mobile-ctrl");
-      if (!seeded)
-        throw new Error("seeded session 'story-mobile-ctrl' missing");
-      const sessionId = seeded.id;
+  try {
+    const sessions = await listSessions(serve.baseUrl);
+    const seeded = sessions.find((s) => s.title === "story-mobile-ctrl");
+    if (!seeded) throw new Error("seeded session 'story-mobile-ctrl' missing");
+    const sessionId = seeded.id;
 
-      await page.goto(
-        `${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`,
-      );
+    await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`);
 
-      const ctrl = page.getByRole("button", { name: "Ctrl", exact: true });
-      await expect(ctrl).toBeVisible({ timeout: 15_000 });
-      await expect(ctrl).toHaveAttribute("aria-pressed", "false");
+    const ctrl = page.getByRole("button", { name: "Ctrl", exact: true });
+    await expect(ctrl).toBeVisible({ timeout: 15_000 });
+    await expect(ctrl).toHaveAttribute("aria-pressed", "false");
 
-      await ctrl.click();
-      await expect(ctrl).toHaveAttribute("aria-pressed", "true");
+    await ctrl.click();
+    await expect(ctrl).toHaveAttribute("aria-pressed", "true");
 
-      await ctrl.click();
-      await expect(ctrl).toHaveAttribute("aria-pressed", "false");
-    } finally {
-      await serve.stop();
-    }
-  },
-);
+    await ctrl.click();
+    await expect(ctrl).toHaveAttribute("aria-pressed", "false");
+  } finally {
+    await serve.stop();
+  }
+});

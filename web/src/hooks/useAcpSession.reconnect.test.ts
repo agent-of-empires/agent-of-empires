@@ -9,11 +9,7 @@
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import {
-  ACP_MAX_RETRIES_EXPORT,
-  acpRetryDelayMs,
-  useAcpSession,
-} from "./useAcpSession";
+import { ACP_MAX_RETRIES_EXPORT, acpRetryDelayMs, useAcpSession } from "./useAcpSession";
 
 describe("acpRetryDelayMs", () => {
   it("returns 1s for the first attempt", () => {
@@ -106,10 +102,7 @@ beforeEach(() => {
           { status: 200 },
         );
       }
-      return new Response(
-        JSON.stringify({ frames: [], lost: false, highest_seq: 0 }),
-        { status: 200 },
-      );
+      return new Response(JSON.stringify({ frames: [], lost: false, highest_seq: 0 }), { status: 200 });
     }),
   );
   originalWebSocket = global.WebSocket;
@@ -225,10 +218,7 @@ describe("useAcpSession reconnect (#1130)", () => {
           "structured view dial should not preflight /api/login/status; the WS is no longer elevation-gated",
         );
       }
-      return new Response(
-        JSON.stringify({ frames: [], lost: false, highest_seq: 0 }),
-        { status: 200 },
-      );
+      return new Response(JSON.stringify({ frames: [], lost: false, highest_seq: 0 }), { status: 200 });
     });
     vi.stubGlobal("fetch", fetchSpy);
 

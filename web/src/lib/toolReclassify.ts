@@ -29,10 +29,7 @@ export function reclassifyBash(tool: ToolCall): Reclassified {
   if (tool.kind !== "execute") {
     return { kind: tool.kind, provenance: null };
   }
-  const command = pickStr(
-    parseJsonObject(tool.args_preview),
-    "command",
-  )?.trim();
+  const command = pickStr(parseJsonObject(tool.args_preview), "command")?.trim();
   if (!command) {
     return { kind: tool.kind, provenance: null };
   }

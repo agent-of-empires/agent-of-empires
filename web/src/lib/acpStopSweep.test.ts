@@ -15,14 +15,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import {
-  applyEvent,
-  emptyAcpState,
-  type AcpEvent,
-  type AcpFrame,
-  type AcpState,
-  type ToolCall,
-} from "./acpTypes";
+import { applyEvent, emptyAcpState, type AcpEvent, type AcpFrame, type AcpState, type ToolCall } from "./acpTypes";
 
 function frame(seq: number, event: AcpEvent): AcpFrame {
   return { session_id: "s-1", seq, event };
@@ -39,26 +32,16 @@ function toolCall(id: string): ToolCall {
 }
 
 function start(state: AcpState, seq: number, id: string): AcpState {
-  return applyEvent(
-    state,
-    frame(seq, { ToolCallStarted: { tool_call: toolCall(id) } }),
-  );
+  return applyEvent(state, frame(seq, { ToolCallStarted: { tool_call: toolCall(id) } }));
 }
 
 function openRows(state: AcpState): string[] {
   const terminal = new Set(
     state.activity
-      .filter(
-        (r) =>
-          r.kind === "tool_complete" ||
-          r.kind === "tool_error" ||
-          r.kind === "tool_stopped",
-      )
+      .filter((r) => r.kind === "tool_complete" || r.kind === "tool_error" || r.kind === "tool_stopped")
       .map((r) => r.toolCallId),
   );
-  return state.activity
-    .filter((r) => r.kind === "tool_start" && !terminal.has(r.toolCallId))
-    .map((r) => r.toolCallId!);
+  return state.activity.filter((r) => r.kind === "tool_start" && !terminal.has(r.toolCallId)).map((r) => r.toolCallId!);
 }
 
 function stoppedRows(state: AcpState) {
@@ -70,10 +53,7 @@ describe("turn-end open-tool sweep", () => {
     const opened = start(emptyAcpState(), 1, "t1");
     expect(openRows(opened)).toEqual(["t1"]);
 
-    const next = applyEvent(
-      opened,
-      frame(2, { Stopped: { reason: "cancelled" } }),
-    );
+    const next = applyEvent(opened, frame(2, { Stopped: { reason: "cancelled" } }));
 
     expect(openRows(next)).toEqual([]);
     expect(next.inFlightTool).toBeNull();
@@ -99,15 +79,10 @@ describe("turn-end open-tool sweep", () => {
         },
       }),
     );
-    const next = applyEvent(
-      state,
-      frame(3, { Stopped: { reason: "cancelled" } }),
-    );
+    const next = applyEvent(state, frame(3, { Stopped: { reason: "cancelled" } }));
 
     expect(stoppedRows(next)).toHaveLength(0);
-    expect(
-      next.activity.filter((r) => r.kind === "tool_complete"),
-    ).toHaveLength(1);
+    expect(next.activity.filter((r) => r.kind === "tool_complete")).toHaveLength(1);
   });
 
   it("closes only the still-open tool when several are in flight", () => {
@@ -119,10 +94,7 @@ describe("turn-end open-tool sweep", () => {
         ToolCallCompleted: { tool_call_id: "a", is_error: false, content: "" },
       }),
     );
-    const next = applyEvent(
-      state,
-      frame(4, { Stopped: { reason: "user_stopped" } }),
-    );
+    const next = applyEvent(state, frame(4, { Stopped: { reason: "user_stopped" } }));
 
     const stopped = stoppedRows(next);
     expect(stopped).toHaveLength(1);
@@ -137,10 +109,7 @@ describe("turn-end open-tool sweep", () => {
         ToolCallContent: { tool_call_id: "t1", content: "partial output" },
       }),
     );
-    const next = applyEvent(
-      state,
-      frame(3, { Stopped: { reason: "cancelled" } }),
-    );
+    const next = applyEvent(state, frame(3, { Stopped: { reason: "cancelled" } }));
 
     expect(stoppedRows(next)[0]).toMatchObject({ text: "partial output" });
     expect(next.toolOutputs.t1).toBeUndefined();
@@ -148,14 +117,8 @@ describe("turn-end open-tool sweep", () => {
 
   it("does not double-close on a second terminal event", () => {
     const opened = start(emptyAcpState(), 1, "t1");
-    const once = applyEvent(
-      opened,
-      frame(2, { Stopped: { reason: "cancelled" } }),
-    );
-    const twice = applyEvent(
-      once,
-      frame(3, { Stopped: { reason: "prompt_complete" } }),
-    );
+    const once = applyEvent(opened, frame(2, { Stopped: { reason: "cancelled" } }));
+    const twice = applyEvent(once, frame(3, { Stopped: { reason: "prompt_complete" } }));
 
     expect(stoppedRows(twice)).toHaveLength(1);
   });
@@ -175,10 +138,7 @@ describe("turn-end open-tool sweep", () => {
         at: "2026-01-01T00:00:00.000Z",
       }),
     };
-    const next = applyEvent(
-      withDupe,
-      frame(2, { Stopped: { reason: "cancelled" } }),
-    );
+    const next = applyEvent(withDupe, frame(2, { Stopped: { reason: "cancelled" } }));
 
     expect(stoppedRows(next)).toHaveLength(1);
   });
@@ -195,10 +155,7 @@ describe("turn-end open-tool sweep", () => {
   });
 
   it.each([
-    [
-      "AgentSwitched",
-      { AgentSwitched: { from: "claude", to: "codex", reason: "rate_limit" } },
-    ],
+    ["AgentSwitched", { AgentSwitched: { from: "claude", to: "codex", reason: "rate_limit" } }],
     ["IncompatibleAgent", { IncompatibleAgent: { detail: { reason: "x" } } }],
     ["AgentStartupError", { AgentStartupError: { message: "boom" } }],
   ] as const)("closes open tools on %s", (_label, event) => {

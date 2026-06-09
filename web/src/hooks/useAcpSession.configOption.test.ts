@@ -188,10 +188,7 @@ describe("useAcpSession / setConfigOption", () => {
       vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
         const url = typeof input === "string" ? input : input.toString();
         if (url.includes("/acp/replay")) {
-          return new Response(
-            JSON.stringify({ frames: [], lost: false, highest_seq: 0 }),
-            { status: 200 },
-          );
+          return new Response(JSON.stringify({ frames: [], lost: false, highest_seq: 0 }), { status: 200 });
         }
         if (url.includes("/acp/config-option")) {
           if (postShouldFail === "throw") {
@@ -199,10 +196,7 @@ describe("useAcpSession / setConfigOption", () => {
           }
           postBodies.push({
             url,
-            body:
-              typeof init?.body === "string"
-                ? JSON.parse(init.body)
-                : init?.body,
+            body: typeof init?.body === "string" ? JSON.parse(init.body) : init?.body,
           });
           if (typeof postShouldFail === "number") {
             return new Response("simulated failure", {
@@ -232,9 +226,7 @@ describe("useAcpSession / setConfigOption", () => {
       await result.current.setConfigOption("model", "claude-sonnet-4-6");
     });
     expect(postBodies).toHaveLength(1);
-    expect(postBodies[0]!.url).toContain(
-      "/api/sessions/sess-cfg-1/acp/config-option",
-    );
+    expect(postBodies[0]!.url).toContain("/api/sessions/sess-cfg-1/acp/config-option");
     expect(postBodies[0]!.body).toEqual({
       config_id: "model",
       value: "claude-sonnet-4-6",
@@ -279,9 +271,7 @@ describe("useAcpSession / setConfigOption", () => {
       await result.current.setConfigOption("effort", "low");
     });
     expect(result.current.state.pendingConfigOption).toBeNull();
-    expect(result.current.state.lastError).toMatch(
-      /Network error setting effort/,
-    );
+    expect(result.current.state.lastError).toMatch(/Network error setting effort/);
   });
 
   it("dismissConfigOptionSwitchFailed clears a populated notice", async () => {
@@ -316,9 +306,7 @@ describe("useAcpSession / setConfigOption", () => {
       );
     });
     expect(result.current.state.configOptionSwitchFailed).not.toBeNull();
-    expect(result.current.state.configOptionSwitchFailed?.reason).toBe(
-      "rate limited",
-    );
+    expect(result.current.state.configOptionSwitchFailed?.reason).toBe("rate limited");
 
     await act(async () => {
       result.current.dismissConfigOptionSwitchFailed();
@@ -350,9 +338,7 @@ describe("normaliseTurnCounters / config-option backfill", () => {
     delete stale.configOptions;
     delete stale.configOptionSwitchFailed;
     delete stale.pendingConfigOption;
-    const next = normaliseTurnCounters(
-      stale as unknown as Parameters<typeof normaliseTurnCounters>[0],
-    );
+    const next = normaliseTurnCounters(stale as unknown as Parameters<typeof normaliseTurnCounters>[0]);
     expect(next.configOptions).toEqual([]);
     expect(next.configOptionSwitchFailed).toBeNull();
     expect(next.pendingConfigOption).toBeNull();

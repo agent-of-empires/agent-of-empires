@@ -8,11 +8,7 @@ import type { DiffComment } from "../components/diff/comments/types";
 
 export type ApprovalDecision = "Allow" | "AllowAlways" | "Deny" | "Cancelled";
 
-export type SessionMode =
-  | "Default"
-  | "Plan"
-  | "AcceptEdits"
-  | "BypassPermissions";
+export type SessionMode = "Default" | "Plan" | "AcceptEdits" | "BypassPermissions";
 
 export type PlanStepStatus = "Pending" | "InProgress" | "Done" | "Cancelled";
 
@@ -145,11 +141,7 @@ export interface AvailableCommand {
  *  a bare string, not a `{ Other: string }` object. Modeling it as a
  *  catch-all string keeps the broadcast frame forward-compatible while
  *  preserving autocomplete on the known literals. See #1403, #1562. */
-export type ConfigOptionCategory =
-  | "mode"
-  | "model"
-  | "thought_level"
-  | (string & {});
+export type ConfigOptionCategory = "mode" | "model" | "thought_level" | (string & {});
 
 /** One choice in a `Select`-kind ConfigOptionDescriptor. */
 export interface ConfigOptionChoice {
@@ -925,9 +917,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // contain the same tool_call_id twice; rendering both makes
     // assistant-ui's tapResources throw "Duplicate key" and crash the
     // panel. Patch the existing row in place instead.
-    const existing = next.activity.findIndex(
-      (r) => r.kind === "tool_start" && r.toolCallId === tc.id,
-    );
+    const existing = next.activity.findIndex((r) => r.kind === "tool_start" && r.toolCallId === tc.id);
     if (existing >= 0) {
       const prev = next.activity[existing];
       if (prev) {
@@ -957,17 +947,13 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     return next;
   }
   if ("ToolCallCompleted" in event) {
-    const { tool_call_id, is_error, content, output, completed_at } =
-      event.ToolCallCompleted;
+    const { tool_call_id, is_error, content, output, completed_at } = event.ToolCallCompleted;
     // #1713: a completion with no preceding start frame would render no
     // card (the render layer only attaches results to an existing
     // tool-call part). Synthesize a minimal start row first so the card
     // appears.
     if (!hasToolStart(next.activity, tool_call_id)) {
-      next.activity = pushActivity(
-        next.activity,
-        synthToolStartRow(tool_call_id, { started_at: completed_at }),
-      );
+      next.activity = pushActivity(next.activity, synthToolStartRow(tool_call_id, { started_at: completed_at }));
       // A synthesized tool call is real turn output; without this the
       // turn-end logic would append "Command produced no output."
       next.turnHasOutput = true;
@@ -980,13 +966,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // the status word when neither carried text.
     const buffered = next.toolOutputs[tool_call_id] ?? "";
     const text =
-      content && content.length > 0
-        ? content
-        : buffered.length > 0
-          ? buffered
-          : is_error
-            ? "tool failed"
-            : "completed";
+      content && content.length > 0 ? content : buffered.length > 0 ? buffered : is_error ? "tool failed" : "completed";
     if (buffered) {
       const { [tool_call_id]: _drop, ...rest } = next.toolOutputs;
       void _drop;
@@ -1012,8 +992,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     return next;
   }
   if ("ToolCallUpdated" in event) {
-    const { tool_call_id, title, args_preview, started_at, diffs } =
-      event.ToolCallUpdated;
+    const { tool_call_id, title, args_preview, started_at, diffs } = event.ToolCallUpdated;
     // Per ACP, content is a replacement: a non-empty diff list overwrites
     // the card's diffs; null/empty leaves an earlier frame's diffs intact
     // so a text-only update can't blank the edit card. See #1721.
@@ -1047,12 +1026,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // the per-tool card.
     let patched = false;
     const updated = next.activity.map((row) => {
-      if (
-        !patched &&
-        row.kind === "tool_start" &&
-        row.toolCallId === tool_call_id &&
-        row.tool
-      ) {
+      if (!patched && row.kind === "tool_start" && row.toolCallId === tool_call_id && row.tool) {
         patched = true;
         return {
           ...row,
@@ -1078,9 +1052,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   }
   if ("ApprovalResolved" in event) {
     const { nonce } = event.ApprovalResolved;
-    next.pendingApprovals = next.pendingApprovals.filter(
-      (a) => a.nonce !== nonce,
-    );
+    next.pendingApprovals = next.pendingApprovals.filter((a) => a.nonce !== nonce);
     return next;
   }
   if ("DiffEmitted" in event) {
@@ -1112,10 +1084,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // an upstream restart ever reports a smaller cumulative. See #1354.
     const incoming = event.UsageUpdated.usage;
     if (next.usageBaseline && incoming.cost) {
-      const rebasedAmount = Math.max(
-        0,
-        incoming.cost.amount - next.usageBaseline.cost,
-      );
+      const rebasedAmount = Math.max(0, incoming.cost.amount - next.usageBaseline.cost);
       const rebasedCost = {
         amount: rebasedAmount,
         currency: incoming.cost.currency,
@@ -1175,10 +1144,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // or the adapter applied asynchronously after the rejection.
     if (next.configOptionSwitchFailed) {
       const failure = next.configOptionSwitchFailed;
-      const confirmed = options.some(
-        (opt) =>
-          opt.id === failure.configId && opt.current_value === failure.value,
-      );
+      const confirmed = options.some((opt) => opt.id === failure.configId && opt.current_value === failure.value);
       if (confirmed) {
         next.configOptionSwitchFailed = null;
       }
@@ -1196,8 +1162,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     return next;
   }
   if ("AgentMessageChunk" in event) {
-    next.assistantMessage =
-      next.assistantMessage + event.AgentMessageChunk.text;
+    next.assistantMessage = next.assistantMessage + event.AgentMessageChunk.text;
     // Visible assistant text means the agent is answering, not thinking.
     // A later reasoning block re-sets `thinking` via ThinkingStarted. See
     // #1213.
@@ -1234,10 +1199,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // clear the "Stopping..." state regardless of reason. See #1727.
     next.cancelling = false;
     next.cancelEscalatesAt = null;
-    next.lastStoppedSeq = Math.min(
-      next.lastStoppedSeq + 1,
-      next.pendingUserPromptSeq,
-    );
+    next.lastStoppedSeq = Math.min(next.lastStoppedSeq + 1, next.pendingUserPromptSeq);
     next.turnActive = isTurnActive(next);
     // The "user_stopped" / "restart_pending" reasons are published by
     // the supervisor's reap_user_stopped pass when it detects an
@@ -1343,10 +1305,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     next.inFlightTool = null;
     sweepOpenToolCalls(next, frame.seq);
     next.agentUnresponsive = false;
-    next.lastStoppedSeq = Math.min(
-      next.lastStoppedSeq + 1,
-      next.pendingUserPromptSeq,
-    );
+    next.lastStoppedSeq = Math.min(next.lastStoppedSeq + 1, next.pendingUserPromptSeq);
     next.turnActive = isTurnActive(next);
     return next;
   }
@@ -1361,10 +1320,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // by one so a startup failure for the prior turn doesn't kill the
     // spinner for a freshly-typed follow-up the user has already
     // submitted. See #1170.
-    next.lastStoppedSeq = Math.min(
-      next.lastStoppedSeq + 1,
-      next.pendingUserPromptSeq,
-    );
+    next.lastStoppedSeq = Math.min(next.lastStoppedSeq + 1, next.pendingUserPromptSeq);
     next.turnActive = isTurnActive(next);
     return next;
   }
@@ -1382,17 +1338,13 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // Map server attachment refs to render-ready attachments backed by
     // the replay GET endpoint. Used on the replay/no-optimistic path;
     // the optimistic row already carries local preview URLs. See #1000.
-    const serverAttachments: AcpAttachment[] = (
-      event.UserPromptSent.attachments ?? []
-    ).map((a) => ({
+    const serverAttachments: AcpAttachment[] = (event.UserPromptSent.attachments ?? []).map((a) => ({
       id: a.id,
       kind: a.kind,
       mimeType: a.mime_type,
       name: a.name,
       size: a.size,
-      url: `/api/sessions/${encodeURIComponent(
-        frame.session_id,
-      )}/acp/attachments/${encodeURIComponent(a.id)}`,
+      url: `/api/sessions/${encodeURIComponent(frame.session_id)}/acp/attachments/${encodeURIComponent(a.id)}`,
     }));
     // Dedupe against the optimistic row that useStructuredView's sendPrompt
     // dispatched a moment ago: find the OLDEST matching un-promoted
@@ -1402,10 +1354,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // first server echo must promote the first optimistic row, not
     // the second, so the seq order matches the submission order.
     const matchIdx = next.activity.findIndex(
-      (r) =>
-        r.kind === "user_prompt" &&
-        r.text === text &&
-        !r.id.startsWith("user-seq-"),
+      (r) => r.kind === "user_prompt" && r.text === text && !r.id.startsWith("user-seq-"),
     );
     if (matchIdx >= 0) {
       // Optimistic-match path: promote the placeholder's id. The
@@ -1444,8 +1393,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
         id: `user-seq-${frame.seq}`,
         kind: "user_prompt",
         text,
-        attachments:
-          serverAttachments.length > 0 ? serverAttachments : undefined,
+        attachments: serverAttachments.length > 0 ? serverAttachments : undefined,
         at: new Date().toISOString(),
       });
       next.pendingUserPromptSeq = next.pendingUserPromptSeq + 1;
@@ -1528,18 +1476,14 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // order, so checking `activity` here captures "any prompt with a
     // lower seq than this reset"; later prompts won't retroactively
     // surface the suppressed row.
-    const hasPriorPrompt = next.activity.some(
-      (r) => r.kind === "user_prompt" || r.kind === "user_diff_comments",
-    );
+    const hasPriorPrompt = next.activity.some((r) => r.kind === "user_prompt" || r.kind === "user_diff_comments");
     if (!hasPriorPrompt) {
       return next;
     }
     next.activity = pushActivity(next.activity, {
       id: `reset-${frame.seq}`,
       kind: "context_reset",
-      text:
-        event.SessionContextReset.reason ||
-        "Conversation context reset; agent transcript was unavailable.",
+      text: event.SessionContextReset.reason || "Conversation context reset; agent transcript was unavailable.",
       at: new Date().toISOString(),
     });
     // Offer the opt-in primer affordance. The banner only appears
@@ -1548,9 +1492,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // it, even if the user typed something other than the primer.
     next.contextPrimerAvailable = {
       resetSeq: frame.seq,
-      reason:
-        event.SessionContextReset.reason ||
-        "Conversation context reset; agent transcript was unavailable.",
+      reason: event.SessionContextReset.reason || "Conversation context reset; agent transcript was unavailable.",
     };
     return next;
   }
@@ -1638,19 +1580,14 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       rejectedAt: new Date().toISOString(),
     };
     const REJECTED_PROMPTS_CAP = 5;
-    next.rejectedPrompts = [...next.rejectedPrompts, entry].slice(
-      -REJECTED_PROMPTS_CAP,
-    );
+    next.rejectedPrompts = [...next.rejectedPrompts, entry].slice(-REJECTED_PROMPTS_CAP);
     // Retire the spinner for this rejected submission so the composer
     // unlocks. `pendingUserPromptSeq` was bumped by the optimistic
     // dispatch; advancing `lastStoppedSeq` by one (capped) gives this
     // rejection the same turn-retirement semantics as a Stopped without
     // letting it spill into a different turn's bookkeeping. See #1170
     // for the cap rationale.
-    next.lastStoppedSeq = Math.min(
-      next.lastStoppedSeq + 1,
-      next.pendingUserPromptSeq,
-    );
+    next.lastStoppedSeq = Math.min(next.lastStoppedSeq + 1, next.pendingUserPromptSeq);
     next.turnActive = isTurnActive(next);
     return next;
   }
@@ -1662,9 +1599,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
 
 /** True when `rows` already carries a `tool_start` row for this id. */
 function hasToolStart(rows: ActivityRow[], toolCallId: string): boolean {
-  return rows.some(
-    (r) => r.kind === "tool_start" && r.toolCallId === toolCallId,
-  );
+  return rows.some((r) => r.kind === "tool_start" && r.toolCallId === toolCallId);
 }
 
 /** Build a minimal `tool_start` row for a tool call we never saw start.
@@ -1701,8 +1636,7 @@ function synthToolStartRow(
 function mergeToolStart(prev: ToolCall, incoming: ToolCall): ToolCall {
   const startedAt =
     !prev.started_at ||
-    (incoming.started_at.length > 0 &&
-      Date.parse(incoming.started_at) > Date.parse(prev.started_at))
+    (incoming.started_at.length > 0 && Date.parse(incoming.started_at) > Date.parse(prev.started_at))
       ? incoming.started_at
       : prev.started_at;
 
@@ -1710,17 +1644,11 @@ function mergeToolStart(prev: ToolCall, incoming: ToolCall): ToolCall {
     ...prev,
     ...incoming,
     name: incoming.name.length > 0 ? incoming.name : prev.name,
-    kind:
-      incoming.kind && incoming.kind !== "other" ? incoming.kind : prev.kind,
-    args_preview:
-      incoming.args_preview.trim().length > 0
-        ? incoming.args_preview
-        : prev.args_preview,
+    kind: incoming.kind && incoming.kind !== "other" ? incoming.kind : prev.kind,
+    args_preview: incoming.args_preview.trim().length > 0 ? incoming.args_preview : prev.args_preview,
     started_at: startedAt,
-    diffs:
-      incoming.diffs && incoming.diffs.length > 0 ? incoming.diffs : prev.diffs,
-    parent_tool_call_id:
-      incoming.parent_tool_call_id ?? prev.parent_tool_call_id,
+    diffs: incoming.diffs && incoming.diffs.length > 0 ? incoming.diffs : prev.diffs,
+    parent_tool_call_id: incoming.parent_tool_call_id ?? prev.parent_tool_call_id,
     memory_recall: incoming.memory_recall ?? prev.memory_recall,
   };
 }
@@ -1751,12 +1679,7 @@ function pushActivity(rows: ActivityRow[], row: ActivityRow): ActivityRow[] {
 function sweepOpenToolCalls(next: AcpState, frameSeq: number): void {
   const terminal = new Set<string>();
   for (const row of next.activity) {
-    if (
-      (row.kind === "tool_complete" ||
-        row.kind === "tool_error" ||
-        row.kind === "tool_stopped") &&
-      row.toolCallId
-    ) {
+    if ((row.kind === "tool_complete" || row.kind === "tool_error" || row.kind === "tool_stopped") && row.toolCallId) {
       terminal.add(row.toolCallId);
     }
   }
@@ -1803,9 +1726,7 @@ function sweepOpenToolCalls(next: AcpState, frameSeq: number): void {
  *  one per `Stopped` / `AgentStartupError` but is capped at
  *  `pendingUserPromptSeq` so spurious extra Stopped frames cannot
  *  poison a future turn. */
-export function isTurnActive(
-  state: Pick<AcpState, "pendingUserPromptSeq" | "lastStoppedSeq">,
-): boolean {
+export function isTurnActive(state: Pick<AcpState, "pendingUserPromptSeq" | "lastStoppedSeq">): boolean {
   return state.pendingUserPromptSeq > state.lastStoppedSeq;
 }
 
@@ -1828,50 +1749,29 @@ export function normaliseTurnCounters(
   },
 ): AcpState {
   const pendingUserPromptSeq =
-    typeof state.pendingUserPromptSeq === "number"
-      ? state.pendingUserPromptSeq
-      : state.turnActive
-        ? 1
-        : 0;
+    typeof state.pendingUserPromptSeq === "number" ? state.pendingUserPromptSeq : state.turnActive ? 1 : 0;
   const lastStoppedSeq =
-    typeof state.lastStoppedSeq === "number"
-      ? state.lastStoppedSeq
-      : state.turnActive
-        ? 0
-        : pendingUserPromptSeq;
+    typeof state.lastStoppedSeq === "number" ? state.lastStoppedSeq : state.turnActive ? 0 : pendingUserPromptSeq;
   // Pre-#1196 persisted entries lack rejectedPrompts / agentUnresponsive;
   // backfill so the reducer and renderers see well-typed values instead
   // of `undefined` (which crashes RejectedPromptsStrip's `.length` read).
-  const rejectedPrompts = Array.isArray(state.rejectedPrompts)
-    ? state.rejectedPrompts
-    : [];
-  const agentUnresponsive =
-    typeof state.agentUnresponsive === "boolean"
-      ? state.agentUnresponsive
-      : false;
+  const rejectedPrompts = Array.isArray(state.rejectedPrompts) ? state.rejectedPrompts : [];
+  const agentUnresponsive = typeof state.agentUnresponsive === "boolean" ? state.agentUnresponsive : false;
   // Pre-#1240 persisted entries lack agentOrphaned; backfill to false
   // so the reducer and renderers see a well-typed value instead of
   // `undefined`.
-  const agentOrphaned =
-    typeof state.agentOrphaned === "boolean" ? state.agentOrphaned : false;
+  const agentOrphaned = typeof state.agentOrphaned === "boolean" ? state.agentOrphaned : false;
   // Pre-#1354 persisted entries lack usageBaseline; backfill to null
   // so the UsageUpdated reducer's `next.usageBaseline && ...` check
   // sees a well-typed value. The baseline stays null until the next
   // SessionCleared / ConversationCompacted, which matches the
   // pre-fix behaviour for that one session; subsequent /clear events
   // start subtracting normally.
-  const usageBaseline =
-    state.usageBaseline === undefined ? null : state.usageBaseline;
+  const usageBaseline = state.usageBaseline === undefined ? null : state.usageBaseline;
   // Pre-#1403 persisted entries lack the config-option trio.
-  const configOptions = Array.isArray(state.configOptions)
-    ? state.configOptions
-    : [];
-  const configOptionSwitchFailed =
-    state.configOptionSwitchFailed === undefined
-      ? null
-      : state.configOptionSwitchFailed;
-  const pendingConfigOption =
-    state.pendingConfigOption === undefined ? null : state.pendingConfigOption;
+  const configOptions = Array.isArray(state.configOptions) ? state.configOptions : [];
+  const configOptionSwitchFailed = state.configOptionSwitchFailed === undefined ? null : state.configOptionSwitchFailed;
+  const pendingConfigOption = state.pendingConfigOption === undefined ? null : state.pendingConfigOption;
   return {
     ...state,
     rejectedPrompts,

@@ -14,25 +14,18 @@
 
 import { test, expect, type ServeHandle } from "../helpers/liveTest";
 
-async function fetchProfiles(
-  serve: ServeHandle,
-): Promise<Array<{ name: string; is_default: boolean }>> {
+async function fetchProfiles(serve: ServeHandle): Promise<Array<{ name: string; is_default: boolean }>> {
   const res = await fetch(`${serve.baseUrl}/api/profiles`);
   expect(res.ok).toBeTruthy();
   return res.json();
 }
 
-test("create profile via + New round-trips through POST /api/profiles", async ({
-  serve,
-  page,
-}) => {
+test("create profile via + New round-trips through POST /api/profiles", async ({ serve, page }) => {
   const baseline = await fetchProfiles(serve);
   expect(baseline.map((p) => p.name)).toEqual(["main"]);
 
   await page.goto(`${serve.baseUrl}/settings/session`);
-  await expect(
-    page.getByTestId("settings-header").getByText("Profile", { exact: true }),
-  ).toBeVisible();
+  await expect(page.getByTestId("settings-header").getByText("Profile", { exact: true })).toBeVisible();
 
   await page.getByRole("button", { name: "+ New" }).click();
   const nameInput = page.getByPlaceholder("Profile name");
@@ -47,10 +40,7 @@ test("create profile via + New round-trips through POST /api/profiles", async ({
   }).toPass({ timeout: 5_000 });
 });
 
-test("rename profile via Rename button round-trips through PATCH .../rename", async ({
-  serve,
-  page,
-}) => {
+test("rename profile via Rename button round-trips through PATCH .../rename", async ({ serve, page }) => {
   // Seed: pre-create `work` so the test focuses on the rename flow.
   const seed = await fetch(`${serve.baseUrl}/api/profiles`, {
     method: "POST",
@@ -60,9 +50,7 @@ test("rename profile via Rename button round-trips through PATCH .../rename", as
   expect(seed.ok).toBeTruthy();
 
   await page.goto(`${serve.baseUrl}/settings/session`);
-  await expect(
-    page.getByTestId("settings-header").getByText("Profile", { exact: true }),
-  ).toBeVisible();
+  await expect(page.getByTestId("settings-header").getByText("Profile", { exact: true })).toBeVisible();
 
   // Select `work` so Rename targets it (rename acts on the selectedProfile).
   const profileSelect = page
@@ -108,15 +96,11 @@ test("set default profile via Default profile dropdown round-trips through PATCH
   // expose, spy on the request itself: the UI must hit the endpoint with
   // the expected body and receive 200.
   const patchPromise = page.waitForResponse(
-    (res) =>
-      res.url().endsWith("/api/default-profile") &&
-      res.request().method() === "PATCH",
+    (res) => res.url().endsWith("/api/default-profile") && res.request().method() === "PATCH",
   );
 
   await page.goto(`${serve.baseUrl}/settings/session`);
-  await expect(
-    page.getByText("Default profile", { exact: true }),
-  ).toBeVisible();
+  await expect(page.getByText("Default profile", { exact: true })).toBeVisible();
 
   const defaultSelect = page
     .locator("label", { hasText: /^Default profile$/ })
@@ -131,10 +115,7 @@ test("set default profile via Default profile dropdown round-trips through PATCH
   expect(patchRes.request().postDataJSON()).toEqual({ name: "work" });
 });
 
-test("delete profile via Delete button round-trips through DELETE /api/profiles/<name>", async ({
-  serve,
-  page,
-}) => {
+test("delete profile via Delete button round-trips through DELETE /api/profiles/<name>", async ({ serve, page }) => {
   // Auto-accept the native confirm() dialog the component pops.
   page.on("dialog", (d) => d.accept());
 
@@ -146,9 +127,7 @@ test("delete profile via Delete button round-trips through DELETE /api/profiles/
   expect(seed.ok).toBeTruthy();
 
   await page.goto(`${serve.baseUrl}/settings/session`);
-  await expect(
-    page.getByTestId("settings-header").getByText("Profile", { exact: true }),
-  ).toBeVisible();
+  await expect(page.getByTestId("settings-header").getByText("Profile", { exact: true })).toBeVisible();
 
   // Select the non-default profile so Delete is visible (component hides
   // it for the active row, and the server rejects deletion of the active
@@ -161,9 +140,7 @@ test("delete profile via Delete button round-trips through DELETE /api/profiles/
   await expect(profileSelect).toHaveValue("scratch");
 
   const deletePromise = page.waitForResponse(
-    (res) =>
-      res.url().endsWith("/api/profiles/scratch") &&
-      res.request().method() === "DELETE",
+    (res) => res.url().endsWith("/api/profiles/scratch") && res.request().method() === "DELETE",
     { timeout: 30_000 },
   );
 
@@ -176,14 +153,9 @@ test("delete profile via Delete button round-trips through DELETE /api/profiles/
   expect(profiles.map((p) => p.name)).toEqual(["main"]);
 });
 
-test("invalid profile name: client validation blocks POST /api/profiles", async ({
-  serve,
-  page,
-}) => {
+test("invalid profile name: client validation blocks POST /api/profiles", async ({ serve, page }) => {
   await page.goto(`${serve.baseUrl}/settings/session`);
-  await expect(
-    page.getByTestId("settings-header").getByText("Profile", { exact: true }),
-  ).toBeVisible();
+  await expect(page.getByTestId("settings-header").getByText("Profile", { exact: true })).toBeVisible();
 
   // Intercept POST /api/profiles to detect any leak through validation.
   let posted = false;
@@ -199,9 +171,7 @@ test("invalid profile name: client validation blocks POST /api/profiles", async 
   await nameInput.fill("bad name");
   await nameInput.press("Enter");
 
-  await expect(
-    page.getByText("Only letters, digits, hyphens, and underscores"),
-  ).toBeVisible();
+  await expect(page.getByText("Only letters, digits, hyphens, and underscores")).toBeVisible();
   expect(posted).toBe(false);
 
   const profiles = await fetchProfiles(serve);

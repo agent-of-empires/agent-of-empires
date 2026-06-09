@@ -6,13 +6,7 @@
 // project row.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import {
-  cleanup,
-  fireEvent,
-  render,
-  screen,
-  waitFor,
-} from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 import { ProjectsView } from "../ProjectsView";
 
@@ -48,12 +42,9 @@ describe("ProjectsView default base branch", () => {
 
     render(<ProjectsView onClose={() => {}} />);
     await openAddForm();
-    fireEvent.change(
-      screen.getByPlaceholderText(
-        "blank = inherit global default, then auto-detect",
-      ),
-      { target: { value: "develop" } },
-    );
+    fireEvent.change(screen.getByPlaceholderText("blank = inherit global default, then auto-detect"), {
+      target: { value: "develop" },
+    });
     fireEvent.click(screen.getByRole("button", { name: "Add" }));
 
     await waitFor(() =>
@@ -97,9 +88,7 @@ describe("ProjectsView default base branch", () => {
   });
 
   it("does not render a base branch row when none is configured", async () => {
-    mockFetch.mockResolvedValue([
-      { name: "plain", path: "/repo/plain", scope: "global" },
-    ]);
+    mockFetch.mockResolvedValue([{ name: "plain", path: "/repo/plain", scope: "global" }]);
 
     render(<ProjectsView onClose={() => {}} />);
 
@@ -125,9 +114,7 @@ describe("ProjectsView default base branch", () => {
     fireEvent.change(input, { target: { value: "release" } });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
-    await waitFor(() =>
-      expect(mockUpdate).toHaveBeenCalledWith("extra", "global", "release"),
-    );
+    await waitFor(() => expect(mockUpdate).toHaveBeenCalledWith("extra", "global", "release"));
   });
 
   it("clears the base branch by saving an empty value in the edit modal", async () => {
@@ -148,9 +135,7 @@ describe("ProjectsView default base branch", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
-    await waitFor(() =>
-      expect(mockUpdate).toHaveBeenCalledWith("extra", "global", null),
-    );
+    await waitFor(() => expect(mockUpdate).toHaveBeenCalledWith("extra", "global", null));
   });
 
   it("clears the base branch field when the add form is cancelled", async () => {
@@ -158,20 +143,14 @@ describe("ProjectsView default base branch", () => {
 
     render(<ProjectsView onClose={() => {}} />);
     await openAddForm();
-    const baseInput = screen.getByPlaceholderText(
-      "blank = inherit global default, then auto-detect",
-    );
+    const baseInput = screen.getByPlaceholderText("blank = inherit global default, then auto-detect");
     fireEvent.change(baseInput, { target: { value: "develop" } });
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
 
     // Reopening starts from a clean form (the cancel handler reset state).
     fireEvent.click(screen.getByRole("button", { name: "+ Add project" }));
     expect(
-      (
-        screen.getByPlaceholderText(
-          "blank = inherit global default, then auto-detect",
-        ) as HTMLInputElement
-      ).value,
+      (screen.getByPlaceholderText("blank = inherit global default, then auto-detect") as HTMLInputElement).value,
     ).toBe("");
   });
 });

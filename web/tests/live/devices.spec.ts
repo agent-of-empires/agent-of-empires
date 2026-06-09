@@ -30,17 +30,10 @@ const test = base.extend<{ servePreauthed: ServeHandle }>({
   },
 });
 
-async function bootDashboardAndNavigate(
-  page: Page,
-  handle: ServeHandle,
-  path: string,
-): Promise<void> {
+async function bootDashboardAndNavigate(page: Page, handle: ServeHandle, path: string): Promise<void> {
   await seedAuth(page, handle);
   await Promise.all([
-    page.waitForResponse(
-      (res) => res.url().endsWith("/api/about") && res.status() === 200,
-      { timeout: 10_000 },
-    ),
+    page.waitForResponse((res) => res.url().endsWith("/api/about") && res.status() === 200, { timeout: 10_000 }),
     page.goto(handle.baseUrl),
   ]);
   if (path !== "/") {
@@ -51,21 +44,14 @@ async function bootDashboardAndNavigate(
   }
 }
 
-test("settings -> devices renders the signed-in session as this device", async ({
-  servePreauthed,
-  page,
-}) => {
+test("settings -> devices renders the signed-in session as this device", async ({ servePreauthed, page }) => {
   await bootDashboardAndNavigate(page, servePreauthed, "/settings/devices");
 
-  await expect(
-    page.getByRole("heading", { name: /connected devices/i }),
-  ).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByRole("heading", { name: /connected devices/i })).toBeVisible({ timeout: 10_000 });
 
   // The pre-authed session renders as a device flagged "this device".
   await expect(page.getByText(/this device/i)).toBeVisible({ timeout: 10_000 });
 
   // The sign-out-everywhere escape hatch is present.
-  await expect(
-    page.getByRole("button", { name: /sign out all devices/i }),
-  ).toBeVisible();
+  await expect(page.getByRole("button", { name: /sign out all devices/i })).toBeVisible();
 });

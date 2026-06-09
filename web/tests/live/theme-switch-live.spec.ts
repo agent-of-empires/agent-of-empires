@@ -13,10 +13,7 @@ import { spawnAoeServe, type ServeHandle } from "../helpers/aoeServe";
 const SWITCH_TO = "dracula";
 
 async function readCssVar(page: Page, name: string): Promise<string> {
-  return await page.evaluate(
-    (n) => document.documentElement.style.getPropertyValue(n).trim(),
-    name,
-  );
+  return await page.evaluate((n) => document.documentElement.style.getPropertyValue(n).trim(), name);
 }
 
 test.describe("Live aoe serve theme switching (#1189)", () => {
@@ -58,14 +55,7 @@ test.describe("Live aoe serve theme switching (#1189)", () => {
   });
 
   test("GET /api/themes/:name handles all 6 builtins sequentially without hanging", async () => {
-    const builtins = [
-      "empire",
-      "phosphor",
-      "tokyo-night-storm",
-      "catppuccin-latte",
-      "dracula",
-      "rose-pine",
-    ];
+    const builtins = ["empire", "phosphor", "tokyo-night-storm", "catppuccin-latte", "dracula", "rose-pine"];
     for (const name of builtins) {
       const ctrl = new AbortController();
       const watchdog = setTimeout(() => ctrl.abort(), 2_000);
@@ -83,9 +73,7 @@ test.describe("Live aoe serve theme switching (#1189)", () => {
     }
   });
 
-  test("dashboard chrome repaints when theme switches via API", async ({
-    page,
-  }) => {
+  test("dashboard chrome repaints when theme switches via API", async ({ page }) => {
     await page.goto(`${handle.baseUrl}/`);
     // Wait for the React-side fetch of /api/theme/current to land
     // and seed --color-surface-900 with the active palette.
@@ -122,9 +110,7 @@ test.describe("Live aoe serve theme switching (#1189)", () => {
       })
       .toBe("#282a36");
 
-    const bg = await page.evaluate(
-      () => getComputedStyle(document.body).backgroundColor,
-    );
+    const bg = await page.evaluate(() => getComputedStyle(document.body).backgroundColor);
     expect(bg).toMatch(/40,\s*42,\s*54/);
   });
 });

@@ -1,9 +1,5 @@
 import { describe, expect, it } from "vitest";
-import {
-  parseFileRef,
-  resolveToRepoRelative,
-  type FileRefSession,
-} from "../fileRef";
+import { parseFileRef, resolveToRepoRelative, type FileRefSession } from "../fileRef";
 
 describe("parseFileRef", () => {
   it("parses an absolute path with a line suffix", () => {
@@ -107,9 +103,9 @@ describe("resolveToRepoRelative", () => {
   };
 
   it("resolves a path inside the worktree to a repo-relative path", () => {
-    expect(
-      resolveToRepoRelative("/Users/me/.aoe/worktrees/feat/src/app.ts", single),
-    ).toEqual({ relativePath: "src/app.ts" });
+    expect(resolveToRepoRelative("/Users/me/.aoe/worktrees/feat/src/app.ts", single)).toEqual({
+      relativePath: "src/app.ts",
+    });
   });
 
   it("falls back to the main repo path", () => {
@@ -120,9 +116,7 @@ describe("resolveToRepoRelative", () => {
 
   it("does not match a sibling dir with a shared prefix", () => {
     // `/Users/me/repo` must not match `/Users/me/repo_old/...`.
-    expect(
-      resolveToRepoRelative("/Users/me/repo_old/src/app.ts", single),
-    ).toBeNull();
+    expect(resolveToRepoRelative("/Users/me/repo_old/src/app.ts", single)).toBeNull();
   });
 
   it("returns null when the path is outside any known root", () => {
@@ -147,9 +141,7 @@ describe("resolveToRepoRelative", () => {
       main_repo_path: null,
       workspace_repos: [],
     };
-    expect(
-      resolveToRepoRelative("c:\\Users\\me\\repo\\src\\app.ts", win),
-    ).toEqual({ relativePath: "src/app.ts" });
+    expect(resolveToRepoRelative("c:\\Users\\me\\repo\\src\\app.ts", win)).toEqual({ relativePath: "src/app.ts" });
   });
 
   it("resolves against a workspace repo root and returns its name", () => {
@@ -161,8 +153,9 @@ describe("resolveToRepoRelative", () => {
         { name: "web", source_path: "/Users/me/web" },
       ],
     };
-    expect(
-      resolveToRepoRelative("/Users/me/web/src/app.ts", workspace),
-    ).toEqual({ relativePath: "src/app.ts", repoName: "web" });
+    expect(resolveToRepoRelative("/Users/me/web/src/app.ts", workspace)).toEqual({
+      relativePath: "src/app.ts",
+      repoName: "web",
+    });
   });
 });

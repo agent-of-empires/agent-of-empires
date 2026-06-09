@@ -8,9 +8,7 @@
 import { test, expect } from "../helpers/liveTest";
 
 test("/api/about reports read_only=true", async ({ serveReadOnly }) => {
-  const about = await fetch(`${serveReadOnly.baseUrl}/api/about`).then((r) =>
-    r.json(),
-  );
+  const about = await fetch(`${serveReadOnly.baseUrl}/api/about`).then((r) => r.json());
   expect(about?.read_only).toBe(true);
 });
 
@@ -29,9 +27,7 @@ test("POST /api/sessions is rejected with 403", async ({ serveReadOnly }) => {
   expect(res.status).toBe(403);
 });
 
-test("POST /api/sessions with malformed body still returns 403", async ({
-  serveReadOnly,
-}) => {
+test("POST /api/sessions with malformed body still returns 403", async ({ serveReadOnly }) => {
   // Regression for #1229: the read-only check runs BEFORE axum's typed
   // body extractor, so any body shape (including intentionally
   // malformed) must be rejected with 403, not 422.
@@ -66,19 +62,15 @@ test("POST /api/sessions with malformed body still returns 403", async ({
   }
 });
 
-test("dashboard suppresses mutation UI in read-only", async ({
-  serveReadOnly,
-  page,
-}) => {
+test("dashboard suppresses mutation UI in read-only", async ({ serveReadOnly, page }) => {
   // Wait for /api/about to land before driving keyboard shortcuts. The
   // "n" shortcut handler reads `serverAbout?.read_only`; if /api/about
   // hasn't resolved yet, `serverAbout` is `null` and the read-only guard
   // is bypassed. Wait for the response so the React state has the flag
   // before the keypress fires.
-  const aboutPromise = page.waitForResponse(
-    (r) => r.url().endsWith("/api/about") && r.status() === 200,
-    { timeout: 10_000 },
-  );
+  const aboutPromise = page.waitForResponse((r) => r.url().endsWith("/api/about") && r.status() === 200, {
+    timeout: 10_000,
+  });
   await page.goto(serveReadOnly.baseUrl);
   await aboutPromise;
   // Small settle so React commits the serverAbout state from the response.

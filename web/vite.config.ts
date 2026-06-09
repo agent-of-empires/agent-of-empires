@@ -47,12 +47,7 @@ export default defineConfig(({ mode }) => {
         ? [
             istanbul({
               include: "src/**/*",
-              exclude: [
-                "node_modules",
-                "dist",
-                "**/*.test.{ts,tsx}",
-                "**/__tests__/**",
-              ],
+              exclude: ["node_modules", "dist", "**/*.test.{ts,tsx}", "**/__tests__/**"],
               extension: [".ts", ".tsx"],
               requireEnv: false,
               forceBuildInstrument: true,
@@ -72,12 +67,7 @@ export default defineConfig(({ mode }) => {
       include: ["src/**/*.{test,spec}.{ts,tsx}"],
       // Type-level tests (`*.types.test.ts`) run under the typecheck runner
       // below, not the runtime runner, so keep them out of `include`.
-      exclude: [
-        "tests/**",
-        "node_modules/**",
-        "dist/**",
-        "src/**/*.types.test.ts",
-      ],
+      exclude: ["tests/**", "node_modules/**", "dist/**", "src/**/*.types.test.ts"],
       // `expectTypeOf` assertions in `*.types.test.ts` are checked by tsc.
       // A failing assertion surfaces as a type error. Scoped to the
       // dedicated type-test files so the rest of the suite stays fast.

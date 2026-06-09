@@ -98,10 +98,7 @@ export interface PingFrame {
 
 function percentile(sorted: number[], q: number): number {
   if (sorted.length === 0) return 0;
-  const idx = Math.min(
-    sorted.length - 1,
-    Math.max(0, Math.ceil(q * sorted.length) - 1),
-  );
+  const idx = Math.min(sorted.length - 1, Math.max(0, Math.ceil(q * sorted.length) - 1));
   return sorted[idx]!;
 }
 
@@ -188,12 +185,7 @@ export class TerminalTiming {
 
   /** Resolve a pong. `clientT` is the value echoed back unchanged;
    *  `serverBusyUs` is the server's own recv-to-send duration. */
-  onPong(
-    seq: number,
-    clientT: number,
-    serverBusyUs: number,
-    now: number,
-  ): void {
+  onPong(seq: number, clientT: number, serverBusyUs: number, now: number): void {
     if (!this.pendingPing || this.pendingPing.seq !== seq) return;
     this.pendingPing = null;
     push(this.wsRtt, now - clientT);
@@ -217,9 +209,7 @@ export class TerminalTiming {
     const ttfbSocketMs = summarize(this.ttfbSocket);
     const wsControlRttMs = summarize(this.wsRtt);
     const stackP50 =
-      ttfbSocketMs.count > 0 && wsControlRttMs.count > 0
-        ? round1(ttfbSocketMs.p50 - wsControlRttMs.p50)
-        : null;
+      ttfbSocketMs.count > 0 && wsControlRttMs.count > 0 ? round1(ttfbSocketMs.p50 - wsControlRttMs.p50) : null;
     return {
       renderer: this.renderer,
       ttfbSocketMs,
@@ -248,8 +238,7 @@ export class TerminalTiming {
 
   summaryLine(): string {
     const s = this.snapshot();
-    const stack =
-      s.derived.stackP50 === null ? "n/a" : `${s.derived.stackP50}ms`;
+    const stack = s.derived.stackP50 === null ? "n/a" : `${s.derived.stackP50}ms`;
     return (
       `[terminal.timing] renderer=${s.renderer} ` +
       `key-socket p50/p95=${s.ttfbSocketMs.p50}/${s.ttfbSocketMs.p95}ms ` +

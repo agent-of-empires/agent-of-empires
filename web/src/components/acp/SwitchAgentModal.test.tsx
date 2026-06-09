@@ -24,11 +24,7 @@ vi.mock("../../lib/api", () => ({
   fetchContextPrimer: vi.fn(),
 }));
 
-import {
-  fetchAcpAgents,
-  fetchContextPrimer,
-  switchAcpAgent,
-} from "../../lib/api";
+import { fetchAcpAgents, fetchContextPrimer, switchAcpAgent } from "../../lib/api";
 
 const mockFetchAgents = vi.mocked(fetchAcpAgents);
 const mockSwitch = vi.mocked(switchAcpAgent);
@@ -87,11 +83,7 @@ describe("SwitchAgentModal (rate_limit)", () => {
   it("filters out the current agent and preselects codex", async () => {
     const { container, findByText } = mount();
     await findByText(/Continue in codex/);
-    const radios = Array.from(
-      container.querySelectorAll<HTMLInputElement>(
-        "input[name=acp-agent-target]",
-      ),
-    );
+    const radios = Array.from(container.querySelectorAll<HTMLInputElement>("input[name=acp-agent-target]"));
     const values = radios.map((r) => r.value);
     expect(values).toEqual(expect.arrayContaining(["codex", "opencode"]));
     expect(values).not.toContain("claude");
@@ -114,12 +106,7 @@ describe("SwitchAgentModal (rate_limit)", () => {
     fireEvent.click(confirm);
     await waitFor(() => expect(mockSwitch).toHaveBeenCalledTimes(1));
     // reason "rate_limited" so the transcript divider reads correctly.
-    expect(mockSwitch).toHaveBeenCalledWith(
-      "s-1",
-      "codex",
-      null,
-      "rate_limited",
-    );
+    expect(mockSwitch).toHaveBeenCalledWith("s-1", "codex", null, "rate_limited");
     await waitFor(() => expect(mockPrimer).toHaveBeenCalledTimes(1));
     // Primer must be invoked with before_seq from the switch response
     // (41), not switch_seq, so the recap excludes the AgentSwitched
@@ -134,9 +121,7 @@ describe("SwitchAgentModal (rate_limit)", () => {
     expect(prefilled).toContain("codex");
     expect(prefilled).toContain("user: hi");
     expect(prefilled).toContain("deploy the thing");
-    expect(prefilled.indexOf("user: hi")).toBeLessThan(
-      prefilled.indexOf("deploy the thing"),
-    );
+    expect(prefilled.indexOf("user: hi")).toBeLessThan(prefilled.indexOf("deploy the thing"));
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
@@ -192,18 +177,14 @@ describe("SwitchAgentModal (rate_limit)", () => {
   it("clicking a non-preselected radio updates the confirm-button target", async () => {
     const { container, findByText } = mount();
     await findByText(/Continue in codex/);
-    const opencodeRadio = container.querySelector<HTMLInputElement>(
-      "input[name=acp-agent-target][value=opencode]",
-    );
+    const opencodeRadio = container.querySelector<HTMLInputElement>("input[name=acp-agent-target][value=opencode]");
     expect(opencodeRadio).not.toBeNull();
     fireEvent.click(opencodeRadio!);
     await findByText(/Continue in opencode/);
   });
 
   it("renders an install hint when no alternative agents are registered", async () => {
-    mockFetchAgents.mockResolvedValue([
-      { name: "claude", description: "claude", command: "claude-agent-acp" },
-    ]);
+    mockFetchAgents.mockResolvedValue([{ name: "claude", description: "claude", command: "claude-agent-acp" }]);
     const { findByText } = mount();
     await findByText(/No alternative structured view agents are registered/i);
   });
@@ -217,11 +198,9 @@ describe("SwitchAgentModal (manual)", () => {
     const { container, findByText, queryByText } = mount({ trigger: "manual" });
     await findByText(/Switch to/);
     expect(queryByText(/Continue in/)).toBeNull();
-    const checked = Array.from(
-      container.querySelectorAll<HTMLInputElement>(
-        "input[name=acp-agent-target]",
-      ),
-    ).find((r) => r.checked);
+    const checked = Array.from(container.querySelectorAll<HTMLInputElement>("input[name=acp-agent-target]")).find(
+      (r) => r.checked,
+    );
     // First remaining agent after filtering out the current one.
     expect(checked?.value).toBe("codex");
   });

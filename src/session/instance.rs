@@ -1960,15 +1960,24 @@ impl Instance {
             if self.is_sandboxed() {
                 // For sandboxed sessions, hooks are installed via build_container_config
             } else {
-                // Install hooks in the user's home directory settings
-                if let Some(home) = dirs::home_dir() {
-                    let settings_path = home.join(hook_cfg.settings_rel_path);
-                    if let Err(e) = crate::hooks::install_hooks(
-                        &settings_path,
-                        hook_cfg.events,
-                        crate::hooks::HookInstallTarget::Host,
-                    ) {
-                        tracing::warn!(target: "session.store", "Failed to install agent hooks: {}", e);
+                // Install hooks in the agent's host settings file, honoring a
+                // config-dir override env var (e.g. CLAUDE_CONFIG_DIR) so hooks
+                // land where the agent actually reads them.
+                match crate::hooks::agent_settings_path_for_host_environment(
+                    hook_cfg,
+                    &self.profile_host_environment(),
+                ) {
+                    Ok(settings_path) => {
+                        if let Err(e) = crate::hooks::install_hooks(
+                            &settings_path,
+                            hook_cfg.events,
+                            crate::hooks::HookInstallTarget::Host,
+                        ) {
+                            tracing::warn!(target: "session.store", "Failed to install agent hooks: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "session.store", "Failed to resolve agent hooks path: {}", e)
                     }
                 }
             }

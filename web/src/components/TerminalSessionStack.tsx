@@ -1,9 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import type { SessionResponse } from "../lib/types";
-import {
-  DEFAULT_PERSISTENT_TERMINALS,
-  normalizePersistentTerminalLimit,
-} from "../lib/persistentTerminals";
+import { DEFAULT_PERSISTENT_TERMINALS, normalizePersistentTerminalLimit } from "../lib/persistentTerminals";
 import { TerminalView } from "./TerminalView";
 
 interface Props {
@@ -21,10 +18,7 @@ export function TerminalSessionStack({
 }: Props) {
   const [recentIds, setRecentIds] = useState<string[]>([]);
   const limit = normalizePersistentTerminalLimit(maxPersistentTerminals);
-  const sessionsById = useMemo(
-    () => new Map(sessions.map((session) => [session.id, session])),
-    [sessions],
-  );
+  const sessionsById = useMemo(() => new Map(sessions.map((session) => [session.id, session])), [sessions]);
   const activeSession = sessionsById.get(activeSessionId);
 
   useEffect(() => {

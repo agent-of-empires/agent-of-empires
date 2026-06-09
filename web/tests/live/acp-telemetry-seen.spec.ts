@@ -8,22 +8,13 @@
 // read-only server short-circuits the shared guard so no ping is sent.
 
 import { test, expect } from "../helpers/liveTest";
-import {
-  spawnAoeServe,
-  listSessions,
-  seedSessionViaAoeAdd,
-} from "../helpers/aoeServe";
-import {
-  enableStructuredViewAndWait,
-  waitForStructuredView,
-} from "../helpers/acp";
+import { spawnAoeServe, listSessions, seedSessionViaAoeAdd } from "../helpers/aoeServe";
+import { enableStructuredViewAndWait, waitForStructuredView } from "../helpers/acp";
 
 /** Capture every `POST /api/telemetry/seen` body the browser sends, parsed
  *  into `{ surface }`. Attach before `page.goto` so the on-load `"web"`
  *  ping and the structured view ping are both observed. */
-function captureSeenPings(
-  page: import("@playwright/test").Page,
-): Array<{ surface?: string }> {
+function captureSeenPings(page: import("@playwright/test").Page): Array<{ surface?: string }> {
   const pings: Array<{ surface?: string }> = [];
   page.on("request", (req) => {
     if (req.method() === "POST" && req.url().includes("/api/telemetry/seen")) {
@@ -40,9 +31,7 @@ function captureSeenPings(
   return pings;
 }
 
-test("opening a structured view session fires the structured view seen-ping", async ({
-  page,
-}, testInfo) => {
+test("opening a structured view session fires the structured view seen-ping", async ({ page }, testInfo) => {
   const serve = await spawnAoeServe({
     authMode: "none",
     acp: true,
@@ -75,20 +64,16 @@ test("opening a structured view session fires the structured view seen-ping", as
   }
 });
 
-test("a read-only server sends no telemetry seen-ping", async ({
-  serveReadOnly,
-  page,
-}) => {
+test("a read-only server sends no telemetry seen-ping", async ({ serveReadOnly, page }) => {
   // The seen-ping effects (both `"web"` and `"structured_view"`) share the same
   // guard: skip on read-only servers, which can't persist a snapshot. The
   // backend also rejects `POST /api/telemetry/seen` with 403 in read-only,
   // but the frontend should never get that far.
   const pings = captureSeenPings(page);
 
-  const aboutPromise = page.waitForResponse(
-    (r) => r.url().endsWith("/api/about") && r.status() === 200,
-    { timeout: 10_000 },
-  );
+  const aboutPromise = page.waitForResponse((r) => r.url().endsWith("/api/about") && r.status() === 200, {
+    timeout: 10_000,
+  });
   await page.goto(serveReadOnly.baseUrl);
   await aboutPromise;
   // Settle so React commits the read-only serverAbout state and any effect

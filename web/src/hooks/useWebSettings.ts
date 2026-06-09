@@ -1,9 +1,6 @@
 import { useCallback, useSyncExternalStore } from "react";
 
-import {
-  DEFAULT_PERSISTENT_TERMINALS,
-  normalizePersistentTerminalLimit,
-} from "../lib/persistentTerminals";
+import { DEFAULT_PERSISTENT_TERMINALS, normalizePersistentTerminalLimit } from "../lib/persistentTerminals";
 import { safeGetItem, safeSetItem } from "../lib/safeStorage";
 
 const STORAGE_KEY = "aoe-web-settings";
@@ -37,12 +34,8 @@ function normalizeSnapshot(settings: WebSettings): WebSettings {
   return {
     ...settings,
     persistentTerminals:
-      typeof settings.persistentTerminals === "boolean"
-        ? settings.persistentTerminals
-        : defaults.persistentTerminals,
-    maxPersistentTerminals: normalizePersistentTerminalLimit(
-      settings.maxPersistentTerminals,
-    ),
+      typeof settings.persistentTerminals === "boolean" ? settings.persistentTerminals : defaults.persistentTerminals,
+    maxPersistentTerminals: normalizePersistentTerminalLimit(settings.maxPersistentTerminals),
   };
 }
 
@@ -92,9 +85,7 @@ export function useWebSettings() {
     const current = getSnapshot();
     const next = { ...current, ...patch };
     if (!safeSetItem(STORAGE_KEY, JSON.stringify(next))) {
-      console.warn(
-        "aoe-web-settings: failed to persist (storage full or disabled)",
-      );
+      console.warn("aoe-web-settings: failed to persist (storage full or disabled)");
     }
     cachedRaw = null;
     emitChange();

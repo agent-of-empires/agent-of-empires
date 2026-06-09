@@ -1,9 +1,5 @@
 import { describe, expect, it } from "vitest";
-import {
-  DEFAULT_AGENT_PROFILE,
-  isClearAlias,
-  resolveAgentProfile,
-} from "./agentProfiles";
+import { DEFAULT_AGENT_PROFILE, isClearAlias, resolveAgentProfile } from "./agentProfiles";
 
 describe("resolveAgentProfile", () => {
   it("resolves known agent keys", () => {

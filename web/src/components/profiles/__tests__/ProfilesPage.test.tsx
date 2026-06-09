@@ -58,16 +58,12 @@ function route(url: string, init?: RequestInit): Response {
 }
 
 function findCall(predicate: (url: string, init?: RequestInit) => boolean) {
-  return fetchSpy.mock.calls.find(([url, init]) =>
-    predicate(String(url), init as RequestInit | undefined),
-  );
+  return fetchSpy.mock.calls.find(([url, init]) => predicate(String(url), init as RequestInit | undefined));
 }
 
 beforeEach(() => {
   fetchSpy.mockReset();
-  fetchSpy.mockImplementation((input, init) =>
-    Promise.resolve(route(String(input), init)),
-  );
+  fetchSpy.mockImplementation((input, init) => Promise.resolve(route(String(input), init)));
   vi.stubGlobal("fetch", fetchSpy);
 });
 
@@ -124,10 +120,7 @@ describe("ProfilesPage", () => {
 
     let patchBody: Record<string, unknown> | null = null;
     await waitFor(() => {
-      const patch = findCall(
-        (url, init) =>
-          url === "/api/profiles/work/settings" && init?.method === "PATCH",
-      );
+      const patch = findCall((url, init) => url === "/api/profiles/work/settings" && init?.method === "PATCH");
       expect(patch).toBeTruthy();
       patchBody = JSON.parse(patch![1]!.body as string);
     });
@@ -145,9 +138,7 @@ describe("ProfilesPage", () => {
     fireEvent.click(api.getByRole("button", { name: "Create" }));
 
     await waitFor(() => {
-      const post = findCall(
-        (url, init) => url === "/api/profiles" && init?.method === "POST",
-      );
+      const post = findCall((url, init) => url === "/api/profiles" && init?.method === "POST");
       expect(post).toBeTruthy();
       expect(JSON.parse(post![1]!.body as string)).toEqual({ name: "qa" });
     });
@@ -162,10 +153,7 @@ describe("ProfilesPage", () => {
     fireEvent.keyDown(renameInput, { key: "Enter" });
 
     await waitFor(() => {
-      const patch = findCall(
-        (url, init) =>
-          url === "/api/profiles/work/rename" && init?.method === "PATCH",
-      );
+      const patch = findCall((url, init) => url === "/api/profiles/work/rename" && init?.method === "PATCH");
       expect(patch).toBeTruthy();
       expect(JSON.parse(patch![1]!.body as string)).toEqual({
         new_name: "clients",
@@ -180,10 +168,7 @@ describe("ProfilesPage", () => {
     fireEvent.click(api.getByRole("button", { name: "Delete" }));
 
     await waitFor(() => {
-      const del = findCall(
-        (url, init) =>
-          url === "/api/profiles/work" && init?.method === "DELETE",
-      );
+      const del = findCall((url, init) => url === "/api/profiles/work" && init?.method === "DELETE");
       expect(del).toBeTruthy();
     });
   });
@@ -194,10 +179,7 @@ describe("ProfilesPage", () => {
     fireEvent.click(api.getByRole("button", { name: "Set as default" }));
 
     await waitFor(() => {
-      const patch = findCall(
-        (url, init) =>
-          url === "/api/default-profile" && init?.method === "PATCH",
-      );
+      const patch = findCall((url, init) => url === "/api/default-profile" && init?.method === "PATCH");
       expect(patch).toBeTruthy();
       expect(JSON.parse(patch![1]!.body as string)).toEqual({ name: "work" });
     });
@@ -207,11 +189,7 @@ describe("ProfilesPage", () => {
     const api = mount();
     await selectWork(api);
     fireEvent.click(api.getByRole("button", { name: /^Worktree/ }));
-    await waitFor(() =>
-      expect(api.getByTestId("loc").textContent).toBe(
-        "/settings/worktree?profile=work",
-      ),
-    );
+    await waitFor(() => expect(api.getByTestId("loc").textContent).toBe("/settings/worktree?profile=work"));
   });
 
   it("hides mutation controls in read-only mode", async () => {
@@ -231,5 +209,53 @@ describe("ProfilesPage", () => {
       return ((init as RequestInit).body as string)?.includes("hooks");
     });
     expect(sawHooks).toBe(false);
+  });
+
+  // Regression: selecting a profile loads its settings asynchronously and the
+  // load's `.then` writes the description field. A user who starts typing
+  // before that resolves must keep their edit; the late load must not reset
+  // the field (which previously made Save PATCH the loaded value, or null).
+  it("keeps a description edit made while the profile load is still in flight", async () => {
+    // Gate every settings GET so the load stays pending while we type.
+    let releaseLoad: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      releaseLoad = resolve;
+    });
+    fetchSpy.mockImplementation((input, init) => {
+      const url = String(input);
+      const method = (init as RequestInit | undefined)?.method ?? "GET";
+      if (/^\/api\/profiles\/[^/]+\/settings$/.test(url) && method === "GET") {
+        return gate.then(() => jsonResponse({ description: "from-server", hooks: {} }));
+      }
+      return Promise.resolve(route(url, init as RequestInit | undefined));
+    });
+
+    const api = mount();
+    await selectWork(api);
+    const field = (await waitFor(() => api.getByPlaceholderText("What this profile is for"))) as HTMLInputElement;
+
+    // Edit while the settings GET is still pending.
+    fireEvent.change(field, { target: { value: "client repos" } });
+    expect(field.value).toBe("client repos");
+
+    // Resolve the load. "echo global" (from the global-settings GET) renders
+    // only after the load's `.then` runs, so it is a deterministic signal
+    // that the load applied and React flushed.
+    releaseLoad();
+    await waitFor(() => api.getByText("echo global"));
+
+    // The edit survives; the loaded "from-server" value never reaches it.
+    expect(field.value).toBe("client repos");
+    expect(api.queryByDisplayValue("from-server")).toBeNull();
+
+    // Save must carry the user's value, not the clobbered/empty one.
+    fireEvent.click(api.getByRole("button", { name: "Save" }));
+    await waitFor(() => {
+      const patch = findCall((url, init) => url === "/api/profiles/work/settings" && init?.method === "PATCH");
+      expect(patch).toBeTruthy();
+      expect(JSON.parse(patch![1]!.body as string)).toEqual({
+        description: "client repos",
+      });
+    });
   });
 });

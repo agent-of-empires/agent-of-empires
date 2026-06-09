@@ -20,8 +20,7 @@ function stubClient(opts: {
       (query === "(min-width: 768px)" && !!opts.wide);
     return { matches, media: query } as MediaQueryList;
   }) as unknown as typeof window.matchMedia;
-  (window.navigator as unknown as { standalone?: boolean }).standalone =
-    opts.iosStandalone ?? false;
+  (window.navigator as unknown as { standalone?: boolean }).standalone = opts.iosStandalone ?? false;
 }
 
 afterEach(() => {

@@ -20,9 +20,7 @@ base("Help overlay opens from overflow menu", async ({ page }, testInfo) => {
     await page.getByRole("button", { name: "More options" }).click();
     await page.getByRole("menuitem", { name: "Help" }).click();
 
-    await expect(
-      page.getByRole("heading", { name: "Help", exact: true }),
-    ).toBeVisible({ timeout: 5_000 });
+    await expect(page.getByRole("heading", { name: "Help", exact: true })).toBeVisible({ timeout: 5_000 });
     // Sample bindings rendered from the overlay's shortcuts list.
     await expect(page.getByText(/Toggle this help/i)).toBeVisible();
   } finally {

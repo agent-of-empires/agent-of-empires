@@ -31,12 +31,7 @@ describe("processFile on a similar-crate patch", () => {
     // not just the patch, so hunk expansion and find line numbers are
     // file-accurate.
     expect(meta!.deletionLines).toEqual(["line 1\n", "line 2\n", "line 3\n"]);
-    expect(meta!.additionLines).toEqual([
-      "line 1 modified\n",
-      "line 2\n",
-      "line 3\n",
-      "new line 4\n",
-    ]);
+    expect(meta!.additionLines).toEqual(["line 1 modified\n", "line 2\n", "line 3\n", "new line 4\n"]);
   });
 
   it("changedLines maps to file-accurate line numbers", () => {

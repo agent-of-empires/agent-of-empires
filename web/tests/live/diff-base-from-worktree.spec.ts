@@ -62,76 +62,69 @@ async function setDiffBase(serve: ServeHandle, id: string, baseBranch: string) {
     body: JSON.stringify({ base_branch: baseBranch }),
   });
   if (!res.ok) {
-    throw new Error(
-      `PATCH diff-base failed: ${res.status} ${await res.text()}`,
-    );
+    throw new Error(`PATCH diff-base failed: ${res.status} ${await res.text()}`);
   }
 }
 
-base(
-  "diff base defaults to the worktree's base branch, override still wins",
-  async ({}, testInfo) => {
-    let serve: ServeHandle | undefined;
-    try {
-      serve = await spawnAoeServe({
-        authMode: "none",
-        workerIndex: testInfo.workerIndex,
-        parallelIndex: testInfo.parallelIndex,
-        seedFn: ({ home }) => {
-          // Healthy single repo: `main` with two commits, plus a
-          // `release` branch pinned at the first commit. Auto-detection
-          // resolves to `main`, so a later base of `release` can only
-          // come from the worktree base layer.
-          const primary = join(home, "primary");
-          run("git", ["init", "-q", "--initial-branch=main", primary], home);
-          writeFileSync(join(primary, "file.txt"), "hello\n");
-          run("git", ["add", "file.txt"], primary);
-          run("git", ["commit", "-q", "-m", "commit A"], primary);
-          run("git", ["branch", "release"], primary);
-          writeFileSync(join(primary, "file2.txt"), "world\n");
-          run("git", ["add", "file2.txt"], primary);
-          run("git", ["commit", "-q", "-m", "commit B"], primary);
-        },
-      });
+base("diff base defaults to the worktree's base branch, override still wins", async ({}, testInfo) => {
+  let serve: ServeHandle | undefined;
+  try {
+    serve = await spawnAoeServe({
+      authMode: "none",
+      workerIndex: testInfo.workerIndex,
+      parallelIndex: testInfo.parallelIndex,
+      seedFn: ({ home }) => {
+        // Healthy single repo: `main` with two commits, plus a
+        // `release` branch pinned at the first commit. Auto-detection
+        // resolves to `main`, so a later base of `release` can only
+        // come from the worktree base layer.
+        const primary = join(home, "primary");
+        run("git", ["init", "-q", "--initial-branch=main", primary], home);
+        writeFileSync(join(primary, "file.txt"), "hello\n");
+        run("git", ["add", "file.txt"], primary);
+        run("git", ["commit", "-q", "-m", "commit A"], primary);
+        run("git", ["branch", "release"], primary);
+        writeFileSync(join(primary, "file2.txt"), "world\n");
+        run("git", ["add", "file2.txt"], primary);
+        run("git", ["commit", "-q", "-m", "commit B"], primary);
+      },
+    });
 
-      const primary = join(serve.home, "primary");
+    const primary = join(serve.home, "primary");
 
-      const res = await fetch(`${serve.baseUrl}/api/sessions`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          path: primary,
-          tool: "claude",
-          title: "diff-base-from-worktree",
-          worktree_branch: "feature/diff-base-from-worktree",
-          create_new_branch: true,
-          base_branch: "release",
-        }),
-      });
-      if (!res.ok) {
-        throw new Error(
-          `POST /api/sessions failed: ${res.status} ${await res.text()}`,
-        );
-      }
-      const created = (await res.json()) as { id: string };
-
-      // No override set: the diff base follows the worktree's recorded
-      // base branch, not the auto-detected `main`.
-      const defaultBases = await diffBases(serve, created.id);
-      expect(defaultBases.length).toBe(1);
-      expect(defaultBases[0].base_branch).toBe("release");
-
-      // An explicit per-session override outranks the worktree base.
-      await setDiffBase(serve, created.id, "main");
-      const overriddenBases = await diffBases(serve, created.id);
-      expect(overriddenBases[0].base_branch).toBe("main");
-
-      // Clearing the override falls back to the worktree base again.
-      await setDiffBase(serve, created.id, "");
-      const clearedBases = await diffBases(serve, created.id);
-      expect(clearedBases[0].base_branch).toBe("release");
-    } finally {
-      await serve?.stop();
+    const res = await fetch(`${serve.baseUrl}/api/sessions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        path: primary,
+        tool: "claude",
+        title: "diff-base-from-worktree",
+        worktree_branch: "feature/diff-base-from-worktree",
+        create_new_branch: true,
+        base_branch: "release",
+      }),
+    });
+    if (!res.ok) {
+      throw new Error(`POST /api/sessions failed: ${res.status} ${await res.text()}`);
     }
-  },
-);
+    const created = (await res.json()) as { id: string };
+
+    // No override set: the diff base follows the worktree's recorded
+    // base branch, not the auto-detected `main`.
+    const defaultBases = await diffBases(serve, created.id);
+    expect(defaultBases.length).toBe(1);
+    expect(defaultBases[0].base_branch).toBe("release");
+
+    // An explicit per-session override outranks the worktree base.
+    await setDiffBase(serve, created.id, "main");
+    const overriddenBases = await diffBases(serve, created.id);
+    expect(overriddenBases[0].base_branch).toBe("main");
+
+    // Clearing the override falls back to the worktree base again.
+    await setDiffBase(serve, created.id, "");
+    const clearedBases = await diffBases(serve, created.id);
+    expect(clearedBases[0].base_branch).toBe("release");
+  } finally {
+    await serve?.stop();
+  }
+});

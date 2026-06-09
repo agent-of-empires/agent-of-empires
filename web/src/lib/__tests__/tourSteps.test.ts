@@ -22,12 +22,7 @@ const SRC_DIR = join(process.cwd(), "src");
 // tourSteps.ts itself legitimately contains the `data-tour="..."` template in
 // tourSelector(); tests and stories are not shipped UI. Everything else must go
 // through the TOUR_ANCHORS constants.
-const EXCLUDED = [
-  join("lib", "tourSteps.ts"),
-  "__tests__",
-  ".test.",
-  ".stories.",
-];
+const EXCLUDED = [join("lib", "tourSteps.ts"), "__tests__", ".test.", ".stories."];
 
 function collectSourceFiles(dir: string, acc: string[] = []): string[] {
   for (const entry of readdirSync(dir)) {
@@ -41,9 +36,7 @@ function collectSourceFiles(dir: string, acc: string[] = []): string[] {
   return acc;
 }
 
-const COMPONENT_SOURCES = collectSourceFiles(SRC_DIR).filter(
-  (f) => !EXCLUDED.some((ex) => f.includes(ex)),
-);
+const COMPONENT_SOURCES = collectSourceFiles(SRC_DIR).filter((f) => !EXCLUDED.some((ex) => f.includes(ex)));
 
 const ANCHOR_KEY_BY_VALUE = new Map<TourAnchorId, string>(
   Object.entries(TOUR_ANCHORS).map(([key, value]) => [value, key]),
@@ -78,10 +71,7 @@ describe("tour drift guard", () => {
     }
     for (const step of TOUR_STEPS) {
       const key = ANCHOR_KEY_BY_VALUE.get(step.anchor);
-      expect(
-        key,
-        `anchor ${step.anchor} missing from TOUR_ANCHORS`,
-      ).toBeDefined();
+      expect(key, `anchor ${step.anchor} missing from TOUR_ANCHORS`).toBeDefined();
       expect(
         usedInSource.has(key as string),
         `anchor "${step.anchor}" (step "${step.id}") is never attached in component source`,
@@ -95,10 +85,7 @@ describe("tour drift guard", () => {
       const text = readFileSync(file, "utf8");
       if (/data-tour=["']/.test(text)) offenders.push(file);
     }
-    expect(
-      offenders,
-      `raw data-tour literals found in: ${offenders.join(", ")}`,
-    ).toEqual([]);
+    expect(offenders, `raw data-tour literals found in: ${offenders.join(", ")}`).toEqual([]);
   });
 });
 

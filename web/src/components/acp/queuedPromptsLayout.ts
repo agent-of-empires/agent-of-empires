@@ -42,10 +42,6 @@ export function queuedStripLayout(args: {
   const collapsed = overflows && !expanded;
   const visibleCount = collapsed ? visibleDefault : queuedCount;
   const hiddenCount = collapsed ? queuedCount - visibleDefault : 0;
-  const toggleLabel = !overflows
-    ? null
-    : expanded
-      ? "Show less"
-      : `Show ${hiddenCount} more`;
+  const toggleLabel = !overflows ? null : expanded ? "Show less" : `Show ${hiddenCount} more`;
   return { visibleDefault, collapsed, visibleCount, hiddenCount, toggleLabel };
 }

@@ -7,9 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 type ProxyEntry = { target: string; ws?: boolean };
 
-async function loadProxy(
-  env: Record<string, string | undefined>,
-): Promise<Record<string, ProxyEntry> | undefined> {
+async function loadProxy(env: Record<string, string | undefined>): Promise<Record<string, ProxyEntry> | undefined> {
   vi.resetModules();
   for (const [k, v] of Object.entries(env)) {
     vi.stubEnv(k, v as string | undefined);

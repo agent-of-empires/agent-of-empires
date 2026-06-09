@@ -44,9 +44,7 @@ function descriptor(
 }
 
 function selectByLabel(label: string): HTMLSelectElement {
-  const el = Array.from(document.querySelectorAll("label")).find(
-    (l) => l.textContent === label,
-  );
+  const el = Array.from(document.querySelectorAll("label")).find((l) => l.textContent === label);
   return el?.parentElement?.querySelector("select") as HTMLSelectElement;
 }
 
@@ -58,11 +56,7 @@ describe("SoundModeWidget", () => {
   it("maps the random/specific enum onto the select", () => {
     const save = vi.fn(() => Promise.resolve(true));
     const { rerender } = render(
-      <SoundModeWidget
-        descriptor={descriptor({ field: "mode", label: "Mode" })}
-        value="random"
-        save={save}
-      />,
+      <SoundModeWidget descriptor={descriptor({ field: "mode", label: "Mode" })} value="random" save={save} />,
     );
     const select = selectByLabel("Mode");
     expect(select.value).toBe("random");
@@ -89,15 +83,9 @@ describe("SoundVolumeWidget", () => {
   it("renders a 0.1-1.5 float slider and saves the number", () => {
     const save = vi.fn(() => Promise.resolve(true));
     const { container } = render(
-      <SoundVolumeWidget
-        descriptor={descriptor({ field: "volume", label: "Volume" })}
-        value={1.0}
-        save={save}
-      />,
+      <SoundVolumeWidget descriptor={descriptor({ field: "volume", label: "Volume" })} value={1.0} save={save} />,
     );
-    const slider = container.querySelector(
-      'input[type="range"]',
-    ) as HTMLInputElement;
+    const slider = container.querySelector('input[type="range"]') as HTMLInputElement;
     expect(slider.min).toBe("0.1");
     expect(slider.max).toBe("1.5");
     fireEvent.change(slider, { target: { value: "0.5" } });
@@ -141,31 +129,17 @@ describe("LoggingTargetsWidget", () => {
 describe("ThemeNameWidget", () => {
   it("lists fetched themes and repaints only after a successful save", async () => {
     const save = vi.fn(() => Promise.resolve(true));
-    render(
-      <ThemeNameWidget
-        descriptor={descriptor({ field: "name", label: "Theme" })}
-        value="dark"
-        save={save}
-      />,
-    );
+    render(<ThemeNameWidget descriptor={descriptor({ field: "name", label: "Theme" })} value="dark" save={save} />);
     await waitFor(() => expect(screen.getByText("light")).toBeTruthy());
 
     fireEvent.change(selectByLabel("Theme"), { target: { value: "light" } });
     expect(save).toHaveBeenCalledWith("light");
-    await waitFor(() =>
-      expect(dispatchThemePickerChanged).toHaveBeenCalledWith("light"),
-    );
+    await waitFor(() => expect(dispatchThemePickerChanged).toHaveBeenCalledWith("light"));
   });
 
   it("does not repaint when the save fails", async () => {
     const save = vi.fn(() => Promise.resolve(false));
-    render(
-      <ThemeNameWidget
-        descriptor={descriptor({ field: "name", label: "Theme" })}
-        value="dark"
-        save={save}
-      />,
-    );
+    render(<ThemeNameWidget descriptor={descriptor({ field: "name", label: "Theme" })} value="dark" save={save} />);
     await waitFor(() => expect(screen.getByText("light")).toBeTruthy());
 
     fireEvent.change(selectByLabel("Theme"), { target: { value: "light" } });
@@ -220,9 +194,7 @@ describe("DefaultToolWidget", () => {
         save={save}
       />,
     );
-    const input = container.querySelector(
-      'input[type="text"]',
-    ) as HTMLInputElement;
+    const input = container.querySelector('input[type="text"]') as HTMLInputElement;
     // TextField commits on blur, not on each keystroke.
     fireEvent.focus(input);
     fireEvent.change(input, { target: { value: "" } });

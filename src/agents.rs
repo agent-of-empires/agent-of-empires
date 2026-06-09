@@ -63,6 +63,12 @@ pub struct AgentHookConfig {
     /// Path relative to the home dir where the agent's settings live
     /// (e.g. `.claude/settings.json`).
     pub settings_rel_path: &'static str,
+    /// Optional env var that overrides the agent's config directory
+    /// (e.g. `CLAUDE_CONFIG_DIR`). When set in the session's host environment,
+    /// or in AoE's own environment, the settings file lives directly under that
+    /// directory using the basename of `settings_rel_path`, rather than under
+    /// `~/<settings_rel_path>`. `None` for agents with a fixed home-relative path.
+    pub config_dir_env_var: Option<&'static str>,
     /// Hook events to register (status transitions and session lifecycle).
     pub events: &'static [HookEvent],
 }
@@ -280,6 +286,7 @@ pub const AGENTS: &[AgentDef] = &[
         container_env: &[("CLAUDE_CONFIG_DIR", "/root/.claude")],
         hook_config: Some(AgentHookConfig {
             settings_rel_path: ".claude/settings.json",
+            config_dir_env_var: Some("CLAUDE_CONFIG_DIR"),
             events: CLAUDE_HOOK_EVENTS,
         }),
         resume_strategy: ResumeStrategy::FlagPair {
@@ -336,6 +343,9 @@ pub const AGENTS: &[AgentDef] = &[
         container_env: &[],
         hook_config: Some(AgentHookConfig {
             settings_rel_path: ".codex/config.toml",
+            // Codex resolves its config dir via `CODEX_HOME` through a bespoke
+            // path pair; install/uninstall are special-cased on agent name.
+            config_dir_env_var: None,
             events: CODEX_HOOK_EVENTS,
         }),
         resume_strategy: ResumeStrategy::Subcommand("resume"),
@@ -358,6 +368,7 @@ pub const AGENTS: &[AgentDef] = &[
         container_env: &[],
         hook_config: Some(AgentHookConfig {
             settings_rel_path: ".gemini/settings.json",
+            config_dir_env_var: None,
             events: &[
                 HookEvent {
                     name: "BeforeTool",
@@ -402,6 +413,7 @@ pub const AGENTS: &[AgentDef] = &[
         container_env: &[("CURSOR_CONFIG_DIR", "/root/.cursor")],
         hook_config: Some(AgentHookConfig {
             settings_rel_path: ".cursor/settings.json",
+            config_dir_env_var: Some("CURSOR_CONFIG_DIR"),
             events: CURSOR_HOOK_EVENTS,
         }),
         resume_strategy: ResumeStrategy::Unsupported,
@@ -533,6 +545,7 @@ pub const AGENTS: &[AgentDef] = &[
         container_env: &[],
         hook_config: Some(AgentHookConfig {
             settings_rel_path: ".qwen/settings.json",
+            config_dir_env_var: None,
             events: QWEN_HOOK_EVENTS,
         }),
         resume_strategy: ResumeStrategy::FlagPair {

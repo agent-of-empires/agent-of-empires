@@ -24,16 +24,12 @@ export function slugifyBranch(title: string): string {
   for (const ch of title) {
     expanded += LIGATURES[ch] ?? ch;
   }
-  const stripped = expanded
-    .normalize("NFKD")
-    .replace(/\p{M}/gu, "")
-    .toLowerCase();
+  const stripped = expanded.normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase();
   let out = "";
   let lastDash = false;
   for (const ch of stripped) {
     const code = ch.charCodeAt(0);
-    const isAlnum =
-      (code >= 0x30 && code <= 0x39) || (code >= 0x61 && code <= 0x7a);
+    const isAlnum = (code >= 0x30 && code <= 0x39) || (code >= 0x61 && code <= 0x7a);
     if (isAlnum || ch === "-" || ch === "_") {
       out += ch;
       lastDash = false;
@@ -64,10 +60,7 @@ export function applyBranchOverride(
   };
 }
 
-export function getSubmittedBranch(
-  title: string,
-  worktreeBranch: string,
-): string {
+export function getSubmittedBranch(title: string, worktreeBranch: string): string {
   return worktreeBranch || title || "";
 }
 

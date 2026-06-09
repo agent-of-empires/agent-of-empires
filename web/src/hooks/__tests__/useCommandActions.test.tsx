@@ -37,9 +37,7 @@ function baseArgs(overrides: Partial<Args> = {}): Args {
 describe("useCommandActions: scratch command", () => {
   it("exposes a 'New scratch session' command", () => {
     const { result } = renderHook(() => useCommandActions(baseArgs()));
-    const scratch = result.current.find(
-      (a) => a.id === "action:new-scratch-session",
-    );
+    const scratch = result.current.find((a) => a.id === "action:new-scratch-session");
     expect(scratch).toBeDefined();
     expect(scratch?.title).toBe("New scratch session");
     expect(scratch?.group).toBe("Actions");
@@ -58,20 +56,14 @@ describe("useCommandActions: scratch command", () => {
 
   it("perform dispatches onNewScratch", () => {
     const onNewScratch = vi.fn();
-    const { result } = renderHook(() =>
-      useCommandActions(baseArgs({ onNewScratch })),
-    );
-    const scratch = result.current.find(
-      (a) => a.id === "action:new-scratch-session",
-    );
+    const { result } = renderHook(() => useCommandActions(baseArgs({ onNewScratch })));
+    const scratch = result.current.find((a) => a.id === "action:new-scratch-session");
     scratch?.perform();
     expect(onNewScratch).toHaveBeenCalledTimes(1);
   });
 
   it("hides both creation commands in read-only mode", () => {
-    const { result } = renderHook(() =>
-      useCommandActions(baseArgs({ readOnly: true })),
-    );
+    const { result } = renderHook(() => useCommandActions(baseArgs({ readOnly: true })));
     const ids = result.current.map((a) => a.id);
     expect(ids).not.toContain("action:new-session");
     expect(ids).not.toContain("action:new-scratch-session");

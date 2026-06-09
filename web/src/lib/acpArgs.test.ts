@@ -108,28 +108,20 @@ describe("pickFirst", () => {
 
 describe("previewFromArgs", () => {
   it("prefers a shell command", () => {
-    expect(previewFromArgs(JSON.stringify({ command: "ls -al" }))).toBe(
-      "ls -al",
-    );
+    expect(previewFromArgs(JSON.stringify({ command: "ls -al" }))).toBe("ls -al");
   });
 
   it("falls back to a file path for read/edit shapes", () => {
-    expect(previewFromArgs(JSON.stringify({ file_path: "src/a.ts" }))).toBe(
-      "src/a.ts",
-    );
+    expect(previewFromArgs(JSON.stringify({ file_path: "src/a.ts" }))).toBe("src/a.ts");
   });
 
   it("surfaces query/pattern and url shapes", () => {
     expect(previewFromArgs(JSON.stringify({ pattern: "TODO" }))).toBe("TODO");
-    expect(previewFromArgs(JSON.stringify({ url: "https://x" }))).toBe(
-      "https://x",
-    );
+    expect(previewFromArgs(JSON.stringify({ url: "https://x" }))).toBe("https://x");
   });
 
   it("falls back to the ACP-forwarded _aoe_title", () => {
-    expect(
-      previewFromArgs(JSON.stringify({ _aoe_title: "Run the suite" })),
-    ).toBe("Run the suite");
+    expect(previewFromArgs(JSON.stringify({ _aoe_title: "Run the suite" }))).toBe("Run the suite");
   });
 
   it("returns null when no usable primary argument is present", () => {
@@ -183,15 +175,7 @@ describe("todoItemsFromArgs", () => {
   });
 
   it("detects todo args only when at least one item has content", () => {
-    expect(
-      hasTodoItemsArgsText(
-        JSON.stringify({ todos: [{ content: "   ", status: "pending" }] }),
-      ),
-    ).toBe(false);
-    expect(
-      hasTodoItemsArgsText(
-        JSON.stringify({ todos: [{ content: "Real", status: "pending" }] }),
-      ),
-    ).toBe(true);
+    expect(hasTodoItemsArgsText(JSON.stringify({ todos: [{ content: "   ", status: "pending" }] }))).toBe(false);
+    expect(hasTodoItemsArgsText(JSON.stringify({ todos: [{ content: "Real", status: "pending" }] }))).toBe(true);
   });
 });

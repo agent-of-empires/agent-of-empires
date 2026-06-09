@@ -17,11 +17,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { emptyAcpState, type QueuedPrompt } from "../lib/acpTypes";
 import { AgentProfileProvider } from "../lib/agentProfileContext";
 import { reportAcpInteraction } from "../lib/api";
-import {
-  acpHookReducer,
-  combineQueuedPrompts,
-  useAcpSession,
-} from "./useAcpSession";
+import { acpHookReducer, combineQueuedPrompts, useAcpSession } from "./useAcpSession";
 
 // Spy on the telemetry ping while keeping the rest of the api module real
 // (the hook also calls setSessionArchive / setSessionSnooze through it).
@@ -220,19 +216,12 @@ describe("combineQueuedPrompts (combined drain mode)", () => {
   });
 
   it("joins entries with a blank line", () => {
-    const out = combineQueuedPrompts([
-      mk("a", "first"),
-      mk("b", "second"),
-      mk("c", "third"),
-    ]);
+    const out = combineQueuedPrompts([mk("a", "first"), mk("b", "second"), mk("c", "third")]);
     expect(out).toBe("first\n\nsecond\n\nthird");
   });
 
   it("preserves intra-entry newlines unchanged", () => {
-    const out = combineQueuedPrompts([
-      mk("a", "line 1\nline 2"),
-      mk("b", "after"),
-    ]);
+    const out = combineQueuedPrompts([mk("a", "line 1\nline 2"), mk("b", "after")]);
     expect(out).toBe("line 1\nline 2\n\nafter");
   });
 
@@ -245,9 +234,7 @@ describe("combineQueuedPrompts (combined drain mode)", () => {
   });
 
   it("skips empty (attachment-only) entries so no stray blank lines appear (#1833)", () => {
-    expect(
-      combineQueuedPrompts([mk("a", "before"), mk("b", ""), mk("c", "after")]),
-    ).toBe("before\n\nafter");
+    expect(combineQueuedPrompts([mk("a", "before"), mk("b", ""), mk("c", "after")])).toBe("before\n\nafter");
     expect(combineQueuedPrompts([mk("a", ""), mk("b", "")])).toBe("");
   });
 });
@@ -374,9 +361,7 @@ describe("useAcpSession drain race (#1144)", () => {
     await flushAsync();
     expect(promptPostCount).toBe(0);
     expect(result.current.state.queuedPrompts).toHaveLength(1);
-    expect(result.current.state.queuedPrompts[0]?.text).toBe(
-      "queued before open",
-    );
+    expect(result.current.state.queuedPrompts[0]?.text).toBe("queued before open");
   });
 
   // #1888: parking a prompt because the agent is busy is the one acp
@@ -416,9 +401,7 @@ describe("useAcpSession drain race (#1144)", () => {
     // Idle-dormant wake: the worker was reaped, so sendPrompt POSTs directly
     // to wake it. When that POST fails retryably (worker_not_ready 503), the
     // prompt is re-queued, and that re-queue must ping telemetry too.
-    const { result } = renderHook(() =>
-      useAcpSession("sess-retry-requeue", "absent"),
-    );
+    const { result } = renderHook(() => useAcpSession("sess-retry-requeue", "absent"));
     await flushAsync();
     const ws = sockets[0]!;
     act(() => {
@@ -511,17 +494,13 @@ describe("useAcpSession drain race (#1144)", () => {
     await flushAsync();
     expect(promptPostCount).toBe(0);
     expect(result.current.state.queuedPrompts).toHaveLength(1);
-    expect(result.current.state.queuedPrompts[0]?.text).toBe(
-      "typed while stopped",
-    );
+    expect(result.current.state.queuedPrompts[0]?.text).toBe("typed while stopped");
   });
 
   it("a fresh prompt POSTs (wakes) instead of parking when the worker is idle-dormant (#1689)", async () => {
     // workerState="absent": the reconciler reaped the worker for
     // inactivity. The REST poll reads "absent" until the respawn lands.
-    const { result } = renderHook(() =>
-      useAcpSession("sess-idle-fresh", "absent"),
-    );
+    const { result } = renderHook(() => useAcpSession("sess-idle-fresh", "absent"));
     await flushAsync();
     const ws = sockets[0]!;
     act(() => {
@@ -539,9 +518,7 @@ describe("useAcpSession drain race (#1144)", () => {
     expect(promptPostCount).toBe(0);
     expect(result.current.state.queuedPrompts).toHaveLength(1);
     act(() => {
-      void result.current.removeQueuedPrompt(
-        result.current.state.queuedPrompts[0]!.id,
-      );
+      void result.current.removeQueuedPrompt(result.current.state.queuedPrompts[0]!.id);
     });
     await flushAsync();
 
@@ -575,9 +552,7 @@ describe("useAcpSession drain race (#1144)", () => {
     // a cold-absent resume, then the reconciler reaped it to dormant.
     // The dormancy signal must let the drain effect fire the parked
     // prompt (the wake POST), otherwise it sits queued forever.
-    const { result } = renderHook(() =>
-      useAcpSession("sess-idle-drain", "absent"),
-    );
+    const { result } = renderHook(() => useAcpSession("sess-idle-drain", "absent"));
     await flushAsync();
     const ws = sockets[0]!;
     act(() => {
@@ -610,9 +585,7 @@ describe("useAcpSession drain race (#1144)", () => {
   });
 
   it("keeps an idle-dormant prompt queued without an error banner on a worker_not_ready 503 (#1748)", async () => {
-    const { result } = renderHook(() =>
-      useAcpSession("sess-idle-503", "absent"),
-    );
+    const { result } = renderHook(() => useAcpSession("sess-idle-503", "absent"));
     await flushAsync();
     const ws = sockets[0]!;
     act(() => {
@@ -648,18 +621,14 @@ describe("useAcpSession drain race (#1144)", () => {
     expect(promptPostCount).toBe(1);
     expect(result.current.state.queuedPrompts).toHaveLength(1);
     expect(result.current.state.queuedPrompts[0]?.text).toBe("wake me up");
-    expect(result.current.state.lastError ?? "").not.toContain(
-      "Could not send prompt",
-    );
+    expect(result.current.state.lastError ?? "").not.toContain("Could not send prompt");
   });
 
   it("still surfaces an error banner on a worker_capacity_full 503 (#1748)", async () => {
     // Control: the capacity 503 needs operator action, so unlike
     // worker_not_ready it must keep its banner rather than being silently
     // swallowed as a transient.
-    const { result } = renderHook(() =>
-      useAcpSession("sess-idle-cap", "absent"),
-    );
+    const { result } = renderHook(() => useAcpSession("sess-idle-cap", "absent"));
     await flushAsync();
     const ws = sockets[0]!;
     act(() => {
@@ -686,9 +655,7 @@ describe("useAcpSession drain race (#1144)", () => {
     });
     await flushAsync();
 
-    expect(result.current.state.lastError ?? "").toContain(
-      "Could not send prompt (503)",
-    );
+    expect(result.current.state.lastError ?? "").toContain("Could not send prompt (503)");
   });
 
   it("re-queues an attachment send without an error banner on a worker_not_ready 503 (#1833)", async () => {
@@ -696,9 +663,7 @@ describe("useAcpSession drain race (#1144)", () => {
     // worker_not_ready 503 for an attachment send has a retry path: park
     // it (image included) and suppress the banner, exactly like a
     // text-only send. The drain re-fires it once the worker comes online.
-    const { result } = renderHook(() =>
-      useAcpSession("sess-idle-attach", "absent"),
-    );
+    const { result } = renderHook(() => useAcpSession("sess-idle-attach", "absent"));
     await flushAsync();
     const ws = sockets[0]!;
     act(() => {
@@ -732,15 +697,11 @@ describe("useAcpSession drain race (#1144)", () => {
     });
     await flushAsync();
 
-    expect(result.current.state.lastError ?? "").not.toContain(
-      "Could not send prompt",
-    );
+    expect(result.current.state.lastError ?? "").not.toContain("Could not send prompt");
     expect(result.current.state.queuedPrompts).toHaveLength(1);
     expect(result.current.state.queuedPrompts[0]?.text).toBe("wake me up");
     expect(result.current.state.queuedPrompts[0]?.attachments).toHaveLength(1);
-    expect(result.current.state.queuedPrompts[0]?.attachments?.[0]?.name).toBe(
-      "shot.png",
-    );
+    expect(result.current.state.queuedPrompts[0]?.attachments?.[0]?.name).toBe("shot.png");
   });
 
   it("queues an attachment send mid-turn instead of dropping it (#1833)", async () => {
@@ -784,9 +745,7 @@ describe("useAcpSession drain race (#1144)", () => {
 
     // No POST yet, no error banner, and the image is parked on the queue.
     expect(promptPostCount).toBe(0);
-    expect(result.current.state.lastError ?? "").not.toContain(
-      "Could not send prompt",
-    );
+    expect(result.current.state.lastError ?? "").not.toContain("Could not send prompt");
     expect(result.current.state.lastError ?? "").not.toContain("Attachments");
     expect(result.current.state.queuedPrompts).toHaveLength(1);
     expect(result.current.state.queuedPrompts[0]?.attachments).toHaveLength(1);
@@ -884,8 +843,7 @@ describe("useAcpSession drain race (#1144)", () => {
     // worker to running, AcpSessionAssigned lands) the drain effect must
     // dispatch the prompt the user queued during the wait, and not before.
     const { result, rerender } = renderHook(
-      ({ ws }: { ws: "absent" | "resuming" | "running" }) =>
-        useAcpSession("sess-rl-resume", ws),
+      ({ ws }: { ws: "absent" | "resuming" | "running" }) => useAcpSession("sess-rl-resume", ws),
       { initialProps: { ws: "absent" as const } },
     );
     await flushAsync();
@@ -990,9 +948,7 @@ describe("useAcpSession drain race (#1144)", () => {
     expect(result.current.state.pendingUserPromptSeq).toBe(1);
     expect(result.current.state.lastStoppedSeq).toBe(1);
     expect(result.current.state.turnActive).toBe(false);
-    expect(result.current.state.lastError).toContain(
-      "Could not send prompt (400)",
-    );
+    expect(result.current.state.lastError).toContain("Could not send prompt (400)");
   });
 
   it("combined-mode drain leaves the queue intact when the prompt POST fails", async () => {
@@ -1095,10 +1051,7 @@ describe("useAcpSession drain race (#1144)", () => {
       vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
         const url = typeof input === "string" ? input : input.toString();
         if (url.includes("/acp/replay")) {
-          return new Response(
-            JSON.stringify({ frames: [], lost: false, highest_seq: 0 }),
-            { status: 200 },
-          );
+          return new Response(JSON.stringify({ frames: [], lost: false, highest_seq: 0 }), { status: 200 });
         }
         if (url.includes("/acp/prompt")) {
           promptPostCount += 1;
@@ -1151,9 +1104,7 @@ describe("useAcpSession drain race (#1144)", () => {
     });
     await flushAsync();
     expect(result.current.state.queuedPrompts).toHaveLength(1);
-    expect(result.current.state.queuedPrompts[0]?.text).toBe(
-      "queued during await",
-    );
+    expect(result.current.state.queuedPrompts[0]?.text).toBe("queued during await");
   });
 });
 
@@ -1182,10 +1133,7 @@ describe("useAcpSession drain split at clear-command boundary (#1356)", () => {
       vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
         const url = typeof input === "string" ? input : input.toString();
         if (url.includes("/acp/replay")) {
-          return new Response(
-            JSON.stringify({ frames: [], lost: false, highest_seq: 0 }),
-            { status: 200 },
-          );
+          return new Response(JSON.stringify({ frames: [], lost: false, highest_seq: 0 }), { status: 200 });
         }
         if (url.includes("/acp/prompt")) {
           promptPostCount += 1;
@@ -1276,17 +1224,12 @@ describe("useAcpSession drain split at clear-command boundary (#1356)", () => {
     await pumpStopped();
     expect(promptPostCount).toBe(1);
     expect(bodyTexts()).toEqual(["a"]);
-    expect(result.current.state.queuedPrompts.map((q) => q.text)).toEqual([
-      "/clear",
-      "b",
-    ]);
+    expect(result.current.state.queuedPrompts.map((q) => q.text)).toEqual(["/clear", "b"]);
 
     await pumpStopped();
     expect(promptPostCount).toBe(2);
     expect(bodyTexts()).toEqual(["a", "/clear"]);
-    expect(result.current.state.queuedPrompts.map((q) => q.text)).toEqual([
-      "b",
-    ]);
+    expect(result.current.state.queuedPrompts.map((q) => q.text)).toEqual(["b"]);
 
     await pumpStopped();
     expect(promptPostCount).toBe(3);
@@ -1325,9 +1268,7 @@ describe("useAcpSession drain split at clear-command boundary (#1356)", () => {
     await pumpStopped();
     expect(promptPostCount).toBe(1);
     expect(bodyTexts()).toEqual(["a\n\nb"]);
-    expect(result.current.state.queuedPrompts.map((q) => q.text)).toEqual([
-      "/clear",
-    ]);
+    expect(result.current.state.queuedPrompts.map((q) => q.text)).toEqual(["/clear"]);
 
     await pumpStopped();
     expect(promptPostCount).toBe(2);
@@ -1381,10 +1322,7 @@ describe("useAcpSession drain split at clear-command boundary (#1356)", () => {
   it("codex profile splits at `/new` boundaries", async () => {
     const codexWrapper = ({ children }: { children: ReactNode }) =>
       createElement(AgentProfileProvider, { toolKey: "codex" }, children);
-    const { result: hookResult } = renderHook(
-      () => useAcpSession("sess-split-codex"),
-      { wrapper: codexWrapper },
-    );
+    const { result: hookResult } = renderHook(() => useAcpSession("sess-split-codex"), { wrapper: codexWrapper });
     await flushAsync();
     const ws = sockets[sockets.length - 1]!;
     act(() => {
@@ -1437,10 +1375,7 @@ describe("useAcpSession drain split at clear-command boundary (#1356)", () => {
   it("gemini profile (no clear aliases) keeps the original single-POST combined behavior", async () => {
     const geminiWrapper = ({ children }: { children: ReactNode }) =>
       createElement(AgentProfileProvider, { toolKey: "gemini" }, children);
-    const { result: hookResult } = renderHook(
-      () => useAcpSession("sess-split-gemini"),
-      { wrapper: geminiWrapper },
-    );
+    const { result: hookResult } = renderHook(() => useAcpSession("sess-split-gemini"), { wrapper: geminiWrapper });
     await flushAsync();
     const ws = sockets[sockets.length - 1]!;
     act(() => {

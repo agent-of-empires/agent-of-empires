@@ -39,9 +39,7 @@ interface MobileKeyboardSnapshot {
 }
 
 function createKeyboardStore() {
-  const initialIsMobile =
-    typeof window !== "undefined" &&
-    window.matchMedia?.("(pointer: coarse)").matches;
+  const initialIsMobile = typeof window !== "undefined" && window.matchMedia?.("(pointer: coarse)").matches;
   let snapshot: MobileKeyboardSnapshot = {
     isMobile: initialIsMobile,
     keyboardOpen: false,
@@ -109,11 +107,7 @@ export function useMobileKeyboard() {
     let lastPadding = 0;
 
     const safeBottom =
-      parseFloat(
-        getComputedStyle(document.documentElement).getPropertyValue(
-          "--safe-area-bottom",
-        ),
-      ) || 0;
+      parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--safe-area-bottom")) || 0;
 
     const scheduleOcclusionCommit = (target: number) => {
       if (target === committedOcclusionRef.current) return;
@@ -134,9 +128,7 @@ export function useMobileKeyboard() {
       const totalOcclusion = fullHeightRef.current - currentVvH;
       const open = totalOcclusion > 100;
 
-      const padding = open
-        ? Math.max(0, window.innerHeight - currentVvH - safeBottom)
-        : 0;
+      const padding = open ? Math.max(0, window.innerHeight - currentVvH - safeBottom) : 0;
 
       if (open !== lastOpen || padding !== lastPadding) {
         lastOpen = open;
@@ -169,10 +161,7 @@ export function useMobileKeyboard() {
           stableCountRef.current = 0;
         }
         lastOcclusionRef.current = occlusion;
-        if (
-          stableCountRef.current < STABLE_THRESHOLD &&
-          frameCount < MAX_POLL_FRAMES
-        ) {
+        if (stableCountRef.current < STABLE_THRESHOLD && frameCount < MAX_POLL_FRAMES) {
           rafRef.current = requestAnimationFrame(poll);
         }
       };

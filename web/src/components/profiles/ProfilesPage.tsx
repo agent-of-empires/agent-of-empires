@@ -10,11 +10,7 @@ import {
   setDefaultProfile,
   updateProfileSettings,
 } from "../../lib/api";
-import type {
-  HooksOverride,
-  ProfileInfo,
-  ProfileSettingsResponse,
-} from "../../lib/types";
+import type { HooksOverride, ProfileInfo, ProfileSettingsResponse } from "../../lib/types";
 import { buildEffectiveHooks } from "../../lib/profileHooks";
 import { HooksReadOnlyPanel } from "./HooksReadOnlyPanel";
 
@@ -36,8 +32,7 @@ const EDIT_SECTIONS: ReadonlyArray<{ tab: string; label: string }> = [
 
 function validateName(name: string): string | null {
   if (!name) return "Name is required";
-  if (!/^[a-zA-Z0-9_-]+$/.test(name))
-    return "Only letters, digits, hyphens, and underscores";
+  if (!/^[a-zA-Z0-9_-]+$/.test(name)) return "Only letters, digits, hyphens, and underscores";
   return null;
 }
 
@@ -45,11 +40,8 @@ export function ProfilesPage({ onClose, readOnly }: Props) {
   const navigate = useNavigate();
   const [profiles, setProfiles] = useState<ProfileInfo[]>([]);
   const [selected, setSelected] = useState<string>("");
-  const [profileSettings, setProfileSettings] =
-    useState<ProfileSettingsResponse | null>(null);
-  const [globalHooks, setGlobalHooks] = useState<HooksOverride | undefined>(
-    undefined,
-  );
+  const [profileSettings, setProfileSettings] = useState<ProfileSettingsResponse | null>(null);
+  const [globalHooks, setGlobalHooks] = useState<HooksOverride | undefined>(undefined);
   const [description, setDescription] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
@@ -59,9 +51,13 @@ export function ProfilesPage({ onClose, readOnly }: Props) {
   // A request id guards against a slow response for a previously-selected
   // profile winning after a fast switch.
   const loadSeq = useRef(0);
+  // Set once the user edits the description, so the async load's late
+  // `setDescription` can't clobber an in-progress edit.
+  const descriptionDirty = useRef(false);
 
   const loadProfileSettings = (name: string) => {
     const seq = ++loadSeq.current;
+    descriptionDirty.current = false;
     if (!name) {
       setProfileSettings(null);
       setGlobalHooks(undefined);
@@ -75,9 +71,9 @@ export function ProfilesPage({ onClose, readOnly }: Props) {
         setProfileSettings(profile);
         setGlobalHooks(global?.hooks as HooksOverride | undefined);
         setError(null);
-        setDescription(
-          typeof profile?.description === "string" ? profile.description : "",
-        );
+        if (!descriptionDirty.current) {
+          setDescription(typeof profile?.description === "string" ? profile.description : "");
+        }
       })
       .catch(() => {
         if (seq !== loadSeq.current) return;
@@ -99,8 +95,7 @@ export function ProfilesPage({ onClose, readOnly }: Props) {
       const list = await fetchProfiles();
       if (cancelled) return;
       setProfiles(list);
-      const current =
-        list.find((p) => p.is_default)?.name ?? list[0]?.name ?? "";
+      const current = list.find((p) => p.is_default)?.name ?? list[0]?.name ?? "";
       setSelected(current);
       loadProfileSettings(current);
     })();
@@ -185,6 +180,7 @@ export function ProfilesPage({ onClose, readOnly }: Props) {
       setError("Failed to save description");
       return;
     }
+    descriptionDirty.current = false;
     await reload();
   };
 
@@ -197,9 +193,7 @@ export function ProfilesPage({ onClose, readOnly }: Props) {
       <div className="flex items-center justify-between px-4 py-3 border-b border-surface-700/30">
         <div>
           <h1 className="text-lg font-semibold text-text-primary">Profiles</h1>
-          <p className="text-xs text-text-dim">
-            Manage configuration profiles and inspect their lifecycle hooks.
-          </p>
+          <p className="text-xs text-text-dim">Manage configuration profiles and inspect their lifecycle hooks.</p>
         </div>
         <div className="flex gap-2">
           {!readOnly && !creating && !renaming && (
@@ -281,9 +275,7 @@ export function ProfilesPage({ onClose, readOnly }: Props) {
                 loadProfileSettings(p.name);
               }}
               className={`flex items-center justify-between rounded-md px-3 py-2 text-sm text-left cursor-pointer ${
-                p.name === selected
-                  ? "bg-surface-700 text-text-primary"
-                  : "text-text-secondary hover:bg-surface-800"
+                p.name === selected ? "bg-surface-700 text-text-primary" : "text-text-secondary hover:bg-surface-800"
               }`}
             >
               <span className="truncate">{p.name}</span>
@@ -300,9 +292,7 @@ export function ProfilesPage({ onClose, readOnly }: Props) {
           {selectedInfo ? (
             <div className="flex flex-col gap-4">
               <div className="flex items-center gap-2">
-                <h2 className="text-base font-semibold text-text-primary">
-                  {selectedInfo.name}
-                </h2>
+                <h2 className="text-base font-semibold text-text-primary">{selectedInfo.name}</h2>
                 {!readOnly && (
                   <>
                     {!isDefault && (
@@ -340,15 +330,16 @@ export function ProfilesPage({ onClose, readOnly }: Props) {
               </div>
 
               <div>
-                <label className="block text-xs text-text-dim mb-1">
-                  Description
-                </label>
+                <label className="block text-xs text-text-dim mb-1">Description</label>
                 <div className="flex gap-2">
                   <input
                     type="text"
                     value={description}
                     disabled={readOnly}
-                    onChange={(e) => setDescription(e.target.value)}
+                    onChange={(e) => {
+                      descriptionDirty.current = true;
+                      setDescription(e.target.value);
+                    }}
                     placeholder="What this profile is for"
                     className="flex-1 bg-surface-900 border border-surface-700 rounded-md px-2 py-1.5 text-sm text-text-primary focus:border-brand-600 focus:outline-none disabled:opacity-60"
                   />
@@ -365,19 +356,13 @@ export function ProfilesPage({ onClose, readOnly }: Props) {
               </div>
 
               <div>
-                <h3 className="text-sm font-semibold text-text-primary mb-2">
-                  Edit configuration
-                </h3>
+                <h3 className="text-sm font-semibold text-text-primary mb-2">Edit configuration</h3>
                 <div className="flex flex-wrap gap-2">
                   {EDIT_SECTIONS.map((s) => (
                     <button
                       key={s.tab}
                       type="button"
-                      onClick={() =>
-                        navigate(
-                          `/settings/${s.tab}?profile=${encodeURIComponent(selectedInfo.name)}`,
-                        )
-                      }
+                      onClick={() => navigate(`/settings/${s.tab}?profile=${encodeURIComponent(selectedInfo.name)}`)}
                       className="px-3 py-1.5 rounded-md border border-surface-700 text-xs text-text-secondary hover:bg-surface-800 cursor-pointer"
                     >
                       {s.label} &rarr;
@@ -390,9 +375,7 @@ export function ProfilesPage({ onClose, readOnly }: Props) {
             </div>
           ) : (
             <p className="text-sm text-text-dim">
-              {profiles.length === 0
-                ? "No profiles yet."
-                : "Select a profile to view its details."}
+              {profiles.length === 0 ? "No profiles yet." : "Select a profile to view its details."}
             </p>
           )}
         </div>

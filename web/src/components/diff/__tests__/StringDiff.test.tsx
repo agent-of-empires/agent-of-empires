@@ -17,11 +17,7 @@ vi.mock("../../../hooks/useHighlightedLines", () => ({
 describe("StringDiff", () => {
   it("renders both sides of an edit even without syntax tokens", () => {
     const { container } = render(
-      <StringDiff
-        oldText="const x = 1;\n"
-        newText="const x = 42;\n"
-        filePath="snippet.ts"
-      />,
+      <StringDiff oldText="const x = 1;\n" newText="const x = 42;\n" filePath="snippet.ts" />,
     );
     expect(container.textContent).toContain("const x");
     expect(container.textContent).toMatch(/42/);
@@ -34,19 +30,13 @@ describe("StringDiff", () => {
     // Without `overflow-x-auto` the embedding card's `overflow-hidden` clips
     // long `whitespace-pre` lines and the right side is unreachable on mobile.
     const { getByTestId } = render(
-      <StringDiff
-        oldText="const x = 1;\n"
-        newText={`const x = ${"a".repeat(200)};\n`}
-        filePath="snippet.ts"
-      />,
+      <StringDiff oldText="const x = 1;\n" newText={`const x = ${"a".repeat(200)};\n`} filePath="snippet.ts" />,
     );
     expect(getByTestId("string-diff").className).toMatch(/\boverflow-x-auto\b/);
   });
 
   it("returns null for an empty diff", () => {
-    const { container } = render(
-      <StringDiff oldText="" newText="" filePath="snippet.ts" />,
-    );
+    const { container } = render(<StringDiff oldText="" newText="" filePath="snippet.ts" />);
     expect(container.textContent).toBe("");
   });
 });

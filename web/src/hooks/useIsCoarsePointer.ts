@@ -12,9 +12,7 @@ import { useEffect, useState } from "react";
  *  visualViewport listeners. */
 export function useIsCoarsePointer(): boolean {
   const [isCoarse, setIsCoarse] = useState(
-    () =>
-      typeof window !== "undefined" &&
-      Boolean(window.matchMedia?.("(pointer: coarse)").matches),
+    () => typeof window !== "undefined" && Boolean(window.matchMedia?.("(pointer: coarse)").matches),
   );
   useEffect(() => {
     if (typeof window === "undefined" || !window.matchMedia) return;

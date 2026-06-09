@@ -11,9 +11,7 @@ import { devices } from "@playwright/test";
 test.use({ ...devices["iPhone 13"] });
 
 test.describe("Mobile settings header (iPhone 13)", () => {
-  test("Back button and title sit on a row above the ProfileSelector", async ({
-    page,
-  }) => {
+  test("Back button and title sit on a row above the ProfileSelector", async ({ page }) => {
     await page.goto("/settings");
 
     const backBtn = page.getByRole("button", { name: /Back/ });
@@ -28,14 +26,10 @@ test.describe("Mobile settings header (iPhone 13)", () => {
     expect(profileBox).not.toBeNull();
     // ProfileSelector must wrap onto its own row, i.e. start at or below
     // the bottom of the Back button (mobile two-row layout).
-    expect(profileBox!.y).toBeGreaterThanOrEqual(
-      backBox!.y + backBox!.height - 1,
-    );
+    expect(profileBox!.y).toBeGreaterThanOrEqual(backBox!.y + backBox!.height - 1);
   });
 
-  test("'Settings' title keeps clear separation from the Back button", async ({
-    page,
-  }) => {
+  test("'Settings' title keeps clear separation from the Back button", async ({ page }) => {
     await page.goto("/settings");
     const backBtn = page.getByRole("button", { name: /Back/ });
     const title = page.getByText("Settings", { exact: true }).first();
@@ -49,9 +43,7 @@ test.describe("Mobile settings header (iPhone 13)", () => {
     expect(titleBox!.x - (backBox!.x + backBox!.width)).toBeGreaterThan(6);
   });
 
-  test("settings header does not overflow horizontally at iPhone 13 width", async ({
-    page,
-  }) => {
+  test("settings header does not overflow horizontally at iPhone 13 width", async ({ page }) => {
     await page.goto("/settings");
     const header = page.getByTestId("settings-header");
     await expect(header).toBeVisible();
@@ -66,9 +58,7 @@ test.describe("Mobile settings header (iPhone 13)", () => {
 test.describe("Mobile settings header (narrow 320px)", () => {
   test.use({ viewport: { width: 320, height: 568 } });
 
-  test('header stays within viewport at 320px (5.4" Android narrow case)', async ({
-    page,
-  }) => {
+  test('header stays within viewport at 320px (5.4" Android narrow case)', async ({ page }) => {
     await page.goto("/settings");
     const header = page.getByTestId("settings-header");
     await expect(header).toBeVisible();

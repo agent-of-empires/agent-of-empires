@@ -1,10 +1,6 @@
 import { useEffect, useState } from "react";
 
-import {
-  fetchTelemetryStatus,
-  setTelemetryConsent,
-  type TelemetryStatus,
-} from "../../lib/api";
+import { fetchTelemetryStatus, setTelemetryConsent, type TelemetryStatus } from "../../lib/api";
 import { ToggleField } from "./FormFields";
 
 /// Telemetry opt-in toggle. Unlike the other settings panels this does not go
@@ -57,8 +53,8 @@ export function TelemetrySettings() {
       />
       {dnt && (
         <p className="text-xs text-text-dim">
-          DO_NOT_TRACK is set in the server environment, so telemetry stays off
-          and no install id is generated regardless of this toggle.
+          DO_NOT_TRACK is set in the server environment, so telemetry stays off and no install id is generated
+          regardless of this toggle.
         </p>
       )}
     </div>

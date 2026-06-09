@@ -6,15 +6,11 @@ const NEW = "new1\nnew2\nnew3\n";
 
 describe("extractSnippetFromContents", () => {
   it("extracts a new-side range", () => {
-    expect(extractSnippetFromContents(OLD, NEW, "new", 1, 2)).toBe(
-      "new1\nnew2",
-    );
+    expect(extractSnippetFromContents(OLD, NEW, "new", 1, 2)).toBe("new1\nnew2");
   });
 
   it("extracts an old-side range", () => {
-    expect(extractSnippetFromContents(OLD, NEW, "old", 2, 4)).toBe(
-      "old2\nold3\nold4",
-    );
+    expect(extractSnippetFromContents(OLD, NEW, "old", 2, 4)).toBe("old2\nold3\nold4");
   });
 
   it("extracts a single line", () => {
@@ -22,9 +18,7 @@ describe("extractSnippetFromContents", () => {
   });
 
   it("normalizes inverted ranges", () => {
-    expect(extractSnippetFromContents(OLD, NEW, "old", 3, 1)).toBe(
-      "old1\nold2\nold3",
-    );
+    expect(extractSnippetFromContents(OLD, NEW, "old", 3, 1)).toBe("old1\nold2\nold3");
   });
 
   it("returns null when the range exceeds the side's line count", () => {

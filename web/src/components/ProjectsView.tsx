@@ -1,11 +1,6 @@
 import { useEffect, useState } from "react";
 import type { ProjectInfo } from "../lib/types";
-import {
-  fetchProjects,
-  createProject,
-  deleteProject,
-  updateProject,
-} from "../lib/api";
+import { fetchProjects, createProject, deleteProject, updateProject } from "../lib/api";
 import { DirectoryBrowser } from "./DirectoryBrowser";
 
 interface Props {
@@ -108,11 +103,7 @@ export function ProjectsView({ onClose, readOnly }: Props) {
     if (!editing) return;
     setSubmitting(true);
     setError(null);
-    const result = await updateProject(
-      editing.name,
-      editing.scope,
-      baseBranch.trim() || null,
-    );
+    const result = await updateProject(editing.name, editing.scope, baseBranch.trim() || null);
     setSubmitting(false);
     if (!result.ok) {
       setError(result.error || "Update failed");
@@ -124,10 +115,7 @@ export function ProjectsView({ onClose, readOnly }: Props) {
 
   const handleRemove = async (project: ProjectInfo) => {
     if (submitting) return;
-    if (
-      !confirm(`Remove project '${project.name}' from ${project.scope} scope?`)
-    )
-      return;
+    if (!confirm(`Remove project '${project.name}' from ${project.scope} scope?`)) return;
     setError(null);
     const result = await deleteProject(project.name, project.scope);
     if (!result.ok) {
@@ -145,9 +133,7 @@ export function ProjectsView({ onClose, readOnly }: Props) {
       <div className="flex items-center justify-between px-4 py-3 border-b border-surface-700/30">
         <div>
           <h1 className="text-lg font-semibold text-text-primary">Projects</h1>
-          <p className="text-xs text-text-dim">
-            Saved repositories you can multi-select when creating sessions.
-          </p>
+          <p className="text-xs text-text-dim">Saved repositories you can multi-select when creating sessions.</p>
         </div>
         <div className="flex gap-2">
           {!readOnly && !formOpen && (
@@ -228,20 +214,14 @@ export function ProjectsView({ onClose, readOnly }: Props) {
               </>
             )}
 
-            <label className="block text-[12px] text-text-dim mb-1">
-              Name{isEdit ? "" : " (optional)"}
-            </label>
+            <label className="block text-[12px] text-text-dim mb-1">Name{isEdit ? "" : " (optional)"}</label>
             <input
               type="text"
               value={name}
               onChange={(e) => setName(e.target.value)}
               disabled={isEdit}
               placeholder={isEdit ? undefined : "defaults to directory name"}
-              title={
-                isEdit
-                  ? "Rename is not supported yet; remove and re-add to rename"
-                  : undefined
-              }
+              title={isEdit ? "Rename is not supported yet; remove and re-add to rename" : undefined}
               className={
                 isEdit
                   ? lockedFieldClass
@@ -249,9 +229,7 @@ export function ProjectsView({ onClose, readOnly }: Props) {
               }
             />
 
-            <label className="block text-[12px] text-text-dim mb-1">
-              Default base branch (optional)
-            </label>
+            <label className="block text-[12px] text-text-dim mb-1">Default base branch (optional)</label>
             <input
               type="text"
               value={baseBranch}
@@ -260,18 +238,13 @@ export function ProjectsView({ onClose, readOnly }: Props) {
               className="w-full px-3 py-2 text-sm bg-surface-900 border border-surface-700/40 rounded-md text-text-primary placeholder:text-text-dim focus:outline-none focus:border-brand-600 font-mono mb-1"
             />
             <p className="text-[11px] text-text-dim mb-3">
-              Base branch new worktree branches for this project fork from. An
-              explicit per-session base wins; blank inherits the global default,
-              then the repo's detected default branch.
+              Base branch new worktree branches for this project fork from. An explicit per-session base wins; blank
+              inherits the global default, then the repo's detected default branch.
             </p>
 
-            <label className="block text-[12px] text-text-dim mb-1">
-              Scope
-            </label>
+            <label className="block text-[12px] text-text-dim mb-1">Scope</label>
             {isEdit ? (
-              <p className="mb-4 text-sm text-text-secondary capitalize">
-                {scope}
-              </p>
+              <p className="mb-4 text-sm text-text-secondary capitalize">{scope}</p>
             ) : (
               <div className="flex gap-2 mb-4">
                 {(["global", "profile"] as const).map((s) => (
@@ -302,9 +275,8 @@ export function ProjectsView({ onClose, readOnly }: Props) {
                 <span className="text-[12px] text-text-secondary">
                   Allow override
                   <span className="block text-text-dim text-[11px] mt-0.5">
-                    Permit registering even if this path already exists in the
-                    other scope. The profile entry will shadow the global one in
-                    merged views.
+                    Permit registering even if this path already exists in the other scope. The profile entry will
+                    shadow the global one in merged views.
                   </span>
                 </span>
               </label>
@@ -329,13 +301,7 @@ export function ProjectsView({ onClose, readOnly }: Props) {
                     : "bg-brand-600 hover:bg-brand-700 text-surface-900 cursor-pointer"
                 }`}
               >
-                {isEdit
-                  ? submitting
-                    ? "Saving…"
-                    : "Save"
-                  : submitting
-                    ? "Adding…"
-                    : "Add"}
+                {isEdit ? (submitting ? "Saving…" : "Save") : submitting ? "Adding…" : "Add"}
               </button>
             </div>
           </div>
@@ -346,25 +312,17 @@ export function ProjectsView({ onClose, readOnly }: Props) {
         {loading && (
           <div className="space-y-2 animate-pulse">
             {[...Array(3)].map((_, i) => (
-              <div
-                key={i}
-                className="h-[60px] bg-surface-800/40 border border-surface-700/40 rounded-md"
-              />
+              <div key={i} className="h-[60px] bg-surface-800/40 border border-surface-700/40 rounded-md" />
             ))}
           </div>
         )}
 
         {!loading && projects.length === 0 && (
           <div className="flex flex-col items-center justify-center py-16 text-center">
-            <p className="text-sm text-text-secondary mb-1">
-              No registered projects yet.
-            </p>
+            <p className="text-sm text-text-secondary mb-1">No registered projects yet.</p>
             <p className="text-xs text-text-dim">
-              Add one above, or use{" "}
-              <code className="text-text-secondary">
-                aoe project add &lt;path&gt;
-              </code>{" "}
-              from the CLI.
+              Add one above, or use <code className="text-text-secondary">aoe project add &lt;path&gt;</code> from the
+              CLI.
             </p>
           </div>
         )}
@@ -378,9 +336,7 @@ export function ProjectsView({ onClose, readOnly }: Props) {
               >
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-2">
-                    <span className="text-sm font-medium text-text-primary">
-                      {p.name}
-                    </span>
+                    <span className="text-sm font-medium text-text-primary">{p.name}</span>
                     <span
                       className={`text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded ${
                         p.scope === "global"
@@ -391,18 +347,12 @@ export function ProjectsView({ onClose, readOnly }: Props) {
                       {p.scope}
                     </span>
                   </div>
-                  <p
-                    className="text-[11px] font-mono text-text-dim truncate mt-0.5"
-                    title={p.path}
-                  >
+                  <p className="text-[11px] font-mono text-text-dim truncate mt-0.5" title={p.path}>
                     {p.path}
                   </p>
                   {p.default_base_branch && (
                     <p className="text-[11px] text-text-dim mt-0.5">
-                      base branch:{" "}
-                      <span className="font-mono text-text-secondary">
-                        {p.default_base_branch}
-                      </span>
+                      base branch: <span className="font-mono text-text-secondary">{p.default_base_branch}</span>
                     </p>
                   )}
                 </div>

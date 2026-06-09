@@ -5,7 +5,5 @@ export const OPEN_SESSION_EVENT = "aoe-open-session";
 
 export function requestOpenSession(sessionId: string): void {
   if (typeof window === "undefined") return;
-  window.dispatchEvent(
-    new CustomEvent(OPEN_SESSION_EVENT, { detail: { sessionId } }),
-  );
+  window.dispatchEvent(new CustomEvent(OPEN_SESSION_EVENT, { detail: { sessionId } }));
 }

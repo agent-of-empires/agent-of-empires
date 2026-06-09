@@ -1,10 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import {
-  createProfile,
-  deleteProfile,
-  fetchProfiles,
-  renameProfile,
-} from "../../lib/api";
+import { createProfile, deleteProfile, fetchProfiles, renameProfile } from "../../lib/api";
 import type { ProfileInfo } from "../../lib/types";
 
 interface Props {
@@ -26,8 +21,7 @@ export function ProfileSelector({ selectedProfile, onSelect }: Props) {
 
   const validateName = (name: string): string | null => {
     if (!name) return "Name is required";
-    if (!/^[a-zA-Z0-9_-]+$/.test(name))
-      return "Only letters, digits, hyphens, and underscores";
+    if (!/^[a-zA-Z0-9_-]+$/.test(name)) return "Only letters, digits, hyphens, and underscores";
     return null;
   };
 
@@ -95,8 +89,7 @@ export function ProfileSelector({ selectedProfile, onSelect }: Props) {
     if (ok) {
       // Fall back to the default profile
       const fallback = activeProfile?.name ?? "default";
-      if (selectedProfile === name)
-        onSelect(fallback === name ? "default" : fallback);
+      if (selectedProfile === name) onSelect(fallback === name ? "default" : fallback);
       load();
     }
   };
@@ -123,9 +116,7 @@ export function ProfileSelector({ selectedProfile, onSelect }: Props) {
   return (
     <div className="relative" ref={panelRef}>
       <div className="flex items-center gap-2 flex-nowrap">
-        <label className="text-sm font-medium text-text-secondary shrink-0">
-          Profile
-        </label>
+        <label className="text-sm font-medium text-text-secondary shrink-0">Profile</label>
         <select
           value={selectedProfile}
           onChange={(e) => onSelect(e.target.value)}

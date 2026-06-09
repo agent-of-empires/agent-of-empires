@@ -39,18 +39,8 @@ export function useToolDensityPref(): [ToolDensity, () => void] {
 
 const ToolDisplayModeContext = createContext<ToolDensity>("detailed");
 
-export function ToolDisplayModeProvider({
-  density,
-  children,
-}: {
-  density: ToolDensity;
-  children: React.ReactNode;
-}) {
-  return (
-    <ToolDisplayModeContext.Provider value={density}>
-      {children}
-    </ToolDisplayModeContext.Provider>
-  );
+export function ToolDisplayModeProvider({ density, children }: { density: ToolDensity; children: React.ReactNode }) {
+  return <ToolDisplayModeContext.Provider value={density}>{children}</ToolDisplayModeContext.Provider>;
 }
 
 /** Active tool-card density. Defaults to "detailed" outside a provider
@@ -63,13 +53,7 @@ export function useToolDisplayMode(): ToolDensity {
 /** Transcript control that flips tool-card density. `aria-pressed`
  *  carries the on/off state; the label stays constant so the control
  *  reads the same whether or not it is engaged. */
-export function ToolDensityToggle({
-  density,
-  onToggle,
-}: {
-  density: ToolDensity;
-  onToggle: () => void;
-}) {
+export function ToolDensityToggle({ density, onToggle }: { density: ToolDensity; onToggle: () => void }) {
   const compact = density === "compact";
   return (
     <button

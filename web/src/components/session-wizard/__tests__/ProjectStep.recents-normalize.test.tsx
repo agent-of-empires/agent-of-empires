@@ -14,9 +14,7 @@ import { describe, expect, it } from "vitest";
 import { collectRecentProjects } from "../steps/ProjectStep";
 import type { SessionResponse } from "../../../lib/types";
 
-function mockSession(
-  overrides: Partial<SessionResponse> = {},
-): SessionResponse {
+function mockSession(overrides: Partial<SessionResponse> = {}): SessionResponse {
   return {
     id: overrides.id ?? "s1",
     title: overrides.title ?? "session",
@@ -85,9 +83,7 @@ describe("collectRecentProjects trailing-slash normalization (#1843)", () => {
   });
 
   it("keeps the filesystem root '/' as a single entry rather than normalizing it away", () => {
-    const recents = collectRecentProjects([
-      mockSession({ id: "s-root", project_path: "/" }),
-    ]);
+    const recents = collectRecentProjects([mockSession({ id: "s-root", project_path: "/" })]);
 
     expect(recents).toHaveLength(1);
     expect(recents[0].path).toBe("/");
@@ -110,9 +106,6 @@ describe("collectRecentProjects trailing-slash normalization (#1843)", () => {
     ]);
 
     expect(recents).toHaveLength(2);
-    expect(recents.map((r) => r.path).sort()).toEqual([
-      "/repo/alpha",
-      "/repo/beta",
-    ]);
+    expect(recents.map((r) => r.path).sort()).toEqual(["/repo/alpha", "/repo/beta"]);
   });
 });

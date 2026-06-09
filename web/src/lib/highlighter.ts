@@ -28,12 +28,8 @@ const SHIKI_THEME_IMPORTS: Record<string, () => Promise<unknown>> = {
 export const DEFAULT_SHIKI_THEME = "github-dark";
 export const DEFAULT_SHIKI_THEME_LIGHT = "github-light";
 
-export function fallbackShikiTheme(
-  appearance: "dark" | "light" | undefined,
-): string {
-  return appearance === "light"
-    ? DEFAULT_SHIKI_THEME_LIGHT
-    : DEFAULT_SHIKI_THEME;
+export function fallbackShikiTheme(appearance: "dark" | "light" | undefined): string {
+  return appearance === "light" ? DEFAULT_SHIKI_THEME_LIGHT : DEFAULT_SHIKI_THEME;
 }
 
 /**
@@ -62,10 +58,7 @@ export async function getHighlighter(): Promise<HighlighterCore> {
  *  cleanly, otherwise an appearance-appropriate fallback
  *  (`github-dark` / `github-light`) so a light AoE theme isn't
  *  rendered with a dark syntax palette. Idempotent. */
-export async function ensureThemeLoaded(
-  name: string,
-  appearance?: "dark" | "light",
-): Promise<string> {
+export async function ensureThemeLoaded(name: string, appearance?: "dark" | "light"): Promise<string> {
   const importer = SHIKI_THEME_IMPORTS[name];
   if (!importer) return fallbackShikiTheme(appearance);
   const hl = await getHighlighter();
@@ -162,16 +155,12 @@ const FILENAME_TO_LANG: Record<string, () => Promise<unknown>> = {
  * Resolve a file path to a Shiki language import. Returns null for
  * unrecognised extensions so the caller can fall back to plain text.
  */
-export function langImportForPath(
-  filePath: string,
-): (() => Promise<unknown>) | null {
+export function langImportForPath(filePath: string): (() => Promise<unknown>) | null {
   const basename = filePath.split("/").pop() ?? filePath;
   const nameNoExt = basename.split(".")[0] ?? "";
   if (FILENAME_TO_LANG[nameNoExt]) return FILENAME_TO_LANG[nameNoExt];
   if (FILENAME_TO_LANG[basename]) return FILENAME_TO_LANG[basename];
-  const ext = basename.includes(".")
-    ? basename.split(".").pop()!.toLowerCase()
-    : "";
+  const ext = basename.includes(".") ? basename.split(".").pop()!.toLowerCase() : "";
   return EXT_TO_LANG[ext] ?? null;
 }
 

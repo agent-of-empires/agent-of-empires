@@ -21,9 +21,7 @@ afterEach(() => {
   cleanup();
 });
 
-function mount(
-  overrides?: Partial<React.ComponentProps<typeof SystemNotices>>,
-) {
+function mount(overrides?: Partial<React.ComponentProps<typeof SystemNotices>>) {
   const manualReconnect = vi.fn();
   const props: React.ComponentProps<typeof SystemNotices> = {
     status: "open",
@@ -72,9 +70,7 @@ describe("SystemNotices rate-limit handoff", () => {
         manualReconnect={vi.fn()}
       />,
     );
-    expect(
-      queryByRole("button", { name: /continue in another agent/i }),
-    ).toBeNull();
+    expect(queryByRole("button", { name: /continue in another agent/i })).toBeNull();
   });
 
   it("hides the switch-agent button when rateLimit is null", () => {
@@ -85,9 +81,7 @@ describe("SystemNotices rate-limit handoff", () => {
       retryCountdown: 3,
       onSwitchAgent: vi.fn(),
     });
-    expect(
-      queryByRole("button", { name: /continue in another agent/i }),
-    ).toBeNull();
+    expect(queryByRole("button", { name: /continue in another agent/i })).toBeNull();
   });
 
   it("invokes onSwitchAgent on click", () => {
@@ -100,9 +94,7 @@ describe("SystemNotices rate-limit handoff", () => {
       },
       onSwitchAgent,
     });
-    fireEvent.click(
-      getByRole("button", { name: /continue in another agent/i }),
-    );
+    fireEvent.click(getByRole("button", { name: /continue in another agent/i }));
     expect(onSwitchAgent).toHaveBeenCalledTimes(1);
   });
 

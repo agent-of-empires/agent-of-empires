@@ -17,98 +17,54 @@ const plainEnter = {
 
 describe("decideEnterAction (#1129)", () => {
   it("returns 'default' for non-Enter keys regardless of context", () => {
-    expect(
-      decideEnterAction(
-        { ...plainEnter, key: "a" },
-        { isMobile: true, turnActive: false },
-      ),
-    ).toBe("default");
-    expect(
-      decideEnterAction(
-        { ...plainEnter, key: "Tab" },
-        { isMobile: false, turnActive: true },
-      ),
-    ).toBe("default");
+    expect(decideEnterAction({ ...plainEnter, key: "a" }, { isMobile: true, turnActive: false })).toBe("default");
+    expect(decideEnterAction({ ...plainEnter, key: "Tab" }, { isMobile: false, turnActive: true })).toBe("default");
   });
 
   it("returns 'default' during IME composition", () => {
-    expect(
-      decideEnterAction(
-        { ...plainEnter, isComposing: true },
-        { isMobile: true, turnActive: false },
-      ),
-    ).toBe("default");
-    expect(
-      decideEnterAction(
-        { ...plainEnter, isComposing: true },
-        { isMobile: false, turnActive: true },
-      ),
-    ).toBe("default");
+    expect(decideEnterAction({ ...plainEnter, isComposing: true }, { isMobile: true, turnActive: false })).toBe(
+      "default",
+    );
+    expect(decideEnterAction({ ...plainEnter, isComposing: true }, { isMobile: false, turnActive: true })).toBe(
+      "default",
+    );
   });
 
   it("returns 'default' for Shift/Ctrl/Meta+Enter (modifier passes through)", () => {
-    for (const mod of [
-      { shiftKey: true },
-      { ctrlKey: true },
-      { metaKey: true },
-    ]) {
-      expect(
-        decideEnterAction(
-          { ...plainEnter, ...mod },
-          { isMobile: true, turnActive: false },
-        ),
-      ).toBe("default");
-      expect(
-        decideEnterAction(
-          { ...plainEnter, ...mod },
-          { isMobile: false, turnActive: true },
-        ),
-      ).toBe("default");
+    for (const mod of [{ shiftKey: true }, { ctrlKey: true }, { metaKey: true }]) {
+      expect(decideEnterAction({ ...plainEnter, ...mod }, { isMobile: true, turnActive: false })).toBe("default");
+      expect(decideEnterAction({ ...plainEnter, ...mod }, { isMobile: false, turnActive: true })).toBe("default");
     }
   });
 
   it("mobile + plain Enter -> 'default' (primitive inserts newline via unstable_insertNewlineOnTouchEnter, idle and mid-turn alike)", () => {
-    expect(
-      decideEnterAction(plainEnter, { isMobile: true, turnActive: false }),
-    ).toBe("default");
+    expect(decideEnterAction(plainEnter, { isMobile: true, turnActive: false })).toBe("default");
     // Mid-turn on mobile must still be "default", never "send": the
     // mobile guard precedes the turnActive queue branch so the
     // on-screen Return never dispatches or queues.
-    expect(
-      decideEnterAction(plainEnter, { isMobile: true, turnActive: true }),
-    ).toBe("default");
+    expect(decideEnterAction(plainEnter, { isMobile: true, turnActive: true })).toBe("default");
   });
 
   it("desktop + mid-turn + plain Enter -> 'send' (queue path)", () => {
-    expect(
-      decideEnterAction(plainEnter, { isMobile: false, turnActive: true }),
-    ).toBe("send");
+    expect(decideEnterAction(plainEnter, { isMobile: false, turnActive: true })).toBe("send");
   });
 
   it("desktop + idle + plain Enter -> 'default' (primitive handles Send)", () => {
-    expect(
-      decideEnterAction(plainEnter, { isMobile: false, turnActive: false }),
-    ).toBe("default");
+    expect(decideEnterAction(plainEnter, { isMobile: false, turnActive: false })).toBe("default");
   });
 });
 
 describe("decideBeforeInputAction (#1174)", () => {
   it("mobile + insertLineBreak -> 'newline'", () => {
-    expect(
-      decideBeforeInputAction("insertLineBreak", false, { isMobile: true }),
-    ).toBe("newline");
+    expect(decideBeforeInputAction("insertLineBreak", false, { isMobile: true })).toBe("newline");
   });
 
   it("mobile + insertParagraph -> 'newline'", () => {
-    expect(
-      decideBeforeInputAction("insertParagraph", false, { isMobile: true }),
-    ).toBe("newline");
+    expect(decideBeforeInputAction("insertParagraph", false, { isMobile: true })).toBe("newline");
   });
 
   it("mobile + insertText -> 'default' (regular character)", () => {
-    expect(
-      decideBeforeInputAction("insertText", false, { isMobile: true }),
-    ).toBe("default");
+    expect(decideBeforeInputAction("insertText", false, { isMobile: true })).toBe("default");
   });
 
   it("mobile + deleteContentBackward -> 'default' (backspace)", () => {
@@ -120,17 +76,11 @@ describe("decideBeforeInputAction (#1174)", () => {
   });
 
   it("desktop + insertLineBreak -> 'default' (keydown handler owns desktop)", () => {
-    expect(
-      decideBeforeInputAction("insertLineBreak", false, { isMobile: false }),
-    ).toBe("default");
+    expect(decideBeforeInputAction("insertLineBreak", false, { isMobile: false })).toBe("default");
   });
 
   it("mobile + insertLineBreak during IME composition -> 'default'", () => {
-    expect(
-      decideBeforeInputAction("insertLineBreak", true, { isMobile: true }),
-    ).toBe("default");
-    expect(
-      decideBeforeInputAction("insertParagraph", true, { isMobile: true }),
-    ).toBe("default");
+    expect(decideBeforeInputAction("insertLineBreak", true, { isMobile: true })).toBe("default");
+    expect(decideBeforeInputAction("insertParagraph", true, { isMobile: true })).toBe("default");
   });
 });

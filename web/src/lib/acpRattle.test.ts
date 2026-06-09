@@ -91,9 +91,7 @@ describe("chooseVerb", () => {
 
   it("leaves short tool titles unchanged (#1728)", () => {
     expect(chooseVerb("tool", 3, "Bash").endsWith(" Bash…")).toBe(true);
-    expect(chooseVerb("tool", 3, "Read foo.ts").endsWith(" Read foo.ts…")).toBe(
-      true,
-    );
+    expect(chooseVerb("tool", 3, "Read foo.ts").endsWith(" Read foo.ts…")).toBe(true);
   });
 
   it("falls back to WORKING_VERBS when state=tool but toolName is null", () => {

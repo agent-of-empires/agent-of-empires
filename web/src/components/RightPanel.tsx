@@ -140,10 +140,7 @@ export function RightPanel({
       className="flex-1 flex flex-col min-h-0 overflow-hidden md:bg-surface-800 md:pb-1.5"
     >
       {/* Upper: file list */}
-      <div
-        style={{ flexBasis: `${topRatio * 100}%` }}
-        className="flex flex-col min-h-0 overflow-hidden"
-      >
+      <div style={{ flexBasis: `${topRatio * 100}%` }} className="flex flex-col min-h-0 overflow-hidden">
         {commentsEnabled && commentsCount > 0 && (
           <CommentsBanner
             count={commentsCount}
@@ -178,10 +175,7 @@ export function RightPanel({
       </div>
 
       {/* Lower: paired terminal */}
-      <div
-        style={{ flexBasis: `${(1 - topRatio) * 100}%` }}
-        className="flex flex-col min-h-0"
-      >
+      <div style={{ flexBasis: `${(1 - topRatio) * 100}%` }} className="flex flex-col min-h-0">
         <PairedShellPane session={session} sessionId={sessionId} />
       </div>
     </div>

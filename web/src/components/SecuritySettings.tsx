@@ -1,30 +1,16 @@
 import { useEffect, useState } from "react";
 import { fetchAbout, type ServerAbout } from "../lib/api";
 
-function Row({
-  label,
-  value,
-}: {
-  label: string;
-  value: string | React.ReactNode;
-}) {
+function Row({ label, value }: { label: string; value: string | React.ReactNode }) {
   return (
     <div className="flex items-start justify-between gap-4 py-2 border-b border-surface-700/40 last:border-0">
-      <span className="font-mono text-[11px] uppercase tracking-wider text-text-muted">
-        {label}
-      </span>
+      <span className="font-mono text-[11px] uppercase tracking-wider text-text-muted">{label}</span>
       <span className="text-[13px] text-text-primary text-right">{value}</span>
     </div>
   );
 }
 
-function Badge({
-  tone,
-  children,
-}: {
-  tone: "ok" | "warn" | "muted";
-  children: React.ReactNode;
-}) {
+function Badge({ tone, children }: { tone: "ok" | "warn" | "muted"; children: React.ReactNode }) {
   const cls =
     tone === "ok"
       ? "bg-status-running/15 text-status-running"
@@ -32,11 +18,7 @@ function Badge({
         ? "bg-status-waiting/15 text-status-waiting"
         : "bg-surface-800 text-text-muted";
   return (
-    <span
-      className={`font-mono text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded ${cls}`}
-    >
-      {children}
-    </span>
+    <span className={`font-mono text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded ${cls}`}>{children}</span>
   );
 }
 
@@ -53,15 +35,9 @@ export function SecuritySettings() {
 
   return (
     <div>
-      <h3 className="font-mono text-sm uppercase tracking-widest text-text-muted mb-4">
-        Security
-      </h3>
+      <h3 className="font-mono text-sm uppercase tracking-widest text-text-muted mb-4">Security</h3>
 
-      {loadError && (
-        <p className="text-[13px] text-status-error mb-3">
-          Could not load server status.
-        </p>
-      )}
+      {loadError && <p className="text-[13px] text-status-error mb-3">Could not load server status.</p>}
 
       <div className="rounded-lg border border-surface-700/50 bg-surface-900 px-4 py-2">
         <Row
@@ -118,9 +94,7 @@ export function SecuritySettings() {
           label="Version"
           value={
             about?.version ? (
-              <span className="font-mono text-text-primary">
-                v{about.version}
-              </span>
+              <span className="font-mono text-text-primary">v{about.version}</span>
             ) : (
               <span className="text-text-muted">unknown</span>
             )
@@ -129,9 +103,8 @@ export function SecuritySettings() {
       </div>
 
       <p className="mt-3 text-[11px] text-text-dim">
-        Security settings are configured at launch via{" "}
-        <code className="font-mono text-text-muted">aoe serve</code> flags. See
-        the{" "}
+        Security settings are configured at launch via <code className="font-mono text-text-muted">aoe serve</code>{" "}
+        flags. See the{" "}
         <a
           href="https://agent-of-empires.com/guides/web-dashboard/"
           target="_blank"

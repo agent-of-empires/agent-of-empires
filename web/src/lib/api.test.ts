@@ -108,9 +108,7 @@ describe("fetchAbout", () => {
 
 describe("setSessionPin", () => {
   it("PATCHes /api/sessions/{id}/pin with the pinned bool", async () => {
-    fetchSpy.mockResolvedValueOnce(
-      jsonResponse({ id: "sess-1", pinned_at: "2026-01-01T00:00:00Z" }),
-    );
+    fetchSpy.mockResolvedValueOnce(jsonResponse({ id: "sess-1", pinned_at: "2026-01-01T00:00:00Z" }));
     await setSessionPin("sess-1", true);
     const [url, init] = fetchSpy.mock.calls[0]!;
     expect(url).toBe("/api/sessions/sess-1/pin");

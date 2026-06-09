@@ -1,8 +1,6 @@
 import { useMemo } from "react";
 
-const IS_MAC =
-  typeof navigator !== "undefined" &&
-  /Mac|iPhone|iPad|iPod/.test(navigator.platform);
+const IS_MAC = typeof navigator !== "undefined" && /Mac|iPhone|iPad|iPod/.test(navigator.platform);
 import type { SessionResponse } from "../lib/types";
 import type { CommandAction } from "../components/command-palette/types";
 
@@ -63,14 +61,7 @@ export function useCommandActions({
         id: "action:new-scratch-session",
         title: "New scratch session",
         group: "Actions",
-        keywords: [
-          "scratch",
-          "temp",
-          "temporary",
-          "ephemeral",
-          "throwaway",
-          "create",
-        ],
+        keywords: ["scratch", "temp", "temporary", "ephemeral", "throwaway", "create"],
         shortcut: IS_MAC ? "⌘⇧N" : "Ctrl+Shift+N",
         perform: onNewScratch,
       });
@@ -133,20 +124,14 @@ export function useCommandActions({
 
     for (const s of sessions) {
       if (s.id === activeSessionId) continue;
-      const repo =
-        (s.main_repo_path || s.project_path).split("/").filter(Boolean).pop() ??
-        "";
-      const subtitleParts = [repo, s.branch, s.tool].filter(
-        Boolean,
-      ) as string[];
+      const repo = (s.main_repo_path || s.project_path).split("/").filter(Boolean).pop() ?? "";
+      const subtitleParts = [repo, s.branch, s.tool].filter(Boolean) as string[];
       actions.push({
         id: `session:${s.id}`,
         title: s.title || s.branch || "(untitled)",
         subtitle: subtitleParts.join(" · "),
         group: "Sessions",
-        keywords: [s.tool, s.status, s.branch ?? "", repo, s.group_path].filter(
-          Boolean,
-        ) as string[],
+        keywords: [s.tool, s.status, s.branch ?? "", repo, s.group_path].filter(Boolean) as string[],
         status: s.status,
         statusCreatedAt: s.created_at,
         perform: () => onSelectSession(s.id),

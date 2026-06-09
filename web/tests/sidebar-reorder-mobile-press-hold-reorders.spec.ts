@@ -10,32 +10,22 @@
 
 import { devices } from "@playwright/test";
 import { test, expect } from "./helpers/mockedTest";
-import {
-  installSidebarMocks,
-  threeSessionsInOneRepo,
-  workspaceId,
-} from "./helpers/sidebarMocks";
+import { installSidebarMocks, threeSessionsInOneRepo, workspaceId } from "./helpers/sidebarMocks";
 
 test.use({ ...devices["iPhone 13"] });
 
-test("touch press-and-hold drag reorders the row and PUTs the new order", async ({
-  page,
-}) => {
+test("touch press-and-hold drag reorders the row and PUTs the new order", async ({ page }) => {
   const sessions = threeSessionsInOneRepo();
   const handle = await installSidebarMocks(page, { sessions });
 
   await page.goto("/");
   await page.getByRole("button", { name: "Toggle sidebar" }).click();
 
-  const wrappers = page.locator(
-    "[aria-roledescription='Press and hold to reorder']",
-  );
+  const wrappers = page.locator("[aria-roledescription='Press and hold to reorder']");
   await expect(wrappers).toHaveCount(3);
   await page.waitForFunction(
     () => {
-      const r = document
-        .querySelector("[aria-roledescription='Press and hold to reorder']")
-        ?.getBoundingClientRect();
+      const r = document.querySelector("[aria-roledescription='Press and hold to reorder']")?.getBoundingClientRect();
       return !!r && r.x >= 0 && r.width > 0;
     },
     null,

@@ -10,22 +10,11 @@
 // Optimistic state shows a spinner until the server's broadcast removes
 // the approval from AcpState.pendingApprovals.
 
-import {
-  Fragment,
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, Check, ChevronDown, Shield, X } from "lucide-react";
 import type { Approval, ApprovalDecision } from "../../lib/acpTypes";
 import { useServerDown, OFFLINE_TITLE } from "../../lib/connectionState";
-import {
-  hasArgsBody,
-  parseJsonObject,
-  previewFromArgs,
-} from "../../lib/acpArgs";
+import { hasArgsBody, parseJsonObject, previewFromArgs } from "../../lib/acpArgs";
 
 interface Props {
   approval: Approval;
@@ -36,9 +25,7 @@ const LONG_PRESS_MS = 800;
 
 export function ApprovalCard({ approval, onResolve }: Props) {
   const offline = useServerDown();
-  const [phase, setPhase] = useState<"pending" | "submitting" | "rolled-back">(
-    "pending",
-  );
+  const [phase, setPhase] = useState<"pending" | "submitting" | "rolled-back">("pending");
   const [progress, setProgress] = useState(0);
   const pressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const progressTimer = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -86,9 +73,7 @@ export function ApprovalCard({ approval, onResolve }: Props) {
       }
       if (typeof navigator !== "undefined" && "vibrate" in navigator) {
         try {
-          (
-            navigator as Navigator & { vibrate?: (p: number) => void }
-          ).vibrate?.(20);
+          (navigator as Navigator & { vibrate?: (p: number) => void }).vibrate?.(20);
         } catch {
           // ignore
         }
@@ -113,9 +98,7 @@ export function ApprovalCard({ approval, onResolve }: Props) {
     <div
       className={[
         "my-2 overflow-hidden rounded-md border bg-surface-800/50 text-sm",
-        approval.destructive
-          ? "border-rose-900/60 bg-rose-950/20"
-          : "border-brand-700/40 bg-brand-700/5",
+        approval.destructive ? "border-rose-900/60 bg-rose-950/20" : "border-brand-700/40 bg-brand-700/5",
       ].join(" ")}
       role="alertdialog"
       aria-label={`Approval needed: ${approval.tool_call.name}`}
@@ -142,14 +125,8 @@ export function ApprovalCard({ approval, onResolve }: Props) {
         >
           {approval.destructive ? "Destructive action" : "Approval needed"}
         </span>
-        <span className="shrink-0 font-mono text-xs text-text-secondary">
-          {approval.tool_call.name}
-        </span>
-        {preview && (
-          <span className="min-w-0 flex-1 truncate font-mono text-xs text-text-dim">
-            {preview}
-          </span>
-        )}
+        <span className="shrink-0 font-mono text-xs text-text-secondary">{approval.tool_call.name}</span>
+        {preview && <span className="min-w-0 flex-1 truncate font-mono text-xs text-text-dim">{preview}</span>}
         {canExpand && (
           <ChevronDown
             className={[
@@ -163,13 +140,9 @@ export function ApprovalCard({ approval, onResolve }: Props) {
       {(expanded || showEmptyArgsState) && <ArgsView raw={raw} />}
 
       {phase === "rolled-back" && (
-        <p className="px-3 pt-2 text-rose-400 text-xs">
-          Could not reach the server. Tap to retry.
-        </p>
+        <p className="px-3 pt-2 text-rose-400 text-xs">Could not reach the server. Tap to retry.</p>
       )}
-      {offline && (
-        <p className="px-3 pt-2 text-status-error text-xs">{OFFLINE_TITLE}</p>
-      )}
+      {offline && <p className="px-3 pt-2 text-status-error text-xs">{OFFLINE_TITLE}</p>}
 
       <div className="flex items-stretch gap-1.5 p-2">
         {approval.destructive ? (
@@ -178,13 +151,9 @@ export function ApprovalCard({ approval, onResolve }: Props) {
             className={[
               "relative flex flex-1 items-center justify-center gap-1.5 overflow-hidden",
               "rounded-md text-white text-xs font-medium py-2 px-3",
-              phase === "pending"
-                ? "bg-rose-600 hover:bg-rose-500"
-                : "bg-rose-700 opacity-70 cursor-wait",
+              phase === "pending" ? "bg-rose-600 hover:bg-rose-500" : "bg-rose-700 opacity-70 cursor-wait",
             ].join(" ")}
-            disabled={
-              offline || (phase !== "pending" && phase !== "rolled-back")
-            }
+            disabled={offline || (phase !== "pending" && phase !== "rolled-back")}
             onMouseDown={startLongPress}
             onMouseUp={cancelLongPress}
             onMouseLeave={cancelLongPress}
@@ -193,9 +162,7 @@ export function ApprovalCard({ approval, onResolve }: Props) {
             onTouchCancel={cancelLongPress}
           >
             <Check className="h-3.5 w-3.5 relative z-10" />
-            <span className="relative z-10">
-              {phase === "submitting" ? "Approving…" : "Hold to allow"}
-            </span>
+            <span className="relative z-10">{phase === "submitting" ? "Approving…" : "Hold to allow"}</span>
             <span
               className="absolute inset-0 bg-rose-400 origin-left"
               style={{ transform: `scaleX(${progress / 100})` }}
@@ -209,9 +176,7 @@ export function ApprovalCard({ approval, onResolve }: Props) {
               className={[
                 "flex flex-1 items-center justify-center gap-1.5",
                 "rounded-md text-white text-xs font-medium py-2 px-3",
-                phase === "pending"
-                  ? "bg-brand-600 hover:bg-brand-500"
-                  : "bg-brand-700 opacity-70 cursor-wait",
+                phase === "pending" ? "bg-brand-600 hover:bg-brand-500" : "bg-brand-700 opacity-70 cursor-wait",
               ].join(" ")}
               disabled={offline || phase !== "pending"}
               onClick={() => void submit("Allow")}
@@ -232,11 +197,7 @@ export function ApprovalCard({ approval, onResolve }: Props) {
                 .join(" ")}
               disabled={offline || phase === "submitting"}
               onClick={() => void submit("AllowAlways")}
-              title={
-                offline
-                  ? OFFLINE_TITLE
-                  : "Allow this tool for the whole session"
-              }
+              title={offline ? OFFLINE_TITLE : "Allow this tool for the whole session"}
             >
               Always
             </button>
@@ -291,18 +252,14 @@ function ArgsView({ raw }: { raw: string }) {
     );
   }
 
-  const entries = Object.entries(parsed).filter(
-    ([k]) => !k.startsWith("_aoe_"),
-  );
+  const entries = Object.entries(parsed).filter(([k]) => !k.startsWith("_aoe_"));
   if (entries.length === 0) return null;
 
   return (
     <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1.5 border-b border-surface-800/60 bg-surface-950 px-3 py-2.5 max-h-48 overflow-y-auto text-xs">
       {entries.map(([k, v]) => (
         <Fragment key={k}>
-          <dt className="font-mono text-[10px] uppercase tracking-wider text-text-dim self-start pt-0.5">
-            {k}
-          </dt>
+          <dt className="font-mono text-[10px] uppercase tracking-wider text-text-dim self-start pt-0.5">{k}</dt>
           <dd className="font-mono text-text-secondary break-all whitespace-pre-wrap min-w-0">
             <ArgValue value={v} />
           </dd>
@@ -314,8 +271,7 @@ function ArgsView({ raw }: { raw: string }) {
 
 function ArgValue({ value }: { value: unknown }) {
   if (value === null) return <span className="text-text-dim italic">null</span>;
-  if (value === undefined)
-    return <span className="text-text-dim italic">—</span>;
+  if (value === undefined) return <span className="text-text-dim italic">—</span>;
   if (typeof value === "string") {
     return <>{value}</>;
   }

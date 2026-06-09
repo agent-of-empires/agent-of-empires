@@ -29,9 +29,7 @@ export interface DiffCommentsCardPayload {
  *  must validate before rendering the card, which assumes `comments` is
  *  iterable. A malformed payload returns `false` so the caller can fall
  *  back to plain-text rendering. */
-export function isDiffCommentsCardPayload(
-  value: unknown,
-): value is DiffCommentsCardPayload {
+export function isDiffCommentsCardPayload(value: unknown): value is DiffCommentsCardPayload {
   if (!value || typeof value !== "object") return false;
   const v = value as Record<string, unknown>;
   return (
@@ -53,9 +51,7 @@ export interface BuiltDiffCommentsPrompt extends DiffCommentsCardPayload {
 /** Returns the structured payload when `text` begins with our sentinel,
  *  or `null` otherwise. Malformed payloads return `null` so the caller
  *  falls back to plain-text rendering. */
-export function parseDiffCommentsSentinel(
-  text: string,
-): DiffCommentsCardPayload | null {
+export function parseDiffCommentsSentinel(text: string): DiffCommentsCardPayload | null {
   if (!text.startsWith(SENTINEL_PREFIX)) return null;
   const end = text.indexOf(SENTINEL_SUFFIX, SENTINEL_PREFIX.length);
   if (end < 0) return null;
@@ -103,10 +99,7 @@ export function stripDiffCommentsSentinel(text: string): string {
 /** Pure assembly of the comments section. Stable sort, single-line
  *  vs range wording, multi-repo prefix, and a dynamically-sized code
  *  fence per snippet. */
-export function buildCommentsMarkdown(
-  comments: DiffComment[],
-  opts: BuildOpts,
-): string {
+export function buildCommentsMarkdown(comments: DiffComment[], opts: BuildOpts): string {
   if (comments.length === 0) return "";
   const sorted = [...comments].sort(compareComments);
   const sections = sorted.map((c) => renderComment(c, opts.isMultiRepo));
@@ -148,10 +141,7 @@ export function buildDiffCommentsPrompt(
 
 function renderComment(c: DiffComment, isMultiRepo: boolean): string {
   const repo = isMultiRepo && c.repoName ? `[${c.repoName}] ` : "";
-  const range =
-    c.startLine === c.endLine
-      ? `line ${c.startLine}`
-      : `lines ${c.startLine}-${c.endLine}`;
+  const range = c.startLine === c.endLine ? `line ${c.startLine}` : `lines ${c.startLine}-${c.endLine}`;
   const heading = `### ${repo}\`${c.filePath}\` ${range} (${c.side})`;
   const fence = makeFence(c.capturedSnippet);
   const lang = c.language ?? "";

@@ -303,8 +303,7 @@ body {
   vertical-align: top;
   white-space: nowrap;
   color: var(--color-text-secondary);
-  border-bottom: 1px solid
-    color-mix(in srgb, var(--color-surface-900) 50%, transparent);
+  border-bottom: 1px solid color-mix(in srgb, var(--color-surface-900) 50%, transparent);
 }
 .acp-markdown tbody tr:nth-child(even) {
   background: color-mix(in srgb, var(--color-surface-900) 30%, transparent);
@@ -418,6 +417,5 @@ select:focus-visible,
 }
 
 .safe-area-inset {
-  padding: env(safe-area-inset-top) env(safe-area-inset-right)
-    env(safe-area-inset-bottom) env(safe-area-inset-left);
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
 }

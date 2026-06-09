@@ -191,7 +191,5 @@ function defaultHasAnchor(anchor: TourAnchorId): boolean {
  */
 export function resolveTourSteps(ctx: ResolveTourContext): TourStep[] {
   const hasAnchor = ctx.hasAnchor ?? defaultHasAnchor;
-  return TOUR_STEPS.filter(
-    (step) => isStepEligible(step, ctx) && hasAnchor(step.anchor),
-  );
+  return TOUR_STEPS.filter((step) => isStepEligible(step, ctx) && hasAnchor(step.anchor));
 }

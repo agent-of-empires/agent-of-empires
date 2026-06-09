@@ -64,7 +64,5 @@ export function applyResolvedTheme(theme: ResolvedTheme): void {
 export const THEME_CHANGED_EVENT = "aoe:theme-changed";
 
 export function dispatchThemeChanged(theme: ResolvedTheme): void {
-  window.dispatchEvent(
-    new CustomEvent<ResolvedTheme>(THEME_CHANGED_EVENT, { detail: theme }),
-  );
+  window.dispatchEvent(new CustomEvent<ResolvedTheme>(THEME_CHANGED_EVENT, { detail: theme }));
 }

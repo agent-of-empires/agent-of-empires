@@ -17,14 +17,9 @@ interface UseDiffFilesResult {
   refresh: () => void;
 }
 
-export function useDiffFiles(
-  sessionId: string | null,
-  enabled: boolean,
-): UseDiffFilesResult {
+export function useDiffFiles(sessionId: string | null, enabled: boolean): UseDiffFilesResult {
   const [files, setFiles] = useState<RichDiffFile[]>([]);
-  const [perRepoBases, setPerRepoBases] = useState<RepoBase[]>([
-    { base_branch: "main" },
-  ]);
+  const [perRepoBases, setPerRepoBases] = useState<RepoBase[]>([{ base_branch: "main" }]);
   const [warning, setWarning] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [revision, setRevision] = useState(0);
@@ -44,8 +39,7 @@ export function useDiffFiles(
     const capturedSessionId = sessionId;
     const resp = await getSessionDiffFiles(capturedSessionId);
     // Drop stale responses: another fetch started, or session changed mid-flight
-    if (reqId !== requestIdRef.current || capturedSessionId !== sessionId)
-      return;
+    if (reqId !== requestIdRef.current || capturedSessionId !== sessionId) return;
     if (resp) {
       const fingerprint = JSON.stringify(resp.files);
       if (fingerprint !== lastFingerprintRef.current) {
@@ -59,10 +53,7 @@ export function useDiffFiles(
       // Gated on enabledRef so a background fetch fired on session change while
       // the panel is closed does not count, and on the per-session ref so the
       // 10s poll does not re-fire it.
-      if (
-        enabledRef.current &&
-        diffPanelSeenForRef.current !== capturedSessionId
-      ) {
+      if (enabledRef.current && diffPanelSeenForRef.current !== capturedSessionId) {
         diffPanelSeenForRef.current = capturedSessionId;
         reportTelemetrySeen("diff_panel");
       }

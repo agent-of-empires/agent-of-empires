@@ -21,12 +21,7 @@ vi.mock("../../../lib/api", () => ({
   deleteProfile: vi.fn(),
 }));
 
-import {
-  fetchProfiles,
-  createProfile,
-  renameProfile,
-  deleteProfile,
-} from "../../../lib/api";
+import { fetchProfiles, createProfile, renameProfile, deleteProfile } from "../../../lib/api";
 
 const mockFetch = vi.mocked(fetchProfiles);
 const mockCreate = vi.mocked(createProfile);
@@ -51,9 +46,7 @@ afterEach(() => {
 
 function mount() {
   const onSelect = vi.fn();
-  const utils = render(
-    <ProfileSelector selectedProfile="default" onSelect={onSelect} />,
-  );
+  const utils = render(<ProfileSelector selectedProfile="default" onSelect={onSelect} />);
   return { onSelect, ...utils };
 }
 
@@ -62,14 +55,10 @@ async function openCreatePanel(getByText: (t: string) => HTMLElement) {
   fireEvent.click(newBtn);
   // Wait for the input to appear before tests fill it.
   await waitFor(() => {
-    const input = document.querySelector(
-      'input[placeholder="Profile name"]',
-    ) as HTMLInputElement | null;
+    const input = document.querySelector('input[placeholder="Profile name"]') as HTMLInputElement | null;
     if (!input) throw new Error("create input not mounted");
   });
-  return document.querySelector(
-    'input[placeholder="Profile name"]',
-  ) as HTMLInputElement;
+  return document.querySelector('input[placeholder="Profile name"]') as HTMLInputElement;
 }
 
 function submit(input: HTMLInputElement) {
@@ -119,9 +108,7 @@ describe("ProfileSelector create-name validation", () => {
     fireEvent.change(input, { target: { value: bad } });
     submit(input);
 
-    expect(container.textContent).toContain(
-      "Only letters, digits, hyphens, and underscores",
-    );
+    expect(container.textContent).toContain("Only letters, digits, hyphens, and underscores");
     expect(mockCreate).not.toHaveBeenCalled();
   });
 
@@ -148,9 +135,7 @@ describe("ProfileSelector create-name validation", () => {
     fireEvent.change(input, { target: { value: "duplicate" } });
     submit(input);
 
-    await waitFor(() =>
-      expect(container.textContent).toContain("Failed to create profile"),
-    );
+    await waitFor(() => expect(container.textContent).toContain("Failed to create profile"));
   });
 });
 
@@ -160,20 +145,14 @@ describe("ProfileSelector rename validation", () => {
       { name: "default", is_default: true },
       { name: "work", is_default: false },
     ]);
-    const { container } = render(
-      <ProfileSelector selectedProfile="work" onSelect={vi.fn()} />,
-    );
+    const { container } = render(<ProfileSelector selectedProfile="work" onSelect={vi.fn()} />);
     await waitFor(() => expect(mockFetch).toHaveBeenCalled());
 
     fireEvent.click(
-      Array.from(container.querySelectorAll("button")).find(
-        (b) => b.textContent === "Rename",
-      ) as HTMLButtonElement,
+      Array.from(container.querySelectorAll("button")).find((b) => b.textContent === "Rename") as HTMLButtonElement,
     );
     const input = (await waitFor(() => {
-      const el = document.querySelector(
-        'input[placeholder="New name"]',
-      ) as HTMLInputElement | null;
+      const el = document.querySelector('input[placeholder="New name"]') as HTMLInputElement | null;
       if (!el) throw new Error("rename input not mounted");
       return el;
     })) as HTMLInputElement;
@@ -191,20 +170,14 @@ describe("ProfileSelector rename validation", () => {
       { name: "default", is_default: true },
       { name: "work", is_default: false },
     ]);
-    const { container } = render(
-      <ProfileSelector selectedProfile="work" onSelect={vi.fn()} />,
-    );
+    const { container } = render(<ProfileSelector selectedProfile="work" onSelect={vi.fn()} />);
     await waitFor(() => expect(mockFetch).toHaveBeenCalled());
 
     fireEvent.click(
-      Array.from(container.querySelectorAll("button")).find(
-        (b) => b.textContent === "Rename",
-      ) as HTMLButtonElement,
+      Array.from(container.querySelectorAll("button")).find((b) => b.textContent === "Rename") as HTMLButtonElement,
     );
     const input = (await waitFor(() => {
-      const el = document.querySelector(
-        'input[placeholder="New name"]',
-      ) as HTMLInputElement | null;
+      const el = document.querySelector('input[placeholder="New name"]') as HTMLInputElement | null;
       if (!el) throw new Error("rename input not mounted");
       return el;
     })) as HTMLInputElement;
@@ -212,9 +185,7 @@ describe("ProfileSelector rename validation", () => {
     fireEvent.change(input, { target: { value: "bad name" } });
     submit(input);
 
-    expect(container.textContent).toContain(
-      "Only letters, digits, hyphens, and underscores",
-    );
+    expect(container.textContent).toContain("Only letters, digits, hyphens, and underscores");
     expect(mockRename).not.toHaveBeenCalled();
   });
 
@@ -224,20 +195,14 @@ describe("ProfileSelector rename validation", () => {
       { name: "work", is_default: false },
     ]);
     const onSelect = vi.fn();
-    const { container } = render(
-      <ProfileSelector selectedProfile="work" onSelect={onSelect} />,
-    );
+    const { container } = render(<ProfileSelector selectedProfile="work" onSelect={onSelect} />);
     await waitFor(() => expect(mockFetch).toHaveBeenCalled());
 
     fireEvent.click(
-      Array.from(container.querySelectorAll("button")).find(
-        (b) => b.textContent === "Rename",
-      ) as HTMLButtonElement,
+      Array.from(container.querySelectorAll("button")).find((b) => b.textContent === "Rename") as HTMLButtonElement,
     );
     const input = (await waitFor(() => {
-      const el = document.querySelector(
-        'input[placeholder="New name"]',
-      ) as HTMLInputElement | null;
+      const el = document.querySelector('input[placeholder="New name"]') as HTMLInputElement | null;
       if (!el) throw new Error("rename input not mounted");
       return el;
     })) as HTMLInputElement;
@@ -245,9 +210,7 @@ describe("ProfileSelector rename validation", () => {
     fireEvent.change(input, { target: { value: "clients" } });
     submit(input);
 
-    await waitFor(() =>
-      expect(mockRename).toHaveBeenCalledWith("work", "clients"),
-    );
+    await waitFor(() => expect(mockRename).toHaveBeenCalledWith("work", "clients"));
     expect(onSelect).toHaveBeenCalledWith("clients");
   });
 });
@@ -258,22 +221,15 @@ describe("ProfileSelector delete confirm gating", () => {
       { name: "default", is_default: true },
       { name: "work", is_default: false },
     ]);
-    const confirmSpy = vi
-      .spyOn(window, "confirm")
-      .mockReturnValueOnce(false)
-      .mockReturnValueOnce(true);
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValueOnce(false).mockReturnValueOnce(true);
 
     const onSelect = vi.fn();
-    const { container } = render(
-      <ProfileSelector selectedProfile="work" onSelect={onSelect} />,
-    );
+    const { container } = render(<ProfileSelector selectedProfile="work" onSelect={onSelect} />);
     await waitFor(() => expect(mockFetch).toHaveBeenCalled());
 
     const deleteBtn = await waitFor(
       () =>
-        Array.from(container.querySelectorAll("button")).find(
-          (b) => b.textContent === "Delete",
-        ) as HTMLButtonElement,
+        Array.from(container.querySelectorAll("button")).find((b) => b.textContent === "Delete") as HTMLButtonElement,
     );
 
     // First click: confirm() returns false -> no API call.

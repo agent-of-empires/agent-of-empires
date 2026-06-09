@@ -14,13 +14,7 @@
 //   - offline + rolled-back states disable the action surface.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  act,
-  cleanup,
-  fireEvent,
-  render,
-  screen,
-} from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 import { ApprovalCard } from "./ApprovalCard";
 import type { Approval, ApprovalDecision } from "../../lib/acpTypes";
@@ -54,9 +48,7 @@ describe("ApprovalCard (benign)", () => {
   it("renders the tool name and Approval-needed chrome", () => {
     const onResolve = vi.fn().mockResolvedValue(undefined);
     render(<ApprovalCard approval={makeApproval()} onResolve={onResolve} />);
-    expect(
-      screen.getByRole("alertdialog", { name: /Approval needed: Bash/i }),
-    ).toBeTruthy();
+    expect(screen.getByRole("alertdialog", { name: /Approval needed: Bash/i })).toBeTruthy();
     expect(screen.getByText("Approval needed")).toBeTruthy();
     expect(screen.getByText("Bash")).toBeTruthy();
   });
@@ -195,9 +187,7 @@ describe("ApprovalCard (benign)", () => {
         onResolve={onResolve}
       />,
     );
-    expect(
-      screen.queryByRole("button", { name: /Approval needed/i }),
-    ).toBeNull();
+    expect(screen.queryByRole("button", { name: /Approval needed/i })).toBeNull();
   });
 
   it("routes the Allow button to onResolve('Allow')", async () => {
@@ -242,12 +232,7 @@ describe("ApprovalCard (destructive)", () => {
 
   it("renders the destructive chrome (AlertTriangle + 'Destructive action' label)", () => {
     const onResolve = vi.fn().mockResolvedValue(undefined);
-    render(
-      <ApprovalCard
-        approval={makeApproval({ destructive: true })}
-        onResolve={onResolve}
-      />,
-    );
+    render(<ApprovalCard approval={makeApproval({ destructive: true })} onResolve={onResolve} />);
     expect(screen.getByText("Destructive action")).toBeTruthy();
     expect(screen.getByText("Hold to allow")).toBeTruthy();
     expect(screen.queryByText("Always")).toBeNull();
@@ -255,24 +240,14 @@ describe("ApprovalCard (destructive)", () => {
 
   it("defaults to expanded so the full command is in view", () => {
     const onResolve = vi.fn().mockResolvedValue(undefined);
-    render(
-      <ApprovalCard
-        approval={makeApproval({ destructive: true })}
-        onResolve={onResolve}
-      />,
-    );
+    render(<ApprovalCard approval={makeApproval({ destructive: true })} onResolve={onResolve} />);
     // The args <dl> renders without a click in the destructive branch.
     expect(screen.getByText("command")).toBeTruthy();
   });
 
   it("does not approve on a quick click of Hold to allow", () => {
     const onResolve = vi.fn().mockResolvedValue(undefined);
-    render(
-      <ApprovalCard
-        approval={makeApproval({ destructive: true })}
-        onResolve={onResolve}
-      />,
-    );
+    render(<ApprovalCard approval={makeApproval({ destructive: true })} onResolve={onResolve} />);
     const btn = screen.getByText("Hold to allow");
     fireEvent.mouseDown(btn);
     act(() => {
@@ -284,12 +259,7 @@ describe("ApprovalCard (destructive)", () => {
 
   it("approves after a sustained 800ms hold", () => {
     const onResolve = vi.fn().mockResolvedValue(undefined);
-    render(
-      <ApprovalCard
-        approval={makeApproval({ destructive: true })}
-        onResolve={onResolve}
-      />,
-    );
+    render(<ApprovalCard approval={makeApproval({ destructive: true })} onResolve={onResolve} />);
     const btn = screen.getByText("Hold to allow");
     fireEvent.mouseDown(btn);
     act(() => {
@@ -301,12 +271,7 @@ describe("ApprovalCard (destructive)", () => {
 
   it("routes Deny without requiring a hold even in destructive mode", () => {
     const onResolve = vi.fn().mockResolvedValue(undefined);
-    render(
-      <ApprovalCard
-        approval={makeApproval({ destructive: true })}
-        onResolve={onResolve}
-      />,
-    );
+    render(<ApprovalCard approval={makeApproval({ destructive: true })} onResolve={onResolve} />);
     fireEvent.click(screen.getByText("Deny"));
     expect(onResolve).toHaveBeenCalledWith("Deny");
   });

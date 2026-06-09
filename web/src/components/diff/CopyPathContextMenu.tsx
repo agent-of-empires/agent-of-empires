@@ -28,9 +28,7 @@ export function CopyPathContextMenu({ menu, onClose }: Props) {
   // render-time re-seeds on reopen at a new spot, both before paint so the
   // clamp hook below lands the menu on-screen without flashing at the raw
   // coordinates first.
-  const [pos, setPos] = useState<{ x: number; y: number } | null>(
-    menu ? { x: menu.x, y: menu.y } : null,
-  );
+  const [pos, setPos] = useState<{ x: number; y: number } | null>(menu ? { x: menu.x, y: menu.y } : null);
   const [trackedMenu, setTrackedMenu] = useState(menu);
   if (menu !== trackedMenu) {
     setTrackedMenu(menu);

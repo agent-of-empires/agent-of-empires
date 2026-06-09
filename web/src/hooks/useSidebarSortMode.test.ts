@@ -43,9 +43,7 @@ describe("useSidebarSortMode", () => {
     });
 
     expect(result.current[0]).toBe("lastActivity");
-    expect(window.localStorage.getItem(SIDEBAR_SORT_MODE_KEY)).toBe(
-      "lastActivity",
-    );
+    expect(window.localStorage.getItem(SIDEBAR_SORT_MODE_KEY)).toBe("lastActivity");
   });
 
   it("setter is stable across renders (useCallback)", () => {

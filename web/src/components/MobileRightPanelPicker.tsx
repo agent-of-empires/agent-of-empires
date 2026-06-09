@@ -24,12 +24,7 @@ interface Props {
  *  full-viewport main pane (#1452). Replaces the old slide-in right-panel
  *  overlay, which collapsed the paired terminal to zero height under the
  *  soft keyboard. */
-export function MobileRightPanelPicker({
-  open,
-  active,
-  onSelect,
-  onClose,
-}: Props) {
+export function MobileRightPanelPicker({ open, active, onSelect, onClose }: Props) {
   // Close on Escape, matching the other dismissible overlays.
   useEffect(() => {
     if (!open) return;
@@ -68,9 +63,7 @@ export function MobileRightPanelPicker({
                   aria-current={isActive ? "true" : undefined}
                   data-testid={`mobile-right-panel-pick-${entry.view}`}
                   className={`w-full flex flex-col items-start gap-0.5 px-3 py-2 rounded-lg text-left cursor-pointer transition-colors ${
-                    isActive
-                      ? "bg-brand-600/10 text-brand-500"
-                      : "text-text-secondary hover:bg-surface-800"
+                    isActive ? "bg-brand-600/10 text-brand-500" : "text-text-secondary hover:bg-surface-800"
                   }`}
                 >
                   <span className="text-sm font-medium">{entry.label}</span>

@@ -14,11 +14,7 @@
 // complete turn the primer can render.
 
 import { test, expect } from "@playwright/test";
-import {
-  spawnAoeServe,
-  listSessions,
-  seedSessionViaAoeAdd,
-} from "../helpers/aoeServe";
+import { spawnAoeServe, listSessions, seedSessionViaAoeAdd } from "../helpers/aoeServe";
 
 const PRIMER_TEXT = "primer-fixture-prompt-1224";
 
@@ -49,24 +45,17 @@ test("structured view/context-primer renders the seeded turn", async ({}, testIn
     });
     // Synthetic Stopped closes the turn boundary so the primer renders
     // it as a complete turn rather than a half-finished one.
-    await fetch(
-      `${serve.baseUrl}/api/sessions/${sessionId}/acp/force_end_turn`,
-      { method: "POST" },
-    );
+    await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/acp/force_end_turn`, { method: "POST" });
 
     let highestSeq = 0;
     await expect
       .poll(
         async () => {
-          const replay = await fetch(
-            `${serve.baseUrl}/api/sessions/${sessionId}/acp/replay?since=0`,
-          ).then((r) => r.json());
+          const replay = await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/acp/replay?since=0`).then((r) =>
+            r.json(),
+          );
           const json = JSON.stringify(replay.frames);
-          if (
-            json.includes(PRIMER_TEXT) &&
-            json.includes("user_forced") &&
-            replay.highest_seq !== null
-          ) {
+          if (json.includes(PRIMER_TEXT) && json.includes("user_forced") && replay.highest_seq !== null) {
             highestSeq = replay.highest_seq;
             return true;
           }

@@ -81,10 +81,7 @@ export function diffPair(oldText: string, newText: string): DiffPairResult {
       for (const segment of hunk.hunkContent) {
         if (segment.type === "context") {
           const idx = segment.additionLineIndex;
-          for (const raw of meta.additionLines.slice(
-            idx,
-            idx + segment.lines,
-          )) {
+          for (const raw of meta.additionLines.slice(idx, idx + segment.lines)) {
             lines.push({
               type: "equal",
               old_line_num: oldNum++,
@@ -94,10 +91,7 @@ export function diffPair(oldText: string, newText: string): DiffPairResult {
           }
         } else {
           const delIdx = segment.deletionLineIndex;
-          for (const raw of meta.deletionLines.slice(
-            delIdx,
-            delIdx + segment.deletions,
-          )) {
+          for (const raw of meta.deletionLines.slice(delIdx, delIdx + segment.deletions)) {
             lines.push({
               type: "delete",
               old_line_num: oldNum++,
@@ -107,10 +101,7 @@ export function diffPair(oldText: string, newText: string): DiffPairResult {
             dels += 1;
           }
           const addIdx = segment.additionLineIndex;
-          for (const raw of meta.additionLines.slice(
-            addIdx,
-            addIdx + segment.additions,
-          )) {
+          for (const raw of meta.additionLines.slice(addIdx, addIdx + segment.additions)) {
             lines.push({
               type: "add",
               old_line_num: null,

@@ -9,18 +9,7 @@
 // spinners (Cargo.toml: rattles = "0.2"; src/tui/home/render.rs:8).
 
 /** Braille spinner frames; classic 10-step rotation. ~80ms per frame. */
-export const SPINNER_FRAMES = [
-  "⠋",
-  "⠙",
-  "⠹",
-  "⠸",
-  "⠼",
-  "⠴",
-  "⠦",
-  "⠧",
-  "⠇",
-  "⠏",
-] as const;
+export const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const;
 
 /** Frame interval in ms for the spinner glyph. */
 export const SPINNER_INTERVAL_MS = 80;
@@ -111,10 +100,7 @@ export const THINKING_VERBS: readonly string[] = [
  * set (the claude-agent-acp adapter can leave `thinking` latched true
  * through a tool run by skipping ThinkingEnded). See #1213.
  */
-export function deriveSpinnerState(
-  thinking: boolean,
-  tool: string | null,
-): "thinking" | "tool" | "working" {
+export function deriveSpinnerState(thinking: boolean, tool: string | null): "thinking" | "tool" | "working" {
   return tool ? "tool" : thinking ? "thinking" : "working";
 }
 
@@ -135,26 +121,13 @@ export function pickIndex(len: number, seed: number): number {
  * Choose a verb for the current state. `seed` lets callers keep the
  * verb stable across re-renders within a tick, then bump it to rotate.
  */
-export function chooseVerb(
-  state: "thinking" | "tool" | "working",
-  seed: number,
-  toolName?: string | null,
-): string {
+export function chooseVerb(state: "thinking" | "tool" | "working", seed: number, toolName?: string | null): string {
   if (state === "tool" && toolName) {
     // Keep the actual tool name but dress it up with an empire verb so
     // tool runs feel of-a-piece with the rest of the spinner.
-    const verbs = [
-      "Dispatching",
-      "Commanding",
-      "Marshalling",
-      "Operating",
-      "Wielding",
-    ];
+    const verbs = ["Dispatching", "Commanding", "Marshalling", "Operating", "Wielding"];
     const v = verbs[pickIndex(verbs.length, seed)];
-    const label =
-      toolName.length > TOOL_LABEL_MAX
-        ? toolName.slice(0, TOOL_LABEL_MAX).trimEnd()
-        : toolName;
+    const label = toolName.length > TOOL_LABEL_MAX ? toolName.slice(0, TOOL_LABEL_MAX).trimEnd() : toolName;
     return `${v} ${label}…`;
   }
   if (state === "thinking") {

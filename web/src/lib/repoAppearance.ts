@@ -33,9 +33,7 @@ function normalizeAppearance(value: unknown): RepoAppearance | null {
   const raw = value as { alias?: unknown; color?: unknown };
   const alias = typeof raw.alias === "string" ? raw.alias.trim() : "";
   const color =
-    typeof raw.color === "string" && validColors.has(raw.color as RepoColor)
-      ? (raw.color as RepoColor)
-      : undefined;
+    typeof raw.color === "string" && validColors.has(raw.color as RepoColor) ? (raw.color as RepoColor) : undefined;
   if (!alias && !color) return null;
   return {
     ...(alias ? { alias } : {}),
@@ -51,19 +49,14 @@ export function loadRepoAppearances(): Record<string, RepoAppearance> {
     if (!parsed || typeof parsed !== "object") return {};
     const entries = Object.entries(parsed)
       .map(([repoId, value]) => [repoId, normalizeAppearance(value)] as const)
-      .filter(
-        (entry): entry is readonly [string, RepoAppearance] =>
-          entry[1] !== null,
-      );
+      .filter((entry): entry is readonly [string, RepoAppearance] => entry[1] !== null);
     return Object.fromEntries(entries);
   } catch {
     return {};
   }
 }
 
-export function persistRepoAppearances(
-  map: Record<string, RepoAppearance>,
-): void {
+export function persistRepoAppearances(map: Record<string, RepoAppearance>): void {
   if (Object.keys(map).length === 0) {
     safeRemoveItem(STORAGE_KEY);
     return;
@@ -83,8 +76,7 @@ export function applyRepoAppearanceUpdate(
     else delete nextForRepo.alias;
   }
   if ("color" in update) {
-    if (update.color && validColors.has(update.color))
-      nextForRepo.color = update.color;
+    if (update.color && validColors.has(update.color)) nextForRepo.color = update.color;
     else delete nextForRepo.color;
   }
 

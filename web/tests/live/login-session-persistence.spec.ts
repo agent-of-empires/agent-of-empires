@@ -38,8 +38,7 @@ const test = base.extend<{ servePreauthed: ServeHandle }>({
 function authHeaders(handle: ServeHandle): Record<string, string> {
   const out: Record<string, string> = {};
   if (handle.sessionCookie) {
-    out["Cookie"] =
-      `${handle.sessionCookie.name}=${handle.sessionCookie.value}`;
+    out["Cookie"] = `${handle.sessionCookie.name}=${handle.sessionCookie.value}`;
   }
   if (handle.deviceBindingSecret) {
     out["X-Aoe-Device-Binding"] = handle.deviceBindingSecret;
@@ -47,18 +46,14 @@ function authHeaders(handle: ServeHandle): Record<string, string> {
   return out;
 }
 
-async function loginStatus(
-  handle: ServeHandle,
-): Promise<{ authenticated: boolean; elevated: boolean }> {
+async function loginStatus(handle: ServeHandle): Promise<{ authenticated: boolean; elevated: boolean }> {
   const res = await fetch(`${handle.baseUrl}/api/login/status`, {
     headers: authHeaders(handle),
   });
   return res.json();
 }
 
-test("login session survives an aoe serve restart with no re-prompt", async ({
-  servePreauthed,
-}) => {
+test("login session survives an aoe serve restart with no re-prompt", async ({ servePreauthed }) => {
   // Sanity: authenticated before the restart.
   expect((await loginStatus(servePreauthed)).authenticated).toBe(true);
 
@@ -72,39 +67,27 @@ test("login session survives an aoe serve restart with no re-prompt", async ({
   }).toPass({ timeout: 10_000 });
 
   // The device shows up in the persisted-session-backed devices view.
-  const devices: Array<Record<string, unknown>> = await fetch(
-    `${servePreauthed.baseUrl}/api/devices`,
-    { headers: authHeaders(servePreauthed) },
-  ).then((r) => r.json());
+  const devices: Array<Record<string, unknown>> = await fetch(`${servePreauthed.baseUrl}/api/devices`, {
+    headers: authHeaders(servePreauthed),
+  }).then((r) => r.json());
   expect(devices.length).toBeGreaterThan(0);
   const mine = devices.find((d) => d.current === true);
   expect(mine, "the requesting session is flagged current").toBeTruthy();
-  for (const field of [
-    "session_id",
-    "user_agent",
-    "created_ip",
-    "created_at",
-    "last_seen",
-  ]) {
+  for (const field of ["session_id", "user_agent", "created_ip", "created_at", "last_seen"]) {
     expect(mine).toHaveProperty(field);
   }
 });
 
-test("elevation does not survive restart: high-risk actions re-prompt", async ({
-  servePreauthed,
-}) => {
+test("elevation does not survive restart: high-risk actions re-prompt", async ({ servePreauthed }) => {
   // Elevate the live session.
-  const elevateRes = await fetch(
-    `${servePreauthed.baseUrl}/api/login/elevate`,
-    {
-      method: "POST",
-      headers: {
-        ...authHeaders(servePreauthed),
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ passphrase: servePreauthed.passphrase }),
+  const elevateRes = await fetch(`${servePreauthed.baseUrl}/api/login/elevate`, {
+    method: "POST",
+    headers: {
+      ...authHeaders(servePreauthed),
+      "Content-Type": "application/json",
     },
-  );
+    body: JSON.stringify({ passphrase: servePreauthed.passphrase }),
+  });
   expect(elevateRes.ok).toBe(true);
   expect((await loginStatus(servePreauthed)).elevated).toBe(true);
 
@@ -125,15 +108,11 @@ test("elevation does not survive restart: high-risk actions re-prompt", async ({
 // observe the 403. The path-level gating policy is unit-tested in
 // `requires_elevation_paths` (src/server/auth.rs); here we exercise the
 // behavior the handlers produce for a trusted local caller.
-test("revoke removes one device and sign-out-all clears every session", async ({
-  servePreauthed,
-}) => {
+test("revoke removes one device and sign-out-all clears every session", async ({ servePreauthed }) => {
   const passphrase = servePreauthed.passphrase!;
 
   // Create a second device by logging in with a distinct binding secret.
-  const otherBinding = Buffer.from(new Uint8Array(32).fill(0x5a)).toString(
-    "base64url",
-  );
+  const otherBinding = Buffer.from(new Uint8Array(32).fill(0x5a)).toString("base64url");
   const loginRes = await fetch(`${servePreauthed.baseUrl}/api/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -141,28 +120,27 @@ test("revoke removes one device and sign-out-all clears every session", async ({
   });
   expect(loginRes.ok).toBe(true);
 
-  const devicesBefore: Array<{ session_id: string; current: boolean }> =
-    await fetch(`${servePreauthed.baseUrl}/api/devices`, {
+  const devicesBefore: Array<{ session_id: string; current: boolean }> = await fetch(
+    `${servePreauthed.baseUrl}/api/devices`,
+    {
       headers: authHeaders(servePreauthed),
-    }).then((r) => r.json());
+    },
+  ).then((r) => r.json());
   expect(devicesBefore.length).toBe(2);
   const otherSession = devicesBefore.find((d) => !d.current);
   expect(otherSession).toBeTruthy();
 
   // Revoke the other device; it disappears from the list.
-  const revoke = await fetch(
-    `${servePreauthed.baseUrl}/api/login/sessions/${otherSession!.session_id}`,
-    { method: "DELETE", headers: authHeaders(servePreauthed) },
-  );
+  const revoke = await fetch(`${servePreauthed.baseUrl}/api/login/sessions/${otherSession!.session_id}`, {
+    method: "DELETE",
+    headers: authHeaders(servePreauthed),
+  });
   expect(revoke.ok).toBe(true);
 
-  const devicesAfter: Array<{ session_id: string }> = await fetch(
-    `${servePreauthed.baseUrl}/api/devices`,
-    { headers: authHeaders(servePreauthed) },
-  ).then((r) => r.json());
-  expect(
-    devicesAfter.some((d) => d.session_id === otherSession!.session_id),
-  ).toBe(false);
+  const devicesAfter: Array<{ session_id: string }> = await fetch(`${servePreauthed.baseUrl}/api/devices`, {
+    headers: authHeaders(servePreauthed),
+  }).then((r) => r.json());
+  expect(devicesAfter.some((d) => d.session_id === otherSession!.session_id)).toBe(false);
 
   // Sign out everyone. The current session is dropped too.
   const all = await fetch(`${servePreauthed.baseUrl}/api/login/logout-all`, {

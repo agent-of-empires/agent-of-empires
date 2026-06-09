@@ -1,8 +1,4 @@
-import {
-  safeGetItem,
-  safeRemoveItem,
-  safeSetItem,
-} from "../../../lib/safeStorage";
+import { safeGetItem, safeRemoveItem, safeSetItem } from "../../../lib/safeStorage";
 import type { DiffComment, DiffCommentsStorageV1 } from "./types";
 
 const KEY_PREFIX = "aoe:diff-comments:v1:";
@@ -44,8 +40,7 @@ export function loadComments(sessionId: string): DiffCommentsStorageV1 {
     return {
       version: 1,
       comments: v.comments.filter(isWellFormed),
-      clearAfterSend:
-        typeof v.clearAfterSend === "boolean" ? v.clearAfterSend : true,
+      clearAfterSend: typeof v.clearAfterSend === "boolean" ? v.clearAfterSend : true,
       introDraft: typeof v.introDraft === "string" ? v.introDraft : "",
       outroDraft: typeof v.outroDraft === "string" ? v.outroDraft : "",
     };
@@ -63,10 +58,7 @@ export function isEmptyState(s: DiffCommentsStorageV1): boolean {
   return s.comments.length === 0 && s.introDraft === "" && s.outroDraft === "";
 }
 
-export function saveComments(
-  sessionId: string,
-  state: DiffCommentsStorageV1,
-): void {
+export function saveComments(sessionId: string, state: DiffCommentsStorageV1): void {
   // Remove the key for empty state rather than writing an empty record, so
   // sessions the user never commented on don't accumulate junk keys. Both
   // the write-through and the pagehide flush route through here, so this
@@ -91,9 +83,7 @@ export function clearStoredComments(sessionId: string): void {
 // session deletions in another tab or on another device, and to retroactively
 // clear empty keys written before the empty-removal fix landed. Mirrors
 // sweepOrphanDrafts (#1358).
-export function sweepOrphanComments(
-  activeSessionIds: ReadonlySet<string>,
-): void {
+export function sweepOrphanComments(activeSessionIds: ReadonlySet<string>): void {
   if (typeof window === "undefined") return;
   const toRemove: string[] = [];
   try {

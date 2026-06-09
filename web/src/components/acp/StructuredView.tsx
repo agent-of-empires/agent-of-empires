@@ -14,38 +14,14 @@
 // only renders what we feed it and surfaces user actions back.
 
 import { Fragment, useEffect, useLayoutEffect, useRef, useState } from "react";
-import {
-  MessagePrimitive,
-  ThreadPrimitive,
-  useMessage,
-} from "@assistant-ui/react";
-import {
-  AlertTriangle,
-  Check,
-  ChevronDown,
-  Clock,
-  Info,
-  ListChecks,
-  Paperclip,
-  RotateCcw,
-  X,
-} from "lucide-react";
+import { MessagePrimitive, ThreadPrimitive, useMessage } from "@assistant-ui/react";
+import { AlertTriangle, Check, ChevronDown, Clock, Info, ListChecks, Paperclip, RotateCcw, X } from "lucide-react";
 
 import { ApprovalCard } from "./ApprovalCard";
 import { AcpFileRefContext } from "./AcpFileRefContext";
 import type { FileRef } from "../../lib/fileRef";
-import {
-  ToolDensityToggle,
-  ToolDisplayModeProvider,
-  useToolDensityPref,
-} from "./ToolDisplayMode";
-import {
-  AcpRuntime,
-  SUBAGENT_TASK_NAME,
-  TODO_GROUP_NAME,
-  TOOL_GROUP_NAME,
-  type AcpContext,
-} from "./AcpRuntime";
+import { ToolDensityToggle, ToolDisplayModeProvider, useToolDensityPref } from "./ToolDisplayMode";
+import { AcpRuntime, SUBAGENT_TASK_NAME, TODO_GROUP_NAME, TOOL_GROUP_NAME, type AcpContext } from "./AcpRuntime";
 import { Composer } from "./Composer";
 import { ConfigOptionSwitchFailedNotice } from "./SessionConfigControls";
 import { ContextPrimerBanner } from "./ContextPrimerBanner";
@@ -54,17 +30,9 @@ import { Markdown } from "./Markdown";
 import { isQueuedPromptLong, queuedStripLayout } from "./queuedPromptsLayout";
 import { StartupErrorScreen } from "./StartupErrorScreen";
 import { pickWorkerStoppedVariant } from "./workerStoppedBanner";
-import {
-  SubagentCard,
-  ToolCard,
-  ToolGroupCard,
-  TodoGroupCard,
-} from "./ToolCards";
+import { SubagentCard, ToolCard, ToolGroupCard, TodoGroupCard } from "./ToolCards";
 import { DiffCommentsUserCard } from "../diff/comments/DiffCommentsUserCard";
-import {
-  isDiffCommentsCardPayload,
-  parseDiffCommentsSentinel,
-} from "../diff/comments/buildPrompt";
+import { isDiffCommentsCardPayload, parseDiffCommentsSentinel } from "../diff/comments/buildPrompt";
 import {
   SPINNER_FRAMES,
   SPINNER_INTERVAL_MS,
@@ -73,10 +41,7 @@ import {
   deriveSpinnerState,
 } from "../../lib/acpRattle";
 import { useAcpPrefs } from "../../lib/acpPrefs";
-import {
-  AgentProfileProvider,
-  useAgentProfile,
-} from "../../lib/agentProfileContext";
+import { AgentProfileProvider, useAgentProfile } from "../../lib/agentProfileContext";
 import { isClearAlias } from "../../lib/agentProfiles";
 import { useApprovalSound } from "../../hooks/useApprovalSound";
 import { useIsCoarsePointer } from "../../hooks/useIsCoarsePointer";
@@ -127,14 +92,7 @@ const STARTER_PROMPTS = [
   "What does the build pipeline do?",
 ];
 
-export function StructuredView({
-  sessionId,
-  acpWorkerState,
-  tool,
-  archivedAt,
-  snoozedUntil,
-  onOpenFileRef,
-}: Props) {
+export function StructuredView({ sessionId, acpWorkerState, tool, archivedAt, snoozedUntil, onOpenFileRef }: Props) {
   // Folds rows above the most recent `/clear` divider out of the
   // thread by default; the disclosure banner toggles this. Lives on
   // the view (not the reducer) because it's a UI preference, not
@@ -283,8 +241,7 @@ function AcpChrome({
     // and momentary content reflows otherwise drop us out of the
     // pinned state for one frame.
     const sampleAtBottom = () => {
-      wasAtBottomRef.current =
-        vp.scrollTop + vp.clientHeight >= vp.scrollHeight - 16;
+      wasAtBottomRef.current = vp.scrollTop + vp.clientHeight >= vp.scrollHeight - 16;
     };
     sampleAtBottom();
     vp.addEventListener("scroll", sampleAtBottom, { passive: true });
@@ -320,16 +277,9 @@ function AcpChrome({
     <div className="flex h-full flex-col bg-surface-900 text-text-primary">
       <PlanStrip plan={state.plan} />
 
-      <RateLimitRecoverySection
-        sessionId={sessionId}
-        currentAgent={state.agent}
-        onPrefill={recoveryHandoffPrefill}
-      >
+      <RateLimitRecoverySection sessionId={sessionId} currentAgent={state.agent} onPrefill={recoveryHandoffPrefill}>
         {({ onSwitchAgent }) =>
-          status !== "open" ||
-          state.lagged ||
-          state.rateLimit ||
-          reconnecting ? (
+          status !== "open" || state.lagged || state.rateLimit || reconnecting ? (
             <SystemNotices
               status={status}
               lagged={state.lagged}
@@ -346,12 +296,7 @@ function AcpChrome({
         }
       </RateLimitRecoverySection>
 
-      {state.startupError && (
-        <StartupErrorBanner
-          sessionId={sessionId}
-          message={state.startupError}
-        />
-      )}
+      {state.startupError && <StartupErrorBanner sessionId={sessionId} message={state.startupError} />}
       {(() => {
         const variant = pickWorkerStoppedVariant({
           workerStopped: state.workerStopped,
@@ -363,26 +308,16 @@ function AcpChrome({
           return <ArchivedWorkerStoppedBanner sessionId={sessionId} />;
         }
         if (variant === "snoozed" && snoozedUntil) {
-          return (
-            <SnoozedWorkerStoppedBanner
-              sessionId={sessionId}
-              snoozedUntil={snoozedUntil}
-            />
-          );
+          return <SnoozedWorkerStoppedBanner sessionId={sessionId} snoozedUntil={snoozedUntil} />;
         }
         if (variant === "generic") {
           return <WorkerStoppedBanner sessionId={sessionId} />;
         }
         return null;
       })()}
-      {state.workerRestarting &&
-        !state.startupError &&
-        !state.workerStopped && (
-          <WorkerRestartingBanner
-            agentUnresponsive={state.agentUnresponsive}
-            agentOrphaned={state.agentOrphaned}
-          />
-        )}
+      {state.workerRestarting && !state.startupError && !state.workerStopped && (
+        <WorkerRestartingBanner agentUnresponsive={state.agentUnresponsive} agentOrphaned={state.agentOrphaned} />
+      )}
       {acpWorkerState === "resuming" &&
         !state.startupError &&
         !state.workerStopped &&
@@ -393,17 +328,9 @@ function AcpChrome({
         !state.startupError &&
         !state.workerStopped &&
         !state.workerRestarting && (
-          <ScheduledWakeupBanner
-            wakeAt={state.nextWakeupAt}
-            reason={state.nextWakeupReason}
-          />
+          <ScheduledWakeupBanner wakeAt={state.nextWakeupAt} reason={state.nextWakeupReason} />
         )}
-      {state.lastError && (
-        <InteractionErrorBanner
-          message={state.lastError}
-          onDismiss={dismissError}
-        />
-      )}
+      {state.lastError && <InteractionErrorBanner message={state.lastError} onDismiss={dismissError} />}
 
       <ThreadPrimitive.Root className="flex flex-1 flex-col min-h-0">
         <ThreadPrimitive.Viewport
@@ -419,10 +346,7 @@ function AcpChrome({
 
             {state.activity.length > 0 && (
               <div className="mb-2 flex">
-                <ToolDensityToggle
-                  density={toolDensity}
-                  onToggle={onToggleToolDensity}
-                />
+                <ToolDensityToggle density={toolDensity} onToggle={onToggleToolDensity} />
               </div>
             )}
 
@@ -455,11 +379,7 @@ function AcpChrome({
             </ThreadPrimitive.If>
 
             {state.pendingApprovals.map((approval) => (
-              <PendingApproval
-                key={approval.nonce}
-                approval={approval}
-                onResolve={resolveApproval}
-              />
+              <PendingApproval key={approval.nonce} approval={approval} onResolve={resolveApproval} />
             ))}
           </div>
         </ThreadPrimitive.Viewport>
@@ -471,10 +391,7 @@ function AcpChrome({
             onEdit={editQueuedPrompt}
             onClear={clearQueue}
             pendingResume={
-              status !== "open" ||
-              acpWorkerState !== "running" ||
-              state.workerStopped ||
-              state.workerRestarting
+              status !== "open" || acpWorkerState !== "running" || state.workerStopped || state.workerRestarting
             }
           />
 
@@ -482,17 +399,10 @@ function AcpChrome({
             rejected={state.rejectedPrompts}
             onRetry={sendPrompt}
             onDismiss={dismissRejectedPrompt}
-            disabled={
-              state.workerRestarting ||
-              state.workerStopped ||
-              Boolean(state.startupError)
-            }
+            disabled={state.workerRestarting || state.workerStopped || Boolean(state.startupError)}
           />
 
-          <ModeSwitchFailedNotice
-            failure={state.modeSwitchFailed}
-            onDismiss={dismissModeSwitchFailed}
-          />
+          <ModeSwitchFailedNotice failure={state.modeSwitchFailed} onDismiss={dismissModeSwitchFailed} />
 
           <ConfigOptionSwitchFailedNotice
             failure={state.configOptionSwitchFailed}
@@ -523,11 +433,7 @@ function AcpChrome({
             setConfigOption={setConfigOption}
             sessionUsage={state.sessionUsage}
             availableCommands={state.availableCommands}
-            connected={
-              status === "open" &&
-              !state.workerStopped &&
-              !state.workerRestarting
-            }
+            connected={status === "open" && !state.workerStopped && !state.workerRestarting}
             turnActive={state.turnActive}
             queuedCount={state.queuedPrompts.length}
             enqueuePrompt={sendPrompt}
@@ -562,11 +468,7 @@ function UserMessage() {
  *  prompts, or from the decoded base64 sentinel for legacy persisted
  *  prompts. Falls back to the classic chat bubble otherwise. */
 function UserText({ text }: { text: string }) {
-  const typedPayload = useMessage(
-    (m) =>
-      (m.metadata?.custom as { diffComments?: unknown } | undefined)
-        ?.diffComments,
-  );
+  const typedPayload = useMessage((m) => (m.metadata?.custom as { diffComments?: unknown } | undefined)?.diffComments);
   if (isDiffCommentsCardPayload(typedPayload)) {
     return <DiffCommentsUserCard payload={typedPayload} />;
   }
@@ -687,9 +589,7 @@ function AssistantToolCall(props: ToolCallProps) {
     started_at: startedAt,
   };
   const resultContent =
-    props.result &&
-    typeof props.result === "object" &&
-    "content" in (props.result as Record<string, unknown>)
+    props.result && typeof props.result === "object" && "content" in (props.result as Record<string, unknown>)
       ? String((props.result as { content?: unknown }).content ?? "")
       : "";
   const result =
@@ -709,10 +609,7 @@ function AssistantToolCall(props: ToolCallProps) {
  *  tool-call args. Returns null when neither the parsed `args` object
  *  nor the raw `argsText` carries it; caller falls back to a minted
  *  client time. */
-function pickStartedAt(
-  args: Record<string, unknown> | undefined,
-  argsText: string | undefined,
-): string | null {
+function pickStartedAt(args: Record<string, unknown> | undefined, argsText: string | undefined): string | null {
   if (args && typeof args._aoe_started_at === "string") {
     return args._aoe_started_at;
   }
@@ -736,11 +633,7 @@ function pickStartedAt(
 
 /** Read the smuggled `endedAt` field set by AssistantBuilder.completeToolCall. */
 function pickEndedAt(result: unknown): string | null {
-  if (
-    result &&
-    typeof result === "object" &&
-    "endedAt" in (result as Record<string, unknown>)
-  ) {
+  if (result && typeof result === "object" && "endedAt" in (result as Record<string, unknown>)) {
     const v = (result as { endedAt?: unknown }).endedAt;
     if (typeof v === "string") return v;
   }
@@ -751,11 +644,7 @@ function pickEndedAt(result: unknown): string | null {
  *  for a tool closed by the reducer's turn-end sweep (#1646), so the
  *  reconstructed row carries the distinct `tool_stopped` kind. */
 function pickStopped(result: unknown): boolean {
-  return (
-    !!result &&
-    typeof result === "object" &&
-    (result as { stopped?: unknown }).stopped === true
-  );
+  return !!result && typeof result === "object" && (result as { stopped?: unknown }).stopped === true;
 }
 
 /** Map a completed tool's flags to its activity-row kind. Error wins
@@ -857,12 +746,7 @@ function AssistantSubagentTask({ argsText }: { argsText?: string }) {
   if (argsText) {
     try {
       const parsed = JSON.parse(argsText);
-      if (
-        parsed &&
-        typeof parsed === "object" &&
-        parsed.parent &&
-        Array.isArray(parsed.children)
-      ) {
+      if (parsed && typeof parsed === "object" && parsed.parent && Array.isArray(parsed.children)) {
         payload = parsed as SubagentPayload;
       }
     } catch {
@@ -906,33 +790,15 @@ function AssistantSubagentTask({ argsText }: { argsText?: string }) {
 
   const parent = reconstruct(payload.parent);
   const children = payload.children.map(reconstruct);
-  return (
-    <SubagentCard
-      tool={parent.tool}
-      result={parent.result}
-      children={children}
-    />
-  );
+  return <SubagentCard tool={parent.tool} result={parent.result} children={children} />;
 }
 
-function prettifyToolName(
-  kind: string,
-  args?: Record<string, unknown>,
-): string {
+function prettifyToolName(kind: string, args?: Record<string, unknown>): string {
   // Pick a human-readable label for the tool card header. Prefer the
   // ACP title we forward via _aoe_title, then any well-known input
   // field, then the bare kind.
   if (args) {
-    for (const key of [
-      "_aoe_title",
-      "path",
-      "file_path",
-      "filePath",
-      "command",
-      "cmd",
-      "query",
-      "url",
-    ]) {
+    for (const key of ["_aoe_title", "path", "file_path", "filePath", "command", "cmd", "query", "url"]) {
       const v = (args as Record<string, unknown>)[key];
       if (typeof v === "string" && v.length > 0) {
         return v;
@@ -955,9 +821,7 @@ function safeStringify(v: unknown): string {
 function EmptyState({ onPick }: { onPick: (text: string) => Promise<void> }) {
   return (
     <div className="mt-12 flex flex-col items-center gap-4 text-center">
-      <div className="text-sm text-text-muted">
-        Ask the agent anything about this workspace.
-      </div>
+      <div className="text-sm text-text-muted">Ask the agent anything about this workspace.</div>
       <div className="flex flex-wrap justify-center gap-2">
         {STARTER_PROMPTS.map((p) => (
           <button
@@ -1000,10 +864,7 @@ function ClearedTurnsBanner({
       <span className="flex-1 text-left">
         {expanded ? "Hide" : "Show"} {hiddenCount} earlier turn
         {hiddenCount === 1 ? "" : "s"}
-        <span className="text-text-dim">
-          {" "}
-          (cleared, not in the model's memory)
-        </span>
+        <span className="text-text-dim"> (cleared, not in the model's memory)</span>
       </span>
     </button>
   );
@@ -1039,9 +900,7 @@ export function WorkingSpinner({
   onForceEndTurn: () => Promise<void>;
 }) {
   const [frame, setFrame] = useState(0);
-  const [seed, setSeed] = useState(() =>
-    Math.floor(Math.random() * 0xffffffff),
-  );
+  const [seed, setSeed] = useState(() => Math.floor(Math.random() * 0xffffffff));
   // 1s-tick clock for the force-end-turn watchdog. We compare against
   // `lastActivityRef.current` (a ref bumped on every incoming frame)
   // and surface the escape hatch when the gap exceeds the configured
@@ -1135,10 +994,7 @@ export function WorkingSpinner({
   return (
     <div className="flex flex-col gap-2 text-sm italic text-text-muted">
       <div className="flex items-center gap-2">
-        <span
-          className="inline-block w-3 text-center font-mono text-brand-500"
-          aria-hidden="true"
-        >
+        <span className="inline-block w-3 text-center font-mono text-brand-500" aria-hidden="true">
           {SPINNER_FRAMES[frame]}
         </span>
         <span>{label}</span>
@@ -1206,24 +1062,16 @@ function PlanStrip({ plan }: PlanStripProps) {
         onClick={() => setExpanded((v) => !v)}
       >
         <ListChecks className="h-3.5 w-3.5 shrink-0 text-text-dim" />
-        <span className="truncate text-text-primary">
-          {current?.title ?? (allDone ? "all steps complete" : "…")}
-        </span>
+        <span className="truncate text-text-primary">{current?.title ?? (allDone ? "all steps complete" : "…")}</span>
         <span className="ml-auto flex items-center gap-2">
           <span className="text-[11px] tabular-nums text-text-dim">
             {completed}/{totalSteps}
           </span>
           <span className="hidden sm:block h-1 w-16 overflow-hidden rounded-full bg-surface-800">
-            <span
-              className="block h-full bg-brand-500 transition-[width] duration-300"
-              style={{ width: `${pct}%` }}
-            />
+            <span className="block h-full bg-brand-500 transition-[width] duration-300" style={{ width: `${pct}%` }} />
           </span>
           <ChevronDown
-            className={[
-              "h-3.5 w-3.5 text-text-dim transition-transform",
-              expanded ? "rotate-180" : "",
-            ].join(" ")}
+            className={["h-3.5 w-3.5 text-text-dim transition-transform", expanded ? "rotate-180" : ""].join(" ")}
           />
         </span>
       </button>
@@ -1232,10 +1080,7 @@ function PlanStrip({ plan }: PlanStripProps) {
         <div className="max-h-64 overflow-y-auto border-t border-surface-800 px-4 py-2 text-sm">
           <ul className="space-y-1">
             {plan.steps.map((step) => (
-              <li
-                key={step.id}
-                className="flex items-start gap-2 text-text-secondary"
-              >
+              <li key={step.id} className="flex items-start gap-2 text-text-secondary">
                 <StepGlyph status={step.status} />
                 <span
                   className={
@@ -1281,12 +1126,7 @@ function PendingApproval({
   onResolve: (nonce: string, decision: ApprovalDecision) => Promise<void>;
 }) {
   // ApprovalCard owns its own chrome (matches the tool-card style).
-  return (
-    <ApprovalCard
-      approval={approval}
-      onResolve={(decision) => onResolve(approval.nonce, decision)}
-    />
-  );
+  return <ApprovalCard approval={approval} onResolve={(decision) => onResolve(approval.nonce, decision)} />;
 }
 
 /* ── System notices ──────────────────────────────────────────────── */
@@ -1350,11 +1190,7 @@ export function SystemNotices({
   // `maxRetries` and we're sitting on a dead WS. Surface the manual
   // affordance instead of a status line so the user has a clear path
   // back to live. See #1130.
-  const retriesExhausted =
-    status !== "open" &&
-    hasEverOpened &&
-    !reconnecting &&
-    retryCount >= maxRetries;
+  const retriesExhausted = status !== "open" && hasEverOpened && !reconnecting && retryCount >= maxRetries;
   if (reconnecting && status !== "open") {
     // Auto-retry banner: "Reconnecting (3/7) in 4s". Replaces the bare
     // "Reconnecting…" copy with concrete progress so the user knows
@@ -1367,9 +1203,7 @@ export function SystemNotices({
   } else if (status === "connecting") {
     messages.push({
       kind: "info",
-      text: hasEverOpened
-        ? "Reconnecting to structured view…"
-        : "Starting structured view…",
+      text: hasEverOpened ? "Reconnecting to structured view…" : "Starting structured view…",
     });
   } else if (status === "error") {
     messages.push({
@@ -1403,10 +1237,7 @@ export function SystemNotices({
   return (
     <div className="border-b border-surface-800 px-4 py-2 space-y-1">
       {messages.map((m, i) => (
-        <div
-          key={i}
-          className={`text-xs ${m.kind === "warn" ? "text-brand-400" : "text-text-muted"}`}
-        >
+        <div key={i} className={`text-xs ${m.kind === "warn" ? "text-brand-400" : "text-text-muted"}`}>
           {m.text}
         </div>
       ))}
@@ -1437,20 +1268,12 @@ export function SystemNotices({
   );
 }
 
-function InteractionErrorBanner({
-  message,
-  onDismiss,
-}: {
-  message: string;
-  onDismiss: () => void;
-}) {
+function InteractionErrorBanner({ message, onDismiss }: { message: string; onDismiss: () => void }) {
   return (
     <div className="flex items-start justify-between gap-3 border-b border-amber-900/60 bg-amber-950/40 px-4 py-2 text-amber-200">
       <div className="flex-1 min-w-0">
         <div className="text-xs font-medium">Action did not complete</div>
-        <div className="mt-0.5 text-xs text-amber-100/90 break-words">
-          {message}
-        </div>
+        <div className="mt-0.5 text-xs text-amber-100/90 break-words">{message}</div>
       </div>
       <button
         type="button"
@@ -1489,10 +1312,7 @@ export function WorkerRestartingBanner({
       : "Restarting structured view worker… the daemon will respawn the agent with your existing transcript shortly.";
   return (
     <div className="flex items-center gap-2 border-b border-sky-900/60 bg-sky-950/40 px-4 py-2 text-xs text-sky-200">
-      <span
-        className="inline-block h-2 w-2 animate-pulse rounded-full bg-sky-400"
-        aria-hidden
-      />
+      <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-sky-400" aria-hidden />
       <span>{message}</span>
     </div>
   );
@@ -1505,14 +1325,8 @@ export function WorkerRestartingBanner({
 function SpawningBanner() {
   return (
     <div className="flex items-center gap-2 border-b border-amber-900/60 bg-amber-950/40 px-4 py-2 text-xs text-amber-200">
-      <span
-        className="inline-block h-2 w-2 animate-pulse rounded-full bg-amber-400"
-        aria-hidden
-      />
-      <span>
-        Starting structured view worker for new session… this can take a few
-        seconds.
-      </span>
+      <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-amber-400" aria-hidden />
+      <span>Starting structured view worker for new session… this can take a few seconds.</span>
     </div>
   );
 }
@@ -1526,13 +1340,10 @@ function WorkerResumingBanner() {
   // See #1088.
   return (
     <div className="flex items-center gap-2 border-b border-amber-900/60 bg-amber-950/40 px-4 py-2 text-xs text-amber-200">
-      <span
-        className="inline-block h-2 w-2 animate-pulse rounded-full bg-amber-400"
-        aria-hidden
-      />
+      <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-amber-400" aria-hidden />
       <span>
-        Resuming structured view worker… cached transcript still available.
-        Queued prompts will send once the agent is back online.
+        Resuming structured view worker… cached transcript still available. Queued prompts will send once the agent is
+        back online.
       </span>
     </div>
   );
@@ -1544,13 +1355,7 @@ function WorkerResumingBanner() {
  *  for the countdown; once the wake fires the next UserPromptSent
  *  clears `state.nextWakeupAt` on the reducer side and this unmounts.
  *  See #1091. */
-function ScheduledWakeupBanner({
-  wakeAt,
-  reason,
-}: {
-  wakeAt: string;
-  reason: string | null;
-}) {
+function ScheduledWakeupBanner({ wakeAt, reason }: { wakeAt: string; reason: string | null }) {
   const targetMs = Date.parse(wakeAt);
   const [now, setNow] = useState(() => Date.now());
   const elapsed = !Number.isFinite(targetMs) || targetMs <= now;
@@ -1562,9 +1367,7 @@ function ScheduledWakeupBanner({
   if (!Number.isFinite(targetMs)) return null;
   const remaining = Math.max(0, Math.floor((targetMs - now) / 1000));
   const wakeDate = new Date(targetMs);
-  const clock = `${String(wakeDate.getHours()).padStart(2, "0")}:${String(
-    wakeDate.getMinutes(),
-  ).padStart(2, "0")}`;
+  const clock = `${String(wakeDate.getHours()).padStart(2, "0")}:${String(wakeDate.getMinutes()).padStart(2, "0")}`;
   let label: string;
   if (elapsed) {
     label = "Waking…";
@@ -1593,23 +1396,18 @@ function ScheduledWakeupBanner({
 }
 
 function WorkerStoppedBanner({ sessionId }: { sessionId: string }) {
-  const [retryState, setRetryState] = useState<
-    "idle" | "retrying" | "ok" | "failed"
-  >("idle");
+  const [retryState, setRetryState] = useState<"idle" | "retrying" | "ok" | "failed">("idle");
   const [retryError, setRetryError] = useState<string | null>(null);
 
   const handleReconnect = async () => {
     setRetryState("retrying");
     setRetryError(null);
     try {
-      const res = await fetch(
-        `/api/sessions/${encodeURIComponent(sessionId)}/acp/spawn`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({}),
-        },
-      );
+      const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/acp/spawn`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
       if (res.ok) {
         // The next AcpSessionAssigned (or UserPromptSent) clears
         // workerStopped on the reducer side and this banner unmounts.
@@ -1629,14 +1427,10 @@ function WorkerStoppedBanner({ sessionId }: { sessionId: string }) {
     <div className="border-b border-amber-900/60 bg-amber-950/40 px-4 py-3 text-amber-200">
       <div className="flex items-start justify-between gap-3">
         <div className="flex-1 min-w-0">
-          <div className="text-sm font-medium">
-            Structured view worker stopped
-          </div>
+          <div className="text-sm font-medium">Structured view worker stopped</div>
           <div className="mt-1 text-xs text-amber-100/90">
-            The agent was terminated via{" "}
-            <code className="rounded bg-amber-900/60 px-1">aoe acp stop</code>{" "}
-            or an equivalent external teardown. New prompts are disabled until
-            you reconnect.
+            The agent was terminated via <code className="rounded bg-amber-900/60 px-1">aoe acp stop</code> or an
+            equivalent external teardown. New prompts are disabled until you reconnect.
           </div>
         </div>
         <button
@@ -1650,14 +1444,11 @@ function WorkerStoppedBanner({ sessionId }: { sessionId: string }) {
       </div>
       {retryState === "ok" && (
         <div className="mt-2 text-xs text-emerald-200/90">
-          Spawn requested. The composer will re-enable when the agent is back
-          online.
+          Spawn requested. The composer will re-enable when the agent is back online.
         </div>
       )}
       {retryState === "failed" && retryError && (
-        <div className="mt-2 text-xs text-amber-100/90">
-          Reconnect failed: {retryError}
-        </div>
+        <div className="mt-2 text-xs text-amber-100/90">Reconnect failed: {retryError}</div>
       )}
     </div>
   );
@@ -1669,11 +1460,7 @@ function WorkerStoppedBanner({ sessionId }: { sessionId: string }) {
  *  startup recovery path both skip archived sessions, so a fresh
  *  spawn would not survive the next reconciliation tick. The user
  *  unblocks by unarchiving from the sidebar context menu. See #1581. */
-export function ArchivedWorkerStoppedBanner({
-  sessionId,
-}: {
-  sessionId: string;
-}) {
+export function ArchivedWorkerStoppedBanner({ sessionId }: { sessionId: string }) {
   return (
     <div
       className="border-b border-amber-900/60 bg-amber-950/40 px-4 py-3 text-amber-200"
@@ -1681,9 +1468,8 @@ export function ArchivedWorkerStoppedBanner({
     >
       <div className="text-sm font-medium">Session archived</div>
       <div className="mt-1 text-xs text-amber-100/90">
-        This session is parked. The structured view worker was shut down and the
-        reconciler will not respawn it. Unarchive from the sidebar (right-click
-        the row, then Unarchive) to bring it back.
+        This session is parked. The structured view worker was shut down and the reconciler will not respawn it.
+        Unarchive from the sidebar (right-click the row, then Unarchive) to bring it back.
       </div>
     </div>
   );
@@ -1694,17 +1480,9 @@ export function ArchivedWorkerStoppedBanner({
  *  so the user knows when the worker will come back on its own;
  *  Unsnooze from the sidebar context menu wakes it sooner. See
  *  #1581. */
-export function SnoozedWorkerStoppedBanner({
-  sessionId,
-  snoozedUntil,
-}: {
-  sessionId: string;
-  snoozedUntil: string;
-}) {
+export function SnoozedWorkerStoppedBanner({ sessionId, snoozedUntil }: { sessionId: string; snoozedUntil: string }) {
   const target = new Date(snoozedUntil);
-  const wallClock = Number.isFinite(target.getTime())
-    ? target.toLocaleString()
-    : snoozedUntil;
+  const wallClock = Number.isFinite(target.getTime()) ? target.toLocaleString() : snoozedUntil;
   return (
     <div
       className="border-b border-amber-900/60 bg-amber-950/40 px-4 py-3 text-amber-200"
@@ -1712,30 +1490,22 @@ export function SnoozedWorkerStoppedBanner({
     >
       <div className="text-sm font-medium">Session snoozed</div>
       <div className="mt-1 text-xs text-amber-100/90">
-        The structured view worker was shut down until{" "}
-        <span className="font-mono">{wallClock}</span>. The reconciler will
-        respawn it automatically once the snooze expires, or you can Unsnooze
-        from the sidebar (right-click the row) to wake it sooner.
+        The structured view worker was shut down until <span className="font-mono">{wallClock}</span>. The reconciler
+        will respawn it automatically once the snooze expires, or you can Unsnooze from the sidebar (right-click the
+        row) to wake it sooner.
       </div>
     </div>
   );
 }
 
-export function StartupErrorBanner({
-  sessionId,
-  message,
-}: {
-  sessionId: string;
-  message: string;
-}) {
+export function StartupErrorBanner({ sessionId, message }: { sessionId: string; message: string }) {
   const isAuth = /authentic|login|api[_ -]?key/i.test(message);
   const isCapacity = /capacity full|max_concurrent_workers/i.test(message);
   // Match the exact `Display` of `AcpError::ProjectPathMissing`.
   // Capture the path so the banner can echo it back to the user; the
   // path lets them spot whether a rename or a delete is the cause and
   // jump straight to the right fix. See #1089.
-  const projectPathMissingMatch =
-    /project path no longer exists:\s*(\S.*)$/im.exec(message);
+  const projectPathMissingMatch = /project path no longer exists:\s*(\S.*)$/im.exec(message);
   const isProjectPathMissing = projectPathMissingMatch !== null;
   const missingPath = projectPathMissingMatch?.[1]?.trim() ?? null;
   // The adapter found the bundled Claude Code native sub-binary at the
@@ -1743,25 +1513,19 @@ export function StartupErrorBanner({
   // mismatch inside a sandbox container, or a bind-mounted host
   // node_modules whose binary doesn't match the container arch. See
   // #1449.
-  const isNativeBinaryLaunchFail =
-    /native binary at .* exists but failed to launch/i.test(message);
-  const [retryState, setRetryState] = useState<
-    "idle" | "retrying" | "ok" | "failed"
-  >("idle");
+  const isNativeBinaryLaunchFail = /native binary at .* exists but failed to launch/i.test(message);
+  const [retryState, setRetryState] = useState<"idle" | "retrying" | "ok" | "failed">("idle");
   const [retryError, setRetryError] = useState<string | null>(null);
 
   const handleRetry = async () => {
     setRetryState("retrying");
     setRetryError(null);
     try {
-      const res = await fetch(
-        `/api/sessions/${encodeURIComponent(sessionId)}/acp/spawn`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({}),
-        },
-      );
+      const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/acp/spawn`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
       if (res.ok) {
         // The supervisor's drain task will start emitting events
         // shortly; the banner will disappear when the next user
@@ -1782,12 +1546,8 @@ export function StartupErrorBanner({
     <div className="border-b border-rose-900/60 bg-rose-950/40 px-4 py-3 text-rose-200">
       <div className="flex items-start justify-between gap-3">
         <div className="flex-1 min-w-0">
-          <div className="text-sm font-medium">
-            Structured view agent failed to start
-          </div>
-          <pre className="mt-1 whitespace-pre-wrap text-xs text-rose-100/90">
-            {message}
-          </pre>
+          <div className="text-sm font-medium">Structured view agent failed to start</div>
+          <pre className="mt-1 whitespace-pre-wrap text-xs text-rose-100/90">{message}</pre>
         </div>
         <button
           type="button"
@@ -1804,99 +1564,64 @@ export function StartupErrorBanner({
         </div>
       )}
       {retryState === "failed" && retryError && (
-        <div className="mt-2 text-xs text-rose-100/90">
-          Retry failed: {retryError}
-        </div>
+        <div className="mt-2 text-xs text-rose-100/90">Retry failed: {retryError}</div>
       )}
       <div className="mt-2 text-xs text-rose-200/80">
         {isAuth ? (
           <>
             The adapter is installed but has no Claude credentials. Either set{" "}
-            <code className="rounded bg-rose-900/60 px-1">
-              ANTHROPIC_API_KEY
-            </code>{" "}
-            in the env that runs{" "}
-            <code className="rounded bg-rose-900/60 px-1">aoe serve</code>, or
-            run{" "}
-            <code className="rounded bg-rose-900/60 px-1">claude /login</code>{" "}
-            in a terminal to write credentials to{" "}
-            <code className="rounded bg-rose-900/60 px-1">~/.claude</code>, then
-            restart aoe.
+            <code className="rounded bg-rose-900/60 px-1">ANTHROPIC_API_KEY</code> in the env that runs{" "}
+            <code className="rounded bg-rose-900/60 px-1">aoe serve</code>, or run{" "}
+            <code className="rounded bg-rose-900/60 px-1">claude /login</code> in a terminal to write credentials to{" "}
+            <code className="rounded bg-rose-900/60 px-1">~/.claude</code>, then restart aoe.
           </>
         ) : isCapacity ? (
           <>
             All structured view worker slots are in use. Either raise{" "}
-            <code className="rounded bg-rose-900/60 px-1">
-              [acp] max_concurrent_workers
-            </code>{" "}
-            in <code className="rounded bg-rose-900/60 px-1">config.toml</code>{" "}
-            and restart{" "}
-            <code className="rounded bg-rose-900/60 px-1">aoe serve</code>, or
-            free a slot by deleting an existing structured view session or
-            switching one to the tmux view. Reinstalling the adapter won't help;
-            the adapter is fine, the cap is the limit.
+            <code className="rounded bg-rose-900/60 px-1">[acp] max_concurrent_workers</code> in{" "}
+            <code className="rounded bg-rose-900/60 px-1">config.toml</code> and restart{" "}
+            <code className="rounded bg-rose-900/60 px-1">aoe serve</code>, or free a slot by deleting an existing
+            structured view session or switching one to the tmux view. Reinstalling the adapter won't help; the adapter
+            is fine, the cap is the limit.
           </>
         ) : isProjectPathMissing ? (
           <>
             The session's working directory no longer exists on disk:
             {missingPath && (
-              <pre className="mt-1 whitespace-pre-wrap break-all rounded bg-rose-900/40 p-2 text-xs">
-                {missingPath}
-              </pre>
+              <pre className="mt-1 whitespace-pre-wrap break-all rounded bg-rose-900/40 p-2 text-xs">{missingPath}</pre>
             )}
-            Reinstalling the adapter won't help; the adapter is fine, the cwd is
-            gone. Two paths forward:
+            Reinstalling the adapter won't help; the adapter is fine, the cwd is gone. Two paths forward:
             <ol className="mt-1 list-decimal space-y-0.5 pl-5">
               <li>
                 Restore the directory at the path above (e.g.{" "}
-                <code className="rounded bg-rose-900/60 px-1">
-                  git worktree move
-                </code>{" "}
-                it back, or recreate it), then click <strong>Retry</strong>.
+                <code className="rounded bg-rose-900/60 px-1">git worktree move</code> it back, or recreate it), then
+                click <strong>Retry</strong>.
               </li>
               <li>
-                Stop{" "}
-                <code className="rounded bg-rose-900/60 px-1">aoe serve</code>,
-                edit{" "}
-                <code className="rounded bg-rose-900/60 px-1">
-                  project_path
-                </code>{" "}
-                for this session in{" "}
+                Stop <code className="rounded bg-rose-900/60 px-1">aoe serve</code>, edit{" "}
+                <code className="rounded bg-rose-900/60 px-1">project_path</code> for this session in{" "}
                 <code className="rounded bg-rose-900/60 px-1">
                   ~/.agent-of-empires/profiles/&lt;profile&gt;/sessions.json
                 </code>{" "}
-                to point at the new location, then start{" "}
-                <code className="rounded bg-rose-900/60 px-1">aoe serve</code>{" "}
+                to point at the new location, then start <code className="rounded bg-rose-900/60 px-1">aoe serve</code>{" "}
                 again.
               </li>
             </ol>
           </>
         ) : isNativeBinaryLaunchFail ? (
           <>
-            The adapter is installed but its bundled Claude Code native
-            sub-binary couldn't launch. The binary exists on disk, the kernel
-            rejected the{" "}
-            <code className="rounded bg-rose-900/60 px-1">execve</code>.
-            Reinstalling the adapter won't help; the binary is already there.
-            Likely causes:
+            The adapter is installed but its bundled Claude Code native sub-binary couldn't launch. The binary exists on
+            disk, the kernel rejected the <code className="rounded bg-rose-900/60 px-1">execve</code>. Reinstalling the
+            adapter won't help; the binary is already there. Likely causes:
             <ul className="mt-1 list-disc space-y-0.5 pl-5">
               <li>
-                Architecture mismatch (e.g. an{" "}
-                <code className="rounded bg-rose-900/60 px-1">arm64</code>{" "}
-                binary inside an{" "}
-                <code className="rounded bg-rose-900/60 px-1">amd64</code>{" "}
-                sandbox container, or vice versa).
+                Architecture mismatch (e.g. an <code className="rounded bg-rose-900/60 px-1">arm64</code> binary inside
+                an <code className="rounded bg-rose-900/60 px-1">amd64</code> sandbox container, or vice versa).
               </li>
+              <li>Container image missing the dynamic loader or a glibc version old enough to refuse the binary.</li>
               <li>
-                Container image missing the dynamic loader or a glibc version
-                old enough to refuse the binary.
-              </li>
-              <li>
-                Host{" "}
-                <code className="rounded bg-rose-900/60 px-1">
-                  node_modules
-                </code>{" "}
-                bind-mounted into a container of a different arch.
+                Host <code className="rounded bg-rose-900/60 px-1">node_modules</code> bind-mounted into a container of
+                a different arch.
               </li>
             </ul>
             Open the agent log below for the verbatim adapter error, or see{" "}
@@ -1912,11 +1637,8 @@ export function StartupErrorBanner({
           </>
         ) : (
           <>
-            Run{" "}
-            <code className="rounded bg-rose-900/60 px-1">
-              aoe acp doctor --fix
-            </code>{" "}
-            from a terminal, or install the adapter manually:
+            Run <code className="rounded bg-rose-900/60 px-1">aoe acp doctor --fix</code> from a terminal, or install
+            the adapter manually:
             <pre className="mt-1 whitespace-pre-wrap rounded bg-rose-900/40 p-2 text-xs">
               npm install -g @agentclientprotocol/claude-agent-acp@latest
             </pre>
@@ -1937,9 +1659,7 @@ export function StartupErrorBanner({
  */
 function AgentLogDisclosure({ sessionId }: { sessionId: string }) {
   const [open, setOpen] = useState(false);
-  const [state, setState] = useState<"idle" | "loading" | "ok" | "failed">(
-    "idle",
-  );
+  const [state, setState] = useState<"idle" | "loading" | "ok" | "failed">("idle");
   const [tail, setTail] = useState<string>("");
   const [exists, setExists] = useState<boolean>(false);
   const [truncated, setTruncated] = useState<boolean>(false);
@@ -1949,9 +1669,7 @@ function AgentLogDisclosure({ sessionId }: { sessionId: string }) {
     setState("loading");
     setErrorText(null);
     try {
-      const res = await fetch(
-        `/api/sessions/${encodeURIComponent(sessionId)}/acp/worker-log?tail=200`,
-      );
+      const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/acp/worker-log?tail=200`);
       if (!res.ok) {
         const detail = (await res.text().catch(() => "")).slice(0, 200);
         setState("failed");
@@ -2008,32 +1726,21 @@ function AgentLogDisclosure({ sessionId }: { sessionId: string }) {
       </div>
       {open && (
         <div className="mt-2" data-testid="acp-agent-log-body">
-          {state === "loading" && (
-            <div className="text-xs text-rose-200/80">Loading log…</div>
-          )}
+          {state === "loading" && <div className="text-xs text-rose-200/80">Loading log…</div>}
           {state === "failed" && errorText && (
-            <div className="text-xs text-rose-100/90">
-              Could not load log: {errorText}
-            </div>
+            <div className="text-xs text-rose-100/90">Could not load log: {errorText}</div>
           )}
           {state === "ok" && !exists && (
             <div className="text-xs text-rose-200/80">
-              No log output yet. The worker may not have written anything before
-              exiting.
+              No log output yet. The worker may not have written anything before exiting.
             </div>
           )}
           {state === "ok" && exists && tail.length === 0 && (
-            <div className="text-xs text-rose-200/80">
-              Log file exists but is empty.
-            </div>
+            <div className="text-xs text-rose-200/80">Log file exists but is empty.</div>
           )}
           {state === "ok" && exists && tail.length > 0 && (
             <>
-              {truncated && (
-                <div className="mb-1 text-[10px] text-rose-200/70">
-                  Log is large; showing the tail.
-                </div>
-              )}
+              {truncated && <div className="mb-1 text-[10px] text-rose-200/70">Log is large; showing the tail.</div>}
               <pre
                 data-testid="acp-agent-log-pre"
                 className="max-h-64 overflow-auto whitespace-pre-wrap break-all rounded bg-rose-950/70 p-2 font-mono text-[11px] text-rose-100/90"
@@ -2062,10 +1769,7 @@ interface ModeSwitchFailedNoticeProps {
  *  session keeps running in `default` and silently prompts on every
  *  Write/Edit/Bash. The notice gives them an explicit signal plus a
  *  pointer to the mode picker. See #1233. */
-function ModeSwitchFailedNotice({
-  failure,
-  onDismiss,
-}: ModeSwitchFailedNoticeProps) {
+function ModeSwitchFailedNotice({ failure, onDismiss }: ModeSwitchFailedNoticeProps) {
   if (!failure) return null;
   const friendly =
     failure.modeId === "bypassPermissions"
@@ -2078,9 +1782,7 @@ function ModeSwitchFailedNotice({
           <Info className="mt-0.5 h-4 w-4 shrink-0 text-amber-300" />
           <div className="min-w-0 flex-1">
             <p className="text-xs leading-5 text-amber-100">{friendly}</p>
-            <p className="mt-0.5 font-mono text-[10px] text-amber-400/70">
-              {failure.reason}
-            </p>
+            <p className="mt-0.5 font-mono text-[10px] text-amber-400/70">{failure.reason}</p>
           </div>
           <button
             type="button"
@@ -2166,9 +1868,7 @@ function RejectedPromptsStrip({
                 <p className="max-h-48 overflow-y-auto whitespace-pre-wrap break-words text-xs text-amber-100">
                   {r.text}
                 </p>
-                <p className="mt-0.5 text-[10px] text-amber-400/80">
-                  Agent was busy; prompt was not sent.
-                </p>
+                <p className="mt-0.5 text-[10px] text-amber-400/80">Agent was busy; prompt was not sent.</p>
               </div>
               <button
                 type="button"
@@ -2196,13 +1896,7 @@ function RejectedPromptsStrip({
   );
 }
 
-export function QueuedPromptsStrip({
-  queued,
-  onRemove,
-  onEdit,
-  onClear,
-  pendingResume,
-}: QueuedPromptsStripProps) {
+export function QueuedPromptsStrip({ queued, onRemove, onEdit, onClear, pendingResume }: QueuedPromptsStripProps) {
   // Strip-level collapse: when the queue exceeds `visibleDefault` rows,
   // only the first N render until the user expands. State resets when
   // the queue length drops back below the threshold (toggle disappears;
@@ -2227,9 +1921,7 @@ export function QueuedPromptsStrip({
         <div className="flex items-center justify-between pb-1.5 text-[11px] uppercase tracking-wider text-text-dim">
           <span className="inline-flex items-center gap-1">
             <Clock className="h-3 w-3" />
-            {pendingResume
-              ? `Pending until session resumes (${queued.length})`
-              : `Queued (${queued.length})`}
+            {pendingResume ? `Pending until session resumes (${queued.length})` : `Queued (${queued.length})`}
           </span>
           {queued.length > 1 && (
             <button
@@ -2251,8 +1943,7 @@ export function QueuedPromptsStrip({
             const showDivider =
               aliases.length > 0 &&
               prev !== undefined &&
-              (isClearAlias(prev.text, aliases) ||
-                isClearAlias(q.text, aliases));
+              (isClearAlias(prev.text, aliases) || isClearAlias(q.text, aliases));
             return (
               <Fragment key={q.id}>
                 {showDivider && (
@@ -2266,11 +1957,7 @@ export function QueuedPromptsStrip({
                     <span className="h-px flex-1 bg-amber-500/20" />
                   </li>
                 )}
-                <QueuedPromptRow
-                  prompt={q}
-                  onRemove={() => onRemove(q.id)}
-                  onEdit={(text) => onEdit(q.id, text)}
-                />
+                <QueuedPromptRow prompt={q} onRemove={() => onRemove(q.id)} onEdit={(text) => onEdit(q.id, text)} />
               </Fragment>
             );
           })}
@@ -2334,9 +2021,7 @@ function QueuedPromptRow({
               grow the strip and push the composer off-screen. The toggle
               below stays a sibling of this box, so capping the height also
               keeps "Show less" reachable. See #1642. */}
-          <div
-            className={isLong && rowExpanded ? "max-h-48 overflow-y-auto" : ""}
-          >
+          <div className={isLong && rowExpanded ? "max-h-48 overflow-y-auto" : ""}>
             <button
               type="button"
               onClick={() => setEditing(true)}
@@ -2364,20 +2049,13 @@ function QueuedPromptRow({
                 setRowExpanded((v) => !v);
               }}
               className="mt-0.5 text-[11px] font-medium text-sky-300 hover:text-sky-200"
-              aria-label={
-                rowExpanded
-                  ? "Collapse queued prompt"
-                  : "Show full queued prompt"
-              }
+              aria-label={rowExpanded ? "Collapse queued prompt" : "Show full queued prompt"}
             >
               {rowExpanded ? "Show less" : "…"}
             </button>
           )}
           {prompt.attachments && prompt.attachments.length > 0 && (
-            <div
-              className="mt-1 flex flex-wrap gap-1.5"
-              data-testid="queued-attachments"
-            >
+            <div className="mt-1 flex flex-wrap gap-1.5" data-testid="queued-attachments">
               {prompt.attachments.map((att, i) => (
                 <span
                   key={`${att.name ?? att.kind}-${i}`}
@@ -2393,9 +2071,7 @@ function QueuedPromptRow({
                   ) : (
                     <Paperclip className="h-3 w-3" />
                   )}
-                  <span className="max-w-[100px] truncate">
-                    {att.name ?? att.kind}
-                  </span>
+                  <span className="max-w-[100px] truncate">{att.name ?? att.kind}</span>
                 </span>
               ))}
             </div>
