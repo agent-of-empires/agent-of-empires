@@ -1513,6 +1513,17 @@ mod tests {
 
     #[test]
     #[serial_test::serial(shell_env)]
+    fn test_agent_settings_path_host_env_takes_precedence_over_process_env() {
+        // When both are set, the session's profile env wins over AoE's own env.
+        let _guard = EnvGuard::set("CLAUDE_CONFIG_DIR", "/from/process/env");
+        let host_env = vec!["CLAUDE_CONFIG_DIR=/from/host/env".to_string()];
+        let path =
+            agent_settings_path_for_host_environment(claude_hook_config(), &host_env).unwrap();
+        assert_eq!(path, PathBuf::from("/from/host/env/settings.json"));
+    }
+
+    #[test]
+    #[serial_test::serial(shell_env)]
     fn test_agent_settings_path_falls_back_to_process_env() {
         // Not present in the host env list at all, but set in AoE's own env:
         // the launched agent inherits it, so hooks must follow.
