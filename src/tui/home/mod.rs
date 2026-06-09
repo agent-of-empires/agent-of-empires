@@ -3406,7 +3406,10 @@ impl HomeView {
         if pane.width > 0 && pane.height > 0 {
             Some((pane.width, pane.height))
         } else {
-            crate::terminal::get_size()
+            // A zero-dimension terminal size is as unusable as no size at all;
+            // drop it so the start path keeps tmux's default instead of being
+            // handed `-x 0`/`-y 0`.
+            crate::terminal::get_size().filter(|(cols, rows)| *cols > 0 && *rows > 0)
         }
     }
 
