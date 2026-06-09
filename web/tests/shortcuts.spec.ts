@@ -19,13 +19,19 @@ import { mockTerminalApis } from "./helpers/terminal-mocks";
 // xterm.js's helper textarea steals focus when the terminal mounts or
 // re-layouts; a focused textarea makes the input-gated shortcuts
 // (Shift+D) no-ops and turns the keystroke into PTY bytes instead.
+// The blur runs INSIDE the poll: a single early blur loses to xterm's
+// asynchronous refocus on a slow runner, so re-blur on every attempt
+// until body actually holds focus.
 async function blurToBody(page: Page) {
-  await page.evaluate(() => {
-    const ae = document.activeElement as HTMLElement | null;
-    ae?.blur?.();
-    document.body.focus?.();
-  });
-  await expect.poll(() => page.evaluate(() => document.activeElement?.tagName ?? null)).toBe("BODY");
+  await expect
+    .poll(() =>
+      page.evaluate(() => {
+        const ae = document.activeElement as HTMLElement | null;
+        if (ae && ae !== document.body) ae.blur?.();
+        return document.activeElement?.tagName ?? null;
+      }),
+    )
+    .toBe("BODY");
 }
 
 test("Cmd/Ctrl+B toggles the workspace sidebar", async ({ page }) => {
