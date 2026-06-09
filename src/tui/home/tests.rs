@@ -1614,6 +1614,135 @@ fn test_delete_selected_group_updates_groups_field() {
     assert!(!group_paths.contains(&"work/projects"));
 }
 
+/// Archiving a manual group archives every session under it, including
+/// nested subgroups, and leaves sessions outside the group untouched.
+#[test]
+#[serial]
+fn test_archive_selected_group_archives_all_members() {
+    let mut env = create_test_env_with_group_sessions();
+
+    // Select the "work" group.
+    for (i, item) in env.view.flat_items.iter().enumerate() {
+        if let Item::Group { path, .. } = item {
+            if path == "work" {
+                env.view.cursor = i;
+                env.view.update_selected();
+                break;
+            }
+        }
+    }
+    assert_eq!(env.view.selected_group.as_deref(), Some("work"));
+
+    // "work" holds two direct sessions plus one in the nested "work/projects".
+    assert_eq!(env.view.active_sessions_in_selected_group().len(), 3);
+
+    env.view.archive_selected_group().unwrap();
+
+    for inst in env.view.instances() {
+        let in_work = inst.group_path == "work" || inst.group_path.starts_with("work/");
+        assert_eq!(
+            inst.is_archived(),
+            in_work,
+            "session {} (group {:?}) archived state should match group membership",
+            inst.title,
+            inst.group_path
+        );
+    }
+}
+
+/// In project group-by mode, archiving a project header archives every live
+/// session that maps to that repo, even though their stored `group_path`
+/// values differ from the synthetic project name.
+#[test]
+#[serial]
+fn test_archive_selected_group_project_mode() {
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let storage = Storage::new_unwatched("test").unwrap();
+
+    // Two sessions sharing one repo, one session in a different repo.
+    let a1 = Instance::new("alpha-1", "/tmp/alpha");
+    let a2 = Instance::new("alpha-2", "/tmp/alpha");
+    let b1 = Instance::new("beta-1", "/tmp/beta");
+    let instances = vec![a1, a2, b1];
+    storage
+        .update(|i, g| {
+            *i = instances.to_vec();
+            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    view.group_by = crate::session::config::GroupByMode::Project;
+    view.flat_items = view.build_flat_items();
+
+    // Select the "alpha" project header.
+    for (i, item) in view.flat_items.iter().enumerate() {
+        if let Item::Group { path, .. } = item {
+            if path == "alpha" {
+                view.cursor = i;
+                view.update_selected();
+                break;
+            }
+        }
+    }
+    assert_eq!(view.selected_group.as_deref(), Some("alpha"));
+    assert_eq!(view.active_sessions_in_selected_group().len(), 2);
+
+    view.archive_selected_group().unwrap();
+
+    for inst in view.instances() {
+        let in_alpha = inst.project_path == "/tmp/alpha";
+        assert_eq!(
+            inst.is_archived(),
+            in_alpha,
+            "session {} (repo {}) archived state should match project membership",
+            inst.title,
+            inst.project_path
+        );
+    }
+}
+
+/// The group-level prompt opens a confirmation carrying the `archive_group`
+/// action and counts only the active members, and no-ops without a prompt when
+/// the group has nothing left to archive.
+#[test]
+#[serial]
+fn test_prompt_archive_selected_group() {
+    let mut env = create_test_env_with_group_sessions();
+
+    for (i, item) in env.view.flat_items.iter().enumerate() {
+        if let Item::Group { path, .. } = item {
+            if path == "work" {
+                env.view.cursor = i;
+                env.view.update_selected();
+                break;
+            }
+        }
+    }
+
+    env.view.prompt_archive_selected_group();
+    assert_eq!(
+        env.view.confirm_dialog.as_ref().map(|d| d.action()),
+        Some("archive_group")
+    );
+
+    // Confirm, which archives the group and clears the prompt.
+    env.view.confirm_dialog = None;
+    env.view.archive_selected_group().unwrap();
+
+    // With every member archived, a second prompt is a silent no-op.
+    env.view.prompt_archive_selected_group();
+    assert!(env.view.confirm_dialog.is_none());
+}
+
 #[test]
 #[serial]
 fn test_delete_group_with_sessions_updates_groups_field() {

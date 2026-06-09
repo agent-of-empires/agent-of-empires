@@ -28,6 +28,7 @@ import { CSS } from "@dnd-kit/utilities";
 import type { SessionResponse, SessionStatus, Workspace } from "../lib/types";
 import type { SidebarAxis } from "../lib/sidebarAxis";
 import {
+  archivableWorkspaces,
   nestedSidebarGroupHasLiveWorkspace,
   sidebarGroupHasLiveWorkspace,
   type NestedSidebarGroup,
@@ -1529,6 +1530,7 @@ const SidebarGroupHeader = memo(function SidebarGroupHeader({
   onClick,
   onNewSession,
   onUpdateAppearance,
+  onArchiveAll,
   offline,
   dragHandle,
 }: {
@@ -1537,6 +1539,9 @@ const SidebarGroupHeader = memo(function SidebarGroupHeader({
   onClick: () => void;
   onNewSession: () => void;
   onUpdateAppearance: (repoId: string, update: RepoAppearanceUpdate) => void;
+  /** Archive every active session under this group. Omitted (read-only /
+   *  offline) hides the action; the parent owns the confirmation. */
+  onArchiveAll?: () => void;
   offline: boolean;
   dragHandle?: DragHandleProps;
 }) {
@@ -1544,6 +1549,13 @@ const SidebarGroupHeader = memo(function SidebarGroupHeader({
   // only. The user-group axis has no per-group appearance in v1, so the
   // menu trigger and rename input are gated off rather than rendered inert.
   const canAppearance = group.capabilities.appearance;
+  // "Archive all in group" works on every axis (a project or a manual
+  // group), so it can light up the context menu even where appearance is
+  // off. Count only the still-active members so the label is honest and the
+  // action hides once everything is already archived.
+  const archivableCount = onArchiveAll ? archivableWorkspaces(group).length : 0;
+  const canArchiveAll = archivableCount > 0;
+  const hasMenu = canAppearance || canArchiveAll;
   const headerTitle = group.groupPath ?? group.repoPath;
   const [contextMenu, setContextMenu] = useState<{
     x: number;
@@ -1633,18 +1645,18 @@ const SidebarGroupHeader = memo(function SidebarGroupHeader({
       <div
         data-testid="sidebar-group-header"
         data-group-id={group.id}
-        tabIndex={canAppearance ? 0 : undefined}
-        aria-haspopup={canAppearance ? "menu" : undefined}
-        aria-label={canAppearance ? `Project actions for ${group.displayName}` : undefined}
+        tabIndex={hasMenu ? 0 : undefined}
+        aria-haspopup={hasMenu ? "menu" : undefined}
+        aria-label={hasMenu ? `Project actions for ${group.displayName}` : undefined}
         onContextMenu={
-          canAppearance
+          hasMenu
             ? (e) => {
                 e.preventDefault();
                 openMenuAt(e.clientX, e.clientY);
               }
             : undefined
         }
-        onKeyDown={canAppearance ? handleHeaderKeyDown : undefined}
+        onKeyDown={hasMenu ? handleHeaderKeyDown : undefined}
         className={`flex items-center gap-2 px-3 py-2 transition-colors duration-75 text-text-secondary focus:outline-none focus:ring-2 focus:ring-brand-600 ${headerHoverClass} ${
           hasActiveChild ? "border-l-2 border-brand-600" : ""
         }`}
@@ -1718,7 +1730,7 @@ const SidebarGroupHeader = memo(function SidebarGroupHeader({
           </button>
         </Tooltip>
       </div>
-      {canAppearance &&
+      {hasMenu &&
         contextMenu &&
         createPortal(
           <div
@@ -1731,61 +1743,80 @@ const SidebarGroupHeader = memo(function SidebarGroupHeader({
               maxHeight: "calc(100vh - 16px)",
             }}
           >
-            <button
-              onClick={() => {
-                setContextMenu(null);
-                setRenameValue(group.alias ?? group.defaultDisplayName);
-                setRenaming(true);
-                requestAnimationFrame(() => renameRef.current?.select());
-              }}
-              data-testid="sidebar-group-context-menu-rename"
-              className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors"
-            >
-              Rename
-            </button>
-            {group.alias && (
+            {canArchiveAll && (
               <button
                 onClick={() => {
                   setContextMenu(null);
-                  onUpdateAppearance(group.id, { alias: null });
+                  onArchiveAll?.();
                 }}
+                data-testid="sidebar-group-context-menu-archive-all"
                 className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors"
               >
-                Clear alias
+                {`Archive all (${archivableCount})`}
               </button>
             )}
-            <div className="border-t border-surface-700/20 my-1" />
-            <div className="px-3 py-1 text-[11px] font-mono uppercase tracking-widest text-text-muted">Background</div>
-            <div className="grid grid-cols-4 gap-1 px-3 py-1.5">
-              {REPO_COLOR_OPTIONS.map((option) => (
+            {canArchiveAll && canAppearance && <div className="border-t border-surface-700/20 my-1" />}
+            {canAppearance && (
+              <>
                 <button
-                  key={option.id}
-                  type="button"
                   onClick={() => {
                     setContextMenu(null);
-                    onUpdateAppearance(group.id, { color: option.id });
+                    setRenameValue(group.alias ?? group.defaultDisplayName);
+                    setRenaming(true);
+                    requestAnimationFrame(() => renameRef.current?.select());
                   }}
-                  data-testid={`sidebar-group-color-${option.id}`}
-                  aria-label={`Set ${option.label} background`}
-                  className={`h-8 rounded-md border cursor-pointer transition-colors ${
-                    group.color === option.id ? "border-text-primary" : "border-surface-700"
-                  }`}
-                  style={repoSwatchStyle(option.id)}
-                />
-              ))}
-              <button
-                type="button"
-                onClick={() => {
-                  setContextMenu(null);
-                  onUpdateAppearance(group.id, { color: null });
-                }}
-                data-testid="sidebar-group-color-clear"
-                aria-label="Clear background"
-                className="h-8 rounded-md border border-surface-700 bg-surface-900 text-[10px] font-mono text-text-dim cursor-pointer hover:bg-surface-700/40"
-              >
-                None
-              </button>
-            </div>
+                  data-testid="sidebar-group-context-menu-rename"
+                  className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors"
+                >
+                  Rename
+                </button>
+                {group.alias && (
+                  <button
+                    onClick={() => {
+                      setContextMenu(null);
+                      onUpdateAppearance(group.id, { alias: null });
+                    }}
+                    className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors"
+                  >
+                    Clear alias
+                  </button>
+                )}
+                <div className="border-t border-surface-700/20 my-1" />
+                <div className="px-3 py-1 text-[11px] font-mono uppercase tracking-widest text-text-muted">
+                  Background
+                </div>
+                <div className="grid grid-cols-4 gap-1 px-3 py-1.5">
+                  {REPO_COLOR_OPTIONS.map((option) => (
+                    <button
+                      key={option.id}
+                      type="button"
+                      onClick={() => {
+                        setContextMenu(null);
+                        onUpdateAppearance(group.id, { color: option.id });
+                      }}
+                      data-testid={`sidebar-group-color-${option.id}`}
+                      aria-label={`Set ${option.label} background`}
+                      className={`h-8 rounded-md border cursor-pointer transition-colors ${
+                        group.color === option.id ? "border-text-primary" : "border-surface-700"
+                      }`}
+                      style={repoSwatchStyle(option.id)}
+                    />
+                  ))}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setContextMenu(null);
+                      onUpdateAppearance(group.id, { color: null });
+                    }}
+                    data-testid="sidebar-group-color-clear"
+                    aria-label="Clear background"
+                    className="h-8 rounded-md border border-surface-700 bg-surface-900 text-[10px] font-mono text-text-dim cursor-pointer hover:bg-surface-700/40"
+                  >
+                    None
+                  </button>
+                </div>
+              </>
+            )}
           </div>,
           document.body,
         )}
@@ -2109,6 +2140,22 @@ export function WorkspaceSidebar({
     [runBulkAction, triage],
   );
 
+  // Archive every active session under a group at once. Archiving a whole
+  // project is a bigger hammer than a single row, so it confirms first
+  // (matching the TUI's `z`-over-a-project prompt). Reversible, so a plain
+  // confirm rather than a destructive warning; the bulk fan-out reuses the
+  // same per-session path as multi-select archive.
+  const onArchiveGroup = useCallback(
+    (group: SidebarGroup) => {
+      const wss = archivableWorkspaces(group);
+      if (wss.length === 0) return;
+      const noun = wss.length === 1 ? "session" : "sessions";
+      if (!window.confirm(`Archive all ${wss.length} ${noun} in "${group.displayName}"?`)) return;
+      onBulkArchive(wss, true);
+    },
+    [onBulkArchive],
+  );
+
   // Interpret a row click: plain click clears the selection and navigates
   // (today's behavior), modifier clicks build the selection instead. The row
   // has already guarded button / deleting / drag, and called preventDefault.
@@ -2340,6 +2387,7 @@ export function WorkspaceSidebar({
                           hasActiveChild={!showExpanded && hasActiveChild}
                           onClick={() => !q && onToggleGroup(group.id)}
                           onUpdateAppearance={onUpdateRepoAppearance}
+                          onArchiveAll={readOnly || offline ? undefined : () => onArchiveGroup(group)}
                           onNewSession={() =>
                             group.capabilities.create === "repo" && group.repoPath
                               ? onCreateSession(group.repoPath)
@@ -2426,6 +2474,7 @@ export function WorkspaceSidebar({
                     hasActiveChild={!repoExpanded && repoHasActiveChild}
                     onClick={() => !q && onToggleGroup(repo.id)}
                     onUpdateAppearance={onUpdateRepoAppearance}
+                    onArchiveAll={readOnly || offline ? undefined : () => onArchiveGroup(repo)}
                     onNewSession={() =>
                       repo.capabilities.create === "repo" && repo.repoPath ? onCreateSession(repo.repoPath) : onNew()
                     }
@@ -2452,6 +2501,7 @@ export function WorkspaceSidebar({
                             hasActiveChild={!subExpanded && subHasActiveChild}
                             onClick={() => !q && onToggleSubgroup(repo.id, groupPath)}
                             onUpdateAppearance={onUpdateRepoAppearance}
+                            onArchiveAll={readOnly || offline ? undefined : () => onArchiveGroup(sg)}
                             onNewSession={onNew}
                             offline={offline}
                           />

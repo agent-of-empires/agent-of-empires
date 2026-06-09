@@ -11,6 +11,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  archivableWorkspaces,
   buildNestedSidebarGroups,
   buildSessionGroups,
   nestedSidebarGroupHasLiveWorkspace,
@@ -368,5 +369,45 @@ describe("sidebarGroupHasLiveWorkspace", () => {
   it("is true when at least one workspace is live", () => {
     const groups = build([workspace("w1", [session({ id: "s1", group_path: "feature" })])]);
     expect(sidebarGroupHasLiveWorkspace(groups[0]!)).toBe(true);
+  });
+});
+
+describe("archivableWorkspaces", () => {
+  it("returns members whose primary session is not archived", () => {
+    const groups = build([
+      workspace("w-live", [session({ id: "a", group_path: "feature" })]),
+      workspace("w-archived", [session({ id: "b", group_path: "feature", archived_at: "2025-01-02T00:00:00Z" })]),
+    ]);
+    const feature = groups.find((g) => g.id === "feature")!;
+    expect(archivableWorkspaces(feature).map((ws) => ws.id)).toEqual(["w-live"]);
+  });
+
+  it("includes snoozed-but-not-archived members (archive sweeps them in)", () => {
+    const groups = build([
+      workspace("w-snoozed", [session({ id: "a", group_path: "feature", snoozed_until: "2999-01-01T00:00:00Z" })]),
+    ]);
+    const feature = groups.find((g) => g.id === "feature")!;
+    expect(archivableWorkspaces(feature).map((ws) => ws.id)).toEqual(["w-snoozed"]);
+  });
+
+  it("is empty once every member is archived", () => {
+    const groups = build([
+      workspace("w1", [session({ id: "a", group_path: "feature", archived_at: "2025-01-02T00:00:00Z" })]),
+    ]);
+    const feature = groups.find((g) => g.id === "feature")!;
+    expect(archivableWorkspaces(feature)).toHaveLength(0);
+  });
+
+  it("keys off the primary session, ignoring archived siblings", () => {
+    // A workspace whose primary session is live is archivable even if a
+    // later session is already archived; triage acts on sessions[0].
+    const groups = build([
+      workspace("w1", [
+        session({ id: "a", group_path: "feature" }),
+        session({ id: "b", group_path: "feature", archived_at: "2025-01-02T00:00:00Z" }),
+      ]),
+    ]);
+    const feature = groups.find((g) => g.id === "feature")!;
+    expect(archivableWorkspaces(feature).map((ws) => ws.id)).toEqual(["w1"]);
   });
 });

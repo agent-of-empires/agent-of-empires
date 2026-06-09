@@ -1060,4 +1060,77 @@ impl HomeView {
         }
         Ok(())
     }
+
+    /// Collect the active (non-archived) session ids under the currently
+    /// selected group header, honoring the active group-by mode. Archived
+    /// sessions are excluded: they already live under the synthetic Archived
+    /// section, and re-archiving them is a no-op. Returns empty when no group
+    /// is selected.
+    pub(super) fn active_sessions_in_selected_group(&self) -> Vec<String> {
+        let Some(group_path) = self.selected_group.as_deref() else {
+            return Vec::new();
+        };
+        match self.group_by {
+            // Project headers are derived from each session's repo name and
+            // unified across profiles, narrowed only by the active profile
+            // filter, exactly as `build_flat_items_by_project` builds them.
+            crate::session::config::GroupByMode::Project => self
+                .instances
+                .iter()
+                .filter(|i| !i.is_archived())
+                .filter(|i| {
+                    self.active_profile
+                        .as_ref()
+                        .is_none_or(|p| &i.source_profile == p)
+                })
+                .filter(|i| super::project_group_name(i) == group_path)
+                .map(|i| i.id.clone())
+                .collect(),
+            // Manual groups can nest, so a session belongs when its path
+            // matches exactly or sits beneath the group. Scope to the group's
+            // owning profile the same way `delete_selected_group` does.
+            crate::session::config::GroupByMode::Manual => {
+                let prefix = format!("{}/", group_path);
+                self.instances
+                    .iter()
+                    .filter(|i| !i.is_archived())
+                    .filter(|i| i.group_path == group_path || i.group_path.starts_with(&prefix))
+                    .filter(|i| {
+                        self.selected_group_profile
+                            .as_ref()
+                            .is_none_or(|p| p == &i.source_profile)
+                    })
+                    .map(|i| i.id.clone())
+                    .collect()
+            }
+        }
+    }
+
+    /// Archive every active session under the selected group. Mirrors the
+    /// single-row archive path in `toggle_archive_at_cursor`: kill each pane
+    /// before flipping the archived bit, then reveal the Archived section so
+    /// the rows stay visible. Triggered behind a confirmation prompt, so there
+    /// is no further guard here.
+    pub(super) fn archive_selected_group(&mut self) -> anyhow::Result<()> {
+        let ids = self.active_sessions_in_selected_group();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        for inst in self.instances.iter().filter(|i| ids.contains(&i.id)) {
+            if let Err(e) = inst.kill() {
+                tracing::warn!("archive_selected_group: kill failed (continuing): {}", e);
+            }
+        }
+        self.bulk_apply_user_action(&ids, |inst| inst.archive())?;
+        self.reveal_archived_section();
+        self.flat_items = self.build_flat_items();
+        // The project header vanishes once its last active member is archived
+        // (project headers are seeded from live sessions only), so the cursor's
+        // old index may now point past the list end; clamp and re-resolve.
+        if !self.flat_items.is_empty() && self.cursor >= self.flat_items.len() {
+            self.cursor = self.flat_items.len() - 1;
+        }
+        self.update_selected();
+        Ok(())
+    }
 }

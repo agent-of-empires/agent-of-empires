@@ -274,6 +274,55 @@ test.describe("Sidebar multi-session (#956)", () => {
     await expect(restoredHeader).toHaveAttribute("style", /color-mix/);
   });
 
+  test("project group context menu archives every active session", async ({ page }) => {
+    await mockApis(page, [
+      {
+        id: "sess-a",
+        title: "Ethiopians",
+        project_path: "/tmp/agent-of-empires",
+        branch: null,
+      },
+      {
+        id: "sess-b",
+        title: "Celts",
+        project_path: "/tmp/agent-of-empires",
+        branch: null,
+      },
+    ]);
+
+    const archived: string[] = [];
+    await page.route("**/api/sessions/*/archive", async (r) => {
+      const url = new URL(r.request().url());
+      const id = url.pathname.split("/")[3];
+      const body = r.request().postDataJSON() as { archived: boolean };
+      if (body.archived) archived.push(id);
+      await r.fulfill({ json: { id, archived_at: new Date().toISOString() } });
+    });
+
+    // The "archive all in project" action confirms first; accept it.
+    let confirmText = "";
+    page.on("dialog", (dialog) => {
+      confirmText = dialog.message();
+      void dialog.accept();
+    });
+
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await page.goto("/");
+    await expect(page.locator("header")).toBeVisible();
+
+    const projectHeader = page.locator('[data-testid="sidebar-group-header"][data-group-id="/tmp/agent-of-empires"]');
+    await projectHeader.click({ button: "right" });
+    const menu = page.locator("[data-testid='sidebar-group-context-menu']");
+    await expect(menu).toBeVisible();
+
+    const archiveAll = menu.locator("[data-testid='sidebar-group-context-menu-archive-all']");
+    await expect(archiveAll).toHaveText("Archive all (2)");
+    await archiveAll.click();
+
+    await expect.poll(() => archived.slice().sort()).toEqual(["sess-a", "sess-b"]);
+    expect(confirmText).toContain("Archive all 2 sessions");
+  });
+
   test("project group appearance menu opens from keyboard", async ({ page }) => {
     await mockApis(page, [
       {

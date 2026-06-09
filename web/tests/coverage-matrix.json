@@ -2155,6 +2155,13 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/BulkActionBar.tsx"]
     },
     {
+      "id": "sidebar.archive-group",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/sidebar-multi-session.spec.ts", "src/lib/__tests__/sidebarGroups.test.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
       "id": "triage.acp-banners",
       "kind": "vitest",
       "risk": "medium",
