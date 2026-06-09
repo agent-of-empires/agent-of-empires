@@ -3046,6 +3046,28 @@ impl Instance {
     /// `finalize_launch` writes those fields and they would otherwise be
     /// dropped with the clone. See `apply_post_restart_sync`.
     pub fn ensure_pane_ready(&mut self) -> Result<EnsureReadyOutcome, EnsureReadyError> {
+        self.ensure_pane_ready_with_size(None)
+    }
+
+    /// Like [`ensure_pane_ready`](Self::ensure_pane_ready), but seeds a
+    /// freshly created or respawned pane at `size` (cols, rows) instead of
+    /// letting tmux fall back to its 80x24 default.
+    ///
+    /// Live-send entry passes the visible preview-pane size here so the agent
+    /// boots at the width it will be shown at. Without it the agent boots
+    /// narrow (80 cols) and depends on a single post-boot `resize-window`
+    /// SIGWINCH to grow into the live area. That SIGWINCH races the agent's
+    /// startup: if it lands before the agent installs its resize handler the
+    /// reflow is lost, and because the per-frame resize loop is deduped on the
+    /// (already-correct) tmux window size, nothing re-issues it. The pane then
+    /// stays pinned at ~80 cols (≈50% of a wide live area) until live mode is
+    /// exited and re-entered. Booting at the right size sidesteps the race.
+    ///
+    /// `None` keeps tmux's default for callers with no target geometry.
+    pub fn ensure_pane_ready_with_size(
+        &mut self,
+        size: Option<(u16, u16)>,
+    ) -> Result<EnsureReadyOutcome, EnsureReadyError> {
         if matches!(self.status, Status::Creating | Status::Deleting) {
             return Err(EnsureReadyError::Transient(self.status));
         }
@@ -3061,7 +3083,7 @@ impl Instance {
             // server kill or reboot resurrects the same bad sid the
             // restart paths exist to recover from.
             let outcome = self
-                .start_with_resume_fallback(None, false)
+                .start_with_resume_fallback(size, false)
                 .map_err(EnsureReadyError::Tmux)?;
             self.wait_for_pane_ready(&session);
             let stale_sid = match outcome {
@@ -3072,7 +3094,7 @@ impl Instance {
         }
         if session.is_pane_dead() {
             let outcome = self
-                .restart_with_size(None)
+                .restart_with_size(size)
                 .map_err(EnsureReadyError::Tmux)?;
             self.wait_for_pane_ready(&session);
             let stale_sid = match outcome {
