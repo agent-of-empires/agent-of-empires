@@ -70,6 +70,7 @@ pub fn codex_config_path_display() -> String {
 pub(crate) fn codex_config_path_for_host_environment(entries: &[String]) -> Result<PathBuf> {
     if let Some(codex_home) =
         crate::session::environment::resolve_host_environment_value(entries, "CODEX_HOME")
+            .filter(|v| !v.is_empty())
     {
         return Ok(PathBuf::from(codex_home).join("config.toml"));
     }
@@ -79,6 +80,7 @@ pub(crate) fn codex_config_path_for_host_environment(entries: &[String]) -> Resu
 
 pub(crate) fn codex_config_path_display_for_host_environment(entries: &[String]) -> String {
     crate::session::environment::resolve_host_environment_value(entries, "CODEX_HOME")
+        .filter(|v| !v.is_empty())
         .map(|codex_home| {
             PathBuf::from(codex_home)
                 .join("config.toml")
@@ -1723,6 +1725,28 @@ mod tests {
         assert_eq!(
             codex_config_path_display(),
             tmp.path().join("config.toml").display().to_string()
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_codex_config_path_for_host_environment_ignores_empty_codex_home() {
+        let tmp = TempDir::new().unwrap();
+        let _guard = CodexHomeGuard::unset();
+        std::env::set_var("HOME", tmp.path());
+
+        // An empty `CODEX_HOME=` must not resolve to a bare relative
+        // `config.toml`; it should fall back to the home-relative default.
+        let entries = vec!["CODEX_HOME=".to_string()];
+
+        let path = codex_config_path_for_host_environment(&entries).unwrap();
+        assert_eq!(path, tmp.path().join(".codex").join("config.toml"));
+        assert!(path.is_absolute());
+        assert_ne!(path, PathBuf::from("config.toml"));
+
+        assert_eq!(
+            codex_config_path_display_for_host_environment(&entries),
+            codex_config_path_display()
         );
     }
 
