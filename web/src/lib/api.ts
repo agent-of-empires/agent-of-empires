@@ -279,6 +279,9 @@ export function profileWritableSections(schema: SettingsFieldDescriptor[]): Set<
   return sections;
 }
 
+/** PATCH a profile's settings, refusing any section the schema does not list as
+ *  writable (see {@link profileWritableSections}) before sending. Returns
+ *  whether the server accepted the write. */
 export async function updateProfileSettings(name: string, updates: Record<string, unknown>): Promise<boolean> {
   const schema = await getSettingsSchema();
   // With the schema in hand, refuse a blocked section before sending. If the

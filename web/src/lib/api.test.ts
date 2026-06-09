@@ -271,6 +271,21 @@ describe("updateProfileSettings write guard", () => {
       description: "my profile",
     });
   });
+
+  it("defers to the server when the schema is unavailable instead of blocking", async () => {
+    // A transient schema fetch failure must not block a legitimate save: with no
+    // schema to derive the allowlist from, the guard sends the PATCH and lets
+    // the server's authoritative validation decide.
+    resetSettingsSchemaCache();
+    fetchSpy.mockResolvedValueOnce(new Response("", { status: 503 })); // schema GET
+    fetchSpy.mockResolvedValueOnce(new Response("", { status: 200 })); // PATCH
+    const ok = await updateProfileSettings("work", { theme: { name: "empire" } });
+    expect(ok).toBe(true);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    const [url, init] = fetchSpy.mock.calls[1]!;
+    expect(url).toBe("/api/profiles/work/settings");
+    expect(init?.method).toBe("PATCH");
+  });
 });
 
 describe("updateSessionGroup", () => {
