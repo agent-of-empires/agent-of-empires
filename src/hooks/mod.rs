@@ -46,7 +46,7 @@ pub enum HookInstallTarget {
 /// Codex treats `CODEX_HOME` as the directory containing `config.toml`, falling
 /// back to `~/.codex` when the variable is not set.
 pub fn codex_config_path() -> Result<PathBuf> {
-    if let Ok(codex_home) = std::env::var("CODEX_HOME") {
+    if let Some(codex_home) = std::env::var("CODEX_HOME").ok().filter(|v| !v.is_empty()) {
         return Ok(PathBuf::from(codex_home).join("config.toml"));
     }
 
@@ -58,13 +58,15 @@ pub fn codex_config_path() -> Result<PathBuf> {
 
 pub fn codex_config_path_display() -> String {
     std::env::var("CODEX_HOME")
+        .ok()
+        .filter(|v| !v.is_empty())
         .map(|codex_home| {
             PathBuf::from(codex_home)
                 .join("config.toml")
                 .display()
                 .to_string()
         })
-        .unwrap_or_else(|_| "~/.codex/config.toml".to_string())
+        .unwrap_or_else(|| "~/.codex/config.toml".to_string())
 }
 
 pub(crate) fn codex_config_path_for_host_environment(entries: &[String]) -> Result<PathBuf> {
@@ -1748,6 +1750,23 @@ mod tests {
             codex_config_path_display_for_host_environment(&entries),
             codex_config_path_display()
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_codex_config_path_ignores_empty_process_codex_home() {
+        let tmp = TempDir::new().unwrap();
+        // An empty `CODEX_HOME` in AoE's own process env must fall back to the
+        // home-relative default rather than a bare relative `config.toml`.
+        let _guard = CodexHomeGuard::set(Path::new(""));
+        std::env::set_var("HOME", tmp.path());
+
+        let path = codex_config_path().unwrap();
+        assert_eq!(path, tmp.path().join(".codex").join("config.toml"));
+        assert!(path.is_absolute());
+        assert_ne!(path, PathBuf::from("config.toml"));
+
+        assert_eq!(codex_config_path_display(), "~/.codex/config.toml");
     }
 
     #[test]
