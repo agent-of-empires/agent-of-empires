@@ -382,6 +382,29 @@
       ]
     },
     {
+      "id": "wizard.hooks-trust",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/wizard-hooks-trust.spec.ts"],
+      "components": [
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/components/session-wizard/HooksTrustDialog.tsx"
+      ]
+    },
+    {
+      "id": "wizard.hooks-trust.unit",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/components/session-wizard/__tests__/HooksTrustDialog.test.tsx",
+        "src/lib/__tests__/createSessionApi.test.ts"
+      ],
+      "components": [
+        "web/src/components/session-wizard/HooksTrustDialog.tsx",
+        "web/src/lib/api.ts"
+      ]
+    },
+    {
       "id": "wizard.volume-ignores-globs.unit",
       "kind": "vitest",
       "risk": "medium",

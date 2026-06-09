@@ -418,6 +418,12 @@ export interface CreateSessionRequest {
    *  Mutually exclusive with `worktree_branch` and `extra_repo_paths`;
    *  the server returns 400 on either combination. */
   scratch?: boolean;
+  /** Approve the repo's `on_create` lifecycle hooks for this create,
+   *  mirroring the CLI `--trust-hooks` flag and the TUI trust dialog
+   *  (#2066). When a repo defines hooks that need approval and this is
+   *  unset, the server returns a `hooks_need_trust` 403; the wizard then
+   *  prompts and resubmits with this set to true. */
+  trust_hooks?: boolean;
 }
 
 /** Live acp worker lifecycle, mirrored from

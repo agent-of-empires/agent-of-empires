@@ -10,8 +10,10 @@ import {
   fetchVolumeIgnoresPreview,
   markVolumeIgnoresGlobsAcknowledged,
   type VolumeIgnoresGlobPreview,
+  type HooksNeedTrust,
 } from "../../lib/api";
 import { VolumeIgnoresGlobDialog } from "./VolumeIgnoresGlobDialog";
+import { HooksTrustDialog } from "./HooksTrustDialog";
 import { ACP_CAPABLE_TOOLS, isAcpCapable } from "../../lib/acpCapableTools";
 import { safeGetItem, safeSetItem } from "../../lib/safeStorage";
 import { toastBus } from "../../lib/toastBus";
@@ -144,6 +146,13 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
   const [globConfirm, setGlobConfirm] = useState<{
     globs: VolumeIgnoresGlobPreview[];
     body: CreateSessionRequest;
+  } | null>(null);
+  // Pending create paused on the hooks-trust confirm modal (#2066). Holds the
+  // commands to show and the request to replay with `trust_hooks: true`.
+  const [hooksTrust, setHooksTrust] = useState<{
+    info: HooksNeedTrust;
+    body: CreateSessionRequest;
+    tool: string;
   } | null>(null);
 
   const steps = useMemo(() => computeSteps(state.data), [state.data]);
@@ -301,6 +310,12 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
         for (const w of warnings) toastBus.handler?.error(w);
       }
       onCreated(result.session);
+    } else if (result.hooksNeedTrust && !body.trust_hooks) {
+      // The repo's hooks need approval (#2066). Pause and show the trust
+      // dialog; on confirm we replay with `trust_hooks: true`. The
+      // `!body.trust_hooks` guard avoids looping if the server still refuses
+      // after we already opted in.
+      setHooksTrust({ info: result.hooksNeedTrust, body, tool });
     } else
       dispatch({
         type: "SUBMIT_ERROR",
@@ -318,6 +333,18 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
 
   const handleGlobCancel = () => {
     setGlobConfirm(null);
+    dispatch({ type: "SUBMIT_CANCEL" });
+  };
+
+  const handleHooksTrustConfirm = async () => {
+    const pending = hooksTrust;
+    if (!pending) return;
+    setHooksTrust(null);
+    await runCreate({ ...pending.body, trust_hooks: true }, pending.tool);
+  };
+
+  const handleHooksTrustCancel = () => {
+    setHooksTrust(null);
     dispatch({ type: "SUBMIT_CANCEL" });
   };
 
@@ -409,6 +436,14 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
       </div>
       {globConfirm && (
         <VolumeIgnoresGlobDialog globs={globConfirm.globs} onConfirm={handleGlobConfirm} onCancel={handleGlobCancel} />
+      )}
+      {hooksTrust && (
+        <HooksTrustDialog
+          onCreate={hooksTrust.info.onCreate}
+          needsMcpTrust={hooksTrust.info.needsMcpTrust}
+          onConfirm={handleHooksTrustConfirm}
+          onCancel={handleHooksTrustCancel}
+        />
       )}
     </div>
   );
