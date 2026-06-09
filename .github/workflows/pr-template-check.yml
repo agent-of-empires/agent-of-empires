@@ -19,7 +19,7 @@ jobs:
     # close-stale job and the nix-npm-hash escape hatch, which both key on
     # pull_request.user.login.
     if: github.event_name == 'pull_request_target' && github.event.pull_request.user.login != 'dependabot[bot]'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions:
       issues: write
       pull-requests: write
@@ -151,7 +151,7 @@ jobs:
 
   close-stale:
     if: github.event_name == 'schedule'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions:
       issues: write
       pull-requests: write

@@ -22,7 +22,7 @@ env:
 jobs:
   validate:
     name: Validate Version
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     # Required-reviewer gate. Pauses every release (tag push or manual
     # dispatch) until njbrake approves in the Actions UI. The whole pipeline
     # waits here, so no build compute or release publish runs without sign-off.
@@ -188,7 +188,7 @@ jobs:
   release:
     name: Create Release
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions:
       contents: write
     steps:
@@ -268,7 +268,7 @@ jobs:
   publish-clawhub:
     name: Publish to ClawHub
     needs: release
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     env:
       CLAWHUB_TOKEN: ${{ secrets.CLAWHUB_TOKEN }}
     steps:
