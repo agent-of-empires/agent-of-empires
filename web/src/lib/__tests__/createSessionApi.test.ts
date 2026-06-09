@@ -29,6 +29,8 @@ describe("createSession hooks-trust handling (#2066)", () => {
           error: "hooks_need_trust",
           message: "Repository hooks require trust.",
           on_create: ["bash scripts/setup-worktree.sh"],
+          on_launch: ["npm start"],
+          on_destroy: ["rm /tmp/seed"],
           needs_mcp_trust: true,
         }),
         { status: 403 },
@@ -40,19 +42,21 @@ describe("createSession hooks-trust handling (#2066)", () => {
     expect(result.ok).toBe(false);
     expect(result.hooksNeedTrust).toEqual({
       onCreate: ["bash scripts/setup-worktree.sh"],
+      onLaunch: ["npm start"],
+      onDestroy: ["rm /tmp/seed"],
       needsMcpTrust: true,
     });
     expect(result.error).toBe("Repository hooks require trust.");
   });
 
-  it("defaults on_create to [] and needsMcpTrust to false when omitted", async () => {
+  it("defaults the hook lists to [] and needsMcpTrust to false when omitted", async () => {
     fetchSpy.mockResolvedValue(
       new Response(JSON.stringify({ error: "hooks_need_trust", message: "trust me" }), { status: 403 }),
     );
 
     const result = await createSession(BODY);
 
-    expect(result.hooksNeedTrust).toEqual({ onCreate: [], needsMcpTrust: false });
+    expect(result.hooksNeedTrust).toEqual({ onCreate: [], onLaunch: [], onDestroy: [], needsMcpTrust: false });
   });
 
   it("forwards trust_hooks: true in the request body", async () => {

@@ -397,9 +397,11 @@
       "risk": "high",
       "specs": [
         "src/components/session-wizard/__tests__/HooksTrustDialog.test.tsx",
+        "src/components/session-wizard/__tests__/SessionWizard.hooksTrust.test.tsx",
         "src/lib/__tests__/createSessionApi.test.ts"
       ],
       "components": [
+        "web/src/components/session-wizard/SessionWizard.tsx",
         "web/src/components/session-wizard/HooksTrustDialog.tsx",
         "web/src/lib/api.ts"
       ]

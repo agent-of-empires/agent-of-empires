@@ -2342,6 +2342,12 @@ fn upsert_instance(
 struct HooksNeedTrust {
     /// The `on_create` commands that would run, for display in the prompt.
     on_create: Vec<String>,
+    /// The `on_launch` commands the same approval would trust. They don't run
+    /// on this create, but the recorded trust covers them for every later
+    /// session (TUI/CLI included), so the prompt must show them too.
+    on_launch: Vec<String>,
+    /// Likewise for `on_destroy`, run when a session is deleted.
+    on_destroy: Vec<String>,
     /// True when the repo's `.mcp.json` also needs approval at this fingerprint.
     needs_mcp_trust: bool,
 }
@@ -2420,20 +2426,22 @@ fn resolve_create_hook_plan(
     // creates the session when MCP is declined. A passed `trust_hooks` still
     // records MCP trust below, bundling approval the way the CLI does.
     if trust.hooks.needs_trust() && !trust_hooks_requested {
-        let repo_hooks = match &trust.hooks {
+        // Approving trusts the repo's whole hooks hash, so the refusal must
+        // carry every hook type the trust would cover (on_launch runs on every
+        // later session start, on_destroy on delete), not just on_create;
+        // mirrors hook_display_groups in the CLI/TUI prompts.
+        let merged = match &trust.hooks {
             TrustSurface::Trusted(h) | TrustSurface::NeedsTrust { config: h, .. } => {
-                Some(h.clone())
+                repo_config::merge_hooks_for_display(profile, h)
             }
-            TrustSurface::Absent => None,
-        };
-        let on_create = match repo_hooks {
-            Some(h) => repo_config::merge_hooks_for_display(profile, &h).on_create,
-            None => repo_config::resolve_global_profile_hooks(profile)
-                .map(|h| h.on_create)
-                .unwrap_or_default(),
+            TrustSurface::Absent => {
+                repo_config::resolve_global_profile_hooks(profile).unwrap_or_default()
+            }
         };
         return Err(anyhow::Error::new(HooksNeedTrust {
-            on_create,
+            on_create: merged.on_create,
+            on_launch: merged.on_launch,
+            on_destroy: merged.on_destroy,
             needs_mcp_trust: trust.mcp.needs_trust(),
         }));
     }
@@ -3094,6 +3102,8 @@ pub async fn create_session(
                         "error": "hooks_need_trust",
                         "message": "Repository hooks require trust. Resubmit with trust_hooks: true to approve.",
                         "on_create": needs_trust.on_create,
+                        "on_launch": needs_trust.on_launch,
+                        "on_destroy": needs_trust.on_destroy,
                         "needs_mcp_trust": needs_trust.needs_mcp_trust,
                     })),
                 )
@@ -5251,6 +5261,13 @@ mod tests {
         std::env::set_var("HOME", temp_home.path());
         let _app_dir = isolated_app_dir(temp_home.path());
         let project = project_with_on_create_hooks(&["bash scripts/setup-worktree.sh"]);
+        // Approval trusts the whole hooks hash, so the refusal must surface
+        // every hook type, not just on_create.
+        std::fs::write(
+            project.path().join(".agent-of-empires/config.toml"),
+            "[hooks]\non_create = [\"bash scripts/setup-worktree.sh\"]\non_launch = [\"npm start\"]\non_destroy = [\"rm -rf /tmp/seed\"]\n",
+        )
+        .unwrap();
 
         let err = resolve_create_hook_plan("default", project.path(), false, false)
             .expect_err("untrusted hooks must be refused");
@@ -5262,6 +5279,12 @@ mod tests {
             vec!["bash scripts/setup-worktree.sh".to_string()],
             "the refused error must carry the commands for the prompt"
         );
+        assert_eq!(
+            needs_trust.on_launch,
+            vec!["npm start".to_string()],
+            "approval also trusts on_launch, so the prompt must show it"
+        );
+        assert_eq!(needs_trust.on_destroy, vec!["rm -rf /tmp/seed".to_string()]);
         assert!(!needs_trust.needs_mcp_trust);
     }
 

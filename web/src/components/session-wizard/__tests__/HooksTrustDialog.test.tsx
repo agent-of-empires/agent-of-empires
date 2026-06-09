@@ -21,6 +21,8 @@ afterEach(() => {
 function setup(
   overrides: {
     onCreate?: string[];
+    onLaunch?: string[];
+    onDestroy?: string[];
     needsMcpTrust?: boolean;
     onConfirm?: () => Promise<void> | void;
   } = {},
@@ -30,6 +32,8 @@ function setup(
   const utils = render(
     <HooksTrustDialog
       onCreate={overrides.onCreate ?? ["bash scripts/setup-worktree.sh", "cp .env.example .env"]}
+      onLaunch={overrides.onLaunch ?? []}
+      onDestroy={overrides.onDestroy ?? []}
       needsMcpTrust={overrides.needsMcpTrust ?? false}
       onConfirm={onConfirm}
       onCancel={onCancel}
@@ -44,6 +48,22 @@ describe("HooksTrustDialog (#2066)", () => {
     const list = getByTestId("hooks-trust-list");
     expect(list.textContent).toContain("bash scripts/setup-worktree.sh");
     expect(list.textContent).toContain("cp .env.example .env");
+  });
+
+  it("lists on_launch and on_destroy groups only when non-empty", () => {
+    const { getByTestId } = setup({ onLaunch: ["npm start"], onDestroy: ["rm /tmp/seed"] });
+    const list = getByTestId("hooks-trust-list");
+    expect(list.textContent).toContain("on_launch");
+    expect(list.textContent).toContain("npm start");
+    expect(list.textContent).toContain("on_destroy");
+    expect(list.textContent).toContain("rm /tmp/seed");
+  });
+
+  it("omits empty hook groups", () => {
+    const { getByTestId } = setup();
+    const list = getByTestId("hooks-trust-list");
+    expect(list.textContent).not.toContain("on_launch");
+    expect(list.textContent).not.toContain("on_destroy");
   });
 
   it("mentions .mcp.json only when it also needs trust", () => {

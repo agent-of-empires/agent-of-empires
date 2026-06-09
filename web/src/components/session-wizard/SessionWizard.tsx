@@ -440,6 +440,8 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
       {hooksTrust && (
         <HooksTrustDialog
           onCreate={hooksTrust.info.onCreate}
+          onLaunch={hooksTrust.info.onLaunch}
+          onDestroy={hooksTrust.info.onDestroy}
           needsMcpTrust={hooksTrust.info.needsMcpTrust}
           onConfirm={handleHooksTrustConfirm}
           onCancel={handleHooksTrustCancel}

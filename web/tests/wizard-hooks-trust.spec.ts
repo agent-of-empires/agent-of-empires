@@ -68,6 +68,8 @@ async function mockApis(page: Page, calls: Calls) {
         error: "hooks_need_trust",
         message: "Repository hooks require trust. Resubmit with trust_hooks: true to approve.",
         on_create: ["bash scripts/setup-worktree.sh", "cp .env.example .env"],
+        on_launch: ["npm run dev-seed"],
+        on_destroy: [],
         needs_mcp_trust: false,
       },
     });
@@ -104,6 +106,8 @@ test.describe("Wizard on_create hooks-trust confirmation (#2066)", () => {
     await expect(dialog).toBeVisible();
     await expect(dialog).toContainText("bash scripts/setup-worktree.sh");
     await expect(dialog).toContainText("cp .env.example .env");
+    // Approval trusts the whole hooks hash, so on_launch is listed too.
+    await expect(dialog).toContainText("npm run dev-seed");
     // The initial (untrusted) attempt was refused; nothing trusted yet.
     await expect.poll(() => calls.createWithoutTrust).toBe(1);
     expect(calls.createWithTrust).toBe(0);

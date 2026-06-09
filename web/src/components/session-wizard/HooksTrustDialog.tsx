@@ -3,6 +3,11 @@ import { useCallback, useEffect, useRef, useState } from "react";
 interface Props {
   /** The `on_create` commands that will run once approved. */
   onCreate: string[];
+  /** The `on_launch` commands the same approval trusts (run on every later
+   *  session start, including TUI/CLI ones). */
+  onLaunch: string[];
+  /** The `on_destroy` commands the same approval trusts (run on delete). */
+  onDestroy: string[];
   /** Whether the repo's `.mcp.json` also needs approval. */
   needsMcpTrust: boolean;
   onConfirm: () => Promise<void> | void;
@@ -16,7 +21,14 @@ interface Props {
  * Mirrors the native TUI trust dialog and the CLI `--trust-hooks` prompt, and
  * shares the VolumeIgnoresGlobDialog layout.
  */
-export function HooksTrustDialog({ onCreate, needsMcpTrust, onConfirm, onCancel }: Props) {
+export function HooksTrustDialog({ onCreate, onLaunch, onDestroy, needsMcpTrust, onConfirm, onCancel }: Props) {
+  // Approval trusts the repo's whole hooks hash, so every hook type the trust
+  // covers is listed, mirroring the CLI/TUI prompts (hook_display_groups).
+  const groups = [
+    { name: "on_create", commands: onCreate },
+    { name: "on_launch", commands: onLaunch },
+    { name: "on_destroy", commands: onDestroy },
+  ].filter((g) => g.commands.length > 0);
   const [confirming, setConfirming] = useState(false);
   const confirmButtonRef = useRef<HTMLButtonElement | null>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
@@ -83,17 +95,24 @@ export function HooksTrustDialog({ onCreate, needsMcpTrust, onConfirm, onCancel 
         {/* Body */}
         <div className="px-5 py-4 space-y-3">
           <p className="text-[13px] text-text-secondary">
-            This repository defines <span className="font-mono text-text-primary">on_create</span> hooks. They run on
-            your machine when the session is created. Review the commands below before approving.
+            This repository defines lifecycle hooks. They run on your machine; approving trusts every hook type listed
+            below, not only the ones that run now. Review the commands before approving.
           </p>
 
-          <ul className="space-y-1 max-h-40 overflow-y-auto" data-testid="hooks-trust-list">
-            {onCreate.map((cmd, i) => (
-              <li key={i} className="text-[13px] font-mono text-text-primary break-all">
-                {cmd}
-              </li>
+          <div className="space-y-2 max-h-40 overflow-y-auto" data-testid="hooks-trust-list">
+            {groups.map((group) => (
+              <div key={group.name}>
+                <div className="text-[11px] font-mono text-text-dim">{group.name}:</div>
+                <ul className="space-y-1">
+                  {group.commands.map((cmd, i) => (
+                    <li key={i} className="text-[13px] font-mono text-text-primary break-all pl-3">
+                      {cmd}
+                    </li>
+                  ))}
+                </ul>
+              </div>
             ))}
-          </ul>
+          </div>
 
           {needsMcpTrust && (
             <p className="text-[12px] text-text-dim">
