@@ -60,6 +60,20 @@ fn prompt_until_accepted(h: &TuiTestHarness, session_id: &str, timeout: Duration
         if out.status.success() {
             return;
         }
+        // Only the "no live worker yet" 404 is an expected transient while the
+        // reconciler recovers the orphaned runner; the client renders every
+        // such 404 as "... not found on the daemon". Any other failure (a 500,
+        // a transport error, a real regression) should fail fast instead of
+        // being masked as a 45s timeout.
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if !stderr.contains("not found on the daemon") {
+            panic!(
+                "acp prompt failed with an unexpected error before recovery.\n\
+                 stdout: {}\n stderr: {}",
+                String::from_utf8_lossy(&out.stdout),
+                stderr,
+            );
+        }
         if Instant::now() >= deadline {
             let ps = h.run_cli(&["acp", "ps", "--json"]);
             panic!(
