@@ -3544,7 +3544,9 @@ impl HomeView {
                 // row, or switches the live target when already in live
                 // mode. `SelectOnly` stops at the cursor update above so
                 // the user can browse preview content without ever
-                // entering live-send; double-click still activates via
+                // entering live-send (and, if a *different* row was already
+                // live, exits live mode so keystrokes don't stay aimed at the
+                // old session); double-click still activates via
                 // `default_attach_mode`. `click_action` returns `None`
                 // for structured view-mode sessions, where `start_live_send`
                 // already short-circuits, so the historical fall-through
@@ -3555,6 +3557,21 @@ impl HomeView {
                         Some(crate::session::ClickAction::SelectOnly)
                     )
                 {
+                    // The click only moves the cursor, but if we're live-sending
+                    // to a *different* row, leave live mode rather than stranding
+                    // keystrokes on the old session while the cursor / preview
+                    // walks away. In `LiveSend` mode the `start_live_send` branch
+                    // below already retargets, so this only matters for the
+                    // select-only (and archived) gesture, which is precisely a
+                    // "stop touching that, let me look at this" intent.
+                    if let Some(state) = self
+                        .live_send
+                        .as_ref()
+                        .filter(|s| s.session_id != id)
+                        .cloned()
+                    {
+                        self.exit_live_send_and_restore_sizing(&state);
+                    }
                     None
                 } else {
                     self.start_live_send()

@@ -6707,6 +6707,78 @@ mod click_to_select {
 
     #[test]
     #[serial]
+    fn select_only_click_on_different_row_exits_live_mode() {
+        // With `click_action = SelectOnly`, clicking a *different* row while
+        // live-sending must leave live mode (otherwise keystrokes stay aimed at
+        // the old session while the cursor/preview walk away). The click still
+        // emits no action and still moves the cursor.
+        use super::live_send::{LiveSendState, LiveSendTarget};
+        use crate::session::config::{save_config, ClickAction, Config};
+        let mut env = create_test_env_with_sessions(3);
+        setup_inner(&mut env);
+        env.view.cursor = 0;
+        env.view.update_selected();
+
+        let mut config = Config::default();
+        config.session.click_action = ClickAction::SelectOnly;
+        save_config(&config).unwrap();
+
+        let live_id = env.view.selected_session.clone().unwrap();
+        env.view.live_send = Some(LiveSendState {
+            session_id: live_id,
+            title: "live".to_string(),
+            tmux_name: "aoe_test_live".to_string(),
+            target: LiveSendTarget::Agent,
+            exit_chords: Vec::new(),
+            leader: None,
+        });
+
+        let action = env.view.handle_click(5, 3);
+        assert_eq!(action, None, "SelectOnly click never emits an action");
+        assert_eq!(env.view.cursor, 2, "the click still moves the cursor");
+        assert!(
+            env.view.live_send.is_none(),
+            "clicking a different row in SelectOnly mode must exit live mode"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn select_only_click_on_live_row_stays_live() {
+        // Clicking the row that's already live-sending is not a "leave" gesture:
+        // the cursor is already there, so SelectOnly must not tear down live mode.
+        use super::live_send::{LiveSendState, LiveSendTarget};
+        use crate::session::config::{save_config, ClickAction, Config};
+        let mut env = create_test_env_with_sessions(3);
+        setup_inner(&mut env);
+        // Row 3 resolves to index 2, so make index 2 the live row.
+        env.view.cursor = 2;
+        env.view.update_selected();
+
+        let mut config = Config::default();
+        config.session.click_action = ClickAction::SelectOnly;
+        save_config(&config).unwrap();
+
+        let live_id = env.view.selected_session.clone().unwrap();
+        env.view.live_send = Some(LiveSendState {
+            session_id: live_id,
+            title: "live".to_string(),
+            tmux_name: "aoe_test_live".to_string(),
+            target: LiveSendTarget::Agent,
+            exit_chords: Vec::new(),
+            leader: None,
+        });
+
+        let action = env.view.handle_click(5, 3);
+        assert_eq!(action, None, "SelectOnly click never emits an action");
+        assert!(
+            env.view.live_send.is_some(),
+            "clicking the already-live row must not exit live mode"
+        );
+    }
+
+    #[test]
+    #[serial]
     fn single_click_on_archived_row_selects_without_reviving() {
         // A parked (archived) session has had its pane killed. Single-clicking
         // it is a "let me look" gesture and must NOT resurrect it: no
