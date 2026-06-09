@@ -578,6 +578,10 @@ pub struct HomeView {
     pub(super) pending_attach_after_warning: Option<String>,
     /// Session to stop after the confirmation dialog is accepted
     pub(super) pending_stop_session: Option<String>,
+    /// Sandbox image to pull after the "image update available" confirm dialog
+    /// is accepted. Carries the image through the generic `ConfirmDialog`,
+    /// which only knows its action string.
+    pub(super) pending_image_pull: Option<String>,
     /// Session to force-remove after the confirmation dialog is accepted
     pub(super) pending_force_remove_session: Option<String>,
     /// Action emitted by a mouse-click on a modal dialog (e.g. clicking
@@ -1137,6 +1141,7 @@ impl HomeView {
             pending_paste: None,
             pending_attach_after_warning: None,
             pending_stop_session: None,
+            pending_image_pull: None,
             pending_force_remove_session: None,
             pending_dialog_click_action: None,
             search_active: false,

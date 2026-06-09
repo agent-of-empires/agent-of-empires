@@ -634,6 +634,13 @@ pub struct AppStateConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dismissed_update_version: Option<String>,
 
+    /// Registry digest of the sandbox image the user dismissed the
+    /// "image update available" banner for. The banner stays hidden while the
+    /// registry still resolves to this digest and returns automatically once a
+    /// newer image is published (the digest no longer matches).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dismissed_image_digest: Option<String>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub home_list_width: Option<u16>,
 

@@ -14,6 +14,7 @@ use super::attached_status_hooks::AttachedStatusHookWatcher;
 use super::home::{HomeView, TerminalMode};
 use super::status_poller::StatusUpdate;
 use super::styles::Theme;
+use crate::containers::image_update::ImageUpdate;
 use crate::session::{get_update_settings, save_config, Config};
 use crate::tmux::AvailableTools;
 use crate::update::{check_for_update, UpdateInfo};
@@ -92,6 +93,18 @@ pub struct App {
     /// fetched latest_version equals this value, and returns
     /// automatically when a newer release ships.
     dismissed_update_version: Option<String>,
+    /// A newer sandbox image detected in its registry, surfaced as the
+    /// lowest-priority bottom banner (below app-update and transient status).
+    /// `None` until the background check finds a drift the user hasn't snoozed.
+    image_update: Option<ImageUpdate>,
+    image_update_rx: Option<tokio::sync::oneshot::Receiver<anyhow::Result<Option<ImageUpdate>>>>,
+    /// In-flight `docker pull` of the sandbox image, kicked off when the user
+    /// accepts the banner's confirm. Result promotes into a transient toast.
+    image_pull_rx: Option<tokio::sync::oneshot::Receiver<anyhow::Result<()>>>,
+    /// Registry digest the user dismissed via Ctrl+x on the image banner.
+    /// Persisted to `app_state.dismissed_image_digest`; the banner stays hidden
+    /// while the registry still resolves to this digest.
+    dismissed_image_digest: Option<String>,
     /// Held in an Option so `with_raw_mode_disabled` can drop it before
     /// spawning child processes. Crossterm's EventStream runs a background
     /// reader thread on stdin; if it's alive when tmux attach-session starts,
@@ -280,6 +293,7 @@ impl App {
         }
 
         let dismissed_update_version = config.app_state.dismissed_update_version.clone();
+        let dismissed_image_digest = config.app_state.dismissed_image_digest.clone();
 
         Ok(Self {
             home,
@@ -291,6 +305,10 @@ impl App {
             update_status: None,
             update_status_rx: None,
             dismissed_update_version,
+            image_update: None,
+            image_update_rx: None,
+            image_pull_rx: None,
+            dismissed_image_digest,
             event_stream: Some(EventStream::new()),
             // Initial state matches whatever `tui::run` did at startup: capture
             // is requested by default, but Mosh suppresses the actual escape, so
@@ -495,6 +513,14 @@ impl App {
             } else {
                 None
             };
+
+        // Check the sandbox image for a newer registry build, once at startup.
+        // Gated on the same network-checks toggle as app updates, and only for
+        // users who actually run sandboxed sessions (so non-sandbox users never
+        // see a docker banner).
+        if settings.update_check_mode.is_enabled() && self.sandbox_in_use() {
+            self.spawn_image_update_check();
+        }
 
         // SIGHUP/SIGTERM futures so we exit cleanly when the terminal
         // emulator is force-quit, preventing PTY slot leaks (#541).
@@ -1136,6 +1162,19 @@ impl App {
                 refresh_needed = true;
                 needs_full_refresh = true;
             }
+            // The sandbox-image banner and its pull toast share the same
+            // bottom-row layout slot, so treat their changes as full-refresh
+            // work too.
+            if self.poll_image_update_check() {
+                self.needs_redraw = true;
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+            if self.poll_image_pull_status() {
+                self.needs_redraw = true;
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
 
             if last_status_refresh.elapsed() >= STATUS_REFRESH_INTERVAL {
                 self.home.request_status_refresh();
@@ -1430,6 +1469,7 @@ impl App {
             &self.theme,
             self.update_info.as_ref(),
             status_text,
+            self.image_update.as_ref(),
         );
         // Sampled trace for frame-budget diagnostics. A full-frame trace on
         // every paint would dominate the log at `default_level = trace`, so
@@ -1546,6 +1586,120 @@ impl App {
         }
 
         true
+    }
+
+    /// Whether the user runs sandboxed sessions, so a docker-image banner is
+    /// worth surfacing. True when sandbox is on by default or any current
+    /// session is sandboxed; otherwise we skip the registry check entirely.
+    fn sandbox_in_use(&self) -> bool {
+        if Config::load_or_warn().sandbox.enabled_by_default {
+            return true;
+        }
+        self.home.instances().iter().any(|i| i.is_sandboxed())
+    }
+
+    /// Is the sandbox-image banner the one currently shown? It sits below the
+    /// app-update banner and transient toast, so it only owns the `u`/Ctrl+x
+    /// keys when neither of those is up.
+    fn image_banner_active(&self) -> bool {
+        self.image_update.is_some() && self.update_info.is_none() && self.update_status.is_none()
+    }
+
+    /// Spawn the background sandbox-image staleness check. Mirrors
+    /// `spawn_update_check`: the result lands on `image_update_rx` for the
+    /// main loop's `poll_image_update_check` to pick up.
+    fn spawn_image_update_check(&mut self) {
+        if self.image_update_rx.is_some() {
+            return;
+        }
+        let image = Config::load_or_warn().sandbox.default_image.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.image_update_rx = Some(rx);
+        tokio::spawn(async move {
+            let result = crate::containers::image_update::check_for_image_update(&image).await;
+            let _ = tx.send(result);
+        });
+    }
+
+    /// Poll the image-update check (non-blocking). Returns true when a fresh,
+    /// non-snoozed update just arrived and the banner should show.
+    fn poll_image_update_check(&mut self) -> bool {
+        let Some(mut rx) = self.image_update_rx.take() else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(Ok(Some(update))) => {
+                // Honor the per-digest snooze; a newer image clears it
+                // automatically because its digest no longer matches.
+                if self.dismissed_image_digest.as_deref() == Some(update.remote_digest.as_str()) {
+                    return false;
+                }
+                self.image_update = Some(update);
+                true
+            }
+            Ok(Ok(None)) => false,
+            Ok(Err(e)) => {
+                tracing::debug!(target: "containers.image_update", error = %e, "image update check failed");
+                false
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                self.image_update_rx = Some(rx);
+                false
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => false,
+        }
+    }
+
+    /// Kick off a `docker pull` of the sandbox image after the user accepts the
+    /// banner's confirm dialog. The blocking pull runs on a std thread (the
+    /// runtime call shells out); the result promotes into a transient toast.
+    fn spawn_image_pull(&mut self, image: String) {
+        if self.image_pull_rx.is_some() {
+            return;
+        }
+        self.update_status = Some(UpdateStatus::transient(format!("pulling {image}…")));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.image_pull_rx = Some(rx);
+        std::thread::spawn(move || {
+            use crate::containers::ContainerRuntimeInterface;
+            let result = crate::containers::get_container_runtime()
+                .pull_image(&image)
+                .map_err(anyhow::Error::from);
+            let _ = tx.send(result);
+        });
+    }
+
+    /// Poll the in-progress image pull. On success the banner clears (the local
+    /// copy now matches the registry) and a confirmation toast shows. Returns
+    /// true when the status line changed.
+    fn poll_image_pull_status(&mut self) -> bool {
+        let Some(mut rx) = self.image_pull_rx.take() else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(Ok(())) => {
+                self.image_update = None;
+                self.update_status = Some(UpdateStatus::transient(
+                    "sandbox image updated. New sessions will use it.".into(),
+                ));
+                true
+            }
+            Ok(Err(e)) => {
+                self.update_status =
+                    Some(UpdateStatus::transient(format!("image pull failed: {e}")));
+                true
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                self.image_pull_rx = Some(rx);
+                false
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                self.update_status = Some(UpdateStatus::transient(
+                    "image pull ended unexpectedly".into(),
+                ));
+                true
+            }
+        }
     }
 
     /// Kick off a background install when `update_check_mode = "auto"` and a
@@ -1726,6 +1880,21 @@ fn persist_dismissed_update_version(version: Option<String>) {
             target: "update.snooze",
             error = %e,
             "failed to persist dismissed_update_version"
+        );
+    }
+}
+
+/// Persist `app_state.dismissed_image_digest` so dismissing the sandbox-image
+/// banner (Ctrl+x) survives restarts. Like the update snooze, failures are
+/// logged but never surfaced.
+fn persist_dismissed_image_digest(digest: Option<String>) {
+    let mut config = Config::load_or_warn();
+    config.app_state.dismissed_image_digest = digest;
+    if let Err(e) = save_config(&config) {
+        tracing::warn!(
+            target: "containers.image_update",
+            error = %e,
+            "failed to persist dismissed_image_digest"
         );
     }
 }
@@ -1917,9 +2086,24 @@ impl App {
             // a beat (visible flash). Ratatui's diff renderer handles the
             // 1-row layout shrink on the next normal draw.
             (KeyCode::Char('x'), KeyModifiers::CONTROL)
-                if (self.update_info.is_some() || self.update_status.is_some())
+                if (self.update_info.is_some()
+                    || self.update_status.is_some()
+                    || self.image_update.is_some())
                     && !self.home.has_dialog() =>
             {
+                // The image banner is lowest priority, so Ctrl+x only dismisses
+                // it when it's the one actually showing. Otherwise it targets
+                // the app update / toast as before, leaving any pending image
+                // update to surface once those clear.
+                if self.image_banner_active() {
+                    if let Some(update) = self.image_update.as_ref() {
+                        let digest = update.remote_digest.clone();
+                        self.dismissed_image_digest = Some(digest.clone());
+                        persist_dismissed_image_digest(Some(digest));
+                    }
+                    self.image_update = None;
+                    return Ok(());
+                }
                 if let Some(info) = self.update_info.as_ref() {
                     let v = info.latest_version.clone();
                     self.dismissed_update_version = Some(v.clone());
@@ -1927,6 +2111,19 @@ impl App {
                 }
                 self.update_info = None;
                 self.update_status = None;
+                return Ok(());
+            }
+            // `u` on the sandbox-image banner opens the pull confirm. The app
+            // update owns `u` via the home bindings, but the image banner only
+            // shows when no app update is up (see `image_banner_active`), so
+            // there's no collision.
+            (KeyCode::Char('u'), KeyModifiers::NONE)
+                if self.image_banner_active() && !self.home.has_dialog() =>
+            {
+                if let Some(update) = self.image_update.as_ref() {
+                    let image = update.image.clone();
+                    self.home.prompt_pull_sandbox_image(image);
+                }
                 return Ok(());
             }
             _ => {}
@@ -2093,6 +2290,15 @@ impl App {
             }
             Action::SetTransientStatus(text) => {
                 self.update_status = Some(UpdateStatus::transient(text));
+            }
+            Action::SpawnImagePull(image) => {
+                if self.image_pull_rx.is_some() {
+                    self.update_status = Some(UpdateStatus::transient(
+                        "image pull already in progress".into(),
+                    ));
+                    return Ok(());
+                }
+                self.spawn_image_pull(image);
             }
             Action::SendMessage(id, message) => {
                 // Flip the row to Starting and show a toast so the user has
@@ -2584,6 +2790,10 @@ pub enum Action {
     SetTheme(String),
     SpawnUpdate(crate::update::install::InstallMethod, String),
     SetTransientStatus(String),
+    /// Pull the sandbox image after the user accepts the "image update
+    /// available" banner's confirm. Deferred to `execute_action` so the loop
+    /// can show a "pulling…" status before the blocking pull starts.
+    SpawnImagePull(String),
     /// Send a message to a session. Deferred to `execute_action` (rather
     /// than handled inline in the dialog Submit branch) so the app loop
     /// can render a "Reviving..." status before the potentially-slow
