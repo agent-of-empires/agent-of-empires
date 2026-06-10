@@ -894,41 +894,6 @@ describe("useTerminal lifecycle", () => {
     }
   });
 
-  it("sendData routes a string payload to the WS as bytes", async () => {
-    const div = document.createElement("div");
-    document.body.appendChild(div);
-    try {
-      const { result } = renderHook(() => {
-        const term = useTerminal("s-send", "ws", false, false);
-        if (term.containerRef && !term.containerRef.current) {
-          (term.containerRef as unknown as { current: HTMLDivElement | null }).current = div;
-        }
-        return term;
-      });
-      await flushAsync();
-      const ws = sockets[0]!;
-      act(() => {
-        ws.readyState = FakeWebSocket.OPEN;
-        ws.onopen?.(new Event("open"));
-      });
-      await flushAsync();
-      const before = ws.sent.length;
-      act(() => {
-        result.current.sendData("hello");
-      });
-      const newBytes = ws.sent.slice(before).find((m) => {
-        if (typeof m === "string") return false;
-        const ascii = Array.from(m)
-          .map((b) => String.fromCharCode(b))
-          .join("");
-        return ascii === "hello";
-      });
-      expect(newBytes).toBeDefined();
-    } finally {
-      div.remove();
-    }
-  });
-
   it("window 'focus' sends an activate message", async () => {
     const div = document.createElement("div");
     document.body.appendChild(div);

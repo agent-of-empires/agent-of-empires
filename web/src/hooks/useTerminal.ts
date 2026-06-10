@@ -1574,12 +1574,6 @@ export function useTerminal(
     };
   });
 
-  const sendData = useCallback((data: string) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(new TextEncoder().encode(data));
-    }
-  }, []);
-
   const activate = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({ type: "activate" } as ActivateMessage));
@@ -1591,7 +1585,6 @@ export function useTerminal(
     termRef,
     state,
     manualReconnect,
-    sendData,
     activate,
     maxRetries: MAX_RETRIES,
   };
