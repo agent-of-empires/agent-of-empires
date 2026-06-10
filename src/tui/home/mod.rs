@@ -973,8 +973,8 @@ fn drop_disk_watch_entry(entry: DiskWatchEntry) {
 /// `dialog_acknowledged` latches once the dialog is shown and clears
 /// only after every source returns to healthy, so the user is notified
 /// once per failure burst, not once per tick. The dialog body aggregates
-/// every currently-failing source (storage and config) into a single
-/// message.
+/// every currently-failing source (storage, config, disk-watcher init,
+/// config-watcher init) into a single message.
 #[derive(Default)]
 pub(super) struct ReloadFailureState {
     storage_failed: bool,
@@ -2230,7 +2230,7 @@ impl HomeView {
             return false;
         }
 
-        self.info_dialog = Some(InfoDialog::new(title, &body));
+        self.info_dialog = Some(InfoDialog::sized_to_fit(title, &body));
         if needs_ack {
             self.reload_failure_state.acknowledge_dialog();
         }
