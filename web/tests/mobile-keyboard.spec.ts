@@ -162,19 +162,21 @@ test.describe("Mobile keyboard detection and layout", () => {
     await expect(page.getByRole("button", { name: "Open keyboard" })).toBeVisible();
   });
 
-  test("keyboard open button hidden when proxy focused", async ({ page }) => {
+  test("keyboard FAB tracks input focus, not viewport heuristics", async ({ page }) => {
     await setupAndOpen(page);
 
-    // Focus the hidden proxy input to simulate keyboard opening
+    // On a touch device the keyboard is open exactly when the live input
+    // has focus; the FAB icon follows focus directly, so no viewport
+    // simulation is needed (or consulted).
+    await expect(page.getByRole("button", { name: "Open keyboard" })).toBeVisible();
     await page.evaluate(() => {
-      const proxy = document.querySelector<HTMLInputElement>('input[autocapitalize="none"]');
-      proxy?.focus();
+      document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Live terminal input"]')?.focus();
     });
-
-    await simulateKeyboardOpen(page, 300);
-    await page.waitForTimeout(200);
-
-    await expect(page.getByRole("button", { name: "Open keyboard" })).not.toBeVisible();
+    await expect(page.getByRole("button", { name: "Close keyboard" })).toBeVisible();
+    await page.evaluate(() => {
+      document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Live terminal input"]')?.blur();
+    });
+    await expect(page.getByRole("button", { name: "Open keyboard" })).toBeVisible();
   });
 
   test("scrollToBottom fires when keyboard opens", async ({ page }) => {

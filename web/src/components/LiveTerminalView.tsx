@@ -33,8 +33,15 @@ export function LiveTerminalView({ session, active = true }: Props) {
   const [ensureState, setEnsureState] = useState<"pending" | "ready" | "error">("pending");
   const [ensureError, setEnsureError] = useState<string | null>(null);
   const live = useLiveTerminal(ensureState === "ready" ? session.id : null);
-  const { keyboardOpen, keyboardHeight } = useMobileKeyboard();
+  // Only the iOS-regular-Safari bottom inset comes from the viewport
+  // hook. Keyboard open/closed state does NOT: on a touch device the
+  // keyboard is open exactly when our input has focus, and focus events
+  // are ground truth where viewport-occlusion heuristics misread.
+  const { keyboardHeight } = useMobileKeyboard();
+  const [inputFocused, setInputFocused] = useState(false);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  // Stable placeholder for the toolbar's xterm-era prop.
+  const nullTermRef = useRef(null);
   const [ctrlActive, setCtrlActive] = useState(false);
   const ctrlActiveRef = useRef(false);
   useEffect(() => {
@@ -119,9 +126,9 @@ export function LiveTerminalView({ session, active = true }: Props) {
   const toggleKeyboard = useCallback(() => {
     const ta = inputRef.current;
     if (!ta) return;
-    if (keyboardOpen) ta.blur();
+    if (inputFocused) ta.blur();
     else ta.focus();
-  }, [keyboardOpen]);
+  }, [inputFocused]);
 
   if (ensureState === "pending") {
     return (
@@ -186,16 +193,17 @@ export function LiveTerminalView({ session, active = true }: Props) {
           ctrlActiveRef={ctrlActiveRef}
           clearCtrl={() => setCtrlActive(false)}
           inputRef={inputRef}
+          onInputFocusChange={setInputFocused}
         />
-        {live.state.connected && <KeyboardFab keyboardOpen={keyboardOpen} onToggle={toggleKeyboard} />}
+        {live.state.connected && <KeyboardFab keyboardOpen={inputFocused} onToggle={toggleKeyboard} />}
       </div>
 
       {live.state.connected && (
         <MobileTerminalToolbar
           sendData={live.sendData}
-          termRef={{ current: null }}
+          termRef={nullTermRef}
           inputElRef={inputRef}
-          keyboardOpen={keyboardOpen}
+          keyboardOpen={inputFocused}
           parentHandlesKeyboardInset
           ctrlActive={ctrlActive}
           onCtrlToggle={() => setCtrlActive((v) => !v)}

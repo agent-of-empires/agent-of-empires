@@ -1,14 +1,9 @@
 // Desktop (fine-pointer) agent terminal: the xterm.js + PTY attach relay.
 // Touch devices render LiveTerminalView instead (capture-snapshot live
 // mode); TerminalView.tsx dispatches between the two.
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useTerminal } from "../hooks/useTerminal";
-import { useMobileKeyboard } from "../hooks/useMobileKeyboard";
-import { MobileTerminalToolbar } from "./MobileTerminalToolbar";
-import { BackToLiveButton } from "./BackToLiveButton";
-import { KeyboardFab } from "./KeyboardFab";
 import { ensureSession } from "../lib/api";
-import { safeSetItem } from "../lib/safeStorage";
 import type { SessionResponse } from "../lib/types";
 import {
   FOCUS_TERMINAL_EVENT,
@@ -21,30 +16,18 @@ import "@xterm/xterm/css/xterm.css";
 interface Props {
   session: SessionResponse;
   active?: boolean;
-  /** When false (the default) the switch-to-structured view pill is hidden
-   *  entirely so it only shows where switching to the structured view is
-   *  actually offered. */
 }
-
-const SCROLL_HINT_SEEN_KEY = "aoe-mobile-scroll-hint-seen";
-const SCROLL_HINT_TIMEOUT_MS = 8000;
 
 export function XtermTerminalView({ session, active = true }: Props) {
   const [ensureState, setEnsureState] = useState<"pending" | "ready" | "error">("pending");
   const [ensureError, setEnsureError] = useState<string | null>(null);
-  const {
-    containerRef,
-    termRef,
-    state,
-    manualReconnect,
-    sendData,
-    activate,
-    exitScrollback,
-    ctrlActiveRef,
-    clearCtrlRef,
-    maxRetries,
-  } = useTerminal(ensureState === "ready" ? session.id : null, "ws", active, session.claude_fullscreen, active);
-  const { isMobile, keyboardOpen, keyboardOcclusion } = useMobileKeyboard();
+  const { containerRef, termRef, state, manualReconnect, activate, maxRetries } = useTerminal(
+    ensureState === "ready" ? session.id : null,
+    "ws",
+    active,
+    session.claude_fullscreen,
+    active,
+  );
   const [trackedSessionId, setTrackedSessionId] = useState(session.id);
   if (session.id !== trackedSessionId) {
     setTrackedSessionId(session.id);
@@ -52,12 +35,7 @@ export function XtermTerminalView({ session, active = true }: Props) {
     setEnsureError(null);
   }
   const lastEnsuredSessionIdRef = useRef<string | null>(null);
-  const [ctrlActive, setCtrlActive] = useState(false);
   const [termFocused, setTermFocused] = useState(false);
-  // On mobile, pad the viewport by the live keyboard occlusion so the
-  // terminal pane shrinks while the soft keyboard is up and grows back when
-  // it dismisses. On desktop keyboardOcclusion stays 0 and this is a no-op.
-  const appliedKeyboardPadding = keyboardOcclusion;
 
   const focusSelf = useCallback(() => {
     const ta = termRef.current?.element?.querySelector("textarea");
@@ -67,18 +45,6 @@ export function XtermTerminalView({ session, active = true }: Props) {
     }
     return false;
   }, [termRef]);
-
-  // Sync React state → hook ref in an effect. The mobile toolbar toggles
-  // `ctrlActive` but the onData callback reads the ref to decide whether
-  // to transform the next keystroke. Writing refs during render trips
-  // react-hooks/refs; a commit-phase effect does the same work without
-  // tripping the lint.
-  useEffect(() => {
-    ctrlActiveRef.current = ctrlActive;
-  });
-  useEffect(() => {
-    clearCtrlRef.current = () => setCtrlActive(false);
-  }, [clearCtrlRef]);
 
   useEffect(() => {
     if (lastEnsuredSessionIdRef.current === session.id) {
@@ -131,26 +97,6 @@ export function XtermTerminalView({ session, active = true }: Props) {
     });
   }, [session.id, active, activate]);
 
-  const [hintDismissed, setHintDismissed] = useState(() => {
-    try {
-      return localStorage.getItem(SCROLL_HINT_SEEN_KEY) === "1";
-    } catch {
-      return true;
-    }
-  });
-  const showScrollHint = isMobile && state.connected && !hintDismissed;
-
-  // Padding changes on the parent (first keyboard open, orientation
-  // flip, fullscreen toggle) shrink the terminal container. The hook's
-  // ResizeObserver picks the new size up and refits the grid; a debounced
-  // window resize event nudges anything else that's watching layout.
-  useLayoutEffect(() => {
-    const t = setTimeout(() => {
-      window.dispatchEvent(new Event("resize"));
-    }, 150);
-    return () => clearTimeout(t);
-  }, [appliedKeyboardPadding]);
-
   // Cmd+` shortcut focuses this terminal when "agent" is the dispatched target.
   useEffect(() => {
     const onFocusEvent = (e: Event) => {
@@ -161,43 +107,6 @@ export function XtermTerminalView({ session, active = true }: Props) {
     window.addEventListener(FOCUS_TERMINAL_EVENT, onFocusEvent);
     return () => window.removeEventListener(FOCUS_TERMINAL_EVENT, onFocusEvent);
   }, [focusSelf]);
-
-  // Auto-keyboard-open on initial connect removed (#1178): the
-  // KeyboardFab is always visible and lets the user open the keyboard
-  // explicitly. Popping the soft keyboard on every session open is the
-  // wrong default for navigation, especially read-only check-ins.
-
-  // Toggle keyboard: focus/blur MUST be the first thing in this handler
-  // so iOS considers it part of the user-gesture chain. Anything before
-  // focus() (even a synchronous ws.send) can break iOS keyboard display.
-  // Claim primary after the focus so the PTY resizes to this viewport.
-  const toggleKeyboard = useCallback(() => {
-    const term = termRef.current;
-    if (!term?.element) return;
-    const ta = term.element.querySelector("textarea");
-    if (keyboardOpen) {
-      ta?.blur();
-    } else if (ta instanceof HTMLElement) {
-      ta.focus();
-    }
-    activate();
-  }, [termRef, keyboardOpen, activate]);
-
-  // Dismiss scroll hint on first touch or timeout.
-  useEffect(() => {
-    if (!showScrollHint) return;
-    const markSeen = () => {
-      setHintDismissed(true);
-      safeSetItem(SCROLL_HINT_SEEN_KEY, "1");
-    };
-    const t = setTimeout(markSeen, SCROLL_HINT_TIMEOUT_MS);
-    const c = containerRef.current;
-    c?.addEventListener("touchmove", markSeen, { once: true });
-    return () => {
-      clearTimeout(t);
-      c?.removeEventListener("touchmove", markSeen);
-    };
-  }, [showScrollHint, containerRef]);
 
   if (ensureState === "pending") {
     return (
@@ -220,15 +129,8 @@ export function XtermTerminalView({ session, active = true }: Props) {
     );
   }
 
-  // Pad the viewport by the live keyboard occlusion so the pane tracks the
-  // soft keyboard: it shrinks when the keyboard opens and grows back when it
-  // closes. The hook debounces the occlusion so one open/close is one PTY
-  // resize, not a storm during the keyboard animation.
-  const rootStyle = {
-    paddingBottom: appliedKeyboardPadding > 0 ? appliedKeyboardPadding : undefined,
-  } as const;
   return (
-    <div className="flex-1 flex flex-col overflow-hidden relative md:bg-surface-800 md:pb-1.5" style={rootStyle}>
+    <div className="flex-1 flex flex-col overflow-hidden relative md:bg-surface-800 md:pb-1.5">
       {!state.connected && state.reconnecting && (
         <div className="bg-status-waiting/15 border-b border-status-waiting/30 px-4 py-1.5 flex items-center gap-2 shrink-0">
           <span className="text-xs text-status-waiting">
@@ -266,36 +168,7 @@ export function XtermTerminalView({ session, active = true }: Props) {
             </span>
           </div>
         )}
-
-        {showScrollHint && (
-          <div
-            aria-hidden="true"
-            className="absolute left-0 right-0 top-3 flex justify-center pointer-events-none motion-safe:animate-[fadeIn_300ms_ease-out]"
-          >
-            <span className="flex items-center gap-2 font-mono text-[13px] text-text-primary bg-surface-800/95 border border-surface-700 rounded-md px-3 py-2 shadow-lg backdrop-blur-sm">
-              <span aria-hidden="true" className="text-base leading-none">
-                {"\u21C5"}
-              </span>
-              Swipe to scroll
-            </span>
-          </div>
-        )}
-
-        {isMobile && state.isInScrollback && <BackToLiveButton onClick={exitScrollback} topOffset="top-3" />}
-
-        {isMobile && state.connected && <KeyboardFab keyboardOpen={keyboardOpen} onToggle={toggleKeyboard} />}
       </div>
-
-      {isMobile && state.connected && (
-        <MobileTerminalToolbar
-          sendData={sendData}
-          termRef={termRef}
-          keyboardOpen={keyboardOpen}
-          parentHandlesKeyboardInset
-          ctrlActive={ctrlActive}
-          onCtrlToggle={() => setCtrlActive((v) => !v)}
-        />
-      )}
     </div>
   );
 }

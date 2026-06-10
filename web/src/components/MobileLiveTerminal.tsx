@@ -62,6 +62,10 @@ export interface MobileLiveTerminalProps {
   /** Hidden input element, exposed so the keyboard FAB / toolbar can
    *  focus and blur it. */
   inputRef: RefObject<HTMLTextAreaElement | null>;
+  /** Focus tracking for the chrome: on touch devices focus == soft
+   *  keyboard visible, the deterministic alternative to occlusion
+   *  heuristics. */
+  onInputFocusChange: (focused: boolean) => void;
 }
 
 function segStyle(style: AnsiStyle): CSSProperties | undefined {
@@ -110,6 +114,7 @@ export function MobileLiveTerminal({
   ctrlActiveRef,
   clearCtrl,
   inputRef,
+  onInputFocusChange,
 }: MobileLiveTerminalProps) {
   const { settings, update } = useWebSettings();
   const [fontSize, setFontSize] = useState(() => settings.mobileFontSize);
@@ -563,7 +568,13 @@ export function MobileLiveTerminal({
         ref={inputRef}
         aria-label="Live terminal input"
         className="absolute bottom-2 left-2 w-px h-px opacity-0"
-        style={{ fontSize: "16px" }}
+        // iOS renders the system text caret in an overlay layer that
+        // IGNORES the element's opacity, so a focused hidden input grows
+        // a ghost caret floating over the terminal. caret-color is the
+        // documented off switch; color guards select-all artifacts.
+        style={{ fontSize: "16px", caretColor: "transparent", color: "transparent" }}
+        onFocus={() => onInputFocusChange(true)}
+        onBlur={() => onInputFocusChange(false)}
         autoCapitalize="off"
         autoCorrect="off"
         autoComplete="off"
