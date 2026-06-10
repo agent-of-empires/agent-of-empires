@@ -280,6 +280,68 @@ async fn reload_storage_only_keeps_disk_watch_scoped_in_single_profile_mode() {
     );
 }
 
+/// Locks the single-profile-mode scoping invariant for
+/// `rewire_after_profile_delete`. In `aoe --profile X` mode
+/// `can_delete_selected` requires `!p.is_active`, so the deleted
+/// profile is always a peer; the post-delete `list_profiles()`
+/// snapshot must not be passed verbatim to
+/// `rewire_disk_subscriptions` because peer-profile disk watches
+/// violate the single-profile-mode contract that the user opted
+/// into with `--profile X`. Disk targets are scoped to
+/// `self.storages.keys()` (the active profile), using the same
+/// shape `reload_storage_only` uses. Config watches stay full-set
+/// because peer config edits must propagate to the picker UI even
+/// in single-profile mode.
+#[tokio::test]
+#[serial]
+async fn rewire_after_profile_delete_keeps_disk_watch_scoped_in_single_profile_mode() {
+    let temp = TempDir::new().expect("tempdir");
+    isolate_home(temp.path());
+
+    let live = FileWatchService::new().expect("live svc");
+    crate::session::get_profile_dir("active-scoped").expect("seed active");
+    crate::session::get_profile_dir("peer-stays").expect("seed peer that stays");
+    crate::session::get_profile_dir("peer-deleted").expect("seed peer to delete");
+
+    let mut view = HomeView::new(
+        Some("active-scoped".to_string()),
+        crate::tmux::AvailableTools::with_tools(&["claude"]),
+        live.clone(),
+    )
+    .expect("HomeView::new");
+
+    let deleted_dir =
+        crate::session::get_profile_dir_path("peer-deleted").expect("peer-deleted path");
+    std::fs::remove_dir_all(&deleted_dir).expect("remove peer-deleted");
+
+    view.rewire_after_profile_delete("peer-deleted");
+
+    use super::ConfigWatchKey;
+    assert_eq!(
+        view.disk_watch_handles.len(),
+        1,
+        "single-profile mode must keep disk watches scoped to the active profile after a peer delete; \
+         got {} entries: {:?}",
+        view.disk_watch_handles.len(),
+        view.disk_watch_handles.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        view.disk_watch_handles.contains_key("active-scoped"),
+        "the active profile's disk watch must remain installed"
+    );
+    assert!(
+        view.config_watch_handles
+            .contains_key(&ConfigWatchKey::profile("peer-stays")),
+        "remaining peer profiles' CONFIG watches must stay wired (asymmetric design)"
+    );
+    assert!(
+        !view
+            .config_watch_handles
+            .contains_key(&ConfigWatchKey::profile("peer-deleted")),
+        "the deleted peer's config watch must be torn down"
+    );
+}
+
 /// When `list_profiles()` fails after a successful create or delete,
 /// `rewire_after_profile_delete` must surface a Watcher Warning to
 /// the user via `info_dialog` (in addition to logging a structured

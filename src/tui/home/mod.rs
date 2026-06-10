@@ -2091,7 +2091,12 @@ impl HomeView {
     pub(super) fn rewire_after_profile_delete(&mut self, profile_name: &str) {
         match crate::session::list_profiles() {
             Ok(profiles) => {
-                self.rewire_disk_subscriptions(&profiles);
+                let disk_targets: Vec<String> = if self.active_profile.is_some() {
+                    self.storages.keys().cloned().collect()
+                } else {
+                    profiles.clone()
+                };
+                self.rewire_disk_subscriptions(&disk_targets);
                 self.rewire_config_subscriptions(&profiles);
             }
             Err(e) => {
