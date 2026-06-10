@@ -22,7 +22,6 @@ import { clearStoredComments, sweepOrphanComments } from "./components/diff/comm
 import { SendCommentsDialog } from "./components/diff/comments/SendCommentsDialog";
 import { useCommandActions } from "./hooks/useCommandActions";
 import { useEdgeSwipe } from "./hooks/useEdgeSwipe";
-import { useMobileKeyboard } from "./hooks/useMobileKeyboard";
 import { useIsCoarsePointer } from "./hooks/useIsCoarsePointer";
 import { useIsWideViewport } from "./hooks/useIsWideViewport";
 import type { RightPanelView } from "./lib/rightPanelView";
@@ -1052,23 +1051,11 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     );
   };
 
-  // Root-height pin: an xterm.js surface needs the layout to NOT shrink
-  // with the soft keyboard (iOS PWA / iOS 26 Safari / Android Chrome
-  // shrink innerHeight and therefore 100dvh), because every layout
-  // shrink becomes a PTY resize and a SIGWINCH redraw storm. With the
-  // agent terminal now on the capture-snapshot live view (no PTY), the
-  // only mobile xterm surface left is the single-pane paired shell, so
-  // the pin applies there and nowhere else; the live view and the
-  // structured view both rely on the natural dvh shrink to keep their
-  // bottom-anchored UI above the keyboard (#1177, #1452).
-  const { isMobile, stableViewportHeight } = useMobileKeyboard();
-  const pairedFullViewport = singlePane && rightPanelView === "paired";
-  // Only the paired shell still hosts xterm.js on mobile; the agent
-  // terminal (capture-snapshot live view) and the structured view both
-  // want the natural `100dvh` shrink, which keeps their bottom-anchored
-  // surfaces above the keyboard with no occlusion math and no SIGWINCH.
-  const pinRootHeight = isMobile && stableViewportHeight > 0 && pairedFullViewport;
-  const rootStyle = pinRootHeight ? { height: `${stableViewportHeight}px` } : undefined;
+  // No root-height pin remains: every mobile terminal surface (agent,
+  // paired host, paired container) is the capture-snapshot live view
+  // now, with no PTY to protect from keyboard-driven layout shrink. The
+  // natural `100dvh` shrink keeps bottom-anchored UI above the keyboard
+  // everywhere (#1177, #1452 are fully superseded).
 
   const acpPrefs = useMemo(
     () => ({
@@ -1163,10 +1150,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
 
   return (
     <AcpPrefsProvider value={acpPrefs}>
-      <div
-        className="h-dvh flex flex-col bg-surface-900 text-text-primary overflow-hidden safe-area-inset"
-        style={rootStyle}
-      >
+      <div className="h-dvh flex flex-col bg-surface-900 text-text-primary overflow-hidden safe-area-inset">
         <TopBar
           activeWorkspace={activeWorkspace}
           activeSession={activeSession ?? null}

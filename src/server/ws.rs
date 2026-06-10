@@ -141,7 +141,7 @@ pub async fn paired_terminal_ws(
 /// dead, kills and recreates the tmux session in a blocking task before
 /// returning. The instance's `terminal_info.created` flag is updated in
 /// the in-memory store on successful recreate.
-async fn respawn_paired_if_dead(
+pub(crate) async fn respawn_paired_if_dead(
     state: &Arc<AppState>,
     id: &str,
     inst: &crate::session::Instance,
@@ -260,7 +260,7 @@ pub async fn container_terminal_ws(
 }
 
 /// Container-terminal counterpart of [`respawn_paired_if_dead`].
-async fn respawn_container_if_dead(
+pub(crate) async fn respawn_container_if_dead(
     state: &Arc<AppState>,
     id: &str,
     inst: &crate::session::Instance,

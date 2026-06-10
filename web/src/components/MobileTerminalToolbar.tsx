@@ -1,5 +1,4 @@
 import { useCallback, useState } from "react";
-import type { Terminal } from "@xterm/xterm";
 import type { RefObject } from "react";
 import { useLongPressDrag, type DragAxis } from "../hooks/useLongPressDrag";
 import { toastBus } from "../lib/toastBus";
@@ -43,22 +42,11 @@ function extractClipboardText(cd: DataTransfer | null): string {
 
 interface Props {
   sendData: (data: string) => void;
-  termRef: RefObject<Terminal | null>;
   keyboardOpen: boolean;
-  /**
-   * Set when the parent already pads its layout by the live keyboard
-   * occlusion (TerminalView). The strip then sits above the keyboard on its
-   * own and must not add an env() inset, which would double-count and shift
-   * the strip on every keyboard cycle. Optional: PairedTerminal (RightPanel)
-   * does not pad for the keyboard, so it omits this and the strip falls back
-   * to env(keyboard-inset-height) to lift itself above the keyboard.
-   */
-  parentHandlesKeyboardInset?: boolean;
   ctrlActive: boolean;
   onCtrlToggle: () => void;
-  /** Live-view mode: the hidden input element that owns keyboard focus
-   *  (there is no xterm Terminal). Preferred over termRef when set. */
-  inputElRef?: RefObject<HTMLTextAreaElement | null>;
+  /** The live view's hidden input element, which owns keyboard focus. */
+  inputElRef: RefObject<HTMLTextAreaElement | null>;
 }
 
 const ARROW_UP = "\x1b[A";
@@ -66,15 +54,7 @@ const ARROW_DOWN = "\x1b[B";
 const ARROW_LEFT = "\x1b[D";
 const ARROW_RIGHT = "\x1b[C";
 
-export function MobileTerminalToolbar({
-  sendData,
-  termRef,
-  keyboardOpen,
-  parentHandlesKeyboardInset = false,
-  ctrlActive,
-  onCtrlToggle,
-  inputElRef,
-}: Props) {
+export function MobileTerminalToolbar({ sendData, keyboardOpen, ctrlActive, onCtrlToggle, inputElRef }: Props) {
   const [upAxis, setUpAxis] = useState<DragAxis>("vertical");
   const [downAxis, setDownAxis] = useState<DragAxis>("vertical");
 
@@ -83,14 +63,10 @@ export function MobileTerminalToolbar({
   }, []);
 
   const refocusTerminal = useCallback(() => {
-    if (inputElRef) {
-      // Only re-focus if the input already had focus (keyboard open);
-      // a toolbar tap must not summon the keyboard on its own.
-      if (keyboardOpen) inputElRef.current?.focus();
-      return;
-    }
-    termRef.current?.focus();
-  }, [termRef, inputElRef, keyboardOpen]);
+    // Only re-focus if the input already had focus (keyboard open);
+    // a toolbar tap must not summon the keyboard on its own.
+    if (keyboardOpen) inputElRef.current?.focus();
+  }, [inputElRef, keyboardOpen]);
 
   const send = useCallback(
     (data: string) => {
@@ -117,15 +93,6 @@ export function MobileTerminalToolbar({
 
   const strip = "shrink-0 flex items-center gap-1 px-2 py-1.5 bg-surface-850 border-t border-surface-700/20";
 
-  // Parent (TerminalView) pads its layout by the live keyboard occlusion, so
-  // the strip already sits above the keyboard and must not add its own inset.
-  // RightPanel's paired terminal does not pad for the keyboard, so it omits
-  // the flag and the strip falls back to env(keyboard-inset-height) to lift
-  // itself above the keyboard.
-  const stripStyle = {
-    paddingBottom: parentHandlesKeyboardInset ? "0" : "env(keyboard-inset-height, 0px)",
-  };
-
   const arrowHint = (axis: DragAxis) =>
     axis !== "vertical" ? (
       <span
@@ -139,7 +106,6 @@ export function MobileTerminalToolbar({
   return (
     <div
       className={strip}
-      style={stripStyle}
       // Prevent toolbar taps from stealing focus away from the proxy input.
       // Without this, every button tap blurs the proxy and iOS closes the
       // soft keyboard. onClick handlers still fire normally.
@@ -255,9 +221,7 @@ export function MobileTerminalToolbar({
               return;
             }
           } else {
-            const ta =
-              inputElRef?.current ??
-              (termRef.current?.element?.querySelector("textarea") as HTMLTextAreaElement | null);
+            const ta = inputElRef.current;
             if (ta) {
               let recovered = "";
               const onPaste = (e: ClipboardEvent) => {

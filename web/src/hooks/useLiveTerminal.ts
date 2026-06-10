@@ -61,7 +61,7 @@ function contentLineCount(content: string): number {
   return n;
 }
 
-export function useLiveTerminal(sessionId: string | null) {
+export function useLiveTerminal(sessionId: string | null, wsPath: string = "live-ws") {
   const wsRef = useRef<WebSocket | null>(null);
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const countdownRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -122,7 +122,7 @@ export function useLiveTerminal(sessionId: string | null) {
     function connect() {
       if (disposed) return;
       const proto = location.protocol === "https:" ? "wss:" : "ws:";
-      const url = `${proto}//${location.host}/sessions/${sessionId}/live-ws`;
+      const url = `${proto}//${location.host}/sessions/${sessionId}/${wsPath}`;
       const token = getToken();
       let bindingSecret: string | null = null;
       try {
@@ -289,7 +289,7 @@ export function useLiveTerminal(sessionId: string | null) {
       wsRef.current = null;
       connectRef.current = null;
     };
-  }, [sessionId, setState]);
+  }, [sessionId, wsPath, setState]);
 
   const sendData = useCallback((data: string) => {
     const ws = wsRef.current;

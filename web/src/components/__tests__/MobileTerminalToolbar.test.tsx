@@ -2,8 +2,9 @@
 //
 // Unit tests for MobileTerminalToolbar's keyboard wiring (#1432). The strip
 // is never rendered under the chromium Playwright coverage run (pointer:coarse
-// does not match there), so these exercise it directly: the parent-handles-
-// inset padding switch and the keyboard-open paste fallback branch.
+// does not match there), so these exercise it directly: the keyboard-open
+// paste fallback branch and the Ctrl latch. The parent (a live terminal
+// view) always owns the keyboard inset now, so the strip carries none.
 
 import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -19,18 +20,17 @@ afterEach(() => {
 
 interface Overrides {
   keyboardOpen?: boolean;
-  parentHandlesKeyboardInset?: boolean;
   sendData?: (data: string) => void;
 }
 
 function renderToolbar(overrides: Overrides = {}) {
   const sendData = overrides.sendData ?? vi.fn();
+  const inputElRef = { current: null };
   const result = render(
     <MobileTerminalToolbar
       sendData={sendData}
-      termRef={{ current: null }}
+      inputElRef={inputElRef}
       keyboardOpen={overrides.keyboardOpen ?? false}
-      parentHandlesKeyboardInset={overrides.parentHandlesKeyboardInset}
       ctrlActive={false}
       onCtrlToggle={vi.fn()}
     />,
@@ -38,20 +38,11 @@ function renderToolbar(overrides: Overrides = {}) {
   return { ...result, sendData };
 }
 
-describe("MobileTerminalToolbar keyboard inset", () => {
-  it("sits flush (padding 0) when the parent already pads for the keyboard", () => {
-    const { container } = renderToolbar({ parentHandlesKeyboardInset: true });
+describe("MobileTerminalToolbar", () => {
+  it("carries no inline keyboard inset (the parent owns it)", () => {
+    const { container } = renderToolbar();
     const strip = container.firstChild as HTMLElement;
-    // jsdom normalizes the "0" string to "0px".
-    expect(strip.style.paddingBottom).toBe("0px");
-  });
-
-  it("does not pin to 0 when the parent does not handle the inset", () => {
-    const { container } = renderToolbar({ parentHandlesKeyboardInset: false });
-    const strip = container.firstChild as HTMLElement;
-    // The fallback uses env(keyboard-inset-height, 0px); whatever jsdom keeps,
-    // it must not be the flush "0px" the parent-handled case produces.
-    expect(strip.style.paddingBottom).not.toBe("0px");
+    expect(strip.style.paddingBottom).toBe("");
   });
 
   it("renders the action buttons", () => {
@@ -96,7 +87,7 @@ function CtrlLatchHarness({ sendData }: { sendData: (data: string) => void }) {
   return (
     <MobileTerminalToolbar
       sendData={sendData}
-      termRef={{ current: null }}
+      inputElRef={{ current: null }}
       keyboardOpen={false}
       ctrlActive={ctrlActive}
       onCtrlToggle={() => setCtrlActive((v) => !v)}

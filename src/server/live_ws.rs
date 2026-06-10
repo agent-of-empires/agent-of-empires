@@ -131,6 +131,75 @@ pub async fn live_terminal_ws(
     }
 }
 
+/// Live view for the paired host shell (TerminalSession). Mirrors the
+/// paired PTY route's pane revival so a dead shell heals on reconnect.
+pub async fn live_paired_terminal_ws(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    live_shell_ws(ws, state, id, "paired-live", |state, id, inst| {
+        Box::pin(super::ws::respawn_paired_if_dead(state, id, inst))
+    })
+    .await
+}
+
+/// Live view for the paired in-container shell.
+pub async fn live_container_terminal_ws(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    live_shell_ws(ws, state, id, "container-live", |state, id, inst| {
+        Box::pin(super::ws::respawn_container_if_dead(state, id, inst))
+    })
+    .await
+}
+
+type RespawnFn = for<'a> fn(
+    &'a Arc<AppState>,
+    &'a str,
+    &'a crate::session::Instance,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + 'a>,
+>;
+
+async fn live_shell_ws(
+    ws: WebSocketUpgrade,
+    state: Arc<AppState>,
+    id: String,
+    kind: &'static str,
+    respawn: RespawnFn,
+) -> axum::response::Response {
+    debug!(target: "terminal.ws", session = %id, kind = %kind, "ws route entered");
+    let instances = state.instances.read().await;
+    let inst = instances.iter().find(|i| i.id == id).cloned();
+    drop(instances);
+
+    let Some(inst) = inst else {
+        warn!(target: "terminal.ws", session = %id, kind = %kind, "session not found, returning 404");
+        return (axum::http::StatusCode::NOT_FOUND, "Session not found").into_response();
+    };
+
+    let tmux_name = match respawn(&state, &id, &inst).await {
+        Ok(name) => name,
+        Err(e) => {
+            warn!(target: "terminal.ws", session = %id, kind = %kind, "failed to revive shell: {}", e);
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to revive terminal",
+            )
+                .into_response();
+        }
+    };
+
+    let read_only = state.read_only;
+    let shutdown = state.shutdown.clone();
+    ws.protocols(["aoe-auth"])
+        .on_upgrade(move |socket| handle_live_ws(socket, tmux_name, read_only, shutdown))
+        .into_response()
+}
+
 async fn handle_live_ws(
     mut socket: WebSocket,
     tmux_name: String,
