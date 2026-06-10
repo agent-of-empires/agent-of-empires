@@ -367,6 +367,18 @@ pub fn build_response(
                         });
                     }
                 }
+                // An unanswered question is "required?" only: min_items /
+                // max_items constrain a selection the user actually made, so
+                // an optional field with min_items > 0 must not error when
+                // left blank.
+                if selected.is_empty() {
+                    if question.required {
+                        return Err(ElicitationValidationError::MissingRequired(
+                            question.field_key.clone(),
+                        ));
+                    }
+                    continue;
+                }
                 if let Some(min) = question.min_items {
                     if (selected.len() as u64) < min {
                         return Err(ElicitationValidationError::TooFewItems {
@@ -382,14 +394,6 @@ pub fn build_response(
                             max,
                         });
                     }
-                }
-                if selected.is_empty() {
-                    if question.required {
-                        return Err(ElicitationValidationError::MissingRequired(
-                            question.field_key.clone(),
-                        ));
-                    }
-                    continue;
                 }
                 content.insert(
                     question.field_key.clone(),
@@ -646,6 +650,25 @@ mod tests {
                 "question_0".into()
             ))
         );
+    }
+
+    #[test]
+    fn build_skips_optional_multiselect_with_min_items_when_blank() {
+        // An optional multi-select with min_items must not error when left
+        // blank: min_items only constrains an actual selection.
+        let mut e = sample_elicitation();
+        e.questions[1].min_items = Some(2);
+        let resp = build_response(
+            &e,
+            accept(vec![("question_0", AnswerValue::Text("Yes".into()))]),
+        )
+        .unwrap();
+        match resp.action {
+            ElicitationAction::Accept(a) => {
+                assert!(!a.content.unwrap_or_default().contains_key("tags"));
+            }
+            other => panic!("expected accept, got {other:?}"),
+        }
     }
 
     #[test]

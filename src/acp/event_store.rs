@@ -955,6 +955,47 @@ impl EventStore {
         rows.filter_map(|r| r.ok()).collect()
     }
 
+    /// Elicitation nonces from `ElicitationRequested` events on disk with
+    /// no matching `ElicitationResolved`. The elicitation parallel of
+    /// [`Self::unresolved_approval_nonces`]: lets the supervisor cancel
+    /// question cards whose responder oneshot died with the previous
+    /// daemon, so they don't reappear as dead 404 cards on replay.
+    pub fn unresolved_elicitation_nonces(&self, session_id: &str) -> Vec<Nonce> {
+        let conn = match self.conn.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let mut stmt = match conn.prepare(
+            "SELECT json_extract(event_json, '$.ElicitationRequested.elicitation.nonce') AS nonce
+             FROM acp_events
+             WHERE session_id = ?1
+               AND json_extract(event_json, '$.ElicitationRequested') IS NOT NULL
+               AND json_extract(event_json, '$.ElicitationRequested.elicitation.nonce') NOT IN (
+                   SELECT json_extract(event_json, '$.ElicitationResolved.nonce')
+                   FROM acp_events
+                   WHERE session_id = ?1
+                     AND json_extract(event_json, '$.ElicitationResolved') IS NOT NULL
+               )",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(target: "acp.event_store", "prepare unresolved_elicitation_nonces for {session_id}: {e}");
+                return Vec::new();
+            }
+        };
+        let rows = match stmt.query_map(params![session_id], |row| {
+            let nonce: String = row.get(0)?;
+            Ok(Nonce(nonce))
+        }) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(target: "acp.event_store", "query unresolved_elicitation_nonces for {session_id}: {e}");
+                return Vec::new();
+            }
+        };
+        rows.filter_map(|r| r.ok()).collect()
+    }
+
     /// True iff the session has a `UserPromptSent` whose turn never
     /// terminated (no later `Stopped` or `AgentStartupError`). Used at
     /// daemon startup to decide whether to synthesize a `Stopped` event

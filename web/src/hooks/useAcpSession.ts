@@ -387,6 +387,26 @@ export function classifyApprovalResolveResponse(
   };
 }
 
+/** Classify an elicitation-resolve response. Mirrors
+ *  `classifyApprovalResolveResponse`: a 204 or a 404 naming *this* nonce
+ *  (the question already resolved or was torn down server-side) both clear
+ *  the card; anything else surfaces an error. */
+export function classifyElicitationResolveResponse(
+  ok: boolean,
+  status: number,
+  detail: string,
+  nonce: string,
+): ApprovalResolveOutcome {
+  if (ok) return { kind: "resolved" };
+  if (status === 404 && /no pending elicitation/i.test(detail) && detail.includes(nonce)) {
+    return { kind: "resolved" };
+  }
+  return {
+    kind: "error",
+    message: `Could not resolve question (${status}). ${detail}`.trim(),
+  };
+}
+
 export function reducer(state: AcpState, action: Action): AcpState {
   if (action.kind === "frame") {
     return applyEvent(state, action.frame);
@@ -1162,7 +1182,7 @@ export function useAcpSession(
           },
         );
         const detail = res.ok ? "" : await safeText(res);
-        const outcome = classifyApprovalResolveResponse(res.ok, res.status, detail, nonce);
+        const outcome = classifyElicitationResolveResponse(res.ok, res.status, detail, nonce);
         if (outcome.kind === "resolved") {
           dispatch({ kind: "elicitation_resolved_locally", nonce });
         } else {

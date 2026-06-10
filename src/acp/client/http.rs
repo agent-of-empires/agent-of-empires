@@ -379,21 +379,23 @@ fn classify_error(status: StatusCode, body: &str, session_id: &str) -> HttpError
     }
 }
 
-/// Classify the response of an approval-resolve POST. Scoped to that
-/// endpoint (not the shared `check_status`, which replay/prompt/cancel use
-/// too) so only this path can mint `ApprovalGone`. A 404 whose body names
-/// *this* nonce means the approval already resolved server-side; anything
-/// else folds back into the generic classifier. See #1821.
+/// Classify the response of an approval- or elicitation-resolve POST.
+/// Scoped to those endpoints (not the shared `check_status`, which
+/// replay/prompt/cancel use too) so only this path can mint `ApprovalGone`.
+/// A 404 whose body names *this* nonce means the pending approval or
+/// elicitation already resolved server-side (a concurrent decision, a
+/// watchdog, or a torn-down request); the caller clears the card quietly
+/// rather than surfacing an error. Anything else folds back into the
+/// generic classifier. See #1821.
 fn classify_resolve_error(
     status: StatusCode,
     body: &str,
     nonce: &str,
     session_id: &str,
 ) -> HttpError {
-    if status == StatusCode::NOT_FOUND
-        && body.contains("no pending approval")
-        && body.contains(nonce)
-    {
+    let names_gone_target =
+        body.contains("no pending approval") || body.contains("no pending elicitation");
+    if status == StatusCode::NOT_FOUND && names_gone_target && body.contains(nonce) {
         HttpError::ApprovalGone
     } else {
         classify_error(status, body, session_id)
@@ -465,6 +467,16 @@ mod tests {
                 "s-1"
             ),
             HttpError::SessionNotFound(s) if s == "s-1"
+        ));
+        // A gone elicitation nonce is classified the same as a gone approval.
+        assert!(matches!(
+            classify_resolve_error(
+                StatusCode::NOT_FOUND,
+                "no pending elicitation with nonce abc-123",
+                "abc-123",
+                "s-1"
+            ),
+            HttpError::ApprovalGone
         ));
     }
 

@@ -7,8 +7,13 @@
 
 import { describe, expect, it } from "vitest";
 
-import { classifyApprovalResolveResponse, reducer, type Action } from "../useAcpSession";
-import { emptyAcpState, type Approval } from "../../lib/acpTypes";
+import {
+  classifyApprovalResolveResponse,
+  classifyElicitationResolveResponse,
+  reducer,
+  type Action,
+} from "../useAcpSession";
+import { emptyAcpState, type Approval, type Elicitation } from "../../lib/acpTypes";
 
 function approval(nonce: string): Approval {
   return {
@@ -54,6 +59,48 @@ describe("classifyApprovalResolveResponse", () => {
   it("treats a 500 as an error", () => {
     const out = classifyApprovalResolveResponse(false, 500, "boom", "n-1");
     expect(out.kind).toBe("error");
+  });
+});
+
+describe("classifyElicitationResolveResponse", () => {
+  it("treats a 204 success as resolved", () => {
+    expect(classifyElicitationResolveResponse(true, 204, "", "e-1")).toEqual({ kind: "resolved" });
+  });
+
+  it("treats a 404 naming this elicitation nonce as resolved", () => {
+    expect(classifyElicitationResolveResponse(false, 404, "no pending elicitation with nonce e-1", "e-1")).toEqual({
+      kind: "resolved",
+    });
+  });
+
+  it("treats a wrong-nonce or session-gone 404 as an error", () => {
+    expect(classifyElicitationResolveResponse(false, 404, "no pending elicitation with nonce other", "e-1").kind).toBe(
+      "error",
+    );
+    expect(classifyElicitationResolveResponse(false, 404, "session has no running acp", "e-1").kind).toBe("error");
+  });
+});
+
+describe("reducer elicitation_resolved_locally", () => {
+  function elicitation(nonce: string): Elicitation {
+    return {
+      nonce,
+      message: "Pick",
+      tool_call_id: null,
+      questions: [],
+      requested_at: new Date().toISOString(),
+      resolved: null,
+    };
+  }
+
+  it("drops the matching pending elicitation", () => {
+    const state = {
+      ...emptyAcpState(),
+      pendingElicitations: [elicitation("e-1"), elicitation("e-2")],
+    };
+    const action: Action = { kind: "elicitation_resolved_locally", nonce: "e-1" };
+    const next = reducer(state, action);
+    expect(next.pendingElicitations.map((e) => e.nonce)).toEqual(["e-2"]);
   });
 });
 

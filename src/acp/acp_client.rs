@@ -5920,10 +5920,13 @@ async fn handle_elicitation_request(
         Ok(elicitation) => elicitation,
         Err(e) => {
             // A schema we can't render (URL mode, or an MCP-server form
-            // with number/boolean fields). Decline so the agent continues
-            // rather than waiting on a card we'll never show.
-            warn!(target: "cockpit.acp", "unsupported elicitation, declining: {e}");
-            return responder.respond(CreateElicitationResponse::new(ElicitationAction::Decline));
+            // with number/boolean fields). Cancel rather than Decline: the
+            // question was never shown, so "user skipped" (Decline, empty
+            // answer) would misrepresent it; Cancel tells the agent the
+            // request could not be presented. Either way the turn does not
+            // hang on a card we'll never show.
+            warn!(target: "cockpit.acp", "unsupported elicitation, cancelling: {e}");
+            return responder.respond(CreateElicitationResponse::new(ElicitationAction::Cancel));
         }
     };
 
