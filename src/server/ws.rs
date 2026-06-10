@@ -355,14 +355,31 @@ pub async fn terminal_ws(
     }
 }
 
-/// Argv for the web attach: hide the tmux status line for this session,
-/// then attach, in one tmux invocation (`;` separates commands). The
-/// dashboard renders its own chrome, so the `Ctrl+b d to detach` footer
-/// is noise in every web view; the TUI/CLI attach paths re-assert their
-/// status-line preference via `apply_all_tmux_options`, so the hint
-/// survives where a real terminal renders it.
+/// Argv for the web attach: reset `window-size` to `latest`, hide the
+/// tmux status line, then attach, all in one tmux invocation (`;`
+/// separates commands).
+///
+/// The window-size reset matters because any detached resizer (the
+/// mobile live view's `resize-window`, the TUI preview sync) flips the
+/// option to `manual`, and a manual window ignores attached client
+/// sizes entirely: without the reset, a session last viewed from a
+/// phone stays pinned at the phone's grid when opened in a desktop
+/// browser (narrow content, unrendered bottom). The TUI attach path
+/// does the same reset via `reset_size_to_latest_client`.
+///
+/// The status line is hidden because the dashboard renders its own
+/// chrome, so the `Ctrl+b d to detach` footer is noise in every web
+/// view; the TUI/CLI attach paths re-assert their status-line
+/// preference via `apply_all_tmux_options`, so the hint survives where
+/// a real terminal renders it.
 fn attach_command_args(tmux_name: &str) -> Vec<String> {
     vec![
+        "set-option".into(),
+        "-t".into(),
+        tmux_name.into(),
+        "window-size".into(),
+        "latest".into(),
+        ";".into(),
         "set-option".into(),
         "-t".into(),
         tmux_name.into(),
@@ -1432,14 +1449,16 @@ mod tests {
     }
 
     #[test]
-    fn attach_args_hide_status_before_attaching() {
+    fn attach_args_reset_window_size_and_hide_status_before_attaching() {
         let args = attach_command_args("aoe_x_1");
-        let semi = args.iter().position(|a| a == ";").expect("chained");
+        let chunks: Vec<&[String]> = args.split(|a| a == ";").collect();
+        assert_eq!(chunks.len(), 3, "three chained tmux commands");
         assert_eq!(
-            &args[..semi],
-            ["set-option", "-t", "aoe_x_1", "status", "off"]
+            chunks[0],
+            ["set-option", "-t", "aoe_x_1", "window-size", "latest"]
         );
-        assert_eq!(&args[semi + 1..], ["attach-session", "-t", "aoe_x_1"]);
+        assert_eq!(chunks[1], ["set-option", "-t", "aoe_x_1", "status", "off"]);
+        assert_eq!(chunks[2], ["attach-session", "-t", "aoe_x_1"]);
     }
 
     #[tokio::test]
