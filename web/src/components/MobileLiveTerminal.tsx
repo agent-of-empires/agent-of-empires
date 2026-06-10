@@ -238,7 +238,11 @@ export function MobileLiveTerminal({
       // The user is reading scrollback; a keyboard transition there
       // must not yank them later.
       pendingHeightPinRef.current = false;
-    } else if (!movingUp && !touchActiveRef.current && (prev.target < 0 || pendingHeightPinRef.current || target > el.scrollTop)) {
+    } else if (
+      !movingUp &&
+      !touchActiveRef.current &&
+      (prev.target < 0 || pendingHeightPinRef.current || target > el.scrollTop)
+    ) {
       el.scrollTop = target;
       pendingHeightPinRef.current = false;
     }
