@@ -34,6 +34,16 @@ destructive_require_double_confirm = true
 
 The card clears as soon as your decision is accepted. If it already resolved on the daemon (a concurrent decision or a watchdog), resolving again clears it quietly instead of erroring.
 
+## Questions (AskUserQuestion)
+
+Some agents ask a structured multiple-choice question mid-turn rather than guessing. With `claude-agent-acp` this is the built-in `AskUserQuestion` tool; the daemon advertises the ACP form-elicitation capability so the agent surfaces it as a question card in the web dashboard:
+
+- **Single-choice** questions render as radio buttons, **multi-choice** as checkboxes, and a free-text "Other" field shows when the agent offers one.
+- **Submit** sends your selections back and the turn continues. **Skip** answers nothing (the agent proceeds without your input). **Cancel** aborts the tool call.
+- Required questions and any min/max selection limits are enforced before Submit; the daemon re-validates, so a stale or malformed answer never reaches the agent.
+
+The rich question form is web-only. In the native TUI the card shows the question with a pointer to answer it in the web dashboard, plus keys to skip or cancel from the transcript pane so a TUI-only session never stalls on a question.
+
 ### Notifications and sound
 
 When an approval lands and you're away from the dashboard, two channels fire:

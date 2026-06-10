@@ -150,8 +150,6 @@ pub struct PendingApproval {
 #[derive(Debug, Clone)]
 pub struct PendingElicitation {
     pub nonce: String,
-    /// The agent's question text, shown in the notice row.
-    pub prompt: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -405,7 +403,6 @@ impl AcpTranscript {
                 });
                 self.pending_elicitations.push(PendingElicitation {
                     nonce: elicitation.nonce.0.clone(),
-                    prompt: elicitation.message.clone(),
                 });
             }
             Event::ElicitationResolved { nonce, .. } => {

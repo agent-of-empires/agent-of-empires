@@ -18,6 +18,7 @@ import {
   type AcpAttachment,
   type AcpFrame,
   type AcpState,
+  type ElicitationResolution,
   type PromptAttachmentInput,
   type QueuedPrompt,
 } from "../lib/acpTypes";
@@ -51,6 +52,7 @@ export type Action =
   | { kind: "error"; message: string }
   | { kind: "clear_error" }
   | { kind: "approval_resolved_locally"; nonce: string }
+  | { kind: "elicitation_resolved_locally"; nonce: string }
   | { kind: "lagged_resolved" }
   | { kind: "reset" }
   | { kind: "hydrate"; state: AcpState }
@@ -417,6 +419,18 @@ export function reducer(state: AcpState, action: Action): AcpState {
       ...state,
       lastError: removed ? null : state.lastError,
       pendingApprovals,
+    };
+  }
+  if (action.kind === "elicitation_resolved_locally") {
+    // Optimistically drop the elicitation card once the server accepts the
+    // resolution (204) or reports the nonce gone (404), instead of waiting
+    // on the ElicitationResolved broadcast, which the seq dedupe can drop.
+    const pendingElicitations = state.pendingElicitations.filter((e) => e.nonce !== action.nonce);
+    const removed = pendingElicitations.length !== state.pendingElicitations.length;
+    return {
+      ...state,
+      lastError: removed ? null : state.lastError,
+      pendingElicitations,
     };
   }
   if (action.kind === "hydrate") {
@@ -1135,6 +1149,35 @@ export function useAcpSession(
     [sessionId],
   );
 
+  const resolveElicitation = useCallback(
+    async (nonce: string, resolution: ElicitationResolution) => {
+      if (!sessionId) return;
+      try {
+        const res = await fetch(
+          `/api/sessions/${encodeURIComponent(sessionId)}/acp/elicitations/${encodeURIComponent(nonce)}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(resolution),
+          },
+        );
+        const detail = res.ok ? "" : await safeText(res);
+        const outcome = classifyApprovalResolveResponse(res.ok, res.status, detail, nonce);
+        if (outcome.kind === "resolved") {
+          dispatch({ kind: "elicitation_resolved_locally", nonce });
+        } else {
+          dispatch({ kind: "error", message: outcome.message });
+        }
+      } catch (e) {
+        dispatch({
+          kind: "error",
+          message: `Network error resolving question: ${describeError(e)}`,
+        });
+      }
+    },
+    [sessionId],
+  );
+
   // Dispatch a prompt immediately, no queueing. Internal helper used by
   // both sendPrompt (when the turn is idle) and the drain effect below
   // (when popping the head of queuedPrompts on Stopped). The result tells
@@ -1624,6 +1667,7 @@ export function useAcpSession(
      *  transcript and the recovery framing are honest). See #1106. */
     hasEverOpened,
     resolveApproval,
+    resolveElicitation,
     sendPrompt,
     cancelPrompt,
     forceEndTurn,

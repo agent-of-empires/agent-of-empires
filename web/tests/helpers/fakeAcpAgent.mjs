@@ -304,6 +304,33 @@ async function emitSessionUpdates(sessionId, updates) {
       });
       continue;
     }
+    if (u && u.sessionUpdate === "elicitation_request") {
+      // AskUserQuestion rides ACP's form-mode `elicitation/create` request
+      // (not session/update). Translate the scripted entry into a real
+      // request and wait for the client's accept/decline/cancel so the
+      // elicitation spec can observe the card and resolve it.
+      await sendRequest("elicitation/create", {
+        mode: "form",
+        sessionId,
+        message: u.message ?? "Pick one",
+        requestedSchema: u.requestedSchema ?? {
+          type: "object",
+          properties: {
+            question_0: {
+              type: "string",
+              title: u.message ?? "Pick one",
+              oneOf: [
+                { const: "Yes", title: "Yes" },
+                { const: "No", title: "No" },
+              ],
+            },
+          },
+        },
+      }).catch((err) => {
+        process.stderr.write(`[fakeAcpAgent] elicitation/create rejected: ${JSON.stringify(err)}\n`);
+      });
+      continue;
+    }
     sendNotification("session/update", { sessionId, update: u });
     // Inter-update tick so the structured view reducer can apply each event in
     // order rather than batching them. Bumped from 1ms to 5ms after

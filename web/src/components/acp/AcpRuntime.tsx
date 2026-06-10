@@ -31,7 +31,14 @@ import { AssistantRuntimeProvider, useExternalStoreRuntime, type ThreadMessageLi
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import { useAcpSession } from "../../hooks/useAcpSession";
-import type { ActivityRow, ApprovalDecision, AcpState, PromptAttachmentInput, ToolCall } from "../../lib/acpTypes";
+import type {
+  ActivityRow,
+  ApprovalDecision,
+  AcpState,
+  ElicitationResolution,
+  PromptAttachmentInput,
+  ToolCall,
+} from "../../lib/acpTypes";
 import { hasTodoItemsArgsText, parseJsonObject } from "../../lib/acpArgs";
 import { useAgentProfile } from "../../lib/agentProfileContext";
 
@@ -72,6 +79,7 @@ export interface AcpContext {
   maxRetries: number;
   manualReconnect: () => void;
   resolveApproval: (nonce: string, decision: ApprovalDecision) => Promise<void>;
+  resolveElicitation: (nonce: string, resolution: ElicitationResolution) => Promise<void>;
   sendPrompt: (text: string, attachments?: PromptAttachmentInput[]) => Promise<void>;
   /** Attachments the composer has staged for the next send. Owned here
    *  (above the assistant-ui runtime) so `onNew` can attach them when
@@ -179,6 +187,7 @@ export function AcpRuntime({
         maxRetries: acp.maxRetries,
         manualReconnect: acp.manualReconnect,
         resolveApproval: acp.resolveApproval,
+        resolveElicitation: acp.resolveElicitation,
         sendPrompt: acp.sendPrompt,
         pendingAttachments,
         setPendingAttachments,

@@ -187,6 +187,49 @@ export interface Approval {
   } | null;
 }
 
+/** Mirror of `ElicitationFieldKind` in src/acp/elicitations.rs. */
+export type ElicitationFieldKind = "free_text" | "single_select" | "multi_select";
+
+export interface ElicitationOption {
+  value: string;
+  label: string;
+}
+
+export interface ElicitationQuestion {
+  field_key: string;
+  title?: string | null;
+  description?: string | null;
+  required: boolean;
+  kind: ElicitationFieldKind;
+  options: ElicitationOption[];
+  min_items?: number | null;
+  max_items?: number | null;
+}
+
+/** Mirror of `Elicitation` in src/acp/elicitations.rs: a normalized,
+ *  form-mode AskUserQuestion the structured view renders. */
+export interface Elicitation {
+  nonce: string;
+  message: string;
+  tool_call_id?: string | null;
+  questions: ElicitationQuestion[];
+  requested_at: string;
+  resolved?: {
+    outcome: ElicitationOutcome;
+    resolved_at: string;
+  } | null;
+}
+
+export type ElicitationOutcome = "Accepted" | "Declined" | "Cancelled";
+
+/** Resolution payload POSTed to
+ *  `/api/sessions/{id}/acp/elicitations/{nonce}`. Mirror of
+ *  `ElicitationResolution` (tag = "action"). */
+export type ElicitationResolution =
+  | { action: "accept"; answers: Record<string, string | string[]> }
+  | { action: "decline" }
+  | { action: "cancel" };
+
 /** Mirror of `StartupErrorDetail` in src/acp/state.rs. Serde's
  *  default for `#[serde(tag = "kind", ...)]` is internal tagging keyed
  *  on `kind`. Carries the structured remediation data the
@@ -290,6 +333,8 @@ export type AcpEvent =
     }
   | { ApprovalRequested: { approval: Approval } }
   | { ApprovalResolved: { nonce: string; decision: ApprovalDecision } }
+  | { ElicitationRequested: { elicitation: Elicitation } }
+  | { ElicitationResolved: { nonce: string; outcome: ElicitationOutcome } }
   | "SessionCleared"
   | "ConversationCompacted"
   | { DiffEmitted: { diff: DiffPreview } }
@@ -408,6 +453,8 @@ export interface AcpState {
   plan: Plan | null;
   inFlightTool: ToolCall | null;
   pendingApprovals: Approval[];
+  /** Pending AskUserQuestion elicitations awaiting a user answer. */
+  pendingElicitations: Elicitation[];
   recentDiffs: DiffPreview[];
   thinking: boolean;
   rateLimit: RateLimitInfo | null;
@@ -726,6 +773,7 @@ export function emptyAcpState(): AcpState {
     plan: null,
     inFlightTool: null,
     pendingApprovals: [],
+    pendingElicitations: [],
     recentDiffs: [],
     thinking: false,
     rateLimit: null,
@@ -887,6 +935,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       next.plan = null;
       next.mode = "Default";
       next.pendingApprovals = [];
+      next.pendingElicitations = [];
       // Capture the agent's cumulative cost snapshot as the new
       // baseline so the next UsageUpdate reports cost-since-clear
       // instead of session-lifetime cumulative. `sessionUsage.cost`
@@ -1053,6 +1102,16 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   if ("ApprovalResolved" in event) {
     const { nonce } = event.ApprovalResolved;
     next.pendingApprovals = next.pendingApprovals.filter((a) => a.nonce !== nonce);
+    return next;
+  }
+  if ("ElicitationRequested" in event) {
+    const e = event.ElicitationRequested.elicitation;
+    next.pendingElicitations = [...next.pendingElicitations, e];
+    return next;
+  }
+  if ("ElicitationResolved" in event) {
+    const { nonce } = event.ElicitationResolved;
+    next.pendingElicitations = next.pendingElicitations.filter((e) => e.nonce !== nonce);
     return next;
   }
   if ("DiffEmitted" in event) {
@@ -1528,6 +1587,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     sweepOpenToolCalls(next, frame.seq);
     next.thinking = false;
     next.pendingApprovals = [];
+    next.pendingElicitations = [];
     next.sessionUsage = null;
     // The new backend reports its own cumulative cost starting from
     // zero, so the prior agent's per-clear baseline does not apply.
