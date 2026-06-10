@@ -1,18 +1,27 @@
-// AskUserQuestion card. Renders a pending ACP form elicitation inline in
-// the conversation, matching ApprovalCard's visual language so it reads as
-// part of the same flow.
+// AskUserQuestion / elicitation card. Renders a pending ACP form
+// elicitation inline in the conversation, matching ApprovalCard's visual
+// language so it reads as part of the same flow.
 //
-// Single-select questions render as radios, multi-select as checkboxes,
-// and a plain string field (the AskUserQuestion "custom answer" box) as a
-// text input. Submit sends the chosen labels (ACP `accept`); Skip sends
-// `decline` (the agent continues with no answer); Cancel sends `cancel`
-// (aborts the tool call). Client-side validation mirrors the server's:
-// required questions must be answered and multi-select min/max enforced,
-// but the server re-validates so the browser is never the only gate.
+// AskUserQuestion is the common producer (single/multi-select questions
+// plus an "Other" free-text box), but the same form path also carries
+// arbitrary MCP-server elicitations, so the card renders the full ACP
+// form-schema surface: single-select -> radios, multi-select -> checkboxes,
+// string -> a text input (typed by `format`), number/integer -> a numeric
+// input, boolean -> a checkbox. Submit sends the answers (ACP `accept`);
+// Skip sends `decline` (the agent continues with no answer); Cancel sends
+// `cancel` (aborts the tool call). Client-side validation mirrors the
+// server's (required / length / range / pattern / item bounds), but the
+// server re-validates so the browser is never the only gate.
 
 import { useCallback, useMemo, useState } from "react";
 import { HelpCircle } from "lucide-react";
-import type { Elicitation, ElicitationQuestion, ElicitationResolution } from "../../lib/acpTypes";
+import type {
+  AnswerValue,
+  Elicitation,
+  ElicitationOption,
+  ElicitationQuestion,
+  ElicitationResolution,
+} from "../../lib/acpTypes";
 import { OFFLINE_TITLE, useServerDown } from "../../lib/connectionState";
 
 interface Props {
@@ -20,50 +29,136 @@ interface Props {
   onResolve: (resolution: ElicitationResolution) => Promise<void>;
 }
 
-/** Per-question answer state: a single value for free-text / single-select,
- *  a set of values for multi-select. */
+/** Per-question answer state: a single scalar (string for free-text /
+ *  single-select, the numeric input's raw text for number / integer,
+ *  "true" / "false" for boolean) plus a set of values for multi-select. */
 interface AnswerEntry {
   single: string;
   multi: Set<string>;
 }
 type AnswerMap = Record<string, AnswerEntry>;
 
+const EMPTY_ENTRY: AnswerEntry = { single: "", multi: new Set<string>() };
+
 /** Definite lookup: every question seeds an entry in `initialAnswers`,
  *  but indexed access is `T | undefined` under noUncheckedIndexedAccess,
  *  so fall back to an empty entry rather than spreading guards. */
 function entryFor(answers: AnswerMap, key: string): AnswerEntry {
-  return answers[key] ?? { single: "", multi: new Set<string>() };
+  return answers[key] ?? EMPTY_ENTRY;
 }
 
+const isNumeric = (kind: ElicitationQuestion["kind"]) => kind === "number" || kind === "integer";
+
+/** Seed answer state from each field's `default`, shaped to its kind. */
 function initialAnswers(questions: ElicitationQuestion[]): AnswerMap {
   const out: AnswerMap = {};
   for (const q of questions) {
-    out[q.field_key] = { single: "", multi: new Set() };
+    const entry: AnswerEntry = { single: "", multi: new Set() };
+    const d = q.default;
+    if (q.kind === "multi_select") {
+      if (Array.isArray(d)) entry.multi = new Set(d);
+    } else if (q.kind === "boolean") {
+      entry.single = d === true ? "true" : "false";
+    } else if (isNumeric(q.kind)) {
+      if (typeof d === "number") entry.single = String(d);
+    } else if (typeof d === "string") {
+      entry.single = d;
+    }
+    out[q.field_key] = entry;
   }
   return out;
 }
 
+/** Map a string `format` annotation to a native input type; unknown
+ *  formats fall back to plain text. */
+function inputTypeFor(format: string | null | undefined): string {
+  switch (format) {
+    case "email":
+      return "email";
+    case "uri":
+      return "url";
+    case "date":
+      return "date";
+    case "date-time":
+      return "datetime-local";
+    default:
+      return "text";
+  }
+}
+
+/** The adapter flattens an AskUserQuestion option's `description` into the
+ *  enum title as `"<label> — <description>"` (the structured option is
+ *  lost on the wire). The bare label survives as the option `value`, so when
+ *  the human label is exactly `value` + that separator we can recover the
+ *  two-tier label/description; otherwise the title is shown verbatim (a
+ *  generic MCP enum where `value` is a code and `label` is the display text). */
+const OPTION_DESC_SEP = " — ";
+function optionParts(opt: ElicitationOption): { label: string; description?: string } {
+  const prefix = `${opt.value}${OPTION_DESC_SEP}`;
+  if (opt.label.startsWith(prefix) && opt.label.length > prefix.length) {
+    return { label: opt.value, description: opt.label.slice(prefix.length) };
+  }
+  return { label: opt.label };
+}
+
+const labelOf = (q: ElicitationQuestion) => q.title || q.field_key;
+
 function validate(questions: ElicitationQuestion[], answers: AnswerMap): string | null {
   for (const q of questions) {
     const a = entryFor(answers, q.field_key);
+    const name = labelOf(q);
     if (q.kind === "multi_select") {
       const n = a.multi.size;
-      if (q.required && n === 0) return `Please answer: ${q.title || q.field_key}`;
-      if (q.min_items != null && n < q.min_items) return `Select at least ${q.min_items} for ${q.title || q.field_key}`;
-      if (q.max_items != null && n > q.max_items) return `Select at most ${q.max_items} for ${q.title || q.field_key}`;
-    } else if (q.required && a.single.trim() === "") {
-      return `Please answer: ${q.title || q.field_key}`;
+      if (q.required && n === 0) return `Please answer: ${name}`;
+      if (q.min_items != null && n > 0 && n < q.min_items) return `Select at least ${q.min_items} for ${name}`;
+      if (q.max_items != null && n > q.max_items) return `Select at most ${q.max_items} for ${name}`;
+    } else if (isNumeric(q.kind)) {
+      const v = a.single.trim();
+      if (v === "") {
+        if (q.required) return `Please answer: ${name}`;
+        continue;
+      }
+      const num = Number(v);
+      if (!Number.isFinite(num)) return `Enter a valid number for ${name}`;
+      if (q.kind === "integer" && !Number.isInteger(num)) return `${name} must be a whole number`;
+      if (q.minimum != null && num < q.minimum) return `${name} must be at least ${q.minimum}`;
+      if (q.maximum != null && num > q.maximum) return `${name} must be at most ${q.maximum}`;
+    } else if (q.kind === "boolean") {
+      // A checkbox always carries a definite value; nothing to validate.
+      continue;
+    } else {
+      // free_text / single_select
+      const v = a.single;
+      if (q.required && v.trim() === "") return `Please answer: ${name}`;
+      if (q.kind === "free_text" && v !== "") {
+        const len = [...v].length;
+        if (q.min_length != null && len < q.min_length) return `${name} must be at least ${q.min_length} characters`;
+        if (q.max_length != null && len > q.max_length) return `${name} must be at most ${q.max_length} characters`;
+        if (q.pattern) {
+          try {
+            if (!new RegExp(q.pattern).test(v)) return `${name} does not match the required format`;
+          } catch {
+            // An unparseable pattern is treated as no constraint, matching
+            // the server, which skips invalid regexes.
+          }
+        }
+      }
     }
   }
   return null;
 }
 
 function toResolution(questions: ElicitationQuestion[], answers: AnswerMap): ElicitationResolution {
-  const payload: Record<string, string | string[]> = {};
+  const payload: Record<string, AnswerValue> = {};
   for (const q of questions) {
     const a = entryFor(answers, q.field_key);
     if (q.kind === "multi_select") {
       if (a.multi.size > 0) payload[q.field_key] = [...a.multi];
+    } else if (isNumeric(q.kind)) {
+      const v = a.single.trim();
+      if (v !== "") payload[q.field_key] = Number(v);
+    } else if (q.kind === "boolean") {
+      payload[q.field_key] = a.single === "true";
     } else if (a.single.trim() !== "") {
       payload[q.field_key] = a.single;
     }
@@ -76,8 +171,6 @@ export function AskUserQuestionCard({ elicitation, onResolve }: Props) {
   const [phase, setPhase] = useState<"pending" | "submitting" | "rolled-back">("pending");
   const [answers, setAnswers] = useState<AnswerMap>(() => initialAnswers(elicitation.questions));
   const [error, setError] = useState<string | null>(null);
-
-  const single = elicitation.questions.length === 1;
 
   const setSingle = useCallback((field: string, value: string) => {
     setAnswers((prev) => ({ ...prev, [field]: { ...entryFor(prev, field), single: value } }));
@@ -126,11 +219,18 @@ export function AskUserQuestionCard({ elicitation, onResolve }: Props) {
       <div className="flex w-full items-center gap-2 border-b border-surface-800/60 px-3 py-2">
         <HelpCircle className="h-3.5 w-3.5 shrink-0 text-brand-500" />
         <span className="shrink-0 text-[11px] uppercase tracking-wider text-brand-500">Question</span>
-        {single && <span className="min-w-0 flex-1 truncate text-xs text-text-secondary">{elicitation.message}</span>}
+        {elicitation.title && (
+          <span className="min-w-0 flex-1 truncate text-xs text-text-secondary">{elicitation.title}</span>
+        )}
       </div>
 
       <div className="flex flex-col gap-4 px-3 py-3">
-        {!single && <p className="text-xs text-text-secondary">{elicitation.message}</p>}
+        {/* The full prompt wraps here rather than being truncated, so a long
+            question is never cut off. */}
+        <p className="whitespace-pre-wrap break-words text-xs text-text-secondary">{elicitation.message}</p>
+        {elicitation.description && (
+          <p className="whitespace-pre-wrap break-words text-[11px] text-text-dim">{elicitation.description}</p>
+        )}
         {elicitation.questions.map((q) => (
           <QuestionField
             key={q.field_key}
@@ -203,23 +303,62 @@ function QuestionField({
   // A radio group needs a stable per-question name so selections don't
   // bleed across questions in a multi-question form.
   const groupName = useMemo(() => `elicit-${question.field_key}`, [question.field_key]);
+  const inputClass =
+    "w-full rounded-md border border-surface-700 bg-surface-900 px-2 py-1.5 text-xs text-text-primary outline-none focus:border-brand-600 disabled:opacity-60";
 
   return (
     <fieldset className="min-w-0 border-0 p-0">
-      {question.title && (
+      {question.kind !== "boolean" && question.title && (
         <legend className="mb-1 text-xs font-medium text-text-secondary">
           {question.title}
           {question.required && <span className="ml-1 text-rose-400">*</span>}
         </legend>
       )}
-      {question.description && <p className="mb-1.5 text-[11px] text-text-dim">{question.description}</p>}
+      {question.kind !== "boolean" && question.description && (
+        <p className="mb-1.5 text-[11px] text-text-dim">{question.description}</p>
+      )}
 
-      {question.kind === "free_text" ? (
+      {question.kind === "boolean" ? (
+        <label
+          className={[
+            "flex cursor-pointer items-center gap-2 rounded-md border px-2 py-1.5 text-xs",
+            single === "true"
+              ? "border-brand-600 bg-brand-700/15 text-text-primary"
+              : "border-surface-700 bg-surface-900 text-text-secondary hover:bg-surface-800",
+            disabled ? "cursor-not-allowed opacity-60" : "",
+          ].join(" ")}
+        >
+          <input
+            type="checkbox"
+            className="accent-brand-600"
+            checked={single === "true"}
+            disabled={disabled}
+            onChange={(e) => onSetSingle(e.target.checked ? "true" : "false")}
+          />
+          <span className="min-w-0 break-words">
+            {question.title || "Yes"}
+            {question.required && <span className="ml-1 text-rose-400">*</span>}
+          </span>
+        </label>
+      ) : isNumeric(question.kind) ? (
         <input
-          type="text"
-          className="w-full rounded-md border border-surface-700 bg-surface-900 px-2 py-1.5 text-xs text-text-primary outline-none focus:border-brand-600 disabled:opacity-60"
+          type="number"
+          className={inputClass}
+          placeholder="Enter a number"
+          value={single}
+          step={question.kind === "integer" ? "1" : "any"}
+          min={question.minimum ?? undefined}
+          max={question.maximum ?? undefined}
+          disabled={disabled}
+          onChange={(e) => onSetSingle(e.target.value)}
+        />
+      ) : question.kind === "free_text" ? (
+        <input
+          type={inputTypeFor(question.format)}
+          className={inputClass}
           placeholder="Type your answer"
           value={single}
+          maxLength={question.max_length ?? undefined}
           disabled={disabled}
           onChange={(e) => onSetSingle(e.target.value)}
         />
@@ -228,11 +367,12 @@ function QuestionField({
           {question.options.map((opt) => {
             const isMulti = question.kind === "multi_select";
             const checked = isMulti ? multi.has(opt.value) : single === opt.value;
+            const { label, description } = optionParts(opt);
             return (
               <label
                 key={opt.value}
                 className={[
-                  "flex cursor-pointer items-center gap-2 rounded-md border px-2 py-1.5 text-xs",
+                  "flex cursor-pointer items-start gap-2 rounded-md border px-2 py-1.5 text-xs",
                   checked
                     ? "border-brand-600 bg-brand-700/15 text-text-primary"
                     : "border-surface-700 bg-surface-900 text-text-secondary hover:bg-surface-800",
@@ -242,12 +382,15 @@ function QuestionField({
                 <input
                   type={isMulti ? "checkbox" : "radio"}
                   name={isMulti ? undefined : groupName}
-                  className="accent-brand-600"
+                  className="mt-0.5 accent-brand-600"
                   checked={checked}
                   disabled={disabled}
                   onChange={() => (isMulti ? onToggleMulti(opt.value) : onSetSingle(opt.value))}
                 />
-                <span className="min-w-0 break-words">{opt.label}</span>
+                <span className="min-w-0 break-words">
+                  <span className={description ? "font-medium" : undefined}>{label}</span>
+                  {description && <span className="block text-[11px] text-text-dim">{description}</span>}
+                </span>
               </label>
             );
           })}

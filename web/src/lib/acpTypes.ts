@@ -188,12 +188,17 @@ export interface Approval {
 }
 
 /** Mirror of `ElicitationFieldKind` in src/acp/elicitations.rs. */
-export type ElicitationFieldKind = "free_text" | "single_select" | "multi_select";
+export type ElicitationFieldKind = "free_text" | "single_select" | "multi_select" | "number" | "integer" | "boolean";
 
 export interface ElicitationOption {
   value: string;
   label: string;
 }
+
+/** A pre-fill / submitted value. Mirror of `AnswerValue` (untagged): a
+ *  string for free-text / single-select, a list for multi-select, a number
+ *  for number / integer, a boolean for boolean. */
+export type AnswerValue = string | string[] | number | boolean;
 
 export interface ElicitationQuestion {
   field_key: string;
@@ -202,15 +207,34 @@ export interface ElicitationQuestion {
   required: boolean;
   kind: ElicitationFieldKind;
   options: ElicitationOption[];
+  /** Multi-select bounds. */
   min_items?: number | null;
   max_items?: number | null;
+  /** String bounds (free_text). */
+  min_length?: number | null;
+  max_length?: number | null;
+  /** Regex the string must match (free_text). */
+  pattern?: string | null;
+  /** Format annotation (`email` / `uri` / `date` / `date-time` / custom),
+   *  a UI hint mapped to an input type. */
+  format?: string | null;
+  /** Numeric bounds (number / integer). */
+  minimum?: number | null;
+  maximum?: number | null;
+  /** Pre-fill value, shaped to match the field kind. */
+  default?: AnswerValue | null;
 }
 
 /** Mirror of `Elicitation` in src/acp/elicitations.rs: a normalized,
- *  form-mode AskUserQuestion the structured view renders. */
+ *  form-mode elicitation the structured view renders. AskUserQuestion is
+ *  the common producer; MCP-server forms flow through the same path. */
 export interface Elicitation {
   nonce: string;
   message: string;
+  /** Schema-level heading (MCP forms may set one; AskUserQuestion does not). */
+  title?: string | null;
+  /** Schema-level description rendered under the message. */
+  description?: string | null;
   tool_call_id?: string | null;
   questions: ElicitationQuestion[];
   requested_at: string;
@@ -226,7 +250,7 @@ export type ElicitationOutcome = "Accepted" | "Declined" | "Cancelled";
  *  `/api/sessions/{id}/acp/elicitations/{nonce}`. Mirror of
  *  `ElicitationResolution` (tag = "action"). */
 export type ElicitationResolution =
-  | { action: "accept"; answers: Record<string, string | string[]> }
+  | { action: "accept"; answers: Record<string, AnswerValue> }
   | { action: "decline" }
   | { action: "cancel" };
 

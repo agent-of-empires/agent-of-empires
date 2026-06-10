@@ -766,6 +766,8 @@ mod tests {
         let elicitation = Elicitation {
             nonce: Nonce("e-1".into()),
             message: "Pick one".into(),
+            title: None,
+            description: None,
             tool_call_id: None,
             questions: Vec::new(),
             requested_at: Utc::now(),

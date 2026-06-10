@@ -3,8 +3,12 @@
 //! claude-agent-acp (>=0.44) re-enables the built-in `AskUserQuestion`
 //! tool only when the client advertises `elicitation.form`, then routes
 //! the question(s) to us as an `elicitation/create` request carrying a
-//! JSON-Schema form. This module owns the boundary between that raw ACP
-//! schema and a clean, web-facing view model:
+//! JSON-Schema form. The same `elicitation.form` capability also lets an
+//! MCP server attached to the agent collect arbitrary structured input,
+//! which arrives through the identical path with a richer schema (number,
+//! integer, boolean fields; length / range / pattern / format
+//! constraints; defaults). This module owns the boundary between that raw
+//! ACP schema and a clean, web-facing view model:
 //!
 //! - [`parse_elicitation`] turns a [`CreateElicitationRequest`] into a
 //!   normalized [`Elicitation`] (a list of questions with options),
@@ -26,7 +30,7 @@ use std::collections::BTreeMap;
 use agent_client_protocol::schema::{
     CreateElicitationRequest, CreateElicitationResponse, ElicitationAcceptAction,
     ElicitationAction, ElicitationContentValue, ElicitationMode, ElicitationPropertySchema,
-    ElicitationSchema, ElicitationScope, MultiSelectItems, StringPropertySchema,
+    ElicitationSchema, ElicitationScope, MultiSelectItems, StringFormat, StringPropertySchema,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -42,6 +46,11 @@ pub struct Elicitation {
     /// Human-readable prompt. For a single AskUserQuestion this is the
     /// question text; for multiple it is a short lead-in.
     pub message: String,
+    /// Optional schema-level title (MCP elicitations may set one;
+    /// AskUserQuestion does not). Rendered as the form heading.
+    pub title: Option<String>,
+    /// Optional schema-level description, rendered under the message.
+    pub description: Option<String>,
     /// Tool call this elicitation belongs to, when the agent scoped it to
     /// one. Lets the UI render the card under the originating tool.
     pub tool_call_id: Option<String>,
@@ -61,21 +70,43 @@ pub struct ElicitationQuestion {
     pub required: bool,
     pub kind: ElicitationFieldKind,
     /// Selectable options for `SingleSelect` / `MultiSelect`; empty for
-    /// `FreeText`.
+    /// every other kind.
     pub options: Vec<ElicitationOption>,
+    /// Multi-select bounds.
     pub min_items: Option<u64>,
     pub max_items: Option<u64>,
+    /// String bounds (`FreeText`).
+    pub min_length: Option<u32>,
+    pub max_length: Option<u32>,
+    /// Regular expression the string must match (`FreeText`).
+    pub pattern: Option<String>,
+    /// String format annotation (`email`, `uri`, `date`, `date-time`, or
+    /// a passthrough custom token); a UI hint only, never a hard gate.
+    pub format: Option<String>,
+    /// Numeric bounds (`Number` / `Integer`), kept as `f64` so a single
+    /// pair covers both; integer fields still validate integrality.
+    pub minimum: Option<f64>,
+    pub maximum: Option<f64>,
+    /// Pre-fill value, shaped to match the field's answer kind.
+    pub default: Option<AnswerValue>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ElicitationFieldKind {
-    /// Plain string input (the AskUserQuestion "custom answer" box).
+    /// Plain string input (the AskUserQuestion "custom answer" box, or any
+    /// unconstrained MCP string field).
     FreeText,
     /// Pick exactly one option (rendered as radios).
     SingleSelect,
     /// Pick zero or more options (rendered as checkboxes).
     MultiSelect,
+    /// Floating-point number input.
+    Number,
+    /// Integer number input.
+    Integer,
+    /// Boolean input (rendered as a checkbox / toggle).
+    Boolean,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,9 +143,9 @@ pub enum ElicitationParseError {
     /// reject loudly rather than rendering nothing.
     #[error("elicitation is not form-mode")]
     NotFormMode,
-    /// A field used a JSON-Schema kind the structured view cannot render
-    /// (number/integer/boolean). AskUserQuestion never emits these; they
-    /// only arise from MCP-server elicitations, which are out of scope.
+    /// A field used a JSON-Schema kind the structured view cannot render.
+    /// All of the kinds the ACP schema currently defines are handled; this
+    /// guards against a future `#[non_exhaustive]` property variant.
     #[error("elicitation field {0:?} uses an unsupported schema kind")]
     UnsupportedField(String),
 }
@@ -134,6 +165,16 @@ pub enum ElicitationValidationError {
     TooFewItems { field: String, min: u64 },
     #[error("field {field:?} allows at most {max} selection(s)")]
     TooManyItems { field: String, max: u64 },
+    #[error("field {field:?} must be at least {min} character(s)")]
+    TooShort { field: String, min: u32 },
+    #[error("field {field:?} must be at most {max} character(s)")]
+    TooLong { field: String, max: u32 },
+    #[error("field {field:?} does not match the required pattern")]
+    PatternMismatch { field: String },
+    #[error("field {field:?} is out of the allowed range")]
+    OutOfRange { field: String },
+    #[error("field {field:?} must be a whole number")]
+    NotAnInteger { field: String },
 }
 
 /// The user's decision, as sent by the web client on resolution.
@@ -141,8 +182,7 @@ pub enum ElicitationValidationError {
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum ElicitationResolution {
     /// User submitted the form. `answers` maps each answered field key to
-    /// its value (a string for free-text / single-select, a list for
-    /// multi-select). Unanswered optional fields may be omitted.
+    /// its value. Unanswered optional fields may be omitted.
     Accept {
         #[serde(default)]
         answers: BTreeMap<String, AnswerValue>,
@@ -153,9 +193,16 @@ pub enum ElicitationResolution {
     Cancel,
 }
 
+/// A submitted (or default) answer value. Untagged: the variant is chosen
+/// by JSON shape, so the order matters. `Bool` and the integer case are
+/// tried before `Number`/`Text` so `true` and `5` do not deserialize as a
+/// float or a string.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum AnswerValue {
+    Bool(bool),
+    Integer(i64),
+    Number(f64),
     Text(String),
     List(Vec<String>),
 }
@@ -192,6 +239,45 @@ fn ordered_fields(
     fields
 }
 
+/// Render a `StringFormat` as the wire token (`email`, `uri`, `date`,
+/// `date-time`) so the web can map it to an input type. Unknown formats
+/// pass through verbatim; the spec treats them as advisory annotations.
+fn format_token(format: &StringFormat) -> String {
+    match format {
+        StringFormat::Email => "email".to_string(),
+        StringFormat::Uri => "uri".to_string(),
+        StringFormat::Date => "date".to_string(),
+        StringFormat::DateTime => "date-time".to_string(),
+        // `StringFormat` is non_exhaustive; a future token surfaces as a
+        // generic annotation rather than failing the parse.
+        _ => "unknown".to_string(),
+    }
+}
+
+fn empty_question(
+    field_key: &str,
+    kind: ElicitationFieldKind,
+    required: bool,
+) -> ElicitationQuestion {
+    ElicitationQuestion {
+        field_key: field_key.to_string(),
+        title: None,
+        description: None,
+        required,
+        kind,
+        options: Vec::new(),
+        min_items: None,
+        max_items: None,
+        min_length: None,
+        max_length: None,
+        pattern: None,
+        format: None,
+        minimum: None,
+        maximum: None,
+        default: None,
+    }
+}
+
 fn parse_string_field(
     field_key: &str,
     s: &StringPropertySchema,
@@ -225,14 +311,16 @@ fn parse_string_field(
         (ElicitationFieldKind::FreeText, Vec::new())
     };
     ElicitationQuestion {
-        field_key: field_key.to_string(),
         title: s.title.clone(),
         description: s.description.clone(),
-        required,
         kind,
         options,
-        min_items: None,
-        max_items: None,
+        min_length: s.min_length,
+        max_length: s.max_length,
+        pattern: s.pattern.clone(),
+        format: s.format.as_ref().map(format_token),
+        default: s.default.clone().map(AnswerValue::Text),
+        ..empty_question(field_key, ElicitationFieldKind::FreeText, required)
     }
 }
 
@@ -267,18 +355,39 @@ fn parse_field(
                 _ => Vec::new(),
             };
             Ok(ElicitationQuestion {
-                field_key: field_key.to_string(),
                 title: a.title.clone(),
                 description: a.description.clone(),
-                required,
-                kind: ElicitationFieldKind::MultiSelect,
                 options,
                 min_items: a.min_items,
                 max_items: a.max_items,
+                default: a.default.clone().map(AnswerValue::List),
+                ..empty_question(field_key, ElicitationFieldKind::MultiSelect, required)
             })
         }
-        // Numbers / integers / booleans only come from MCP-server
-        // elicitations, which the structured view does not render.
+        ElicitationPropertySchema::Number(n) => Ok(ElicitationQuestion {
+            title: n.title.clone(),
+            description: n.description.clone(),
+            minimum: n.minimum,
+            maximum: n.maximum,
+            default: n.default.map(AnswerValue::Number),
+            ..empty_question(field_key, ElicitationFieldKind::Number, required)
+        }),
+        ElicitationPropertySchema::Integer(i) => Ok(ElicitationQuestion {
+            title: i.title.clone(),
+            description: i.description.clone(),
+            minimum: i.minimum.map(|v| v as f64),
+            maximum: i.maximum.map(|v| v as f64),
+            default: i.default.map(AnswerValue::Integer),
+            ..empty_question(field_key, ElicitationFieldKind::Integer, required)
+        }),
+        ElicitationPropertySchema::Boolean(b) => Ok(ElicitationQuestion {
+            title: b.title.clone(),
+            description: b.description.clone(),
+            default: b.default.map(AnswerValue::Bool),
+            ..empty_question(field_key, ElicitationFieldKind::Boolean, required)
+        }),
+        // Guards a future `#[non_exhaustive]` property variant the schema
+        // crate may add; every kind defined today is handled above.
         _ => Err(ElicitationParseError::UnsupportedField(
             field_key.to_string(),
         )),
@@ -310,6 +419,8 @@ pub fn parse_elicitation(
     Ok(Elicitation {
         nonce,
         message: request.message.clone(),
+        title: schema.title.clone(),
+        description: schema.description.clone(),
         tool_call_id,
         questions,
         requested_at,
@@ -317,12 +428,104 @@ pub fn parse_elicitation(
     })
 }
 
+/// Validate the text-shaped value of a free-text or single-select field
+/// and return the string to store, or `None` when the (optional) field was
+/// left blank.
+fn validate_text(
+    question: &ElicitationQuestion,
+    answer: Option<&AnswerValue>,
+) -> Result<Option<String>, ElicitationValidationError> {
+    let text = match answer {
+        Some(AnswerValue::Text(text)) => text.clone(),
+        // Numbers / booleans coerce to their textual form so a free-text
+        // field stays forgiving; selects are checked against options below.
+        Some(AnswerValue::Integer(i)) => i.to_string(),
+        Some(AnswerValue::Number(n)) => n.to_string(),
+        Some(AnswerValue::Bool(b)) => b.to_string(),
+        Some(AnswerValue::List(_)) => {
+            return Err(ElicitationValidationError::WrongValueType(
+                question.field_key.clone(),
+                "string",
+            ));
+        }
+        None => String::new(),
+    };
+
+    if matches!(question.kind, ElicitationFieldKind::SingleSelect)
+        && !text.is_empty()
+        && !question.options.iter().any(|o| o.value == text)
+    {
+        return Err(ElicitationValidationError::InvalidOption {
+            field: question.field_key.clone(),
+            value: text,
+        });
+    }
+
+    if text.is_empty() {
+        if question.required {
+            return Err(ElicitationValidationError::MissingRequired(
+                question.field_key.clone(),
+            ));
+        }
+        return Ok(None);
+    }
+
+    // Length / pattern constraints only apply to a value the user actually
+    // typed; selects answer from a fixed option set, so skip them there.
+    if matches!(question.kind, ElicitationFieldKind::FreeText) {
+        let len = text.chars().count() as u32;
+        if let Some(min) = question.min_length {
+            if len < min {
+                return Err(ElicitationValidationError::TooShort {
+                    field: question.field_key.clone(),
+                    min,
+                });
+            }
+        }
+        if let Some(max) = question.max_length {
+            if len > max {
+                return Err(ElicitationValidationError::TooLong {
+                    field: question.field_key.clone(),
+                    max,
+                });
+            }
+        }
+        if let Some(pattern) = &question.pattern {
+            // An invalid pattern from the agent is treated as no constraint
+            // rather than rejecting every answer.
+            if let Ok(re) = regex::Regex::new(pattern) {
+                if !re.is_match(&text) {
+                    return Err(ElicitationValidationError::PatternMismatch {
+                        field: question.field_key.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(Some(text))
+}
+
+fn check_range(
+    question: &ElicitationQuestion,
+    value: f64,
+) -> Result<(), ElicitationValidationError> {
+    if question.minimum.is_some_and(|min| value < min)
+        || question.maximum.is_some_and(|max| value > max)
+    {
+        return Err(ElicitationValidationError::OutOfRange {
+            field: question.field_key.clone(),
+        });
+    }
+    Ok(())
+}
+
 /// Validate a user resolution against the normalized form and build the
-/// ACP response. Accept answers are checked server-side: every key must
-/// be a known field, value shapes must match the field kind, selected
-/// values must be offered options, and required / min / max constraints
-/// must hold. This is the only place answers cross back to the agent, so
-/// the browser is never trusted to send well-formed content.
+/// ACP response. Accept answers are checked server-side: every key must be
+/// a known field, value shapes must match the field kind, selected values
+/// must be offered options, and required / length / range / pattern / item
+/// constraints must hold. This is the only place answers cross back to the
+/// agent, so the browser is never trusted to send well-formed content.
 pub fn build_response(
     elicitation: &Elicitation,
     resolution: ElicitationResolution,
@@ -351,7 +554,7 @@ pub fn build_response(
             ElicitationFieldKind::MultiSelect => {
                 let selected = match answer {
                     Some(AnswerValue::List(values)) => values.clone(),
-                    Some(AnswerValue::Text(_)) => {
+                    Some(_) => {
                         return Err(ElicitationValidationError::WrongValueType(
                             question.field_key.clone(),
                             "list",
@@ -401,36 +604,91 @@ pub fn build_response(
                 );
             }
             ElicitationFieldKind::SingleSelect | ElicitationFieldKind::FreeText => {
-                let text = match answer {
-                    Some(AnswerValue::Text(text)) => text.clone(),
-                    Some(AnswerValue::List(_)) => {
+                if let Some(text) = validate_text(question, answer)? {
+                    content.insert(
+                        question.field_key.clone(),
+                        ElicitationContentValue::String(text),
+                    );
+                }
+            }
+            ElicitationFieldKind::Number => {
+                let value = match answer {
+                    Some(AnswerValue::Number(n)) => *n,
+                    Some(AnswerValue::Integer(i)) => *i as f64,
+                    Some(_) => {
                         return Err(ElicitationValidationError::WrongValueType(
                             question.field_key.clone(),
-                            "string",
+                            "number",
                         ));
                     }
-                    None => String::new(),
+                    None => {
+                        if question.required {
+                            return Err(ElicitationValidationError::MissingRequired(
+                                question.field_key.clone(),
+                            ));
+                        }
+                        continue;
+                    }
                 };
-                if matches!(question.kind, ElicitationFieldKind::SingleSelect)
-                    && !text.is_empty()
-                    && !question.options.iter().any(|o| o.value == text)
-                {
-                    return Err(ElicitationValidationError::InvalidOption {
-                        field: question.field_key.clone(),
-                        value: text,
-                    });
-                }
-                if text.is_empty() {
-                    if question.required {
-                        return Err(ElicitationValidationError::MissingRequired(
-                            question.field_key.clone(),
-                        ));
-                    }
-                    continue;
-                }
+                check_range(question, value)?;
                 content.insert(
                     question.field_key.clone(),
-                    ElicitationContentValue::String(text),
+                    ElicitationContentValue::Number(value),
+                );
+            }
+            ElicitationFieldKind::Integer => {
+                let value = match answer {
+                    Some(AnswerValue::Integer(i)) => *i,
+                    // A whole-valued float (the browser may send `5` as a
+                    // JSON number) coerces; a fractional one is rejected.
+                    Some(AnswerValue::Number(n)) if n.fract() == 0.0 => *n as i64,
+                    Some(AnswerValue::Number(_)) => {
+                        return Err(ElicitationValidationError::NotAnInteger {
+                            field: question.field_key.clone(),
+                        });
+                    }
+                    Some(_) => {
+                        return Err(ElicitationValidationError::WrongValueType(
+                            question.field_key.clone(),
+                            "integer",
+                        ));
+                    }
+                    None => {
+                        if question.required {
+                            return Err(ElicitationValidationError::MissingRequired(
+                                question.field_key.clone(),
+                            ));
+                        }
+                        continue;
+                    }
+                };
+                check_range(question, value as f64)?;
+                content.insert(
+                    question.field_key.clone(),
+                    ElicitationContentValue::Integer(value),
+                );
+            }
+            ElicitationFieldKind::Boolean => {
+                let value = match answer {
+                    Some(AnswerValue::Bool(b)) => *b,
+                    Some(_) => {
+                        return Err(ElicitationValidationError::WrongValueType(
+                            question.field_key.clone(),
+                            "boolean",
+                        ));
+                    }
+                    None => {
+                        if question.required {
+                            return Err(ElicitationValidationError::MissingRequired(
+                                question.field_key.clone(),
+                            ));
+                        }
+                        continue;
+                    }
+                };
+                content.insert(
+                    question.field_key.clone(),
+                    ElicitationContentValue::Boolean(value),
                 );
             }
         }
@@ -446,7 +704,8 @@ mod tests {
     use super::*;
     use agent_client_protocol::schema::{
         BooleanPropertySchema, ElicitationFormMode, ElicitationSessionScope, EnumOption,
-        MultiSelectPropertySchema, StringPropertySchema,
+        IntegerPropertySchema, MultiSelectPropertySchema, NumberPropertySchema,
+        StringPropertySchema,
     };
 
     fn form_request(schema: ElicitationSchema, message: &str) -> CreateElicitationRequest {
@@ -508,24 +767,85 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_field_kind() {
-        let schema =
-            ElicitationSchema::new().property("question_0", BooleanPropertySchema::new(), false);
-        let req = form_request(schema, "bool");
-        assert_eq!(
-            parse_elicitation(Nonce::new(), &req, Utc::now()),
-            Err(ElicitationParseError::UnsupportedField("question_0".into()))
+    fn parses_number_integer_boolean_with_constraints_and_defaults() {
+        let schema = ElicitationSchema::new()
+            .property(
+                "question_0",
+                NumberPropertySchema::new()
+                    .minimum(0.0)
+                    .maximum(1.0)
+                    .default_value(0.5),
+                true,
+            )
+            .property(
+                "question_1",
+                IntegerPropertySchema::new().minimum(1).maximum(10),
+                false,
+            )
+            .property(
+                "question_2",
+                BooleanPropertySchema::new().default_value(true),
+                false,
+            );
+        let req = form_request(schema, "mixed");
+        let e = parse_elicitation(Nonce::new(), &req, Utc::now()).unwrap();
+
+        assert_eq!(e.questions[0].kind, ElicitationFieldKind::Number);
+        assert_eq!(e.questions[0].minimum, Some(0.0));
+        assert_eq!(e.questions[0].maximum, Some(1.0));
+        assert_eq!(e.questions[0].default, Some(AnswerValue::Number(0.5)));
+
+        assert_eq!(e.questions[1].kind, ElicitationFieldKind::Integer);
+        assert_eq!(e.questions[1].minimum, Some(1.0));
+        assert_eq!(e.questions[1].maximum, Some(10.0));
+
+        assert_eq!(e.questions[2].kind, ElicitationFieldKind::Boolean);
+        assert_eq!(e.questions[2].default, Some(AnswerValue::Bool(true)));
+    }
+
+    #[test]
+    fn parses_string_constraints_and_format() {
+        let schema = ElicitationSchema::new().property(
+            "question_0",
+            StringPropertySchema::email()
+                .min_length(3)
+                .max_length(64)
+                .pattern("^.+@.+$")
+                .default_value("a@b.co"),
+            true,
         );
+        let req = form_request(schema, "email");
+        let e = parse_elicitation(Nonce::new(), &req, Utc::now()).unwrap();
+        let q = &e.questions[0];
+        assert_eq!(q.kind, ElicitationFieldKind::FreeText);
+        assert_eq!(q.min_length, Some(3));
+        assert_eq!(q.max_length, Some(64));
+        assert_eq!(q.pattern.as_deref(), Some("^.+@.+$"));
+        assert_eq!(q.format.as_deref(), Some("email"));
+        assert_eq!(q.default, Some(AnswerValue::Text("a@b.co".into())));
+    }
+
+    #[test]
+    fn parses_schema_title_and_description() {
+        let schema = ElicitationSchema::new()
+            .title("Profile")
+            .description("Tell us about yourself")
+            .string("question_0", false);
+        let req = form_request(schema, "msg");
+        let e = parse_elicitation(Nonce::new(), &req, Utc::now()).unwrap();
+        assert_eq!(e.title.as_deref(), Some("Profile"));
+        assert_eq!(e.description.as_deref(), Some("Tell us about yourself"));
     }
 
     fn sample_elicitation() -> Elicitation {
         Elicitation {
             nonce: Nonce::new(),
             message: "q".into(),
+            title: None,
+            description: None,
             tool_call_id: None,
             questions: vec![
                 ElicitationQuestion {
-                    field_key: "question_0".into(),
                     title: None,
                     description: None,
                     required: true,
@@ -540,15 +860,10 @@ mod tests {
                             label: "No".into(),
                         },
                     ],
-                    min_items: None,
-                    max_items: None,
+                    ..empty_question("question_0", ElicitationFieldKind::SingleSelect, true)
                 },
                 ElicitationQuestion {
-                    field_key: "tags".into(),
-                    title: None,
-                    description: None,
-                    required: false,
-                    kind: ElicitationFieldKind::MultiSelect,
+                    max_items: Some(1),
                     options: vec![
                         ElicitationOption {
                             value: "a".into(),
@@ -559,8 +874,7 @@ mod tests {
                             label: "B".into(),
                         },
                     ],
-                    min_items: None,
-                    max_items: Some(1),
+                    ..empty_question("tags", ElicitationFieldKind::MultiSelect, false)
                 },
             ],
             requested_at: Utc::now(),
@@ -574,31 +888,34 @@ mod tests {
         }
     }
 
+    fn accept_content(
+        e: &Elicitation,
+        pairs: Vec<(&str, AnswerValue)>,
+    ) -> BTreeMap<String, ElicitationContentValue> {
+        match build_response(e, accept(pairs)).unwrap().action {
+            ElicitationAction::Accept(a) => a.content.unwrap_or_default(),
+            other => panic!("expected accept, got {other:?}"),
+        }
+    }
+
     #[test]
     fn build_accept_maps_selected_labels() {
         let e = sample_elicitation();
-        let resp = build_response(
+        let content = accept_content(
             &e,
-            accept(vec![
+            vec![
                 ("question_0", AnswerValue::Text("Yes".into())),
                 ("tags", AnswerValue::List(vec!["a".into()])),
-            ]),
-        )
-        .unwrap();
-        match resp.action {
-            ElicitationAction::Accept(a) => {
-                let content = a.content.unwrap();
-                assert_eq!(
-                    content.get("question_0"),
-                    Some(&ElicitationContentValue::String("Yes".into()))
-                );
-                assert_eq!(
-                    content.get("tags"),
-                    Some(&ElicitationContentValue::StringArray(vec!["a".into()]))
-                );
-            }
-            other => panic!("expected accept, got {other:?}"),
-        }
+            ],
+        );
+        assert_eq!(
+            content.get("question_0"),
+            Some(&ElicitationContentValue::String("Yes".into()))
+        );
+        assert_eq!(
+            content.get("tags"),
+            Some(&ElicitationContentValue::StringArray(vec!["a".into()]))
+        );
     }
 
     #[test]
@@ -658,17 +975,8 @@ mod tests {
         // blank: min_items only constrains an actual selection.
         let mut e = sample_elicitation();
         e.questions[1].min_items = Some(2);
-        let resp = build_response(
-            &e,
-            accept(vec![("question_0", AnswerValue::Text("Yes".into()))]),
-        )
-        .unwrap();
-        match resp.action {
-            ElicitationAction::Accept(a) => {
-                assert!(!a.content.unwrap_or_default().contains_key("tags"));
-            }
-            other => panic!("expected accept, got {other:?}"),
-        }
+        let content = accept_content(&e, vec![("question_0", AnswerValue::Text("Yes".into()))]);
+        assert!(!content.contains_key("tags"));
     }
 
     #[test]
@@ -686,6 +994,114 @@ mod tests {
                 field: "tags".into(),
                 max: 1,
             })
+        );
+    }
+
+    fn number_elicitation(kind: ElicitationFieldKind) -> Elicitation {
+        Elicitation {
+            questions: vec![ElicitationQuestion {
+                minimum: Some(0.0),
+                maximum: Some(10.0),
+                ..empty_question("question_0", kind, true)
+            }],
+            ..sample_elicitation()
+        }
+    }
+
+    #[test]
+    fn build_number_accepts_and_range_checks() {
+        let e = number_elicitation(ElicitationFieldKind::Number);
+        let content = accept_content(&e, vec![("question_0", AnswerValue::Number(2.5))]);
+        assert_eq!(
+            content.get("question_0"),
+            Some(&ElicitationContentValue::Number(2.5))
+        );
+        assert_eq!(
+            build_response(&e, accept(vec![("question_0", AnswerValue::Number(99.0))])),
+            Err(ElicitationValidationError::OutOfRange {
+                field: "question_0".into()
+            })
+        );
+    }
+
+    #[test]
+    fn build_integer_coerces_whole_float_and_rejects_fraction() {
+        let e = number_elicitation(ElicitationFieldKind::Integer);
+        let content = accept_content(&e, vec![("question_0", AnswerValue::Number(3.0))]);
+        assert_eq!(
+            content.get("question_0"),
+            Some(&ElicitationContentValue::Integer(3))
+        );
+        assert_eq!(
+            build_response(&e, accept(vec![("question_0", AnswerValue::Number(3.5))])),
+            Err(ElicitationValidationError::NotAnInteger {
+                field: "question_0".into()
+            })
+        );
+    }
+
+    #[test]
+    fn build_boolean_round_trips() {
+        let e = Elicitation {
+            questions: vec![empty_question(
+                "question_0",
+                ElicitationFieldKind::Boolean,
+                true,
+            )],
+            ..sample_elicitation()
+        };
+        let content = accept_content(&e, vec![("question_0", AnswerValue::Bool(true))]);
+        assert_eq!(
+            content.get("question_0"),
+            Some(&ElicitationContentValue::Boolean(true))
+        );
+    }
+
+    #[test]
+    fn build_enforces_string_length_and_pattern() {
+        let e = Elicitation {
+            questions: vec![ElicitationQuestion {
+                min_length: Some(2),
+                max_length: Some(5),
+                pattern: Some("^[a-z]+$".into()),
+                ..empty_question("question_0", ElicitationFieldKind::FreeText, false)
+            }],
+            ..sample_elicitation()
+        };
+        assert_eq!(
+            build_response(
+                &e,
+                accept(vec![("question_0", AnswerValue::Text("a".into()))])
+            ),
+            Err(ElicitationValidationError::TooShort {
+                field: "question_0".into(),
+                min: 2
+            })
+        );
+        assert_eq!(
+            build_response(
+                &e,
+                accept(vec![("question_0", AnswerValue::Text("toolong".into()))])
+            ),
+            Err(ElicitationValidationError::TooLong {
+                field: "question_0".into(),
+                max: 5
+            })
+        );
+        assert_eq!(
+            build_response(
+                &e,
+                accept(vec![("question_0", AnswerValue::Text("AB".into()))])
+            ),
+            Err(ElicitationValidationError::PatternMismatch {
+                field: "question_0".into()
+            })
+        );
+        // A conforming value passes.
+        let content = accept_content(&e, vec![("question_0", AnswerValue::Text("abc".into()))]);
+        assert_eq!(
+            content.get("question_0"),
+            Some(&ElicitationContentValue::String("abc".into()))
         );
     }
 }

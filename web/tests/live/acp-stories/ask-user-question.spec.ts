@@ -50,6 +50,36 @@ const ASK_SCRIPT = {
   ],
 };
 
+// A richer MCP-style form: an integer field with a range plus a boolean.
+// Proves the number/integer/boolean kinds round-trip through the real
+// backend (parse -> server-side validate -> build_response) end to end.
+const MIXED_SCRIPT = {
+  turns: [
+    {
+      updates: [
+        {
+          sessionUpdate: "elicitation_request",
+          message: "Configure the run.",
+          requestedSchema: {
+            type: "object",
+            title: "Run options",
+            properties: {
+              question_0: { type: "integer", title: "Workers", minimum: 1, maximum: 8 },
+              question_1: { type: "boolean", title: "Verbose" },
+            },
+            required: ["question_0"],
+          },
+        },
+        {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "Configured." },
+        },
+      ],
+      stopReason: "end_turn",
+    },
+  ],
+};
+
 base("AskUserQuestion card submit resolves and the turn continues", async ({ page }, testInfo) => {
   const scriptDir = mkdtempSync(join(tmpdir(), "aoe-pw-story-ask-"));
   const scriptPath = join(scriptDir, "script.json");
@@ -93,6 +123,53 @@ base("AskUserQuestion card submit resolves and the turn continues", async ({ pag
     await questionDialog.getByRole("button", { name: "Submit" }).click();
 
     await expect(postAnswerChunk).toBeVisible({ timeout: 10_000 });
+    await expect(questionDialog).toBeHidden({ timeout: 10_000 });
+  } finally {
+    await serve.stop();
+    rmSync(scriptDir, { recursive: true, force: true });
+  }
+});
+
+base("elicitation form with number + boolean fields round-trips", async ({ page }, testInfo) => {
+  const scriptDir = mkdtempSync(join(tmpdir(), "aoe-pw-story-mixed-"));
+  const scriptPath = join(scriptDir, "script.json");
+  writeFileSync(scriptPath, JSON.stringify(MIXED_SCRIPT));
+
+  const serve = await spawnAoeServe({
+    authMode: "none",
+    acp: true,
+    fakeAcpScript: scriptPath,
+    workerIndex: testInfo.workerIndex,
+    parallelIndex: testInfo.parallelIndex,
+    seedFn: seedSessionViaAoeAdd({ title: "story-mixed" }),
+  });
+
+  try {
+    const sessions = await listSessions(serve.baseUrl);
+    const seeded = sessions.find((s) => s.title === "story-mixed");
+    if (!seeded) throw new Error("seeded session 'story-mixed' missing");
+    const sessionId = seeded.id;
+
+    await enableStructuredViewAndWait(serve.baseUrl, sessionId);
+
+    await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`);
+    await waitForStructuredView(page);
+
+    const composer = page.getByRole("textbox", { name: /Send a message/i });
+    await composer.fill("configure");
+    await composer.press("Enter");
+
+    const questionDialog = page.getByRole("alertdialog", { name: /Question from the agent/i });
+    await expect(questionDialog).toBeVisible({ timeout: 10_000 });
+
+    const postChunk = page.getByText("Configured.");
+    await expect(postChunk).toHaveCount(0);
+
+    await questionDialog.getByPlaceholder("Enter a number").fill("3");
+    await questionDialog.getByRole("checkbox").check();
+    await questionDialog.getByRole("button", { name: "Submit" }).click();
+
+    await expect(postChunk).toBeVisible({ timeout: 10_000 });
     await expect(questionDialog).toBeHidden({ timeout: 10_000 });
   } finally {
     await serve.stop();
