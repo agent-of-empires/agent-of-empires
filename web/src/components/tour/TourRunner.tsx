@@ -5,18 +5,10 @@
 // TourProvider stays engine-agnostic and deals only in TourStep data. Swapping
 // the engine later means rewriting this file alone.
 import { useCallback, useMemo } from "react";
-import {
-  Joyride,
-  EVENTS,
-  STATUS,
-  type ButtonType,
-  type EventData,
-  type Options,
-  type Step,
-  type Styles,
-} from "react-joyride";
+import { Joyride, EVENTS, STATUS, type EventData, type Step } from "react-joyride";
 import { type TourShortcutHint, type TourStep, tourSelector } from "../../lib/tourSteps";
 import { SHORTCUTS_BY_ID, formatTourShortcut } from "../../lib/shortcuts";
+import { TOUR_RUNNER_OPTIONS, TOUR_RUNNER_STYLES } from "./tourRunnerStyles";
 
 export interface TourRunnerProps {
   run: boolean;
@@ -26,48 +18,7 @@ export interface TourRunnerProps {
   onFinish: (markSeen: boolean) => void;
 }
 
-// Theme via the app's resolved-theme CSS variables (web/src/index.css) so the
-// tooltip tracks light vs dark instead of being pinned to dark hex. These land
-// as inline CSS styles, where var() resolves. The exception is overlayColor: it
-// is painted as an SVG fill *attribute*, where var() does not reliably resolve,
-// so the scrim stays a literal translucent dark (it reads correctly over both
-// light and dark content).
-const OPTIONS: Partial<Options> = {
-  buttons: ["skip", "back", "primary"] as ButtonType[],
-  showProgress: true,
-  skipBeacon: true,
-  primaryColor: "var(--color-brand-600)",
-  overlayColor: "rgba(2, 6, 23, 0.65)",
-  textColor: "var(--color-text-primary)",
-  zIndex: 10_000,
-  scrollOffset: 96,
-};
-
 const LOCALE = { skip: "Skip", last: "Done", next: "Next", back: "Back" };
-
-const STYLES: Partial<Styles> = {
-  tooltip: {
-    backgroundColor: "var(--color-surface-800)",
-    border: "1px solid var(--color-surface-700)",
-    borderRadius: 10,
-    color: "var(--color-text-primary)",
-    fontSize: 13,
-  },
-  tooltipTitle: {
-    color: "var(--color-brand-500)",
-    fontSize: 14,
-    fontWeight: 600,
-  },
-  tooltipContent: { padding: "10px 4px" },
-  buttonPrimary: {
-    backgroundColor: "var(--color-brand-600)",
-    borderRadius: 6,
-    // Dark text reads on the amber primary in both themes; keep it fixed.
-    color: "#0f172a",
-  },
-  buttonBack: { color: "var(--color-text-secondary)" },
-  buttonSkip: { color: "var(--color-text-dim)" },
-};
 
 function hintLine(hint: TourShortcutHint): string {
   return `${formatTourShortcut(SHORTCUTS_BY_ID[hint.id].chord)} ${hint.verb}`;
@@ -122,9 +73,9 @@ export default function TourRunner({ run, steps, onFinish }: TourRunnerProps) {
       run={run}
       steps={joyrideSteps}
       continuous
-      options={OPTIONS}
+      options={TOUR_RUNNER_OPTIONS}
       locale={LOCALE}
-      styles={STYLES}
+      styles={TOUR_RUNNER_STYLES}
       onEvent={handleEvent}
     />
   );

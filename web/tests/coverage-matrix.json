@@ -2184,9 +2184,17 @@
       "specs": [
         "src/lib/__tests__/tourSteps.test.ts",
         "src/hooks/__tests__/useTour.test.ts",
-        "src/components/__tests__/Dashboard.tour.test.tsx"
+        "src/components/__tests__/Dashboard.tour.test.tsx",
+        "src/components/tour/TourRunner.theme.test.tsx"
       ],
-      "components": ["web/src/components/Dashboard.tsx", "web/src/lib/tourSteps.ts", "web/src/hooks/useTour.tsx"]
+      "components": [
+        "web/src/components/Dashboard.tsx",
+        "web/src/components/tour/TourRunner.tsx",
+        "web/src/components/tour/tourRunnerStyles.ts",
+        "web/src/lib/brandMark.ts",
+        "web/src/lib/tourSteps.ts",
+        "web/src/hooks/useTour.tsx"
+      ]
     },
     {
       "id": "onboarding.theme-welcome",

@@ -24,7 +24,7 @@ use ratatui::style::Color;
 use serde::Serialize;
 use tracing::debug;
 
-use super::{load_theme, Theme, ThemeAppearance};
+use super::{contrast::contrast_ratio as wcag_contrast_ratio, load_theme, Theme, ThemeAppearance};
 
 /// Source classification for a resolved theme. Frontends use this to
 /// label the picker entry (e.g. "(custom)" vs the builtin name) and to
@@ -216,6 +216,10 @@ fn web_projection(theme: &Theme, appearance: ThemeAppearance) -> CssVarProjectio
     {
         css.insert(format!("--color-brand-{step}"), hex(color));
     }
+    css.insert(
+        "--color-text-on-brand".into(),
+        hex(readable_on(brand_ramp[5])),
+    );
 
     // Accent ramp anchored on theme.terminal_border (the existing
     // teal-style anchor used by the TUI's accent surface), so secondary
@@ -279,6 +283,7 @@ fn terminal_projection(theme: &Theme, appearance: ThemeAppearance) -> CssVarProj
     css.insert("--term-bg".into(), hex(theme.background));
     css.insert("--term-fg".into(), hex(theme.text));
     css.insert("--term-cursor".into(), hex(theme.accent));
+    css.insert("--term-selection-bg".into(), rgba(theme.hint, 0.35));
 
     // Derived ANSI 16 palette. Maps semantic fields to the standard
     // ANSI slots (red=error, green=running, etc.) and lifts each by
@@ -368,6 +373,23 @@ fn mix(a: Color, b: Color, t: f32) -> Color {
     Color::Rgb(lerp(ar, br), lerp(ag, bg), lerp(ab, bb))
 }
 
+fn rgba(c: Color, alpha: f32) -> String {
+    let (r, g, b) = rgb_components(c);
+    format!("rgba({r}, {g}, {b}, {:.2})", alpha.clamp(0.0, 1.0))
+}
+
+fn readable_on(bg: Color) -> Color {
+    if contrast_ratio(BLACK, bg) >= contrast_ratio(WHITE, bg) {
+        BLACK
+    } else {
+        WHITE
+    }
+}
+
+fn contrast_ratio(a: Color, b: Color) -> f32 {
+    wcag_contrast_ratio(a, b).unwrap_or(0.0)
+}
+
 /// Rec. 601 relative luminance (0.0 to 1.0). Coarser than WCAG's
 /// gamma-corrected formula but adequate for the dark/light split: only
 /// custom themes with mid-tone backgrounds (around 0.5) sit near the
@@ -432,6 +454,13 @@ mod tests {
         for name in builtin_theme_names() {
             let r = resolve_theme(name);
             for (key, value) in r.web.css_vars.iter().chain(r.terminal.css_vars.iter()) {
+                if key == "--term-selection-bg" {
+                    assert!(
+                        value.starts_with("rgba(") && value.ends_with(')'),
+                        "{name}: var {key} = {value} not rgba(...)"
+                    );
+                    continue;
+                }
                 assert!(
                     value.starts_with('#') && value.len() == 7,
                     "{name}: var {key} = {value} not a #rrggbb"
@@ -509,6 +538,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn on_brand_token_keeps_contrast_for_all_builtins() {
+        for name in builtin_theme_names() {
+            let theme = resolve_theme(name);
+            let fg = color_from_hex(theme.web.css_vars.get("--color-text-on-brand").unwrap());
+            let bg = color_from_hex(theme.web.css_vars.get("--color-brand-600").unwrap());
+            assert!(
+                contrast_ratio(fg, bg) >= 4.5,
+                "{name}: color-text-on-brand must remain readable on brand-600"
+            );
+        }
+    }
+
+    #[test]
+    fn on_brand_token_uses_wcag_contrast_for_custom_mid_amber() {
+        let theme = Theme {
+            accent: Color::Rgb(0xb6, 0x76, 0x08),
+            ..Theme::default()
+        };
+
+        let projection = web_projection(&theme, ThemeAppearance::Dark);
+        let fg = color_from_hex(projection.css_vars.get("--color-text-on-brand").unwrap());
+        let bg = color_from_hex(projection.css_vars.get("--color-brand-600").unwrap());
+
+        assert_eq!(fg, WHITE);
+        assert!(
+            contrast_ratio(BLACK, bg) < 4.5,
+            "regression fixture should keep black below AA contrast"
+        );
+        assert!(
+            contrast_ratio(fg, bg) >= 4.5,
+            "custom amber text-on-brand must use the WCAG-readable foreground"
+        );
+    }
+
     fn parse_hex(s: &str) -> String {
         s.to_string()
     }
@@ -540,14 +604,6 @@ mod tests {
 
     fn composite_channel(fg: u8, bg: u8, alpha: f32) -> u8 {
         ((fg as f32 * alpha) + (bg as f32 * (1.0 - alpha))).round() as u8
-    }
-
-    fn contrast_ratio(a: Color, b: Color) -> f32 {
-        let a_l = relative_luminance(a);
-        let b_l = relative_luminance(b);
-        let lighter = a_l.max(b_l);
-        let darker = a_l.min(b_l);
-        (lighter + 0.05) / (darker + 0.05)
     }
 
     fn web_semantic_color_vars_used_by_dashboard() -> BTreeSet<String> {
@@ -636,7 +692,12 @@ mod tests {
             || name.starts_with("diff-")
             || matches!(
                 name,
-                "selection" | "session-selection" | "terminal-active" | "branch" | "sandbox"
+                "text-on-brand"
+                    | "selection"
+                    | "session-selection"
+                    | "terminal-active"
+                    | "branch"
+                    | "sandbox"
             )
     }
 }
