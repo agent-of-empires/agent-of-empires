@@ -32,6 +32,21 @@ fn looks_like_git_url(url: &str) -> bool {
         || (url.contains('@') && url.contains(':') && !url.contains(' '))
 }
 
+/// Expand a leading `~` or `~/` to the user's home directory.
+/// Leaves the path unchanged when no home dir is available.
+fn expand_tilde(path: &str) -> std::path::PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    } else if path == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home;
+        }
+    }
+    std::path::PathBuf::from(path)
+}
+
 /// Extract a repository name from a git URL.
 ///
 /// Handles HTTPS, SSH, and scp-style URLs:
@@ -109,7 +124,7 @@ pub async fn clone_repo(
         if dest.is_empty() {
             None
         } else {
-            Some(std::path::PathBuf::from(dest))
+            Some(expand_tilde(dest))
         }
     } else {
         None
@@ -379,5 +394,21 @@ mod tests {
     #[test]
     fn looks_like_git_url_rejects_scp_style_with_space() {
         assert!(!looks_like_git_url("git@host: /path"));
+    }
+
+    #[test]
+    fn expand_tilde_expands_home() {
+        let home = dirs::home_dir().expect("home dir");
+        assert_eq!(expand_tilde("~/foo"), home.join("foo"));
+        assert_eq!(expand_tilde("~"), home);
+    }
+
+    #[test]
+    fn expand_tilde_leaves_absolute_paths_alone() {
+        assert_eq!(
+            expand_tilde("/tmp/foo"),
+            std::path::PathBuf::from("/tmp/foo")
+        );
+        assert_eq!(expand_tilde("foo/bar"), std::path::PathBuf::from("foo/bar"));
     }
 }
