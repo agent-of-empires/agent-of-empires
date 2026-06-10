@@ -1371,10 +1371,11 @@ fn output_after_baseline(baseline: &str, latest: &str) -> String {
 
 fn clean_agent_reply(raw: &str, prompt: &str) -> String {
     let turn = reply_turn_after_prompt(raw, prompt);
-    let without_footer = strip_terminal_footer(&turn);
-    let without_chrome = strip_terminal_chrome_lines(&without_footer);
+    let without_chrome = strip_terminal_chrome_lines(&turn);
     let without_tools = strip_pi_tool_blocks(&without_chrome);
-    normalize_reply_text(&without_tools)
+    let without_footer = strip_terminal_footer(&without_tools);
+    let without_meta = strip_pi_meta_lines(&without_footer);
+    normalize_reply_text(&without_meta)
 }
 
 fn reply_turn_after_prompt(raw: &str, prompt: &str) -> String {
@@ -1401,6 +1402,10 @@ fn reply_turn_after_prompt(raw: &str, prompt: &str) -> String {
         }
     }
 
+    if let Some(after_wrapped_prompt) = reply_turn_after_wrapped_prompt(raw, prompt) {
+        return after_wrapped_prompt;
+    }
+
     let compact_prompt = prompt.trim();
     if compact_prompt.chars().count() >= 12 {
         if let Some(pos) = raw.rfind(compact_prompt) {
@@ -1410,6 +1415,44 @@ fn reply_turn_after_prompt(raw: &str, prompt: &str) -> String {
     }
 
     raw.to_string()
+}
+
+fn reply_turn_after_wrapped_prompt(raw: &str, prompt: &str) -> Option<String> {
+    let target = collapse_whitespace(prompt);
+    if target.chars().count() < 12 {
+        return None;
+    }
+
+    let lines: Vec<&str> = raw.lines().collect();
+    let max_span = ((target.chars().count() / 48) + 4).clamp(2, 24);
+    for start in (0..lines.len()).rev() {
+        let mut joined = String::new();
+        let end_limit = (start + max_span).min(lines.len());
+        for end in start..end_limit {
+            let trimmed = lines[end].trim();
+            if trimmed.is_empty() && joined.is_empty() {
+                continue;
+            }
+            if !joined.is_empty() {
+                joined.push(' ');
+            }
+            joined.push_str(trimmed);
+
+            let candidate = collapse_whitespace(&joined);
+            if candidate == target {
+                return Some(lines[end + 1..].join("\n"));
+            }
+            if candidate.chars().count() > target.chars().count() + 80 {
+                break;
+            }
+        }
+    }
+
+    None
+}
+
+fn collapse_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn strip_terminal_footer(text: &str) -> String {
@@ -1511,7 +1554,28 @@ fn strip_pi_tool_blocks(text: &str) -> String {
 }
 
 fn is_pi_tool_block_end(trimmed: &str) -> bool {
-    trimmed.starts_with("Took ") || trimmed.starts_with("Tool failed after ")
+    trimmed.starts_with("Took ")
+        || trimmed.starts_with("Tool failed after ")
+        || trimmed.starts_with("Command exited with code ")
+}
+
+fn strip_pi_meta_lines(text: &str) -> String {
+    text.lines()
+        .filter(|line| !is_pi_meta_line(line.trim()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn is_pi_meta_line(trimmed: &str) -> bool {
+    trimmed.starts_with("[skill] ")
+        || is_folded_output_marker(trimmed)
+        || trimmed.starts_with("Took ")
+        || trimmed.starts_with("Command exited with code ")
+        || trimmed == "(no output)"
+}
+
+fn is_folded_output_marker(trimmed: &str) -> bool {
+    trimmed.starts_with("... (") && trimmed.contains(" earlier lines") && trimmed.contains("ctrl+o")
 }
 
 fn normalize_reply_text(text: &str) -> String {
@@ -1539,6 +1603,8 @@ fn normalize_reply_text(text: &str) -> String {
         }
     }
 
+    lines = reflow_wrapped_lines(lines);
+
     let mut collapsed = Vec::new();
     let mut previous_blank = false;
     for line in lines {
@@ -1551,6 +1617,84 @@ fn normalize_reply_text(text: &str) -> String {
     }
 
     collapsed.join("\n").trim().to_string()
+}
+
+fn reflow_wrapped_lines(lines: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut in_code_fence = false;
+
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            in_code_fence = !in_code_fence;
+            out.push(line);
+            continue;
+        }
+
+        if in_code_fence || trimmed.is_empty() {
+            out.push(line);
+            continue;
+        }
+
+        if let Some(last) = out.last_mut() {
+            if should_join_wrapped_line(last, &line) {
+                last.push(' ');
+                last.push_str(trimmed);
+                continue;
+            }
+        }
+
+        out.push(line);
+    }
+
+    out
+}
+
+fn should_join_wrapped_line(previous: &str, current: &str) -> bool {
+    let prev = previous.trim_end();
+    let cur = current.trim_start();
+    if prev.is_empty() || cur.is_empty() {
+        return false;
+    }
+    if is_list_start(cur) || is_hard_break_line(prev) || is_hard_break_line(cur) {
+        return false;
+    }
+    true
+}
+
+fn is_hard_break_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.ends_with(':')
+        || trimmed.starts_with("```")
+        || trimmed.starts_with('|')
+        || trimmed.starts_with("$ ")
+        || trimmed.starts_with('>')
+        || is_terminal_rule_line(trimmed)
+}
+
+fn is_list_start(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("- ")
+        || trimmed.starts_with("* ")
+        || trimmed.starts_with("+ ")
+        || is_numbered_list_start(trimmed)
+}
+
+fn is_numbered_list_start(trimmed: &str) -> bool {
+    let mut chars = trimmed.chars().peekable();
+    let mut saw_digit = false;
+    while let Some(ch) = chars.peek().copied() {
+        if ch.is_ascii_digit() {
+            saw_digit = true;
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    if !saw_digit {
+        return false;
+    }
+    matches!(chars.next(), Some('.') | Some(')')) && matches!(chars.next(), Some(' '))
 }
 
 fn resolve_selector(
@@ -1846,7 +1990,7 @@ Model scope: gpt-5.3-codex-spark:high, nvidia/nemotron-3-super-120b-a12b:low
 
         assert_eq!(
             clean_agent_reply(raw, "What agents are running"),
-            "I don't see any separate background agents running in this environment right\nnow (no pi/coding-agent processes detected).\nI can help you launch or inspect a specific agent workflow if you want."
+            "I don't see any separate background agents running in this environment right now (no pi/coding-agent processes detected). I can help you launch or inspect a specific agent workflow if you want."
         );
     }
 
@@ -1876,6 +2020,85 @@ Model scope: gpt-5.3-codex-spark:high, nvidia/nemotron-3-super-120b-a12b:low
         assert_eq!(
             clean_agent_reply(raw, "Reply with exactly: TELEGRAM_PI_ROUTE_OK"),
             "TELEGRAM_PI_ROUTE_OK"
+        );
+    }
+
+    #[test]
+    fn clean_agent_reply_strips_folded_tool_chatter_and_reflows_answer() {
+        let raw = "\
+ $ TOKEN=\"$(cat ~/.agent-of-empires/serve.token)\";
+ BASE=\"http://100.75.37.105:8765\"; curl -fsS
+ \"${BASE}/api/sessions/2c746b74296b49dc/output?token=${TOKEN}&lines=180&format=
+ text\" | jq -r '.content' | tail -n 120
+
+ ... (123 earlier lines, ctrl+o to expand)
+ \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}
+ ~/Python_local_Mac
+ \u{2191}24k \u{2193}4.5k R33k CH67.4% $0.110 17.9%/128k (auto) gpt-5.3-codex-spark high
+
+ Took 0.0s
+
+
+ $ aoe-agent-control running
+
+ ... (20 earlier lines, ctrl+o to expand)
+ 2c746b74296b49dc   Running   pi   Telegram Pi Agent
+ /Users/williamsmith/Python_local_Mac
+
+ Took 0.0s
+
+
+ Running AOE sessions now (via aoe-agent-control running):
+
+ - 6bfb2b8ece5f4b92 - codex - Sicilians -
+   ~/Python_local_Mac/02_ml_research/Research (Running)
+ - 2c746b74296b49dc - pi - Telegram Pi Agent -
+   ~/Python_local_Mac (Running)
+
+ Also active but idle: fc01df9321ad4b27 (codex pi) and 10 others idle.
+
+\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}
+~/Python_local_Mac
+\u{2191}36k \u{2193}7.5k R137k CH87.4% $0.193 27.0%/128k (auto) gpt-5.3-codex-spark high";
+
+        assert_eq!(
+            clean_agent_reply(raw, "plan deep make it work great test it"),
+            "Running AOE sessions now (via aoe-agent-control running):\n\n- 6bfb2b8ece5f4b92 - codex - Sicilians - ~/Python_local_Mac/02_ml_research/Research (Running)\n- 2c746b74296b49dc - pi - Telegram Pi Agent - ~/Python_local_Mac (Running)\n\nAlso active but idle: fc01df9321ad4b27 (codex pi) and 10 others idle."
+        );
+    }
+
+    #[test]
+    fn clean_agent_reply_removes_terminal_wrapped_prompt() {
+        let prompt = "Use aoe-agent-control running, then answer in two concise bullet points: which AOE sessions are running and confirm Telegram replies should be clean. Do not include raw command output in your final answer.";
+        let raw = "\
+ Use aoe-agent-control running, then answer in two concise bullet points: which
+ AOE sessions are running and confirm Telegram replies should be clean. Do not
+ include raw command output in your final answer.
+
+
+ $ aoe-agent-control running
+
+ ... (20 earlier lines, ctrl+o to expand)
+ 2c746b74296b49dc   Running   pi   Telegram Pi Agent
+ /Users/williamsmith/Python_local_Mac
+
+ Took 0.1s
+
+
+ - Running AOE sessions: 6bfb2b8 (codex, Sicilians,
+   ~/Python_local_Mac/02_ml_research/Research), fc01df9 (codex, pi,
+   ~/Python_local_Mac), and 2c746b7 (pi, Telegram Pi Agent,
+   ~/Python_local_Mac).
+ - Telegram reply status: confirmed clean - replies are now expected to be
+   AoE-aware via aoe-agent-control.
+
+\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}
+~/Python_local_Mac
+\u{2191}63k \u{2193}8.2k R169k CH97.0% $0.254 23.8%/128k (auto)";
+
+        assert_eq!(
+            clean_agent_reply(raw, prompt),
+            "- Running AOE sessions: 6bfb2b8 (codex, Sicilians, ~/Python_local_Mac/02_ml_research/Research), fc01df9 (codex, pi, ~/Python_local_Mac), and 2c746b7 (pi, Telegram Pi Agent, ~/Python_local_Mac).\n- Telegram reply status: confirmed clean - replies are now expected to be AoE-aware via aoe-agent-control."
         );
     }
 
