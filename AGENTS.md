@@ -44,6 +44,7 @@
 - Build: `cargo build --features serve` (build.rs runs `npm install && npm run build` in `web/` when inputs change).
 - Run: `aoe serve --host 0.0.0.0` (token-based auth by default).
 - Frontend dev: `cargo xtask dev` (Unix) builds the serve binary, then runs `aoe serve` (8081) and the Vite dev server (5173, HMR) together, pointing Vite at the backend via `VITE_PROXY` so `/api` and the `/sessions/*/ws` relays resolve; open `:5173`, Ctrl-C stops both. Or run them by hand: `cd web && npm run dev` plus a separate `cargo run --features serve -- serve`.
+- Web checks (CI gates all three on any `web/` change): `cd web && npm run format:check` (oxfmt, NOT prettier; `npm run format` to fix), `npm run lint` (ESLint), and `npx tsc -b` (typecheck, also part of `npm run build`). ESLint and tsc do not catch formatting; run oxfmt explicitly.
 - TUI-only `cargo build` (without `--features serve`) needs no JS tooling.
 
 ## Settings & Configuration
@@ -163,7 +164,7 @@ Full recipe, harness API, and fake-ACP-agent details live in `docs/development/p
 
 Before requesting review, every PR must clear:
 
-1. **`cargo fmt`, `cargo clippy`, `cargo test`** all clean (`--features serve` if the change touches the web dashboard or structured view).
+1. **`cargo fmt`, `cargo clippy`, `cargo test`** all clean (`--features serve` if the change touches the web dashboard or structured view). For any `web/` change, also **`cd web && npm run format:check && npm run lint`** (oxfmt + ESLint; both are CI gates, and neither ESLint nor tsc catches formatting).
 2. **Web tests when applicable.** If the change touches a user-facing dashboard flow listed in the coverage matrix mandate (auth, wizard, settings, profiles, sessions / sidebar, right panel / diff / notifications, directory browser, devices, git clone, connectivity, read-only), update `web/tests/coverage-matrix.json` and add or modify the appropriate Vitest / Playwright test. CI fails on a missing matrix entry.
 3. **Codecov checks.** See below.
 
