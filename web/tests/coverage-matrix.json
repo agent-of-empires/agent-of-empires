@@ -24,7 +24,8 @@
       "components": [
         "web/src/components/Dashboard.tsx",
         "web/src/components/TerminalView.tsx",
-        "web/src/components/ContentSplit.tsx"
+        "web/src/components/ContentSplit.tsx",
+        "web/src/components/XtermTerminalView.tsx"
       ]
     },
     {
@@ -74,7 +75,11 @@
       "kind": "mocked-playwright",
       "risk": "high",
       "specs": ["tests/mobile-dom-renderer.spec.ts"],
-      "components": ["web/src/components/MobileLiveTerminal.tsx", "web/src/hooks/useLiveTerminal.ts"]
+      "components": [
+        "web/src/components/MobileLiveTerminal.tsx",
+        "web/src/components/LiveTerminalView.tsx",
+        "web/src/hooks/useLiveTerminal.ts"
+      ]
     },
     {
       "id": "terminal.webgl-gate-units",
@@ -88,11 +93,7 @@
       "kind": "mocked-playwright",
       "risk": "high",
       "specs": ["tests/scrollback-exit.spec.ts"],
-      "components": [
-        "web/src/hooks/useLiveTerminal.ts",
-        "web/src/components/MobileLiveTerminal.tsx",
-        "web/src/components/BackToLiveButton.tsx"
-      ]
+      "components": ["web/src/hooks/useLiveTerminal.ts", "web/src/components/MobileLiveTerminal.tsx"]
     },
     {
       "id": "auth.no-auth",

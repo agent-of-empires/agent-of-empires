@@ -3,42 +3,58 @@ import type { CSSProperties, RefObject } from "react";
 import type { AnsiSegment, AnsiStyle } from "../lib/ansi";
 import { ansiToLines } from "../lib/liveTermLines";
 import type { LiveFrame } from "../hooks/useLiveTerminal";
-import { BackToLiveButton } from "./BackToLiveButton";
 import { useWebSettings } from "../hooks/useWebSettings";
 
 // Mobile rendering of a tmux agent pane, mirroring the TUI's live mode:
-// the server streams `capture-pane` snapshots (see src/server/live_ws.rs)
+// the server streams `capture-pane` snapshots (src/server/live_ws.rs)
 // and this component renders them as real DOM text inside a NATIVELY
-// scrolling container. Scrollback is the browser's own scroll (momentum,
-// 120Hz, finger-true, long-press text selection), not tmux copy-mode:
-// the agent keeps running while the user reads, and there is no wheel
-// synthesis, momentum re-implementation, or copy-mode state to infer.
+// scrolling container. There is no tmux copy-mode, no wheel synthesis,
+// no momentum re-implementation, and the agent keeps running while the
+// user reads.
 //
-// Scroll model: total virtual content = history (tmux scrollback) +
-// live screen. The frame carries the pane's `history` line count, and
-// `content` covers the last `window` lines of that. A spacer div stands
-// in for the un-fetched history above, so the scroller's total height
-// is stable: growing the capture window converts spacer rows into real
-// rows 1:1 with no scroll jump, and appended output only ever grows the
-// bottom edge.
+// Reading model (mirrors the TUI's "capture window follows the scroll
+// offset", adapted for a network hop):
+//
+//   live     — pinned to the bottom. The capture window is just the
+//              screen, so frames are small and fast.
+//   fetching — the user scrolled up. One window request covers the
+//              ENTIRE history; the spacer (sized from tmux's
+//              #{history_size}) already made the area scrollable, so a
+//              flick lands wherever it lands and the content fills in
+//              underneath it in one round trip.
+//   held     — the full-history frame arrived. The client freezes it
+//              and tells the server to stop pushing (`hold`), so the
+//              reading surface cannot move and zero bytes flow while
+//              reading. Returning to the bottom releases the hold; a
+//              fresh frame arrives in ~one capture interval.
+//
+// Total scroll height is constant across all of this: spacer rows are
+// converted into real rows 1:1 as content arrives, so the browser's
+// preserved scrollTop keeps the same lines in view with no compensation.
+//
+// The soft keyboard never resizes tmux. Rows are derived from the
+// LARGEST container height seen for the current width (the no-keyboard
+// size); a keyboard cycle only shrinks the visible part of the
+// bottom-pinned scroller, exactly like a chat app.
 
 const MIN_FONT_SIZE = 6;
 const MAX_FONT_SIZE = 28;
 const LINE_RATIO = 1.2;
-/** How many lines each history fetch adds to the capture window. */
-const WINDOW_GROW_LINES = 400;
-/** Mirrors MAX_WINDOW_LINES in src/server/live_ws.rs. */
-const MAX_WINDOW_LINES = 4000;
-/** Resize debounce: one SIGWINCH-equivalent per settled layout. */
+/** Resize debounce: one tmux resize per settled layout. */
 const RESIZE_DEBOUNCE_MS = 150;
 
 export interface MobileLiveTerminalProps {
   frame: LiveFrame | null;
   connected: boolean;
   active: boolean;
+  /** True while the hook's read machine is off the live edge; the frame
+   *  prop is then the frozen full-history snapshot. */
+  reading: boolean;
   sendResize: (cols: number, rows: number) => void;
   setWindow: (lines: number) => void;
   setCadence: (fast: boolean) => void;
+  enterReading: (rows: number) => void;
+  returnToLive: (rows: number) => void;
   sendData: (data: string) => void;
   /** Virtual Ctrl modifier from the mobile toolbar. */
   ctrlActiveRef: RefObject<boolean>;
@@ -67,7 +83,7 @@ function segStyle(style: AnsiStyle): CSSProperties | undefined {
 const Row = memo(function Row({ segs }: { segs: AnsiSegment[] }) {
   if (segs.length === 0) {
     // Keep empty rows at full line height.
-    return <div>{" "}</div>;
+    return <div> </div>;
   }
   return (
     <div>
@@ -94,9 +110,12 @@ export function MobileLiveTerminal({
   frame,
   connected,
   active,
+  reading,
   sendResize,
   setWindow,
   setCadence,
+  enterReading,
+  returnToLive,
   sendData,
   ctrlActiveRef,
   clearCtrl,
@@ -109,94 +128,48 @@ export function MobileLiveTerminal({
   const lineH = fontSize * LINE_RATIO;
   const charW = useMemo(() => measureCharWidth(fontSize), [fontSize]);
 
+  // --- frame geometry -------------------------------------------------------
+  // The hook owns the read machine: `frame` is already the frozen
+  // snapshot while reading, the live stream otherwise.
+  const rowsRef = useRef(0);
+  const readingRef = useRef(reading);
+  useEffect(() => {
+    readingRef.current = reading;
+  }, [reading]);
   const lines = useMemo(() => (frame ? ansiToLines(frame.content) : []), [frame]);
   const screenRows = frame?.rows ?? 0;
   const history = frame?.history ?? 0;
-  // Lines of history the current capture window does NOT cover; rendered
-  // as a spacer so total scroll height tracks the full virtual content.
   const fetchedHistory = Math.max(0, lines.length - screenRows);
   const spacerLines = Math.max(0, history - fetchedHistory);
-
-  // --- at-bottom tracking + cadence + window growth -------------------
-  const atBottomRef = useRef(true);
-  const [showBackToLive, setShowBackToLive] = useState(false);
-  const windowRef = useRef(0);
-  const growThrottleRef = useRef(0);
-  const rowsRef = useRef(0);
   useEffect(() => {
-    rowsRef.current = screenRows;
+    rowsRef.current = screenRows || rowsRef.current;
   }, [screenRows]);
 
-  const requestWindow = useCallback(
-    (lines: number) => {
-      const clamped = Math.min(MAX_WINDOW_LINES, lines);
-      if (clamped === windowRef.current) return;
-      windowRef.current = clamped;
-      setWindow(clamped);
-    },
-    [setWindow],
-  );
-
-  const syncCadence = useCallback(() => {
-    setCadence(atBottomRef.current && active && document.visibilityState === "visible");
-  }, [setCadence, active]);
+  const atBottom = useCallback(() => {
+    const el = scrollerRef.current;
+    if (!el) return true;
+    return el.scrollHeight - el.scrollTop - el.clientHeight < lineH;
+  }, [lineH]);
 
   const onScroll = useCallback(() => {
+    if (atBottom()) {
+      returnToLive(rowsRef.current);
+    } else {
+      enterReading(rowsRef.current);
+    }
+  }, [atBottom, enterReading, returnToLive]);
+
+  const jumpToLatest = useCallback(() => {
     const el = scrollerRef.current;
-    if (!el) return;
-    const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
-    const atBottom = distance < lineH;
-    if (atBottom !== atBottomRef.current) {
-      atBottomRef.current = atBottom;
-      setShowBackToLive(!atBottom);
-      syncCadence();
-      if (atBottom) {
-        // Back at the live edge: shrink the capture window so fast-
-        // cadence frames stay small. The spacer reabsorbs the height.
-        requestWindow(Math.max(rowsRef.current, 0) || 0);
-      }
-    }
-    // Approaching the spacer: pull more history into the window.
-    if (!atBottom && el.scrollTop < el.clientHeight * 2) {
-      const now = Date.now();
-      if (now - growThrottleRef.current > 300 && windowRef.current < MAX_WINDOW_LINES) {
-        growThrottleRef.current = now;
-        requestWindow(windowRef.current + WINDOW_GROW_LINES);
-      }
-    }
-  }, [lineH, requestWindow, syncCadence]);
+    if (el) el.scrollTop = el.scrollHeight;
+    returnToLive(rowsRef.current);
+  }, [returnToLive]);
 
-  // First upward gesture: with the window at screen size there may be
-  // nothing to scroll yet, so a plain scroll event never fires. Detect a
-  // downward drag at the top and seed the first history fetch.
-  const touchStartYRef = useRef(0);
-  const onTouchStartCapture = useCallback((e: React.TouchEvent) => {
-    if (e.touches.length === 1) touchStartYRef.current = e.touches[0]!.clientY;
-  }, []);
-  const onTouchMoveCapture = useCallback(
-    (e: React.TouchEvent) => {
-      if (e.touches.length !== 1) return;
-      const el = scrollerRef.current;
-      if (!el) return;
-      const dy = e.touches[0]!.clientY - touchStartYRef.current;
-      const scrollable = el.scrollHeight > el.clientHeight + 1;
-      if (dy > 24 && !scrollable && history > 0 && windowRef.current < MAX_WINDOW_LINES) {
-        const now = Date.now();
-        if (now - growThrottleRef.current > 300) {
-          growThrottleRef.current = now;
-          requestWindow(windowRef.current + WINDOW_GROW_LINES);
-        }
-      }
-    },
-    [history, requestWindow],
-  );
-
-  // --- pinch zoom (two-finger) -----------------------------------------
+  // --- pinch zoom (two-finger) ---------------------------------------------
   const pinchRef = useRef<{ startDist: number; startSize: number; changed: boolean } | null>(null);
   const persistTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const onTouchStart = useCallback(
     (e: React.TouchEvent) => {
-      onTouchStartCapture(e);
       if (e.touches.length === 2) {
         const [a, b] = [e.touches[0]!, e.touches[1]!];
         pinchRef.current = {
@@ -206,26 +179,21 @@ export function MobileLiveTerminal({
         };
       }
     },
-    [fontSize, onTouchStartCapture],
+    [fontSize],
   );
-  const onTouchMove = useCallback(
-    (e: React.TouchEvent) => {
-      if (e.touches.length === 2 && pinchRef.current) {
-        e.preventDefault();
-        const [a, b] = [e.touches[0]!, e.touches[1]!];
-        const dist = Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
-        const { startDist, startSize } = pinchRef.current;
-        if (startDist > 0) {
-          const next = Math.round(Math.max(MIN_FONT_SIZE, Math.min(MAX_FONT_SIZE, startSize * (dist / startDist))));
-          if (next !== startSize) pinchRef.current.changed = true;
-          setFontSize(next);
-        }
-        return;
+  const onTouchMove = useCallback((e: React.TouchEvent) => {
+    if (e.touches.length === 2 && pinchRef.current) {
+      e.preventDefault();
+      const [a, b] = [e.touches[0]!, e.touches[1]!];
+      const dist = Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+      const { startDist, startSize } = pinchRef.current;
+      if (startDist > 0) {
+        const next = Math.round(Math.max(MIN_FONT_SIZE, Math.min(MAX_FONT_SIZE, startSize * (dist / startDist))));
+        if (next !== startSize) pinchRef.current.changed = true;
+        setFontSize(next);
       }
-      onTouchMoveCapture(e);
-    },
-    [onTouchMoveCapture],
-  );
+    }
+  }, []);
   const onTouchEnd = useCallback(
     (e: React.TouchEvent) => {
       if (e.touches.length < 2 && pinchRef.current) {
@@ -247,21 +215,45 @@ export function MobileLiveTerminal({
     [],
   );
 
-  // --- grid sizing ------------------------------------------------------
+  // --- grid sizing -----------------------------------------------------------
+  // Rows come from the LATCHED maximum container height for the current
+  // width, so a soft-keyboard cycle (which shrinks the container) never
+  // resizes tmux; the bottom-pinned scroller just shows fewer rows of an
+  // unchanged screen. The latch resets when the width changes
+  // (rotation, sidebar) or the font scale changes the grid anyway.
+  const latchRef = useRef<{ width: number; maxHeight: number }>({ width: 0, maxHeight: 0 });
   useEffect(() => {
     const el = scrollerRef.current;
     if (!el || !active) return;
     let timer: ReturnType<typeof setTimeout> | null = null;
     const compute = () => {
-      const cols = Math.floor(el.clientWidth / charW);
-      const rows = Math.floor(el.clientHeight / lineH);
+      const width = el.clientWidth;
+      const height = el.clientHeight;
+      if (width <= 0 || height <= 0) return;
+      const latch = latchRef.current;
+      if (Math.abs(width - latch.width) > 1) {
+        latch.width = width;
+        latch.maxHeight = height;
+      } else if (height > latch.maxHeight) {
+        latch.maxHeight = height;
+      }
+      const cols = Math.floor(width / charW);
+      const rows = Math.floor(latch.maxHeight / lineH);
       // Implausibly small means a hidden/mid-transition container; never
-      // ship that to tmux (same guard as the xterm path).
+      // ship that to tmux.
       if (cols < 20 || rows < 5) return;
+      rowsRef.current = rows;
       sendResize(cols, rows);
-      if (windowRef.current < rows) requestWindow(rows);
+      if (!readingRef.current) {
+        setWindow(rows);
+      }
     };
     const ro = new ResizeObserver(() => {
+      // Keep the live edge pinned through layout changes (keyboard
+      // open/close, toolbar mount) immediately, then settle the grid.
+      if (!readingRef.current) {
+        el.scrollTop = el.scrollHeight;
+      }
       if (timer) clearTimeout(timer);
       timer = setTimeout(compute, RESIZE_DEBOUNCE_MS);
     });
@@ -270,42 +262,30 @@ export function MobileLiveTerminal({
       ro.disconnect();
       if (timer) clearTimeout(timer);
     };
-  }, [active, charW, lineH, sendResize, requestWindow]);
+  }, [active, charW, lineH, sendResize, setWindow]);
 
-  // Cadence follows tab visibility too.
+  // Cadence: fast only while this pane is the active, visible surface.
   useEffect(() => {
-    const onVisibility = () => syncCadence();
-    document.addEventListener("visibilitychange", onVisibility);
-    syncCadence();
-    return () => document.removeEventListener("visibilitychange", onVisibility);
-  }, [syncCadence]);
+    const sync = () => setCadence(active && document.visibilityState === "visible");
+    sync();
+    document.addEventListener("visibilitychange", sync);
+    return () => document.removeEventListener("visibilitychange", sync);
+  }, [active, setCadence]);
 
-  // --- scroll anchoring on frame updates --------------------------------
+  // --- bottom pinning ---------------------------------------------------------
   useLayoutEffect(() => {
     const el = scrollerRef.current;
     if (!el) return;
-    if (atBottomRef.current) {
+    if (!readingRef.current) {
       el.scrollTop = el.scrollHeight;
     }
-    // Not at bottom: leave scrollTop alone. The spacer model keeps the
-    // height ABOVE the viewport invariant under every transition
-    // (output flow moves a line from content-top into the spacer;
-    // window growth converts spacer rows into content rows 1:1), so the
-    // browser-preserved scrollTop keeps the same lines in view, and new
-    // output only ever extends the bottom edge.
+    // fetching/held: leave scrollTop alone. Above-viewport height is
+    // invariant (spacer rows convert to content rows 1:1; appends only
+    // extend the bottom), so the browser-preserved offset keeps the
+    // same lines in view.
   }, [lines, spacerLines, lineH]);
 
-  const exitScrollback = useCallback(() => {
-    const el = scrollerRef.current;
-    if (!el) return;
-    el.scrollTop = el.scrollHeight;
-    atBottomRef.current = true;
-    setShowBackToLive(false);
-    syncCadence();
-    requestWindow(rowsRef.current || 0);
-  }, [requestWindow, syncCadence]);
-
-  // --- keyboard input ----------------------------------------------------
+  // --- keyboard input -----------------------------------------------------------
   const composingRef = useRef(false);
   const sendKeys = useCallback(
     (data: string) => {
@@ -425,8 +405,8 @@ export function MobileLiveTerminal({
     [sendKeys, inputRef],
   );
 
-  // --- cursor overlay ------------------------------------------------------
-  const cursor = frame?.cursor ?? null;
+  // --- cursor overlay (live edge only; a frozen snapshot has no cursor) -------
+  const cursor = !reading ? (frame?.cursor ?? null) : null;
   const cursorTop = cursor ? (spacerLines + Math.max(0, lines.length - screenRows) + cursor.y) * lineH : 0;
   const cursorLeft = cursor ? cursor.x * charW : 0;
 
@@ -472,7 +452,28 @@ export function MobileLiveTerminal({
         </div>
       </div>
 
-      {showBackToLive && <BackToLiveButton onClick={exitScrollback} topOffset="top-3" />}
+      {reading && (
+        <button
+          type="button"
+          onClick={jumpToLatest}
+          aria-label="Back to live"
+          className="absolute right-3 bottom-16 z-10 w-10 h-10 rounded-full bg-surface-800/90 border border-surface-700/30 text-text-secondary flex items-center justify-center shadow-lg backdrop-blur-sm active:scale-95 motion-safe:animate-[fadeIn_200ms_ease-out]"
+        >
+          <svg
+            width="16"
+            height="16"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            <polyline points="6 9 12 15 18 9" />
+          </svg>
+        </button>
+      )}
 
       <textarea
         ref={inputRef}

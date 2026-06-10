@@ -81,6 +81,13 @@ async function setKeyboard(page: Page, opts: { open: boolean; px?: number; pwa?:
   );
 }
 
+async function paneHeight(page: Page): Promise<number> {
+  return page.evaluate(() => {
+    const el = document.querySelector<HTMLElement>("[data-live-terminal]");
+    return el?.getBoundingClientRect().height ?? 0;
+  });
+}
+
 async function openSession(page: Page, handle: MockHandle) {
   await openMobileSidebar(page);
   await clickSidebarSession(page, "pinch-test");
@@ -89,7 +96,7 @@ async function openSession(page: Page, handle: MockHandle) {
 }
 
 test.describe("Keyboard auto-resize (#1432)", () => {
-  test("Safari mode: opening the keyboard shrinks the terminal, closing grows it back", async ({ page }) => {
+  test("Safari mode: keyboard insets the pane but never resizes tmux", async ({ page }) => {
     const handle = await mockTerminalApis(page);
     await page.goto("/");
     await openSession(page, handle);
@@ -98,91 +105,71 @@ test.describe("Keyboard auto-resize (#1432)", () => {
     const baselineCount = extractResizes(handle).length;
     const baselineRows = lastResize(handle)?.rows ?? 0;
     expect(baselineRows).toBeGreaterThan(0);
+    const paneHeightBefore = await paneHeight(page);
 
-    // Open keyboard: pane is padded by the live occlusion, so the terminal
-    // shrinks. Debounce collapses the animation into a single resize (allow
-    // a couple for ResizeObserver noise).
+    // iOS regular Safari: the layout viewport does not shrink with the
+    // keyboard, so the live view insets itself by the visualViewport
+    // delta. The pane shrinks visually, but rows are latched to the
+    // no-keyboard height, so tmux must NOT be resized: the live screen
+    // is bottom-pinned and simply shows fewer rows, like a chat app.
     await setKeyboard(page, { open: true, px: 320, pwa: false });
     await page.waitForTimeout(800);
 
-    const afterOpenCount = extractResizes(handle).length;
-    const afterOpenRows = lastResize(handle)?.rows ?? 0;
-    const openDelta = afterOpenCount - baselineCount;
-    expect(
-      openDelta,
-      `opening the keyboard should emit 1 resize (<=2 tolerated), got ${openDelta}`,
-    ).toBeGreaterThanOrEqual(1);
-    expect(openDelta).toBeLessThanOrEqual(2);
-    expect(afterOpenRows, "terminal should have fewer rows while the keyboard occludes the viewport").toBeLessThan(
-      baselineRows,
+    expect(await paneHeight(page), "pane should shrink under the keyboard inset").toBeLessThan(paneHeightBefore);
+    expect(extractResizes(handle).length, "keyboard open must not emit a tmux resize (rows are latched)").toBe(
+      baselineCount,
     );
 
-    // Close keyboard: occlusion releases to 0, the terminal grows back.
+    // Close: inset releases, still no tmux resize.
     await setKeyboard(page, { open: false, pwa: false });
     await page.waitForTimeout(800);
 
-    const afterCloseCount = extractResizes(handle).length;
-    const afterCloseRows = lastResize(handle)?.rows ?? 0;
-    const closeDelta = afterCloseCount - afterOpenCount;
-    expect(
-      closeDelta,
-      `closing the keyboard should emit 1 resize (<=2 tolerated), got ${closeDelta}`,
-    ).toBeGreaterThanOrEqual(1);
-    expect(closeDelta).toBeLessThanOrEqual(2);
-    expect(afterCloseRows, "terminal should grow back to roughly the no-keyboard row count").toBeGreaterThan(
-      afterOpenRows,
-    );
+    expect(await paneHeight(page)).toBeGreaterThanOrEqual(paneHeightBefore - 2);
+    expect(extractResizes(handle).length, "keyboard close must not emit a tmux resize").toBe(baselineCount);
   });
 
-  test("PWA mode: innerHeight shrinks with the keyboard but occlusion padding still resizes the terminal", async ({
-    page,
-  }) => {
+  test("PWA mode: dvh shrink owns the layout; no inset, no tmux resize", async ({ page }) => {
     const handle = await mockTerminalApis(page);
     await page.goto("/");
     await openSession(page, handle);
     await page.waitForTimeout(1000);
 
     const baselineCount = extractResizes(handle).length;
-    const baselineRows = lastResize(handle)?.rows ?? 0;
-    expect(baselineRows).toBeGreaterThan(0);
 
-    // PWA: innerHeight shrinks alongside vv.height. The old design relied on
-    // keyboardHeight here, which is 0 in this mode, so nothing resized. The
-    // occlusion signal is measured against the remembered full height, so it
-    // is non-zero and the terminal shrinks like everywhere else.
+    // iOS PWA / iOS 26 / Android: innerHeight (and 100dvh) shrink with
+    // the keyboard, so the layout shrinks natively and the live view
+    // must add NO inset of its own (keyboardHeight is 0 in this mode)
+    // and never resize tmux. The dvh shrink itself cannot be simulated
+    // here (it tracks the real viewport, not the patched innerHeight);
+    // what is testable is that the legacy machinery stays quiet.
     await setKeyboard(page, { open: true, px: 320, pwa: true });
     await page.waitForTimeout(800);
 
-    const afterOpenCount = extractResizes(handle).length;
-    const afterOpenRows = lastResize(handle)?.rows ?? 0;
-    const openDelta = afterOpenCount - baselineCount;
-    expect(
-      openDelta,
-      `PWA keyboard open should emit 1 resize (<=2 tolerated), got ${openDelta}`,
-    ).toBeGreaterThanOrEqual(1);
-    expect(openDelta).toBeLessThanOrEqual(2);
-    expect(afterOpenRows).toBeLessThan(baselineRows);
+    const padding = await page.evaluate(() => {
+      const pane = document.querySelector<HTMLElement>('[data-term="agent"]');
+      return pane?.style?.paddingBottom || "";
+    });
+    expect(padding, "PWA mode must not add an inset (dvh shrink owns it)").toBe("");
+    expect(extractResizes(handle).length, "PWA keyboard open must not emit a tmux resize").toBe(baselineCount);
   });
 
-  test("App root is pinned to stableViewportHeight on mobile", async ({ page }) => {
+  test("App root is NOT pinned for live-view sessions (dvh shrink wanted)", async ({ page }) => {
     const handle = await mockTerminalApis(page);
     await page.goto("/");
     await openSession(page, handle);
     await page.waitForTimeout(1000);
 
-    const before = await page.evaluate(() => {
+    const rootInlineHeight = await page.evaluate(() => {
       const root = document.querySelector<HTMLElement>("div.h-dvh.flex.flex-col");
-      return {
-        innerHeight: window.innerHeight,
-        rootInlineHeight: root?.style?.height ?? "",
-      };
+      return root?.style?.height ?? "";
     });
 
-    // The hook latches max(innerHeight, vv.height) into stableViewportHeight
-    // and App.tsx applies it as inline pixel height. Without this, 100dvh
-    // shrinks on iOS PWA and the terminal pane shrinks with it.
-    expect(before.rootInlineHeight).toMatch(/^\d+px$/);
-    expect(parseInt(before.rootInlineHeight)).toBeGreaterThanOrEqual(before.innerHeight - 5);
+    // The stableViewportHeight pin exists to stop dvh from shrinking
+    // under an xterm surface (every shrink would SIGWINCH the PTY). The
+    // live view has no PTY and WANTS the natural dvh shrink, so the pin
+    // must stay off; only the single-pane paired shell still pins.
+    expect(rootInlineHeight, "live sessions must keep the natural 100dvh root").toBe("");
+    expect(extractResizes(handle).length).toBeGreaterThan(0);
   });
 
   test("no persisted reservation: a closed keyboard on load starts full-size", async ({ page }) => {

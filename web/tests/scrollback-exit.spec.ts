@@ -77,7 +77,7 @@ test.describe("Mobile live-view scrollback", () => {
     expect(all).not.toContain("resume_output");
   });
 
-  test("scrolled-up reading drops the capture cadence to idle", async ({ page }) => {
+  test("reading freezes the stream via hold; returning releases it", async ({ page }) => {
     await installTerminalSpies(page);
     const handle = await mockTerminalApis(page);
     await page.goto("/");
@@ -85,20 +85,23 @@ test.describe("Mobile live-view scrollback", () => {
     await page.reload();
     await openSession(page, handle);
 
+    // Scrolling up requests the full history; once the covering frame
+    // arrives the client holds the server's pushes (zero bandwidth, a
+    // perfectly still reading surface, agent untouched).
     await scroller(page).evaluate((el) => {
       el.scrollTop = 0;
     });
     await expect
-      .poll(() => textMessages(handle).filter((m) => m.includes('"fast":false')).length, { timeout: 3_000 })
+      .poll(() => textMessages(handle).filter((m) => m.includes('"hold":true')).length, { timeout: 3_000 })
       .toBeGreaterThan(0);
 
-    // Returning to live restores the fast cadence.
+    // Returning to live releases the hold so a fresh frame repaints.
     await page.getByRole("button", { name: "Back to live" }).tap();
     await expect
       .poll(() => {
-        const msgs = textMessages(handle).filter((m) => m.includes('"type":"cadence"'));
+        const msgs = textMessages(handle).filter((m) => m.includes('"type":"hold"'));
         return msgs[msgs.length - 1] ?? "";
       })
-      .toContain('"fast":true');
+      .toContain('"hold":false');
   });
 });

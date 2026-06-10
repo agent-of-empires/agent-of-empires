@@ -1052,29 +1052,22 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     );
   };
 
-  // Lock the root height to the latched max innerHeight on mobile. Without
-  // this, iOS PWA / iOS 26 Safari / Android Chrome shrink innerHeight
-  // (and therefore 100dvh) when the soft keyboard opens, which would move
-  // the terminal pane by the full keyboard height on its own. Pinning the
-  // root to the no-keyboard height makes occlusion padding in TerminalView
-  // the single thing that resizes the terminal, so the keyboard behaves the
-  // same way on every platform (and not double-shrink on the shrinking ones).
-  //
-  // Acp substrate doesn't host xterm.js, so the SIGWINCH concern
-  // doesn't apply; leaving the pin on for acp traps the composer
-  // below the keyboard on Android Chrome PWA (#1177). Drop the pin when
-  // the active session is acp so `h-dvh` plus the viewport meta's
-  // `interactive-widget=resizes-content` shrink the container with the
-  // keyboard and lift the composer back into view.
-  //
-  // Exception: when the single-pane paired shell is the active mobile view,
-  // an xterm.js terminal owns the viewport even on an acp session, so it
-  // needs the pin (plus the reservation in PairedTerminal) for the same
-  // reason the agent terminal does (#1452).
+  // Root-height pin: an xterm.js surface needs the layout to NOT shrink
+  // with the soft keyboard (iOS PWA / iOS 26 Safari / Android Chrome
+  // shrink innerHeight and therefore 100dvh), because every layout
+  // shrink becomes a PTY resize and a SIGWINCH redraw storm. With the
+  // agent terminal now on the capture-snapshot live view (no PTY), the
+  // only mobile xterm surface left is the single-pane paired shell, so
+  // the pin applies there and nowhere else; the live view and the
+  // structured view both rely on the natural dvh shrink to keep their
+  // bottom-anchored UI above the keyboard (#1177, #1452).
   const { isMobile, stableViewportHeight } = useMobileKeyboard();
   const pairedFullViewport = singlePane && rightPanelView === "paired";
-  const pinRootHeight =
-    isMobile && stableViewportHeight > 0 && (activeSession?.view !== "structured" || pairedFullViewport);
+  // Only the paired shell still hosts xterm.js on mobile; the agent
+  // terminal (capture-snapshot live view) and the structured view both
+  // want the natural `100dvh` shrink, which keeps their bottom-anchored
+  // surfaces above the keyboard with no occlusion math and no SIGWINCH.
+  const pinRootHeight = isMobile && stableViewportHeight > 0 && pairedFullViewport;
   const rootStyle = pinRootHeight ? { height: `${stableViewportHeight}px` } : undefined;
 
   const acpPrefs = useMemo(

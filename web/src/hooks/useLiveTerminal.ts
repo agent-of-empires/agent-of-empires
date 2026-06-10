@@ -36,7 +36,12 @@ export interface LiveTerminalState {
   reconnecting: boolean;
   retryCount: number;
   retryCountdown: number;
+  /** Frame to RENDER. While reading scrollback this is the frozen
+   *  full-history snapshot; at the live edge it tracks the stream. */
   frame: LiveFrame | null;
+  /** True from the moment the user leaves the live edge until they
+   *  return: drives the jump-to-latest affordance. */
+  reading: boolean;
 }
 
 const INITIAL_STATE: LiveTerminalState = {
@@ -45,7 +50,16 @@ const INITIAL_STATE: LiveTerminalState = {
   retryCount: 0,
   retryCountdown: 0,
   frame: null,
+  reading: false,
 };
+
+/** Cheap line count for the freeze trigger; capture content terminates
+ *  every line with `\n`, so count terminators. */
+function contentLineCount(content: string): number {
+  let n = 0;
+  for (let i = 0; i < content.length; i++) if (content.charCodeAt(i) === 10) n++;
+  return n;
+}
 
 export function useLiveTerminal(sessionId: string | null) {
   const wsRef = useRef<WebSocket | null>(null);
@@ -60,7 +74,18 @@ export function useLiveTerminal(sessionId: string | null) {
     resize: { cols: number; rows: number } | null;
     window: number | null;
     fast: boolean;
-  }>({ resize: null, window: null, fast: true });
+    hold: boolean;
+  }>({ resize: null, window: null, fast: true, hold: false });
+  // Scrollback read machine (see LiveTerminalState.reading). "fetching"
+  // means the full-history window was requested and the next covering
+  // frame will be frozen; "held" means the server push-freeze is active.
+  const readPhaseRef = useRef<"live" | "fetching" | "held">("live");
+  // Freeze threshold: the requested window, capped by what the pane can
+  // actually provide (rows + history at request time).
+  const fetchTargetRef = useRef(0);
+  // Newest frame from the wire, regardless of freeze state, so returning
+  // to the live edge can repaint instantly while a fresh frame arrives.
+  const latestFrameRef = useRef<LiveFrame | null>(null);
 
   const storeRef = useRef<{
     snapshot: LiveTerminalState;
@@ -127,6 +152,9 @@ export function useLiveTerminal(sessionId: string | null) {
           ws.send(JSON.stringify({ type: "window", lines: desired.window }));
         }
         ws.send(JSON.stringify({ type: "cadence", fast: desired.fast }));
+        if (desired.hold) {
+          ws.send(JSON.stringify({ type: "hold", hold: true }));
+        }
       };
 
       let hasReceivedData = false;
@@ -151,16 +179,38 @@ export function useLiveTerminal(sessionId: string | null) {
           hasReceivedData = true;
           retryCountRef.current = 0;
         }
+        const incoming: LiveFrame = {
+          content: msg.content ?? "",
+          rows: msg.rows ?? 0,
+          history: msg.history ?? 0,
+          cursor: msg.cursor ?? null,
+        };
+        latestFrameRef.current = incoming;
+        if (readPhaseRef.current === "held") {
+          // Frozen: the rendered frame must not move under the reader.
+          // (The server holds pushes anyway; this guards stragglers.)
+          setState((prev) => ({
+            ...prev,
+            retryCount: retryCountRef.current,
+            retryCountdown: 0,
+          }));
+          return;
+        }
+        if (
+          readPhaseRef.current === "fetching" &&
+          contentLineCount(incoming.content) >= Math.min(fetchTargetRef.current, incoming.rows + incoming.history)
+        ) {
+          // This frame covers the requested history: freeze it and stop
+          // the server's pushes until the reader returns to the edge.
+          readPhaseRef.current = "held";
+          desiredRef.current.hold = true;
+          ws.send(JSON.stringify({ type: "hold", hold: true }));
+        }
         setState((prev) => ({
           ...prev,
           retryCount: retryCountRef.current,
           retryCountdown: 0,
-          frame: {
-            content: msg.content ?? "",
-            rows: msg.rows ?? 0,
-            history: msg.history ?? 0,
-            cursor: msg.cursor ?? null,
-          },
+          frame: incoming,
         }));
       };
 
@@ -249,6 +299,11 @@ export function useLiveTerminal(sessionId: string | null) {
   }, []);
 
   const sendResize = useCallback((cols: number, rows: number) => {
+    // Dedup: the sizing observer recomputes on every container change,
+    // but rows are latched to the no-keyboard height, so keyboard cycles
+    // arrive here with identical dimensions and must not touch tmux.
+    const prev = desiredRef.current.resize;
+    if (prev && prev.cols === cols && prev.rows === rows) return;
     desiredRef.current.resize = { cols, rows };
     const ws = wsRef.current;
     if (ws?.readyState === WebSocket.OPEN) {
@@ -256,12 +311,16 @@ export function useLiveTerminal(sessionId: string | null) {
     }
   }, []);
 
-  const setWindow = useCallback((lines: number) => {
+  const setWindowInternal = (lines: number) => {
+    if (desiredRef.current.window === lines) return;
     desiredRef.current.window = lines;
     const ws = wsRef.current;
     if (ws?.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: "window", lines }));
     }
+  };
+  const setWindow = useCallback((lines: number) => {
+    setWindowInternal(lines);
   }, []);
 
   const setCadence = useCallback((fast: boolean) => {
@@ -272,6 +331,38 @@ export function useLiveTerminal(sessionId: string | null) {
       ws.send(JSON.stringify({ type: "cadence", fast }));
     }
   }, []);
+
+  /** The user left the live edge: request the full history once; the
+   *  covering frame freezes and the server push-freezes (see onmessage). */
+  const enterReading = useCallback(
+    (rows: number) => {
+      if (readPhaseRef.current !== "live") return;
+      const latest = latestFrameRef.current;
+      const full = Math.min(4000, Math.max(rows, latest ? latest.rows + latest.history : rows));
+      readPhaseRef.current = "fetching";
+      fetchTargetRef.current = full;
+      setWindowInternal(full);
+      setState((prev) => ({ ...prev, reading: true }));
+    },
+    [setState],
+  );
+
+  /** Back at the live edge: release the hold, shrink the window, and
+   *  resume rendering the freshest frame immediately. */
+  const returnToLive = useCallback(
+    (rows: number) => {
+      if (readPhaseRef.current === "live") return;
+      readPhaseRef.current = "live";
+      desiredRef.current.hold = false;
+      const ws = wsRef.current;
+      if (ws?.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "hold", hold: false }));
+      }
+      if (rows > 0) setWindowInternal(rows);
+      setState((prev) => ({ ...prev, reading: false, frame: latestFrameRef.current ?? prev.frame }));
+    },
+    [setState],
+  );
 
   const manualReconnect = useCallback(() => {
     if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
@@ -298,6 +389,8 @@ export function useLiveTerminal(sessionId: string | null) {
     sendResize,
     setWindow,
     setCadence,
+    enterReading,
+    returnToLive,
     manualReconnect,
     maxRetries: MAX_RETRIES,
   };

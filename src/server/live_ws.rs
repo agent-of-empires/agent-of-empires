@@ -26,8 +26,13 @@
 //!   `{"type":"window","lines":N}`: total capture window (history +
 //!     screen). Clamped to [screen rows, MAX_WINDOW_LINES].
 //!   `{"type":"cadence","fast":bool}`: capture cadence. Fast while the
-//!     client is at the live edge and visible; idle while scrolled up
-//!     or backgrounded.
+//!     client is at the live edge and visible; idle while backgrounded.
+//!   `{"type":"hold","hold":bool}`: freeze pushes while the client reads
+//!     scrollback. While held the loop skips captures entirely (zero
+//!     bandwidth, zero forks) except a single forced capture after a
+//!     window/resize change, so the client's full-history fetch still
+//!     gets its one frame. `hold:false` triggers an immediate fresh
+//!     capture so returning to the live edge repaints at once.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -72,6 +77,8 @@ enum LiveControlMessage {
     Window { lines: usize },
     #[serde(rename = "cadence")]
     Cadence { fast: bool },
+    #[serde(rename = "hold")]
+    Hold { hold: bool },
 }
 
 /// Shared per-connection knobs the recv loop writes and the capture
@@ -82,6 +89,10 @@ struct LiveSettings {
     /// Rows from the latest client resize; used as the window floor so a
     /// shrunk window can never clip the live screen.
     screen_rows: AtomicU64,
+    /// Freeze pushes while the client reads scrollback (see module docs).
+    hold: AtomicBool,
+    /// One capture is owed despite `hold` (window/resize changed).
+    force_once: AtomicBool,
 }
 
 pub async fn live_terminal_ws(
@@ -136,6 +147,8 @@ async fn handle_live_ws(
         window_lines: AtomicUsize::new(DEFAULT_WINDOW_LINES),
         fast: AtomicBool::new(true),
         screen_rows: AtomicU64::new(0),
+        hold: AtomicBool::new(false),
+        force_once: AtomicBool::new(false),
     });
     // Wakes the capture loop out of its inter-capture sleep: after
     // dispatched input (echo latency) and after cadence/window changes.
@@ -157,6 +170,20 @@ async fn handle_live_ws(
         let mut last_published: Option<(String, Option<crate::tmux::PaneCursor>)> = None;
         let mut dead_probes: u32 = 0;
         loop {
+            // Held: skip the capture (and its tmux fork) entirely unless a
+            // window/resize change owes the client one frame. The
+            // inter-capture wait below still runs, so hold release (which
+            // nudges) is picked up promptly.
+            if capture_settings.hold.load(Ordering::Relaxed)
+                && !capture_settings.force_once.swap(false, Ordering::Relaxed)
+            {
+                let ms = CAPTURE_INTERVAL_IDLE_MS;
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(ms)) => {}
+                    _ = capture_nudge.notified() => {}
+                }
+                continue;
+            }
             let lines = capture_settings.window_lines.load(Ordering::Relaxed);
             let name = capture_tmux.clone();
             let captured = tokio::task::spawn_blocking(move || {
@@ -285,6 +312,7 @@ async fn handle_live_ws(
                                 })
                                 .await;
                                 resized = true;
+                                settings.force_once.store(true, Ordering::Relaxed);
                                 nudge.notify_one();
                             }
                             LiveControlMessage::Window { lines } => {
@@ -292,11 +320,19 @@ async fn handle_live_ws(
                                     .max(DEFAULT_WINDOW_LINES);
                                 let clamped = lines.clamp(floor, MAX_WINDOW_LINES);
                                 settings.window_lines.store(clamped, Ordering::Relaxed);
+                                settings.force_once.store(true, Ordering::Relaxed);
                                 nudge.notify_one();
                             }
                             LiveControlMessage::Cadence { fast } => {
                                 settings.fast.store(fast, Ordering::Relaxed);
                                 if fast {
+                                    nudge.notify_one();
+                                }
+                            }
+                            LiveControlMessage::Hold { hold } => {
+                                settings.hold.store(hold, Ordering::Relaxed);
+                                if !hold {
+                                    // Repaint immediately on release.
                                     nudge.notify_one();
                                 }
                             }
@@ -419,5 +455,7 @@ mod tests {
         let m: LiveControlMessage =
             serde_json::from_str(r#"{"type":"cadence","fast":false}"#).unwrap();
         assert!(matches!(m, LiveControlMessage::Cadence { fast: false }));
+        let m: LiveControlMessage = serde_json::from_str(r#"{"type":"hold","hold":true}"#).unwrap();
+        assert!(matches!(m, LiveControlMessage::Hold { hold: true }));
     }
 }

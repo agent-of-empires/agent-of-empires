@@ -116,24 +116,20 @@ test.describe("Mobile keyboard detection and layout", () => {
     expect(parseInt(after.rootPaddingBottom)).toBeGreaterThanOrEqual(250);
   });
 
-  test("auto-resizes when keyboard opens in PWA mode (innerHeight shrinks with keyboard)", async ({ page }) => {
+  test("PWA mode keyboard adds no inset (dvh shrink owns the layout)", async ({ page }) => {
     await setupAndOpen(page);
 
-    const before = await getKeyboardState(page);
-    expect(parseInt(before.rootPaddingBottom) || 0).toBe(0);
-
-    // PWA keyboard: vv.height AND window.innerHeight both shrink with the
-    // keyboard, but the full-height baseline (the real viewport) is unchanged.
-    // This is how iOS PWA / iOS 26 Safari / Android Chrome behave.
+    // PWA / iOS 26 / Android: innerHeight shrinks with the keyboard, so
+    // 100dvh shrinks the layout natively. The live view must not stack
+    // its own inset on top (that would double-shrink), and the agent
+    // pane root carries no inline padding in this mode. The dvh shrink
+    // itself is not simulable here; the assertable part is that the
+    // legacy occlusion machinery stays quiet.
     await simulateKeyboardOpen(page, 300, { innerHeightShrinks: true });
-    await page.waitForTimeout(800);
+    await page.waitForTimeout(600);
 
-    const after = await getKeyboardState(page);
-    // Occlusion is measured against the remembered full height, so the pane is
-    // padded (~300) even though innerHeight shrank with the keyboard. The old
-    // design left this at 0 because it keyed off keyboardHeight, which is 0 in
-    // PWA mode, so nothing resized there (#1432).
-    expect(parseInt(after.rootPaddingBottom)).toBeGreaterThanOrEqual(250);
+    const state = await getKeyboardState(page);
+    expect(state.rootPaddingBottom === "0" || state.rootPaddingBottom === "").toBe(true);
   });
 
   test("auto-resizes back when keyboard closes (occlusion releases)", async ({ page }) => {
