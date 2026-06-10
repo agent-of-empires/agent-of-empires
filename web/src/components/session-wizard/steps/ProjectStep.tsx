@@ -125,6 +125,7 @@ export function ProjectStep({ data, onChange, initialTab }: Props) {
   const [cloneUrl, setCloneUrl] = useState("");
   const [cloneDestination, setCloneDestination] = useState("");
   const [shallowClone, setShallowClone] = useState(false);
+  const [bareClone, setBareClone] = useState(false);
   const [cloning, setCloning] = useState(false);
   const [cloneError, setCloneError] = useState<string | null>(null);
   const [showAdvanced, setShowAdvanced] = useState(false);
@@ -164,6 +165,7 @@ export function ProjectStep({ data, onChange, initialTab }: Props) {
     const result = await cloneRepo(url, {
       destination: dest,
       shallow: shallowClone,
+      bare: bareClone,
     });
     setCloning(false);
     if (result.ok && result.path) {
@@ -358,10 +360,26 @@ export function ProjectStep({ data, onChange, initialTab }: Props) {
                       checked={shallowClone}
                       onChange={(e) => setShallowClone(e.target.checked)}
                       className="accent-brand-600"
+                      disabled={cloning || bareClone}
+                    />
+                    <span className={`text-sm ${bareClone ? "text-text-dim" : "text-text-secondary"}`}>
+                      Shallow clone (--depth 1)
+                    </span>
+                    <span className="text-[10px] text-text-dim">faster for large repos</span>
+                  </label>
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={bareClone}
+                      onChange={(e) => {
+                        setBareClone(e.target.checked);
+                        if (e.target.checked) setShallowClone(false);
+                      }}
+                      className="accent-brand-600"
                       disabled={cloning}
                     />
-                    <span className="text-sm text-text-secondary">Shallow clone (--depth 1)</span>
-                    <span className="text-[10px] text-text-dim">faster for large repos</span>
+                    <span className="text-sm text-text-secondary">Clone as bare repository</span>
+                    <span className="text-[10px] text-text-dim">recommended for worktrees</span>
                   </label>
                 </div>
               )}

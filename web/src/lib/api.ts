@@ -887,12 +887,13 @@ export async function createSession(body: CreateSessionRequest): Promise<{
 
 export async function cloneRepo(
   url: string,
-  opts?: { destination?: string; shallow?: boolean },
+  opts?: { destination?: string; shallow?: boolean; bare?: boolean },
 ): Promise<{ ok: boolean; path?: string; error?: string }> {
   try {
     const body: Record<string, unknown> = { url };
     if (opts?.destination) body.destination = opts.destination;
     if (opts?.shallow) body.shallow = true;
+    if (opts?.bare) body.bare = true;
     const res = await fetch("/api/git/clone", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
