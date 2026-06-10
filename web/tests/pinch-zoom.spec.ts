@@ -15,7 +15,7 @@ test.describe("Terminal pinch zoom (mobile)", () => {
   async function openSession(page: Page) {
     await openMobileSidebar(page);
     await clickSidebarSession(page, "pinch-test");
-    await page.locator(".xterm").waitFor({ state: "visible", timeout: 10_000 });
+    await page.locator("[data-live-terminal]").waitFor({ state: "visible", timeout: 10_000 });
   }
 
   async function wsCount(page: Page) {

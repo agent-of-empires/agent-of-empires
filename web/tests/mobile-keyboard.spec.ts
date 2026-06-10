@@ -66,13 +66,13 @@ async function simulateKeyboardClose(page: Page) {
 async function openSession(page: Page) {
   await openMobileSidebar(page);
   await clickSidebarSession(page, "pinch-test");
-  await page.locator(".xterm").waitFor({ state: "visible", timeout: 10_000 });
+  await page.locator("[data-live-terminal]").waitFor({ state: "visible", timeout: 10_000 });
 }
 
 async function getKeyboardState(page: Page) {
   return page.evaluate(() => {
     const root = document.querySelector<HTMLElement>('[class*="flex-1 flex flex-col overflow-hidden relative"]');
-    const termContainer = document.querySelector<HTMLElement>(".xterm");
+    const termContainer = document.querySelector<HTMLElement>("[data-live-terminal]");
     return {
       rootHeight: root?.getBoundingClientRect().height ?? 0,
       rootPaddingBottom: root?.style.paddingBottom || "0",
@@ -158,7 +158,7 @@ test.describe("Mobile keyboard detection and layout", () => {
     await setupAndOpen(page);
     // On chromium headless, pointer:coarse may not match — toolbar only
     // renders when isMobile is true. Check that the terminal at least loaded.
-    await expect(page.locator(".xterm")).toBeVisible();
+    await expect(page.locator("[data-live-terminal]")).toBeVisible();
   });
 
   test("keyboard open button visible when keyboard closed", async ({ page }) => {
@@ -192,7 +192,7 @@ test.describe("Mobile keyboard detection and layout", () => {
           }
         ).__termScrollBottom;
         // Watch for scrollTop change on the terminal container
-        const wt = document.querySelector(".xterm");
+        const wt = document.querySelector("[data-live-terminal]");
         if (!wt) return resolve(false);
         // Watch for scroll events on the .xterm element
         const onScroll = () => {

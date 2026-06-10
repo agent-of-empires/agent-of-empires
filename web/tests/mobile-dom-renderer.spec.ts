@@ -3,31 +3,31 @@ import { devices, type Page } from "@playwright/test";
 import { clickSidebarSession, openMobileSidebar } from "./helpers/sidebar";
 import { mockTerminalApis, installTerminalSpies } from "./helpers/terminal-mocks";
 
-// On WebKit (every iOS browser + desktop Safari) the WebGL addon must
-// not load: Safari 26.x garbles xterm's WebGL glyph atlas
-// (xtermjs/xterm.js#5816), which on an iPhone PWA rendered the terminal
-// as a mostly-blank screen with giant mis-scaled glyphs. The iPhone 13
-// device descriptor carries an iOS Safari user agent, so
-// shouldUseWebglRenderer() must pick the DOM renderer here. The WebGL
-// addon is the only thing that injects <canvas> elements into .xterm,
-// so "no canvas" is a faithful proxy for "DOM renderer active".
+// On touch-primary devices the agent pane renders the capture-snapshot
+// live view (the TUI's live-mode architecture): real DOM text, native
+// scrolling, no xterm.js and no canvases at all. This sidesteps the
+// WebKit WebGL corruption (xtermjs/xterm.js#5816) that motivated the
+// earlier DOM-renderer gate, and gives iOS native text selection.
 test.use({ ...devices["iPhone 13"] });
 
 test.describe("Mobile terminal renderer", () => {
   async function openSession(page: Page) {
     await openMobileSidebar(page);
     await clickSidebarSession(page, "pinch-test");
-    await page.locator(".xterm").waitFor({ state: "visible", timeout: 10_000 });
+    await page.locator("[data-live-terminal]").waitFor({ state: "visible", timeout: 10_000 });
   }
 
-  test("iPhone terminal uses the DOM renderer, not WebGL", async ({ page }) => {
+  test("iPhone agent pane renders the live view, not xterm", async ({ page }) => {
     await installTerminalSpies(page);
     await mockTerminalApis(page);
     await page.goto("/");
     await openSession(page);
 
-    // DOM renderer mounts the .xterm-rows tree and no canvases.
-    await expect(page.locator(".xterm .xterm-rows")).toBeAttached();
-    await expect(page.locator(".xterm canvas")).toHaveCount(0);
+    // Live view: DOM rows, zero canvases, no xterm mount.
+    await expect(page.locator("[data-live-content]")).toBeAttached();
+    await expect(page.locator("[data-live-terminal] canvas")).toHaveCount(0);
+    await expect(page.locator(".xterm")).toHaveCount(0);
+    // Frame content is real selectable text.
+    await expect.poll(() => page.locator("[data-live-content]").innerText()).toContain("$ ready");
   });
 });

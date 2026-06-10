@@ -1,5 +1,8 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useTerminal } from "../hooks/useTerminal";
+import { useLiveTerminal } from "../hooks/useLiveTerminal";
+import { useIsCoarsePointer } from "../hooks/useIsCoarsePointer";
+import { MobileLiveTerminal } from "./MobileLiveTerminal";
 import { useMobileKeyboard } from "../hooks/useMobileKeyboard";
 import { MobileTerminalToolbar } from "./MobileTerminalToolbar";
 import { BackToLiveButton } from "./BackToLiveButton";
@@ -31,18 +34,37 @@ const SCROLL_HINT_TIMEOUT_MS = 8000;
 export function TerminalView({ session, active = true }: Props) {
   const [ensureState, setEnsureState] = useState<"pending" | "ready" | "error">("pending");
   const [ensureError, setEnsureError] = useState<string | null>(null);
+  // Touch-primary devices render the capture-snapshot live view (the
+  // TUI's live-mode architecture) instead of the xterm.js PTY relay:
+  // native scrolling, no copy-mode, the agent never pauses. Desktop
+  // keeps the attach relay. Both hooks are called unconditionally
+  // (hooks rule); the inactive one gets a null session id and stays
+  // dormant.
+  const liveMode = useIsCoarsePointer();
   const {
     containerRef,
     termRef,
-    state,
-    manualReconnect,
-    sendData,
+    state: xtermState,
+    manualReconnect: xtermReconnect,
+    sendData: xtermSendData,
     activate,
     exitScrollback,
     ctrlActiveRef,
     clearCtrlRef,
-    maxRetries,
-  } = useTerminal(ensureState === "ready" ? session.id : null, "ws", active, session.claude_fullscreen, active);
+    maxRetries: xtermMaxRetries,
+  } = useTerminal(
+    ensureState === "ready" && !liveMode ? session.id : null,
+    "ws",
+    active,
+    session.claude_fullscreen,
+    active,
+  );
+  const live = useLiveTerminal(ensureState === "ready" && liveMode ? session.id : null);
+  const liveInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const state = liveMode ? live.state : xtermState;
+  const sendData = liveMode ? live.sendData : xtermSendData;
+  const manualReconnect = liveMode ? live.manualReconnect : xtermReconnect;
+  const maxRetries = liveMode ? live.maxRetries : xtermMaxRetries;
   const { isMobile, keyboardOpen, keyboardOcclusion } = useMobileKeyboard();
   const [trackedSessionId, setTrackedSessionId] = useState(session.id);
   if (session.id !== trackedSessionId) {
@@ -59,13 +81,21 @@ export function TerminalView({ session, active = true }: Props) {
   const appliedKeyboardPadding = keyboardOcclusion;
 
   const focusSelf = useCallback(() => {
+    if (liveMode) {
+      const ta = liveInputRef.current;
+      if (ta) {
+        ta.focus();
+        return true;
+      }
+      return false;
+    }
     const ta = termRef.current?.element?.querySelector("textarea");
     if (ta instanceof HTMLElement) {
       ta.focus();
       return true;
     }
     return false;
-  }, [termRef]);
+  }, [termRef, liveMode]);
 
   // Sync React state → hook ref in an effect. The mobile toolbar toggles
   // `ctrlActive` but the onData callback reads the ref to decide whether
@@ -171,6 +201,13 @@ export function TerminalView({ session, active = true }: Props) {
   // focus() (even a synchronous ws.send) can break iOS keyboard display.
   // Claim primary after the focus so the PTY resizes to this viewport.
   const toggleKeyboard = useCallback(() => {
+    if (liveMode) {
+      const ta = liveInputRef.current;
+      if (!ta) return;
+      if (keyboardOpen) ta.blur();
+      else ta.focus();
+      return;
+    }
     const term = termRef.current;
     if (!term?.element) return;
     const ta = term.element.querySelector("textarea");
@@ -180,7 +217,7 @@ export function TerminalView({ session, active = true }: Props) {
       ta.focus();
     }
     activate();
-  }, [termRef, keyboardOpen, activate]);
+  }, [termRef, keyboardOpen, activate, liveMode]);
 
   // Dismiss scroll hint on first touch or timeout.
   useEffect(() => {
@@ -266,9 +303,24 @@ export function TerminalView({ session, active = true }: Props) {
         onFocus={() => setTermFocused(true)}
         onBlur={() => setTermFocused(false)}
       >
-        <div ref={containerRef} className="absolute inset-0" onPointerDown={activate} />
+        {liveMode ? (
+          <MobileLiveTerminal
+            frame={live.state.frame}
+            connected={live.state.connected}
+            active={active}
+            sendResize={live.sendResize}
+            setWindow={live.setWindow}
+            setCadence={live.setCadence}
+            sendData={live.sendData}
+            ctrlActiveRef={ctrlActiveRef}
+            clearCtrl={() => setCtrlActive(false)}
+            inputRef={liveInputRef}
+          />
+        ) : (
+          <div ref={containerRef} className="absolute inset-0" onPointerDown={activate} />
+        )}
 
-        {state.connected && !state.isPrimary && (
+        {!liveMode && state.connected && !xtermState.isPrimary && (
           <div
             aria-hidden="true"
             className="absolute left-0 right-0 top-3 flex justify-center pointer-events-none z-10"
@@ -293,7 +345,9 @@ export function TerminalView({ session, active = true }: Props) {
           </div>
         )}
 
-        {isMobile && state.isInScrollback && <BackToLiveButton onClick={exitScrollback} topOffset="top-3" />}
+        {!liveMode && isMobile && xtermState.isInScrollback && (
+          <BackToLiveButton onClick={exitScrollback} topOffset="top-3" />
+        )}
 
         {isMobile && state.connected && <KeyboardFab keyboardOpen={keyboardOpen} onToggle={toggleKeyboard} />}
       </div>
@@ -302,6 +356,7 @@ export function TerminalView({ session, active = true }: Props) {
         <MobileTerminalToolbar
           sendData={sendData}
           termRef={termRef}
+          inputElRef={liveMode ? liveInputRef : undefined}
           keyboardOpen={keyboardOpen}
           parentHandlesKeyboardInset
           ctrlActive={ctrlActive}

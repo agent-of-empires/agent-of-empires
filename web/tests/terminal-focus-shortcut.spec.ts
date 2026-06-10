@@ -13,7 +13,9 @@ async function shot(page: Page, name: string) {
 async function openSession(page: Page) {
   await clickSidebarSession(page, "pinch-test");
   await expect(page.locator('[data-term="agent"]')).toHaveCount(1);
-  await expect(page.locator('[data-term="agent"] .xterm')).toBeVisible();
+  await expect(
+    page.locator('[data-term="agent"] .xterm, [data-term="agent"] [data-live-terminal]').first(),
+  ).toBeVisible();
 }
 
 async function focusedKind(page: Page): Promise<"agent" | "paired" | null> {

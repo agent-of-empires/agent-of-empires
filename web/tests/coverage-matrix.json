@@ -70,25 +70,29 @@
       "components": ["web/src/components/DashboardUpdateBanner.tsx"]
     },
     {
-      "id": "terminal.mobile-dom-renderer",
+      "id": "terminal.mobile-live-view",
       "kind": "mocked-playwright",
       "risk": "high",
       "specs": ["tests/mobile-dom-renderer.spec.ts"],
-      "components": ["web/src/hooks/useTerminal.ts"]
+      "components": ["web/src/components/MobileLiveTerminal.tsx", "web/src/hooks/useLiveTerminal.ts"]
     },
     {
       "id": "terminal.webgl-gate-units",
       "kind": "vitest",
       "risk": "high",
-      "specs": ["src/hooks/useTerminal.webgl.test.ts"],
+      "specs": ["src/hooks/useTerminal.webgl.test.ts", "src/lib/liveTermLines.test.ts"],
       "components": ["web/src/hooks/useTerminal.ts"]
     },
     {
-      "id": "terminal.mobile-scrollback-touch",
+      "id": "terminal.mobile-live-scrollback",
       "kind": "mocked-playwright",
       "risk": "high",
       "specs": ["tests/scrollback-exit.spec.ts"],
-      "components": ["web/src/hooks/useTerminal.ts", "web/src/components/BackToLiveButton.tsx"]
+      "components": [
+        "web/src/hooks/useLiveTerminal.ts",
+        "web/src/components/MobileLiveTerminal.tsx",
+        "web/src/components/BackToLiveButton.tsx"
+      ]
     },
     {
       "id": "auth.no-auth",

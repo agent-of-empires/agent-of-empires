@@ -35,22 +35,30 @@ pub struct PaneCursor {
     /// e.g. an agent that parks it while "working". Don't paint when false.
     pub visible: bool,
     pub pane_height: u16,
+    /// `#{history_size}`: lines currently in the pane's scrollback. The
+    /// web live view sizes its virtual scroll spacer off this; absent in
+    /// older format strings, in which case it parses as 0.
+    pub history_size: u32,
 }
 
 impl PaneCursor {
     /// Parse the single space-separated line emitted by the
-    /// `#{cursor_x} #{cursor_y} #{cursor_flag} #{pane_height}` format.
+    /// `#{cursor_x} #{cursor_y} #{cursor_flag} #{pane_height}
+    /// #{history_size}` format. The history field is optional so an
+    /// older four-field line still parses (as history 0).
     fn parse(line: &str) -> Option<Self> {
         let mut fields = line.split_whitespace();
         let x = fields.next()?.parse().ok()?;
         let y = fields.next()?.parse().ok()?;
         let flag: u8 = fields.next()?.parse().ok()?;
         let pane_height = fields.next()?.parse().ok()?;
+        let history_size = fields.next().and_then(|f| f.parse().ok()).unwrap_or(0);
         Some(Self {
             x,
             y,
             visible: flag != 0,
             pane_height,
+            history_size,
         })
     }
 }
@@ -365,7 +373,7 @@ impl Session {
                 "-t",
                 &target,
                 "-F",
-                "#{cursor_x} #{cursor_y} #{cursor_flag} #{pane_height}",
+                "#{cursor_x} #{cursor_y} #{cursor_flag} #{pane_height} #{history_size}",
                 ";",
                 "capture-pane",
                 "-t",
@@ -389,6 +397,31 @@ impl Session {
         let cursor_line = parts.next().unwrap_or("");
         let content = parts.next().unwrap_or("").to_string();
         Ok((content, PaneCursor::parse(cursor_line)))
+    }
+
+    /// Deliver raw bytes to the session's active pane via `tmux send-keys
+    /// -H`, one hex argument per byte, chunked so a large paste cannot
+    /// overflow `execve` ARG_MAX (the same bound the TUI's live-send path
+    /// uses; macOS caps total argv at 256KB and per-byte hex args burn it
+    /// ~13x faster than the payload size). tmux injects the bytes in
+    /// order, so a bracketed paste split across forks reassembles
+    /// transparently on the agent's PTY. This is the web live view's
+    /// input path: raw bytes from the browser (printables, CSI sequences,
+    /// control bytes) all ride the same encoding.
+    pub fn send_raw_bytes(&self, bytes: &[u8]) -> Result<()> {
+        for batch in raw_byte_batches(bytes) {
+            let output = Command::new("tmux")
+                .args(["send-keys", "-t", &self.name, "-H"])
+                .args(&batch)
+                .output()?;
+            if !output.status.success() {
+                anyhow::bail!(
+                    "tmux send-keys -H exited non-zero for {} bytes",
+                    bytes.len()
+                );
+            }
+        }
+        Ok(())
     }
 
     pub fn get_pane_pid(&self) -> Option<u32> {
@@ -613,6 +646,22 @@ fn sanitize_session_name(name: &str) -> String {
         .collect()
 }
 
+/// Max bytes per `send-keys -H` fork. Each byte becomes one two-char
+/// argv entry, so a bound well under ARG_MAX keeps the spawn safe on
+/// every platform (macOS caps argv+envp at 256KB). Matches the TUI
+/// live-send chunking bound.
+const MAX_RAW_BYTES_PER_SEND: usize = 4096;
+
+/// Split a raw byte payload into per-fork hex argument batches for
+/// [`Session::send_raw_bytes`]. Pure so the chunk bound and byte order
+/// are unit-testable without tmux.
+fn raw_byte_batches(bytes: &[u8]) -> Vec<Vec<String>> {
+    bytes
+        .chunks(MAX_RAW_BYTES_PER_SEND)
+        .map(|chunk| chunk.iter().map(|b| format!("{:02x}", b)).collect())
+        .collect()
+}
+
 /// Build the argument list for tmux new-session command.
 /// Extracted for testability.
 fn build_create_args(
@@ -659,8 +708,30 @@ mod tests {
     }
 
     #[test]
+    fn raw_byte_batches_chunks_and_preserves_order() {
+        let payload: Vec<u8> = (0..=255u8)
+            .cycle()
+            .take(MAX_RAW_BYTES_PER_SEND + 10)
+            .collect();
+        let batches = raw_byte_batches(&payload);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].len(), MAX_RAW_BYTES_PER_SEND);
+        assert_eq!(batches[1].len(), 10);
+        assert_eq!(batches[0][0], "00");
+        assert_eq!(batches[0][255], "ff");
+        // Last byte of the payload survives in order at the tail.
+        let last = payload[payload.len() - 1];
+        assert_eq!(batches[1][9], format!("{:02x}", last));
+    }
+
+    #[test]
+    fn raw_byte_batches_empty_payload_sends_nothing() {
+        assert!(raw_byte_batches(&[]).is_empty());
+    }
+
+    #[test]
     fn pane_cursor_parses_format_line() {
-        let c = PaneCursor::parse("3 2 1 24").expect("parses");
+        let c = PaneCursor::parse("3 2 1 24 120").expect("parses");
         assert_eq!(
             c,
             PaneCursor {
@@ -668,8 +739,13 @@ mod tests {
                 y: 2,
                 visible: true,
                 pane_height: 24,
+                history_size: 120,
             }
         );
+        // Four-field (pre-history) lines still parse, history defaults 0.
+        let c = PaneCursor::parse("3 2 0 24").expect("parses");
+        assert!(!c.visible);
+        assert_eq!(c.history_size, 0);
         // cursor_flag 0 => hidden.
         assert!(!PaneCursor::parse("0 0 0 10").unwrap().visible);
         // Garbage / short input yields None rather than a bogus cursor.

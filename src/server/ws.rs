@@ -24,13 +24,13 @@ use axum::{
 /// reconnect banner" rather than burning the retry budget against a
 /// permanently broken pane. Picked from the application-reserved
 /// 4000-4999 range; not used elsewhere. See #1107.
-const CLOSE_CODE_PTY_DEAD: u16 = 4001;
+pub(crate) const CLOSE_CODE_PTY_DEAD: u16 = 4001;
 
 /// WebSocket close code 1001 ("going away"). Sent when the daemon is
 /// shutting down so the client can distinguish a server-side exit from
 /// a transient transport error and skip its reconnect backoff for one
 /// cycle. See #1198.
-const CLOSE_CODE_GOING_AWAY: u16 = 1001;
+pub(crate) const CLOSE_CODE_GOING_AWAY: u16 = 1001;
 
 /// WebSocket close code 1011 ("internal server error"). Sent on the
 /// OS-level early-return paths in `handle_terminal_ws` (openpty,
@@ -44,7 +44,7 @@ const CLOSE_CODE_INTERNAL_ERROR: u16 = 1011;
 /// retries on the fast-start ladder. Distinct from 1011 (internal
 /// server fault) and 4001 (permanently dead pane) so logs separate
 /// transient warm-up from genuine failure. See #1455.
-const CLOSE_CODE_TRY_AGAIN_LATER: u16 = 1013;
+pub(crate) const CLOSE_CODE_TRY_AGAIN_LATER: u16 = 1013;
 
 /// Total time we'll spend waiting for the tmux session + pane to be
 /// attachable before giving up and closing 1013. 2s covers tmux warm-up
@@ -1263,7 +1263,7 @@ async fn resize_pty(
 /// Send a Close frame on an early-return path that hasn't split the
 /// socket yet. The `let _ = ` discards send errors: if the peer is
 /// already gone the close frame is moot, and we're returning anyway.
-async fn close_early(socket: &mut WebSocket, code: u16, reason: &'static str) {
+pub(crate) async fn close_early(socket: &mut WebSocket, code: u16, reason: &'static str) {
     let _ = socket
         .send(Message::Close(Some(CloseFrame {
             code,
@@ -1277,7 +1277,7 @@ async fn close_early(socket: &mut WebSocket, code: u16, reason: &'static str) {
 /// interval; `Dead` short-circuits the wait when every pane is reported
 /// dead (no point in polling further).
 #[derive(Debug, PartialEq, Eq)]
-enum PaneReadiness {
+pub(crate) enum PaneReadiness {
     Ready,
     NotReady,
     Dead,
@@ -1310,7 +1310,7 @@ fn parse_pane_dead_output(output: &str) -> PaneReadiness {
 /// dead pane (`Dead` -> 4001 short-circuit). Bails out early on `Dead`
 /// rather than polling further because no amount of waiting will make
 /// an exited pane reattachable.
-async fn wait_for_tmux_ready(tmux_name: &str) -> PaneReadiness {
+pub(crate) async fn wait_for_tmux_ready(tmux_name: &str) -> PaneReadiness {
     let deadline = Instant::now() + TMUX_READY_TIMEOUT;
     loop {
         match probe_tmux_readiness(tmux_name).await {

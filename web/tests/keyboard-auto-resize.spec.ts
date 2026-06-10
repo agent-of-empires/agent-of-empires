@@ -28,7 +28,7 @@ interface ResizeMsg {
 
 function extractResizes(handle: MockHandle): ResizeMsg[] {
   const out: ResizeMsg[] = [];
-  for (const msg of handle.wsMessages) {
+  for (const msg of handle.liveMessages) {
     const s = msg.toString("utf8");
     if (!s.startsWith("{")) continue;
     try {
@@ -84,8 +84,8 @@ async function setKeyboard(page: Page, opts: { open: boolean; px?: number; pwa?:
 async function openSession(page: Page, handle: MockHandle) {
   await openMobileSidebar(page);
   await clickSidebarSession(page, "pinch-test");
-  await page.locator('[data-term="agent"] .xterm').waitFor({ state: "visible", timeout: 10_000 });
-  await expect.poll(() => handle.wsMessages.length, { timeout: 5_000 }).toBeGreaterThan(0);
+  await page.locator('[data-term="agent"] [data-live-terminal]').waitFor({ state: "visible", timeout: 10_000 });
+  await expect.poll(() => handle.liveMessages.length, { timeout: 5_000 }).toBeGreaterThan(0);
 }
 
 test.describe("Keyboard auto-resize (#1432)", () => {

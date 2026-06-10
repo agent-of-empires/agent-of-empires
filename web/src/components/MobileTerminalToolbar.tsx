@@ -56,6 +56,9 @@ interface Props {
   parentHandlesKeyboardInset?: boolean;
   ctrlActive: boolean;
   onCtrlToggle: () => void;
+  /** Live-view mode: the hidden input element that owns keyboard focus
+   *  (there is no xterm Terminal). Preferred over termRef when set. */
+  inputElRef?: RefObject<HTMLTextAreaElement | null>;
 }
 
 const ARROW_UP = "\x1b[A";
@@ -70,6 +73,7 @@ export function MobileTerminalToolbar({
   parentHandlesKeyboardInset = false,
   ctrlActive,
   onCtrlToggle,
+  inputElRef,
 }: Props) {
   const [upAxis, setUpAxis] = useState<DragAxis>("vertical");
   const [downAxis, setDownAxis] = useState<DragAxis>("vertical");
@@ -79,8 +83,14 @@ export function MobileTerminalToolbar({
   }, []);
 
   const refocusTerminal = useCallback(() => {
+    if (inputElRef) {
+      // Only re-focus if the input already had focus (keyboard open);
+      // a toolbar tap must not summon the keyboard on its own.
+      if (keyboardOpen) inputElRef.current?.focus();
+      return;
+    }
     termRef.current?.focus();
-  }, [termRef]);
+  }, [termRef, inputElRef, keyboardOpen]);
 
   const send = useCallback(
     (data: string) => {
@@ -245,22 +255,26 @@ export function MobileTerminalToolbar({
               return;
             }
           } else {
-            const ta = termRef.current?.element?.querySelector("textarea") as HTMLTextAreaElement | null;
+            const ta =
+              inputElRef?.current ??
+              (termRef.current?.element?.querySelector("textarea") as HTMLTextAreaElement | null);
             if (ta) {
               let recovered = "";
               const onPaste = (e: ClipboardEvent) => {
                 recovered = extractClipboardText(e.clipboardData);
               };
               ta.addEventListener("paste", onPaste, { once: true });
-              const prevReadOnly = ta.readOnly;
-              ta.readOnly = true;
+              // Attribute (not property) toggles keep the react-hooks
+              // immutability lint happy about ref-derived elements.
+              const prevReadOnly = ta.hasAttribute("readonly");
+              ta.setAttribute("readonly", "");
               try {
                 ta.focus({ preventScroll: true });
                 document.execCommand("paste");
               } catch {
                 // continue to error toast
               }
-              ta.readOnly = prevReadOnly;
+              if (!prevReadOnly) ta.removeAttribute("readonly");
               ta.blur();
               ta.removeEventListener("paste", onPaste);
               if (recovered) {

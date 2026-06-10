@@ -2880,6 +2880,7 @@ mod tests {
             y,
             visible,
             pane_height,
+            history_size: 0,
         }
     }
 
