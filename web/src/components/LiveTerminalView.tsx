@@ -4,6 +4,7 @@ import { useMobileKeyboard } from "../hooks/useMobileKeyboard";
 import { MobileTerminalToolbar } from "./MobileTerminalToolbar";
 import { MobileLiveTerminal } from "./MobileLiveTerminal";
 import { KeyboardFab } from "./KeyboardFab";
+import { TerminalConnectionBanners } from "./TerminalConnectionBanners";
 import { ensureSession, ensureTerminal } from "../lib/api";
 import type { SessionResponse } from "../lib/types";
 import {
@@ -186,24 +187,14 @@ export function LiveTerminalView({ session, active = true, surface = "agent" }: 
 
   return (
     <div className="flex-1 flex flex-col overflow-hidden relative" style={rootStyle} data-term={dataTerm}>
-      {!live.state.connected && live.state.reconnecting && (
-        <div className="bg-status-waiting/15 border-b border-status-waiting/30 px-4 py-1.5 flex items-center gap-2 shrink-0">
-          <span className="text-xs text-status-waiting">
-            Reconnecting in {live.state.retryCountdown}s... ({live.state.retryCount}/{live.maxRetries})
-          </span>
-        </div>
-      )}
-      {!live.state.connected && !live.state.reconnecting && live.state.retryCount >= live.maxRetries && (
-        <div className="bg-status-error/10 border-b border-status-error/30 px-4 py-1.5 flex items-center gap-2 shrink-0">
-          <span className="text-xs text-status-error">Connection lost</span>
-          <button
-            onClick={live.manualReconnect}
-            className="text-xs text-brand-500 hover:text-brand-400 cursor-pointer underline"
-          >
-            Retry
-          </button>
-        </div>
-      )}
+      <TerminalConnectionBanners
+        connected={live.state.connected}
+        reconnecting={live.state.reconnecting}
+        retryCount={live.state.retryCount}
+        retryCountdown={live.state.retryCountdown}
+        maxRetries={live.maxRetries}
+        onRetry={live.manualReconnect}
+      />
 
       <div className="flex-1 overflow-hidden bg-surface-950 relative">
         <MobileLiveTerminal

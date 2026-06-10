@@ -324,15 +324,6 @@ impl Session {
     }
 
     pub fn capture_pane(&self, lines: usize) -> Result<String> {
-        self.capture_pane_with_size(lines, None, None)
-    }
-
-    pub fn capture_pane_with_size(
-        &self,
-        lines: usize,
-        _width: Option<u16>,
-        _height: Option<u16>,
-    ) -> Result<String> {
         if !self.exists() {
             return Ok(String::new());
         }
@@ -669,9 +660,11 @@ fn raw_byte_batches(bytes: &[u8]) -> Vec<Vec<String>> {
         .collect()
 }
 
-/// Build the argument list for tmux new-session command.
+/// Build the argument list for tmux new-session command. Shared by the
+/// agent session and the paired/container terminal sessions (their
+/// invocations are identical; only the session-name prefix differs).
 /// Extracted for testability.
-fn build_create_args(
+pub(crate) fn build_create_args(
     session_name: &str,
     working_dir: &str,
     command: Option<&str>,
@@ -734,6 +727,27 @@ mod tests {
     #[test]
     fn raw_byte_batches_empty_payload_sends_nothing() {
         assert!(raw_byte_batches(&[]).is_empty());
+    }
+
+    #[test]
+    fn raw_byte_batches_large_paste_roundtrips_in_order() {
+        // Regression for the silently-dropped large paste (#1942-era
+        // live-send bug, now shared with the web live view): a ~100 KB
+        // bracketed paste encoded one hex arg per byte overflows execve
+        // ARG_MAX in a single fork. Verify it splits, every batch stays
+        // under the bound, and the bytes reconstruct in order.
+        let payload: Vec<u8> = (0..100_000).map(|i| (i % 256) as u8).collect();
+        let batches = raw_byte_batches(&payload);
+        assert!(batches.len() > 1);
+        for batch in &batches {
+            assert!(batch.len() <= MAX_RAW_BYTES_PER_SEND);
+        }
+        let roundtrip: Vec<u8> = batches
+            .iter()
+            .flatten()
+            .map(|h| u8::from_str_radix(h, 16).unwrap())
+            .collect();
+        assert_eq!(roundtrip, payload);
     }
 
     #[test]

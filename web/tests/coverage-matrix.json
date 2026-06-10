@@ -25,7 +25,8 @@
         "web/src/components/Dashboard.tsx",
         "web/src/components/TerminalView.tsx",
         "web/src/components/ContentSplit.tsx",
-        "web/src/components/XtermTerminalView.tsx"
+        "web/src/components/XtermTerminalView.tsx",
+        "web/src/components/TerminalConnectionBanners.tsx"
       ]
     },
     {

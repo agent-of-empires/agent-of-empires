@@ -89,7 +89,7 @@ impl PairedTerminal {
             return Ok(());
         }
 
-        let mut args = build_terminal_create_args(&self.name, working_dir, command, size);
+        let mut args = super::session::build_create_args(&self.name, working_dir, command, size);
         append_remain_on_exit_args(&mut args, &self.name);
         append_pane_base_index_args(&mut args, &self.name);
         append_mouse_on_args(&mut args, &self.name);
@@ -170,30 +170,9 @@ impl PairedTerminal {
     }
 
     fn capture_pane(&self, lines: usize) -> Result<String> {
-        if !self.exists() {
-            return Ok(String::new());
-        }
-
-        // Use `^.0` to target the first window's first pane regardless of
-        // base-index or which pane is active.  See #435, #488.
-        let target = format!("{}:^.0", self.name);
-        let output = Command::new("tmux")
-            .args([
-                "capture-pane",
-                "-t",
-                &target,
-                "-p",
-                "-e",
-                "-S",
-                &format!("-{}", lines),
-            ])
-            .output()?;
-
-        if output.status.success() {
-            Ok(String::from_utf8_lossy(&output.stdout).to_string())
-        } else {
-            Ok(String::new())
-        }
+        // Shared with the agent session / web live view paths: same
+        // `^.0` targeting and trailing-blank preservation semantics.
+        super::Session::from_name(&self.name).capture_pane(lines)
     }
 }
 
@@ -301,37 +280,6 @@ impl ContainerTerminalSession {
     }
 }
 
-/// Build the argument list for tmux new-session command (terminal sessions).
-/// Extracted for testability.
-fn build_terminal_create_args(
-    session_name: &str,
-    working_dir: &str,
-    command: Option<&str>,
-    size: Option<(u16, u16)>,
-) -> Vec<String> {
-    let mut args = vec![
-        "new-session".to_string(),
-        "-d".to_string(),
-        "-s".to_string(),
-        session_name.to_string(),
-        "-c".to_string(),
-        working_dir.to_string(),
-    ];
-
-    if let Some((width, height)) = size {
-        args.push("-x".to_string());
-        args.push(width.to_string());
-        args.push("-y".to_string());
-        args.push(height.to_string());
-    }
-
-    if let Some(cmd) = command {
-        args.push(cmd.to_string());
-    }
-
-    args
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,69 +318,6 @@ mod tests {
         assert_ne!(host_name, container_name);
         assert!(host_name.starts_with(TERMINAL_PREFIX));
         assert!(container_name.starts_with(CONTAINER_TERMINAL_PREFIX));
-    }
-
-    #[test]
-    fn test_build_terminal_create_args_without_size() {
-        let args = build_terminal_create_args("test_terminal", "/tmp/work", None, None);
-        assert_eq!(
-            args,
-            vec![
-                "new-session",
-                "-d",
-                "-s",
-                "test_terminal",
-                "-c",
-                "/tmp/work"
-            ]
-        );
-        assert!(!args.contains(&"-x".to_string()));
-        assert!(!args.contains(&"-y".to_string()));
-    }
-
-    #[test]
-    fn test_build_terminal_create_args_with_size() {
-        let args = build_terminal_create_args("test_terminal", "/tmp/work", None, Some((100, 30)));
-        assert!(args.contains(&"-x".to_string()));
-        assert!(args.contains(&"100".to_string()));
-        assert!(args.contains(&"-y".to_string()));
-        assert!(args.contains(&"30".to_string()));
-
-        // Verify order: -x should come before width, -y before height
-        let x_idx = args.iter().position(|a| a == "-x").unwrap();
-        let y_idx = args.iter().position(|a| a == "-y").unwrap();
-        assert_eq!(args[x_idx + 1], "100");
-        assert_eq!(args[y_idx + 1], "30");
-    }
-
-    #[test]
-    fn test_build_terminal_create_args_with_command() {
-        let args = build_terminal_create_args(
-            "test_terminal",
-            "/tmp/work",
-            Some("docker exec -it container /bin/bash"),
-            None,
-        );
-        assert_eq!(args.last().unwrap(), "docker exec -it container /bin/bash");
-    }
-
-    #[test]
-    fn test_build_terminal_create_args_with_size_and_command() {
-        let args = build_terminal_create_args(
-            "test_terminal",
-            "/tmp/work",
-            Some("docker exec -it container /bin/bash"),
-            Some((80, 24)),
-        );
-
-        // Size args should be present
-        assert!(args.contains(&"-x".to_string()));
-        assert!(args.contains(&"80".to_string()));
-        assert!(args.contains(&"-y".to_string()));
-        assert!(args.contains(&"24".to_string()));
-
-        // Command should be last
-        assert_eq!(args.last().unwrap(), "docker exec -it container /bin/bash");
     }
 
     fn tmux_available() -> bool {

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { useTerminal } from "../hooks/useTerminal";
 import { useIsCoarsePointer } from "../hooks/useIsCoarsePointer";
 import { LiveTerminalView } from "./LiveTerminalView";
+import { TerminalConnectionBanners } from "./TerminalConnectionBanners";
 import { ensureTerminal } from "../lib/api";
 import type { SessionResponse } from "../lib/types";
 import {
@@ -117,21 +118,14 @@ function PairedTerminal({ sessionId, mode }: { sessionId: string; mode: ShellMod
 
   return (
     <div className="flex-1 flex flex-col min-h-0 overflow-hidden md:bg-surface-800">
-      {!state.connected && state.reconnecting && (
-        <div className="bg-status-waiting/15 border-b border-status-waiting/30 px-3 py-1 shrink-0">
-          <span className="text-xs text-status-waiting">
-            Reconnecting... ({state.retryCount}/{maxRetries})
-          </span>
-        </div>
-      )}
-      {!state.connected && !state.reconnecting && state.retryCount >= maxRetries && (
-        <div className="bg-status-error/10 border-b border-status-error/30 px-3 py-1 flex items-center gap-2 shrink-0">
-          <span className="text-xs text-status-error">Disconnected</span>
-          <button onClick={manualReconnect} className="text-xs text-brand-500 cursor-pointer underline">
-            Retry
-          </button>
-        </div>
-      )}
+      <TerminalConnectionBanners
+        connected={state.connected}
+        reconnecting={state.reconnecting}
+        retryCount={state.retryCount}
+        retryCountdown={state.retryCountdown}
+        maxRetries={maxRetries}
+        onRetry={manualReconnect}
+      />
       <div
         data-term="paired"
         className={`flex-1 overflow-hidden bg-surface-950 relative md:rounded-lg term-panel${termFocused ? " term-focused" : ""}`}
