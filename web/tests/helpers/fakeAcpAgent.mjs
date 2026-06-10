@@ -360,7 +360,10 @@ const INITIALIZE_RESULT = {
   },
   agentInfo: {
     name: "@agentclientprotocol/claude-agent-acp",
-    version: "0.41.0",
+    // Must satisfy aoe's adapter floor (>=0.44.0, the release that routes
+    // AskUserQuestion through form elicitation); a lower version makes the
+    // version gate reject spawn before any frame reaches the client.
+    version: "0.44.0",
   },
   // No authMethods key at all. An empty array is interpreted by some
   // ACP client implementations as "auth methods listed but none
