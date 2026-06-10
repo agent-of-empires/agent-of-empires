@@ -885,7 +885,7 @@ pub struct HomeView {
     /// a post-edit refresh attempt as a deterministic completion
     /// signal. Production builds and non-e2e test runs never set the
     /// env var, so the file is never written.
-    pub(super) watcher_config_refresh_count: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    pub(super) watcher_config_refresh_count: std::sync::atomic::AtomicU64,
     /// Tracks tick-driven reload failures so a malformed `sessions.json`,
     /// `groups.json`, or `config.toml` does not crash the TUI. Populated
     /// by `handle_tick_reload_*`; consumed once per tick to surface a
@@ -911,6 +911,7 @@ impl ConfigWatchKey {
 }
 
 const RELOAD_FAILED_TITLE: &str = "Reload Failed";
+const WATCHER_WARNING_TITLE: &str = "Watcher Warning";
 
 /// Distinguishes user-driven config reloads from watcher kicks so
 /// `refresh_from_config` can suppress interactive-only dialogs on
@@ -1351,7 +1352,7 @@ impl HomeView {
             disk_watch_handles: HashMap::new(),
             config_dirty,
             config_watch_handles: HashMap::new(),
-            watcher_config_refresh_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            watcher_config_refresh_count: std::sync::atomic::AtomicU64::new(0),
             reload_failure_state: ReloadFailureState::default(),
         };
 
@@ -1987,6 +1988,10 @@ impl HomeView {
                         error = %e,
                         "skipping global config subscribe; app dir resolution failed"
                     );
+                    self.reload_failure_state
+                        .record_config_watcher_init_failure(&format!(
+                            "global config: app dir resolution failed: {e}"
+                        ));
                 }
             }
         }
@@ -2109,7 +2114,7 @@ impl HomeView {
                 );
                 if self.info_dialog.is_none() {
                     self.info_dialog = Some(InfoDialog::new(
-                        "Watcher Warning",
+                        WATCHER_WARNING_TITLE,
                         &format!(
                             "Profile '{}' was deleted but the watcher rewire could not enumerate profiles: {}\n\nThe next successful reload will repair watcher state.",
                             profile_name, e
@@ -5193,6 +5198,13 @@ impl HomeView {
     /// through the lenient `resolve_config_or_warn` and fall back to
     /// `Default::default()` on parse error; the strict-resolve
     /// guarantee applies to the active profile only.
+    ///
+    /// Error attribution: `resolve_config` loads the global
+    /// `<app_dir>/config.toml` first then merges per-profile overrides,
+    /// so a Reload Failed dialog body rendered from this path can name
+    /// a global parse error even when the watcher fired for a
+    /// per-profile edit. `toml::de::Error` renders line and column
+    /// without the source file path.
     pub(super) fn try_refresh_from_config_watcher(&mut self) -> anyhow::Result<()> {
         let new_count = self
             .watcher_config_refresh_count
