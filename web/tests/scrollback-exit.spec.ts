@@ -77,6 +77,36 @@ test.describe("Mobile live-view scrollback", () => {
     expect(all).not.toContain("resume_output");
   });
 
+  test("incoming frames never move the scroll position while reading", async ({ page }) => {
+    await installTerminalSpies(page);
+    const handle = await mockTerminalApis(page);
+    await page.goto("/");
+    await seedSettings(page, { mobileFontSize: 14 });
+    await page.reload();
+    await openSession(page, handle);
+
+    // Scroll partway up (a gesture start, not the absolute top), then
+    // push frames as if the agent were streaming. Both the gesture-start
+    // race (frames pinning under a starting drag) and the browser's
+    // native scroll anchoring (re-anchoring when the spacer collapses)
+    // historically snapped the viewport; the position must hold.
+    const target = await scroller(page).evaluate((el) => {
+      el.scrollTop = Math.max(0, el.scrollHeight - el.clientHeight - el.clientHeight * 0.7);
+      return el.scrollTop;
+    });
+    for (let i = 0; i < 4; i++) {
+      await page.waitForTimeout(120);
+      handle.pushLiveFrame({
+        content: Array.from({ length: 24 }, (_, n) => `streamed ${i}-${n}`).join("\n") + "\n",
+        rows: 24,
+        history: 130 + i,
+      });
+    }
+    await page.waitForTimeout(300);
+    const after = await scroller(page).evaluate((el) => el.scrollTop);
+    expect(Math.abs(after - target), "scroll position must hold while frames arrive").toBeLessThan(20);
+  });
+
   test("reading freezes the stream via hold; returning releases it", async ({ page }) => {
     await installTerminalSpies(page);
     const handle = await mockTerminalApis(page);

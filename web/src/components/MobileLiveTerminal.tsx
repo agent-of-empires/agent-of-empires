@@ -96,16 +96,6 @@ const Row = memo(function Row({ segs }: { segs: AnsiSegment[] }) {
   );
 });
 
-/** Measure the monospace advance width for the live font at `size`. */
-function measureCharWidth(size: number): number {
-  const canvas = document.createElement("canvas");
-  const ctx = canvas.getContext("2d");
-  if (!ctx) return size * 0.6;
-  ctx.font = `${size}px 'Geist Mono', ui-monospace, 'SFMono-Regular', monospace`;
-  const w = ctx.measureText("M").width;
-  return w > 0 ? w : size * 0.6;
-}
-
 export function MobileLiveTerminal({
   frame,
   connected,
@@ -124,9 +114,36 @@ export function MobileLiveTerminal({
   const { settings, update } = useWebSettings();
   const [fontSize, setFontSize] = useState(() => settings.mobileFontSize);
   const scrollerRef = useRef<HTMLDivElement>(null);
+  const measureRef = useRef<HTMLSpanElement>(null);
 
   const lineH = fontSize * LINE_RATIO;
-  const charW = useMemo(() => measureCharWidth(fontSize), [fontSize]);
+  // Real rendered glyph advance, measured off a hidden span INSIDE the
+  // scroller so it reflects whatever font is actually in effect right
+  // now. A canvas measurement at mount ran before the webfont loaded on
+  // a cold boot, so the cursor overlay and the cols shipped to tmux were
+  // both computed from fallback metrics: the cursor sat off the cells
+  // and claude drew its box at the wrong width. Re-measured when
+  // `document.fonts.ready` resolves and whenever the font size changes.
+  const [charW, setCharW] = useState(() => fontSize * 0.6);
+  const remeasure = useCallback(() => {
+    const el = measureRef.current;
+    if (!el) return;
+    const w = el.getBoundingClientRect().width / 20;
+    if (w > 0) {
+      setCharW((prev) => (Math.abs(prev - w) > 0.01 ? w : prev));
+    }
+  }, []);
+  useLayoutEffect(() => {
+    remeasure();
+  }, [remeasure, fontSize]);
+  useEffect(() => {
+    const fonts = (document as Document & { fonts?: { ready: Promise<unknown> } }).fonts;
+    fonts?.ready
+      ?.then(() => remeasure())
+      .catch(() => {
+        // No FontFaceSet (headless/jsdom); the layout-effect measure stands.
+      });
+  }, [remeasure]);
 
   // --- frame geometry -------------------------------------------------------
   // The hook owns the read machine: `frame` is already the frozen
@@ -136,6 +153,28 @@ export function MobileLiveTerminal({
   useEffect(() => {
     readingRef.current = reading;
   }, [reading]);
+  // No pinning (and no live-edge re-entry) while a finger is down: a
+  // programmatic scrollTop during an active touch cancels the native
+  // gesture on iOS.
+  const touchActiveRef = useRef(false);
+  // Geometry from BEFORE the current DOM mutation. Pinning decisions use
+  // "was the user at the bottom before this content/size change", the
+  // classic chat-scroll algorithm: it reads the user's position straight
+  // from the DOM (scrollTop is current the instant a drag moves, ahead
+  // of any scroll EVENT), so an arriving frame can never pin the
+  // scroller back under a starting gesture, while appended output still
+  // follows the live tail.
+  const geomRef = useRef({ scrollHeight: 0, clientHeight: 0 });
+  const pinIfWasAtBottom = useCallback(() => {
+    const el = scrollerRef.current;
+    if (!el) return;
+    const prev = geomRef.current;
+    const wasAtBottom = prev.scrollHeight === 0 || prev.scrollHeight - el.scrollTop - prev.clientHeight < lineH * 1.5;
+    if (wasAtBottom && !touchActiveRef.current) {
+      el.scrollTop = el.scrollHeight;
+    }
+    geomRef.current = { scrollHeight: el.scrollHeight, clientHeight: el.clientHeight };
+  }, [lineH]);
   const lines = useMemo(() => (frame ? ansiToLines(frame.content) : []), [frame]);
   const screenRows = frame?.rows ?? 0;
   const history = frame?.history ?? 0;
@@ -148,14 +187,17 @@ export function MobileLiveTerminal({
   const atBottom = useCallback(() => {
     const el = scrollerRef.current;
     if (!el) return true;
-    return el.scrollHeight - el.scrollTop - el.clientHeight < lineH;
+    return el.scrollHeight - el.scrollTop - el.clientHeight < lineH * 1.5;
   }, [lineH]);
 
   const onScroll = useCallback(() => {
-    if (atBottom()) {
-      returnToLive(rowsRef.current);
-    } else {
+    if (!atBottom()) {
       enterReading(rowsRef.current);
+    } else if (!touchActiveRef.current) {
+      // Mid-gesture passes over the bottom edge are settled on touchend;
+      // re-entering live here would let the next frame pin against the
+      // user's finger.
+      returnToLive(rowsRef.current);
     }
   }, [atBottom, enterReading, returnToLive]);
 
@@ -170,6 +212,7 @@ export function MobileLiveTerminal({
   const persistTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const onTouchStart = useCallback(
     (e: React.TouchEvent) => {
+      touchActiveRef.current = true;
       if (e.touches.length === 2) {
         const [a, b] = [e.touches[0]!, e.touches[1]!];
         pinchRef.current = {
@@ -196,6 +239,14 @@ export function MobileLiveTerminal({
   }, []);
   const onTouchEnd = useCallback(
     (e: React.TouchEvent) => {
+      if (e.touches.length === 0) {
+        touchActiveRef.current = false;
+        // Settle the live-edge decision deferred by onScroll; momentum
+        // scroll events after this keep re-evaluating via onScroll.
+        if (atBottom()) {
+          returnToLive(rowsRef.current);
+        }
+      }
       if (e.touches.length < 2 && pinchRef.current) {
         const changed = pinchRef.current.changed;
         pinchRef.current = null;
@@ -206,7 +257,7 @@ export function MobileLiveTerminal({
         }, 400);
       }
     },
-    [fontSize, update],
+    [fontSize, update, returnToLive, atBottom],
   );
   useEffect(
     () => () => {
@@ -251,9 +302,7 @@ export function MobileLiveTerminal({
     const ro = new ResizeObserver(() => {
       // Keep the live edge pinned through layout changes (keyboard
       // open/close, toolbar mount) immediately, then settle the grid.
-      if (!readingRef.current) {
-        el.scrollTop = el.scrollHeight;
-      }
+      pinIfWasAtBottom();
       if (timer) clearTimeout(timer);
       timer = setTimeout(compute, RESIZE_DEBOUNCE_MS);
     });
@@ -262,7 +311,7 @@ export function MobileLiveTerminal({
       ro.disconnect();
       if (timer) clearTimeout(timer);
     };
-  }, [active, charW, lineH, sendResize, setWindow]);
+  }, [active, charW, lineH, sendResize, setWindow, pinIfWasAtBottom]);
 
   // Cadence: fast only while this pane is the active, visible surface.
   useEffect(() => {
@@ -274,16 +323,12 @@ export function MobileLiveTerminal({
 
   // --- bottom pinning ---------------------------------------------------------
   useLayoutEffect(() => {
-    const el = scrollerRef.current;
-    if (!el) return;
-    if (!readingRef.current) {
-      el.scrollTop = el.scrollHeight;
-    }
-    // fetching/held: leave scrollTop alone. Above-viewport height is
+    pinIfWasAtBottom();
+    // When not pinned, scrollTop is left alone. Above-viewport height is
     // invariant (spacer rows convert to content rows 1:1; appends only
     // extend the bottom), so the browser-preserved offset keeps the
     // same lines in view.
-  }, [lines, spacerLines, lineH]);
+  }, [lines, spacerLines, lineH, pinIfWasAtBottom]);
 
   // --- keyboard input -----------------------------------------------------------
   const composingRef = useRef(false);
@@ -427,8 +472,22 @@ export function MobileLiveTerminal({
           color: "var(--term-fg, #e4e4e7)",
           overscrollBehavior: "contain",
           WebkitOverflowScrolling: "touch",
+          // The spacer model keeps above-viewport pixels invariant by
+          // construction, so a preserved scrollTop is always correct.
+          // The browser's own scroll anchoring doesn't know that: when
+          // the full-history frame replaces the spacer it re-anchors and
+          // teleports scrollTop. Ours is the only anchoring allowed.
+          overflowAnchor: "none",
         }}
       >
+        <span
+          ref={measureRef}
+          aria-hidden="true"
+          className="absolute whitespace-pre"
+          style={{ visibility: "hidden", pointerEvents: "none" }}
+        >
+          MMMMMMMMMMMMMMMMMMMM
+        </span>
         <div className="relative whitespace-pre" data-live-content>
           {spacerLines > 0 && <div style={{ height: `${spacerLines * lineH}px` }} aria-hidden="true" />}
           {lines.map((segs, i) => (
