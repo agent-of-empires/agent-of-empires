@@ -255,7 +255,7 @@ async fn handle_live_ws(
             // inter-capture wait below still runs, so hold release (which
             // nudges) is picked up promptly.
             if capture_settings.hold.load(Ordering::Relaxed)
-                && !capture_settings.force_once.swap(false, Ordering::Relaxed)
+                && !capture_settings.force_once.swap(false, Ordering::Acquire)
             {
                 let ms = CAPTURE_INTERVAL_IDLE_MS;
                 tokio::select! {
@@ -412,7 +412,11 @@ async fn handle_live_ws(
                         };
                         match control {
                             LiveControlMessage::Resize { cols, rows } => {
-                                if read_only || cols == 0 || rows == 0 {
+                                // read_only blocks pane input (the binary
+                                // branch above), not viewport negotiation:
+                                // a read-only viewer still publishes its
+                                // grid, like the desktop attach.
+                                if cols == 0 || rows == 0 {
                                     continue;
                                 }
                                 settings.screen_rows.store(rows as u64, Ordering::Relaxed);
@@ -428,7 +432,7 @@ async fn handle_live_ws(
                                 })
                                 .await;
                                 settings.resized.store(true, Ordering::Relaxed);
-                                settings.force_once.store(true, Ordering::Relaxed);
+                                settings.force_once.store(true, Ordering::Release);
                                 nudge.notify_one();
                             }
                             LiveControlMessage::Window { lines } => {
@@ -436,7 +440,7 @@ async fn handle_live_ws(
                                     .max(DEFAULT_WINDOW_LINES);
                                 let clamped = lines.clamp(floor, MAX_WINDOW_LINES);
                                 settings.window_lines.store(clamped, Ordering::Relaxed);
-                                settings.force_once.store(true, Ordering::Relaxed);
+                                settings.force_once.store(true, Ordering::Release);
                                 nudge.notify_one();
                             }
                             LiveControlMessage::Cadence { fast } => {
@@ -481,6 +485,13 @@ async fn handle_live_ws(
     // Live-view resizes flip the window-size option to manual (tmux
     // behavior); restore automatic sizing so a later full-size attach
     // isn't pinned at phone dimensions. Mirrors the TUI's live-send exit.
+    //
+    // `resized` is per-socket, so with two live viewers on one session the
+    // first disconnect resets sizing out from under the survivor. That
+    // self-heals: the survivor's capture loop re-asserts its grid on the
+    // next drift check (<= REASSERT_MIN_INTERVAL), and a held reader is
+    // rendering a frozen frame anyway and re-asserts on release. Tracking
+    // last-resizer-standing across sockets isn't worth that transient.
     if settings.resized.load(Ordering::Relaxed) {
         let name = tmux_name.clone();
         let _ = tokio::task::spawn_blocking(move || {

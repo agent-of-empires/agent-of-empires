@@ -18,8 +18,6 @@
 
 /** Lines tmux scrolls per SGR wheel event (its copy-mode default). */
 export const LINES_PER_WHEEL_EVENT = 5;
-/** Lines per notch for DOM_DELTA_LINE deltas (browser convention). */
-const LINES_PER_NOTCH = 3;
 /** A pause longer than this starts a new gesture (fresh dead-zone). */
 const IDLE_RESET_MS = 250;
 
@@ -62,9 +60,12 @@ export class WheelAccumulator {
     if (px !== 0) this.lastSign = Math.sign(px);
     this.accum += px;
 
-    // Line-mode notches map one notch to one event; pixel devices pay
-    // 5 lines of travel per event so content tracks the gesture 1:1.
-    const sustainedStep = (input.deltaMode === 1 ? LINES_PER_NOTCH : LINES_PER_WHEEL_EVENT) * cellH;
+    // Line-mode notches map one notch to one event regardless of the
+    // OS lines-per-notch setting (a hardware terminal sends tmux one
+    // wheel report per notch), so the step derives from the event's own
+    // delta; pixel devices pay 5 lines of travel per event so content
+    // tracks the gesture 1:1.
+    const sustainedStep = (input.deltaMode === 1 ? Math.max(1, Math.abs(input.deltaY)) : LINES_PER_WHEEL_EVENT) * cellH;
 
     if (!this.streakActive) {
       if (Math.abs(this.accum) < cellH) return 0;

@@ -27,6 +27,15 @@ describe("WheelAccumulator", () => {
     expect(feed(acc, 168, 0, 30)).toBe(2);
   });
 
+  it("maps one line-mode notch to one event regardless of the OS lines-per-notch", () => {
+    const acc = new WheelAccumulator();
+    // Windows wheel settings can make line-mode notches report deltaY=1
+    // (or any other value); the cadence must stay one event per notch.
+    expect(feed(acc, 1, 1, 0)).toBe(1);
+    expect(feed(acc, 1, 1, 50)).toBe(1);
+    expect(feed(acc, 1, 1, 100)).toBe(1);
+  });
+
   it("maps one Firefox line-mode notch to one event, every notch", () => {
     const acc = new WheelAccumulator();
     // Firefox wheel mice: deltaMode=1, deltaY=3 per notch.

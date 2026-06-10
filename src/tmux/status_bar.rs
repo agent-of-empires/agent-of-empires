@@ -144,9 +144,19 @@ pub fn apply_all_tmux_options(
     } else {
         // aoe's bar is disabled (user preference or their own tmux
         // config). A web attach may have set the session-scoped
-        // `status off`; unset it so the user's own global preference
-        // governs again in real terminals.
-        let _ = set_session_option_unset(session_name, "status");
+        // `status off`, and a previously enabled aoe bar leaves its
+        // session-scoped visual overrides behind; unset them all so the
+        // user's own global config governs again in real terminals.
+        for option in [
+            "status",
+            "status-left",
+            "status-left-length",
+            "status-right",
+            "status-right-length",
+            "status-style",
+        ] {
+            let _ = set_session_option_unset(session_name, option);
+        }
     }
 
     if let Some(mouse_enabled) = should_apply_tmux_mouse() {

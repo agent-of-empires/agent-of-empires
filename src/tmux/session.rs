@@ -407,9 +407,13 @@ impl Session {
     /// input path: raw bytes from the browser (printables, CSI sequences,
     /// control bytes) all ride the same encoding.
     pub fn send_raw_bytes(&self, bytes: &[u8]) -> Result<()> {
+        // `^.0` pins the first window's first pane, matching capture_pane:
+        // a bare session name follows the ACTIVE pane, which would let
+        // input land in a different pane than the one being captured.
+        let target = format!("{}:^.0", self.name);
         for batch in raw_byte_batches(bytes) {
             let output = Command::new("tmux")
-                .args(["send-keys", "-t", &self.name, "-H"])
+                .args(["send-keys", "-t", &target, "-H"])
                 .args(&batch)
                 .output()?;
             if !output.status.success() {

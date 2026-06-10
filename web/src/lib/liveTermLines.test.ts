@@ -55,4 +55,32 @@ describe("wrapLine", () => {
   it("returns one empty row for an empty line", () => {
     expect(wrapLine([], 10)).toEqual([[]]);
   });
+
+  it("never splits an emoji's surrogate pair and counts it two cells", () => {
+    // "a" (1 cell) + grinning face U+1F600 (2 cells) at cols=2: the
+    // emoji wraps whole, leaving the first row's last cell empty.
+    const rows = wrapLine([seg("a\u{1F600}\u{1F600}")], 2);
+    expect(rows.map((r) => lineText(r))).toEqual(["a", "\u{1F600}", "\u{1F600}"]);
+  });
+
+  it("counts CJK as two cells when wrapping", () => {
+    // Four CJK chars are eight cells; at cols=4 they wrap two per row.
+    const rows = wrapLine([seg("\u4F60\u597D\u4E16\u754C")], 4);
+    expect(rows.map((r) => lineText(r))).toEqual(["\u4F60\u597D", "\u4E16\u754C"]);
+  });
+
+  it("treats CJK width as identity-breaking even when code units fit", () => {
+    // Three CJK chars are 3 UTF-16 units but 6 cells; cols=4 must wrap.
+    const rows = wrapLine([seg("\u4F60\u597D\u4E16")], 4);
+    expect(rows.length).toBe(2);
+  });
+
+  it("keeps combining marks attached to their base character", () => {
+    // e + combining acute (zero cells) + "x" is 2 cells; at cols=2 the
+    // line is identity, and at cols=1 the mark stays with the e.
+    const line = [seg("e\u0301x")];
+    expect(wrapLine(line, 2)).toEqual([line]);
+    const rows = wrapLine(line, 1);
+    expect(rows.map((r) => lineText(r))).toEqual(["e\u0301", "x"]);
+  });
 });

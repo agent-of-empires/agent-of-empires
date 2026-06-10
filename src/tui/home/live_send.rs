@@ -839,7 +839,8 @@ fn dispatch_via_fork(tmux_name: &str, action: &TmuxAction) -> anyhow::Result<()>
                 if !head.is_empty() {
                     send_literal(&target, head)?;
                 }
-                return crate::tmux::Session::from_name(&target).send_raw_bytes(&vec![0x3b; semis]);
+                return crate::tmux::Session::from_name(tmux_name)
+                    .send_raw_bytes(&vec![0x3b; semis]);
             }
             // `-l --` mirrors `send_literal_no_enter`: literal-mode
             // send, followed by the end-of-options marker so a payload
@@ -856,7 +857,7 @@ fn dispatch_via_fork(tmux_name: &str, action: &TmuxAction) -> anyhow::Result<()>
             // ride a `-l` payload safely. Chunking against ARG_MAX and
             // the per-byte hex encoding live in the shared tmux layer
             // (the web live view's input path uses the same fn).
-            return crate::tmux::Session::from_name(&target).send_raw_bytes(bytes);
+            return crate::tmux::Session::from_name(tmux_name).send_raw_bytes(bytes);
         }
         TmuxAction::Resize { cols, rows } => {
             cmd.args([
