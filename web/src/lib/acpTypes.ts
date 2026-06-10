@@ -455,6 +455,12 @@ export interface AcpState {
   pendingApprovals: Approval[];
   /** Pending AskUserQuestion elicitations awaiting a user answer. */
   pendingElicitations: Elicitation[];
+  /** tool_call_ids that surfaced as an elicitation. The adapter emits an
+   *  AskUserQuestion tool call alongside the `elicitation/create`; the
+   *  elicitation card is the real UI, so its tool card is suppressed from
+   *  the transcript. Persisted across resolution so the completion frame
+   *  is dropped too. */
+  elicitationToolCallIds: string[];
   recentDiffs: DiffPreview[];
   thinking: boolean;
   rateLimit: RateLimitInfo | null;
@@ -774,6 +780,7 @@ export function emptyAcpState(): AcpState {
     inFlightTool: null,
     pendingApprovals: [],
     pendingElicitations: [],
+    elicitationToolCallIds: [],
     recentDiffs: [],
     thinking: false,
     rateLimit: null,
@@ -936,6 +943,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       next.mode = "Default";
       next.pendingApprovals = [];
       next.pendingElicitations = [];
+      next.elicitationToolCallIds = [];
       // Capture the agent's cumulative cost snapshot as the new
       // baseline so the next UsageUpdate reports cost-since-clear
       // instead of session-lifetime cumulative. `sessionUsage.cost`
@@ -956,6 +964,12 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   }
   if ("ToolCallStarted" in event) {
     const tc = event.ToolCallStarted.tool_call;
+    // An AskUserQuestion tool call is rendered by its elicitation card, not
+    // a transcript tool card. If the elicitation arrived first, drop the
+    // redundant start frame entirely. See ElicitationRequested.
+    if (tc.id && next.elicitationToolCallIds.includes(tc.id)) {
+      return next;
+    }
     next.inFlightTool = tc;
     // The reasoning block produced output (a tool call), so the agent is
     // no longer thinking. The adapter often skips ThinkingEnded when it
@@ -997,6 +1011,15 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   }
   if ("ToolCallCompleted" in event) {
     const { tool_call_id, is_error, content, output, completed_at } = event.ToolCallCompleted;
+    // The AskUserQuestion tool's completion is owned by its elicitation
+    // card; drop it so no transcript tool card materializes. Clear the
+    // in-flight pointer if it still points at this suppressed tool.
+    if (next.elicitationToolCallIds.includes(tool_call_id)) {
+      if (next.inFlightTool && next.inFlightTool.id === tool_call_id) {
+        next.inFlightTool = null;
+      }
+      return next;
+    }
     // #1713: a completion with no preceding start frame would render no
     // card (the render layer only attaches results to an existing
     // tool-call part). Synthesize a minimal start row first so the card
@@ -1107,6 +1130,20 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   if ("ElicitationRequested" in event) {
     const e = event.ElicitationRequested.elicitation;
     next.pendingElicitations = [...next.pendingElicitations, e];
+    // The adapter also emits an AskUserQuestion tool call for this
+    // elicitation. The card below replaces it, so remember the
+    // tool_call_id (to drop a later start/complete frame) and strip any
+    // tool row + in-flight pointer it already produced.
+    if (e.tool_call_id) {
+      const id = e.tool_call_id;
+      if (!next.elicitationToolCallIds.includes(id)) {
+        next.elicitationToolCallIds = [...next.elicitationToolCallIds, id];
+      }
+      next.activity = next.activity.filter((r) => r.toolCallId !== id);
+      if (next.inFlightTool && next.inFlightTool.id === id) {
+        next.inFlightTool = null;
+      }
+    }
     return next;
   }
   if ("ElicitationResolved" in event) {
@@ -1588,6 +1625,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     next.thinking = false;
     next.pendingApprovals = [];
     next.pendingElicitations = [];
+    next.elicitationToolCallIds = [];
     next.sessionUsage = null;
     // The new backend reports its own cumulative cost starting from
     // zero, so the prior agent's per-clear baseline does not apply.

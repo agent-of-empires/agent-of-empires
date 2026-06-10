@@ -19,7 +19,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { emptyAcpState } from "../lib/acpTypes";
 import { __test } from "./useAcpSession";
 
-const { persistState, evictOldestPersistedAcpState, STORAGE_KEY_PREFIX } = __test;
+const { persistState, loadPersistedState, evictOldestPersistedAcpState, STORAGE_KEY_PREFIX } = __test;
 
 const DRAFT_KEY_PREFIX = "acp:draft:";
 
@@ -33,6 +33,46 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.restoreAllMocks();
+});
+
+describe("loadPersistedState schema backfill", () => {
+  it("backfills fields added after an entry was persisted (pendingElicitations)", () => {
+    // Simulate an entry written by an older bundle: a valid state that
+    // predates pendingElicitations. Without the merge-over-defaults on
+    // load, the new StructuredView reads `undefined` and crashes on
+    // `.pendingElicitations.map`.
+    const legacy = { ...emptyAcpState() } as Record<string, unknown>;
+    delete legacy.pendingElicitations;
+    window.localStorage.setItem(
+      `${STORAGE_KEY_PREFIX}sess-legacy`,
+      JSON.stringify({ savedAt: Date.now(), state: legacy }),
+    );
+
+    const loaded = loadPersistedState("sess-legacy");
+    expect(loaded).toBeDefined();
+    expect(loaded?.pendingElicitations).toEqual([]);
+    // An existing field round-trips unchanged.
+    expect(loaded?.pendingApprovals).toEqual([]);
+  });
+
+  it("preserves a persisted pendingElicitations list", () => {
+    const state = {
+      ...emptyAcpState(),
+      pendingElicitations: [
+        {
+          nonce: "e-1",
+          message: "Pick",
+          tool_call_id: null,
+          questions: [],
+          requested_at: "2026-06-10T00:00:00Z",
+          resolved: null,
+        },
+      ],
+    };
+    window.localStorage.setItem(`${STORAGE_KEY_PREFIX}sess-keep`, JSON.stringify({ savedAt: Date.now(), state }));
+    const loaded = loadPersistedState("sess-keep");
+    expect(loaded?.pendingElicitations.map((e) => e.nonce)).toEqual(["e-1"]);
+  });
 });
 
 describe("structured view cache eviction (#1345)", () => {

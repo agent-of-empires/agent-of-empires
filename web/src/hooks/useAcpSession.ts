@@ -191,6 +191,7 @@ function persistState(sessionId: string, state: AcpState): void {
 // driving the full hook lifecycle. Not part of the public API.
 export const __test = {
   persistState,
+  loadPersistedState,
   evictOldestPersistedAcpState,
   STORAGE_KEY_PREFIX,
 };
@@ -213,10 +214,13 @@ function loadPersistedState(sessionId: string): AcpState | undefined {
       window.localStorage.removeItem(storageKey(sessionId));
       return undefined;
     }
-    // Backfill the seq-counter pair introduced by #1170 for entries
-    // persisted before the schema change; see `normaliseTurnCounters`
-    // for the rules.
-    return normaliseTurnCounters(state as AcpState);
+    // Merge over the current defaults so an entry persisted by an older
+    // bundle gains any fields added since (e.g. `pendingElicitations`);
+    // without this the new code reads `undefined` for a freshly-added
+    // array and crashes on `.map`. Then backfill the seq-counter pair
+    // introduced by #1170; see `normaliseTurnCounters` for the rules.
+    const merged: AcpState = { ...emptyAcpState(), ...(state as AcpState) };
+    return normaliseTurnCounters(merged);
   } catch {
     return undefined;
   }
