@@ -15,6 +15,7 @@ import { reportTelemetrySeen } from "../lib/api";
 import { getToken } from "../lib/token";
 import { useWebSettings } from "./useWebSettings";
 import { TerminalTiming } from "../lib/terminalTiming";
+import { WheelAccumulator, LINES_PER_WHEEL_EVENT } from "../lib/wheelScroll";
 import type { TimingPingMessage, TimingPongMessage } from "../lib/types";
 
 // Client-side terminal WS debug logging is gated behind a runtime flag
@@ -1001,17 +1002,16 @@ export function useTerminal(
     let singleLastTs = 0;
     let suppressNextClick = false;
     const GESTURE_LOCK_PX = 12;
-    // tmux's default copy-mode wheel binding scrolls 5 lines per wheel
-    // event, so one wheel must cost 5 lines of finger travel for the
-    // content to track the finger 1:1. The old value of 2 made the
-    // scrollback fly past at 2.5x finger speed.
-    const LINES_PER_WHEEL = 5;
     const MAX_VELOCITY = 2.0;
     const MAX_WHEELS_PER_FRAME = 6;
     const clampV = (v: number) => Math.max(-MAX_VELOCITY, Math.min(MAX_VELOCITY, v));
     const currentFontSize = (): number =>
       typeof term.options.fontSize === "number" ? term.options.fontSize : DEFAULT_FONT_SIZE;
-    const pxPerWheel = () => currentFontSize() * 1.2 * LINES_PER_WHEEL;
+    // tmux's default copy-mode wheel binding scrolls 5 lines per wheel
+    // event, so one wheel must cost 5 lines of finger travel for the
+    // touch content to track the finger 1:1. The old value of 2 made
+    // the scrollback fly past at 2.5x finger speed.
+    const pxPerWheel = () => currentFontSize() * 1.2 * LINES_PER_WHEEL_EVENT;
     const prefersReducedMotion = () => window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
 
     const midpointY = (e: TouchEvent) => {
@@ -1336,7 +1336,7 @@ export function useTerminal(
     // emission. Returning false from the custom handler tells xterm.js
     // to skip its own wheel processing.
     let wheelAccum = 0;
-    let scrollWheelAccum = 0;
+    const scrollWheel = new WheelAccumulator();
     let wheelPersistTimer: ReturnType<typeof setTimeout> | null = null;
     let lastCapturedWheelCell: { col: number; row: number } | null = null;
     const onWheelCapture = (e: WheelEvent) => {
@@ -1368,17 +1368,22 @@ export function useTerminal(
         return false;
       }
 
-      // Plain scroll: convert to SGR mouse-wheel sequences for tmux
-      scrollWheelAccum += e.deltaY;
-      const step = pxPerWheel();
-      const rawWheels = Math.trunc(scrollWheelAccum / step);
+      // Plain scroll: convert to SGR mouse-wheel sequences for tmux.
+      // The accumulator normalizes deltaMode (Firefox wheel mice report
+      // line deltas) and fires the first event after one line of travel
+      // so the response is immediate instead of behind a 5-line dead
+      // zone; see lib/wheelScroll.ts.
+      const rawWheels = scrollWheel.feed(
+        { deltaY: e.deltaY, deltaMode: e.deltaMode, timeStamp: e.timeStamp },
+        currentFontSize() * 1.2,
+        Math.max(1, term.rows),
+      );
       const wheels = Math.max(-MAX_WHEELS_PER_FRAME, Math.min(MAX_WHEELS_PER_FRAME, rawWheels));
       if (wheels !== 0) {
         const eventCell = cellFromClientPoint(e.clientX, e.clientY, e.currentTarget ?? e.target);
         const cell =
           eventCell.col === 1 && eventCell.row === 1 && lastCapturedWheelCell ? lastCapturedWheelCell : eventCell;
         sendWheel(wheels > 0 ? "down" : "up", Math.abs(wheels), cell);
-        scrollWheelAccum -= wheels * step;
       }
       return false;
     });
