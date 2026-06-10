@@ -112,43 +112,51 @@ pub fn clone_bare_repo(url: &str, destination: &Path) -> Result<String> {
 
     run_in_bare(&["fetch", "origin"])?;
 
-    let default_branch = {
-        let output = run_in_bare(&["symbolic-ref", "refs/remotes/origin/HEAD"])?;
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        stdout
-            .rsplit_once('/')
-            .map(|(_, name)| name.to_string())
-            .filter(|s| !s.is_empty())
+    // Detect the default branch. `git clone --bare` points the bare repo's
+    // own HEAD at the remote's default branch, which works on every git
+    // version. `refs/remotes/origin/HEAD` is only populated by `git fetch`
+    // on git >= 2.45 (followRemoteHEAD), so it can't be relied on; try it
+    // and then main/master as fallbacks. These probes must tolerate a
+    // non-zero exit (the ref simply not existing), so they don't go through
+    // `run_in_bare`, which treats failure as fatal and wipes the clone.
+    let probe = |args: &[&str]| -> Option<String> {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&bare_dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let out = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        (!out.is_empty()).then_some(out)
     };
+    let branch_from_ref = |full: &str| full.rsplit_once('/').map(|(_, name)| name.to_string());
+
+    let default_branch = probe(&["symbolic-ref", "--short", "HEAD"])
+        .or_else(|| {
+            probe(&["symbolic-ref", "refs/remotes/origin/HEAD"])
+                .as_deref()
+                .and_then(branch_from_ref)
+        })
+        .or_else(|| {
+            probe(&["show-ref", "--verify", "refs/remotes/origin/main"]).map(|_| "main".into())
+        })
+        .or_else(|| {
+            probe(&["show-ref", "--verify", "refs/remotes/origin/master"]).map(|_| "master".into())
+        });
 
     let default_branch = match default_branch {
         Some(b) => b,
         None => {
-            let try_branch = |branch: &str| -> bool {
-                std::process::Command::new("git")
-                    .args([
-                        "show-ref",
-                        "--verify",
-                        &format!("refs/remotes/origin/{branch}"),
-                    ])
-                    .current_dir(&bare_dir)
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status()
-                    .map(|s| s.success())
-                    .unwrap_or(false)
-            };
-            if try_branch("main") {
-                "main".to_string()
-            } else if try_branch("master") {
-                "master".to_string()
-            } else {
-                let _ = std::fs::remove_dir_all(destination);
-                return Err(GitError::CloneFailed(
-                    "Could not detect default branch (tried main, master)".to_string(),
-                ));
-            }
+            let _ = std::fs::remove_dir_all(destination);
+            return Err(GitError::CloneFailed(
+                "Could not detect default branch (tried HEAD, origin/HEAD, main, master)"
+                    .to_string(),
+            ));
         }
     };
 
