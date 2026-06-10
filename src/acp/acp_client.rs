@@ -19,7 +19,9 @@ use std::sync::Arc;
 use agent_client_protocol::schema::ErrorCode;
 use agent_client_protocol::schema::{
     AudioContent, BlobResourceContents, CancelNotification, ClientCapabilities, ContentBlock,
-    CreateTerminalRequest, CreateTerminalResponse, EmbeddedResource, EmbeddedResourceResource,
+    CreateElicitationRequest, CreateElicitationResponse, CreateTerminalRequest,
+    CreateTerminalResponse, ElicitationAction, ElicitationCapabilities,
+    ElicitationFormCapabilities, EmbeddedResource, EmbeddedResourceResource,
     FileSystemCapabilities, ImageContent, InitializeRequest, KillTerminalRequest,
     KillTerminalResponse, LoadSessionRequest, McpServer, NewSessionRequest, PermissionOptionKind,
     PromptRequest, ProtocolVersion, ReadTextFileRequest, ReadTextFileResponse,
@@ -43,6 +45,9 @@ use super::agent_compat::{self, ExpectedAgent};
 use super::agent_profiles;
 use super::agent_registry::AgentSpec;
 use super::approvals::{is_destructive, ApprovalDecision, Nonce};
+use super::elicitations::{
+    build_response, parse_elicitation, ElicitationOutcome, ElicitationResolution,
+};
 use super::event_store::AttachmentBlob;
 use super::fs_handler::{self, FsPolicy, SandboxPathMap};
 use super::mcp_config;
@@ -1070,10 +1075,20 @@ fn silent_orphan_check_interval() -> std::time::Duration {
     SILENT_ORPHAN_CHECK_INTERVAL
 }
 
-/// Resolution channel + the option set the agent offered. Stored in the
-/// pending-responders map keyed by the structured view's server-generated nonce.
+/// Resolution channel for a parked agent->client request awaiting a user
+/// decision. Stored in the pending-responders map keyed by the structured
+/// view's server-generated nonce. One map carries both permission
+/// approvals and form elicitations; nonces are unique across both, and
+/// the resolver variant records which kind of request is parked.
 struct PendingResponder {
-    resolver: oneshot::Sender<ApprovalResolutionMessage>,
+    resolver: PendingResolver,
+}
+
+enum PendingResolver {
+    /// `session/request_permission` awaiting allow/deny.
+    Approval(oneshot::Sender<ApprovalResolutionMessage>),
+    /// `elicitation/create` awaiting an accept/decline/cancel answer.
+    Elicitation(oneshot::Sender<ElicitationResolution>),
 }
 
 /// Message sent over the resolver oneshot to unblock the parked
@@ -1728,9 +1743,16 @@ impl AcpClient {
         decision: ApprovalDecision,
     ) -> Result<(), AcpError> {
         let mut map = self.pending_responders.lock().await;
-        let pending = map.remove(&nonce).ok_or(AcpError::UnknownNonce)?;
-        pending
-            .resolver
+        // Only consume the entry if it is actually a permission; a nonce
+        // that belongs to an elicitation is "unknown" to this endpoint.
+        let PendingResolver::Approval(_) = &map.get(&nonce).ok_or(AcpError::UnknownNonce)?.resolver
+        else {
+            return Err(AcpError::UnknownNonce);
+        };
+        let PendingResolver::Approval(resolver) = map.remove(&nonce).unwrap().resolver else {
+            unreachable!("checked above");
+        };
+        resolver
             .send(ApprovalResolutionMessage::Decision { decision })
             .map_err(|_| AcpError::AgentExited)
     }
@@ -1739,11 +1761,37 @@ impl AcpClient {
     /// the agent receives a structured cancellation outcome.
     pub async fn cancel_permission(&self, nonce: Nonce) -> Result<(), AcpError> {
         let mut map = self.pending_responders.lock().await;
-        let pending = map.remove(&nonce).ok_or(AcpError::UnknownNonce)?;
-        pending
-            .resolver
+        let PendingResolver::Approval(_) = &map.get(&nonce).ok_or(AcpError::UnknownNonce)?.resolver
+        else {
+            return Err(AcpError::UnknownNonce);
+        };
+        let PendingResolver::Approval(resolver) = map.remove(&nonce).unwrap().resolver else {
+            unreachable!("checked above");
+        };
+        resolver
             .send(ApprovalResolutionMessage::Cancelled)
             .map_err(|_| AcpError::AgentExited)
+    }
+
+    /// Resolve a pending elicitation by nonce, unblocking the parked
+    /// `elicitation/create` callback with the user's accept/decline/cancel
+    /// answer. A nonce belonging to a permission (or already resolved) is
+    /// reported as unknown.
+    pub async fn resolve_elicitation(
+        &self,
+        nonce: Nonce,
+        resolution: ElicitationResolution,
+    ) -> Result<(), AcpError> {
+        let mut map = self.pending_responders.lock().await;
+        let PendingResolver::Elicitation(_) =
+            &map.get(&nonce).ok_or(AcpError::UnknownNonce)?.resolver
+        else {
+            return Err(AcpError::UnknownNonce);
+        };
+        let PendingResolver::Elicitation(resolver) = map.remove(&nonce).unwrap().resolver else {
+            unreachable!("checked above");
+        };
+        resolver.send(resolution).map_err(|_| AcpError::AgentExited)
     }
 
     /// Best-effort experimental `session/delete` RPC. Sent before
@@ -3828,8 +3876,10 @@ async fn run_connection_task<W, R>(
     let ready_for_block = ready_tx.clone();
     let event_tx_for_notif = event_tx.clone();
     let event_tx_for_perm = event_tx.clone();
+    let event_tx_for_elicit = event_tx.clone();
     let event_tx_for_block = event_tx.clone();
     let pending_for_perm = pending_responders.clone();
+    let pending_for_elicit = pending_responders.clone();
     let mut cmd_rx = cmd_rx;
     let session_label_for_log = session_label.clone();
 
@@ -4024,6 +4074,18 @@ async fn run_connection_task<W, R>(
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
+            move |request: CreateElicitationRequest,
+                  responder: Responder<CreateElicitationResponse>,
+                  _conn| {
+                let event_tx = event_tx_for_elicit.clone();
+                let pending = pending_for_elicit.clone();
+                async move {
+                    handle_elicitation_request(request, responder, event_tx, pending).await
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
             move |request: ReadTextFileRequest,
                   responder: Responder<ReadTextFileResponse>,
                   _conn| {
@@ -4092,7 +4154,14 @@ async fn run_connection_task<W, R>(
                 .fs(FileSystemCapabilities::new()
                     .read_text_file(true)
                     .write_text_file(true))
-                .terminal(true);
+                .terminal(true)
+                // Advertise form-mode elicitation so claude-agent-acp
+                // (>=0.44) re-enables AskUserQuestion and routes it to us as
+                // an `elicitation/create` request. Without this the adapter
+                // unconditionally blacklists the tool. See handle_elicitation_request.
+                .elicitation(
+                    ElicitationCapabilities::new().form(ElicitationFormCapabilities::new()),
+                );
             // `initialize` is sent in both Fresh and Resume modes.
             // It's idempotent on every ACP agent we ship against
             // (aoe-agent, claude-agent-acp); the response only carries
@@ -5725,7 +5794,7 @@ async fn handle_permission_request(
     pending.lock().await.insert(
         nonce.clone(),
         PendingResponder {
-            resolver: resolve_tx,
+            resolver: PendingResolver::Approval(resolve_tx),
         },
     );
 
@@ -5831,6 +5900,85 @@ async fn handle_permission_request(
         "responding to permission request"
     );
     responder.respond(RequestPermissionResponse::new(outcome))
+}
+
+/// Handle an `elicitation/create` request (claude-agent-acp's
+/// `AskUserQuestion`, surfaced because we advertise `elicitation.form`).
+/// Mirrors `handle_permission_request`: normalize the form, park a
+/// resolver under a fresh nonce, broadcast the card, await the user's
+/// answer, then respond to the agent. Cancellation (resolver dropped on
+/// teardown) and an unparseable schema both fall back to a graceful
+/// response so the agent's turn never hangs.
+async fn handle_elicitation_request(
+    request: CreateElicitationRequest,
+    responder: Responder<CreateElicitationResponse>,
+    event_tx: mpsc::Sender<Event>,
+    pending: PendingResponders,
+) -> agent_client_protocol::Result<()> {
+    let nonce = Nonce::new();
+    let elicitation = match parse_elicitation(nonce.clone(), &request, chrono::Utc::now()) {
+        Ok(elicitation) => elicitation,
+        Err(e) => {
+            // A schema we can't render (URL mode, or an MCP-server form
+            // with number/boolean fields). Decline so the agent continues
+            // rather than waiting on a card we'll never show.
+            warn!(target: "cockpit.acp", "unsupported elicitation, declining: {e}");
+            return responder.respond(CreateElicitationResponse::new(ElicitationAction::Decline));
+        }
+    };
+
+    let (resolve_tx, resolve_rx) = oneshot::channel::<ElicitationResolution>();
+    pending.lock().await.insert(
+        nonce.clone(),
+        PendingResponder {
+            resolver: PendingResolver::Elicitation(resolve_tx),
+        },
+    );
+
+    if event_tx
+        .send(Event::ElicitationRequested {
+            elicitation: elicitation.clone(),
+        })
+        .await
+        .is_err()
+    {
+        pending.lock().await.remove(&nonce);
+        return responder.respond(CreateElicitationResponse::new(ElicitationAction::Cancel));
+    }
+
+    // Await the user's answer. A dropped resolver (daemon teardown,
+    // agent cancel) cancels the tool call.
+    let (response, outcome) = match resolve_rx.await {
+        Ok(resolution) => {
+            let outcome = resolution.outcome();
+            // Server-side validation: a rejected payload (unknown field,
+            // bad option, missing required) cancels rather than feeding
+            // the agent a malformed answer.
+            match build_response(&elicitation, resolution) {
+                Ok(response) => (response, outcome),
+                Err(e) => {
+                    warn!(target: "cockpit.acp", "invalid elicitation answer, cancelling: {e}");
+                    (
+                        CreateElicitationResponse::new(ElicitationAction::Cancel),
+                        ElicitationOutcome::Cancelled,
+                    )
+                }
+            }
+        }
+        Err(_) => (
+            CreateElicitationResponse::new(ElicitationAction::Cancel),
+            ElicitationOutcome::Cancelled,
+        ),
+    };
+
+    let _ = event_tx
+        .send(Event::ElicitationResolved {
+            nonce: nonce.clone(),
+            outcome,
+        })
+        .await;
+
+    responder.respond(response)
 }
 
 #[cfg(test)]

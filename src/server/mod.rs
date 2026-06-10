@@ -1554,6 +1554,10 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/api/sessions/{id}/acp/approvals/{nonce}",
             post(api::resolve_approval),
         )
+        .route(
+            "/api/sessions/{id}/acp/elicitations/{nonce}",
+            post(api::resolve_elicitation),
+        )
         .route("/api/acp/agents", get(api::list_acp_agents));
 
     app

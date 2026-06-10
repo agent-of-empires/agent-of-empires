@@ -32,6 +32,7 @@ use tracing::{debug, info, warn};
 use super::acp_client::{AcpClient, AcpError, DeleteSessionOutcome, SpawnConfig};
 use super::agent_registry::{AgentRegistry, AgentSpec};
 use super::approvals::{ApprovalDecision, Nonce};
+use super::elicitations::ElicitationResolution;
 use super::state::{AcpSessionId, Event};
 use crate::session::SandboxInfo;
 
@@ -2022,6 +2023,19 @@ impl<S: BroadcastSink> Supervisor<S> {
     ) -> Result<(), SupervisorError> {
         let client = self.client_for_session(session_id).await?;
         client.resolve_permission(nonce, decision).await?;
+        Ok(())
+    }
+
+    /// Resolve a pending `AskUserQuestion` elicitation by nonce, unblocking
+    /// the parked `elicitation/create` callback with the user's answer.
+    pub async fn resolve_elicitation(
+        &self,
+        session_id: &str,
+        nonce: Nonce,
+        resolution: ElicitationResolution,
+    ) -> Result<(), SupervisorError> {
+        let client = self.client_for_session(session_id).await?;
+        client.resolve_elicitation(nonce, resolution).await?;
         Ok(())
     }
 

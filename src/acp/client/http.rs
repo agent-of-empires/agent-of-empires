@@ -12,6 +12,7 @@ use reqwest::{header, StatusCode};
 use thiserror::Error;
 
 use super::discovery::DaemonEndpoint;
+use crate::acp::elicitations::ElicitationResolution;
 use crate::acp::protocol::{
     ApprovalDecisionWire, ContextPrimerResponse, FilesResponse, PromptRequest, ReplayResponse,
     ResolveApprovalRequest, SwitchAgentRequest, SwitchAgentResponse,
@@ -271,6 +272,33 @@ impl HttpClient {
         );
         let body = ResolveApprovalRequest { decision };
         let res = self.auth(self.http.post(&url)).json(&body).send().await?;
+        let status = res.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let text = res.text().await.unwrap_or_default();
+        Err(classify_resolve_error(status, &text, nonce, session_id))
+    }
+
+    /// `POST /api/sessions/{id}/acp/elicitations/{nonce}`. The native TUI
+    /// only ever sends decline/cancel (the rich answer form is web-only),
+    /// but the body is the full `ElicitationResolution` so the same client
+    /// could submit answers.
+    pub async fn resolve_elicitation(
+        &self,
+        session_id: &str,
+        nonce: &str,
+        resolution: &ElicitationResolution,
+    ) -> Result<(), HttpError> {
+        let url = format!(
+            "{}/api/sessions/{}/acp/elicitations/{}",
+            self.endpoint.base_url, session_id, nonce
+        );
+        let res = self
+            .auth(self.http.post(&url))
+            .json(resolution)
+            .send()
+            .await?;
         let status = res.status();
         if status.is_success() {
             return Ok(());
