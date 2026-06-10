@@ -16,7 +16,7 @@ use tracing::{debug, info, warn};
 
 use crate::server::api::{send_text_to_tmux_session, SendTextError};
 use crate::server::AppState;
-use crate::session::Instance;
+use crate::session::{Instance, Status};
 
 const CONFIG_FILE: &str = "telegram.toml";
 const TOKEN_ENV: &str = "AOE_TELEGRAM_BOT_TOKEN";
@@ -25,6 +25,9 @@ const ALLOWED_CHATS_ENV: &str = "AOE_TELEGRAM_ALLOWED_CHAT_IDS";
 const DEFAULT_SESSION_ENV: &str = "AOE_TELEGRAM_DEFAULT_SESSION";
 const PARAKEET_MODEL_ENV: &str = "AOE_TELEGRAM_PARAKEET_MODEL";
 const DEFAULT_POLL_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_REPLY_TIMEOUT_SECS: u64 = 120;
+const DEFAULT_REPLY_POLL_SECS: u64 = 3;
+const DEFAULT_REPLY_TAIL_LINES: usize = 120;
 const DEFAULT_VOICE_MAX_FILE_SIZE_MB: u64 = 25;
 const DEFAULT_VOICE_TRANSCRIPTION_TIMEOUT_SECS: u64 = 600;
 const DEFAULT_PARAKEET_MODEL: &str = "mlx-community/parakeet-tdt-0.6b-v2";
@@ -43,6 +46,10 @@ struct TelegramConfig {
     last_update_id: Option<i64>,
     drop_pending_on_start: bool,
     poll_timeout_secs: u64,
+    reply_relay_enabled: bool,
+    reply_timeout_secs: u64,
+    reply_poll_secs: u64,
+    reply_tail_lines: usize,
     voice_transcription_enabled: bool,
     voice_max_file_size_mb: u64,
     voice_transcription_timeout_secs: u64,
@@ -62,6 +69,10 @@ impl Default for TelegramConfig {
             last_update_id: None,
             drop_pending_on_start: true,
             poll_timeout_secs: DEFAULT_POLL_TIMEOUT_SECS,
+            reply_relay_enabled: true,
+            reply_timeout_secs: DEFAULT_REPLY_TIMEOUT_SECS,
+            reply_poll_secs: DEFAULT_REPLY_POLL_SECS,
+            reply_tail_lines: DEFAULT_REPLY_TAIL_LINES,
             voice_transcription_enabled: true,
             voice_max_file_size_mb: DEFAULT_VOICE_MAX_FILE_SIZE_MB,
             voice_transcription_timeout_secs: DEFAULT_VOICE_TRANSCRIPTION_TIMEOUT_SECS,
@@ -236,6 +247,9 @@ impl TelegramBridge {
             changed = true;
         }
         config.poll_timeout_secs = config.poll_timeout_secs.clamp(5, 50);
+        config.reply_timeout_secs = config.reply_timeout_secs.clamp(5, 600);
+        config.reply_poll_secs = config.reply_poll_secs.clamp(1, 30);
+        config.reply_tail_lines = config.reply_tail_lines.clamp(20, MAX_TAIL_LINES);
         config.voice_max_file_size_mb = config.voice_max_file_size_mb.clamp(1, 50);
         config.voice_transcription_timeout_secs =
             config.voice_transcription_timeout_secs.clamp(30, 1800);
@@ -402,7 +416,9 @@ impl TelegramBridge {
     async fn handle_text(&self, chat_id: i64, text: &str) -> Result<()> {
         let trimmed = text.trim();
         if let Some((cmd, rest)) = parse_command(trimmed) {
-            return self.handle_command(chat_id, &cmd, rest).await;
+            if is_bridge_command(&cmd) {
+                return self.handle_command(chat_id, &cmd, rest).await;
+            }
         }
 
         if !self.is_authorized(chat_id).await {
@@ -701,12 +717,78 @@ impl TelegramBridge {
                 .await;
         }
 
+        let relay_config = self.config.lock().await.clone();
+        let baseline = if relay_config.reply_relay_enabled {
+            match self
+                .capture_tail(session_id, relay_config.reply_tail_lines)
+                .await
+            {
+                Ok(content) => content,
+                Err(e) => {
+                    debug!(
+                        target: "telegram.bridge",
+                        session_id,
+                        error = ?e,
+                        "could not capture reply relay baseline"
+                    );
+                    String::new()
+                }
+            }
+        } else {
+            String::new()
+        };
+
         match send_text_to_tmux_session(self.state.clone(), session_id, text.to_string(), true)
             .await
         {
             Ok(_) => {
-                self.send_reply(chat_id, &format!("Sent to {}.", instance.title))
+                if !relay_config.reply_relay_enabled {
+                    return self
+                        .send_reply(chat_id, &format!("Sent to {}.", instance.title))
+                        .await;
+                }
+
+                self.send_reply(
+                    chat_id,
+                    &format!("Sent to {}. Waiting for reply...", instance.title),
+                )
+                .await?;
+                match self
+                    .wait_for_session_reply(session_id, &baseline, &relay_config)
                     .await
+                {
+                    Ok(Some(output)) => {
+                        let output = truncate_from_end(output.trim(), MAX_TELEGRAM_TEXT_CHARS);
+                        self.send_reply(chat_id, &format!("{} output:\n{}", instance.title, output))
+                            .await
+                    }
+                    Ok(None) => {
+                        self.send_reply(
+                            chat_id,
+                            &format!(
+                                "No new output from {} after {}s. Use /tail 80 to check the pane.",
+                                instance.title, relay_config.reply_timeout_secs
+                            ),
+                        )
+                        .await
+                    }
+                    Err(e) => {
+                        debug!(
+                            target: "telegram.bridge",
+                            session_id,
+                            error = ?e,
+                            "reply relay failed"
+                        );
+                        self.send_reply(
+                            chat_id,
+                            &format!(
+                                "Sent to {}, but could not read the reply. Use /tail 80.",
+                                instance.title
+                            ),
+                        )
+                        .await
+                    }
+                }
             }
             Err(e) => self.send_reply(chat_id, &format_send_error(&e)).await,
         }
@@ -779,6 +861,54 @@ impl TelegramBridge {
                 Err(TailError::Internal)
             }
         }
+    }
+
+    async fn wait_for_session_reply(
+        &self,
+        session_id: &str,
+        baseline: &str,
+        config: &TelegramConfig,
+    ) -> Result<Option<String>, TailError> {
+        let timeout = Duration::from_secs(config.reply_timeout_secs.clamp(5, 600));
+        let poll_interval = Duration::from_secs(config.reply_poll_secs.clamp(1, 30));
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut latest_output = None;
+
+        loop {
+            tokio::select! {
+                _ = self.state.shutdown.cancelled() => return Ok(latest_output),
+                _ = tokio::time::sleep(poll_interval) => {}
+            }
+
+            let tail = self
+                .capture_tail(
+                    session_id,
+                    config.reply_tail_lines.clamp(20, MAX_TAIL_LINES),
+                )
+                .await?;
+            let output = output_after_baseline(baseline, &tail);
+            if !output.trim().is_empty() {
+                latest_output = Some(output);
+            }
+
+            if let Some(status) = self.session_status(session_id).await {
+                if latest_output.is_some() && reply_is_ready(status) {
+                    return Ok(latest_output);
+                }
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(latest_output);
+            }
+        }
+    }
+
+    async fn session_status(&self, session_id: &str) -> Option<Status> {
+        self.sessions_snapshot()
+            .await
+            .into_iter()
+            .find(|session| session.id == session_id)
+            .map(|session| session.status)
     }
 
     async fn download_telegram_file(
@@ -1204,6 +1334,36 @@ fn parse_command(text: &str) -> Option<(String, &str)> {
     }
 }
 
+fn is_bridge_command(cmd: &str) -> bool {
+    matches!(
+        cmd,
+        "start" | "help" | "claim" | "whoami" | "sessions" | "use" | "tail" | "output" | "status"
+    )
+}
+
+fn reply_is_ready(status: Status) -> bool {
+    matches!(
+        status,
+        Status::Idle | Status::Waiting | Status::Stopped | Status::Error | Status::Unknown
+    )
+}
+
+fn output_after_baseline(baseline: &str, latest: &str) -> String {
+    let baseline = baseline.trim_end();
+    let latest = latest.trim_end();
+    if latest.is_empty() || latest == baseline {
+        return String::new();
+    }
+    if baseline.is_empty() {
+        return latest.trim().to_string();
+    }
+    latest
+        .strip_prefix(baseline)
+        .unwrap_or(latest)
+        .trim()
+        .to_string()
+}
+
 fn resolve_selector(
     sessions: &[Instance],
     selector: &str,
@@ -1308,7 +1468,7 @@ fn format_send_error(error: &SendTextError) -> String {
 
 fn help_text(authorized: bool) -> &'static str {
     if authorized {
-        "AoE Telegram commands:\n/sessions - list sessions\n/use <number, id, or title> - select a session\n/status - selected session status\n/tail [lines] - show recent tmux output\n/whoami - show this chat id\n\nSend normal text or a voice note to the selected session. Voice notes are transcribed locally with NVIDIA Parakeet v2."
+        "AoE Telegram commands:\n/sessions - list sessions\n/use <number, id, or title> - select a session\n/status - selected session status\n/tail [lines] - show recent tmux output\n/whoami - show this chat id\n\nSend normal text or a voice note to the selected session. Voice notes are transcribed locally with NVIDIA Parakeet v2. Other slash commands are forwarded to the agent, and tmux replies are sent back after the turn."
     } else {
         "AoE Telegram bridge is locked. Use /claim <code> from the private AoE Telegram config, or /whoami to get this chat id."
     }
@@ -1436,6 +1596,30 @@ mod tests {
         assert_eq!(
             parse_command("/use@Pi_agent_l337_bot 1"),
             Some(("use".to_string(), "1"))
+        );
+    }
+
+    #[test]
+    fn bridge_command_detection_leaves_agent_slash_commands_for_session() {
+        assert!(is_bridge_command("sessions"));
+        assert!(is_bridge_command("tail"));
+        assert!(!is_bridge_command("login"));
+        assert!(!is_bridge_command("model"));
+    }
+
+    #[test]
+    fn output_after_baseline_returns_only_new_tail() {
+        assert_eq!(
+            output_after_baseline("old line\nprompt", "old line\nprompt\nnew reply\n"),
+            "new reply"
+        );
+    }
+
+    #[test]
+    fn output_after_baseline_falls_back_when_tail_rotated() {
+        assert_eq!(
+            output_after_baseline("old line not present anymore", "prompt\nnew reply"),
+            "prompt\nnew reply"
         );
     }
 
