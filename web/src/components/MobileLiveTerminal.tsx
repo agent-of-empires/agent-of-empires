@@ -169,16 +169,25 @@ export function MobileLiveTerminal({
   // of any scroll EVENT), so an arriving frame can never pin the
   // scroller back under a starting gesture, while appended output still
   // follows the live tail.
-  const geomRef = useRef({ scrollHeight: 0, clientHeight: 0 });
+  //
+  // The scrollTop comparison covers the gap touchActiveRef can't: a
+  // flick lifts the finger immediately, and on a busy session a live
+  // frame can land in the first ~50ms of momentum while the scroller
+  // is still inside the at-bottom threshold. Pinning there snaps the
+  // view back AND cancels iOS momentum, making scroll-up nearly
+  // impossible to start. Upward motion since the last mutation means
+  // the user is heading into scrollback; never pin against it.
+  const geomRef = useRef({ scrollHeight: 0, clientHeight: 0, scrollTop: 0 });
   const pinIfWasAtBottom = useCallback(() => {
     const el = scrollerRef.current;
     if (!el) return;
     const prev = geomRef.current;
     const wasAtBottom = prev.scrollHeight === 0 || prev.scrollHeight - el.scrollTop - prev.clientHeight < lineH * 1.5;
-    if (wasAtBottom && !touchActiveRef.current) {
+    const movingUp = prev.scrollHeight !== 0 && el.scrollTop < prev.scrollTop - 0.5;
+    if (wasAtBottom && !movingUp && !touchActiveRef.current) {
       el.scrollTop = el.scrollHeight;
     }
-    geomRef.current = { scrollHeight: el.scrollHeight, clientHeight: el.clientHeight };
+    geomRef.current = { scrollHeight: el.scrollHeight, clientHeight: el.clientHeight, scrollTop: el.scrollTop };
   }, [lineH]);
   const lines = useMemo(() => (frame ? ansiToLines(frame.content) : []), [frame]);
   // Columns this viewer renders at. Normally the pane is exactly this

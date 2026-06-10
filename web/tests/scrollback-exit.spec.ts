@@ -107,6 +107,46 @@ test.describe("Mobile live-view scrollback", () => {
     expect(Math.abs(after - target), "scroll position must hold while frames arrive").toBeLessThan(20);
   });
 
+  test("a frame landing in the first instants of a scroll-up never snaps back to the bottom", async ({ page }) => {
+    await installTerminalSpies(page);
+    const handle = await mockTerminalApis(page);
+    await page.goto("/");
+    await seedSettings(page, { mobileFontSize: 14 });
+    await page.reload();
+    await openSession(page, handle);
+
+    // A flick lifts the finger immediately, so the touch-active guard is
+    // already gone while the scroller is still within the at-bottom
+    // threshold. On a busy agent session a live frame lands within ~50ms;
+    // pinning there snapped the view back AND killed iOS momentum, which
+    // made starting scrollback nearly impossible. Upward motion since the
+    // last frame must suppress the pin even inside the threshold.
+    const nudged = await scroller(page).evaluate((el) => {
+      el.scrollTop = el.scrollHeight - el.clientHeight - 10; // inside the 1.5-line bottom threshold
+      return el.scrollTop;
+    });
+    handle.pushLiveFrame({
+      content: Array.from({ length: 24 }, (_, n) => `busy ${n}`).join("\n") + "\n",
+      rows: 24,
+      history: 130,
+    });
+    await page.waitForTimeout(200);
+    // The momentum continues a little further up; another frame arrives.
+    await scroller(page).evaluate((el) => {
+      el.scrollTop -= 15;
+    });
+    handle.pushLiveFrame({
+      content: Array.from({ length: 24 }, (_, n) => `busy2 ${n}`).join("\n") + "\n",
+      rows: 24,
+      history: 131,
+    });
+    await page.waitForTimeout(200);
+    const distance = await scroller(page).evaluate((el) => el.scrollHeight - el.scrollTop - el.clientHeight);
+    expect(distance, "the starting gesture must keep its upward progress").toBeGreaterThanOrEqual(20);
+    const after = await scroller(page).evaluate((el) => el.scrollTop);
+    expect(after, "the scroller must not be pinned back to the bottom").toBeLessThanOrEqual(nudged);
+  });
+
   test("reading freezes the stream via hold; returning releases it", async ({ page }) => {
     await installTerminalSpies(page);
     const handle = await mockTerminalApis(page);
