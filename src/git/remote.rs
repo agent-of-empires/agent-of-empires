@@ -5,6 +5,185 @@ use std::path::Path;
 use super::error::{GitError, Result};
 use super::open_repo_at;
 
+/// Clone a git repository as a bare repo with worktree setup, following the
+/// workflow-guide structure. Returns the path to the created worktree
+/// (`<destination>/main`). Cleans up `<destination>` on failure.
+#[tracing::instrument(target = "git.fetch", skip_all, fields(url = %redact_url(url)))]
+pub fn clone_bare_repo(url: &str, destination: &Path) -> Result<String> {
+    if destination.exists() {
+        return Err(GitError::CloneFailed(format!(
+            "Destination already exists: {}",
+            destination.display()
+        )));
+    }
+
+    let bare_dir = destination.join(".bare");
+    let bare_str = bare_dir
+        .to_str()
+        .ok_or_else(|| GitError::CloneFailed("Invalid bare directory path".to_string()))?;
+
+    let redacted_url = redact_url(url);
+
+    tracing::debug!(
+        target: "git.command",
+        args = ?["clone", "--bare", &redacted_url, bare_str],
+        "spawning git clone --bare"
+    );
+    let mut child = std::process::Command::new("git")
+        .args(["clone", "--bare", url, bare_str])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| GitError::CloneFailed(format!("Failed to run git clone --bare: {e}")))?;
+
+    let timeout = std::time::Duration::from_secs(300);
+    let poll_interval = std::time::Duration::from_millis(200);
+    let start = std::time::Instant::now();
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => break,
+            Ok(Some(_)) => {
+                let stderr = child
+                    .stderr
+                    .take()
+                    .and_then(|mut s| {
+                        let mut buf = String::new();
+                        std::io::Read::read_to_string(&mut s, &mut buf).ok()?;
+                        Some(buf)
+                    })
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                let _ = std::fs::remove_dir_all(destination);
+                return Err(GitError::CloneFailed(stderr));
+            }
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = std::fs::remove_dir_all(destination);
+                    return Err(GitError::CloneFailed(
+                        "Bare clone timed out after 5 minutes".to_string(),
+                    ));
+                }
+                std::thread::sleep(poll_interval);
+            }
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(destination);
+                return Err(GitError::CloneFailed(format!(
+                    "Failed waiting for git clone --bare: {e}"
+                )));
+            }
+        }
+    }
+
+    let run_in_bare = |args: &[&str]| -> Result<std::process::Output> {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&bare_dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .map_err(|e| GitError::CloneFailed(format!("Git command failed: {e}")))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let _ = std::fs::remove_dir_all(destination);
+            return Err(GitError::CloneFailed(stderr));
+        }
+        Ok(output)
+    };
+
+    let gitfile_path = destination.join(".git");
+    if let Err(e) = std::fs::write(&gitfile_path, "gitdir: ./.bare\n") {
+        let _ = std::fs::remove_dir_all(destination);
+        return Err(GitError::CloneFailed(format!(
+            "Failed to create .git file: {e}"
+        )));
+    }
+
+    run_in_bare(&[
+        "config",
+        "remote.origin.fetch",
+        "+refs/heads/*:refs/remotes/origin/*",
+    ])?;
+
+    run_in_bare(&["fetch", "origin"])?;
+
+    let default_branch = {
+        let output = run_in_bare(&["symbolic-ref", "refs/remotes/origin/HEAD"])?;
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        stdout
+            .rsplit_once('/')
+            .map(|(_, name)| name.to_string())
+            .filter(|s| !s.is_empty())
+    };
+
+    let default_branch = match default_branch {
+        Some(b) => b,
+        None => {
+            let try_branch = |branch: &str| -> bool {
+                std::process::Command::new("git")
+                    .args([
+                        "show-ref",
+                        "--verify",
+                        &format!("refs/remotes/origin/{branch}"),
+                    ])
+                    .current_dir(&bare_dir)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false)
+            };
+            if try_branch("main") {
+                "main".to_string()
+            } else if try_branch("master") {
+                "master".to_string()
+            } else {
+                let _ = std::fs::remove_dir_all(destination);
+                return Err(GitError::CloneFailed(
+                    "Could not detect default branch (tried main, master)".to_string(),
+                ));
+            }
+        }
+    };
+
+    let worktree_path = destination.join("main");
+    let worktree_str = worktree_path
+        .to_str()
+        .ok_or_else(|| GitError::CloneFailed("Invalid worktree path".to_string()))?;
+
+    let output = std::process::Command::new("git")
+        .args(["worktree", "add", worktree_str, &default_branch])
+        .current_dir(destination)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|e| GitError::CloneFailed(format!("Git worktree add failed: {e}")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let _ = std::fs::remove_dir_all(destination);
+        return Err(GitError::CloneFailed(format!(
+            "Failed to create worktree: {stderr}"
+        )));
+    }
+
+    tracing::info!(
+        target: "git.fetch",
+        "Bare clone complete: {} -> {}",
+        redacted_url,
+        worktree_path.display()
+    );
+
+    Ok(worktree_path.display().to_string())
+}
+
 /// Clone a git repository from a URL into the given destination directory.
 ///
 /// The destination must not already exist. If `shallow` is true, only the

@@ -15,6 +15,8 @@ pub struct CloneRepoBody {
     pub destination: Option<String>,
     #[serde(default)]
     pub shallow: bool,
+    #[serde(default)]
+    pub bare: bool,
 }
 
 /// Returns true if `url` looks like a git clone URL accepted by this
@@ -93,6 +95,14 @@ pub async fn clone_repo(
             .into_response();
     }
 
+    if body.bare && body.shallow {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "validation_failed", "message": "Cannot use both bare and shallow options"})),
+        )
+            .into_response();
+    }
+
     // Resolve destination path
     let destination = if let Some(ref dest) = body.destination {
         let dest = dest.trim();
@@ -156,9 +166,14 @@ pub async fn clone_repo(
     }
 
     let shallow = body.shallow;
+    let bare = body.bare;
     let result = tokio::task::spawn_blocking(move || {
-        crate::git::clone_repo(&url, &destination, shallow)?;
-        Ok::<String, crate::git::error::GitError>(destination.display().to_string())
+        if bare {
+            crate::git::clone_bare_repo(&url, &destination)
+        } else {
+            crate::git::clone_repo(&url, &destination, shallow)?;
+            Ok(destination.display().to_string())
+        }
     })
     .await;
 
