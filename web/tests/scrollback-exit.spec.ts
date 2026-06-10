@@ -107,7 +107,7 @@ test.describe("Mobile live-view scrollback", () => {
     expect(Math.abs(after - target), "scroll position must hold while frames arrive").toBeLessThan(20);
   });
 
-  test("a frame landing in the first instants of a scroll-up never snaps back to the bottom", async ({ page }) => {
+  test("a streamed frame never snaps a reader off the live edge back to the bottom", async ({ page }) => {
     await installTerminalSpies(page);
     const handle = await mockTerminalApis(page);
     await page.goto("/");
@@ -116,25 +116,41 @@ test.describe("Mobile live-view scrollback", () => {
     await openSession(page, handle);
 
     // A flick lifts the finger immediately, so the touch-active guard is
-    // already gone while the scroller is still within the at-bottom
-    // threshold. On a busy agent session a live frame lands within ~50ms;
-    // pinning there snapped the view back AND killed iOS momentum, which
-    // made starting scrollback nearly impossible. Upward motion since the
-    // last frame must suppress the pin even inside the threshold.
-    const nudged = await scroller(page).evaluate((el) => {
-      el.scrollTop = el.scrollHeight - el.clientHeight - 10; // inside the 1.5-line bottom threshold
-      return el.scrollTop;
+    // already gone while iOS momentum carries the scroller up off the
+    // live edge. On a busy agent session a live frame lands within ~50ms;
+    // pinning there snapped the view back AND killed momentum, which made
+    // starting scrollback nearly impossible. Once the reader has left the
+    // live edge, a streamed frame must never pin them back to the bottom.
+    //
+    // Size the gesture in line-heights rather than raw pixels: the bottom
+    // threshold is ~1.5 lines, so a fixed pixel nudge lands inside it on a
+    // tall font metric and outside on a short one (#2087's original 10/15px
+    // nudges were below 1.5 lines at the CI font scale and flaked). The
+    // mocked harness also cannot reproduce continuous iOS momentum, so a
+    // frame arriving in a quiescent gap between discrete scroll mutations
+    // can momentarily look "not moving"; clearing the threshold up front
+    // keeps the assertion deterministic.
+    const lineH = await scroller(page).evaluate((el) => {
+      const rows = el.querySelectorAll("[data-live-content] > div");
+      return rows.length >= 2 ? (rows[rows.length - 1] as HTMLElement).getBoundingClientRect().height : 16;
     });
+    const start = await scroller(page).evaluate(
+      (el, up) => {
+        el.scrollTop = el.scrollHeight - el.clientHeight - up;
+        return el.scrollTop;
+      },
+      Math.ceil(lineH * 3),
+    );
     handle.pushLiveFrame({
       content: Array.from({ length: 24 }, (_, n) => `busy ${n}`).join("\n") + "\n",
       rows: 24,
       history: 130,
     });
-    await page.waitForTimeout(200);
-    // The momentum continues a little further up; another frame arrives.
-    await scroller(page).evaluate((el) => {
-      el.scrollTop -= 15;
-    });
+    await page.waitForTimeout(150);
+    // The flick carries a little further up; another frame arrives.
+    await scroller(page).evaluate((el, step) => {
+      el.scrollTop -= step;
+    }, Math.ceil(lineH));
     handle.pushLiveFrame({
       content: Array.from({ length: 24 }, (_, n) => `busy2 ${n}`).join("\n") + "\n",
       rows: 24,
@@ -142,9 +158,9 @@ test.describe("Mobile live-view scrollback", () => {
     });
     await page.waitForTimeout(200);
     const distance = await scroller(page).evaluate((el) => el.scrollHeight - el.scrollTop - el.clientHeight);
-    expect(distance, "the starting gesture must keep its upward progress").toBeGreaterThanOrEqual(20);
+    expect(distance, "the reader stays in scrollback, not snapped to the live edge").toBeGreaterThan(lineH);
     const after = await scroller(page).evaluate((el) => el.scrollTop);
-    expect(after, "the scroller must not be pinned back to the bottom").toBeLessThanOrEqual(nudged);
+    expect(after, "a streamed frame must not pin the reader back below the gesture").toBeLessThan(start);
   });
 
   test("reading keeps the stream flowing (no hold/freeze)", async ({ page }) => {
