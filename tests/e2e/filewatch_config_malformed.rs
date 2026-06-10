@@ -26,18 +26,18 @@ fn malformed_then_valid_config_does_not_crash_and_recovers() {
     require_tmux!();
 
     let mut h = TuiTestHarness::new("filewatch_config_malformed");
+    h.enable_e2e_debug_signals();
     h.spawn_tui();
     h.wait_for(" aoe ");
 
     let config_dir = app_dir_in(h.home_path());
     let config_path = config_dir.join("config.toml");
 
+    let baseline_malformed = h.read_watcher_config_refresh_count();
     std::fs::write(&config_path, b"[session\nconfirm_before_quit = true\n")
         .expect("peer-write malformed TOML");
 
-    // Watcher debounce + ~2s disk-mirror tick + refresh_from_config window;
-    // no harness-visible signal for "TUI processed the malformed TOML" to poll on.
-    std::thread::sleep(Duration::from_millis(1_200));
+    h.wait_for_watcher_config_refresh_above(baseline_malformed, Duration::from_secs(5));
 
     assert!(
         h.session_alive(),
@@ -58,11 +58,10 @@ confirm_before_quit = true
 "#,
         env!("CARGO_PKG_VERSION")
     );
+    let baseline_recovery = h.read_watcher_config_refresh_count();
     std::fs::write(&config_path, valid).expect("peer-write valid TOML");
 
-    // Watcher debounce + tick + refresh_from_config recovery window after the
-    // valid TOML re-replaces the malformed one; no harness-visible signal to poll on.
-    std::thread::sleep(Duration::from_millis(1_200));
+    h.wait_for_watcher_config_refresh_above(baseline_recovery, Duration::from_secs(5));
 
     h.send_keys("q");
     h.wait_for_timeout("Quit Agent of Empires", Duration::from_secs(8));

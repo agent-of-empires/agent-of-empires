@@ -876,6 +876,16 @@ pub struct HomeView {
     /// Reuses `DiskWatchEntry` so the drop-then-abort teardown protocol is
     /// identical to the storage-mirror migration.
     pub(super) config_watch_handles: HashMap<ConfigWatchKey, DiskWatchEntry>,
+    /// Monotonic counter incremented on every watcher-driven config
+    /// refresh attempt (`try_refresh_from_config_watcher` invocation,
+    /// including parse failures that return Err before
+    /// `apply_config_to_state` runs). Surfaced to e2e tests via
+    /// `<app_dir>/.aoe_e2e_refresh_count` when `AOE_E2E_DEBUG=1` is
+    /// set on the TUI process; harness-driven tests poll the file for
+    /// a post-edit refresh attempt as a deterministic completion
+    /// signal. Production builds and non-e2e test runs never set the
+    /// env var, so the file is never written.
+    pub(super) watcher_config_refresh_count: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Tracks tick-driven reload failures so a malformed `sessions.json`,
     /// `groups.json`, or `config.toml` does not crash the TUI. Populated
     /// by `handle_tick_reload_*`; consumed once per tick to surface a
@@ -1338,6 +1348,7 @@ impl HomeView {
             disk_watch_handles: HashMap::new(),
             config_dirty,
             config_watch_handles: HashMap::new(),
+            watcher_config_refresh_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             reload_failure_state: ReloadFailureState::default(),
         };
 
@@ -5193,6 +5204,11 @@ impl HomeView {
     /// `Default::default()` on parse error; the strict-resolve
     /// guarantee applies to the active profile only.
     pub(super) fn try_refresh_from_config_watcher(&mut self) -> anyhow::Result<()> {
+        let new_count = self
+            .watcher_config_refresh_count
+            .fetch_add(1, std::sync::atomic::Ordering::Release)
+            + 1;
+        self.maybe_export_watcher_refresh_count(new_count);
         let profile = self.config_profile();
         let config = crate::session::resolve_config(&profile)?;
         self.apply_config_to_state(config, ConfigRefreshOrigin::Watcher);
@@ -5228,6 +5244,41 @@ impl HomeView {
                 "Tool hotkey config errors",
                 &hotkey_warnings.join("\n"),
             ));
+        }
+    }
+
+    /// Export the watcher-config-refresh counter to a hidden file in
+    /// the app dir when `AOE_E2E_DEBUG=1` is set on the TUI process.
+    /// The file (`<app_dir>/.aoe_e2e_refresh_count`) is polled by the
+    /// e2e harness as a deterministic completion signal for the
+    /// watcher path. Production builds and non-e2e test runs never
+    /// set the env var, so the file is never written. Write failures
+    /// fall through to a `tracing::trace!`; the file is debug-only,
+    /// so a missing write surfaces as a harness poll timeout rather
+    /// than a hard error on the TUI side.
+    fn maybe_export_watcher_refresh_count(&self, count: u64) {
+        if std::env::var("AOE_E2E_DEBUG").as_deref() != Ok("1") {
+            return;
+        }
+        let app_dir = match crate::session::get_app_dir() {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::trace!(
+                    target: "tui.e2e_debug",
+                    error = %e,
+                    "AOE_E2E_DEBUG export skipped; app dir resolution failed"
+                );
+                return;
+            }
+        };
+        let path = app_dir.join(".aoe_e2e_refresh_count");
+        if let Err(e) = std::fs::write(&path, count.to_string()) {
+            tracing::trace!(
+                target: "tui.e2e_debug",
+                error = %e,
+                path = %path.display(),
+                "AOE_E2E_DEBUG export failed"
+            );
         }
     }
 

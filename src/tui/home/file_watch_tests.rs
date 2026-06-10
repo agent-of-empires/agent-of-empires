@@ -931,3 +931,70 @@ async fn try_present_reload_failure_dialog_refreshes_body_on_partial_recovery() 
         "refreshed body drops the recovered source's line: {refreshed_body}"
     );
 }
+
+/// Locks the e2e debug-counter export contract:
+/// `try_refresh_from_config_watcher` increments
+/// `watcher_config_refresh_count` on every invocation and, when
+/// `AOE_E2E_DEBUG=1` is set on the process, writes the new count to
+/// `<app_dir>/.aoe_e2e_refresh_count` so the e2e harness polls a
+/// deterministic completion signal for the watcher path.
+#[tokio::test]
+#[serial]
+async fn watcher_config_refresh_count_exports_to_e2e_debug_file() {
+    let temp = TempDir::new().expect("tempdir");
+    isolate_home(temp.path());
+
+    let live = FileWatchService::new().expect("live svc");
+    crate::session::get_profile_dir("e2e-debug").expect("seed dir");
+
+    let mut view = HomeView::new(
+        Some("e2e-debug".to_string()),
+        crate::tmux::AvailableTools::with_tools(&["claude"]),
+        live.clone(),
+    )
+    .expect("HomeView::new");
+
+    let app_dir = crate::session::get_app_dir().expect("app_dir");
+    let counter_path = app_dir.join(".aoe_e2e_refresh_count");
+
+    assert!(
+        !counter_path.exists(),
+        "precondition: counter file does not exist on a fresh test app dir"
+    );
+    let _ = view.try_refresh_from_config_watcher();
+    assert_eq!(
+        view.watcher_config_refresh_count
+            .load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "the counter increments on every watcher refresh attempt"
+    );
+    assert!(
+        !counter_path.exists(),
+        "AOE_E2E_DEBUG unset keeps the export file absent so production \
+         builds and unrelated test runs leave the disk untouched"
+    );
+
+    // SAFETY: env mutation; #[serial] guards cross-test races on the process env.
+    unsafe { std::env::set_var("AOE_E2E_DEBUG", "1") };
+
+    let _ = view.try_refresh_from_config_watcher();
+    let exported = std::fs::read_to_string(&counter_path)
+        .expect("counter file is written once AOE_E2E_DEBUG=1");
+    assert_eq!(
+        exported.trim(),
+        "2",
+        "exported value matches the post-increment counter"
+    );
+
+    let _ = view.try_refresh_from_config_watcher();
+    let exported = std::fs::read_to_string(&counter_path)
+        .expect("counter file refreshes on subsequent attempts");
+    assert_eq!(
+        exported.trim(),
+        "3",
+        "subsequent attempts re-export the latest counter value"
+    );
+
+    // SAFETY: env cleanup; #[serial] keeps this scoped to this test.
+    unsafe { std::env::remove_var("AOE_E2E_DEBUG") };
+}

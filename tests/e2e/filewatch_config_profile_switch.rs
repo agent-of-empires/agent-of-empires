@@ -21,6 +21,7 @@ fn peer_edit_after_switch_propagates_via_watcher() {
     let profile_dir = config_dir.join("profiles").join(new_profile);
     std::fs::create_dir_all(&profile_dir).expect("seed profile B dir");
 
+    h.enable_e2e_debug_signals();
     h.spawn(&["--profile", "default"]);
     h.wait_for(" aoe ");
 
@@ -37,6 +38,7 @@ fn peer_edit_after_switch_propagates_via_watcher() {
     // so only the watcher subscription installed by `rewire_config_subscriptions`
     // can deliver this change to the running TUI.
     let profile_b_config = profile_dir.join("config.toml");
+    let baseline = h.read_watcher_config_refresh_count();
     std::fs::write(
         &profile_b_config,
         r#"[session]
@@ -45,9 +47,7 @@ confirm_before_quit = true
     )
     .expect("peer-write profile B config.toml");
 
-    // Watcher debounce + ~2s disk-mirror tick + refresh_from_config window
-    // before 'q' triggers the Quit dialog; no harness-visible signal exists.
-    std::thread::sleep(Duration::from_millis(1_200));
+    h.wait_for_watcher_config_refresh_above(baseline, Duration::from_secs(5));
 
     h.send_keys("q");
     h.wait_for_timeout("Quit Agent of Empires", Duration::from_secs(8));
@@ -66,6 +66,7 @@ fn delete_then_recreate_same_name_propagates_via_watcher() {
     let recycled = "scratch_recycle";
     let config_dir = app_dir_in(h.home_path());
 
+    h.enable_e2e_debug_signals();
     h.spawn_tui();
     h.wait_for(" aoe ");
 
@@ -82,6 +83,7 @@ fn delete_then_recreate_same_name_propagates_via_watcher() {
     std::fs::remove_dir_all(&profile_dir).expect("remove first incarnation");
     std::fs::create_dir_all(&profile_dir).expect("recreate same-name dir");
 
+    let baseline = h.read_watcher_config_refresh_count();
     std::fs::write(
         profile_dir.join("config.toml"),
         r#"[session]
@@ -90,14 +92,11 @@ confirm_before_quit = true
     )
     .expect("peer-write recreated profile config.toml");
 
-    // The disk-mirror reload tick fires every ~2s; on macOS FSEvents
-    // coalesces attribute / metadata events with multi-second latency
-    // before the watcher delivers. 2500ms exceeds both bounds. Pressing
-    // `q` before the watcher has delivered would exit the app (default
-    // confirm_before_quit=false), making the assertion below time out
-    // with a misleading "no dialog" failure. There is no harness-visible
-    // signal for "refresh_from_config has run" to poll on instead.
-    std::thread::sleep(Duration::from_millis(2_500));
+    // The disk-mirror tick fires every ~2s; on macOS FSEvents
+    // coalesces attribute / metadata events with multi-second
+    // latency before the watcher delivers. The deterministic
+    // counter signal subsumes both bounds without a hard sleep.
+    h.wait_for_watcher_config_refresh_above(baseline, Duration::from_secs(8));
 
     h.send_keys("q");
     h.wait_for_timeout("Quit Agent of Empires", Duration::from_secs(8));
@@ -114,6 +113,7 @@ fn create_profile_then_peer_edit_propagates_via_watcher() {
     let config_dir = app_dir_in(h.home_path());
     let profile_dir = config_dir.join("profiles").join(new_profile);
 
+    h.enable_e2e_debug_signals();
     h.spawn_tui();
     h.wait_for(" aoe ");
 
@@ -126,6 +126,7 @@ fn create_profile_then_peer_edit_propagates_via_watcher() {
     h.wait_for_absent("Profiles", Duration::from_secs(5));
     h.assert_screen_contains("[scratch_create]");
 
+    let baseline = h.read_watcher_config_refresh_count();
     std::fs::write(
         profile_dir.join("config.toml"),
         r#"[session]
@@ -134,9 +135,7 @@ confirm_before_quit = true
     )
     .expect("peer-write created profile config.toml");
 
-    // Watcher debounce + tick + refresh_from_config window after a fresh
-    // profile's config.toml peer-write; no harness-visible signal to poll on.
-    std::thread::sleep(Duration::from_millis(1_200));
+    h.wait_for_watcher_config_refresh_above(baseline, Duration::from_secs(5));
 
     h.send_keys("q");
     h.wait_for_timeout("Quit Agent of Empires", Duration::from_secs(8));

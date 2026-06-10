@@ -23,6 +23,7 @@ fn external_config_edit_propagates_to_refresh_from_config() {
     require_tmux!();
 
     let mut h = TuiTestHarness::new("filewatch_config_tui");
+    h.enable_e2e_debug_signals();
     h.spawn_tui();
     h.wait_for(" aoe ");
 
@@ -41,11 +42,10 @@ confirm_before_quit = true
 "#,
         env!("CARGO_PKG_VERSION")
     );
+    let baseline = h.read_watcher_config_refresh_count();
     std::fs::write(&config_path, updated).expect("peer-write global config.toml");
 
-    // Watcher debounce + tick + refresh_from_config window before 'q'
-    // triggers the Quit dialog; no harness-visible signal to poll on.
-    std::thread::sleep(Duration::from_millis(1_200));
+    h.wait_for_watcher_config_refresh_above(baseline, Duration::from_secs(5));
 
     h.send_keys("q");
     h.wait_for_timeout("Quit Agent of Empires", Duration::from_secs(8));

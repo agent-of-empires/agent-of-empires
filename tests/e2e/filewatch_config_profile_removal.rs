@@ -33,10 +33,12 @@ fn profile_removal_tears_down_config_subscription_without_crash() {
     let profile_dir = config_dir.join("profiles").join(new_profile);
     std::fs::create_dir_all(&profile_dir).expect("seed profile B dir");
 
+    h.enable_e2e_debug_signals();
     h.spawn_tui();
     h.wait_for(" aoe ");
 
     let profile_b_config = profile_dir.join("config.toml");
+    let baseline = h.read_watcher_config_refresh_count();
     std::fs::write(
         &profile_b_config,
         r#"[session]
@@ -45,11 +47,7 @@ confirm_before_quit = true
     )
     .expect("peer-write profile B config.toml");
 
-    // Subscription-alive probe: the TUI must survive the watcher
-    // delivery + refresh_from_config window without panicking. There is
-    // no UI signal the harness can poll for refresh_from_config itself,
-    // so this is a single bounded sleep over the watcher debounce.
-    std::thread::sleep(Duration::from_millis(800));
+    h.wait_for_watcher_config_refresh_above(baseline, Duration::from_secs(5));
     assert!(
         h.session_alive(),
         "TUI must remain alive after peer-write to profile B config"
