@@ -25,6 +25,7 @@ impl SettingsView {
     pub fn handle_key(&mut self, key: KeyEvent) -> SettingsAction {
         // Clear transient messages on any key
         self.success_message = None;
+        self.success_message_expires_at = None;
         // Any keypress invalidates the mouse hover highlight; otherwise
         // a stationary cursor keeps highlighting an unrelated row while
         // the keyboard cursor moves elsewhere. Mirrors the sidebar's

@@ -16,6 +16,10 @@ use crate::tui::dialogs::CustomInstructionDialog;
 pub use fields::{FieldValue, HookField, SettingField, SettingsCategory};
 pub use input::SettingsAction;
 
+/// How long the "Settings saved" toast lingers before it auto-dismisses.
+/// Matches the dashboard's transient update-bar window (`app.rs`).
+const SUCCESS_MESSAGE_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Which scope of settings is being edited
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SettingsScope {
@@ -149,8 +153,15 @@ pub struct SettingsView {
     /// Error message to display
     pub(super) error_message: Option<String>,
 
-    /// Success message to display
+    /// Success message to display (e.g. "Settings saved"). Rendered in the
+    /// footer status row, not over the fields.
     pub(super) success_message: Option<String>,
+
+    /// When the success toast should auto-dismiss. Set alongside
+    /// `success_message` on save so the "Settings saved" notice fades on its
+    /// own if the user just walks away, mirroring the dashboard's transient
+    /// update bar. Errors are sticky and have no expiry.
+    pub(super) success_message_expires_at: Option<std::time::Instant>,
 
     /// Active search input. `Some` while the user is typing in the
     /// settings-wide `/` search overlay. The settings view freezes
@@ -248,6 +259,7 @@ impl SettingsView {
             show_help: false,
             error_message: None,
             success_message: None,
+            success_message_expires_at: None,
             search_input: None,
             search_hits: Vec::new(),
             search_selected: 0,
@@ -517,10 +529,13 @@ impl SettingsView {
 
     /// Save the current configuration
     pub fn save(&mut self) -> anyhow::Result<()> {
-        // Validate all fields before saving
+        // Validate all fields before saving. Prefix the field's label so the
+        // message points at the offending setting instead of a bare reason
+        // like "expected a string" with no clue which row it came from
+        // (issue #2083).
         for field in &self.fields {
             if let Err(e) = field.validate() {
-                self.error_message = Some(e);
+                self.error_message = Some(format!("{}: {e}", field.label));
                 return Ok(());
             }
         }
@@ -570,8 +585,24 @@ impl SettingsView {
 
         self.has_changes = false;
         self.success_message = Some("Settings saved".to_string());
+        self.success_message_expires_at = Some(std::time::Instant::now() + SUCCESS_MESSAGE_TTL);
         self.error_message = None;
         Ok(())
+    }
+
+    /// Drop the transient "Settings saved" toast once its window passes, so it
+    /// fades even when the user leaves the keyboard idle. Returns whether the
+    /// toast was cleared so the caller can request a redraw. Errors are sticky
+    /// (no expiry) and clear only on the next keypress.
+    pub fn tick_status(&mut self) -> bool {
+        match self.success_message_expires_at {
+            Some(expires_at) if std::time::Instant::now() >= expires_at => {
+                self.success_message = None;
+                self.success_message_expires_at = None;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Check if there are unsaved changes
