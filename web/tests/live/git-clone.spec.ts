@@ -62,6 +62,58 @@ base("clone happy path: file:// URL clones into HOME and the wizard advances", a
   }
 });
 
+base("bare clone: creates worktree structure and returns main path", async ({ page }, testInfo) => {
+  const serve = await spawnAoeServe({
+    authMode: "none",
+    workerIndex: testInfo.workerIndex,
+    parallelIndex: testInfo.parallelIndex,
+  });
+
+  try {
+    const bare = createBareRepo(serve.home);
+
+    await page.goto(serve.baseUrl);
+    await page.locator("body").click();
+    await page.keyboard.press("n");
+    await expect(page.getByRole("heading", { name: "New session" })).toBeVisible({
+      timeout: 10_000,
+    });
+
+    await page.getByRole("button", { name: "Clone URL", exact: true }).click();
+    await page.locator("#clone-url").fill(bare.url);
+
+    await page.getByRole("button", { name: /Advanced/ }).click();
+    const dest = join(serve.home, "bare-clone-test");
+    await page.locator("#clone-dest").fill(dest);
+
+    // Check the bare clone checkbox
+    await page.getByText("Clone as bare repository").click();
+
+    // Shallow clone should be disabled when bare is checked
+    const shallowCheckbox = page.locator('input[type="checkbox"]').first();
+    await expect(shallowCheckbox).toBeDisabled();
+
+    await page.getByRole("button", { name: "Clone repository" }).click();
+
+    // The wizard shows the worktree path (dest/main)
+    await expect(page.getByText("Selected project")).toBeVisible({
+      timeout: 30_000,
+    });
+    const mainPath = join(dest, "main");
+    await expect(page.getByText(mainPath, { exact: false })).toBeVisible();
+
+    // Verify bare repo structure on disk
+    expect(existsSync(join(dest, ".bare"))).toBe(true);
+    expect(existsSync(join(dest, ".git"))).toBe(true);
+    expect(existsSync(mainPath)).toBe(true);
+    expect(existsSync(join(mainPath, ".git"))).toBe(true);
+
+    await expect(page.getByRole("button", { name: "Next" })).toBeEnabled();
+  } finally {
+    await serve.stop();
+  }
+});
+
 base("clone failure path: unrecognised URL scheme surfaces a server error", async ({ page }, testInfo) => {
   const serve = await spawnAoeServe({
     authMode: "none",

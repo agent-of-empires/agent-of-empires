@@ -371,4 +371,67 @@ mod tests {
     fn test_parse_owner_empty_url() {
         assert_eq!(parse_owner_from_remote_url(""), None);
     }
+
+    #[test]
+    fn test_clone_bare_repo_creates_structure() {
+        use tempfile::TempDir;
+
+        // Create a source repo to clone from
+        let source_dir = TempDir::new().unwrap();
+        let source_repo = git2::Repository::init(source_dir.path()).unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        let tree_id = {
+            let mut index = source_repo.index().unwrap();
+            index.write_tree().unwrap()
+        };
+        let tree = source_repo.find_tree(tree_id).unwrap();
+        source_repo
+            .commit(Some("HEAD"), &sig, &sig, "Initial", &tree, &[])
+            .unwrap();
+
+        // Clone as bare repo
+        let dest_dir = TempDir::new().unwrap();
+        let dest_path = dest_dir.path().join("test-bare-clone");
+        let url = format!("file://{}", source_dir.path().display());
+
+        let result = clone_bare_repo(&url, &dest_path);
+        assert!(result.is_ok(), "clone_bare_repo failed: {:?}", result.err());
+
+        let worktree_path = result.unwrap();
+        assert!(
+            worktree_path.ends_with("/main"),
+            "Expected path ending with /main"
+        );
+
+        // Verify structure
+        assert!(dest_path.join(".bare").exists(), ".bare directory missing");
+        assert!(dest_path.join(".git").exists(), ".git file missing");
+        assert!(dest_path.join("main").exists(), "main worktree missing");
+
+        // Verify .git file content
+        let gitfile = std::fs::read_to_string(dest_path.join(".git")).unwrap();
+        assert_eq!(gitfile.trim(), "gitdir: ./.bare");
+
+        // Verify main is a valid worktree
+        let main_path = dest_path.join("main");
+        assert!(main_path.join(".git").exists(), "worktree .git missing");
+    }
+
+    #[test]
+    fn test_clone_bare_repo_destination_exists() {
+        use tempfile::TempDir;
+
+        let dest_dir = TempDir::new().unwrap();
+        let dest_path = dest_dir.path().join("existing");
+        std::fs::create_dir(&dest_path).unwrap();
+
+        let result = clone_bare_repo("https://example.com/repo.git", &dest_path);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("already exists"),
+            "Expected 'already exists' error, got: {}",
+            err
+        );
+    }
 }
