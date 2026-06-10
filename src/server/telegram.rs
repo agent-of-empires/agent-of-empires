@@ -33,6 +33,8 @@ const DEFAULT_VOICE_TRANSCRIPTION_TIMEOUT_SECS: u64 = 600;
 const DEFAULT_PARAKEET_MODEL: &str = "mlx-community/parakeet-tdt-0.6b-v2";
 const MAX_TELEGRAM_TEXT_CHARS: usize = 3900;
 const MAX_TAIL_LINES: usize = 200;
+const TELEGRAM_REPLY_START: &str = "<telegram_reply>";
+const TELEGRAM_REPLY_END: &str = "</telegram_reply>";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -738,7 +740,8 @@ impl TelegramBridge {
             String::new()
         };
 
-        match send_text_to_tmux_session(self.state.clone(), session_id, text.to_string(), true)
+        let outbound_text = prompt_with_telegram_reply_contract(&instance, text);
+        match send_text_to_tmux_session(self.state.clone(), session_id, outbound_text.clone(), true)
             .await
         {
             Ok(_) => {
@@ -758,7 +761,7 @@ impl TelegramBridge {
                     .await
                 {
                     Ok(Some(output)) => {
-                        let cleaned = clean_agent_reply(&output, text);
+                        let cleaned = clean_agent_reply(&output, &outbound_text);
                         let output = if cleaned.is_empty() {
                             output.trim().to_string()
                         } else {
@@ -1369,13 +1372,75 @@ fn output_after_baseline(baseline: &str, latest: &str) -> String {
         .to_string()
 }
 
+fn prompt_with_telegram_reply_contract(instance: &Instance, text: &str) -> String {
+    if !should_request_telegram_reply_contract(instance, text) {
+        return text.to_string();
+    }
+
+    format!(
+        "{text}\n\n\
+<telegram_bridge_instructions>\n\
+You are replying through Telegram. Do any needed tool use first. When finished, end with exactly one {TELEGRAM_REPLY_START}...{TELEGRAM_REPLY_END} block.\n\
+Inside {TELEGRAM_REPLY_START}, write only the clean human-readable answer for the user. Do not include raw shell commands, logs, terminal status bars, token values, or huge pasted output unless the user explicitly asked for raw output.\n\
+If a command fails or returns noisy permission errors, summarize the issue and the next useful action instead of pasting the raw output.\n\
+Keep the final Telegram reply concise, legible, and useful. Bullets are good when they help.\n\
+</telegram_bridge_instructions>"
+    )
+}
+
+fn should_request_telegram_reply_contract(instance: &Instance, text: &str) -> bool {
+    instance.tool == "pi" && !text.trim_start().starts_with('/')
+}
+
 fn clean_agent_reply(raw: &str, prompt: &str) -> String {
+    if let Some(reply) = extract_tagged_telegram_reply(raw) {
+        return normalize_reply_text(&reply);
+    }
+
     let turn = reply_turn_after_prompt(raw, prompt);
     let without_chrome = strip_terminal_chrome_lines(&turn);
     let without_tools = strip_pi_tool_blocks(&without_chrome);
     let without_footer = strip_terminal_footer(&without_tools);
     let without_meta = strip_pi_meta_lines(&without_footer);
     normalize_reply_text(&without_meta)
+}
+
+fn extract_tagged_telegram_reply(raw: &str) -> Option<String> {
+    let end = raw.rfind(TELEGRAM_REPLY_END)?;
+    let before_end = &raw[..end];
+    let start = before_end.rfind(TELEGRAM_REPLY_START)?;
+    let reply_start = start + TELEGRAM_REPLY_START.len();
+    let reply = dedent_text_block(before_end[reply_start..].trim_matches(['\r', '\n']));
+    let reply = reply.trim();
+    if reply.is_empty() {
+        None
+    } else {
+        Some(reply.to_string())
+    }
+}
+
+fn dedent_text_block(text: &str) -> String {
+    let min_indent = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.chars().take_while(|ch| *ch == ' ').count())
+        .min()
+        .unwrap_or(0);
+
+    if min_indent == 0 {
+        return text.to_string();
+    }
+
+    text.lines()
+        .map(|line| {
+            if line.trim().is_empty() {
+                String::new()
+            } else {
+                line.chars().skip(min_indent).collect()
+            }
+        })
+        .collect::<Vec<String>>()
+        .join("\n")
 }
 
 fn reply_turn_after_prompt(raw: &str, prompt: &str) -> String {
@@ -1938,6 +2003,47 @@ mod tests {
         assert!(is_bridge_command("tail"));
         assert!(!is_bridge_command("login"));
         assert!(!is_bridge_command("model"));
+    }
+
+    #[test]
+    fn telegram_reply_contract_is_added_only_for_pi_non_commands() {
+        let mut pi = Instance::new("pi", "/tmp");
+        pi.tool = "pi".to_string();
+        let wrapped = prompt_with_telegram_reply_contract(&pi, "what agents are running");
+        assert!(wrapped.contains("<telegram_bridge_instructions>"));
+        assert!(wrapped.contains(TELEGRAM_REPLY_START));
+
+        let slash = prompt_with_telegram_reply_contract(&pi, "/model gpt-5.4-mini");
+        assert_eq!(slash, "/model gpt-5.4-mini");
+
+        let mut codex = Instance::new("codex", "/tmp");
+        codex.tool = "codex".to_string();
+        assert_eq!(
+            prompt_with_telegram_reply_contract(&codex, "hello"),
+            "hello"
+        );
+    }
+
+    #[test]
+    fn clean_agent_reply_prefers_tagged_telegram_reply() {
+        let raw = "\
+ $ rg -i exformer /Users/williamsmith
+ rg: /Users/williamsmith/Library/Group Containers/example: Operation not permitted (os error 1)
+ Took 117.2s
+
+ <telegram_reply>
+ I searched the safe workspace paths and hit macOS permission-protected Library folders when the search targeted all of `/Users/williamsmith`.
+
+ Next step: use `aoe-safe-rg exformer /Users/williamsmith/Python_local_Mac` or narrow the target directory.
+ </telegram_reply>
+
+ ~/Python_local_Mac
+ 0.0%/128k (auto)";
+
+        assert_eq!(
+            clean_agent_reply(raw, "find exformer"),
+            "I searched the safe workspace paths and hit macOS permission-protected Library folders when the search targeted all of `/Users/williamsmith`.\n\nNext step: use `aoe-safe-rg exformer /Users/williamsmith/Python_local_Mac` or narrow the target directory."
+        );
     }
 
     #[test]
