@@ -698,6 +698,21 @@
       ]
     },
     {
+      "id": "mobile.input-controls",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/mobile-keyboard.spec.ts",
+        "tests/mobile-toolbar.spec.ts",
+        "src/components/cockpit/Composer.insert.test.ts"
+      ],
+      "components": [
+        "web/src/components/TerminalView.tsx",
+        "web/src/components/MobileTerminalToolbar.tsx",
+        "web/src/components/cockpit/Composer.tsx"
+      ]
+    },
+    {
       "id": "read-only.mode",
       "kind": "live-playwright",
       "risk": "high",

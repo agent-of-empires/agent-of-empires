@@ -22,6 +22,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AtSign,
   ChevronUp,
+  ClipboardPaste,
+  Send,
   Slash,
   Square,
 } from "lucide-react";
@@ -31,6 +33,7 @@ import type { CockpitState } from "../../lib/cockpitTypes";
 import { getDraft, setDraft } from "../../lib/cockpitDrafts";
 import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
 import { useAgentProfile } from "../../lib/agentProfileContext";
+import { toastBus } from "../../lib/toastBus";
 
 /** Decision returned by {@link decideEnterAction} for an Enter
  *  keystroke on the cockpit composer textarea.
@@ -536,6 +539,8 @@ export function Composer({
                 void sendFromTextarea(taRef, composerRuntime, enqueuePrompt);
               }}
               autoFocus={!isMobile}
+              enterKeyHint={isMobile ? "enter" : undefined}
+              inputMode="text"
               className={[
                 "min-h-[56px] max-h-[200px] resize-none bg-transparent",
                 "px-4 pt-3 pb-1 text-sm leading-6 text-text-primary",
@@ -544,8 +549,8 @@ export function Composer({
             />
 
             {/* Footer strip — affordances on the left, send/stop on the right */}
-            <div className="flex items-center justify-between gap-2 border-t border-surface-800/60 px-2 pb-2 pt-1.5">
-              <div className="flex items-center gap-0.5">
+            <div className="flex flex-wrap items-center justify-between gap-2 border-t border-surface-800/60 px-2 pb-2 pt-1.5">
+              <div className="flex min-w-0 flex-wrap items-center gap-0.5">
                 <ToolbarButton
                   icon={<AtSign className="h-3.5 w-3.5" />}
                   label="Add file context (@)"
@@ -558,6 +563,20 @@ export function Composer({
                   hint="/"
                   onClick={() => insertAtCaret(taRef, "/")}
                 />
+                <ToolbarButton
+                  icon={<ClipboardPaste className="h-3.5 w-3.5" />}
+                  label="Paste from clipboard"
+                  onClick={() => {
+                    void pasteClipboardAtCaret(taRef).then((ok) => {
+                      if (!ok) {
+                        toastBus.handler?.error(
+                          "Couldn't read clipboard. Use HTTPS or paste from the keyboard menu.",
+                        );
+                        taRef.current?.focus();
+                      }
+                    });
+                  }}
+                />
                 <span className="mx-1 h-4 w-px bg-surface-700" aria-hidden />
                 <ModePicker
                   sessionId={sessionId}
@@ -567,7 +586,7 @@ export function Composer({
                 />
               </div>
 
-              <div className="flex items-center gap-2">
+              <div className="ml-auto flex items-center gap-2">
                 <UsageHint usage={sessionUsage} />
                 {turnActive ? (
                   <>
@@ -728,6 +747,54 @@ export function insertAtCaret(
   ta.setSelectionRange(pos, pos);
 }
 
+/** Insert arbitrary pasted text without trigger-specific whitespace
+ *  padding. Kept separate from `insertAtCaret` because @ and / toolbar
+ *  injections need trigger detection, while pasted code or shell
+ *  snippets must stay byte-for-byte as copied. */
+export function insertPlainTextAtCaret(
+  ref: React.RefObject<HTMLTextAreaElement | null>,
+  text: string,
+) {
+  const ta = ref.current;
+  if (!ta || text.length === 0) return;
+  const start = ta.selectionStart ?? ta.value.length;
+  const end = ta.selectionEnd ?? start;
+  const before = ta.value.slice(0, start);
+  const next = before + text + ta.value.slice(end);
+  const setter = Object.getOwnPropertyDescriptor(
+    HTMLTextAreaElement.prototype,
+    "value",
+  )?.set;
+  setter?.call(ta, next);
+  ta.dispatchEvent(
+    new InputEvent("input", {
+      bubbles: true,
+      inputType: "insertFromPaste",
+      data: text,
+    }),
+  );
+  const pos = before.length + text.length;
+  ta.focus();
+  ta.setSelectionRange(pos, pos);
+}
+
+export async function pasteClipboardAtCaret(
+  ref: React.RefObject<HTMLTextAreaElement | null>,
+): Promise<boolean> {
+  if (typeof window === "undefined") return false;
+  if (!window.isSecureContext) return false;
+  const readText = navigator.clipboard?.readText;
+  if (!readText) return false;
+  try {
+    const text = await readText.call(navigator.clipboard);
+    if (!text) return false;
+    insertPlainTextAtCaret(ref, text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function extDescription(path: string): string | undefined {
   const m = path.match(/\.([a-z0-9]+)$/i);
   return m?.[1]?.toLowerCase();
@@ -754,6 +821,7 @@ function ToolbarButton({
       title={label}
       aria-label={label}
       disabled={disabled}
+      onMouseDown={(e) => e.preventDefault()}
       onClick={onClick}
       className={[
         "inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11px] text-text-dim",
@@ -1007,7 +1075,7 @@ function SendButton({ connected = true }: { connected?: boolean }) {
           "transition-all duration-100",
         ].join(" ")}
       >
-        <PaperPlaneIcon />
+        <Send className="h-3.5 w-3.5" aria-hidden="true" />
       </button>
     </ComposerPrimitive.Send>
   );
@@ -1072,7 +1140,7 @@ function QueueSendButton({
         "transition-all duration-100",
       ].join(" ")}
     >
-      <PaperPlaneIcon />
+      <Send className="h-3.5 w-3.5" aria-hidden="true" />
       {queuedCount > 0 && (
         <span
           aria-hidden
@@ -1106,23 +1174,4 @@ function sendFromTextarea(
   // and we cleared the value without firing one.
   const el = taRef.current;
   if (el) el.style.height = "auto";
-}
-
-function PaperPlaneIcon() {
-  return (
-    <svg
-      viewBox="0 0 24 24"
-      width="14"
-      height="14"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
-    >
-      <path d="M22 2 11 13" />
-      <path d="M22 2 15 22l-4-9-9-4 20-7Z" />
-    </svg>
-  );
 }

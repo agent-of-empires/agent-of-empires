@@ -13,6 +13,7 @@ pub mod login;
 pub mod push;
 pub mod push_send;
 pub mod rate_limit;
+pub mod telegram;
 pub mod tunnel;
 pub mod ws;
 
@@ -608,6 +609,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     });
 
     let app = build_router(state.clone());
+    telegram::spawn_if_configured(state.clone()).await;
 
     // Cockpit workers for persisted sessions get auto-spawned by the
     // reconciler in `status_poll_loop`. The poll interval's first tick

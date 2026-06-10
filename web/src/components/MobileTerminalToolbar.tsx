@@ -1,6 +1,7 @@
 import { useCallback, useState } from "react";
 import type { Terminal } from "@xterm/xterm";
 import type { RefObject } from "react";
+import { ClipboardPaste, CornerDownLeft } from "lucide-react";
 import { useLongPressDrag, type DragAxis } from "../hooks/useLongPressDrag";
 import { toastBus } from "../lib/toastBus";
 
@@ -104,10 +105,11 @@ export function MobileTerminalToolbar({
   });
 
   const btnBase =
-    "flex-1 flex items-center justify-center h-11 rounded-md transition-colors duration-75 text-text-secondary select-none touch-manipulation relative active:bg-surface-700/50 active:scale-95";
+    "flex-none min-w-11 flex items-center justify-center h-11 rounded-md transition-colors duration-75 text-text-secondary select-none touch-manipulation relative active:bg-surface-700/50 active:scale-95";
+  const btnWide = `${btnBase} min-w-[58px] gap-1 px-2`;
 
   const strip =
-    "shrink-0 flex items-center gap-1 px-2 py-1.5 bg-surface-850 border-t border-surface-700/20";
+    "shrink-0 flex items-center gap-1 overflow-x-auto px-2 py-1.5 bg-surface-850 border-t border-surface-700/20 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden";
 
   // Parent (TerminalView) reserves paddingBottom for the keyboard
   // (sticky once any keyboard has opened), so once that has happened the
@@ -161,6 +163,10 @@ export function MobileTerminalToolbar({
         onClick={() => send("\x1b")}>
         <span className="font-mono text-sm">Esc</span>
       </button>
+      <button type="button" aria-label="Enter" className={btnBase}
+        onClick={() => send("\r")}>
+        <CornerDownLeft className="h-3.5 w-3.5" aria-hidden="true" />
+      </button>
       <button
         type="button"
         aria-label="Ctrl"
@@ -178,7 +184,7 @@ export function MobileTerminalToolbar({
         onClick={() => { send("\x03"); if (ctrlActive) onCtrlToggle(); }}>
         <span className="font-mono text-xs">^C</span>
       </button>
-      <button type="button" aria-label="Paste from clipboard" className={btnBase}
+      <button type="button" aria-label="Paste from clipboard" className={btnWide}
         onClick={async () => {
           haptic();
           const t = toastBus.handler;
@@ -290,20 +296,8 @@ export function MobileTerminalToolbar({
             );
           }
         }}>
-        <svg
-          width="14"
-          height="14"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="2"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          aria-hidden="true"
-        >
-          <rect x="9" y="2" width="6" height="4" rx="1" />
-          <path d="M8 4H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2h-2" />
-        </svg>
+        <ClipboardPaste className="h-3.5 w-3.5" aria-hidden="true" />
+        <span className="font-mono text-[11px]">Paste</span>
       </button>
     </div>
   );

@@ -3143,38 +3143,40 @@ enum SendKeysError {
 type SendKeysResult =
     Result<(EnsureReadyOutcome, Instance), Box<(Instance, EnsureReadyOutcome, SendKeysError)>>;
 
-pub async fn send_message(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-    req: Result<Json<SendMessageRequest>, axum::extract::rejection::JsonRejection>,
-) -> impl IntoResponse {
-    if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({"error": "read_only"})),
-        )
-            .into_response();
-    }
-    let Json(req) = match req {
-        Ok(j) => j,
-        Err(rej) => return rej.into_response(),
-    };
+#[derive(Debug, Clone)]
+pub struct SendTextOutcome {
+    pub stale_session_id: Option<String>,
+}
 
-    if req.message.trim().is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "message_empty"})),
-        )
-            .into_response();
+#[derive(Debug)]
+pub enum SendTextError {
+    ReadOnly,
+    MessageEmpty,
+    NotFound,
+    NotRunning,
+    Transient(Status),
+    CockpitModeUnsupported,
+    Tmux(String),
+    Internal,
+}
+
+pub async fn send_text_to_tmux_session(
+    state: Arc<AppState>,
+    id: &str,
+    message: String,
+    revive: bool,
+) -> Result<SendTextOutcome, SendTextError> {
+    if state.read_only {
+        return Err(SendTextError::ReadOnly);
+    }
+
+    if message.trim().is_empty() {
+        return Err(SendTextError::MessageEmpty);
     }
 
     let instances = state.instances.read().await;
     let Some(instance) = instances.iter().find(|i| i.id == id).cloned() else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "not_found"})),
-        )
-            .into_response();
+        return Err(SendTextError::NotFound);
     };
     drop(instances);
 
@@ -3182,12 +3184,10 @@ pub async fn send_message(
     // Without this, two POSTs racing against the same session would issue
     // overlapping `tmux send-keys -l` invocations and the bytes can interleave
     // inside the pane.
-    let inst_lock = state.instance_lock(&id).await;
+    let inst_lock = state.instance_lock(id).await;
     let _guard = inst_lock.lock().await;
 
     let tool = instance.tool.clone();
-    let message = req.message;
-    let revive = req.revive;
     let send_result = tokio::task::spawn_blocking(move || -> SendKeysResult {
         // Revive the pane before sending. Without this, a send to a dead
         // pane silently writes keystrokes to a corpse with no agent.
@@ -3269,10 +3269,12 @@ pub async fn send_message(
             } else {
                 // Session was deleted between the send and the stamp; nothing
                 // left to persist.
-                return (StatusCode::OK, Json(serde_json::json!({"sent": true}))).into_response();
+                return Ok(SendTextOutcome {
+                    stale_session_id: None,
+                });
             };
             drop(instances);
-            let id_for_save = id.clone();
+            let id_for_save = id.to_string();
             let started_for_save = started.clone();
             let outcome_already_alive = matches!(outcome, EnsureReadyOutcome::AlreadyAlive);
             tokio::task::spawn_blocking(move || {
@@ -3290,7 +3292,6 @@ pub async fn send_message(
                     }
                 }
             });
-            let mut body = serde_json::json!({"sent": true});
             let stale_sid = match &outcome {
                 EnsureReadyOutcome::Respawned {
                     stale_sid: Some(sid),
@@ -3301,9 +3302,14 @@ pub async fn send_message(
                 _ => None,
             };
             if let Some(sid) = stale_sid {
-                body["stale_session_id"] = serde_json::Value::String(sid);
+                Ok(SendTextOutcome {
+                    stale_session_id: Some(sid),
+                })
+            } else {
+                Ok(SendTextOutcome {
+                    stale_session_id: None,
+                })
             }
-            (StatusCode::OK, Json(body)).into_response()
         }
         Ok(Err(boxed)) => {
             let (started, outcome, send_err) = *boxed;
@@ -3334,25 +3340,10 @@ pub async fn send_message(
                             apply_cascade_state_sync(i, &started);
                         }
                     }
-                    (
-                        StatusCode::CONFLICT,
-                        Json(serde_json::json!({"error": "session_not_running"})),
-                    )
-                        .into_response()
+                    Err(SendTextError::NotRunning)
                 }
-                SendKeysError::Transient(status) => (
-                    StatusCode::CONFLICT,
-                    Json(serde_json::json!({
-                        "error": "session_transient",
-                        "status": format!("{status:?}"),
-                    })),
-                )
-                    .into_response(),
-                SendKeysError::CockpitMode => (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": "cockpit_mode_unsupported"})),
-                )
-                    .into_response(),
+                SendKeysError::Transient(status) => Err(SendTextError::Transient(status)),
+                SendKeysError::CockpitMode => Err(SendTextError::CockpitModeUnsupported),
                 SendKeysError::Tmux(e) => {
                     tracing::error!(target: "http.api.sessions", "send_message: tmux error for {id}: {e}");
                     let msg = e.to_string();
@@ -3371,22 +3362,86 @@ pub async fn send_message(
                         i.status = crate::session::Status::Error;
                         i.last_error = Some(msg);
                     }
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"error": "tmux_error"})),
-                    )
-                        .into_response()
+                    Err(SendTextError::Tmux(e.to_string()))
                 }
             }
         }
         Err(e) => {
             tracing::error!(target: "http.api.sessions", "send_message: blocking task panicked for {id}: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal"})),
-            )
-                .into_response()
+            Err(SendTextError::Internal)
         }
+    }
+}
+
+pub async fn send_message(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    req: Result<Json<SendMessageRequest>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "read_only"})),
+        )
+            .into_response();
+    }
+
+    let Json(req) = match req {
+        Ok(j) => j,
+        Err(rej) => return rej.into_response(),
+    };
+
+    match send_text_to_tmux_session(state, &id, req.message, req.revive).await {
+        Ok(outcome) => {
+            let mut body = serde_json::json!({"sent": true});
+            if let Some(sid) = outcome.stale_session_id {
+                body["stale_session_id"] = serde_json::Value::String(sid);
+            }
+            (StatusCode::OK, Json(body)).into_response()
+        }
+        Err(SendTextError::ReadOnly) => (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "read_only"})),
+        )
+            .into_response(),
+        Err(SendTextError::MessageEmpty) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "message_empty"})),
+        )
+            .into_response(),
+        Err(SendTextError::NotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "not_found"})),
+        )
+            .into_response(),
+        Err(SendTextError::NotRunning) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "session_not_running"})),
+        )
+            .into_response(),
+        Err(SendTextError::Transient(status)) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "session_transient",
+                "status": format!("{status:?}"),
+            })),
+        )
+            .into_response(),
+        Err(SendTextError::CockpitModeUnsupported) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "cockpit_mode_unsupported"})),
+        )
+            .into_response(),
+        Err(SendTextError::Tmux(_)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "tmux_error"})),
+        )
+            .into_response(),
+        Err(SendTextError::Internal) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "internal"})),
+        )
+            .into_response(),
     }
 }
 

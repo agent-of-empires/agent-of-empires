@@ -12,7 +12,11 @@
 import { describe, expect, it } from "vitest";
 import { createRef } from "react";
 
-import { insertAtCaret } from "./Composer";
+import {
+  insertAtCaret,
+  insertPlainTextAtCaret,
+  pasteClipboardAtCaret,
+} from "./Composer";
 
 describe("insertAtCaret (#1149)", () => {
   it("dispatches an InputEvent with inputType=insertText and data=text", () => {
@@ -68,6 +72,48 @@ describe("insertAtCaret (#1149)", () => {
     insertAtCaret(ref, "@");
 
     expect(ta.value).toBe("hello @");
+
+    document.body.removeChild(ta);
+  });
+
+  it("inserts pasted text without adding trigger whitespace", () => {
+    const ta = document.createElement("textarea");
+    document.body.appendChild(ta);
+    ta.value = "run";
+    ta.setSelectionRange(3, 3);
+    const ref = createRef<HTMLTextAreaElement>();
+    (ref as { current: HTMLTextAreaElement }).current = ta;
+
+    const events: InputEvent[] = [];
+    ta.addEventListener("input", (e) => events.push(e as InputEvent));
+
+    insertPlainTextAtCaret(ref, " --help\nnext");
+
+    expect(ta.value).toBe("run --help\nnext");
+    expect(events).toHaveLength(1);
+    expect(events[0].inputType).toBe("insertFromPaste");
+    expect(events[0].data).toBe(" --help\nnext");
+
+    document.body.removeChild(ta);
+  });
+
+  it("reads clipboard text into the composer on secure origins", async () => {
+    const ta = document.createElement("textarea");
+    document.body.appendChild(ta);
+    const ref = createRef<HTMLTextAreaElement>();
+    (ref as { current: HTMLTextAreaElement }).current = ta;
+
+    Object.defineProperty(window, "isSecureContext", {
+      value: true,
+      configurable: true,
+    });
+    Object.defineProperty(navigator, "clipboard", {
+      value: { readText: async () => "hello from clipboard" },
+      configurable: true,
+    });
+
+    await expect(pasteClipboardAtCaret(ref)).resolves.toBe(true);
+    expect(ta.value).toBe("hello from clipboard");
 
     document.body.removeChild(ta);
   });
