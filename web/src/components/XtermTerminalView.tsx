@@ -7,9 +7,7 @@ import { useMobileKeyboard } from "../hooks/useMobileKeyboard";
 import { MobileTerminalToolbar } from "./MobileTerminalToolbar";
 import { BackToLiveButton } from "./BackToLiveButton";
 import { KeyboardFab } from "./KeyboardFab";
-import { SwitchViewAction } from "./acp/SwitchViewAction";
 import { ensureSession } from "../lib/api";
-import { isAcpCapable } from "../lib/acpCapableTools";
 import { safeSetItem } from "../lib/safeStorage";
 import type { SessionResponse } from "../lib/types";
 import {
@@ -231,19 +229,6 @@ export function XtermTerminalView({ session, active = true }: Props) {
   } as const;
   return (
     <div className="flex-1 flex flex-col overflow-hidden relative md:bg-surface-800 md:pb-1.5" style={rootStyle}>
-      {/* Top-right view switch, a discreet pill that lets the
-          user flip this session into structured view mode. Only enabled
-          for tools whose ACP adapter we ship. */}
-      {session?.id && (
-        <div className="absolute right-2 top-2 z-10">
-          <SwitchViewAction
-            sessionId={session.id}
-            structuredView={false}
-            acpCapable={isAcpCapable(session.tool, session.acp_capable)}
-            variant="icon"
-          />
-        </div>
-      )}
       {!state.connected && state.reconnecting && (
         <div className="bg-status-waiting/15 border-b border-status-waiting/30 px-4 py-1.5 flex items-center gap-2 shrink-0">
           <span className="text-xs text-status-waiting">

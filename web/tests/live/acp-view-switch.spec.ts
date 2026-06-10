@@ -1,7 +1,6 @@
-// Structured view view switch.
+// Structured view view switch (API level).
 //
-// `SwitchViewAction` toggles a session between tmux and structured view
-// modes. The two endpoints (`POST /acp/enable` and
+// The two endpoints (`POST /acp/enable` and
 // `POST /acp/disable`) both return
 // `{ session_id, view?: "structured" | "terminal" }` and persist the new view
 // to the on-disk session record. This spec round-trips both directions

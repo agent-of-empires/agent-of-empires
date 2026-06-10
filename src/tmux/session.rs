@@ -39,13 +39,18 @@ pub struct PaneCursor {
     /// web live view sizes its virtual scroll spacer off this; absent in
     /// older format strings, in which case it parses as 0.
     pub history_size: u32,
+    /// `#{pane_width}`: the live web view compares this against the
+    /// viewer's requested grid to detect another writer (e.g. the TUI's
+    /// preview sync) resizing the window out from under it. Optional in
+    /// the format line; parses as 0 when absent.
+    pub pane_width: u16,
 }
 
 impl PaneCursor {
     /// Parse the single space-separated line emitted by the
     /// `#{cursor_x} #{cursor_y} #{cursor_flag} #{pane_height}
-    /// #{history_size}` format. The history field is optional so an
-    /// older four-field line still parses (as history 0).
+    /// #{history_size} #{pane_width}` format. The trailing fields are
+    /// optional so an older four-field line still parses (as 0).
     fn parse(line: &str) -> Option<Self> {
         let mut fields = line.split_whitespace();
         let x = fields.next()?.parse().ok()?;
@@ -53,12 +58,14 @@ impl PaneCursor {
         let flag: u8 = fields.next()?.parse().ok()?;
         let pane_height = fields.next()?.parse().ok()?;
         let history_size = fields.next().and_then(|f| f.parse().ok()).unwrap_or(0);
+        let pane_width = fields.next().and_then(|f| f.parse().ok()).unwrap_or(0);
         Some(Self {
             x,
             y,
             visible: flag != 0,
             pane_height,
             history_size,
+            pane_width,
         })
     }
 }
@@ -373,7 +380,7 @@ impl Session {
                 "-t",
                 &target,
                 "-F",
-                "#{cursor_x} #{cursor_y} #{cursor_flag} #{pane_height} #{history_size}",
+                "#{cursor_x} #{cursor_y} #{cursor_flag} #{pane_height} #{history_size} #{pane_width}",
                 ";",
                 "capture-pane",
                 "-t",
@@ -731,7 +738,7 @@ mod tests {
 
     #[test]
     fn pane_cursor_parses_format_line() {
-        let c = PaneCursor::parse("3 2 1 24 120").expect("parses");
+        let c = PaneCursor::parse("3 2 1 24 120 74").expect("parses");
         assert_eq!(
             c,
             PaneCursor {
@@ -740,12 +747,14 @@ mod tests {
                 visible: true,
                 pane_height: 24,
                 history_size: 120,
+                pane_width: 74,
             }
         );
-        // Four-field (pre-history) lines still parse, history defaults 0.
+        // Four-field (pre-history) lines still parse, trailing fields 0.
         let c = PaneCursor::parse("3 2 0 24").expect("parses");
         assert!(!c.visible);
         assert_eq!(c.history_size, 0);
+        assert_eq!(c.pane_width, 0);
         // cursor_flag 0 => hidden.
         assert!(!PaneCursor::parse("0 0 0 10").unwrap().visible);
         // Garbage / short input yields None rather than a bogus cursor.

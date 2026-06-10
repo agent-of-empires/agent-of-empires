@@ -4,9 +4,7 @@ import { useMobileKeyboard } from "../hooks/useMobileKeyboard";
 import { MobileTerminalToolbar } from "./MobileTerminalToolbar";
 import { MobileLiveTerminal } from "./MobileLiveTerminal";
 import { KeyboardFab } from "./KeyboardFab";
-import { SwitchViewAction } from "./acp/SwitchViewAction";
 import { ensureSession } from "../lib/api";
-import { isAcpCapable } from "../lib/acpCapableTools";
 import type { SessionResponse } from "../lib/types";
 import {
   FOCUS_TERMINAL_EVENT,
@@ -154,16 +152,6 @@ export function LiveTerminalView({ session, active = true }: Props) {
 
   return (
     <div className="flex-1 flex flex-col overflow-hidden relative" style={rootStyle} data-term="agent">
-      {session?.id && (
-        <div className="absolute right-2 top-2 z-10">
-          <SwitchViewAction
-            sessionId={session.id}
-            structuredView={false}
-            acpCapable={isAcpCapable(session.tool, session.acp_capable)}
-            variant="icon"
-          />
-        </div>
-      )}
       {!live.state.connected && live.state.reconnecting && (
         <div className="bg-status-waiting/15 border-b border-status-waiting/30 px-4 py-1.5 flex items-center gap-2 shrink-0">
           <span className="text-xs text-status-waiting">

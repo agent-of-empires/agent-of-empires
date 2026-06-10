@@ -1,7 +1,7 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, RefObject } from "react";
 import type { AnsiSegment, AnsiStyle } from "../lib/ansi";
-import { ansiToLines } from "../lib/liveTermLines";
+import { ansiToLines, wrapLine } from "../lib/liveTermLines";
 import type { LiveFrame } from "../hooks/useLiveTerminal";
 import { useWebSettings } from "../hooks/useWebSettings";
 
@@ -176,6 +176,22 @@ export function MobileLiveTerminal({
     geomRef.current = { scrollHeight: el.scrollHeight, clientHeight: el.clientHeight };
   }, [lineH]);
   const lines = useMemo(() => (frame ? ansiToLines(frame.content) : []), [frame]);
+  // Columns this viewer renders at. Normally the pane is exactly this
+  // wide and wrapping is the identity; when another writer resizes the
+  // window wider (see the server-side drift re-assert), wrapping keeps
+  // the frame readable instead of clipping at the right edge.
+  const [renderCols, setRenderCols] = useState(0);
+  const visual = useMemo(() => {
+    const cols = renderCols > 0 ? renderCols : Number.POSITIVE_INFINITY;
+    const rows: AnsiSegment[][] = [];
+    // Visual row index where each pane line starts (for cursor math).
+    const lineStartRow: number[] = new Array(lines.length);
+    for (let i = 0; i < lines.length; i++) {
+      lineStartRow[i] = rows.length;
+      for (const row of wrapLine(lines[i]!, cols)) rows.push(row);
+    }
+    return { rows, lineStartRow };
+  }, [lines, renderCols]);
   const screenRows = frame?.rows ?? 0;
   const history = frame?.history ?? 0;
   const fetchedHistory = Math.max(0, lines.length - screenRows);
@@ -294,6 +310,7 @@ export function MobileLiveTerminal({
       // ship that to tmux.
       if (cols < 20 || rows < 5) return;
       rowsRef.current = rows;
+      setRenderCols(cols);
       sendResize(cols, rows);
       if (!readingRef.current) {
         setWindow(rows);
@@ -452,8 +469,16 @@ export function MobileLiveTerminal({
 
   // --- cursor overlay (live edge only; a frozen snapshot has no cursor) -------
   const cursor = !reading ? (frame?.cursor ?? null) : null;
-  const cursorTop = cursor ? (spacerLines + Math.max(0, lines.length - screenRows) + cursor.y) * lineH : 0;
-  const cursorLeft = cursor ? cursor.x * charW : 0;
+  let cursorTop = 0;
+  let cursorLeft = 0;
+  if (cursor) {
+    const lineIdx = Math.max(0, lines.length - screenRows) + cursor.y;
+    const baseRow = visual.lineStartRow[lineIdx] ?? visual.rows.length;
+    const cols = renderCols > 0 ? renderCols : Number.POSITIVE_INFINITY;
+    const wrapOffset = Number.isFinite(cols) ? Math.floor(cursor.x / cols) : 0;
+    cursorTop = (spacerLines + baseRow + wrapOffset) * lineH;
+    cursorLeft = (Number.isFinite(cols) ? cursor.x % cols : cursor.x) * charW;
+  }
 
   return (
     <div className="absolute inset-0" data-live-terminal>
@@ -490,7 +515,7 @@ export function MobileLiveTerminal({
         </span>
         <div className="relative whitespace-pre" data-live-content>
           {spacerLines > 0 && <div style={{ height: `${spacerLines * lineH}px` }} aria-hidden="true" />}
-          {lines.map((segs, i) => (
+          {visual.rows.map((segs, i) => (
             <Row key={i} segs={segs} />
           ))}
           {connected && cursor && (

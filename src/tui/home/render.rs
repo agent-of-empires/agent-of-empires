@@ -2881,6 +2881,7 @@ mod tests {
             visible,
             pane_height,
             history_size: 0,
+            pane_width: 0,
         }
     }
 

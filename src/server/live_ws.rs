@@ -67,6 +67,9 @@ const MAX_WINDOW_LINES: usize = 4000;
 const DEFAULT_WINDOW_LINES: usize = 50;
 /// Keepalive ping interval; the recv side relies on the browser's pong.
 const PING_INTERVAL: Duration = Duration::from_secs(30);
+/// Floor between drift re-asserts (see the capture loop): both known
+/// writers dedup, so this only matters against an unknown one.
+const REASSERT_MIN_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Deserialize)]
 #[serde(tag = "type")]
@@ -86,9 +89,14 @@ enum LiveControlMessage {
 struct LiveSettings {
     window_lines: AtomicUsize,
     fast: AtomicBool,
-    /// Rows from the latest client resize; used as the window floor so a
-    /// shrunk window can never clip the live screen.
+    /// Grid from the latest client resize. Rows double as the window
+    /// floor so a shrunk window can never clip the live screen; both
+    /// dimensions feed the drift re-assert below.
     screen_rows: AtomicU64,
+    screen_cols: AtomicU64,
+    /// Set once any resize has been applied; the disconnect path then
+    /// restores `window-size latest`.
+    resized: AtomicBool,
     /// Freeze pushes while the client reads scrollback (see module docs).
     hold: AtomicBool,
     /// One capture is owed despite `hold` (window/resize changed).
@@ -147,6 +155,8 @@ async fn handle_live_ws(
         window_lines: AtomicUsize::new(DEFAULT_WINDOW_LINES),
         fast: AtomicBool::new(true),
         screen_rows: AtomicU64::new(0),
+        screen_cols: AtomicU64::new(0),
+        resized: AtomicBool::new(false),
         hold: AtomicBool::new(false),
         force_once: AtomicBool::new(false),
     });
@@ -169,6 +179,7 @@ async fn handle_live_ws(
     let capture_task = tokio::spawn(async move {
         let mut last_published: Option<(String, Option<crate::tmux::PaneCursor>)> = None;
         let mut dead_probes: u32 = 0;
+        let mut last_reassert = std::time::Instant::now() - REASSERT_MIN_INTERVAL;
         loop {
             // Held: skip the capture (and its tmux fork) entirely unless a
             // window/resize change owes the client one frame. The
@@ -195,6 +206,42 @@ async fn handle_live_ws(
             match captured {
                 Ok(Ok((content, cursor))) if !content.is_empty() || cursor.is_some() => {
                     dead_probes = 0;
+                    // Another writer (most commonly the TUI's preview sync,
+                    // which sizes the selected session's window to ITS
+                    // preview area) can resize the window out from under
+                    // this viewer; capture lines then exceed the phone's
+                    // grid and render clipped. Both writers dedup their own
+                    // sends, so re-asserting here converges on the active
+                    // viewer instead of flapping. Rate-limited as a guard
+                    // against an unknown third writer.
+                    if let Some(c) = cursor.as_ref() {
+                        let want_cols = capture_settings.screen_cols.load(Ordering::Relaxed) as u16;
+                        let want_rows = capture_settings.screen_rows.load(Ordering::Relaxed) as u16;
+                        let drifted = want_cols > 0
+                            && want_rows > 0
+                            && c.pane_width > 0
+                            && (c.pane_width != want_cols || c.pane_height != want_rows);
+                        if drifted && last_reassert.elapsed() >= REASSERT_MIN_INTERVAL {
+                            last_reassert = std::time::Instant::now();
+                            warn!(
+                                target: "terminal.ws",
+                                tmux = %capture_tmux,
+                                kind = "live",
+                                pane_cols = c.pane_width,
+                                pane_rows = c.pane_height,
+                                want_cols,
+                                want_rows,
+                                "pane drifted from live viewer's grid; re-asserting"
+                            );
+                            let name = capture_tmux.clone();
+                            capture_settings.resized.store(true, Ordering::Relaxed);
+                            let _ = tokio::task::spawn_blocking(move || {
+                                crate::tmux::Session::from_name(&name)
+                                    .resize_window(want_cols, want_rows);
+                            })
+                            .await;
+                        }
+                    }
                     let frame = (content, cursor);
                     if last_published.as_ref() != Some(&frame) {
                         let json = frame_json(&frame.0, frame.1.as_ref());
@@ -267,7 +314,6 @@ async fn handle_live_ws(
     });
 
     // Recv loop: input bytes + control messages, until close/shutdown.
-    let mut resized = false;
     loop {
         tokio::select! {
             msg = ws_receiver.next() => {
@@ -301,6 +347,7 @@ async fn handle_live_ws(
                                     continue;
                                 }
                                 settings.screen_rows.store(rows as u64, Ordering::Relaxed);
+                                settings.screen_cols.store(cols as u64, Ordering::Relaxed);
                                 // Never let the capture window clip the screen.
                                 let floor = rows as usize;
                                 if settings.window_lines.load(Ordering::Relaxed) < floor {
@@ -311,7 +358,7 @@ async fn handle_live_ws(
                                     crate::tmux::Session::from_name(&name).resize_window(cols, rows);
                                 })
                                 .await;
-                                resized = true;
+                                settings.resized.store(true, Ordering::Relaxed);
                                 settings.force_once.store(true, Ordering::Relaxed);
                                 nudge.notify_one();
                             }
@@ -365,7 +412,7 @@ async fn handle_live_ws(
     // Live-view resizes flip the window-size option to manual (tmux
     // behavior); restore automatic sizing so a later full-size attach
     // isn't pinned at phone dimensions. Mirrors the TUI's live-send exit.
-    if resized {
+    if settings.resized.load(Ordering::Relaxed) {
         let name = tmux_name.clone();
         let _ = tokio::task::spawn_blocking(move || {
             crate::tmux::Session::from_name(&name).reset_size_to_latest_client();
@@ -409,6 +456,7 @@ mod tests {
             visible: true,
             pane_height: 46,
             history_size: 1200,
+            pane_width: 74,
         };
         let json = frame_json("hello\nworld", Some(&cursor));
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -428,6 +476,7 @@ mod tests {
             visible: false,
             pane_height: 46,
             history_size: 0,
+            pane_width: 74,
         };
         let v: serde_json::Value = serde_json::from_str(&frame_json("x", Some(&cursor))).unwrap();
         assert!(v["cursor"].is_null());

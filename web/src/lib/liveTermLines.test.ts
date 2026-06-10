@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, expect, it } from "vitest";
-import { ansiToLines, lineText } from "./liveTermLines";
+import { ansiToLines, lineText, wrapLine } from "./liveTermLines";
 
 describe("ansiToLines", () => {
   it("splits plain text into lines and drops the capture trailing terminator", () => {
@@ -27,5 +27,32 @@ describe("ansiToLines", () => {
 
   it("renders an empty frame as a single empty line", () => {
     expect(ansiToLines("").map(lineText)).toEqual([""]);
+  });
+});
+
+describe("wrapLine", () => {
+  const seg = (text: string, fg?: string) => ({ text, style: fg ? { fg } : {} });
+
+  it("is the identity for lines within the column limit", () => {
+    const line = [seg("hello world")];
+    expect(wrapLine(line, 80)).toEqual([line]);
+  });
+
+  it("hard-wraps at the column boundary preserving styles", () => {
+    const rows = wrapLine([seg("aaaa", "red"), seg("bbbb")], 3);
+    expect(rows.map((r) => lineText(r))).toEqual(["aaa", "abb", "bb"]);
+    expect(rows[0]![0]!.style.fg).toBe("red");
+    expect(rows[1]![0]!.style.fg).toBe("red");
+    expect(rows[1]![1]!.style.fg).toBeUndefined();
+  });
+
+  it("treats zero or non-finite cols as no-wrap", () => {
+    const line = [seg("abcdef")];
+    expect(wrapLine(line, 0)).toEqual([line]);
+    expect(wrapLine(line, Number.POSITIVE_INFINITY)).toEqual([line]);
+  });
+
+  it("returns one empty row for an empty line", () => {
+    expect(wrapLine([], 10)).toEqual([[]]);
   });
 });

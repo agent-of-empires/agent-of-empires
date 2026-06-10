@@ -1109,7 +1109,7 @@
       "kind": "live-playwright",
       "risk": "medium",
       "specs": ["tests/live/acp-mode-switch.spec.ts"],
-      "components": ["web/src/components/acp/SwitchViewAction.tsx", "web/src/components/acp/ContextPrimerBanner.tsx"]
+      "components": ["web/src/components/acp/ContextPrimerBanner.tsx"]
     },
     {
       "id": "acp.completion",
@@ -1344,13 +1344,6 @@
       "risk": "medium",
       "specs": ["src/components/acp/ContextPrimerBanner.test.tsx"],
       "components": ["web/src/components/acp/ContextPrimerBanner.tsx"]
-    },
-    {
-      "id": "acp.switch-view-action",
-      "kind": "vitest",
-      "risk": "medium",
-      "specs": ["src/components/acp/SwitchViewAction.test.tsx"],
-      "components": ["web/src/components/acp/SwitchViewAction.tsx"]
     },
     {
       "id": "acp.tool-error-body",
@@ -1592,13 +1585,6 @@
         "tests/live/acp-stories/sidebar-select-focuses-composer.spec.ts"
       ],
       "components": ["web/src/App.tsx", "web/src/lib/terminalFocus.ts", "web/src/components/acp/Composer.tsx"]
-    },
-    {
-      "id": "acp.story.view-switch-to-acp",
-      "kind": "live-playwright",
-      "risk": "medium",
-      "specs": ["tests/live/acp-stories/view-switch-to-acp.spec.ts"],
-      "components": ["web/src/components/acp/SwitchViewAction.tsx"]
     },
     {
       "id": "story.auth-sign-out",
