@@ -35,22 +35,37 @@ pub struct PaneCursor {
     /// e.g. an agent that parks it while "working". Don't paint when false.
     pub visible: bool,
     pub pane_height: u16,
+    /// `#{history_size}`: lines currently in the pane's scrollback. The
+    /// web live view sizes its virtual scroll spacer off this; absent in
+    /// older format strings, in which case it parses as 0.
+    pub history_size: u32,
+    /// `#{pane_width}`: the live web view compares this against the
+    /// viewer's requested grid to detect another writer (e.g. the TUI's
+    /// preview sync) resizing the window out from under it. Optional in
+    /// the format line; parses as 0 when absent.
+    pub pane_width: u16,
 }
 
 impl PaneCursor {
     /// Parse the single space-separated line emitted by the
-    /// `#{cursor_x} #{cursor_y} #{cursor_flag} #{pane_height}` format.
+    /// `#{cursor_x} #{cursor_y} #{cursor_flag} #{pane_height}
+    /// #{history_size} #{pane_width}` format. The trailing fields are
+    /// optional so an older four-field line still parses (as 0).
     fn parse(line: &str) -> Option<Self> {
         let mut fields = line.split_whitespace();
         let x = fields.next()?.parse().ok()?;
         let y = fields.next()?.parse().ok()?;
         let flag: u8 = fields.next()?.parse().ok()?;
         let pane_height = fields.next()?.parse().ok()?;
+        let history_size = fields.next().and_then(|f| f.parse().ok()).unwrap_or(0);
+        let pane_width = fields.next().and_then(|f| f.parse().ok()).unwrap_or(0);
         Some(Self {
             x,
             y,
             visible: flag != 0,
             pane_height,
+            history_size,
+            pane_width,
         })
     }
 }
@@ -309,15 +324,6 @@ impl Session {
     }
 
     pub fn capture_pane(&self, lines: usize) -> Result<String> {
-        self.capture_pane_with_size(lines, None, None)
-    }
-
-    pub fn capture_pane_with_size(
-        &self,
-        lines: usize,
-        _width: Option<u16>,
-        _height: Option<u16>,
-    ) -> Result<String> {
         if !self.exists() {
             return Ok(String::new());
         }
@@ -365,7 +371,7 @@ impl Session {
                 "-t",
                 &target,
                 "-F",
-                "#{cursor_x} #{cursor_y} #{cursor_flag} #{pane_height}",
+                "#{cursor_x} #{cursor_y} #{cursor_flag} #{pane_height} #{history_size} #{pane_width}",
                 ";",
                 "capture-pane",
                 "-t",
@@ -389,6 +395,35 @@ impl Session {
         let cursor_line = parts.next().unwrap_or("");
         let content = parts.next().unwrap_or("").to_string();
         Ok((content, PaneCursor::parse(cursor_line)))
+    }
+
+    /// Deliver raw bytes to the session's active pane via `tmux send-keys
+    /// -H`, one hex argument per byte, chunked so a large paste cannot
+    /// overflow `execve` ARG_MAX (the same bound the TUI's live-send path
+    /// uses; macOS caps total argv at 256KB and per-byte hex args burn it
+    /// ~13x faster than the payload size). tmux injects the bytes in
+    /// order, so a bracketed paste split across forks reassembles
+    /// transparently on the agent's PTY. This is the web live view's
+    /// input path: raw bytes from the browser (printables, CSI sequences,
+    /// control bytes) all ride the same encoding.
+    pub fn send_raw_bytes(&self, bytes: &[u8]) -> Result<()> {
+        // `^.0` pins the first window's first pane, matching capture_pane:
+        // a bare session name follows the ACTIVE pane, which would let
+        // input land in a different pane than the one being captured.
+        let target = format!("{}:^.0", self.name);
+        for batch in raw_byte_batches(bytes) {
+            let output = Command::new("tmux")
+                .args(["send-keys", "-t", &target, "-H"])
+                .args(&batch)
+                .output()?;
+            if !output.status.success() {
+                anyhow::bail!(
+                    "tmux send-keys -H exited non-zero for {} bytes",
+                    bytes.len()
+                );
+            }
+        }
+        Ok(())
     }
 
     pub fn get_pane_pid(&self) -> Option<u32> {
@@ -613,9 +648,27 @@ fn sanitize_session_name(name: &str) -> String {
         .collect()
 }
 
-/// Build the argument list for tmux new-session command.
+/// Max bytes per `send-keys -H` fork. Each byte becomes one two-char
+/// argv entry, so a bound well under ARG_MAX keeps the spawn safe on
+/// every platform (macOS caps argv+envp at 256KB). Matches the TUI
+/// live-send chunking bound.
+const MAX_RAW_BYTES_PER_SEND: usize = 4096;
+
+/// Split a raw byte payload into per-fork hex argument batches for
+/// [`Session::send_raw_bytes`]. Pure so the chunk bound and byte order
+/// are unit-testable without tmux.
+fn raw_byte_batches(bytes: &[u8]) -> Vec<Vec<String>> {
+    bytes
+        .chunks(MAX_RAW_BYTES_PER_SEND)
+        .map(|chunk| chunk.iter().map(|b| format!("{:02x}", b)).collect())
+        .collect()
+}
+
+/// Build the argument list for tmux new-session command. Shared by the
+/// agent session and the paired/container terminal sessions (their
+/// invocations are identical; only the session-name prefix differs).
 /// Extracted for testability.
-fn build_create_args(
+pub(crate) fn build_create_args(
     session_name: &str,
     working_dir: &str,
     command: Option<&str>,
@@ -659,8 +712,51 @@ mod tests {
     }
 
     #[test]
+    fn raw_byte_batches_chunks_and_preserves_order() {
+        let payload: Vec<u8> = (0..=255u8)
+            .cycle()
+            .take(MAX_RAW_BYTES_PER_SEND + 10)
+            .collect();
+        let batches = raw_byte_batches(&payload);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].len(), MAX_RAW_BYTES_PER_SEND);
+        assert_eq!(batches[1].len(), 10);
+        assert_eq!(batches[0][0], "00");
+        assert_eq!(batches[0][255], "ff");
+        // Last byte of the payload survives in order at the tail.
+        let last = payload[payload.len() - 1];
+        assert_eq!(batches[1][9], format!("{:02x}", last));
+    }
+
+    #[test]
+    fn raw_byte_batches_empty_payload_sends_nothing() {
+        assert!(raw_byte_batches(&[]).is_empty());
+    }
+
+    #[test]
+    fn raw_byte_batches_large_paste_roundtrips_in_order() {
+        // Regression for the silently-dropped large paste (#1942-era
+        // live-send bug, now shared with the web live view): a ~100 KB
+        // bracketed paste encoded one hex arg per byte overflows execve
+        // ARG_MAX in a single fork. Verify it splits, every batch stays
+        // under the bound, and the bytes reconstruct in order.
+        let payload: Vec<u8> = (0..100_000).map(|i| (i % 256) as u8).collect();
+        let batches = raw_byte_batches(&payload);
+        assert!(batches.len() > 1);
+        for batch in &batches {
+            assert!(batch.len() <= MAX_RAW_BYTES_PER_SEND);
+        }
+        let roundtrip: Vec<u8> = batches
+            .iter()
+            .flatten()
+            .map(|h| u8::from_str_radix(h, 16).unwrap())
+            .collect();
+        assert_eq!(roundtrip, payload);
+    }
+
+    #[test]
     fn pane_cursor_parses_format_line() {
-        let c = PaneCursor::parse("3 2 1 24").expect("parses");
+        let c = PaneCursor::parse("3 2 1 24 120 74").expect("parses");
         assert_eq!(
             c,
             PaneCursor {
@@ -668,8 +764,15 @@ mod tests {
                 y: 2,
                 visible: true,
                 pane_height: 24,
+                history_size: 120,
+                pane_width: 74,
             }
         );
+        // Four-field (pre-history) lines still parse, trailing fields 0.
+        let c = PaneCursor::parse("3 2 0 24").expect("parses");
+        assert!(!c.visible);
+        assert_eq!(c.history_size, 0);
+        assert_eq!(c.pane_width, 0);
         // cursor_flag 0 => hidden.
         assert!(!PaneCursor::parse("0 0 0 10").unwrap().visible);
         // Garbage / short input yields None rather than a bogus cursor.

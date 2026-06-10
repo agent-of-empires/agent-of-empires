@@ -3430,14 +3430,11 @@ impl Instance {
         self.update_status_with_metadata(None);
     }
 
-    pub fn capture_output_with_size(
-        &self,
-        lines: usize,
-        width: u16,
-        height: u16,
-    ) -> Result<String> {
-        let session = self.tmux_session()?;
-        session.capture_pane_with_size(lines, Some(width), Some(height))
+    pub fn capture_output(&self, lines: usize) -> Result<String> {
+        // capture-pane has no size parameters: the pane is captured at
+        // the window's own dimensions. (A previous *_with_size variant
+        // accepted width/height and silently ignored them.)
+        self.tmux_session()?.capture_pane(lines)
     }
 }
 

@@ -15,6 +15,7 @@ import { reportTelemetrySeen } from "../lib/api";
 import { getToken } from "../lib/token";
 import { useWebSettings } from "./useWebSettings";
 import { TerminalTiming } from "../lib/terminalTiming";
+import { WheelAccumulator, LINES_PER_WHEEL_EVENT } from "../lib/wheelScroll";
 import type { TimingPingMessage, TimingPongMessage } from "../lib/types";
 
 // Client-side terminal WS debug logging is gated behind a runtime flag
@@ -89,7 +90,6 @@ export const retryDelayMs = (attempt: number) => {
 const MIN_FONT_SIZE = 6;
 const MAX_FONT_SIZE = 28;
 const DEFAULT_FONT_SIZE = 14;
-const MOBILE_BREAKPOINT_PX = 768;
 const WHEEL_ZOOM_SENSITIVITY = 0.05;
 const WHEEL_PERSIST_DEBOUNCE_MS = 400;
 // How long, after a drag-select releases, to wait for tmux's OSC 52
@@ -120,7 +120,7 @@ export interface TerminalState {
   /**
    * True when the user has scrolled up and tmux is (likely) in copy-mode.
    * Set when the first wheel-up byte goes out after being false; cleared
-   * by an explicit call to `exitScrollback()` from the "Back to live" UI.
+   * cleared when tmux's `-e` auto-exit fires on scroll-down-past-bottom.
    * We use the client-side send as the signal rather than a server-sent
    * notification because tmux copy-mode state is not exposed on the PTY.
    */
@@ -136,30 +136,48 @@ export interface TerminalState {
 export function readThemeFromCss(): ITheme {
   const root = document.documentElement;
   const cs = getComputedStyle(root);
-  const v = (name: string, fallback: string) => cs.getPropertyValue(name).trim() || fallback;
+  const v = (name: string) => cs.getPropertyValue(name).trim() || undefined;
   return {
-    background: v("--term-bg", "#1c1c1f"),
-    foreground: v("--term-fg", "#e4e4e7"),
-    cursor: v("--term-cursor", "#f59e0b"),
-    cursorAccent: v("--term-bg", "#1c1c1f"),
-    selectionBackground: "rgba(161, 161, 170, 0.35)",
-    black: v("--term-color-0", "#1c1c1f"),
-    red: v("--term-color-1", "#ef4444"),
-    green: v("--term-color-2", "#22c55e"),
-    yellow: v("--term-color-3", "#fbbf24"),
-    blue: v("--term-color-4", "#0d9488"),
-    magenta: v("--term-color-5", "#f59e0b"),
-    cyan: v("--term-color-6", "#0d9488"),
-    white: v("--term-color-7", "#e4e4e7"),
-    brightBlack: v("--term-color-8", "#8b8b94"),
-    brightRed: v("--term-color-9", "#f26969"),
-    brightGreen: v("--term-color-10", "#4ed17e"),
-    brightYellow: v("--term-color-11", "#fccc50"),
-    brightBlue: v("--term-color-12", "#3da9a0"),
-    brightMagenta: v("--term-color-13", "#f7b13c"),
-    brightCyan: v("--term-color-14", "#3da9a0"),
-    brightWhite: v("--term-color-15", "#fbbf24"),
+    background: v("--term-bg"),
+    foreground: v("--term-fg"),
+    cursor: v("--term-cursor"),
+    cursorAccent: v("--term-bg"),
+    selectionBackground: v("--term-selection-bg"),
+    black: v("--term-color-0"),
+    red: v("--term-color-1"),
+    green: v("--term-color-2"),
+    yellow: v("--term-color-3"),
+    blue: v("--term-color-4"),
+    magenta: v("--term-color-5"),
+    cyan: v("--term-color-6"),
+    white: v("--term-color-7"),
+    brightBlack: v("--term-color-8"),
+    brightRed: v("--term-color-9"),
+    brightGreen: v("--term-color-10"),
+    brightYellow: v("--term-color-11"),
+    brightBlue: v("--term-color-12"),
+    brightMagenta: v("--term-color-13"),
+    brightCyan: v("--term-color-14"),
+    brightWhite: v("--term-color-15"),
   };
+}
+
+/**
+ * Decide whether the WebGL addon is safe to load. WebKit is excluded:
+ * Safari 26.x garbles xterm's WebGL glyph atlas (xtermjs/xterm.js#5816)
+ * and iOS WebKit (which backs every iOS browser, including CriOS/EdgiOS)
+ * also tears down GL contexts whenever a PWA is backgrounded. iPadOS 13+
+ * masquerades as "MacIntel", so the touch-point probe is needed to catch
+ * iPads. Exported for unit tests.
+ */
+export function shouldUseWebglRenderer(
+  ua: string = navigator.userAgent,
+  platform: string = navigator.platform,
+  maxTouchPoints: number = navigator.maxTouchPoints,
+): boolean {
+  const isIOS = /iPad|iPhone|iPod/.test(ua) || (platform === "MacIntel" && maxTouchPoints > 1);
+  const isSafari = /AppleWebKit/.test(ua) && !/Chrome|CriOS|Chromium|Edg|OPR|Android/.test(ua);
+  return !isIOS && !isSafari;
 }
 
 /**
@@ -188,20 +206,6 @@ export function useTerminal(
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const countdownRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const retryCountRef = useRef(0);
-  // Shared ref so the onData callback can read the virtual Ctrl state
-  // set by MobileTerminalToolbar. This bridges React state with the
-  // native event handler without requiring focus on the proxy input.
-  const ctrlActiveRef = useRef(false);
-  // Stable callback set by the component to clear React's ctrlActive state
-  // when onData consumes the Ctrl modifier.
-  const clearCtrlRef = useRef<(() => void) | null>(null);
-  // Populated inside the effect; `exitScrollback()` uses it to reset the
-  // mobile scroll-depth counter when the user escapes copy-mode.
-  const resetScrollbackDepthRef = useRef<(() => void) | null>(null);
-  // Populated inside the effect; `exitScrollback()` uses it to cancel any
-  // in-flight momentum decay so post-flick wheel-ups don't immediately
-  // re-enter scrollback after the user taps "Back to live".
-  const cancelMomentumRef = useRef<(() => void) | null>(null);
   // Mirror of state.isInScrollback so the resize callback can read the
   // latest value without re-creating the terminal. Updated by an effect
   // below.
@@ -298,12 +302,12 @@ export function useTerminal(
       (window as Window & { __aoeTiming?: TerminalTiming }).__aoeTiming = timing;
     }
 
-    const isMobileViewport = () => window.innerWidth < MOBILE_BREAKPOINT_PX;
-    const readFontSize = () =>
-      isMobileViewport() ? settingsRef.current.mobileFontSize : settingsRef.current.desktopFontSize;
+    // xterm renders only on fine-pointer devices now (touch devices get
+    // the capture-snapshot live view), so the desktop font size is the
+    // only one in play here.
+    const readFontSize = () => settingsRef.current.desktopFontSize;
     const persistFontSize = (size: number) => {
-      if (isMobileViewport()) updateRef.current({ mobileFontSize: size });
-      else updateRef.current({ desktopFontSize: size });
+      updateRef.current({ desktopFontSize: size });
     };
     const fontSize = readFontSize();
 
@@ -390,34 +394,6 @@ export function useTerminal(
       return true;
     });
 
-    // Mobile soft-keyboard Backspace autorepeat arrives as a stream of
-    // `beforeinput` events (inputType "deleteContentBackward", with keydown
-    // surfacing as "Unidentified" / keyCode 229). xterm decodes only the
-    // first into a single onData, so holding Backspace deletes one character
-    // instead of repeat-deleting; the PTY sees one DEL rather than one per
-    // tick. Intercept on xterm's hidden textarea and emit one DEL per tick
-    // ourselves. preventDefault blocks the textarea mutation so xterm's
-    // input-diff decoder never fires its own onData for the same tick (no
-    // double-delete). Gated to coarse-pointer-without-fine-pointer: a
-    // hardware Backspace fires a recognized keydown that xterm preventDefaults,
-    // which per the UI Events spec suppresses the follow-on beforeinput, so
-    // this path only runs for soft keyboards. Mirrors the mobile-Enter
-    // interception in Composer.tsx. See #1450.
-    const xtermTextarea = termEl.querySelector("textarea");
-    const onBeforeInput = (e: InputEvent) => {
-      if (e.inputType !== "deleteContentBackward" || e.isComposing) return;
-      const coarse = window.matchMedia?.("(pointer: coarse)").matches;
-      const anyFine = window.matchMedia?.("(any-pointer: fine)").matches;
-      if (!coarse || anyFine) return;
-      const ws = wsRef.current;
-      if (ws?.readyState !== WebSocket.OPEN) return;
-      e.preventDefault();
-      ws.send(new TextEncoder().encode("\x7f"));
-    };
-    xtermTextarea?.addEventListener("beforeinput", onBeforeInput, {
-      capture: true,
-    });
-
     // Shift+Enter → bracketed paste containing a newline. Agents like
     // Claude Code treat pasted newlines as literal text (inserted, not
     // submitted). Bracketed paste passes cleanly through tmux without
@@ -439,18 +415,29 @@ export function useTerminal(
     // GPU renderer. Loaded after .open() per the addon's contract. Falls
     // back to the DOM renderer silently on machines where the context is
     // unavailable (Safari private mode, headless CI, software-render VMs)
-    // so the terminal still works there.
-    try {
-      const webgl = new WebglAddon();
-      webgl.onContextLoss(() => {
+    // so the terminal still works there. Skipped entirely on WebKit
+    // (iOS + Safari): xterm's WebGL output is garbled there
+    // (xtermjs/xterm.js#5816, reproduced on iPhone PWA as giant
+    // mis-scaled glyphs), and iOS additionally drops GL contexts every
+    // time a PWA is backgrounded. The DOM renderer handles phone-sized
+    // grids comfortably; desktop Chromium / Firefox / Android Chrome
+    // keep the GPU path.
+    if (shouldUseWebglRenderer()) {
+      try {
+        const webgl = new WebglAddon();
+        webgl.onContextLoss(() => {
+          timing?.setRenderer("dom");
+          webgl.dispose();
+        });
+        term.loadAddon(webgl);
+        timing?.setRenderer("webgl");
+      } catch (err) {
         timing?.setRenderer("dom");
-        webgl.dispose();
-      });
-      term.loadAddon(webgl);
-      timing?.setRenderer("webgl");
-    } catch (err) {
+        tdbg("webgl addon unavailable, using DOM renderer", err);
+      }
+    } else {
       timing?.setRenderer("dom");
-      tdbg("webgl addon unavailable, using DOM renderer", err);
+      tdbg("webkit detected, using DOM renderer");
     }
 
     // Resize messaging. FitAddon measures the container and calls
@@ -847,24 +834,13 @@ export function useTerminal(
         });
       };
 
-      // Relay keystrokes as binary. When the virtual Ctrl button is armed,
-      // intercept single printable characters and transform them to their
-      // Ctrl equivalents (Ctrl+A = 0x01, Ctrl+U = 0x15, etc.).
+      // Relay keystrokes as binary.
       term.onData((data: string) => {
         if (ws.readyState !== WebSocket.OPEN) return;
         // Arm an Idle-TTFB sample for this keystroke. Arming (not the
         // exact byte) is all the tracker needs; it only records when the
         // terminal was idle and resolves on the next inbound frame.
         timing?.onKeystroke(performance.now());
-        if (ctrlActiveRef.current && data.length === 1) {
-          const code = data.toUpperCase().charCodeAt(0);
-          if (code >= 65 && code <= 90) {
-            ws.send(new TextEncoder().encode(String.fromCharCode(code - 64)));
-            ctrlActiveRef.current = false;
-            clearCtrlRef.current?.();
-            return;
-          }
-        }
         ws.send(new TextEncoder().encode(data));
       });
     }
@@ -902,7 +878,9 @@ export function useTerminal(
     }
 
     // Touch swipe emits SGR mouse-wheel escape sequences to the PTY
-    // so tmux mouse-mode enters copy-mode and scrolls.
+    // so tmux mouse-mode enters copy-mode and scrolls. Direction follows
+    // direct manipulation: dragging the finger DOWN reveals older lines
+    // above (wheel-UP), dragging UP heads back toward live (wheel-DOWN).
     //
     // Track net wheel-UP depth so the client knows whether tmux is in
     // copy-mode and can pause/resume the pane's process accordingly.
@@ -912,14 +890,9 @@ export function useTerminal(
     // auto-exited via tmux's `-e` flag on desktop, or manually exited
     // via the "Back to live" button on mobile).
     //
-    // Mobile-only: clamp wheel-DOWN emissions so depth floors at 1,
-    // preventing tmux's `-e` auto-exit. On mobile the down-swipe
-    // overshoots easily and the snap-to-live discards the scroll
-    // position. Desktop keeps the unclamped behavior — scroll-down-past-
-    // bottom auto-exits, as users expect there.
-    //
-    // Pause/resume apply to BOTH platforms: claude's continued output
-    // shifts scrollback under the reader regardless of client size.
+    // Pause/resume: claude's continued output would shift scrollback
+    // under the reader, so entering copy-mode pauses the pane's process
+    // and tmux's `-e` auto-exit (scroll-down-past-bottom) resumes it.
     const wheelSeq = (dir: "up" | "down", cell: { col: number; row: number }) =>
       `\x1b[<${dir === "up" ? 64 : 65};${cell.col};${cell.row}M`;
     const wheelGrid = () => {
@@ -966,8 +939,7 @@ export function useTerminal(
       // scrollback inside the alt screen, so tmux copy-mode is never
       // engaged. Skip the depth tracking and the pause/resume dance.
       // Just emit raw wheel sequences and let Claude's renderer handle
-      // them. isInScrollback stays false; downstream UI (BackToLiveButton)
-      // hides itself accordingly.
+      // them. isInScrollback stays false accordingly.
       if (claudeFullscreenRef.current) {
         const seq = wheelSeq(dir, cell);
         for (let i = 0; i < count; i++) {
@@ -976,17 +948,11 @@ export function useTerminal(
         return;
       }
 
-      let sendCount = count;
-      const clampForMobile = isMobileViewport();
+      const sendCount = count;
       if (dir === "up") {
         scrollbackDepth += sendCount;
-      } else if (clampForMobile) {
-        const maxDown = Math.max(0, scrollbackDepth - 1);
-        sendCount = Math.min(sendCount, maxDown);
-        if (sendCount === 0) return;
-        scrollbackDepth -= sendCount;
       } else {
-        // Desktop: emit freely, let tmux's -e handle exit. Track depth
+        // Emit freely; tmux's -e auto-exits at the bottom. Track depth
         // so the resume transition fires when the user scrolls back.
         scrollbackDepth = Math.max(0, scrollbackDepth - sendCount);
       }
@@ -1004,10 +970,8 @@ export function useTerminal(
           return { ...prev, isInScrollback: true };
         });
       } else if (scrollbackDepth === 0) {
-        // Back at live on desktop (tmux auto-exited copy-mode via -e);
-        // resume the pane's process. On mobile this branch never fires
-        // because the clamp keeps depth >= 1; mobile exits via the
-        // explicit "Back to live" button (see exitScrollback).
+        // Back at live (tmux auto-exited copy-mode via -e); resume the
+        // pane's process.
         terminalSetState((prev) => {
           if (!prev.isInScrollback) return prev;
           if (ws.readyState === WebSocket.OPEN) {
@@ -1021,13 +985,6 @@ export function useTerminal(
         });
       }
     };
-    // Expose so exitScrollback can reset the depth in sync with the
-    // Escape sent to tmux.
-    const resetScrollbackDepth = () => {
-      scrollbackDepth = 0;
-    };
-    resetScrollbackDepthRef.current = resetScrollbackDepth;
-
     let touchMidY = 0;
     let touchAccum = 0;
     let lastMoveTs = 0;
@@ -1045,13 +1002,16 @@ export function useTerminal(
     let singleLastTs = 0;
     let suppressNextClick = false;
     const GESTURE_LOCK_PX = 12;
-    const LINES_PER_WHEEL = 2;
     const MAX_VELOCITY = 2.0;
     const MAX_WHEELS_PER_FRAME = 6;
     const clampV = (v: number) => Math.max(-MAX_VELOCITY, Math.min(MAX_VELOCITY, v));
     const currentFontSize = (): number =>
       typeof term.options.fontSize === "number" ? term.options.fontSize : DEFAULT_FONT_SIZE;
-    const pxPerWheel = () => currentFontSize() * 1.2 * LINES_PER_WHEEL;
+    // tmux's default copy-mode wheel binding scrolls 5 lines per wheel
+    // event, so one wheel must cost 5 lines of finger travel for the
+    // touch content to track the finger 1:1. The old value of 2 made
+    // the scrollback fly past at 2.5x finger speed.
+    const pxPerWheel = () => currentFontSize() * 1.2 * LINES_PER_WHEEL_EVENT;
     const prefersReducedMotion = () => window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
 
     const midpointY = (e: TouchEvent) => {
@@ -1116,7 +1076,6 @@ export function useTerminal(
         momentumRaf = null;
       }
     };
-    cancelMomentumRef.current = cancelMomentum;
 
     const onTouchStart = (e: TouchEvent) => {
       cancelMomentum();
@@ -1166,7 +1125,11 @@ export function useTerminal(
 
         e.preventDefault();
 
-        const dy = singleY - y;
+        // Direct manipulation: content follows the finger. Dragging DOWN
+        // (positive dy) reveals older lines above, which in tmux terms is
+        // wheel-UP. The previous `singleY - y` mapping was inverted
+        // relative to every native iOS scroll surface.
+        const dy = y - singleY;
         singleY = y;
         singleAccum += dy;
         const step = pxPerWheel();
@@ -1209,7 +1172,9 @@ export function useTerminal(
         return;
       }
 
-      const dy = touchMidY - y;
+      // Same direct-manipulation sign convention as the single-finger
+      // path above: midpoint moving DOWN scrolls into older content.
+      const dy = y - touchMidY;
       touchMidY = y;
       touchAccum += dy;
       const step = pxPerWheel();
@@ -1277,13 +1242,12 @@ export function useTerminal(
     viewport.addEventListener("touchend", onTouchEnd, touchOpts);
     viewport.addEventListener("touchcancel", onTouchEnd, touchOpts);
 
-    // On mobile, suppress ALL click-to-focus so the keyboard is only
-    // controlled via the FAB button. On desktop, only suppress after a
-    // scroll gesture.
+    // Suppress click-to-focus after a touch scroll gesture so releasing
+    // a swipe doesn't also focus the terminal.
     const onClickCapture = (e: MouseEvent) => {
       const wasScroll = suppressNextClick;
       suppressNextClick = false;
-      if (isMobileViewport() || wasScroll) e.stopPropagation();
+      if (wasScroll) e.stopPropagation();
     };
     viewport.addEventListener("click", onClickCapture, true);
 
@@ -1372,7 +1336,7 @@ export function useTerminal(
     // emission. Returning false from the custom handler tells xterm.js
     // to skip its own wheel processing.
     let wheelAccum = 0;
-    let scrollWheelAccum = 0;
+    const scrollWheel = new WheelAccumulator();
     let wheelPersistTimer: ReturnType<typeof setTimeout> | null = null;
     let lastCapturedWheelCell: { col: number; row: number } | null = null;
     const onWheelCapture = (e: WheelEvent) => {
@@ -1404,17 +1368,22 @@ export function useTerminal(
         return false;
       }
 
-      // Plain scroll: convert to SGR mouse-wheel sequences for tmux
-      scrollWheelAccum += e.deltaY;
-      const step = pxPerWheel();
-      const rawWheels = Math.trunc(scrollWheelAccum / step);
+      // Plain scroll: convert to SGR mouse-wheel sequences for tmux.
+      // The accumulator normalizes deltaMode (Firefox wheel mice report
+      // line deltas) and fires the first event after one line of travel
+      // so the response is immediate instead of behind a 5-line dead
+      // zone; see lib/wheelScroll.ts.
+      const rawWheels = scrollWheel.feed(
+        { deltaY: e.deltaY, deltaMode: e.deltaMode, timeStamp: e.timeStamp },
+        currentFontSize() * 1.2,
+        Math.max(1, term.rows),
+      );
       const wheels = Math.max(-MAX_WHEELS_PER_FRAME, Math.min(MAX_WHEELS_PER_FRAME, rawWheels));
       if (wheels !== 0) {
         const eventCell = cellFromClientPoint(e.clientX, e.clientY, e.currentTarget ?? e.target);
         const cell =
           eventCell.col === 1 && eventCell.row === 1 && lastCapturedWheelCell ? lastCapturedWheelCell : eventCell;
         sendWheel(wheels > 0 ? "down" : "up", Math.abs(wheels), cell);
-        scrollWheelAccum -= wheels * step;
       }
       return false;
     });
@@ -1491,9 +1460,6 @@ export function useTerminal(
       });
       window.removeEventListener("mouseup", onWindowMouseUp, { capture: true });
       viewport.removeEventListener("wheel", onWheelCapture, true);
-      xtermTextarea?.removeEventListener("beforeinput", onBeforeInput, {
-        capture: true,
-      });
       if (wheelPersistTimer) clearTimeout(wheelPersistTimer);
       if (resizeDebounceTimer) clearTimeout(resizeDebounceTimer);
       if (fontSizeRaf !== null) cancelAnimationFrame(fontSizeRaf);
@@ -1547,7 +1513,7 @@ export function useTerminal(
     const term = termRef.current;
     const fit = fitRef.current;
     if (!term) return;
-    const size = window.innerWidth < MOBILE_BREAKPOINT_PX ? settings.mobileFontSize : settings.desktopFontSize;
+    const size = settings.desktopFontSize;
     if (term.options.fontSize !== size) {
       term.options.fontSize = size;
       try {
@@ -1556,7 +1522,7 @@ export function useTerminal(
         // ignore
       }
     }
-  }, [settings.mobileFontSize, settings.desktopFontSize]);
+  }, [settings.desktopFontSize]);
 
   // Mirror state.isInScrollback into a ref so the resize callback can read
   // the latest value, and drain any pending deferred resize when the user
@@ -1613,51 +1579,18 @@ export function useTerminal(
     };
   });
 
-  const sendData = useCallback((data: string) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(new TextEncoder().encode(data));
-    }
-  }, []);
-
   const activate = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({ type: "activate" } as ActivateMessage));
     }
   }, []);
 
-  // Mobile-only: sends ESC to force tmux out of copy-mode. On mobile we
-  // clamp scroll-down so tmux never reaches the bottom on its own; the
-  // button is the only way back to live.
-  //
-  // Also sends `resume_output` so the server SIGCONTs the pane's
-  // process tree (which was paused on entry to scrollback). The server
-  // auto-resumes on disconnect as a safety net, so forgetting this is
-  // annoying but not permanent.
-  const exitScrollback = useCallback(() => {
-    // Cancel any in-flight momentum decay first. Otherwise a tap that
-    // lands while a fast flick is still emitting wheel-ups would let the
-    // next decay frame call sendWheel("up", ...), which re-sets
-    // isInScrollback: true and the button reappears.
-    cancelMomentumRef.current?.();
-    const ws = wsRef.current;
-    if (ws?.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "resume_output" } as ResumeOutputMessage));
-      ws.send(new TextEncoder().encode("\x1b"));
-    }
-    resetScrollbackDepthRef.current?.();
-    terminalSetState((prev) => (prev.isInScrollback ? { ...prev, isInScrollback: false } : prev));
-  }, [terminalSetState]);
-
   return {
     containerRef,
     termRef,
     state,
     manualReconnect,
-    sendData,
     activate,
-    exitScrollback,
-    ctrlActiveRef,
-    clearCtrlRef,
     maxRetries: MAX_RETRIES,
   };
 }

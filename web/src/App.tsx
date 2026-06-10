@@ -22,7 +22,6 @@ import { clearStoredComments, sweepOrphanComments } from "./components/diff/comm
 import { SendCommentsDialog } from "./components/diff/comments/SendCommentsDialog";
 import { useCommandActions } from "./hooks/useCommandActions";
 import { useEdgeSwipe } from "./hooks/useEdgeSwipe";
-import { useMobileKeyboard } from "./hooks/useMobileKeyboard";
 import { useIsCoarsePointer } from "./hooks/useIsCoarsePointer";
 import { useIsWideViewport } from "./hooks/useIsWideViewport";
 import type { RightPanelView } from "./lib/rightPanelView";
@@ -1052,30 +1051,11 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     );
   };
 
-  // Lock the root height to the latched max innerHeight on mobile. Without
-  // this, iOS PWA / iOS 26 Safari / Android Chrome shrink innerHeight
-  // (and therefore 100dvh) when the soft keyboard opens, which would move
-  // the terminal pane by the full keyboard height on its own. Pinning the
-  // root to the no-keyboard height makes occlusion padding in TerminalView
-  // the single thing that resizes the terminal, so the keyboard behaves the
-  // same way on every platform (and not double-shrink on the shrinking ones).
-  //
-  // Acp substrate doesn't host xterm.js, so the SIGWINCH concern
-  // doesn't apply; leaving the pin on for acp traps the composer
-  // below the keyboard on Android Chrome PWA (#1177). Drop the pin when
-  // the active session is acp so `h-dvh` plus the viewport meta's
-  // `interactive-widget=resizes-content` shrink the container with the
-  // keyboard and lift the composer back into view.
-  //
-  // Exception: when the single-pane paired shell is the active mobile view,
-  // an xterm.js terminal owns the viewport even on an acp session, so it
-  // needs the pin (plus the reservation in PairedTerminal) for the same
-  // reason the agent terminal does (#1452).
-  const { isMobile, stableViewportHeight } = useMobileKeyboard();
-  const pairedFullViewport = singlePane && rightPanelView === "paired";
-  const pinRootHeight =
-    isMobile && stableViewportHeight > 0 && (activeSession?.view !== "structured" || pairedFullViewport);
-  const rootStyle = pinRootHeight ? { height: `${stableViewportHeight}px` } : undefined;
+  // No root-height pin remains: every mobile terminal surface (agent,
+  // paired host, paired container) is the capture-snapshot live view
+  // now, with no PTY to protect from keyboard-driven layout shrink. The
+  // natural `100dvh` shrink keeps bottom-anchored UI above the keyboard
+  // everywhere (#1177, #1452 are fully superseded).
 
   const acpPrefs = useMemo(
     () => ({
@@ -1170,10 +1150,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
 
   return (
     <AcpPrefsProvider value={acpPrefs}>
-      <div
-        className="h-dvh flex flex-col bg-surface-900 text-text-primary overflow-hidden safe-area-inset"
-        style={rootStyle}
-      >
+      <div className="h-dvh flex flex-col bg-surface-900 text-text-primary overflow-hidden safe-area-inset">
         <TopBar
           activeWorkspace={activeWorkspace}
           activeSession={activeSession ?? null}

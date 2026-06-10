@@ -24,13 +24,13 @@ use axum::{
 /// reconnect banner" rather than burning the retry budget against a
 /// permanently broken pane. Picked from the application-reserved
 /// 4000-4999 range; not used elsewhere. See #1107.
-const CLOSE_CODE_PTY_DEAD: u16 = 4001;
+pub(crate) const CLOSE_CODE_PTY_DEAD: u16 = 4001;
 
 /// WebSocket close code 1001 ("going away"). Sent when the daemon is
 /// shutting down so the client can distinguish a server-side exit from
 /// a transient transport error and skip its reconnect backoff for one
 /// cycle. See #1198.
-const CLOSE_CODE_GOING_AWAY: u16 = 1001;
+pub(crate) const CLOSE_CODE_GOING_AWAY: u16 = 1001;
 
 /// WebSocket close code 1011 ("internal server error"). Sent on the
 /// OS-level early-return paths in `handle_terminal_ws` (openpty,
@@ -44,7 +44,7 @@ const CLOSE_CODE_INTERNAL_ERROR: u16 = 1011;
 /// retries on the fast-start ladder. Distinct from 1011 (internal
 /// server fault) and 4001 (permanently dead pane) so logs separate
 /// transient warm-up from genuine failure. See #1455.
-const CLOSE_CODE_TRY_AGAIN_LATER: u16 = 1013;
+pub(crate) const CLOSE_CODE_TRY_AGAIN_LATER: u16 = 1013;
 
 /// Total time we'll spend waiting for the tmux session + pane to be
 /// attachable before giving up and closing 1013. 2s covers tmux warm-up
@@ -141,7 +141,7 @@ pub async fn paired_terminal_ws(
 /// dead, kills and recreates the tmux session in a blocking task before
 /// returning. The instance's `terminal_info.created` flag is updated in
 /// the in-memory store on successful recreate.
-async fn respawn_paired_if_dead(
+pub(crate) async fn respawn_paired_if_dead(
     state: &Arc<AppState>,
     id: &str,
     inst: &crate::session::Instance,
@@ -260,7 +260,7 @@ pub async fn container_terminal_ws(
 }
 
 /// Container-terminal counterpart of [`respawn_paired_if_dead`].
-async fn respawn_container_if_dead(
+pub(crate) async fn respawn_container_if_dead(
     state: &Arc<AppState>,
     id: &str,
     inst: &crate::session::Instance,
@@ -353,6 +353,43 @@ pub async fn terminal_ws(
             (axum::http::StatusCode::NOT_FOUND, "Session not found").into_response()
         }
     }
+}
+
+/// Argv for the web attach: reset `window-size` to `latest`, hide the
+/// tmux status line, then attach, all in one tmux invocation (`;`
+/// separates commands).
+///
+/// The window-size reset matters because any detached resizer (the
+/// mobile live view's `resize-window`, the TUI preview sync) flips the
+/// option to `manual`, and a manual window ignores attached client
+/// sizes entirely: without the reset, a session last viewed from a
+/// phone stays pinned at the phone's grid when opened in a desktop
+/// browser (narrow content, unrendered bottom). The TUI attach path
+/// does the same reset via `reset_size_to_latest_client`.
+///
+/// The status line is hidden because the dashboard renders its own
+/// chrome, so the `Ctrl+b d to detach` footer is noise in every web
+/// view; the TUI/CLI attach paths re-assert their status-line
+/// preference via `apply_all_tmux_options`, so the hint survives where
+/// a real terminal renders it.
+fn attach_command_args(tmux_name: &str) -> Vec<String> {
+    vec![
+        "set-option".into(),
+        "-t".into(),
+        tmux_name.into(),
+        "window-size".into(),
+        "latest".into(),
+        ";".into(),
+        "set-option".into(),
+        "-t".into(),
+        tmux_name.into(),
+        "status".into(),
+        "off".into(),
+        ";".into(),
+        "attach-session".into(),
+        "-t".into(),
+        tmux_name.into(),
+    ]
 }
 
 /// Unique client ID counter for primary-client tracking.
@@ -473,7 +510,7 @@ async fn handle_terminal_ws(
     };
 
     let mut cmd = CommandBuilder::new("tmux");
-    cmd.args(["attach-session", "-t", &tmux_name]);
+    cmd.args(attach_command_args(&tmux_name));
     cmd.env("TERM", "xterm-256color");
     // Allow nesting: unset TMUX so the attach works when aoe serve runs inside tmux
     cmd.env_remove("TMUX");
@@ -1263,7 +1300,7 @@ async fn resize_pty(
 /// Send a Close frame on an early-return path that hasn't split the
 /// socket yet. The `let _ = ` discards send errors: if the peer is
 /// already gone the close frame is moot, and we're returning anyway.
-async fn close_early(socket: &mut WebSocket, code: u16, reason: &'static str) {
+pub(crate) async fn close_early(socket: &mut WebSocket, code: u16, reason: &'static str) {
     let _ = socket
         .send(Message::Close(Some(CloseFrame {
             code,
@@ -1277,7 +1314,7 @@ async fn close_early(socket: &mut WebSocket, code: u16, reason: &'static str) {
 /// interval; `Dead` short-circuits the wait when every pane is reported
 /// dead (no point in polling further).
 #[derive(Debug, PartialEq, Eq)]
-enum PaneReadiness {
+pub(crate) enum PaneReadiness {
     Ready,
     NotReady,
     Dead,
@@ -1310,7 +1347,7 @@ fn parse_pane_dead_output(output: &str) -> PaneReadiness {
 /// dead pane (`Dead` -> 4001 short-circuit). Bails out early on `Dead`
 /// rather than polling further because no amount of waiting will make
 /// an exited pane reattachable.
-async fn wait_for_tmux_ready(tmux_name: &str) -> PaneReadiness {
+pub(crate) async fn wait_for_tmux_ready(tmux_name: &str) -> PaneReadiness {
     let deadline = Instant::now() + TMUX_READY_TIMEOUT;
     loop {
         match probe_tmux_readiness(tmux_name).await {
@@ -1409,6 +1446,19 @@ mod tests {
 
     fn make_primaries() -> SessionPrimaries {
         Arc::new(RwLock::new(std::collections::HashMap::new()))
+    }
+
+    #[test]
+    fn attach_args_reset_window_size_and_hide_status_before_attaching() {
+        let args = attach_command_args("aoe_x_1");
+        let chunks: Vec<&[String]> = args.split(|a| a == ";").collect();
+        assert_eq!(chunks.len(), 3, "three chained tmux commands");
+        assert_eq!(
+            chunks[0],
+            ["set-option", "-t", "aoe_x_1", "window-size", "latest"]
+        );
+        assert_eq!(chunks[1], ["set-option", "-t", "aoe_x_1", "status", "off"]);
+        assert_eq!(chunks[2], ["attach-session", "-t", "aoe_x_1"]);
     }
 
     #[tokio::test]

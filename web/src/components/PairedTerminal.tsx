@@ -1,9 +1,8 @@
-import { useCallback, useEffect, useLayoutEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useTerminal } from "../hooks/useTerminal";
-import { useMobileKeyboard } from "../hooks/useMobileKeyboard";
-import { MobileTerminalToolbar } from "./MobileTerminalToolbar";
-import { BackToLiveButton } from "./BackToLiveButton";
-import { KeyboardFab } from "./KeyboardFab";
+import { useIsCoarsePointer } from "../hooks/useIsCoarsePointer";
+import { LiveTerminalView } from "./LiveTerminalView";
+import { TerminalConnectionBanners } from "./TerminalConnectionBanners";
 import { ensureTerminal } from "../lib/api";
 import type { SessionResponse } from "../lib/types";
 import {
@@ -16,40 +15,17 @@ import "@xterm/xterm/css/xterm.css";
 
 type ShellMode = "host" | "container";
 
-/** The paired (side-shell) xterm.js terminal.
- *
- *  `fullViewport` switches the keyboard-padding posture. In the desktop
- *  split this terminal owns only half of an already-capped panel, so it
- *  pads by the live `keyboardHeight` (and on desktop that is always 0).
- *  When promoted to the single full-viewport mobile pane it owns the
- *  whole viewport, so it pads by `keyboardOcclusion`, the same value the
- *  agent `TerminalView` uses; padding by the live height there would
- *  collapse the grid on every keyboard show/hide. See #1452. */
-function PairedTerminal({
-  sessionId,
-  mode,
-  fullViewport = false,
-}: {
-  sessionId: string;
-  mode: ShellMode;
-  fullViewport?: boolean;
-}) {
+/** The paired (side-shell) xterm.js terminal, desktop only: touch
+ *  devices render the capture-snapshot LiveTerminalView instead (see
+ *  PairedShellPane), so this component carries no mobile machinery. */
+function PairedTerminal({ sessionId, mode }: { sessionId: string; mode: ShellMode }) {
   const [ready, setReady] = useState(false);
   const wsPath = mode === "container" ? "container-terminal/ws" : "terminal/ws";
-  const {
-    containerRef,
-    termRef,
-    state,
-    manualReconnect,
-    sendData,
-    activate,
-    exitScrollback,
-    ctrlActiveRef,
-    clearCtrlRef,
-    maxRetries,
-  } = useTerminal(ready ? sessionId : null, wsPath, false);
-  const { isMobile, keyboardOpen, keyboardHeight, keyboardOcclusion } = useMobileKeyboard();
-  const [ctrlActive, setCtrlActive] = useState(false);
+  const { containerRef, termRef, state, manualReconnect, activate, maxRetries } = useTerminal(
+    ready ? sessionId : null,
+    wsPath,
+    false,
+  );
   const [termFocused, setTermFocused] = useState(false);
   const [bootError, setBootError] = useState(false);
   const [bootAttempt, setBootAttempt] = useState(0);
@@ -71,15 +47,6 @@ function PairedTerminal({
     setReady(false);
     setBootError(false);
   }
-
-  // See TerminalView.tsx for why these syncs live in effects rather
-  // than running during render.
-  useEffect(() => {
-    ctrlActiveRef.current = ctrlActive;
-  });
-  useEffect(() => {
-    clearCtrlRef.current = () => setCtrlActive(false);
-  }, [clearCtrlRef]);
 
   useEffect(() => {
     let cancelled = false;
@@ -107,28 +74,6 @@ function PairedTerminal({
     if (!ready) return;
     if (consumePendingTerminalFocus("paired")) focusSelf();
   }, [ready, focusSelf]);
-
-  // Dispatch a window resize after keyboard transitions so anything else
-  // watching layout is nudged; the hook's ResizeObserver already refits
-  // the terminal grid automatically.
-  useLayoutEffect(() => {
-    const t = setTimeout(() => {
-      window.dispatchEvent(new Event("resize"));
-    }, 150);
-    return () => clearTimeout(t);
-  }, [keyboardHeight, keyboardOpen]);
-
-  const toggleKeyboard = useCallback(() => {
-    const term = termRef.current;
-    if (!term?.element) return;
-    const ta = term.element.querySelector("textarea");
-    if (keyboardOpen) {
-      ta?.blur();
-    } else if (ta instanceof HTMLElement) {
-      ta.focus();
-    }
-    activate();
-  }, [termRef, keyboardOpen, activate]);
 
   // Returns true if focus was applied. Callers can fall back to the pending
   // latch when the textarea isn't in the DOM yet (PTY still booting).
@@ -171,28 +116,16 @@ function PairedTerminal({
     );
   }
 
-  const appliedKeyboardPadding = fullViewport ? keyboardOcclusion : keyboardHeight;
-  const rootStyle = {
-    paddingBottom: appliedKeyboardPadding > 0 ? appliedKeyboardPadding : undefined,
-  } as const;
-
   return (
-    <div className="flex-1 flex flex-col min-h-0 overflow-hidden md:bg-surface-800" style={rootStyle}>
-      {!state.connected && state.reconnecting && (
-        <div className="bg-status-waiting/15 border-b border-status-waiting/30 px-3 py-1 shrink-0">
-          <span className="text-xs text-status-waiting">
-            Reconnecting... ({state.retryCount}/{maxRetries})
-          </span>
-        </div>
-      )}
-      {!state.connected && !state.reconnecting && state.retryCount >= maxRetries && (
-        <div className="bg-status-error/10 border-b border-status-error/30 px-3 py-1 flex items-center gap-2 shrink-0">
-          <span className="text-xs text-status-error">Disconnected</span>
-          <button onClick={manualReconnect} className="text-xs text-brand-500 cursor-pointer underline">
-            Retry
-          </button>
-        </div>
-      )}
+    <div className="flex-1 flex flex-col min-h-0 overflow-hidden md:bg-surface-800">
+      <TerminalConnectionBanners
+        connected={state.connected}
+        reconnecting={state.reconnecting}
+        retryCount={state.retryCount}
+        retryCountdown={state.retryCountdown}
+        maxRetries={maxRetries}
+        onRetry={manualReconnect}
+      />
       <div
         data-term="paired"
         className={`flex-1 overflow-hidden bg-surface-950 relative md:rounded-lg term-panel${termFocused ? " term-focused" : ""}`}
@@ -200,20 +133,7 @@ function PairedTerminal({
         onBlur={() => setTermFocused(false)}
       >
         <div ref={containerRef} className="absolute inset-0" onPointerDown={activate} />
-
-        {isMobile && state.isInScrollback && <BackToLiveButton onClick={exitScrollback} topOffset="top-2" />}
-
-        {isMobile && state.connected && <KeyboardFab keyboardOpen={keyboardOpen} onToggle={toggleKeyboard} />}
       </div>
-      {isMobile && state.connected && (
-        <MobileTerminalToolbar
-          sendData={sendData}
-          termRef={termRef}
-          keyboardOpen={keyboardOpen}
-          ctrlActive={ctrlActive}
-          onCtrlToggle={() => setCtrlActive((v) => !v)}
-        />
-      )}
     </div>
   );
 }
@@ -221,17 +141,12 @@ function PairedTerminal({
 /** Host/container shell switch plus the paired terminal. Used both in the
  *  desktop right-panel split (`fullViewport={false}`) and as the promoted
  *  single full-viewport mobile pane (`fullViewport`). */
-export function PairedShellPane({
-  session,
-  sessionId,
-  fullViewport = false,
-}: {
-  session: SessionResponse | null;
-  sessionId: string | null;
-  fullViewport?: boolean;
-}) {
+export function PairedShellPane({ session, sessionId }: { session: SessionResponse | null; sessionId: string | null }) {
   const [shellMode, setShellMode] = useState<ShellMode>("host");
   const isSandboxed = session?.is_sandboxed ?? false;
+  // Touch devices get the capture-snapshot live view (same architecture
+  // as the agent pane); fine pointers keep the xterm PTY relay.
+  const coarse = useIsCoarsePointer();
 
   return (
     <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
@@ -258,12 +173,15 @@ export function PairedShellPane({
       </div>
 
       {sessionId ? (
-        <PairedTerminal
-          key={`${sessionId}-${shellMode}`}
-          sessionId={sessionId}
-          mode={shellMode}
-          fullViewport={fullViewport}
-        />
+        coarse && session ? (
+          <LiveTerminalView
+            key={`${sessionId}-${shellMode}`}
+            session={session}
+            surface={shellMode === "container" ? "paired-container" : "paired-host"}
+          />
+        ) : (
+          <PairedTerminal key={`${sessionId}-${shellMode}`} sessionId={sessionId} mode={shellMode} />
+        )
       ) : (
         <div className="flex-1 flex items-center justify-center bg-surface-950 text-text-dim">
           <p className="text-xs">Select a session</p>

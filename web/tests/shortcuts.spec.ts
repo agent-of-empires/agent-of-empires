@@ -23,6 +23,17 @@ import { mockTerminalApis } from "./helpers/terminal-mocks";
 // asynchronous refocus on a slow runner, so re-blur on every attempt
 // until body actually holds focus.
 async function blurToBody(page: Page) {
+  // xterm autofocuses its textarea when the WS connects (async, after
+  // mount), so a blur that runs before that one-shot lands gets undone
+  // and the shortcut keystroke types into the terminal instead. Wait
+  // out the autofocus (soft timeout: it may have fired already), THEN
+  // blur until body holds focus.
+  const deadline = Date.now() + 1_500;
+  while (Date.now() < deadline) {
+    const tag = await page.evaluate(() => document.activeElement?.tagName ?? null);
+    if (tag === "TEXTAREA") break;
+    await page.waitForTimeout(50);
+  }
   await expect
     .poll(() =>
       page.evaluate(() => {

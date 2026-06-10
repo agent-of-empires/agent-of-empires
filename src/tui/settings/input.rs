@@ -25,6 +25,7 @@ impl SettingsView {
     pub fn handle_key(&mut self, key: KeyEvent) -> SettingsAction {
         // Clear transient messages on any key
         self.success_message = None;
+        self.success_message_expires_at = None;
         // Any keypress invalidates the mouse hover highlight; otherwise
         // a stationary cursor keeps highlighting an unrelated row while
         // the keyboard cursor moves elsewhere. Mirrors the sidebar's
@@ -641,7 +642,7 @@ impl SettingsView {
             ));
         }
 
-        self.has_changes = true;
+        self.recompute_dirty();
     }
 
     /// Force close without saving
@@ -665,7 +666,7 @@ impl SettingsView {
             .as_ref()
             .map(crate::session::repo_config_to_profile)
             .unwrap_or_default();
-        self.has_changes = false;
+        self.snapshot_baseline();
         self.rebuild_fields();
         Ok(())
     }

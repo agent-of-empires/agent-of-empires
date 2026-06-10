@@ -124,7 +124,7 @@ export function MobileMainPane({
 
         {pairedMounted && (
           <div className={layerClass(view === "paired")} inert={view !== "paired"}>
-            <PairedShellPane session={activeSession} sessionId={activeSessionId} fullViewport />
+            <PairedShellPane session={activeSession} sessionId={activeSessionId} />
           </div>
         )}
 

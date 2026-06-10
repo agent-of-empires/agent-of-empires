@@ -1,41 +1,31 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 
-// Detects touch-primary devices and tracks soft-keyboard state via visualViewport.
-// isMobile is used to decide whether the mobile toolbar renders at all.
+// Tracks soft-keyboard state on touch devices via visualViewport.
 //
-// keyboardOpen flips as soon as the visual viewport is occluded enough to be
-// a keyboard (not a URL bar nudge). It drives icon/affordance state and is
-// allowed to update live; it does not by itself resize the main terminal.
+// keyboardOpen flips as soon as the visual viewport is occluded enough to
+// be a keyboard (not a URL bar nudge). The structured-view composer uses
+// it for layout posture. (Terminal surfaces derive their open/closed
+// state from input focus instead, which is exact.)
 //
-// keyboardHeight is the extra padding needed to keep content above the keyboard
-// for iOS regular Safari (where the layout viewport doesn't shrink); it stays
-// 0 on iOS PWA and iOS 26 Safari, where innerHeight shrinks with the keyboard
-// and the flex layout would already account for it. RightPanel's paired
-// terminal uses this live value directly.
+// keyboardHeight is the bottom inset needed to keep content above the
+// keyboard on iOS regular Safari, the one platform where the layout
+// viewport does not shrink with the keyboard; it stays 0 on iOS PWA /
+// iOS 26 Safari / Android Chrome, where `100dvh` shrinks natively and
+// the flex layout already accounts for it.
 //
-// keyboardOcclusion is the live, cross-platform height the soft keyboard is
-// covering: stableFullHeight - visualViewport.height. It is the value the main
-// TerminalView pads its layout by so the terminal pane shrinks while the
-// keyboard is up and grows back when it dismisses. Unlike keyboardHeight, it
-// stays correct on iOS PWA / iOS 26 Safari / Android Chrome, where innerHeight
-// shrinks WITH the keyboard. The commit is debounced so the ~300ms keyboard
-// animation, which ramps the occlusion frame by frame, produces a single PTY
-// resize per open/close instead of a storm.
+// measure() also snaps back any stray layout-viewport scroll: iOS
+// scrolls the page to reveal a focused input even under overflow:hidden
+// roots, and nothing else ever scrolls the layout viewport.
 //
-// stableViewportHeight is the largest window.innerHeight seen since the last
-// orientation change. On iOS PWA / iOS 26 Safari / Android Chrome, innerHeight
-// shrinks when the keyboard opens and the App root's `100dvh` would shrink
-// with it; the App root applies this as an explicit pixel height instead so
-// the layout stays at the no-keyboard size and occlusion padding (not a
-// shrinking root) is what moves the terminal. Reset on orientation change.
-const OCCLUSION_COMMIT_DEBOUNCE_MS = 150;
+// The PTY-era machinery (debounced keyboardOcclusion, the
+// stableViewportHeight root pin) is gone: every mobile terminal surface
+// renders the capture-snapshot live view now, so no PTY needs shielding
+// from keyboard-driven layout changes.
 
 interface MobileKeyboardSnapshot {
   isMobile: boolean;
   keyboardOpen: boolean;
   keyboardHeight: number;
-  keyboardOcclusion: number;
-  stableViewportHeight: number;
 }
 
 function createKeyboardStore() {
@@ -44,8 +34,6 @@ function createKeyboardStore() {
     isMobile: initialIsMobile,
     keyboardOpen: false,
     keyboardHeight: 0,
-    keyboardOcclusion: 0,
-    stableViewportHeight: 0,
   };
   const listeners = new Set<() => void>();
   return {
@@ -70,8 +58,6 @@ export function useMobileKeyboard() {
   const rafRef = useRef(0);
   const stableCountRef = useRef(0);
   const lastOcclusionRef = useRef(0);
-  const committedOcclusionRef = useRef(0);
-  const commitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const fullHeightRef = useRef(0);
 
   useEffect(() => {
@@ -87,8 +73,6 @@ export function useMobileKeyboard() {
           isMobile: false,
           keyboardOpen: false,
           keyboardHeight: 0,
-          keyboardOcclusion: 0,
-          stableViewportHeight: 0,
         });
       }
     };
@@ -109,16 +93,18 @@ export function useMobileKeyboard() {
     const safeBottom =
       parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--safe-area-bottom")) || 0;
 
-    const scheduleOcclusionCommit = (target: number) => {
-      if (target === committedOcclusionRef.current) return;
-      if (commitTimerRef.current) clearTimeout(commitTimerRef.current);
-      commitTimerRef.current = setTimeout(() => {
-        committedOcclusionRef.current = target;
-        store.update({ keyboardOcclusion: target });
-      }, OCCLUSION_COMMIT_DEBOUNCE_MS);
-    };
-
     const measure = () => {
+      // iOS scrolls the layout viewport to reveal a focused input even
+      // though the app root is overflow:hidden (the xterm helper
+      // textarea rides the terminal cursor near the bottom of the pane,
+      // so opening the keyboard shoves the whole app up by roughly the
+      // keyboard height and it never comes back). The app never scrolls
+      // the layout viewport itself, so any non-zero scroll here is
+      // WebKit's doing; snap it back so occlusion padding stays the only
+      // thing that moves the terminal.
+      if (window.scrollY !== 0 || document.documentElement.scrollTop !== 0) {
+        window.scrollTo(0, 0);
+      }
       const currentVvH = vv.height;
 
       if (currentVvH > fullHeightRef.current - 50) {
@@ -137,12 +123,6 @@ export function useMobileKeyboard() {
         store.update({ keyboardOpen: open, keyboardHeight: padding });
       }
 
-      scheduleOcclusionCommit(open ? Math.max(0, totalOcclusion) : 0);
-
-      const heightCandidate = Math.max(window.innerHeight, currentVvH);
-      if (heightCandidate > store.getSnapshot().stableViewportHeight) {
-        store.update({ stableViewportHeight: heightCandidate });
-      }
       return totalOcclusion;
     };
 
@@ -183,10 +163,6 @@ export function useMobileKeyboard() {
     let orientTimer: ReturnType<typeof setTimeout> | null = null;
     const handleOrientationChange = () => {
       fullHeightRef.current = 0;
-      store.update({ stableViewportHeight: 0 });
-      if (commitTimerRef.current) clearTimeout(commitTimerRef.current);
-      committedOcclusionRef.current = 0;
-      store.update({ keyboardOcclusion: 0 });
       if (orientTimer) clearTimeout(orientTimer);
       orientTimer = setTimeout(() => {
         fullHeightRef.current = Math.max(window.innerHeight, vv.height);
@@ -199,14 +175,19 @@ export function useMobileKeyboard() {
     vv.addEventListener("scroll", handleViewportChange);
     document.addEventListener("focusin", handleFocusIn);
     window.addEventListener("orientationchange", handleOrientationChange);
+    // WebKit's focus-driven layout-viewport scroll does not always move
+    // the visual viewport relative to the layout viewport, so the vv
+    // "scroll" listener alone can miss it; the window scroll event is
+    // the reliable signal for the snap-back in measure().
+    window.addEventListener("scroll", handleViewportChange);
     return () => {
       cancelAnimationFrame(rafRef.current);
       if (orientTimer) clearTimeout(orientTimer);
-      if (commitTimerRef.current) clearTimeout(commitTimerRef.current);
       vv.removeEventListener("resize", handleViewportChange);
       vv.removeEventListener("scroll", handleViewportChange);
       document.removeEventListener("focusin", handleFocusIn);
       window.removeEventListener("orientationchange", handleOrientationChange);
+      window.removeEventListener("scroll", handleViewportChange);
     };
   }, [state.isMobile, store]);
 
@@ -214,7 +195,5 @@ export function useMobileKeyboard() {
     isMobile: state.isMobile,
     keyboardOpen: state.keyboardOpen,
     keyboardHeight: state.keyboardHeight,
-    keyboardOcclusion: state.keyboardOcclusion,
-    stableViewportHeight: state.stableViewportHeight,
   };
 }

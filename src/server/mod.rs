@@ -9,6 +9,7 @@ pub mod acp_reconciler;
 pub mod acp_ws;
 pub mod api;
 pub mod auth;
+pub mod live_ws;
 pub mod login;
 pub mod push;
 pub mod push_send;
@@ -1495,6 +1496,15 @@ fn build_router(state: Arc<AppState>) -> Router {
         )
         // Terminal WebSockets
         .route("/sessions/{id}/ws", get(ws::terminal_ws))
+        .route("/sessions/{id}/live-ws", get(live_ws::live_terminal_ws))
+        .route(
+            "/sessions/{id}/terminal/live-ws",
+            get(live_ws::live_paired_terminal_ws),
+        )
+        .route(
+            "/sessions/{id}/container-terminal/live-ws",
+            get(live_ws::live_container_terminal_ws),
+        )
         .route("/sessions/{id}/terminal/ws", get(ws::paired_terminal_ws))
         .route(
             "/sessions/{id}/container-terminal/ws",

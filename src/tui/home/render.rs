@@ -1600,12 +1600,12 @@ impl HomeView {
         }
 
         // Cold-start / fallback capture via the fork-based path
-        // (`Session::capture_pane_with_size` via the instance helper). The
+        // (`Session::capture_pane` via the instance helper). The
         // 250ms gate in `refresh_preview_cache_core` keeps this from forking
         // every frame; in steady state the worker above satisfies the render.
         //
         // Live vs. non-live failure semantics differ. In live mode an empty
-        // capture (which is what `Session::capture_pane_with_size` returns when
+        // capture (which is what `Session::capture_pane` returns when
         // the session is gone OR tmux had a transient hiccup) preserves the
         // last-known-good capture so the preview doesn't flash blank (the
         // kill-switch behavior introduced in #1501). The capture closure
@@ -1632,10 +1632,9 @@ impl HomeView {
                 // always overwrite, falling back to an empty body (the same
                 // "session looks gone" signal the non-live path uses).
                 let same_session = s.preview_cache.session_id.as_deref() == Some(id);
-                let fork_capture = s.get_instance(id).and_then(|inst| {
-                    inst.capture_output_with_size(capture_lines, width, height)
-                        .ok()
-                });
+                let fork_capture = s
+                    .get_instance(id)
+                    .and_then(|inst| inst.capture_output(capture_lines).ok());
                 if in_live {
                     match fork_capture {
                         Some(content) if !content.is_empty() => Some(content),
@@ -2880,6 +2879,8 @@ mod tests {
             y,
             visible,
             pane_height,
+            history_size: 0,
+            pane_width: 0,
         }
     }
 

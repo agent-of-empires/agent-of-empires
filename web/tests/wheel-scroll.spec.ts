@@ -90,8 +90,10 @@ test.describe("Terminal mouse-wheel scroll (desktop)", () => {
     handle.wsMessages.length = 0;
 
     // deltaY > 0 = scroll down. Fire enough events to exceed pxPerWheel
-    // threshold (fontSize 14 * LINES_PER_WHEEL 2 = 28px per wheel tick).
-    // deltaY=120 is a typical single mouse wheel notch on most browsers.
+    // threshold (fontSize 14 * 1.2 * LINES_PER_WHEEL 5 = 84px per wheel
+    // tick). deltaY=120 is a typical single mouse wheel notch on most
+    // browsers, so one notch lands one wheel (5 tmux lines), matching
+    // native terminals.
     await fireUntil(page, { deltaY: 120, times: 3 }, () => countSeq(handle, WHEEL_DOWN_SEQ) > 0);
     expect(countSeq(handle, WHEEL_UP_SEQ)).toBe(0);
   });

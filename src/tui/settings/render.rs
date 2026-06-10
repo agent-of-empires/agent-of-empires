@@ -426,13 +426,10 @@ impl SettingsView {
             0u16
         };
 
-        // Reserve space for messages at the bottom
-        let has_message = self.error_message.is_some() || self.success_message.is_some();
-        let message_height: u16 = if has_message { 2 } else { 0 };
-        let fields_viewport_height = inner
-            .height
-            .saturating_sub(message_height)
-            .saturating_sub(warning_offset);
+        // Status messages render in the footer status row (see
+        // `render_footer`), not over the fields, so the fields panel keeps its
+        // full height and nothing has to be reserved here.
+        let fields_viewport_height = inner.height.saturating_sub(warning_offset);
         self.fields_viewport_height = fields_viewport_height;
 
         // Calculate total content height
@@ -518,27 +515,6 @@ impl SettingsView {
                 &mut scrollbar_state,
             );
         }
-
-        // Render messages at the bottom if present
-        if let Some(ref error) = self.error_message {
-            let msg_area = Rect {
-                x: inner.x,
-                y: inner.y + inner.height.saturating_sub(2),
-                width: inner.width,
-                height: 1,
-            };
-            let msg = Paragraph::new(error.as_str()).style(Style::default().fg(theme.error));
-            frame.render_widget(msg, msg_area);
-        } else if let Some(ref success) = self.success_message {
-            let msg_area = Rect {
-                x: inner.x,
-                y: inner.y + inner.height.saturating_sub(2),
-                width: inner.width,
-                height: 1,
-            };
-            let msg = Paragraph::new(success.as_str()).style(Style::default().fg(theme.running));
-            frame.render_widget(msg, msg_area);
-        }
     }
 
     pub(super) fn field_height(&self, field: &super::SettingField, index: usize) -> u16 {
@@ -593,17 +569,27 @@ impl SettingsView {
             frame.render_widget(Paragraph::new(heading), area);
             if !field.description.is_empty() {
                 let wrapped = wrap_description_lines(&field.description, area.width);
-                let subtitle_area = Rect {
-                    x: area.x,
-                    y: area.y + 1,
-                    width: area.width,
-                    height: wrapped.len() as u16,
-                };
-                let lines: Vec<Line> = wrapped
-                    .into_iter()
-                    .map(|line| Line::from(Span::styled(line, Style::default().fg(theme.dimmed))))
-                    .collect();
-                frame.render_widget(Paragraph::new(lines), subtitle_area);
+                // Clamp the subtitle to the slice of `area` left below the
+                // heading. When the header sits at the bottom of the viewport
+                // `area` is clipped to fewer rows than the header's natural
+                // height, and an unclamped subtitle would paint past the panel,
+                // over its bottom border (issue #2083).
+                let subtitle_height = (wrapped.len() as u16).min(area.height.saturating_sub(1));
+                if subtitle_height > 0 {
+                    let subtitle_area = Rect {
+                        x: area.x,
+                        y: area.y + 1,
+                        width: area.width,
+                        height: subtitle_height,
+                    };
+                    let lines: Vec<Line> = wrapped
+                        .into_iter()
+                        .map(|line| {
+                            Line::from(Span::styled(line, Style::default().fg(theme.dimmed)))
+                        })
+                        .collect();
+                    frame.render_widget(Paragraph::new(lines), subtitle_area);
+                }
             }
             return;
         }
@@ -636,23 +622,37 @@ impl SettingsView {
 
         frame.render_widget(Paragraph::new(label), area);
 
+        // `area` is clipped to the field's visible slice when the field sits at
+        // the bottom of the viewport. Bound the description and value to that
+        // slice so neither bleeds past the panel, over its bottom border or
+        // into the footer below (issue #2083).
         let wrapped_desc = wrap_description_lines(&field.description, area.width);
         let desc_height = wrapped_desc.len() as u16;
-        let description_area = Rect {
-            x: area.x,
-            y: area.y + 1,
-            width: area.width,
-            height: desc_height,
-        };
-        let desc_lines: Vec<Line> = wrapped_desc
-            .into_iter()
-            .map(|line| Line::from(Span::styled(line, Style::default().fg(theme.dimmed))))
-            .collect();
-        frame.render_widget(Paragraph::new(desc_lines), description_area);
+        let desc_visible = desc_height.min(area.height.saturating_sub(1));
+        if desc_visible > 0 {
+            let description_area = Rect {
+                x: area.x,
+                y: area.y + 1,
+                width: area.width,
+                height: desc_visible,
+            };
+            let desc_lines: Vec<Line> = wrapped_desc
+                .into_iter()
+                .map(|line| Line::from(Span::styled(line, Style::default().fg(theme.dimmed))))
+                .collect();
+            frame.render_widget(Paragraph::new(desc_lines), description_area);
+        }
 
         // Inner value renderers paint at `value_area.y + 1`, so shift
         // by the wrapped description height to keep the value aligned
-        // directly under the (potentially multi-line) description.
+        // directly under the (potentially multi-line) description. Skip the
+        // value entirely when that row falls outside the clipped slice rather
+        // than letting it spill past the field. The value occupies the row at
+        // `desc_height + 1` within the field, so it fits only when the clipped
+        // height leaves room for it.
+        if desc_height.saturating_add(1) >= area.height {
+            return;
+        }
         let value_area = Rect {
             y: area.y + desc_height,
             ..area
@@ -1106,9 +1106,40 @@ impl SettingsView {
             s
         };
 
+        // Key hints sit on the first footer row, exactly where they were.
+        let help_area = Rect { height: 1, ..inner };
         let help = Paragraph::new(Line::from(spans)).alignment(ratatui::layout::Alignment::Center);
+        frame.render_widget(help, help_area);
 
-        frame.render_widget(help, inner);
+        // The save/error status renders on its own footer row below the hints
+        // (the dashboard's hints-then-bar ordering), so it can never collide
+        // with field content the way the old in-panel message did (issue
+        // #2083). Only the message text is coloured; errors are red and stick
+        // until the next keypress, the "Settings saved" toast is green and
+        // auto-dismisses (see `tick_status`).
+        if inner.height > 1 {
+            let status = self
+                .error_message
+                .as_deref()
+                .map(|text| (text, theme.error))
+                .or_else(|| {
+                    self.success_message
+                        .as_deref()
+                        .map(|text| (text, theme.running))
+                });
+            if let Some((text, color)) = status {
+                let status_area = Rect {
+                    y: inner.y + 1,
+                    height: 1,
+                    ..inner
+                };
+                let line = Line::from(vec![
+                    Span::raw(" "),
+                    Span::styled(text.to_string(), Style::default().fg(color)),
+                ]);
+                frame.render_widget(Paragraph::new(line), status_area);
+            }
+        }
     }
 
     fn render_help_overlay(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
@@ -1512,5 +1543,254 @@ mod field_height_tests {
 
         view.fields_content_width = 12;
         assert_eq!(view.field_height(&header, 0), 3);
+    }
+}
+
+#[cfg(test)]
+mod status_message_tests {
+    use super::super::fields::FieldKind;
+    use super::super::{FieldValue, SettingField, SettingsCategory, SettingsScope, SettingsView};
+    use crate::session::settings_schema::{ValidationKind, WidgetKind};
+    use crate::session::Storage;
+    use crate::tui::styles::load_theme;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::Terminal;
+    use serial_test::serial;
+    use std::time::{Duration, Instant};
+    use tempfile::TempDir;
+
+    fn fresh_view() -> (TempDir, SettingsView) {
+        let temp = TempDir::new().unwrap();
+        std::env::set_var("HOME", temp.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _ = Storage::new_unwatched("test").unwrap();
+        let view = SettingsView::new("test", None).unwrap();
+        (temp, view)
+    }
+
+    fn row_text(buf: &Buffer, y: u16) -> String {
+        let area = *buf.area();
+        (area.x..area.x + area.width)
+            .map(|x| buf[(x, y)].symbol())
+            .collect()
+    }
+
+    fn buffer_text(buf: &Buffer) -> String {
+        (0..buf.area().height)
+            .map(|y| row_text(buf, y))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn bool_field(label: &str, desc: &str) -> SettingField {
+        SettingField {
+            kind: FieldKind::HostEnvironment,
+            label: label.to_string(),
+            description: desc.to_string(),
+            value: FieldValue::Bool(false),
+            category: SettingsCategory::Sandbox,
+            has_override: false,
+            inherited_display: None,
+        }
+    }
+
+    /// A field clipped to a partial row at the bottom of the fields panel must
+    /// not paint its description or value past the panel, over its bottom
+    /// border or into the footer below it (issue #2083). The status message no
+    /// longer lives in the panel, so the only thing that can spill is field
+    /// content, and the clamps must stop it.
+    #[test]
+    #[serial]
+    fn clipped_bottom_field_does_not_spill_below_panel() {
+        let (_temp, mut view) = fresh_view();
+        let theme = load_theme("empire");
+
+        // FieldA fits fully; FieldB lands at the bottom clipped to ~2 rows even
+        // though its wrapped description plus value need five. Its value
+        // ("SPILLVALUE") and the lower description lines would, before the fix,
+        // paint over the panel's bottom border and onto the blank rows beneath.
+        view.fields = vec![
+            bool_field("FieldA", "alpha"),
+            SettingField {
+                value: FieldValue::Text("SPILLVALUE".to_string()),
+                ..bool_field(
+                    "FieldB",
+                    "WRAPTOKEN alpha bravo charlie delta echo foxtrot golf hotel india juliet",
+                )
+            },
+        ];
+        view.fields_scroll_offset = 0;
+
+        // 8-row panel inside a 12-row buffer: rows 8..11 sit below the panel, so
+        // any spill is visible (not clipped off-screen) and readable.
+        let area = Rect::new(0, 0, 30, 8);
+        let mut terminal = Terminal::new(TestBackend::new(30, 12)).unwrap();
+        terminal
+            .draw(|f| view.render_fields(f, area, &theme))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+
+        let all = buffer_text(&buf);
+        assert!(
+            all.contains("FieldB"),
+            "the clipped field's label should still render, got:\n{all}"
+        );
+        assert!(
+            !all.contains("SPILLVALUE"),
+            "the clipped field's value must not render past its slice, got:\n{all}"
+        );
+        // The panel's bottom border row (y = 7) must stay border-only; before
+        // the fix a wrapped description line painted letters over it.
+        let border_row = row_text(&buf, 7);
+        assert!(
+            !border_row.chars().any(|c| c.is_ascii_alphabetic()),
+            "field text must not overwrite the panel's bottom border, got {border_row:?}"
+        );
+    }
+
+    /// The save/error status renders on its own footer row beneath the key
+    /// hints, colouring only its text, so it never collides with field content
+    /// (issue #2083).
+    #[test]
+    #[serial]
+    fn footer_shows_status_below_hints() {
+        let (_temp, mut view) = fresh_view();
+        let theme = load_theme("empire");
+        let area = Rect::new(0, 0, 100, 3);
+
+        // Success toast: green, on the second inner row (y = 2), hints on y = 1.
+        view.success_message = Some("Settings saved".to_string());
+        let mut terminal = Terminal::new(TestBackend::new(100, 3)).unwrap();
+        terminal
+            .draw(|f| view.render_footer(f, area, &theme))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        assert!(
+            row_text(&buf, 1).contains("save"),
+            "key hints should remain on the first footer row"
+        );
+        assert!(
+            row_text(&buf, 2).contains("Settings saved"),
+            "the toast should render on the status row, got {:?}",
+            row_text(&buf, 2)
+        );
+        assert_eq!(
+            buf[(1, 2)].fg,
+            theme.running,
+            "the success toast should use the running (green) colour"
+        );
+
+        // Error: red, same row, sticky.
+        view.success_message = None;
+        view.error_message = Some("Memory Limit: expected a string".to_string());
+        let mut terminal = Terminal::new(TestBackend::new(100, 3)).unwrap();
+        terminal
+            .draw(|f| view.render_footer(f, area, &theme))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        assert!(
+            row_text(&buf, 2).contains("Memory Limit: expected a string"),
+            "the error should render on the status row, got {:?}",
+            row_text(&buf, 2)
+        );
+        assert_eq!(
+            buf[(1, 2)].fg,
+            theme.error,
+            "the error should use the error (red) colour"
+        );
+    }
+
+    /// The "Settings saved" toast auto-dismisses once its window passes, while
+    /// a sticky error is left untouched (issue #2083).
+    #[test]
+    #[serial]
+    fn tick_status_expires_success_but_keeps_error() {
+        let (_temp, mut view) = fresh_view();
+
+        // Expired success toast: cleared, and the tick reports a redraw.
+        view.success_message = Some("Settings saved".to_string());
+        view.success_message_expires_at = Instant::now().checked_sub(Duration::from_secs(1));
+        assert!(
+            view.tick_status(),
+            "an expired toast should request a redraw"
+        );
+        assert!(
+            view.success_message.is_none(),
+            "the toast should be cleared"
+        );
+
+        // Sticky error with no expiry: untouched.
+        view.error_message = Some("Memory Limit: expected a string".to_string());
+        view.success_message_expires_at = None;
+        assert!(!view.tick_status(), "a sticky error should not tick away");
+        assert!(view.error_message.is_some(), "the error should persist");
+
+        // Unexpired toast: left in place.
+        view.success_message = Some("Settings saved".to_string());
+        view.success_message_expires_at = Some(Instant::now() + Duration::from_secs(60));
+        assert!(!view.tick_status(), "an unexpired toast should stay");
+        assert!(
+            view.success_message.is_some(),
+            "the toast should still show"
+        );
+    }
+
+    /// A successful save arms the auto-dismiss timer alongside the toast.
+    #[test]
+    #[serial]
+    fn save_arms_the_success_toast_timer() {
+        let (_temp, mut view) = fresh_view();
+        // Profile scope avoids the Global telemetry side effect; no fields means
+        // validation passes straight through to a real write.
+        view.scope = SettingsScope::Profile;
+        view.fields = Vec::new();
+
+        view.save().unwrap();
+
+        assert_eq!(view.success_message.as_deref(), Some("Settings saved"));
+        assert!(
+            view.success_message_expires_at.is_some(),
+            "save should arm the auto-dismiss timer"
+        );
+    }
+
+    /// A validation failure on save names the offending field so the user can
+    /// find it, instead of surfacing a bare reason like "expected a string"
+    /// (issue #2083).
+    #[test]
+    #[serial]
+    fn save_error_names_the_field() {
+        let (_temp, mut view) = fresh_view();
+
+        // A set-but-invalid value (not a cleared one, which now validates as
+        // unset) so validation genuinely fails and we can check the prefix.
+        view.fields = vec![SettingField {
+            kind: FieldKind::Schema {
+                section: "sandbox".to_string(),
+                field: "memory_limit".to_string(),
+                widget: WidgetKind::OptionalText { mono: false },
+                validation: ValidationKind::MemoryLimit,
+                profile_overridable: true,
+            },
+            label: "Memory Limit".to_string(),
+            description: "Memory ceiling for sandbox containers.".to_string(),
+            value: FieldValue::OptionalText(Some("not-a-size".to_string())),
+            category: SettingsCategory::Sandbox,
+            has_override: false,
+            inherited_display: None,
+        }];
+
+        view.save().unwrap();
+
+        let msg = view
+            .error_message
+            .expect("save should surface a validation error");
+        assert!(
+            msg.starts_with("Memory Limit: "),
+            "error should be prefixed with the field label, got {msg:?}"
+        );
     }
 }
