@@ -1113,7 +1113,7 @@ async fn watcher_config_refresh_count_exports_to_e2e_debug_file() {
     let _ = view.try_refresh_from_config_watcher();
     assert_eq!(
         view.watcher_config_refresh_count
-            .load(std::sync::atomic::Ordering::Acquire),
+            .load(std::sync::atomic::Ordering::Relaxed),
         1,
         "the counter increments on every watcher refresh attempt"
     );
