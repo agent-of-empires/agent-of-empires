@@ -910,6 +910,8 @@ impl ConfigWatchKey {
     }
 }
 
+const RELOAD_FAILED_TITLE: &str = "Reload Failed";
+
 /// Distinguishes user-driven config reloads from watcher kicks so
 /// `refresh_from_config` can suppress interactive-only dialogs on
 /// background refreshes.
@@ -921,7 +923,8 @@ pub(super) enum ConfigRefreshOrigin {
     Watcher,
 }
 
-/// Per-profile subscription pair, held in `HomeView::disk_watch_handles`.
+/// Per-profile subscription pair, held in `HomeView::disk_watch_handles`
+/// and `HomeView::config_watch_handles`.
 ///
 /// Two teardown paths exist:
 /// 1. Explicit-remove (rewire / profile delete via `drop_disk_watch_entry`):
@@ -1462,7 +1465,7 @@ impl HomeView {
         // exactly that profile's instance state, so we don't watch
         // sessions.json/groups.json for unrelated profiles.
         let initial_disk_profiles: Vec<String> = view.storages.keys().cloned().collect();
-        view.rewire_disk_subscriptions(&initial_disk_profiles)?;
+        view.rewire_disk_subscriptions(&initial_disk_profiles);
         // Config subscriptions are intentionally asymmetric: even in
         // single-profile mode, peer edits to ANY profile's config.toml
         // (or the global config) must be observable so the picker UI
@@ -1482,7 +1485,7 @@ impl HomeView {
                 initial_disk_profiles.clone()
             }
         };
-        view.rewire_config_subscriptions(&initial_config_profiles)?;
+        view.rewire_config_subscriptions(&initial_config_profiles);
         Ok(view)
     }
 
@@ -1527,12 +1530,12 @@ impl HomeView {
         // `self.storages.keys()` (the active profile, plus any profile
         // loaded via `move_to_profile`). Helpers are set-diff idempotent,
         // so the unconditional call is a no-op on a stable profile set.
-        self.rewire_config_subscriptions(&current_profiles)?;
+        self.rewire_config_subscriptions(&current_profiles);
         if self.active_profile.is_some() {
             let active_only: Vec<String> = self.storages.keys().cloned().collect();
-            self.rewire_disk_subscriptions(&active_only)?;
+            self.rewire_disk_subscriptions(&active_only);
         } else {
-            self.rewire_disk_subscriptions(&current_profiles)?;
+            self.rewire_disk_subscriptions(&current_profiles);
         }
 
         // Storage rebuild: unified mode only. Single-profile mode keeps the
@@ -1667,13 +1670,13 @@ impl HomeView {
     /// the same name): the caller must drop the stale entry first via
     /// `drop_disk_watch_entry` before invoking this helper, so the name
     /// is missing from `prior` and the install path runs.
-    pub(super) fn rewire_disk_subscriptions(&mut self, current: &[String]) -> anyhow::Result<()> {
+    pub(super) fn rewire_disk_subscriptions(&mut self, current: &[String]) {
         use crate::file_watch::{FileMatcher, WatchSpec};
         use std::collections::HashSet;
         use std::time::Duration;
 
         if tokio::runtime::Handle::try_current().is_err() {
-            return Ok(());
+            return;
         }
 
         let prior: HashSet<String> = self.disk_watch_handles.keys().cloned().collect();
@@ -1708,7 +1711,7 @@ impl HomeView {
             .collect();
 
         if prior == current.iter().cloned().collect() && inode_invalidated.is_empty() {
-            return Ok(());
+            return;
         }
 
         // Clear the latch ahead of the install loop. `record_disk_watcher_init_failure`
@@ -1811,7 +1814,6 @@ impl HomeView {
             removed = ?to_remove,
             "reconciled per-profile disk-watch subscriptions"
         );
-        Ok(())
     }
 
     /// Reconcile the per-key config-file subscriptions against the live
@@ -1841,12 +1843,12 @@ impl HomeView {
     /// watcher; in-process config writes are out of scope here because
     /// `Storage::update` does not write config files (only sessions /
     /// groups), so no `notify_local_change` is wired on this path.
-    pub(super) fn rewire_config_subscriptions(&mut self, current: &[String]) -> anyhow::Result<()> {
+    pub(super) fn rewire_config_subscriptions(&mut self, current: &[String]) {
         use crate::file_watch::{FileMatcher, WatchSpec};
         use std::time::Duration;
 
         if tokio::runtime::Handle::try_current().is_err() {
-            return Ok(());
+            return;
         }
 
         // Drop the existing global entry when its stored canonical_dir
@@ -1922,7 +1924,7 @@ impl HomeView {
             .collect();
 
         if !global_needs_install && to_remove.is_empty() && to_add.is_empty() {
-            return Ok(());
+            return;
         }
 
         // Clear the latch ahead of the install loop. `record_config_watcher_init_failure`
@@ -2079,7 +2081,6 @@ impl HomeView {
                 "rewire_config_subscriptions: per-profile set-diff update"
             );
         }
-        Ok(())
     }
 
     /// Rewire disk + config subscriptions after a successful profile
@@ -2090,24 +2091,8 @@ impl HomeView {
     pub(super) fn rewire_after_profile_delete(&mut self, profile_name: &str) {
         match crate::session::list_profiles() {
             Ok(profiles) => {
-                if let Err(e) = self.rewire_disk_subscriptions(&profiles) {
-                    tracing::warn!(
-                        target: "tui.file_watch",
-                        profile = %profile_name,
-                        op = "delete_profile",
-                        error = %e,
-                        "rewire_disk_subscriptions after profile delete failed"
-                    );
-                }
-                if let Err(e) = self.rewire_config_subscriptions(&profiles) {
-                    tracing::warn!(
-                        target: "tui.file_watch",
-                        profile = %profile_name,
-                        op = "delete_profile",
-                        error = %e,
-                        "rewire_config_subscriptions after profile delete failed"
-                    );
-                }
+                self.rewire_disk_subscriptions(&profiles);
+                self.rewire_config_subscriptions(&profiles);
             }
             Err(e) => {
                 tracing::warn!(
@@ -2155,7 +2140,7 @@ impl HomeView {
         if !self.reload_failure_state.has_any_failure() {
             return false;
         }
-        let title = "Reload Failed";
+        let title = RELOAD_FAILED_TITLE;
         let occupied_by_other = self
             .info_dialog
             .as_ref()
@@ -2201,7 +2186,7 @@ impl HomeView {
             && self
                 .info_dialog
                 .as_ref()
-                .is_some_and(|d| d.title() == "Reload Failed")
+                .is_some_and(|d| d.title() == RELOAD_FAILED_TITLE)
         {
             self.info_dialog = None;
             true
@@ -3744,7 +3729,7 @@ impl HomeView {
                 );
             }
             self.storages.retain(|name, _| name == &profile);
-            self.rewire_disk_subscriptions(std::slice::from_ref(&profile))?;
+            self.rewire_disk_subscriptions(std::slice::from_ref(&profile));
         }
         // Reconcile config-watch subscriptions explicitly so this contract
         // is local to switch_profile rather than implicit through
@@ -3763,7 +3748,7 @@ impl HomeView {
                 self.storages.keys().cloned().collect()
             }
         };
-        self.rewire_config_subscriptions(&config_targets)?;
+        self.rewire_config_subscriptions(&config_targets);
         // Clear selection before reload so stale session/group refs don't linger
         self.selected_session = None;
         self.selected_group = None;

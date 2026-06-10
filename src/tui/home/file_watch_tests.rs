@@ -67,8 +67,7 @@ async fn home_view_new_spawns_adapter_that_flips_disk_dirty() {
     // dispatcher routes peer writes through the adapter task that
     // HomeView::new just spawned.
     let mut view = view;
-    view.rewire_disk_subscriptions(&["hv-adapter".to_string()])
-        .expect("rewire");
+    view.rewire_disk_subscriptions(&["hv-adapter".to_string()]);
 
     let writer = Storage::new("hv-adapter", live.clone()).expect("writer");
     writer
@@ -108,8 +107,7 @@ async fn rewire_disk_subscriptions_drops_removed_profile_entry() {
     )
     .expect("HomeView::new");
 
-    view.rewire_disk_subscriptions(&["hv-keep".to_string(), "hv-drop".to_string()])
-        .expect("install both");
+    view.rewire_disk_subscriptions(&["hv-keep".to_string(), "hv-drop".to_string()]);
     assert!(
         view.disk_watch_handles.contains_key("hv-keep"),
         "precondition: hv-keep installed"
@@ -119,8 +117,7 @@ async fn rewire_disk_subscriptions_drops_removed_profile_entry() {
         "precondition: hv-drop installed"
     );
 
-    view.rewire_disk_subscriptions(&["hv-keep".to_string()])
-        .expect("remove hv-drop");
+    view.rewire_disk_subscriptions(&["hv-keep".to_string()]);
 
     assert!(
         view.disk_watch_handles.contains_key("hv-keep"),
@@ -158,8 +155,7 @@ async fn config_subscriptions_remove_then_recreate_does_not_leak_or_double_subsc
 
     use super::ConfigWatchKey;
 
-    view.rewire_config_subscriptions(&["cfg-leak".to_string()])
-        .expect("install profile sub");
+    view.rewire_config_subscriptions(&["cfg-leak".to_string()]);
     let baseline = live.subscriber_count();
     assert!(
         view.config_watch_handles
@@ -167,7 +163,7 @@ async fn config_subscriptions_remove_then_recreate_does_not_leak_or_double_subsc
         "precondition: profile config sub installed"
     );
 
-    view.rewire_config_subscriptions(&[]).expect("remove all");
+    view.rewire_config_subscriptions(&[]);
     assert!(
         !view
             .config_watch_handles
@@ -175,8 +171,7 @@ async fn config_subscriptions_remove_then_recreate_does_not_leak_or_double_subsc
         "remove must drop the per-profile entry"
     );
 
-    view.rewire_config_subscriptions(&["cfg-leak".to_string()])
-        .expect("recreate profile sub");
+    view.rewire_config_subscriptions(&["cfg-leak".to_string()]);
     assert!(
         view.config_watch_handles
             .contains_key(&ConfigWatchKey::profile("cfg-leak")),
@@ -211,8 +206,7 @@ async fn rewire_config_subscriptions_does_not_resurrect_deleted_profile_dir() {
     )
     .expect("HomeView::new");
 
-    view.rewire_config_subscriptions(&["ghost".to_string()])
-        .expect("install profile sub");
+    view.rewire_config_subscriptions(&["ghost".to_string()]);
     assert!(
         view.config_watch_handles
             .contains_key(&ConfigWatchKey::profile("ghost")),
@@ -225,8 +219,7 @@ async fn rewire_config_subscriptions_does_not_resurrect_deleted_profile_dir() {
         "precondition: profile dir is gone before the rewire pre-pass runs"
     );
 
-    view.rewire_config_subscriptions(&[])
-        .expect("rewire after delete");
+    view.rewire_config_subscriptions(&[]);
 
     assert!(
         !profile_dir.exists(),
@@ -487,8 +480,7 @@ async fn rewire_no_op_preserves_latched_disk_watcher_init_failure() {
     )
     .expect("HomeView::new");
 
-    view.rewire_disk_subscriptions(&["hv-noop".to_string()])
-        .expect("install");
+    view.rewire_disk_subscriptions(&["hv-noop".to_string()]);
     assert!(
         view.disk_watch_handles.contains_key("hv-noop"),
         "precondition: hv-noop installed"
@@ -501,8 +493,7 @@ async fn rewire_no_op_preserves_latched_disk_watcher_init_failure() {
         "precondition: latch is set"
     );
 
-    view.rewire_disk_subscriptions(&["hv-noop".to_string()])
-        .expect("no-op rewire");
+    view.rewire_disk_subscriptions(&["hv-noop".to_string()]);
 
     assert!(
         view.reload_failure_state.has_any_failure(),
@@ -537,8 +528,7 @@ async fn config_init_failure_survives_concurrent_disk_rewire_clear() {
         "precondition: config latch is set"
     );
 
-    view.rewire_disk_subscriptions(&["hv-iso".to_string()])
-        .expect("disk rewire install");
+    view.rewire_disk_subscriptions(&["hv-iso".to_string()]);
 
     assert!(
         view.reload_failure_state.has_any_failure(),
@@ -791,8 +781,7 @@ async fn rewire_config_subscriptions_install_loop_skips_missing_profile_dir() {
         "precondition: stale profile dir is absent (peer delete raced the snapshot)"
     );
 
-    view.rewire_config_subscriptions(&["active".to_string(), stale_name.to_string()])
-        .expect("rewire with stale snapshot");
+    view.rewire_config_subscriptions(&["active".to_string(), stale_name.to_string()]);
 
     assert!(
         !stale_path.exists(),
@@ -839,8 +828,7 @@ async fn rewire_disk_subscriptions_install_loop_skips_missing_profile_dir() {
         "precondition: stale profile dir is absent"
     );
 
-    view.rewire_disk_subscriptions(&["disk-active".to_string(), stale_name.to_string()])
-        .expect("rewire with stale snapshot");
+    view.rewire_disk_subscriptions(&["disk-active".to_string(), stale_name.to_string()]);
 
     assert!(
         !stale_path.exists(),

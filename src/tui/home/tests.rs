@@ -63,7 +63,7 @@ fn rewire_disk_subscriptions_is_noop_without_tokio_runtime() {
         view.disk_watch_handles.is_empty(),
         "construction outside a tokio runtime must not prewire subscriptions"
     );
-    view.rewire_disk_subscriptions(&current).unwrap();
+    view.rewire_disk_subscriptions(&current);
     assert!(
         view.disk_watch_handles.is_empty(),
         "rewire outside a tokio runtime must stay a no-op for lib tests"

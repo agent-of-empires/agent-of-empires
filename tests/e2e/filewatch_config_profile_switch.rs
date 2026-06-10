@@ -92,10 +92,10 @@ confirm_before_quit = true
     )
     .expect("peer-write recreated profile config.toml");
 
-    // The disk-mirror tick fires every ~2s; on macOS FSEvents
-    // coalesces attribute / metadata events with multi-second
-    // latency before the watcher delivers. The deterministic
-    // counter signal subsumes both bounds without a hard sleep.
+    // On macOS FSEvents coalesces attribute / metadata events with
+    // multi-second latency before the watcher delivers; the 8 s bound
+    // tolerates that worst case while the deterministic counter
+    // signal gates the assertion.
     h.wait_for_watcher_config_refresh_above(baseline, Duration::from_secs(8));
 
     h.send_keys("q");
