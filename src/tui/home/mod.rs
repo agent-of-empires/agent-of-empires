@@ -2184,7 +2184,7 @@ impl HomeView {
     /// when every reload source returns to healthy. Returns `true`
     /// when the dialog was cleared so the caller can request a redraw.
     /// The `Watcher Warning` dialog raised by
-    /// `rewire_after_profile_mutation` is intentionally outside
+    /// `rewire_after_profile_delete` is intentionally outside
     /// `reload_failure_state` and is left for the user to dismiss.
     pub(super) fn try_clear_recovered_reload_dialog(&mut self) -> bool {
         if !self.reload_failure_state.has_any_failure()

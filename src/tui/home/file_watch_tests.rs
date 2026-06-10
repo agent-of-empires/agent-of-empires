@@ -45,6 +45,28 @@ where
     false
 }
 
+/// RAII guard that sets `AOE_E2E_DEBUG=1` for the scope and clears it
+/// on drop. Mirrors `FailNextListProfilesGuard`'s shape so a panic
+/// between assertions cannot leak the env var to subsequent tests in
+/// the same `cargo test` process.
+struct E2eDebugGuard;
+
+impl E2eDebugGuard {
+    fn enable() -> Self {
+        // SAFETY: env mutation; the Drop impl pairs with this set_var.
+        // #[serial] guards cross-test races on the process env.
+        unsafe { std::env::set_var("AOE_E2E_DEBUG", "1") };
+        Self
+    }
+}
+
+impl Drop for E2eDebugGuard {
+    fn drop(&mut self) {
+        // SAFETY: env cleanup; matches set_var in E2eDebugGuard::enable.
+        unsafe { std::env::remove_var("AOE_E2E_DEBUG") };
+    }
+}
+
 /// Locks the adapter-spawn contract: real watcher events must flip
 /// `disk_dirty` through the `HomeView::new` wiring.
 #[tokio::test]
@@ -1024,8 +1046,7 @@ async fn watcher_config_refresh_count_exports_to_e2e_debug_file() {
          builds and unrelated test runs leave the disk untouched"
     );
 
-    // SAFETY: env mutation; #[serial] guards cross-test races on the process env.
-    unsafe { std::env::set_var("AOE_E2E_DEBUG", "1") };
+    let _guard = E2eDebugGuard::enable();
 
     let _ = view.try_refresh_from_config_watcher();
     let exported = std::fs::read_to_string(&counter_path)
@@ -1044,7 +1065,4 @@ async fn watcher_config_refresh_count_exports_to_e2e_debug_file() {
         "3",
         "subsequent attempts re-export the latest counter value"
     );
-
-    // SAFETY: env cleanup; #[serial] keeps this scoped to this test.
-    unsafe { std::env::remove_var("AOE_E2E_DEBUG") };
 }
