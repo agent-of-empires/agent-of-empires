@@ -1765,17 +1765,19 @@ mod status_message_tests {
     fn save_error_names_the_field() {
         let (_temp, mut view) = fresh_view();
 
+        // A set-but-invalid value (not a cleared one, which now validates as
+        // unset) so validation genuinely fails and we can check the prefix.
         view.fields = vec![SettingField {
             kind: FieldKind::Schema {
                 section: "sandbox".to_string(),
                 field: "memory_limit".to_string(),
                 widget: WidgetKind::OptionalText { mono: false },
-                validation: ValidationKind::NonEmptyString,
+                validation: ValidationKind::MemoryLimit,
                 profile_overridable: true,
             },
             label: "Memory Limit".to_string(),
             description: "Memory ceiling for sandbox containers.".to_string(),
-            value: FieldValue::OptionalText(None),
+            value: FieldValue::OptionalText(Some("not-a-size".to_string())),
             category: SettingsCategory::Sandbox,
             has_override: false,
             inherited_display: None,
