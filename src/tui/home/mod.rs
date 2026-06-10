@@ -2665,6 +2665,16 @@ impl HomeView {
         }
     }
 
+    /// Expire the settings view's transient "Settings saved" toast when its
+    /// window passes, so it fades even while the keyboard is idle. Returns true
+    /// when a redraw is needed. No-op when the settings overlay isn't open.
+    pub fn tick_settings_status(&mut self) -> bool {
+        self.settings_view
+            .as_mut()
+            .map(|view| view.tick_status())
+            .unwrap_or(false)
+    }
+
     /// Tick dialog animations/timers and drain hook progress.
     /// Returns true when a redraw is needed.
     pub fn tick_dialog(&mut self) -> bool {

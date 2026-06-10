@@ -55,6 +55,7 @@
   --color-brand-700: #ac6f08;
   --color-brand-800: #865606;
   --color-brand-900: #6e4705;
+  --color-text-on-brand: #000000;
 
   /* Accent -- Muted Teal (used sparingly) */
   --color-accent-500: #14b8a6;
@@ -125,6 +126,7 @@
   --term-bg: #1c1c1f;
   --term-fg: #e4e4e7;
   --term-cursor: #f59e0b;
+  --term-selection-bg: rgba(161, 161, 170, 0.35);
   --term-color-0: #1c1c1f;
   --term-color-1: #ef4444;
   --term-color-2: #22c55e;
@@ -402,7 +404,7 @@ select:focus-visible,
 }
 
 .xterm ::selection {
-  background: rgba(161, 161, 170, 0.2);
+  background: color-mix(in srgb, var(--color-text-secondary) 20%, transparent);
 }
 
 /* Subtle focus ring for terminal panels (desktop only).
@@ -412,7 +414,7 @@ select:focus-visible,
     content: "";
     position: absolute;
     inset: 0;
-    border: 1px solid rgba(217, 119, 6, 0.45);
+    border: 1px solid color-mix(in srgb, var(--color-brand-600) 45%, transparent);
     border-radius: inherit;
     pointer-events: none;
     z-index: 20;

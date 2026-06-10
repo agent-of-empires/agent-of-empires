@@ -16,6 +16,19 @@ use crate::tui::dialogs::CustomInstructionDialog;
 pub use fields::{FieldValue, HookField, SettingField, SettingsCategory};
 pub use input::SettingsAction;
 
+/// How long the "Settings saved" toast lingers before it auto-dismisses.
+/// Matches the dashboard's transient update-bar window (`app.rs`).
+const SUCCESS_MESSAGE_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Serialize a config (or `Option<RepoConfig>`) to JSON for change detection.
+/// Comparing the serialized form (the same representation that gets written to
+/// disk) sidesteps adding `PartialEq` to every nested config type, and a
+/// serialization failure degrades to `Null` so two failures compare equal
+/// rather than spuriously flagging changes.
+fn config_to_json<T: serde::Serialize>(value: &T) -> serde_json::Value {
+    serde_json::to_value(value).unwrap_or(serde_json::Value::Null)
+}
+
 /// Which scope of settings is being edited
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SettingsScope {
@@ -140,8 +153,16 @@ pub struct SettingsView {
     /// next frame will actually paint.
     pub(super) fields_content_width: u16,
 
-    /// Whether there are unsaved changes
+    /// Whether there are unsaved changes. Recomputed on every edit by diffing
+    /// the live configs against [`Self::baseline_*`], so reverting a field back
+    /// to its saved value clears the flag rather than latching it (issue #2083).
     pub(super) has_changes: bool,
+
+    /// Serialized snapshots of the editable configs as of the last load or
+    /// save. The unsaved-changes flag compares the live configs against these.
+    pub(super) baseline_global: serde_json::Value,
+    pub(super) baseline_profile: serde_json::Value,
+    pub(super) baseline_repo: serde_json::Value,
 
     /// Whether the help overlay is shown
     pub(super) show_help: bool,
@@ -149,8 +170,15 @@ pub struct SettingsView {
     /// Error message to display
     pub(super) error_message: Option<String>,
 
-    /// Success message to display
+    /// Success message to display (e.g. "Settings saved"). Rendered in the
+    /// footer status row, not over the fields.
     pub(super) success_message: Option<String>,
+
+    /// When the success toast should auto-dismiss. Set alongside
+    /// `success_message` on save so the "Settings saved" notice fades on its
+    /// own if the user just walks away, mirroring the dashboard's transient
+    /// update bar. Errors are sticky and have no expiry.
+    pub(super) success_message_expires_at: Option<std::time::Instant>,
 
     /// Active search input. `Some` while the user is typing in the
     /// settings-wide `/` search overlay. The settings view freezes
@@ -221,6 +249,10 @@ impl SettingsView {
 
         let categories = Self::categories_for_scope(SettingsScope::Global);
 
+        let baseline_global = config_to_json(&global_config);
+        let baseline_profile = config_to_json(&profile_config);
+        let baseline_repo = config_to_json(&repo_config);
+
         let mut view = Self {
             profile: profile.to_string(),
             available_profiles,
@@ -245,9 +277,13 @@ impl SettingsView {
             fields_viewport_height: 0,
             fields_content_width: 0,
             has_changes: false,
+            baseline_global,
+            baseline_profile,
+            baseline_repo,
             show_help: false,
             error_message: None,
             success_message: None,
+            success_message_expires_at: None,
             search_input: None,
             search_hits: Vec::new(),
             search_selected: 0,
@@ -512,15 +548,37 @@ impl SettingsView {
                 self.repo_config = Some(profile_to_repo_config(&self.repo_as_profile));
             }
         }
-        self.has_changes = true;
+        self.recompute_dirty();
+    }
+
+    /// Recompute `has_changes` by diffing the live configs against the
+    /// baselines. Editing a field and reverting it leaves the configs
+    /// byte-identical to the last save, so this clears the flag instead of
+    /// leaving a phantom "unsaved changes" warning (issue #2083).
+    pub(super) fn recompute_dirty(&mut self) {
+        self.has_changes = config_to_json(&self.global_config) != self.baseline_global
+            || config_to_json(&self.profile_config) != self.baseline_profile
+            || config_to_json(&self.repo_config) != self.baseline_repo;
+    }
+
+    /// Adopt the live configs as the new baseline and mark the view clean.
+    /// Called after a save or a reload, when on-disk state matches memory.
+    pub(super) fn snapshot_baseline(&mut self) {
+        self.baseline_global = config_to_json(&self.global_config);
+        self.baseline_profile = config_to_json(&self.profile_config);
+        self.baseline_repo = config_to_json(&self.repo_config);
+        self.has_changes = false;
     }
 
     /// Save the current configuration
     pub fn save(&mut self) -> anyhow::Result<()> {
-        // Validate all fields before saving
+        // Validate all fields before saving. Prefix the field's label so the
+        // message points at the offending setting instead of a bare reason
+        // like "expected a string" with no clue which row it came from
+        // (issue #2083).
         for field in &self.fields {
             if let Err(e) = field.validate() {
-                self.error_message = Some(e);
+                self.error_message = Some(format!("{}: {e}", field.label));
                 return Ok(());
             }
         }
@@ -568,10 +626,27 @@ impl SettingsView {
             }
         }
 
-        self.has_changes = false;
+        // The just-written state is the new clean baseline.
+        self.snapshot_baseline();
         self.success_message = Some("Settings saved".to_string());
+        self.success_message_expires_at = Some(std::time::Instant::now() + SUCCESS_MESSAGE_TTL);
         self.error_message = None;
         Ok(())
+    }
+
+    /// Drop the transient "Settings saved" toast once its window passes, so it
+    /// fades even when the user leaves the keyboard idle. Returns whether the
+    /// toast was cleared so the caller can request a redraw. Errors are sticky
+    /// (no expiry) and clear only on the next keypress.
+    pub fn tick_status(&mut self) -> bool {
+        match self.success_message_expires_at {
+            Some(expires_at) if std::time::Instant::now() >= expires_at => {
+                self.success_message = None;
+                self.success_message_expires_at = None;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Check if there are unsaved changes
@@ -701,5 +776,70 @@ impl SettingsView {
         }
         self.focus = SettingsFocus::Fields;
         self.close_search();
+    }
+}
+
+#[cfg(test)]
+mod dirty_tracking_tests {
+    use super::*;
+    use crate::session::Storage;
+    use serial_test::serial;
+    use tempfile::TempDir;
+
+    fn fresh_view() -> (TempDir, SettingsView) {
+        let temp = TempDir::new().unwrap();
+        std::env::set_var("HOME", temp.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _ = Storage::new_unwatched("test").unwrap();
+        let view = SettingsView::new("test", None).unwrap();
+        (temp, view)
+    }
+
+    /// Editing a setting and then reverting it to the saved value must not
+    /// leave the view reporting unsaved changes (issue #2083). The flag is
+    /// diff-based, not a one-way latch.
+    #[test]
+    #[serial]
+    fn reverting_an_edit_clears_unsaved_changes() {
+        let (_temp, mut view) = fresh_view();
+        assert!(!view.has_changes, "a freshly loaded view is clean");
+
+        let original = view.global_config.default_profile.clone();
+
+        view.global_config.default_profile = format!("{original}-edited");
+        view.recompute_dirty();
+        assert!(view.has_changes, "an edit marks unsaved changes");
+
+        view.global_config.default_profile = original;
+        view.recompute_dirty();
+        assert!(
+            !view.has_changes,
+            "reverting the edit should clear unsaved changes"
+        );
+    }
+
+    /// Saving adopts the live config as the new baseline, so an edit that
+    /// matches a previously-saved value is correctly seen as a change again.
+    #[test]
+    #[serial]
+    fn save_resets_the_baseline() {
+        let (_temp, mut view) = fresh_view();
+        view.scope = SettingsScope::Profile;
+
+        view.profile_config.description = Some("from-save".to_string());
+        view.recompute_dirty();
+        assert!(view.has_changes, "the edit is pending before save");
+
+        view.save().unwrap();
+        assert!(!view.has_changes, "saving clears the flag");
+
+        // Reverting to the pre-save value is now itself a change to save.
+        view.profile_config.description = None;
+        view.recompute_dirty();
+        assert!(
+            view.has_changes,
+            "the post-save baseline tracks the saved value"
+        );
     }
 }

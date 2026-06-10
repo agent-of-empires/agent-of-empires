@@ -17,6 +17,12 @@ my-project/
 
 ### Initial Setup
 
+**From the web dashboard:**
+
+When creating a new session, go to the "Clone URL" tab, enter the repository URL, expand "Advanced", and check "Clone as bare repository". This performs the setup automatically and returns the path to the main worktree.
+
+**From the command line:**
+
 ```bash
 git clone --bare git@github.com:user/repo.git my-project/.bare
 cd my-project
