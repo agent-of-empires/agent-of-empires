@@ -758,9 +758,14 @@ impl TelegramBridge {
                     .await
                 {
                     Ok(Some(output)) => {
+                        let cleaned = clean_agent_reply(&output, text);
+                        let output = if cleaned.is_empty() {
+                            output.trim().to_string()
+                        } else {
+                            cleaned
+                        };
                         let output = truncate_from_end(output.trim(), MAX_TELEGRAM_TEXT_CHARS);
-                        self.send_reply(chat_id, &format!("{} output:\n{}", instance.title, output))
-                            .await
+                        self.send_reply(chat_id, &output).await
                     }
                     Ok(None) => {
                         self.send_reply(
@@ -1364,6 +1369,190 @@ fn output_after_baseline(baseline: &str, latest: &str) -> String {
         .to_string()
 }
 
+fn clean_agent_reply(raw: &str, prompt: &str) -> String {
+    let turn = reply_turn_after_prompt(raw, prompt);
+    let without_footer = strip_terminal_footer(&turn);
+    let without_chrome = strip_terminal_chrome_lines(&without_footer);
+    let without_tools = strip_pi_tool_blocks(&without_chrome);
+    normalize_reply_text(&without_tools)
+}
+
+fn reply_turn_after_prompt(raw: &str, prompt: &str) -> String {
+    let prompt_lines: Vec<String> = prompt
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    if prompt_lines.is_empty() {
+        return raw.to_string();
+    }
+
+    let lines: Vec<&str> = raw.lines().collect();
+    if lines.len() >= prompt_lines.len() {
+        for start in (0..=lines.len() - prompt_lines.len()).rev() {
+            let matches_prompt = prompt_lines
+                .iter()
+                .enumerate()
+                .all(|(offset, prompt_line)| lines[start + offset].trim() == prompt_line);
+            if matches_prompt {
+                return lines[start + prompt_lines.len()..].join("\n");
+            }
+        }
+    }
+
+    let compact_prompt = prompt.trim();
+    if compact_prompt.chars().count() >= 12 {
+        if let Some(pos) = raw.rfind(compact_prompt) {
+            let after = pos + compact_prompt.len();
+            return raw[after..].to_string();
+        }
+    }
+
+    raw.to_string()
+}
+
+fn strip_terminal_footer(text: &str) -> String {
+    let mut kept = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if is_terminal_rule_line(trimmed)
+            || (is_terminal_cwd_footer(trimmed)
+                && kept
+                    .last()
+                    .is_some_and(|line: &&str| line.trim().is_empty()))
+            || is_terminal_status_footer(trimmed)
+        {
+            break;
+        }
+        kept.push(line);
+    }
+    kept.join("\n")
+}
+
+fn is_terminal_rule_line(trimmed: &str) -> bool {
+    trimmed.chars().count() >= 8
+        && trimmed
+            .chars()
+            .all(|ch| ch == '\u{2500}' || ch == '-' || ch.is_whitespace())
+}
+
+fn is_terminal_cwd_footer(trimmed: &str) -> bool {
+    trimmed.starts_with("~/")
+}
+
+fn is_terminal_status_footer(trimmed: &str) -> bool {
+    (trimmed.contains("%/") && trimmed.contains("(auto)"))
+        || trimmed.starts_with('\u{2191}')
+        || trimmed.starts_with("0.0%/")
+}
+
+fn strip_terminal_chrome_lines(text: &str) -> String {
+    let mut lines = Vec::new();
+    let mut skipping_section = false;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            skipping_section = false;
+            lines.push(line);
+            continue;
+        }
+
+        if skipping_section {
+            continue;
+        }
+
+        if is_startup_chrome_line(trimmed) {
+            skipping_section = trimmed == "[Context]" || trimmed == "[Extensions]";
+            continue;
+        }
+
+        lines.push(line);
+    }
+
+    lines.join("\n")
+}
+
+fn is_startup_chrome_line(trimmed: &str) -> bool {
+    trimmed.starts_with("Model scope:")
+        || trimmed.contains("(Ctrl+P to cycle)")
+        || trimmed.starts_with("pi v")
+        || trimmed.starts_with("escape interrupt")
+        || trimmed == "more"
+        || trimmed.starts_with("Press ctrl+o")
+        || trimmed.starts_with("Pi can explain")
+        || trimmed == "[Context]"
+        || trimmed == "[Extensions]"
+        || trimmed.starts_with("Warning: tmux extended-keys")
+        || trimmed.starts_with("-g extended-keys")
+}
+
+fn strip_pi_tool_blocks(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+
+    while i < lines.len() {
+        if lines[i].trim_start().starts_with("$ ") {
+            if let Some(end) = lines[i..]
+                .iter()
+                .position(|line| is_pi_tool_block_end(line.trim()))
+            {
+                i += end + 1;
+                continue;
+            }
+        }
+        out.push(lines[i]);
+        i += 1;
+    }
+
+    out.join("\n")
+}
+
+fn is_pi_tool_block_end(trimmed: &str) -> bool {
+    trimmed.starts_with("Took ") || trimmed.starts_with("Tool failed after ")
+}
+
+fn normalize_reply_text(text: &str) -> String {
+    let mut lines: Vec<String> = text
+        .lines()
+        .map(|line| line.trim_end().to_string())
+        .collect();
+
+    while lines.first().is_some_and(|line| line.trim().is_empty()) {
+        lines.remove(0);
+    }
+    while lines.last().is_some_and(|line| line.trim().is_empty()) {
+        lines.pop();
+    }
+
+    let strip_one_leading_space = lines
+        .iter()
+        .filter(|line| !line.trim().is_empty())
+        .all(|line| line.starts_with(' '));
+    if strip_one_leading_space {
+        for line in &mut lines {
+            if line.starts_with(' ') {
+                line.remove(0);
+            }
+        }
+    }
+
+    let mut collapsed = Vec::new();
+    let mut previous_blank = false;
+    for line in lines {
+        let blank = line.trim().is_empty();
+        if blank && previous_blank {
+            continue;
+        }
+        collapsed.push(line);
+        previous_blank = blank;
+    }
+
+    collapsed.join("\n").trim().to_string()
+}
+
 fn resolve_selector(
     sessions: &[Instance],
     selector: &str,
@@ -1620,6 +1809,73 @@ mod tests {
         assert_eq!(
             output_after_baseline("old line not present anymore", "prompt\nnew reply"),
             "prompt\nnew reply"
+        );
+    }
+
+    #[test]
+    fn clean_agent_reply_strips_pi_terminal_chrome_and_tool_blocks() {
+        let raw = "\
+Model scope: gpt-5.3-codex-spark:high, nvidia/nemotron-3-super-120b-a12b:low
+
+ pi v0.79.1
+ escape interrupt - ctrl+c/ctrl+d clear/exit - / commands - ! bash - ctrl+o
+ more
+ Press ctrl+o to show full startup help and loaded resources.
+
+ What agents are running
+
+
+ $ ps aux | grep -i 'pi-agent\\|pi-coding-agent\\|coding-agent' | grep -v grep
+
+ (no output)
+
+ Command exited with code 1
+
+ Took 0.1s
+
+
+ I don't see any separate background agents running in this environment right
+ now (no pi/coding-agent processes detected).
+ I can help you launch or inspect a specific agent workflow if you want.
+
+\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}
+
+\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}
+~/Python_local_Mac
+\u{2191}1.9k \u{2193}428 1.2%/128k (auto)      gpt-5.3-codex-spark high";
+
+        assert_eq!(
+            clean_agent_reply(raw, "What agents are running"),
+            "I don't see any separate background agents running in this environment right\nnow (no pi/coding-agent processes detected).\nI can help you launch or inspect a specific agent workflow if you want."
+        );
+    }
+
+    #[test]
+    fn clean_agent_reply_uses_exact_prompt_line_for_short_prompts() {
+        let raw = "\
+ Hey
+
+
+ Hey! How can I help?
+
+\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}";
+
+        assert_eq!(clean_agent_reply(raw, "Hey"), "Hey! How can I help?");
+    }
+
+    #[test]
+    fn clean_agent_reply_keeps_simple_exact_reply() {
+        let raw = "\
+ Reply with exactly: TELEGRAM_PI_ROUTE_OK
+
+
+ TELEGRAM_PI_ROUTE_OK
+
+\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}";
+
+        assert_eq!(
+            clean_agent_reply(raw, "Reply with exactly: TELEGRAM_PI_ROUTE_OK"),
+            "TELEGRAM_PI_ROUTE_OK"
         );
     }
 
