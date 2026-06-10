@@ -11,7 +11,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { test as base, expect } from "@playwright/test";
 import { spawnAoeServe } from "../helpers/aoeServe";
-import { createBareRepo } from "../helpers/gitFixture";
+import { createBareRepo, createSeededBareRepo } from "../helpers/gitFixture";
 
 base("clone happy path: file:// URL clones into HOME and the wizard advances", async ({ page }, testInfo) => {
   const serve = await spawnAoeServe({
@@ -70,7 +70,9 @@ base("bare clone: creates worktree structure and returns main path", async ({ pa
   });
 
   try {
-    const bare = createBareRepo(serve.home);
+    // A bare clone checks out a worktree, so the source must have a commit
+    // on its default branch; an empty bare repo has no reference to resolve.
+    const bare = createSeededBareRepo(serve.home);
 
     await page.goto(serve.baseUrl);
     await page.locator("body").click();
