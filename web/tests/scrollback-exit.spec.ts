@@ -147,7 +147,7 @@ test.describe("Mobile live-view scrollback", () => {
     expect(after, "the scroller must not be pinned back to the bottom").toBeLessThanOrEqual(nudged);
   });
 
-  test("reading freezes the stream via hold; returning releases it", async ({ page }) => {
+  test("reading keeps the stream flowing (no hold/freeze)", async ({ page }) => {
     await installTerminalSpies(page);
     const handle = await mockTerminalApis(page);
     await page.goto("/");
@@ -155,23 +155,32 @@ test.describe("Mobile live-view scrollback", () => {
     await page.reload();
     await openSession(page, handle);
 
-    // Scrolling up requests the full history; once the covering frame
-    // arrives the client holds the server's pushes (zero bandwidth, a
-    // perfectly still reading surface, agent untouched).
+    // Scrolling up widens the capture window but never freezes the pane:
+    // mirroring the TUI's live mode, the agent keeps running and frames
+    // keep arriving while the user reads. The client must NOT send a
+    // hold (the whole freeze path is gone); it drops cadence to idle.
     await scroller(page).evaluate((el) => {
       el.scrollTop = 0;
     });
     await expect
-      .poll(() => textMessages(handle).filter((m) => m.includes('"hold":true')).length, { timeout: 3_000 })
+      .poll(() => textMessages(handle).filter((m) => m.includes('"type":"window"')).length, { timeout: 3_000 })
       .toBeGreaterThan(0);
-
-    // Returning to live releases the hold so a fresh frame repaints.
-    await page.getByRole("button", { name: "Back to live" }).tap();
     await expect
       .poll(() => {
-        const msgs = textMessages(handle).filter((m) => m.includes('"type":"hold"'));
+        const msgs = textMessages(handle).filter((m) => m.includes('"type":"cadence"'));
         return msgs[msgs.length - 1] ?? "";
       })
-      .toContain('"hold":false');
+      .toContain('"fast":false');
+
+    const all = textMessages(handle).join("");
+    expect(all, "the hold control message is retired").not.toContain('"type":"hold"');
+
+    // A streamed frame still renders while reading (pane is not frozen).
+    handle.pushLiveFrame({
+      content: Array.from({ length: 24 }, (_, n) => `still streaming ${n}`).join("\n") + "\n",
+      rows: 24,
+      history: 200,
+    });
+    await expect.poll(() => page.locator("[data-live-content]").innerText()).toContain("still streaming");
   });
 });

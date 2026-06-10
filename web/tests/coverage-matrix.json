@@ -75,7 +75,11 @@
       "id": "terminal.mobile-live-view",
       "kind": "mocked-playwright",
       "risk": "high",
-      "specs": ["tests/mobile-dom-renderer.spec.ts"],
+      "specs": [
+        "tests/mobile-dom-renderer.spec.ts",
+        "tests/keyboard-auto-resize.spec.ts",
+        "tests/mobile-keyboard.spec.ts"
+      ],
       "components": [
         "web/src/components/MobileLiveTerminal.tsx",
         "web/src/components/LiveTerminalView.tsx",

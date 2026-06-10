@@ -15,27 +15,31 @@ import { useWebSettings } from "../hooks/useWebSettings";
 // Reading model (mirrors the TUI's "capture window follows the scroll
 // offset", adapted for a network hop):
 //
-//   live     — pinned to the bottom. The capture window is just the
-//              screen, so frames are small and fast.
-//   fetching — the user scrolled up. One window request covers the
-//              ENTIRE history; the spacer (sized from tmux's
-//              #{history_size}) already made the area scrollable, so a
-//              flick lands wherever it lands and the content fills in
-//              underneath it in one round trip.
-//   held     — the full-history frame arrived. The client freezes it
-//              and tells the server to stop pushing (`hold`), so the
-//              reading surface cannot move and zero bytes flow while
-//              reading. Returning to the bottom releases the hold; a
-//              fresh frame arrives in ~one capture interval.
+//   live    — pinned to the live edge. The capture window is just the
+//             screen, so frames are small and fast.
+//   reading — the user scrolled up. One window request covers the
+//             ENTIRE history; the spacer (sized from tmux's
+//             #{history_size}) already made the area scrollable, so a
+//             flick lands wherever it lands and the content fills in
+//             underneath it in one round trip. The stream keeps flowing
+//             at idle cadence (the agent runs on, like the TUI); there
+//             is no hold/freeze.
 //
-// Total scroll height is constant across all of this: spacer rows are
-// converted into real rows 1:1 as content arrives, so the browser's
-// preserved scrollTop keeps the same lines in view with no compensation.
+// The reading position is stable without a freeze because above-viewport
+// pixels are invariant by construction: spacer rows convert into real
+// rows 1:1 as content arrives, and when the agent appends k lines the
+// spacer grows by k while the capture window slides down by k, which
+// cancels. The browser-preserved scrollTop keeps the same lines in view
+// with no compensation.
 //
 // The soft keyboard never resizes tmux. Rows are derived from the
 // LARGEST container height seen for the current width (the no-keyboard
-// size); a keyboard cycle only shrinks the visible part of the
-// bottom-pinned scroller, exactly like a chat app.
+// size); a keyboard cycle only shrinks the visible part of the scroller.
+// While the keyboard has the container shrunk below that latched height,
+// the live-edge scroll target anchors the CURSOR near the viewport
+// bottom (see liveScrollTarget) so the agent's prompt stays in view; at
+// full height the target is the literal bottom and the whole screen is
+// visible, exactly like a terminal.
 
 const MIN_FONT_SIZE = 6;
 const MAX_FONT_SIZE = 28;
@@ -47,8 +51,9 @@ export interface MobileLiveTerminalProps {
   frame: LiveFrame | null;
   connected: boolean;
   active: boolean;
-  /** True while the hook's read machine is off the live edge; the frame
-   *  prop is then the frozen full-history snapshot. */
+  /** True while the user reads scrollback (off the live edge); the
+   *  capture window is widened and the jump-to-latest button shows.
+   *  The frame keeps streaming either way. */
   reading: boolean;
   sendResize: (cols: number, rows: number) => void;
   setWindow: (lines: number) => void;
@@ -151,8 +156,8 @@ export function MobileLiveTerminal({
   }, [remeasure]);
 
   // --- frame geometry -------------------------------------------------------
-  // The hook owns the read machine: `frame` is already the frozen
-  // snapshot while reading, the live stream otherwise.
+  // `frame` always tracks the live stream; reading scrollback just widens
+  // the capture window (the hook owns that). Nothing is frozen.
   const rowsRef = useRef(0);
   const readingRef = useRef(reading);
   useEffect(() => {
@@ -177,18 +182,68 @@ export function MobileLiveTerminal({
   // view back AND cancels iOS momentum, making scroll-up nearly
   // impossible to start. Upward motion since the last mutation means
   // the user is heading into scrollback; never pin against it.
-  const geomRef = useRef({ scrollHeight: 0, clientHeight: 0, scrollTop: 0 });
+  //
+  // The live-edge scroll target is the literal bottom, with ONE
+  // exception: while the soft keyboard has the container shrunk below
+  // the latched no-keyboard height, the screen is taller than the
+  // viewport and a fresh agent's literal bottom is blank rows with the
+  // prompt scrolled off the top. The target then anchors the CURSOR
+  // near the viewport bottom instead. The cursor (parked in the agent's
+  // input box) is the stable choice of anchor: pinning to the last
+  // non-blank row was tried and reverted, because capture-pane catches
+  // mid-repaint states whose lowest non-blank row jumps around
+  // (spinner / footer redraws), and every flutter moved the viewport.
+  const latchRef = useRef<{ width: number; maxHeight: number }>({ width: 0, maxHeight: 0 });
+  // Pixel top of the cursor row. Sticky across frames that momentarily
+  // hide the cursor (mid-redraw captures) so the target cannot flap.
+  const cursorAnchorRef = useRef<number | null>(null);
+  // The anchor is in pixels at the current line height; a font-scale
+  // change while the cursor is hidden would leave it in the old scale,
+  // so invalidate and wait for the next cursor-bearing frame.
+  useEffect(() => {
+    cursorAnchorRef.current = null;
+  }, [lineH]);
+  const liveScrollTarget = useCallback(
+    (el: HTMLDivElement) => {
+      const bottom = Math.max(0, el.scrollHeight - el.clientHeight);
+      const shrunken = latchRef.current.maxHeight - el.clientHeight > lineH * 1.5;
+      const anchor = cursorAnchorRef.current;
+      if (!shrunken || anchor == null) return bottom;
+      // One spare line under the cursor row keeps the input box border
+      // visible beneath it.
+      return Math.min(bottom, Math.max(0, anchor + 2 * lineH - el.clientHeight));
+    },
+    [lineH],
+  );
+  const geomRef = useRef({ target: -1, clientHeight: 0, scrollTop: 0 });
+  // A height change observed while pinning was suppressed (finger down,
+  // gesture in flight) would otherwise be consumed without effect and
+  // the cursor anchor never applied; latch it until a pin actually runs.
+  const pendingHeightPinRef = useRef(false);
   const pinIfWasAtBottom = useCallback(() => {
     const el = scrollerRef.current;
     if (!el) return;
     const prev = geomRef.current;
-    const wasAtBottom = prev.scrollHeight === 0 || prev.scrollHeight - el.scrollTop - prev.clientHeight < lineH * 1.5;
-    const movingUp = prev.scrollHeight !== 0 && el.scrollTop < prev.scrollTop - 0.5;
-    if (wasAtBottom && !movingUp && !touchActiveRef.current) {
-      el.scrollTop = el.scrollHeight;
+    const target = liveScrollTarget(el);
+    const wasAtLive = prev.target < 0 || el.scrollTop >= prev.target - lineH * 1.5;
+    const movingUp = prev.target >= 0 && el.scrollTop < prev.scrollTop - 0.5;
+    // Pin downward freely (following appended output); pin upward only
+    // when the viewport height changed (keyboard transition). An upward
+    // pin at constant height would yank a user who deliberately
+    // scrolled below the cursor anchor.
+    if (prev.target >= 0 && Math.abs(el.clientHeight - prev.clientHeight) > 1) {
+      pendingHeightPinRef.current = true;
     }
-    geomRef.current = { scrollHeight: el.scrollHeight, clientHeight: el.clientHeight, scrollTop: el.scrollTop };
-  }, [lineH]);
+    if (!wasAtLive) {
+      // The user is reading scrollback; a keyboard transition there
+      // must not yank them later.
+      pendingHeightPinRef.current = false;
+    } else if (!movingUp && !touchActiveRef.current && (prev.target < 0 || pendingHeightPinRef.current || target > el.scrollTop)) {
+      el.scrollTop = target;
+      pendingHeightPinRef.current = false;
+    }
+    geomRef.current = { target, clientHeight: el.clientHeight, scrollTop: el.scrollTop };
+  }, [lineH, liveScrollTarget]);
   const lines = useMemo(() => (frame ? ansiToLines(frame.content) : []), [frame]);
   // Columns this viewer renders at. Normally the pane is exactly this
   // wide and wrapping is the identity; when another writer resizes the
@@ -214,11 +269,32 @@ export function MobileLiveTerminal({
     rowsRef.current = screenRows || rowsRef.current;
   }, [screenRows]);
 
+  // Cursor cell -> visual overlay position. Shown only at the live edge;
+  // reading scrollback hides it. The pinning layout effect also feeds
+  // this position into cursorAnchorRef for the keyboard-shrunk target.
+  const live = useMemo(() => {
+    const cursor = !reading ? (frame?.cursor ?? null) : null;
+    let cursorTop = 0;
+    let cursorLeft = 0;
+    if (cursor) {
+      const lineIdx = Math.max(0, lines.length - screenRows) + cursor.y;
+      const baseRow = visual.lineStartRow[lineIdx] ?? visual.rows.length;
+      const cols = renderCols > 0 ? renderCols : Number.POSITIVE_INFINITY;
+      const wrapOffset = Number.isFinite(cols) ? Math.floor(cursor.x / cols) : 0;
+      cursorTop = (spacerLines + baseRow + wrapOffset) * lineH;
+      cursorLeft = (Number.isFinite(cols) ? cursor.x % cols : cursor.x) * charW;
+    }
+    return { cursor, cursorTop, cursorLeft };
+  }, [reading, frame, lines.length, screenRows, visual, renderCols, charW, spacerLines, lineH]);
+
   const atBottom = useCallback(() => {
     const el = scrollerRef.current;
     if (!el) return true;
-    return el.scrollHeight - el.scrollTop - el.clientHeight < lineH * 1.5;
-  }, [lineH]);
+    // At (or below) the live-edge target counts as live: scrolling down
+    // past a keyboard-shrunk cursor anchor into the screen's tail must
+    // not enter reading mode.
+    return el.scrollTop >= liveScrollTarget(el) - lineH * 1.5;
+  }, [lineH, liveScrollTarget]);
 
   const onScroll = useCallback(() => {
     if (!atBottom()) {
@@ -233,9 +309,9 @@ export function MobileLiveTerminal({
 
   const jumpToLatest = useCallback(() => {
     const el = scrollerRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
+    if (el) el.scrollTop = liveScrollTarget(el);
     returnToLive(rowsRef.current);
-  }, [returnToLive]);
+  }, [returnToLive, liveScrollTarget]);
 
   // --- pinch zoom (two-finger) ---------------------------------------------
   const pinchRef = useRef<{ startDist: number; startSize: number; changed: boolean } | null>(null);
@@ -299,10 +375,12 @@ export function MobileLiveTerminal({
   // --- grid sizing -----------------------------------------------------------
   // Rows come from the LATCHED maximum container height for the current
   // width, so a soft-keyboard cycle (which shrinks the container) never
-  // resizes tmux; the bottom-pinned scroller just shows fewer rows of an
-  // unchanged screen. The latch resets when the width changes
-  // (rotation, sidebar) or the font scale changes the grid anyway.
-  const latchRef = useRef<{ width: number; maxHeight: number }>({ width: 0, maxHeight: 0 });
+  // resizes tmux; the scroller just shows fewer rows of an unchanged
+  // screen, anchored at the cursor (see liveScrollTarget). The latch
+  // resets when the width changes (rotation, sidebar) or the font scale
+  // changes the grid anyway. Resizing tmux on every keyboard cycle was
+  // tried and reverted: on the capture+network path it flashed the pane
+  // (blank-then-redraw) and clipped scrollback.
   useEffect(() => {
     const el = scrollerRef.current;
     if (!el || !active) return;
@@ -344,22 +422,30 @@ export function MobileLiveTerminal({
     };
   }, [active, charW, lineH, sendResize, setWindow, pinIfWasAtBottom]);
 
-  // Cadence: fast only while this pane is the active, visible surface.
+  // Cadence: fast only while this pane is the active, visible surface AND
+  // at the live edge. Reading scrollback drops to idle: the window is
+  // wide (big frames), and the reader is not watching the live tail.
   useEffect(() => {
-    const sync = () => setCadence(active && document.visibilityState === "visible");
+    const sync = () => setCadence(active && document.visibilityState === "visible" && !reading);
     sync();
     document.addEventListener("visibilitychange", sync);
     return () => document.removeEventListener("visibilitychange", sync);
-  }, [active, setCadence]);
+  }, [active, reading, setCadence]);
 
   // --- bottom pinning ---------------------------------------------------------
   useLayoutEffect(() => {
+    // Refresh the cursor anchor before pinning so this commit pins
+    // against the current frame's cursor. Sticky on purpose: a
+    // mid-redraw capture that momentarily hides the cursor keeps the
+    // last known anchor instead of flapping the target to the literal
+    // bottom and back.
+    if (live.cursor) cursorAnchorRef.current = live.cursorTop;
     pinIfWasAtBottom();
     // When not pinned, scrollTop is left alone. Above-viewport height is
     // invariant (spacer rows convert to content rows 1:1; appends only
     // extend the bottom), so the browser-preserved offset keeps the
     // same lines in view.
-  }, [lines, spacerLines, lineH, pinIfWasAtBottom]);
+  }, [lines, spacerLines, lineH, live, pinIfWasAtBottom]);
 
   // --- keyboard input -----------------------------------------------------------
   const composingRef = useRef(false);
@@ -481,18 +567,8 @@ export function MobileLiveTerminal({
     [sendKeys, inputRef],
   );
 
-  // --- cursor overlay (live edge only; a frozen snapshot has no cursor) -------
-  const cursor = !reading ? (frame?.cursor ?? null) : null;
-  let cursorTop = 0;
-  let cursorLeft = 0;
-  if (cursor) {
-    const lineIdx = Math.max(0, lines.length - screenRows) + cursor.y;
-    const baseRow = visual.lineStartRow[lineIdx] ?? visual.rows.length;
-    const cols = renderCols > 0 ? renderCols : Number.POSITIVE_INFINITY;
-    const wrapOffset = Number.isFinite(cols) ? Math.floor(cursor.x / cols) : 0;
-    cursorTop = (spacerLines + baseRow + wrapOffset) * lineH;
-    cursorLeft = (Number.isFinite(cols) ? cursor.x % cols : cursor.x) * charW;
-  }
+  // Cursor overlay geometry (computed in the `live` memo above).
+  const { cursor, cursorTop, cursorLeft } = live;
 
   return (
     <div className="absolute inset-0" data-live-terminal>

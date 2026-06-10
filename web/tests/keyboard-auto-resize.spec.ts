@@ -3,20 +3,19 @@ import { devices, type Page } from "@playwright/test";
 import { clickSidebarSession, openMobileSidebar } from "./helpers/sidebar";
 import { mockTerminalApis, type MockHandle } from "./helpers/terminal-mocks";
 
-// #1432: the mobile terminal auto-resizes as the soft keyboard opens/closes.
+// #1432: the soft keyboard shrinks the mobile terminal visually but never
+// resizes tmux. Rows are latched to the no-keyboard height, so a keyboard
+// cycle only shrinks the visible part of the scroller; while shrunk, the
+// live-edge scroll target anchors the CURSOR near the viewport bottom, so the
+// agent's prompt stays in view instead of scrolling off the top behind a tail
+// of blank rows.
 //
-// The pane is padded by the LIVE cross-platform keyboard occlusion
-// (stableFullHeight - visualViewport.height), so opening the keyboard shrinks
-// the terminal and closing it grows it back. The previous design latched a
-// fixed reservation and required a manual fullscreen FAB to reclaim space; that
-// reservation, its localStorage seed, and the FAB are gone.
-//
-// The occlusion commit is DEBOUNCED in useMobileKeyboard, so each open/close
-// produces a single PTY resize (a bounded couple, allowing for ResizeObserver
-// noise), not one per animation frame. iOS PWA / iOS 26 Safari shrink
-// innerHeight with the keyboard; App.tsx still pins the root to a measured
-// pixel height so occlusion padding (not a shrinking root) is the one thing
-// that moves the terminal, keeping the behavior identical across platforms.
+// Resizing tmux on every keyboard cycle was tried and reverted: on the
+// capture+network path it flashed the pane (blank-then-redraw) and clipped
+// scrollback. The pane is padded by the LIVE cross-platform keyboard occlusion
+// (stableFullHeight - visualViewport.height) on iOS regular Safari, where the
+// layout viewport does not shrink; on iOS PWA / iOS 26 / Android, 100dvh
+// shrinks natively and the live view adds no inset of its own.
 
 test.use({ ...devices["iPhone 13"] });
 
@@ -110,8 +109,8 @@ test.describe("Keyboard auto-resize (#1432)", () => {
     // iOS regular Safari: the layout viewport does not shrink with the
     // keyboard, so the live view insets itself by the visualViewport
     // delta. The pane shrinks visually, but rows are latched to the
-    // no-keyboard height, so tmux must NOT be resized: the live screen
-    // is bottom-pinned and simply shows fewer rows, like a chat app.
+    // no-keyboard height, so tmux must NOT be resized: the scroller
+    // pins to the live content and simply shows fewer rows.
     await setKeyboard(page, { open: true, px: 320, pwa: false });
     await page.waitForTimeout(800);
 
@@ -126,6 +125,32 @@ test.describe("Keyboard auto-resize (#1432)", () => {
 
     expect(await paneHeight(page)).toBeGreaterThanOrEqual(paneHeightBefore - 2);
     expect(extractResizes(handle).length, "keyboard close must not emit a tmux resize").toBe(baselineCount);
+  });
+
+  test("Safari mode: the prompt cursor stays visible in the keyboard-shrunk viewport", async ({ page }) => {
+    const handle = await mockTerminalApis(page);
+    await page.goto("/");
+    await openSession(page, handle);
+    await page.waitForTimeout(1000);
+
+    // The mock screen is a fresh-agent shape: prompt + cursor on the
+    // FIRST screen row, blank rows below. With rows latched, the screen
+    // is now taller than the shrunk viewport; a literal bottom pin would
+    // show only the blank tail and scroll the prompt off the top (the
+    // original bug). The live-edge target must anchor the cursor near
+    // the viewport bottom instead.
+    await setKeyboard(page, { open: true, px: 320, pwa: false });
+    await page.waitForTimeout(800);
+
+    const m = await page.evaluate(() => {
+      const el = document.querySelector<HTMLElement>("[data-live-terminal] > div");
+      const cur = el?.querySelector<HTMLElement>("[data-live-cursor]");
+      if (!el || !cur) return null;
+      return { cursorTop: cur.offsetTop, scrollTop: el.scrollTop, clientHeight: el.clientHeight };
+    });
+    expect(m, "live cursor is rendered").not.toBeNull();
+    expect(m!.cursorTop, "cursor is not above the viewport").toBeGreaterThanOrEqual(m!.scrollTop - 2);
+    expect(m!.cursorTop, "cursor is not below the viewport").toBeLessThanOrEqual(m!.scrollTop + m!.clientHeight);
   });
 
   test("PWA mode: dvh shrink owns the layout; no inset, no tmux resize", async ({ page }) => {

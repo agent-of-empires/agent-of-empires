@@ -26,13 +26,11 @@
 //!   `{"type":"window","lines":N}`: total capture window (history +
 //!     screen). Clamped to [screen rows, MAX_WINDOW_LINES].
 //!   `{"type":"cadence","fast":bool}`: capture cadence. Fast while the
-//!     client is at the live edge and visible; idle while backgrounded.
-//!   `{"type":"hold","hold":bool}`: freeze pushes while the client reads
-//!     scrollback. While held the loop skips captures entirely (zero
-//!     bandwidth, zero forks) except a single forced capture after a
-//!     window/resize change, so the client's full-history fetch still
-//!     gets its one frame. `hold:false` triggers an immediate fresh
-//!     capture so returning to the live edge repaints at once.
+//!     client is at the live edge and visible; idle while reading
+//!     scrollback or backgrounded. Like the TUI's live mode, the loop
+//!     keeps capturing while the user reads (the agent runs on); a
+//!     scrolled-up client just asks for a bigger window and renders it
+//!     against a stable position via its spacer model.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -80,8 +78,6 @@ enum LiveControlMessage {
     Window { lines: usize },
     #[serde(rename = "cadence")]
     Cadence { fast: bool },
-    #[serde(rename = "hold")]
-    Hold { hold: bool },
 }
 
 /// Shared per-connection knobs the recv loop writes and the capture
@@ -97,10 +93,6 @@ struct LiveSettings {
     /// Set once any resize has been applied; the disconnect path then
     /// restores `window-size latest`.
     resized: AtomicBool,
-    /// Freeze pushes while the client reads scrollback (see module docs).
-    hold: AtomicBool,
-    /// One capture is owed despite `hold` (window/resize changed).
-    force_once: AtomicBool,
 }
 
 pub async fn live_terminal_ws(
@@ -226,8 +218,6 @@ async fn handle_live_ws(
         screen_rows: AtomicU64::new(0),
         screen_cols: AtomicU64::new(0),
         resized: AtomicBool::new(false),
-        hold: AtomicBool::new(false),
-        force_once: AtomicBool::new(false),
     });
     // Wakes the capture loop out of its inter-capture sleep: after
     // dispatched input (echo latency) and after cadence/window changes.
@@ -250,20 +240,6 @@ async fn handle_live_ws(
         let mut dead_probes: u32 = 0;
         let mut last_reassert = std::time::Instant::now() - REASSERT_MIN_INTERVAL;
         loop {
-            // Held: skip the capture (and its tmux fork) entirely unless a
-            // window/resize change owes the client one frame. The
-            // inter-capture wait below still runs, so hold release (which
-            // nudges) is picked up promptly.
-            if capture_settings.hold.load(Ordering::Relaxed)
-                && !capture_settings.force_once.swap(false, Ordering::Acquire)
-            {
-                let ms = CAPTURE_INTERVAL_IDLE_MS;
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_millis(ms)) => {}
-                    _ = capture_nudge.notified() => {}
-                }
-                continue;
-            }
             let lines = capture_settings.window_lines.load(Ordering::Relaxed);
             let name = capture_tmux.clone();
             let captured = tokio::task::spawn_blocking(move || {
@@ -340,7 +316,16 @@ async fn handle_live_ws(
                 _ => break, // join error / capture error: bail quietly
             }
 
-            let ms = if capture_settings.fast.load(Ordering::Relaxed) {
+            // Fast cadence only makes sense for screen-sized windows. A
+            // wide window means a client reading scrollback; the new
+            // client requests idle cadence itself, but cap it here too so
+            // a stale PWA bundle (which spoke the retired hold protocol
+            // and never lowers cadence) cannot keep the server pushing
+            // multi-thousand-line frames at 20/s.
+            let screen = (capture_settings.screen_rows.load(Ordering::Relaxed) as usize)
+                .max(DEFAULT_WINDOW_LINES);
+            let small_window = capture_settings.window_lines.load(Ordering::Relaxed) <= screen * 4;
+            let ms = if capture_settings.fast.load(Ordering::Relaxed) && small_window {
                 CAPTURE_INTERVAL_FAST_MS
             } else {
                 CAPTURE_INTERVAL_IDLE_MS
@@ -432,7 +417,6 @@ async fn handle_live_ws(
                                 })
                                 .await;
                                 settings.resized.store(true, Ordering::Relaxed);
-                                settings.force_once.store(true, Ordering::Release);
                                 nudge.notify_one();
                             }
                             LiveControlMessage::Window { lines } => {
@@ -440,19 +424,11 @@ async fn handle_live_ws(
                                     .max(DEFAULT_WINDOW_LINES);
                                 let clamped = lines.clamp(floor, MAX_WINDOW_LINES);
                                 settings.window_lines.store(clamped, Ordering::Relaxed);
-                                settings.force_once.store(true, Ordering::Release);
                                 nudge.notify_one();
                             }
                             LiveControlMessage::Cadence { fast } => {
                                 settings.fast.store(fast, Ordering::Relaxed);
                                 if fast {
-                                    nudge.notify_one();
-                                }
-                            }
-                            LiveControlMessage::Hold { hold } => {
-                                settings.hold.store(hold, Ordering::Relaxed);
-                                if !hold {
-                                    // Repaint immediately on release.
                                     nudge.notify_one();
                                 }
                             }
@@ -489,8 +465,9 @@ async fn handle_live_ws(
     // `resized` is per-socket, so with two live viewers on one session the
     // first disconnect resets sizing out from under the survivor. That
     // self-heals: the survivor's capture loop re-asserts its grid on the
-    // next drift check (<= REASSERT_MIN_INTERVAL), and a held reader is
-    // rendering a frozen frame anyway and re-asserts on release. Tracking
+    // next drift check (<= REASSERT_MIN_INTERVAL), so the survivor renders
+    // at the wrong wrap width for at most that interval (and the client
+    // hard-wraps drifted frames rather than clipping). Tracking
     // last-resizer-standing across sockets isn't worth that transient.
     if settings.resized.load(Ordering::Relaxed) {
         let name = tmux_name.clone();
@@ -584,7 +561,5 @@ mod tests {
         let m: LiveControlMessage =
             serde_json::from_str(r#"{"type":"cadence","fast":false}"#).unwrap();
         assert!(matches!(m, LiveControlMessage::Cadence { fast: false }));
-        let m: LiveControlMessage = serde_json::from_str(r#"{"type":"hold","hold":true}"#).unwrap();
-        assert!(matches!(m, LiveControlMessage::Hold { hold: true }));
     }
 }
