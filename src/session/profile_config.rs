@@ -188,11 +188,15 @@ pub fn validate_memory_limit(limit: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    let re = regex::Regex::new(r"^\d+[bkmgBKMG]?$").unwrap();
+    // Require a unit suffix. A bare number is bytes to Docker, which is almost
+    // never intended and falls below Docker's ~6MB floor anyway, so reject it
+    // up front with a message that matches the field's "512m"/"8g" examples
+    // (issue #2083 smoke test).
+    let re = regex::Regex::new(r"^\d+[bkmgBKMG]$").unwrap();
     if re.is_match(limit) {
         Ok(())
     } else {
-        Err("Memory limit must be a number optionally followed by b, k, m, or g".to_string())
+        Err("Memory limit must be a number followed by b, k, m, or g (e.g. 512m, 8g)".to_string())
     }
 }
 
@@ -328,10 +332,13 @@ mod tests {
 
     #[test]
     fn test_validate_memory_limit() {
-        assert!(validate_memory_limit("").is_ok());
+        assert!(validate_memory_limit("").is_ok()); // empty == no limit
         assert!(validate_memory_limit("512m").is_ok());
         assert!(validate_memory_limit("2g").is_ok());
-        assert!(validate_memory_limit("1024").is_ok());
+        assert!(validate_memory_limit("8G").is_ok());
+        // A unit suffix is required: a bare number (bytes to Docker) is rejected.
+        assert!(validate_memory_limit("1024").is_err());
+        assert!(validate_memory_limit("12").is_err());
         assert!(validate_memory_limit("invalid").is_err());
         assert!(validate_memory_limit("512mb").is_err());
     }

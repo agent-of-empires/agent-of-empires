@@ -303,6 +303,14 @@ impl SettingField {
 /// [`crate::session::settings_schema::validate_value`] the server applies.
 fn validate_field_value(kind: &ValidationKind, value: &FieldValue) -> Result<(), String> {
     let json = field_value_to_json_for_validation(value);
+    // A cleared optional field projects to JSON null. Clearing means "unset",
+    // which is always valid, so there's nothing to check: feeding null to a
+    // string validator would otherwise reject it as "expected a string". This
+    // mirrors the server's null-leaf handling in
+    // `settings_schema::validate_patch` (issue #2083).
+    if json.is_null() {
+        return Ok(());
+    }
     crate::session::settings_schema::validate_value(kind, &json).map_err(|e| e.reason)
 }
 
@@ -1040,6 +1048,42 @@ mod tests {
 
     fn profile_from(value: serde_json::Value) -> ProfileConfig {
         serde_json::from_value(value).expect("profile override deserializes")
+    }
+
+    /// Clearing an optional field (empty input stores `None`) must validate:
+    /// "unset" is always allowed and must not surface as "expected a string"
+    /// (issue #2083). A set value is still checked against the schema rule.
+    #[test]
+    fn clearing_optional_field_validates_as_unset() {
+        let mut f = SettingField {
+            kind: FieldKind::Schema {
+                section: "sandbox".to_string(),
+                field: "memory_limit".to_string(),
+                widget: WidgetKind::OptionalText { mono: false },
+                validation: ValidationKind::MemoryLimit,
+                profile_overridable: true,
+            },
+            label: "Memory Limit".to_string(),
+            description: String::new(),
+            value: FieldValue::OptionalText(None),
+            category: SettingsCategory::Sandbox,
+            has_override: false,
+            inherited_display: None,
+        };
+
+        assert!(
+            f.validate().is_ok(),
+            "a cleared optional field should validate as unset"
+        );
+
+        f.value = FieldValue::OptionalText(Some("not-a-size".to_string()));
+        assert!(
+            f.validate().is_err(),
+            "a set-but-invalid value should still be rejected"
+        );
+
+        f.value = FieldValue::OptionalText(Some("512m".to_string()));
+        assert!(f.validate().is_ok(), "a set-and-valid value should pass");
     }
 
     #[test]

@@ -136,29 +136,29 @@ export interface TerminalState {
 export function readThemeFromCss(): ITheme {
   const root = document.documentElement;
   const cs = getComputedStyle(root);
-  const v = (name: string, fallback: string) => cs.getPropertyValue(name).trim() || fallback;
+  const v = (name: string) => cs.getPropertyValue(name).trim() || undefined;
   return {
-    background: v("--term-bg", "#1c1c1f"),
-    foreground: v("--term-fg", "#e4e4e7"),
-    cursor: v("--term-cursor", "#f59e0b"),
-    cursorAccent: v("--term-bg", "#1c1c1f"),
-    selectionBackground: "rgba(161, 161, 170, 0.35)",
-    black: v("--term-color-0", "#1c1c1f"),
-    red: v("--term-color-1", "#ef4444"),
-    green: v("--term-color-2", "#22c55e"),
-    yellow: v("--term-color-3", "#fbbf24"),
-    blue: v("--term-color-4", "#0d9488"),
-    magenta: v("--term-color-5", "#f59e0b"),
-    cyan: v("--term-color-6", "#0d9488"),
-    white: v("--term-color-7", "#e4e4e7"),
-    brightBlack: v("--term-color-8", "#8b8b94"),
-    brightRed: v("--term-color-9", "#f26969"),
-    brightGreen: v("--term-color-10", "#4ed17e"),
-    brightYellow: v("--term-color-11", "#fccc50"),
-    brightBlue: v("--term-color-12", "#3da9a0"),
-    brightMagenta: v("--term-color-13", "#f7b13c"),
-    brightCyan: v("--term-color-14", "#3da9a0"),
-    brightWhite: v("--term-color-15", "#fbbf24"),
+    background: v("--term-bg"),
+    foreground: v("--term-fg"),
+    cursor: v("--term-cursor"),
+    cursorAccent: v("--term-bg"),
+    selectionBackground: v("--term-selection-bg"),
+    black: v("--term-color-0"),
+    red: v("--term-color-1"),
+    green: v("--term-color-2"),
+    yellow: v("--term-color-3"),
+    blue: v("--term-color-4"),
+    magenta: v("--term-color-5"),
+    cyan: v("--term-color-6"),
+    white: v("--term-color-7"),
+    brightBlack: v("--term-color-8"),
+    brightRed: v("--term-color-9"),
+    brightGreen: v("--term-color-10"),
+    brightYellow: v("--term-color-11"),
+    brightBlue: v("--term-color-12"),
+    brightMagenta: v("--term-color-13"),
+    brightCyan: v("--term-color-14"),
+    brightWhite: v("--term-color-15"),
   };
 }
 
