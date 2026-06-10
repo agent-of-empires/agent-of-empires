@@ -571,7 +571,7 @@ async fn rewire_no_op_preserves_latched_disk_watcher_init_failure() {
     );
 
     view.reload_failure_state
-        .record_disk_watcher_init_failure("seed: simulated prior failure");
+        .record_disk_watcher_init_failure("hv-noop: simulated prior failure");
     assert!(
         view.reload_failure_state.has_any_failure(),
         "precondition: latch is set"
@@ -582,6 +582,83 @@ async fn rewire_no_op_preserves_latched_disk_watcher_init_failure() {
     assert!(
         view.reload_failure_state.has_any_failure(),
         "no-op rewire (unchanged set, no inode change) must preserve the disk_watcher_init_error latch"
+    );
+}
+
+/// Locks the stale-latch detection invariant for
+/// `rewire_disk_subscriptions`: when the latch records a failure for
+/// profile X but X is no longer in `current` (subscribe_channel Err
+/// for X then user deletes X), the rewire pass clears the latch
+/// even when the installed-profile set is otherwise unchanged.
+/// Companion to `rewire_no_op_preserves_latched_disk_watcher_init_failure`:
+/// no-op preserves the latch only when the latch is still relevant.
+#[tokio::test]
+#[serial]
+async fn rewire_disk_clears_stale_latch_when_failing_profile_is_removed() {
+    let temp = TempDir::new().expect("tempdir");
+    isolate_home(temp.path());
+
+    let live = FileWatchService::new().expect("live svc");
+    crate::session::get_profile_dir("active-stale").expect("seed active");
+
+    let mut view = HomeView::new(
+        Some("active-stale".to_string()),
+        crate::tmux::AvailableTools::with_tools(&["claude"]),
+        live.clone(),
+    )
+    .expect("HomeView::new");
+
+    view.reload_failure_state
+        .record_disk_watcher_init_failure("ghost: simulated subscribe failure");
+    assert!(
+        view.reload_failure_state.has_any_failure(),
+        "precondition: latch is set, references the now-deleted profile"
+    );
+
+    view.rewire_disk_subscriptions(&["active-stale".to_string()]);
+
+    assert!(
+        view.reload_failure_state.disk_watcher_init_error.is_none(),
+        "stale latch must clear when its referenced profile is no longer in current; \
+         the early-return fast-path must consider latch staleness"
+    );
+}
+
+/// Locks the stale-latch detection invariant for
+/// `rewire_config_subscriptions`. Sibling to
+/// `rewire_disk_clears_stale_latch_when_failing_profile_is_removed`;
+/// the per-profile config error format is `"profile {name} config: ..."`.
+#[tokio::test]
+#[serial]
+async fn rewire_config_clears_stale_latch_when_failing_profile_is_removed() {
+    let temp = TempDir::new().expect("tempdir");
+    isolate_home(temp.path());
+
+    let live = FileWatchService::new().expect("live svc");
+    crate::session::get_profile_dir("active-stale-cfg").expect("seed active");
+
+    let mut view = HomeView::new(
+        Some("active-stale-cfg".to_string()),
+        crate::tmux::AvailableTools::with_tools(&["claude"]),
+        live.clone(),
+    )
+    .expect("HomeView::new");
+
+    view.reload_failure_state
+        .record_config_watcher_init_failure("profile ghost config: simulated subscribe failure");
+    assert!(
+        view.reload_failure_state.has_any_failure(),
+        "precondition: latch is set, references the now-deleted profile"
+    );
+
+    view.rewire_config_subscriptions(&["active-stale-cfg".to_string()]);
+
+    assert!(
+        view.reload_failure_state
+            .config_watcher_init_error
+            .is_none(),
+        "stale latch must clear when its referenced profile is no longer in current; \
+         the early-return fast-path must consider latch staleness"
     );
 }
 

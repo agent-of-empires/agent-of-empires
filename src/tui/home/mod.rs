@@ -1082,6 +1082,44 @@ impl ReloadFailureState {
         }
     }
 
+    /// Whether the disk_watcher_init_error latch references a profile
+    /// name not in `current`. The latch detail string format is set by
+    /// `record_disk_watcher_init_failure` call sites in
+    /// `rewire_disk_subscriptions` as `"{profile_name}: {error}"`; the
+    /// extractor splits at the first `": "` to recover the name.
+    pub(super) fn disk_watcher_init_error_references_missing_profile(
+        &self,
+        current: &[String],
+    ) -> bool {
+        let Some(err) = self.disk_watcher_init_error.as_deref() else {
+            return false;
+        };
+        let Some((name, _)) = err.split_once(": ") else {
+            return false;
+        };
+        !current.iter().any(|p| p == name)
+    }
+
+    /// Whether the config_watcher_init_error latch references a
+    /// per-profile name not in `current`. The per-profile detail
+    /// string format is `"profile {name} config: {error}"`; the global
+    /// format `"global config: ..."` returns false.
+    pub(super) fn config_watcher_init_error_references_missing_profile(
+        &self,
+        current: &[String],
+    ) -> bool {
+        let Some(err) = self.config_watcher_init_error.as_deref() else {
+            return false;
+        };
+        let Some(rest) = err.strip_prefix("profile ") else {
+            return false;
+        };
+        let Some((name, _)) = rest.split_once(" config:") else {
+            return false;
+        };
+        !current.iter().any(|p| p == name)
+    }
+
     pub(super) fn has_any_failure(&self) -> bool {
         self.storage_failed
             || self.config_failed
@@ -1711,7 +1749,12 @@ impl HomeView {
             .cloned()
             .collect();
 
-        if prior == current.iter().cloned().collect() && inode_invalidated.is_empty() {
+        if prior == current.iter().cloned().collect()
+            && inode_invalidated.is_empty()
+            && !self
+                .reload_failure_state
+                .disk_watcher_init_error_references_missing_profile(current)
+        {
             return;
         }
 
@@ -1924,7 +1967,13 @@ impl HomeView {
             .cloned()
             .collect();
 
-        if !global_needs_install && to_remove.is_empty() && to_add.is_empty() {
+        if !global_needs_install
+            && to_remove.is_empty()
+            && to_add.is_empty()
+            && !self
+                .reload_failure_state
+                .config_watcher_init_error_references_missing_profile(current)
+        {
             return;
         }
 
@@ -1947,7 +1996,9 @@ impl HomeView {
                     };
                     match self.file_watch.subscribe_channel(spec, 4) {
                         Ok((mut rx, handle)) => {
+                            use tracing::Instrument;
                             let dirty = std::sync::Arc::clone(&self.config_dirty);
+                            let span = tracing::debug_span!("tui.config_watch.global.forwarder");
                             let join = crate::task_util::spawn_supervised(
                                 "tui.config_watch.global.forwarder",
                                 crate::task_util::PanicPolicy::Log,
@@ -1955,7 +2006,8 @@ impl HomeView {
                                     while rx.recv().await.is_some() {
                                         dirty.store(true, std::sync::atomic::Ordering::Release);
                                     }
-                                },
+                                }
+                                .instrument(span),
                             );
                             self.config_watch_handles.insert(
                                 ConfigWatchKey::Global,
@@ -5208,7 +5260,7 @@ impl HomeView {
     pub(super) fn try_refresh_from_config_watcher(&mut self) -> anyhow::Result<()> {
         let new_count = self
             .watcher_config_refresh_count
-            .fetch_add(1, std::sync::atomic::Ordering::Release)
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1;
         self.maybe_export_watcher_refresh_count(new_count);
         let profile = self.config_profile();
