@@ -639,11 +639,27 @@ pub fn build_response(
             ElicitationFieldKind::Integer => {
                 let value = match answer {
                     Some(AnswerValue::Integer(i)) => *i,
-                    // A whole-valued float (the browser may send `5` as a
-                    // JSON number) coerces; a fractional one is rejected.
-                    Some(AnswerValue::Number(n)) if n.fract() == 0.0 => *n as i64,
-                    Some(AnswerValue::Number(_)) => {
+                    // A whole-valued float in range (the browser may send
+                    // `5` as a JSON number) coerces. `as i64` saturates, so
+                    // an out-of-range or non-finite float must be rejected
+                    // before the cast or it would silently clamp to
+                    // i64::MIN / i64::MAX and slip past check_range.
+                    Some(AnswerValue::Number(n))
+                        if n.is_finite()
+                            && n.fract() == 0.0
+                            && *n >= i64::MIN as f64
+                            && *n <= i64::MAX as f64 =>
+                    {
+                        *n as i64
+                    }
+                    Some(AnswerValue::Number(n)) if n.is_finite() && n.fract() != 0.0 => {
                         return Err(ElicitationValidationError::NotAnInteger {
+                            field: question.field_key.clone(),
+                        });
+                    }
+                    // Non-finite or out-of-i64-range whole float.
+                    Some(AnswerValue::Number(_)) => {
+                        return Err(ElicitationValidationError::OutOfRange {
                             field: question.field_key.clone(),
                         });
                     }
@@ -1035,6 +1051,14 @@ mod tests {
         assert_eq!(
             build_response(&e, accept(vec![("question_0", AnswerValue::Number(3.5))])),
             Err(ElicitationValidationError::NotAnInteger {
+                field: "question_0".into()
+            })
+        );
+        // A whole float past i64 range must not saturate-cast past the
+        // range check; it is rejected as out of range.
+        assert_eq!(
+            build_response(&e, accept(vec![("question_0", AnswerValue::Number(1e30))])),
+            Err(ElicitationValidationError::OutOfRange {
                 field: "question_0".into()
             })
         );
