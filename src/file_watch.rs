@@ -25,7 +25,19 @@ use tokio::sync::mpsc;
 /// the same string), but the `(dev, ino)` pair from `fs::metadata` does
 /// not. On non-Unix platforms `WatchIdentity` is `()`, so identity
 /// comparisons trivially match and the watch-install logic falls back
-/// to canonical-path probes alone.
+/// to canonical-path probes alone; Windows still carries the original
+/// same-name recreate hazard since `ReadDirectoryChangesW` keys watches
+/// by `HANDLE` rather than `(dev, ino)`. Tracking that gap separately.
+///
+/// Storage convention: the primitive (`DirState`) wraps this in
+/// `Option<WatchIdentity>` because the entry is inserted with
+/// `refcount=0` before `watcher.watch` runs, so `None` represents the
+/// pre-install transient state. Consumers (e.g. `DiskWatchEntry` in
+/// `tui/home/mod.rs`) only construct their entries after a successful
+/// `subscribe_channel`, so they store a bare `WatchIdentity` and use
+/// `unwrap_or_default()` to record `(0, 0)` / `()` when the install-time
+/// stat fails; that sentinel self-heals on the next rewire because a
+/// real `(dev, ino)` will mismatch and force an entry rebuild.
 #[cfg(unix)]
 pub type WatchIdentity = (u64, u64);
 /// See [`WatchIdentity`] (Unix variant).
@@ -34,9 +46,17 @@ pub type WatchIdentity = ();
 
 /// Read the filesystem identity of `path` for watch-invalidation
 /// comparisons. On Unix returns `(dev, ino)` from `fs::metadata`; on
-/// other platforms returns `()` after the metadata call surfaces a
-/// missing path as `Err`. Errors propagate so callers can treat
-/// stat-failed as "identity unknown" rather than synthesising a value.
+/// other platforms `Ok(())` indicates the path exists (the metadata
+/// call is used only to surface a missing path as `Err`; no metadata
+/// fields are read). Errors propagate so callers can treat stat-failed
+/// as "identity unknown" rather than synthesizing a value.
+///
+/// # Errors
+///
+/// Returns `Err` if `fs::metadata(path)` fails (path missing,
+/// permission denied, or any other I/O failure). Callers that treat
+/// stat-failed as "identity unknown" should call `.ok()` at the use
+/// site.
 pub fn capture_watch_identity(path: &Path) -> std::io::Result<WatchIdentity> {
     #[cfg(unix)]
     {
@@ -176,12 +196,16 @@ struct SubscriptionId(u64);
 #[derive(Debug)]
 struct DirState {
     refcount: usize,
-    /// Filesystem identity recorded at the most recent successful
-    /// `watcher.watch` call for this dir. `None` between insertion and
-    /// the first install (transient), `Some` once watched. Re-stat on
-    /// every `subscribe_channel`; mismatch indicates the kernel watch
-    /// is in IN_IGNORED limbo (peer recreated the same path) and
-    /// forces a rewatch even when refcount > 0.
+    /// Filesystem identity captured immediately before each successful
+    /// `watcher.watch` call (initial install or drift rewatch) and
+    /// stored after the call returns `Ok`. `None` between insertion
+    /// and the first install (transient), `Some` once watched.
+    /// Re-stat on every `subscribe_channel`; mismatch against this
+    /// stored value forces a rewatch even when refcount > 0, since
+    /// notify NonRecursive watches do not auto-reattach across the
+    /// inode change a same-path recreate produces. A rewatch failure
+    /// clears this back to `None` so a permanently failing watch
+    /// does not retry on every subsequent subscribe.
     installed_identity: Option<WatchIdentity>,
 }
 
@@ -512,6 +536,7 @@ impl FileWatchService {
                 Some(stored) => stored != curr,
                 None => false,
             },
+            (None, Some(state)) => state.installed_identity.is_some(),
             _ => false,
         };
         let pre_bump = inner
@@ -528,9 +553,12 @@ impl FileWatchService {
         if needs_install || drift_against_existing {
             // Lock STAYS HELD across the watch call to preserve the
             // invariant: another subscriber must not observe
-            // refcount==1 mid-rollback. Re-arming on inode drift uses
-            // the same idempotent `Watcher::watch` call that initial
-            // installs use; notify reconciles the kernel descriptor.
+            // refcount==1 mid-rollback. Re-arming on inode drift
+            // calls `Watcher::watch` a second time on the same path;
+            // notify-rs is expected to install a fresh kernel
+            // descriptor against the new inode (inotify allocates a
+            // new wd, FSEvents starts a new stream, kqueue reopens
+            // the fd).
             let watcher = inner.watcher.as_mut().expect(
                 "watcher initialized in FileWatchService::new; noop path short-circuits above",
             );
@@ -538,11 +566,12 @@ impl FileWatchService {
                 if needs_install {
                     inner.dirs.remove(&dir);
                 } else {
-                    inner
+                    let state = inner
                         .dirs
                         .get_mut(&dir)
-                        .expect("entry exists during drift rewatch")
-                        .refcount = pre_bump;
+                        .expect("entry exists during drift rewatch");
+                    state.refcount = pre_bump;
+                    state.installed_identity = None;
                 }
                 let kind = classify_notify_err(&e);
                 return Err(WatchError::Watch {
@@ -1752,7 +1781,7 @@ mod tests {
         );
 
         write_file(&dir, "file", "payload");
-        let evt = timeout(Duration::from_secs(2), rx.recv())
+        let evt = timeout(KERNEL_WAIT, rx.recv())
             .await
             .expect("event arrives within budget after watch re-arm")
             .expect("channel open");

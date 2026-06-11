@@ -951,7 +951,11 @@ pub(super) struct DiskWatchEntry {
     /// string survives a peer `rm -rf X && mkdir X` race because the
     /// new dir resolves to the same string, but the inode does not.
     /// On rewire, mismatch against a fresh stat forces an entry rebuild
-    /// even when the canonical path is unchanged.
+    /// even when the canonical path is unchanged. Stat failure at install
+    /// stores the type's `Default` (`(0, 0)` on Unix; `()` elsewhere) as
+    /// a sentinel; on Unix `(0, 0)` cannot collide with a real
+    /// filesystem identity, so the next rewire that successfully stats
+    /// the dir mismatches against the sentinel and forces a rebuild.
     installed_identity: crate::file_watch::WatchIdentity,
 }
 
@@ -1152,7 +1156,7 @@ impl ReloadFailureState {
             lines.push(format!("- Config watcher init: {e}"));
         }
         lines.push(String::new());
-        lines.push("Previous in-memory state preserved; sources retry automatically.".to_string());
+        lines.push("In-memory state preserved; sources retry automatically.".to_string());
         lines.join("\n")
     }
 
