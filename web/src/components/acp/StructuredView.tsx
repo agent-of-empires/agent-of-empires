@@ -144,7 +144,9 @@ export function StructuredView({ sessionId, acpWorkerState, tool, archivedAt, sn
  *  the keyboard. `keyboardHeight` is 0 on platforms where innerHeight already
  *  shrinks with the keyboard (iOS PWA, iOS 26 Safari, Android Chrome), so this
  *  returns undefined there and the existing dvh / interactive-widget path is
- *  untouched. Same value and rationale as RightPanel's embedded paired terminal.
+ *  untouched. Same value and rationale as `LiveTerminalView`'s `rootStyle`,
+ *  which reserves `keyboardHeight` for the mobile terminal surfaces; the
+ *  structured ACP view is the lone holdout that never adopted it.
  *  Extracted as a pure helper so the layout decision can be unit-tested without
  *  mounting the assistant-ui runtime. */
 export function structuredViewRootStyle(
