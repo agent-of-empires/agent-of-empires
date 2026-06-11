@@ -137,7 +137,7 @@ export function RightPanel({
     <div
       ref={containerRef}
       {...tourAnchor(TOUR_ANCHORS.rightPanel)}
-      className="flex-1 flex flex-col min-h-0 overflow-hidden md:border-l md:border-surface-700/60 md:bg-surface-800 md:pb-1.5"
+      className="flex-1 flex flex-col min-h-0 overflow-hidden md:border-l md:border-surface-700/60 md:bg-surface-800"
     >
       {/* Upper: file list */}
       <div

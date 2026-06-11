@@ -403,7 +403,10 @@ select:focus-visible,
    on small touches that haven't yet crossed our gesture-lock
    threshold. */
 .xterm {
-  padding: 4px 8px;
+  /* No padding: an inset gutter shows the panel's --term-bg around the
+     viewport, which reads as a frame whenever the running program paints
+     its own background across the rows. Flush to the panel edge instead. */
+  padding: 0;
   border-radius: 0;
   box-shadow: none;
   overflow: hidden;
