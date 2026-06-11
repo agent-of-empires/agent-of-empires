@@ -1143,11 +1143,8 @@ impl HomeView {
             if id == archiving_id {
                 return None;
             }
-            self.instances
-                .iter()
-                .find(|i| &i.id == id)
-                .filter(|i| !i.is_archived())
-                .map(|i| i.id.clone())
+            let inst = self.instances.iter().find(|i| &i.id == id)?;
+            (!inst.is_archived()).then(|| id.clone())
         };
         for item in self.flat_items.iter().skip(self.cursor + 1) {
             if let Some(id) = candidate(item) {
