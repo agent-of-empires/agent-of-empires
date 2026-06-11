@@ -5485,6 +5485,68 @@ fn archive_last_active_session_clears_selection() {
     );
 }
 
+/// The successor scan must skip rows already parked under an EXPANDED
+/// Archived section: archiving the last active row with an archived row
+/// visible below clears the selection instead of advancing into the section.
+#[test]
+#[serial]
+fn archive_successor_skips_archived_rows() {
+    let mut env = create_test_env_with_sessions(2);
+    env.view.archived_section_collapsed = false;
+
+    // Park the second session first, so an archived row sits below.
+    let parked_id = match env.view.flat_items.get(1) {
+        Some(Item::Session { id, .. }) => id.clone(),
+        other => panic!("expected a second session row, got {other:?}"),
+    };
+    env.view.select_session_by_id(&parked_id);
+    env.view.toggle_archive_at_cursor().unwrap();
+    assert!(env.view.get_instance(&parked_id).unwrap().is_archived());
+
+    // Archive the remaining active session. The only session row left below
+    // the cursor is the parked one, which must NOT become the selection.
+    let id = env.view.selected_session.clone().unwrap();
+    assert_ne!(
+        id, parked_id,
+        "selection must have fallen back to the active row"
+    );
+    env.view.toggle_archive_at_cursor().unwrap();
+
+    assert!(env.view.get_instance(&id).unwrap().is_archived());
+    assert_eq!(
+        env.view.selected_session, None,
+        "the cursor must not advance onto a row inside the Archived section"
+    );
+}
+
+/// Attention sort: archiving the only active session with the Archived
+/// section collapsed leaves no session row for `select_top_attention` to
+/// land on. Selection must clear (not stay pinned to the invisible archived
+/// row) and the cursor must clamp into the shrunken list.
+#[test]
+#[serial]
+fn archive_last_active_session_attention_sort_clears_selection() {
+    let mut env = create_test_env_with_sessions(1);
+    env.view.sort_order = crate::session::config::SortOrder::Attention;
+    env.view.flat_items = env.view.build_flat_items();
+    env.view.archived_section_collapsed = true;
+    env.view.cursor = 0;
+    env.view.update_selected();
+    let id = env.view.selected_session.clone().unwrap();
+
+    env.view.toggle_archive_at_cursor().unwrap();
+
+    assert!(env.view.get_instance(&id).unwrap().is_archived());
+    assert_eq!(
+        env.view.selected_session, None,
+        "selection must not point at the archived row hidden in the collapsed section"
+    );
+    assert!(
+        env.view.cursor < env.view.flat_items.len(),
+        "cursor must stay clamped inside the rebuilt list"
+    );
+}
+
 /// Restoring with `z` unarchives the row and keeps it selected, following it
 /// back to its real tier. Unarchive does not restart the agent: the row stays
 /// Stopped (archive killed its pane) and the user restarts with `e`.

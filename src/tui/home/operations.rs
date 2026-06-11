@@ -1130,9 +1130,11 @@ impl HomeView {
 
     /// The session the cursor should land on after the cursor's row is
     /// archived away: the nearest non-archived session below the cursor,
-    /// else the nearest one above. `None` when the archiving row is the
-    /// only active session (the caller falls back to an index clamp).
-    /// Scans the pre-archive flat list, so it walks exactly the rows the
+    /// else the nearest one above. `None` when no other active session is
+    /// VISIBLE (the caller falls back to an index clamp); active sessions
+    /// hidden inside collapsed groups are deliberately not candidates, so
+    /// archiving never yanks the cursor into a group the user folded away.
+    /// Scans the pre-archive flat list, so it walks the rows the
     /// user sees; archived rows already parked under the Archived section
     /// are skipped so the cursor never advances into it.
     fn archive_successor_session(&self, archiving_id: &str) -> Option<String> {
@@ -1201,8 +1203,11 @@ impl HomeView {
         }
 
         // Decide where the cursor lands BEFORE the row sinks, against the
-        // pre-archive list the user is actually looking at.
-        let successor = self.archive_successor_session(&id);
+        // pre-archive list the user is actually looking at. Only the
+        // non-Attention branch consumes it; Attention re-picks from the top.
+        let successor = (self.sort_order != crate::session::config::SortOrder::Attention)
+            .then(|| self.archive_successor_session(&id))
+            .flatten();
 
         self.apply_user_action(&id, |inst| inst.archive())?;
         if self.sort_order == crate::session::config::SortOrder::Attention {
@@ -1212,6 +1217,16 @@ impl HomeView {
             // dead-pane/selection-swap jank the default sort did.
             self.flat_items = self.build_flat_items();
             self.select_top_attention(None);
+            // select_top_attention is a no-op when no session row is visible
+            // (the archived row sank into a collapsed Archived section and
+            // nothing else is left), which would strand `selected_session`
+            // on the now-invisible archived row and leave the cursor index
+            // past the shrunken list. Clamp and re-resolve, mirroring the
+            // non-Attention fallback below.
+            if self.selected_session.as_deref() == Some(id.as_str()) {
+                self.cursor = self.cursor.min(self.flat_items.len().saturating_sub(1));
+                self.update_selected();
+            }
         } else {
             // Advance to the next session instead of following the archived
             // row into the Archived section: archiving reads as "I'm done
