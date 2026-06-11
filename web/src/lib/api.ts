@@ -1280,6 +1280,22 @@ export async function stopSession(id: string): Promise<SessionResponse | null> {
   }
 }
 
+/** Start (resume) a stopped session, the inverse of stopSession: restarts a
+ *  plain session's pane or un-parks a structured session so its worker
+ *  respawns. Returns null on failure. */
+export async function startSession(id: string): Promise<SessionResponse | null> {
+  try {
+    const res = await fetch(`/api/sessions/${id}/start`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as SessionResponse;
+  } catch {
+    return null;
+  }
+}
+
 /** Snooze or unsnooze a session. Pass `null` to unsnooze, or a positive
  *  number of minutes between 1 and 43200 (30 days) to snooze. The server
  *  validates against the shared `validate_snooze_duration` so the bounds

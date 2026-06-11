@@ -2067,12 +2067,12 @@ impl Config {
     }
 
     /// Effective theme name to paint, mapping the empty default to the
-    /// `default` builtin. Theme is a global preference (see
+    /// `zinc` builtin (the default theme). Theme is a global preference (see
     /// [`resolve_theme_name`]); callers read it from the global config, never
     /// the profile-merged config.
     pub fn effective_theme_name(&self) -> String {
         if self.theme.name.is_empty() {
-            "default".to_string()
+            "zinc".to_string()
         } else {
             self.theme.name.clone()
         }

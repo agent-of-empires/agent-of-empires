@@ -1394,6 +1394,7 @@ fn build_router(state: Arc<AppState>) -> Router {
             patch(api::update_session_snooze),
         )
         .route("/api/sessions/{id}/stop", post(api::stop_session))
+        .route("/api/sessions/{id}/start", post(api::start_session))
         .route("/api/sessions/{id}/terminal", post(api::ensure_terminal))
         .route(
             "/api/sessions/{id}/container-terminal",

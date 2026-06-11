@@ -680,14 +680,14 @@ pub async fn get_resolved_theme(
             "GET /api/themes/{{name}} rejected: name exceeds {} bytes",
             MAX_THEME_NAME_LEN,
         );
-        return Json(crate::tui::styles::resolve_theme("default"));
+        return Json(crate::tui::styles::resolve_theme("zinc"));
     }
     tracing::debug!(theme = %name, "GET /api/themes/{{name}}");
     let resolved = tokio::task::spawn_blocking(move || crate::tui::styles::resolve_theme(&name))
         .await
         .unwrap_or_else(|e| {
             tracing::warn!(error = %e, "theme resolve task panicked, falling back to default");
-            crate::tui::styles::resolve_theme("default")
+            crate::tui::styles::resolve_theme("zinc")
         });
     Json(resolved)
 }
@@ -709,7 +709,7 @@ pub async fn get_current_theme(
     .await
     .unwrap_or_else(|e| {
         tracing::warn!(error = %e, "current theme resolve task panicked, falling back to default");
-        crate::tui::styles::resolve_theme("default")
+        crate::tui::styles::resolve_theme("zinc")
     });
     Json(resolved)
 }

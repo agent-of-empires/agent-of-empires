@@ -30,6 +30,7 @@ import {
   logout,
   deleteSession,
   stopSession,
+  startSession,
   fetchAbout,
   fetchSettings,
   fetchTelemetryStatus,
@@ -662,6 +663,25 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     }
     toastBus.handler?.info("Session stopped");
   }, [stoppingSession, setSessionStatus]);
+
+  const handleStartSession = useCallback(
+    async (workspaceId: string) => {
+      const ws = workspaces.find((w) => w.id === workspaceId);
+      const session = ws?.sessions[0];
+      if (!session) return;
+
+      // Optimistic Starting; the status poller reconciles to the real state.
+      setSessionStatus(session.id, "Starting");
+      const result = await startSession(session.id);
+      if (!result) {
+        setSessionStatus(session.id, "Error");
+        toastBus.handler?.error("Failed to start session");
+        return;
+      }
+      toastBus.handler?.info("Session started");
+    },
+    [workspaces, setSessionStatus],
+  );
 
   const handleCreateSession = useCallback(
     (repoPath: string) => {
@@ -1298,6 +1318,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
               onProfiles={handleOpenProfiles}
               onDeleteSession={handleDeleteSession}
               onStopSession={handleStopSession}
+              onStartSession={handleStartSession}
               readOnly={serverAbout?.read_only}
               sortMode={sidebarSortMode}
               onSortModeChange={setSidebarSortMode}
