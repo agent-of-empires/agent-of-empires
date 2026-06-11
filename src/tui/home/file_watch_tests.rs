@@ -1143,3 +1143,97 @@ async fn watcher_config_refresh_count_exports_to_e2e_debug_file() {
         "subsequent attempts re-export the latest counter value"
     );
 }
+
+/// Locks consumer-side identity invalidation for the config rewire:
+/// when a peer recreates a profile dir between heartbeats, the
+/// canonical path string is unchanged but the inode is fresh, and
+/// `rewire_config_subscriptions` MUST rebuild the entry; the
+/// early-return fast path on an unchanged name set must not skip
+/// the install loop in this case.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn rewire_config_invalidates_on_inode_change_with_same_canonical_path() {
+    let temp = TempDir::new().expect("tempdir");
+    isolate_home(temp.path());
+
+    let live = FileWatchService::new().expect("live svc");
+    let _seed = crate::session::get_profile_dir("inode-drift-cfg").expect("seed dir");
+
+    let mut view = HomeView::new(
+        Some("inode-drift-cfg".to_string()),
+        crate::tmux::AvailableTools::with_tools(&["claude"]),
+        live.clone(),
+    )
+    .expect("HomeView::new");
+
+    use super::ConfigWatchKey;
+    let identity_before = view
+        .config_watch_handles
+        .get(&ConfigWatchKey::profile("inode-drift-cfg"))
+        .expect("initial install populated config entry")
+        .installed_identity;
+
+    let profile_dir =
+        crate::session::get_profile_dir_path("inode-drift-cfg").expect("resolve profile dir");
+    std::fs::remove_dir_all(&profile_dir).expect("remove first incarnation");
+    std::fs::create_dir_all(&profile_dir).expect("recreate same-name dir");
+
+    view.rewire_config_subscriptions(&["inode-drift-cfg".to_string()]);
+
+    let identity_after = view
+        .config_watch_handles
+        .get(&ConfigWatchKey::profile("inode-drift-cfg"))
+        .expect("entry rebuilt after inode drift")
+        .installed_identity;
+
+    assert_ne!(
+        identity_before, identity_after,
+        "rewire must rebuild the entry when the inode drifts even though the canonical path string is unchanged"
+    );
+}
+
+/// Disk-side mirror of the config invalidation test. The disk
+/// rewire path shares the same identity-tracking field on
+/// `DiskWatchEntry`, so the regression locks both consumers.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn rewire_disk_invalidates_on_inode_change_with_same_canonical_path() {
+    let temp = TempDir::new().expect("tempdir");
+    isolate_home(temp.path());
+
+    let live = FileWatchService::new().expect("live svc");
+    let _seed = crate::session::get_profile_dir("inode-drift-disk").expect("seed dir");
+
+    let mut view = HomeView::new(
+        Some("inode-drift-disk".to_string()),
+        crate::tmux::AvailableTools::with_tools(&["claude"]),
+        live.clone(),
+    )
+    .expect("HomeView::new");
+
+    let identity_before = view
+        .disk_watch_handles
+        .get("inode-drift-disk")
+        .expect("initial install populated disk entry")
+        .installed_identity;
+
+    let profile_dir =
+        crate::session::get_profile_dir_path("inode-drift-disk").expect("resolve profile dir");
+    std::fs::remove_dir_all(&profile_dir).expect("remove first incarnation");
+    std::fs::create_dir_all(&profile_dir).expect("recreate same-name dir");
+
+    view.rewire_disk_subscriptions(&["inode-drift-disk".to_string()]);
+
+    let identity_after = view
+        .disk_watch_handles
+        .get("inode-drift-disk")
+        .expect("entry rebuilt after inode drift")
+        .installed_identity;
+
+    assert_ne!(
+        identity_before, identity_after,
+        "rewire must rebuild the entry when the inode drifts even though the canonical path string is unchanged"
+    );
+}

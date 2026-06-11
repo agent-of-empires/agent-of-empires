@@ -942,12 +942,17 @@ pub(super) struct DiskWatchEntry {
     handle: crate::file_watch::SubscriptionHandle,
     forwarder: tokio::task::AbortHandle,
     /// Canonicalized dir at install time. Compared against the current
-    /// canonical resolution on rewire to detect peer-driven
-    /// delete-and-recreate (same name, new inode); on mismatch the entry
-    /// is treated as needing rewire even when the name set is unchanged.
+    /// canonical resolution on rewire to detect path-level moves.
     /// notify NonRecursive watches do not auto-reattach to a recreated
     /// directory on Linux inotify or macOS FSEvents.
     canonical_dir: std::path::PathBuf,
+    /// Filesystem identity (`(dev, ino)` on Unix; `()` elsewhere)
+    /// captured when the subscription was installed. The canonical path
+    /// string survives a peer `rm -rf X && mkdir X` race because the
+    /// new dir resolves to the same string, but the inode does not.
+    /// On rewire, mismatch against a fresh stat forces an entry rebuild
+    /// even when the canonical path is unchanged.
+    installed_identity: crate::file_watch::WatchIdentity,
 }
 
 /// Drop the subscription handle FIRST. Closing the source channel
@@ -958,6 +963,7 @@ fn drop_disk_watch_entry(entry: DiskWatchEntry) {
         handle,
         forwarder,
         canonical_dir: _,
+        installed_identity: _,
     } = entry;
     drop(handle);
     forwarder.abort();
@@ -1146,7 +1152,7 @@ impl ReloadFailureState {
             lines.push(format!("- Config watcher init: {e}"));
         }
         lines.push(String::new());
-        lines.push("Previous in-memory state preserved; will retry on next tick.".to_string());
+        lines.push("Previous in-memory state preserved; sources retry automatically.".to_string());
         lines.join("\n")
     }
 
@@ -1742,7 +1748,12 @@ impl HomeView {
                     .ok()
                     .and_then(|p| std::fs::canonicalize(&p).ok());
                 match current_canonical {
-                    Some(canonical) => canonical != entry.canonical_dir,
+                    Some(canonical) => {
+                        canonical != entry.canonical_dir
+                            || crate::file_watch::capture_watch_identity(&canonical)
+                                .map(|id| id != entry.installed_identity)
+                                .unwrap_or(false)
+                    }
                     None => true,
                 }
             })
@@ -1836,7 +1847,11 @@ impl HomeView {
                         DiskWatchEntry {
                             handle,
                             forwarder: join.abort_handle(),
-                            canonical_dir,
+                            canonical_dir: canonical_dir.clone(),
+                            installed_identity: crate::file_watch::capture_watch_identity(
+                                &canonical_dir,
+                            )
+                            .unwrap_or_default(),
                         },
                     );
                 }
@@ -1900,10 +1915,20 @@ impl HomeView {
         // disk-watch inode-aware rewire. The install-once branch below
         // picks up the new inode.
         let global_invalidated = match self.config_watch_handles.get(&ConfigWatchKey::Global) {
-            Some(entry) => crate::session::get_app_dir()
-                .ok()
-                .and_then(|p| std::fs::canonicalize(&p).ok())
-                .is_none_or(|canonical| canonical != entry.canonical_dir),
+            Some(entry) => {
+                let current_canonical = crate::session::get_app_dir()
+                    .ok()
+                    .and_then(|p| std::fs::canonicalize(&p).ok());
+                match current_canonical {
+                    Some(canonical) => {
+                        canonical != entry.canonical_dir
+                            || crate::file_watch::capture_watch_identity(&canonical)
+                                .map(|id| id != entry.installed_identity)
+                                .unwrap_or(false)
+                    }
+                    None => true,
+                }
+            }
             None => false,
         };
         if global_invalidated {
@@ -1949,7 +1974,12 @@ impl HomeView {
                     .ok()
                     .and_then(|p| std::fs::canonicalize(&p).ok());
                 match current_canonical {
-                    Some(canonical) => canonical != entry.canonical_dir,
+                    Some(canonical) => {
+                        canonical != entry.canonical_dir
+                            || crate::file_watch::capture_watch_identity(&canonical)
+                                .map(|id| id != entry.installed_identity)
+                                .unwrap_or(false)
+                    }
                     None => true,
                 }
             })
@@ -2014,7 +2044,11 @@ impl HomeView {
                                 DiskWatchEntry {
                                     handle,
                                     forwarder: join.abort_handle(),
-                                    canonical_dir,
+                                    canonical_dir: canonical_dir.clone(),
+                                    installed_identity: crate::file_watch::capture_watch_identity(
+                                        &canonical_dir,
+                                    )
+                                    .unwrap_or_default(),
                                 },
                             );
                             tracing::debug!(
@@ -2108,7 +2142,11 @@ impl HomeView {
                         DiskWatchEntry {
                             handle,
                             forwarder: join.abort_handle(),
-                            canonical_dir,
+                            canonical_dir: canonical_dir.clone(),
+                            installed_identity: crate::file_watch::capture_watch_identity(
+                                &canonical_dir,
+                            )
+                            .unwrap_or_default(),
                         },
                     );
                     tracing::debug!(
