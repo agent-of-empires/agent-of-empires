@@ -946,14 +946,17 @@ pub(super) struct DiskWatchEntry {
     /// notify NonRecursive watches do not auto-reattach to a recreated
     /// directory on Linux inotify or macOS FSEvents.
     canonical_dir: std::path::PathBuf,
-    /// Filesystem identity (`(dev, ino)` on Unix; `()` elsewhere)
-    /// captured when the subscription was installed. The canonical path
-    /// string survives a peer `rm -rf X && mkdir X` race because the
-    /// new dir resolves to the same string, but the inode does not.
-    /// On rewire, mismatch against a fresh stat forces an entry rebuild
-    /// even when the canonical path is unchanged. Stat failure at install
-    /// stores the type's `Default` (`(0, 0)` on Unix; `()` elsewhere) as
-    /// a sentinel; on Unix `(0, 0)` cannot collide with a real
+    /// Filesystem identity (`(dev, ino, btime)` on Unix; `()`
+    /// elsewhere) captured when the subscription was installed. The
+    /// canonical path string survives a peer `rm -rf X && mkdir X`
+    /// race because the new dir resolves to the same string, and on
+    /// ext4/overlayfs the freed inode number is routinely recycled by
+    /// the immediate recreate; the birth time component is what
+    /// distinguishes the new dir there. On rewire, mismatch against a
+    /// fresh stat forces an entry rebuild even when the canonical path
+    /// is unchanged. Stat failure at install stores the type's
+    /// `Default` (`(0, 0, None)` on Unix; `()` elsewhere) as a
+    /// sentinel; on Unix `(0, 0, _)` cannot collide with a real
     /// filesystem identity, so the next rewire that successfully stats
     /// the dir mismatches against the sentinel and forces a rebuild.
     installed_identity: crate::file_watch::WatchIdentity,
@@ -1877,6 +1880,14 @@ impl HomeView {
             removed = ?to_remove,
             "reconciled per-profile disk-watch subscriptions"
         );
+        // Missed-window compensation, mirroring the config rewire: a
+        // sessions.json/groups.json write into a recreated dir before
+        // this rebuild produced no event, so kick the latch and let the
+        // next tick reload storage from disk.
+        if !inode_invalidated.is_empty() {
+            self.disk_dirty
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
     }
 
     /// Reconcile the per-key config-file subscriptions against the live
@@ -2179,6 +2190,17 @@ impl HomeView {
                 removed = ?to_remove,
                 "rewire_config_subscriptions: per-profile set-diff update"
             );
+        }
+        // Missed-window compensation: an invalidation-driven rebuild means
+        // the kernel watch was dead for some interval (peer rm+recreate of
+        // the watched dir), and any config write landing in that interval
+        // produced no event. Kick the dirty latch so the next tick
+        // re-reads config from disk rather than trusting the (silent)
+        // fresh watch. Scoped to invalidation rebuilds; plain set-diff
+        // adds/removes have no dead window to compensate.
+        if global_invalidated || !inode_invalidated.is_empty() {
+            self.config_dirty
+                .store(true, std::sync::atomic::Ordering::Release);
         }
     }
 

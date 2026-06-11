@@ -22,12 +22,19 @@ use tokio::sync::mpsc;
 /// Filesystem identity recorded at watch-install time, used to detect
 /// peer-driven `rm -rf X && mkdir X` of the same canonical path. The
 /// canonical path string survives that race (the new dir resolves to
-/// the same string), but the `(dev, ino)` pair from `fs::metadata` does
-/// not. On non-Unix platforms `WatchIdentity` is `()`, so identity
-/// comparisons trivially match and the watch-install logic falls back
-/// to canonical-path probes alone; Windows still carries the original
-/// same-name recreate hazard since `ReadDirectoryChangesW` keys watches
-/// by `HANDLE` rather than `(dev, ino)`. Tracking that gap separately.
+/// the same string), and on ext4/overlayfs the freed inode number is
+/// routinely recycled by the immediate recreate, so `(dev, ino)` alone
+/// is insufficient; the identity also carries the birth time
+/// (`fs::Metadata::created`, statx btime on Linux), which a recycled
+/// inode cannot reproduce. On filesystems without btime the third
+/// component is `None` on both sides and the comparison degrades to
+/// `(dev, ino)`, leaving the residual hazard only where no-btime and
+/// inode recycling coincide. On non-Unix platforms `WatchIdentity` is
+/// `()`, so identity comparisons trivially match and the watch-install
+/// logic falls back to canonical-path probes alone; Windows still
+/// carries the original same-name recreate hazard since
+/// `ReadDirectoryChangesW` keys watches by `HANDLE` rather than
+/// `(dev, ino)`. Tracking that gap separately.
 ///
 /// Storage convention: the primitive (`DirState`) wraps this in
 /// `Option<WatchIdentity>` because the entry is inserted with
@@ -35,21 +42,24 @@ use tokio::sync::mpsc;
 /// pre-install transient state. Consumers (e.g. `DiskWatchEntry` in
 /// `tui/home/mod.rs`) only construct their entries after a successful
 /// `subscribe_channel`, so they store a bare `WatchIdentity` and use
-/// `unwrap_or_default()` to record `(0, 0)` / `()` when the install-time
-/// stat fails; that sentinel self-heals on the next rewire because a
-/// real `(dev, ino)` will mismatch and force an entry rebuild.
+/// `unwrap_or_default()` to record `(0, 0, None)` / `()` when the
+/// install-time stat fails; that sentinel self-heals on the next
+/// rewire because a real `(dev, ino)` will mismatch and force an
+/// entry rebuild.
 #[cfg(unix)]
-pub type WatchIdentity = (u64, u64);
+pub type WatchIdentity = (u64, u64, Option<std::time::SystemTime>);
 /// See [`WatchIdentity`] (Unix variant).
 #[cfg(not(unix))]
 pub type WatchIdentity = ();
 
 /// Read the filesystem identity of `path` for watch-invalidation
-/// comparisons. On Unix returns `(dev, ino)` from `fs::metadata`; on
-/// other platforms `Ok(())` indicates the path exists (the metadata
-/// call is used only to surface a missing path as `Err`; no metadata
-/// fields are read). Errors propagate so callers can treat stat-failed
-/// as "identity unknown" rather than synthesizing a value.
+/// comparisons. On Unix returns `(dev, ino, btime)` from
+/// `fs::metadata`, with `btime` as `None` where the filesystem does
+/// not report a creation time; on other platforms `Ok(())` indicates
+/// the path exists (the metadata call is used only to surface a
+/// missing path as `Err`; no metadata fields are read). Errors
+/// propagate so callers can treat stat-failed as "identity unknown"
+/// rather than synthesizing a value.
 ///
 /// # Errors
 ///
@@ -62,7 +72,7 @@ pub fn capture_watch_identity(path: &Path) -> std::io::Result<WatchIdentity> {
     {
         use std::os::unix::fs::MetadataExt;
         let m = std::fs::metadata(path)?;
-        Ok((m.dev(), m.ino()))
+        Ok((m.dev(), m.ino(), m.created().ok()))
     }
     #[cfg(not(unix))]
     {
@@ -1753,6 +1763,15 @@ mod tests {
                 .expect("identity recorded on install")
         };
 
+        // ext4/overlayfs recycle the freed inode number for an immediate
+        // same-path recreate, and inode timestamps come from the kernel's
+        // coarse clock (jiffy resolution, up to 10ms at HZ=100), so a
+        // recreate landing in the same tick as the original create would
+        // tie on (dev, ino, btime) and hide the drift from the identity
+        // check. Real recreates are seconds away from the original
+        // install; the sleep models that gap without flaking on fast
+        // filesystems.
+        std::thread::sleep(Duration::from_millis(50));
         std::fs::remove_dir_all(&dir).unwrap();
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -1777,7 +1796,8 @@ mod tests {
         };
         assert_ne!(
             identity_before, identity_after,
-            "remove + recreate of the same path must yield a distinct (dev, ino)"
+            "remove + recreate of the same path must yield a distinct identity \
+             (btime breaks the tie when the filesystem recycles the inode number)"
         );
 
         write_file(&dir, "file", "payload");

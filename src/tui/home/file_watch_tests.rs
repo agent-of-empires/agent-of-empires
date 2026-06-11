@@ -1176,6 +1176,10 @@ async fn rewire_config_invalidates_on_inode_change_with_same_canonical_path() {
 
     let profile_dir =
         crate::session::get_profile_dir_path("inode-drift-cfg").expect("resolve profile dir");
+    // Cross a kernel coarse-clock tick before the recreate so the new
+    // dir's btime cannot tie with the seed dir's even when the inode
+    // number is recycled (see the sibling primitive test for details).
+    std::thread::sleep(std::time::Duration::from_millis(50));
     std::fs::remove_dir_all(&profile_dir).expect("remove first incarnation");
     std::fs::create_dir_all(&profile_dir).expect("recreate same-name dir");
 
@@ -1221,6 +1225,10 @@ async fn rewire_disk_invalidates_on_inode_change_with_same_canonical_path() {
 
     let profile_dir =
         crate::session::get_profile_dir_path("inode-drift-disk").expect("resolve profile dir");
+    // Cross a kernel coarse-clock tick before the recreate so the new
+    // dir's btime cannot tie with the seed dir's even when the inode
+    // number is recycled (see the sibling primitive test for details).
+    std::thread::sleep(std::time::Duration::from_millis(50));
     std::fs::remove_dir_all(&profile_dir).expect("remove first incarnation");
     std::fs::create_dir_all(&profile_dir).expect("recreate same-name dir");
 
