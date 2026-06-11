@@ -1095,7 +1095,8 @@
       "risk": "medium",
       "specs": [
         "tests/acp-composer-keyboard.spec.ts",
-        "src/components/acp/StructuredView.layout.test.ts"
+        "src/components/acp/StructuredView.layout.test.ts",
+        "src/components/acp/__tests__/StructuredViewRoot.test.tsx"
       ],
       "components": ["web/src/components/acp/StructuredView.tsx"]
     },

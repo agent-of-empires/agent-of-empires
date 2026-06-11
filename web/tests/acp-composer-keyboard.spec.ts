@@ -24,9 +24,7 @@ const SESSION_ID = "sess-acp-kbd";
 const TITLE = "acp-kbd";
 
 async function setup(page: Page) {
-  await page.route("**/api/login/status", (r) =>
-    r.fulfill({ json: { required: false, authenticated: true } }),
-  );
+  await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
   for (const path of [
     "settings",
     "themes",
@@ -41,10 +39,7 @@ async function setup(page: Page) {
     await page.route(`**/api/${path}`, (r) =>
       r.fulfill({
         json:
-          path === "docker/status" ||
-          path === "about" ||
-          path === "settings" ||
-          path === "system/update-status"
+          path === "docker/status" || path === "about" || path === "settings" || path === "system/update-status"
             ? {}
             : [],
       }),
@@ -81,9 +76,7 @@ async function setup(page: Page) {
       },
     });
   });
-  await page.route("**/api/sessions/*/ensure", (r) =>
-    r.fulfill({ json: { ok: true } }),
-  );
+  await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));
   await page.route("**/api/sessions/*/acp/**", (r) => r.fulfill({ json: {} }));
   await page.routeWebSocket(/\/sessions\/[^/]+\/ws(\?|$)/, () => {});
   await page.routeWebSocket(/\/sessions\/[^/]+\/acp\/ws/, () => {});
@@ -103,11 +96,7 @@ async function openStructuredSession(page: Page) {
 
 // Override visualViewport.height (and optionally innerHeight) to mimic the soft
 // keyboard, then fire the resize the hook listens for.
-async function simulateKeyboardOpen(
-  page: Page,
-  keyboardPx: number,
-  opts: { innerHeightShrinks?: boolean } = {},
-) {
+async function simulateKeyboardOpen(page: Page, keyboardPx: number, opts: { innerHeightShrinks?: boolean } = {}) {
   await page.evaluate(
     ({ keyboardPx, shrinkInner }) => {
       const vv = window.visualViewport;
@@ -135,9 +124,7 @@ async function simulateKeyboardOpen(
 
 async function rootPaddingBottom(page: Page): Promise<number> {
   return page.evaluate(() => {
-    const root = document.querySelector<HTMLElement>(
-      '[data-testid="structured-view-root"]',
-    );
+    const root = document.querySelector<HTMLElement>('[data-testid="structured-view-root"]');
     return parseInt(root?.style.paddingBottom || "0") || 0;
   });
 }

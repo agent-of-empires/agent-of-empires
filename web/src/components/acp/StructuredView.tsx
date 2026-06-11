@@ -149,10 +149,25 @@ export function StructuredView({ sessionId, acpWorkerState, tool, archivedAt, sn
  *  structured ACP view is the lone holdout that never adopted it.
  *  Extracted as a pure helper so the layout decision can be unit-tested without
  *  mounting the assistant-ui runtime. */
-export function structuredViewRootStyle(
-  keyboardHeight: number,
-): React.CSSProperties | undefined {
+export function structuredViewRootStyle(keyboardHeight: number): React.CSSProperties | undefined {
   return keyboardHeight > 0 ? { paddingBottom: keyboardHeight } : undefined;
+}
+
+/** Fixed-height flex root for the structured view, owning the mobile-keyboard
+ *  reservation (see {@link structuredViewRootStyle}). Exported and kept tiny so
+ *  the hook-to-style wiring is testable without mounting the assistant-ui
+ *  runtime, mirroring the #1282 rate-limit-recovery extraction. */
+export function StructuredViewRoot({ children }: { children: React.ReactNode }) {
+  const { keyboardHeight } = useMobileKeyboard();
+  return (
+    <div
+      data-testid="structured-view-root"
+      className="flex h-full flex-col bg-surface-900 text-text-primary"
+      style={structuredViewRootStyle(keyboardHeight)}
+    >
+      {children}
+    </div>
+  );
 }
 
 function AcpChrome({
@@ -256,8 +271,6 @@ function AcpChrome({
   const belowViewportRef = useRef<HTMLDivElement | null>(null);
   const wasAtBottomRef = useRef<boolean>(true);
 
-  const { keyboardHeight } = useMobileKeyboard();
-  const rootStyle = structuredViewRootStyle(keyboardHeight);
   useLayoutEffect(() => {
     const vp = viewportRef.current;
     const below = belowViewportRef.current;
@@ -300,11 +313,7 @@ function AcpChrome({
     );
   }
   return (
-    <div
-      data-testid="structured-view-root"
-      className="flex h-full flex-col bg-surface-900 text-text-primary"
-      style={rootStyle}
-    >
+    <StructuredViewRoot>
       <PlanStrip plan={state.plan} />
 
       <RateLimitRecoverySection sessionId={sessionId} currentAgent={state.agent} onPrefill={recoveryHandoffPrefill}>
@@ -474,7 +483,7 @@ function AcpChrome({
           />
         </div>
       </ThreadPrimitive.Root>
-    </div>
+    </StructuredViewRoot>
   );
 }
 
