@@ -181,7 +181,10 @@ export function readFontSize(page: Page, which: "mobile" | "desktop") {
   }, which);
 }
 
-export async function seedSettings(page: Page, settings: { mobileFontSize?: number; desktopFontSize?: number }) {
+export async function seedSettings(
+  page: Page,
+  settings: { mobileFontSize?: number; desktopFontSize?: number; autoOpenKeyboard?: boolean },
+) {
   await page.evaluate((settings) => {
     localStorage.setItem(
       "aoe-web-settings",

@@ -93,7 +93,11 @@ test.describe("Mobile keyboard detection and layout", () => {
     await page.goto("/");
     // seedSettings writes to localStorage (needs page loaded), then reload
     // so the app picks up the seeded settings with mocks still active.
-    await seedSettings(page, { mobileFontSize: 10 });
+    // This suite exercises keyboard detection / layout / FAB mechanics, not the
+    // auto-open-on-select feature. Disable auto-open so the keyboard starts
+    // closed deterministically (otherwise the select handler focuses the input
+    // and the FAB would read "Close keyboard").
+    await seedSettings(page, { mobileFontSize: 10, autoOpenKeyboard: false });
     await page.reload();
     await page.waitForTimeout(500);
     await openSession(page);
