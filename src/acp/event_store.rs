@@ -2527,9 +2527,9 @@ mod tests {
         assert!(store.unresolved_approval_nonces("s-2").is_empty());
     }
 
-    fn orphan_test_elicitation(nonce: &str) -> crate::acp::elicitations::Elicitation {
+    fn orphan_test_elicitation(nonce: &Nonce) -> crate::acp::elicitations::Elicitation {
         crate::acp::elicitations::Elicitation {
-            nonce: Nonce(nonce.into()),
+            nonce: nonce.clone(),
             message: "Pick".into(),
             title: None,
             description: None,
@@ -2549,14 +2549,14 @@ mod tests {
         use crate::acp::elicitations::ElicitationOutcome;
 
         let (_tmp, store) = open_store(1000);
-        let nonce_a = Nonce("elic-a".into());
-        let nonce_b = Nonce("elic-b".into());
+        let nonce_a = Nonce::new();
+        let nonce_b = Nonce::new();
         store
             .record(
                 "s-1",
                 1,
                 &Event::ElicitationRequested {
-                    elicitation: orphan_test_elicitation("elic-a"),
+                    elicitation: orphan_test_elicitation(&nonce_a),
                 },
             )
             .unwrap();
@@ -2565,7 +2565,7 @@ mod tests {
                 "s-1",
                 2,
                 &Event::ElicitationRequested {
-                    elicitation: orphan_test_elicitation("elic-b"),
+                    elicitation: orphan_test_elicitation(&nonce_b),
                 },
             )
             .unwrap();
@@ -2595,12 +2595,13 @@ mod tests {
         use crate::acp::elicitations::ElicitationOutcome;
 
         let (_tmp, store) = open_store(1000);
+        let nonce_a = Nonce::new();
         store
             .record(
                 "s-1",
                 1,
                 &Event::ElicitationRequested {
-                    elicitation: orphan_test_elicitation("elic-a"),
+                    elicitation: orphan_test_elicitation(&nonce_a),
                 },
             )
             .unwrap();
@@ -2614,7 +2615,7 @@ mod tests {
                 "s-1",
                 2,
                 &Event::ElicitationResolved {
-                    nonce: Nonce("elic-a".into()),
+                    nonce: nonce_a,
                     outcome: ElicitationOutcome::Accepted,
                 },
             )
