@@ -103,6 +103,30 @@ function optionParts(opt: ElicitationOption): { label: string; description?: str
 
 const labelOf = (q: ElicitationQuestion) => q.title || q.field_key;
 
+/** Pre-submit check for a string `format` annotation. The server treats
+ *  format as advisory (the ACP spec says unknown formats are annotations,
+ *  not gates), so this only catches obviously malformed email / uri / date
+ *  values before a round-trip; it never blocks an unknown format. */
+function isValidByFormat(format: string | null | undefined, value: string): boolean {
+  switch (format) {
+    case "email":
+      return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
+    case "uri":
+      try {
+        new URL(value);
+        return true;
+      } catch {
+        return false;
+      }
+    case "date":
+      return /^\d{4}-\d{2}-\d{2}$/.test(value);
+    case "date-time":
+      return !Number.isNaN(Date.parse(value));
+    default:
+      return true;
+  }
+}
+
 function validate(questions: ElicitationQuestion[], answers: AnswerMap): string | null {
   for (const q of questions) {
     const a = entryFor(answers, q.field_key);
@@ -131,6 +155,7 @@ function validate(questions: ElicitationQuestion[], answers: AnswerMap): string 
       const v = a.single;
       if (q.required && v.trim() === "") return `Please answer: ${name}`;
       if (q.kind === "free_text" && v !== "") {
+        if (!isValidByFormat(q.format, v)) return `${name} is not a valid ${q.format}`;
         const len = [...v].length;
         if (q.min_length != null && len < q.min_length) return `${name} must be at least ${q.min_length} characters`;
         if (q.max_length != null && len > q.max_length) return `${name} must be at most ${q.max_length} characters`;
@@ -212,7 +237,7 @@ export function AskUserQuestionCard({ elicitation, onResolve }: Props) {
 
   return (
     <div
-      className="my-2 overflow-hidden rounded-md border border-brand-700/40 bg-brand-700/5 text-sm"
+      className="my-2 overflow-hidden rounded-md border border-surface-800/60 bg-surface-800/50 text-sm"
       role="alertdialog"
       aria-label="Question from the agent"
     >
@@ -255,7 +280,7 @@ export function AskUserQuestionCard({ elicitation, onResolve }: Props) {
           type="button"
           className={[
             "flex flex-1 items-center justify-center gap-1.5 rounded-md py-2 px-3 text-xs font-medium text-white",
-            phase === "pending" ? "bg-brand-600 hover:bg-brand-500" : "bg-brand-700 opacity-70 cursor-wait",
+            phase === "submitting" ? "bg-brand-700 opacity-70 cursor-wait" : "bg-brand-600 hover:bg-brand-500",
           ].join(" ")}
           disabled={disabled}
           onClick={submit}

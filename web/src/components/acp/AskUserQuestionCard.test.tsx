@@ -202,6 +202,20 @@ describe("AskUserQuestionCard extended field kinds", () => {
     expect(screen.getByPlaceholderText("Type your answer").getAttribute("type")).toBe("email");
   });
 
+  it("blocks Submit on a malformed email and accepts a valid one", () => {
+    const onResolve = vi.fn().mockResolvedValue(undefined);
+    const email = q({ field_key: "question_0", kind: "free_text", title: "Email", format: "email" });
+    render(<AskUserQuestionCard elicitation={makeElicitation([email])} onResolve={onResolve} />);
+    const input = screen.getByPlaceholderText("Type your answer");
+    fireEvent.change(input, { target: { value: "notanemail" } });
+    fireEvent.click(screen.getByRole("button", { name: "Submit" }));
+    expect(onResolve).not.toHaveBeenCalled();
+    expect(screen.getByText(/is not a valid email/i)).toBeTruthy();
+    fireEvent.change(input, { target: { value: "a@b.co" } });
+    fireEvent.click(screen.getByRole("button", { name: "Submit" }));
+    expect(onResolve).toHaveBeenCalledWith({ action: "accept", answers: { question_0: "a@b.co" } });
+  });
+
   it("splits the adapter's flattened option label into a two-tier label + description", () => {
     const onResolve = vi.fn().mockResolvedValue(undefined);
     // The adapter flattens to `"<label> — <description>"` keeping the bare
