@@ -45,6 +45,8 @@ function renderTopBar(
       isOffline={overrides.isOffline ?? false}
       isDevBuild={overrides.isDevBuild ?? false}
       onGoDashboard={vi.fn()}
+      sidebarColumnVisible={false}
+      rightColumnVisible={false}
     />,
   );
 }

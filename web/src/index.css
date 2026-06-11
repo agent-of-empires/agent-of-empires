@@ -166,6 +166,13 @@ html {
      making the document taller than the viewport (which lets iOS scroll
      the page when the keyboard opens, breaking keyboard-height math). */
   --safe-area-bottom: env(safe-area-inset-bottom, 0px);
+  /* Live sidebar width, published by WorkspaceSidebar so the TopBar's left
+     zone can match the column and extend the divider up through the header.
+     Default mirrors WorkspaceSidebar's DEFAULT_WIDTH. */
+  --aoe-sidebar-width: 280px;
+  /* Live right-panel width, published by ContentSplit for the symmetric
+     treatment on the right. Default mirrors ContentSplit's DEFAULT_DIFF_WIDTH. */
+  --aoe-right-panel-width: 380px;
 }
 
 body {

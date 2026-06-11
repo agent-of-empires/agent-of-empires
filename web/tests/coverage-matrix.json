@@ -830,6 +830,13 @@
       "components": ["web/src/components/DeleteSessionDialog.tsx"]
     },
     {
+      "id": "session.stop-dialog-keyboard",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/__tests__/StopSessionDialog.test.tsx"],
+      "components": ["web/src/components/StopSessionDialog.tsx"]
+    },
+    {
       "id": "storage.quota-crash-regression",
       "kind": "mocked-playwright",
       "risk": "high",

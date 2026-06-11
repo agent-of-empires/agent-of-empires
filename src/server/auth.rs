@@ -1538,6 +1538,20 @@ mod tests {
             &Method::POST,
             "/api/app-state/web-tour-seen"
         ));
+        // Dismissing the update banner persists one version string and grants
+        // no capability, so it stays off the passphrase wall too (the handler
+        // still enforces read_only).
+        assert!(!requires_elevation(
+            &Method::POST,
+            "/api/app-state/dismiss-update"
+        ));
+        // Web UI-state sync persists only cosmetic preferences and grants no
+        // capability, so it stays off the passphrase wall (read_only still
+        // blocks it).
+        assert!(!requires_elevation(
+            &Method::PATCH,
+            "/api/app-state/web-ui-state"
+        ));
 
         // Read-only GETs are NOT gated even on settings/profile paths.
         assert!(!requires_elevation(&Method::GET, "/api/settings"));

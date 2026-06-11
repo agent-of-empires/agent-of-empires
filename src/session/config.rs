@@ -693,6 +693,17 @@ pub struct AppStateConfig {
     /// shelved session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_section_collapsed: Option<bool>,
+
+    /// Server-side mirror of the web dashboard's syncable UI state, keyed by
+    /// the frontend's localStorage key (the value is the opaque string the
+    /// browser stored). Single-tenant: there is one user, so these prefs
+    /// (sidebar sort/axis, tool density, repo appearance/order, group collapse,
+    /// last-used tool, welcome-seen, etc.) live here so they follow the user
+    /// across browsers and devices instead of being trapped in per-browser
+    /// localStorage. The server never interprets the values; the web owns the
+    /// shape. See `GET`/`PATCH /api/app-state/web-ui-state`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub web_ui_state: std::collections::BTreeMap<String, String>,
 }
 
 /// Session-related configuration defaults

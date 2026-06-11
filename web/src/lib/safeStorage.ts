@@ -12,11 +12,32 @@ function getStorage(): Storage | null {
   return ls ?? null;
 }
 
+// Optional server-sync chokepoint. The web UI-state sync layer (webUiSync.ts)
+// registers a matcher + handler so writes to *synced* keys are mirrored to the
+// server, without every individual store having to know about syncing. Keys
+// that don't match (layout dimensions, per-session drafts, caches) stay purely
+// local. A removed key is reported with `value === null`.
+let syncMatcher: ((key: string) => boolean) | null = null;
+let syncHandler: ((key: string, value: string | null) => void) | null = null;
+
+export function configureStorageSync(
+  matcher: (key: string) => boolean,
+  handler: (key: string, value: string | null) => void,
+): void {
+  syncMatcher = matcher;
+  syncHandler = handler;
+}
+
+function notifySync(key: string, value: string | null): void {
+  if (syncMatcher?.(key)) syncHandler?.(key, value);
+}
+
 export function safeSetItem(key: string, value: string): boolean {
   const storage = getStorage();
   if (!storage) return false;
   try {
     storage.setItem(key, value);
+    notifySync(key, value);
     return true;
   } catch {
     return false;
@@ -28,6 +49,7 @@ export function safeRemoveItem(key: string): void {
   if (!storage) return;
   try {
     storage.removeItem(key);
+    notifySync(key, null);
   } catch {
     // private mode or storage disabled; non-fatal
   }

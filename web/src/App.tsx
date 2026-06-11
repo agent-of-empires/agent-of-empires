@@ -29,6 +29,7 @@ import {
   loginStatus,
   logout,
   deleteSession,
+  stopSession,
   fetchAbout,
   fetchSettings,
   fetchTelemetryStatus,
@@ -44,8 +45,10 @@ import { toastBus } from "./lib/toastBus";
 import { resolveToRepoRelative, type FileRef } from "./lib/fileRef";
 import { OPEN_SESSION_EVENT } from "./lib/sessionRoute";
 import { dispatchFocusTerminal, requestSessionInputFocus, setPendingTerminalFocus } from "./lib/terminalFocus";
+import { hydrateWebUiStateFromServer, initWebUiSync } from "./lib/webUiSync";
 import { WorkspaceSidebar } from "./components/WorkspaceSidebar";
 import { DeleteSessionDialog } from "./components/DeleteSessionDialog";
+import { StopSessionDialog } from "./components/StopSessionDialog";
 import { TopBar } from "./components/TopBar";
 import { ContentSplit } from "./components/ContentSplit";
 import { TerminalSessionStack } from "./components/TerminalSessionStack";
@@ -155,6 +158,11 @@ export default function App() {
     setLoginAuthenticated(false);
   };
 
+  // Only hydrate once the user is past every auth gate, so the request runs as
+  // the authenticated user (and never against the login/token screens).
+  const authReady = !tokenExpired && loginRequired !== null && !(loginRequired && !loginAuthenticated);
+  const hydrated = useServerHydration(authReady);
+
   // Token auth is the first factor; show token entry before anything else
   if (tokenExpired) {
     return <TokenEntryPage onSuccess={handleTokenSuccess} />;
@@ -168,12 +176,44 @@ export default function App() {
     return <div className="h-dvh bg-surface-900 safe-area-inset" />;
   }
 
+  // Past auth: pull the server-side UI-state blob into localStorage before
+  // AppContent mounts, so its stores read the user's synced (cross-device)
+  // preferences on first paint instead of this browser's stale cache.
+  if (!hydrated) {
+    return <div className="h-dvh bg-surface-900 safe-area-inset" />;
+  }
+
   return (
     <IdleDecayWindowContext.Provider value={idleDecayWindowMs}>
       <AppContent loginRequired={loginRequired} onLogout={handleLogout} />
       <ElevationPrompt />
     </IdleDecayWindowContext.Provider>
   );
+}
+
+/** Hydrate the synced UI-state from the server once, after auth, before
+ *  rendering the app. Falls back to the local cache if the backend is slow or
+ *  unreachable so a failed fetch never blocks the dashboard. */
+function useServerHydration(enabled: boolean): boolean {
+  const [hydrated, setHydrated] = useState(false);
+  useEffect(() => {
+    if (!enabled || hydrated) return;
+    initWebUiSync();
+    let cancelled = false;
+    const fallback = setTimeout(() => {
+      if (!cancelled) setHydrated(true);
+    }, 1500);
+    void hydrateWebUiStateFromServer().finally(() => {
+      if (cancelled) return;
+      clearTimeout(fallback);
+      setHydrated(true);
+    });
+    return () => {
+      cancelled = true;
+      clearTimeout(fallback);
+    };
+  }, [enabled, hydrated]);
+  return hydrated;
 }
 
 /** Walk from the event target up to the document root looking for any
@@ -428,16 +468,25 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     (sessionId: string) => {
       const ws = workspaces.find((w) => w.sessions.some((s) => s.id === sessionId));
       if (ws) {
+        const picked = ws.sessions.find((s) => s.id === sessionId);
         navigate(`/session/${encodeURIComponent(sessionId)}`);
-        // The proxy is a real textarea; focusing it inside the click gesture
-        // would pop the soft keyboard on touch devices, so skip it on coarse
-        // pointers (#1178), matching the focusAgentInput suppression.
-        if (!isCoarse) focusKeyboardProxy();
-        focusAgentInput(ws.sessions.find((s) => s.id === sessionId));
+        // On touch devices, raise the soft keyboard within the tap gesture and
+        // latch the terminal/composer to take focus once it mounts (keeping the
+        // keyboard up) — but only when the user opted into auto-open keyboard.
+        // On desktop the proxy is a no-op and we focus the real input directly.
+        if (isCoarse) {
+          if (webSettings.autoOpenKeyboard) {
+            focusKeyboardProxy();
+            setPendingTerminalFocus(picked?.view === "structured" ? "composer" : "agent");
+          }
+        } else {
+          focusKeyboardProxy();
+          focusAgentInput(picked);
+        }
         if (window.innerWidth < 768) setSidebarOpen(false);
       }
     },
-    [navigate, workspaces, focusAgentInput, isCoarse],
+    [navigate, workspaces, focusAgentInput, isCoarse, webSettings.autoOpenKeyboard],
   );
 
   const handleSelectWorkspace = (workspaceId: string) => {
@@ -447,12 +496,21 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       const picked = running ?? ws.sessions[0] ?? null;
       if (picked) {
         navigate(`/session/${encodeURIComponent(picked.id)}`);
-        focusAgentInput(picked);
+        // Mirror handleSelectSession: on touch, raise the keyboard + latch focus
+        // only when auto-open keyboard is enabled; on desktop focus directly.
+        if (isCoarse) {
+          if (webSettings.autoOpenKeyboard) {
+            focusKeyboardProxy();
+            setPendingTerminalFocus(picked.view === "structured" ? "composer" : "agent");
+          }
+        } else {
+          focusKeyboardProxy();
+          focusAgentInput(picked);
+        }
       } else {
         navigate("/");
       }
     }
-    if (!isCoarse) focusKeyboardProxy();
     if (window.innerWidth < 768) {
       setSidebarOpen(false);
     }
@@ -473,6 +531,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
 
   const [wizardPrefill, setWizardPrefill] = useState<WizardPrefill | undefined>(undefined);
   const [deletingWorkspaceId, setDeletingWorkspaceId] = useState<string | null>(null);
+  const [stoppingWorkspaceId, setStoppingWorkspaceId] = useState<string | null>(null);
   const [serverAbout, setServerAbout] = useState<ServerAbout | null>(null);
   // `serverAbout === null` conflates "not fetched yet" with "fetch failed", so
   // the tour gates auto-launch on an explicit loaded flag instead.
@@ -578,6 +637,31 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     },
     [deletingSession, activeSessionId, setSessionStatus, navigate],
   );
+
+  const stoppingWorkspace = stoppingWorkspaceId ? workspaces.find((w) => w.id === stoppingWorkspaceId) : null;
+  const stoppingSession = stoppingWorkspace?.sessions[0] ?? null;
+
+  const handleStopSession = useCallback((workspaceId: string) => {
+    setStoppingWorkspaceId(workspaceId);
+  }, []);
+
+  const handleConfirmStop = useCallback(async () => {
+    if (!stoppingSession) return;
+    const sessionId = stoppingSession.id;
+
+    // Close the dialog and show "Stopped" immediately; the 2s status poller
+    // reconciles the true state and corrects this if the request fails.
+    setStoppingWorkspaceId(null);
+    setSessionStatus(sessionId, "Stopped");
+
+    const result = await stopSession(sessionId);
+    if (!result) {
+      setSessionStatus(sessionId, "Error");
+      toastBus.handler?.error("Failed to stop session");
+      return;
+    }
+    toastBus.handler?.info("Session stopped");
+  }, [stoppingSession, setSessionStatus]);
 
   const handleCreateSession = useCallback(
     (repoPath: string) => {
@@ -712,6 +796,9 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     enabled: !sidebarOpen,
     onSwipe: openSidebar,
     blurOnSwipe: true,
+    // A swipe-right anywhere on screen opens the sidebar, not just from the
+    // left edge. The right-edge (diff) swipe stays edge-only below.
+    anywhere: true,
   });
   useEdgeSwipe({
     edge: "right",
@@ -810,6 +897,10 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
             setDeletingWorkspaceId(null);
             return;
           }
+          if (stoppingWorkspaceId) {
+            setStoppingWorkspaceId(null);
+            return;
+          }
           if (showPalette) {
             setShowPalette(false);
             return;
@@ -831,6 +922,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
         toggleDiff,
         showPalette,
         deletingWorkspaceId,
+        stoppingWorkspaceId,
         showSettings,
         handleCloseSettings,
         navigate,
@@ -1166,6 +1258,16 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
           isOffline={!!error}
           isDevBuild={isDebugBuild(serverAbout)}
           onGoDashboard={handleGoDashboard}
+          sidebarColumnVisible={!showSettings && !showProjects && sidebarOpen}
+          rightColumnVisible={
+            isMdUp &&
+            !showSettings &&
+            !showProjects &&
+            !showProfiles &&
+            !!activeWorkspace &&
+            !!activeSession &&
+            !diffCollapsed
+          }
         />
 
         <DisconnectBanner />
@@ -1195,6 +1297,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
               onProjects={handleOpenProjects}
               onProfiles={handleOpenProfiles}
               onDeleteSession={handleDeleteSession}
+              onStopSession={handleStopSession}
               readOnly={serverAbout?.read_only}
               sortMode={sidebarSortMode}
               onSortModeChange={setSidebarSortMode}
@@ -1244,6 +1347,14 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
             cleanupDefaults={deletingSession.cleanup_defaults}
             onConfirm={handleConfirmDelete}
             onCancel={() => setDeletingWorkspaceId(null)}
+          />
+        )}
+
+        {stoppingSession && (
+          <StopSessionDialog
+            sessionTitle={stoppingSession.title}
+            onConfirm={handleConfirmStop}
+            onCancel={() => setStoppingWorkspaceId(null)}
           />
         )}
 

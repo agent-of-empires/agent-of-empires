@@ -1859,6 +1859,165 @@ pub async fn update_session_archive(
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
 
+/// Stop a session, matching the TUI's `x` keybind: kill the tmux pane and
+/// stop (but do not remove) the Docker container for plain sessions; shut down
+/// the worker for structured-view sessions. The session record is preserved
+/// with status `Stopped` so it can be resumed later. This is NOT delete.
+pub async fn stop_session(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "read_only",
+                "message": "Server is in read-only mode"
+            })),
+        )
+            .into_response();
+    }
+
+    let lock = state.instance_lock(&id).await;
+    let _guard = lock.lock().await;
+
+    // Snapshot profile, session type, and current status without mutating yet
+    // so a persist failure leaves disk and memory in agreement (mirrors the
+    // archive handler).
+    let (profile, is_structured, already_stopped) = {
+        let instances = state.instances.read().await;
+        let Some(inst) = instances.iter().find(|i| i.id == id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "message": "Session not found" })),
+            )
+                .into_response();
+        };
+        let structured;
+        #[cfg(feature = "serve")]
+        {
+            structured = inst.is_structured();
+        }
+        #[cfg(not(feature = "serve"))]
+        {
+            structured = false;
+        }
+        // Mirror the TUI's `stop_selected` guard: a session that is already
+        // stopped or mid-lifecycle has nothing to stop.
+        let already = matches!(
+            inst.status,
+            Status::Stopped | Status::Deleting | Status::Creating
+        );
+        (inst.source_profile.clone(), structured, already)
+    };
+
+    if already_stopped {
+        let instances = state.instances.read().await;
+        let response = match instances.iter().find(|i| i.id == id) {
+            Some(inst) => {
+                SessionResponse::from_instance(inst, crate::claude_settings::read_tui_fullscreen())
+            }
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({ "message": "Session not found" })),
+                )
+                    .into_response();
+            }
+        };
+        return (StatusCode::OK, Json(serde_json::json!(response))).into_response();
+    }
+
+    // Persist Stopped first. For structured sessions also mark the row
+    // idle-dormant so the acp reconciler does not respawn the worker we are
+    // about to shut down (mirrors the structured auto-stop reaper).
+    let persist_id = id.clone();
+    if persist_session_update(
+        profile,
+        "stop session",
+        state.file_watch.clone(),
+        move |instances| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+                inst.status = Status::Stopped;
+                if is_structured {
+                    inst.mark_idle_dormant();
+                }
+            }
+        },
+    )
+    .await
+    .is_err()
+    {
+        return persist_failed_response();
+    }
+
+    // Disk is durable; apply to memory and snapshot the instance for the
+    // side effects below.
+    let inst_clone = {
+        let mut instances = state.instances.write().await;
+        let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
+            tracing::error!(
+                target: "http.api.sessions",
+                session = %id,
+                "stop session: instance vanished after persist"
+            );
+            return persist_failed_response();
+        };
+        inst.status = Status::Stopped;
+        if is_structured {
+            inst.mark_idle_dormant();
+        }
+        inst.clone()
+    };
+
+    if is_structured {
+        // Structured view: shut down the worker so the reconciler does not
+        // race to respawn it. `shutdown` preserves the transcript, so the
+        // session resumes the conversation when reopened.
+        #[cfg(feature = "serve")]
+        match state.acp_supervisor.shutdown(&id).await {
+            Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
+            Err(e) => tracing::warn!(
+                target: "acp.supervisor",
+                session = %id,
+                "shutdown during stop failed: {e}"
+            ),
+        }
+    } else {
+        // Plain session: kill the tmux pane and stop (not remove) the Docker
+        // container. `Instance::stop` can block ~10s on `docker stop`, so run
+        // it off the async runtime. Mirrors the TUI's StopPoller.
+        let inst_for_stop = inst_clone.clone();
+        match tokio::task::spawn_blocking(move || inst_for_stop.stop()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(
+                target: "http.api.sessions",
+                "Stop: session stop failed: {e}"
+            ),
+            Err(e) => tracing::warn!(
+                target: "http.api.sessions",
+                "Stop: stop join failed: {e}"
+            ),
+        }
+    }
+
+    // Re-read so the response reflects the Stopped status.
+    let instances = state.instances.read().await;
+    let response = match instances.iter().find(|i| i.id == id) {
+        Some(inst) => {
+            SessionResponse::from_instance(inst, crate::claude_settings::read_tui_fullscreen())
+        }
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "message": "Session not found" })),
+            )
+                .into_response();
+        }
+    };
+    (StatusCode::OK, Json(serde_json::json!(response))).into_response()
+}
+
 pub async fn update_session_snooze(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
