@@ -894,6 +894,8 @@ impl EventStore {
                    AND (json_extract(event_json, '$.UserPromptSent') IS NOT NULL
                      OR json_extract(event_json, '$.ApprovalRequested') IS NOT NULL
                      OR json_extract(event_json, '$.ApprovalResolved') IS NOT NULL
+                     OR json_extract(event_json, '$.ElicitationRequested') IS NOT NULL
+                     OR json_extract(event_json, '$.ElicitationResolved') IS NOT NULL
                      OR json_extract(event_json, '$.Stopped') IS NOT NULL
                      OR json_extract(event_json, '$.RateLimitAutoResumed') IS NOT NULL
                      OR json_extract(event_json, '$.AgentStartupError') IS NOT NULL)
@@ -2523,6 +2525,104 @@ mod tests {
 
         // Unrelated session must not bleed into the query.
         assert!(store.unresolved_approval_nonces("s-2").is_empty());
+    }
+
+    fn orphan_test_elicitation(nonce: &str) -> crate::acp::elicitations::Elicitation {
+        crate::acp::elicitations::Elicitation {
+            nonce: Nonce(nonce.into()),
+            message: "Pick".into(),
+            title: None,
+            description: None,
+            tool_call_id: None,
+            questions: Vec::new(),
+            requested_at: Utc::now(),
+            resolved: None,
+        }
+    }
+
+    /// Elicitation parallel of `unresolved_approval_nonces`: an
+    /// `ElicitationRequested` whose nonce never saw a matching
+    /// `ElicitationResolved` is reported as orphaned on reattach.
+    #[test]
+    fn unresolved_elicitation_nonces_finds_orphaned_requests() {
+        use crate::acp::approvals::Nonce;
+        use crate::acp::elicitations::ElicitationOutcome;
+
+        let (_tmp, store) = open_store(1000);
+        let nonce_a = Nonce("elic-a".into());
+        let nonce_b = Nonce("elic-b".into());
+        store
+            .record(
+                "s-1",
+                1,
+                &Event::ElicitationRequested {
+                    elicitation: orphan_test_elicitation("elic-a"),
+                },
+            )
+            .unwrap();
+        store
+            .record(
+                "s-1",
+                2,
+                &Event::ElicitationRequested {
+                    elicitation: orphan_test_elicitation("elic-b"),
+                },
+            )
+            .unwrap();
+        // Only nonce_a is resolved; nonce_b stays orphaned.
+        store
+            .record(
+                "s-1",
+                3,
+                &Event::ElicitationResolved {
+                    nonce: nonce_a,
+                    outcome: ElicitationOutcome::Accepted,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(store.unresolved_elicitation_nonces("s-1"), vec![nonce_b]);
+        // Unrelated session must not bleed into the query.
+        assert!(store.unresolved_elicitation_nonces("s-2").is_empty());
+    }
+
+    /// `latest_status_event` must recognize elicitation lifecycle events,
+    /// so a session blocked on a pending elicitation re-derives to Waiting
+    /// on cold-start / attach instead of waiting for the next live event.
+    #[test]
+    fn latest_status_event_includes_elicitation_lifecycle() {
+        use crate::acp::approvals::Nonce;
+        use crate::acp::elicitations::ElicitationOutcome;
+
+        let (_tmp, store) = open_store(1000);
+        store
+            .record(
+                "s-1",
+                1,
+                &Event::ElicitationRequested {
+                    elicitation: orphan_test_elicitation("elic-a"),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            store.latest_status_event("s-1"),
+            Some(Event::ElicitationRequested { .. })
+        ));
+
+        store
+            .record(
+                "s-1",
+                2,
+                &Event::ElicitationResolved {
+                    nonce: Nonce("elic-a".into()),
+                    outcome: ElicitationOutcome::Accepted,
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            store.latest_status_event("s-1"),
+            Some(Event::ElicitationResolved { .. })
+        ));
     }
 
     fn rate_limit_event(secs_until_reset: i64) -> Event {
