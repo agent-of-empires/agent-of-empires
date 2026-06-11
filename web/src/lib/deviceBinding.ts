@@ -56,9 +56,7 @@ export function getOrCreateDeviceBindingSecret(): string {
   }
   const bytes = new Uint8Array(BINDING_SECRET_BYTES);
   if (typeof crypto === "undefined" || !crypto.getRandomValues) {
-    throw new Error(
-      "Browser does not expose crypto.getRandomValues; cannot create device binding",
-    );
+    throw new Error("Browser does not expose crypto.getRandomValues; cannot create device binding");
   }
   crypto.getRandomValues(bytes);
   const secret = base64UrlEncode(bytes);
@@ -68,10 +66,7 @@ export function getOrCreateDeviceBindingSecret(): string {
     // eslint-disable-next-line no-restricted-syntax
     window.localStorage.setItem(STORAGE_KEY, secret);
   } catch (err) {
-    throw new Error(
-      `Could not persist device binding secret: ${describeError(err)}`,
-      { cause: err },
-    );
+    throw new Error(`Could not persist device binding secret: ${describeError(err)}`, { cause: err });
   }
   cached = secret;
   return secret;
@@ -105,10 +100,7 @@ export function __resetDeviceBindingForTests(): void {
 function base64UrlEncode(bytes: Uint8Array): string {
   let binary = "";
   for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary)
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/, "");
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
 function isValidEncoded(value: string): boolean {

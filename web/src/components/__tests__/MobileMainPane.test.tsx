@@ -62,9 +62,7 @@ function session(overrides: Partial<SessionResponse> = {}): SessionResponse {
   } as SessionResponse;
 }
 
-function makeStore(
-  overrides: Partial<ReturnType<typeof useDiffComments>> = {},
-): ReturnType<typeof useDiffComments> {
+function makeStore(overrides: Partial<ReturnType<typeof useDiffComments>> = {}): ReturnType<typeof useDiffComments> {
   return {
     count: 0,
     comments: [],
@@ -162,9 +160,7 @@ describe("MobileMainPane", () => {
     setup({
       view: "diff",
       commentsEnabled: true,
-      diffComments: { ...diffComments, count: 2 } as ReturnType<
-        typeof useDiffComments
-      >,
+      diffComments: { ...diffComments, count: 2 } as ReturnType<typeof useDiffComments>,
     });
     expect(screen.getByTestId("comments-banner")).toBeDefined();
   });

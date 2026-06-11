@@ -54,8 +54,7 @@ function authHeaders(handle: ServeHandle): Record<string, string> {
   // browser.
   const out: Record<string, string> = {};
   if (handle.sessionCookie) {
-    out["Cookie"] =
-      `${handle.sessionCookie.name}=${handle.sessionCookie.value}`;
+    out["Cookie"] = `${handle.sessionCookie.name}=${handle.sessionCookie.value}`;
   }
   if (handle.deviceBindingSecret) {
     out["X-Aoe-Device-Binding"] = handle.deviceBindingSecret;
@@ -84,35 +83,24 @@ async function reLogin(handle: ServeHandle): Promise<void> {
     }),
   });
   if (!res.ok) {
-    throw new Error(
-      `re-login after restart failed: ${res.status} ${await res.text()}`,
-    );
+    throw new Error(`re-login after restart failed: ${res.status} ${await res.text()}`);
   }
   const setCookie = res.headers.get("set-cookie") ?? "";
   const match = /aoe_session=([^;]+)/.exec(setCookie);
   if (!match) {
-    throw new Error(
-      `re-login did not set aoe_session cookie. Set-Cookie: ${setCookie}`,
-    );
+    throw new Error(`re-login did not set aoe_session cookie. Set-Cookie: ${setCookie}`);
   }
   handle.sessionCookie = { name: "aoe_session", value: match[1] };
 }
 
 async function resolveDefaultProfile(handle: ServeHandle): Promise<string> {
-  const profiles: Array<{ name: string; is_default?: boolean }> = await fetch(
-    `${handle.baseUrl}/api/profiles`,
-    { headers: authHeaders(handle) },
-  ).then((r) => r.json());
-  return (
-    profiles.find((p) => p.is_default)?.name ?? profiles[0]?.name ?? "main"
-  );
+  const profiles: Array<{ name: string; is_default?: boolean }> = await fetch(`${handle.baseUrl}/api/profiles`, {
+    headers: authHeaders(handle),
+  }).then((r) => r.json());
+  return profiles.find((p) => p.is_default)?.name ?? profiles[0]?.name ?? "main";
 }
 
-async function bootDashboardAndNavigate(
-  page: Page,
-  handle: ServeHandle,
-  path: string,
-): Promise<void> {
+async function bootDashboardAndNavigate(page: Page, handle: ServeHandle, path: string): Promise<void> {
   await seedAuth(page, handle);
   // Register the response listener BEFORE navigating: the SPA fires
   // /api/about during bootstrap, which can resolve before `page.goto`
@@ -122,10 +110,7 @@ async function bootDashboardAndNavigate(
   // once auth passes, so once it resolves the SPA's cookie+binding pair is
   // known good.
   await Promise.all([
-    page.waitForResponse(
-      (res) => res.url().endsWith("/api/about") && res.status() === 200,
-      { timeout: 10_000 },
-    ),
+    page.waitForResponse((res) => res.url().endsWith("/api/about") && res.status() === 200, { timeout: 10_000 }),
     page.goto(handle.baseUrl),
   ]);
   if (path !== "/") {
@@ -136,10 +121,7 @@ async function bootDashboardAndNavigate(
   }
 }
 
-test("theme picker persists across reload + restart without passphrase prompt", async ({
-  servePreauthed,
-  page,
-}) => {
+test("theme picker persists across reload + restart without passphrase prompt", async ({ servePreauthed, page }) => {
   // The theme is a global preference written via the dedicated,
   // non-elevated /api/theme endpoint, so persistence is read back from the
   // global settings, not a profile config. The point of this test is that a
@@ -152,11 +134,9 @@ test("theme picker persists across reload + restart without passphrase prompt", 
   // on 403 elevation_required, so a flaky "dialog never opened" race
   // can't silently let the test pass.
   await page.evaluate(() => {
-    (window as unknown as { __elevationFired?: boolean }).__elevationFired =
-      false;
+    (window as unknown as { __elevationFired?: boolean }).__elevationFired = false;
     window.addEventListener("aoe:elevation-required", () => {
-      (window as unknown as { __elevationFired?: boolean }).__elevationFired =
-        true;
+      (window as unknown as { __elevationFired?: boolean }).__elevationFired = true;
     });
   });
 
@@ -169,8 +149,7 @@ test("theme picker persists across reload + restart without passphrase prompt", 
     .poll(
       async () =>
         await themeSelect.evaluate(
-          (sel: HTMLSelectElement, target) =>
-            Array.from(sel.options).some((o) => o.value === target),
+          (sel: HTMLSelectElement, target) => Array.from(sel.options).some((o) => o.value === target),
           SWITCH_TO,
         ),
       { timeout: 5_000 },
@@ -187,37 +166,25 @@ test("theme picker persists across reload + restart without passphrase prompt", 
 
   // No elevation prompt fired anywhere. Checks both the DOM dialog
   // and the event the interceptor would have dispatched.
-  await expect(
-    page.locator('[role="dialog"]').filter({ hasText: /Confirm passphrase/i }),
-  ).toHaveCount(0);
+  await expect(page.locator('[role="dialog"]').filter({ hasText: /Confirm passphrase/i })).toHaveCount(0);
   const fired = await page.evaluate(
-    () =>
-      (window as unknown as { __elevationFired?: boolean }).__elevationFired ??
-      false,
+    () => (window as unknown as { __elevationFired?: boolean }).__elevationFired ?? false,
   );
   expect(fired).toBe(false);
 
   // Client-side repaint after PATCH resolves.
   await expect
-    .poll(
-      () =>
-        page.evaluate(() =>
-          document.documentElement.style
-            .getPropertyValue("--color-surface-900")
-            .trim(),
-        ),
-      { timeout: 5_000, intervals: [100, 200, 400] },
-    )
+    .poll(() => page.evaluate(() => document.documentElement.style.getPropertyValue("--color-surface-900").trim()), {
+      timeout: 5_000,
+      intervals: [100, 200, 400],
+    })
     .toBe("#282a36");
 
   // Same register-before-navigate guard as the initial boot: the post-reload
   // /api/about can resolve before `page.reload()` settles, so attach the
   // listener first via `Promise.all`.
   await Promise.all([
-    page.waitForResponse(
-      (res) => res.url().endsWith("/api/about") && res.status() === 200,
-      { timeout: 10_000 },
-    ),
+    page.waitForResponse((res) => res.url().endsWith("/api/about") && res.status() === 200, { timeout: 10_000 }),
     page.reload(),
   ]);
   const afterReload = await fetch(globalUrl, {
@@ -233,10 +200,7 @@ test("theme picker persists across reload + restart without passphrase prompt", 
   expect(afterRestart?.theme?.name).toBe(SWITCH_TO);
 });
 
-test("sandbox image change still requires passphrase elevation", async ({
-  servePreauthed,
-  page,
-}) => {
+test("sandbox image change still requires passphrase elevation", async ({ servePreauthed, page }) => {
   const defaultProfile = await resolveDefaultProfile(servePreauthed);
 
   await bootDashboardAndNavigate(page, servePreauthed, "/");
@@ -246,16 +210,13 @@ test("sandbox image change still requires passphrase elevation", async ({
   // A direct test-side `fetch` would bypass the interceptor and the
   // dialog would never open even when the server side is correct.
   const status = await page.evaluate(async (profile) => {
-    const res = await fetch(
-      `/api/profiles/${encodeURIComponent(profile)}/settings`,
-      {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          sandbox: { default_image: "ghcr.io/example/img:tampered" },
-        }),
-      },
-    );
+    const res = await fetch(`/api/profiles/${encodeURIComponent(profile)}/settings`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        sandbox: { default_image: "ghcr.io/example/img:tampered" },
+      }),
+    });
     return res.status;
   }, defaultProfile);
   expect(status).toBe(403);
@@ -266,17 +227,14 @@ test("sandbox image change still requires passphrase elevation", async ({
   // accessible name (no aria-label, no aria-labelledby pointing at
   // the "Confirm passphrase" header), so `getByRole("dialog", { name })`
   // does not match. Locate by role then filter on visible text instead.
-  await expect(
-    page.locator('[role="dialog"]').filter({ hasText: /Confirm passphrase/i }),
-  ).toBeVisible({ timeout: 5_000 });
+  await expect(page.locator('[role="dialog"]').filter({ hasText: /Confirm passphrase/i })).toBeVisible({
+    timeout: 5_000,
+  });
 
   // Server state did not move: the sandbox image stays at whatever it
   // was. Use the seeded cookie + binding so the GET passes the wall.
-  const after = await fetch(
-    `${servePreauthed.baseUrl}/api/profiles/${encodeURIComponent(defaultProfile)}/settings`,
-    { headers: authHeaders(servePreauthed) },
-  ).then((r) => r.json());
-  expect(after?.sandbox?.default_image ?? "").not.toBe(
-    "ghcr.io/example/img:tampered",
-  );
+  const after = await fetch(`${servePreauthed.baseUrl}/api/profiles/${encodeURIComponent(defaultProfile)}/settings`, {
+    headers: authHeaders(servePreauthed),
+  }).then((r) => r.json());
+  expect(after?.sandbox?.default_image ?? "").not.toBe("ghcr.io/example/img:tampered");
 });

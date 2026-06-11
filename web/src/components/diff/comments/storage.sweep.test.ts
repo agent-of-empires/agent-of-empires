@@ -6,12 +6,7 @@
 
 import { beforeEach, describe, expect, it } from "vitest";
 
-import {
-  EMPTY_STORAGE,
-  saveComments,
-  storageKey,
-  sweepOrphanComments,
-} from "./storage";
+import { EMPTY_STORAGE, saveComments, storageKey, sweepOrphanComments } from "./storage";
 import type { DiffComment } from "./types";
 
 function mkComment(overrides: Partial<DiffComment> = {}): DiffComment {

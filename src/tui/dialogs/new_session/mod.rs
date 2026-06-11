@@ -1532,53 +1532,24 @@ impl NewSessionDialog {
         }
     }
 
-    /// Handle key events when in tool configuration mode.
+    /// Handle key events when in tool configuration mode. `?` opens the help
+    /// overlay (new-session only); everything else delegates to the shared
+    /// tool-config component.
     fn handle_tool_config_key(&mut self, key: KeyEvent) -> DialogResult<NewSessionData> {
-        // Tool config fields: 0=command override, 1=extra args
-        const TOOL_CMD: usize = 0;
-        const TOOL_ARGS: usize = 1;
-        const TOOL_MAX: usize = 2;
-
-        match key.code {
-            KeyCode::Esc => {
-                self.tool_config_mode = false;
-                DialogResult::Continue
-            }
-            KeyCode::Char('?') => {
-                self.show_help = true;
-                DialogResult::Continue
-            }
-            KeyCode::Enter => {
-                self.tool_config_mode = false;
-                DialogResult::Continue
-            }
-            KeyCode::Tab | KeyCode::Down => {
-                self.tool_config_focused_field = (self.tool_config_focused_field + 1) % TOOL_MAX;
-                DialogResult::Continue
-            }
-            KeyCode::BackTab | KeyCode::Up => {
-                self.tool_config_focused_field = if self.tool_config_focused_field == 0 {
-                    TOOL_MAX - 1
-                } else {
-                    self.tool_config_focused_field - 1
-                };
-                DialogResult::Continue
-            }
-            _ => {
-                match self.tool_config_focused_field {
-                    TOOL_CMD => {
-                        self.command_override
-                            .handle_event(&crossterm::event::Event::Key(key));
-                    }
-                    TOOL_ARGS => {
-                        self.extra_args
-                            .handle_event(&crossterm::event::Event::Key(key));
-                    }
-                    _ => {}
-                }
-                DialogResult::Continue
-            }
+        if key.code == KeyCode::Char('?') {
+            self.show_help = true;
+            return DialogResult::Continue;
         }
+        match crate::tui::components::handle_tool_config_key(
+            key,
+            &mut self.command_override,
+            &mut self.extra_args,
+            &mut self.tool_config_focused_field,
+        ) {
+            crate::tui::components::ToolConfigOutcome::Close => self.tool_config_mode = false,
+            crate::tui::components::ToolConfigOutcome::Continue => {}
+        }
+        DialogResult::Continue
     }
 
     /// Resolve a label chosen from the project picker back to the underlying

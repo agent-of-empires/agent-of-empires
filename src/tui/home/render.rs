@@ -9,8 +9,9 @@ use rattles::presets::prelude as spinners;
 
 use super::{
     get_indent, live_send, HomeView, TerminalMode, ViewMode, ICON_COLLAPSED, ICON_DELETING,
-    ICON_ERROR, ICON_EXPANDED, ICON_IDLE, ICON_STOPPED, ICON_UNKNOWN,
+    ICON_ERROR, ICON_EXPANDED, ICON_IDLE, ICON_PINNED, ICON_STOPPED, ICON_UNKNOWN,
 };
+use crate::containers::image_update::ImageUpdate;
 use crate::session::config::{GroupByMode, SortOrder};
 use crate::session::{Item, Status};
 use crate::tui::components::preview::{self, CachedPreview};
@@ -418,6 +419,19 @@ const LAST_ACTIVITY_SLOT: usize = 6;
 /// horizontal budget on narrow panes.
 const LAST_ACTIVITY_RIGHT_MARGIN: usize = 1;
 
+const SELECTED_ROW_CONTRAST_RATIO: f32 = 3.0;
+
+fn selected_row_style(style: Style, theme: &Theme) -> Style {
+    let Some(fg) = style.fg else {
+        return style.fg(theme.text).bold();
+    };
+    if has_min_contrast(fg, theme.session_selection, SELECTED_ROW_CONTRAST_RATIO) {
+        style.bold()
+    } else {
+        style.fg(theme.text).bold()
+    }
+}
+
 /// Decide where the right-aligned activity column lives on a session row.
 ///
 /// `prefix_width` is the display width of the spans already pushed (indent,
@@ -452,6 +466,7 @@ impl HomeView {
         theme: &Theme,
         update_info: Option<&UpdateInfo>,
         update_status: Option<&str>,
+        image_update: Option<&ImageUpdate>,
     ) {
         // Settings view takes over the whole screen
         if let Some(ref mut settings) = self.settings_view {
@@ -502,7 +517,8 @@ impl HomeView {
         // (update_info) and transient toasts (update_status); we need a row
         // for it whenever either is present, otherwise toasts fired without
         // a pending update would never reach the screen.
-        let has_update_bar = update_info.is_some() || update_status.is_some();
+        let has_update_bar =
+            update_info.is_some() || update_status.is_some() || image_update.is_some();
         let constraints = if has_update_bar {
             vec![
                 Constraint::Min(0),
@@ -581,7 +597,14 @@ impl HomeView {
         self.render_status_bar(frame, main_chunks[1], theme);
 
         if has_update_bar {
-            self.render_update_bar(frame, main_chunks[2], theme, update_info, update_status);
+            self.render_update_bar(
+                frame,
+                main_chunks[2],
+                theme,
+                update_info,
+                update_status,
+                image_update,
+            );
         }
 
         // Render dialogs on top
@@ -630,6 +653,7 @@ impl HomeView {
             worktree_name_dialog,
             restart_dialog,
             hooks_install_dialog,
+            volume_ignores_glob_dialog,
             repo_trust_dialog,
             intro_dialog,
             no_agents_dialog,
@@ -867,6 +891,7 @@ impl HomeView {
             || self.worktree_name_dialog.is_some()
             || self.repo_trust_dialog.is_some()
             || self.hooks_install_dialog.is_some()
+            || self.volume_ignores_glob_dialog.is_some()
             || self.intro_dialog.is_some()
             || self.no_agents_dialog.is_some()
             || self.changelog_dialog.is_some()
@@ -918,7 +943,18 @@ impl HomeView {
                 } else {
                     ICON_EXPANDED
                 };
-                let text = Cow::Owned(format!("{} ({})", name, session_count));
+                // Mark pinned project headers with a trailing pin glyph so an
+                // empty (sessionless) pinned project still reads as deliberate
+                // rather than stale. Project view only; the registry lookup is
+                // keyed by the header label.
+                let pinned = self.group_by == GroupByMode::Project
+                    && !crate::session::is_within_archived_section(path)
+                    && self.is_project_label_pinned(name);
+                let text = if pinned {
+                    Cow::Owned(format!("{} ({}) {}", name, session_count, ICON_PINNED))
+                } else {
+                    Cow::Owned(format!("{} ({})", name, session_count))
+                };
                 let mut style = Style::default().fg(theme.group).bold();
                 if crate::session::is_within_archived_section(path) {
                     // Synthetic Archived section header (and any
@@ -1143,22 +1179,7 @@ impl HomeView {
         line_spans.push(Span::styled(
             text.into_owned(),
             if is_selected {
-                // Selected-row contrast gate. The previous unconditional
-                // override stripped per-status color from every selected
-                // row (running-green, error-red, etc.); the contrast check
-                // only swaps in theme.text when the status fg actually
-                // clashes with session_selection. 3:1 is WCAG AA Large /
-                // bold-UI, which matches the row styling. Non-Rgb fg
-                // (palette mode after downsample) falls through to the
-                // override branch for safety. Italic/dim modifiers on
-                // `style` survive both branches so archive/snooze visual
-                // language reads either way.
-                let fg = style.fg.unwrap_or(theme.text);
-                if has_min_contrast(fg, theme.session_selection, 3.0) {
-                    style.bold()
-                } else {
-                    style.fg(theme.text).bold()
-                }
+                selected_row_style(style, theme)
             } else {
                 style
             },
@@ -1167,15 +1188,25 @@ impl HomeView {
         if let Item::Session { id, .. } = item {
             if let Some(inst) = self.get_instance(id) {
                 if let Some(ws_info) = &inst.workspace_info {
+                    let branch_style = Style::default().fg(theme.branch);
                     line_spans.push(Span::styled(
                         format!("  {} [{} repos]", ws_info.branch, ws_info.repos.len()),
-                        Style::default().fg(theme.branch),
+                        if is_selected {
+                            selected_row_style(branch_style, theme)
+                        } else {
+                            branch_style
+                        },
                     ));
                 } else if let Some(wt_info) = &inst.worktree_info {
                     if wt_info.branch != inst.title {
+                        let branch_style = Style::default().fg(theme.branch);
                         line_spans.push(Span::styled(
                             format!("  {}", wt_info.branch),
-                            Style::default().fg(theme.branch),
+                            if is_selected {
+                                selected_row_style(branch_style, theme)
+                            } else {
+                                branch_style
+                            },
                         ));
                     }
                 }
@@ -1190,9 +1221,14 @@ impl HomeView {
                 if let Some(tag) =
                     compute_row_tag(inst, self.row_tag_mode, self.active_profile.is_none())
                 {
+                    let tag_style = Style::default().fg(theme.dimmed);
                     line_spans.push(Span::styled(
                         format!("  {}", tag.rendered()),
-                        Style::default().fg(theme.dimmed),
+                        if is_selected {
+                            selected_row_style(tag_style, theme)
+                        } else {
+                            tag_style
+                        },
                     ));
                 }
 
@@ -1271,11 +1307,27 @@ impl HomeView {
                         format_relative_age(age_ts)
                     };
                     let padded = format!("{:>width$}", age, width = LAST_ACTIVITY_SLOT);
-                    line_spans.push(Span::styled(padded, Style::default().fg(theme.dimmed)));
+                    let activity_style = Style::default().fg(theme.dimmed);
+                    line_spans.push(Span::styled(
+                        padded,
+                        if is_selected {
+                            selected_row_style(activity_style, theme)
+                        } else {
+                            activity_style
+                        },
+                    ));
                 }
 
                 if let Some(badge) = badge_text {
-                    line_spans.push(Span::styled(badge, Style::default().fg(theme.sandbox)));
+                    let badge_style = Style::default().fg(theme.sandbox);
+                    line_spans.push(Span::styled(
+                        badge,
+                        if is_selected {
+                            selected_row_style(badge_style, theme)
+                        } else {
+                            badge_style
+                        },
+                    ));
                 }
                 if column_fits {
                     let trailing_margin: String =
@@ -1548,12 +1600,12 @@ impl HomeView {
         }
 
         // Cold-start / fallback capture via the fork-based path
-        // (`Session::capture_pane_with_size` via the instance helper). The
+        // (`Session::capture_pane` via the instance helper). The
         // 250ms gate in `refresh_preview_cache_core` keeps this from forking
         // every frame; in steady state the worker above satisfies the render.
         //
         // Live vs. non-live failure semantics differ. In live mode an empty
-        // capture (which is what `Session::capture_pane_with_size` returns when
+        // capture (which is what `Session::capture_pane` returns when
         // the session is gone OR tmux had a transient hiccup) preserves the
         // last-known-good capture so the preview doesn't flash blank (the
         // kill-switch behavior introduced in #1501). The capture closure
@@ -1580,10 +1632,9 @@ impl HomeView {
                 // always overwrite, falling back to an empty body (the same
                 // "session looks gone" signal the non-live path uses).
                 let same_session = s.preview_cache.session_id.as_deref() == Some(id);
-                let fork_capture = s.get_instance(id).and_then(|inst| {
-                    inst.capture_output_with_size(capture_lines, width, height)
-                        .ok()
-                });
+                let fork_capture = s
+                    .get_instance(id)
+                    .and_then(|inst| inst.capture_output(capture_lines).ok());
                 if in_live {
                     match fork_capture {
                         Some(content) if !content.is_empty() => Some(content),
@@ -2786,11 +2837,13 @@ impl HomeView {
         theme: &Theme,
         info: Option<&UpdateInfo>,
         status: Option<&str>,
+        image_update: Option<&ImageUpdate>,
     ) {
         let update_style = Style::default().fg(theme.waiting).bold();
-        // Transient status takes precedence over the persistent update banner
-        // so users see the latest signal (e.g. "restart failed: ...") even
-        // when an update banner is also up.
+        // Precedence (highest first): transient status, app update, then the
+        // sandbox-image update. Only one banner shows at a time, so its keys
+        // ([u]/[Ctrl+x]) are unambiguous; a lower-priority banner surfaces once
+        // the ones above it clear.
         let text = if let Some(s) = status {
             format!(" {s}  [Ctrl+x] dismiss")
         } else if let Some(info) = info {
@@ -2798,6 +2851,8 @@ impl HomeView {
                 " update available {} → {}  [u] update  [Ctrl+x] dismiss",
                 info.current_version, info.latest_version
             )
+        } else if image_update.is_some() {
+            " sandbox image update available  [u] pull  [Ctrl+x] dismiss".to_string()
         } else {
             return;
         };
@@ -2824,6 +2879,8 @@ mod tests {
             y,
             visible,
             pane_height,
+            history_size: 0,
+            pane_width: 0,
         }
     }
 
@@ -2892,6 +2949,31 @@ mod tests {
         // char + ellipsis (2 + 1 = 3) — but we reserve 1 for ellipsis
         // so budget for content is 2, fitting exactly one wide char.
         assert_eq!(truncate_to_width("你好世界", 3), "你\u{2026}");
+    }
+
+    #[test]
+    fn selected_row_style_preserves_readable_status_color() {
+        let theme = crate::tui::styles::load_theme_with_mode("empire", false);
+        let style = Style::default().fg(theme.running);
+
+        assert_eq!(selected_row_style(style, &theme).fg, Some(theme.running));
+    }
+
+    #[test]
+    fn selected_row_style_sets_text_for_default_foreground() {
+        let theme = crate::tui::styles::load_theme_with_mode("empire", false);
+        let style = Style::default();
+
+        assert_eq!(selected_row_style(style, &theme).fg, Some(theme.text));
+    }
+
+    #[test]
+    fn selected_row_style_falls_back_when_color_clashes() {
+        let mut theme = crate::tui::styles::load_theme_with_mode("empire", false);
+        theme.dimmed = theme.session_selection;
+        let style = Style::default().fg(theme.dimmed);
+
+        assert_eq!(selected_row_style(style, &theme).fg, Some(theme.text));
     }
 
     #[test]

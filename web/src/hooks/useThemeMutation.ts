@@ -22,22 +22,19 @@ export function useThemeMutation(): {
 } {
   const [pending, setPending] = useState(false);
 
-  const select = useCallback(
-    async (name: string): Promise<ThemeSelectResult> => {
-      setPending(true);
-      try {
-        const ok = await updateTheme({ name });
-        if (!ok) return { ok: false, error: SAVE_ERROR };
-        dispatchThemePickerChanged(name);
-        return { ok: true };
-      } catch {
-        return { ok: false, error: SAVE_ERROR };
-      } finally {
-        setPending(false);
-      }
-    },
-    [],
-  );
+  const select = useCallback(async (name: string): Promise<ThemeSelectResult> => {
+    setPending(true);
+    try {
+      const ok = await updateTheme({ name });
+      if (!ok) return { ok: false, error: SAVE_ERROR };
+      dispatchThemePickerChanged(name);
+      return { ok: true };
+    } catch {
+      return { ok: false, error: SAVE_ERROR };
+    } finally {
+      setPending(false);
+    }
+  }, []);
 
   return { select, pending };
 }

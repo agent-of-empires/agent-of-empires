@@ -11,9 +11,7 @@ export const EMPTY_COMMAND_MAPS: CommandMaps = {
 function asMap(v: unknown): Record<string, string> {
   return v && typeof v === "object"
     ? Object.fromEntries(
-        Object.entries(v as Record<string, unknown>).filter(
-          ([, val]) => typeof val === "string",
-        ) as [string, string][],
+        Object.entries(v as Record<string, unknown>).filter(([, val]) => typeof val === "string") as [string, string][],
       )
     : {};
 }
@@ -28,9 +26,7 @@ function asMap(v: unknown): Record<string, string> {
  *  to binary + registry args rather than a wrong command. */
 export function commandMapsFromSettings(settings: unknown): CommandMaps {
   if (!settings || typeof settings !== "object") return EMPTY_COMMAND_MAPS;
-  const session = (settings as Record<string, unknown>).session as
-    | Record<string, unknown>
-    | undefined;
+  const session = (settings as Record<string, unknown>).session as Record<string, unknown> | undefined;
   return {
     agentCommandOverride: asMap(session?.agent_command_override),
     customAgents: asMap(session?.custom_agents),

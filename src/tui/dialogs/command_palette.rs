@@ -722,6 +722,10 @@ mod tests {
             ActionId::SearchPrev,
             "search-cycle; only meaningful while a search is active",
         ),
+        (
+            ActionId::ToggleProjectPin,
+            "only valid on a project header in project view; reached via the header context menu and `p`",
+        ),
     ];
 
     /// Drift guard. The palette is generated from `bindings::BINDINGS`, so a

@@ -46,7 +46,7 @@ pub enum HookInstallTarget {
 /// Codex treats `CODEX_HOME` as the directory containing `config.toml`, falling
 /// back to `~/.codex` when the variable is not set.
 pub fn codex_config_path() -> Result<PathBuf> {
-    if let Ok(codex_home) = std::env::var("CODEX_HOME") {
+    if let Some(codex_home) = std::env::var("CODEX_HOME").ok().filter(|v| !v.is_empty()) {
         return Ok(PathBuf::from(codex_home).join("config.toml"));
     }
 
@@ -58,18 +58,21 @@ pub fn codex_config_path() -> Result<PathBuf> {
 
 pub fn codex_config_path_display() -> String {
     std::env::var("CODEX_HOME")
+        .ok()
+        .filter(|v| !v.is_empty())
         .map(|codex_home| {
             PathBuf::from(codex_home)
                 .join("config.toml")
                 .display()
                 .to_string()
         })
-        .unwrap_or_else(|_| "~/.codex/config.toml".to_string())
+        .unwrap_or_else(|| "~/.codex/config.toml".to_string())
 }
 
 pub(crate) fn codex_config_path_for_host_environment(entries: &[String]) -> Result<PathBuf> {
     if let Some(codex_home) =
         crate::session::environment::resolve_host_environment_value(entries, "CODEX_HOME")
+            .filter(|v| !v.is_empty())
     {
         return Ok(PathBuf::from(codex_home).join("config.toml"));
     }
@@ -79,6 +82,7 @@ pub(crate) fn codex_config_path_for_host_environment(entries: &[String]) -> Resu
 
 pub(crate) fn codex_config_path_display_for_host_environment(entries: &[String]) -> String {
     crate::session::environment::resolve_host_environment_value(entries, "CODEX_HOME")
+        .filter(|v| !v.is_empty())
         .map(|codex_home| {
             PathBuf::from(codex_home)
                 .join("config.toml")
@@ -827,20 +831,18 @@ const SETTL_HOOKS: &[(&str, &str)] = &[
     ("GameWon", "idle"),
 ];
 
-/// Install AoE status hooks into settl's `~/.settl/config.toml`.
+/// Install AoE status hooks into a settl TOML config file (typically
+/// `~/.settl/config.toml`).
 ///
 /// settl uses TOML config with `[[hooks]]` array entries instead of JSON
 /// settings files. This function reads the existing config, removes any
 /// previous AoE-managed hooks (identified by the marker), and adds hooks
 /// for the three status transitions: TurnStarted->running,
 /// WaitingForHuman->waiting, GameWon->idle.
-pub fn install_settl_hooks() -> Result<()> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("No home directory"))?;
-    let config_path = home.join(".settl").join("config.toml");
-
+pub fn install_settl_hooks(config_path: &Path) -> Result<()> {
     // Parse existing config or start fresh
     let mut config: toml::Value = if config_path.exists() {
-        let content = std::fs::read_to_string(&config_path)?;
+        let content = std::fs::read_to_string(config_path)?;
         toml::from_str(&content).unwrap_or_else(|e| {
             tracing::warn!(target: "hooks.install", "Failed to parse {}: {}", config_path.display(), e);
             toml::Value::Table(toml::map::Map::new())
@@ -882,22 +884,20 @@ pub fn install_settl_hooks() -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let formatted = toml::to_string_pretty(&config)?;
-    std::fs::write(&config_path, formatted)?;
+    std::fs::write(config_path, formatted)?;
 
     tracing::info!(target: "hooks.install", "Installed AoE hooks in {}", config_path.display());
     Ok(())
 }
 
-/// Remove AoE hooks from settl's `~/.settl/config.toml`.
-pub fn uninstall_settl_hooks() -> Result<bool> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("No home directory"))?;
-    let config_path = home.join(".settl").join("config.toml");
-
+/// Remove AoE hooks from a settl TOML config file (typically
+/// `~/.settl/config.toml`).
+pub fn uninstall_settl_hooks(config_path: &Path) -> Result<bool> {
     if !config_path.exists() {
         return Ok(false);
     }
 
-    let content = std::fs::read_to_string(&config_path)?;
+    let content = std::fs::read_to_string(config_path)?;
     let mut config: toml::Value = toml::from_str(&content).unwrap_or_else(|e| {
         tracing::warn!(target: "hooks.uninstall", "Failed to parse {}: {}", config_path.display(), e);
         toml::Value::Table(toml::map::Map::new())
@@ -920,7 +920,7 @@ pub fn uninstall_settl_hooks() -> Result<bool> {
     }
 
     let formatted = toml::to_string_pretty(&config)?;
-    std::fs::write(&config_path, formatted)?;
+    std::fs::write(config_path, formatted)?;
     tracing::info!(target: "hooks.uninstall", "Removed AoE hooks from {}", config_path.display());
     Ok(true)
 }
@@ -1305,32 +1305,17 @@ pub fn uninstall_kiro_hooks(agent_config_path: &Path) -> Result<bool> {
 /// Remove all AoE hooks from all known agent settings files and clean up
 /// the hook status base directory. Called during `aoe uninstall`.
 pub fn uninstall_all_hooks() {
-    // Remove settl TOML hooks
-    match uninstall_settl_hooks() {
-        Ok(true) => println!("Removed AoE hooks from ~/.settl/config.toml"),
-        Ok(false) => {}
-        Err(e) => tracing::warn!(target: "hooks.uninstall", "Failed to remove settl hooks: {}", e),
-    }
-
-    let home = dirs::home_dir();
-    if let Some(home) = &home {
-        // Remove Hermes YAML hooks
-        let hermes_config = home.join(".hermes").join("config.yaml");
-        match uninstall_hermes_hooks(&hermes_config) {
-            Ok(true) => println!("Removed AoE hooks from {}", hermes_config.display()),
-            Ok(false) => {}
-            Err(e) => {
-                tracing::warn!(target: "hooks.uninstall", "Failed to remove hermes hooks: {}", e)
-            }
-        }
-
-        // Remove Kiro CLI agent config hooks
-        let kiro_config = home.join(KIRO_HOOKS_AGENT_FILE);
-        match uninstall_kiro_hooks(&kiro_config) {
-            Ok(true) => println!("Removed AoE hooks from {}", kiro_config.display()),
-            Ok(false) => {}
-            Err(e) => {
-                tracing::warn!(target: "hooks.uninstall", "Failed to remove kiro hooks: {}", e)
+    // Remove sidecar hooks (settl TOML, hermes YAML, kiro per-agent JSON).
+    if let Some(home) = dirs::home_dir() {
+        for agent in crate::agents::AGENTS {
+            if let Some(sidecar) = &agent.sidecar_hooks {
+                let config_path = home.join(sidecar.host_config_subpath);
+                match (sidecar.uninstall)(&config_path) {
+                    Ok(true) => println!("Removed AoE hooks from {}", config_path.display()),
+                    Ok(false) => {}
+                    Err(e) => tracing::warn!(target: "hooks.uninstall",
+                        "Failed to remove {} hooks: {}", agent.name, e),
+                }
             }
         }
     }
@@ -1724,6 +1709,45 @@ mod tests {
             codex_config_path_display(),
             tmp.path().join("config.toml").display().to_string()
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_codex_config_path_for_host_environment_ignores_empty_codex_home() {
+        let tmp = TempDir::new().unwrap();
+        let _guard = CodexHomeGuard::unset();
+        std::env::set_var("HOME", tmp.path());
+
+        // An empty `CODEX_HOME=` must not resolve to a bare relative
+        // `config.toml`; it should fall back to the home-relative default.
+        let entries = vec!["CODEX_HOME=".to_string()];
+
+        let path = codex_config_path_for_host_environment(&entries).unwrap();
+        assert_eq!(path, tmp.path().join(".codex").join("config.toml"));
+        assert!(path.is_absolute());
+        assert_ne!(path, PathBuf::from("config.toml"));
+
+        assert_eq!(
+            codex_config_path_display_for_host_environment(&entries),
+            codex_config_path_display()
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_codex_config_path_ignores_empty_process_codex_home() {
+        let tmp = TempDir::new().unwrap();
+        // An empty `CODEX_HOME` in AoE's own process env must fall back to the
+        // home-relative default rather than a bare relative `config.toml`.
+        let _guard = CodexHomeGuard::set(Path::new(""));
+        std::env::set_var("HOME", tmp.path());
+
+        let path = codex_config_path().unwrap();
+        assert_eq!(path, tmp.path().join(".codex").join("config.toml"));
+        assert!(path.is_absolute());
+        assert_ne!(path, PathBuf::from("config.toml"));
+
+        assert_eq!(codex_config_path_display(), "~/.codex/config.toml");
     }
 
     #[test]
@@ -2342,15 +2366,11 @@ command = "echo user-hook"
     }
 
     #[test]
-    #[serial_test::serial]
     fn test_install_settl_hooks_creates_new_file() {
         let tmp = TempDir::new().unwrap();
         let config_path = tmp.path().join(".settl").join("config.toml");
 
-        // Override HOME so install_settl_hooks writes to our temp dir
-        std::env::set_var("HOME", tmp.path());
-        install_settl_hooks().unwrap();
-        std::env::remove_var("HOME");
+        install_settl_hooks(&config_path).unwrap();
 
         let content = std::fs::read_to_string(&config_path).unwrap();
         let config: toml::Value = toml::from_str(&content).unwrap();
@@ -2366,15 +2386,13 @@ command = "echo user-hook"
     }
 
     #[test]
-    #[serial_test::serial]
     fn test_install_settl_hooks_idempotent() {
         let tmp = TempDir::new().unwrap();
-        std::env::set_var("HOME", tmp.path());
-        install_settl_hooks().unwrap();
-        install_settl_hooks().unwrap();
-        std::env::remove_var("HOME");
-
         let config_path = tmp.path().join(".settl").join("config.toml");
+
+        install_settl_hooks(&config_path).unwrap();
+        install_settl_hooks(&config_path).unwrap();
+
         let content = std::fs::read_to_string(&config_path).unwrap();
         let config: toml::Value = toml::from_str(&content).unwrap();
         let hooks = config["hooks"].as_array().unwrap();
@@ -2386,13 +2404,13 @@ command = "echo user-hook"
     }
 
     #[test]
-    #[serial_test::serial]
     fn test_install_settl_hooks_preserves_user_hooks() {
         let tmp = TempDir::new().unwrap();
         let config_dir = tmp.path().join(".settl");
         std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("config.toml");
         std::fs::write(
-            config_dir.join("config.toml"),
+            &config_path,
             r#"
 [[hooks]]
 event = "GameWon"
@@ -2401,11 +2419,9 @@ command = "echo user-hook"
         )
         .unwrap();
 
-        std::env::set_var("HOME", tmp.path());
-        install_settl_hooks().unwrap();
-        std::env::remove_var("HOME");
+        install_settl_hooks(&config_path).unwrap();
 
-        let content = std::fs::read_to_string(config_dir.join("config.toml")).unwrap();
+        let content = std::fs::read_to_string(&config_path).unwrap();
         let config: toml::Value = toml::from_str(&content).unwrap();
         let hooks = config["hooks"].as_array().unwrap();
         // 1 user hook + 3 AoE hooks = 4
@@ -2414,17 +2430,14 @@ command = "echo user-hook"
     }
 
     #[test]
-    #[serial_test::serial]
     fn test_uninstall_settl_hooks_removes_aoe_entries() {
         let tmp = TempDir::new().unwrap();
-        std::env::set_var("HOME", tmp.path());
-        install_settl_hooks().unwrap();
+        let config_path = tmp.path().join(".settl").join("config.toml");
 
-        let modified = uninstall_settl_hooks().unwrap();
-        std::env::remove_var("HOME");
+        install_settl_hooks(&config_path).unwrap();
+        let modified = uninstall_settl_hooks(&config_path).unwrap();
 
         assert!(modified);
-        let config_path = tmp.path().join(".settl").join("config.toml");
         let content = std::fs::read_to_string(&config_path).unwrap();
         let config: toml::Value = toml::from_str(&content).unwrap();
         let hooks = config["hooks"].as_array().unwrap();
@@ -2432,13 +2445,13 @@ command = "echo user-hook"
     }
 
     #[test]
-    #[serial_test::serial]
     fn test_uninstall_settl_hooks_preserves_user_hooks() {
         let tmp = TempDir::new().unwrap();
         let config_dir = tmp.path().join(".settl");
         std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("config.toml");
         std::fs::write(
-            config_dir.join("config.toml"),
+            &config_path,
             r#"
 [[hooks]]
 event = "GameWon"
@@ -2447,13 +2460,11 @@ command = "echo user-hook"
         )
         .unwrap();
 
-        std::env::set_var("HOME", tmp.path());
-        install_settl_hooks().unwrap();
-        let modified = uninstall_settl_hooks().unwrap();
-        std::env::remove_var("HOME");
+        install_settl_hooks(&config_path).unwrap();
+        let modified = uninstall_settl_hooks(&config_path).unwrap();
 
         assert!(modified);
-        let content = std::fs::read_to_string(config_dir.join("config.toml")).unwrap();
+        let content = std::fs::read_to_string(&config_path).unwrap();
         let config: toml::Value = toml::from_str(&content).unwrap();
         let hooks = config["hooks"].as_array().unwrap();
         assert_eq!(hooks.len(), 1);

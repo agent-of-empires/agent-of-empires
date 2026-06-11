@@ -39,21 +39,13 @@ export default async function globalSetup(): Promise<void> {
     return;
   }
 
-  process.stdout.write(
-    `[liveGlobalSetup] building aoe via 'cargo build --features serve --release'...\n`,
-  );
-  const result = spawnSync(
-    "cargo",
-    ["build", "--features", "serve", "--release"],
-    {
-      cwd: repoRoot,
-      stdio: "inherit",
-    },
-  );
+  process.stdout.write(`[liveGlobalSetup] building aoe via 'cargo build --features serve --release'...\n`);
+  const result = spawnSync("cargo", ["build", "--features", "serve", "--release"], {
+    cwd: repoRoot,
+    stdio: "inherit",
+  });
   if (result.status !== 0) {
-    throw new Error(
-      `cargo build --features serve --release failed with status ${result.status}`,
-    );
+    throw new Error(`cargo build --features serve --release failed with status ${result.status}`);
   }
   if (!existsSync(fallback)) {
     throw new Error(`cargo build succeeded but ${fallback} is missing`);

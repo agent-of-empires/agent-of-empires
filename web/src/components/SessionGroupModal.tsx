@@ -10,12 +10,7 @@ interface Props {
   onClose: () => void;
 }
 
-export function SessionGroupModal({
-  sessionTitle,
-  currentGroup,
-  onSave,
-  onClose,
-}: Props) {
+export function SessionGroupModal({ sessionTitle, currentGroup, onSave, onClose }: Props) {
   const [value, setValue] = useState(currentGroup);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -71,10 +66,7 @@ export function SessionGroupModal({
       >
         {/* Header */}
         <div className="px-5 py-4 border-b border-surface-700">
-          <h2
-            id="session-group-modal-title"
-            className="text-sm font-semibold text-text-primary"
-          >
+          <h2 id="session-group-modal-title" className="text-sm font-semibold text-text-primary">
             Edit group
           </h2>
         </div>
@@ -82,8 +74,7 @@ export function SessionGroupModal({
         {/* Body */}
         <div className="px-5 py-4 space-y-3">
           <p className="text-[13px] text-text-secondary">
-            Move <span className="text-text-primary">{sessionTitle}</span> to a
-            group.
+            Move <span className="text-text-primary">{sessionTitle}</span> to a group.
           </p>
           <input
             ref={inputRef}
@@ -105,15 +96,11 @@ export function SessionGroupModal({
             className="w-full bg-surface-900 border border-surface-700 rounded px-2 py-1.5 text-[13px] font-mono text-text-primary focus:outline-none focus:border-brand-600"
           />
           <p className="text-[12px] text-text-dim">
-            Leave blank to ungroup. Use <span className="font-mono">/</span> for
-            hierarchy, for example{" "}
+            Leave blank to ungroup. Use <span className="font-mono">/</span> for hierarchy, for example{" "}
             <span className="font-mono">work/projects</span>.
           </p>
           {error && (
-            <p
-              data-testid="session-group-modal-error"
-              className="text-[12px] text-status-error"
-            >
+            <p data-testid="session-group-modal-error" className="text-[12px] text-status-error">
               {error}
             </p>
           )}
@@ -145,11 +132,7 @@ export function SessionGroupModal({
                   strokeWidth="4"
                   fill="none"
                 />
-                <path
-                  className="opacity-75"
-                  fill="currentColor"
-                  d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
-                />
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
               </svg>
             )}
             {saving ? "Saving..." : "Save"}

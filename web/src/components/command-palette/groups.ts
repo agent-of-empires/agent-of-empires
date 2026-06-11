@@ -1,7 +1,3 @@
 import type { CommandActionGroup } from "./types";
 
-export const GROUP_ORDER: CommandActionGroup[] = [
-  "Actions",
-  "Sessions",
-  "Settings",
-];
+export const GROUP_ORDER: CommandActionGroup[] = ["Actions", "Sessions", "Settings"];

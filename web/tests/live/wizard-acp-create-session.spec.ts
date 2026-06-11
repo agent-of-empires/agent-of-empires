@@ -6,9 +6,7 @@
 import { test, expect } from "@playwright/test";
 import { listSessions, spawnAoeServe } from "../helpers/aoeServe";
 
-test("wizard with Use structured view on creates a structured_view session", async ({
-  page,
-}, testInfo) => {
+test("wizard with Use structured view on creates a structured_view session", async ({ page }, testInfo) => {
   const serve = await spawnAoeServe({
     authMode: "none",
     acp: true,
@@ -18,14 +16,9 @@ test("wizard with Use structured view on creates a structured_view session", asy
 
   try {
     await page.goto(serve.baseUrl);
-    await page
-      .getByRole("button", { name: "New session", exact: true })
-      .first()
-      .click();
+    await page.getByRole("button", { name: "New session", exact: true }).first().click();
 
-    const wizard = page.locator(
-      'div.fixed.inset-0.z-50:has(h1:has-text("New session"))',
-    );
+    const wizard = page.locator('div.fixed.inset-0.z-50:has(h1:has-text("New session"))');
     await expect(wizard).toBeVisible({ timeout: 15_000 });
 
     // ProjectStep: a scratch dir keeps the test self-contained, advance.
@@ -33,9 +26,9 @@ test("wizard with Use structured view on creates a structured_view session", asy
     await wizard.getByRole("button", { name: "Next" }).click();
 
     // SessionStep: title is auto-generated, advance.
-    await expect(
-      wizard.getByRole("heading", { name: "Name your session", exact: true }),
-    ).toBeVisible({ timeout: 10_000 });
+    await expect(wizard.getByRole("heading", { name: "Name your session", exact: true })).toBeVisible({
+      timeout: 10_000,
+    });
     await wizard.getByRole("button", { name: "Next" }).click();
 
     // AgentStep: claude is the default ACP-capable agent and the structured view

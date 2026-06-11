@@ -1,7 +1,4 @@
-import type {
-  SettingsFieldDescriptor,
-  SettingsValidation,
-} from "../../lib/types";
+import type { SettingsFieldDescriptor, SettingsValidation } from "../../lib/types";
 import {
   CollapsibleSection,
   ListField,
@@ -30,29 +27,20 @@ interface Props {
    *  saves successfully. Used by the acp section to refresh `serverAbout`
    *  (consumed live by ToolCards / the composer); widget-specific effects
    *  (e.g. theme repaint) live in the custom widget itself, not here. */
-  onAfterSave?: (
-    descriptor: SettingsFieldDescriptor,
-    value: unknown,
-  ) => Promise<void> | void;
+  onAfterSave?: (descriptor: SettingsFieldDescriptor, value: unknown) => Promise<void> | void;
 }
 
 /** Client-side list-entry validator derived from the server's validation rule,
  *  purely a UX nicety; the server is authoritative either way. */
-function listValidator(
-  validation: SettingsValidation,
-): ((value: string) => string | null) | undefined {
+function listValidator(validation: SettingsValidation): ((value: string) => string | null) | undefined {
   switch (validation.rule) {
     case "volume_list":
-      return (v) =>
-        v.includes(":") ? null : "Must contain ':' (host:container)";
+      return (v) => (v.includes(":") ? null : "Must contain ':' (host:container)");
     case "env_list":
       return (v) =>
-        /^[A-Za-z_][A-Za-z0-9_]*(=.*)?$/.test(v)
-          ? null
-          : "Must be KEY or KEY=VALUE (letters, digits, underscores)";
+        /^[A-Za-z_][A-Za-z0-9_]*(=.*)?$/.test(v) ? null : "Must be KEY or KEY=VALUE (letters, digits, underscores)";
     case "port_mapping_list":
-      return (v) =>
-        /^\d+:\d+$/.test(v) ? null : "Must be port:port (e.g. 3000:3000)";
+      return (v) => (/^\d+:\d+$/.test(v) ? null : "Must be port:port (e.g. 3000:3000)");
     default:
       return undefined;
   }
@@ -69,17 +57,11 @@ function describe(d: SettingsFieldDescriptor): string {
 /** Visible placeholder for a `custom` widget whose `id` has no registered web
  *  component. Rendering this (rather than silently dropping the field) keeps a
  *  schema/web mismatch obvious instead of letting a setting vanish. */
-function UnsupportedCustomWidget({
-  d,
-  id,
-}: {
-  d: SettingsFieldDescriptor;
-  id: string;
-}) {
+function UnsupportedCustomWidget({ d, id }: { d: SettingsFieldDescriptor; id: string }) {
   return (
     <div className="text-xs text-status-error bg-status-error/10 rounded-lg p-3">
-      No web control registered for "{d.label}" (custom widget "{id}"). Edit it
-      from the TUI or <code>config.toml</code>.
+      No web control registered for "{d.label}" (custom widget "{id}"). Edit it from the TUI or <code>config.toml</code>
+      .
     </div>
   );
 }
@@ -160,9 +142,7 @@ function renderField(
           key={d.field}
           label={d.label}
           description={description}
-          value={
-            typeof raw === "string" ? raw : (widget.options[0]?.value ?? "")
-          }
+          value={typeof raw === "string" ? raw : (widget.options[0]?.value ?? "")}
           onChange={save}
           options={widget.options}
         />
@@ -183,14 +163,7 @@ function renderField(
       if (!Widget) {
         return <UnsupportedCustomWidget key={d.field} d={d} id={widget.id} />;
       }
-      return (
-        <Widget
-          key={d.field}
-          descriptor={{ ...d, description }}
-          value={raw}
-          save={save}
-        />
-      );
+      return <Widget key={d.field} descriptor={{ ...d, description }} value={raw} save={save} />;
     }
   }
 }
@@ -203,17 +176,8 @@ function renderField(
  * grouped under an "Advanced" fold to match the TUI. `custom` widgets render
  * via the custom-widget registry (`customWidgets.tsx`).
  */
-export function SchemaSection({
-  section,
-  schema,
-  values,
-  onSaveField,
-  advancedSubtitle,
-  onAfterSave,
-}: Props) {
-  const fields = schema.filter(
-    (d) => d.section === section && d.web_write.policy !== "local_only",
-  );
+export function SchemaSection({ section, schema, values, onSaveField, advancedSubtitle, onAfterSave }: Props) {
+  const fields = schema.filter((d) => d.section === section && d.web_write.policy !== "local_only");
   const primary = fields.filter((d) => !d.advanced);
   const advanced = fields.filter((d) => d.advanced);
 

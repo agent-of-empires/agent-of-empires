@@ -62,17 +62,14 @@ describe("SessionWizard reducer / APPLY_PROFILE_DEFAULTS (#1142)", () => {
     // `(session?.default_tool as string) || ""` resolves empty when the
     // profile doesn't set a tool; the reducer must keep whatever the
     // wizard already had (the prefill or "claude" default).
-    const next = reducer(
-      makeState({ data: { ...initialData, tool: "opencode" } }),
-      {
-        type: "APPLY_PROFILE_DEFAULTS",
-        yoloMode: false,
-        sandboxEnabled: false,
-        tool: "",
-        extraEnv: [],
-        skipIfDirty: true,
-      },
-    );
+    const next = reducer(makeState({ data: { ...initialData, tool: "opencode" } }), {
+      type: "APPLY_PROFILE_DEFAULTS",
+      yoloMode: false,
+      sandboxEnabled: false,
+      tool: "",
+      extraEnv: [],
+      skipIfDirty: true,
+    });
     expect(next.data.tool).toBe("opencode");
   });
 
@@ -267,5 +264,18 @@ describe("SessionWizard reducer / useStructuredView (#1580)", () => {
     });
     expect(next.data.tool).toBe("opencode");
     expect(next.data.useStructuredView).toBe(false);
+  });
+});
+
+describe("SessionWizard reducer / SUBMIT_CANCEL (#2045)", () => {
+  it("re-enables submit without an error when a pre-create confirm is cancelled", () => {
+    // SUBMIT_START disables the button; backing out of the glob volume_ignores
+    // confirm modal must restore the interactive state and leave no error.
+    const submitting = reducer(makeState(), { type: "SUBMIT_START" });
+    expect(submitting.isSubmitting).toBe(true);
+
+    const cancelled = reducer(submitting, { type: "SUBMIT_CANCEL" });
+    expect(cancelled.isSubmitting).toBe(false);
+    expect(cancelled.error).toBeNull();
   });
 });

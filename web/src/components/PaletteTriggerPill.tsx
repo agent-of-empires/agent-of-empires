@@ -2,9 +2,7 @@ interface Props {
   onClick: () => void;
 }
 
-const IS_MAC =
-  typeof navigator !== "undefined" &&
-  /Mac|iPhone|iPad|iPod/.test(navigator.platform);
+const IS_MAC = typeof navigator !== "undefined" && /Mac|iPhone|iPad|iPod/.test(navigator.platform);
 
 export function PaletteTriggerPill({ onClick }: Props) {
   const modKey = IS_MAC ? "⌘" : "Ctrl";

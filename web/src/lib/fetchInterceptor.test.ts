@@ -11,12 +11,8 @@ function jsonResponse(status: number, body: unknown): Response {
 describe("classifyAuthError", () => {
   it("returns null for non-401 responses", async () => {
     expect(await classifyAuthError(jsonResponse(200, { ok: true }))).toBeNull();
-    expect(
-      await classifyAuthError(jsonResponse(403, { error: "x" })),
-    ).toBeNull();
-    expect(
-      await classifyAuthError(jsonResponse(500, { error: "x" })),
-    ).toBeNull();
+    expect(await classifyAuthError(jsonResponse(403, { error: "x" }))).toBeNull();
+    expect(await classifyAuthError(jsonResponse(500, { error: "x" }))).toBeNull();
   });
 
   // Regression: when the server returns 401 with `error: "login_required"`

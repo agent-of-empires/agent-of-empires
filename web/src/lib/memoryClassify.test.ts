@@ -1,16 +1,8 @@
 import { describe, expect, it } from "vitest";
-import {
-  classifyMemory,
-  isMemoryPath,
-  parseMemoryFrontmatter,
-} from "./memoryClassify";
+import { classifyMemory, isMemoryPath, parseMemoryFrontmatter } from "./memoryClassify";
 import type { ToolCall } from "./acpTypes";
 
-function tool(
-  name: string,
-  kind: ToolCall["kind"],
-  args: Record<string, unknown> = {},
-): ToolCall {
+function tool(name: string, kind: ToolCall["kind"], args: Record<string, unknown> = {}): ToolCall {
   return {
     id: "tc-1",
     name,
@@ -22,34 +14,20 @@ function tool(
 
 describe("isMemoryPath", () => {
   it("matches the canonical per-project memory dir", () => {
-    expect(
-      isMemoryPath(
-        "/Users/jules/.claude/projects/-Users-jules-foo/memory/user_role.md",
-      ),
-    ).toBe(true);
+    expect(isMemoryPath("/Users/jules/.claude/projects/-Users-jules-foo/memory/user_role.md")).toBe(true);
   });
 
   it("matches MEMORY.md at the root of a memory dir", () => {
-    expect(
-      isMemoryPath(
-        "/Users/jules/.claude/projects/-Users-jules-foo/memory/MEMORY.md",
-      ),
-    ).toBe(true);
+    expect(isMemoryPath("/Users/jules/.claude/projects/-Users-jules-foo/memory/MEMORY.md")).toBe(true);
   });
 
   it("rejects non-md files", () => {
-    expect(
-      isMemoryPath(
-        "/Users/jules/.claude/projects/-Users-jules-foo/memory/notes.txt",
-      ),
-    ).toBe(false);
+    expect(isMemoryPath("/Users/jules/.claude/projects/-Users-jules-foo/memory/notes.txt")).toBe(false);
   });
 
   it("rejects unrelated paths that merely contain the word memory", () => {
     expect(isMemoryPath("/Users/jules/memory/notes.md")).toBe(false);
-    expect(isMemoryPath("/Users/jules/.claude/projects/foo/memory.md")).toBe(
-      false,
-    );
+    expect(isMemoryPath("/Users/jules/.claude/projects/foo/memory.md")).toBe(false);
   });
 
   it("rejects paths outside the .claude/projects root", () => {
@@ -58,8 +36,7 @@ describe("isMemoryPath", () => {
 });
 
 describe("classifyMemory", () => {
-  const path =
-    "/Users/jules/.claude/projects/-Users-jules-foo/memory/feedback_testing.md";
+  const path = "/Users/jules/.claude/projects/-Users-jules-foo/memory/feedback_testing.md";
 
   it("classifies a Read on a memory file as 'recalled'", () => {
     const r = classifyMemory(tool("Read", "read", { file_path: path }));
@@ -84,8 +61,7 @@ describe("classifyMemory", () => {
   });
 
   it("flags MEMORY.md as the index", () => {
-    const idx =
-      "/Users/jules/.claude/projects/-Users-jules-foo/memory/MEMORY.md";
+    const idx = "/Users/jules/.claude/projects/-Users-jules-foo/memory/MEMORY.md";
     const r = classifyMemory(tool("Read", "read", { file_path: idx }));
     expect(r.isMemory).toBe(true);
     if (r.isMemory) {
@@ -100,9 +76,7 @@ describe("classifyMemory", () => {
   });
 
   it("rejects file ops outside the memory dir", () => {
-    const r = classifyMemory(
-      tool("Read", "read", { file_path: "/Users/jules/foo.md" }),
-    );
+    const r = classifyMemory(tool("Read", "read", { file_path: "/Users/jules/foo.md" }));
     expect(r.isMemory).toBe(false);
   });
 
@@ -131,14 +105,7 @@ describe("parseMemoryFrontmatter", () => {
   });
 
   it("strips matched surrounding quotes from values", () => {
-    const text = [
-      "---",
-      'name: "Quoted name"',
-      "type: 'user'",
-      "---",
-      "",
-      "body",
-    ].join("\n");
+    const text = ["---", 'name: "Quoted name"', "type: 'user'", "---", "", "body"].join("\n");
     const r = parseMemoryFrontmatter(text);
     expect(r.name).toBe("Quoted name");
     expect(r.type).toBe("user");

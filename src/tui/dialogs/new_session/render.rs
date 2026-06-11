@@ -9,8 +9,8 @@ use rattles::presets::prelude as spinners;
 use super::{NewSessionDialog, FIELD_HELP, HELP_DIALOG_WIDTH};
 use crate::tui::components::{
     focused_input_spans, input_scroll, profile_cycler_spans, render_text_field,
-    render_text_field_with_ghost, set_prefixed_input_cursor_position, tool_cycler_spans,
-    visible_slice,
+    render_text_field_with_ghost, render_tool_config_overlay, set_prefixed_input_cursor_position,
+    tool_config_suffix_spans, tool_cycler_spans, visible_slice,
 };
 use crate::tui::styles::Theme;
 
@@ -222,22 +222,7 @@ impl NewSessionDialog {
         );
         let has_config =
             !self.extra_args.value().is_empty() || !self.command_override.value().is_empty();
-        if has_config {
-            tool_spans.push(Span::styled(
-                "  (configured)",
-                Style::default().fg(theme.dimmed),
-            ));
-        }
-        if is_tool_focused {
-            tool_spans.push(Span::styled(
-                if has_config {
-                    "  Ctrl+P: edit"
-                } else {
-                    "  (Ctrl+P to configure)"
-                },
-                Style::default().fg(theme.dimmed),
-            ));
-        }
+        tool_spans.extend(tool_config_suffix_spans(has_config, is_tool_focused, theme));
         let area = chunks[ci];
         frame.render_widget(Paragraph::new(Line::from(tool_spans)), area);
         // Push the tool rect only when interactive (multiple tools).
@@ -745,101 +730,21 @@ impl NewSessionDialog {
     }
 
     fn render_tool_config(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        self.tool_config_rects.clear();
-        let dialog_width: u16 = 72;
-
-        let constraints = vec![
-            Constraint::Length(2), // Command Override
-            Constraint::Length(2), // Extra Args
-            Constraint::Min(1),    // Hints
-        ];
-
-        let fields_height: u16 = constraints
-            .iter()
-            .map(|c| match c {
-                Constraint::Length(n) => *n,
-                Constraint::Min(n) => *n,
-                _ => 0,
-            })
-            .sum();
-        let dialog_height = fields_height + 4;
-
         let selected_tool = self
             .available_tools
             .get(self.tool_index)
             .or_else(|| self.available_tools.first())
             .map(|s| s.as_str())
             .unwrap_or("claude");
-        let title = format!(" Tool Configuration: {} ", selected_tool);
-
-        let dialog_area = crate::tui::dialogs::centered_rect(area, dialog_width, dialog_height);
-
-        frame.render_widget(Clear, dialog_area);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme.accent))
-            .title(title)
-            .title_style(Style::default().fg(theme.title).bold());
-
-        let inner = block.inner(dialog_area);
-        frame.render_widget(block, dialog_area);
-
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .margin(1)
-            .constraints(constraints)
-            .split(inner);
-
-        // Command Override
-        let cmd_placeholder = if self.tool_config_focused_field == 0 {
-            Some("(replaces default binary)")
-        } else if self.command_override.value().is_empty() {
-            Some("(default)")
-        } else {
-            None
-        };
-        render_text_field(
+        self.tool_config_rects = render_tool_config_overlay(
             frame,
-            chunks[0],
-            "Command:",
+            area,
+            selected_tool,
             &self.command_override,
-            self.tool_config_focused_field == 0,
-            cmd_placeholder,
-            theme,
-        );
-        self.tool_config_rects.push((0, chunks[0]));
-
-        // Extra Args
-        let args_placeholder = if self.tool_config_focused_field == 1 {
-            Some("(e.g. --port 8080)")
-        } else if self.extra_args.value().is_empty() {
-            Some("(none)")
-        } else {
-            None
-        };
-        render_text_field(
-            frame,
-            chunks[1],
-            "Extra Args:",
             &self.extra_args,
-            self.tool_config_focused_field == 1,
-            args_placeholder,
+            self.tool_config_focused_field,
             theme,
         );
-        self.tool_config_rects.push((1, chunks[1]));
-
-        // Hints
-        let hint_spans = vec![
-            Span::styled("Tab", Style::default().fg(theme.hint)),
-            Span::raw(" next  "),
-            Span::styled("Enter", Style::default().fg(theme.hint)),
-            Span::raw(" done  "),
-            Span::styled("Esc", Style::default().fg(theme.hint)),
-            Span::raw(" back"),
-        ];
-        frame.render_widget(Paragraph::new(Line::from(hint_spans)), chunks[2]);
 
         if self.show_help {
             self.render_help_overlay(frame, area, theme);

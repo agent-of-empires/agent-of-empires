@@ -69,11 +69,7 @@ function workspace(id: string, sessions: SessionResponse[]): Workspace {
 
 function Wrap({ children }: { children: ReactNode }) {
   const ref = useRef(0);
-  return (
-    <DragSuppressContext.Provider value={ref}>
-      {children}
-    </DragSuppressContext.Provider>
-  );
+  return <DragSuppressContext.Provider value={ref}>{children}</DragSuppressContext.Provider>;
 }
 
 const fetchSpy = vi.fn<typeof fetch>();
@@ -116,32 +112,24 @@ function openMenu(ws: Workspace) {
 describe("sidebar Edit workdir name", () => {
   it("offers the action for a managed, idle worktree session", () => {
     openMenu(workspace("w", [session()]));
-    expect(
-      screen.queryByTestId("sidebar-context-menu-edit-workdir"),
-    ).not.toBeNull();
+    expect(screen.queryByTestId("sidebar-context-menu-edit-workdir")).not.toBeNull();
   });
 
   it("hides the action for a non-managed worktree", () => {
     openMenu(workspace("w", [session({ has_managed_worktree: false })]));
-    expect(
-      screen.queryByTestId("sidebar-context-menu-edit-workdir"),
-    ).toBeNull();
+    expect(screen.queryByTestId("sidebar-context-menu-edit-workdir")).toBeNull();
   });
 
   it("hides the action while the session is running", () => {
     openMenu(workspace("w", [session({ status: "Running" })]));
-    expect(
-      screen.queryByTestId("sidebar-context-menu-edit-workdir"),
-    ).toBeNull();
+    expect(screen.queryByTestId("sidebar-context-menu-edit-workdir")).toBeNull();
   });
 
   it("hides the action when the session is tied (#1927)", () => {
     // Tied mode collapses naming into the rename action, so the standalone
     // workdir edit is not offered.
     openMenu(workspace("w", [session({ tie_workdir_to_name: true })]));
-    expect(
-      screen.queryByTestId("sidebar-context-menu-edit-workdir"),
-    ).toBeNull();
+    expect(screen.queryByTestId("sidebar-context-menu-edit-workdir")).toBeNull();
   });
 
   it("PATCHes the worktree-name endpoint with name and rename_branch", async () => {
@@ -201,11 +189,7 @@ describe("sidebar Edit workdir name", () => {
       key: "Enter",
     });
 
-    await vi.waitFor(() =>
-      expect(reportError).toHaveBeenCalledWith(
-        "Stop the session before renaming it.",
-      ),
-    );
+    await vi.waitFor(() => expect(reportError).toHaveBeenCalledWith("Stop the session before renaming it."));
   });
 
   it("surfaces the server validation message on failure", async () => {
@@ -223,10 +207,6 @@ describe("sidebar Edit workdir name", () => {
     });
     fireEvent.click(screen.getByTestId("workdir-modal-save"));
 
-    await vi.waitFor(() =>
-      expect(screen.getByTestId("workdir-modal-error").textContent).toContain(
-        "already exists",
-      ),
-    );
+    await vi.waitFor(() => expect(screen.getByTestId("workdir-modal-error").textContent).toContain("already exists"));
   });
 });

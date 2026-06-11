@@ -24,8 +24,7 @@ export function ElevationPrompt() {
       setLoading(false);
     };
     window.addEventListener(ELEVATION_REQUIRED_EVENT, onElevationRequired);
-    return () =>
-      window.removeEventListener(ELEVATION_REQUIRED_EVENT, onElevationRequired);
+    return () => window.removeEventListener(ELEVATION_REQUIRED_EVENT, onElevationRequired);
   }, []);
 
   const close = () => setOpen(false);
@@ -62,13 +61,10 @@ export function ElevationPrompt() {
         className="w-full max-w-sm rounded-xl border border-surface-700/40 bg-surface-800 p-6 shadow-xl"
       >
         <div className="mb-3">
-          <div className="text-sm font-medium text-text-primary">
-            Confirm passphrase
-          </div>
+          <div className="text-sm font-medium text-text-primary">Confirm passphrase</div>
           <div className="mt-1 text-xs text-text-muted">
-            This action requires re-entering your passphrase. The confirmation
-            stays valid for 15 minutes; you will not be prompted again during
-            that window.
+            This action requires re-entering your passphrase. The confirmation stays valid for 15 minutes; you will not
+            be prompted again during that window.
           </div>
         </div>
         <input

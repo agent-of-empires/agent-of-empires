@@ -78,10 +78,7 @@ describe("DiffFileList copy relative path", () => {
 
   it("copies from a flat-list row too", () => {
     const writeText = stubClipboard();
-    window.localStorage.setItem(
-      "aoe-web-settings",
-      JSON.stringify({ diffViewMode: "flat" }),
-    );
+    window.localStorage.setItem("aoe-web-settings", JSON.stringify({ diffViewMode: "flat" }));
     render(
       <DiffFileList
         files={files}

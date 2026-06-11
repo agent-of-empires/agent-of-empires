@@ -18,9 +18,7 @@ describe("useSessions / loaded sentinel", () => {
 
   it("starts loaded=false before the first fetch resolves", () => {
     let resolveFetch: (value: api.SessionsEnvelope | null) => void = () => {};
-    vi.spyOn(api, "fetchSessions").mockImplementation(
-      () => new Promise((r) => (resolveFetch = r)),
-    );
+    vi.spyOn(api, "fetchSessions").mockImplementation(() => new Promise((r) => (resolveFetch = r)));
 
     const { result } = renderHook(() => useSessions());
 

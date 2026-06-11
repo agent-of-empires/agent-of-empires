@@ -9,6 +9,7 @@ pub mod acp_reconciler;
 pub mod acp_ws;
 pub mod api;
 pub mod auth;
+pub mod live_ws;
 pub mod login;
 pub mod push;
 pub mod push_send;
@@ -225,6 +226,20 @@ impl CleanupDefaultsCache {
     }
 }
 
+/// A cached branch-diff scan (`compute_changed_files`) with its refresh
+/// timestamp. The scan is the heavy part of every diff request, and both the
+/// file-list endpoint and the per-file endpoint need the identical result, so
+/// rapidly clicking through the sidebar would otherwise re-scan the whole tree
+/// per file. The TTL is short because the working tree changes as the agent
+/// edits; it only dedupes bursts of requests, and `compute_file_contents`
+/// always reads the live working tree, so file contents are never served stale.
+struct ChangedFilesEntry {
+    refreshed_at: std::time::Instant,
+    files: Vec<crate::git::diff::DiffFile>,
+}
+
+pub const CHANGED_FILES_TTL: std::time::Duration = std::time::Duration::from_millis(1500);
+
 /// Per-profile entry tracking a live `FileWatchService` subscription and the
 /// `tokio::spawn`ed forwarder that drains its receiver into
 /// `AppState::disk_changed`. Stored under `AppState::disk_watch_handles`.
@@ -289,6 +304,13 @@ pub struct AppState {
     /// transitions to `Status::Error` for up to 8 seconds while the agent
     /// is still settling. Periodically GC'd by a background task.
     pub recently_restarted: crate::session::recovery::RecentlyRestarted,
+    /// Ids whose startup-recovery cascade is scheduled but not yet complete.
+    /// Phase A seeds it; each Phase B worker drains its id on completion. The
+    /// background refresher walks it to keep queued candidates' marks in
+    /// `recently_restarted` fresh past `RECENTLY_RESTARTED_TTL`, closing the
+    /// race where a candidate waiting on a `STARTUP_RECOVERY_CONCURRENCY`
+    /// permit ages out of suppression and trips a phantom `Status::Error`.
+    pub recovery_pending: crate::session::recovery::RecoveryPending,
     /// Cached per-profile cleanup defaults for the delete dialog, with a
     /// timestamp so we re-resolve after config changes (see
     /// `CLEANUP_DEFAULTS_TTL`).
@@ -296,6 +318,11 @@ pub struct AppState {
     /// Cached remote owner per repo path. Remote owners don't change, so
     /// entries live for the lifetime of the process.
     pub remote_owner_cache: RwLock<std::collections::HashMap<String, Option<String>>>,
+    /// Short-TTL cache of `compute_changed_files` keyed by `(repo_path,
+    /// base_branch)`, shared by the file-list and per-file diff endpoints so a
+    /// burst of file switches reuses one branch scan. See `ChangedFilesEntry`.
+    changed_files_cache:
+        std::sync::RwLock<std::collections::HashMap<(String, String), ChangedFilesEntry>>,
     /// Broadcasts session status transitions to consumers (currently the
     /// push-notification module). Emitted from `status_poll_loop` after
     /// each tmux scrape when `old != new`. Keep the Sender around even
@@ -411,6 +438,42 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Read-through cache over `compute_changed_files`. Returns a fresh scan
+    /// when the cached entry is missing or older than `CHANGED_FILES_TTL`;
+    /// errors are never cached. Safe to call from `spawn_blocking` (the lock is
+    /// a `std::sync::RwLock`, held only across the map lookup/insert).
+    pub fn changed_files_cached(
+        &self,
+        repo_path: &std::path::Path,
+        base_branch: &str,
+    ) -> crate::git::error::Result<Vec<crate::git::diff::DiffFile>> {
+        let key = (
+            repo_path.to_string_lossy().into_owned(),
+            base_branch.to_string(),
+        );
+        if let Ok(cache) = self.changed_files_cache.read() {
+            if let Some(entry) = cache.get(&key) {
+                if entry.refreshed_at.elapsed() < CHANGED_FILES_TTL {
+                    return Ok(entry.files.clone());
+                }
+            }
+        }
+        let files = crate::git::diff::compute_changed_files(repo_path, base_branch)?;
+        if let Ok(mut cache) = self.changed_files_cache.write() {
+            // Drop expired entries while we hold the write lock so the map can't
+            // grow without bound across stale (repo, base) combinations.
+            cache.retain(|_, e| e.refreshed_at.elapsed() < CHANGED_FILES_TTL);
+            cache.insert(
+                key,
+                ChangedFilesEntry {
+                    refreshed_at: std::time::Instant::now(),
+                    files: files.clone(),
+                },
+            );
+        }
+        Ok(files)
+    }
+
     /// Get or create the per-instance serialization mutex. The outer
     /// `RwLock` is only held long enough to insert/lookup the `Arc<Mutex>`;
     /// the caller awaits the inner mutex without holding the map lock.
@@ -893,6 +956,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         serve_mode,
         instance_locks: RwLock::new(std::collections::HashMap::new()),
         recently_restarted: crate::session::recovery::new_recently_restarted(),
+        recovery_pending: crate::session::recovery::new_recovery_pending(),
         cleanup_defaults_cache: RwLock::new(CleanupDefaultsCache {
             // Seed with an already-stale timestamp so the first request
             // forces a fresh resolve instead of handing out an empty map.
@@ -900,6 +964,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
             entries: std::collections::HashMap::new(),
         }),
         remote_owner_cache: RwLock::new(std::collections::HashMap::new()),
+        changed_files_cache: std::sync::RwLock::new(std::collections::HashMap::new()),
         session_primaries: Arc::new(RwLock::new(std::collections::HashMap::new())),
         session_pause_counts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         status_tx: broadcast::channel(STATUS_CHANNEL_CAPACITY).0,
@@ -983,6 +1048,42 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     }
 
     if let Some((lock, candidates)) = recovery_inputs {
+        // Background mark-refresher (#1264). Re-stamps every still-pending
+        // candidate in `recently_restarted` every RECENTLY_RESTARTED_TTL / 2
+        // so a candidate queued past the TTL behind a
+        // STARTUP_RECOVERY_CONCURRENCY permit does not age out of suppression
+        // and trip a phantom Status::Error in status_poll_loop. Exits once the
+        // pending set drains (every worker finished) or on shutdown.
+        {
+            let pending = state.recovery_pending.clone();
+            let recently = state.recently_restarted.clone();
+            let shutdown = state.shutdown.clone();
+            crate::task_util::spawn_supervised(
+                "server.startup_recovery_refresher",
+                crate::task_util::PanicPolicy::Log,
+                async move {
+                    let mut interval =
+                        tokio::time::interval(crate::session::recovery::RECENTLY_RESTARTED_TTL / 2);
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    // First tick fires immediately; skip past it so we don't
+                    // redundantly re-stamp the marks Phase A just wrote.
+                    interval.tick().await;
+                    loop {
+                        tokio::select! {
+                            _ = interval.tick() => {
+                                if !crate::session::recovery::refresh_recovery_pending(
+                                    &pending, &recently,
+                                ) {
+                                    break;
+                                }
+                            }
+                            _ = shutdown.cancelled() => break,
+                        }
+                    }
+                },
+            );
+        }
+
         let cascade_state = state.clone();
         crate::task_util::spawn_supervised(
             "server.startup_recovery_cascade",
@@ -1335,6 +1436,14 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/api/app-state/web-tour-seen",
             post(api::mark_web_tour_seen),
         )
+        .route(
+            "/api/app-state/volume-ignores-globs-acknowledged",
+            post(api::mark_volume_ignores_globs_acknowledged),
+        )
+        .route(
+            "/api/sandbox/volume-ignores-preview",
+            get(api::preview_volume_ignores_globs),
+        )
         .route("/api/themes", get(api::list_themes))
         .route("/api/themes/{name}", get(api::get_resolved_theme))
         .route("/api/theme/current", get(api::get_current_theme))
@@ -1387,6 +1496,15 @@ fn build_router(state: Arc<AppState>) -> Router {
         )
         // Terminal WebSockets
         .route("/sessions/{id}/ws", get(ws::terminal_ws))
+        .route("/sessions/{id}/live-ws", get(live_ws::live_terminal_ws))
+        .route(
+            "/sessions/{id}/terminal/live-ws",
+            get(live_ws::live_paired_terminal_ws),
+        )
+        .route(
+            "/sessions/{id}/container-terminal/live-ws",
+            get(live_ws::live_container_terminal_ws),
+        )
         .route("/sessions/{id}/terminal/ws", get(ws::paired_terminal_ws))
         .route(
             "/sessions/{id}/container-terminal/ws",
@@ -1564,34 +1682,35 @@ async fn security_headers(
     response
 }
 
-async fn serve_index(uri: axum::http::Uri) -> impl axum::response::IntoResponse {
-    use axum::response::IntoResponse;
-
+async fn serve_index(
+    uri: axum::http::Uri,
+    headers: axum::http::HeaderMap,
+) -> impl axum::response::IntoResponse {
     let path = uri.path().trim_start_matches('/');
-    if !path.is_empty() && path != "index.html" && path.contains('.') {
-        if let Some(file) = StaticAssets::get(path) {
-            let mime = mime_guess::from_path(path).first_or_octet_stream();
-            return (
-                axum::http::StatusCode::OK,
-                [(axum::http::header::CONTENT_TYPE, mime.as_ref().to_string())],
-                file.data.to_vec(),
-            )
-                .into_response();
-        }
+    if !path.is_empty()
+        && path != "index.html"
+        && path.contains('.')
+        && StaticAssets::get(path).is_some()
+    {
+        return serve_embedded_file(path, &headers);
     }
-    serve_embedded_file("index.html")
+    serve_embedded_file("index.html", &headers)
 }
 
 async fn serve_asset(
     axum::extract::Path(path): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> impl axum::response::IntoResponse {
-    serve_embedded_file(&format!("assets/{}", path))
+    serve_embedded_file(&format!("assets/{}", path), &headers)
 }
 
-async fn serve_public_file(uri: axum::http::Uri) -> impl axum::response::IntoResponse {
+async fn serve_public_file(
+    uri: axum::http::Uri,
+    headers: axum::http::HeaderMap,
+) -> impl axum::response::IntoResponse {
     // Strip leading slash to match rust-embed paths
     let path = uri.path().trim_start_matches('/');
-    serve_embedded_file(path)
+    serve_embedded_file(path, &headers)
 }
 
 /// Best-effort launch of `url` in the user's default browser. Suppressed
@@ -1617,22 +1736,123 @@ fn maybe_open_browser(url: &str) {
     }
 }
 
-fn serve_embedded_file(path: &str) -> axum::response::Response {
+/// The content-hashed entry bundle filename (`index-<hash>.js`) baked
+/// into the embedded `index.html`. This is the dashboard's build
+/// identity: the client compares its own entry script's filename
+/// against this value (via `GET /api/about`) and offers a reload when
+/// they differ. Installed PWAs (especially iOS) resume a long-lived
+/// page with no refresh affordance, so without this prompt a phone can
+/// keep running a stale dashboard for weeks after the binary updates.
+pub fn web_build_id() -> Option<&'static str> {
+    static ID: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        let index = StaticAssets::get("index.html")?;
+        let html = std::str::from_utf8(index.data.as_ref()).ok()?;
+        extract_web_build_id(html)
+    })
+    .as_deref()
+}
+
+/// Pull `index-<hash>.js` out of the built index.html. Vite names the
+/// entry chunk `assets/index-<hash>.js`; lazy chunks get their own
+/// names, so the first match is the entry.
+fn extract_web_build_id(html: &str) -> Option<String> {
+    let start = html.find("assets/index-")?;
+    let name = &html[start + "assets/".len()..];
+    let end = name.find(".js")?;
+    Some(format!("{}.js", &name[..end]))
+}
+
+fn serve_embedded_file(
+    path: &str,
+    request_headers: &axum::http::HeaderMap,
+) -> axum::response::Response {
     use axum::http::{header, StatusCode};
     use axum::response::IntoResponse;
 
     match StaticAssets::get(path) {
         Some(file) => {
+            // Strong ETag from rust-embed's content hash, so `no-cache`
+            // revalidation costs a 304 instead of a re-download.
+            let etag = {
+                let hash = file.metadata.sha256_hash();
+                let mut s = String::with_capacity(hash.len() * 2 + 2);
+                s.push('"');
+                for b in hash {
+                    use std::fmt::Write;
+                    let _ = write!(s, "{:02x}", b);
+                }
+                s.push('"');
+                s
+            };
+            if request_headers
+                .get(header::IF_NONE_MATCH)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|inm| {
+                    inm.split(',')
+                        .any(|t| t.trim().trim_start_matches("W/") == etag)
+                })
+            {
+                return (
+                    StatusCode::NOT_MODIFIED,
+                    [
+                        (header::ETAG, etag),
+                        (header::CACHE_CONTROL, cache_control_for(path).to_string()),
+                    ],
+                )
+                    .into_response();
+            }
             let mime = mime_guess::from_path(path).first_or_octet_stream();
             (
                 StatusCode::OK,
-                [(header::CONTENT_TYPE, mime.as_ref().to_string())],
+                [
+                    (header::CONTENT_TYPE, mime.as_ref().to_string()),
+                    (header::ETAG, etag),
+                    (header::CACHE_CONTROL, cache_control_for(path).to_string()),
+                ],
                 file.data.to_vec(),
             )
                 .into_response()
         }
         None => (StatusCode::NOT_FOUND, "Not found").into_response(),
     }
+}
+
+/// Cache policy for embedded dashboard files. Vite content-hashes
+/// everything under `assets/`, so those are immutable; everything else
+/// (index.html, sw.js, manifest, icons, fonts) must revalidate on every
+/// load or an installed PWA keeps booting a stale shell long after the
+/// binary shipped new assets. Revalidation is cheap: the ETag above
+/// turns it into a 304.
+fn cache_control_for(path: &str) -> &'static str {
+    if is_content_hashed_asset(path) {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    }
+}
+
+/// True for `assets/<name>-<hash>.<ext>` where `<hash>` is a Rollup
+/// content hash: 8 chars (the default length) of the base64url
+/// alphabet, immediately preceded by `-`. The `assets/` prefix alone is
+/// not enough: should a non-hashed file ever land there through a Vite
+/// config change, a year of `immutable` would pin clients to it.
+/// Misclassifying a hashed file the other way is harmless; it just
+/// revalidates via ETag like everything else.
+fn is_content_hashed_asset(path: &str) -> bool {
+    let Some(name) = path.strip_prefix("assets/") else {
+        return false;
+    };
+    let Some((stem, _ext)) = name.rsplit_once('.') else {
+        return false;
+    };
+    let bytes = stem.as_bytes();
+    if bytes.len() < 9 || bytes[bytes.len() - 9] != b'-' {
+        return false;
+    }
+    bytes[bytes.len() - 8..]
+        .iter()
+        .all(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-')
 }
 
 /// Kind tag for a local IPv4 address. Ordering in this enum is also the
@@ -1809,7 +2029,14 @@ fn load_all_instances(file_watch: &Arc<FileWatchService>) -> anyhow::Result<Vec<
 fn merge_runtime_fields(prior: Instance, mut fresh: Instance) -> Instance {
     fresh.last_error_check = prior.last_error_check;
     fresh.last_start_time = prior.last_start_time;
-    fresh.last_error = prior.last_error;
+    // Only preserve `last_error` while the session is still in Error. A healthy
+    // `fresh` clears it in `update_status_with_metadata_inner`; carrying the
+    // prior string over unconditionally would re-stick a stale error on a now-green
+    // session every poll tick when a healthy transition happened through a path that
+    // did not explicitly null `last_error` in-memory (issue #1271).
+    if fresh.status == Status::Error {
+        fresh.last_error = prior.last_error;
+    }
     fresh.session_id_poller = prior.session_id_poller;
     fresh.retroactive_capture_excludes = prior.retroactive_capture_excludes;
     fresh
@@ -2905,6 +3132,14 @@ async fn daemon_startup_recovery_mark(
     for inst in &candidates {
         crate::session::recovery::mark_recently_restarted(&state.recently_restarted, &inst.id);
     }
+    // Seed the pending set so the refresher (spawned between Phase A and
+    // Phase B) keeps these marks fresh while candidates wait on a
+    // STARTUP_RECOVERY_CONCURRENCY permit. Each worker drains its own id on
+    // completion.
+    crate::session::recovery::seed_recovery_pending(
+        &state.recovery_pending,
+        candidates.iter().map(|i| i.id.clone()),
+    );
 
     tracing::info!(
         target: "session.startup_recovery",
@@ -2924,6 +3159,9 @@ async fn daemon_startup_recovery_cascade(
     let semaphore = Arc::new(tokio::sync::Semaphore::new(
         crate::session::recovery::STARTUP_RECOVERY_CONCURRENCY,
     ));
+    // Captured up front for the completion sweep below; the worker loop
+    // consumes `candidates`.
+    let all_ids: Vec<String> = candidates.iter().map(|i| i.id.clone()).collect();
     let mut tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
     for inst in candidates {
@@ -2959,7 +3197,8 @@ async fn daemon_startup_recovery_cascade(
                         error = %e,
                         "tmux probe failed during recovery re-check; skipping cascade",
                     );
-                    crate::session::recovery::unmark_recently_restarted(
+                    crate::session::recovery::drain_recovery_pending(
+                        &inst_state.recovery_pending,
                         &inst_state.recently_restarted,
                         &id,
                     );
@@ -2982,10 +3221,12 @@ async fn daemon_startup_recovery_cascade(
                     .unwrap_or(false)
             };
             if !still_candidate {
-                // Phase A pre-marked this id; without unmarking, the
-                // status_poll_loop would suppress the real status for
-                // the full TTL even though we are not running a cascade.
-                crate::session::recovery::unmark_recently_restarted(
+                // Phase A pre-marked this id and seeded recovery_pending;
+                // without draining, the refresher would keep re-stamping the
+                // mark and status_poll_loop would suppress the real status
+                // even though we are not running a cascade.
+                crate::session::recovery::drain_recovery_pending(
+                    &inst_state.recovery_pending,
                     &inst_state.recently_restarted,
                     &id,
                 );
@@ -3044,7 +3285,8 @@ async fn daemon_startup_recovery_cascade(
                     // reload; once the cascade has finished the on-disk
                     // status is current and the poll path resolves to the
                     // correct status without help.
-                    crate::session::recovery::unmark_recently_restarted(
+                    crate::session::recovery::drain_recovery_pending(
+                        &inst_state.recovery_pending,
                         &inst_state.recently_restarted,
                         &id,
                     );
@@ -3087,7 +3329,8 @@ async fn daemon_startup_recovery_cascade(
                     // Release the suppression so the next poll respects the
                     // Error state instead of forcing Status::Starting for
                     // the rest of the TTL window.
-                    crate::session::recovery::unmark_recently_restarted(
+                    crate::session::recovery::drain_recovery_pending(
+                        &inst_state.recovery_pending,
                         &inst_state.recently_restarted,
                         &id,
                     );
@@ -3111,7 +3354,8 @@ async fn daemon_startup_recovery_cascade(
                     // Same suppression release as above: without unmarking,
                     // the next poll forces Status::Starting and wipes the
                     // panic-specific last_error written above.
-                    crate::session::recovery::unmark_recently_restarted(
+                    crate::session::recovery::drain_recovery_pending(
+                        &inst_state.recovery_pending,
                         &inst_state.recently_restarted,
                         &id,
                     );
@@ -3121,6 +3365,21 @@ async fn daemon_startup_recovery_cascade(
     }
 
     while tasks.join_next().await.is_some() {}
+
+    // Completion sweep: every worker drains its own id on each exit arm
+    // (including the spawn_blocking panic arm), but a panic in a worker's
+    // async body *outside* that match would skip its drain and leave the id
+    // pending, so the refresher would re-stamp it until daemon shutdown. By
+    // the time the JoinSet is fully drained every worker has terminated, so
+    // sweeping all ids guarantees `recovery_pending` is empty and the
+    // refresher exits on its next tick. Idempotent for ids already drained.
+    for id in &all_ids {
+        crate::session::recovery::drain_recovery_pending(
+            &state.recovery_pending,
+            &state.recently_restarted,
+            id,
+        );
+    }
     drop(lock);
 }
 
@@ -3529,10 +3788,12 @@ pub mod test_support {
             serve_mode: "local",
             instance_locks: RwLock::new(HashMap::new()),
             recently_restarted: crate::session::recovery::new_recently_restarted(),
+            recovery_pending: crate::session::recovery::new_recovery_pending(),
             cleanup_defaults_cache: RwLock::new(CleanupDefaultsCache {
                 refreshed_at: std::time::Instant::now(),
                 entries: HashMap::new(),
             }),
+            changed_files_cache: std::sync::RwLock::new(std::collections::HashMap::new()),
             remote_owner_cache: RwLock::new(HashMap::new()),
             session_primaries: Arc::new(RwLock::new(HashMap::new())),
             session_pause_counts: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -3608,6 +3869,97 @@ pub mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_web_build_id_finds_entry_bundle() {
+        let html = r#"<head><script type="module" crossorigin src="/assets/index-DKenwdW0.js"></script>
+<link rel="modulepreload" crossorigin href="/assets/vendor-Bx91yz.js"></head>"#;
+        assert_eq!(
+            extract_web_build_id(html).as_deref(),
+            Some("index-DKenwdW0.js")
+        );
+    }
+
+    #[test]
+    fn extract_web_build_id_none_without_entry() {
+        assert_eq!(extract_web_build_id("<html><body>hi</body></html>"), None);
+    }
+
+    #[test]
+    fn cache_control_immutable_only_for_hashed_assets() {
+        assert_eq!(
+            cache_control_for("assets/index-DKenwdW0.js"),
+            "public, max-age=31536000, immutable"
+        );
+        // Rollup hashes draw from the base64url alphabet (`_` and `-`
+        // included), and chunk base names can themselves contain `-`.
+        assert_eq!(
+            cache_control_for("assets/StructuredView-DM_xphSL.js"),
+            "public, max-age=31536000, immutable"
+        );
+        assert_eq!(
+            cache_control_for("assets/theme-bootstrap-Ab12Cd34.css"),
+            "public, max-age=31536000, immutable"
+        );
+        assert_eq!(cache_control_for("index.html"), "no-cache");
+        assert_eq!(cache_control_for("sw.js"), "no-cache");
+        assert_eq!(
+            cache_control_for("fonts/GeistMono-Regular.woff2"),
+            "no-cache"
+        );
+        // Un-hashed files under assets/ must NOT be pinned for a year.
+        assert_eq!(cache_control_for("assets/logo.svg"), "no-cache");
+        assert_eq!(cache_control_for("assets/readme"), "no-cache");
+        assert_eq!(cache_control_for("assets/short-a1.js"), "no-cache");
+    }
+
+    #[test]
+    fn merge_runtime_fields_preserves_last_error_while_still_in_error() {
+        // Cascade-Err preservation: prior held the error string, fresh re-derived
+        // Error from a still-dead pane without re-attaching the message. Carry it.
+        let mut prior = Instance::new("seed", "/tmp/seed");
+        prior.status = Status::Error;
+        prior.last_error = Some("recovery cascade: foo".to_string());
+
+        let mut fresh = Instance::new("seed", "/tmp/seed");
+        fresh.status = Status::Error;
+        fresh.last_error = None;
+
+        let merged = merge_runtime_fields(prior, fresh);
+        assert_eq!(merged.last_error.as_deref(), Some("recovery cascade: foo"));
+    }
+
+    #[test]
+    fn merge_runtime_fields_drops_stale_last_error_on_healthy_transition() {
+        // Issue #1271: prior errored in-memory, the session recovered to Idle
+        // through a path that never nulled `last_error`. The fresh poll must not
+        // re-stick the stale string on a now-green session.
+        let mut prior = Instance::new("seed", "/tmp/seed");
+        prior.status = Status::Error;
+        prior.last_error = Some("recovery cascade: foo".to_string());
+
+        let mut fresh = Instance::new("seed", "/tmp/seed");
+        fresh.status = Status::Idle;
+        fresh.last_error = None;
+
+        let merged = merge_runtime_fields(prior, fresh);
+        assert_eq!(merged.last_error, None);
+    }
+
+    #[test]
+    fn merge_runtime_fields_drops_stale_last_error_idle_to_idle() {
+        // Both ends healthy but prior still carried a stale string: don't propagate.
+        let mut prior = Instance::new("seed", "/tmp/seed");
+        prior.status = Status::Idle;
+        prior.last_error = Some("stale".to_string());
+
+        let mut fresh = Instance::new("seed", "/tmp/seed");
+        fresh.status = Status::Idle;
+        fresh.last_error = None;
+
+        let merged = merge_runtime_fields(prior, fresh);
+        assert_eq!(merged.last_error, None);
+    }
 
     #[tokio::test]
     #[serial_test::serial]

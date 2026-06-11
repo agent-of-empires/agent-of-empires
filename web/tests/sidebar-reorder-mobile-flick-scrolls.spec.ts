@@ -11,10 +11,7 @@
 
 import { devices } from "@playwright/test";
 import { test, expect } from "./helpers/mockedTest";
-import {
-  installSidebarMocks,
-  threeSessionsInOneRepo,
-} from "./helpers/sidebarMocks";
+import { installSidebarMocks, threeSessionsInOneRepo } from "./helpers/sidebarMocks";
 
 test.use({ ...devices["iPhone 13"] });
 
@@ -30,9 +27,7 @@ test("touch flick on the sidebar does not reorder rows", async ({ page }) => {
   await expect(rows).toHaveCount(3);
   await page.waitForFunction(
     () => {
-      const r = document
-        .querySelector('[data-testid="sidebar-session-row"]')
-        ?.getBoundingClientRect();
+      const r = document.querySelector('[data-testid="sidebar-session-row"]')?.getBoundingClientRect();
       return !!r && r.x >= 0 && r.width > 0;
     },
     null,

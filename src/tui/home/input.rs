@@ -744,6 +744,12 @@ impl HomeView {
                 }
                 None
             }
+            "archive_group" => {
+                if let Err(e) = self.archive_selected_group() {
+                    tracing::error!(target: "tui.input", "Failed to archive group: {}", e);
+                }
+                None
+            }
             "stop_session" => self.pending_stop_session.take().map(Action::StopSession),
             "force_remove_session" => {
                 if let Some(session_id) = self.pending_force_remove_session.take() {
@@ -753,10 +759,64 @@ impl HomeView {
                 }
                 None
             }
+            "pull_sandbox_image" => self.pending_image_pull.take().map(Action::SpawnImagePull),
             "quit_during_creation" => Some(Action::Quit),
             "quit" => Some(Action::Quit),
             _ => None,
         }
+    }
+
+    /// Open a neutral confirm dialog offering to pull the newer sandbox image
+    /// the registry check surfaced. The image is stashed in
+    /// `pending_image_pull` because the generic `ConfirmDialog` only carries an
+    /// action string; the Submit handler reads it back to emit the pull.
+    pub(crate) fn prompt_pull_sandbox_image(&mut self, image: String) {
+        if self.confirm_dialog.is_some() {
+            return;
+        }
+        self.pending_image_pull = Some(image.clone());
+        self.confirm_dialog = Some(
+            ConfirmDialog::new(
+                "Update sandbox image",
+                &format!(
+                    "Pull the latest {image}? This downloads the new image and uses it for new sandbox sessions."
+                ),
+                "pull_sandbox_image",
+            )
+            .neutral(),
+        );
+    }
+
+    /// Confirm before archiving every active session under the focused group.
+    /// Archiving a whole project at once is a bigger hammer than the single-row
+    /// `z`, so it routes through a prompt. Archiving is reversible, hence the
+    /// calmer neutral tone rather than the destructive red. No-ops silently
+    /// (no prompt) when the group has no active sessions left to archive.
+    pub(super) fn prompt_archive_selected_group(&mut self) {
+        let Some(group_path) = self.selected_group.clone() else {
+            return;
+        };
+        let count = self.active_sessions_in_selected_group().len();
+        if count == 0 {
+            return;
+        }
+        // Project mode groups by repo, Manual mode by user-assigned path; name
+        // the scope accordingly and show the full path so nested groups that
+        // share a leaf segment aren't ambiguous.
+        let (title, scope) = if self.group_by == crate::session::config::GroupByMode::Project {
+            ("Archive project", "project")
+        } else {
+            ("Archive group", "group")
+        };
+        let noun = if count == 1 { "session" } else { "sessions" };
+        self.confirm_dialog = Some(
+            ConfirmDialog::new(
+                title,
+                &format!("Archive all {count} {noun} in {scope} \"{group_path}\"?"),
+                "archive_group",
+            )
+            .neutral(),
+        );
     }
 
     /// Discard unsaved Settings changes: force-close the view, clear the
@@ -863,6 +923,7 @@ impl HomeView {
                         self.confirm_dialog = None;
                         self.pending_stop_session = None;
                         self.pending_force_remove_session = None;
+                        self.pending_image_pull = None;
                         // The settings close path mirrors the keyboard
                         // route: Cancel here means "don't discard," so
                         // settings stays open and `settings_close_confirm`
@@ -1109,6 +1170,29 @@ impl HomeView {
                             }
                         }
                         if let Some(data) = self.pending_hooks_install_data.take() {
+                            self.pending_dialog_click_action =
+                                self.maybe_confirm_volume_ignores_globs(data);
+                        }
+                    }
+                }
+            }
+            return true;
+        }
+        if let Some(dialog) = &self.volume_ignores_glob_dialog {
+            if let Some(result) = dialog.handle_click(col, row) {
+                let dont_ask_again = dialog.dont_ask_again();
+                match result {
+                    DialogResult::Continue => {}
+                    DialogResult::Cancel => {
+                        self.volume_ignores_glob_dialog = None;
+                        self.pending_volume_ignores_glob_data = None;
+                    }
+                    DialogResult::Submit(_) => {
+                        self.volume_ignores_glob_dialog = None;
+                        if dont_ask_again {
+                            self.persist_volume_ignores_globs_ack();
+                        }
+                        if let Some(data) = self.pending_volume_ignores_glob_data.take() {
                             self.pending_dialog_click_action = self.continue_session_creation(data);
                         }
                     }
@@ -1506,6 +1590,27 @@ impl HomeView {
                     }
                     // Resume session creation
                     if let Some(data) = self.pending_hooks_install_data.take() {
+                        return self.maybe_confirm_volume_ignores_globs(data);
+                    }
+                }
+            }
+            return None;
+        }
+
+        if let Some(dialog) = &mut self.volume_ignores_glob_dialog {
+            match dialog.handle_key(key) {
+                DialogResult::Continue => {}
+                DialogResult::Cancel => {
+                    self.volume_ignores_glob_dialog = None;
+                    self.pending_volume_ignores_glob_data = None;
+                }
+                DialogResult::Submit(_) => {
+                    let dont_ask_again = dialog.dont_ask_again();
+                    self.volume_ignores_glob_dialog = None;
+                    if dont_ask_again {
+                        self.persist_volume_ignores_globs_ack();
+                    }
+                    if let Some(data) = self.pending_volume_ignores_glob_data.take() {
                         return self.continue_session_creation(data);
                     }
                 }
@@ -1598,7 +1703,7 @@ impl HomeView {
                         }
                     }
 
-                    return self.continue_session_creation(data);
+                    return self.maybe_confirm_volume_ignores_globs(data);
                 }
             }
             return None;
@@ -1611,6 +1716,7 @@ impl HomeView {
                     self.confirm_dialog = None;
                     self.pending_stop_session = None;
                     self.pending_force_remove_session = None;
+                    self.pending_image_pull = None;
                 }
                 DialogResult::Submit(_) => {
                     let action = dialog.action().to_string();
@@ -1728,7 +1834,11 @@ impl HomeView {
                     self.restart_dialog = None;
                     let profile = data.profile.as_deref();
                     let tool = data.tool.as_deref();
-                    if let Err(e) = self.restart_selected_session(profile, tool) {
+                    let extra_args = data.extra_args.as_deref();
+                    let command_override = data.command_override.as_deref();
+                    if let Err(e) =
+                        self.restart_selected_session(profile, tool, extra_args, command_override)
+                    {
                         // Surface the restart error to the user via the
                         // InfoDialog rather than only the debug log; the
                         // user explicitly initiated this action and needs
@@ -1994,6 +2104,7 @@ impl HomeView {
             view_mode: self.view_mode.clone(),
             sort_order: self.sort_order,
             has_search: !self.search_matches.is_empty(),
+            project_group_selected: self.project_group_at_cursor().is_some(),
         };
         if let Some(id) = bindings::resolve(&key, self.strict_hotkeys, &ctx) {
             return self.run_action(id, update_info);
@@ -2159,7 +2270,9 @@ impl HomeView {
             ActionId::Restart => self.open_restart_dialog(),
             ActionId::Update => return self.run_update(update_info),
             ActionId::ToggleArchive => {
-                if let Err(e) = self.toggle_archive_at_cursor() {
+                if self.selected_group.is_some() {
+                    self.prompt_archive_selected_group();
+                } else if let Err(e) = self.toggle_archive_at_cursor() {
                     tracing::error!("toggle_archive_at_cursor failed: {}", e);
                 }
             }
@@ -2177,6 +2290,7 @@ impl HomeView {
             ActionId::TogglePreviewInfo => self.toggle_preview_info(),
             ActionId::SortPicker => self.show_sort_picker(),
             ActionId::GroupBy => self.show_group_picker(),
+            ActionId::ToggleProjectPin => self.toggle_project_pin_at_cursor(),
             ActionId::NextWaiting => self.jump_to_next_waiting(),
         }
         None
@@ -2190,15 +2304,27 @@ impl HomeView {
             ));
             return;
         }
+        // Same gate as `open_new_session_dialog`: with no agent available the
+        // dialog has nothing to create, so point the user at setup instead of
+        // opening an unusable form. Keeps `'N'` and the group menu's New
+        // Session in step with `'n'` and the empty-sidebar menu.
+        if !self.available_tools.any_available() {
+            self.show_no_agents();
+            return;
+        }
         let prefill_path = self
             .selected_session
             .as_ref()
             .and_then(|id| self.get_instance(id))
-            .map(|inst| {
-                inst.worktree_info
+            .map(|inst| inst.repo_path().to_string())
+            .or_else(|| {
+                // No session selected (the project/group right-click menu, or
+                // `'N'` on a group header): borrow a member's repo path so the
+                // new session lands in the same project, matching the web
+                // sidebar's per-project "+".
+                self.selected_group
                     .as_ref()
-                    .map(|wt| wt.main_repo_path.clone())
-                    .unwrap_or_else(|| inst.project_path.clone())
+                    .and_then(|g| self.group_repo_path(g))
             });
         let prefill_group = self
             .selected_session
@@ -2233,14 +2359,49 @@ impl HomeView {
             if let Some(group) = prefill_group {
                 dialog.set_group(group);
             }
-            // Only skip to the title when the path was inherited from a
-            // session. In the group-only fallback the path is still the
-            // default cwd, so leaving focus there lets the user confirm it.
+            // Skip to the title whenever the path is genuinely prefilled,
+            // whether inherited from a session or borrowed from a project/group
+            // member, so the user lands directly on naming. Only an empty group
+            // (no member to borrow a path from) leaves focus on the default cwd
+            // so the user can confirm it.
             if has_prefilled_path {
                 dialog.focus_title();
             }
             self.new_dialog = Some(dialog);
         }
+    }
+
+    /// Pick a representative repo path for a selected group so "New Session"
+    /// from a project/group can prefill the working directory. In project mode
+    /// the group label is a derived basename, so match members by
+    /// `project_group_name`; in manual mode match by the stored `group_path`,
+    /// including nested subgroups. Returns `None` for an empty group (no member
+    /// to borrow a path from), leaving the dialog on the default cwd.
+    pub(super) fn group_repo_path(&self, group_path: &str) -> Option<String> {
+        self.instances
+            .iter()
+            .find(|inst| match self.group_by {
+                GroupByMode::Project => super::project_group_name(inst) == group_path,
+                _ => {
+                    inst.group_path == group_path
+                        || inst.group_path.starts_with(&format!("{group_path}/"))
+                }
+            })
+            .map(|inst| inst.repo_path().to_string())
+            .or_else(|| {
+                // An empty pinned project has no member sessions to borrow a
+                // path from; fall back to the registered project's path so
+                // "New Session" can still launch under it (the point of pinning
+                // an empty project).
+                if self.group_by == GroupByMode::Project {
+                    self.registered_projects
+                        .iter()
+                        .find(|p| crate::session::projects::repo_label(&p.path) == group_path)
+                        .map(|p| p.path.clone())
+                } else {
+                    None
+                }
+            })
     }
 
     fn attach_terminal_for_selected(&mut self) -> Option<Action> {
@@ -3088,16 +3249,29 @@ impl HomeView {
             // row reads as "Rename Group / Delete Group" instead of bare
             // "Rename / Delete".
             let is_group = matches!(self.flat_items[idx], super::Item::Group { .. });
-            self.context_menu = Some(if is_group {
+            // A real project header in project view gets the pin menu; the
+            // cursor was just moved onto this row, so `project_group_at_cursor`
+            // reflects it. Manual/synthetic group rows keep Rename/Delete.
+            let project_label = self.project_group_at_cursor();
+            self.context_menu = Some(if let Some(label) = project_label {
+                ContextMenuDialog::for_project_group(anchor, self.is_project_label_pinned(&label))
+            } else if is_group {
                 ContextMenuDialog::for_group(anchor)
             } else {
-                let is_archived = match &self.flat_items[idx] {
-                    super::Item::Session { id, .. } => {
-                        self.get_instance(id).is_some_and(|inst| inst.is_archived())
-                    }
-                    super::Item::Group { .. } => false,
+                let (is_archived, is_snoozed) = match &self.flat_items[idx] {
+                    super::Item::Session { id, .. } => self
+                        .get_instance(id)
+                        .map(|inst| (inst.is_archived(), inst.is_snoozed()))
+                        .unwrap_or((false, false)),
+                    super::Item::Group { .. } => (false, false),
                 };
-                ContextMenuDialog::for_session(anchor, is_archived)
+                // Snooze is an Attention-sort triage primitive: the `'h'`
+                // keybinding only fires in Attention sort, so the menu omits
+                // the Snooze row everywhere else to keep the mouse and keyboard
+                // paths in step.
+                let snooze = (self.sort_order == crate::session::config::SortOrder::Attention)
+                    .then_some(is_snoozed);
+                ContextMenuDialog::for_session(anchor, is_archived, snooze)
             });
             return true;
         }
@@ -3166,9 +3340,28 @@ impl HomeView {
                     tracing::error!("toggle_archive_at_cursor (context menu) failed: {}", e);
                 }
             }
+            ContextMenuAction::ToggleSnooze => {
+                // Same cursor-on-the-clicked-row guarantee as ToggleArchive:
+                // snoozing an active row opens the duration picker, unsnoozing
+                // wakes it immediately.
+                if let Err(e) = self.toggle_snooze_at_cursor() {
+                    tracing::error!("toggle_snooze_at_cursor (context menu) failed: {}", e);
+                }
+            }
             ContextMenuAction::NewSession => self.open_new_session_dialog(),
+            // The right-click already moved the cursor onto the group row, so
+            // reuse the "new from selection" path: with a group selected it
+            // prefills the project's repo path (and group) the same way `'N'`
+            // does on a session.
+            ContextMenuAction::NewFromGroup => self.open_new_from_selection(),
             ContextMenuAction::OpenSortPicker => self.show_sort_picker(),
             ContextMenuAction::OpenGroupPicker => self.show_group_picker(),
+            ContextMenuAction::TogglePin => {
+                // The right-click already moved the cursor onto the project
+                // header, so the toggle acts on the same project the menu was
+                // opened for.
+                self.toggle_project_pin_at_cursor();
+            }
         }
     }
 
@@ -3540,7 +3733,9 @@ impl HomeView {
                 // row, or switches the live target when already in live
                 // mode. `SelectOnly` stops at the cursor update above so
                 // the user can browse preview content without ever
-                // entering live-send; double-click still activates via
+                // entering live-send (and, if a *different* row was already
+                // live, exits live mode so keystrokes don't stay aimed at the
+                // old session); double-click still activates via
                 // `default_attach_mode`. `click_action` returns `None`
                 // for structured view-mode sessions, where `start_live_send`
                 // already short-circuits, so the historical fall-through
@@ -3551,6 +3746,21 @@ impl HomeView {
                         Some(crate::session::ClickAction::SelectOnly)
                     )
                 {
+                    // The click only moves the cursor, but if we're live-sending
+                    // to a *different* row, leave live mode rather than stranding
+                    // keystrokes on the old session while the cursor / preview
+                    // walks away. In `LiveSend` mode the `start_live_send` branch
+                    // below already retargets, so this only matters for the
+                    // select-only (and archived) gesture, which is precisely a
+                    // "stop touching that, let me look at this" intent.
+                    if let Some(state) = self
+                        .live_send
+                        .as_ref()
+                        .filter(|s| s.session_id != id)
+                        .cloned()
+                    {
+                        self.exit_live_send_and_restore_sizing(&state);
+                    }
                     None
                 } else {
                     self.start_live_send()
@@ -3782,12 +3992,16 @@ impl HomeView {
             inst.source_profile.clone()
         };
         let current_tool = inst.tool.clone();
+        let current_command = inst.command.clone();
+        let current_extra_args = inst.extra_args.clone();
         let profiles = list_profiles().unwrap_or_else(|_| vec![current_profile.clone()]);
         let tools: Vec<String> = self.available_tools.available_list().to_vec();
         self.restart_dialog = Some(RestartDialog::new(
             &current_title,
             &current_profile,
             &current_tool,
+            &current_command,
+            &current_extra_args,
             profiles,
             tools,
         ));
@@ -4265,6 +4479,85 @@ impl HomeView {
         }
     }
 
+    /// Gate sandbox session creation on a one-time confirmation when the resolved
+    /// config has glob `volume_ignores` (e.g. `**/bin`). Those entries are expanded
+    /// against the workspace at create time, a point-in-time snapshot that won't
+    /// shadow directories a build creates later inside the container (#2045). Shows
+    /// the dialog once (unless already acknowledged or no glob is configured),
+    /// otherwise proceeds straight to creation.
+    fn maybe_confirm_volume_ignores_globs(&mut self, data: NewSessionData) -> Option<Action> {
+        if data.sandbox && !Self::volume_ignores_globs_acknowledged() {
+            if let Some(message) = Self::volume_ignores_glob_confirm_message(&data) {
+                self.volume_ignores_glob_dialog = Some(
+                    crate::tui::dialogs::ConfirmDialog::new(
+                        "Glob volume_ignores",
+                        &message,
+                        "volume_ignores_globs",
+                    )
+                    .neutral()
+                    .offering_dont_ask_again(),
+                );
+                self.pending_volume_ignores_glob_data = Some(data);
+                return None;
+            }
+        }
+        self.continue_session_creation(data)
+    }
+
+    fn volume_ignores_globs_acknowledged() -> bool {
+        load_config()
+            .ok()
+            .flatten()
+            .map(|c| c.app_state.has_acknowledged_volume_ignores_globs)
+            .unwrap_or(false)
+    }
+
+    fn persist_volume_ignores_globs_ack(&self) {
+        if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
+            config.app_state.has_acknowledged_volume_ignores_globs = true;
+            if let Err(e) = save_config(&config) {
+                tracing::warn!(target: "tui.input", "Failed to save volume_ignores ack: {e}");
+            }
+        }
+    }
+
+    /// Build the confirm message describing how this session's glob volume_ignores
+    /// will expand, or `None` when there is no glob entry (nothing to confirm).
+    fn volume_ignores_glob_confirm_message(data: &NewSessionData) -> Option<String> {
+        let config =
+            repo_config::resolve_config_with_repo(&data.profile, std::path::Path::new(&data.path))
+                .ok()?;
+        let expansions = crate::session::container_config::preview_glob_volume_ignores(
+            &data.path,
+            None,
+            &config.sandbox.volume_ignores,
+        )
+        .ok()?;
+        if expansions.is_empty() {
+            return None;
+        }
+        let match_count: usize = expansions
+            .iter()
+            .map(|e| e.matched_container_paths.len())
+            .sum();
+        // Name the patterns (capped) so the user sees what will expand.
+        let mut patterns: Vec<&str> = expansions.iter().map(|e| e.pattern.as_str()).collect();
+        let pattern_list = if patterns.len() > 3 {
+            patterns.truncate(3);
+            format!("{}, ...", patterns.join(", "))
+        } else {
+            patterns.join(", ")
+        };
+        Some(format!(
+            "volume_ignores globs ({}) match {} director{} in the workspace right now. Each \
+             becomes an ignore mount at create time; directories a build creates later inside the \
+             container are not hidden. Proceed?",
+            pattern_list,
+            match_count,
+            if match_count == 1 { "y" } else { "ies" },
+        ))
+    }
+
     /// Continue session creation after agent hooks acknowledgment.
     /// Runs the repo hook trust check and then creates the session.
     fn continue_session_creation(&mut self, data: NewSessionData) -> Option<Action> {
@@ -4596,5 +4889,65 @@ mod tests {
         let cache = build_tool_hotkey_cache(&tools);
         assert_eq!(cache[0].0, "alpha");
         assert_eq!(cache[1].0, "beta");
+    }
+
+    fn glob_session_data(path: &str) -> NewSessionData {
+        NewSessionData {
+            profile: String::new(),
+            title: String::new(),
+            path: path.to_string(),
+            group: String::new(),
+            tool: "claude".to_string(),
+            worktree_enabled: false,
+            worktree_branch: None,
+            create_new_branch: false,
+            base_branch: None,
+            extra_repo_paths: Vec::new(),
+            sandbox: true,
+            sandbox_image: "ubuntu:latest".to_string(),
+            yolo_mode: false,
+            extra_env: Vec::new(),
+            extra_args: String::new(),
+            command_override: String::new(),
+            scratch: false,
+        }
+    }
+
+    /// The confirm gate only fires when the resolved config has a glob ignore
+    /// that the message can name; literal-only ignores produce no dialog.
+    #[test]
+    #[serial_test::serial]
+    fn volume_ignores_glob_confirm_message_fires_only_on_globs() {
+        let temp_home = tempfile::TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+        let project = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(project.path().join("src/App/bin")).unwrap();
+        git2::Repository::init(project.path()).unwrap();
+        let cfg = project.path().join(".agent-of-empires");
+        std::fs::create_dir_all(&cfg).unwrap();
+        let path = project.path().to_str().unwrap();
+
+        std::fs::write(
+            cfg.join("config.toml"),
+            "[sandbox]\nvolume_ignores = [\"**/bin\", \"target\"]\n",
+        )
+        .unwrap();
+        let msg = HomeView::volume_ignores_glob_confirm_message(&glob_session_data(path))
+            .expect("glob ignore should produce a confirm message");
+        assert!(msg.contains("**/bin"), "message names the pattern: {msg}");
+        assert!(msg.contains("1 directory"), "one match counted: {msg}");
+
+        std::fs::write(
+            cfg.join("config.toml"),
+            "[sandbox]\nvolume_ignores = [\"target\", \".venv\"]\n",
+        )
+        .unwrap();
+        assert!(
+            HomeView::volume_ignores_glob_confirm_message(&glob_session_data(path)).is_none(),
+            "literal-only ignores must not trigger the gate"
+        );
     }
 }

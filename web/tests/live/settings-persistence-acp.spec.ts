@@ -10,18 +10,10 @@
 
 import { test, expect } from "../helpers/liveTest";
 
-test("structured view settings persist through PATCH + reload, node_path is stripped", async ({
-  serve,
-  page,
-}) => {
-  const before = await fetch(`${serve.baseUrl}/api/settings`).then((r) =>
-    r.json(),
-  );
+test("structured view settings persist through PATCH + reload, node_path is stripped", async ({ serve, page }) => {
+  const before = await fetch(`${serve.baseUrl}/api/settings`).then((r) => r.json());
   const baselineAcp = (before?.acp ?? {}) as Record<string, unknown>;
-  const baselineNodePath =
-    typeof baselineAcp.node_path === "string"
-      ? (baselineAcp.node_path as string)
-      : "";
+  const baselineNodePath = typeof baselineAcp.node_path === "string" ? (baselineAcp.node_path as string) : "";
   const newIdle = baselineAcp.auto_stop_idle_secs === 28800 ? 14400 : 28800;
 
   // PATCH a safe knob plus a malicious node_path through the same endpoint
@@ -42,9 +34,7 @@ test("structured view settings persist through PATCH + reload, node_path is stri
 
   // Server-side: the safe knob persisted, node_path was stripped (still
   // the baseline, never the injected /tmp/evil-node).
-  const after = await fetch(`${serve.baseUrl}/api/settings`).then((r) =>
-    r.json(),
-  );
+  const after = await fetch(`${serve.baseUrl}/api/settings`).then((r) => r.json());
   expect(after?.acp?.auto_stop_idle_secs).toBe(newIdle);
   expect(after?.acp?.node_path).toBe(baselineNodePath);
   expect(after?.acp?.node_path).not.toBe("/tmp/evil-node");

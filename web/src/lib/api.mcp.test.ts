@@ -6,13 +6,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import {
-  fetchMcpServers,
-  resolveMcpConflict,
-  keepMcpServer,
-  dropMcpServer,
-  type McpServersResponse,
-} from "./api";
+import { fetchMcpServers, resolveMcpConflict, keepMcpServer, dropMcpServer, type McpServersResponse } from "./api";
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -21,9 +15,7 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
-function makeResponse(
-  overrides: Partial<McpServersResponse> = {},
-): McpServersResponse {
+function makeResponse(overrides: Partial<McpServersResponse> = {}): McpServersResponse {
   return {
     agent: "claude",
     effective: [],
@@ -47,9 +39,7 @@ afterEach(() => {
 
 describe("fetchMcpServers", () => {
   it("returns the parsed payload and omits the query when no agent is given", async () => {
-    fetchSpy.mockResolvedValueOnce(
-      jsonResponse(makeResponse({ agent: "claude" })),
-    );
+    fetchSpy.mockResolvedValueOnce(jsonResponse(makeResponse({ agent: "claude" })));
     const res = await fetchMcpServers();
     expect(res?.agent).toBe("claude");
     expect(fetchSpy).toHaveBeenCalledWith("/api/mcp/servers", undefined);
@@ -58,10 +48,7 @@ describe("fetchMcpServers", () => {
   it("encodes the agent into the query string", async () => {
     fetchSpy.mockResolvedValueOnce(jsonResponse(makeResponse()));
     await fetchMcpServers("claude code");
-    expect(fetchSpy).toHaveBeenCalledWith(
-      "/api/mcp/servers?agent=claude%20code",
-      undefined,
-    );
+    expect(fetchSpy).toHaveBeenCalledWith("/api/mcp/servers?agent=claude%20code", undefined);
   });
 
   it("returns null on non-2xx and on network failure", async () => {
@@ -89,13 +76,9 @@ describe("resolveMcpConflict", () => {
 
   it("maps 409 to `stale` and other non-2xx to `error`", async () => {
     fetchSpy.mockResolvedValueOnce(new Response("", { status: 409 }));
-    expect(await resolveMcpConflict("fs", "claude", "native", "fp")).toBe(
-      "stale",
-    );
+    expect(await resolveMcpConflict("fs", "claude", "native", "fp")).toBe("stale");
     fetchSpy.mockResolvedValueOnce(new Response("", { status: 500 }));
-    expect(await resolveMcpConflict("fs", "claude", "native", "fp")).toBe(
-      "error",
-    );
+    expect(await resolveMcpConflict("fs", "claude", "native", "fp")).toBe("error");
   });
 
   it("maps a network failure to `error`", async () => {

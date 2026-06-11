@@ -56,12 +56,7 @@ describe("diffPair counts", () => {
 describe("diffPair hunk shape", () => {
   it("emits add/delete/equal line types in interleaved order", () => {
     const r = diffPair("a\nb\nc", "a\nB\nc");
-    expect(r.hunk.lines.map((l) => l.type)).toEqual([
-      "equal",
-      "delete",
-      "add",
-      "equal",
-    ]);
+    expect(r.hunk.lines.map((l) => l.type)).toEqual(["equal", "delete", "add", "equal"]);
   });
 
   it("assigns line numbers per side (null on the absent side)", () => {

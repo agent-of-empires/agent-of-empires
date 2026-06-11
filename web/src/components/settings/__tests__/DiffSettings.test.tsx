@@ -23,9 +23,7 @@ beforeEach(() => {
 describe("DiffSettings localStorage contract", () => {
   it("toggling side-by-side writes diffViewLayout", () => {
     const { getByText, container } = render(<DiffSettings />);
-    const splitBox = container.querySelectorAll(
-      "input[type=checkbox]",
-    )[0] as HTMLInputElement;
+    const splitBox = container.querySelectorAll("input[type=checkbox]")[0] as HTMLInputElement;
 
     expect(getByText("Side-by-side diff")).toBeTruthy();
     expect(splitBox.checked).toBe(false); // defaults to unified
@@ -39,9 +37,7 @@ describe("DiffSettings localStorage contract", () => {
 
   it("toggling tree file list writes diffViewMode", () => {
     const { getByText, container } = render(<DiffSettings />);
-    const treeBox = container.querySelectorAll(
-      "input[type=checkbox]",
-    )[1] as HTMLInputElement;
+    const treeBox = container.querySelectorAll("input[type=checkbox]")[1] as HTMLInputElement;
 
     expect(getByText("Tree file list")).toBeTruthy();
     fireEvent.click(treeBox);

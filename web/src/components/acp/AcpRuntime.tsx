@@ -27,21 +27,11 @@
 // rattle spinner, ApprovalCard) and slot them into assistant-ui's
 // component-injection points.
 
-import {
-  AssistantRuntimeProvider,
-  useExternalStoreRuntime,
-  type ThreadMessageLike,
-} from "@assistant-ui/react";
+import { AssistantRuntimeProvider, useExternalStoreRuntime, type ThreadMessageLike } from "@assistant-ui/react";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import { useAcpSession } from "../../hooks/useAcpSession";
-import type {
-  ActivityRow,
-  ApprovalDecision,
-  AcpState,
-  PromptAttachmentInput,
-  ToolCall,
-} from "../../lib/acpTypes";
+import type { ActivityRow, ApprovalDecision, AcpState, PromptAttachmentInput, ToolCall } from "../../lib/acpTypes";
 import { hasTodoItemsArgsText, parseJsonObject } from "../../lib/acpArgs";
 import { useAgentProfile } from "../../lib/agentProfileContext";
 
@@ -82,18 +72,13 @@ export interface AcpContext {
   maxRetries: number;
   manualReconnect: () => void;
   resolveApproval: (nonce: string, decision: ApprovalDecision) => Promise<void>;
-  sendPrompt: (
-    text: string,
-    attachments?: PromptAttachmentInput[],
-  ) => Promise<void>;
+  sendPrompt: (text: string, attachments?: PromptAttachmentInput[]) => Promise<void>;
   /** Attachments the composer has staged for the next send. Owned here
    *  (above the assistant-ui runtime) so `onNew` can attach them when
    *  the user submits via Enter / the assistant-ui Send path, and the
    *  composer can render + clear them. See #1000 / #965. */
   pendingAttachments: PromptAttachmentInput[];
-  setPendingAttachments: React.Dispatch<
-    React.SetStateAction<PromptAttachmentInput[]>
-  >;
+  setPendingAttachments: React.Dispatch<React.SetStateAction<PromptAttachmentInput[]>>;
   forceEndTurn: () => Promise<void>;
   lastActivityRef: ReturnType<typeof useAcpSession>["lastActivityRef"];
   dismissError: () => void;
@@ -121,19 +106,12 @@ export function AcpRuntime({
   showClearedTurns = false,
   children,
 }: Props) {
-  const acp = useAcpSession(
-    sessionId,
-    acpWorkerState,
-    archivedAt,
-    snoozedUntil,
-  );
+  const acp = useAcpSession(sessionId, acpWorkerState, archivedAt, snoozedUntil);
   const agentProfile = useAgentProfile();
   // Staged attachments for the next prompt. A ref mirror keeps `onNew`
   // (recreated each render by useExternalStoreRuntime) reading the
   // latest value without going stale. See #1000 / #965.
-  const [pendingAttachments, setPendingAttachments] = useState<
-    PromptAttachmentInput[]
-  >([]);
+  const [pendingAttachments, setPendingAttachments] = useState<PromptAttachmentInput[]>([]);
   const pendingAttachmentsRef = useRef<PromptAttachmentInput[]>([]);
   useEffect(() => {
     pendingAttachmentsRef.current = pendingAttachments;
@@ -152,12 +130,7 @@ export function AcpRuntime({
         showClearedTurns,
         agentProfile.capabilities.todos,
       ),
-    [
-      acp.state.activity,
-      acp.state.turnActive,
-      showClearedTurns,
-      agentProfile.capabilities.todos,
-    ],
+    [acp.state.activity, acp.state.turnActive, showClearedTurns, agentProfile.capabilities.todos],
   );
 
   const runtime = useExternalStoreRuntime<ThreadMessageLike>({
@@ -323,9 +296,7 @@ export function activityToThreadMessages(
         id: row.id,
         role: "user",
         content: [{ type: "text", text: row.text }],
-        metadata: row.diffComments
-          ? { custom: { diffComments: row.diffComments } }
-          : undefined,
+        metadata: row.diffComments ? { custom: { diffComments: row.diffComments } } : undefined,
         createdAt: parseDate(row.at),
       });
       continue;
@@ -381,11 +352,7 @@ export function activityToThreadMessages(
       currentAssistant.appendText(row.text);
     } else if (row.kind === "tool_start" && row.tool) {
       currentAssistant.appendToolCall(row.tool);
-    } else if (
-      row.kind === "tool_complete" ||
-      row.kind === "tool_error" ||
-      row.kind === "tool_stopped"
-    ) {
+    } else if (row.kind === "tool_complete" || row.kind === "tool_error" || row.kind === "tool_stopped") {
       currentAssistant.completeToolCall(
         row.toolCallId ?? row.id.replace(/^(done|stopped)-/, ""),
         row.kind === "tool_error",
@@ -505,13 +472,7 @@ class AssistantBuilder {
     });
   }
 
-  completeToolCall(
-    toolCallId: string,
-    isError: boolean,
-    stopped: boolean,
-    resultText: string,
-    endedAt: string,
-  ) {
+  completeToolCall(toolCallId: string, isError: boolean, stopped: boolean, resultText: string, endedAt: string) {
     for (const part of this.parts) {
       if (part.type === "tool-call" && part.toolCallId === toolCallId) {
         part.result = {
@@ -535,9 +496,7 @@ class AssistantBuilder {
       // for tool-call args. We don't carry parsed args through this
       // path; the renderer parses argsText itself; so the loose
       // shape is safe in practice.
-      content: (grouped.length
-        ? grouped
-        : [{ type: "text", text: "" }]) as ThreadMessageLike["content"],
+      content: (grouped.length ? grouped : [{ type: "text", text: "" }]) as ThreadMessageLike["content"],
       createdAt: this.createdAt,
     };
   }
@@ -718,10 +677,7 @@ function buildGroupChildren(run: DraftPart[]): {
  *  underlying tool-call data is preserved verbatim inside the group's
  *  argsText payload so the renderer can expand back to the original
  *  per-tool cards on click. */
-function collapseToolRuns(
-  parts: DraftPart[],
-  todosEnabled: boolean,
-): DraftPart[] {
+function collapseToolRuns(parts: DraftPart[], todosEnabled: boolean): DraftPart[] {
   const out: DraftPart[] = [];
   let run: DraftPart[] = [];
   const flushRun = () => {
@@ -734,8 +690,7 @@ function collapseToolRuns(
       // shows the latest list collapsed and the per-call history on
       // expand. TodoWrites are detected via the `_aoe_title` echo /
       // `todos` payload stashed in argsText.
-      const isTodo = (p: DraftPart) =>
-        p.type === "tool-call" && isTodoWriteArgsText(p.argsText, todosEnabled);
+      const isTodo = (p: DraftPart) => p.type === "tool-call" && isTodoWriteArgsText(p.argsText, todosEnabled);
       if (run.every(isTodo)) {
         const { childIds, children } = buildGroupChildren(run);
         out.push({
@@ -759,9 +714,7 @@ function collapseToolRuns(
       // Subagent cards are already their own collapsible block (one card
       // per Task). Folding N parallel Tasks into a single generic group
       // card hides the parallelism the user dispatched. See #1041.
-      const hasSubagent = run.some(
-        (p) => p.type === "tool-call" && p.toolName === SUBAGENT_TASK_NAME,
-      );
+      const hasSubagent = run.some((p) => p.type === "tool-call" && p.toolName === SUBAGENT_TASK_NAME);
       if (hasSubagent) {
         for (const p of run) out.push(p);
         run = [];

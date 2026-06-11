@@ -31,9 +31,7 @@ function writeDismissed(version: string) {
  */
 export function UpdateBanner() {
   const [status, setStatus] = useState<UpdateStatus | null>(null);
-  const [dismissedVersion, setDismissedVersion] = useState<string | null>(() =>
-    readDismissed(),
-  );
+  const [dismissedVersion, setDismissedVersion] = useState<string | null>(() => readDismissed());
 
   useEffect(() => {
     let cancelled = false;
@@ -43,10 +41,7 @@ export function UpdateBanner() {
       const s = await fetchUpdateStatus();
       if (cancelled) return;
       if (s) setStatus(s);
-      const minutes = Math.max(
-        MIN_POLL_MINUTES,
-        s?.web_poll_interval_minutes ?? 60,
-      );
+      const minutes = Math.max(MIN_POLL_MINUTES, s?.web_poll_interval_minutes ?? 60);
       timer = setTimeout(poll, minutes * 60_000);
     };
 

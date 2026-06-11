@@ -4,10 +4,7 @@
 
 import { test, expect } from "../helpers/liveTest";
 
-test("--no-auth skips LoginPage and lands on dashboard", async ({
-  serve,
-  page,
-}) => {
+test("--no-auth skips LoginPage and lands on dashboard", async ({ serve, page }) => {
   await page.goto(serve.baseUrl);
 
   // LoginPage renders the passphrase field. In no-auth mode it must

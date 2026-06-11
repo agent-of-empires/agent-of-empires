@@ -123,10 +123,7 @@ export function setQueueCount(sessionId: string, count: number): void {
 // limited). Called by useStructuredView's persistState on every successful
 // write; the value is already in hand there, so no JSON parsing happens
 // on the write hot path.
-export function setRateLimit(
-  sessionId: string,
-  info: RateLimitInfo | null,
-): void {
+export function setRateLimit(sessionId: string, info: RateLimitInfo | null): void {
   rateLimits.set(sessionId, info);
   notify(sessionId);
 }
@@ -156,8 +153,7 @@ export function getQueuedCount(sessionId: string): number {
   if (typeof window === "undefined") return 0;
   let count: number;
   try {
-    count =
-      parseQueuedCount(window.localStorage.getItem(storageKey(sessionId))) ?? 0;
+    count = parseQueuedCount(window.localStorage.getItem(storageKey(sessionId))) ?? 0;
   } catch {
     // localStorage blocked/threw: don't memoise a transient failure.
     return 0;
@@ -188,10 +184,7 @@ export function getRateLimit(sessionId: string): RateLimitInfo | null {
 // set of session ids; null receives every change. Fires for same-tab
 // writes (via the notify in setQueueCount) and cross-tab writes (storage
 // event). Returns an unsubscribe function. Mirrors subscribeDrafts.
-export function subscribeAcpState(
-  cb: Listener,
-  filter: ReadonlySet<string> | null = null,
-): () => void {
+export function subscribeAcpState(cb: Listener, filter: ReadonlySet<string> | null = null): () => void {
   listeners.set(cb, filter);
   const onStorage = (e: StorageEvent) => {
     // localStorage.clear() in another tab leaves e.key null; drop the

@@ -7,13 +7,56 @@ import type { Page } from "@playwright/test";
 export interface MockHandle {
   /** Raw bytes received from the page via WebSocket (PTY data + JSON messages). */
   wsMessages: Buffer[];
+  /** Messages the page sent on the capture-snapshot live-ws route
+   *  (mobile live view): binary input bytes + JSON control messages. */
+  liveMessages: Buffer[];
+  /** Push a live frame to every connected live-ws client. */
+  pushLiveFrame: (frame: {
+    content: string;
+    rows: number;
+    history: number;
+    cursor?: { x: number; y: number } | null;
+  }) => void;
+}
+
+/** Build a deterministic live frame: `history` numbered scrollback lines
+ *  followed by a `rows`-tall screen with a prompt on its first line. */
+export function makeLiveFrame(opts: { rows?: number; history?: number; window?: number } = {}) {
+  const rows = opts.rows ?? 24;
+  const history = opts.history ?? 0;
+  const window = Math.min(opts.window ?? rows, rows + history);
+  const fetchedHistory = Math.max(0, window - rows);
+  const lines: string[] = [];
+  for (let i = history - fetchedHistory + 1; i <= history; i++) {
+    lines.push(`history line ${String(i).padStart(3, "0")} lorem ipsum`);
+  }
+  lines.push("$ ready");
+  for (let i = 1; i < rows; i++) lines.push("");
+  return {
+    content: lines.join("\n") + "\n",
+    rows,
+    history,
+    cursor: { x: 8, y: 0 },
+  };
 }
 
 export async function mockTerminalApis(page: Page): Promise<MockHandle> {
-  const handle: MockHandle = { wsMessages: [] };
-  await page.route("**/api/login/status", (r) =>
-    r.fulfill({ json: { required: false, authenticated: true } }),
-  );
+  const liveSockets: Array<{ send: (data: string) => void }> = [];
+  const handle: MockHandle = {
+    wsMessages: [],
+    liveMessages: [],
+    pushLiveFrame: (frame) => {
+      const payload = JSON.stringify({ type: "frame", cursor: null, ...frame });
+      for (const ws of liveSockets) {
+        try {
+          ws.send(payload);
+        } catch {
+          // closed socket at test teardown; ignore
+        }
+      }
+    },
+  };
+  await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
   await page.route("**/api/sessions", (r) => {
     if (r.request().method() === "POST") return r.fulfill({ status: 400 });
     return r.fulfill({
@@ -42,28 +85,13 @@ export async function mockTerminalApis(page: Page): Promise<MockHandle> {
       },
     });
   });
-  await page.route("**/api/sessions/*/ensure", (r) =>
-    r.fulfill({ json: { ok: true } }),
-  );
-  await page.route("**/api/sessions/*/terminal", (r) =>
-    r.fulfill({ status: 200, body: "" }),
-  );
+  await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));
+  await page.route("**/api/sessions/*/terminal", (r) => r.fulfill({ status: 200, body: "" }));
   await page.route("**/api/sessions/*/diff/files", (r) =>
     r.fulfill({ json: { files: [], per_repo_bases: [], warning: null } }),
   );
-  for (const path of [
-    "settings",
-    "themes",
-    "agents",
-    "profiles",
-    "groups",
-    "devices",
-    "docker/status",
-    "about",
-  ]) {
-    await page.route(`**/api/${path}`, (r) =>
-      r.fulfill({ json: path === "docker/status" ? {} : [] }),
-    );
+  for (const path of ["settings", "themes", "agents", "profiles", "groups", "devices", "docker/status", "about"]) {
+    await page.route(`**/api/${path}`, (r) => r.fulfill({ json: path === "docker/status" ? {} : [] }));
   }
   await page.routeWebSocket(/\/sessions\/.*\/(ws|container-ws)$/, (ws) => {
     ws.onMessage((msg) => {
@@ -77,6 +105,43 @@ export async function mockTerminalApis(page: Page): Promise<MockHandle> {
         // ws may have been closed while the test ended — safe to ignore
       }
     }, 50);
+  });
+  // Capture-snapshot live view (mobile). Replies to resize/window control
+  // messages with a frame sized accordingly so the component always has
+  // content to render, mirroring src/server/live_ws.rs.
+  await page.routeWebSocket(/\/sessions\/.*\/live-ws$/, (ws) => {
+    liveSockets.push(ws);
+    let rows = 24;
+    let window = 24;
+    const history = 120;
+    const reply = () => {
+      try {
+        ws.send(JSON.stringify({ type: "frame", ...makeLiveFrame({ rows, history, window }) }));
+      } catch {
+        // closed socket at test teardown; ignore
+      }
+    };
+    ws.onMessage((msg) => {
+      if (Buffer.isBuffer(msg)) {
+        handle.liveMessages.push(msg);
+        return;
+      }
+      handle.liveMessages.push(Buffer.from(msg));
+      try {
+        const control = JSON.parse(String(msg)) as { type?: string; rows?: number; lines?: number };
+        if (control.type === "resize" && control.rows) {
+          rows = control.rows;
+          window = Math.max(window, rows);
+          reply();
+        } else if (control.type === "window" && control.lines) {
+          window = control.lines;
+          reply();
+        }
+      } catch {
+        // non-JSON text; ignore
+      }
+    });
+    setTimeout(reply, 50);
   });
   return handle;
 }
@@ -101,9 +166,7 @@ export async function installTerminalSpies(page: Page) {
     (window as unknown as { __LS_WRITES__: string[] }).__LS_WRITES__ = [];
     const origSetItem = Storage.prototype.setItem;
     Storage.prototype.setItem = function (key: string, value: string) {
-      (window as unknown as { __LS_WRITES__: string[] }).__LS_WRITES__.push(
-        `${key}=${value}`,
-      );
+      (window as unknown as { __LS_WRITES__: string[] }).__LS_WRITES__.push(`${key}=${value}`);
       return origSetItem.call(this, key, value);
     };
   });
@@ -118,10 +181,7 @@ export function readFontSize(page: Page, which: "mobile" | "desktop") {
   }, which);
 }
 
-export async function seedSettings(
-  page: Page,
-  settings: { mobileFontSize?: number; desktopFontSize?: number },
-) {
+export async function seedSettings(page: Page, settings: { mobileFontSize?: number; desktopFontSize?: number }) {
   await page.evaluate((settings) => {
     localStorage.setItem(
       "aoe-web-settings",
@@ -145,8 +205,8 @@ export async function fireTouches(
 ) {
   await page.evaluate(
     ({ type, points }) => {
-      const target = document.querySelector<HTMLElement>(".xterm");
-      if (!target) throw new Error(".xterm not mounted");
+      const target = document.querySelector<HTMLElement>("[data-live-terminal] > div, .xterm");
+      if (!target) throw new Error("no terminal surface mounted");
       const rect = target.getBoundingClientRect();
       const touches = points.map((p, i) => {
         const clientX = rect.left + p.x;

@@ -204,14 +204,7 @@ export interface TimingPongMessage {
 export interface RichDiffFile {
   path: string;
   old_path: string | null;
-  status:
-    | "added"
-    | "modified"
-    | "deleted"
-    | "renamed"
-    | "copied"
-    | "untracked"
-    | "conflicted";
+  status: "added" | "modified" | "deleted" | "renamed" | "copied" | "untracked" | "conflicted";
   additions: number;
   deletions: number;
   /** Workspace repo this file belongs to. Omitted for single-repo
@@ -340,7 +333,7 @@ export interface ProfileInfo {
  *  HooksConfigOverride (src/session/profile_config.rs): a field that is
  *  absent/undefined means "inherit the global hooks"; an explicit array
  *  (including the empty array) means "override". Hooks are read-only on
- *  the dashboard; see HooksReadOnlyPanel and PROFILE_WRITABLE_SECTIONS. */
+ *  the dashboard; see HooksReadOnlyPanel and profileWritableSections. */
 export interface HooksOverride {
   on_create?: string[];
   on_launch?: string[];
@@ -425,6 +418,12 @@ export interface CreateSessionRequest {
    *  Mutually exclusive with `worktree_branch` and `extra_repo_paths`;
    *  the server returns 400 on either combination. */
   scratch?: boolean;
+  /** Approve the repo's `on_create` lifecycle hooks for this create,
+   *  mirroring the CLI `--trust-hooks` flag and the TUI trust dialog
+   *  (#2066). When a repo defines hooks that need approval and this is
+   *  unset, the server returns a `hooks_need_trust` 403; the wizard then
+   *  prompts and resubmits with this set to true. */
+  trust_hooks?: boolean;
 }
 
 /** Live acp worker lifecycle, mirrored from

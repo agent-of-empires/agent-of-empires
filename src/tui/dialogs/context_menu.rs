@@ -15,12 +15,23 @@ pub enum ContextMenuAction {
     /// Archive (or unarchive) the session (mirrors the `'z'` hotkey). The menu
     /// label flips to "Unarchive" when the row is already archived.
     ToggleArchive,
+    /// Snooze (or wake) the session (mirrors the `'h'` hotkey). The menu label
+    /// flips to "Unsnooze" when the row is already snoozed. Snoozing an active
+    /// row opens the duration picker; unsnoozing wakes it immediately.
+    ToggleSnooze,
     /// Open the new-session dialog (mirrors the `'n'` hotkey).
     NewSession,
+    /// Open the new-session dialog prefilled from the right-clicked
+    /// project/group (mirrors `'N'` "new from selection" on a group),
+    /// so the mouse path matches the web sidebar's per-project "+".
+    NewFromGroup,
     /// Open the sort-order picker (mirrors `'o'`).
     OpenSortPicker,
     /// Open the group-by mode picker (mirrors `'g'`).
     OpenGroupPicker,
+    /// Pin or unpin the project header (project view only; mirrors `'p'`). The
+    /// menu label flips to "Unpin project" when the project is already pinned.
+    TogglePin,
 }
 
 pub struct ContextMenuDialog {
@@ -61,24 +72,53 @@ fn row_to_item_idx(area: Rect, items_len: usize, col: u16, row: u16) -> Option<u
 }
 
 impl ContextMenuDialog {
-    pub fn for_session(anchor: (u16, u16), is_archived: bool) -> Self {
+    /// Build the session row's menu. `snooze` is `None` when the Snooze entry
+    /// should be hidden (the `'h'` keybinding is gated to Attention sort, so
+    /// the mouse path matches: no Snooze row outside Attention sort), and
+    /// `Some(is_snoozed)` when it should appear, with the label flipping to
+    /// "Unsnooze" for an already-snoozed row.
+    pub fn for_session(anchor: (u16, u16), is_archived: bool, snooze: Option<bool>) -> Self {
         let archive_label = if is_archived { "Unarchive" } else { "Archive" };
-        Self::new(
-            anchor,
-            vec![
-                (ContextMenuAction::Rename, "Rename"),
-                (ContextMenuAction::ToggleArchive, archive_label),
-                (ContextMenuAction::Delete, "Delete"),
-            ],
-        )
+        let mut items = vec![
+            (ContextMenuAction::Rename, "Rename"),
+            (ContextMenuAction::ToggleArchive, archive_label),
+        ];
+        if let Some(is_snoozed) = snooze {
+            let snooze_label = if is_snoozed { "Unsnooze" } else { "Snooze" };
+            items.push((ContextMenuAction::ToggleSnooze, snooze_label));
+        }
+        items.push((ContextMenuAction::Delete, "Delete"));
+        Self::new(anchor, items)
     }
 
     pub fn for_group(anchor: (u16, u16)) -> Self {
         Self::new(
             anchor,
             vec![
+                (ContextMenuAction::NewFromGroup, "New Session"),
                 (ContextMenuAction::Rename, "Rename Group"),
                 (ContextMenuAction::Delete, "Delete Group"),
+            ],
+        )
+    }
+
+    /// Menu for a project header in project view. Project groups are
+    /// automatic, so Rename/Delete don't apply (they'd only show the
+    /// "Project groups are automatic" info dialog). It keeps the group menu's
+    /// "New Session" (launch under this project) and adds the pin toggle so the
+    /// project can persist without any sessions. The pin label flips based on
+    /// the current pinned state.
+    pub fn for_project_group(anchor: (u16, u16), is_pinned: bool) -> Self {
+        let pin_label = if is_pinned {
+            "Unpin project"
+        } else {
+            "Pin project"
+        };
+        Self::new(
+            anchor,
+            vec![
+                (ContextMenuAction::NewFromGroup, "New Session"),
+                (ContextMenuAction::TogglePin, pin_label),
             ],
         )
     }
@@ -205,9 +245,25 @@ impl ContextMenuDialog {
                     'r' | 'R' => Some(ContextMenuAction::Rename),
                     'd' | 'D' => Some(ContextMenuAction::Delete),
                     'z' | 'Z' => Some(ContextMenuAction::ToggleArchive),
-                    'n' | 'N' => Some(ContextMenuAction::NewSession),
+                    'h' | 'H' => Some(ContextMenuAction::ToggleSnooze),
+                    // `n` opens a new session from whichever new-session entry
+                    // the current menu carries: the group/project menu prefills
+                    // from the row (NewFromGroup), the empty-sidebar menu opens
+                    // a blank one (NewSession).
+                    'n' | 'N' => {
+                        if self
+                            .items
+                            .iter()
+                            .any(|(item, _)| *item == ContextMenuAction::NewFromGroup)
+                        {
+                            Some(ContextMenuAction::NewFromGroup)
+                        } else {
+                            Some(ContextMenuAction::NewSession)
+                        }
+                    }
                     'o' | 'O' => Some(ContextMenuAction::OpenSortPicker),
                     'g' | 'G' => Some(ContextMenuAction::OpenGroupPicker),
+                    'p' | 'P' => Some(ContextMenuAction::TogglePin),
                     _ => None,
                 };
                 match action {
@@ -294,14 +350,14 @@ mod tests {
 
     #[test]
     fn session_menu_starts_on_rename() {
-        let menu = ContextMenuDialog::for_session((0, 0), false);
+        let menu = ContextMenuDialog::for_session((0, 0), false, Some(false));
         assert_eq!(menu.selected_action(), ContextMenuAction::Rename);
     }
 
     #[test]
     fn down_then_enter_selects_toggle_archive() {
         // Rename -> ToggleArchive is one Down in the 3-item session menu.
-        let mut menu = ContextMenuDialog::for_session((0, 0), false);
+        let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false));
         assert!(matches!(
             menu.handle_key(key(KeyCode::Down)),
             DialogResult::Continue
@@ -314,8 +370,22 @@ mod tests {
     }
 
     #[test]
-    fn down_twice_then_enter_selects_delete() {
-        let mut menu = ContextMenuDialog::for_session((0, 0), false);
+    fn down_twice_then_enter_selects_snooze() {
+        // Rename -> Archive -> Snooze is two Downs in the 4-item session menu.
+        let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false));
+        menu.handle_key(key(KeyCode::Down));
+        menu.handle_key(key(KeyCode::Down));
+        let result = menu.handle_key(key(KeyCode::Enter));
+        assert!(matches!(
+            result,
+            DialogResult::Submit(ContextMenuAction::ToggleSnooze)
+        ));
+    }
+
+    #[test]
+    fn down_thrice_then_enter_selects_delete() {
+        let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false));
+        menu.handle_key(key(KeyCode::Down));
         menu.handle_key(key(KeyCode::Down));
         menu.handle_key(key(KeyCode::Down));
         let result = menu.handle_key(key(KeyCode::Enter));
@@ -326,15 +396,103 @@ mod tests {
     }
 
     #[test]
+    fn group_menu_offers_new_session_first() {
+        let menu = ContextMenuDialog::for_group((0, 0));
+        let items: Vec<(ContextMenuAction, &str)> = menu
+            .items_for_test()
+            .iter()
+            .map(|(a, l)| (*a, *l))
+            .collect();
+        assert_eq!(
+            items,
+            vec![
+                (ContextMenuAction::NewFromGroup, "New Session"),
+                (ContextMenuAction::Rename, "Rename Group"),
+                (ContextMenuAction::Delete, "Delete Group"),
+            ]
+        );
+    }
+
+    #[test]
+    fn n_hotkey_in_group_menu_submits_new_from_group() {
+        let mut menu = ContextMenuDialog::for_group((0, 0));
+        // Pre-select Delete to prove the hotkey wins over the cursor.
+        menu.handle_key(key(KeyCode::Up));
+        let result = menu.handle_key(key(KeyCode::Char('n')));
+        assert!(matches!(
+            result,
+            DialogResult::Submit(ContextMenuAction::NewFromGroup)
+        ));
+    }
+
+    #[test]
+    fn n_hotkey_in_empty_sidebar_menu_submits_new_session() {
+        // The empty-sidebar menu carries the blank NewSession entry, so `n`
+        // must resolve there and never to the group-scoped NewFromGroup.
+        let mut menu = ContextMenuDialog::for_empty_sidebar((0, 0));
+        let result = menu.handle_key(key(KeyCode::Char('n')));
+        assert!(matches!(
+            result,
+            DialogResult::Submit(ContextMenuAction::NewSession)
+        ));
+    }
+
+    #[test]
     fn archived_session_menu_labels_unarchive() {
-        let menu = ContextMenuDialog::for_session((0, 0), true);
+        let menu = ContextMenuDialog::for_session((0, 0), true, Some(false));
         let labels: Vec<&str> = menu.items_for_test().iter().map(|(_, l)| *l).collect();
-        assert_eq!(labels, vec!["Rename", "Unarchive", "Delete"]);
+        assert_eq!(labels, vec!["Rename", "Unarchive", "Snooze", "Delete"]);
+    }
+
+    #[test]
+    fn snoozed_session_menu_labels_unsnooze() {
+        let menu = ContextMenuDialog::for_session((0, 0), false, Some(true));
+        let labels: Vec<&str> = menu.items_for_test().iter().map(|(_, l)| *l).collect();
+        assert_eq!(labels, vec!["Rename", "Archive", "Unsnooze", "Delete"]);
+    }
+
+    #[test]
+    fn active_session_menu_lists_all_four_actions() {
+        let menu = ContextMenuDialog::for_session((0, 0), false, Some(false));
+        let items: Vec<ContextMenuAction> = menu.items_for_test().iter().map(|(a, _)| *a).collect();
+        assert_eq!(
+            items,
+            vec![
+                ContextMenuAction::Rename,
+                ContextMenuAction::ToggleArchive,
+                ContextMenuAction::ToggleSnooze,
+                ContextMenuAction::Delete,
+            ]
+        );
+    }
+
+    #[test]
+    fn h_hotkey_submits_toggle_snooze() {
+        let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false));
+        let result = menu.handle_key(key(KeyCode::Char('h')));
+        assert!(matches!(
+            result,
+            DialogResult::Submit(ContextMenuAction::ToggleSnooze)
+        ));
+    }
+
+    #[test]
+    fn snooze_none_hides_the_row_and_makes_h_inert() {
+        // Outside Attention sort the caller passes `None`, so the menu drops to
+        // the three always-available actions and `h` must not fire (it has no
+        // Snooze item to resolve to), matching the Attention-gated keybinding.
+        let mut menu = ContextMenuDialog::for_session((0, 0), false, None);
+        let labels: Vec<&str> = menu.items_for_test().iter().map(|(_, l)| *l).collect();
+        assert_eq!(labels, vec!["Rename", "Archive", "Delete"]);
+        assert!(matches!(
+            menu.handle_key(key(KeyCode::Char('h'))),
+            DialogResult::Continue
+        ));
     }
 
     #[test]
     fn z_hotkey_submits_toggle_archive() {
-        let mut menu = ContextMenuDialog::for_session((0, 0), false);
+        let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false));
         let result = menu.handle_key(key(KeyCode::Char('z')));
         assert!(matches!(
             result,
@@ -344,7 +502,7 @@ mod tests {
 
     #[test]
     fn enter_on_default_submits_rename() {
-        let mut menu = ContextMenuDialog::for_session((0, 0), false);
+        let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false));
         let result = menu.handle_key(key(KeyCode::Enter));
         assert!(matches!(
             result,
@@ -354,14 +512,14 @@ mod tests {
 
     #[test]
     fn esc_cancels() {
-        let mut menu = ContextMenuDialog::for_session((0, 0), false);
+        let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false));
         let result = menu.handle_key(key(KeyCode::Esc));
         assert!(matches!(result, DialogResult::Cancel));
     }
 
     #[test]
     fn up_wraps_from_first_to_last() {
-        let mut menu = ContextMenuDialog::for_session((0, 0), false);
+        let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false));
         menu.handle_key(key(KeyCode::Up));
         let result = menu.handle_key(key(KeyCode::Enter));
         assert!(matches!(
@@ -372,8 +530,10 @@ mod tests {
 
     #[test]
     fn down_wraps_from_last_to_first() {
-        let mut menu = ContextMenuDialog::for_session((0, 0), false);
-        // 3 items: Down x3 walks Rename -> Archive -> Delete -> back to Rename.
+        let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false));
+        // 4 items: Down x4 walks Rename -> Archive -> Snooze -> Delete -> back
+        // to Rename.
+        menu.handle_key(key(KeyCode::Down));
         menu.handle_key(key(KeyCode::Down));
         menu.handle_key(key(KeyCode::Down));
         menu.handle_key(key(KeyCode::Down));
@@ -386,7 +546,7 @@ mod tests {
 
     #[test]
     fn r_hotkey_submits_rename() {
-        let mut menu = ContextMenuDialog::for_session((0, 0), false);
+        let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false));
         // Pre-select Delete to prove the hotkey wins over the cursor.
         menu.handle_key(key(KeyCode::Down));
         let result = menu.handle_key(key(KeyCode::Char('r')));
@@ -398,7 +558,7 @@ mod tests {
 
     #[test]
     fn d_hotkey_submits_delete() {
-        let mut menu = ContextMenuDialog::for_session((0, 0), false);
+        let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false));
         let result = menu.handle_key(key(KeyCode::Char('d')));
         assert!(matches!(
             result,
@@ -407,15 +567,44 @@ mod tests {
     }
 
     #[test]
+    fn project_group_menu_keeps_new_session_and_flips_pin_label() {
+        let unpinned = ContextMenuDialog::for_project_group((0, 0), false);
+        let labels: Vec<&str> = unpinned.items_for_test().iter().map(|(_, l)| *l).collect();
+        assert_eq!(labels, vec!["New Session", "Pin project"]);
+
+        let pinned = ContextMenuDialog::for_project_group((0, 0), true);
+        let labels: Vec<&str> = pinned.items_for_test().iter().map(|(_, l)| *l).collect();
+        assert_eq!(labels, vec!["New Session", "Unpin project"]);
+    }
+
+    #[test]
+    fn p_hotkey_submits_toggle_pin() {
+        let mut menu = ContextMenuDialog::for_project_group((0, 0), false);
+        let result = menu.handle_key(key(KeyCode::Char('p')));
+        assert!(matches!(
+            result,
+            DialogResult::Submit(ContextMenuAction::TogglePin)
+        ));
+    }
+
+    #[test]
+    fn p_hotkey_inert_on_session_menu() {
+        // The session menu has no pin entry, so `p` must not fire it.
+        let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false));
+        let result = menu.handle_key(key(KeyCode::Char('p')));
+        assert!(matches!(result, DialogResult::Continue));
+    }
+
+    #[test]
     fn unknown_key_is_continue() {
-        let mut menu = ContextMenuDialog::for_session((0, 0), false);
+        let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false));
         let result = menu.handle_key(key(KeyCode::Char('x')));
         assert!(matches!(result, DialogResult::Continue));
     }
 
     #[test]
     fn click_is_outside_before_render_is_true() {
-        let menu = ContextMenuDialog::for_session((10, 10), false);
+        let menu = ContextMenuDialog::for_session((10, 10), false, Some(false));
         // Before a render captures `last_area`, every point should count
         // as "outside" so a stray click can't be mis-classified as "inside
         // the menu" and accidentally kept open.
@@ -430,7 +619,7 @@ mod tests {
 
     #[test]
     fn click_on_first_row_submits_rename() {
-        let mut menu = ContextMenuDialog::for_session((10, 10), false);
+        let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false));
         stub_render(&mut menu, 10, 10, 14, 4);
         // Item rows live inside the bordered block, so row y+1 is the
         // first item and y+2 is the second.
@@ -443,7 +632,7 @@ mod tests {
 
     #[test]
     fn click_on_second_row_submits_toggle_archive() {
-        let mut menu = ContextMenuDialog::for_session((10, 10), false);
+        let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false));
         stub_render(&mut menu, 10, 10, 14, 5);
         let result = menu.handle_click(12, 12);
         assert!(matches!(
@@ -453,10 +642,21 @@ mod tests {
     }
 
     #[test]
-    fn click_on_third_row_submits_delete() {
-        let mut menu = ContextMenuDialog::for_session((10, 10), false);
-        stub_render(&mut menu, 10, 10, 14, 5);
+    fn click_on_third_row_submits_toggle_snooze() {
+        let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false));
+        stub_render(&mut menu, 10, 10, 14, 6);
         let result = menu.handle_click(12, 13);
+        assert!(matches!(
+            result,
+            Some(DialogResult::Submit(ContextMenuAction::ToggleSnooze))
+        ));
+    }
+
+    #[test]
+    fn click_on_fourth_row_submits_delete() {
+        let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false));
+        stub_render(&mut menu, 10, 10, 14, 6);
+        let result = menu.handle_click(12, 14);
         assert!(matches!(
             result,
             Some(DialogResult::Submit(ContextMenuAction::Delete))
@@ -465,7 +665,7 @@ mod tests {
 
     #[test]
     fn click_on_border_keeps_menu_open() {
-        let mut menu = ContextMenuDialog::for_session((10, 10), false);
+        let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false));
         stub_render(&mut menu, 10, 10, 14, 4);
         // Top border row is y itself.
         let result = menu.handle_click(12, 10);
@@ -480,7 +680,7 @@ mod tests {
         // The router must reject both vertical borders or a click on
         // the right edge of the menu, at an item's y, would fire
         // Rename / Delete the same as clicking the label.
-        let mut menu = ContextMenuDialog::for_session((10, 10), false);
+        let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false));
         stub_render(&mut menu, 10, 10, 14, 4);
         // (10, 11) = left vertical border, first item's row.
         assert!(matches!(
@@ -497,7 +697,7 @@ mod tests {
 
     #[test]
     fn click_outside_returns_none() {
-        let mut menu = ContextMenuDialog::for_session((10, 10), false);
+        let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false));
         stub_render(&mut menu, 10, 10, 14, 4);
         let result = menu.handle_click(40, 40);
         assert!(result.is_none());
@@ -505,7 +705,7 @@ mod tests {
 
     #[test]
     fn hover_moves_highlight() {
-        let mut menu = ContextMenuDialog::for_session((10, 10), false);
+        let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false));
         stub_render(&mut menu, 10, 10, 14, 5);
         assert_eq!(menu.selected_action(), ContextMenuAction::Rename);
         let changed = menu.handle_hover(12, 12);
@@ -515,7 +715,7 @@ mod tests {
 
     #[test]
     fn hover_on_same_row_returns_false() {
-        let mut menu = ContextMenuDialog::for_session((10, 10), false);
+        let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false));
         stub_render(&mut menu, 10, 10, 14, 4);
         // First hover lands on row 1 (Rename, already selected).
         assert!(!menu.handle_hover(12, 11));
@@ -525,9 +725,9 @@ mod tests {
 
     #[test]
     fn hover_off_menu_leaves_selection_alone() {
-        let mut menu = ContextMenuDialog::for_session((10, 10), false);
-        stub_render(&mut menu, 10, 10, 14, 5);
-        menu.handle_hover(12, 13); // Delete (third row)
+        let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false));
+        stub_render(&mut menu, 10, 10, 14, 6);
+        menu.handle_hover(12, 14); // Delete (fourth/last row)
         assert_eq!(menu.selected_action(), ContextMenuAction::Delete);
         assert!(!menu.handle_hover(40, 40));
         assert_eq!(

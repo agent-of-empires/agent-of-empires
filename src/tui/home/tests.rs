@@ -221,7 +221,7 @@ fn preview_info_follows_flag_and_never_auto_shows_in_live() {
         terminal
             .draw(|f| {
                 let area = f.area();
-                view.render(f, area, &theme, None, None);
+                view.render(f, area, &theme, None, None, None);
             })
             .unwrap();
         let buf = terminal.backend().buffer().clone();
@@ -300,7 +300,7 @@ fn preview_visible_rows_equal_output_area_with_info_shown() {
     terminal
         .draw(|f| {
             let area = f.area();
-            env.view.render(f, area, &theme, None, None);
+            env.view.render(f, area, &theme, None, None, None);
         })
         .unwrap();
 
@@ -1612,6 +1612,135 @@ fn test_delete_selected_group_updates_groups_field() {
     let group_paths: Vec<_> = all_groups.iter().map(|g| g.path.as_str()).collect();
     assert!(!group_paths.contains(&"work"));
     assert!(!group_paths.contains(&"work/projects"));
+}
+
+/// Archiving a manual group archives every session under it, including
+/// nested subgroups, and leaves sessions outside the group untouched.
+#[test]
+#[serial]
+fn test_archive_selected_group_archives_all_members() {
+    let mut env = create_test_env_with_group_sessions();
+
+    // Select the "work" group.
+    for (i, item) in env.view.flat_items.iter().enumerate() {
+        if let Item::Group { path, .. } = item {
+            if path == "work" {
+                env.view.cursor = i;
+                env.view.update_selected();
+                break;
+            }
+        }
+    }
+    assert_eq!(env.view.selected_group.as_deref(), Some("work"));
+
+    // "work" holds two direct sessions plus one in the nested "work/projects".
+    assert_eq!(env.view.active_sessions_in_selected_group().len(), 3);
+
+    env.view.archive_selected_group().unwrap();
+
+    for inst in env.view.instances() {
+        let in_work = inst.group_path == "work" || inst.group_path.starts_with("work/");
+        assert_eq!(
+            inst.is_archived(),
+            in_work,
+            "session {} (group {:?}) archived state should match group membership",
+            inst.title,
+            inst.group_path
+        );
+    }
+}
+
+/// In project group-by mode, archiving a project header archives every live
+/// session that maps to that repo, even though their stored `group_path`
+/// values differ from the synthetic project name.
+#[test]
+#[serial]
+fn test_archive_selected_group_project_mode() {
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let storage = Storage::new_unwatched("test").unwrap();
+
+    // Two sessions sharing one repo, one session in a different repo.
+    let a1 = Instance::new("alpha-1", "/tmp/alpha");
+    let a2 = Instance::new("alpha-2", "/tmp/alpha");
+    let b1 = Instance::new("beta-1", "/tmp/beta");
+    let instances = vec![a1, a2, b1];
+    storage
+        .update(|i, g| {
+            *i = instances.to_vec();
+            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    view.group_by = crate::session::config::GroupByMode::Project;
+    view.flat_items = view.build_flat_items();
+
+    // Select the "alpha" project header.
+    for (i, item) in view.flat_items.iter().enumerate() {
+        if let Item::Group { path, .. } = item {
+            if path == "alpha" {
+                view.cursor = i;
+                view.update_selected();
+                break;
+            }
+        }
+    }
+    assert_eq!(view.selected_group.as_deref(), Some("alpha"));
+    assert_eq!(view.active_sessions_in_selected_group().len(), 2);
+
+    view.archive_selected_group().unwrap();
+
+    for inst in view.instances() {
+        let in_alpha = inst.project_path == "/tmp/alpha";
+        assert_eq!(
+            inst.is_archived(),
+            in_alpha,
+            "session {} (repo {}) archived state should match project membership",
+            inst.title,
+            inst.project_path
+        );
+    }
+}
+
+/// The group-level prompt opens a confirmation carrying the `archive_group`
+/// action and counts only the active members, and no-ops without a prompt when
+/// the group has nothing left to archive.
+#[test]
+#[serial]
+fn test_prompt_archive_selected_group() {
+    let mut env = create_test_env_with_group_sessions();
+
+    for (i, item) in env.view.flat_items.iter().enumerate() {
+        if let Item::Group { path, .. } = item {
+            if path == "work" {
+                env.view.cursor = i;
+                env.view.update_selected();
+                break;
+            }
+        }
+    }
+
+    env.view.prompt_archive_selected_group();
+    assert_eq!(
+        env.view.confirm_dialog.as_ref().map(|d| d.action()),
+        Some("archive_group")
+    );
+
+    // Confirm, which archives the group and clears the prompt.
+    env.view.confirm_dialog = None;
+    env.view.archive_selected_group().unwrap();
+
+    // With every member archived, a second prompt is a silent no-op.
+    env.view.prompt_archive_selected_group();
+    assert!(env.view.confirm_dialog.is_none());
 }
 
 #[test]
@@ -3634,6 +3763,178 @@ fn test_shift_n_opens_prefilled_dialog_from_group() {
     env.view.handle_key(key(KeyCode::Char('N')), None);
     let dialog = env.view.new_dialog.as_ref().expect("N should open dialog");
     assert_eq!(dialog.group_value(), "work");
+    // The group has a member at "/tmp/work", so the path is borrowed from it
+    // instead of being left on the default cwd (issue #2023).
+    assert_eq!(dialog.path_value(), "/tmp/work");
+}
+
+#[test]
+#[serial]
+fn test_group_context_menu_new_session_prefills_path() {
+    use crate::tui::dialogs::ContextMenuAction;
+
+    let mut env = create_test_env_with_groups();
+
+    // Move cursor to the "work" group row, as a right-click would.
+    let group_idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|item| matches!(item, Item::Group { path, .. } if path == "work"))
+        .expect("work group should exist in flat_items");
+    env.view.cursor = group_idx;
+    env.view.update_selected();
+
+    // The group right-click menu's "New Session" routes here.
+    env.view
+        .dispatch_context_menu_action(ContextMenuAction::NewFromGroup);
+    let dialog = env
+        .view
+        .new_dialog
+        .as_ref()
+        .expect("NewFromGroup should open the new-session dialog");
+    assert_eq!(dialog.path_value(), "/tmp/work");
+    assert_eq!(dialog.group_value(), "work");
+}
+
+#[test]
+#[serial]
+fn test_group_context_menu_new_session_shows_no_agents_without_tools() {
+    use crate::tui::dialogs::ContextMenuAction;
+
+    let mut env = create_test_env_with_groups();
+    env.view.available_tools = AvailableTools::with_tools(&[]);
+
+    let group_idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|item| matches!(item, Item::Group { path, .. } if path == "work"))
+        .expect("work group should exist in flat_items");
+    env.view.cursor = group_idx;
+    env.view.update_selected();
+
+    env.view
+        .dispatch_context_menu_action(ContextMenuAction::NewFromGroup);
+    assert!(
+        env.view.new_dialog.is_none(),
+        "no agents means the new-session form must not open"
+    );
+    assert!(
+        env.view.no_agents_dialog.is_some(),
+        "should point the user at agent setup instead, like 'n'"
+    );
+}
+
+#[test]
+#[serial]
+fn test_group_context_menu_new_session_prefills_path_in_project_mode() {
+    use crate::session::config::GroupByMode;
+    use crate::tui::dialogs::ContextMenuAction;
+
+    let mut env = create_test_env_with_groups();
+    env.view.group_by = GroupByMode::Project;
+    env.view.flat_items = env.view.build_flat_items();
+
+    // In project mode the group label is the repo basename ("work" from
+    // "/tmp/work"), not the stored group_path.
+    let group_idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|item| matches!(item, Item::Group { name, .. } if name == "work"))
+        .expect("work project group should exist in flat_items");
+    env.view.cursor = group_idx;
+    env.view.update_selected();
+
+    env.view
+        .dispatch_context_menu_action(ContextMenuAction::NewFromGroup);
+    let dialog = env
+        .view
+        .new_dialog
+        .as_ref()
+        .expect("NewFromGroup should open the new-session dialog");
+    assert_eq!(
+        dialog.path_value(),
+        "/tmp/work",
+        "project-mode prefill should borrow the member repo path"
+    );
+}
+
+#[test]
+#[serial]
+fn test_session_context_menu_snooze_opens_duration_dialog() {
+    use crate::session::config::SortOrder;
+    use crate::tui::dialogs::ContextMenuAction;
+
+    let mut env = create_test_env_with_groups();
+    // Snooze is offered in Attention sort (it mirrors the Attention-gated `h`
+    // keybinding); dispatching it on an active session opens the duration
+    // picker, the same path the keyboard takes.
+    env.view.sort_order = SortOrder::Attention;
+    env.view.flat_items = env.view.build_flat_items();
+    let session_idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|item| matches!(item, Item::Session { .. }))
+        .expect("setup should produce a session");
+    env.view.cursor = session_idx;
+    env.view.update_selected();
+
+    env.view
+        .dispatch_context_menu_action(ContextMenuAction::ToggleSnooze);
+    assert!(
+        env.view.snooze_duration_dialog.is_some(),
+        "context-menu Snooze on an active session must open the duration picker"
+    );
+}
+
+#[test]
+#[serial]
+fn test_session_context_menu_snooze_wakes_snoozed_session() {
+    use crate::tui::dialogs::ContextMenuAction;
+
+    let mut env = create_test_env_with_groups();
+    let session_idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|item| matches!(item, Item::Session { .. }))
+        .expect("setup should produce a session");
+    env.view.cursor = session_idx;
+    env.view.update_selected();
+    let id = env
+        .view
+        .selected_session
+        .clone()
+        .expect("a session should be selected");
+
+    // Pre-snooze the session so the toggle takes the wake path.
+    env.view.snooze_session_for(&id, 60).unwrap();
+    assert!(
+        env.view
+            .instances
+            .iter()
+            .find(|i| i.id == id)
+            .is_some_and(|i| i.is_snoozed()),
+        "session should be snoozed before the toggle"
+    );
+
+    env.view
+        .dispatch_context_menu_action(ContextMenuAction::ToggleSnooze);
+    assert!(
+        env.view.snooze_duration_dialog.is_none(),
+        "waking a snoozed session must not open the duration picker"
+    );
+    assert!(
+        !env.view
+            .instances
+            .iter()
+            .find(|i| i.id == id)
+            .is_some_and(|i| i.is_snoozed()),
+        "context-menu Snooze on a snoozed session must wake it immediately"
+    );
 }
 
 #[test]
@@ -4759,7 +5060,7 @@ fn update_bar_renders_status_toast_without_update_info() {
     terminal
         .draw(|f| {
             let area = f.area();
-            env.view.render(f, area, &theme, None, Some(toast));
+            env.view.render(f, area, &theme, None, Some(toast), None);
         })
         .unwrap();
 
@@ -4780,6 +5081,116 @@ fn update_bar_renders_status_toast_without_update_info() {
     assert!(
         out.contains("[Ctrl+x] dismiss"),
         "expected the dismiss hint alongside the toast.\nFull buffer:\n{out}"
+    );
+}
+
+/// The sandbox-image update banner renders (with its `[u] pull` /
+/// `[Ctrl+x] dismiss` hints) when an `ImageUpdate` is present and no
+/// higher-priority banner is up. Guards the lowest-priority slot in
+/// `render_update_bar`.
+#[test]
+#[serial]
+fn update_bar_renders_sandbox_image_banner() {
+    use crate::containers::image_update::ImageUpdate;
+    use crate::tui::styles::load_theme;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut env = create_test_env_empty();
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let theme = load_theme("empire");
+
+    let image_update = ImageUpdate {
+        image: "ghcr.io/agent-of-empires/aoe-sandbox:latest".to_string(),
+        remote_digest: "sha256:abc".to_string(),
+    };
+
+    terminal
+        .draw(|f| {
+            let area = f.area();
+            env.view
+                .render(f, area, &theme, None, None, Some(&image_update));
+        })
+        .unwrap();
+
+    let buf = terminal.backend().buffer();
+    let mut out = String::new();
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            out.push_str(buf[(x, y)].symbol());
+        }
+        out.push('\n');
+    }
+
+    assert!(
+        out.contains("sandbox image update available"),
+        "expected the sandbox image banner to render.\nFull buffer:\n{out}"
+    );
+    assert!(
+        out.contains("[u] pull") && out.contains("[Ctrl+x] dismiss"),
+        "expected the pull/dismiss hints alongside the image banner.\nFull buffer:\n{out}"
+    );
+}
+
+/// The app-update banner wins the shared bottom row over a pending
+/// sandbox-image update: only one shows at a time, so the lower-priority
+/// image banner must stay hidden (and its `[u] pull` hint absent) while an
+/// app update is up. This is what keeps the `u` / Ctrl+x keys unambiguous.
+#[test]
+#[serial]
+fn app_update_banner_takes_precedence_over_image_banner() {
+    use crate::containers::image_update::ImageUpdate;
+    use crate::tui::styles::load_theme;
+    use crate::update::UpdateInfo;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut env = create_test_env_empty();
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let theme = load_theme("empire");
+
+    let update_info = UpdateInfo {
+        available: true,
+        current_version: "1.0.0".to_string(),
+        latest_version: "1.1.0".to_string(),
+    };
+    let image_update = ImageUpdate {
+        image: "ghcr.io/agent-of-empires/aoe-sandbox:latest".to_string(),
+        remote_digest: "sha256:abc".to_string(),
+    };
+
+    terminal
+        .draw(|f| {
+            let area = f.area();
+            env.view.render(
+                f,
+                area,
+                &theme,
+                Some(&update_info),
+                None,
+                Some(&image_update),
+            );
+        })
+        .unwrap();
+
+    let buf = terminal.backend().buffer();
+    let mut out = String::new();
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            out.push_str(buf[(x, y)].symbol());
+        }
+        out.push('\n');
+    }
+
+    assert!(
+        out.contains("update available 1.0.0"),
+        "expected the app update banner to win the row.\nFull buffer:\n{out}"
+    );
+    assert!(
+        !out.contains("sandbox image update available"),
+        "image banner must stay hidden while an app update is shown.\nFull buffer:\n{out}"
     );
 }
 
@@ -4870,7 +5281,7 @@ fn footer_hides_attention_workflow_hints_outside_attention_sort() {
         terminal
             .draw(|f| {
                 let area = f.area();
-                env.view.render(f, area, &theme, None, None);
+                env.view.render(f, area, &theme, None, None, None);
             })
             .unwrap();
         let buf = terminal.backend().buffer();
@@ -5054,7 +5465,7 @@ fn unarchive_keeps_selection() {
 fn restart_selected_session_noop_with_no_selection() {
     let mut env = create_test_env_empty();
     env.view.selected_session = None;
-    let result = env.view.restart_selected_session(None, None);
+    let result = env.view.restart_selected_session(None, None, None, None);
     assert!(result.is_ok());
     assert!(env.view.restart_cooldown_at.is_empty());
 }
@@ -5070,7 +5481,7 @@ fn restart_selected_session_skips_archived_row() {
     env.view.selected_session = Some(id.clone());
     env.view.mutate_instance(&id, |inst| inst.archive());
 
-    let result = env.view.restart_selected_session(None, None);
+    let result = env.view.restart_selected_session(None, None, None, None);
     assert!(result.is_ok());
     assert!(
         env.view.instances[0].is_archived(),
@@ -5093,7 +5504,7 @@ fn restart_selected_session_skips_snoozed_row_in_attention_sort() {
     env.view.sort_order = SortOrder::Attention;
     env.view.mutate_instance(&id, |inst| inst.snooze(30));
 
-    let result = env.view.restart_selected_session(None, None);
+    let result = env.view.restart_selected_session(None, None, None, None);
     assert!(result.is_ok());
     assert!(
         env.view.instances[0].is_snoozed(),
@@ -5121,7 +5532,7 @@ fn restart_selected_session_wakes_snooze_outside_attention_sort() {
     env.view.mutate_instance(&id, |inst| inst.snooze(30));
     assert!(env.view.instances[0].is_snoozed(), "pre-condition");
 
-    let result = env.view.restart_selected_session(None, None);
+    let result = env.view.restart_selected_session(None, None, None, None);
     assert!(result.is_ok());
     assert!(
         !env.view.instances[0].is_snoozed(),
@@ -5145,7 +5556,7 @@ fn restart_selected_session_skips_creating_row() {
     env.view
         .mutate_instance(&id, |inst| inst.status = crate::session::Status::Creating);
 
-    let result = env.view.restart_selected_session(None, None);
+    let result = env.view.restart_selected_session(None, None, None, None);
     assert!(result.is_ok());
     assert!(env.view.restart_cooldown_at.is_empty());
 }
@@ -5172,7 +5583,7 @@ fn restart_selected_session_debounces_via_cooldown_map() {
     let now = std::time::Instant::now();
     env.view.restart_cooldown_at.insert(id.clone(), now);
 
-    let result = env.view.restart_selected_session(None, None);
+    let result = env.view.restart_selected_session(None, None, None, None);
     assert!(result.is_ok());
     let stored = env.view.restart_cooldown_at.get(&id).copied().unwrap();
     assert_eq!(
@@ -5326,6 +5737,614 @@ fn project_groups_sort_by_top_attention_member() {
         group_order,
         vec!["alpha".to_string(), "beta".to_string()],
         "alpha (Waiting=tier 0) must sort above beta (Error=tier 1)"
+    );
+}
+
+/// A registered (pinned) project with no sessions surfaces as an empty
+/// header in project view, mirroring the WebUI where an empty project is just
+/// a registry entry decoupled from sessions. This is the core of #2047.
+#[test]
+#[serial]
+fn pinned_project_without_sessions_shows_empty_header() {
+    use crate::session::config::GroupByMode;
+    use crate::session::projects::{self, Project, ProjectScope};
+
+    let mut env = create_test_env_two_projects_mixed_attention();
+    // Register a project that has no sessions at all. The path need not exist;
+    // `add` falls back to the literal path when canonicalization fails.
+    projects::add(
+        "test",
+        ProjectScope::Global,
+        Project::new("gamma", "/repos/gamma", ProjectScope::Global),
+        false,
+    )
+    .unwrap();
+
+    env.view.group_by = GroupByMode::Project;
+    env.view.refresh_registered_projects();
+    env.view.flat_items = env.view.build_flat_items();
+
+    let group_names: Vec<String> = env
+        .view
+        .flat_items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Group { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        group_names.iter().any(|n| n == "gamma"),
+        "pinned empty project gamma must show as a header, got {group_names:?}"
+    );
+    assert!(env.view.is_project_label_pinned("gamma"));
+}
+
+/// Pressing `p` on a project header pins it (registers the repo) instead of
+/// opening the projects dialog; the pin toggle binding wins the shared chord
+/// because a project header is selected.
+#[test]
+#[serial]
+fn p_key_pins_project_on_header() {
+    use crate::session::config::GroupByMode;
+
+    let mut env = create_test_env_two_projects_mixed_attention();
+    env.view.group_by = GroupByMode::Project;
+    env.view.flat_items = env.view.build_flat_items();
+
+    let alpha_idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|i| matches!(i, Item::Group { name, .. } if name == "alpha"))
+        .expect("alpha header present");
+    env.view.cursor = alpha_idx;
+    env.view.update_selected();
+
+    assert!(!env.view.is_project_label_pinned("alpha"));
+    env.view.handle_key(key(KeyCode::Char('p')), None);
+    assert!(
+        env.view.is_project_label_pinned("alpha"),
+        "p on a project header should pin it"
+    );
+    // The pin path must not open the projects dialog (the chord is shared).
+    assert!(env.view.projects_dialog.is_none());
+
+    // Unpinning (a second toggle) drops the registry entry.
+    env.view.toggle_project_pin_at_cursor();
+    assert!(!env.view.is_project_label_pinned("alpha"));
+}
+
+/// Off a project header (here: in Manual grouping), `p` keeps its original
+/// meaning and opens the projects dialog, so the overload doesn't shadow the
+/// global binding.
+#[test]
+#[serial]
+fn p_key_opens_projects_dialog_off_project_header() {
+    use crate::session::config::GroupByMode;
+
+    let mut env = create_test_env_two_projects_mixed_attention();
+    env.view.group_by = GroupByMode::Manual;
+    env.view.flat_items = env.view.build_flat_items();
+    env.view.cursor = 0;
+    env.view.update_selected();
+
+    env.view.handle_key(key(KeyCode::Char('p')), None);
+    assert!(
+        env.view.projects_dialog.is_some(),
+        "p off a project header should open the projects dialog"
+    );
+}
+
+/// Pin a project, archive its only session, then unpin: the empty header must
+/// leave the main flow (the archived session stays under the Archived section).
+#[test]
+#[serial]
+fn unpin_archived_only_project_leaves_main_flow() {
+    use crate::session::{config::GroupByMode, is_within_archived_section};
+
+    let mut env = create_test_env_two_projects_mixed_attention();
+    env.view.group_by = GroupByMode::Project;
+    env.view.flat_items = env.view.build_flat_items();
+
+    // Pin beta.
+    let beta_idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|i| matches!(i, Item::Group { name, .. } if name == "beta"))
+        .expect("beta header present");
+    env.view.cursor = beta_idx;
+    env.view.update_selected();
+    env.view.toggle_project_pin_at_cursor();
+    assert!(env.view.is_project_label_pinned("beta"));
+
+    // Archive both beta sessions.
+    let beta_ids: Vec<String> = env
+        .view
+        .instances
+        .iter()
+        .filter(|i| super::project_group_name(i) == "beta")
+        .map(|i| i.id.clone())
+        .collect();
+    for id in &beta_ids {
+        env.view
+            .apply_user_action(id, |inst| inst.archive())
+            .unwrap();
+    }
+    env.view.flat_items = env.view.build_flat_items();
+
+    // Now unpin via the cursor on the empty main-flow beta header.
+    let beta_idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|i| matches!(i, Item::Group { name, path, .. } if name == "beta" && !is_within_archived_section(path)))
+        .expect("empty beta header present in main flow after archiving");
+    env.view.cursor = beta_idx;
+    env.view.update_selected();
+    env.view.toggle_project_pin_at_cursor();
+
+    assert!(
+        !env.view.is_project_label_pinned("beta"),
+        "beta must read as unpinned after the toggle; registry still has it"
+    );
+
+    // Count beta headers OUTSIDE the Archived section.
+    let mut in_archived = false;
+    let mut main_beta = 0;
+    for item in &env.view.flat_items {
+        if let Item::Group { path, name, .. } = item {
+            if is_within_archived_section(path) {
+                in_archived = true;
+            } else if name == "beta" && !in_archived {
+                main_beta += 1;
+            }
+        }
+    }
+    assert_eq!(
+        main_beta, 0,
+        "unpinned archived-only beta must not render in the main flow; got: {:?}",
+        env.view.flat_items
+    );
+}
+
+/// A registry entry whose path differs from an archived session's repo path
+/// sharing the same basename must still read as pinned and be unpinnable.
+/// The empty header is surfaced by LABEL match (`unpopulated_projects`), so
+/// pin state and the unpin toggle must resolve by the same rule. Previously
+/// `project_header_repo_path` let the archived row lend the header its path:
+/// the path comparison failed (repo gone from disk, `canonical_key` compares
+/// raw strings), the header read as unpinned, and `p` routed to the pin
+/// branch and died on the name conflict, leaving a phantom header the user
+/// could not clear.
+#[test]
+#[serial]
+fn stale_registry_entry_with_mismatched_archived_path_stays_pinned_and_unpinnable() {
+    use crate::session::config::GroupByMode;
+    use crate::session::is_within_archived_section;
+    use crate::session::projects::{self, Project, ProjectScope};
+    use crate::session::Status;
+
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let storage = Storage::new_unwatched("test").unwrap();
+
+    // A live session in another project, plus an ARCHIVED session whose repo
+    // basename is "otari" but whose recorded path differs from the registry
+    // entry below (repo deleted/moved, so neither canonicalizes).
+    let mut alpha = Instance::new("alpha-running", "/repos/alpha");
+    alpha.status = Status::Running;
+    let mut orphan = Instance::new("otari-old", "/old/home/otari");
+    orphan.status = Status::Stopped;
+    orphan.archive();
+
+    let instances = vec![alpha, orphan];
+    storage
+        .update(|i, g| {
+            *i = instances.to_vec();
+            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    // Stale registry entry: same basename, different (nonexistent) path.
+    projects::add(
+        "test",
+        ProjectScope::Global,
+        Project::new("otari", "/repos/otari", ProjectScope::Global),
+        false,
+    )
+    .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+
+    view.group_by = GroupByMode::Project;
+    view.refresh_registered_projects();
+    view.flat_items = view.build_flat_items();
+
+    // 1. The phantom: an empty otari header renders in the main flow.
+    let otari_idx = view.flat_items.iter().position(|i| {
+        matches!(i, Item::Group { name, path, .. }
+            if name == "otari" && !is_within_archived_section(path))
+    });
+    assert!(
+        otari_idx.is_some(),
+        "stale registry entry must surface an empty otari header; got {:?}",
+        view.flat_items
+    );
+
+    // 2. With no live session populating the label, pin state resolves by
+    //    label, the same rule that injected the header.
+    assert!(
+        view.is_project_label_pinned("otari"),
+        "registry-backed empty header must read as pinned even when an \
+         archived session recorded a different path for the same basename"
+    );
+
+    // 3. `p` on the header routes to the unpin branch and clears it.
+    view.cursor = otari_idx.unwrap();
+    view.update_selected();
+    view.toggle_project_pin_at_cursor();
+
+    let still_there = view.flat_items.iter().any(|i| {
+        matches!(i, Item::Group { name, path, .. }
+            if name == "otari" && !is_within_archived_section(path))
+    });
+    assert!(
+        !still_there,
+        "unpin must drop the empty header from the main flow; got {:?}",
+        view.flat_items
+    );
+    assert!(
+        projects::load_global().unwrap().is_empty(),
+        "unpin must remove the stale registry entry"
+    );
+    // The archived session itself is untouched; it stays under Archived.
+    assert!(
+        view.flat_items
+            .iter()
+            .any(|i| { matches!(i, Item::Group { path, .. } if is_within_archived_section(path)) }),
+        "archived section still present"
+    );
+}
+
+/// The pin must persist a project across its last session leaving the view:
+/// once pinned, the header remains even when no sessions reference it. This
+/// is the user-visible promise of #2047.
+#[test]
+#[serial]
+fn pinned_project_survives_losing_last_session() {
+    use crate::session::config::GroupByMode;
+
+    let mut env = create_test_env_two_projects_mixed_attention();
+    env.view.group_by = GroupByMode::Project;
+    env.view.flat_items = env.view.build_flat_items();
+
+    let alpha_idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|i| matches!(i, Item::Group { name, .. } if name == "alpha"))
+        .expect("alpha header present");
+    env.view.cursor = alpha_idx;
+    env.view.update_selected();
+    env.view.toggle_project_pin_at_cursor();
+    assert!(env.view.is_project_label_pinned("alpha"));
+
+    // Drop every alpha session, then rebuild as a reload would. The registry
+    // entry keeps the header alive even with zero members.
+    env.view
+        .instances
+        .retain(|i| super::project_group_name(i) != "alpha");
+    env.view.flat_items = env.view.build_flat_items();
+
+    let alpha_header = env.view.flat_items.iter().find_map(|i| match i {
+        Item::Group {
+            name,
+            session_count,
+            ..
+        } if name == "alpha" => Some(*session_count),
+        _ => None,
+    });
+    assert_eq!(
+        alpha_header,
+        Some(0),
+        "pinned alpha must remain as an empty (0) header after losing its sessions"
+    );
+}
+
+/// Two repos that share a basename are judged independently for pinning: a
+/// header whose own repo is not registered must read as unpinned even when a
+/// different same-basename repo is in the registry. Guards the path-keyed pin
+/// identity (CodeRabbit #2055).
+#[test]
+#[serial]
+fn same_basename_repos_pin_independently() {
+    use crate::session::config::GroupByMode;
+    use crate::session::projects::{self, Project, ProjectScope};
+
+    let mut env = create_test_env_empty();
+    // Register `/work/api`, but the visible header's repo is `/other/api`.
+    projects::add(
+        "test",
+        ProjectScope::Global,
+        Project::new("api", "/work/api", ProjectScope::Global),
+        false,
+    )
+    .unwrap();
+    let mut sess = Instance::new("api-sess", "/other/api");
+    sess.source_profile = "test".to_string();
+    env.view.instances.push(sess);
+
+    env.view.group_by = GroupByMode::Project;
+    env.view.refresh_registered_projects();
+    env.view.flat_items = env.view.build_flat_items();
+
+    let api_idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|i| matches!(i, Item::Group { name, .. } if name == "api"))
+        .expect("api header present");
+    // The header's repo (/other/api) is not registered, so it is NOT pinned,
+    // even though a same-basename repo (/work/api) is. The old basename match
+    // would have reported pinned here.
+    assert!(!env.view.is_project_label_pinned("api"));
+
+    // Pinning this header would register under the basename "api", which the
+    // registry already holds for /work/api, so the registry's name-uniqueness
+    // surfaces a conflict rather than silently toggling the unrelated entry.
+    env.view.cursor = api_idx;
+    env.view.update_selected();
+    env.view.toggle_project_pin_at_cursor();
+    assert!(
+        !env.view.is_project_label_pinned("api"),
+        "the unrelated /work/api entry must not make this header read as pinned"
+    );
+    // The conflicting pin did not register the header's repo.
+    let paths: Vec<String> = projects::load_global()
+        .unwrap()
+        .into_iter()
+        .map(|p| p.path)
+        .collect();
+    assert_eq!(paths, vec!["/work/api".to_string()]);
+}
+
+/// "New Session" on an empty pinned project (no member sessions) must prefill
+/// the registered repo path, so the pin->launch loop works: the path can only
+/// come from the registry fallback in `group_repo_path`.
+#[test]
+#[serial]
+fn empty_pinned_project_new_session_uses_registered_path() {
+    use crate::session::config::GroupByMode;
+    use crate::session::projects::{self, Project, ProjectScope};
+
+    let mut env = create_test_env_empty();
+    projects::add(
+        "test",
+        ProjectScope::Global,
+        Project::new("lonely", "/repos/lonely", ProjectScope::Global),
+        false,
+    )
+    .unwrap();
+    env.view.group_by = GroupByMode::Project;
+    env.view.refresh_registered_projects();
+    env.view.flat_items = env.view.build_flat_items();
+
+    assert_eq!(
+        env.view.group_repo_path("lonely"),
+        Some("/repos/lonely".to_string()),
+        "empty pinned project must source its new-session path from the registry"
+    );
+}
+
+/// In all-profiles mode the pin registry must include every loaded profile's
+/// projects, not just the default profile's, so a profile-scoped pin keeps its
+/// empty header (CodeRabbit #2055).
+#[test]
+#[serial]
+fn all_profiles_view_includes_profile_scoped_pins() {
+    use crate::session::config::GroupByMode;
+    use crate::session::projects::{self, Project, ProjectScope};
+
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+
+    // Two discoverable profiles, each with a session.
+    for (profile, title, path) in [
+        ("alpha", "Alpha Session", "/tmp/a"),
+        ("beta", "Beta Session", "/tmp/b"),
+    ] {
+        let storage = Storage::new_unwatched(profile).unwrap();
+        let xs = vec![Instance::new(title, path)];
+        storage
+            .update(|i, g| {
+                *i = xs.to_vec();
+                *g = GroupTree::new_with_groups(&xs, &[]).get_all_groups();
+                Ok(())
+            })
+            .unwrap();
+    }
+    // A profile-scoped pin in `beta` with no sessions of its own.
+    projects::add(
+        "beta",
+        ProjectScope::Profile,
+        Project::new("lonely", "/repos/lonely", ProjectScope::Profile),
+        false,
+    )
+    .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
+    view.group_by = GroupByMode::Project;
+    view.flat_items = view.build_flat_items();
+
+    let names: Vec<String> = view
+        .flat_items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Group { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        names.iter().any(|n| n == "lonely"),
+        "beta's profile-scoped pin must show in all-profiles project view, got {names:?}"
+    );
+    assert!(view.is_project_label_pinned("lonely"));
+}
+
+/// Unpinning a PROFILE-scoped pin from all-profiles mode must actually clear
+/// it. Regression for #2055: the empty header surfaced from a non-default
+/// profile's registry, but the unpin removed against `config_profile()` (the
+/// default profile) rather than the profile that owned the entry, so the
+/// header never disappeared.
+#[test]
+#[serial]
+fn unpin_profile_scoped_pin_from_all_profiles_clears_header() {
+    use crate::session::config::GroupByMode;
+    use crate::session::projects::{self, Project, ProjectScope};
+
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+
+    // Two discoverable profiles, each with a session, so all-profiles mode
+    // loads both registries.
+    for (profile, title, path) in [
+        ("alpha", "Alpha Session", "/tmp/a"),
+        ("beta", "Beta Session", "/tmp/b"),
+    ] {
+        let storage = Storage::new_unwatched(profile).unwrap();
+        let xs = vec![Instance::new(title, path)];
+        storage
+            .update(|i, g| {
+                *i = xs.to_vec();
+                *g = GroupTree::new_with_groups(&xs, &[]).get_all_groups();
+                Ok(())
+            })
+            .unwrap();
+    }
+    // A profile-scoped pin in `beta` (NOT the default profile) with no sessions.
+    projects::add(
+        "beta",
+        ProjectScope::Profile,
+        Project::new("lonely", "/repos/lonely", ProjectScope::Profile),
+        false,
+    )
+    .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
+    view.group_by = GroupByMode::Project;
+    view.flat_items = view.build_flat_items();
+
+    let idx = view
+        .flat_items
+        .iter()
+        .position(|i| matches!(i, Item::Group { name, .. } if name == "lonely"))
+        .expect("lonely header present in all-profiles project view");
+    view.cursor = idx;
+    view.update_selected();
+    view.toggle_project_pin_at_cursor();
+
+    assert!(
+        !view.is_project_label_pinned("lonely"),
+        "lonely must read as unpinned after the toggle"
+    );
+    // The entry is gone from beta's on-disk registry, not just the in-memory view.
+    assert!(
+        projects::load_profile("beta").unwrap().is_empty(),
+        "the profile-scoped registry entry must be removed from disk"
+    );
+    let still: Vec<String> = view
+        .flat_items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Group { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !still.iter().any(|n| n == "lonely"),
+        "unpinned lonely must drop from the view, got {still:?}"
+    );
+}
+
+/// A repo pinned in BOTH scopes (a profile entry shadowing a global one via
+/// `--allow-override`) must fully unpin in a single press. `load_merged` only
+/// surfaces the shadowing profile entry, so removing just that one would
+/// re-surface the global entry and leave the header pinned after a "success"
+/// dialog. Unpin sweeps every scope for the path.
+#[test]
+#[serial]
+fn unpin_clears_both_global_and_profile_entries_for_a_path() {
+    use crate::session::config::GroupByMode;
+    use crate::session::projects::{self, Project, ProjectScope};
+
+    let mut env = create_test_env_empty();
+    // Same path pinned globally and profile-scoped (override allows the shadow).
+    projects::add(
+        "test",
+        ProjectScope::Global,
+        Project::new("dual-global", "/repos/dual", ProjectScope::Global),
+        false,
+    )
+    .unwrap();
+    projects::add(
+        "test",
+        ProjectScope::Profile,
+        Project::new("dual-profile", "/repos/dual", ProjectScope::Profile),
+        true,
+    )
+    .unwrap();
+
+    env.view.group_by = GroupByMode::Project;
+    env.view.refresh_registered_projects();
+    env.view.flat_items = env.view.build_flat_items();
+
+    let idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|i| matches!(i, Item::Group { name, .. } if name == "dual"))
+        .expect("dual header present");
+    env.view.cursor = idx;
+    env.view.update_selected();
+
+    // One press must fully unpin.
+    env.view.toggle_project_pin_at_cursor();
+
+    assert!(
+        !env.view.is_project_label_pinned("dual"),
+        "dual must read as unpinned after a single press"
+    );
+    assert!(
+        projects::load_global().unwrap().is_empty(),
+        "global entry must be removed"
+    );
+    assert!(
+        projects::load_profile("test").unwrap().is_empty(),
+        "profile entry must be removed"
+    );
+    let names: Vec<String> = env
+        .view
+        .flat_items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Group { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !names.iter().any(|n| n == "dual"),
+        "unpinned dual must drop from the view, got {names:?}"
     );
 }
 
@@ -6606,7 +7625,7 @@ mod scroll_pane_isolation {
             terminal
                 .draw(|f| {
                     let area = f.area();
-                    env.view.render(f, area, &theme, None, None);
+                    env.view.render(f, area, &theme, None, None, None);
                 })
                 .unwrap();
             env.view.preview_pane_area.width
@@ -6702,6 +7721,78 @@ mod click_to_select {
         assert_eq!(
             env.view.cursor, 2,
             "SelectOnly must still move the cursor to the clicked row"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn select_only_click_on_different_row_exits_live_mode() {
+        // With `click_action = SelectOnly`, clicking a *different* row while
+        // live-sending must leave live mode (otherwise keystrokes stay aimed at
+        // the old session while the cursor/preview walk away). The click still
+        // emits no action and still moves the cursor.
+        use crate::session::config::{save_config, ClickAction, Config};
+        use crate::tui::home::live_send::{LiveSendState, LiveSendTarget};
+        let mut env = create_test_env_with_sessions(3);
+        setup_inner(&mut env);
+        env.view.cursor = 0;
+        env.view.update_selected();
+
+        let mut config = Config::default();
+        config.session.click_action = ClickAction::SelectOnly;
+        save_config(&config).unwrap();
+
+        let live_id = env.view.selected_session.clone().unwrap();
+        env.view.live_send = Some(LiveSendState {
+            session_id: live_id,
+            title: "live".to_string(),
+            tmux_name: "aoe_test_live".to_string(),
+            target: LiveSendTarget::Agent,
+            exit_chords: Vec::new(),
+            leader: None,
+        });
+
+        let action = env.view.handle_click(5, 3);
+        assert_eq!(action, None, "SelectOnly click never emits an action");
+        assert_eq!(env.view.cursor, 2, "the click still moves the cursor");
+        assert!(
+            env.view.live_send.is_none(),
+            "clicking a different row in SelectOnly mode must exit live mode"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn select_only_click_on_live_row_stays_live() {
+        // Clicking the row that's already live-sending is not a "leave" gesture:
+        // the cursor is already there, so SelectOnly must not tear down live mode.
+        use crate::session::config::{save_config, ClickAction, Config};
+        use crate::tui::home::live_send::{LiveSendState, LiveSendTarget};
+        let mut env = create_test_env_with_sessions(3);
+        setup_inner(&mut env);
+        // Row 3 resolves to index 2, so make index 2 the live row.
+        env.view.cursor = 2;
+        env.view.update_selected();
+
+        let mut config = Config::default();
+        config.session.click_action = ClickAction::SelectOnly;
+        save_config(&config).unwrap();
+
+        let live_id = env.view.selected_session.clone().unwrap();
+        env.view.live_send = Some(LiveSendState {
+            session_id: live_id,
+            title: "live".to_string(),
+            tmux_name: "aoe_test_live".to_string(),
+            target: LiveSendTarget::Agent,
+            exit_chords: Vec::new(),
+            leader: None,
+        });
+
+        let action = env.view.handle_click(5, 3);
+        assert_eq!(action, None, "SelectOnly click never emits an action");
+        assert!(
+            env.view.live_send.is_some(),
+            "clicking the already-live row must not exit live mode"
         );
     }
 
@@ -8173,7 +9264,7 @@ mod preview_drag_select {
         terminal
             .draw(|f| {
                 let area = f.area();
-                env.view.render(f, area, &theme, None, None);
+                env.view.render(f, area, &theme, None, None, None);
             })
             .unwrap();
 
@@ -8224,7 +9315,7 @@ mod preview_drag_select {
         terminal
             .draw(|f| {
                 let area = f.area();
-                env.view.render(f, area, &theme, None, None);
+                env.view.render(f, area, &theme, None, None, None);
             })
             .unwrap();
 
@@ -9822,6 +10913,7 @@ mod right_click_context_menu {
     //! `d`. Click-outside dismisses the menu.
 
     use super::*;
+    use crate::session::config::SortOrder;
     use crate::session::Item;
     use crate::tui::dialogs::ContextMenuAction;
     use ratatui::layout::Rect;
@@ -9912,8 +11004,12 @@ mod right_click_context_menu {
     fn down_then_enter_in_menu_opens_delete_dialog() {
         let mut env = create_test_env_with_sessions(2);
         setup_inner(&mut env);
+        // Attention sort surfaces the full session menu (Rename / Archive /
+        // Snooze / Delete), so Delete is three Downs away.
+        env.view.sort_order = SortOrder::Attention;
+        env.view.flat_items = env.view.build_flat_items();
         env.view.handle_right_click(5, 1);
-        // Session menu is Rename / Archive / Delete; Delete is two Downs away.
+        env.view.handle_key(key(KeyCode::Down), None);
         env.view.handle_key(key(KeyCode::Down), None);
         env.view.handle_key(key(KeyCode::Down), None);
         env.view.handle_key(key(KeyCode::Enter), None);
@@ -9994,6 +11090,8 @@ mod right_click_context_menu {
             .iter()
             .map(|(_, l)| *l)
             .collect();
+        // Default sort here is Newest, where Snooze is gated out, so the
+        // archived-row menu is just Rename / Unarchive / Delete.
         assert_eq!(labels, vec!["Rename", "Unarchive", "Delete"]);
 
         env.view.handle_key(key(KeyCode::Down), None); // Rename -> Unarchive
@@ -10001,6 +11099,46 @@ mod right_click_context_menu {
         assert!(
             !env.view.get_instance(&id).unwrap().is_archived(),
             "context-menu Unarchive must unarchive the session"
+        );
+    }
+
+    /// The Snooze row mirrors the `'h'` keybinding, which only fires in
+    /// Attention sort. So the right-click session menu must omit Snooze in
+    /// every other sort and include it in Attention sort.
+    #[test]
+    #[serial]
+    fn right_click_session_menu_gates_snooze_to_attention_sort() {
+        let mut env = create_test_env_with_sessions(2);
+        setup_inner(&mut env);
+
+        let menu_actions = |env: &TestEnv| -> Vec<ContextMenuAction> {
+            env.view
+                .context_menu
+                .as_ref()
+                .unwrap()
+                .items_for_test()
+                .iter()
+                .map(|(a, _)| *a)
+                .collect()
+        };
+
+        // Newest sort (the default): no Snooze row.
+        env.view.sort_order = SortOrder::Newest;
+        env.view.flat_items = env.view.build_flat_items();
+        assert!(env.view.handle_right_click(5, 1));
+        assert!(
+            !menu_actions(&env).contains(&ContextMenuAction::ToggleSnooze),
+            "Snooze must be hidden outside Attention sort"
+        );
+        env.view.context_menu = None;
+
+        // Attention sort: Snooze row present.
+        env.view.sort_order = SortOrder::Attention;
+        env.view.flat_items = env.view.build_flat_items();
+        assert!(env.view.handle_right_click(5, 1));
+        assert!(
+            menu_actions(&env).contains(&ContextMenuAction::ToggleSnooze),
+            "Snooze must appear in Attention sort"
         );
     }
 
@@ -10580,7 +11718,7 @@ mod apply_session_id_updates {
         terminal
             .draw(|f| {
                 let area = f.area();
-                view.render(f, area, &theme, None, None);
+                view.render(f, area, &theme, None, None, None);
             })
             .unwrap();
 
@@ -10603,5 +11741,45 @@ mod apply_session_id_updates {
         );
         assert!(view.settings_view.is_none(), "settings should be closed");
         assert!(!view.settings_close_confirm, "confirm flag should reset");
+    }
+}
+
+/// Live-send must boot a cold/dead agent pane at the visible preview size so it
+/// does not start at tmux's 80x24 default and then depend on a single,
+/// race-prone post-boot `resize-window` SIGWINCH to grow into the live area.
+/// Regression guard for the "live mode opens at ~50% width" race: if this seed
+/// regresses back to `None`/default, the agent boots narrow again.
+mod live_send_boot_size_tests {
+    use super::create_test_env_empty;
+    use ratatui::layout::Rect;
+
+    #[test]
+    #[serial_test::serial]
+    fn boots_agent_at_visible_preview_size() {
+        let mut env = create_test_env_empty();
+        // The rect `finalize_live_send_resize` would resize the pane to.
+        env.view.preview_pane_area = Rect::new(35, 1, 123, 38);
+
+        assert_eq!(
+            env.view.live_send_boot_size(),
+            Some((123, 38)),
+            "cold agent must boot at the preview pane's visible size, not tmux's 80x24 default"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn never_seeds_a_zero_sized_pane() {
+        let mut env = create_test_env_empty();
+        // No preview has been drawn yet (attach-on-create style entry): the
+        // cached rect is empty. The seed must fall back, never hand tmux a
+        // degenerate 0x0 boot size.
+        env.view.preview_pane_area = Rect::default();
+
+        let seed = env.view.live_send_boot_size();
+        assert!(
+            !matches!(seed, Some((0, _)) | Some((_, 0))),
+            "empty preview rect must fall back, not seed a 0-dimension size; got {seed:?}"
+        );
     }
 }

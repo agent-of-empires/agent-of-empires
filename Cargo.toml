@@ -3,7 +3,7 @@ members = [".", "xtask", "aoe-settings-derive"]
 
 [package]
 name = "agent-of-empires"
-version = "1.10.1"
+version = "1.11.0"
 edition = "2021"
 rust-version = "1.85"
 authors = ["Agent of Empires Contributors"]
@@ -70,6 +70,9 @@ rand = "0.10"
 
 # Directory utilities
 dirs = "6.0"
+
+# Glob expansion for sandbox volume_ignores patterns (e.g. `**/bin`, `**/obj`)
+glob = "0.3"
 
 # Logging
 tracing = "0.1"

@@ -100,25 +100,14 @@ export interface ResolveModeChannelArgs {
   allowLegacyFallback: boolean;
 }
 
-function findModeConfig(
-  options: ConfigOptionDescriptor[],
-): ConfigOptionDescriptor | undefined {
+function findModeConfig(options: ConfigOptionDescriptor[]): ConfigOptionDescriptor | undefined {
   return options.find((o) => o.category === "mode" && o.options.length > 0);
 }
 
 /** Resolve the mode-picker channel, or null when the picker should not
  *  render. Pure; unit-tested in `modeChannel.test.ts`. */
-export function resolveModeChannel(
-  args: ResolveModeChannelArgs,
-): ModeChannel | null {
-  const {
-    configOptions,
-    availableModes,
-    currentModeId,
-    legacyMode,
-    pendingConfigOption,
-    allowLegacyFallback,
-  } = args;
+export function resolveModeChannel(args: ResolveModeChannelArgs): ModeChannel | null {
+  const { configOptions, availableModes, currentModeId, legacyMode, pendingConfigOption, allowLegacyFallback } = args;
 
   const modeConfig = findModeConfig(configOptions);
   if (modeConfig) {
@@ -131,10 +120,7 @@ export function resolveModeChannel(
         description: o.description ?? "",
       })),
       activeId: modeConfig.current_value,
-      pendingId:
-        pendingConfigOption?.configId === modeConfig.id
-          ? pendingConfigOption.value
-          : null,
+      pendingId: pendingConfigOption?.configId === modeConfig.id ? pendingConfigOption.value : null,
       label: modeConfig.name || "Agent modes",
     };
   }
@@ -155,8 +141,7 @@ export function resolveModeChannel(
   }
 
   if (allowLegacyFallback) {
-    const fallbackId =
-      LEGACY_MODES.find((m) => m.legacyId === legacyMode)?.id ?? "default";
+    const fallbackId = LEGACY_MODES.find((m) => m.legacyId === legacyMode)?.id ?? "default";
     return {
       kind: "legacy",
       configId: null,

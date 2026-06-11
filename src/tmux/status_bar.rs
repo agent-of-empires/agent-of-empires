@@ -30,6 +30,11 @@ pub fn apply_status_bar(
     sandbox: Option<&SandboxDisplay>,
     theme: &Theme,
 ) -> Result<()> {
+    // Re-enable the status line explicitly: a web attach turns it off
+    // for that session (the dashboard renders its own chrome), and the
+    // TUI/CLI attach experience wants the themed bar + detach hint back.
+    set_session_option(session_name, "status", "on")?;
+
     // Set the session title as a tmux user option
     set_session_option(session_name, "@aoe_title", title)?;
 
@@ -77,6 +82,21 @@ pub fn apply_status_bar(
 }
 
 /// Set a tmux option for a specific session.
+/// Remove a session-scoped option override so the global value applies.
+fn set_session_option_unset(session_name: &str, option: &str) -> Result<()> {
+    let output = std::process::Command::new("tmux")
+        .args(["set-option", "-u", "-t", session_name, option])
+        .output()?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "tmux set-option -u {} failed: {}",
+            option,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
+
 fn set_session_option(session_name: &str, option: &str, value: &str) -> Result<()> {
     let output = Command::new("tmux")
         .args(["set-option", "-t", session_name, option, value])
@@ -120,6 +140,22 @@ pub fn apply_all_tmux_options(
 
         if let Err(e) = apply_status_bar(session_name, title, branch, sandbox, &theme) {
             tracing::debug!(target: "tmux.status", "Failed to apply tmux status bar: {}", e);
+        }
+    } else {
+        // aoe's bar is disabled (user preference or their own tmux
+        // config). A web attach may have set the session-scoped
+        // `status off`, and a previously enabled aoe bar leaves its
+        // session-scoped visual overrides behind; unset them all so the
+        // user's own global config governs again in real terminals.
+        for option in [
+            "status",
+            "status-left",
+            "status-left-length",
+            "status-right",
+            "status-right-length",
+            "status-style",
+        ] {
+            let _ = set_session_option_unset(session_name, option);
         }
     }
 

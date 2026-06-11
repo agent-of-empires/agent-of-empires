@@ -11,9 +11,7 @@ import { getQueuedCount, subscribeAcpState } from "../lib/acpStateStorage";
 // Returns the total number of queued structured view follow-up prompts across the
 // given session ids. Re-renders the caller only when one of THESE ids'
 // counts changes, not on every acp-state write anywhere in the app.
-export function useQueuedCountForSessions(
-  sessionIds: readonly string[],
-): number {
+export function useQueuedCountForSessions(sessionIds: readonly string[]): number {
   // Stable join key so getSnapshot returns the same primitive across
   // renders unless the relevant counts actually change; otherwise
   // useSyncExternalStore would tear under React 18's strict checks.

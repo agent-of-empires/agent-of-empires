@@ -78,12 +78,7 @@ export function customThemesDir(home: string, xdg: string): string {
  *  directory. Caller passes both `home` and the per-test XDG path; the
  *  resolution mirrors `appDirFor` so the same binary that the spec
  *  resolves will discover the file on boot. */
-export function seedCustomTheme(
-  home: string,
-  xdg: string,
-  name: string,
-  body: string,
-): string {
+export function seedCustomTheme(home: string, xdg: string, name: string, body: string): string {
   const dir = customThemesDir(home, xdg);
   mkdirSync(dir, { recursive: true });
   const path = join(dir, `${name}.toml`);
@@ -102,9 +97,7 @@ export interface ThemeDocumentSnapshot {
  *  root element. Returning a strict shape (rather than asserting inline)
  *  lets the failure-mode specs compare a single object against a
  *  pre-change baseline without re-reading per-property. */
-export async function readThemeFromDocument(
-  page: Page,
-): Promise<ThemeDocumentSnapshot> {
+export async function readThemeFromDocument(page: Page): Promise<ThemeDocumentSnapshot> {
   return await page.evaluate(() => {
     const root = document.documentElement;
     return {

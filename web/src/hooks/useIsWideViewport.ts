@@ -13,9 +13,7 @@ import { useEffect, useState } from "react";
  *  window into a cramped split. */
 export function useIsWideViewport(): boolean {
   const [isWide, setIsWide] = useState(
-    () =>
-      typeof window !== "undefined" &&
-      Boolean(window.matchMedia?.("(min-width: 768px)").matches),
+    () => typeof window !== "undefined" && Boolean(window.matchMedia?.("(min-width: 768px)").matches),
   );
   useEffect(() => {
     if (typeof window === "undefined" || !window.matchMedia) return;

@@ -21,9 +21,7 @@ export const ELEVATION_REQUIRED_EVENT = "aoe:elevation-required";
 /** Classify a 401 body as `login_required` or `unauthorized`. Clones the
  *  response so downstream readers (fetchJson, etc.) can still parse the
  *  body. Non-401 returns null. */
-export async function classifyAuthError(
-  res: Response,
-): Promise<"login_required" | "unauthorized" | null> {
+export async function classifyAuthError(res: Response): Promise<"login_required" | "unauthorized" | null> {
   if (res.status !== 401) return null;
   try {
     const data = (await res.clone().json()) as { error?: unknown };
@@ -66,23 +64,15 @@ export function isLoginAttemptPath(path: string): boolean {
  * Safe to call multiple times; only the first call installs the wrapper.
  */
 export function installFetchErrorToasts(): void {
-  if (
-    (window as unknown as { __aoeFetchPatched?: boolean }).__aoeFetchPatched
-  ) {
+  if ((window as unknown as { __aoeFetchPatched?: boolean }).__aoeFetchPatched) {
     return;
   }
-  (window as unknown as { __aoeFetchPatched?: boolean }).__aoeFetchPatched =
-    true;
+  (window as unknown as { __aoeFetchPatched?: boolean }).__aoeFetchPatched = true;
 
   const original = window.fetch.bind(window);
 
   window.fetch = async (input, init) => {
-    const rawUrl =
-      typeof input === "string"
-        ? input
-        : input instanceof URL
-          ? input.toString()
-          : input.url;
+    const rawUrl = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
     const path = toPath(rawUrl);
     const isApi = path.startsWith("/api/");
     const sameOrigin = isSameOrigin(rawUrl);
@@ -146,10 +136,7 @@ export function installFetchErrorToasts(): void {
       return res;
     } catch (err) {
       // Ignore aborts (triggered by deliberate cleanup).
-      if (
-        err instanceof DOMException &&
-        (err.name === "AbortError" || err.name === "TimeoutError")
-      ) {
+      if (err instanceof DOMException && (err.name === "AbortError" || err.name === "TimeoutError")) {
         throw err;
       }
       // When the server is known to be down, suppress per-request toasts.
@@ -200,10 +187,7 @@ export function resetTokenExpired(): void {
 // Inject Authorization + device-binding headers without clobbering
 // anything the caller set. Skips cross-origin URLs so we never leak
 // either credential off-site.
-function attachAuthHeader(
-  sameOrigin: boolean,
-  init: RequestInit | undefined,
-): RequestInit | undefined {
+function attachAuthHeader(sameOrigin: boolean, init: RequestInit | undefined): RequestInit | undefined {
   if (!sameOrigin) return init;
   const token = getToken();
   let bindingSecret: string | null = null;
@@ -229,9 +213,7 @@ function attachAuthHeader(
 function isSameOrigin(url: string): boolean {
   if (url.startsWith("/")) return true;
   try {
-    return (
-      new URL(url, window.location.origin).origin === window.location.origin
-    );
+    return new URL(url, window.location.origin).origin === window.location.origin;
   } catch {
     return false;
   }

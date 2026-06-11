@@ -3,11 +3,7 @@ import type { AgentInfo, ProfileInfo } from "../../../lib/types";
 import { fetchSettings } from "../../../lib/api";
 import { isAcpCapable } from "../../../lib/acpCapableTools";
 import { resolveLaunchCommand } from "../../../lib/launchCommand";
-import {
-  commandMapsFromSettings,
-  EMPTY_COMMAND_MAPS,
-  type CommandMaps,
-} from "../commandMaps";
+import { commandMapsFromSettings, EMPTY_COMMAND_MAPS, type CommandMaps } from "../commandMaps";
 
 interface WizardData {
   tool: string;
@@ -53,19 +49,11 @@ interface Props {
  *  includes built-in tools without ACP support and custom agents that do
  *  not provide `agent_acp_cmd`. ACP-capable tools render
  *  `ViewPickerCard` instead. */
-function ViewNotice({
-  tool,
-  customAgent,
-}: {
-  tool: string;
-  customAgent: boolean;
-}) {
+function ViewNotice({ tool, customAgent }: { tool: string; customAgent: boolean }) {
   return (
     <div className="mb-5 rounded-lg border border-surface-700 bg-surface-950 px-3 py-2.5">
       <div className="flex items-center gap-2">
-        <span className="text-sm font-semibold text-text-primary">
-          Terminal
-        </span>
+        <span className="text-sm font-semibold text-text-primary">Terminal</span>
         <span className="rounded px-1.5 py-px text-[10px] font-mono uppercase tracking-wide bg-surface-700 text-text-dim">
           Fallback
         </span>
@@ -97,9 +85,7 @@ function ViewPickerCard({
       <div className="flex items-center justify-between gap-3">
         <div className="flex-1">
           <div className="flex items-center gap-2">
-            <span className="text-sm font-semibold text-text-primary">
-              Structured view
-            </span>
+            <span className="text-sm font-semibold text-text-primary">Structured view</span>
           </div>
           <p className="mt-1 text-xs text-text-dim leading-snug">
             {sandboxedStructuredView
@@ -109,11 +95,7 @@ function ViewPickerCard({
                 : "This session will run in the terminal view (raw tmux). Turn on to use the structured view; you can also switch views from the session later."}
           </p>
         </div>
-        <Toggle
-          checked={checked}
-          onChange={onChange}
-          label="Use structured view"
-        />
+        <Toggle checked={checked} onChange={onChange} label="Use structured view" />
       </div>
     </div>
   );
@@ -160,9 +142,7 @@ export function AgentStep({
   onApplyProfileDefaults,
   commandMaps = EMPTY_COMMAND_MAPS,
 }: Props) {
-  const selectableAgents = agents.filter(
-    (agent) => agent.kind === "custom" || agent.installed,
-  );
+  const selectableAgents = agents.filter((agent) => agent.kind === "custom" || agent.installed);
   const selectedAgent = agents.find((a) => a.name === data.tool);
   const selectedCustomAgent = selectedAgent?.kind === "custom";
   const acpCapable = isAcpCapable(data.tool, selectedAgent?.acp_capable);
@@ -184,16 +164,13 @@ export function AgentStep({
     agentCommandOverride: commandMaps.agentCommandOverride,
     customAgents: commandMaps.customAgents,
   }).full;
-  const extraArgsIgnored =
-    willUseStructuredView && data.extraArgs.trim().length > 0;
+  const extraArgsIgnored = willUseStructuredView && data.extraArgs.trim().length > 0;
 
   const handleProfileChange = useCallback(
     async (profileName: string) => {
       // If user had manual edits, confirm before overwriting
       if (data.profileDirty && profileName) {
-        const ok = window.confirm(
-          "Selecting a profile will reset your settings to that profile's defaults. Continue?",
-        );
+        const ok = window.confirm("Selecting a profile will reset your settings to that profile's defaults. Continue?");
         if (!ok) return;
       }
 
@@ -205,36 +182,24 @@ export function AgentStep({
       try {
         const settings = await fetchSettings(profileName);
         if (settings) {
-          const session = settings.session as
-            | Record<string, unknown>
-            | undefined;
-          const sandbox = settings.sandbox as
-            | Record<string, unknown>
-            | undefined;
+          const session = settings.session as Record<string, unknown> | undefined;
+          const sandbox = settings.sandbox as Record<string, unknown> | undefined;
           // Pre-populate sandbox env from the profile so the user can see and edit
           // it before submission; without this, an empty extra_env is sent and the
           // backend falls back to the wrong (globally-default) profile's env vars.
           const env = Array.isArray(sandbox?.environment)
-            ? (sandbox.environment as unknown[]).filter(
-                (v): v is string => typeof v === "string",
-              )
+            ? (sandbox.environment as unknown[]).filter((v): v is string => typeof v === "string")
             : [];
           const defaultTool = (session?.default_tool as string) || data.tool;
-          const acpDefaults = session?.acp_defaults as
-            | Record<string, unknown>
-            | undefined;
-          const acpDefault = acpDefaults?.[defaultTool] as
-            | Record<string, unknown>
-            | undefined;
+          const acpDefaults = session?.acp_defaults as Record<string, unknown> | undefined;
+          const acpDefault = acpDefaults?.[defaultTool] as Record<string, unknown> | undefined;
           onApplyProfileDefaults({
             yoloMode: (session?.yolo_mode_default as boolean) ?? false,
             sandboxEnabled: (sandbox?.enabled_by_default as boolean) ?? false,
             tool: defaultTool,
             extraEnv: env,
-            agentModel:
-              typeof acpDefault?.model === "string" ? acpDefault.model : "",
-            agentEffort:
-              typeof acpDefault?.effort === "string" ? acpDefault.effort : "",
+            agentModel: typeof acpDefault?.model === "string" ? acpDefault.model : "",
+            agentEffort: typeof acpDefault?.effort === "string" ? acpDefault.effort : "",
             commandMaps: commandMapsFromSettings(settings),
           });
         }
@@ -247,33 +212,21 @@ export function AgentStep({
 
   return (
     <div>
-      <h2 className="text-lg font-semibold text-text-primary mb-1">
-        Which AI agent?
-      </h2>
-      <p className="text-sm text-text-muted mb-5">
-        Pick the coding assistant and configure your session.
-      </p>
+      <h2 className="text-lg font-semibold text-text-primary mb-1">Which AI agent?</h2>
+      <p className="text-sm text-text-muted mb-5">Pick the coding assistant and configure your session.</p>
 
       {/* No agents installed */}
       {selectableAgents.length === 0 && agents.length > 0 && (
         <div className="mb-5 p-4 rounded-lg border border-status-warning/30 bg-status-warning/5">
-          <p className="text-sm font-semibold text-status-warning mb-2">
-            No agents installed
-          </p>
-          <p className="text-sm text-text-muted mb-3">
-            Install at least one AI coding agent to create a session.
-          </p>
+          <p className="text-sm font-semibold text-status-warning mb-2">No agents installed</p>
+          <p className="text-sm text-text-muted mb-3">Install at least one AI coding agent to create a session.</p>
           <div className="space-y-1.5">
             {agents
               .filter((a) => ["claude", "codex", "gemini"].includes(a.name))
               .map((agent) => (
                 <div key={agent.name} className="flex items-baseline gap-2">
-                  <span className="text-sm font-medium text-text-primary w-20">
-                    {agent.name}
-                  </span>
-                  <code className="text-xs text-text-dim font-mono">
-                    {agent.install_hint}
-                  </code>
+                  <span className="text-sm font-medium text-text-primary w-20">{agent.name}</span>
+                  <code className="text-xs text-text-dim font-mono">{agent.install_hint}</code>
                 </div>
               ))}
           </div>
@@ -294,9 +247,7 @@ export function AgentStep({
             }`}
           >
             <div className="flex flex-wrap items-center gap-2">
-              <span className="text-sm font-semibold text-text-primary">
-                {agent.name}
-              </span>
+              <span className="text-sm font-semibold text-text-primary">{agent.name}</span>
               {agent.kind === "custom" && (
                 <span className="rounded px-1.5 py-px text-[10px] font-mono uppercase tracking-wide bg-surface-700 text-text-dim">
                   Custom
@@ -327,18 +278,11 @@ export function AgentStep({
           obvious on touch devices. See #949. */}
       {showProfilePicker && (
         <div className="mb-5">
-          <label className="block text-sm text-text-dim mb-1.5">
-            Workflow preset
-          </label>
+          <label className="block text-sm text-text-dim mb-1.5">Workflow preset</label>
           <p className="text-xs text-text-dim mb-2">
-            Profiles preload tool, sandbox, auto-approve, and env defaults for
-            common workflows.
+            Profiles preload tool, sandbox, auto-approve, and env defaults for common workflows.
           </p>
-          <div
-            role="radiogroup"
-            aria-label="Workflow preset"
-            className="space-y-1.5"
-          >
+          <div role="radiogroup" aria-label="Workflow preset" className="space-y-1.5">
             <button
               type="button"
               role="radio"
@@ -350,9 +294,7 @@ export function AgentStep({
                   : "border-surface-700 bg-surface-950 hover:border-surface-600"
               }`}
             >
-              <div className="text-sm font-semibold text-text-primary">
-                Server default
-              </div>
+              <div className="text-sm font-semibold text-text-primary">Server default</div>
               <div className="mt-0.5 text-xs text-text-dim leading-snug">
                 Use the active profile on the server with no client-side preset.
               </div>
@@ -371,27 +313,19 @@ export function AgentStep({
                 }`}
               >
                 <div className="flex flex-wrap items-baseline gap-2">
-                  <span className="text-sm font-semibold text-text-primary">
-                    {p.name}
-                  </span>
+                  <span className="text-sm font-semibold text-text-primary">{p.name}</span>
                   {p.is_default && (
                     <span className="rounded px-1.5 py-px text-[10px] font-mono uppercase tracking-wide bg-surface-700 text-text-dim">
                       Active
                     </span>
                   )}
                 </div>
-                {p.description && (
-                  <div className="mt-0.5 text-xs text-text-dim leading-snug">
-                    {p.description}
-                  </div>
-                )}
+                {p.description && <div className="mt-0.5 text-xs text-text-dim leading-snug">{p.description}</div>}
               </button>
             ))}
           </div>
           {data.profile && data.profileDirty && (
-            <p className="text-xs text-brand-500 mt-1">
-              (Custom) Settings differ from preset defaults
-            </p>
+            <p className="text-xs text-brand-500 mt-1">(Custom) Settings differ from preset defaults</p>
           )}
         </div>
       )}
@@ -400,15 +334,10 @@ export function AgentStep({
       <div className="space-y-2 mb-4">
         <label
           className="flex items-center justify-between gap-3 p-3 bg-surface-900 border border-surface-700 rounded-lg cursor-pointer"
-          onClick={() =>
-            !(isHostOnly || !dockerAvailable) &&
-            onChange("sandboxEnabled", !data.sandboxEnabled)
-          }
+          onClick={() => !(isHostOnly || !dockerAvailable) && onChange("sandboxEnabled", !data.sandboxEnabled)}
         >
           <div className="flex-1">
-            <div className="text-sm font-medium text-text-primary">
-              Run in a safe container
-            </div>
+            <div className="text-sm font-medium text-text-primary">Run in a safe container</div>
             <div className="text-xs text-text-dim mt-0.5 leading-snug">
               {!dockerAvailable
                 ? "Docker is not running. Install or start Docker to use containers."
@@ -427,26 +356,19 @@ export function AgentStep({
           onClick={() => onChange("yoloMode", !data.yoloMode)}
         >
           <div className="flex-1">
-            <div className="text-sm font-medium text-text-primary">
-              Auto-approve actions
-            </div>
+            <div className="text-sm font-medium text-text-primary">Auto-approve actions</div>
             <div className="text-xs text-text-dim mt-0.5 leading-snug">
               Let the agent run commands without asking. Faster, less safe.
             </div>
           </div>
-          <Toggle
-            checked={data.yoloMode}
-            onChange={(v) => onChange("yoloMode", v)}
-          />
+          <Toggle checked={data.yoloMode} onChange={(v) => onChange("yoloMode", v)} />
         </label>
       </div>
 
       {isHostOnly && (
         <p className="text-xs text-status-warning mt-3 mb-3">
           {selectedAgent?.name} can only run on the host. Container is disabled
-          {data.useWorktree
-            ? "; go back and turn off “Create a worktree” too."
-            : "."}
+          {data.useWorktree ? "; go back and turn off “Create a worktree” too." : "."}
         </p>
       )}
 
@@ -481,9 +403,7 @@ export function AgentStep({
           {data.sandboxEnabled && (
             <>
               <div>
-                <label className="block text-sm text-text-dim mb-1.5">
-                  Container image
-                </label>
+                <label className="block text-sm text-text-dim mb-1.5">Container image</label>
                 <input
                   type="text"
                   value={data.sandboxImage}
@@ -493,9 +413,7 @@ export function AgentStep({
                 />
               </div>
               <div>
-                <label className="block text-sm text-text-dim mb-1.5">
-                  Environment variables
-                </label>
+                <label className="block text-sm text-text-dim mb-1.5">Environment variables</label>
                 {data.extraEnv.map((env, i) => (
                   <div key={i} className="flex gap-2 mb-1">
                     <input
@@ -534,9 +452,7 @@ export function AgentStep({
 
           {/* Custom instruction */}
           <div>
-            <label className="block text-sm text-text-dim mb-1.5">
-              Agent instructions
-            </label>
+            <label className="block text-sm text-text-dim mb-1.5">Agent instructions</label>
             <textarea
               value={data.customInstruction}
               onChange={(e) => onChange("customInstruction", e.target.value)}
@@ -548,9 +464,7 @@ export function AgentStep({
 
           {/* Extra args */}
           <div>
-            <label className="block text-sm text-text-dim mb-1.5">
-              Additional arguments
-            </label>
+            <label className="block text-sm text-text-dim mb-1.5">Additional arguments</label>
             <input
               type="text"
               value={data.extraArgs}
@@ -559,21 +473,16 @@ export function AgentStep({
               className="w-full bg-surface-900 border border-surface-700 rounded-lg px-3 py-2.5 text-sm font-mono text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"
             />
             {extraArgsIgnored && (
-              <p
-                className="mt-1.5 text-xs text-status-warning"
-                data-testid="extra-args-ignored"
-              >
-                Extra args are ignored for structured-view sessions; use the
-                command override to change the launch command.
+              <p className="mt-1.5 text-xs text-status-warning" data-testid="extra-args-ignored">
+                Extra args are ignored for structured-view sessions; use the command override to change the launch
+                command.
               </p>
             )}
           </div>
 
           {/* Command override */}
           <div>
-            <label className="block text-sm text-text-dim mb-1.5">
-              Command override
-            </label>
+            <label className="block text-sm text-text-dim mb-1.5">Command override</label>
             <input
               type="text"
               value={data.commandOverride}
@@ -582,14 +491,8 @@ export function AgentStep({
               className="w-full bg-surface-900 border border-surface-700 rounded-lg px-3 py-2.5 text-sm font-mono text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"
             />
             {resolvedCommand && (
-              <p
-                className="mt-1.5 text-xs text-text-dim"
-                data-testid="resolved-launch-command"
-              >
-                Resolved launch command:{" "}
-                <code className="font-mono text-text-secondary">
-                  {resolvedCommand}
-                </code>
+              <p className="mt-1.5 text-xs text-text-dim" data-testid="resolved-launch-command">
+                Resolved launch command: <code className="font-mono text-text-secondary">{resolvedCommand}</code>
               </p>
             )}
           </div>

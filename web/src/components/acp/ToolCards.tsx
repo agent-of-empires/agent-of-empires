@@ -41,39 +41,17 @@ import {
   Trash2,
 } from "lucide-react";
 
-import {
-  ensureThemeLoaded,
-  getHighlighter,
-  langKeyForExt,
-  loadLanguage,
-} from "../../lib/highlighter";
+import { ensureThemeLoaded, getHighlighter, langKeyForExt, loadLanguage } from "../../lib/highlighter";
 import { useShikiTheme } from "../../hooks/useShikiTheme";
 import { hasAnsi, parseAnsi, type AnsiStyle } from "../../lib/ansi";
-import {
-  parseJsonObject,
-  pickFirst,
-  pickStr,
-  todoItemsFromArgs,
-} from "../../lib/acpArgs";
+import { parseJsonObject, pickFirst, pickStr, todoItemsFromArgs } from "../../lib/acpArgs";
 import { useAcpPrefs } from "../../lib/acpPrefs";
-import type {
-  ActivityRow,
-  ToolCall,
-  ToolOutputBlock,
-} from "../../lib/acpTypes";
+import type { ActivityRow, ToolCall, ToolOutputBlock } from "../../lib/acpTypes";
 import { diffPair } from "../../lib/diffPair";
 import { StringDiff } from "../diff/StringDiff";
 import { ToolErrorBody } from "./ToolErrorBody";
-import {
-  classifyMcp,
-  humanizeServer,
-  humanizeVerb,
-} from "../../lib/mcpClassify";
-import {
-  classifyMemory,
-  parseMemoryFrontmatter,
-  type MemoryHit,
-} from "../../lib/memoryClassify";
+import { classifyMcp, humanizeServer, humanizeVerb } from "../../lib/mcpClassify";
+import { classifyMemory, parseMemoryFrontmatter, type MemoryHit } from "../../lib/memoryClassify";
 import { reclassifyBash } from "../../lib/toolReclassify";
 import { useAgentProfile } from "../../lib/agentProfileContext";
 import { useToolDisplayMode, type ToolDensity } from "./ToolDisplayMode";
@@ -89,11 +67,7 @@ interface Props {
  *  label, the sub-agent parent tool-call id). Excluded from any
  *  user-visible input JSON dumps. */
 function isAcpBookkeepingKey(key: string): boolean {
-  return (
-    key === "_aoe_title" ||
-    key === "_aoe_started_at" ||
-    key === "_aoe_parent_tool_call_id"
-  );
+  return key === "_aoe_title" || key === "_aoe_started_at" || key === "_aoe_parent_tool_call_id";
 }
 
 /** Read the smuggled `_aoe_parent_tool_call_id` from a tool's
@@ -116,9 +90,7 @@ export function ToolCard({ tool, result, nested }: ToolCardProps) {
   const card = renderToolCard(tool, result, profile);
   // Structured media/resources the agent shipped at completion render
   // below the per-kind card, regardless of tool kind. See #1818.
-  const media = result?.output?.length ? (
-    <ToolOutputMedia blocks={result.output} />
-  ) : null;
+  const media = result?.output?.length ? <ToolOutputMedia blocks={result.output} /> : null;
   const content = media ? (
     <>
       {card}
@@ -185,11 +157,7 @@ function MediaPlaceholder({ icon, label }: { icon: ReactNode; label: string }) {
 function ToolOutputBlockView({ block }: { block: ToolOutputBlock }) {
   switch (block.kind) {
     case "text":
-      return (
-        <pre className="whitespace-pre-wrap break-words font-mono text-xs text-text-secondary">
-          {block.text}
-        </pre>
-      );
+      return <pre className="whitespace-pre-wrap break-words font-mono text-xs text-text-secondary">{block.text}</pre>;
     case "image": {
       const src = block.data
         ? dataUri(block.mime_type, block.data)
@@ -197,12 +165,7 @@ function ToolOutputBlockView({ block }: { block: ToolOutputBlock }) {
           ? safeUri(block.uri, SAFE_MEDIA_SCHEMES)
           : null;
       if (!src) {
-        return (
-          <MediaPlaceholder
-            icon={<ImageIcon className="h-3.5 w-3.5" />}
-            label={`image (${block.mime_type})`}
-          />
-        );
+        return <MediaPlaceholder icon={<ImageIcon className="h-3.5 w-3.5" />} label={`image (${block.mime_type})`} />;
       }
       return (
         <img
@@ -214,30 +177,14 @@ function ToolOutputBlockView({ block }: { block: ToolOutputBlock }) {
     }
     case "audio": {
       if (!block.data) {
-        return (
-          <MediaPlaceholder
-            icon={<Music className="h-3.5 w-3.5" />}
-            label={`audio (${block.mime_type})`}
-          />
-        );
+        return <MediaPlaceholder icon={<Music className="h-3.5 w-3.5" />} label={`audio (${block.mime_type})`} />;
       }
-      return (
-        <audio
-          controls
-          src={dataUri(block.mime_type, block.data)}
-          className="w-full"
-        />
-      );
+      return <audio controls src={dataUri(block.mime_type, block.data)} className="w-full" />;
     }
     case "resource_link": {
       const href = safeUri(block.uri, SAFE_LINK_SCHEMES);
       if (!href) {
-        return (
-          <MediaPlaceholder
-            icon={<LinkIcon className="h-3.5 w-3.5" />}
-            label={`${block.name} (${block.uri})`}
-          />
-        );
+        return <MediaPlaceholder icon={<LinkIcon className="h-3.5 w-3.5" />} label={`${block.name} (${block.uri})`} />;
       }
       return (
         <a
@@ -254,9 +201,7 @@ function ToolOutputBlockView({ block }: { block: ToolOutputBlock }) {
     case "resource": {
       if (block.text != null) {
         return (
-          <pre className="whitespace-pre-wrap break-words font-mono text-xs text-text-secondary">
-            {block.text}
-          </pre>
+          <pre className="whitespace-pre-wrap break-words font-mono text-xs text-text-secondary">{block.text}</pre>
         );
       }
       // A binary (blob) resource ships its bytes inline; offer them as a
@@ -265,10 +210,7 @@ function ToolOutputBlockView({ block }: { block: ToolOutputBlock }) {
         const filename = block.uri.split("/").pop() || "resource";
         return (
           <a
-            href={dataUri(
-              block.mime_type ?? "application/octet-stream",
-              block.data,
-            )}
+            href={dataUri(block.mime_type ?? "application/octet-stream", block.data)}
             download={filename}
             className="flex items-center gap-2 text-xs text-accent-500 hover:underline"
           >
@@ -279,12 +221,7 @@ function ToolOutputBlockView({ block }: { block: ToolOutputBlock }) {
       }
       const href = safeUri(block.uri, SAFE_LINK_SCHEMES);
       if (!href) {
-        return (
-          <MediaPlaceholder
-            icon={<FileDown className="h-3.5 w-3.5" />}
-            label={block.uri}
-          />
-        );
+        return <MediaPlaceholder icon={<FileDown className="h-3.5 w-3.5" />} label={block.uri} />;
       }
       return (
         <a
@@ -303,11 +240,7 @@ function ToolOutputBlockView({ block }: { block: ToolOutputBlock }) {
   }
 }
 
-function renderToolCard(
-  tool: ToolCall,
-  result: ActivityRow | undefined,
-  profile: AgentProfile,
-) {
+function renderToolCard(tool: ToolCall, result: ActivityRow | undefined, profile: AgentProfile) {
   // claude-agent-acp v0.37.0+ routes session-start memory recall
   // through the tool channel with structured metadata (upstream #703).
   // Render the dedicated card before falling through to the path-sniff
@@ -322,21 +255,12 @@ function renderToolCard(
   }
   const mcp = classifyMcp(tool, profile);
   if (mcp.isMcp) {
-    return (
-      <McpToolCard
-        tool={tool}
-        result={result}
-        server={mcp.server}
-        verb={mcp.verb}
-      />
-    );
+    return <McpToolCard tool={tool} result={result} server={mcp.server} verb={mcp.verb} />;
   }
   if (profile.capabilities.skills) {
     const skill = classifySkill(tool, profile);
     if (skill.isSkill) {
-      return (
-        <SkillToolCard tool={tool} result={result} skillName={skill.name} />
-      );
+      return <SkillToolCard tool={tool} result={result} skillName={skill.name} />;
     }
   }
   if (profile.capabilities.todos) {
@@ -348,9 +272,7 @@ function renderToolCard(
   if (profile.capabilities.wakeup) {
     const schedule = classifySchedule(tool, profile);
     if (schedule.kind) {
-      return (
-        <ScheduleToolCard tool={tool} result={result} kind={schedule.kind} />
-      );
+      return <ScheduleToolCard tool={tool} result={result} kind={schedule.kind} />;
     }
   }
   const { kind, provenance } = reclassifyBash(tool);
@@ -365,9 +287,7 @@ function renderToolCard(
     case "delete":
       return <DeleteToolCard tool={tool} result={result} />;
     case "search":
-      return (
-        <SearchToolCard tool={tool} result={result} provenance={provenance} />
-      );
+      return <SearchToolCard tool={tool} result={result} provenance={provenance} />;
     case "fetch":
       return <FetchToolCard tool={tool} result={result} />;
     case "think":
@@ -382,29 +302,14 @@ function renderToolCard(
  *  kinds, consults the active agent profile's alias table so adapter
  *  tools that don't take advantage of `ToolKind` (codex `shell`,
  *  gemini `run_shell_command`, etc.) still land on the right card. */
-function resolveEffectiveKind(
-  tool: ToolCall,
-  reclassifiedKind: string,
-  profile: AgentProfile,
-): string {
-  const known: ReadonlySet<string> = new Set([
-    "execute",
-    "read",
-    "edit",
-    "delete",
-    "search",
-    "fetch",
-    "think",
-  ]);
+function resolveEffectiveKind(tool: ToolCall, reclassifiedKind: string, profile: AgentProfile): string {
+  const known: ReadonlySet<string> = new Set(["execute", "read", "edit", "delete", "search", "fetch", "think"]);
   if (known.has(reclassifiedKind)) {
     return reclassifiedKind;
   }
   const name = tool.name?.trim() ?? "";
   if (!name) return reclassifiedKind;
-  for (const [card, aliases] of Object.entries(profile.aliases) as [
-    CardKind,
-    string[],
-  ][]) {
+  for (const [card, aliases] of Object.entries(profile.aliases) as [CardKind, string[]][]) {
     if (aliases.some((alias) => alias === name)) {
       return card;
     }
@@ -458,14 +363,12 @@ function statusFor(result?: ActivityRow): Status {
 // every untouched card without a useEffect.
 function useToolCardExpansion(status: Status, defaultOpen = false) {
   const density = useToolDisplayMode();
-  const baseline =
-    status === "err" ? true : density === "compact" ? false : defaultOpen;
+  const baseline = status === "err" ? true : density === "compact" ? false : defaultOpen;
   const [override, setOverride] = useState<{
     density: ToolDensity;
     open: boolean;
   } | null>(null);
-  const active =
-    override && override.density === density ? override.open : null;
+  const active = override && override.density === density ? override.open : null;
   const open = active ?? baseline;
   const setOpen = useCallback(
     (action: SetStateAction<boolean>) => {
@@ -601,23 +504,14 @@ function CardChrome({
       >
         <StatusDot status={status} neutral={showNeutral} />
         <span className="text-text-dim">{icon}</span>
-        <span className="text-[11px] uppercase tracking-wider text-text-dim">
-          {label}
-        </span>
-        <span className="min-w-0 flex-1 truncate font-mono text-xs text-text-secondary">
-          {primary}
-        </span>
+        <span className="text-[11px] uppercase tracking-wider text-text-dim">{label}</span>
+        <span className="min-w-0 flex-1 truncate font-mono text-xs text-text-secondary">{primary}</span>
         {meta}
-        {showToolDurations && startedAt && (
-          <DurationLabel startedAt={startedAt} endedAt={endedAt} />
-        )}
+        {showToolDurations && startedAt && <DurationLabel startedAt={startedAt} endedAt={endedAt} />}
         {!showNeutral && <StatusBadge status={status} />}
         {onToggle && (
           <ChevronDown
-            className={[
-              "h-3.5 w-3.5 text-text-dim transition-transform",
-              expanded ? "rotate-180" : "",
-            ].join(" ")}
+            className={["h-3.5 w-3.5 text-text-dim transition-transform", expanded ? "rotate-180" : ""].join(" ")}
           />
         )}
       </Header>
@@ -632,13 +526,7 @@ function CardChrome({
  *  elapsed time grow. Tooltip names the known measurement
  *  imprecision (see `CardChromeProps.startedAt`) so users who notice
  *  "sleep 1 took 3s" find the explanation in-place. */
-function DurationLabel({
-  startedAt,
-  endedAt,
-}: {
-  startedAt: string;
-  endedAt?: string;
-}) {
+function DurationLabel({ startedAt, endedAt }: { startedAt: string; endedAt?: string }) {
   const running = !endedAt;
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
@@ -724,25 +612,14 @@ function unwrapMarkdownFence(text: string): {
   return { text: m[2] ?? "", lang: m[1] ?? null };
 }
 
-function HighlightedBlock({
-  text,
-  language,
-  maxLines = 20,
-}: {
-  text: string;
-  language?: string;
-  maxLines?: number;
-}) {
+function HighlightedBlock({ text, language, maxLines = 20 }: { text: string; language?: string; maxLines?: number }) {
   const [html, setHtml] = useState<string | null>(null);
   const [showAll, setShowAll] = useState(false);
   const shiki = useShikiTheme();
   const unwrapped = unwrapMarkdownFence(text);
   const effectiveText = unwrapped.text;
   const effectiveLang = unwrapped.lang ?? language;
-  const { shown, truncated } = truncateLines(
-    effectiveText,
-    showAll ? 1_000_000 : maxLines,
-  );
+  const { shown, truncated } = truncateLines(effectiveText, showAll ? 1_000_000 : maxLines);
 
   // ANSI fast path: when the text carries SGR escape sequences (e.g.
   // `gls --color=always`, `git status --color=always`), Shiki's bash
@@ -759,10 +636,7 @@ function HighlightedBlock({
       try {
         const langKey = langKeyForExt(effectiveLang) ?? effectiveLang;
         await loadLanguage(langKey);
-        const resolvedTheme = await ensureThemeLoaded(
-          shiki.theme,
-          shiki.appearance,
-        );
+        const resolvedTheme = await ensureThemeLoaded(shiki.theme, shiki.appearance);
         const hl = await getHighlighter();
         if (cancelled) return;
         const out = hl.codeToHtml(shown, {
@@ -914,9 +788,7 @@ function ReadToolCard({ tool, result }: Props) {
   const [open, setOpen] = useToolCardExpansion(status);
 
   const meta = content && (
-    <span className="hidden md:inline text-[11px] text-text-dim">
-      {content.split("\n").length} lines
-    </span>
+    <span className="hidden md:inline text-[11px] text-text-dim">{content.split("\n").length} lines</span>
   );
 
   return (
@@ -934,14 +806,10 @@ function ReadToolCard({ tool, result }: Props) {
         </>
       }
       expanded={open}
-      onToggle={
-        status === "err" || content ? () => setOpen((v) => !v) : undefined
-      }
+      onToggle={status === "err" || content ? () => setOpen((v) => !v) : undefined}
       body={
         <ToolErrorBody status={status} errorText={result?.text}>
-          {content && status !== "err" && (
-            <HighlightedBlock text={content} language={ext} maxLines={16} />
-          )}
+          {content && status !== "err" && <HighlightedBlock text={content} language={ext} maxLines={16} />}
         </ToolErrorBody>
       }
     />
@@ -971,18 +839,13 @@ function EditToolCard({ tool, result }: Props) {
   const structuredDiffs = tool.diffs ?? [];
   const hasStructuredDiffs = structuredDiffs.length > 0;
   const legacyOld = pickStr(args, "old_string", "oldString", "old_str") ?? "";
-  const legacyNew =
-    pickStr(args, "new_string", "newString", "new_str", "content") ?? "";
+  const legacyNew = pickStr(args, "new_string", "newString", "new_str", "content") ?? "";
   const hasLegacyDiff = legacyOld !== "" || legacyNew !== "";
-  const path =
-    pickFirst(structuredDiffs[0]?.path, argPath, title, tool.name) ??
-    "(unknown file)";
+  const path = pickFirst(structuredDiffs[0]?.path, argPath, title, tool.name) ?? "(unknown file)";
   const [open, setOpen] = useToolCardExpansion(status);
   const hasDiff = hasStructuredDiffs || hasLegacyDiff;
   // "edit" when a prior version existed, "write" for a fresh file.
-  const isEdit = hasStructuredDiffs
-    ? structuredDiffs.some((d) => (d.old_text ?? "") !== "")
-    : legacyOld !== "";
+  const isEdit = hasStructuredDiffs ? structuredDiffs.some((d) => (d.old_text ?? "") !== "") : legacyOld !== "";
   const verb = isEdit ? "edit" : "write";
   const multiFile = structuredDiffs.length > 1;
 
@@ -1001,8 +864,7 @@ function EditToolCard({ tool, result }: Props) {
   }, [tool.diffs, legacyOld, legacyNew]);
   const meta = hasDiff && (adds > 0 || dels > 0) && (
     <span className="hidden md:inline text-[11px]">
-      <span className="text-emerald-400">+{adds}</span>{" "}
-      <span className="text-rose-400">−{dels}</span>
+      <span className="text-emerald-400">+{adds}</span> <span className="text-rose-400">−{dels}</span>
     </span>
   );
 
@@ -1020,36 +882,22 @@ function EditToolCard({ tool, result }: Props) {
       primary={multiFile ? `${path} +${structuredDiffs.length - 1} more` : path}
       meta={errorChip ? undefined : meta}
       expanded={open}
-      onToggle={
-        status === "err" || hasDiff ? () => setOpen((v) => !v) : undefined
-      }
+      onToggle={status === "err" || hasDiff ? () => setOpen((v) => !v) : undefined}
       body={
         <ToolErrorBody status={status} errorText={result?.text}>
           {hasStructuredDiffs ? (
             <div className="border-t border-surface-800 bg-surface-950">
               {structuredDiffs.map((d, i) => (
                 <div key={`${d.path}-${i}`}>
-                  {multiFile && (
-                    <div className="px-2 py-1 text-[11px] text-text-dim">
-                      {d.path}
-                    </div>
-                  )}
-                  <StringDiff
-                    oldText={d.old_text ?? ""}
-                    newText={d.new_text ?? ""}
-                    filePath={d.path}
-                  />
+                  {multiFile && <div className="px-2 py-1 text-[11px] text-text-dim">{d.path}</div>}
+                  <StringDiff oldText={d.old_text ?? ""} newText={d.new_text ?? ""} filePath={d.path} />
                 </div>
               ))}
             </div>
           ) : (
             hasLegacyDiff && (
               <div className="border-t border-surface-800 bg-surface-950">
-                <StringDiff
-                  oldText={legacyOld}
-                  newText={legacyNew}
-                  filePath={path}
-                />
+                <StringDiff oldText={legacyOld} newText={legacyNew} filePath={path} />
               </div>
             )
           )}
@@ -1104,8 +952,7 @@ function SearchToolCard({ tool, result, provenance }: SearchProps) {
   const argQuery = pickStr(args, "query", "pattern", "q", "search");
   const argCommand = pickStr(args, "command");
   const title = pickStr(args, "_aoe_title");
-  const query =
-    pickFirst(argQuery, title, argCommand, tool.name) ?? "(no query)";
+  const query = pickFirst(argQuery, title, argCommand, tool.name) ?? "(no query)";
   const path = pickStr(args, "path", "directory", "scope");
   const output = result?.text ?? "";
   const lines = output ? output.split("\n").filter(Boolean) : [];
@@ -1121,11 +968,7 @@ function SearchToolCard({ tool, result, provenance }: SearchProps) {
       primary={query}
       meta={
         <>
-          {path && (
-            <span className="hidden md:inline text-[11px] text-text-dim">
-              in {path}
-            </span>
-          )}
+          {path && <span className="hidden md:inline text-[11px] text-text-dim">in {path}</span>}
           {lines.length > 0 && (
             <span className="text-[11px] text-text-dim">
               {lines.length} match{lines.length === 1 ? "" : "es"}
@@ -1134,26 +977,15 @@ function SearchToolCard({ tool, result, provenance }: SearchProps) {
         </>
       }
       expanded={open}
-      onToggle={
-        status === "err" || lines.length > 0
-          ? () => setOpen((v) => !v)
-          : undefined
-      }
+      onToggle={status === "err" || lines.length > 0 ? () => setOpen((v) => !v) : undefined}
       body={
         <ToolErrorBody status={status} errorText={result?.text}>
           {lines.length > 0 && status !== "err" && (
             <div className="border-t border-surface-800 bg-surface-950 max-h-64 overflow-y-auto">
               {lines.slice(0, 50).map((l, i) => (
-                <div
-                  key={i}
-                  className="flex font-mono text-[11px] hover:bg-surface-900"
-                >
-                  <span className="select-none w-10 shrink-0 px-2 py-0.5 text-right text-text-dim">
-                    {i + 1}
-                  </span>
-                  <span className="px-2 py-0.5 text-text-secondary truncate">
-                    {l}
-                  </span>
+                <div key={i} className="flex font-mono text-[11px] hover:bg-surface-900">
+                  <span className="select-none w-10 shrink-0 px-2 py-0.5 text-right text-text-dim">{i + 1}</span>
+                  <span className="px-2 py-0.5 text-text-secondary truncate">{l}</span>
                 </div>
               ))}
               {lines.length > 50 && (
@@ -1190,14 +1022,10 @@ function FetchToolCard({ tool, result }: Props) {
       label="fetch"
       primary={url}
       expanded={open}
-      onToggle={
-        status === "err" || output ? () => setOpen((v) => !v) : undefined
-      }
+      onToggle={status === "err" || output ? () => setOpen((v) => !v) : undefined}
       body={
         <ToolErrorBody status={status} errorText={result?.text}>
-          {output && status !== "err" && (
-            <HighlightedBlock text={output} language="json" maxLines={16} />
-          )}
+          {output && status !== "err" && <HighlightedBlock text={output} language="json" maxLines={16} />}
         </ToolErrorBody>
       }
     />
@@ -1300,16 +1128,9 @@ function TodoList({ todos }: { todos: TodoItem[] }) {
     <div className="border-t border-surface-800 bg-surface-950 px-3 py-2">
       <ul className="flex flex-col gap-1 font-mono text-xs">
         {todos.map((t, i) => (
-          <li
-            key={`${i}-${t.content}`}
-            className={`flex items-start gap-2 ${TODO_CLASS[t.status]}`}
-          >
-            <span className="select-none w-4 shrink-0 text-center">
-              {TODO_GLYPH[t.status]}
-            </span>
-            <span className="min-w-0 flex-1 whitespace-pre-wrap break-words">
-              {t.content}
-            </span>
+          <li key={`${i}-${t.content}`} className={`flex items-start gap-2 ${TODO_CLASS[t.status]}`}>
+            <span className="select-none w-4 shrink-0 text-center">{TODO_GLYPH[t.status]}</span>
+            <span className="min-w-0 flex-1 whitespace-pre-wrap break-words">{t.content}</span>
           </li>
         ))}
       </ul>
@@ -1331,11 +1152,7 @@ function TodoUpdateCard({ tool, result, todos }: TodoCardProps) {
       primary={
         <>
           <span>{todos.length} items</span>
-          {breakdown.length > 0 && (
-            <span className="ml-2 text-text-dim">
-              · {breakdown.join(" · ")}
-            </span>
-          )}
+          {breakdown.length > 0 && <span className="ml-2 text-text-dim">· {breakdown.join(" · ")}</span>}
         </>
       }
       expanded={open}
@@ -1369,9 +1186,7 @@ export function TodoGroupCard({ items }: { items: TodoGroupChild[] }) {
       items
         .map((it) => {
           const c = classifyTodoWrite(it.tool, profile);
-          return c.isTodoWrite
-            ? { tool: it.tool, result: it.result, todos: c.todos }
-            : null;
+          return c.isTodoWrite ? { tool: it.tool, result: it.result, todos: c.todos } : null;
         })
         .filter(
           (
@@ -1393,24 +1208,13 @@ export function TodoGroupCard({ items }: { items: TodoGroupChild[] }) {
   // surfaces as an error rather than looking clean. See #1468.
   const latestAttempt = snapshots[snapshots.length - 1]!;
   const latestSuccessful =
-    [...snapshots]
-      .reverse()
-      .find(
-        (s) =>
-          s.result?.kind !== "tool_error" && s.result?.kind !== "tool_stopped",
-      ) ?? null;
+    [...snapshots].reverse().find((s) => s.result?.kind !== "tool_error" && s.result?.kind !== "tool_stopped") ?? null;
   const previewSnapshot = latestSuccessful ?? latestAttempt;
   const latestFailed = latestAttempt.result?.kind === "tool_error";
   const latestStopped = latestAttempt.result?.kind === "tool_stopped";
   const breakdown = todoBreakdown(todoCounts(previewSnapshot.todos));
   const running = snapshots.some((s) => !s.result);
-  const status: Status = running
-    ? "running"
-    : latestFailed
-      ? "err"
-      : latestStopped
-        ? "stopped"
-        : "ok";
+  const status: Status = running ? "running" : latestFailed ? "err" : latestStopped ? "stopped" : "ok";
 
   const startedAt = snapshots
     .map((s) => s.tool.started_at)
@@ -1433,31 +1237,18 @@ export function TodoGroupCard({ items }: { items: TodoGroupChild[] }) {
       primary={
         <>
           <span>updated {snapshots.length} times</span>
-          {breakdown.length > 0 && (
-            <span className="ml-2 text-text-dim">
-              · {breakdown.join(" · ")}
-            </span>
-          )}
+          {breakdown.length > 0 && <span className="ml-2 text-text-dim">· {breakdown.join(" · ")}</span>}
         </>
       }
       expanded={open}
       onToggle={() => setOpen((v) => !v)}
       startedAt={startedAt}
       endedAt={endedAt}
-      subBody={
-        previewSnapshot.result?.kind === "tool_error" ? undefined : (
-          <TodoList todos={previewSnapshot.todos} />
-        )
-      }
+      subBody={previewSnapshot.result?.kind === "tool_error" ? undefined : <TodoList todos={previewSnapshot.todos} />}
       body={
         <div className="border-t border-surface-800 bg-surface-900/30 px-2 py-1">
           {snapshots.map((s) => (
-            <TodoUpdateCard
-              key={s.tool.id}
-              tool={s.tool}
-              result={s.result}
-              todos={s.todos}
-            />
+            <TodoUpdateCard key={s.tool.id} tool={s.tool} result={s.result} todos={s.todos} />
           ))}
         </div>
       }
@@ -1473,10 +1264,7 @@ export function TodoGroupCard({ items }: { items: TodoGroupChild[] }) {
  *  reclassify on (case-insensitive) name + args presence so the structured view
  *  shows what skill ran without making the user expand a JSON blob.
  *  See #1062. */
-function classifySkill(
-  tool: ToolCall,
-  profile: AgentProfile,
-): { isSkill: true; name: string } | { isSkill: false } {
+function classifySkill(tool: ToolCall, profile: AgentProfile): { isSkill: true; name: string } | { isSkill: false } {
   if (tool.kind !== "other") return { isSkill: false };
   const title = tool.name?.trim().toLowerCase() ?? "";
   const names = profile.specialTitles.skillNames;
@@ -1495,10 +1283,7 @@ function SkillToolCard({ tool, result, skillName }: SkillProps) {
   const [open, setOpen] = useToolCardExpansion(status);
   // Memo on the raw string so downstream memos see a stable args reference
   // and don't recompute every render.
-  const args = useMemo(
-    () => parseJsonObject(tool.args_preview),
-    [tool.args_preview],
-  );
+  const args = useMemo(() => parseJsonObject(tool.args_preview), [tool.args_preview]);
   const output = result?.text ?? "";
 
   // Pretty-printed input minus the bookkeeping _aoe_title field so the
@@ -1522,29 +1307,23 @@ function SkillToolCard({ tool, result, skillName }: SkillProps) {
       label="skill"
       primary={skillName}
       expanded={open}
-      onToggle={
-        status === "err" || hasBody ? () => setOpen((v) => !v) : undefined
-      }
+      onToggle={status === "err" || hasBody ? () => setOpen((v) => !v) : undefined}
       startedAt={tool.started_at}
       endedAt={result?.at}
       body={
         <ToolErrorBody status={status} errorText={result?.text}>
-          {args &&
-            Object.keys(args).filter((k) => !isAcpBookkeepingKey(k)).length >
-              0 && (
-              <div className="border-t border-surface-800 bg-surface-950 px-3 py-2">
-                <div className="mb-1 flex items-center justify-between text-[10px] uppercase tracking-wider text-text-dim">
-                  <span>input</span>
-                  <CopyButton text={inputJson} />
-                </div>
-                <pre className="overflow-x-auto font-mono text-[11px] text-text-muted whitespace-pre-wrap break-all">
-                  {inputJson}
-                </pre>
+          {args && Object.keys(args).filter((k) => !isAcpBookkeepingKey(k)).length > 0 && (
+            <div className="border-t border-surface-800 bg-surface-950 px-3 py-2">
+              <div className="mb-1 flex items-center justify-between text-[10px] uppercase tracking-wider text-text-dim">
+                <span>input</span>
+                <CopyButton text={inputJson} />
               </div>
-            )}
-          {output && status !== "err" && (
-            <HighlightedBlock text={output} language="markdown" maxLines={16} />
+              <pre className="overflow-x-auto font-mono text-[11px] text-text-muted whitespace-pre-wrap break-all">
+                {inputJson}
+              </pre>
+            </div>
           )}
+          {output && status !== "err" && <HighlightedBlock text={output} language="markdown" maxLines={16} />}
         </ToolErrorBody>
       }
     />
@@ -1567,9 +1346,7 @@ interface ToolGroupItem {
  *  phases. See #1057. */
 export function ToolGroupCard({ items }: { items: ToolGroupItem[] }) {
   const runningCount = items.filter((i) => !i.result).length;
-  const errorCount = items.filter(
-    (i) => i.result && i.result.kind === "tool_error",
-  ).length;
+  const errorCount = items.filter((i) => i.result && i.result.kind === "tool_error").length;
   // No err rollup on the group header. A single failed child in an
   // 11-step investigation doesn't make the whole investigation
   // failed; per-child status stays on the inner cards. See #1102.
@@ -1608,9 +1385,7 @@ export function ToolGroupCard({ items }: { items: ToolGroupItem[] }) {
       primary={
         <>
           <span>{items.length} actions</span>
-          {breakdown && (
-            <span className="ml-2 text-text-dim">· {breakdown}</span>
-          )}
+          {breakdown && <span className="ml-2 text-text-dim">· {breakdown}</span>}
         </>
       }
       expanded={open}
@@ -1619,11 +1394,7 @@ export function ToolGroupCard({ items }: { items: ToolGroupItem[] }) {
         open && (
           <div className="border-t border-surface-800 bg-surface-900/30 px-2 py-1">
             {items.map((item) => (
-              <ToolCard
-                key={item.tool.id}
-                tool={item.tool}
-                result={item.result}
-              />
+              <ToolCard key={item.tool.id} tool={item.tool} result={item.result} />
             ))}
           </div>
         )
@@ -1652,12 +1423,8 @@ interface SubagentProps {
 export function SubagentCard({ tool, result, children }: SubagentProps) {
   const [open, setOpen] = useState(false);
 
-  const args = useMemo(
-    () => parseJsonObject(tool.args_preview),
-    [tool.args_preview],
-  );
-  const description =
-    pickStr(args, "description", "_aoe_title") ?? tool.name ?? "Subagent task";
+  const args = useMemo(() => parseJsonObject(tool.args_preview), [tool.args_preview]);
+  const description = pickStr(args, "description", "_aoe_title") ?? tool.name ?? "Subagent task";
 
   const runningChildren = children.filter((c) => !c.result).length;
   const parentDone = result !== undefined;
@@ -1667,20 +1434,13 @@ export function SubagentCard({ tool, result, children }: SubagentProps) {
   // as #1102 spotted on tool groups; let the per-child card carry
   // the actionable signal instead of marking the whole subagent
   // "failed".
-  const status: Status =
-    !parentDone || runningChildren > 0
-      ? "running"
-      : parentErrored
-        ? "err"
-        : "ok";
+  const status: Status = !parentDone || runningChildren > 0 ? "running" : parentErrored ? "err" : "ok";
 
   // Span the earliest started_at across the parent and any children
   // (children typically start slightly after the parent) and the
   // latest completion. Mirrors ToolGroupCard so the duration label
   // reflects total subagent runtime.
-  const startedAt = [tool.started_at, ...children.map((c) => c.tool.started_at)]
-    .sort()
-    .at(0);
+  const startedAt = [tool.started_at, ...children.map((c) => c.tool.started_at)].sort().at(0);
   const allDone = parentDone && children.every((c) => c.result !== undefined);
   const endedAt = allDone
     ? [result?.at ?? null, ...children.map((c) => c.result?.at ?? null)]
@@ -1710,18 +1470,9 @@ export function SubagentCard({ tool, result, children }: SubagentProps) {
         open && (
           <div className="border-t border-surface-800 bg-surface-900/30 px-2 py-1">
             {children.length === 0 ? (
-              <div className="px-2 py-1 text-[11px] text-text-dim">
-                No tool calls recorded yet.
-              </div>
+              <div className="px-2 py-1 text-[11px] text-text-dim">No tool calls recorded yet.</div>
             ) : (
-              children.map((c) => (
-                <ToolCard
-                  key={c.tool.id}
-                  tool={c.tool}
-                  result={c.result}
-                  nested
-                />
-              ))
+              children.map((c) => <ToolCard key={c.tool.id} tool={c.tool} result={c.result} nested />)
             )}
           </div>
         )
@@ -1730,10 +1481,7 @@ export function SubagentCard({ tool, result, children }: SubagentProps) {
   );
 }
 
-function summariseKinds(
-  items: ToolGroupItem[],
-  errorCount: number = 0,
-): string | null {
+function summariseKinds(items: ToolGroupItem[], errorCount: number = 0): string | null {
   const counts = new Map<string, number>();
   for (const i of items) {
     const k = labelForKind(i.kind);
@@ -1784,10 +1532,7 @@ function McpToolCard({ tool, result, server, verb }: McpProps) {
   const [open, setOpen] = useToolCardExpansion(status);
   // Memo on the raw string so downstream memos see a stable args reference
   // and don't recompute every render.
-  const args = useMemo(
-    () => parseJsonObject(tool.args_preview),
-    [tool.args_preview],
-  );
+  const args = useMemo(() => parseJsonObject(tool.args_preview), [tool.args_preview]);
   const output = result?.text ?? "";
 
   // Pull a short single-field arg preview for the header so the user
@@ -1830,33 +1575,25 @@ function McpToolCard({ tool, result, server, verb }: McpProps) {
       primary={
         <>
           {humanizeVerb(verb)}
-          {argPreview && (
-            <span className="ml-2 text-text-dim">· {argPreview}</span>
-          )}
+          {argPreview && <span className="ml-2 text-text-dim">· {argPreview}</span>}
         </>
       }
       expanded={open}
-      onToggle={
-        status === "err" || hasBody ? () => setOpen((v) => !v) : undefined
-      }
+      onToggle={status === "err" || hasBody ? () => setOpen((v) => !v) : undefined}
       body={
         <ToolErrorBody status={status} errorText={result?.text}>
-          {args &&
-            Object.keys(args).filter((k) => !isAcpBookkeepingKey(k)).length >
-              0 && (
-              <div className="border-t border-surface-800 bg-surface-950 px-3 py-2">
-                <div className="mb-1 flex items-center justify-between text-[10px] uppercase tracking-wider text-text-dim">
-                  <span>input</span>
-                  <CopyButton text={inputJson} />
-                </div>
-                <pre className="overflow-x-auto font-mono text-[11px] text-text-muted whitespace-pre-wrap break-all">
-                  {inputJson}
-                </pre>
+          {args && Object.keys(args).filter((k) => !isAcpBookkeepingKey(k)).length > 0 && (
+            <div className="border-t border-surface-800 bg-surface-950 px-3 py-2">
+              <div className="mb-1 flex items-center justify-between text-[10px] uppercase tracking-wider text-text-dim">
+                <span>input</span>
+                <CopyButton text={inputJson} />
               </div>
-            )}
-          {output && status !== "err" && (
-            <HighlightedBlock text={output} language="markdown" maxLines={24} />
+              <pre className="overflow-x-auto font-mono text-[11px] text-text-muted whitespace-pre-wrap break-all">
+                {inputJson}
+              </pre>
+            </div>
           )}
+          {output && status !== "err" && <HighlightedBlock text={output} language="markdown" maxLines={24} />}
         </ToolErrorBody>
       }
     />
@@ -1878,32 +1615,20 @@ function MemoryCard({ tool, result, hit }: MemoryCardProps) {
   const status = statusFor(result);
   const [open, setOpen] = useToolCardExpansion(status);
 
-  const args = useMemo(
-    () => parseJsonObject(tool.args_preview),
-    [tool.args_preview],
-  );
+  const args = useMemo(() => parseJsonObject(tool.args_preview), [tool.args_preview]);
 
   const content = useMemo<string>(() => {
     if (hit.verb === "recalled") return result?.text ?? "";
-    const fromArgs =
-      pickStr(args, "new_string", "newString", "new_str", "content") ?? "";
+    const fromArgs = pickStr(args, "new_string", "newString", "new_str", "content") ?? "";
     return fromArgs;
   }, [hit.verb, args, result?.text]);
 
-  const parsed = useMemo(
-    () => (content ? parseMemoryFrontmatter(content) : null),
-    [content],
-  );
+  const parsed = useMemo(() => (content ? parseMemoryFrontmatter(content) : null), [content]);
 
-  const verbLabel =
-    hit.isIndex && hit.verb === "recalled" ? "read index" : hit.verb;
+  const verbLabel = hit.isIndex && hit.verb === "recalled" ? "read index" : hit.verb;
   const headerLabel = hit.isIndex ? "Memory index" : "Memory";
 
-  const meta = parsed?.type && (
-    <span className="hidden md:inline text-[11px] text-text-dim">
-      {parsed.type}
-    </span>
-  );
+  const meta = parsed?.type && <span className="hidden md:inline text-[11px] text-text-dim">{parsed.type}</span>;
 
   const hasBody = Boolean(content);
 
@@ -1922,9 +1647,7 @@ function MemoryCard({ tool, result, hit }: MemoryCardProps) {
       }
       meta={meta}
       expanded={open}
-      onToggle={
-        status === "err" || hasBody ? () => setOpen((v) => !v) : undefined
-      }
+      onToggle={status === "err" || hasBody ? () => setOpen((v) => !v) : undefined}
       body={
         <ToolErrorBody status={status} errorText={result?.text}>
           {hasBody && parsed && status !== "err" ? (
@@ -1946,20 +1669,12 @@ function MemoryCard({ tool, result, hit }: MemoryCardProps) {
                   {parsed.description && (
                     <>
                       <dt className="text-text-dim">description</dt>
-                      <dd className="text-text-secondary">
-                        {parsed.description}
-                      </dd>
+                      <dd className="text-text-secondary">{parsed.description}</dd>
                     </>
                   )}
                 </dl>
               )}
-              {parsed.body && (
-                <HighlightedBlock
-                  text={parsed.body}
-                  language="markdown"
-                  maxLines={24}
-                />
-              )}
+              {parsed.body && <HighlightedBlock text={parsed.body} language="markdown" maxLines={24} />}
             </div>
           ) : null}
         </ToolErrorBody>
@@ -2021,9 +1736,7 @@ function MemoryRecallCard({ tool, result }: Props) {
       label="Memory recall"
       primary={primary}
       expanded={open}
-      onToggle={
-        status === "err" || hasBody ? () => setOpen((v) => !v) : undefined
-      }
+      onToggle={status === "err" || hasBody ? () => setOpen((v) => !v) : undefined}
       body={
         <ToolErrorBody status={status} errorText={result?.text}>
           {status !== "err" && hasBody ? (
@@ -2036,10 +1749,7 @@ function MemoryRecallCard({ tool, result }: Props) {
                   {synthesized}
                 </pre>
               ) : (
-                <ul
-                  data-testid="memory-recall-paths"
-                  className="space-y-0.5 text-[11px] text-text-secondary"
-                >
+                <ul data-testid="memory-recall-paths" className="space-y-0.5 text-[11px] text-text-secondary">
                   {paths.map((p) => (
                     <li key={p} className="break-all font-mono">
                       {p}
@@ -2129,10 +1839,7 @@ interface ScheduleProps extends Props {
 function ScheduleToolCard({ tool, result, kind }: ScheduleProps) {
   const status = statusFor(result);
   const [open, setOpen] = useToolCardExpansion(status);
-  const args = useMemo(
-    () => parseJsonObject(tool.args_preview),
-    [tool.args_preview],
-  );
+  const args = useMemo(() => parseJsonObject(tool.args_preview), [tool.args_preview]);
   const output = result?.text ?? "";
 
   // Hide the bookkeeping fields and (for wakeup) the `prompt` field:
@@ -2151,9 +1858,7 @@ function ScheduleToolCard({ tool, result, kind }: ScheduleProps) {
 
   const hasRawInput = useMemo(() => {
     if (!args) return Boolean(tool.args_preview);
-    return Object.keys(args).some(
-      (k) => !isAcpBookkeepingKey(k) && !(kind === "wakeup" && k === "prompt"),
-    );
+    return Object.keys(args).some((k) => !isAcpBookkeepingKey(k) && !(kind === "wakeup" && k === "prompt"));
   }, [args, tool.args_preview, kind]);
 
   let icon: React.ReactNode;
@@ -2164,24 +1869,16 @@ function ScheduleToolCard({ tool, result, kind }: ScheduleProps) {
   if (kind === "wakeup") {
     const delayRaw = args ? args["delaySeconds"] : undefined;
     const delaySeconds =
-      typeof delayRaw === "number"
-        ? delayRaw
-        : typeof delayRaw === "string"
-          ? Number(delayRaw)
-          : NaN;
+      typeof delayRaw === "number" ? delayRaw : typeof delayRaw === "string" ? Number(delayRaw) : NaN;
     const reason = pickStr(args, "reason");
     const started = Date.parse(tool.started_at);
     const wakeAt =
-      Number.isFinite(started) && Number.isFinite(delaySeconds)
-        ? new Date(started + delaySeconds * 1000)
-        : null;
+      Number.isFinite(started) && Number.isFinite(delaySeconds) ? new Date(started + delaySeconds * 1000) : null;
     icon = <Clock className="h-3.5 w-3.5" />;
     label = "scheduled wakeup";
     primary = (
       <span>
-        {Number.isFinite(delaySeconds)
-          ? `in ${formatDurationSeconds(delaySeconds)}`
-          : "scheduled"}
+        {Number.isFinite(delaySeconds) ? `in ${formatDurationSeconds(delaySeconds)}` : "scheduled"}
         {reason ? <span className="text-text-dim">: {reason}</span> : null}
       </span>
     );
@@ -2199,11 +1896,7 @@ function ScheduleToolCard({ tool, result, kind }: ScheduleProps) {
     label = "cron schedule created";
     primary = (
       <span>
-        {schedule ? (
-          <span className="font-mono">{schedule}</span>
-        ) : (
-          "schedule created"
-        )}
+        {schedule ? <span className="font-mono">{schedule}</span> : "schedule created"}
         {reason ? <span className="text-text-dim">: {reason}</span> : null}
       </span>
     );
@@ -2229,9 +1922,7 @@ function ScheduleToolCard({ tool, result, kind }: ScheduleProps) {
       primary={primary}
       meta={meta}
       expanded={open}
-      onToggle={
-        status === "err" || hasBody ? () => setOpen((v) => !v) : undefined
-      }
+      onToggle={status === "err" || hasBody ? () => setOpen((v) => !v) : undefined}
       startedAt={tool.started_at}
       endedAt={result?.at}
       body={
@@ -2279,11 +1970,7 @@ function GenericToolCard({ tool, result }: Props) {
       label={tool.kind || "tool"}
       primary={tool.name}
       expanded={open}
-      onToggle={
-        status === "err" || tool.args_preview || output
-          ? () => setOpen((v) => !v)
-          : undefined
-      }
+      onToggle={status === "err" || tool.args_preview || output ? () => setOpen((v) => !v) : undefined}
       body={
         <ToolErrorBody status={status} errorText={result?.text}>
           {tool.args_preview && (

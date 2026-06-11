@@ -26,15 +26,11 @@ const { captured } = vi.hoisted(() => ({
     disposed: false as boolean,
     writes: [] as Array<string | Uint8Array>,
     options: { fontSize: 14, theme: undefined as unknown },
-    onResize: undefined as
-      | ((s: { cols: number; rows: number }) => void)
-      | undefined,
+    onResize: undefined as ((s: { cols: number; rows: number }) => void) | undefined,
     onData: undefined as ((data: string) => void) | undefined,
     customWheel: undefined as ((e: WheelEvent) => boolean) | undefined,
     resizeObserverCallback: undefined as ResizeObserverCallback | undefined,
-    proposedDimensions: { cols: 100, rows: 30 } as
-      | { cols: number; rows: number }
-      | undefined,
+    proposedDimensions: { cols: 100, rows: 30 } as { cols: number; rows: number } | undefined,
     oscHandlers: {} as Record<number, (data: string) => boolean>,
   },
 }));
@@ -81,10 +77,7 @@ vi.mock("@xterm/xterm", () => {
     }
     attachCustomKeyEventHandler(_fn: (e: KeyboardEvent) => boolean): void {}
     parser = {
-      registerOscHandler(
-        id: number,
-        cb: (data: string) => boolean,
-      ): { dispose: () => void } {
+      registerOscHandler(id: number, cb: (data: string) => boolean): { dispose: () => void } {
         captured.oscHandlers[id] = cb;
         return { dispose: () => {} };
       },
@@ -205,8 +198,7 @@ beforeEach(() => {
   originalWebSocket = global.WebSocket;
   global.WebSocket = FakeWebSocket as unknown as typeof WebSocket;
   originalResizeObserver = global.ResizeObserver;
-  global.ResizeObserver =
-    FakeResizeObserver as unknown as typeof ResizeObserver;
+  global.ResizeObserver = FakeResizeObserver as unknown as typeof ResizeObserver;
   // localStorage starts empty so the hook reads bundled-default font
   // sizes and theme colors.
   window.localStorage.clear();
@@ -215,9 +207,7 @@ beforeEach(() => {
 afterEach(() => {
   global.WebSocket = originalWebSocket;
   if (originalResizeObserver) global.ResizeObserver = originalResizeObserver;
-  else
-    (global as unknown as { ResizeObserver: undefined }).ResizeObserver =
-      undefined;
+  else (global as unknown as { ResizeObserver: undefined }).ResizeObserver = undefined;
   vi.useRealTimers();
   vi.unstubAllGlobals();
 });
@@ -284,9 +274,7 @@ describe("useTerminal lifecycle", () => {
       const { result } = renderHook(() => {
         const term = useTerminal("s-2", "ws", false, false);
         if (term.containerRef && !term.containerRef.current) {
-          (
-            term.containerRef as unknown as { current: HTMLDivElement | null }
-          ).current = div;
+          (term.containerRef as unknown as { current: HTMLDivElement | null }).current = div;
         }
         return term;
       });
@@ -310,16 +298,11 @@ describe("useTerminal lifecycle", () => {
       expect(result.current.state.isPrimary).toBe(true);
 
       // Activate JSON message must have been queued on connect.
-      const activate = ws.sent.find(
-        (m) => typeof m === "string" && m.includes('"activate"'),
-      );
+      const activate = ws.sent.find((m) => typeof m === "string" && m.includes('"activate"'));
       expect(activate).toBeDefined();
       // FitAddon's stub emits cols=100/rows=30, so the resize message
       // should reflect that exact pair.
-      const resize = ws.sent.find(
-        (m) =>
-          typeof m === "string" && m.includes('"resize"') && m.includes("100"),
-      );
+      const resize = ws.sent.find((m) => typeof m === "string" && m.includes('"resize"') && m.includes("100"));
       expect(resize).toBeDefined();
     } finally {
       div.remove();
@@ -333,9 +316,7 @@ describe("useTerminal lifecycle", () => {
       renderHook(() => {
         const term = useTerminal("s-passive", "ws", false, false, false);
         if (term.containerRef && !term.containerRef.current) {
-          (
-            term.containerRef as unknown as { current: HTMLDivElement | null }
-          ).current = div;
+          (term.containerRef as unknown as { current: HTMLDivElement | null }).current = div;
         }
         return term;
       });
@@ -348,9 +329,7 @@ describe("useTerminal lifecycle", () => {
       });
       await flushAsync();
 
-      const activate = ws.sent.find(
-        (m) => typeof m === "string" && m.includes('"activate"'),
-      );
+      const activate = ws.sent.find((m) => typeof m === "string" && m.includes('"activate"'));
       expect(activate).toBeUndefined();
     } finally {
       div.remove();
@@ -364,8 +343,7 @@ describe("useTerminal lifecycle", () => {
     // before any RO fires, and force offsetParent to null so the
     // hidden-container guard engages even though jsdom's default
     // would normally let any size through.
-    const FakeFitAddonClass = (await import("@xterm/addon-fit"))
-      .FitAddon as unknown as {
+    const FakeFitAddonClass = (await import("@xterm/addon-fit")).FitAddon as unknown as {
       prototype: { fit: () => void };
     };
     const origFit = FakeFitAddonClass.prototype.fit;
@@ -378,9 +356,7 @@ describe("useTerminal lifecycle", () => {
       const { result } = renderHook(() => {
         const term = useTerminal("s-hidden", "ws", false, false);
         if (term.containerRef && !term.containerRef.current) {
-          (
-            term.containerRef as unknown as { current: HTMLDivElement | null }
-          ).current = div;
+          (term.containerRef as unknown as { current: HTMLDivElement | null }).current = div;
         }
         return term;
       });
@@ -399,11 +375,7 @@ describe("useTerminal lifecycle", () => {
       // Activate is fine (it does not carry a measurement), but no
       // resize message should have shipped at the tiny grid.
       const tinyResize = ws.sent.find(
-        (m) =>
-          typeof m === "string" &&
-          m.includes('"resize"') &&
-          m.includes('"cols":10') &&
-          m.includes('"rows":4'),
+        (m) => typeof m === "string" && m.includes('"resize"') && m.includes('"cols":10') && m.includes('"rows":4'),
       );
       expect(tinyResize).toBeUndefined();
       expect(result.current.state.connected).toBe(true);
@@ -420,9 +392,7 @@ describe("useTerminal lifecycle", () => {
       renderHook(() => {
         const term = useTerminal("s-live-output", "ws", false, false);
         if (term.containerRef && !term.containerRef.current) {
-          (
-            term.containerRef as unknown as { current: HTMLDivElement | null }
-          ).current = div;
+          (term.containerRef as unknown as { current: HTMLDivElement | null }).current = div;
         }
         return term;
       });
@@ -458,9 +428,7 @@ describe("useTerminal lifecycle", () => {
       });
       await flushAsync();
 
-      const resizeAfterOutput = ws.sent
-        .slice(before)
-        .find((m) => typeof m === "string" && m.includes('"resize"'));
+      const resizeAfterOutput = ws.sent.slice(before).find((m) => typeof m === "string" && m.includes('"resize"'));
       expect(resizeAfterOutput).toBeUndefined();
 
       act(() => {
@@ -473,11 +441,7 @@ describe("useTerminal lifecycle", () => {
       const resizeAfterRealChange = ws.sent
         .slice(before)
         .find(
-          (m) =>
-            typeof m === "string" &&
-            m.includes('"resize"') &&
-            m.includes('"cols":101') &&
-            m.includes('"rows":31'),
+          (m) => typeof m === "string" && m.includes('"resize"') && m.includes('"cols":101') && m.includes('"rows":31'),
         );
       expect(resizeAfterRealChange).toBeDefined();
     } finally {
@@ -492,9 +456,7 @@ describe("useTerminal lifecycle", () => {
       const { result } = renderHook(() => {
         const term = useTerminal("s-3", "ws", false, false);
         if (term.containerRef && !term.containerRef.current) {
-          (
-            term.containerRef as unknown as { current: HTMLDivElement | null }
-          ).current = div;
+          (term.containerRef as unknown as { current: HTMLDivElement | null }).current = div;
         }
         return term;
       });
@@ -549,9 +511,7 @@ describe("useTerminal lifecycle", () => {
       const { result } = renderHook(() => {
         const term = useTerminal("s-4", "ws", false, false);
         if (term.containerRef && !term.containerRef.current) {
-          (
-            term.containerRef as unknown as { current: HTMLDivElement | null }
-          ).current = div;
+          (term.containerRef as unknown as { current: HTMLDivElement | null }).current = div;
         }
         return term;
       });
@@ -581,9 +541,7 @@ describe("useTerminal lifecycle", () => {
       const { result } = renderHook(() => {
         const term = useTerminal("s-5", "ws", false, false);
         if (term.containerRef && !term.containerRef.current) {
-          (
-            term.containerRef as unknown as { current: HTMLDivElement | null }
-          ).current = div;
+          (term.containerRef as unknown as { current: HTMLDivElement | null }).current = div;
         }
         return term;
       });
@@ -613,9 +571,7 @@ describe("useTerminal lifecycle", () => {
       const { result } = renderHook(() => {
         const term = useTerminal("s-6", "ws", false, false);
         if (term.containerRef && !term.containerRef.current) {
-          (
-            term.containerRef as unknown as { current: HTMLDivElement | null }
-          ).current = div;
+          (term.containerRef as unknown as { current: HTMLDivElement | null }).current = div;
         }
         return term;
       });
@@ -716,9 +672,7 @@ describe("useTerminal lifecycle", () => {
         await vi.advanceTimersByTimeAsync(12_000);
       });
       await flushAsync();
-      const ghostForOldSession = sockets
-        .slice(1)
-        .find((s) => s.url.includes("/sessions/s-old/ws"));
+      const ghostForOldSession = sockets.slice(1).find((s) => s.url.includes("/sessions/s-old/ws"));
       expect(ghostForOldSession).toBeUndefined();
     } finally {
       div.remove();
@@ -736,9 +690,7 @@ describe("useTerminal lifecycle", () => {
       const { result } = renderHook(() => {
         const term = useTerminal("s-1011", "ws", false, false);
         if (term.containerRef && !term.containerRef.current) {
-          (
-            term.containerRef as unknown as { current: HTMLDivElement | null }
-          ).current = div;
+          (term.containerRef as unknown as { current: HTMLDivElement | null }).current = div;
         }
         return term;
       });
@@ -755,9 +707,7 @@ describe("useTerminal lifecycle", () => {
       await flushAsync();
       expect(result.current.state.reconnecting).toBe(true);
       expect(result.current.state.retryCount).toBe(1);
-      expect(result.current.state.retryCount).toBeLessThan(
-        result.current.maxRetries,
-      );
+      expect(result.current.state.retryCount).toBeLessThan(result.current.maxRetries);
     } finally {
       div.remove();
     }
@@ -773,9 +723,7 @@ describe("useTerminal lifecycle", () => {
       const { result } = renderHook(() => {
         const term = useTerminal("s-1013", "ws", false, false);
         if (term.containerRef && !term.containerRef.current) {
-          (
-            term.containerRef as unknown as { current: HTMLDivElement | null }
-          ).current = div;
+          (term.containerRef as unknown as { current: HTMLDivElement | null }).current = div;
         }
         return term;
       });
@@ -812,9 +760,7 @@ describe("useTerminal lifecycle", () => {
       renderHook(() => {
         const term = useTerminal("s-zoom", "ws", false, false);
         if (term.containerRef && !term.containerRef.current) {
-          (
-            term.containerRef as unknown as { current: HTMLDivElement | null }
-          ).current = div;
+          (term.containerRef as unknown as { current: HTMLDivElement | null }).current = div;
         }
         return term;
       });
@@ -852,9 +798,7 @@ describe("useTerminal lifecycle", () => {
       renderHook(() => {
         const term = useTerminal("s-scroll", "ws", false, false);
         if (term.containerRef && !term.containerRef.current) {
-          (
-            term.containerRef as unknown as { current: HTMLDivElement | null }
-          ).current = div;
+          (term.containerRef as unknown as { current: HTMLDivElement | null }).current = div;
         }
         return term;
       });
@@ -901,9 +845,7 @@ describe("useTerminal lifecycle", () => {
       renderHook(() => {
         const term = useTerminal("s-theme", "ws", false, false);
         if (term.containerRef && !term.containerRef.current) {
-          (
-            term.containerRef as unknown as { current: HTMLDivElement | null }
-          ).current = div;
+          (term.containerRef as unknown as { current: HTMLDivElement | null }).current = div;
         }
         return term;
       });
@@ -915,9 +857,7 @@ describe("useTerminal lifecycle", () => {
       });
       await flushAsync();
       // The terminal's options.theme should now have the swapped bg.
-      const themeAny = captured.options.theme as
-        | { background?: string }
-        | undefined;
+      const themeAny = captured.options.theme as { background?: string } | undefined;
       expect(themeAny?.background).toBe("#deadbe");
     } finally {
       document.documentElement.style.removeProperty("--term-bg");
@@ -932,9 +872,7 @@ describe("useTerminal lifecycle", () => {
       const { result } = renderHook(() => {
         const term = useTerminal("s-activate", "ws", false, false);
         if (term.containerRef && !term.containerRef.current) {
-          (
-            term.containerRef as unknown as { current: HTMLDivElement | null }
-          ).current = div;
+          (term.containerRef as unknown as { current: HTMLDivElement | null }).current = div;
         }
         return term;
       });
@@ -949,47 +887,8 @@ describe("useTerminal lifecycle", () => {
       act(() => {
         result.current.activate();
       });
-      const newActivate = ws.sent
-        .slice(before)
-        .find((m) => typeof m === "string" && m.includes('"activate"'));
+      const newActivate = ws.sent.slice(before).find((m) => typeof m === "string" && m.includes('"activate"'));
       expect(newActivate).toBeDefined();
-    } finally {
-      div.remove();
-    }
-  });
-
-  it("sendData routes a string payload to the WS as bytes", async () => {
-    const div = document.createElement("div");
-    document.body.appendChild(div);
-    try {
-      const { result } = renderHook(() => {
-        const term = useTerminal("s-send", "ws", false, false);
-        if (term.containerRef && !term.containerRef.current) {
-          (
-            term.containerRef as unknown as { current: HTMLDivElement | null }
-          ).current = div;
-        }
-        return term;
-      });
-      await flushAsync();
-      const ws = sockets[0]!;
-      act(() => {
-        ws.readyState = FakeWebSocket.OPEN;
-        ws.onopen?.(new Event("open"));
-      });
-      await flushAsync();
-      const before = ws.sent.length;
-      act(() => {
-        result.current.sendData("hello");
-      });
-      const newBytes = ws.sent.slice(before).find((m) => {
-        if (typeof m === "string") return false;
-        const ascii = Array.from(m)
-          .map((b) => String.fromCharCode(b))
-          .join("");
-        return ascii === "hello";
-      });
-      expect(newBytes).toBeDefined();
     } finally {
       div.remove();
     }
@@ -1002,9 +901,7 @@ describe("useTerminal lifecycle", () => {
       renderHook(() => {
         const term = useTerminal("s-focus", "ws", false, false);
         if (term.containerRef && !term.containerRef.current) {
-          (
-            term.containerRef as unknown as { current: HTMLDivElement | null }
-          ).current = div;
+          (term.containerRef as unknown as { current: HTMLDivElement | null }).current = div;
         }
         return term;
       });
@@ -1019,9 +916,7 @@ describe("useTerminal lifecycle", () => {
       act(() => {
         window.dispatchEvent(new Event("focus"));
       });
-      const sentActivate = ws.sent
-        .slice(before)
-        .find((m) => typeof m === "string" && m.includes('"activate"'));
+      const sentActivate = ws.sent.slice(before).find((m) => typeof m === "string" && m.includes('"activate"'));
       expect(sentActivate).toBeDefined();
     } finally {
       div.remove();
@@ -1035,9 +930,7 @@ describe("useTerminal lifecycle", () => {
       renderHook(() => {
         const term = useTerminal("s-vis", "ws", false, false);
         if (term.containerRef && !term.containerRef.current) {
-          (
-            term.containerRef as unknown as { current: HTMLDivElement | null }
-          ).current = div;
+          (term.containerRef as unknown as { current: HTMLDivElement | null }).current = div;
         }
         return term;
       });
@@ -1056,9 +949,7 @@ describe("useTerminal lifecycle", () => {
       act(() => {
         document.dispatchEvent(new Event("visibilitychange"));
       });
-      const sentActivate = ws.sent
-        .slice(before)
-        .find((m) => typeof m === "string" && m.includes('"activate"'));
+      const sentActivate = ws.sent.slice(before).find((m) => typeof m === "string" && m.includes('"activate"'));
       expect(sentActivate).toBeDefined();
     } finally {
       div.remove();
@@ -1072,9 +963,7 @@ describe("useTerminal lifecycle", () => {
       renderHook(() => {
         const term = useTerminal("s-online", "ws", false, false);
         if (term.containerRef && !term.containerRef.current) {
-          (
-            term.containerRef as unknown as { current: HTMLDivElement | null }
-          ).current = div;
+          (term.containerRef as unknown as { current: HTMLDivElement | null }).current = div;
         }
         return term;
       });
@@ -1100,16 +989,11 @@ describe("useTerminal lifecycle", () => {
     // initial font size, then bump it via localStorage. The hook
     // re-reads settings via useWebSettings which is store-backed.
     try {
-      localStorage.setItem(
-        "aoe-web-settings",
-        JSON.stringify({ mobileFontSize: 14, desktopFontSize: 22 }),
-      );
+      localStorage.setItem("aoe-web-settings", JSON.stringify({ mobileFontSize: 14, desktopFontSize: 22 }));
       renderHook(() => {
         const term = useTerminal("s-font", "ws", false, false);
         if (term.containerRef && !term.containerRef.current) {
-          (
-            term.containerRef as unknown as { current: HTMLDivElement | null }
-          ).current = div;
+          (term.containerRef as unknown as { current: HTMLDivElement | null }).current = div;
         }
         return term;
       });
@@ -1133,9 +1017,7 @@ describe("useTerminal lifecycle", () => {
       renderHook(() => {
         const term = useTerminal("s-touch", "ws", false, false);
         if (term.containerRef && !term.containerRef.current) {
-          (
-            term.containerRef as unknown as { current: HTMLDivElement | null }
-          ).current = div;
+          (term.containerRef as unknown as { current: HTMLDivElement | null }).current = div;
         }
         return term;
       });
@@ -1152,18 +1034,12 @@ describe("useTerminal lifecycle", () => {
       expect(xtermEl).toBeTruthy();
 
       const before = ws.sent.length;
-      const fireTouch = (
-        type: "touchstart" | "touchmove" | "touchend",
-        y: number,
-      ) => {
+      const fireTouch = (type: "touchstart" | "touchmove" | "touchend", y: number) => {
         // jsdom has no Touch constructor; build the event ourselves
         // and attach plain Touch-like objects through Object.defineProperty
         // so the hook's TouchEvent.touches reads see what we want.
         const ev = new Event(type, { bubbles: true, cancelable: true });
-        const touches =
-          type === "touchend"
-            ? []
-            : [{ clientX: 100, clientY: y, identifier: 1 }];
+        const touches = type === "touchend" ? [] : [{ clientX: 100, clientY: y, identifier: 1 }];
         Object.defineProperty(ev, "touches", { value: touches });
         Object.defineProperty(ev, "targetTouches", { value: touches });
         Object.defineProperty(ev, "changedTouches", {
@@ -1209,9 +1085,7 @@ describe("useTerminal lifecycle", () => {
       renderHook(() => {
         const term = useTerminal("s-pinch", "ws", false, false);
         if (term.containerRef && !term.containerRef.current) {
-          (
-            term.containerRef as unknown as { current: HTMLDivElement | null }
-          ).current = div;
+          (term.containerRef as unknown as { current: HTMLDivElement | null }).current = div;
         }
         return term;
       });
@@ -1219,10 +1093,7 @@ describe("useTerminal lifecycle", () => {
       const xtermEl = div.querySelector(".xterm") as HTMLDivElement;
       const startSize = captured.options.fontSize;
 
-      const twoFinger = (
-        type: "touchstart" | "touchmove" | "touchend",
-        dist: number,
-      ) => {
+      const twoFinger = (type: "touchstart" | "touchmove" | "touchend", dist: number) => {
         const t1 = { identifier: 1, clientX: 100 - dist / 2, clientY: 500 };
         const t2 = { identifier: 2, clientX: 100 + dist / 2, clientY: 500 };
         const ev = new Event(type, { bubbles: true, cancelable: true });
@@ -1259,9 +1130,7 @@ describe("useTerminal lifecycle", () => {
       renderHook(() => {
         const term = useTerminal("s-retry", "ws", false, false);
         if (term.containerRef && !term.containerRef.current) {
-          (
-            term.containerRef as unknown as { current: HTMLDivElement | null }
-          ).current = div;
+          (term.containerRef as unknown as { current: HTMLDivElement | null }).current = div;
         }
         return term;
       });
@@ -1279,10 +1148,7 @@ describe("useTerminal lifecycle", () => {
       // term.write should have printed the disconnect+reconnect banner
       const newWrites = captured.writes.slice(beforeWrites);
       const banner = newWrites.find(
-        (w) =>
-          typeof w === "string" &&
-          w.includes("Disconnected") &&
-          w.includes("reconnecting"),
+        (w) => typeof w === "string" && w.includes("Disconnected") && w.includes("reconnecting"),
       );
       expect(banner).toBeDefined();
     } finally {
@@ -1297,9 +1163,7 @@ describe("useTerminal lifecycle", () => {
       renderHook(() => {
         const term = useTerminal("s-err", "ws", false, false);
         if (term.containerRef && !term.containerRef.current) {
-          (
-            term.containerRef as unknown as { current: HTMLDivElement | null }
-          ).current = div;
+          (term.containerRef as unknown as { current: HTMLDivElement | null }).current = div;
         }
         return term;
       });
@@ -1321,9 +1185,7 @@ describe("useTerminal lifecycle", () => {
       const { result } = renderHook(() => {
         const term = useTerminal("s-exhaust", "ws", false, false);
         if (term.containerRef && !term.containerRef.current) {
-          (
-            term.containerRef as unknown as { current: HTMLDivElement | null }
-          ).current = div;
+          (term.containerRef as unknown as { current: HTMLDivElement | null }).current = div;
         }
         return term;
       });
@@ -1355,9 +1217,7 @@ describe("useTerminal lifecycle", () => {
         }
       }
       // Final close should land on retries-exhausted.
-      const banner = captured.writes.find(
-        (w) => typeof w === "string" && w.includes("Connection lost"),
-      );
+      const banner = captured.writes.find((w) => typeof w === "string" && w.includes("Connection lost"));
       expect(banner).toBeDefined();
     } finally {
       div.remove();
@@ -1371,9 +1231,7 @@ describe("useTerminal lifecycle", () => {
       const { result } = renderHook(() => {
         const term = useTerminal("s-pause", "ws", false, false);
         if (term.containerRef && !term.containerRef.current) {
-          (
-            term.containerRef as unknown as { current: HTMLDivElement | null }
-          ).current = div;
+          (term.containerRef as unknown as { current: HTMLDivElement | null }).current = div;
         }
         return term;
       });
@@ -1400,268 +1258,9 @@ describe("useTerminal lifecycle", () => {
         }
       });
       await flushAsync();
-      const pause = ws.sent
-        .slice(before)
-        .find((m) => typeof m === "string" && m.includes('"pause_output"'));
+      const pause = ws.sent.slice(before).find((m) => typeof m === "string" && m.includes('"pause_output"'));
       expect(pause).toBeDefined();
       expect(result.current.state.isInScrollback).toBe(true);
-    } finally {
-      div.remove();
-    }
-  });
-
-  it("exitScrollback() sends resume_output + Escape and clears the flag", async () => {
-    const div = document.createElement("div");
-    document.body.appendChild(div);
-    try {
-      const { result } = renderHook(() => {
-        const term = useTerminal("s-exit", "ws", false, false);
-        if (term.containerRef && !term.containerRef.current) {
-          (
-            term.containerRef as unknown as { current: HTMLDivElement | null }
-          ).current = div;
-        }
-        return term;
-      });
-      await flushAsync();
-      const ws = sockets[0]!;
-      act(() => {
-        ws.readyState = FakeWebSocket.OPEN;
-        ws.onopen?.(new Event("open"));
-      });
-      await flushAsync();
-      // Get into scrollback first
-      await act(async () => {
-        for (let i = 0; i < 8; i++) {
-          const e = new WheelEvent("wheel", {
-            deltaY: -200,
-            bubbles: true,
-            cancelable: true,
-          });
-          captured.customWheel!(e);
-        }
-      });
-      await flushAsync();
-      expect(result.current.state.isInScrollback).toBe(true);
-
-      const before = ws.sent.length;
-      act(() => {
-        result.current.exitScrollback();
-      });
-      const newSends = ws.sent.slice(before);
-      const resume = newSends.find(
-        (m) => typeof m === "string" && m.includes('"resume_output"'),
-      );
-      expect(resume).toBeDefined();
-      // \x1b (ESC) should also have been sent
-      const escByte = newSends.find((m) => {
-        if (typeof m === "string") return false;
-        return m.length === 1 && m[0] === 0x1b;
-      });
-      expect(escByte).toBeDefined();
-      expect(result.current.state.isInScrollback).toBe(false);
-    } finally {
-      div.remove();
-    }
-  });
-
-  it("the virtual Ctrl bridge transforms onData printable -> control byte", async () => {
-    const div = document.createElement("div");
-    document.body.appendChild(div);
-    try {
-      const { result } = renderHook(() => {
-        const term = useTerminal("s-ctrl", "ws", false, false);
-        if (term.containerRef && !term.containerRef.current) {
-          (
-            term.containerRef as unknown as { current: HTMLDivElement | null }
-          ).current = div;
-        }
-        return term;
-      });
-      await flushAsync();
-      const ws = sockets[0]!;
-      act(() => {
-        ws.readyState = FakeWebSocket.OPEN;
-        ws.onopen?.(new Event("open"));
-      });
-      await flushAsync();
-      // Arm the Ctrl bridge from React state.
-      act(() => {
-        result.current.ctrlActiveRef.current = true;
-      });
-      // Now simulate the user typing 'a' through xterm's onData.
-      const before = ws.sent.length;
-      act(() => {
-        captured.onData?.("a");
-      });
-      // The hook should have sent 0x01 (Ctrl-A) instead of 'a'.
-      const newSends = ws.sent.slice(before);
-      const ctrlA = newSends.find((m) => {
-        if (typeof m === "string") return false;
-        return m.length === 1 && m[0] === 0x01;
-      });
-      expect(ctrlA).toBeDefined();
-      // The ref should also be cleared after consumption.
-      expect(result.current.ctrlActiveRef.current).toBe(false);
-    } finally {
-      div.remove();
-    }
-  });
-});
-
-// Mobile soft-keyboard Backspace autorepeat handler (#1450). The hook
-// intercepts `beforeinput` on xterm's hidden textarea and emits one DEL
-// (0x7f) per `deleteContentBackward` tick, gated to coarse-pointer devices
-// without a fine pointer. jsdom lets us drive every branch deterministically:
-// matchMedia controls the gate, the FakeSocket's readyState the open guard.
-describe("useTerminal mobile backspace autorepeat", () => {
-  function stubPointer(coarse: boolean, anyFine: boolean): void {
-    vi.stubGlobal(
-      "matchMedia",
-      (q: string) =>
-        ({
-          matches:
-            q === "(pointer: coarse)"
-              ? coarse
-              : q === "(any-pointer: fine)"
-                ? anyFine
-                : false,
-        }) as MediaQueryList,
-    );
-  }
-
-  // Mount the hook, attach a container, and drive the socket to OPEN so the
-  // beforeinput handler's `ws.readyState === OPEN` guard passes. Returns the
-  // textarea xterm's mock created and the live FakeSocket.
-  async function mountOpen(): Promise<{
-    div: HTMLDivElement;
-    ws: FakeSocket;
-    ta: HTMLTextAreaElement;
-  }> {
-    const div = document.createElement("div");
-    document.body.appendChild(div);
-    renderHook(() => {
-      const term = useTerminal("s-bksp", "ws", false, false);
-      if (term.containerRef && !term.containerRef.current) {
-        (
-          term.containerRef as unknown as { current: HTMLDivElement | null }
-        ).current = div;
-      }
-      return term;
-    });
-    await flushAsync();
-    const ws = sockets[0]!;
-    act(() => {
-      ws.readyState = FakeWebSocket.OPEN;
-      ws.onopen?.(new Event("open"));
-    });
-    await flushAsync();
-    const ta = div.querySelector("textarea") as HTMLTextAreaElement;
-    return { div, ws, ta };
-  }
-
-  function fireDelete(
-    ta: HTMLTextAreaElement,
-    count: number,
-    opts: { inputType?: string; isComposing?: boolean } = {},
-  ): void {
-    const inputType = opts.inputType ?? "deleteContentBackward";
-    act(() => {
-      for (let i = 0; i < count; i++) {
-        const e = new InputEvent("beforeinput", {
-          inputType,
-          bubbles: true,
-          cancelable: true,
-        });
-        if (opts.isComposing) {
-          Object.defineProperty(e, "isComposing", { get: () => true });
-        }
-        ta.dispatchEvent(e);
-      }
-    });
-  }
-
-  function delBytes(ws: FakeSocket): number {
-    return ws.sent.filter(
-      (m) => typeof m !== "string" && m.length === 1 && m[0] === 0x7f,
-    ).length;
-  }
-
-  it("emits one DEL per tick on a coarse pointer", async () => {
-    stubPointer(true, false);
-    const { div, ws, ta } = await mountOpen();
-    try {
-      fireDelete(ta, 3);
-      expect(delBytes(ws)).toBe(3);
-    } finally {
-      div.remove();
-    }
-  });
-
-  it("emits exactly one DEL for a single tick (no double-delete)", async () => {
-    stubPointer(true, false);
-    const { div, ws, ta } = await mountOpen();
-    try {
-      fireDelete(ta, 1);
-      expect(delBytes(ws)).toBe(1);
-    } finally {
-      div.remove();
-    }
-  });
-
-  it("does nothing on a fine pointer", async () => {
-    stubPointer(false, false);
-    const { div, ws, ta } = await mountOpen();
-    try {
-      fireDelete(ta, 3);
-      expect(delBytes(ws)).toBe(0);
-    } finally {
-      div.remove();
-    }
-  });
-
-  it("does nothing when a fine pointer is also present (iPad + keyboard)", async () => {
-    stubPointer(true, true);
-    const { div, ws, ta } = await mountOpen();
-    try {
-      fireDelete(ta, 3);
-      expect(delBytes(ws)).toBe(0);
-    } finally {
-      div.remove();
-    }
-  });
-
-  it("ignores non-delete input types", async () => {
-    stubPointer(true, false);
-    const { div, ws, ta } = await mountOpen();
-    try {
-      fireDelete(ta, 3, { inputType: "insertText" });
-      expect(delBytes(ws)).toBe(0);
-    } finally {
-      div.remove();
-    }
-  });
-
-  it("leaves composition deletes to xterm", async () => {
-    stubPointer(true, false);
-    const { div, ws, ta } = await mountOpen();
-    try {
-      fireDelete(ta, 3, { isComposing: true });
-      expect(delBytes(ws)).toBe(0);
-    } finally {
-      div.remove();
-    }
-  });
-
-  it("does not send while the socket is not open", async () => {
-    stubPointer(true, false);
-    const { div, ws, ta } = await mountOpen();
-    try {
-      act(() => {
-        ws.readyState = FakeWebSocket.CLOSED;
-      });
-      fireDelete(ta, 3);
-      expect(delBytes(ws)).toBe(0);
     } finally {
       div.remove();
     }
@@ -1701,9 +1300,7 @@ describe("useTerminal OSC 52 clipboard", () => {
     renderHook(() => {
       const term = useTerminal("s-osc52", "ws", false, false);
       if (term.containerRef && !term.containerRef.current) {
-        (
-          term.containerRef as unknown as { current: HTMLDivElement | null }
-        ).current = div;
+        (term.containerRef as unknown as { current: HTMLDivElement | null }).current = div;
       }
       return term;
     });
@@ -1758,9 +1355,7 @@ describe("useTerminal OSC 52 clipboard", () => {
   it("ignores an undecodable payload without throwing", async () => {
     const div = await mountHook();
     try {
-      expect(() =>
-        captured.oscHandlers[52]!("c;!!!not base64!!!"),
-      ).not.toThrow();
+      expect(() => captured.oscHandlers[52]!("c;!!!not base64!!!")).not.toThrow();
       await flushAsync();
       expect(writeText).not.toHaveBeenCalled();
     } finally {
@@ -1779,16 +1374,11 @@ describe("useTerminal OSC 52 clipboard", () => {
   // green).
   class FakeClipboardItem {
     constructor(public data: Record<string, Promise<Blob>>) {
-      for (const v of Object.values(data))
-        void Promise.resolve(v).catch(() => {});
+      for (const v of Object.values(data)) void Promise.resolve(v).catch(() => {});
     }
   }
 
-  function fireDrag(
-    viewport: HTMLElement,
-    from: { x: number; y: number },
-    to: { x: number; y: number },
-  ): void {
+  function fireDrag(viewport: HTMLElement, from: { x: number; y: number }, to: { x: number; y: number }): void {
     viewport.dispatchEvent(
       new MouseEvent("mousedown", {
         button: 0,

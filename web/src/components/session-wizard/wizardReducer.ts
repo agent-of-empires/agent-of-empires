@@ -79,6 +79,7 @@ export type Action =
   | { type: "SUBMIT_START" }
   | { type: "SUBMIT_ERROR"; error: string }
   | { type: "SUBMIT_SUCCESS" }
+  | { type: "SUBMIT_CANCEL" }
   | { type: "SET_AGENTS"; agents: AgentInfo[] }
   | { type: "SET_GROUPS"; groups: GroupInfo[] }
   | { type: "SET_PROFILES"; profiles: ProfileInfo[] }
@@ -134,10 +135,7 @@ export function reducer(state: WizardState, action: Action): WizardState {
         newData.worktreeBranch = slugifyBranch(String(action.value));
       }
       if (action.field === "worktreeBranch") {
-        const override = applyBranchOverride(
-          String(newData.title),
-          String(action.value),
-        );
+        const override = applyBranchOverride(String(newData.title), String(action.value));
         newData.worktreeBranch = override.worktreeBranch;
         newData.worktreeBranchDirty = override.worktreeBranchDirty;
       }
@@ -151,12 +149,8 @@ export function reducer(state: WizardState, action: Action): WizardState {
         newData.useWorktree = false;
       }
       if (
-        (action.field === "path" &&
-          typeof action.value === "string" &&
-          action.value.length > 0) ||
-        (action.field === "extraRepoPaths" &&
-          Array.isArray(action.value) &&
-          action.value.length > 0)
+        (action.field === "path" && typeof action.value === "string" && action.value.length > 0) ||
+        (action.field === "extraRepoPaths" && Array.isArray(action.value) && action.value.length > 0)
       ) {
         newData.scratch = false;
       }
@@ -169,16 +163,7 @@ export function reducer(state: WizardState, action: Action): WizardState {
       // no-profile guard would leave profileDirty false. The picker
       // path's window.confirm() also benefits: picking a profile after
       // unprofiled edits now prompts before overwriting.
-      if (
-        [
-          "yoloMode",
-          "sandboxEnabled",
-          "tool",
-          "extraEnv",
-          "agentModel",
-          "agentEffort",
-        ].includes(action.field)
-      ) {
+      if (["yoloMode", "sandboxEnabled", "tool", "extraEnv", "agentModel", "agentEffort"].includes(action.field)) {
         newData.profileDirty = true;
       }
       return { ...state, data: newData, error: null };
@@ -191,6 +176,10 @@ export function reducer(state: WizardState, action: Action): WizardState {
       return { ...state, isSubmitting: false, error: action.error };
     case "SUBMIT_SUCCESS":
       return { ...state, isSubmitting: false };
+    case "SUBMIT_CANCEL":
+      // User backed out of a pre-create confirmation (e.g. the glob
+      // volume_ignores modal); re-enable the submit button without an error.
+      return { ...state, isSubmitting: false, error: null };
     case "SET_AGENTS":
       return { ...state, agents: action.agents };
     case "SET_GROUPS":

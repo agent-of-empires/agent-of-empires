@@ -23,9 +23,7 @@ import { useEffect, useRef } from "react";
 /** Dictation burst state for the iOS-Safari native-mic input path
  *  (#1431). Tracks whether we are currently inside a sequence of
  *  `inputType: "insertReplacementText"` events. */
-export type DictationBurstState =
-  | { active: false }
-  | { active: true; sinceMs: number };
+export type DictationBurstState = { active: false } | { active: true; sinceMs: number };
 
 /** Event the composer feeds into {@link decideDictationAction}. The
  *  helper only needs the discriminator + the current monotonic clock
@@ -68,10 +66,7 @@ export const DICTATION_BURST_TIMEOUT_MS = 1200;
 /** Pure decision helper for the iOS-dictation burst state machine
  *  (#1431). The hook below mirrors this state in refs and applies the
  *  returned actions; tests exercise the matrix directly. */
-export function decideDictationAction(
-  prev: DictationBurstState,
-  ev: DictationEvent,
-): DictationDecision {
+export function decideDictationAction(prev: DictationBurstState, ev: DictationEvent): DictationDecision {
   if (ev.kind === "blur") {
     if (!prev.active) {
       return {
@@ -153,9 +148,7 @@ export interface DictationGuard {
 /** Builds a {@link DictationGuard} bound to a single `setText` sink.
  *  The hook owns three refs (state, buffered text, timer handle) and
  *  one cleanup effect that clears the timer on unmount. */
-export function useDictationBurstGuard(
-  setText: (text: string) => void,
-): DictationGuard {
+export function useDictationBurstGuard(setText: (text: string) => void): DictationGuard {
   const stateRef = useRef<DictationBurstState>({ active: false });
   const bufferRef = useRef<string | null>(null);
   const timerRef = useRef<number | null>(null);

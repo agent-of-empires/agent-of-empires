@@ -442,6 +442,58 @@ pub async fn mark_web_tour_seen(State(state): State<Arc<AppState>>) -> impl Into
     }
 }
 
+/// Records that the user has acknowledged glob `volume_ignores` snapshot
+/// expansion (#2045), so the new-session wizard's confirm modal is shown once
+/// and never again. Single-purpose write mirroring [`mark_web_tour_seen`]: it
+/// flips one bool, grants no capability, stays exempt from the elevation wall,
+/// and `read_only` still blocks it. `Config::load()` (not `load_or_warn`) keeps
+/// a corrupt config from being silently overwritten.
+pub async fn mark_volume_ignores_globs_acknowledged(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(
+                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
+            ),
+        )
+            .into_response();
+    }
+
+    let result = tokio::task::spawn_blocking(|| {
+        let mut config = crate::session::Config::load()?;
+        config.app_state.has_acknowledged_volume_ignores_globs = true;
+        crate::session::save_config(&config)?;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"has_acknowledged_volume_ignores_globs": true})),
+        )
+            .into_response(),
+        Ok(Err(e)) => {
+            tracing::warn!(target: "http.api.system", "Marking volume_ignores globs acknowledged failed: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "save_failed", "message": "Failed to persist acknowledgment"})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!(target: "http.api.system", "Marking volume_ignores globs acknowledged panicked: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
 // --- Themes ---
 
 pub async fn list_themes() -> Json<Vec<String>> {
@@ -779,6 +831,12 @@ pub struct ServerAbout {
     /// a glance, including PWA installs where the port disappears
     /// from the window chrome. See #1055.
     pub build_flavor: &'static str,
+    /// Content-hashed entry bundle name (`index-<hash>.js`) of the
+    /// embedded dashboard build. The client compares this against its
+    /// own entry script tag and offers a reload when they differ, so
+    /// installed PWAs (which have no refresh affordance) pick up new
+    /// dashboard code after the binary updates.
+    pub web_build_id: Option<&'static str>,
 }
 
 pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> {
@@ -810,6 +868,7 @@ pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> 
         } else {
             "release"
         },
+        web_build_id: crate::server::web_build_id(),
     })
 }
 

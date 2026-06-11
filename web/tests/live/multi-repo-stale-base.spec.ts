@@ -36,12 +36,7 @@ const GIT_ENV = {
   GIT_CONFIG_SYSTEM: "/dev/null",
 } as const;
 
-function run(
-  cmd: string,
-  args: string[],
-  cwd: string,
-  extraEnv: Record<string, string> = {},
-) {
+function run(cmd: string, args: string[], cwd: string, extraEnv: Record<string, string> = {}) {
   const res = spawnSync(cmd, args, {
     cwd,
     env: { ...process.env, ...GIT_ENV, ...extraEnv },
@@ -75,11 +70,7 @@ interface ForkUpstreamLayout {
  * Returns paths and tip commit OIDs. The local clone is what the user
  * passes to `aoe add` / `extra_repo_paths`.
  */
-function seedForkUpstreamLayout(
-  root: string,
-  name: string,
-  branch: string,
-): ForkUpstreamLayout {
+function seedForkUpstreamLayout(root: string, name: string, branch: string): ForkUpstreamLayout {
   const upstreamDir = join(root, `${name}-upstream`);
   const originDir = join(root, `${name}-origin`);
   const localDir = join(root, name);
@@ -87,16 +78,8 @@ function seedForkUpstreamLayout(
   mkdirSync(upstreamDir, { recursive: true });
   mkdirSync(originDir, { recursive: true });
 
-  run(
-    "git",
-    ["init", "--bare", "-q", `--initial-branch=${branch}`, upstreamDir],
-    root,
-  );
-  run(
-    "git",
-    ["init", "--bare", "-q", `--initial-branch=${branch}`, originDir],
-    root,
-  );
+  run("git", ["init", "--bare", "-q", `--initial-branch=${branch}`, upstreamDir], root);
+  run("git", ["init", "--bare", "-q", `--initial-branch=${branch}`, originDir], root);
 
   // Seed both with commit A from a scratch clone of upstream.
   const seedA = join(root, `${name}-seed-a`);
@@ -150,19 +133,14 @@ interface CreatedSession {
   }>;
 }
 
-async function createSession(
-  serve: ServeHandle,
-  body: Record<string, unknown>,
-): Promise<CreatedSession> {
+async function createSession(serve: ServeHandle, body: Record<string, unknown>): Promise<CreatedSession> {
   const res = await fetch(`${serve.baseUrl}/api/sessions`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
   if (!res.ok) {
-    throw new Error(
-      `POST /api/sessions failed: ${res.status} ${await res.text()}`,
-    );
+    throw new Error(`POST /api/sessions failed: ${res.status} ${await res.text()}`);
   }
   // Server returns the SessionResponse directly (web/src/lib/api.ts:615
   // wraps it as `{ session }` client-side). Don't wrap here.
@@ -190,214 +168,163 @@ function workspaceDir(home: string, branchSlug: string): string {
   const prefix = `${branchSlug}-workspace-`;
   const matches = readdirSync(home).filter((name) => name.startsWith(prefix));
   if (matches.length !== 1) {
-    throw new Error(
-      `expected exactly one ${prefix}* entry in ${home}, got: ${JSON.stringify(matches)}`,
-    );
+    throw new Error(`expected exactly one ${prefix}* entry in ${home}, got: ${JSON.stringify(matches)}`);
   }
   return join(home, matches[0]);
 }
 
-function multiRepoWorktreePath(
-  home: string,
-  branchSlug: string,
-  repoName: string,
-): string {
+function multiRepoWorktreePath(home: string, branchSlug: string, repoName: string): string {
   return join(workspaceDir(home, branchSlug), repoName);
 }
 
-base(
-  "single-repo: explicit base_branch branches off fresh upstream tip, not stale origin",
-  async ({}, testInfo) => {
-    let serve: ServeHandle | undefined;
-    try {
-      serve = await spawnAoeServe({
-        authMode: "none",
-        workerIndex: testInfo.workerIndex,
-        parallelIndex: testInfo.parallelIndex,
-        seedFn: ({ home }) => {
-          // Seed the fork+upstream layout under HOME so cleanup wipes
-          // it along with the rest of the isolated tree.
-          seedForkUpstreamLayout(home, "primary", "main");
-        },
-      });
+base("single-repo: explicit base_branch branches off fresh upstream tip, not stale origin", async ({}, testInfo) => {
+  let serve: ServeHandle | undefined;
+  try {
+    serve = await spawnAoeServe({
+      authMode: "none",
+      workerIndex: testInfo.workerIndex,
+      parallelIndex: testInfo.parallelIndex,
+      seedFn: ({ home }) => {
+        // Seed the fork+upstream layout under HOME so cleanup wipes
+        // it along with the rest of the isolated tree.
+        seedForkUpstreamLayout(home, "primary", "main");
+      },
+    });
 
-      // Reach into the home dir we just seeded. The harness exposes it
-      // on the handle so the test can compute paths the daemon will
-      // accept.
-      const layout = {
-        localPath: join(serve.home, "primary"),
-      };
-      const upstreamTip = run(
-        "git",
-        ["rev-parse", "upstream/main"],
-        layout.localPath,
-      );
+    // Reach into the home dir we just seeded. The harness exposes it
+    // on the handle so the test can compute paths the daemon will
+    // accept.
+    const layout = {
+      localPath: join(serve.home, "primary"),
+    };
+    const upstreamTip = run("git", ["rev-parse", "upstream/main"], layout.localPath);
 
-      const created = await createSession(serve, {
-        path: layout.localPath,
-        tool: "claude",
-        title: "stale-base-single",
-        worktree_branch: "feature/stale-base-single",
-        create_new_branch: true,
-        base_branch: "main",
-      });
+    const created = await createSession(serve, {
+      path: layout.localPath,
+      tool: "claude",
+      title: "stale-base-single",
+      worktree_branch: "feature/stale-base-single",
+      create_new_branch: true,
+      base_branch: "main",
+    });
 
-      expect(created.warnings ?? []).toEqual([]);
+    expect(created.warnings ?? []).toEqual([]);
 
-      const worktreePath = join(
-        serve.home,
-        "primary-worktrees",
-        "feature-stale-base-single",
-      );
-      const head = worktreeHead(worktreePath);
-      expect(head).toBe(upstreamTip);
-    } finally {
-      await serve?.stop();
-    }
-  },
-);
+    const worktreePath = join(serve.home, "primary-worktrees", "feature-stale-base-single");
+    const head = worktreeHead(worktreePath);
+    expect(head).toBe(upstreamTip);
+  } finally {
+    await serve?.stop();
+  }
+});
 
-base(
-  "multi-repo: secondary repo with fork+upstream layout branches off upstream tip",
-  async ({}, testInfo) => {
-    let serve: ServeHandle | undefined;
-    try {
-      serve = await spawnAoeServe({
-        authMode: "none",
-        workerIndex: testInfo.workerIndex,
-        parallelIndex: testInfo.parallelIndex,
-        seedFn: ({ home }) => {
-          seedForkUpstreamLayout(home, "primary", "main");
-          seedForkUpstreamLayout(home, "secondary", "main");
-        },
-      });
+base("multi-repo: secondary repo with fork+upstream layout branches off upstream tip", async ({}, testInfo) => {
+  let serve: ServeHandle | undefined;
+  try {
+    serve = await spawnAoeServe({
+      authMode: "none",
+      workerIndex: testInfo.workerIndex,
+      parallelIndex: testInfo.parallelIndex,
+      seedFn: ({ home }) => {
+        seedForkUpstreamLayout(home, "primary", "main");
+        seedForkUpstreamLayout(home, "secondary", "main");
+      },
+    });
 
-      const primary = join(serve.home, "primary");
-      const secondary = join(serve.home, "secondary");
-      const primaryUpstream = run(
-        "git",
-        ["rev-parse", "upstream/main"],
-        primary,
-      );
-      const secondaryUpstream = run(
-        "git",
-        ["rev-parse", "upstream/main"],
-        secondary,
-      );
+    const primary = join(serve.home, "primary");
+    const secondary = join(serve.home, "secondary");
+    const primaryUpstream = run("git", ["rev-parse", "upstream/main"], primary);
+    const secondaryUpstream = run("git", ["rev-parse", "upstream/main"], secondary);
 
-      const created = await createSession(serve, {
-        path: primary,
-        tool: "claude",
-        title: "stale-base-multi",
-        worktree_branch: "feature/stale-base-multi",
-        create_new_branch: true,
-        base_branch: "main",
-        extra_repo_paths: [secondary],
-      });
+    const created = await createSession(serve, {
+      path: primary,
+      tool: "claude",
+      title: "stale-base-multi",
+      worktree_branch: "feature/stale-base-multi",
+      create_new_branch: true,
+      base_branch: "main",
+      extra_repo_paths: [secondary],
+    });
 
-      expect(created.warnings ?? []).toEqual([]);
-      expect(created.workspace_repos).toBeDefined();
-      expect((created.workspace_repos ?? []).length).toBeGreaterThanOrEqual(2);
+    expect(created.warnings ?? []).toEqual([]);
+    expect(created.workspace_repos).toBeDefined();
+    expect((created.workspace_repos ?? []).length).toBeGreaterThanOrEqual(2);
 
-      // Each repo's worktree must land on its respective upstream tip.
-      // Multi-repo workspaces use the workspace template
-      // `../{branch}-workspace-{session-id}` with per-repo subdirs.
-      const primaryWorktree = multiRepoWorktreePath(
-        serve.home,
-        "feature-stale-base-multi",
-        "primary",
-      );
-      const secondaryWorktree = multiRepoWorktreePath(
-        serve.home,
-        "feature-stale-base-multi",
-        "secondary",
-      );
-      expect(worktreeHead(primaryWorktree)).toBe(primaryUpstream);
-      expect(worktreeHead(secondaryWorktree)).toBe(secondaryUpstream);
-    } finally {
-      await serve?.stop();
-    }
-  },
-);
+    // Each repo's worktree must land on its respective upstream tip.
+    // Multi-repo workspaces use the workspace template
+    // `../{branch}-workspace-{session-id}` with per-repo subdirs.
+    const primaryWorktree = multiRepoWorktreePath(serve.home, "feature-stale-base-multi", "primary");
+    const secondaryWorktree = multiRepoWorktreePath(serve.home, "feature-stale-base-multi", "secondary");
+    expect(worktreeHead(primaryWorktree)).toBe(primaryUpstream);
+    expect(worktreeHead(secondaryWorktree)).toBe(secondaryUpstream);
+  } finally {
+    await serve?.stop();
+  }
+});
 
-base(
-  "multi-repo: per-repo fetch failure surfaces as warning, session still created",
-  async ({}, testInfo) => {
-    let serve: ServeHandle | undefined;
-    try {
-      serve = await spawnAoeServe({
-        authMode: "none",
-        workerIndex: testInfo.workerIndex,
-        parallelIndex: testInfo.parallelIndex,
-        seedFn: ({ home }) => {
-          // Primary is a healthy repo with one commit.
-          const primary = join(home, "primary");
-          mkdirSync(primary, { recursive: true });
-          run("git", ["init", "-q", "--initial-branch=main", primary], home);
-          writeFileSync(join(primary, "file.txt"), "hi\n");
-          run("git", ["add", "file.txt"], primary);
-          run("git", ["commit", "-q", "-m", "init"], primary);
+base("multi-repo: per-repo fetch failure surfaces as warning, session still created", async ({}, testInfo) => {
+  let serve: ServeHandle | undefined;
+  try {
+    serve = await spawnAoeServe({
+      authMode: "none",
+      workerIndex: testInfo.workerIndex,
+      parallelIndex: testInfo.parallelIndex,
+      seedFn: ({ home }) => {
+        // Primary is a healthy repo with one commit.
+        const primary = join(home, "primary");
+        mkdirSync(primary, { recursive: true });
+        run("git", ["init", "-q", "--initial-branch=main", primary], home);
+        writeFileSync(join(primary, "file.txt"), "hi\n");
+        run("git", ["add", "file.txt"], primary);
+        run("git", ["commit", "-q", "-m", "init"], primary);
 
-          // Secondary repo has a misconfigured `origin` remote pointing
-          // at a non-existent path. `git fetch origin main` exits
-          // non-zero; the new code path surfaces this as a warning
-          // instead of failing the session.
-          const secondary = join(home, "secondary");
-          mkdirSync(secondary, { recursive: true });
-          run("git", ["init", "-q", "--initial-branch=main", secondary], home);
-          writeFileSync(join(secondary, "file.txt"), "hi\n");
-          run("git", ["add", "file.txt"], secondary);
-          run("git", ["commit", "-q", "-m", "init"], secondary);
-          run(
-            "git",
-            ["remote", "add", "origin", join(home, "does-not-exist.git")],
-            secondary,
-          );
-        },
-      });
+        // Secondary repo has a misconfigured `origin` remote pointing
+        // at a non-existent path. `git fetch origin main` exits
+        // non-zero; the new code path surfaces this as a warning
+        // instead of failing the session.
+        const secondary = join(home, "secondary");
+        mkdirSync(secondary, { recursive: true });
+        run("git", ["init", "-q", "--initial-branch=main", secondary], home);
+        writeFileSync(join(secondary, "file.txt"), "hi\n");
+        run("git", ["add", "file.txt"], secondary);
+        run("git", ["commit", "-q", "-m", "init"], secondary);
+        run("git", ["remote", "add", "origin", join(home, "does-not-exist.git")], secondary);
+      },
+    });
 
-      const primary = join(serve.home, "primary");
-      const secondary = join(serve.home, "secondary");
+    const primary = join(serve.home, "primary");
+    const secondary = join(serve.home, "secondary");
 
-      const created = await createSession(serve, {
-        path: primary,
-        tool: "claude",
-        title: "fetch-fail",
-        worktree_branch: "feature/fetch-fail",
-        create_new_branch: true,
-        extra_repo_paths: [secondary],
-      });
+    const created = await createSession(serve, {
+      path: primary,
+      tool: "claude",
+      title: "fetch-fail",
+      worktree_branch: "feature/fetch-fail",
+      create_new_branch: true,
+      extra_repo_paths: [secondary],
+    });
 
-      const warnings = created.warnings ?? [];
-      // The warning shape comes from `record_fetch_warning` in
-      // src/git/worktree.rs: `git fetch {remote} {branch} failed for
-      // {repo}: {detail}`. Pin the format so a future rewording of
-      // the warning forces this test to be reconsidered (it's a
-      // user-facing string the wizard pipes to a toast).
-      const warningPattern = new RegExp(
-        `^git fetch \\S+ \\S+ failed for ${secondary.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}: .+`,
-      );
-      const secondaryWarning = warnings.find((w) => warningPattern.test(w));
-      expect(
-        secondaryWarning,
-        `expected warning matching ${warningPattern} for ${secondary}, got: ${JSON.stringify(warnings)}`,
-      ).toBeDefined();
+    const warnings = created.warnings ?? [];
+    // The warning shape comes from `record_fetch_warning` in
+    // src/git/worktree.rs: `git fetch {remote} {branch} failed for
+    // {repo}: {detail}`. Pin the format so a future rewording of
+    // the warning forces this test to be reconsidered (it's a
+    // user-facing string the wizard pipes to a toast).
+    const warningPattern = new RegExp(
+      `^git fetch \\S+ \\S+ failed for ${secondary.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}: .+`,
+    );
+    const secondaryWarning = warnings.find((w) => warningPattern.test(w));
+    expect(
+      secondaryWarning,
+      `expected warning matching ${warningPattern} for ${secondary}, got: ${JSON.stringify(warnings)}`,
+    ).toBeDefined();
 
-      // Workspace was still created. Both worktree dirs exist.
-      const primaryWorktree = multiRepoWorktreePath(
-        serve.home,
-        "feature-fetch-fail",
-        "primary",
-      );
-      const secondaryWorktree = multiRepoWorktreePath(
-        serve.home,
-        "feature-fetch-fail",
-        "secondary",
-      );
-      expect(worktreeHead(primaryWorktree)).toBeTruthy();
-      expect(worktreeHead(secondaryWorktree)).toBeTruthy();
-    } finally {
-      await serve?.stop();
-    }
-  },
-);
+    // Workspace was still created. Both worktree dirs exist.
+    const primaryWorktree = multiRepoWorktreePath(serve.home, "feature-fetch-fail", "primary");
+    const secondaryWorktree = multiRepoWorktreePath(serve.home, "feature-fetch-fail", "secondary");
+    expect(worktreeHead(primaryWorktree)).toBeTruthy();
+    expect(worktreeHead(secondaryWorktree)).toBeTruthy();
+  } finally {
+    await serve?.stop();
+  }
+});

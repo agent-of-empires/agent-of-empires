@@ -17,11 +17,7 @@ vi.mock("../../lib/api", () => ({
   fetchContextPrimer: vi.fn(),
 }));
 
-import {
-  fetchAcpAgents,
-  switchAcpAgent,
-  fetchContextPrimer,
-} from "../../lib/api";
+import { fetchAcpAgents, switchAcpAgent, fetchContextPrimer } from "../../lib/api";
 
 const mockFetchAgents = vi.mocked(fetchAcpAgents);
 const mockSwitch = vi.mocked(switchAcpAgent);
@@ -58,11 +54,7 @@ describe("RateLimitRecoverySection", () => {
   it("modal stays closed by default and opens on the children trigger", async () => {
     const onPrefill = vi.fn();
     const { findByText, getByText, queryByText } = render(
-      <RateLimitRecoverySection
-        sessionId="s-1"
-        currentAgent="claude"
-        onPrefill={onPrefill}
-      >
+      <RateLimitRecoverySection sessionId="s-1" currentAgent="claude" onPrefill={onPrefill}>
         {({ onSwitchAgent }) => (
           <button type="button" onClick={onSwitchAgent}>
             handoff
@@ -80,11 +72,7 @@ describe("RateLimitRecoverySection", () => {
   it("forwards the handoff prefill text to onPrefill and closes", async () => {
     const onPrefill = vi.fn();
     const { findByText, getByText, queryByText } = render(
-      <RateLimitRecoverySection
-        sessionId="s-1"
-        currentAgent="claude"
-        onPrefill={onPrefill}
-      >
+      <RateLimitRecoverySection sessionId="s-1" currentAgent="claude" onPrefill={onPrefill}>
         {({ onSwitchAgent }) => (
           <button type="button" onClick={onSwitchAgent}>
             handoff
@@ -100,9 +88,7 @@ describe("RateLimitRecoverySection", () => {
     expect(prefilled).toContain("CONTEXT HANDOFF");
     expect(prefilled).toContain("deploy");
     // Modal closes after a successful switch.
-    await waitFor(() =>
-      expect(queryByText(/Continue in another agent\?/i)).toBeNull(),
-    );
+    await waitFor(() => expect(queryByText(/Continue in another agent\?/i)).toBeNull());
   });
 
   it("renders children with the current onSwitchAgent prop signature", () => {
@@ -113,11 +99,7 @@ describe("RateLimitRecoverySection", () => {
       return null;
     });
     render(
-      <RateLimitRecoverySection
-        sessionId="s-1"
-        currentAgent="claude"
-        onPrefill={onPrefill}
-      >
+      <RateLimitRecoverySection sessionId="s-1" currentAgent="claude" onPrefill={onPrefill}>
         {childrenFn}
       </RateLimitRecoverySection>,
     );

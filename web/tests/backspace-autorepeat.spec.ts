@@ -5,32 +5,28 @@ import { clickSidebarSession, openMobileSidebar } from "./helpers/sidebar";
 
 // Mobile soft-keyboard Backspace autorepeat arrives as a stream of
 // `beforeinput` events (inputType "deleteContentBackward") rather than the
-// repeated `keydown` autorepeat desktop OSes deliver. xterm decodes only the
-// first into a single onData, so the PTY used to receive one DEL no matter how
-// long Backspace was held. useTerminal now intercepts `beforeinput` on the
-// hidden textarea and emits one DEL (0x7f) per tick, gated to coarse-pointer
-// devices. See #1450.
+// repeated `keydown` autorepeat desktop OSes deliver. The mobile live view
+// listens for native `beforeinput` on its hidden input and emits one DEL
+// (0x7f) per tick; composition events are left to the IME until
+// compositionend. See #1450 for the original xterm-era bug.
 
 // Count the lone 0x7f bytes our handler emits, ignoring the JSON control
-// messages (activate / resize) that share the WS.
+// messages (resize / window / cadence) that share the WS.
 function delCount(handle: MockHandle, start: number) {
-  return handle.wsMessages
+  return handle.liveMessages
     .slice(start)
     .map((msg) => msg.toString("utf8"))
     .filter((s) => s === "\x7f").length;
 }
 
-// Dispatch N `beforeinput` ticks on xterm's real hidden textarea, mirroring a
-// held soft-keyboard Backspace. `isComposing` lets the IME case opt in.
-async function fireDeleteBackward(
-  page: Page,
-  count: number,
-  isComposing = false,
-) {
+// Dispatch N `beforeinput` ticks on the live view's hidden input,
+// mirroring a held soft-keyboard Backspace. `isComposing` lets the IME
+// case opt in.
+async function fireDeleteBackward(page: Page, count: number, isComposing = false) {
   await page.evaluate(
     ({ count, isComposing }) => {
-      const ta = document.querySelector<HTMLTextAreaElement>(".xterm textarea");
-      if (!ta) throw new Error("xterm textarea not found");
+      const ta = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Live terminal input"]');
+      if (!ta) throw new Error("live terminal input not found");
       ta.focus();
       for (let i = 0; i < count; i++) {
         const evt = new InputEvent("beforeinput", {
@@ -54,8 +50,7 @@ async function fireDeleteBackward(
 // a describe-level test.use (it would force a new worker), and the project
 // already pins chromium. We only want the iPhone 13 viewport / touch / UA so
 // `(pointer: coarse)` matches.
-const { defaultBrowserType: _iphoneBrowser, ...iPhone13 } =
-  devices["iPhone 13"];
+const { defaultBrowserType: _iphoneBrowser, ...iPhone13 } = devices["iPhone 13"];
 
 test.describe("Mobile soft-keyboard Backspace autorepeat", () => {
   test.use(iPhone13);
@@ -64,58 +59,41 @@ test.describe("Mobile soft-keyboard Backspace autorepeat", () => {
     await page.goto("/");
     await openMobileSidebar(page);
     await clickSidebarSession(page, "pinch-test");
-    // Desktop renders two `.xterm` nodes (agent + paired); scope to the first
-    // to avoid a strict-mode locator violation.
-    await page
-      .locator(".xterm")
-      .first()
-      .waitFor({ state: "visible", timeout: 10_000 });
-    await expect
-      .poll(() => handle.wsMessages.length, { timeout: 5_000 })
-      .toBeGreaterThan(0);
+    await page.locator("[data-live-terminal]").waitFor({ state: "visible", timeout: 10_000 });
+    await expect.poll(() => handle.liveMessages.length, { timeout: 5_000 }).toBeGreaterThan(0);
   }
 
-  test("holding Backspace sends one DEL per autorepeat tick", async ({
-    page,
-  }) => {
+  test("holding Backspace sends one DEL per autorepeat tick", async ({ page }) => {
     const handle = await mockTerminalApis(page);
     await openSession(page, handle);
 
-    const start = handle.wsMessages.length;
+    const start = handle.liveMessages.length;
     await fireDeleteBackward(page, 5);
 
     // Core bug: pre-fix this stream produced a single DEL (or none); post-fix
     // each tick maps to one DEL.
-    await expect
-      .poll(() => delCount(handle, start), { timeout: 5_000 })
-      .toBe(5);
+    await expect.poll(() => delCount(handle, start), { timeout: 5_000 }).toBe(5);
   });
 
-  test("single Backspace tap sends exactly one DEL (no double-delete)", async ({
-    page,
-  }) => {
+  test("single Backspace tap sends exactly one DEL (no double-delete)", async ({ page }) => {
     const handle = await mockTerminalApis(page);
     await openSession(page, handle);
 
-    const start = handle.wsMessages.length;
+    const start = handle.liveMessages.length;
     await fireDeleteBackward(page, 1);
 
     // Regression guard: if preventDefault failed to suppress xterm's own
     // decode, a single tap would emit two DELs. Settle, then assert exactly 1.
-    await expect
-      .poll(() => delCount(handle, start), { timeout: 5_000 })
-      .toBe(1);
+    await expect.poll(() => delCount(handle, start), { timeout: 5_000 }).toBe(1);
     await page.waitForTimeout(200);
     expect(delCount(handle, start)).toBe(1);
   });
 
-  test("Backspace during IME composition is left to xterm", async ({
-    page,
-  }) => {
+  test("Backspace during IME composition is left to xterm", async ({ page }) => {
     const handle = await mockTerminalApis(page);
     await openSession(page, handle);
 
-    const start = handle.wsMessages.length;
+    const start = handle.liveMessages.length;
     await fireDeleteBackward(page, 3, true);
 
     // isComposing ticks belong to xterm's composition path; our handler must
@@ -128,28 +106,16 @@ test.describe("Mobile soft-keyboard Backspace autorepeat", () => {
 test.describe("Desktop Backspace path unchanged", () => {
   test.use({ viewport: { width: 1280, height: 800 }, hasTouch: false });
 
-  test("fine-pointer beforeinput does not trigger the mobile handler", async ({
-    page,
-  }) => {
+  test("desktop keeps the xterm path; no live input is mounted", async ({ page }) => {
     const handle = await mockTerminalApis(page);
     await page.goto("/");
     await clickSidebarSession(page, "pinch-test");
-    // Desktop renders two `.xterm` nodes (agent + paired); scope to the first
-    // to avoid a strict-mode locator violation.
-    await page
-      .locator(".xterm")
-      .first()
-      .waitFor({ state: "visible", timeout: 10_000 });
-    await expect
-      .poll(() => handle.wsMessages.length, { timeout: 5_000 })
-      .toBeGreaterThan(0);
+    await page.locator(".xterm").first().waitFor({ state: "visible", timeout: 10_000 });
+    await expect.poll(() => handle.wsMessages.length, { timeout: 5_000 }).toBeGreaterThan(0);
 
-    const start = handle.wsMessages.length;
-    await fireDeleteBackward(page, 5);
-
-    // On a fine pointer the coarse-pointer gate is closed, so the handler is
-    // inert; the real desktop delete path runs through xterm's keydown decode.
-    await page.waitForTimeout(200);
-    expect(delCount(handle, start)).toBe(0);
+    // Fine pointer: the live view (and its beforeinput handler) does not
+    // exist; deletes run through xterm's own keydown decode.
+    await expect(page.locator('textarea[aria-label="Live terminal input"]')).toHaveCount(0);
+    expect(handle.liveMessages.length).toBe(0);
   });
 });

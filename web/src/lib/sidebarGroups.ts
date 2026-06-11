@@ -1,16 +1,7 @@
 import type { RepoColor } from "./repoAppearance";
-import type {
-  RepoGroup,
-  SessionResponse,
-  Workspace,
-  WorkspaceStatus,
-} from "./types";
+import type { RepoGroup, SessionResponse, Workspace, WorkspaceStatus } from "./types";
 import { isSessionActive } from "./session";
-import {
-  compareWorkspacesForComputedSortMode,
-  type SidebarSortMode,
-  workspaceIsSunk,
-} from "./sidebarSort";
+import { compareWorkspacesForComputedSortMode, type SidebarSortMode, workspaceIsSunk } from "./sidebarSort";
 import { MULTI_REPO_GROUP_ID, SCRATCH_GROUP_ID } from "../hooks/useRepoGroups";
 
 // Synthetic id for the bucket that collects sessions with no user-assigned
@@ -148,9 +139,7 @@ export function buildSessionGroups(
       const sliced: Workspace = {
         ...ws,
         sessions,
-        status: sessions.some((s) => isSessionActive(s, opts.idleDecayWindowMs))
-          ? "active"
-          : "idle",
+        status: sessions.some((s) => isSessionActive(s, opts.idleDecayWindowMs)) ? "active" : "idle",
       };
       const view: SidebarWorkspaceView = {
         key: `${gp}::${ws.id}`,
@@ -204,6 +193,21 @@ export function sidebarGroupHasLiveWorkspace(group: SidebarGroup): boolean {
   return group.workspaces.some((v) => !workspaceIsSunk(v.workspace));
 }
 
+// The workspaces an "archive all in group" action would act on: every member
+// whose primary session is not already archived. Triage targets each
+// workspace's primary session (`sessions[0]`), matching the single-row and
+// bulk archive paths, so the predicate keys off that session rather than any
+// sibling. Snoozed-but-not-archived members are included (archiving the whole
+// project should still sweep them in); members with no session are skipped.
+export function archivableWorkspaces(group: SidebarGroup): Workspace[] {
+  return group.workspaces
+    .map((v) => v.workspace)
+    .filter((ws) => {
+      const primary = ws.sessions[0];
+      return primary != null && primary.archived_at == null;
+    });
+}
+
 // The nested `repo+group` axis (#1720). A repository header keeps its full
 // repo-axis identity (`repo`), and inside it the same `group_path` buckets
 // the user-group axis already computes show up as `subgroups`. This is a
@@ -238,8 +242,7 @@ export function buildNestedSidebarGroups(
     const subgroups = buildSessionGroups(repoGroup.workspaces, {
       idleDecayWindowMs: opts.idleDecayWindowMs,
       sortMode: opts.sortMode,
-      isCollapsed: (_groupId, groupPath) =>
-        opts.isSubgroupCollapsed(repo.id, groupPath),
+      isCollapsed: (_groupId, groupPath) => opts.isSubgroupCollapsed(repo.id, groupPath),
     });
     return {
       repo: {
@@ -254,8 +257,6 @@ export function buildNestedSidebarGroups(
 // Nested-axis equivalent of `sidebarGroupHasLiveWorkspace`: true while any
 // subgroup still has a live row, so an all-sunk repository block is not
 // rendered as an empty header.
-export function nestedSidebarGroupHasLiveWorkspace(
-  group: NestedSidebarGroup,
-): boolean {
+export function nestedSidebarGroupHasLiveWorkspace(group: NestedSidebarGroup): boolean {
   return group.subgroups.some(sidebarGroupHasLiveWorkspace);
 }

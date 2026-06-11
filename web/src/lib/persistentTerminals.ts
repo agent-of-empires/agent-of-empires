@@ -6,8 +6,5 @@ export function normalizePersistentTerminalLimit(value: unknown): number {
   if (typeof value !== "number" || !Number.isFinite(value)) {
     return DEFAULT_PERSISTENT_TERMINALS;
   }
-  return Math.min(
-    MAX_PERSISTENT_TERMINALS,
-    Math.max(MIN_PERSISTENT_TERMINALS, Math.round(value)),
-  );
+  return Math.min(MAX_PERSISTENT_TERMINALS, Math.max(MIN_PERSISTENT_TERMINALS, Math.round(value)));
 }

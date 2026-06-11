@@ -60,9 +60,7 @@ describe("getOrCreateDeviceBindingSecret", () => {
       value: undefined,
     });
     try {
-      expect(() => getOrCreateDeviceBindingSecret()).toThrow(
-        /crypto\.getRandomValues/,
-      );
+      expect(() => getOrCreateDeviceBindingSecret()).toThrow(/crypto\.getRandomValues/);
     } finally {
       Object.defineProperty(globalThis, "crypto", {
         configurable: true,

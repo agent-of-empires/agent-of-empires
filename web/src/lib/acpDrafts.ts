@@ -21,9 +21,7 @@ const toastedSessions = new Set<string>();
 function notifyDraftPersistFailure(sessionId: string): void {
   if (toastedSessions.has(sessionId)) return;
   toastedSessions.add(sessionId);
-  toastBus.handler?.error(
-    "Storage full: unsent draft not saved. Free space or copy your draft elsewhere.",
-  );
+  toastBus.handler?.error("Storage full: unsent draft not saved. Free space or copy your draft elsewhere.");
 }
 
 function clearDraftPersistFailure(sessionId: string): void {
@@ -122,10 +120,7 @@ export function hasDraft(sessionId: string): boolean {
 // set of session ids; pass null/undefined to receive every draft change.
 // Fires for writes in the current tab (manually emitted) and for writes
 // in other tabs (storage event). Returns an unsubscribe function.
-export function subscribeDrafts(
-  cb: Listener,
-  filter: ReadonlySet<string> | null = null,
-): () => void {
+export function subscribeDrafts(cb: Listener, filter: ReadonlySet<string> | null = null): () => void {
   localListeners.set(cb, filter);
   const onStorage = (e: StorageEvent) => {
     // e.key is null when localStorage.clear() is called from another

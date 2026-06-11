@@ -1,26 +1,19 @@
 // @vitest-environment jsdom
 //
-// Covers PairedShellPane / PairedTerminal render branches: the loading
-// placeholder, the connected/reconnecting/disconnected banners, mobile
-// chrome, the host/container shell switch, the fullViewport keyboard
-// padding, and the focus/keyboard interaction handlers. The live PTY path
-// is exercised by the Playwright suites; this drives the conditional JSX
-// and the focus latch deterministically with a mocked useTerminal.
+// Covers PairedShellPane / PairedTerminal render branches (desktop,
+// fine-pointer): the loading placeholder, the
+// connected/reconnecting/disconnected banners, the host/container shell
+// switch, and the focus latch. Mobile chrome moved wholesale to
+// LiveTerminalView (touch devices render the capture-snapshot live view
+// instead of xterm), so this file carries no mobile cases. The live PTY
+// path is exercised by the Playwright suites; this drives the
+// conditional JSX deterministically with a mocked useTerminal.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  act,
-  fireEvent,
-  render,
-  screen,
-  waitFor,
-} from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 import type { SessionResponse } from "../../lib/types";
-import {
-  FOCUS_TERMINAL_EVENT,
-  setPendingTerminalFocus,
-} from "../../lib/terminalFocus";
+import { FOCUS_TERMINAL_EVENT, setPendingTerminalFocus } from "../../lib/terminalFocus";
 
 const ensureTerminal = vi.fn();
 const manualReconnect = vi.fn();
@@ -47,8 +40,7 @@ const termEl = vi.hoisted(() => ({ current: null as HTMLElement | null }));
 
 vi.mock("../../lib/api", () => ({
   ensureSession: vi.fn(),
-  ensureTerminal: (id: string, container: boolean) =>
-    ensureTerminal(id, container),
+  ensureTerminal: (id: string, container: boolean) => ensureTerminal(id, container),
 }));
 
 vi.mock("../../hooks/useTerminal", () => ({
@@ -129,13 +121,9 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-async function renderReady(
-  props: Partial<Parameters<typeof PairedShellPane>[0]> = {},
-) {
+async function renderReady(props: Partial<Parameters<typeof PairedShellPane>[0]> = {}) {
   render(<PairedShellPane session={session()} sessionId="sess-1" {...props} />);
-  await waitFor(() =>
-    expect(document.querySelector('[data-term="paired"]')).not.toBeNull(),
-  );
+  await waitFor(() => expect(document.querySelector('[data-term="paired"]')).not.toBeNull());
 }
 
 describe("PairedShellPane", () => {
@@ -162,9 +150,7 @@ describe("PairedShellPane", () => {
     // Retry re-runs ensureTerminal (now succeeding) and the terminal mounts.
     ensureTerminal.mockResolvedValue(true);
     fireEvent.click(screen.getByRole("button", { name: /Retry/i }));
-    await waitFor(() =>
-      expect(document.querySelector('[data-term="paired"]')).not.toBeNull(),
-    );
+    await waitFor(() => expect(document.querySelector('[data-term="paired"]')).not.toBeNull());
   });
 
   it("shows the error state when ensureTerminal rejects", async () => {
@@ -173,52 +159,14 @@ describe("PairedShellPane", () => {
     await screen.findByText(/Couldn't start the terminal/i);
   });
 
-  it("renders mobile chrome and scrollback affordance", async () => {
-    mockKeyboard.current.isMobile = true;
-    mockState.current.isInScrollback = true;
-    await renderReady();
-    expect(screen.getByTestId("mobile-toolbar")).toBeDefined();
-    expect(screen.getByTestId("back-to-live")).toBeDefined();
-  });
-
-  it("focuses the textarea when the FAB opens the keyboard", async () => {
-    mockKeyboard.current.isMobile = true;
-    await renderReady();
-    const ta = termEl.current!.querySelector("textarea") as HTMLTextAreaElement;
-    const focusSpy = vi.spyOn(ta, "focus");
-    fireEvent.click(screen.getByRole("button", { name: /Open keyboard/i }));
-    expect(focusSpy).toHaveBeenCalled();
-  });
-
-  it("blurs the textarea when the FAB closes the keyboard", async () => {
-    mockKeyboard.current.isMobile = true;
-    mockKeyboard.current.keyboardOpen = true;
-    await renderReady();
-    const ta = termEl.current!.querySelector("textarea") as HTMLTextAreaElement;
-    const blurSpy = vi.spyOn(ta, "blur");
-    fireEvent.click(screen.getByRole("button", { name: /Close keyboard/i }));
-    expect(blurSpy).toHaveBeenCalled();
-  });
-
   it("ignores focus events aimed at the agent terminal", async () => {
     await renderReady();
     const ta = termEl.current!.querySelector("textarea") as HTMLTextAreaElement;
     const focusSpy = vi.spyOn(ta, "focus");
     act(() => {
-      window.dispatchEvent(
-        new CustomEvent(FOCUS_TERMINAL_EVENT, { detail: { target: "agent" } }),
-      );
+      window.dispatchEvent(new CustomEvent(FOCUS_TERMINAL_EVENT, { detail: { target: "agent" } }));
     });
     expect(focusSpy).not.toHaveBeenCalled();
-  });
-
-  it("no-ops the keyboard toggle when the terminal element is absent", async () => {
-    mockKeyboard.current.isMobile = true;
-    termEl.current = null;
-    await renderReady();
-    // FAB present but termRef has no element; toggling must not throw.
-    fireEvent.click(screen.getByRole("button", { name: /Open keyboard/i }));
-    expect(document.querySelector('[data-term="paired"]')).not.toBeNull();
   });
 
   it("latches focus when the textarea is not in the DOM yet", async () => {
@@ -227,9 +175,7 @@ describe("PairedShellPane", () => {
     termEl.current = document.createElement("div");
     await renderReady();
     act(() => {
-      window.dispatchEvent(
-        new CustomEvent(FOCUS_TERMINAL_EVENT, { detail: { target: "paired" } }),
-      );
+      window.dispatchEvent(new CustomEvent(FOCUS_TERMINAL_EVENT, { detail: { target: "paired" } }));
     });
     expect(document.querySelector('[data-term="paired"]')).not.toBeNull();
   });
@@ -239,9 +185,7 @@ describe("PairedShellPane", () => {
     const ta = termEl.current!.querySelector("textarea") as HTMLTextAreaElement;
     const focusSpy = vi.spyOn(ta, "focus");
     act(() => {
-      window.dispatchEvent(
-        new CustomEvent(FOCUS_TERMINAL_EVENT, { detail: { target: "paired" } }),
-      );
+      window.dispatchEvent(new CustomEvent(FOCUS_TERMINAL_EVENT, { detail: { target: "paired" } }));
     });
     expect(focusSpy).toHaveBeenCalled();
   });
@@ -289,26 +233,9 @@ describe("PairedShellPane", () => {
   });
 
   it("offers the Container switch for sandboxed sessions and re-ensures on switch", async () => {
-    render(
-      <PairedShellPane
-        session={session({ is_sandboxed: true })}
-        sessionId="sess-1"
-      />,
-    );
-    await waitFor(() =>
-      expect(document.querySelector('[data-term="paired"]')).not.toBeNull(),
-    );
+    render(<PairedShellPane session={session({ is_sandboxed: true })} sessionId="sess-1" />);
+    await waitFor(() => expect(document.querySelector('[data-term="paired"]')).not.toBeNull());
     fireEvent.click(screen.getByRole("button", { name: /^Container$/ }));
-    await waitFor(() =>
-      expect(ensureTerminal).toHaveBeenCalledWith("sess-1", true),
-    );
-  });
-
-  it("reserves keyboard padding in fullViewport mode", async () => {
-    mockKeyboard.current.keyboardOcclusion = 320;
-    await renderReady({ fullViewport: true });
-    const root = document.querySelector('[data-term="paired"]')
-      ?.parentElement as HTMLElement;
-    expect(root.style.paddingBottom).toBe("320px");
+    await waitFor(() => expect(ensureTerminal).toHaveBeenCalledWith("sess-1", true));
   });
 });

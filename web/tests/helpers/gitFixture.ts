@@ -35,19 +35,14 @@ export interface BareRepoFixture {
  *
  * Returns the absolute path and the `file://` URL.
  */
-export function createBareRepo(
-  parentDir: string,
-  name = "bare.git",
-): BareRepoFixture {
+export function createBareRepo(parentDir: string, name = "bare.git"): BareRepoFixture {
   const path = join(parentDir, name);
   mkdirSync(parentDir, { recursive: true });
   const res = spawnSync("git", ["init", "--bare", "--quiet", path], {
     env: { ...process.env, ...GIT_ENV },
   });
   if (res.status !== 0) {
-    throw new Error(
-      `git init --bare failed: status=${res.status} stderr=${res.stderr?.toString() ?? "<none>"}`,
-    );
+    throw new Error(`git init --bare failed: status=${res.status} stderr=${res.stderr?.toString() ?? "<none>"}`);
   }
   return { path, url: `file://${path}` };
 }
@@ -70,10 +65,7 @@ function runGit(cwd: string, args: string[]): void {
  * compare against. Uses `-b <branch>` so the default branch is
  * deterministic across hosts where `init.defaultBranch` may be unset.
  */
-export function initWorkingRepo(
-  repoPath: string,
-  opts: { defaultBranch?: string } = {},
-): { path: string } {
+export function initWorkingRepo(repoPath: string, opts: { defaultBranch?: string } = {}): { path: string } {
   const branch = opts.defaultBranch ?? "main";
   mkdirSync(repoPath, { recursive: true });
   runGit(repoPath, ["init", "-q", "-b", branch]);
@@ -82,15 +74,40 @@ export function initWorkingRepo(
 }
 
 /**
+ * Create a throwaway bare repo that already contains one commit on
+ * `defaultBranch`. Unlike {@link createBareRepo}, this one has a branch to
+ * check out, so it can be cloned as a bare repo + worktree (cloning an
+ * empty bare repo leaves `git worktree add` with no reference to resolve).
+ * Built by committing into a temporary working repo, then cloning it bare.
+ *
+ * Returns the absolute path and the `file://` URL.
+ */
+export function createSeededBareRepo(
+  parentDir: string,
+  opts: { name?: string; defaultBranch?: string } = {},
+): BareRepoFixture {
+  const name = opts.name ?? "seeded-bare.git";
+  const branch = opts.defaultBranch ?? "main";
+  mkdirSync(parentDir, { recursive: true });
+  const path = join(parentDir, name);
+  const workdir = join(parentDir, `${name}.src`);
+  initWorkingRepo(workdir, { defaultBranch: branch });
+  const res = spawnSync("git", ["clone", "--bare", "--quiet", workdir, path], {
+    env: { ...process.env, ...GIT_ENV },
+  });
+  if (res.status !== 0) {
+    throw new Error(`git clone --bare failed: status=${res.status} stderr=${res.stderr?.toString() ?? "<none>"}`);
+  }
+  return { path, url: `file://${path}` };
+}
+
+/**
  * Write a set of files into a repo (uncommitted). Paths are joined onto
  * `repoPath`; nested directories are created automatically. Use to
  * stage uncommitted modifications visible to the diff endpoint, or as
  * the source for a follow-up `commitAll`.
  */
-export function writeFiles(
-  repoPath: string,
-  files: Record<string, string>,
-): void {
+export function writeFiles(repoPath: string, files: Record<string, string>): void {
   for (const [relPath, content] of Object.entries(files)) {
     const abs = join(repoPath, relPath);
     mkdirSync(dirname(abs), { recursive: true });
@@ -102,11 +119,7 @@ export function writeFiles(
  * Write a binary file (raw bytes) into a repo (uncommitted). Useful
  * for exercising the diff viewer's "Binary file changed" branch.
  */
-export function writeBinaryFile(
-  repoPath: string,
-  relPath: string,
-  bytes: Uint8Array,
-): void {
+export function writeBinaryFile(repoPath: string, relPath: string, bytes: Uint8Array): void {
   const abs = join(repoPath, relPath);
   mkdirSync(dirname(abs), { recursive: true });
   writeFileSync(abs, bytes);
@@ -123,10 +136,7 @@ export function commitAll(repoPath: string, message: string): void {
  * lines, each unique so virtualization tests can grep for specific
  * mid-file lines without ambiguity.
  */
-export function generateLargeFileContent(
-  lineCount: number,
-  prefix = "line",
-): string {
+export function generateLargeFileContent(lineCount: number, prefix = "line"): string {
   const lines = new Array<string>(lineCount);
   for (let i = 0; i < lineCount; i++) {
     lines[i] = `${prefix} ${i}: ${"lorem ".repeat(8).trim()}`;

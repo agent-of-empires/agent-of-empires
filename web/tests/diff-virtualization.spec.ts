@@ -53,12 +53,8 @@ const DIFF_FILE_RESPONSE = {
 
 async function setup(page: Page) {
   await mockTerminalApis(page);
-  await page.route("**/api/sessions/*/diff/files", (r) =>
-    r.fulfill({ json: DIFF_FILES_RESPONSE }),
-  );
-  await page.route(/\/api\/sessions\/[^/]+\/diff\/file\?/, (r) =>
-    r.fulfill({ json: DIFF_FILE_RESPONSE }),
-  );
+  await page.route("**/api/sessions/*/diff/files", (r) => r.fulfill({ json: DIFF_FILES_RESPONSE }));
+  await page.route(/\/api\/sessions\/[^/]+\/diff\/file\?/, (r) => r.fulfill({ json: DIFF_FILE_RESPONSE }));
 }
 
 async function openBigFile(page: Page) {
@@ -70,19 +66,15 @@ async function openBigFile(page: Page) {
   });
   await page.getByText("big.txt").first().click();
   // Early rows render.
-  await expect(page.getByText("edit 1:", { exact: false }).first()).toBeVisible(
-    {
-      timeout: 15000,
-    },
-  );
+  await expect(page.getByText("edit 1:", { exact: false }).first()).toBeVisible({
+    timeout: 15000,
+  });
 }
 
 test.use({ viewport: { width: 1280, height: 720 } });
 
 test.describe("Diff virtualization", () => {
-  test("late rows mount only after scrolling (virtualized)", async ({
-    page,
-  }) => {
+  test("late rows mount only after scrolling (virtualized)", async ({ page }) => {
     await setup(page);
     await openBigFile(page);
 
@@ -99,16 +91,12 @@ test.describe("Diff virtualization", () => {
       if (el) el.scrollTop = el.scrollHeight;
     });
 
-    await expect(
-      page.getByText("edit 991:", { exact: false }).first(),
-    ).toBeVisible({
+    await expect(page.getByText("edit 991:", { exact: false }).first()).toBeVisible({
       timeout: 15000,
     });
   });
 
-  test("find searches only changed lines, jumps off-screen, and highlights", async ({
-    page,
-  }) => {
+  test("find searches only changed lines, jumps off-screen, and highlights", async ({ page }) => {
     await setup(page);
     await openBigFile(page);
 
@@ -125,9 +113,7 @@ test.describe("Diff virtualization", () => {
     // scrolled into view.
     await input.fill("edit 971:");
     await expect(page.getByText(/^1\/\d+$/).first()).toBeVisible();
-    await expect(
-      page.getByText("edit 971:", { exact: false }).first(),
-    ).toBeVisible({ timeout: 15000 });
+    await expect(page.getByText("edit 971:", { exact: false }).first()).toBeVisible({ timeout: 15000 });
 
     // The matched line is highlighted (Pierre marks the selected line).
     await expect(page.locator("[data-selected-line]").first()).toBeVisible({

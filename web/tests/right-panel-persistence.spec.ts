@@ -37,9 +37,7 @@ test.describe("Right panel collapsed-state persistence", () => {
     expect(await getStored(page)).toBe("0");
   });
 
-  test("keyboard toggle flips the stored value and survives reload", async ({
-    page,
-  }) => {
+  test("keyboard toggle flips the stored value and survives reload", async ({ page }) => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
     await expect(page.locator("header")).toBeVisible();

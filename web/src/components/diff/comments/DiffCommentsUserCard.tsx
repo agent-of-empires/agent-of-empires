@@ -2,12 +2,7 @@ import { useEffect, useState } from "react";
 import { CommentMarkdown } from "./CommentMarkdown";
 import type { DiffCommentsCardPayload } from "./buildPrompt";
 import type { DiffComment } from "./types";
-import {
-  ensureThemeLoaded,
-  getHighlighter,
-  langKeyForExt,
-  loadLanguage,
-} from "../../../lib/highlighter";
+import { ensureThemeLoaded, getHighlighter, langKeyForExt, loadLanguage } from "../../../lib/highlighter";
 import { useShikiTheme } from "../../../hooks/useShikiTheme";
 
 interface Props {
@@ -25,9 +20,7 @@ export function DiffCommentsUserCard({ payload }: Props) {
   return (
     <div className="w-full max-w-3xl rounded-2xl rounded-br-sm border border-surface-700 bg-surface-800/70 px-4 py-3 text-sm">
       <div className="mb-2 flex items-center gap-2 text-[11px] uppercase tracking-wider text-text-dim">
-        <span className="rounded bg-brand-600/15 px-1.5 py-0.5 font-mono text-brand-300">
-          diff review
-        </span>
+        <span className="rounded bg-brand-600/15 px-1.5 py-0.5 font-mono text-brand-300">diff review</span>
         <span>
           {comments.length} comment{comments.length === 1 ? "" : "s"}
         </span>
@@ -39,16 +32,9 @@ export function DiffCommentsUserCard({ payload }: Props) {
       )}
       <ul className="flex flex-col gap-3">
         {sorted.map((c) => (
-          <li
-            key={c.id}
-            className="rounded-lg border border-surface-700/60 bg-surface-900/60"
-          >
+          <li key={c.id} className="rounded-lg border border-surface-700/60 bg-surface-900/60">
             <CommentHeader comment={c} isMultiRepo={isMultiRepo} />
-            <HighlightedSnippet
-              code={c.capturedSnippet}
-              language={c.language}
-              filePath={c.filePath}
-            />
+            <HighlightedSnippet code={c.capturedSnippet} language={c.language} filePath={c.filePath} />
             <div className="px-3 py-2 text-text-primary">
               <CommentMarkdown text={c.body} />
             </div>
@@ -68,32 +54,18 @@ export function DiffCommentsUserCard({ payload }: Props) {
  *  block style. Loads the language module on demand and falls back to
  *  plain `<pre>` while loading or when the language can't be resolved.
  *  See `lib/highlighter.ts`. */
-function HighlightedSnippet({
-  code,
-  language,
-  filePath,
-}: {
-  code: string;
-  language?: string;
-  filePath: string;
-}) {
+function HighlightedSnippet({ code, language, filePath }: { code: string; language?: string; filePath: string }) {
   const [html, setHtml] = useState<string | null>(null);
   const shiki = useShikiTheme();
   useEffect(() => {
     let cancelled = false;
-    const hint =
-      language && language.length > 0
-        ? language
-        : (filePath.split(".").pop() ?? "");
+    const hint = language && language.length > 0 ? language : (filePath.split(".").pop() ?? "");
     if (!hint) return;
     (async () => {
       try {
         const langKey = langKeyForExt(hint) ?? hint;
         await loadLanguage(langKey);
-        const resolvedTheme = await ensureThemeLoaded(
-          shiki.theme,
-          shiki.appearance,
-        );
+        const resolvedTheme = await ensureThemeLoaded(shiki.theme, shiki.appearance);
         const hl = await getHighlighter();
         if (cancelled) return;
         if (!hl.getLoadedLanguages().includes(langKey)) return;
@@ -126,13 +98,7 @@ function HighlightedSnippet({
   );
 }
 
-function CommentHeader({
-  comment,
-  isMultiRepo,
-}: {
-  comment: DiffComment;
-  isMultiRepo: boolean;
-}) {
+function CommentHeader({ comment, isMultiRepo }: { comment: DiffComment; isMultiRepo: boolean }) {
   const range =
     comment.startLine === comment.endLine
       ? `line ${comment.startLine}`
@@ -140,9 +106,7 @@ function CommentHeader({
   return (
     <div className="flex flex-wrap items-center gap-1.5 border-b border-surface-700/40 px-3 py-1.5 text-[11px] font-mono text-text-dim">
       {isMultiRepo && comment.repoName && (
-        <span className="rounded bg-surface-800 px-1.5 py-0.5 text-text-secondary">
-          {comment.repoName}
-        </span>
+        <span className="rounded bg-surface-800 px-1.5 py-0.5 text-text-secondary">{comment.repoName}</span>
       )}
       <span className="text-text-secondary">{comment.filePath}</span>
       <span>·</span>

@@ -1,3 +1,8 @@
+// Git path-resolution shared with the regression test in
+// `tests/build_version_rerun.rs` so the test exercises the real watch-path
+// logic against a temporary worktree.
+include!("build_git_watch.rs");
+
 fn main() {
     check_stale_build_cache();
     emit_build_version();
@@ -30,9 +35,16 @@ fn emit_build_version() {
     use std::process::Command;
 
     // Re-run when the committed revision changes or an override toggles.
-    // `.git/HEAD` moves on checkout/commit; `.git/index` moves on stage.
-    println!("cargo:rerun-if-changed=.git/HEAD");
-    println!("cargo:rerun-if-changed=.git/index");
+    // HEAD moves on checkout/commit; index moves on stage. Resolve the real
+    // paths via `git rev-parse --git-path` rather than hardcoding `.git/HEAD`:
+    // in a git worktree `.git` is a file pointing at
+    // `<main>/.git/worktrees/<name>/`, so the literal `.git/HEAD` path does not
+    // exist. Cargo treats a missing `rerun-if-changed` input as perpetually
+    // stale, which reran this script (and recompiled the lib + binary that read
+    // AOE_BUILD_VERSION) on every build inside a worktree (issue #1962).
+    for path in git_watch_paths(std::path::Path::new(".")) {
+        println!("cargo:rerun-if-changed={path}");
+    }
     println!("cargo:rerun-if-env-changed=AOE_BUILD_VERSION");
     println!("cargo:rerun-if-env-changed=GITHUB_SHA");
 

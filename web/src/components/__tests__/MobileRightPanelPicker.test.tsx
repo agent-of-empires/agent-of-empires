@@ -5,32 +5,17 @@ import { fireEvent, render, screen } from "@testing-library/react";
 
 import { MobileRightPanelPicker } from "../MobileRightPanelPicker";
 
-function setup(
-  overrides: Partial<Parameters<typeof MobileRightPanelPicker>[0]> = {},
-) {
+function setup(overrides: Partial<Parameters<typeof MobileRightPanelPicker>[0]> = {}) {
   const onSelect = vi.fn();
   const onClose = vi.fn();
-  render(
-    <MobileRightPanelPicker
-      open
-      active="agent"
-      onSelect={onSelect}
-      onClose={onClose}
-      {...overrides}
-    />,
-  );
+  render(<MobileRightPanelPicker open active="agent" onSelect={onSelect} onClose={onClose} {...overrides} />);
   return { onSelect, onClose };
 }
 
 describe("MobileRightPanelPicker", () => {
   it("renders nothing when closed", () => {
     const { container } = render(
-      <MobileRightPanelPicker
-        open={false}
-        active="agent"
-        onSelect={vi.fn()}
-        onClose={vi.fn()}
-      />,
+      <MobileRightPanelPicker open={false} active="agent" onSelect={vi.fn()} onClose={vi.fn()} />,
     );
     expect(container.firstChild).toBeNull();
   });

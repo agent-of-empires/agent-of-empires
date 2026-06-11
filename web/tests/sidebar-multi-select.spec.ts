@@ -13,9 +13,7 @@ interface MockSession {
 }
 
 async function mockApis(page: Page, sessions: MockSession[]) {
-  await page.route("**/api/login/status", (r) =>
-    r.fulfill({ json: { required: false, authenticated: true } }),
-  );
+  await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
   await page.route("**/api/sessions", (r) => {
     if (r.request().method() !== "GET") return r.fulfill({ status: 400 });
     return r.fulfill({
@@ -43,19 +41,8 @@ async function mockApis(page: Page, sessions: MockSession[]) {
       },
     });
   });
-  for (const path of [
-    "settings",
-    "themes",
-    "agents",
-    "profiles",
-    "groups",
-    "devices",
-    "docker/status",
-    "about",
-  ]) {
-    await page.route(`**/api/${path}`, (r) =>
-      r.fulfill({ json: path === "docker/status" ? {} : [] }),
-    );
+  for (const path of ["settings", "themes", "agents", "profiles", "groups", "devices", "docker/status", "about"]) {
+    await page.route(`**/api/${path}`, (r) => r.fulfill({ json: path === "docker/status" ? {} : [] }));
   }
 }
 
@@ -66,9 +53,7 @@ const THREE: MockSession[] = [
 ];
 
 test.describe("Sidebar multi-select (#1724)", () => {
-  test("Cmd/Ctrl+click toggles selection without navigating", async ({
-    page,
-  }) => {
+  test("Cmd/Ctrl+click toggles selection without navigating", async ({ page }) => {
     await mockApis(page, THREE);
     await page.goto("/");
     await expect(page.locator("header")).toBeVisible();
@@ -95,9 +80,7 @@ test.describe("Sidebar multi-select (#1724)", () => {
     await expect(bar).toHaveCount(0);
   });
 
-  test("Shift+click range selects every row in between, then bulk archives", async ({
-    page,
-  }) => {
+  test("Shift+click range selects every row in between, then bulk archives", async ({ page }) => {
     await mockApis(page, THREE);
     const archived: Array<{ id: string; body: unknown }> = [];
     await page.route("**/api/sessions/*/archive", (r) => {

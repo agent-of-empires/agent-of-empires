@@ -108,9 +108,7 @@ process.on("SIGPIPE", () => {
 process.on("SIGHUP", () => {
   fakeDebug("SIGHUP received (ignored)");
 });
-fakeDebug(
-  `fake-acp starting pid=${process.pid} argv=${JSON.stringify(process.argv)}`,
-);
+fakeDebug(`fake-acp starting pid=${process.pid} argv=${JSON.stringify(process.argv)}`);
 
 const DEFAULT_TURN = {
   updates: [
@@ -128,9 +126,7 @@ function loadScript() {
   try {
     return JSON.parse(readFileSync(path, "utf8"));
   } catch (err) {
-    process.stderr.write(
-      `[fakeAcpAgent] failed to parse FAKE_ACP_SCRIPT=${path}: ${err}\n`,
-    );
+    process.stderr.write(`[fakeAcpAgent] failed to parse FAKE_ACP_SCRIPT=${path}: ${err}\n`);
     return { turns: [] };
   }
 }
@@ -179,11 +175,7 @@ function sendRequest(method, params) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       if (pendingOutbound.delete(id)) {
-        reject(
-          new Error(
-            `fakeAcpAgent: outbound ${method} id=${id} timed out after ${OUTBOUND_REQUEST_TIMEOUT_MS}ms`,
-          ),
-        );
+        reject(new Error(`fakeAcpAgent: outbound ${method} id=${id} timed out after ${OUTBOUND_REQUEST_TIMEOUT_MS}ms`));
       }
     }, OUTBOUND_REQUEST_TIMEOUT_MS);
     pendingOutbound.set(id, {
@@ -278,8 +270,7 @@ async function emitSessionUpdates(sessionId, updates) {
       // Clamp the raw value: NaN, Infinity, or negative numbers would
       // make setTimeout fire immediately or behave unpredictably and
       // mask bad fixture data. Cap at 60s so a typo can't hang CI.
-      const raw =
-        typeof u.ms === "number" && Number.isFinite(u.ms) ? u.ms : 200;
+      const raw = typeof u.ms === "number" && Number.isFinite(u.ms) ? u.ms : 200;
       const ms = Math.min(60_000, Math.max(0, Math.floor(raw)));
       // Sleep in 50ms slices so a cancel notification arriving during
       // a long wait_ms doesn't have to wait for the full duration
@@ -309,9 +300,7 @@ async function emitSessionUpdates(sessionId, updates) {
         },
         options: u.options ?? DEFAULT_PERMISSION_OPTIONS,
       }).catch((err) => {
-        process.stderr.write(
-          `[fakeAcpAgent] permission_request rejected: ${JSON.stringify(err)}\n`,
-        );
+        process.stderr.write(`[fakeAcpAgent] permission_request rejected: ${JSON.stringify(err)}\n`);
       });
       continue;
     }
@@ -344,7 +333,11 @@ const INITIALIZE_RESULT = {
   },
   agentInfo: {
     name: "@agentclientprotocol/claude-agent-acp",
-    version: "0.41.0",
+    // Keep at (or above) the agent_compat floor in src/acp/agent_compat.rs;
+    // the gate rejects the fake's handshake otherwise, which fails every
+    // live Playwright acp spec and the acp live-daemon e2e suite (#2077
+    // bumped the floor without this fixture and broke both).
+    version: "0.44.0",
   },
   // No authMethods key at all. An empty array is interpreted by some
   // ACP client implementations as "auth methods listed but none
@@ -446,9 +439,7 @@ async function handleRequest(msg) {
             });
           }
         } catch (err) {
-          process.stderr.write(
-            `[fakeAcpAgent] bad FAKE_ACP_COMMANDS: ${err}\n`,
-          );
+          process.stderr.write(`[fakeAcpAgent] bad FAKE_ACP_COMMANDS: ${err}\n`);
         }
       }
       // Mirror claude-agent-acp v0.37.0: the initial set of
@@ -456,8 +447,7 @@ async function handleRequest(msg) {
       // session/new and session/load *response*, not as a subsequent
       // notification. The structured view's acp_client reads the response
       // field and emits Event::ConfigOptionsUpdated. See #1403.
-      const includeConfigOptions =
-        process.env.FAKE_ACP_EMIT_CONFIG_OPTIONS !== "0";
+      const includeConfigOptions = process.env.FAKE_ACP_EMIT_CONFIG_OPTIONS !== "0";
       const result = { sessionId };
       if (includeConfigOptions) {
         result.configOptions = [
@@ -490,15 +480,10 @@ async function handleRequest(msg) {
       if (process.env.FAKE_ACP_MODE_VIA_CONFIG_OPTION) {
         const current = opencodeModeBySession.get(sessionId) ?? "build";
         opencodeModeBySession.set(sessionId, current);
-        result.configOptions = [
-          ...(result.configOptions ?? []),
-          makeOpencodeModeOption(current),
-        ];
+        result.configOptions = [...(result.configOptions ?? []), makeOpencodeModeOption(current)];
       }
       if (process.env.FAKE_ACP_EMIT_SESSION_MODEL === "1") {
-        const current =
-          sessionModelBySession.get(sessionId) ??
-          SESSION_MODEL_CHOICES[0].modelId;
+        const current = sessionModelBySession.get(sessionId) ?? SESSION_MODEL_CHOICES[0].modelId;
         sessionModelBySession.set(sessionId, current);
         // ACP SessionModelState (camelCase wire shape per
         // agent-client-protocol-schema unstable_session_model).
@@ -543,10 +528,7 @@ async function handleRequest(msg) {
       // rename doesn't silently regress this fake.
       const sessionId = params?.sessionId;
       const modeId = params?.modeId;
-      if (
-        process.env.FAKE_ACP_MODE_VIA_CONFIG_OPTION &&
-        !OPENCODE_MODE_CHOICES.some((m) => m.value === modeId)
-      ) {
+      if (process.env.FAKE_ACP_MODE_VIA_CONFIG_OPTION && !OPENCODE_MODE_CHOICES.some((m) => m.value === modeId)) {
         // OpenCode rejects set_mode for any id outside its real mode
         // list (this is the "mode not found" the trapped user hit).
         sendError(id, -32000, `mode not found: ${modeId}`);
@@ -556,9 +538,7 @@ async function handleRequest(msg) {
       if (sessionId && modeId) {
         // Emit the ACP-correct variant so the supervisor translates to
         // a server-side Event::CurrentModeChanged for the reducer.
-        await emitSessionUpdates(sessionId, [
-          { sessionUpdate: "current_mode_update", currentModeId: modeId },
-        ]);
+        await emitSessionUpdates(sessionId, [{ sessionUpdate: "current_mode_update", currentModeId: modeId }]);
       }
       return;
     }
@@ -644,9 +624,7 @@ async function handleRequest(msg) {
         return;
       }
       sendResult(id, {
-        stopReason: wasCancelled
-          ? "cancelled"
-          : (turn.stopReason ?? "end_turn"),
+        stopReason: wasCancelled ? "cancelled" : (turn.stopReason ?? "end_turn"),
       });
       return;
     }
@@ -661,9 +639,7 @@ async function main() {
   const rl = createInterface({ input: process.stdin });
   process.stdin.on("end", () => fakeDebug("stdin end"));
   process.stdin.on("close", () => fakeDebug("stdin close"));
-  process.stdin.on("error", (err) =>
-    fakeDebug(`stdin error: ${err.code ?? err.message}`),
-  );
+  process.stdin.on("error", (err) => fakeDebug(`stdin error: ${err.code ?? err.message}`));
   rl.on("line", async (line) => {
     const trimmed = line.trim();
     if (!trimmed) return;
@@ -681,10 +657,7 @@ async function main() {
         process.stderr.write(`[fakeAcpAgent] handler error: ${err}\n`);
         sendError(msg.id, -32603, `internal: ${err}`);
       }
-    } else if (
-      msg.id !== undefined &&
-      (msg.result !== undefined || msg.error !== undefined)
-    ) {
+    } else if (msg.id !== undefined && (msg.result !== undefined || msg.error !== undefined)) {
       // Response to one of our outbound requests (e.g.
       // session/request_permission). Resolve the awaiting Promise.
       resolveOutbound(msg);
@@ -699,9 +672,7 @@ async function main() {
         const sid = msg.params?.sessionId;
         if (sid) cancelFlags.set(sid, true);
       } else {
-        process.stderr.write(
-          `[fakeAcpAgent] received notification: ${msg.method}\n`,
-        );
+        process.stderr.write(`[fakeAcpAgent] received notification: ${msg.method}\n`);
       }
     }
   });

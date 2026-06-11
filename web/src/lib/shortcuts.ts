@@ -15,9 +15,7 @@
 // The drift guard in shortcuts.test.ts locks the binding behavior, the exact
 // rendered label strings, and the tour's id references.
 
-export const IS_MAC =
-  typeof navigator !== "undefined" &&
-  /Mac|iPhone|iPad|iPod/.test(navigator.platform);
+export const IS_MAC = typeof navigator !== "undefined" && /Mac|iPhone|iPad|iPod/.test(navigator.platform);
 
 export interface ShortcutActions {
   onNew: () => void;
@@ -232,11 +230,9 @@ export const SHORTCUTS: readonly ShortcutDef[] = [
   },
 ] as const;
 
-export const SHORTCUTS_BY_ID: Record<ShortcutId, ShortcutDef> =
-  Object.fromEntries(SHORTCUTS.map((s) => [s.id, s])) as Record<
-    ShortcutId,
-    ShortcutDef
-  >;
+export const SHORTCUTS_BY_ID: Record<ShortcutId, ShortcutDef> = Object.fromEntries(
+  SHORTCUTS.map((s) => [s.id, s]),
+) as Record<ShortcutId, ShortcutDef>;
 
 function modifierGlyphs(chord: ShortcutChord, mac: boolean): string[] {
   const parts: string[] = [];
@@ -276,10 +272,7 @@ export function formatTourShortcut(chord: ShortcutChord): string {
 }
 
 /** The subset of a KeyboardEvent the matcher reads; lets tests pass plain objects. */
-export type ShortcutKeyEvent = Pick<
-  KeyboardEvent,
-  "key" | "code" | "metaKey" | "ctrlKey" | "altKey" | "shiftKey"
->;
+export type ShortcutKeyEvent = Pick<KeyboardEvent, "key" | "code" | "metaKey" | "ctrlKey" | "altKey" | "shiftKey">;
 
 export interface MatchedShortcut {
   shortcut: ShortcutDef;
@@ -287,19 +280,13 @@ export interface MatchedShortcut {
   stopPropagation: boolean;
 }
 
-function globalMatches(
-  e: ShortcutKeyEvent,
-  t: ShortcutTrigger,
-  mod: boolean,
-): boolean {
+function globalMatches(e: ShortcutKeyEvent, t: ShortcutTrigger, mod: boolean): boolean {
   if (t.mod !== undefined && t.mod !== mod) return false;
   if (t.shift !== undefined && t.shift !== e.shiftKey) return false;
   if (t.alt !== undefined && t.alt !== e.altKey) return false;
   if (t.code !== undefined) return e.code === t.code;
   if (t.key !== undefined) {
-    return t.keyCaseInsensitive
-      ? e.key.toLowerCase() === t.key.toLowerCase()
-      : e.key === t.key;
+    return t.keyCaseInsensitive ? e.key.toLowerCase() === t.key.toLowerCase() : e.key === t.key;
   }
   return false;
 }

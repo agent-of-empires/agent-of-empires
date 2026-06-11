@@ -270,15 +270,8 @@ fn default_true() -> bool {
     true
 }
 
-fn status_hook_env_prefix(
-    instance_id: &str,
-    tool: &str,
-    agent: Option<&crate::agents::AgentDef>,
-) -> String {
-    let has_hooks = agent.and_then(|a| a.hook_config.as_ref()).is_some()
-        || tool == "settl"
-        || tool == "hermes"
-        || tool == "kiro";
+fn status_hook_env_prefix(instance_id: &str, agent: Option<&crate::agents::AgentDef>) -> String {
+    let has_hooks = agent.is_some_and(|a| a.hook_config.is_some() || a.sidecar_hooks.is_some());
 
     if has_hooks {
         format!("AOE_INSTANCE_ID={} ", instance_id)
@@ -1288,6 +1281,18 @@ impl Instance {
         self.sandbox_info.as_ref().is_some_and(|s| s.enabled)
     }
 
+    /// The repo this session groups under: the worktree's main repo when
+    /// present (so all branches of a repo group together), else the project
+    /// path. Shared by sidebar project grouping and new-session prefill so
+    /// the "which directory does this session belong to" rule lives in one
+    /// place.
+    pub fn repo_path(&self) -> &str {
+        self.worktree_info
+            .as_ref()
+            .map(|w| w.main_repo_path.as_str())
+            .unwrap_or(&self.project_path)
+    }
+
     pub fn is_yolo_mode(&self) -> bool {
         self.yolo_mode
     }
@@ -1918,28 +1923,22 @@ impl Instance {
         if !hooks_enabled {
             return;
         }
-        if self.tool == "settl" {
-            // settl uses TOML config, not JSON settings
-            if let Err(e) = crate::hooks::install_settl_hooks() {
-                tracing::warn!(target: "session.store", "Failed to install settl hooks: {}", e);
-            }
-        } else if self.tool == "hermes" && !self.is_sandboxed() {
-            // Hermes uses YAML config; sandbox path is handled by build_container_config
-            if let Some(home) = dirs::home_dir() {
-                let config_path = home.join(".hermes").join("config.yaml");
-                if let Err(e) = crate::hooks::install_hermes_hooks(&config_path) {
-                    tracing::warn!(target: "session.store", "Failed to install hermes hooks: {}", e);
-                }
-            }
-        } else if self.tool == "kiro" && !self.is_sandboxed() {
-            // Kiro uses its own JSON agent config format; sandbox path is
-            // handled by build_container_config.
-            if let Some(home) = dirs::home_dir() {
-                let config_path = home.join(crate::hooks::KIRO_HOOKS_AGENT_FILE);
-                match crate::hooks::install_kiro_hooks(&config_path) {
-                    Ok(()) => crate::hooks::set_kiro_default_agent_if_builtin(),
-                    Err(e) => {
-                        tracing::warn!(target: "session.store", "Failed to install kiro hooks: {}", e)
+        if let Some(sidecar) = agent.and_then(|a| a.sidecar_hooks.as_ref()) {
+            // Sidecar agents (settl TOML, hermes YAML, kiro per-agent JSON)
+            // install into a host config file; sandbox install is handled by
+            // build_container_config. host_only agents (settl) are never
+            // sandboxed, so the gate is a no-op for them.
+            if !self.is_sandboxed() {
+                if let Some(home) = dirs::home_dir() {
+                    let config_path = home.join(sidecar.host_config_subpath);
+                    match (sidecar.install)(&config_path) {
+                        Ok(()) => {
+                            if let Some(post_install) = sidecar.post_install_host {
+                                post_install();
+                            }
+                        }
+                        Err(e) => tracing::warn!(target: "session.store",
+                            "Failed to install {} hooks: {}", self.tool, e),
                     }
                 }
             }
@@ -2014,7 +2013,7 @@ impl Instance {
             }
         }
 
-        let mut env_prefix = status_hook_env_prefix(&self.id, &self.tool, agent);
+        let mut env_prefix = status_hook_env_prefix(&self.id, agent);
 
         // Profile-scoped host environment entries (KEY=value, KEY=$VAR,
         // KEY=$$literal, or bare KEY for passthrough). Sandboxed sessions
@@ -3047,6 +3046,28 @@ impl Instance {
     /// `finalize_launch` writes those fields and they would otherwise be
     /// dropped with the clone. See `apply_post_restart_sync`.
     pub fn ensure_pane_ready(&mut self) -> Result<EnsureReadyOutcome, EnsureReadyError> {
+        self.ensure_pane_ready_with_size(None)
+    }
+
+    /// Like [`ensure_pane_ready`](Self::ensure_pane_ready), but seeds a
+    /// freshly created or respawned pane at `size` (cols, rows) instead of
+    /// letting tmux fall back to its 80x24 default.
+    ///
+    /// Live-send entry passes the visible preview-pane size here so the agent
+    /// boots at the width it will be shown at. Without it the agent boots
+    /// narrow (80 cols) and depends on a single post-boot `resize-window`
+    /// SIGWINCH to grow into the live area. That SIGWINCH races the agent's
+    /// startup: if it lands before the agent installs its resize handler the
+    /// reflow is lost, and because the per-frame resize loop is deduped on the
+    /// (already-correct) tmux window size, nothing re-issues it. The pane then
+    /// stays pinned at ~80 cols (≈50% of a wide live area) until live mode is
+    /// exited and re-entered. Booting at the right size sidesteps the race.
+    ///
+    /// `None` keeps tmux's default for callers with no target geometry.
+    pub fn ensure_pane_ready_with_size(
+        &mut self,
+        size: Option<(u16, u16)>,
+    ) -> Result<EnsureReadyOutcome, EnsureReadyError> {
         if matches!(self.status, Status::Creating | Status::Deleting) {
             return Err(EnsureReadyError::Transient(self.status));
         }
@@ -3062,7 +3083,7 @@ impl Instance {
             // server kill or reboot resurrects the same bad sid the
             // restart paths exist to recover from.
             let outcome = self
-                .start_with_resume_fallback(None, false)
+                .start_with_resume_fallback(size, false)
                 .map_err(EnsureReadyError::Tmux)?;
             self.wait_for_pane_ready(&session);
             let stale_sid = match outcome {
@@ -3073,7 +3094,7 @@ impl Instance {
         }
         if session.is_pane_dead() {
             let outcome = self
-                .restart_with_size(None)
+                .restart_with_size(size)
                 .map_err(EnsureReadyError::Tmux)?;
             self.wait_for_pane_ready(&session);
             let stale_sid = match outcome {
@@ -3409,14 +3430,11 @@ impl Instance {
         self.update_status_with_metadata(None);
     }
 
-    pub fn capture_output_with_size(
-        &self,
-        lines: usize,
-        width: u16,
-        height: u16,
-    ) -> Result<String> {
-        let session = self.tmux_session()?;
-        session.capture_pane_with_size(lines, Some(width), Some(height))
+    pub fn capture_output(&self, lines: usize) -> Result<String> {
+        // capture-pane has no size parameters: the pane is captured at
+        // the window's own dimensions. (A previous *_with_size variant
+        // accepted width/height and silently ignored them.)
+        self.tmux_session()?.capture_pane(lines)
     }
 }
 
@@ -3731,7 +3749,7 @@ mod tests {
     fn test_codex_gets_status_hook_env_prefix() {
         let agent = crate::agents::get_agent("codex");
         assert_eq!(
-            status_hook_env_prefix("abc123", "codex", agent),
+            status_hook_env_prefix("abc123", agent),
             "AOE_INSTANCE_ID=abc123 "
         );
     }
@@ -4416,7 +4434,13 @@ mod tests {
 
     /// Real-tmux integration: an alive pane yields AlreadyAlive with no
     /// status/start_time mutations. Skipped if tmux isn't installed.
+    // Serialized: this test creates and kills a real tmux session. Unserialized
+    // it can kill the shared server's last session while a `#[serial]` peer's
+    // `new-session` is connecting, which fails that peer with "server exited
+    // unexpectedly" (and its own skip-on-failure fallback silently masks the
+    // same race in the other direction).
     #[test]
+    #[serial_test::serial]
     fn test_ensure_pane_ready_alive_pane_is_noop() {
         if std::process::Command::new("tmux")
             .arg("-V")
@@ -4920,6 +4944,24 @@ mod tests {
         assert!(wt.managed_by_aoe);
     }
 
+    #[test]
+    fn test_repo_path_prefers_worktree_main_repo() {
+        let mut inst = Instance::new("Test", "/tmp/worktrees/feature");
+        assert_eq!(inst.repo_path(), "/tmp/worktrees/feature");
+        inst.worktree_info = Some(WorktreeInfo {
+            branch: "feature".to_string(),
+            main_repo_path: "/tmp/main-repo".to_string(),
+            managed_by_aoe: true,
+            created_at: Utc::now(),
+            base_branch: None,
+        });
+        assert_eq!(
+            inst.repo_path(),
+            "/tmp/main-repo",
+            "worktree sessions group under the main repo, not the worktree dir"
+        );
+    }
+
     // Test generate_id function properties
     #[test]
     fn test_generate_id_uniqueness() {
@@ -5255,23 +5297,23 @@ mod tests {
     #[test]
     fn test_status_hook_env_prefix_includes_hermes() {
         assert_eq!(
-            status_hook_env_prefix("abc123", "hermes", crate::agents::get_agent("hermes")),
+            status_hook_env_prefix("abc123", crate::agents::get_agent("hermes")),
             "AOE_INSTANCE_ID=abc123 "
         );
         assert_eq!(
-            status_hook_env_prefix("abc123", "settl", crate::agents::get_agent("settl")),
+            status_hook_env_prefix("abc123", crate::agents::get_agent("settl")),
             "AOE_INSTANCE_ID=abc123 "
         );
         assert_eq!(
-            status_hook_env_prefix("abc123", "claude", crate::agents::get_agent("claude")),
+            status_hook_env_prefix("abc123", crate::agents::get_agent("claude")),
             "AOE_INSTANCE_ID=abc123 "
         );
         assert_eq!(
-            status_hook_env_prefix("abc123", "opencode", crate::agents::get_agent("opencode")),
+            status_hook_env_prefix("abc123", crate::agents::get_agent("opencode")),
             ""
         );
         assert_eq!(
-            status_hook_env_prefix("abc123", "kiro", crate::agents::get_agent("kiro")),
+            status_hook_env_prefix("abc123", crate::agents::get_agent("kiro")),
             "AOE_INSTANCE_ID=abc123 "
         );
     }

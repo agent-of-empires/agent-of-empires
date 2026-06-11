@@ -28,22 +28,13 @@ function approvalWith(argsPreview: string): Approval {
 
 describe("ApprovalCard args rendering (#1713)", () => {
   it("renders an empty-state instead of literal null when no args provided", () => {
-    const { container } = render(
-      <ApprovalCard approval={approvalWith("")} onResolve={vi.fn()} />,
-    );
+    const { container } = render(<ApprovalCard approval={approvalWith("")} onResolve={vi.fn()} />);
     expect(container.textContent).toContain("No raw args provided by agent.");
   });
 
   it("still renders provided args as a definition list", () => {
-    const { container } = render(
-      <ApprovalCard
-        approval={approvalWith('{"path":"/tmp/x"}')}
-        onResolve={vi.fn()}
-      />,
-    );
+    const { container } = render(<ApprovalCard approval={approvalWith('{"path":"/tmp/x"}')} onResolve={vi.fn()} />);
     expect(container.textContent).toContain("/tmp/x");
-    expect(container.textContent).not.toContain(
-      "No raw args provided by agent.",
-    );
+    expect(container.textContent).not.toContain("No raw args provided by agent.");
   });
 });

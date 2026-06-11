@@ -193,8 +193,7 @@ export const fixtures = {
     args_preview: "{}",
     memory_recall: {
       mode: "synthesize",
-      synthesized_text:
-        "User is a senior engineer working on agent-of-empires.",
+      synthesized_text: "User is a senior engineer working on agent-of-empires.",
     },
   }),
 };

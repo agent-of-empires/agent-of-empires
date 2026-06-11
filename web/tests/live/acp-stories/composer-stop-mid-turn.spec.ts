@@ -10,15 +10,8 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test as base, expect } from "@playwright/test";
-import {
-  spawnAoeServe,
-  listSessions,
-  seedSessionViaAoeAdd,
-} from "../../helpers/aoeServe";
-import {
-  waitForStructuredView,
-  enableStructuredViewAndWait,
-} from "../../helpers/acp";
+import { spawnAoeServe, listSessions, seedSessionViaAoeAdd } from "../../helpers/aoeServe";
+import { waitForStructuredView, enableStructuredViewAndWait } from "../../helpers/acp";
 
 const STOP_SCRIPT = {
   turns: [
@@ -67,9 +60,7 @@ base("Stop button cancels a running turn", async ({ page }, testInfo) => {
 
     await enableStructuredViewAndWait(serve.baseUrl, sessionId);
 
-    await page.goto(
-      `${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`,
-    );
+    await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`);
     await waitForStructuredView(page);
 
     const composer = page.getByRole("textbox", { name: /Send a message/i });
@@ -86,9 +77,7 @@ base("Stop button cancels a running turn", async ({ page }, testInfo) => {
     await stopButton.click();
 
     // Composer placeholder flips back to idle once the turn ends.
-    await expect(
-      page.getByRole("textbox", { name: /Send a message/i }),
-    ).toBeVisible({ timeout: 10_000 });
+    await expect(page.getByRole("textbox", { name: /Send a message/i })).toBeVisible({ timeout: 10_000 });
     await expect(stopButton).toBeHidden({ timeout: 10_000 });
     // We do NOT assert that the post-wait chunk never renders. The fake
     // ACP harness is single-threaded JS and does not abort its

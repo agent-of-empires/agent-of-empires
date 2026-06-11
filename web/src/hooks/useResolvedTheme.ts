@@ -1,11 +1,6 @@
 import { useEffect, useState } from "react";
 import { fetchCurrentTheme, fetchResolvedTheme } from "../lib/api";
-import {
-  applyResolvedTheme,
-  dispatchThemeChanged,
-  readCachedResolvedTheme,
-  type ResolvedTheme,
-} from "../lib/theme";
+import { applyResolvedTheme, dispatchThemeChanged, readCachedResolvedTheme, type ResolvedTheme } from "../lib/theme";
 
 /** Event name fired by the settings UI after the user picks a new
  *  theme. The hook listens for it and refetches /api/theme/current
@@ -23,9 +18,7 @@ export interface ThemePickerChangedDetail {
  *  Reads the cached payload from localStorage first to prevent FOUC,
  *  then fetches the authoritative payload and applies it. */
 export function useResolvedTheme(): ResolvedTheme | null {
-  const [theme, setTheme] = useState<ResolvedTheme | null>(() =>
-    readCachedResolvedTheme(),
-  );
+  const [theme, setTheme] = useState<ResolvedTheme | null>(() => readCachedResolvedTheme());
 
   useEffect(() => {
     // Monotonic sequence numbers tag every in-flight fetch. A fetch's
@@ -50,9 +43,7 @@ export function useResolvedTheme(): ResolvedTheme | null {
     const onChange = (event: Event) => {
       const detail = (event as CustomEvent<ThemePickerChangedDetail>).detail;
       const seq = ++nextSeq;
-      const promise = detail?.name
-        ? fetchResolvedTheme(detail.name)
-        : fetchCurrentTheme();
+      const promise = detail?.name ? fetchResolvedTheme(detail.name) : fetchCurrentTheme();
       promise.then((next) => apply(next, seq));
     };
     window.addEventListener(THEME_PICKER_CHANGED_EVENT, onChange);

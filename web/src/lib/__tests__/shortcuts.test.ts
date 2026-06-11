@@ -254,10 +254,7 @@ describe("matchShortcut behavior (no binding changed by the refactor)", () => {
     });
 
     // terminalFocus deliberately does not stopPropagation.
-    const term = matchShortcut(
-      ev({ key: "`", code: "Backquote", metaKey: true }),
-      { mac: true, isInput: false },
-    );
+    const term = matchShortcut(ev({ key: "`", code: "Backquote", metaKey: true }), { mac: true, isInput: false });
     expect(term).toMatchObject({
       preventDefault: true,
       stopPropagation: false,
@@ -291,10 +288,7 @@ describe("array order is cosmetic (predicates are mutually exclusive)", () => {
       if (t.alt) e.altKey = true;
       if (t.code) {
         e.code = t.code;
-        e.key =
-          t.code === "Backquote"
-            ? "`"
-            : t.code.replace(/^Key/, "").toLowerCase();
+        e.key = t.code === "Backquote" ? "`" : t.code.replace(/^Key/, "").toLowerCase();
       }
       if (t.key) e.key = t.key;
     } else {
@@ -303,10 +297,7 @@ describe("array order is cosmetic (predicates are mutually exclusive)", () => {
     return { event: e, isInput: false };
   }
 
-  function allMatchingIds(
-    event: ShortcutKeyEvent,
-    opts: { mac: boolean; isInput: boolean },
-  ): string[] {
+  function allMatchingIds(event: ShortcutKeyEvent, opts: { mac: boolean; isInput: boolean }): string[] {
     const mod = opts.mac ? event.metaKey : event.metaKey || event.ctrlKey;
     const hasMetaCtrlAlt = event.metaKey || event.ctrlKey || event.altKey;
     const ids: string[] = [];
@@ -319,9 +310,7 @@ describe("array order is cosmetic (predicates are mutually exclusive)", () => {
         if (t.code !== undefined) {
           if (event.code !== t.code) continue;
         } else if (t.key !== undefined) {
-          const ok = t.keyCaseInsensitive
-            ? event.key.toLowerCase() === t.key.toLowerCase()
-            : event.key === t.key;
+          const ok = t.keyCaseInsensitive ? event.key.toLowerCase() === t.key.toLowerCase() : event.key === t.key;
           if (!ok) continue;
         } else {
           continue;
@@ -347,10 +336,7 @@ describe("tour drift guard", () => {
   it("every tour shortcut hint id resolves to a registered shortcut", () => {
     for (const step of TOUR_STEPS) {
       for (const hint of step.shortcutHints ?? []) {
-        expect(
-          SHORTCUTS_BY_ID[hint.id],
-          `step "${step.id}" hint "${hint.id}" is not registered`,
-        ).toBeDefined();
+        expect(SHORTCUTS_BY_ID[hint.id], `step "${step.id}" hint "${hint.id}" is not registered`).toBeDefined();
       }
     }
   });

@@ -25,10 +25,7 @@ afterEach(() => {
 describe("ContentSplit quota crash regression (#1345)", () => {
   it("survives mousedown + mouseup when localStorage.setItem throws QuotaExceededError", () => {
     vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
-      throw new DOMException(
-        "The quota has been exceeded.",
-        "QuotaExceededError",
-      );
+      throw new DOMException("The quota has been exceeded.", "QuotaExceededError");
     });
 
     const { getByTestId } = render(

@@ -12,32 +12,15 @@ interface MockOptions {
 }
 
 async function mockApis(page: Page, opts: MockOptions = {}) {
-  await page.route("**/api/login/status", (r) =>
-    r.fulfill({ json: { required: false, authenticated: true } }),
-  );
-  for (const path of [
-    "settings",
-    "themes",
-    "profiles",
-    "groups",
-    "devices",
-    "about",
-    "system/update-status",
-  ]) {
+  await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
+  for (const path of ["settings", "themes", "profiles", "groups", "devices", "about", "system/update-status"]) {
     await page.route(`**/api/${path}`, (r) =>
       r.fulfill({
-        json:
-          path === "settings" ||
-          path === "about" ||
-          path === "system/update-status"
-            ? {}
-            : [],
+        json: path === "settings" || path === "about" || path === "system/update-status" ? {} : [],
       }),
     );
   }
-  await page.route("**/api/docker/status", (r) =>
-    r.fulfill({ json: { available: false, runtime: null } }),
-  );
+  await page.route("**/api/docker/status", (r) => r.fulfill({ json: { available: false, runtime: null } }));
   await page.route("**/api/agents", (r) =>
     r.fulfill({
       json: [
@@ -92,13 +75,8 @@ async function mockApis(page: Page, opts: MockOptions = {}) {
 async function openProjectStepWithPath(page: Page) {
   await page.locator("body").click();
   await page.keyboard.press("n");
-  await expect(
-    page.getByRole("heading", { name: "New session" }),
-  ).toBeVisible();
-  const recent = page
-    .getByRole("button")
-    .filter({ hasText: "/tmp/example" })
-    .first();
+  await expect(page.getByRole("heading", { name: "New session" })).toBeVisible();
+  const recent = page.getByRole("button").filter({ hasText: "/tmp/example" }).first();
   await recent.waitFor({ state: "visible", timeout: 5000 });
   await recent.click();
   // Extra repos picker section becomes visible once a primary path is set.
@@ -106,9 +84,7 @@ async function openProjectStepWithPath(page: Page) {
 }
 
 test.describe("Wizard extra repos picker (#1219)", () => {
-  test("registered projects render and the primary path is filtered out", async ({
-    page,
-  }) => {
+  test("registered projects render and the primary path is filtered out", async ({ page }) => {
     await mockApis(page);
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
@@ -116,20 +92,12 @@ test.describe("Wizard extra repos picker (#1219)", () => {
     await expect(page.getByText("Registered projects")).toBeVisible();
     // The primary entry (matching /tmp/example) is hidden from the picker
     // so users can't accidentally duplicate it.
-    await expect(
-      page.getByRole("button").filter({ hasText: /^primary$/ }),
-    ).toHaveCount(0);
-    await expect(
-      page.getByRole("button").filter({ hasText: /^shared-lib/ }),
-    ).toBeVisible();
-    await expect(
-      page.getByRole("button").filter({ hasText: /^docs/ }),
-    ).toBeVisible();
+    await expect(page.getByRole("button").filter({ hasText: /^primary$/ })).toHaveCount(0);
+    await expect(page.getByRole("button").filter({ hasText: /^shared-lib/ })).toBeVisible();
+    await expect(page.getByRole("button").filter({ hasText: /^docs/ })).toBeVisible();
   });
 
-  test("clicking a registered project chip toggles selection", async ({
-    page,
-  }) => {
+  test("clicking a registered project chip toggles selection", async ({ page }) => {
     await mockApis(page);
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
@@ -145,9 +113,7 @@ test.describe("Wizard extra repos picker (#1219)", () => {
     await expect(page.getByText("none")).toBeVisible();
   });
 
-  test("free-text path: typing + Enter appends a chip and clears the input", async ({
-    page,
-  }) => {
+  test("free-text path: typing + Enter appends a chip and clears the input", async ({ page }) => {
     await mockApis(page);
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
@@ -162,9 +128,7 @@ test.describe("Wizard extra repos picker (#1219)", () => {
     await expect(page.getByText("none")).toBeVisible();
   });
 
-  test("free-text path: Add button stays disabled while input is empty", async ({
-    page,
-  }) => {
+  test("free-text path: Add button stays disabled while input is empty", async ({ page }) => {
     await mockApis(page);
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
@@ -177,9 +141,7 @@ test.describe("Wizard extra repos picker (#1219)", () => {
     await expect(page.getByText("1 selected")).toBeVisible();
   });
 
-  test("attempting to add the primary path as a free-text entry is a no-op", async ({
-    page,
-  }) => {
+  test("attempting to add the primary path as a free-text entry is a no-op", async ({ page }) => {
     await mockApis(page);
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");

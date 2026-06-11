@@ -32,9 +32,7 @@ describe("classifyMcp", () => {
   });
 
   it("handles servers with hyphens in their name", () => {
-    const r = classifyMcp(
-      tool("mcp__db-toolbox-preprod__preprod_cluster_dbsize"),
-    );
+    const r = classifyMcp(tool("mcp__db-toolbox-preprod__preprod_cluster_dbsize"));
     expect(r.isMcp).toBe(true);
     if (r.isMcp) {
       expect(r.server).toBe("db-toolbox-preprod");

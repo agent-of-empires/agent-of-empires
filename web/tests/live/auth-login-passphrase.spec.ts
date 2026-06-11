@@ -10,10 +10,7 @@
 
 import { test, expect } from "../helpers/liveTest";
 
-test("wrong passphrase shows an error and stays on LoginPage", async ({
-  servePassphrase,
-  page,
-}) => {
+test("wrong passphrase shows an error and stays on LoginPage", async ({ servePassphrase, page }) => {
   await page.goto(servePassphrase.baseUrl);
 
   await expect(page.locator("input#passphrase")).toBeVisible();
@@ -31,10 +28,7 @@ test("wrong passphrase shows an error and stays on LoginPage", async ({
   });
 });
 
-test("correct passphrase logs in and reveals the dashboard", async ({
-  servePassphrase,
-  page,
-}) => {
+test("correct passphrase logs in and reveals the dashboard", async ({ servePassphrase, page }) => {
   if (!servePassphrase.passphrase) {
     throw new Error("servePassphrase fixture must expose passphrase");
   }
@@ -52,7 +46,5 @@ test("correct passphrase logs in and reveals the dashboard", async ({
   await expect(page.locator("input#passphrase")).toBeHidden({
     timeout: 10_000,
   });
-  await expect(
-    page.getByRole("button", { name: "Go to dashboard" }),
-  ).toBeVisible({ timeout: 5_000 });
+  await expect(page.getByRole("button", { name: "Go to dashboard" })).toBeVisible({ timeout: 5_000 });
 });

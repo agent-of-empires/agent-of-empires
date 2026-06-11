@@ -12,9 +12,7 @@ interface MockSession {
 }
 
 async function mockApis(page: Page, sessions: MockSession[]) {
-  await page.route("**/api/login/status", (r) =>
-    r.fulfill({ json: { required: false, authenticated: true } }),
-  );
+  await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
   await page.route("**/api/sessions", (r) => {
     if (r.request().method() !== "GET") return r.fulfill({ status: 400 });
     return r.fulfill({
@@ -41,19 +39,8 @@ async function mockApis(page: Page, sessions: MockSession[]) {
       },
     });
   });
-  for (const path of [
-    "settings",
-    "themes",
-    "agents",
-    "profiles",
-    "groups",
-    "devices",
-    "docker/status",
-    "about",
-  ]) {
-    await page.route(`**/api/${path}`, (r) =>
-      r.fulfill({ json: path === "docker/status" ? {} : [] }),
-    );
+  for (const path of ["settings", "themes", "agents", "profiles", "groups", "devices", "docker/status", "about"]) {
+    await page.route(`**/api/${path}`, (r) => r.fulfill({ json: path === "docker/status" ? {} : [] }));
   }
 }
 
@@ -71,10 +58,7 @@ async function menuFitsViewport(page: Page, locator: string) {
         const box = await page.locator(locator).boundingBox();
         if (!box) return null;
         return (
-          box.x >= 0 &&
-          box.y >= 0 &&
-          box.x + box.width <= viewport!.width &&
-          box.y + box.height <= viewport!.height
+          box.x >= 0 && box.y >= 0 && box.x + box.width <= viewport!.width && box.y + box.height <= viewport!.height
         );
       },
       { timeout: 5_000 },
@@ -83,9 +67,7 @@ async function menuFitsViewport(page: Page, locator: string) {
 }
 
 test.describe("Sidebar context-menu viewport clamp (#1601)", () => {
-  test("right-click on the bottom session row keeps the menu inside the viewport", async ({
-    page,
-  }) => {
+  test("right-click on the bottom session row keeps the menu inside the viewport", async ({ page }) => {
     await mockApis(page, [
       { id: "s-1", title: "Mongols", project_path: "/tmp/repo-a" },
       { id: "s-2", title: "Goths", project_path: "/tmp/repo-b" },
@@ -106,9 +88,7 @@ test.describe("Sidebar context-menu viewport clamp (#1601)", () => {
     await menuFitsViewport(page, "[data-testid='sidebar-context-menu']");
   });
 
-  test("right-click on a repo group header near the bottom clamps the menu", async ({
-    page,
-  }) => {
+  test("right-click on a repo group header near the bottom clamps the menu", async ({ page }) => {
     await mockApis(page, [
       { id: "s-1", title: "Mongols", project_path: "/tmp/repo-a" },
       { id: "s-2", title: "Goths", project_path: "/tmp/repo-b" },

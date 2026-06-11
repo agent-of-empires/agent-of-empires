@@ -1,9 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import {
-  EMPTY_STORAGE,
-  loadComments,
-  saveComments,
-} from "../components/diff/comments/storage";
+import { EMPTY_STORAGE, loadComments, saveComments } from "../components/diff/comments/storage";
 import type { DiffComment } from "../components/diff/comments/types";
 
 // `useDiffComments` switches the React state when the active sessionId
@@ -100,9 +96,7 @@ describe("useDiffComments contract", () => {
     // The hook explicitly guards `if (!sessionId) return;` in its save
     // and load effects, so a logged-out / pre-selection render stays
     // empty and never writes a key with the literal string "null".
-    expect((globalThis as { localStorage: Storage }).localStorage.length).toBe(
-      0,
-    );
+    expect((globalThis as { localStorage: Storage }).localStorage.length).toBe(0);
     expect({ ...EMPTY_STORAGE }).toEqual(EMPTY_STORAGE);
   });
 });

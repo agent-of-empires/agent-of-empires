@@ -38,14 +38,8 @@ function sessionResponse(s: MockSession) {
   };
 }
 
-async function mockApis(
-  page: Page,
-  getSessions: () => MockSession[],
-  getOrdering: () => string[],
-) {
-  await page.route("**/api/login/status", (r) =>
-    r.fulfill({ json: { required: false, authenticated: true } }),
-  );
+async function mockApis(page: Page, getSessions: () => MockSession[], getOrdering: () => string[]) {
+  await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
   await page.route("**/api/sessions", (r) => {
     if (r.request().method() !== "GET") return r.fulfill({ status: 400 });
     return r.fulfill({
@@ -59,40 +53,21 @@ async function mockApis(
   // drag now — the server-side merge in `list_sessions` covers the
   // "new workspace appears" case. The drag test overrides this route
   // with `page.route(..., ...)` to capture the PUT body.
-  await page.route("**/api/workspace-ordering", (r) =>
-    r.fulfill({ json: { order: [] } }),
-  );
-  for (const path of [
-    "settings",
-    "themes",
-    "agents",
-    "profiles",
-    "groups",
-    "devices",
-    "docker/status",
-    "about",
-  ]) {
-    await page.route(`**/api/${path}`, (r) =>
-      r.fulfill({ json: path === "docker/status" ? {} : [] }),
-    );
+  await page.route("**/api/workspace-ordering", (r) => r.fulfill({ json: { order: [] } }));
+  for (const path of ["settings", "themes", "agents", "profiles", "groups", "devices", "docker/status", "about"]) {
+    await page.route(`**/api/${path}`, (r) => r.fulfill({ json: path === "docker/status" ? {} : [] }));
   }
 }
 
 async function readWorkspaceOrder(page: Page): Promise<string[]> {
   return page.evaluate(() => {
-    const links = Array.from(
-      document.querySelectorAll<HTMLAnchorElement>("a[href^='/session/']"),
-    );
-    return links
-      .map((a) => a.querySelector("[title]")?.getAttribute("title") ?? "")
-      .filter(Boolean);
+    const links = Array.from(document.querySelectorAll<HTMLAnchorElement>("a[href^='/session/']"));
+    return links.map((a) => a.querySelector("[title]")?.getAttribute("title") ?? "").filter(Boolean);
   });
 }
 
 test.describe("Sidebar drag-to-reorder (#1169)", () => {
-  test("applies the server-supplied ordering on first paint", async ({
-    page,
-  }) => {
+  test("applies the server-supplied ordering on first paint", async ({ page }) => {
     const sessions: MockSession[] = [
       {
         id: "s-old",
@@ -126,17 +101,11 @@ test.describe("Sidebar drag-to-reorder (#1169)", () => {
     // the drag affordance disappears and these tests break in confusing
     // ways. Assert the toggle's state up front so the failure mode is
     // obvious. See #1418.
-    await expect(
-      page.locator("[data-testid='sidebar-sort-toggle']"),
-    ).toHaveAttribute("data-sort-mode", "manual");
-    await expect
-      .poll(() => readWorkspaceOrder(page), { timeout: 8000 })
-      .toEqual(["old-ws", "new-ws"]);
+    await expect(page.locator("[data-testid='sidebar-sort-toggle']")).toHaveAttribute("data-sort-mode", "manual");
+    await expect.poll(() => readWorkspaceOrder(page), { timeout: 8000 }).toEqual(["old-ws", "new-ws"]);
   });
 
-  test("renders the server-returned order verbatim (no client-side resort)", async ({
-    page,
-  }) => {
+  test("renders the server-returned order verbatim (no client-side resort)", async ({ page }) => {
     const sessions: MockSession[] = [
       {
         id: "s-old",
@@ -165,14 +134,10 @@ test.describe("Sidebar drag-to-reorder (#1169)", () => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
 
-    await expect
-      .poll(() => readWorkspaceOrder(page), { timeout: 8000 })
-      .toEqual(["new-ws", "old-ws"]);
+    await expect.poll(() => readWorkspaceOrder(page), { timeout: 8000 }).toEqual(["new-ws", "old-ws"]);
   });
 
-  test("press-and-hold drag reorders the row and PUTs the new order", async ({
-    page,
-  }) => {
+  test("press-and-hold drag reorders the row and PUTs the new order", async ({ page }) => {
     const sessions: MockSession[] = [
       {
         id: "s-c",
@@ -200,11 +165,7 @@ test.describe("Sidebar drag-to-reorder (#1169)", () => {
     // The real server returns the merged ordering; the mock mirrors
     // that, so the client renders the rows in the exact order the
     // server gave it.
-    const initialOrdering = [
-      "/tmp/repo::feature/a",
-      "/tmp/repo::feature/b",
-      "/tmp/repo::feature/c",
-    ];
+    const initialOrdering = ["/tmp/repo::feature/a", "/tmp/repo::feature/b", "/tmp/repo::feature/c"];
 
     const puts: string[][] = [];
     await mockApis(
@@ -224,18 +185,14 @@ test.describe("Sidebar drag-to-reorder (#1169)", () => {
 
     // Initial newest-first per the server-supplied ordering: alpha,
     // beta, gamma.
-    await expect
-      .poll(() => readWorkspaceOrder(page), { timeout: 8000 })
-      .toEqual(["alpha", "beta", "gamma"]);
+    await expect.poll(() => readWorkspaceOrder(page), { timeout: 8000 }).toEqual(["alpha", "beta", "gamma"]);
 
     // Press-and-hold on gamma's row, wait past the 250ms sensor delay,
     // then drag up onto alpha's row. The press has to target the
     // sortable wrapper (not the inner Link or its children), because
     // dnd-kit's MouseSensor only listens on `setNodeRef`'d nodes; clicks
     // that land on the Link bypass the sensor and just navigate.
-    const wrappers = page.locator(
-      "[aria-roledescription='Press and hold to reorder']",
-    );
+    const wrappers = page.locator("[aria-roledescription='Press and hold to reorder']");
     await expect(wrappers).toHaveCount(3);
     const sourceBox = await wrappers.nth(2).boundingBox();
     const targetBox = await wrappers.nth(0).boundingBox();
@@ -246,17 +203,10 @@ test.describe("Sidebar drag-to-reorder (#1169)", () => {
     // Press near the right edge to avoid landing on the inner Link's
     // status glyph. The drag listeners are on the wrapper div, so the
     // exact pixel doesn't matter as long as it's inside.
-    await page.mouse.move(
-      sourceBox.x + sourceBox.width - 4,
-      sourceBox.y + sourceBox.height / 2,
-    );
+    await page.mouse.move(sourceBox.x + sourceBox.width - 4, sourceBox.y + sourceBox.height / 2);
     await page.mouse.down();
     await page.waitForTimeout(250);
-    await page.mouse.move(
-      targetBox.x + targetBox.width / 2,
-      targetBox.y + targetBox.height / 2,
-      { steps: 12 },
-    );
+    await page.mouse.move(targetBox.x + targetBox.width / 2, targetBox.y + targetBox.height / 2, { steps: 12 });
 
     // Mid-drag: the source row must visibly lift (amber ring + shadow).
     // We assert this before releasing so the test fails if a future
@@ -270,19 +220,13 @@ test.describe("Sidebar drag-to-reorder (#1169)", () => {
     await page.mouse.up();
 
     // Order now starts with gamma (visually moved to the top).
-    await expect
-      .poll(() => readWorkspaceOrder(page), { timeout: 4000 })
-      .toEqual(["gamma", "alpha", "beta"]);
+    await expect.poll(() => readWorkspaceOrder(page), { timeout: 4000 }).toEqual(["gamma", "alpha", "beta"]);
 
     // The drag is the only PUT now (server-side merge handles "new
     // workspace appears" without a client write).
     await expect
       .poll(() => puts.at(-1), { timeout: 4000 })
-      .toEqual([
-        "/tmp/repo::feature/c",
-        "/tmp/repo::feature/a",
-        "/tmp/repo::feature/b",
-      ]);
+      .toEqual(["/tmp/repo::feature/c", "/tmp/repo::feature/a", "/tmp/repo::feature/b"]);
     expect(puts.length).toBe(1);
   });
 });

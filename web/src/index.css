@@ -45,32 +45,40 @@
    matches the resolved palette for default. Keep these values in
    sync with that TOML file. */
 @theme {
-  /* Brand -- Amber/Copper (used sparingly) */
-  --color-brand-400: #fbbf24;
+  /* Brand, derived from default.accent */
+  --color-brand-100: #fdecce;
+  --color-brand-200: #fcddaa;
+  --color-brand-300: #faca79;
+  --color-brand-400: #f7b13c;
   --color-brand-500: #f59e0b;
-  --color-brand-600: #d97706;
-  --color-brand-700: #b45309;
+  --color-brand-600: #d08609;
+  --color-brand-700: #ac6f08;
+  --color-brand-800: #865606;
+  --color-brand-900: #6e4705;
+  --color-text-on-brand: #000000;
 
   /* Accent -- Muted Teal (used sparingly) */
   --color-accent-500: #14b8a6;
   --color-accent-600: #0d9488;
   --color-accent-700: #0f766e;
 
-  /* Surfaces -- neutral zinc */
+  /* Surfaces, derived from default.background and border */
+  --color-surface-500: #65656b;
+  --color-surface-600: #525258;
   --color-surface-700: #3f3f46;
-  --color-surface-800: #2c2c30;
-  --color-surface-850: #262629;
+  --color-surface-800: #2e2e31;
+  --color-surface-850: #27272a;
   --color-surface-900: #1c1c1f;
-  --color-surface-950: #141416;
+  --color-surface-950: #0f0f11;
 
   /* Semantic Text */
   --color-text-primary: #e4e4e7;
   --color-text-secondary: #a1a1aa;
   --color-text-muted: #71717a;
-  /* Body text using the dim slot must clear WCAG AA against
-     surface-900 (#1c1c1f) and surface-800 (#2c2c30); the previous
+  /* Body text using the dim slot must stay legible against
+     surface-900 (#1c1c1f) and surface-800 (#2e2e31); the previous
      value (#52525b ≈ 2.6:1 vs surface-900) failed both AA body and
-     AA large. Bumped to ~5.0:1 vs surface-900 / ~4.2:1 vs surface-800
+     AA large. Bumped to ~5.0:1 vs surface-900 / ~4.0:1 vs surface-800
      so per-setting descriptions and similar tertiary copy stay
      legible. Decorative uses (separator hairlines, etc.) that need
      to read as quieter can drop to surface-700 directly. See #1105. */
@@ -83,6 +91,7 @@
      ramp so it wins on luminance against fresh-idle. Saturation alone
      reads as DIMMER on dark backgrounds, so we lean on luminance. */
   --color-status-waiting: #fbbf24;
+  --color-status-warning: #fbbf24;
   /* Color of an Idle session whose Stop fired within the decay window.
      Held constant for the full window (then snaps to `--color-status-idle`)
      so the breathe rattle's pulse stays visually consistent. One rung
@@ -117,6 +126,7 @@
   --term-bg: #1c1c1f;
   --term-fg: #e4e4e7;
   --term-cursor: #f59e0b;
+  --term-selection-bg: rgba(161, 161, 170, 0.35);
   --term-color-0: #1c1c1f;
   --term-color-1: #ef4444;
   --term-color-2: #22c55e;
@@ -303,8 +313,7 @@ body {
   vertical-align: top;
   white-space: nowrap;
   color: var(--color-text-secondary);
-  border-bottom: 1px solid
-    color-mix(in srgb, var(--color-surface-900) 50%, transparent);
+  border-bottom: 1px solid color-mix(in srgb, var(--color-surface-900) 50%, transparent);
 }
 .acp-markdown tbody tr:nth-child(even) {
   background: color-mix(in srgb, var(--color-surface-900) 30%, transparent);
@@ -395,7 +404,7 @@ select:focus-visible,
 }
 
 .xterm ::selection {
-  background: rgba(161, 161, 170, 0.2);
+  background: color-mix(in srgb, var(--color-text-secondary) 20%, transparent);
 }
 
 /* Subtle focus ring for terminal panels (desktop only).
@@ -405,7 +414,7 @@ select:focus-visible,
     content: "";
     position: absolute;
     inset: 0;
-    border: 1px solid rgba(217, 119, 6, 0.45);
+    border: 1px solid color-mix(in srgb, var(--color-brand-600) 45%, transparent);
     border-radius: inherit;
     pointer-events: none;
     z-index: 20;
@@ -418,6 +427,5 @@ select:focus-visible,
 }
 
 .safe-area-inset {
-  padding: env(safe-area-inset-top) env(safe-area-inset-right)
-    env(safe-area-inset-bottom) env(safe-area-inset-left);
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
 }

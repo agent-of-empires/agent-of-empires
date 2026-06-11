@@ -39,9 +39,7 @@ async function pathExists(p) {
 
 async function loadVitestCoverage() {
   if (!(await pathExists(vitestFinal))) {
-    console.log(
-      `[merge-coverage] no vitest coverage at ${vitestFinal}, skipping`,
-    );
+    console.log(`[merge-coverage] no vitest coverage at ${vitestFinal}, skipping`);
     return null;
   }
   const raw = await readFile(vitestFinal, "utf8");
@@ -50,9 +48,7 @@ async function loadVitestCoverage() {
 
 async function loadPlaywrightCoverages() {
   if (!(await pathExists(playwrightDir))) {
-    console.log(
-      `[merge-coverage] no playwright coverage dir at ${playwrightDir}, skipping`,
-    );
+    console.log(`[merge-coverage] no playwright coverage dir at ${playwrightDir}, skipping`);
     return [];
   }
   const entries = await readdir(playwrightDir);
@@ -94,9 +90,7 @@ async function main() {
   const vitestCov = await loadVitestCoverage();
   if (vitestCov) {
     await mcr.add(vitestCov);
-    console.log(
-      `[merge-coverage] added vitest coverage (${Object.keys(vitestCov).length} files)`,
-    );
+    console.log(`[merge-coverage] added vitest coverage (${Object.keys(vitestCov).length} files)`);
   }
 
   const pwCovs = await loadPlaywrightCoverages();
@@ -104,9 +98,7 @@ async function main() {
     await mcr.add(cov);
   }
   if (pwCovs.length > 0) {
-    console.log(
-      `[merge-coverage] added ${pwCovs.length} playwright coverage files`,
-    );
+    console.log(`[merge-coverage] added ${pwCovs.length} playwright coverage files`);
   }
 
   if (!vitestCov && pwCovs.length === 0) {
@@ -116,9 +108,7 @@ async function main() {
 
   const report = await mcr.generate();
   console.log(`[merge-coverage] wrote ${outDir}`);
-  console.log(
-    `[merge-coverage] summary: lines=${report.summary?.lines?.pct ?? "?"}%`,
-  );
+  console.log(`[merge-coverage] summary: lines=${report.summary?.lines?.pct ?? "?"}%`);
 }
 
 main().catch((err) => {

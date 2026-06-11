@@ -1,7 +1,6 @@
 import { test, expect } from "./helpers/mockedTest";
 
-const NEW_SESSION_PANE_NAME =
-  /New session Pick a project, then launch a new session/i;
+const NEW_SESSION_PANE_NAME = /New session Pick a project, then launch a new session/i;
 
 test.describe("Dashboard layout", () => {
   test("loads and shows header", async ({ page }) => {
@@ -17,9 +16,7 @@ test.describe("Dashboard layout", () => {
   test("shows branded home screen with action panes", async ({ page }) => {
     await page.goto("/");
     await expect(page.getByText("empires", { exact: false })).toBeVisible();
-    await expect(
-      page.getByRole("button", { name: NEW_SESSION_PANE_NAME }),
-    ).toBeVisible();
+    await expect(page.getByRole("button", { name: NEW_SESSION_PANE_NAME })).toBeVisible();
     await expect(page.getByText("Clone URL")).toBeVisible();
     await expect(page.getByText("Docs")).toBeVisible();
   });
@@ -39,14 +36,24 @@ test.describe("Sidebar", () => {
 
   test("sidebar toggle button exists", async ({ page }) => {
     await page.goto("/");
-    await expect(
-      page.getByRole("button", { name: "Toggle sidebar" }),
-    ).toBeVisible();
+    await expect(page.getByRole("button", { name: "Toggle sidebar" })).toBeVisible();
   });
 
-  test("sidebar can be toggled closed and open on desktop", async ({
-    page,
-  }) => {
+  test("sidebar Projects button opens the Projects view", async ({ page }) => {
+    // Ported from the live projects-open story: the sidebar footer's
+    // Projects button navigates to /projects and ProjectsView mounts.
+    await page.route("**/api/projects*", (r) => r.fulfill({ json: [] }));
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await page.goto("/");
+
+    await page.getByRole("button", { name: "Projects", exact: true }).click();
+
+    await expect(page).toHaveURL(/\/projects/);
+    await expect(page.getByRole("heading", { name: "Projects", exact: true })).toBeVisible();
+    await expect(page.getByText(/Saved repositories you can multi-select/i)).toBeVisible();
+  });
+
+  test("sidebar can be toggled closed and open on desktop", async ({ page }) => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
     const addBtn = page.getByLabel("New session");
@@ -64,21 +71,15 @@ test.describe("Create session from home screen", () => {
   test("'New session' pane opens session wizard", async ({ page }) => {
     await page.goto("/");
     await page.getByRole("button", { name: NEW_SESSION_PANE_NAME }).click();
-    await expect(
-      page.getByRole("heading", { name: "New session" }),
-    ).toBeVisible();
+    await expect(page.getByRole("heading", { name: "New session" })).toBeVisible();
   });
 
   test("'Clone URL' pane opens wizard on Clone tab", async ({ page }) => {
     await page.goto("/");
     await page.getByText("Clone URL").click();
-    await expect(
-      page.getByRole("heading", { name: "New session" }),
-    ).toBeVisible();
+    await expect(page.getByRole("heading", { name: "New session" })).toBeVisible();
     // Should be on the Clone tab, showing the URL input
-    await expect(
-      page.getByPlaceholder("https://github.com/user/repo.git"),
-    ).toBeVisible();
+    await expect(page.getByPlaceholder("https://github.com/user/repo.git")).toBeVisible();
   });
 
   test("opens with keyboard shortcut n", async ({ page }) => {
@@ -86,46 +87,47 @@ test.describe("Create session from home screen", () => {
     await page.goto("/");
     await page.locator("body").click();
     await page.keyboard.press("n");
-    await expect(
-      page.getByRole("heading", { name: "New session" }),
-    ).toBeVisible();
+    await expect(page.getByRole("heading", { name: "New session" })).toBeVisible();
   });
 
   test("wizard closes on cancel", async ({ page }) => {
     await page.goto("/");
     await page.getByRole("button", { name: NEW_SESSION_PANE_NAME }).click();
-    await expect(
-      page.getByRole("heading", { name: "New session" }),
-    ).toBeVisible();
+    await expect(page.getByRole("heading", { name: "New session" })).toBeVisible();
     await page.getByRole("button", { name: "Cancel" }).click();
-    await expect(
-      page.getByRole("heading", { name: "New session" }),
-    ).not.toBeVisible();
+    await expect(page.getByRole("heading", { name: "New session" })).not.toBeVisible();
   });
 
   test("wizard closes on escape", async ({ page }) => {
     await page.goto("/");
     await page.getByRole("button", { name: NEW_SESSION_PANE_NAME }).click();
-    await expect(
-      page.getByRole("heading", { name: "New session" }),
-    ).toBeVisible();
+    await expect(page.getByRole("heading", { name: "New session" })).toBeVisible();
     await page.keyboard.press("Escape");
-    await expect(
-      page.getByRole("heading", { name: "New session" }),
-    ).not.toBeVisible();
+    await expect(page.getByRole("heading", { name: "New session" })).not.toBeVisible();
+  });
+
+  test("sidebar New session opens wizard and the header X closes it", async ({ page }) => {
+    // Ported from the live wizard-open-close story. Stub /api/sessions
+    // so useSessions reports the server reachable; otherwise the
+    // offline-state UI disables the sidebar "New session" trigger.
+    await page.route("**/api/sessions", (r) => r.fulfill({ json: { sessions: [], workspace_ordering: [] } }));
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await page.goto("/");
+
+    await page.getByLabel("New session").first().click();
+    await expect(page.getByRole("heading", { name: "New session" })).toBeVisible();
+
+    await page.getByRole("button", { name: "Close" }).click();
+    await expect(page.getByRole("heading", { name: "New session" })).not.toBeVisible();
   });
 
   test("wizard closes on backdrop click", async ({ page }) => {
     await page.goto("/");
     await page.getByRole("button", { name: NEW_SESSION_PANE_NAME }).click();
-    await expect(
-      page.getByRole("heading", { name: "New session" }),
-    ).toBeVisible();
+    await expect(page.getByRole("heading", { name: "New session" })).toBeVisible();
     // Click the backdrop (top-left corner, outside the modal)
     await page.mouse.click(10, 10);
-    await expect(
-      page.getByRole("heading", { name: "New session" }),
-    ).not.toBeVisible();
+    await expect(page.getByRole("heading", { name: "New session" })).not.toBeVisible();
   });
 });
 
@@ -151,9 +153,7 @@ test.describe("Settings", () => {
 });
 
 test.describe("Keyboard shortcuts", () => {
-  test("D toggles diff pane (no-op when no session, no crash)", async ({
-    page,
-  }) => {
+  test("D toggles diff pane (no-op when no session, no crash)", async ({ page }) => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
     // Should not crash even with no session selected
@@ -166,9 +166,7 @@ test.describe("Keyboard shortcuts", () => {
     await page.goto("/");
     await page.locator("body").click();
     await page.evaluate(() => {
-      document.dispatchEvent(
-        new KeyboardEvent("keydown", { key: "?", bubbles: true }),
-      );
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: "?", bubbles: true }));
     });
     await expect(page.getByRole("heading", { name: "Help" })).toBeVisible();
   });
@@ -178,9 +176,7 @@ test.describe("Keyboard shortcuts", () => {
     await page.goto("/");
     await page.locator("body").click();
     await page.evaluate(() => {
-      document.dispatchEvent(
-        new KeyboardEvent("keydown", { key: "?", bubbles: true }),
-      );
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: "?", bubbles: true }));
     });
     await expect(page.getByRole("heading", { name: "Help" })).toBeVisible();
     await page.keyboard.press("Escape");
@@ -199,15 +195,11 @@ test.describe("Mobile responsive", () => {
     await expect(page.getByText("empires", { exact: false })).toBeVisible();
   });
 
-  test("mobile home screen shows sidebar toggle between title and panes", async ({
-    page,
-  }) => {
+  test("mobile home screen shows sidebar toggle between title and panes", async ({ page }) => {
     await page.setViewportSize({ width: 375, height: 812 });
     await page.goto("/");
     await expect(page.getByText("Show sessions")).toBeVisible();
-    await expect(
-      page.getByRole("button", { name: NEW_SESSION_PANE_NAME }),
-    ).toBeVisible();
+    await expect(page.getByRole("button", { name: NEW_SESSION_PANE_NAME })).toBeVisible();
   });
 
   test("hamburger opens sidebar overlay on mobile", async ({ page }) => {
@@ -237,18 +229,14 @@ test.describe("Mobile responsive", () => {
     await page.setViewportSize({ width: 375, height: 812 });
     await page.goto("/");
     await page.getByRole("button", { name: NEW_SESSION_PANE_NAME }).click();
-    await expect(
-      page.getByRole("heading", { name: "New session" }),
-    ).toBeVisible();
+    await expect(page.getByRole("heading", { name: "New session" })).toBeVisible();
   });
 });
 
 test.describe("Design system", () => {
   test("uses dark surface background", async ({ page }) => {
     await page.goto("/");
-    const bg = await page.evaluate(
-      () => getComputedStyle(document.body).backgroundColor,
-    );
+    const bg = await page.evaluate(() => getComputedStyle(document.body).backgroundColor);
     // surface-900 = #1c1c1f = rgb(28, 28, 31)
     expect(bg).toContain("28");
     expect(bg).not.toBe("rgb(255, 255, 255)");
@@ -256,15 +244,11 @@ test.describe("Design system", () => {
 
   test("loads Geist Sans body font", async ({ page }) => {
     await page.goto("/");
-    const fonts = await page.evaluate(
-      () => getComputedStyle(document.body).fontFamily,
-    );
+    const fonts = await page.evaluate(() => getComputedStyle(document.body).fontFamily);
     expect(fonts.toLowerCase()).toContain("geist");
   });
 
-  test("focus-visible ring appears on keyboard navigation", async ({
-    page,
-  }) => {
+  test("focus-visible ring appears on keyboard navigation", async ({ page }) => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
     // Tab to the first button

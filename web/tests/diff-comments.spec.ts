@@ -39,8 +39,7 @@ const DIFF_FILE_RESPONSE = {
     additions: 3,
     deletions: 1,
   },
-  old_content:
-    'import { useState } from "react";\nconst x = 42;\nexport default x;\n',
+  old_content: 'import { useState } from "react";\nconst x = 42;\nexport default x;\n',
   new_content:
     'import { useState } from "react";\n' +
     "const x: number = 42;\n" +
@@ -65,9 +64,7 @@ interface SetupOpts {
 async function setup(page: Page, opts: SetupOpts = {}) {
   const structuredView = opts.structuredView ?? true;
   const acpWorkerState = opts.acpWorkerState ?? "running";
-  await page.route("**/api/login/status", (r) =>
-    r.fulfill({ json: { required: false, authenticated: true } }),
-  );
+  await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
   for (const path of [
     "settings",
     "themes",
@@ -82,10 +79,7 @@ async function setup(page: Page, opts: SetupOpts = {}) {
     await page.route(`**/api/${path}`, (r) =>
       r.fulfill({
         json:
-          path === "docker/status" ||
-          path === "about" ||
-          path === "settings" ||
-          path === "system/update-status"
+          path === "docker/status" || path === "about" || path === "settings" || path === "system/update-status"
             ? {}
             : [],
       }),
@@ -122,18 +116,10 @@ async function setup(page: Page, opts: SetupOpts = {}) {
       },
     });
   });
-  await page.route("**/api/sessions/*/ensure", (r) =>
-    r.fulfill({ json: { ok: true } }),
-  );
-  await page.route("**/api/sessions/*/terminal", (r) =>
-    r.fulfill({ status: 200, body: "" }),
-  );
-  await page.route("**/api/sessions/*/diff/files", (r) =>
-    r.fulfill({ json: DIFF_FILES_RESPONSE }),
-  );
-  await page.route(/\/api\/sessions\/[^/]+\/diff\/file\?/, (r) =>
-    r.fulfill({ json: DIFF_FILE_RESPONSE }),
-  );
+  await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));
+  await page.route("**/api/sessions/*/terminal", (r) => r.fulfill({ status: 200, body: "" }));
+  await page.route("**/api/sessions/*/diff/files", (r) => r.fulfill({ json: DIFF_FILES_RESPONSE }));
+  await page.route(/\/api\/sessions\/[^/]+\/diff\/file\?/, (r) => r.fulfill({ json: DIFF_FILE_RESPONSE }));
   // Structured view panel endpoints — content irrelevant for these tests.
   await page.route("**/api/sessions/*/acp/**", (r) => r.fulfill({ json: {} }));
   await page.routeWebSocket(/\/sessions\/.*\/(ws|acp-ws)$/, () => {
@@ -160,9 +146,7 @@ async function openSessionAndFile(page: Page) {
  *  comment form. `[data-line-number-content]` cells contain only the number,
  *  so an exact-text filter is unambiguous. */
 function gutterLine(page: Page, lineNum: number) {
-  return page
-    .locator("[data-line-number-content]")
-    .filter({ hasText: new RegExp(`^${lineNum}$`) });
+  return page.locator("[data-line-number-content]").filter({ hasText: new RegExp(`^${lineNum}$`) });
 }
 
 /** Open a single-line comment form by selecting one line. */
@@ -181,15 +165,11 @@ async function selectRange(page: Page, startLine: number, endLine: number) {
 test.use({ viewport: { width: 1280, height: 900 } });
 
 test.describe("Diff comments (#928)", () => {
-  test("saves a single-line comment and renders the card inline", async ({
-    page,
-  }) => {
+  test("saves a single-line comment and renders the card inline", async ({ page }) => {
     await setup(page);
     await openSessionAndFile(page);
     await startSingleLineComment(page, 3);
-    const textarea = page.getByPlaceholder(
-      /Leave a comment \(markdown supported\)/,
-    );
+    const textarea = page.getByPlaceholder(/Leave a comment \(markdown supported\)/);
     await expect(textarea).toBeVisible();
     await textarea.fill("rename `greet` to `salute`");
     await page.getByRole("button", { name: "Save" }).click();
@@ -202,9 +182,7 @@ test.describe("Diff comments (#928)", () => {
     await setup(page);
     await openSessionAndFile(page);
     await selectRange(page, 3, 4);
-    const textarea = page.getByPlaceholder(
-      /Leave a comment \(markdown supported\)/,
-    );
+    const textarea = page.getByPlaceholder(/Leave a comment \(markdown supported\)/);
     await expect(textarea).toBeVisible();
     // Form heading should reflect the range
     await expect(page.getByText("lines 3-4 (new)").first()).toBeVisible();
@@ -213,15 +191,11 @@ test.describe("Diff comments (#928)", () => {
     await expect(page.getByText("lines 3-4 (new)").first()).toBeVisible();
   });
 
-  test("banner shows count and persists comments through reload", async ({
-    page,
-  }) => {
+  test("banner shows count and persists comments through reload", async ({ page }) => {
     await setup(page);
     await openSessionAndFile(page);
     await startSingleLineComment(page, 3);
-    await page
-      .getByPlaceholder(/Leave a comment \(markdown supported\)/)
-      .fill("nit");
+    await page.getByPlaceholder(/Leave a comment \(markdown supported\)/).fill("nit");
     await page.getByRole("button", { name: "Save" }).click();
     await expect(page.getByText(/^1 comment$/).first()).toBeVisible();
     // (Banner renders once per visible right-pane instance; on desktop
@@ -267,9 +241,7 @@ test.describe("Diff comments (#928)", () => {
     });
     await openSessionAndFile(page);
     await startSingleLineComment(page, 3);
-    await page
-      .getByPlaceholder(/Leave a comment \(markdown supported\)/)
-      .fill("**rename** this please");
+    await page.getByPlaceholder(/Leave a comment \(markdown supported\)/).fill("**rename** this please");
     await page.getByRole("button", { name: "Save" }).click();
     // Open the send dialog via the banner's Send button.
     await page
@@ -295,9 +267,7 @@ test.describe("Diff comments (#928)", () => {
     expect(captured?.assembledMarkdown).toContain("Hey:");
     expect(captured?.assembledMarkdown).toContain("## Diff comments");
     expect(captured?.assembledMarkdown).toContain("rename");
-    expect(captured?.assembledMarkdown).toContain(
-      "Please address these comments.",
-    );
+    expect(captured?.assembledMarkdown).toContain("Please address these comments.");
     expect(captured?.assembledMarkdown).not.toContain("aoe:diff-comments");
     // Banner cleared.
     await expect(page.getByText(/^1 comment$/)).toHaveCount(0);
@@ -311,18 +281,14 @@ test.describe("Diff comments (#928)", () => {
     // Line selection is disabled for tmux sessions, so selecting a line must
     // not open a comment form.
     await startSingleLineComment(page, 3);
-    await expect(
-      page.getByPlaceholder(/Leave a comment \(markdown supported\)/),
-    ).toHaveCount(0);
+    await expect(page.getByPlaceholder(/Leave a comment \(markdown supported\)/)).toHaveCount(0);
   });
 
   test("send button disabled when worker not running", async ({ page }) => {
     await setup(page, { structuredView: true, acpWorkerState: "absent" });
     await openSessionAndFile(page);
     await startSingleLineComment(page, 3);
-    await page
-      .getByPlaceholder(/Leave a comment \(markdown supported\)/)
-      .fill("nit");
+    await page.getByPlaceholder(/Leave a comment \(markdown supported\)/).fill("nit");
     await page.getByRole("button", { name: "Save" }).click();
     const send = page.getByRole("button", { name: /^Send$/ }).first();
     await expect(send).toBeDisabled();

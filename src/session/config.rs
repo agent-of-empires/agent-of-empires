@@ -634,6 +634,13 @@ pub struct AppStateConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dismissed_update_version: Option<String>,
 
+    /// Registry digest of the sandbox image the user dismissed the
+    /// "image update available" banner for. The banner stays hidden while the
+    /// registry still resolves to this digest and returns automatically once a
+    /// newer image is published (the digest no longer matches).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dismissed_image_digest: Option<String>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub home_list_width: Option<u16>,
 
@@ -658,6 +665,14 @@ pub struct AppStateConfig {
 
     #[serde(default)]
     pub has_acknowledged_agent_hooks: bool,
+
+    /// True once the user has acknowledged that glob `volume_ignores` entries
+    /// (e.g. `**/bin`) are expanded against the workspace at session-create time,
+    /// a point-in-time snapshot that won't shadow directories created later by an
+    /// in-container build (#2045). Gates the one-time confirm dialog shown before a
+    /// sandbox session whose resolved config contains a glob ignore.
+    #[serde(default)]
+    pub has_acknowledged_volume_ignores_globs: bool,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sort_order: Option<SortOrder>,

@@ -61,6 +61,10 @@ pub enum ActionId {
     SortPicker,
     GroupBy,
     NextWaiting,
+    /// Pin or unpin the selected project header (project view only). Pinning
+    /// registers the repo so the project persists in the view without any
+    /// sessions; unpinning removes the registry entry.
+    ToggleProjectPin,
 }
 
 /// A single chord. `ctrl` requires the Control modifier; Shift is implicit in
@@ -101,6 +105,8 @@ pub enum Context {
     TerminalView,
     AttentionSort,
     SearchActive,
+    /// The cursor is on a real (non-synthetic) project header in project view.
+    ProjectGroupSelected,
 }
 
 /// Help-overlay section. Ordering mirrors `components/help.rs`.
@@ -139,6 +145,9 @@ pub struct Ctx {
     pub view_mode: ViewMode,
     pub sort_order: SortOrder,
     pub has_search: bool,
+    /// True when the cursor sits on a real project header in project view, so
+    /// the pin toggle can claim its chord ahead of the projects-dialog binding.
+    pub project_group_selected: bool,
 }
 
 fn chord_matches(c: &Chord, key: &KeyEvent) -> bool {
@@ -155,6 +164,7 @@ fn context_holds(context: Context, ctx: &Ctx) -> bool {
         Context::TerminalView => ctx.view_mode == ViewMode::Terminal,
         Context::AttentionSort => ctx.sort_order == SortOrder::Attention,
         Context::SearchActive => ctx.has_search,
+        Context::ProjectGroupSelected => ctx.project_group_selected,
     }
 }
 
@@ -516,6 +526,21 @@ pub static BINDINGS: &[Binding] = &[
             serve_only: false,
         }),
     },
+    // Pin toggle shares `p` (Shift+P in strict) with Projects, but only fires
+    // when a project header is selected, so it must precede the Projects
+    // binding. On a project header `p` pins/unpins; everywhere else `p` still
+    // opens the projects dialog.
+    Binding {
+        id: ActionId::ToggleProjectPin,
+        non_strict: &[k('p')],
+        strict: &[k('P')],
+        context: Context::ProjectGroupSelected,
+        help: Some(HelpMeta {
+            section: HelpSection::Actions,
+            desc: "Pin/unpin project (keep without sessions)",
+        }),
+        palette: None,
+    },
     // P flip: Projects is the primary (bare `p`) action -> Shift+P in strict;
     // Profiles is the secondary (`Shift+P`) action -> Ctrl+P in strict.
     Binding {
@@ -695,6 +720,7 @@ pub fn palette_id(id: ActionId) -> &'static str {
         ActionId::SearchPrev => "search-prev",
         ActionId::Update => "update",
         ActionId::ToggleContainer => "toggle-container",
+        ActionId::ToggleProjectPin => "toggle-project-pin",
     }
 }
 
@@ -707,6 +733,7 @@ mod tests {
             view_mode: ViewMode::Structured,
             sort_order: SortOrder::Newest,
             has_search: false,
+            project_group_selected: false,
         }
     }
 

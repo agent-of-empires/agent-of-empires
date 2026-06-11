@@ -41,10 +41,7 @@ function setState(s: PushState) {
   refresh.mockClear();
 }
 
-function buttonByText(
-  container: HTMLElement,
-  match: string,
-): HTMLButtonElement | null {
+function buttonByText(container: HTMLElement, match: string): HTMLButtonElement | null {
   const buttons = container.querySelectorAll("button");
   for (const b of buttons) {
     if (b.textContent && b.textContent.includes(match)) {

@@ -9,13 +9,7 @@
 // web/tests/live/settings-persistence-theme.spec.ts.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import {
-  cleanup,
-  fireEvent,
-  render,
-  screen,
-  waitFor,
-} from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { SettingsView } from "../SettingsView";
 
 const PROFILES = [{ name: "main", is_default: true }];
@@ -70,48 +64,40 @@ const updateProfileSettings = vi.fn(() => Promise.resolve(true));
 
 vi.mock("../../lib/api", () => ({
   fetchProfiles: vi.fn(() => Promise.resolve(PROFILES)),
-  fetchSettings: vi.fn(() =>
-    Promise.resolve({ theme: { name: "empire", idle_decay_minutes: 0 } }),
-  ),
+  fetchSettings: vi.fn(() => Promise.resolve({ theme: { name: "empire", idle_decay_minutes: 0 } })),
   getSettingsSchema: vi.fn(() => Promise.resolve(THEME_SCHEMA)),
   setDefaultProfile: vi.fn(() => Promise.resolve(true)),
   createProfile: vi.fn(() => Promise.resolve(true)),
   renameProfile: vi.fn(() => Promise.resolve(true)),
   deleteProfile: vi.fn(() => Promise.resolve(true)),
-  updateProfileSettings: (name: string, updates: Record<string, unknown>) =>
-    updateProfileSettings(name, updates),
+  updateProfileSettings: (name: string, updates: Record<string, unknown>) => updateProfileSettings(name, updates),
   updateTheme: (patch: Record<string, unknown>) => updateTheme(patch),
   fetchThemes: vi.fn(() => Promise.resolve(["empire", "dracula"])),
 }));
 
+const dispatchThemePickerChanged = vi.fn();
 vi.mock("../../hooks/useResolvedTheme", () => ({
-  dispatchThemePickerChanged: vi.fn(),
+  dispatchThemePickerChanged: (name?: string) => dispatchThemePickerChanged(name),
 }));
 
 afterEach(() => {
   cleanup();
   updateTheme.mockClear();
   updateProfileSettings.mockClear();
+  dispatchThemePickerChanged.mockClear();
 });
 
 function renderThemeTab() {
-  return render(
-    <SettingsView
-      onClose={() => {}}
-      tab="theme"
-      onSelectTab={vi.fn()}
-      onServerAboutRefresh={() => {}}
-    />,
-  );
+  return render(<SettingsView onClose={() => {}} tab="theme" onSelectTab={vi.fn()} onServerAboutRefresh={() => {}} />);
 }
 
 /** A <select> that carries an <option> with this value. Labels in FormFields
  *  are not wired to their controls, so we locate by option value rather than
  *  accessible name (and dodge the duplicated mobile/desktop tab strips). */
 function selectWithOption(value: string): HTMLSelectElement {
-  const found = Array.from(
-    document.querySelectorAll<HTMLSelectElement>("select"),
-  ).find((s) => Array.from(s.options).some((o) => o.value === value));
+  const found = Array.from(document.querySelectorAll<HTMLSelectElement>("select")).find((s) =>
+    Array.from(s.options).some((o) => o.value === value),
+  );
   if (!found) throw new Error(`no <select> has an option "${value}"`);
   return found;
 }
@@ -131,9 +117,7 @@ describe("SettingsView theme tab save routing", () => {
     fireEvent.change(selectWithOption("dracula"), {
       target: { value: "dracula" },
     });
-    await waitFor(() =>
-      expect(updateTheme).toHaveBeenCalledWith({ name: "dracula" }),
-    );
+    await waitFor(() => expect(updateTheme).toHaveBeenCalledWith({ name: "dracula" }));
     expect(updateProfileSettings).not.toHaveBeenCalled();
   });
 
@@ -143,10 +127,32 @@ describe("SettingsView theme tab save routing", () => {
     fireEvent.change(selectWithOption("palette"), {
       target: { value: "palette" },
     });
-    await waitFor(() =>
-      expect(updateTheme).toHaveBeenCalledWith({ color_mode: "palette" }),
-    );
+    await waitFor(() => expect(updateTheme).toHaveBeenCalledWith({ color_mode: "palette" }));
     expect(updateProfileSettings).not.toHaveBeenCalled();
+  });
+
+  // Ported from live settings-theme-color-mode.spec.ts (#1405). Color mode is
+  // a TUI-only palette setting: only the theme-name custom widget dispatches
+  // the dashboard repaint event after its save lands. A refactor that routes
+  // color mode through the same dispatch would re-fetch /api/themes/<name> and
+  // repaint the dashboard on every toggle of a setting the web never renders.
+  it("color-mode change PATCHes but never dispatches the theme repaint event", async () => {
+    renderThemeTab();
+    await waitFor(() => selectWithOption("palette"));
+    fireEvent.change(selectWithOption("palette"), {
+      target: { value: "palette" },
+    });
+    await waitFor(() => expect(updateTheme).toHaveBeenCalledWith({ color_mode: "palette" }));
+    expect(dispatchThemePickerChanged).not.toHaveBeenCalled();
+
+    // Positive control: a theme-name pick through the same tab does dispatch,
+    // proving the spy is wired and the gating is per-field, not global.
+    fireEvent.change(selectWithOption("dracula"), {
+      target: { value: "dracula" },
+    });
+    await waitFor(() => expect(updateTheme).toHaveBeenCalledWith({ name: "dracula" }));
+    await waitFor(() => expect(dispatchThemePickerChanged).toHaveBeenCalledWith("dracula"));
+    expect(dispatchThemePickerChanged).toHaveBeenCalledTimes(1);
   });
 
   it("routes a profile-overridable row (idle decay) to the profile, not /api/theme", async () => {

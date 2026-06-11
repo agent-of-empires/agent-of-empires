@@ -41,9 +41,7 @@ function snapshotFor(ids: readonly string[]): string {
 // Returns the rate-limit aggregate for the given session ids, or null
 // when none are rate-limited. Re-renders the caller only when one of
 // THESE ids' rate-limit state changes.
-export function useRateLimitedForSessions(
-  sessionIds: readonly string[],
-): SidebarRateLimit | null {
+export function useRateLimitedForSessions(sessionIds: readonly string[]): SidebarRateLimit | null {
   const ids = sessionIds.join("|");
   const subscribe = useMemo(() => {
     const filter = new Set(ids ? ids.split("|").filter(Boolean) : []);

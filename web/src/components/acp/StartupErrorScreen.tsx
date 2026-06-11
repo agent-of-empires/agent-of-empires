@@ -27,9 +27,7 @@ export function StartupErrorScreen({ detail }: Props) {
         <div className="text-[11px] font-semibold uppercase tracking-wide text-status-error">
           Adapter compatibility check failed
         </div>
-        <h2 className="mt-2 text-lg font-semibold text-text-primary">
-          {heading}
-        </h2>
+        <h2 className="mt-2 text-lg font-semibold text-text-primary">{heading}</h2>
         <p className="mt-3 text-sm text-text-secondary">{summary}</p>
 
         {installCommand && (
@@ -49,17 +47,10 @@ export function StartupErrorScreen({ detail }: Props) {
         <DetailRows detail={detail} />
 
         <div className="mt-4 text-xs text-text-dim">
-          The session is paused until the adapter satisfies the required
-          version. Once you have run the command above, restart{" "}
-          <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">
-            aoe serve
-          </code>{" "}
-          (or spawn a fresh structured view session) and the check re-runs at
-          the next ACP{" "}
-          <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">
-            initialize
-          </code>{" "}
-          handshake.
+          The session is paused until the adapter satisfies the required version. Once you have run the command above,
+          restart <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">aoe serve</code> (or spawn a fresh
+          structured view session) and the check re-runs at the next ACP{" "}
+          <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">initialize</code> handshake.
         </div>
       </div>
     </div>

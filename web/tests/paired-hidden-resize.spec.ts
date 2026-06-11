@@ -42,18 +42,13 @@ function resizesFor(handle: MockHandle): ResizeMsg[] {
 }
 
 test.describe("Paired terminal hidden-container resize gating", () => {
-  test("the hidden mobile slide-in's paired terminal does NOT ship a tiny resize", async ({
-    page,
-  }) => {
+  test("the hidden mobile slide-in's paired terminal does NOT ship a tiny resize", async ({ page }) => {
     const handle = await mockTerminalApis(page);
     await page.goto("/");
     await clickSidebarSession(page, "pinch-test");
     // Wait for both .xterm panels to mount (agent + the two paired
     // copies the ContentSplit + RightPanel chain renders).
-    await page
-      .locator(".xterm")
-      .first()
-      .waitFor({ state: "visible", timeout: 10_000 });
+    await page.locator(".xterm").first().waitFor({ state: "visible", timeout: 10_000 });
     await page.waitForTimeout(1500);
 
     const allResizes = resizesFor(handle);
@@ -64,8 +59,7 @@ test.describe("Paired terminal hidden-container resize gating", () => {
     const tiny = allResizes.filter((r) => r.cols < 20 || r.rows < 5);
     expect(
       tiny,
-      `Hidden-container measurement leaked: ${JSON.stringify(tiny)}. ` +
-        `Full list: ${JSON.stringify(allResizes)}`,
+      `Hidden-container measurement leaked: ${JSON.stringify(tiny)}. ` + `Full list: ${JSON.stringify(allResizes)}`,
     ).toHaveLength(0);
     // At least one real resize must have shipped so we know the
     // visible terminals connected.

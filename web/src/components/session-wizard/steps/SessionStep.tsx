@@ -61,19 +61,14 @@ export function SessionStep({ data, onChange }: Props) {
   const [advancedOpen, setAdvancedOpen] = useState(false);
   return (
     <div>
-      <h2 className="text-lg font-semibold text-text-primary mb-1">
-        Name your session
-      </h2>
+      <h2 className="text-lg font-semibold text-text-primary mb-1">Name your session</h2>
       <p className="text-sm text-text-muted mb-5">
-        Give it a title; defaults to a new git worktree branched off the current
-        HEAD. Expand Advanced to change the branch, attach to an existing one,
-        or set a group.
+        Give it a title; defaults to a new git worktree branched off the current HEAD. Expand Advanced to change the
+        branch, attach to an existing one, or set a group.
       </p>
 
       <div className="mb-5">
-        <label className="block text-sm text-text-dim mb-1.5">
-          Session title
-        </label>
+        <label className="block text-sm text-text-dim mb-1.5">Session title</label>
         <input
           type="text"
           value={data.title}
@@ -82,8 +77,7 @@ export function SessionStep({ data, onChange }: Props) {
           className="w-full bg-surface-900 border border-surface-700 rounded-lg px-3 py-2.5 text-base font-mono text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"
         />
         <p className="text-xs text-text-dim mt-1">
-          Shown in the dashboard. Renaming it later does not rename the git
-          branch.
+          Shown in the dashboard. Renaming it later does not rename the git branch.
         </p>
       </div>
 
@@ -93,10 +87,7 @@ export function SessionStep({ data, onChange }: Props) {
         aria-expanded={advancedOpen}
         className="flex items-center gap-1.5 text-sm text-text-dim hover:text-text-secondary cursor-pointer"
       >
-        <span
-          className={`inline-block transition-transform ${advancedOpen ? "rotate-90" : ""}`}
-          aria-hidden="true"
-        >
+        <span className={`inline-block transition-transform ${advancedOpen ? "rotate-90" : ""}`} aria-hidden="true">
           ▸
         </span>
         Advanced
@@ -109,10 +100,7 @@ export function SessionStep({ data, onChange }: Props) {
               on; this hide is purely a UX confirmation that the worktree
               path is not available in scratch mode. */}
           {data.scratch ? (
-            <p
-              className="text-xs text-text-dim mb-3"
-              aria-label="Worktree disabled: scratch session"
-            >
+            <p className="text-xs text-text-dim mb-3" aria-label="Worktree disabled: scratch session">
               Scratch sessions do not use git worktrees.
             </p>
           ) : (
@@ -124,35 +112,26 @@ export function SessionStep({ data, onChange }: Props) {
                 // handler also fire would flip the value a second time
                 // and land back on the original. Skip the label handler
                 // for clicks originating inside the Toggle.
-                if (
-                  (e.target as HTMLElement).closest('button[role="switch"]')
-                ) {
+                if ((e.target as HTMLElement).closest('button[role="switch"]')) {
                   return;
                 }
                 onChange("useWorktree", !data.useWorktree);
               }}
             >
               <div className="flex-1">
-                <div className="text-sm font-medium text-text-primary">
-                  Create a worktree
-                </div>
+                <div className="text-sm font-medium text-text-primary">Create a worktree</div>
                 <div className="text-xs text-text-dim mt-0.5 leading-snug">
-                  Run the agent in a new git worktree branched off the current
-                  HEAD. Off = run directly in the repo folder.
+                  Run the agent in a new git worktree branched off the current HEAD. Off = run directly in the repo
+                  folder.
                 </div>
               </div>
-              <Toggle
-                checked={data.useWorktree}
-                onChange={(v) => onChange("useWorktree", v)}
-              />
+              <Toggle checked={data.useWorktree} onChange={(v) => onChange("useWorktree", v)} />
             </label>
           )}
 
           {!data.scratch && data.useWorktree && (
             <div className="mb-5">
-              <label className="block text-sm text-text-dim mb-1.5">
-                Branch / worktree name
-              </label>
+              <label className="block text-sm text-text-dim mb-1.5">Branch / worktree name</label>
               <input
                 type="text"
                 value={data.worktreeBranch}
@@ -161,8 +140,7 @@ export function SessionStep({ data, onChange }: Props) {
                 className="w-full bg-surface-900 border border-surface-700 rounded-lg px-3 py-2.5 text-base font-mono text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"
               />
               <p className="text-xs text-text-dim mt-1">
-                The branch name is also the worktree directory name. Leave blank
-                to use the session title.
+                The branch name is also the worktree directory name. Leave blank to use the session title.
               </p>
 
               <label
@@ -170,23 +148,15 @@ export function SessionStep({ data, onChange }: Props) {
                 onClick={() => onChange("attachExisting", !data.attachExisting)}
               >
                 <div className="flex-1">
-                  <div className="text-sm font-medium text-text-primary">
-                    Attach to existing branch
-                  </div>
+                  <div className="text-sm font-medium text-text-primary">Attach to existing branch</div>
                   <div className="text-xs text-text-dim mt-0.5 leading-snug">
-                    Re-use a branch + worktree that already exists. Off = create
-                    a new branch.
+                    Re-use a branch + worktree that already exists. Off = create a new branch.
                   </div>
                 </div>
-                <Toggle
-                  checked={data.attachExisting}
-                  onChange={(v) => onChange("attachExisting", v)}
-                />
+                <Toggle checked={data.attachExisting} onChange={(v) => onChange("attachExisting", v)} />
               </label>
 
-              {!data.attachExisting && (
-                <AdvancedWorktreeOptions data={data} onChange={onChange} />
-              )}
+              {!data.attachExisting && <AdvancedWorktreeOptions data={data} onChange={onChange} />}
             </div>
           )}
 
@@ -228,8 +198,7 @@ function AdvancedWorktreeOptions({
   const [hasFocus, setHasFocus] = useState(false);
   const blurTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const branchLoadKey = open ? data.path : null;
-  const [trackedBranchLoadKey, setTrackedBranchLoadKey] =
-    useState(branchLoadKey);
+  const [trackedBranchLoadKey, setTrackedBranchLoadKey] = useState(branchLoadKey);
   if (branchLoadKey !== trackedBranchLoadKey) {
     setTrackedBranchLoadKey(branchLoadKey);
     setBranches(null);
@@ -251,9 +220,7 @@ function AdvancedWorktreeOptions({
   }, [open, data.path]);
 
   const query = data.baseBranch.trim().toLowerCase();
-  const suggestions = (branches ?? [])
-    .filter((b) => !query || b.name.toLowerCase().includes(query))
-    .slice(0, 8);
+  const suggestions = (branches ?? []).filter((b) => !query || b.name.toLowerCase().includes(query)).slice(0, 8);
 
   const choose = (name: string) => {
     onChange("baseBranch", name);
@@ -268,19 +235,14 @@ function AdvancedWorktreeOptions({
         aria-expanded={open}
         className="flex items-center gap-1.5 text-xs text-text-dim hover:text-text-secondary cursor-pointer"
       >
-        <span
-          className={`inline-block transition-transform ${open ? "rotate-90" : ""}`}
-          aria-hidden="true"
-        >
+        <span className={`inline-block transition-transform ${open ? "rotate-90" : ""}`} aria-hidden="true">
           ▸
         </span>
         Base branch
       </button>
       {open && (
         <div className="mt-2 pl-4 border-l border-surface-700/40">
-          <label className="block text-xs text-text-dim mb-1.5">
-            Base branch
-          </label>
+          <label className="block text-xs text-text-dim mb-1.5">Base branch</label>
           <div className="relative">
             <input
               type="text"
@@ -299,9 +261,7 @@ function AdvancedWorktreeOptions({
               onKeyDown={(e) => {
                 if (e.key === "ArrowDown") {
                   e.preventDefault();
-                  setHighlightIdx((i) =>
-                    Math.min(i + 1, suggestions.length - 1),
-                  );
+                  setHighlightIdx((i) => Math.min(i + 1, suggestions.length - 1));
                 } else if (e.key === "ArrowUp") {
                   e.preventDefault();
                   setHighlightIdx((i) => Math.max(i - 1, 0));
@@ -312,11 +272,7 @@ function AdvancedWorktreeOptions({
                   setHasFocus(false);
                 }
               }}
-              placeholder={
-                loading
-                  ? "Loading branches..."
-                  : "Defaults to project default branch"
-              }
+              placeholder={loading ? "Loading branches..." : "Defaults to project default branch"}
               aria-label="Base branch"
               autoComplete="off"
               className="w-full bg-surface-900 border border-surface-700 rounded-lg px-3 py-2 text-sm font-mono text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"
@@ -338,18 +294,12 @@ function AdvancedWorktreeOptions({
                       choose(b.name);
                     }}
                     className={`flex items-center justify-between gap-2 px-3 py-1.5 text-sm font-mono cursor-pointer ${
-                      i === highlightIdx
-                        ? "bg-surface-800 text-text-primary"
-                        : "text-text-secondary"
+                      i === highlightIdx ? "bg-surface-800 text-text-primary" : "text-text-secondary"
                     }`}
                   >
                     <span className="truncate">{b.name}</span>
                     <span className="text-[10px] uppercase tracking-wider text-text-dim shrink-0">
-                      {b.is_current
-                        ? "current"
-                        : b.remote_only
-                          ? "remote"
-                          : "local"}
+                      {b.is_current ? "current" : b.remote_only ? "remote" : "local"}
                     </span>
                   </li>
                 ))}
@@ -357,9 +307,8 @@ function AdvancedWorktreeOptions({
             )}
           </div>
           <p className="text-xs text-text-dim mt-1">
-            Stack a new worktree on top of a different branch (an in-flight PR,
-            a release branch, a teammate's branch). Leave blank for the repo's
-            default.
+            Stack a new worktree on top of a different branch (an in-flight PR, a release branch, a teammate's branch).
+            Leave blank for the repo's default.
           </p>
         </div>
       )}

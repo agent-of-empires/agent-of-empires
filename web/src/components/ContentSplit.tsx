@@ -23,12 +23,7 @@ function loadSavedWidth(): number {
   return DEFAULT_DIFF_WIDTH;
 }
 
-export function ContentSplit({
-  left,
-  right,
-  collapsed,
-  onToggleCollapse,
-}: Props) {
+export function ContentSplit({ left, right, collapsed, onToggleCollapse }: Props) {
   const [diffWidth, setDiffWidth] = useState(loadSavedWidth);
   const containerRef = useRef<HTMLDivElement>(null);
   const dragging = useRef(false);
@@ -47,10 +42,7 @@ export function ContentSplit({
       const newDiffWidth = rect.right - e.clientX;
       const terminalWidth = rect.width - newDiffWidth;
 
-      if (
-        newDiffWidth >= MIN_DIFF_WIDTH &&
-        terminalWidth >= MIN_TERMINAL_WIDTH
-      ) {
+      if (newDiffWidth >= MIN_DIFF_WIDTH && terminalWidth >= MIN_TERMINAL_WIDTH) {
         setDiffWidth(newDiffWidth);
       }
     };
@@ -83,10 +75,7 @@ export function ContentSplit({
   }, [collapsed]);
 
   return (
-    <div
-      ref={containerRef}
-      className="flex-1 flex min-h-0 overflow-hidden relative"
-    >
+    <div ref={containerRef} className="flex-1 flex min-h-0 overflow-hidden relative">
       {/* Terminal pane */}
       <div className="flex-1 flex flex-col min-w-0 min-h-0">{left}</div>
 
@@ -103,10 +92,7 @@ export function ContentSplit({
           {/* Right pane (inline). ContentSplit only renders at the md
               breakpoint and up; below md the mobile picker promotes the
               chosen view into the single full-viewport pane instead (#1452). */}
-          <div
-            style={{ width: diffWidth }}
-            className="flex shrink-0 flex-col min-h-0 overflow-hidden"
-          >
+          <div style={{ width: diffWidth }} className="flex shrink-0 flex-col min-h-0 overflow-hidden">
             {right}
           </div>
         </>

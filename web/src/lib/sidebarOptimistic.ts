@@ -1,8 +1,5 @@
 import type { Workspace } from "./types";
-import {
-  resolveEffectiveSnoozedUntil,
-  snoozeTimestampCloseEnough,
-} from "./sidebarSort";
+import { resolveEffectiveSnoozedUntil, snoozeTimestampCloseEnough } from "./sidebarSort";
 
 /** Wall-clock target for an optimistic snooze: `Date.now() + minutes *
  *  60_000` as an RFC3339 ISO string. Sits outside any component so the
@@ -52,22 +49,15 @@ export function serverTriageOf(ws: Workspace): {
   return {
     isPinned: ws.sessions.some((s) => s.pinned_at != null),
     isArchived: ws.sessions.some((s) => s.archived_at != null),
-    snoozedUntil:
-      ws.sessions.find((s) => s.snoozed_until)?.snoozed_until ?? null,
+    snoozedUntil: ws.sessions.find((s) => s.snoozed_until)?.snoozed_until ?? null,
   };
 }
 
-export function effectivePinnedOf(
-  optimistic: OptimisticTriage,
-  serverPinned: boolean,
-): boolean {
+export function effectivePinnedOf(optimistic: OptimisticTriage, serverPinned: boolean): boolean {
   return optimistic.pinned ?? serverPinned;
 }
 
-export function effectiveArchivedOf(
-  optimistic: OptimisticTriage,
-  serverArchived: boolean,
-): boolean {
+export function effectiveArchivedOf(optimistic: OptimisticTriage, serverArchived: boolean): boolean {
   return optimistic.archived ?? serverArchived;
 }
 
@@ -75,10 +65,7 @@ export function effectiveSnoozedUntilOf(
   optimistic: OptimisticTriage,
   serverSnoozedUntil: string | null | undefined,
 ): string | null | undefined {
-  return resolveEffectiveSnoozedUntil(
-    optimistic.snoozedUntil,
-    serverSnoozedUntil,
-  );
+  return resolveEffectiveSnoozedUntil(optimistic.snoozedUntil, serverSnoozedUntil);
 }
 
 /** True when an override has been caught up to by the server and can be
@@ -90,10 +77,7 @@ function fieldCaughtUp<T>(override: T | null, server: T): boolean {
   return override !== null && override === server;
 }
 
-function snoozeCaughtUp(
-  override: string | null | undefined,
-  server: string | null,
-): boolean {
+function snoozeCaughtUp(override: string | null | undefined, server: string | null): boolean {
   if (override === undefined) return false;
   if (override === null) return server == null;
   return server != null && snoozeTimestampCloseEnough(override, server);
@@ -124,23 +108,10 @@ export function reconcileOptimistic(
       next.set(id, override);
       continue;
     }
-    const pinned = fieldCaughtUp(override.pinned, server.isPinned)
-      ? null
-      : override.pinned;
-    const archived = fieldCaughtUp(override.archived, server.isArchived)
-      ? null
-      : override.archived;
-    const snoozedUntil = snoozeCaughtUp(
-      override.snoozedUntil,
-      server.snoozedUntil,
-    )
-      ? undefined
-      : override.snoozedUntil;
-    if (
-      pinned !== override.pinned ||
-      archived !== override.archived ||
-      snoozedUntil !== override.snoozedUntil
-    ) {
+    const pinned = fieldCaughtUp(override.pinned, server.isPinned) ? null : override.pinned;
+    const archived = fieldCaughtUp(override.archived, server.isArchived) ? null : override.archived;
+    const snoozedUntil = snoozeCaughtUp(override.snoozedUntil, server.snoozedUntil) ? undefined : override.snoozedUntil;
+    if (pinned !== override.pinned || archived !== override.archived || snoozedUntil !== override.snoozedUntil) {
       changed = true;
     }
     if (pinned === null && archived === null && snoozedUntil === undefined) {
@@ -155,17 +126,10 @@ export function reconcileOptimistic(
 /** Merge a partial override into an existing entry, preserving the fields the
  *  patch does not mention. Used by both single-row and bulk mutations to set
  *  the optimistic state before the request lands. */
-export function withOverride(
-  prev: OptimisticTriage | undefined,
-  patch: Partial<OptimisticTriage>,
-): OptimisticTriage {
+export function withOverride(prev: OptimisticTriage | undefined, patch: Partial<OptimisticTriage>): OptimisticTriage {
   return {
     pinned: patch.pinned !== undefined ? patch.pinned : (prev?.pinned ?? null),
-    archived:
-      patch.archived !== undefined ? patch.archived : (prev?.archived ?? null),
-    snoozedUntil:
-      "snoozedUntil" in patch
-        ? patch.snoozedUntil
-        : (prev?.snoozedUntil ?? undefined),
+    archived: patch.archived !== undefined ? patch.archived : (prev?.archived ?? null),
+    snoozedUntil: "snoozedUntil" in patch ? patch.snoozedUntil : (prev?.snoozedUntil ?? undefined),
   };
 }

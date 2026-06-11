@@ -13,10 +13,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
-import {
-  ConfigOptionSwitchFailedNotice,
-  SessionConfigControls,
-} from "./SessionConfigControls";
+import { ConfigOptionSwitchFailedNotice, SessionConfigControls } from "./SessionConfigControls";
 import type { ConfigOptionDescriptor } from "../../lib/acpTypes";
 
 afterEach(() => {
@@ -54,22 +51,14 @@ function effortOption(): ConfigOptionDescriptor {
 describe("SessionConfigControls", () => {
   it("renders nothing when adapter advertises neither category", () => {
     const { container } = render(
-      <SessionConfigControls
-        configOptions={[]}
-        pendingConfigOption={null}
-        onSetConfigOption={vi.fn()}
-      />,
+      <SessionConfigControls configOptions={[]} pendingConfigOption={null} onSetConfigOption={vi.fn()} />,
     );
     expect(container.firstChild).toBeNull();
   });
 
   it("renders only the model dropdown when no effort option exists", () => {
     render(
-      <SessionConfigControls
-        configOptions={[modelOption()]}
-        pendingConfigOption={null}
-        onSetConfigOption={vi.fn()}
-      />,
+      <SessionConfigControls configOptions={[modelOption()]} pendingConfigOption={null} onSetConfigOption={vi.fn()} />,
     );
     expect(screen.getByTestId("config-option-model")).toBeTruthy();
     expect(screen.queryByTestId("config-option-effort")).toBeNull();
@@ -77,11 +66,7 @@ describe("SessionConfigControls", () => {
 
   it("renders only the effort segmented control when no model option exists", () => {
     render(
-      <SessionConfigControls
-        configOptions={[effortOption()]}
-        pendingConfigOption={null}
-        onSetConfigOption={vi.fn()}
-      />,
+      <SessionConfigControls configOptions={[effortOption()]} pendingConfigOption={null} onSetConfigOption={vi.fn()} />,
     );
     expect(screen.getByTestId("config-option-effort")).toBeTruthy();
     expect(screen.queryByTestId("config-option-model")).toBeNull();
@@ -89,11 +74,7 @@ describe("SessionConfigControls", () => {
 
   it("renders the effort options as a segmented radiogroup for short lists", () => {
     render(
-      <SessionConfigControls
-        configOptions={[effortOption()]}
-        pendingConfigOption={null}
-        onSetConfigOption={vi.fn()}
-      />,
+      <SessionConfigControls configOptions={[effortOption()]} pendingConfigOption={null} onSetConfigOption={vi.fn()} />,
     );
     const group = screen.getByRole("radiogroup", { name: "Reasoning Effort" });
     expect(group).toBeTruthy();
@@ -114,11 +95,7 @@ describe("SessionConfigControls", () => {
       ],
     };
     render(
-      <SessionConfigControls
-        configOptions={[sixOptions]}
-        pendingConfigOption={null}
-        onSetConfigOption={vi.fn()}
-      />,
+      <SessionConfigControls configOptions={[sixOptions]} pendingConfigOption={null} onSetConfigOption={vi.fn()} />,
     );
     // > 5 options trips the threshold; dropdown is rendered (no
     // radiogroup) and a single chip is shown for the current value.
@@ -128,11 +105,7 @@ describe("SessionConfigControls", () => {
 
   it("model trigger exposes aria-expanded + aria-controls toggling open state", () => {
     render(
-      <SessionConfigControls
-        configOptions={[modelOption()]}
-        pendingConfigOption={null}
-        onSetConfigOption={vi.fn()}
-      />,
+      <SessionConfigControls configOptions={[modelOption()]} pendingConfigOption={null} onSetConfigOption={vi.fn()} />,
     );
     const chip = screen.getByTestId("config-option-model");
     expect(chip.getAttribute("aria-haspopup")).toBe("menu");
@@ -146,17 +119,9 @@ describe("SessionConfigControls", () => {
 
   it("clicking a model option invokes onSetConfigOption with config_id and value", () => {
     const fn = vi.fn();
-    render(
-      <SessionConfigControls
-        configOptions={[modelOption()]}
-        pendingConfigOption={null}
-        onSetConfigOption={fn}
-      />,
-    );
+    render(<SessionConfigControls configOptions={[modelOption()]} pendingConfigOption={null} onSetConfigOption={fn} />);
     fireEvent.click(screen.getByTestId("config-option-model"));
-    fireEvent.click(
-      screen.getByTestId("config-option-model-value-claude-sonnet-4-6"),
-    );
+    fireEvent.click(screen.getByTestId("config-option-model-value-claude-sonnet-4-6"));
     expect(fn).toHaveBeenCalledTimes(1);
     expect(fn).toHaveBeenCalledWith("model", "claude-sonnet-4-6");
   });
@@ -164,11 +129,7 @@ describe("SessionConfigControls", () => {
   it("clicking an effort segment invokes onSetConfigOption with the value (not the label)", () => {
     const fn = vi.fn();
     render(
-      <SessionConfigControls
-        configOptions={[effortOption()]}
-        pendingConfigOption={null}
-        onSetConfigOption={fn}
-      />,
+      <SessionConfigControls configOptions={[effortOption()]} pendingConfigOption={null} onSetConfigOption={fn} />,
     );
     fireEvent.click(screen.getByTestId("config-option-effort-value-high"));
     expect(fn).toHaveBeenCalledWith("effort", "high");
@@ -186,12 +147,8 @@ describe("SessionConfigControls", () => {
       />,
     );
     fireEvent.click(screen.getByTestId("config-option-model"));
-    const pending = screen.getByTestId(
-      "config-option-model-value-claude-sonnet-4-6",
-    ) as HTMLButtonElement;
-    const other = screen.getByTestId(
-      "config-option-model-value-claude-opus-4-7",
-    ) as HTMLButtonElement;
+    const pending = screen.getByTestId("config-option-model-value-claude-sonnet-4-6") as HTMLButtonElement;
+    const other = screen.getByTestId("config-option-model-value-claude-opus-4-7") as HTMLButtonElement;
     expect(pending.disabled).toBe(true);
     expect(other.disabled).toBe(false);
   });
@@ -229,11 +186,7 @@ describe("SessionConfigControls", () => {
       options: [{ value: "a", name: "A" }],
     };
     const { container } = render(
-      <SessionConfigControls
-        configOptions={[unknown]}
-        pendingConfigOption={null}
-        onSetConfigOption={vi.fn()}
-      />,
+      <SessionConfigControls configOptions={[unknown]} pendingConfigOption={null} onSetConfigOption={vi.fn()} />,
     );
     expect(container.firstChild).toBeNull();
   });
@@ -250,11 +203,7 @@ describe("SessionConfigControls", () => {
       ],
     };
     render(
-      <SessionConfigControls
-        configOptions={[longModel]}
-        pendingConfigOption={null}
-        onSetConfigOption={vi.fn()}
-      />,
+      <SessionConfigControls configOptions={[longModel]} pendingConfigOption={null} onSetConfigOption={vi.fn()} />,
     );
     const chip = screen.getByTestId("config-option-model");
     // truncate() preserves the trailing ellipsis on overflow; assert
@@ -266,11 +215,7 @@ describe("SessionConfigControls", () => {
 describe("ConfigOptionSwitchFailedNotice", () => {
   it("renders nothing when there is no failure", () => {
     const { container } = render(
-      <ConfigOptionSwitchFailedNotice
-        failure={null}
-        configOptions={[]}
-        onDismiss={vi.fn()}
-      />,
+      <ConfigOptionSwitchFailedNotice failure={null} configOptions={[]} onDismiss={vi.fn()} />,
     );
     expect(container.firstChild).toBeNull();
   });

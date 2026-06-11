@@ -2278,6 +2278,14 @@ pub struct CreateSessionBody {
     /// on either combination.
     #[serde(default)]
     pub scratch: bool,
+    /// Approve the repo's `on_create` lifecycle hooks (and any project MCP) for
+    /// this non-interactive create, mirroring the CLI `--trust-hooks` flag and
+    /// the TUI trust dialog (#2066). When a repo defines hooks that need
+    /// approval and this is unset/false, the handler returns a structured
+    /// `hooks_need_trust` error so the caller can prompt and resubmit with
+    /// `trust_hooks: true`. Already-trusted hooks run regardless.
+    #[serde(default)]
+    pub trust_hooks: Option<bool>,
 }
 
 fn validate_session_tool_identity(
@@ -2323,6 +2331,204 @@ fn upsert_instance(
     } else {
         instances.push(instance);
     }
+}
+
+/// Carried out of `create_session` to mark a create that was refused because
+/// the repo's hooks (or project MCP) need approval and the request did not pass
+/// `trust_hooks: true` (#2066). The outer match downcasts this to emit a
+/// structured `hooks_need_trust` response instead of the generic
+/// `create_failed`, so a caller can show the commands and resubmit.
+#[derive(Debug)]
+struct HooksNeedTrust {
+    /// The `on_create` commands that would run, for display in the prompt.
+    on_create: Vec<String>,
+    /// The `on_launch` commands the same approval would trust. They don't run
+    /// on this create, but the recorded trust covers them for every later
+    /// session (TUI/CLI included), so the prompt must show them too.
+    on_launch: Vec<String>,
+    /// Likewise for `on_destroy`, run when a session is deleted.
+    on_destroy: Vec<String>,
+    /// True when the repo's `.mcp.json` also needs approval at this fingerprint.
+    needs_mcp_trust: bool,
+}
+
+impl std::fmt::Display for HooksNeedTrust {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Repository hooks require trust before this session can be created"
+        )
+    }
+}
+
+impl std::error::Error for HooksNeedTrust {}
+
+/// Resolved plan for a web-API create's `on_create` lifecycle hooks (#2066).
+/// Computed before the worktree is built so an untrusted repo fails fast
+/// without leaving an orphan worktree; executed after the build once the
+/// session directory exists.
+#[derive(Debug)]
+struct CreateHookPlan {
+    /// Commands to run, already merged (repo overrides global/profile per type).
+    on_create: Vec<String>,
+    /// `(hooks_hash, mcp_hash)` to persist into `trusted_repos.toml` when the
+    /// caller passed `trust_hooks: true` and a surface needed approval. `None`
+    /// when nothing new needs recording (already trusted, or no hooks/MCP).
+    trust_write: Option<(Option<String>, Option<String>)>,
+}
+
+/// Resolve the repo's `on_create` hooks and the trust decision for a web-API
+/// create. Returns `Err(HooksNeedTrust)` when a surface needs approval and the
+/// caller did not pass `trust_hooks: true`; the surrounding handler maps that to
+/// a structured `hooks_need_trust` response. Mirrors the CLI `--trust-hooks`
+/// path in `src/cli/add.rs`, adapted for the API's non-interactive context.
+fn resolve_create_hook_plan(
+    profile: &str,
+    project_path: &std::path::Path,
+    scratch: bool,
+    trust_hooks_requested: bool,
+) -> anyhow::Result<CreateHookPlan> {
+    use crate::session::repo_config::{self, TrustSurface};
+
+    // Scratch sessions have no `.agent-of-empires/config.toml` anchored on a
+    // repo path, so skip the repo trust check entirely and fall back to
+    // profile-level hooks (matching the CLI scratch branch).
+    if scratch {
+        let on_create = repo_config::resolve_global_profile_hooks(profile)
+            .map(|h| h.on_create)
+            .unwrap_or_default();
+        return Ok(CreateHookPlan {
+            on_create,
+            trust_write: None,
+        });
+    }
+
+    let trust = match repo_config::check_repo_trust(project_path) {
+        Ok(t) => t,
+        Err(e) => {
+            // A failed trust check must not silently drop already-trusted hooks
+            // run via global/profile; degrade to profile hooks like the CLI does.
+            tracing::warn!(target: "http.api.sessions", "Failed to check repo trust: {e:#}");
+            let on_create = repo_config::resolve_global_profile_hooks(profile)
+                .map(|h| h.on_create)
+                .unwrap_or_default();
+            return Ok(CreateHookPlan {
+                on_create,
+                trust_write: None,
+            });
+        }
+    };
+
+    // Refuse only when HOOKS need approval and the caller did not opt in.
+    // Project MCP is deliberately not a gate here: the supervisor skips an
+    // untrusted `.mcp.json` at spawn (it's the real MCP gate), so blocking
+    // creation on it would be more aggressive than the CLI, which still
+    // creates the session when MCP is declined. A passed `trust_hooks` still
+    // records MCP trust below, bundling approval the way the CLI does.
+    if trust.hooks.needs_trust() && !trust_hooks_requested {
+        // Approving trusts the repo's whole hooks hash, so the refusal must
+        // carry every hook type the trust would cover (on_launch runs on every
+        // later session start, on_destroy on delete), not just on_create;
+        // mirrors hook_display_groups in the CLI/TUI prompts.
+        let merged = match &trust.hooks {
+            TrustSurface::Trusted(h) | TrustSurface::NeedsTrust { config: h, .. } => {
+                repo_config::merge_hooks_for_display(profile, h)
+            }
+            TrustSurface::Absent => {
+                repo_config::resolve_global_profile_hooks(profile).unwrap_or_default()
+            }
+        };
+        return Err(anyhow::Error::new(HooksNeedTrust {
+            on_create: merged.on_create,
+            on_launch: merged.on_launch,
+            on_destroy: merged.on_destroy,
+            needs_mcp_trust: trust.mcp.needs_trust(),
+        }));
+    }
+
+    // Approved (nothing needed prompting, or the caller passed trust_hooks).
+    let repo_hooks = match &trust.hooks {
+        TrustSurface::Trusted(h) | TrustSurface::NeedsTrust { config: h, .. } => Some(h.clone()),
+        TrustSurface::Absent => None,
+    };
+    let trust_write = if trust_hooks_requested {
+        let hooks_hash = match &trust.hooks {
+            TrustSurface::NeedsTrust { hash, .. } => Some(hash.clone()),
+            _ => None,
+        };
+        let mcp_hash = match &trust.mcp {
+            TrustSurface::NeedsTrust { hash, .. } => Some(hash.clone()),
+            _ => None,
+        };
+        if hooks_hash.is_some() || mcp_hash.is_some() {
+            Some((hooks_hash, mcp_hash))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let on_create = match repo_hooks {
+        Some(h) => repo_config::merge_hooks_with_config(profile, h)
+            .map(|m| m.on_create)
+            .unwrap_or_default(),
+        None => repo_config::resolve_global_profile_hooks(profile)
+            .map(|h| h.on_create)
+            .unwrap_or_default(),
+    };
+    Ok(CreateHookPlan {
+        on_create,
+        trust_write,
+    })
+}
+
+/// Record any pending trust and run the planned `on_create` hooks for a
+/// web-API create (#2066). Runs after the worktree exists. Hook output is
+/// streamed to a discarded channel so the shared streamed executor's
+/// terminal-detach (credential-prompt suppression) applies; failures surface
+/// through the returned `Result` with a captured output tail.
+fn run_create_hooks(
+    instance: &mut Instance,
+    plan: &CreateHookPlan,
+    project_path: &std::path::Path,
+) -> anyhow::Result<()> {
+    use crate::session::repo_config;
+
+    if let Some((hooks_hash, mcp_hash)) = &plan.trust_write {
+        repo_config::trust_repo(project_path, hooks_hash.as_deref(), mcp_hash.as_deref())?;
+    }
+
+    if plan.on_create.is_empty() {
+        return Ok(());
+    }
+
+    let hook_env = repo_config::lifecycle_env_vars(instance);
+    // No live consumer: drop the receiver so the executor's sends no-op while
+    // its detach-tty behavior and error-tail capture still apply.
+    let (progress_tx, progress_rx) = std::sync::mpsc::channel::<repo_config::HookProgress>();
+    drop(progress_rx);
+
+    if instance.sandbox_info.is_some() {
+        instance.get_container_for_instance()?;
+        let workdir = instance.container_workdir();
+        if let Some(sandbox) = instance.sandbox_info.as_ref() {
+            repo_config::execute_hooks_in_container_streamed(
+                &plan.on_create,
+                &sandbox.container_name,
+                &workdir,
+                &progress_tx,
+                &hook_env,
+            )?;
+        }
+    } else {
+        repo_config::execute_hooks_streamed(
+            &plan.on_create,
+            std::path::Path::new(&instance.project_path),
+            &progress_tx,
+            &hook_env,
+        )?;
+    }
+    Ok(())
 }
 
 pub async fn create_session(
@@ -2509,6 +2715,21 @@ pub async fn create_session(
             .filter(|s| !s.is_empty())
             .collect();
 
+        // Resolve repo hook trust BEFORE building the worktree (#2066): a repo
+        // whose hooks need approval and that was not sent `trust_hooks: true`
+        // is refused here, so the handler never leaves an orphan worktree on
+        // disk. The original `path` is the trust anchor (the same source the
+        // CLI/TUI use); `check_repo_trust` resolves a worktree path to its main
+        // repo, so a worktree created from an already-trusted repo inherits its
+        // trust without a separate prompt.
+        let original_path = body.path.clone();
+        let hook_plan = resolve_create_hook_plan(
+            &profile,
+            std::path::Path::new(&original_path),
+            body.scratch,
+            body.trust_hooks.unwrap_or(false),
+        )?;
+
         // When worktree_branch is empty string, generate a name from civilizations.
         // The generated name is used as both title and branch.
         let title = body.title.unwrap_or_default();
@@ -2556,6 +2777,8 @@ pub async fn create_session(
         let mut instance = build_result.instance;
         instance.source_profile = profile.clone();
         let build_warnings = build_result.warnings;
+        let created_worktree = build_result.created_worktree;
+        let created_workspace_worktrees = build_result.created_workspace_worktrees;
 
         // Apply per-session sandbox overrides from the request body.
         if let Some(ref mut sandbox) = instance.sandbox_info {
@@ -2625,6 +2848,24 @@ pub async fn create_session(
 
             agent_effort
         };
+
+        // Run on_create hooks now that the worktree exists, before the session
+        // is persisted or started (#2066). Mirrors the TUI/CLI ordering so the
+        // worktree is bootstrapped (`.env` copies, venv symlinks, DB seeds)
+        // before the agent launches. On failure, tear down the just-built
+        // worktree/container so a broken hook doesn't leave an orphan.
+        if let Err(e) = run_create_hooks(
+            &mut instance,
+            &hook_plan,
+            std::path::Path::new(&original_path),
+        ) {
+            builder::cleanup_instance(
+                &instance,
+                created_worktree.as_ref(),
+                &created_workspace_worktrees,
+            );
+            return Err(anyhow::anyhow!("on_create hook failed: {e:#}"));
+        }
 
         // Anything that fails between here and the final `Ok(..)`
         // would otherwise orphan the scratch directory `build_instance`
@@ -2851,6 +3092,23 @@ pub async fn create_session(
             (StatusCode::CREATED, Json(resp)).into_response()
         }
         Ok(Err(e)) => {
+            // A repo whose hooks need approval gets a distinct, structured
+            // response so the caller can surface the commands and resubmit with
+            // `trust_hooks: true` (#2066), rather than the opaque create_failed.
+            if let Some(needs_trust) = e.downcast_ref::<HooksNeedTrust>() {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({
+                        "error": "hooks_need_trust",
+                        "message": "Repository hooks require trust. Resubmit with trust_hooks: true to approve.",
+                        "on_create": needs_trust.on_create,
+                        "on_launch": needs_trust.on_launch,
+                        "on_destroy": needs_trust.on_destroy,
+                        "needs_mcp_trust": needs_trust.needs_mcp_trust,
+                    })),
+                )
+                    .into_response();
+            }
             tracing::warn!(target: "http.api.sessions", "Session creation failed: {}", e);
             (
                 StatusCode::BAD_REQUEST,
@@ -3550,6 +3808,7 @@ pub async fn session_diff_files(
         Err(resp) => return resp,
     };
 
+    let scan_state = state.clone();
     let result = tokio::task::spawn_blocking(move || {
         use crate::git::diff;
 
@@ -3570,7 +3829,9 @@ pub async fn session_diff_files(
                 path,
             );
             let warning = diff::check_merge_base_status(path, &base_branch);
-            let changed = diff::compute_changed_files(path, &base_branch).unwrap_or_default();
+            let changed = scan_state
+                .changed_files_cached(path, &base_branch)
+                .unwrap_or_default();
 
             for f in changed {
                 all_files.push(RichDiffFileInfo {
@@ -3680,6 +3941,7 @@ pub async fn session_diff_file(
     let selected_repo_name = selected_repo.name;
     let base_branch_override = ctx.base_branch_override.clone();
     let base_from_worktree = ctx.base_from_worktree.clone();
+    let scan_state = state.clone();
 
     let result =
         tokio::task::spawn_blocking(move || -> Result<serde_json::Value, DiffFileError> {
@@ -3702,7 +3964,8 @@ pub async fn session_diff_file(
             // Validate the requested path against the set of actually-changed files.
             // This is the primary security boundary: only files modified on this
             // branch are diffable, preventing arbitrary file reads via ?path=...
-            let changed_files = diff::compute_changed_files(repo_path, &base_branch)
+            let changed_files = scan_state
+                .changed_files_cached(repo_path, &base_branch)
                 .map_err(|e| DiffFileError::Internal(e.into()))?;
             match validate_diff_path(repo_path, file_path, &changed_files) {
                 Ok(_) => {}
@@ -3788,6 +4051,91 @@ pub async fn session_diff_file(
         }
         Err(e) => {
             tracing::error!(target: "http.api.sessions", "File diff panicked: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct VolumeIgnoresPreviewQuery {
+    pub path: String,
+    #[serde(default)]
+    pub profile: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct VolumeIgnoresGlobPreview {
+    pub pattern: String,
+    pub matched_paths: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct VolumeIgnoresPreviewResponse {
+    /// True once the user has acknowledged the snapshot-expansion behavior, so
+    /// the wizard can skip the confirm modal without another round trip.
+    pub acknowledged: bool,
+    /// One entry per glob `volume_ignores` pattern with the directories it
+    /// currently matches (container-side paths). Empty when none are configured.
+    pub globs: Vec<VolumeIgnoresGlobPreview>,
+}
+
+/// Dry-run how glob `volume_ignores` entries would expand for a session rooted at
+/// `path`, without creating anything. The wizard calls this before a sandbox
+/// create to decide whether to show the snapshot-expansion confirm modal (#2045).
+/// Read-only: no `read_only` guard needed.
+pub async fn preview_volume_ignores_globs(
+    axum::extract::Query(query): axum::extract::Query<VolumeIgnoresPreviewQuery>,
+) -> impl IntoResponse {
+    let result = tokio::task::spawn_blocking(move || {
+        let profile = query.profile.unwrap_or_default();
+        let config = crate::session::repo_config::resolve_config_with_repo(
+            &profile,
+            std::path::Path::new(&query.path),
+        )?;
+        let expansions = crate::session::container_config::preview_glob_volume_ignores(
+            &query.path,
+            None,
+            &config.sandbox.volume_ignores,
+        )?;
+        let acknowledged = crate::session::Config::load()
+            .map(|c| c.app_state.has_acknowledged_volume_ignores_globs)
+            .unwrap_or(false);
+        Ok::<_, anyhow::Error>((acknowledged, expansions))
+    })
+    .await;
+
+    match result {
+        Ok(Ok((acknowledged, expansions))) => {
+            let globs = expansions
+                .into_iter()
+                .map(|e| VolumeIgnoresGlobPreview {
+                    pattern: e.pattern,
+                    matched_paths: e.matched_container_paths,
+                })
+                .collect();
+            (
+                StatusCode::OK,
+                Json(VolumeIgnoresPreviewResponse {
+                    acknowledged,
+                    globs,
+                }),
+            )
+                .into_response()
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(target: "http.api.sessions", "volume_ignores glob preview failed: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "preview_failed", "message": "Failed to preview volume_ignores"})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!(target: "http.api.sessions", "volume_ignores glob preview panicked: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
@@ -4878,6 +5226,218 @@ mod tests {
             reloaded.iter().find(|i| i.id == id).unwrap().group_path,
             "",
             "empty string must clear the group on disk"
+        );
+    }
+
+    // --- #2066: web-API on_create hook trust + execution ---
+
+    /// Write `.agent-of-empires/config.toml` with the given `on_create` hooks
+    /// into a fresh project dir. Returns the dir so the caller keeps it alive.
+    fn project_with_on_create_hooks(commands: &[&str]) -> tempfile::TempDir {
+        let project = tempfile::tempdir().unwrap();
+        let cfg_dir = project.path().join(".agent-of-empires");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let list = commands
+            .iter()
+            .map(|c| format!("{c:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        std::fs::write(
+            cfg_dir.join("config.toml"),
+            format!("[hooks]\non_create = [{list}]\n"),
+        )
+        .unwrap();
+        project
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_hook_plan_refuses_untrusted_repo_hooks() {
+        // Bug #2066: the web API used to skip hooks entirely. The plan must now
+        // refuse an untrusted repo with hooks unless trust_hooks is passed, so
+        // the caller can prompt rather than silently get an un-bootstrapped
+        // worktree.
+        let temp_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        let _app_dir = isolated_app_dir(temp_home.path());
+        let project = project_with_on_create_hooks(&["bash scripts/setup-worktree.sh"]);
+        // Approval trusts the whole hooks hash, so the refusal must surface
+        // every hook type, not just on_create.
+        std::fs::write(
+            project.path().join(".agent-of-empires/config.toml"),
+            "[hooks]\non_create = [\"bash scripts/setup-worktree.sh\"]\non_launch = [\"npm start\"]\non_destroy = [\"rm -rf /tmp/seed\"]\n",
+        )
+        .unwrap();
+
+        let err = resolve_create_hook_plan("default", project.path(), false, false)
+            .expect_err("untrusted hooks must be refused");
+        let needs_trust = err
+            .downcast_ref::<HooksNeedTrust>()
+            .expect("error must be HooksNeedTrust");
+        assert_eq!(
+            needs_trust.on_create,
+            vec!["bash scripts/setup-worktree.sh".to_string()],
+            "the refused error must carry the commands for the prompt"
+        );
+        assert_eq!(
+            needs_trust.on_launch,
+            vec!["npm start".to_string()],
+            "approval also trusts on_launch, so the prompt must show it"
+        );
+        assert_eq!(needs_trust.on_destroy, vec!["rm -rf /tmp/seed".to_string()]);
+        assert!(!needs_trust.needs_mcp_trust);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_hook_plan_trusts_and_runs_with_trust_hooks() {
+        // trust_hooks: true mirrors the CLI --trust-hooks flag: approve, record
+        // trust, and return the commands to run.
+        let temp_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        let _app_dir = isolated_app_dir(temp_home.path());
+        let project = project_with_on_create_hooks(&["echo hi"]);
+
+        let plan = resolve_create_hook_plan("default", project.path(), false, true)
+            .expect("trust_hooks: true must approve");
+        assert_eq!(plan.on_create, vec!["echo hi".to_string()]);
+        let (hooks_hash, mcp_hash) = plan
+            .trust_write
+            .expect("a newly-approved repo must record trust");
+        assert!(hooks_hash.is_some(), "hooks hash must be recorded");
+        assert!(mcp_hash.is_none(), "no .mcp.json means no mcp hash");
+
+        // And the recorded trust makes a later create succeed without opting in.
+        crate::session::repo_config::trust_repo(
+            project.path(),
+            hooks_hash.as_deref(),
+            mcp_hash.as_deref(),
+        )
+        .unwrap();
+        let plan2 = resolve_create_hook_plan("default", project.path(), false, false)
+            .expect("already-trusted hooks must run without trust_hooks");
+        assert_eq!(plan2.on_create, vec!["echo hi".to_string()]);
+        assert!(
+            plan2.trust_write.is_none(),
+            "already-trusted repo needs no new trust record"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_hook_plan_absent_hooks_is_ok() {
+        // A repo with no hooks (and no global hooks) is never refused.
+        let temp_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        let _app_dir = isolated_app_dir(temp_home.path());
+        let project = tempfile::tempdir().unwrap();
+
+        let plan = resolve_create_hook_plan("default", project.path(), false, false)
+            .expect("no hooks means no trust needed");
+        assert!(plan.on_create.is_empty());
+        assert!(plan.trust_write.is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_hook_plan_scratch_skips_repo_trust() {
+        // Scratch sessions have no repo config anchor; even pointing at a path
+        // with untrusted hooks must not refuse (matches the CLI scratch branch).
+        let temp_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        let _app_dir = isolated_app_dir(temp_home.path());
+        let project = project_with_on_create_hooks(&["echo nope"]);
+
+        let plan = resolve_create_hook_plan("default", project.path(), true, false)
+            .expect("scratch must skip the repo trust check");
+        assert!(
+            plan.on_create.is_empty(),
+            "no global hooks, so scratch resolves to nothing"
+        );
+        assert!(plan.trust_write.is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_hook_plan_does_not_block_on_untrusted_mcp_without_hooks() {
+        // A repo with an untrusted `.mcp.json` but no hooks must NOT be refused:
+        // the supervisor gates MCP at spawn, so blocking creation here would be
+        // stricter than the CLI. The session is created with MCP left untrusted.
+        let temp_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        let _app_dir = isolated_app_dir(temp_home.path());
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join(".mcp.json"),
+            r#"{"mcpServers": {"foo": {"command": "echo"}}}"#,
+        )
+        .unwrap();
+
+        let plan = resolve_create_hook_plan("default", project.path(), false, false)
+            .expect("untrusted MCP without hooks must not block creation");
+        assert!(plan.on_create.is_empty());
+        assert!(
+            plan.trust_write.is_none(),
+            "MCP is left untrusted when the caller did not opt in"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_hook_plan_inherits_trust_across_worktrees() {
+        // Secondary half of #2066: hook trust is keyed on the main repo
+        // (check_repo_trust resolves a worktree path back to it), so a worktree
+        // created from an already-trusted repo inherits that trust without a
+        // fresh prompt, even with trust_hooks: false.
+        let temp_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        let _app_dir = isolated_app_dir(temp_home.path());
+
+        let parent = tempfile::Builder::new()
+            .prefix("aoe-test-")
+            .tempdir()
+            .unwrap();
+        let root = parent.path().join("proj");
+        std::fs::create_dir(&root).unwrap();
+        let repo = git2::Repository::init(&root).unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        std::fs::create_dir_all(root.join(".agent-of-empires")).unwrap();
+        std::fs::write(
+            root.join(".agent-of-empires/config.toml"),
+            "[hooks]\non_create = [\"echo wt\"]\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("README.md"), "proj\n").unwrap();
+        let tree_id = {
+            let mut index = repo.index().unwrap();
+            index.add_path(std::path::Path::new("README.md")).unwrap();
+            index.write_tree().unwrap()
+        };
+        let tree = repo.find_tree(tree_id).unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+            .unwrap();
+
+        // Trust the main repo at its current hooks hash.
+        let hooks = crate::session::repo_config::load_repo_config(&root)
+            .unwrap()
+            .and_then(|rc| rc.hooks())
+            .unwrap();
+        let hash = crate::session::repo_config::compute_hooks_hash(&hooks);
+        crate::session::repo_config::trust_repo(&root, Some(&hash), None).unwrap();
+
+        // A worktree of that repo inherits the trust.
+        let main_wt = crate::git::GitWorktree::new(root.clone()).unwrap();
+        let wt_path = parent.path().join("proj-wt");
+        main_wt
+            .create_worktree("wt-branch", &wt_path, true, None)
+            .unwrap();
+
+        let plan = resolve_create_hook_plan("default", &wt_path, false, false)
+            .expect("worktree must inherit the main repo's hook trust");
+        assert_eq!(plan.on_create, vec!["echo wt".to_string()]);
+        assert!(
+            plan.trust_write.is_none(),
+            "inherited trust needs no new record"
         );
     }
 }

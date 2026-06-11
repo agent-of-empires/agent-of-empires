@@ -16,9 +16,7 @@ import { spawnAoeServe } from "../helpers/aoeServe";
 
 /** Capture every `POST /api/telemetry/seen` body a context's page sends,
  *  parsed into `{ surface, form_factor }`. */
-function captureSeenPings(
-  page: Page,
-): Array<{ surface?: string; form_factor?: string }> {
+function captureSeenPings(page: Page): Array<{ surface?: string; form_factor?: string }> {
   const pings: Array<{ surface?: string; form_factor?: string }> = [];
   page.on("request", (req) => {
     if (req.method() === "POST" && req.url().includes("/api/telemetry/seen")) {
@@ -64,9 +62,7 @@ async function emulateMobilePwa(ctx: BrowserContext): Promise<void> {
   });
 }
 
-test("desktop and mobile-PWA clients report distinct form-factor classes", async ({
-  browser,
-}, testInfo) => {
+test("desktop and mobile-PWA clients report distinct form-factor classes", async ({ browser }, testInfo) => {
   const serve = await spawnAoeServe({
     authMode: "none",
     workerIndex: testInfo.workerIndex,
@@ -93,29 +89,15 @@ test("desktop and mobile-PWA clients report distinct form-factor classes", async
     await mobilePage.goto(serve.baseUrl);
 
     await expect
-      .poll(
-        () =>
-          desktopPings.some(
-            (p) => p.surface === "web" && p.form_factor === "desktop",
-          ),
-        { timeout: 10_000 },
-      )
+      .poll(() => desktopPings.some((p) => p.surface === "web" && p.form_factor === "desktop"), { timeout: 10_000 })
       .toBe(true);
 
     await expect
-      .poll(
-        () =>
-          mobilePings.some(
-            (p) => p.surface === "web" && p.form_factor === "mobile_pwa",
-          ),
-        { timeout: 10_000 },
-      )
+      .poll(() => mobilePings.some((p) => p.surface === "web" && p.form_factor === "mobile_pwa"), { timeout: 10_000 })
       .toBe(true);
 
     // The two classes are genuinely distinct, not one undifferentiated client.
-    expect(desktopPings.some((p) => p.form_factor === "mobile_pwa")).toBe(
-      false,
-    );
+    expect(desktopPings.some((p) => p.form_factor === "mobile_pwa")).toBe(false);
 
     await desktopCtx.close();
     await mobileCtx.close();

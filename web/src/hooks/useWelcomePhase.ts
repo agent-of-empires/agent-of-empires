@@ -1,10 +1,5 @@
 import { useCallback, useState } from "react";
-import {
-  hasSeenWelcome,
-  isAutomatedSession,
-  markWelcomeSeen,
-  shouldShowWelcome,
-} from "../lib/onboarding";
+import { hasSeenWelcome, isAutomatedSession, markWelcomeSeen, shouldShowWelcome } from "../lib/onboarding";
 import type { TourScope } from "../lib/tourSteps";
 
 type Phase = "pending" | "showing" | "done";

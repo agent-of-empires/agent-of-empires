@@ -1,0 +1,9 @@
+# Revs ignored by git blame, such as large reformatting diffs.
+# Docs: https://git-scm.com/docs/git-blame#Documentation/git-blame.txt---ignore-revs-fileltfilegt
+# Enable with: git config blame.ignoreRevsFile .git-blame-ignore-revs
+
+# oxfmt
+9f9414197e890eda18b9d914b9c6d9406f8c0fda
+
+# oxfmt 80 -> 120 line width
+1f1a33396d189a596d29404df074b22e11646721

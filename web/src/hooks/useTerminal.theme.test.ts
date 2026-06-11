@@ -26,16 +26,16 @@ describe("readThemeFromCss", () => {
     }
   });
 
-  it("falls back to the bundled defaults when nothing is set", () => {
+  it("does not duplicate bundled default colors when nothing is set", () => {
     const theme = readThemeFromCss();
-    expect(theme.background).toBe("#1c1c1f");
-    expect(theme.foreground).toBe("#e4e4e7");
-    expect(theme.cursor).toBe("#f59e0b");
-    // cursorAccent matches background so the cursor reads against any bg
-    expect(theme.cursorAccent).toBe("#1c1c1f");
-    expect(theme.black).toBe("#1c1c1f");
-    expect(theme.red).toBe("#ef4444");
-    expect(theme.brightWhite).toBe("#fbbf24");
+    expect(theme.background).toBeUndefined();
+    expect(theme.foreground).toBeUndefined();
+    expect(theme.cursor).toBeUndefined();
+    expect(theme.cursorAccent).toBeUndefined();
+    expect(theme.selectionBackground).toBeUndefined();
+    expect(theme.black).toBeUndefined();
+    expect(theme.red).toBeUndefined();
+    expect(theme.brightWhite).toBeUndefined();
   });
 
   it("projects --term-bg / --term-fg / --term-cursor through", () => {
@@ -43,11 +43,13 @@ describe("readThemeFromCss", () => {
       "--term-bg": "#101010",
       "--term-fg": "#fafafa",
       "--term-cursor": "#ff00ff",
+      "--term-selection-bg": "rgba(10, 20, 30, 0.4)",
     });
     const theme = readThemeFromCss();
     expect(theme.background).toBe("#101010");
     expect(theme.foreground).toBe("#fafafa");
     expect(theme.cursor).toBe("#ff00ff");
+    expect(theme.selectionBackground).toBe("rgba(10, 20, 30, 0.4)");
     // cursorAccent reads from the same --term-bg slot
     expect(theme.cursorAccent).toBe("#101010");
   });
@@ -87,11 +89,8 @@ describe("readThemeFromCss", () => {
     expect(readThemeFromCss().background).toBe("#abcdef");
   });
 
-  it("uses the fallback when an explicit empty value is set", () => {
-    // An empty string from getComputedStyle should resolve to the
-    // hard-coded default, otherwise the terminal would paint with an
-    // empty ITheme slot (xterm.js treats that as transparent).
+  it("treats an explicit empty value as missing", () => {
     document.documentElement.style.setProperty("--term-bg", "");
-    expect(readThemeFromCss().background).toBe("#1c1c1f");
+    expect(readThemeFromCss().background).toBeUndefined();
   });
 });

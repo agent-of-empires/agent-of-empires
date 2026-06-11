@@ -22,6 +22,136 @@ fn humanize_minutes(m: u32) -> String {
 }
 
 impl HomeView {
+    /// Pin or unpin the project header under the cursor (project view only).
+    ///
+    /// Pinning registers the repo in the global project registry (the same
+    /// store the WebUI writes), so the project keeps its header in project
+    /// view even after its last session is deleted. Unpinning removes the
+    /// registry entry; a project with no remaining sessions then disappears.
+    ///
+    /// The registry is the shared persistence layer: this goes through the
+    /// same `projects::add` / `projects::remove` the web API and the projects
+    /// dialog use, so canonicalization and conflict rules stay in one place.
+    pub(super) fn toggle_project_pin_at_cursor(&mut self) {
+        use crate::session::{projects, Project, ProjectScope};
+        use crate::tui::dialogs::InfoDialog;
+
+        let Some(label) = self.project_group_at_cursor() else {
+            return;
+        };
+        let profile = self.config_profile();
+        // The header's own repo path (canonical), or None for an empty pinned
+        // header. Keying on the path keeps two repos that share a basename
+        // independent, so the toggle acts on the repo the user is looking at.
+        let header_path = self.project_header_repo_path(&label);
+
+        if self.is_project_label_pinned(&label) {
+            // Unpin. Prefer the registry entry whose canonical path matches the
+            // header's own repo. An empty header has no session path, so fall
+            // back to the basename match (it exists only because a registered
+            // project carries that basename; two such empties share one header
+            // and clear one per press).
+            let existing = match &header_path {
+                Some(path) => self
+                    .registered_projects
+                    .iter()
+                    .find(|p| projects::canonical_key(&p.path) == *path),
+                None => self
+                    .registered_projects
+                    .iter()
+                    .find(|p| projects::repo_label(&p.path) == label),
+            }
+            .cloned();
+            let Some(existing) = existing else {
+                return;
+            };
+            // Unpin means "this repo is no longer pinned anywhere", so clear
+            // every registry entry for its canonical path rather than just the
+            // one `load_merged` happened to surface. A path can sit in more than
+            // one scope at once (`--allow-override` lets a profile entry shadow
+            // a global one); removing only the visible entry would re-surface
+            // the shadowed one and leave the header pinned after a "success"
+            // dialog. `registered_projects` also drops which profile each entry
+            // came from in all-profiles mode, and `config_profile()` is only
+            // the default, so sweep the global file plus every loaded profile.
+            let target = existing.path.clone();
+            let mut profiles: Vec<String> = self.storages.keys().cloned().collect();
+            if !profiles.contains(&profile) {
+                profiles.push(profile.clone());
+            }
+            // Global lives in one shared file, so the profile arg is irrelevant.
+            let mut removals = vec![projects::remove(&profile, ProjectScope::Global, &target)];
+            for p in &profiles {
+                removals.push(projects::remove(p, ProjectScope::Profile, &target));
+            }
+            let mut removed_any = false;
+            let mut hard_err: Option<projects::RegistryError> = None;
+            for res in removals {
+                match res {
+                    Ok(_) => removed_any = true,
+                    Err(projects::RegistryError::NotFound(_)) => {}
+                    Err(e) => hard_err = Some(e),
+                }
+            }
+            // Surface a real I/O/parse failure even if some entry was removed;
+            // a partial unpin the user can't see is worse than a visible error.
+            let result: Result<(), projects::RegistryError> = match (hard_err, removed_any) {
+                (Some(e), _) => Err(e),
+                (None, true) => Ok(()),
+                (None, false) => Err(projects::RegistryError::NotFound(format!(
+                    "No pinned project '{}' found in any loaded scope",
+                    label
+                ))),
+            };
+            match result {
+                Ok(_) => {
+                    self.info_dialog = Some(InfoDialog::new(
+                        "Project Unpinned",
+                        &format!(
+                            "'{}' is no longer pinned. It will drop from project view once it has no sessions.",
+                            label
+                        ),
+                    ));
+                }
+                Err(e) => {
+                    self.info_dialog = Some(InfoDialog::new(
+                        "Unpin Failed",
+                        &format!("Could not unpin: {}", e),
+                    ));
+                }
+            }
+        } else {
+            // Pin the repo backing this header. An unpinned header always has at
+            // least one live session (an empty header is pinned by
+            // construction), so its repo path is known.
+            let Some(repo_path) = header_path else {
+                return;
+            };
+            let project = Project::new(label.clone(), repo_path, ProjectScope::Global);
+            match projects::add(&profile, ProjectScope::Global, project, false) {
+                Ok(_) => {
+                    self.info_dialog = Some(InfoDialog::new(
+                        "Project Pinned",
+                        &format!(
+                            "'{}' is pinned. It will stay in project view even with no sessions.",
+                            label
+                        ),
+                    ));
+                }
+                Err(e) => {
+                    self.info_dialog = Some(InfoDialog::new(
+                        "Pin Failed",
+                        &format!("Could not pin: {}", e),
+                    ));
+                }
+            }
+        }
+
+        self.refresh_registered_projects();
+        self.flat_items = self.build_flat_items();
+        self.update_selected();
+    }
+
     pub(super) fn create_session(&mut self, data: NewSessionData) -> anyhow::Result<String> {
         let target_profile = data.profile.clone();
 
@@ -141,6 +271,8 @@ impl HomeView {
         &mut self,
         new_profile: Option<&str>,
         new_tool: Option<&str>,
+        new_extra_args: Option<&str>,
+        new_command_override: Option<&str>,
     ) -> anyhow::Result<()> {
         let id = match &self.selected_session {
             Some(id) => id.clone(),
@@ -199,6 +331,22 @@ impl HomeView {
                     inst.tool = target_tool.to_string();
                 });
             }
+        }
+
+        // Apply command override + extra args swaps before restart so the
+        // adjusted launch command takes effect on the next spawn. Both come
+        // pre-resolved from the restart dialog (which re-seeds them from the
+        // selected tool's config when the engine is swapped), so we set the
+        // instance fields directly. `None` means "leave as-is".
+        if let Some(command) = new_command_override {
+            self.mutate_instance(&id, |inst| {
+                inst.command = command.to_string();
+            });
+        }
+        if let Some(extra) = new_extra_args {
+            self.mutate_instance(&id, |inst| {
+                inst.extra_args = extra.to_string();
+            });
         }
 
         // Apply profile move. Validates the target exists, lazily creates
@@ -1040,6 +1188,79 @@ impl HomeView {
             self.flat_items = self.build_flat_items();
             self.select_session_by_id(&id);
         }
+        Ok(())
+    }
+
+    /// Collect the active (non-archived) session ids under the currently
+    /// selected group header, honoring the active group-by mode. Archived
+    /// sessions are excluded: they already live under the synthetic Archived
+    /// section, and re-archiving them is a no-op. Returns empty when no group
+    /// is selected.
+    pub(super) fn active_sessions_in_selected_group(&self) -> Vec<String> {
+        let Some(group_path) = self.selected_group.as_deref() else {
+            return Vec::new();
+        };
+        match self.group_by {
+            // Project headers are derived from each session's repo name and
+            // unified across profiles, narrowed only by the active profile
+            // filter, exactly as `build_flat_items_by_project` builds them.
+            crate::session::config::GroupByMode::Project => self
+                .instances
+                .iter()
+                .filter(|i| !i.is_archived())
+                .filter(|i| {
+                    self.active_profile
+                        .as_ref()
+                        .is_none_or(|p| &i.source_profile == p)
+                })
+                .filter(|i| super::project_group_name(i) == group_path)
+                .map(|i| i.id.clone())
+                .collect(),
+            // Manual groups can nest, so a session belongs when its path
+            // matches exactly or sits beneath the group. Scope to the group's
+            // owning profile the same way `delete_selected_group` does.
+            crate::session::config::GroupByMode::Manual => {
+                let prefix = format!("{}/", group_path);
+                self.instances
+                    .iter()
+                    .filter(|i| !i.is_archived())
+                    .filter(|i| i.group_path == group_path || i.group_path.starts_with(&prefix))
+                    .filter(|i| {
+                        self.selected_group_profile
+                            .as_ref()
+                            .is_none_or(|p| p == &i.source_profile)
+                    })
+                    .map(|i| i.id.clone())
+                    .collect()
+            }
+        }
+    }
+
+    /// Archive every active session under the selected group. Mirrors the
+    /// single-row archive path in `toggle_archive_at_cursor`: kill each pane
+    /// before flipping the archived bit, then reveal the Archived section so
+    /// the rows stay visible. Triggered behind a confirmation prompt, so there
+    /// is no further guard here.
+    pub(super) fn archive_selected_group(&mut self) -> anyhow::Result<()> {
+        let ids = self.active_sessions_in_selected_group();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        for inst in self.instances.iter().filter(|i| ids.contains(&i.id)) {
+            if let Err(e) = inst.kill() {
+                tracing::warn!("archive_selected_group: kill failed (continuing): {}", e);
+            }
+        }
+        self.bulk_apply_user_action(&ids, |inst| inst.archive())?;
+        self.reveal_archived_section();
+        self.flat_items = self.build_flat_items();
+        // The project header vanishes once its last active member is archived
+        // (project headers are seeded from live sessions only), so the cursor's
+        // old index may now point past the list end; clamp and re-resolve.
+        if !self.flat_items.is_empty() && self.cursor >= self.flat_items.len() {
+            self.cursor = self.flat_items.len() - 1;
+        }
+        self.update_selected();
         Ok(())
     }
 }

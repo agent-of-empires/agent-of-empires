@@ -8,11 +8,7 @@ interface Props {
   onChange: (paths: string[]) => void;
 }
 
-export function ExtraReposPicker({
-  primaryPath,
-  selectedPaths,
-  onChange,
-}: Props) {
+export function ExtraReposPicker({ primaryPath, selectedPaths, onChange }: Props) {
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [freeText, setFreeText] = useState("");
@@ -56,26 +52,20 @@ export function ExtraReposPicker({
   return (
     <div>
       <div className="flex items-center justify-between mb-2">
-        <h3 className="text-sm font-medium text-text-primary">
-          Extra repos (optional)
-        </h3>
+        <h3 className="text-sm font-medium text-text-primary">Extra repos (optional)</h3>
         <span className="text-[11px] text-text-dim">
-          {selectedPaths.length > 0
-            ? `${selectedPaths.length} selected`
-            : "none"}
+          {selectedPaths.length > 0 ? `${selectedPaths.length} selected` : "none"}
         </span>
       </div>
       <p className="text-[11px] text-text-dim mb-3">
-        Include additional repositories in the same workspace. Each gets its own
-        worktree on the same branch.
+        Include additional repositories in the same workspace. Each gets its own worktree on the same branch.
       </p>
 
       {selectedPaths.length > 0 && (
         <div className="flex flex-wrap gap-1.5 mb-3">
           {selectedPaths.map((path) => {
             const known = projects.find((p) => p.path === path);
-            const label =
-              known?.name || path.split("/").filter(Boolean).pop() || path;
+            const label = known?.name || path.split("/").filter(Boolean).pop() || path;
             return (
               <span
                 key={path}
@@ -99,9 +89,7 @@ export function ExtraReposPicker({
 
       {!loading && pickable.length > 0 && (
         <div className="mb-3">
-          <p className="text-[10px] uppercase tracking-wider text-text-dim mb-1.5">
-            Registered projects
-          </p>
+          <p className="text-[10px] uppercase tracking-wider text-text-dim mb-1.5">Registered projects</p>
           <div className="flex flex-wrap gap-1.5">
             {pickable.map((p) => (
               <button
@@ -116,9 +104,7 @@ export function ExtraReposPicker({
                 title={p.path}
               >
                 <span className="font-mono">{p.name}</span>
-                <span className="text-[9px] uppercase text-text-dim">
-                  {p.scope}
-                </span>
+                <span className="text-[9px] uppercase text-text-dim">{p.scope}</span>
               </button>
             ))}
           </div>
@@ -128,10 +114,7 @@ export function ExtraReposPicker({
       {!loading && pickable.length === 0 && projects.length === 0 && (
         <p className="text-[11px] text-text-dim mb-3">
           No registered projects yet. Add one with{" "}
-          <code className="text-text-secondary">
-            aoe project add &lt;path&gt;
-          </code>{" "}
-          or via the Projects page.
+          <code className="text-text-secondary">aoe project add &lt;path&gt;</code> or via the Projects page.
         </p>
       )}
 

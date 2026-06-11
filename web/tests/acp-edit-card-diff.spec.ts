@@ -20,8 +20,7 @@ const FILE_PATH = "src/example.ts";
 // old != new with one changed line per side plus a pure addition, so
 // diffPair takes the parseDiffFromFile path and emits +3 / −2.
 const OLD_STRING = "const x = 42;\nconst y = 1;\nexport default x;";
-const NEW_STRING =
-  "const x: number = 42;\nconst y = 2;\nconst z = 3;\nexport default x;";
+const NEW_STRING = "const x: number = 42;\nconst y = 2;\nconst z = 3;\nexport default x;";
 
 function editFrame() {
   return {
@@ -46,9 +45,7 @@ function editFrame() {
 }
 
 async function setup(page: Page) {
-  await page.route("**/api/login/status", (r) =>
-    r.fulfill({ json: { required: false, authenticated: true } }),
-  );
+  await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
   for (const path of [
     "settings",
     "themes",
@@ -63,10 +60,7 @@ async function setup(page: Page) {
     await page.route(`**/api/${path}`, (r) =>
       r.fulfill({
         json:
-          path === "docker/status" ||
-          path === "about" ||
-          path === "settings" ||
-          path === "system/update-status"
+          path === "docker/status" || path === "about" || path === "settings" || path === "system/update-status"
             ? {}
             : [],
       }),
@@ -103,9 +97,7 @@ async function setup(page: Page) {
       },
     });
   });
-  await page.route("**/api/sessions/*/ensure", (r) =>
-    r.fulfill({ json: { ok: true } }),
-  );
+  await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));
   // Structured view REST endpoints (replay/snapshot/prompt): empty is fine, the
   // tool frame arrives over the WebSocket below.
   await page.route("**/api/sessions/*/acp/**", (r) => r.fulfill({ json: {} }));
@@ -120,9 +112,7 @@ async function setup(page: Page) {
   });
 }
 
-test("structured view edit card renders diffPair output (chip + StringDiff)", async ({
-  page,
-}) => {
+test("structured view edit card renders diffPair output (chip + StringDiff)", async ({ page }) => {
   await setup(page);
   await page.goto("/");
   await expect(page.locator("header")).toBeVisible();

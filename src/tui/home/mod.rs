@@ -57,23 +57,7 @@ fn project_group_name(inst: &Instance) -> String {
         return "scratch".to_string();
     }
 
-    let base_path = inst
-        .worktree_info
-        .as_ref()
-        .map(|wt| wt.main_repo_path.as_str())
-        .unwrap_or(&inst.project_path);
-
-    let path = std::path::Path::new(base_path);
-    path.file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| {
-            // For root paths like "/", use a readable fallback
-            if base_path == "/" || base_path.is_empty() {
-                "(root)".to_string()
-            } else {
-                base_path.to_string()
-            }
-        })
+    crate::session::projects::repo_label(inst.repo_path())
 }
 
 /// Kinds of in-progress mouse drags. Today only the list/preview divider
@@ -394,6 +378,9 @@ pub(super) const ICON_STOPPED: &str = "⠒";
 pub(super) const ICON_DELETING: &str = "✕";
 pub(super) const ICON_COLLAPSED: &str = "▶";
 pub(super) const ICON_EXPANDED: &str = "▼";
+/// Marks a pinned project header in project view. Geometric per DESIGN.md
+/// (clean readable glyphs, not emoji).
+pub(super) const ICON_PINNED: &str = "◆";
 
 /// Hook progress for a session being created in the background
 pub(super) struct CreatingHookProgress {
@@ -454,6 +441,12 @@ pub struct HomeView {
     pub(super) profile_default_attach_mode: crate::session::NewSessionAttachMode,
     /// Collapsed state for project-mode groups (persists across rebuilds)
     pub(super) project_group_collapsed: HashMap<String, bool>,
+    /// Merged project registry (global + active profile), refreshed on reload
+    /// and after a pin/unpin. Project view injects the registered projects
+    /// with no live sessions as empty "pinned" headers, and the renderer reads
+    /// it to mark pinned headers. Mirrors the WebUI, where an empty project is
+    /// just a registry entry decoupled from any session.
+    pub(super) registered_projects: Vec<crate::session::Project>,
 
     // Dialogs
     pub(super) show_help: bool,
@@ -475,6 +468,13 @@ pub struct HomeView {
     pub(super) hooks_install_dialog: Option<HooksInstallDialog>,
     /// Session data pending agent hooks acknowledgment
     pub(super) pending_hooks_install_data: Option<NewSessionData>,
+    /// One-time confirm shown before a sandbox session whose resolved config
+    /// has glob `volume_ignores` (e.g. `**/bin`), explaining the create-time
+    /// snapshot expansion (#2045). Reuses [`ConfirmDialog`] with a
+    /// "don't warn me again" checkbox persisted to app_state.
+    pub(super) volume_ignores_glob_dialog: Option<ConfirmDialog>,
+    /// Session data pending the volume_ignores glob expansion acknowledgment.
+    pub(super) pending_volume_ignores_glob_data: Option<NewSessionData>,
     pub(super) intro_dialog: Option<IntroDialog>,
     /// Theme name queued by a click on the intro dialog (live preview or
     /// final pick). Drained by the `App` mouse handler after
@@ -578,6 +578,10 @@ pub struct HomeView {
     pub(super) pending_attach_after_warning: Option<String>,
     /// Session to stop after the confirmation dialog is accepted
     pub(super) pending_stop_session: Option<String>,
+    /// Sandbox image to pull after the "image update available" confirm dialog
+    /// is accepted. Carries the image through the generic `ConfirmDialog`,
+    /// which only knows its action string.
+    pub(super) pending_image_pull: Option<String>,
     /// Session to force-remove after the confirmation dialog is accepted
     pub(super) pending_force_remove_session: Option<String>,
     /// Action emitted by a mouse-click on a modal dialog (e.g. clicking
@@ -1086,6 +1090,7 @@ impl HomeView {
             row_tag_mode: resolved.session.row_tag,
             profile_default_attach_mode: resolved.session.default_attach_mode,
             project_group_collapsed: HashMap::new(),
+            registered_projects: Vec::new(),
             show_help: false,
             help_scroll: 0,
             new_dialog: None,
@@ -1101,6 +1106,8 @@ impl HomeView {
             pending_repo_trust_data: None,
             hooks_install_dialog: None,
             pending_hooks_install_data: None,
+            volume_ignores_glob_dialog: None,
+            pending_volume_ignores_glob_data: None,
             intro_dialog: None,
             pending_intro_theme: None,
             no_agents_dialog: None,
@@ -1134,6 +1141,7 @@ impl HomeView {
             pending_paste: None,
             pending_attach_after_warning: None,
             pending_stop_session: None,
+            pending_image_pull: None,
             pending_force_remove_session: None,
             pending_dialog_click_action: None,
             search_active: false,
@@ -1316,6 +1324,7 @@ impl HomeView {
             .map(|i| (i.id.clone(), i.clone()))
             .collect();
 
+        view.refresh_registered_projects();
         view.flat_items = view.build_flat_items();
         view.update_selected();
         let initial_profiles: Vec<String> = view.storages.keys().cloned().collect();
@@ -1416,6 +1425,10 @@ impl HomeView {
             .iter()
             .map(|i| (i.id.clone(), i.clone()))
             .collect();
+        // Refresh the project registry so project view's empty pinned headers
+        // and pin indicators reflect the current on-disk registry.
+        self.refresh_registered_projects();
+
         // Remember what the cursor was pointing at so we can follow it
         let prev_selected_session = self.selected_session.clone();
         let prev_selected_group = self.selected_group.clone();
@@ -2652,6 +2665,16 @@ impl HomeView {
         }
     }
 
+    /// Expire the settings view's transient "Settings saved" toast when its
+    /// window passes, so it fades even while the keyboard is idle. Returns true
+    /// when a redraw is needed. No-op when the settings overlay isn't open.
+    pub fn tick_settings_status(&mut self) -> bool {
+        self.settings_view
+            .as_mut()
+            .map(|view| view.tick_status())
+            .unwrap_or(false)
+    }
+
     /// Tick dialog animations/timers and drain hook progress.
     /// Returns true when a redraw is needed.
     pub fn tick_dialog(&mut self) -> bool {
@@ -2764,6 +2787,7 @@ impl HomeView {
             || self.context_menu.is_some()
             || self.repo_trust_dialog.is_some()
             || self.hooks_install_dialog.is_some()
+            || self.volume_ignores_glob_dialog.is_some()
             || self.intro_dialog.is_some()
             || self.no_agents_dialog.is_some()
             || self.changelog_dialog.is_some()
@@ -2801,6 +2825,7 @@ impl HomeView {
             || self.context_menu.is_some()
             || self.repo_trust_dialog.is_some()
             || self.hooks_install_dialog.is_some()
+            || self.volume_ignores_glob_dialog.is_some()
             || self.intro_dialog.is_some()
             || self.no_agents_dialog.is_some()
             || self.changelog_dialog.is_some()
@@ -3085,7 +3110,27 @@ impl HomeView {
             .filter(|i| !i.is_archived())
             .cloned()
             .collect();
-        let mut tree = GroupTree::new_with_groups(&tree_seed, &[]);
+
+        // Surface registered projects with no live session as empty "pinned"
+        // headers, so a project can persist in the view without any sessions,
+        // matching the WebUI where an empty project is just a registry entry.
+        // Seed them as empty groups; their headers render even with zero
+        // members (the phantom-header guard above only excludes archived-only
+        // session groups, not deliberately pinned ones).
+        let populated_labels: std::collections::HashSet<String> = tree_seed
+            .iter()
+            .map(|i| i.group_path.clone())
+            .filter(|p| !p.is_empty())
+            .collect();
+        let empty_pinned: Vec<crate::session::Group> =
+            crate::session::projects::unpopulated_projects(
+                &populated_labels,
+                &self.registered_projects,
+            )
+            .into_iter()
+            .map(|p| crate::session::Group::new(&p.label, &p.label))
+            .collect();
+        let mut tree = GroupTree::new_with_groups(&tree_seed, &empty_pinned);
         for (path, &collapsed) in &self.project_group_collapsed {
             if collapsed {
                 tree.set_collapsed(path, true);
@@ -3270,11 +3315,15 @@ impl HomeView {
         let size = crate::terminal::get_size();
         // Same pane-readiness cascades as live-send: agent runs the
         // full `ensure_pane_ready` (Docker, splash, resume); terminals
-        // just need their tmux session to exist with a live pane.
+        // just need their tmux session to exist with a live pane. Seed a
+        // cold/dead agent pane at the terminal size for the same reason
+        // live-send does (see `ensure_pane_ready_with_size`): otherwise it
+        // boots at tmux's 80x24 default and runs narrow until something
+        // resizes it.
         let stale_sid = match target {
             live_send::LiveSendTarget::Agent => {
                 let outcome = self.try_mutate_instance_writeback_on_err(session_id, |inst| {
-                    inst.ensure_pane_ready().map_err(Into::into)
+                    inst.ensure_pane_ready_with_size(size).map_err(Into::into)
                 });
                 match outcome {
                     Ok(Some(EnsureReadyOutcome::Respawned {
@@ -3360,6 +3409,25 @@ impl HomeView {
         stale_sid
     }
 
+    /// Size to boot a cold/dead agent pane at on live-send entry: the visible
+    /// preview output rect when known, else the full terminal. `preview_pane_area`
+    /// is the exact rect `finalize_live_send_resize` resizes to, so seeding the
+    /// boot here makes the post-boot resize a no-op for cold starts (no reflow,
+    /// no SIGWINCH race). Falls back to the terminal size for the rare entry
+    /// with no prior preview frame (e.g. attach-on-create), and to `None` if
+    /// neither is available so tmux keeps its default.
+    fn live_send_boot_size(&self) -> Option<(u16, u16)> {
+        let pane = self.preview_pane_area;
+        if pane.width > 0 && pane.height > 0 {
+            Some((pane.width, pane.height))
+        } else {
+            // A zero-dimension terminal size is as unusable as no size at all;
+            // drop it so the start path keeps tmux's default instead of being
+            // handed `-x 0`/`-y 0`.
+            crate::terminal::get_size().filter(|(cols, rows)| *cols > 0 && *rows > 0)
+        }
+    }
+
     /// Stage live-send mode against `session_id`. Mirrors
     /// `execute_send_message`'s revive cascade so a cold-start (Docker
     /// pull, agent splash) is handled before the user starts typing,
@@ -3390,10 +3458,19 @@ impl HomeView {
         // targets are simpler: the paired terminal is a plain shell,
         // so we just ensure the tmux session exists and re-spawn it if
         // the pane has died (matches `attach_terminal`).
+        //
+        // Boot the agent at the size it will be shown at, not tmux's 80x24
+        // default. A cold-started agent that boots narrow relies on
+        // `finalize_live_send_resize`'s single post-boot SIGWINCH to grow into
+        // the live area, a resize that races the agent's startup and, when
+        // lost, leaves the pane pinned at ~50% width until live mode is
+        // re-entered. See `Instance::ensure_pane_ready_with_size`.
+        let agent_boot_size = self.live_send_boot_size();
         let stale_sid = match target {
             live_send::LiveSendTarget::Agent => {
                 let outcome = self.try_mutate_instance_writeback_on_err(session_id, |inst| {
-                    inst.ensure_pane_ready().map_err(Into::into)
+                    inst.ensure_pane_ready_with_size(agent_boot_size)
+                        .map_err(Into::into)
                 });
                 match outcome {
                     Ok(Some(EnsureReadyOutcome::Respawned {
@@ -4266,6 +4343,91 @@ impl HomeView {
         self.active_profile
             .clone()
             .unwrap_or_else(crate::session::config::resolve_default_profile)
+    }
+
+    /// Reload the merged project registry into `registered_projects`. Called on
+    /// every storage reload and after a pin/unpin so the project view's empty
+    /// headers and pin indicators track the on-disk registry.
+    ///
+    /// In all-profiles mode `build_flat_items_by_project` merges sessions from
+    /// every loaded profile, so the registry must too: a profile-scoped pin
+    /// would otherwise lose its header (and glyph) the moment its sessions are
+    /// gone. Dedupe across profiles by canonical path since each
+    /// `load_merged` repeats the global entries.
+    pub(super) fn refresh_registered_projects(&mut self) {
+        use crate::session::projects::{canonical_key, load_merged};
+        if self.active_profile.is_some() {
+            self.registered_projects = load_merged(&self.config_profile()).unwrap_or_default();
+            return;
+        }
+        let profiles: Vec<String> = self.storages.keys().cloned().collect();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut merged = Vec::new();
+        for profile in &profiles {
+            for p in load_merged(profile).unwrap_or_default() {
+                if seen.insert(canonical_key(&p.path)) {
+                    merged.push(p);
+                }
+            }
+        }
+        self.registered_projects = merged;
+    }
+
+    /// The canonical repo path of the first live (non-archived) session under
+    /// project header `label`, or `None` when no live session populates the
+    /// header (an empty pinned header). This is the header's stable repo
+    /// identity, so two repos that merely share a basename are judged against
+    /// their own paths rather than the shared display label.
+    ///
+    /// Archived sessions are excluded on purpose: an empty main-flow header is
+    /// injected by LABEL match against the registry, so its pin state and
+    /// unpin toggle must resolve by the same rule. Letting an archived row
+    /// lend the header its path made a registry entry with a different
+    /// recorded path (repo deleted or moved, so `canonical_key` compares raw
+    /// strings) render an unpinnable phantom header: pinned by label, judged
+    /// by path.
+    pub(super) fn project_header_repo_path(&self, label: &str) -> Option<String> {
+        self.instances
+            .iter()
+            .find(|i| !i.is_archived() && project_group_name(i) == label)
+            .map(|i| crate::session::projects::canonical_key(i.repo_path()))
+    }
+
+    /// Whether the project-view header `label` is backed by a registered
+    /// (pinned) project. A header with live sessions is pinned iff its own repo
+    /// path is in the registry, so two repos sharing a basename are judged
+    /// independently. An empty header exists only because a registered project
+    /// carries that basename, so it is pinned by construction (matched by
+    /// label). Used for the pin indicator and the pin toggle.
+    pub(super) fn is_project_label_pinned(&self, label: &str) -> bool {
+        match self.project_header_repo_path(label) {
+            Some(path) => self
+                .registered_projects
+                .iter()
+                .any(|p| crate::session::projects::canonical_key(&p.path) == path),
+            None => self
+                .registered_projects
+                .iter()
+                .any(|p| crate::session::projects::repo_label(&p.path) == label),
+        }
+    }
+
+    /// The project-view header label under the cursor when it is a real,
+    /// pinnable project: project grouping is active, the cursor is on a group
+    /// header, and that header is neither the synthetic Archived section nor
+    /// the `scratch` bucket (scratch sessions have no backing repo to pin).
+    pub(super) fn project_group_at_cursor(&self) -> Option<String> {
+        if self.group_by != GroupByMode::Project {
+            return None;
+        }
+        match self.flat_items.get(self.cursor) {
+            Some(Item::Group { path, name, .. })
+                if !crate::session::is_within_archived_section(path) && name != "scratch" =>
+            {
+                Some(name.clone())
+            }
+            _ => None,
+        }
     }
 
     /// Resolve the effective `SessionConfig` for an existing session

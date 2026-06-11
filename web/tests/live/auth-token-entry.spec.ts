@@ -8,10 +8,7 @@ import { test, expect } from "../helpers/liveTest";
 
 const BAD_TOKEN = "a".repeat(64);
 
-test("bad token in URL routes to TokenEntryPage; valid token routes to dashboard", async ({
-  serveToken,
-  page,
-}) => {
+test("bad token in URL routes to TokenEntryPage; valid token routes to dashboard", async ({ serveToken, page }) => {
   expect(serveToken.authToken, "harness must expose serve.token").toBeTruthy();
   const validToken = serveToken.authToken!;
 
@@ -27,14 +24,10 @@ test("bad token in URL routes to TokenEntryPage; valid token routes to dashboard
   // timeout above the harness's spawn slack so a cold-cache Vite serve
   // doesn't race the assertion.
   await expect(page.locator("#token")).toBeVisible({ timeout: 15_000 });
-  await expect(
-    page.getByText(/session token has expired or is missing/i),
-  ).toBeVisible();
+  await expect(page.getByText(/session token has expired or is missing/i)).toBeVisible();
 
   // Sanity: localStorage was cleared by the interceptor on 401.
-  const storedAfterReject = await page.evaluate(() =>
-    window.localStorage.getItem("aoe_auth_token"),
-  );
+  const storedAfterReject = await page.evaluate(() => window.localStorage.getItem("aoe_auth_token"));
   expect(storedAfterReject).toBeNull();
 
   // Submitting another bad token surfaces the inline error.
@@ -54,16 +47,11 @@ test("bad token in URL routes to TokenEntryPage; valid token routes to dashboard
   await expect(page.locator("#token")).toBeHidden({ timeout: 10_000 });
 
   // Token was persisted to localStorage by saveToken.
-  const storedAfterAccept = await page.evaluate(() =>
-    window.localStorage.getItem("aoe_auth_token"),
-  );
+  const storedAfterAccept = await page.evaluate(() => window.localStorage.getItem("aoe_auth_token"));
   expect(storedAfterAccept).toBe(validToken);
 });
 
-test("URL form (?token=...) and raw-token form both unlock TokenEntryPage", async ({
-  serveToken,
-  page,
-}) => {
+test("URL form (?token=...) and raw-token form both unlock TokenEntryPage", async ({ serveToken, page }) => {
   const validToken = serveToken.authToken!;
 
   // Start with a bad token to land on TokenEntryPage.
@@ -73,9 +61,7 @@ test("URL form (?token=...) and raw-token form both unlock TokenEntryPage", asyn
   await expect(page.locator("#token")).toBeVisible({ timeout: 15_000 });
 
   // Submit the full URL form (extractToken in TokenEntryPage.tsx parses it).
-  await page
-    .locator("#token")
-    .fill(`${serveToken.baseUrl}/?token=${validToken}`);
+  await page.locator("#token").fill(`${serveToken.baseUrl}/?token=${validToken}`);
   await page.getByRole("button", { name: /connect/i }).click();
   await expect(page.locator("#token")).toBeHidden({ timeout: 10_000 });
 });

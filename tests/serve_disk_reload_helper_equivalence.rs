@@ -5,7 +5,11 @@
 //! `StatusSource` variants: `DiskOnly` keeps the prior in-memory `status` and
 //! `idle_entered_at` while `TmuxApplied` trusts the caller-applied scrape.
 //! Both paths must take the monotonic-max `last_accessed_at` and carry the
-//! five `#[serde(skip)]` runtime fields preserved by `merge_runtime_fields`.
+//! `#[serde(skip)]` runtime fields preserved by `merge_runtime_fields`.
+//! `last_error` is the exception: it is preserved only while the merged status
+//! is still `Error`, so a session that recovered to a healthy state drops the
+//! stale string (issue #1271). The other runtime fields (here `last_error_check`)
+//! carry over unconditionally.
 //!
 //! Drives the helper directly via the `crate::server::test_support` surface
 //! exposed for this test (the merge invariants live below the HTTP API and
@@ -22,8 +26,10 @@ use chrono::TimeZone;
 
 #[tokio::test]
 async fn reload_state_instances_from_disk_disk_only_preserves_prior_status() {
+    let probe = std::time::Instant::now();
     let mut prior = Instance::new("seed", "/tmp/seed");
     prior.status = Status::Running;
+    prior.last_error_check = Some(probe);
     prior.last_error = Some("boom".to_string());
     prior.last_accessed_at = Some(chrono::Utc.with_ymd_and_hms(2024, 6, 1, 0, 0, 0).unwrap());
     let prior_id = prior.id.clone();
@@ -46,9 +52,13 @@ async fn reload_state_instances_from_disk_disk_only_preserves_prior_status() {
         "DiskOnly: prior in-memory status must win"
     );
     assert_eq!(
-        row.last_error.as_deref(),
-        Some("boom"),
-        "runtime field preserved"
+        row.last_error_check,
+        Some(probe),
+        "runtime field preserved unconditionally"
+    );
+    assert_eq!(
+        row.last_error, None,
+        "healthy merged status drops the stale last_error (#1271)"
     );
     assert_eq!(
         row.last_accessed_at.unwrap().timestamp(),
@@ -62,8 +72,10 @@ async fn reload_state_instances_from_disk_disk_only_preserves_prior_status() {
 
 #[tokio::test]
 async fn reload_state_instances_from_disk_tmux_applied_takes_fresh_status() {
+    let probe = std::time::Instant::now();
     let mut prior = Instance::new("seed", "/tmp/seed");
     prior.status = Status::Idle;
+    prior.last_error_check = Some(probe);
     prior.last_error = Some("prev".to_string());
     prior.last_accessed_at = Some(chrono::Utc.with_ymd_and_hms(2024, 6, 1, 0, 0, 0).unwrap());
     let prior_id = prior.id.clone();
@@ -85,9 +97,13 @@ async fn reload_state_instances_from_disk_tmux_applied_takes_fresh_status() {
         "TmuxApplied: fresh status must win",
     );
     assert_eq!(
-        row.last_error.as_deref(),
-        Some("prev"),
-        "runtime field preserved"
+        row.last_error_check,
+        Some(probe),
+        "runtime field preserved unconditionally"
+    );
+    assert_eq!(
+        row.last_error, None,
+        "healthy merged status drops the stale last_error (#1271)"
     );
     assert_eq!(
         row.last_accessed_at.unwrap().timestamp(),

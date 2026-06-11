@@ -11,11 +11,7 @@
 // catches wire-format drift on either side that a mocked spec would miss.
 
 import { test as base, expect } from "@playwright/test";
-import {
-  spawnAoeServe,
-  listSessions,
-  seedSessionViaAoeAdd,
-} from "../helpers/aoeServe";
+import { spawnAoeServe, listSessions, seedSessionViaAoeAdd } from "../helpers/aoeServe";
 
 base.describe("session group edit via sidebar context menu (#1726)", () => {
   base(
@@ -47,19 +43,13 @@ base.describe("session group edit via sidebar context menu (#1726)", () => {
         await expect(menu).toBeVisible();
 
         const patchPromise = page.waitForResponse(
-          (res) =>
-            res.url().endsWith(`/api/sessions/${sessionId}/group`) &&
-            res.request().method() === "PATCH",
+          (res) => res.url().endsWith(`/api/sessions/${sessionId}/group`) && res.request().method() === "PATCH",
         );
 
-        await menu
-          .locator("[data-testid='sidebar-context-menu-edit-group']")
-          .click();
+        await menu.locator("[data-testid='sidebar-context-menu-edit-group']").click();
         const modal = page.locator("[data-testid='session-group-modal']");
         await expect(modal).toBeVisible();
-        const input = modal.locator(
-          "[data-testid='session-group-modal-input']",
-        );
+        const input = modal.locator("[data-testid='session-group-modal-input']");
         await input.fill(newGroup);
         await modal.locator("[data-testid='session-group-modal-save']").click();
 
@@ -70,12 +60,9 @@ base.describe("session group edit via sidebar context menu (#1726)", () => {
 
         // The session persists under the new group...
         await expect
-          .poll(
-            async () => (await listSessions(serve.baseUrl))[0]?.group_path,
-            {
-              timeout: 5_000,
-            },
-          )
+          .poll(async () => (await listSessions(serve.baseUrl))[0]?.group_path, {
+            timeout: 5_000,
+          })
           .toBe(newGroup);
 
         // ...and the group now exists in the derived group list.
@@ -88,79 +75,64 @@ base.describe("session group edit via sidebar context menu (#1726)", () => {
     },
   );
 
-  base(
-    "clearing the field commits an empty group, ungrouping the session",
-    async ({ page }, testInfo) => {
-      const title = "group-edit-clear";
-      const startGroup = "team/beta";
-      const serve = await spawnAoeServe({
-        authMode: "none",
-        workerIndex: testInfo.workerIndex,
-        parallelIndex: testInfo.parallelIndex,
-        seedFn: seedSessionViaAoeAdd({ title }),
+  base("clearing the field commits an empty group, ungrouping the session", async ({ page }, testInfo) => {
+    const title = "group-edit-clear";
+    const startGroup = "team/beta";
+    const serve = await spawnAoeServe({
+      authMode: "none",
+      workerIndex: testInfo.workerIndex,
+      parallelIndex: testInfo.parallelIndex,
+      seedFn: seedSessionViaAoeAdd({ title }),
+    });
+
+    try {
+      const sessions = await listSessions(serve.baseUrl);
+      const sessionId = sessions[0]!.id as string;
+
+      // Put the session into a group up front via the same endpoint, so
+      // the test starts from a grouped state. This mutates the running
+      // server's in-memory state (unlike a pre-boot `aoe add`).
+      const setRes = await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/group`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ group: startGroup }),
       });
+      expect(setRes.ok).toBe(true);
 
-      try {
-        const sessions = await listSessions(serve.baseUrl);
-        const sessionId = sessions[0]!.id as string;
+      await page.goto(`${serve.baseUrl}/`);
 
-        // Put the session into a group up front via the same endpoint, so
-        // the test starts from a grouped state. This mutates the running
-        // server's in-memory state (unlike a pre-boot `aoe add`).
-        const setRes = await fetch(
-          `${serve.baseUrl}/api/sessions/${sessionId}/group`,
-          {
-            method: "PATCH",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ group: startGroup }),
-          },
-        );
-        expect(setRes.ok).toBe(true);
+      const row = page.locator("[data-testid='sidebar-session-row']");
+      await expect(row).toContainText(title, { timeout: 10_000 });
 
-        await page.goto(`${serve.baseUrl}/`);
+      await row.click({ button: "right" });
+      const menu = page.locator("[data-testid='sidebar-context-menu']");
+      await expect(menu).toBeVisible();
 
-        const row = page.locator("[data-testid='sidebar-session-row']");
-        await expect(row).toContainText(title, { timeout: 10_000 });
+      const patchPromise = page.waitForResponse(
+        (res) => res.url().endsWith(`/api/sessions/${sessionId}/group`) && res.request().method() === "PATCH",
+      );
 
-        await row.click({ button: "right" });
-        const menu = page.locator("[data-testid='sidebar-context-menu']");
-        await expect(menu).toBeVisible();
+      await menu.locator("[data-testid='sidebar-context-menu-edit-group']").click();
+      const modal = page.locator("[data-testid='session-group-modal']");
+      await expect(modal).toBeVisible();
+      const input = modal.locator("[data-testid='session-group-modal-input']");
+      // The input is prefilled with the current group; clear it.
+      await expect(input).toHaveValue(startGroup);
+      await input.fill("");
+      await modal.locator("[data-testid='session-group-modal-save']").click();
 
-        const patchPromise = page.waitForResponse(
-          (res) =>
-            res.url().endsWith(`/api/sessions/${sessionId}/group`) &&
-            res.request().method() === "PATCH",
-        );
+      const patchRes = await patchPromise;
+      expect(patchRes.ok()).toBe(true);
+      expect(patchRes.request().postDataJSON()).toEqual({ group: "" });
+      await expect(modal).toBeHidden();
 
-        await menu
-          .locator("[data-testid='sidebar-context-menu-edit-group']")
-          .click();
-        const modal = page.locator("[data-testid='session-group-modal']");
-        await expect(modal).toBeVisible();
-        const input = modal.locator(
-          "[data-testid='session-group-modal-input']",
-        );
-        // The input is prefilled with the current group; clear it.
-        await expect(input).toHaveValue(startGroup);
-        await input.fill("");
-        await modal.locator("[data-testid='session-group-modal-save']").click();
-
-        const patchRes = await patchPromise;
-        expect(patchRes.ok()).toBe(true);
-        expect(patchRes.request().postDataJSON()).toEqual({ group: "" });
-        await expect(modal).toBeHidden();
-
-        await expect
-          .poll(
-            async () => (await listSessions(serve.baseUrl))[0]?.group_path,
-            {
-              timeout: 5_000,
-            },
-          )
-          .toBe("");
-      } finally {
-        await serve.stop();
-      }
-    },
-  );
+      await expect
+        .poll(async () => (await listSessions(serve.baseUrl))[0]?.group_path, {
+          timeout: 5_000,
+        })
+        .toBe("");
+    } finally {
+      await serve.stop();
+    }
+  });
 });

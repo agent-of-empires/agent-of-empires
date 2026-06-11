@@ -5,13 +5,7 @@ import type { ReactNode } from "react";
 // the native browser `title` so every control shares one look. Lives in its
 // own module so SidebarSortPicker can import it without a cycle back through
 // WorkspaceSidebar (which imports SidebarSortPicker).
-export function Tooltip({
-  text,
-  children,
-}: {
-  text: string;
-  children: ReactNode;
-}) {
+export function Tooltip({ text, children }: { text: string; children: ReactNode }) {
   return (
     <span className="relative group/tip inline-flex">
       {children}

@@ -8,32 +8,19 @@
 // success / stale / failure path is driven deterministically.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  fireEvent,
-  render,
-  screen,
-  waitFor,
-  within,
-} from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 
 import type { McpServersResponse, McpResolveResult } from "../../lib/api";
 
 const fetchMcpServers = vi.fn<[string?], Promise<McpServersResponse | null>>();
-const resolveMcpConflict = vi.fn<
-  [string, string, "aoe" | "native", string],
-  Promise<McpResolveResult>
->();
+const resolveMcpConflict = vi.fn<[string, string, "aoe" | "native", string], Promise<McpResolveResult>>();
 const keepMcpServer = vi.fn<[string, string], Promise<boolean>>();
 const dropMcpServer = vi.fn<[string, string], Promise<boolean>>();
 
 vi.mock("../../lib/api", () => ({
   fetchMcpServers: (agent?: string) => fetchMcpServers(agent),
-  resolveMcpConflict: (
-    name: string,
-    agent: string,
-    winner: "aoe" | "native",
-    fingerprint: string,
-  ) => resolveMcpConflict(name, agent, winner, fingerprint),
+  resolveMcpConflict: (name: string, agent: string, winner: "aoe" | "native", fingerprint: string) =>
+    resolveMcpConflict(name, agent, winner, fingerprint),
   keepMcpServer: (name: string, agent: string) => keepMcpServer(name, agent),
   dropMcpServer: (name: string, agent: string) => dropMcpServer(name, agent),
 }));
@@ -41,9 +28,7 @@ vi.mock("../../lib/api", () => ({
 // Imported after the mock is registered.
 import { McpServers } from "../McpServers";
 
-function response(
-  overrides: Partial<McpServersResponse> = {},
-): McpServersResponse {
+function response(overrides: Partial<McpServersResponse> = {}): McpServersResponse {
   return {
     agent: "claude",
     effective: [],
@@ -138,17 +123,8 @@ describe("McpServers conflict resolution", () => {
     // After an applied resolution the surface reloads with no conflict.
     fetchMcpServers.mockResolvedValue(response());
     fireEvent.click(within(dialog).getByText("Keep AoE version"));
-    await waitFor(() =>
-      expect(resolveMcpConflict).toHaveBeenCalledWith(
-        "fs",
-        "claude",
-        "aoe",
-        "fp-123",
-      ),
-    );
-    await waitFor(() =>
-      expect(screen.queryByLabelText("resolve fs")).toBeNull(),
-    );
+    await waitFor(() => expect(resolveMcpConflict).toHaveBeenCalledWith("fs", "claude", "aoe", "fp-123"));
+    await waitFor(() => expect(screen.queryByLabelText("resolve fs")).toBeNull());
   });
 
   it("'Use native' resolves with the native winner", async () => {
@@ -156,23 +132,14 @@ describe("McpServers conflict resolution", () => {
     const dialog = await openConflictModal();
     fetchMcpServers.mockResolvedValue(response());
     fireEvent.click(within(dialog).getByText("Use native"));
-    await waitFor(() =>
-      expect(resolveMcpConflict).toHaveBeenCalledWith(
-        "fs",
-        "claude",
-        "native",
-        "fp-123",
-      ),
-    );
+    await waitFor(() => expect(resolveMcpConflict).toHaveBeenCalledWith("fs", "claude", "native", "fp-123"));
   });
 
   it("a stale result shows the 'already resolved' notice", async () => {
     resolveMcpConflict.mockResolvedValue("stale");
     const dialog = await openConflictModal();
     fireEvent.click(within(dialog).getByText("Keep AoE version"));
-    expect(
-      await screen.findByText(/already resolved by another surface/),
-    ).toBeTruthy();
+    expect(await screen.findByText(/already resolved by another surface/)).toBeTruthy();
   });
 
   it("an error result shows the failure notice", async () => {
@@ -211,12 +178,8 @@ describe("McpServers keep / drop", () => {
     const keepBtn = await screen.findByLabelText("keep gone");
     fetchMcpServers.mockResolvedValue(response());
     fireEvent.click(keepBtn);
-    await waitFor(() =>
-      expect(keepMcpServer).toHaveBeenCalledWith("gone", "claude"),
-    );
-    await waitFor(() =>
-      expect(screen.queryByLabelText("keep gone")).toBeNull(),
-    );
+    await waitFor(() => expect(keepMcpServer).toHaveBeenCalledWith("gone", "claude"));
+    await waitFor(() => expect(screen.queryByLabelText("keep gone")).toBeNull());
   });
 
   it("keep failure shows a notice and does not clear the row", async () => {
@@ -235,9 +198,7 @@ describe("McpServers keep / drop", () => {
     const dropBtn = await screen.findByLabelText("drop gone");
     fetchMcpServers.mockResolvedValue(response());
     fireEvent.click(dropBtn);
-    await waitFor(() =>
-      expect(dropMcpServer).toHaveBeenCalledWith("gone", "claude"),
-    );
+    await waitFor(() => expect(dropMcpServer).toHaveBeenCalledWith("gone", "claude"));
   });
 
   it("drop failure shows a notice", async () => {

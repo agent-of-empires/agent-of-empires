@@ -18,9 +18,7 @@ function stubMatchMedia(initialMatches: boolean) {
     addEventListener: (_: string, cb: Listener) => listeners.add(cb),
     removeEventListener: (_: string, cb: Listener) => listeners.delete(cb),
   };
-  window.matchMedia = vi
-    .fn()
-    .mockReturnValue(mql) as unknown as typeof window.matchMedia;
+  window.matchMedia = vi.fn().mockReturnValue(mql) as unknown as typeof window.matchMedia;
   return {
     set(next: boolean) {
       matches = next;
