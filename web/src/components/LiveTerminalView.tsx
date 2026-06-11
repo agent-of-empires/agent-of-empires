@@ -196,6 +196,19 @@ export function LiveTerminalView({ session, active = true, surface = "agent" }: 
         onRetry={live.manualReconnect}
       />
 
+      {live.state.connected && !live.state.isOwner && (
+        <div className="absolute left-0 right-0 top-3 flex justify-center z-20 px-3">
+          <button
+            type="button"
+            onClick={live.claim}
+            data-live-takeover
+            className="font-mono text-[11px] text-text-dim bg-surface-800/90 border border-surface-700/50 rounded-md px-3 py-1.5 backdrop-blur-sm active:bg-surface-700/90"
+          >
+            Live on another device. Tap to take over.
+          </button>
+        </div>
+      )}
+
       <div className="flex-1 overflow-hidden bg-[var(--term-bg)] relative">
         <MobileLiveTerminal
           frame={live.state.frame}

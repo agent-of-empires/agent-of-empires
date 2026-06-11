@@ -44,6 +44,14 @@ export interface LiveTerminalState {
    *  return: widens the capture window and drives the jump-to-latest
    *  affordance. */
   reading: boolean;
+  /** Whether this client holds the session's size-owner lock and may
+   *  resize/type. Only one client at a time owns it across every surface
+   *  (web PTY attach, mobile live view, native TUI); a non-owner renders
+   *  best-effort at the owner's grid and shows a "take over" banner.
+   *  Defaults true so a lone client (and an older server that never sends
+   *  `size_owner`) behaves as owner; the server corrects it within a
+   *  round-trip of the first resize. */
+  isOwner: boolean;
 }
 
 const INITIAL_STATE: LiveTerminalState = {
@@ -53,6 +61,7 @@ const INITIAL_STATE: LiveTerminalState = {
   retryCountdown: 0,
   frame: null,
   reading: false,
+  isOwner: true,
 };
 
 export function useLiveTerminal(sessionId: string | null, wsPath: string = "live-ws") {
@@ -160,10 +169,16 @@ export function useLiveTerminal(sessionId: string | null, wsPath: string = "live
           rows?: number;
           history?: number;
           cursor?: LiveCursor | null;
+          is_owner?: boolean;
         };
         try {
           msg = JSON.parse(event.data) as typeof msg;
         } catch {
+          return;
+        }
+        if (msg.type === "size_owner") {
+          const owner = msg.is_owner ?? true;
+          setState((prev) => (prev.isOwner === owner ? prev : { ...prev, isOwner: owner }));
           return;
         }
         if (msg.type !== "frame") return;
@@ -278,9 +293,21 @@ export function useLiveTerminal(sessionId: string | null, wsPath: string = "live
   }, [sessionId, wsPath, setState]);
 
   const sendData = useCallback((data: string) => {
+    // Only the size owner may type; the server drops a non-owner's input
+    // anyway, but gating here keeps the wire quiet and matches the banner.
+    if (!storeRef.current!.snapshot.isOwner) return;
     const ws = wsRef.current;
     if (ws?.readyState === WebSocket.OPEN) {
       ws.send(new TextEncoder().encode(data));
+    }
+  }, []);
+
+  /** Explicit take-over from a read-only viewer: steal the size-owner lock
+   *  even from a live holder, then size the window to this client. */
+  const claim = useCallback(() => {
+    const ws = wsRef.current;
+    if (ws?.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "claim" }));
     }
   }, []);
 
@@ -366,6 +393,7 @@ export function useLiveTerminal(sessionId: string | null, wsPath: string = "live
     enterReading,
     returnToLive,
     manualReconnect,
+    claim,
     maxRetries: MAX_RETRIES,
   };
 }

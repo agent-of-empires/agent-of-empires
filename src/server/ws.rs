@@ -6,6 +6,7 @@
 //! zero input lag, all key sequences work, real-time output.
 
 use std::io::{Read, Write};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -73,6 +74,7 @@ fn terminal_trace_enabled() -> bool {
 }
 
 use super::AppState;
+use crate::tmux::{SIZE_OWNER_HEARTBEAT, SIZE_OWNER_TTL};
 
 /// WebSocket for the paired host terminal (TerminalSession tmux session)
 pub async fn paired_terminal_ws(
@@ -355,17 +357,17 @@ pub async fn terminal_ws(
     }
 }
 
-/// Argv for the web attach: reset `window-size` to `latest`, hide the
-/// tmux status line, then attach, all in one tmux invocation (`;`
-/// separates commands).
+/// Argv for the web attach: hide the tmux status line, then attach, in one
+/// tmux invocation (`;` separates commands).
 ///
-/// The window-size reset matters because any detached resizer (the
-/// mobile live view's `resize-window`, the TUI preview sync) flips the
-/// option to `manual`, and a manual window ignores attached client
-/// sizes entirely: without the reset, a session last viewed from a
-/// phone stays pinned at the phone's grid when opened in a desktop
-/// browser (narrow content, unrendered bottom). The TUI attach path
-/// does the same reset via `reset_size_to_latest_client`.
+/// We deliberately do NOT reset `window-size` here. Window sizing is governed
+/// by the cross-process size-owner lock (`@aoe_size_owner`): the owner of a
+/// session drives its size, and only when this attach acquires that lock does
+/// it re-assert `window-size latest` (so its attached-client size drives the
+/// window). Attaching as a non-owner leaves a live viewer's `manual` size in
+/// place, so a desktop opening a session a phone is actively driving renders
+/// the phone's grid read-only with a "take over" affordance instead of
+/// stomping it. See the resize/activate handlers and `release_size_owner`.
 ///
 /// The status line is hidden because the dashboard renders its own
 /// chrome, so the `Ctrl+b d to detach` footer is noise in every web
@@ -374,12 +376,6 @@ pub async fn terminal_ws(
 /// a real terminal renders it.
 fn attach_command_args(tmux_name: &str) -> Vec<String> {
     vec![
-        "set-option".into(),
-        "-t".into(),
-        tmux_name.into(),
-        "window-size".into(),
-        "latest".into(),
-        ";".into(),
         "set-option".into(),
         "-t".into(),
         tmux_name.into(),
@@ -793,6 +789,12 @@ async fn handle_terminal_ws(
     // shared between the receive loop and the post-loop cleanup.
     let this_ws_paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let this_ws_paused_for_recv = this_ws_paused.clone();
+    // Whether this client currently holds the cross-process size-owner lock
+    // (`@aoe_size_owner`). Shared between the recv loop (which acquires/steals
+    // it) and the heartbeat task (which keeps it fresh and notices a take-over
+    // by another surface). Mirrors the live capture view's `is_owner`.
+    let is_size_owner = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let is_size_owner_for_recv = is_size_owner.clone();
 
     let recv_client = client_id.clone();
     let recv_tmux = tmux_name.clone();
@@ -904,6 +906,13 @@ async fn handle_terminal_ws(
                             tmux = %recv_tmux,
                             "claimed primary on binary input"
                         );
+                        // Typing is an intentional take-over: steal the size
+                        // lock from any other surface and make our client size
+                        // drive the window.
+                        if pty_steal_size(&tmux_name_for_recv, &client_id_for_recv).await {
+                            is_size_owner_for_recv.store(true, Ordering::Relaxed);
+                            assert_window_follows_client(&tmux_name_for_recv).await;
+                        }
                         if let Some((cols, rows)) = pending_size {
                             resize_pty(&master_for_resize, cols, rows).await;
                         }
@@ -946,9 +955,30 @@ async fn handle_terminal_ws(
                                     &client_id_for_recv,
                                 )
                                 .await;
-                                if dominated {
+                                // Driving the window also requires the
+                                // cross-surface size-owner lock: a live viewer
+                                // (phone) may own it, in which case this attach
+                                // is a read-only viewer until it takes over.
+                                let acquired = dominated
+                                    && pty_claim_size(&tmux_name_for_recv, &client_id_for_recv)
+                                        .await;
+                                if acquired {
+                                    let newly =
+                                        !is_size_owner_for_recv.swap(true, Ordering::Relaxed);
+                                    if newly {
+                                        assert_window_follows_client(&tmux_name_for_recv).await;
+                                    }
                                     resize_pty(&master_for_resize, cols, rows).await;
+                                    if newly {
+                                        let _ = ctrl_tx_for_recv
+                                            .send(
+                                                r#"{"type":"primary_status","is_primary":true}"#
+                                                    .into(),
+                                            )
+                                            .await;
+                                    }
                                 } else {
+                                    is_size_owner_for_recv.store(false, Ordering::Relaxed);
                                     let _ = ctrl_tx_for_recv
                                         .send(
                                             r#"{"type":"primary_status","is_primary":false}"#
@@ -987,6 +1017,14 @@ async fn handle_terminal_ws(
                                 )
                                 .await;
                                 if became_primary {
+                                    // Explicit take-over (banner click): steal
+                                    // the size lock and drive the window.
+                                    if pty_steal_size(&tmux_name_for_recv, &client_id_for_recv)
+                                        .await
+                                    {
+                                        is_size_owner_for_recv.store(true, Ordering::Relaxed);
+                                        assert_window_follows_client(&tmux_name_for_recv).await;
+                                    }
                                     if let Some((cols, rows)) = pending_size {
                                         resize_pty(&master_for_resize, cols, rows).await;
                                     }
@@ -1140,11 +1178,49 @@ async fn handle_terminal_ws(
         );
     });
 
+    // Heartbeat task: while this client owns the cross-surface size lock, keep
+    // it fresh so an idle-but-connected owner is not stolen from after the TTL,
+    // and notice promptly if another surface took over (then demote and tell
+    // the client it is no longer primary). Mirrors the live view's in-loop
+    // heartbeat.
+    let hb_tmux = tmux_name.clone();
+    let hb_client = client_id.clone();
+    let hb_owner = is_size_owner.clone();
+    let hb_ctrl = ctrl_tx.clone();
+    let hb_shutdown = shutdown.clone();
+    let heartbeat_handle = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(SIZE_OWNER_HEARTBEAT);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = hb_shutdown.cancelled() => break,
+                _ = tick.tick() => {}
+            }
+            if !hb_owner.load(Ordering::Relaxed) {
+                continue;
+            }
+            let name = hb_tmux.clone();
+            let who = hb_client.clone();
+            let still_owner = tokio::task::spawn_blocking(move || {
+                crate::tmux::Session::from_name(&name).refresh_size_owner(&who)
+            })
+            .await
+            .unwrap_or(false);
+            if !still_owner {
+                hb_owner.store(false, Ordering::Relaxed);
+                let _ = hb_ctrl
+                    .send(r#"{"type":"primary_status","is_primary":false}"#.into())
+                    .await;
+            }
+        }
+    });
+
     // Wait for either direction to finish
     let exit_side = tokio::select! {
         _ = send_handle => "send",
         _ = recv_handle => "recv",
     };
+    heartbeat_handle.abort();
     let elapsed = started_at.elapsed();
     info!(
         target: "terminal.ws",
@@ -1158,6 +1234,18 @@ async fn handle_terminal_ws(
 
     // Release primary if this client held it, so the next client can take over.
     release_primary(&primaries, &tmux_name, &client_id).await;
+
+    // Release the cross-surface size-owner lock if we held it (no-op
+    // otherwise). This restores `window-size latest` once the lock is vacant
+    // so a later attach isn't pinned at our grid.
+    {
+        let name = tmux_name.clone();
+        let who = client_id.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            crate::tmux::Session::from_name(&name).release_size_owner(&who);
+        })
+        .await;
+    }
 
     // Safety net: if this client paused the pane but the WebSocket
     // disconnected before it sent ResumeOutput (WiFi blip, app close,
@@ -1174,6 +1262,42 @@ async fn handle_terminal_ws(
         tmux = %tmux_name,
         "tmux attach child reaped, ws handler done"
     );
+}
+
+/// Claim the cross-surface size-owner lock for this PTY client, respecting a
+/// live viewer that currently owns it (its lock is only stealable once stale).
+/// Off-runtime: forks tmux.
+async fn pty_claim_size(tmux_name: &str, client_id: &str) -> bool {
+    let name = tmux_name.to_string();
+    let who = client_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        crate::tmux::Session::from_name(&name).claim_size_owner(&who, SIZE_OWNER_TTL)
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// Force the size-owner lock to this PTY client (explicit take-over via typing
+/// or a banner click). Off-runtime: forks tmux.
+async fn pty_steal_size(tmux_name: &str, client_id: &str) -> bool {
+    let name = tmux_name.to_string();
+    let who = client_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        crate::tmux::Session::from_name(&name).steal_size_owner(&who)
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// Re-assert `window-size latest` so this attach's client size drives the
+/// window. Called on a fresh acquisition of the size-owner lock, undoing any
+/// `manual` size a live viewer left behind. Off-runtime: forks tmux.
+async fn assert_window_follows_client(tmux_name: &str) {
+    let name = tmux_name.to_string();
+    let _ = tokio::task::spawn_blocking(move || {
+        crate::tmux::Session::from_name(&name).reset_size_to_latest_client();
+    })
+    .await;
 }
 
 /// Claim primary for this client. Returns `true` if the client was NOT
@@ -1449,16 +1573,18 @@ mod tests {
     }
 
     #[test]
-    fn attach_args_reset_window_size_and_hide_status_before_attaching() {
+    fn attach_args_hide_status_before_attaching_without_touching_window_size() {
         let args = attach_command_args("aoe_x_1");
         let chunks: Vec<&[String]> = args.split(|a| a == ";").collect();
-        assert_eq!(chunks.len(), 3, "three chained tmux commands");
-        assert_eq!(
-            chunks[0],
-            ["set-option", "-t", "aoe_x_1", "window-size", "latest"]
+        assert_eq!(chunks.len(), 2, "two chained tmux commands");
+        assert_eq!(chunks[0], ["set-option", "-t", "aoe_x_1", "status", "off"]);
+        assert_eq!(chunks[1], ["attach-session", "-t", "aoe_x_1"]);
+        // Window sizing is governed by the size-owner lock, not the attach, so
+        // attaching as a non-owner must not stomp a live viewer's `manual` size.
+        assert!(
+            !args.iter().any(|a| a == "window-size"),
+            "attach must not set window-size"
         );
-        assert_eq!(chunks[1], ["set-option", "-t", "aoe_x_1", "status", "off"]);
-        assert_eq!(chunks[2], ["attach-session", "-t", "aoe_x_1"]);
     }
 
     #[tokio::test]

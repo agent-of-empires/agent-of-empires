@@ -4,6 +4,7 @@ use anyhow::{bail, Result};
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use super::{
     refresh_session_cache, session_exists_from_cache,
@@ -20,6 +21,31 @@ use crate::session::Status;
 
 pub struct Session {
     name: String,
+}
+
+/// tmux user options holding the cross-process size-owner lock (see
+/// [`Session::claim_size_owner`]). User options ride on the session itself, so
+/// the web daemon and the native TUI read and write the same state.
+const SIZE_OWNER_OPT: &str = "@aoe_size_owner";
+const SIZE_OWNER_HB_OPT: &str = "@aoe_size_owner_hb";
+
+/// How long a size-owner lock survives without a heartbeat before another
+/// client may steal it. Shared by every surface that drives window size (the
+/// web PTY relay, the mobile live view, the native TUI) so they age the lock
+/// the same and a connected owner is never stolen from mid-use.
+pub const SIZE_OWNER_TTL: Duration = Duration::from_secs(4);
+/// How often a connected size owner refreshes its heartbeat. Well under
+/// [`SIZE_OWNER_TTL`] so a live-but-idle owner keeps the lock while connected;
+/// the lock only frees on disconnect/crash (TTL expiry) or explicit take-over.
+pub const SIZE_OWNER_HEARTBEAT: Duration = Duration::from_millis(1500);
+
+/// Wall-clock millis since the unix epoch. The size-owner heartbeat is compared
+/// across processes, so it must be wall-clock, not a per-process monotonic.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// The active pane's cursor, queried alongside a `capture-pane` so the
@@ -566,6 +592,125 @@ impl Session {
             .output();
     }
 
+    /// Try to become the sole size owner of this session. Returns true if we
+    /// hold the lock afterward.
+    ///
+    /// One tmux window has one size, but three writers resize it (the web PTY
+    /// attach, the mobile capture viewer, and the TUI's preview sync), each
+    /// living in a different process. The lock lives in tmux user options so
+    /// every process sees the same owner and only the owner calls
+    /// [`resize_window`](Self::resize_window); non-owners render best-effort.
+    ///
+    /// Steals the lock when the current holder's heartbeat is older than
+    /// `ttl`, so a crashed or disconnected owner self-heals. The confirm-read
+    /// after the write resolves the race where two processes both observe a
+    /// vacant lock and both write: the last write wins and only its author
+    /// reads its own id back.
+    pub fn claim_size_owner(&self, owner_id: &str, ttl: Duration) -> bool {
+        if !self.exists() {
+            return false;
+        }
+        let now = now_ms();
+        let claimable = match self.size_owner() {
+            None => true,
+            Some((id, _)) if id == owner_id => true,
+            Some((_, hb)) => now.saturating_sub(hb) > ttl.as_millis() as u64,
+        };
+        if !claimable {
+            return false;
+        }
+        self.set_user_option(SIZE_OWNER_OPT, owner_id);
+        self.set_user_option(SIZE_OWNER_HB_OPT, &now.to_string());
+        matches!(self.size_owner(), Some((id, _)) if id == owner_id)
+    }
+
+    /// Bump the heartbeat iff we still own the lock. Returns false when
+    /// ownership was lost (another client took over), so the caller can demote
+    /// itself. Cheap enough to call on each capture/render tick.
+    pub fn refresh_size_owner(&self, owner_id: &str) -> bool {
+        match self.size_owner() {
+            Some((id, _)) if id == owner_id => {
+                self.set_user_option(SIZE_OWNER_HB_OPT, &now_ms().to_string());
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Force ownership to `owner_id`, even over a live holder. Used by the
+    /// explicit "take over" action: a user tap is an intentional steal, not
+    /// the passive flap the heartbeat guards against.
+    pub fn steal_size_owner(&self, owner_id: &str) -> bool {
+        if !self.exists() {
+            return false;
+        }
+        self.set_user_option(SIZE_OWNER_OPT, owner_id);
+        self.set_user_option(SIZE_OWNER_HB_OPT, &now_ms().to_string());
+        matches!(self.size_owner(), Some((id, _)) if id == owner_id)
+    }
+
+    /// Whether a non-stale size owner currently holds the lock. A passive
+    /// writer (the TUI's detached preview sync) checks this to defer to an
+    /// active owner without claiming the lock itself.
+    pub fn has_active_size_owner(&self) -> bool {
+        match self.size_owner() {
+            Some((_, hb)) => now_ms().saturating_sub(hb) <= SIZE_OWNER_TTL.as_millis() as u64,
+            None => false,
+        }
+    }
+
+    /// Read the current size owner and its last heartbeat (unix millis), if a
+    /// lock is held.
+    pub fn size_owner(&self) -> Option<(String, u64)> {
+        let id = self.show_user_option(SIZE_OWNER_OPT)?;
+        let hb = self
+            .show_user_option(SIZE_OWNER_HB_OPT)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        Some((id, hb))
+    }
+
+    /// Release the lock iff we own it. Restores `window-size latest` once the
+    /// lock is vacant so a later out-of-band `tmux attach` from a real terminal
+    /// sizes the window to itself instead of staying pinned at our grid.
+    pub fn release_size_owner(&self, owner_id: &str) {
+        if let Some((id, _)) = self.size_owner() {
+            if id == owner_id {
+                self.unset_user_option(SIZE_OWNER_OPT);
+                self.unset_user_option(SIZE_OWNER_HB_OPT);
+                self.reset_size_to_latest_client();
+            }
+        }
+    }
+
+    fn show_user_option(&self, opt: &str) -> Option<String> {
+        let out = Command::new("tmux")
+            .args(["show-options", "-v", "-t", &self.name, opt])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if value.is_empty() {
+            None
+        } else {
+            Some(value)
+        }
+    }
+
+    fn set_user_option(&self, opt: &str, value: &str) {
+        let _ = Command::new("tmux")
+            .args(["set-option", "-t", &self.name, opt, value])
+            .output();
+    }
+
+    fn unset_user_option(&self, opt: &str) {
+        let _ = Command::new("tmux")
+            .args(["set-option", "-u", "-t", &self.name, opt])
+            .output();
+    }
+
     /// Deliver `text` to `target` via tmux's load-buffer + paste-buffer.
     /// Buffer names are scoped by pid + a per-call counter so concurrent
     /// senders (and retries) cannot clobber each other. `-p` enables
@@ -779,6 +924,70 @@ mod tests {
         assert!(PaneCursor::parse("").is_none());
         assert!(PaneCursor::parse("1 2 3").is_none());
         assert!(PaneCursor::parse("a b c d").is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn size_owner_lock_claims_rejects_steals_and_releases() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let guard = TmuxTestSession::new("aoe_test_owner");
+        let out = Command::new("tmux")
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                guard.name(),
+                "-x",
+                "80",
+                "-y",
+                "24",
+                "sleep 30",
+            ])
+            .output()
+            .expect("tmux new-session");
+        assert!(out.status.success());
+        let session = Session::from_name(guard.name());
+
+        // Vacant -> first claimer wins and is recorded.
+        assert!(session.claim_size_owner("a", Duration::from_secs(10)));
+        assert_eq!(
+            session.size_owner().map(|(id, _)| id),
+            Some("a".to_string())
+        );
+        // Re-claiming as the same owner is idempotent (stays true).
+        assert!(session.claim_size_owner("a", Duration::from_secs(10)));
+
+        // A different client cannot claim while the owner's heartbeat is fresh.
+        assert!(!session.claim_size_owner("b", Duration::from_secs(10)));
+        assert!(session.refresh_size_owner("a"));
+        assert!(!session.refresh_size_owner("b"));
+
+        // A stale heartbeat is stealable through the normal claim path.
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(session.claim_size_owner("c", Duration::from_millis(1)));
+        assert_eq!(
+            session.size_owner().map(|(id, _)| id),
+            Some("c".to_string())
+        );
+
+        // An explicit take-over steals even a fresh lock.
+        assert!(session.steal_size_owner("d"));
+        assert_eq!(
+            session.size_owner().map(|(id, _)| id),
+            Some("d".to_string())
+        );
+
+        // A non-owner release is a no-op; the owner's release clears the lock.
+        session.release_size_owner("not-d");
+        assert_eq!(
+            session.size_owner().map(|(id, _)| id),
+            Some("d".to_string())
+        );
+        session.release_size_owner("d");
+        assert!(session.size_owner().is_none());
     }
 
     #[test]

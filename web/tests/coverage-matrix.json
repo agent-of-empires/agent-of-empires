@@ -101,6 +101,13 @@
       "components": ["web/src/hooks/useLiveTerminal.ts", "web/src/components/MobileLiveTerminal.tsx"]
     },
     {
+      "id": "terminal.live-size-owner",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/hooks/useLiveTerminal.sizeOwner.test.ts"],
+      "components": ["web/src/hooks/useLiveTerminal.ts", "web/src/components/LiveTerminalView.tsx"]
+    },
+    {
       "id": "auth.no-auth",
       "kind": "live-playwright",
       "risk": "high",

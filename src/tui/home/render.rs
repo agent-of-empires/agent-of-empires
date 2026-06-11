@@ -1584,8 +1584,16 @@ impl HomeView {
                         .and_then(|inst| inst.tmux_session().ok())
                         .filter(|s| s.exists())
                     {
-                        session.resize_window(width, height);
-                        self.preview_pane_synced = Some(want);
+                        // Defer to an active size owner (a phone/desktop live
+                        // client, or this TUI's own live-send below). The
+                        // detached preview is a passive display, so it only
+                        // sizes a session nobody else is driving and never
+                        // claims the lock itself; leaving the dedup unset
+                        // retries once the owner disconnects.
+                        if !session.has_active_size_owner() {
+                            session.resize_window(width, height);
+                            self.preview_pane_synced = Some(want);
+                        }
                     }
                 }
             }
