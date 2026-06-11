@@ -3613,10 +3613,14 @@ pub(crate) enum StatusIntent {
 pub(crate) fn derive_acp_status(event: &crate::acp::Event) -> Option<StatusIntent> {
     use crate::acp::Event;
     match event {
-        Event::UserPromptSent { .. } | Event::ApprovalResolved { .. } => {
-            Some(StatusIntent::Set(Status::Running))
+        Event::UserPromptSent { .. }
+        | Event::ApprovalResolved { .. }
+        | Event::ElicitationResolved { .. } => Some(StatusIntent::Set(Status::Running)),
+        // A pending approval or elicitation both block the turn on the
+        // user, so the sidebar dot goes yellow either way.
+        Event::ApprovalRequested { .. } | Event::ElicitationRequested { .. } => {
+            Some(StatusIntent::Set(Status::Waiting))
         }
-        Event::ApprovalRequested { .. } => Some(StatusIntent::Set(Status::Waiting)),
         // All Stopped reasons surface as Idle, including the
         // rate-limit park: the worker is not crashed, the user just
         // hit a provider quota and the session is waiting for reset
@@ -4268,6 +4272,30 @@ mod tests {
             derive_acp_status(&Event::ApprovalResolved {
                 nonce: Nonce("x".into()),
                 decision: ApprovalDecision::Allow,
+            }),
+            Some(StatusIntent::Set(Status::Running))
+        );
+        // A pending elicitation blocks the turn on the user just like an
+        // approval, so the sidebar dot must go yellow (Waiting) and recover
+        // to Running on resolution.
+        let elicitation = crate::acp::elicitations::Elicitation {
+            nonce: Nonce("e-1".into()),
+            message: "Pick".into(),
+            title: None,
+            description: None,
+            tool_call_id: None,
+            questions: Vec::new(),
+            requested_at: chrono::Utc::now(),
+            resolved: None,
+        };
+        assert_eq!(
+            derive_acp_status(&Event::ElicitationRequested { elicitation }),
+            Some(StatusIntent::Set(Status::Waiting))
+        );
+        assert_eq!(
+            derive_acp_status(&Event::ElicitationResolved {
+                nonce: Nonce("e-1".into()),
+                outcome: crate::acp::elicitations::ElicitationOutcome::Accepted,
             }),
             Some(StatusIntent::Set(Status::Running))
         );
