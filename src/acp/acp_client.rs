@@ -46,7 +46,7 @@ use super::agent_profiles;
 use super::agent_registry::AgentSpec;
 use super::approvals::{is_destructive, ApprovalDecision, Nonce};
 use super::elicitations::{
-    build_response, parse_elicitation, ElicitationOutcome, ElicitationResolution,
+    build_response, parse_elicitation, Elicitation, ElicitationOutcome, ElicitationResolution,
 };
 use super::event_store::AttachmentBlob;
 use super::fs_handler::{self, FsPolicy, SandboxPathMap};
@@ -96,6 +96,11 @@ pub enum AcpError {
     UnknownNonce,
     #[error("agent did not offer a {0:?} option")]
     NoMatchingOption(ApprovalDecision),
+    /// A submitted elicitation answer failed server-side validation. The
+    /// pending elicitation is left intact so the client can correct the
+    /// answer and resubmit (rather than the question aborting). See #2100.
+    #[error("submitted answer is invalid: {0}")]
+    InvalidAnswer(String),
 }
 
 /// Boxed payload for `AcpError::IncompatibleAgent`. Carries the
@@ -1087,8 +1092,17 @@ struct PendingResponder {
 enum PendingResolver {
     /// `session/request_permission` awaiting allow/deny.
     Approval(oneshot::Sender<ApprovalResolutionMessage>),
-    /// `elicitation/create` awaiting an accept/decline/cancel answer.
-    Elicitation(oneshot::Sender<ElicitationResolution>),
+    /// `elicitation/create` awaiting an accept/decline/cancel answer. The
+    /// parsed form is kept so `resolve_elicitation` can validate the
+    /// submitted answer BEFORE consuming the resolver: a validation
+    /// failure then leaves the elicitation pending for a corrected
+    /// resubmission instead of permanently cancelling it. The validated
+    /// response (and its outcome) ride the oneshot so the parked callback
+    /// just forwards them. Boxed to keep the enum small.
+    Elicitation {
+        elicitation: Box<Elicitation>,
+        resolver: oneshot::Sender<(CreateElicitationResponse, ElicitationOutcome)>,
+    },
 }
 
 /// Message sent over the resolver oneshot to unblock the parked
@@ -1777,21 +1791,37 @@ impl AcpClient {
     /// `elicitation/create` callback with the user's accept/decline/cancel
     /// answer. A nonce belonging to a permission (or already resolved) is
     /// reported as unknown.
+    ///
+    /// The submitted answer is validated (`build_response`) BEFORE the
+    /// parked resolver is consumed. An invalid answer returns
+    /// `InvalidAnswer` and leaves the elicitation pending, so the client
+    /// can correct it and resubmit instead of the question aborting on a
+    /// client/server validation mismatch (#2100). Only a valid answer
+    /// removes the nonce and forwards the built response to the agent.
     pub async fn resolve_elicitation(
         &self,
         nonce: Nonce,
         resolution: ElicitationResolution,
     ) -> Result<(), AcpError> {
         let mut map = self.pending_responders.lock().await;
-        let PendingResolver::Elicitation(_) =
+        let PendingResolver::Elicitation { elicitation, .. } =
             &map.get(&nonce).ok_or(AcpError::UnknownNonce)?.resolver
         else {
             return Err(AcpError::UnknownNonce);
         };
-        let PendingResolver::Elicitation(resolver) = map.remove(&nonce).unwrap().resolver else {
+        // Validate against the parked form while it is still borrowed; on
+        // failure the nonce stays in the map untouched.
+        let outcome = resolution.outcome();
+        let response = build_response(elicitation, resolution)
+            .map_err(|e| AcpError::InvalidAnswer(e.to_string()))?;
+        // Valid: now consume the responder and forward the built response.
+        let PendingResolver::Elicitation { resolver, .. } = map.remove(&nonce).unwrap().resolver
+        else {
             unreachable!("checked above");
         };
-        resolver.send(resolution).map_err(|_| AcpError::AgentExited)
+        resolver
+            .send((response, outcome))
+            .map_err(|_| AcpError::AgentExited)
     }
 
     /// Best-effort experimental `session/delete` RPC. Sent before
@@ -5930,11 +5960,15 @@ async fn handle_elicitation_request(
         }
     };
 
-    let (resolve_tx, resolve_rx) = oneshot::channel::<ElicitationResolution>();
+    let (resolve_tx, resolve_rx) =
+        oneshot::channel::<(CreateElicitationResponse, ElicitationOutcome)>();
     pending.lock().await.insert(
         nonce.clone(),
         PendingResponder {
-            resolver: PendingResolver::Elicitation(resolve_tx),
+            resolver: PendingResolver::Elicitation {
+                elicitation: Box::new(elicitation.clone()),
+                resolver: resolve_tx,
+            },
         },
     );
 
@@ -5949,30 +5983,16 @@ async fn handle_elicitation_request(
         return responder.respond(CreateElicitationResponse::new(ElicitationAction::Cancel));
     }
 
-    // Await the user's answer. A dropped resolver (daemon teardown,
-    // agent cancel) cancels the tool call.
-    let (response, outcome) = match resolve_rx.await {
-        Ok(resolution) => {
-            let outcome = resolution.outcome();
-            // Server-side validation: a rejected payload (unknown field,
-            // bad option, missing required) cancels rather than feeding
-            // the agent a malformed answer.
-            match build_response(&elicitation, resolution) {
-                Ok(response) => (response, outcome),
-                Err(e) => {
-                    warn!(target: "cockpit.acp", "invalid elicitation answer, cancelling: {e}");
-                    (
-                        CreateElicitationResponse::new(ElicitationAction::Cancel),
-                        ElicitationOutcome::Cancelled,
-                    )
-                }
-            }
-        }
-        Err(_) => (
+    // Await the user's answer. `resolve_elicitation` validates server-side
+    // before sending, so whatever arrives here is already a built, valid
+    // response. A dropped resolver (daemon teardown, agent cancel) cancels
+    // the tool call.
+    let (response, outcome) = resolve_rx.await.unwrap_or_else(|_| {
+        (
             CreateElicitationResponse::new(ElicitationAction::Cancel),
             ElicitationOutcome::Cancelled,
-        ),
-    };
+        )
+    });
 
     let _ = event_tx
         .send(Event::ElicitationResolved {

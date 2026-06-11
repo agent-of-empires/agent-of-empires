@@ -1725,6 +1725,12 @@ pub async fn resolve_elicitation(
             format!("no pending elicitation with nonce {nonce_str}"),
         )
             .into_response(),
+        // A failed server-side validation leaves the elicitation pending,
+        // so 422 (not 404): the client can correct the answer and resubmit
+        // the same nonce.
+        Err(SupervisorError::Acp(crate::acp::acp_client::AcpError::InvalidAnswer(msg))) => {
+            (StatusCode::UNPROCESSABLE_ENTITY, msg).into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("resolve failed: {e}"),

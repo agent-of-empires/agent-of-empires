@@ -1176,8 +1176,9 @@ export function useAcpSession(
   const resolveElicitation = useCallback(
     async (nonce: string, resolution: ElicitationResolution) => {
       if (!sessionId) return;
+      let res: Response;
       try {
-        const res = await fetch(
+        res = await fetch(
           `/api/sessions/${encodeURIComponent(sessionId)}/acp/elicitations/${encodeURIComponent(nonce)}`,
           {
             method: "POST",
@@ -1185,19 +1186,26 @@ export function useAcpSession(
             body: JSON.stringify(resolution),
           },
         );
-        const detail = res.ok ? "" : await safeText(res);
-        const outcome = classifyElicitationResolveResponse(res.ok, res.status, detail, nonce);
-        if (outcome.kind === "resolved") {
-          dispatch({ kind: "elicitation_resolved_locally", nonce });
-        } else {
-          dispatch({ kind: "error", message: outcome.message });
-        }
       } catch (e) {
         dispatch({
           kind: "error",
           message: `Network error resolving question: ${describeError(e)}`,
         });
+        // Rethrow so the card re-enables (it can be resubmitted).
+        throw e;
       }
+      const detail = res.ok ? "" : await safeText(res);
+      const outcome = classifyElicitationResolveResponse(res.ok, res.status, detail, nonce);
+      if (outcome.kind === "resolved") {
+        dispatch({ kind: "elicitation_resolved_locally", nonce });
+        return;
+      }
+      // A validation rejection (422) leaves the elicitation pending
+      // server-side, so surface the reason and rethrow: the card resets to
+      // its editable state and the user can correct and resubmit the same
+      // nonce instead of the question being stranded. See #2100.
+      dispatch({ kind: "error", message: outcome.message });
+      throw new Error(outcome.message);
     },
     [sessionId],
   );
