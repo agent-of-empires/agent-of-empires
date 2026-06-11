@@ -81,19 +81,27 @@ describe("safeStorage sync chokepoint", () => {
 });
 
 describe("hydrateWebUiStateFromServer", () => {
-  it("applies server values locally and backfills local-only keys", async () => {
-    // A local-only synced pref the server has never seen.
+  it("backfills local keys only when the server blob is empty (first-ever sync)", async () => {
     localStorage.setItem("aoe-welcome-seen", "1");
-    // The server has a different synced pref.
+    getWebUiState.mockResolvedValue({});
+
+    await hydrateWebUiStateFromServer();
+
+    expect(patchWebUiState).toHaveBeenCalledTimes(1);
+    expect(patchWebUiState).toHaveBeenCalledWith({ "aoe-welcome-seen": "1" });
+  });
+
+  it("does NOT backfill (resurrect) local-only keys once the server is non-empty", async () => {
+    // The server has data (already synced once). A local-only key here can mean
+    // "deleted on another device", so it must not be pushed back up.
+    localStorage.setItem("aoe-welcome-seen", "1");
     getWebUiState.mockResolvedValue({ "aoe-sidebar-axis": "group" });
 
     await hydrateWebUiStateFromServer();
 
-    // Server value applied to localStorage (source of truth).
+    // Server value applied; no backfill.
     expect(localStorage.getItem("aoe-sidebar-axis")).toBe("group");
-    // Local-only key seeded back to the server.
-    expect(patchWebUiState).toHaveBeenCalledTimes(1);
-    expect(patchWebUiState).toHaveBeenCalledWith({ "aoe-welcome-seen": "1" });
+    expect(patchWebUiState).not.toHaveBeenCalled();
   });
 
   it("server values win over a differing local value", async () => {

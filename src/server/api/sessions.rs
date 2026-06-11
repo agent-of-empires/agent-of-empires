@@ -2097,6 +2097,7 @@ pub async fn start_session(
                 if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
                     inst.idle_dormant_since = None;
                     inst.status = Status::Idle;
+                    inst.last_error = None;
                 }
             },
         )
@@ -2110,6 +2111,7 @@ pub async fn start_session(
             if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
                 inst.idle_dormant_since = None;
                 inst.status = Status::Idle;
+                inst.last_error = None;
             }
         }
         let instances = state.instances.read().await;

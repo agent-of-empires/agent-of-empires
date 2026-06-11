@@ -29,7 +29,13 @@ export function configureStorageSync(
 }
 
 function notifySync(key: string, value: string | null): void {
-  if (syncMatcher?.(key)) syncHandler?.(key, value);
+  // A failure in the (best-effort) sync layer must not change the result of the
+  // local write that already succeeded, so swallow anything it throws.
+  try {
+    if (syncMatcher?.(key)) syncHandler?.(key, value);
+  } catch {
+    // sync is best-effort; the localStorage write stands regardless
+  }
 }
 
 export function safeSetItem(key: string, value: string): boolean {

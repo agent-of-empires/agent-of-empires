@@ -553,6 +553,26 @@ pub async fn patch_web_ui_state(
         Err(rej) => return rej.into_response(),
     };
 
+    // Values must be string (set) or null (delete); reject anything else
+    // explicitly so a client regression surfaces instead of silently dropping
+    // part of the sync.
+    let invalid: Vec<&String> = patch
+        .iter()
+        .filter(|(_, v)| !v.is_string() && !v.is_null())
+        .map(|(k, _)| k)
+        .collect();
+    if !invalid.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid_value_type",
+                "message": "web UI state values must be string or null",
+                "keys": invalid,
+            })),
+        )
+            .into_response();
+    }
+
     let result = tokio::task::spawn_blocking(move || {
         let mut config = crate::session::Config::load()?;
         for (key, value) in patch {
@@ -563,6 +583,7 @@ pub async fn patch_web_ui_state(
                 serde_json::Value::String(s) => {
                     config.app_state.web_ui_state.insert(key, s);
                 }
+                // Already rejected above; keep exhaustive for safety.
                 _ => {}
             }
         }

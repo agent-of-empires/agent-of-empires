@@ -99,21 +99,23 @@ export async function hydrateWebUiStateFromServer(): Promise<void> {
   const server = await getWebUiState();
   if (!server) return;
 
-  // Seed the server with any synced key it doesn't yet know about (first-run
-  // migration from this browser's existing localStorage), without overwriting
-  // what the server already has.
-  const backfill: Record<string, string | null> = {};
-  for (const key of enumerateLocalSyncedKeys()) {
-    if (!(key in server)) {
+  // One-time migration: only seed the server from this browser's existing
+  // localStorage when the server has NEVER stored anything. Backfilling once
+  // the server is non-empty would resurrect keys another device legitimately
+  // deleted (a local key absent from the server can mean "deleted elsewhere",
+  // not "never synced"), so we don't.
+  if (Object.keys(server).length === 0) {
+    const backfill: Record<string, string | null> = {};
+    for (const key of enumerateLocalSyncedKeys()) {
       const local = window.localStorage?.getItem(key);
       if (local != null) backfill[key] = local;
     }
+    if (Object.keys(backfill).length > 0) void patchWebUiState(backfill);
+    return;
   }
 
   // Server is the source of truth: apply its values locally.
   for (const [key, value] of Object.entries(server)) {
     rawSet(key, value);
   }
-
-  if (Object.keys(backfill).length > 0) void patchWebUiState(backfill);
 }

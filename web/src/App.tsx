@@ -161,9 +161,6 @@ export default function App() {
 
   // Only hydrate once the user is past every auth gate, so the request runs as
   // the authenticated user (and never against the login/token screens).
-  const authReady = !tokenExpired && loginRequired !== null && !(loginRequired && !loginAuthenticated);
-  const hydrated = useServerHydration(authReady);
-
   // Token auth is the first factor; show token entry before anything else
   if (tokenExpired) {
     return <TokenEntryPage onSuccess={handleTokenSuccess} />;
@@ -177,44 +174,12 @@ export default function App() {
     return <div className="h-dvh bg-surface-900 safe-area-inset" />;
   }
 
-  // Past auth: pull the server-side UI-state blob into localStorage before
-  // AppContent mounts, so its stores read the user's synced (cross-device)
-  // preferences on first paint instead of this browser's stale cache.
-  if (!hydrated) {
-    return <div className="h-dvh bg-surface-900 safe-area-inset" />;
-  }
-
   return (
     <IdleDecayWindowContext.Provider value={idleDecayWindowMs}>
       <AppContent loginRequired={loginRequired} onLogout={handleLogout} />
       <ElevationPrompt />
     </IdleDecayWindowContext.Provider>
   );
-}
-
-/** Hydrate the synced UI-state from the server once, after auth, before
- *  rendering the app. Falls back to the local cache if the backend is slow or
- *  unreachable so a failed fetch never blocks the dashboard. */
-function useServerHydration(enabled: boolean): boolean {
-  const [hydrated, setHydrated] = useState(false);
-  useEffect(() => {
-    if (!enabled || hydrated) return;
-    initWebUiSync();
-    let cancelled = false;
-    const fallback = setTimeout(() => {
-      if (!cancelled) setHydrated(true);
-    }, 1500);
-    void hydrateWebUiStateFromServer().finally(() => {
-      if (cancelled) return;
-      clearTimeout(fallback);
-      setHydrated(true);
-    });
-    return () => {
-      cancelled = true;
-      clearTimeout(fallback);
-    };
-  }, [enabled, hydrated]);
-  return hydrated;
 }
 
 /** Walk from the event target up to the document root looking for any
@@ -234,6 +199,18 @@ function isInsideEditable(target: EventTarget | null): boolean {
 }
 
 function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLogout: () => void }) {
+  // Wire the localStorage write chokepoint and pull the server-side UI-state
+  // blob into localStorage. AppContent only mounts past auth, so this runs as
+  // the authenticated user. Background (does NOT gate render): blocking first
+  // paint on this fetch raced immediate interactions and could flash a blank
+  // screen if the endpoint were slow. A brand-new browser paints local defaults
+  // for the first session; hydration writes the synced values for the next
+  // mount/reload. Same-device loads (populated cache) are unaffected.
+  useEffect(() => {
+    initWebUiSync();
+    void hydrateWebUiStateFromServer();
+  }, []);
+
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const idleDecayWindowMs = useIdleDecayWindowMs();

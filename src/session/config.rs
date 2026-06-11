@@ -2108,7 +2108,7 @@ pub fn save_config(config: &Config) -> Result<()> {
 /// the global theme on others let a per-profile override (which the web theme
 /// picker used to write) shadow the global pick on every Settings open/close,
 /// flipping the theme until the next restart. An empty name maps to the
-/// `default` builtin, matching the web dashboard's empty-name fallback.
+/// `zinc` builtin, matching the web dashboard's empty-name fallback.
 pub fn resolve_theme_name() -> String {
     Config::load_or_warn().effective_theme_name()
 }
