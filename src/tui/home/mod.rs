@@ -2924,9 +2924,11 @@ impl HomeView {
     }
 
     /// Expand the synthetic Archived section if it is collapsed, persisting
-    /// the change. Used when archiving a session in the non-Attention sort so
-    /// the freshly archived row is visible and can stay selected under the
-    /// cursor. No-op (and no save) when the section is already open.
+    /// the change. Used when archiving a whole group, where the rows the
+    /// user was looking at all sink at once and revealing the section shows
+    /// where they went. Single-row archive does NOT reveal: the cursor
+    /// advances to the next active session instead and the section header's
+    /// count is the feedback. No-op (and no save) when already open.
     pub(super) fn reveal_archived_section(&mut self) {
         if !self.archived_section_collapsed {
             return;
