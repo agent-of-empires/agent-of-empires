@@ -208,6 +208,30 @@ export async function markWebTourSeen(): Promise<boolean> {
   }
 }
 
+// --- Web UI state sync (server-side mirror of synced localStorage keys) ---
+
+/** Fetch the server-side UI-state blob: a flat map of localStorage key ->
+ *  stored string value. Null on failure so the caller falls back to its local
+ *  cache. Single-tenant: this is the one user's synced preferences. */
+export async function getWebUiState(): Promise<Record<string, string> | null> {
+  return fetchJson<Record<string, string>>("/api/app-state/web-ui-state");
+}
+
+/** Merge a partial update into the server UI-state blob. Values are strings to
+ *  set, or `null` to delete the key. Best-effort; returns success. */
+export async function patchWebUiState(patch: Record<string, string | null>): Promise<boolean> {
+  try {
+    const res = await fetch("/api/app-state/web-ui-state", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patch),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
 // --- Sandbox volume_ignores glob expansion (#2045) ---
 
 export interface VolumeIgnoresGlobPreview {
@@ -447,6 +471,12 @@ export interface ServerAbout {
    *  instead of clipping at a hard-coded frontend constant. See #1111. */
   acp_replay_events: number;
   build_flavor: "debug" | "release"; // `"debug"` => debug_assertions; drives topbar DEV badge. See #1055.
+  /** Content-hashed entry bundle name (`index-<hash>.js`) of the
+   *  embedded dashboard build. Compared against this page's own entry
+   *  script by DashboardUpdateBanner to detect a stale client (an
+   *  installed PWA has no refresh affordance, so it keeps running old
+   *  code after the binary updates until prompted to reload). */
+  web_build_id?: string | null;
 }
 
 export function fetchAbout(): Promise<ServerAbout | null> {
@@ -527,10 +557,29 @@ export interface UpdateStatus {
   release_url: string | null;
   web_poll_interval_minutes: number;
   error: string | null;
+  /** Version the user already dismissed the banner for, persisted server-side
+   *  in app_state so the acknowledgement is once-per-account, not per device. */
+  dismissed_version: string | null;
 }
 
 export function fetchUpdateStatus(): Promise<UpdateStatus | null> {
   return fetchJson<UpdateStatus>("/api/system/update-status");
+}
+
+/** Persist that the update banner was dismissed for `version`, server-side, so
+ *  it stays dismissed across devices (and matches the TUI). Returns true on
+ *  success; the banner optimistically hides regardless. */
+export async function dismissUpdate(version: string): Promise<boolean> {
+  try {
+    const res = await fetch("/api/app-state/dismiss-update", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ version }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
 }
 
 // --- Branches ---
@@ -881,12 +930,13 @@ export async function createSession(body: CreateSessionRequest): Promise<{
 
 export async function cloneRepo(
   url: string,
-  opts?: { destination?: string; shallow?: boolean },
+  opts?: { destination?: string; shallow?: boolean; bare?: boolean },
 ): Promise<{ ok: boolean; path?: string; error?: string }> {
   try {
     const body: Record<string, unknown> = { url };
     if (opts?.destination) body.destination = opts.destination;
     if (opts?.shallow) body.shallow = true;
+    if (opts?.bare) body.bare = true;
     const res = await fetch("/api/git/clone", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1205,6 +1255,39 @@ export async function setSessionArchive(
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ archived, kill_pane: killPane }),
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as SessionResponse;
+  } catch {
+    return null;
+  }
+}
+
+/** Stop a session, matching the TUI's `x` keybind: kills the tmux pane and
+ *  stops (but does not remove) the Docker container for plain sessions, or
+ *  shuts down the worker for structured-view sessions. The session record is
+ *  preserved with status `Stopped` and can be resumed later. NOT a delete. */
+export async function stopSession(id: string): Promise<SessionResponse | null> {
+  try {
+    const res = await fetch(`/api/sessions/${id}/stop`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as SessionResponse;
+  } catch {
+    return null;
+  }
+}
+
+/** Start (resume) a stopped session, the inverse of stopSession: restarts a
+ *  plain session's pane or un-parks a structured session so its worker
+ *  respawns. Returns null on failure. */
+export async function startSession(id: string): Promise<SessionResponse | null> {
+  try {
+    const res = await fetch(`/api/sessions/${id}/start`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
     });
     if (!res.ok) return null;
     return (await res.json()) as SessionResponse;

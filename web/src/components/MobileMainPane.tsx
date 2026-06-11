@@ -87,7 +87,7 @@ export function MobileMainPane({
   return (
     <div className="flex-1 flex flex-col min-h-0">
       {view !== "agent" && (
-        <div className="flex items-center gap-2 h-9 px-2 border-b border-surface-700/20 bg-surface-900 shrink-0">
+        <div className="flex items-center gap-2 h-9 px-2 border-b border-surface-700/60 bg-surface-900 shrink-0">
           <button
             onClick={onBackToAgent}
             data-testid="mobile-back-to-agent"
@@ -124,7 +124,7 @@ export function MobileMainPane({
 
         {pairedMounted && (
           <div className={layerClass(view === "paired")} inert={view !== "paired"}>
-            <PairedShellPane session={activeSession} sessionId={activeSessionId} fullViewport />
+            <PairedShellPane session={activeSession} sessionId={activeSessionId} />
           </div>
         )}
 

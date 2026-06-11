@@ -3430,14 +3430,11 @@ impl Instance {
         self.update_status_with_metadata(None);
     }
 
-    pub fn capture_output_with_size(
-        &self,
-        lines: usize,
-        width: u16,
-        height: u16,
-    ) -> Result<String> {
-        let session = self.tmux_session()?;
-        session.capture_pane_with_size(lines, Some(width), Some(height))
+    pub fn capture_output(&self, lines: usize) -> Result<String> {
+        // capture-pane has no size parameters: the pane is captured at
+        // the window's own dimensions. (A previous *_with_size variant
+        // accepted width/height and silently ignored them.)
+        self.tmux_session()?.capture_pane(lines)
     }
 }
 
@@ -4437,7 +4434,13 @@ mod tests {
 
     /// Real-tmux integration: an alive pane yields AlreadyAlive with no
     /// status/start_time mutations. Skipped if tmux isn't installed.
+    // Serialized: this test creates and kills a real tmux session. Unserialized
+    // it can kill the shared server's last session while a `#[serial]` peer's
+    // `new-session` is connecting, which fails that peer with "server exited
+    // unexpectedly" (and its own skip-on-failure fallback silently masks the
+    // same race in the other direction).
     #[test]
+    #[serial_test::serial]
     fn test_ensure_pane_ready_alive_pane_is_noop() {
         if std::process::Command::new("tmux")
             .arg("-V")

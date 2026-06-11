@@ -24,7 +24,9 @@
       "components": [
         "web/src/components/Dashboard.tsx",
         "web/src/components/TerminalView.tsx",
-        "web/src/components/ContentSplit.tsx"
+        "web/src/components/ContentSplit.tsx",
+        "web/src/components/XtermTerminalView.tsx",
+        "web/src/components/TerminalConnectionBanners.tsx"
       ]
     },
     {
@@ -61,6 +63,42 @@
       "risk": "medium",
       "specs": ["tests/backspace-autorepeat.spec.ts"],
       "components": ["web/src/hooks/useTerminal.ts"]
+    },
+    {
+      "id": "app-shell.dashboard-update-banner",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/__tests__/DashboardUpdateBanner.test.tsx", "src/lib/webBuildId.test.ts"],
+      "components": ["web/src/components/DashboardUpdateBanner.tsx"]
+    },
+    {
+      "id": "terminal.mobile-live-view",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": [
+        "tests/mobile-dom-renderer.spec.ts",
+        "tests/keyboard-auto-resize.spec.ts",
+        "tests/mobile-keyboard.spec.ts"
+      ],
+      "components": [
+        "web/src/components/MobileLiveTerminal.tsx",
+        "web/src/components/LiveTerminalView.tsx",
+        "web/src/hooks/useLiveTerminal.ts"
+      ]
+    },
+    {
+      "id": "terminal.webgl-gate-units",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/hooks/useTerminal.webgl.test.ts", "src/lib/liveTermLines.test.ts"],
+      "components": ["web/src/hooks/useTerminal.ts"]
+    },
+    {
+      "id": "terminal.mobile-live-scrollback",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/scrollback-exit.spec.ts"],
+      "components": ["web/src/hooks/useLiveTerminal.ts", "web/src/components/MobileLiveTerminal.tsx"]
     },
     {
       "id": "auth.no-auth",
@@ -792,6 +830,13 @@
       "components": ["web/src/components/DeleteSessionDialog.tsx"]
     },
     {
+      "id": "session.stop-dialog-keyboard",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/__tests__/StopSessionDialog.test.tsx"],
+      "components": ["web/src/components/StopSessionDialog.tsx"]
+    },
+    {
       "id": "storage.quota-crash-regression",
       "kind": "mocked-playwright",
       "risk": "high",
@@ -1070,6 +1115,17 @@
       "components": []
     },
     {
+      "id": "acp.composer-ios-keyboard-reservation",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/acp-composer-keyboard.spec.ts",
+        "src/components/acp/StructuredView.layout.test.ts",
+        "src/components/acp/__tests__/StructuredViewRoot.test.tsx"
+      ],
+      "components": ["web/src/components/acp/StructuredView.tsx"]
+    },
+    {
       "id": "acp.config-pickers",
       "kind": "live-playwright",
       "risk": "medium",
@@ -1093,7 +1149,7 @@
       "kind": "live-playwright",
       "risk": "medium",
       "specs": ["tests/live/acp-mode-switch.spec.ts"],
-      "components": ["web/src/components/acp/SwitchViewAction.tsx", "web/src/components/acp/ContextPrimerBanner.tsx"]
+      "components": ["web/src/components/acp/ContextPrimerBanner.tsx"]
     },
     {
       "id": "acp.completion",
@@ -1328,13 +1384,6 @@
       "risk": "medium",
       "specs": ["src/components/acp/ContextPrimerBanner.test.tsx"],
       "components": ["web/src/components/acp/ContextPrimerBanner.tsx"]
-    },
-    {
-      "id": "acp.switch-view-action",
-      "kind": "vitest",
-      "risk": "medium",
-      "specs": ["src/components/acp/SwitchViewAction.test.tsx"],
-      "components": ["web/src/components/acp/SwitchViewAction.tsx"]
     },
     {
       "id": "acp.tool-error-body",
@@ -1576,13 +1625,6 @@
         "tests/live/acp-stories/sidebar-select-focuses-composer.spec.ts"
       ],
       "components": ["web/src/App.tsx", "web/src/lib/terminalFocus.ts", "web/src/components/acp/Composer.tsx"]
-    },
-    {
-      "id": "acp.story.view-switch-to-acp",
-      "kind": "live-playwright",
-      "risk": "medium",
-      "specs": ["tests/live/acp-stories/view-switch-to-acp.spec.ts"],
-      "components": ["web/src/components/acp/SwitchViewAction.tsx"]
     },
     {
       "id": "story.auth-sign-out",
@@ -2194,9 +2236,17 @@
       "specs": [
         "src/lib/__tests__/tourSteps.test.ts",
         "src/hooks/__tests__/useTour.test.ts",
-        "src/components/__tests__/Dashboard.tour.test.tsx"
+        "src/components/__tests__/Dashboard.tour.test.tsx",
+        "src/components/tour/TourRunner.theme.test.tsx"
       ],
-      "components": ["web/src/components/Dashboard.tsx", "web/src/lib/tourSteps.ts", "web/src/hooks/useTour.tsx"]
+      "components": [
+        "web/src/components/Dashboard.tsx",
+        "web/src/components/tour/TourRunner.tsx",
+        "web/src/components/tour/tourRunnerStyles.ts",
+        "web/src/lib/brandMark.ts",
+        "web/src/lib/tourSteps.ts",
+        "web/src/hooks/useTour.tsx"
+      ]
     },
     {
       "id": "onboarding.theme-welcome",

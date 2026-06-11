@@ -1,9 +1,6 @@
 import { useEffect, useState } from "react";
-import { fetchUpdateStatus } from "../lib/api";
+import { dismissUpdate, fetchUpdateStatus } from "../lib/api";
 import type { UpdateStatus } from "../lib/api";
-import { safeGetItem, safeSetItem } from "../lib/safeStorage";
-
-const DISMISS_KEY = "aoe-update-dismissed-version";
 
 // Minimum poll period regardless of what the server reports. Guards
 // against a misconfigured `web_poll_interval_minutes = 0` hammering
@@ -11,17 +8,11 @@ const DISMISS_KEY = "aoe-update-dismissed-version";
 // server-side cache lapses).
 const MIN_POLL_MINUTES = 5;
 
-function readDismissed(): string | null {
-  return safeGetItem(DISMISS_KEY);
-}
-
-function writeDismissed(version: string) {
-  safeSetItem(DISMISS_KEY, version);
-}
-
 /**
  * Top-of-app banner shown when `update_available` is true. Dismiss
- * persists by latest_version, so a newer release re-surfaces it.
+ * persists by latest_version in server-side app_state (not per-browser
+ * localStorage), so acknowledging a release once hides it on every device
+ * and matches the TUI's snooze; a newer release re-surfaces it.
  * Polls on mount + at `web_poll_interval_minutes` cadence + on tab
  * visibilitychange. Honors `update_check_mode`: server returns
  * `update_available: false` when mode = off, so nothing renders.
@@ -31,7 +22,9 @@ function writeDismissed(version: string) {
  */
 export function UpdateBanner() {
   const [status, setStatus] = useState<UpdateStatus | null>(null);
-  const [dismissedVersion, setDismissedVersion] = useState<string | null>(() => readDismissed());
+  // Optimistic local dismissal so the banner hides immediately on click,
+  // before the POST lands and the next poll reflects the persisted value.
+  const [locallyDismissed, setLocallyDismissed] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -69,12 +62,16 @@ export function UpdateBanner() {
   // Suppress the banner in auto mode (the runtime is handling the install
   // in the background; nothing for the user to do).
   if (status.update_check_mode === "auto") return null;
-  if (dismissedVersion === status.latest_version) return null;
+  // Hide if dismissed for this version, either optimistically this session or
+  // persisted server-side (from this or any other device, or the TUI).
+  if (locallyDismissed === status.latest_version || status.dismissed_version === status.latest_version) {
+    return null;
+  }
 
   const onDismiss = () => {
     if (!status.latest_version) return;
-    writeDismissed(status.latest_version);
-    setDismissedVersion(status.latest_version);
+    setLocallyDismissed(status.latest_version);
+    void dismissUpdate(status.latest_version);
   };
 
   return (

@@ -12,7 +12,18 @@ import {
   type MutableRefObject,
 } from "react";
 import { createPortal } from "react-dom";
-import { Archive, ArrowLeftRight, GripVertical, Hourglass, Layers, Moon, Pencil, Pin } from "lucide-react";
+import {
+  Archive,
+  ArrowLeftRight,
+  CircleStop,
+  GripVertical,
+  Hourglass,
+  Layers,
+  Moon,
+  Pencil,
+  Pin,
+  Play,
+} from "lucide-react";
 import {
   DndContext,
   MouseSensor,
@@ -143,6 +154,8 @@ interface Props {
   onProjects: () => void;
   onProfiles: () => void;
   onDeleteSession?: (workspaceId: string) => void;
+  onStopSession?: (workspaceId: string) => void;
+  onStartSession?: (workspaceId: string) => void;
   readOnly?: boolean;
   sortMode: SidebarSortMode;
   onSortModeChange: (mode: SidebarSortMode) => void;
@@ -381,6 +394,8 @@ function SortableSessionRow({
   isSelected: boolean;
   onActivate: (e: { metaKey: boolean; ctrlKey: boolean; shiftKey: boolean }) => void;
   onDelete?: (workspaceId: string) => void;
+  onStop?: (workspaceId: string) => void;
+  onStart?: (workspaceId: string) => void;
   readOnly?: boolean;
   dragDisabled?: boolean;
   optimistic: OptimisticTriage;
@@ -498,6 +513,8 @@ export const SessionRow = memo(function SessionRow({
   isSelected,
   onActivate,
   onDelete,
+  onStop,
+  onStart,
   readOnly,
   indented,
   optimistic,
@@ -514,6 +531,8 @@ export const SessionRow = memo(function SessionRow({
   // than navigating directly. See #1724.
   onActivate: (e: { metaKey: boolean; ctrlKey: boolean; shiftKey: boolean }) => void;
   onDelete?: (workspaceId: string) => void;
+  onStop?: (workspaceId: string) => void;
+  onStart?: (workspaceId: string) => void;
   readOnly?: boolean;
   indented?: boolean;
   // Optimistic triage overlay for this row plus the parent-owned mutation
@@ -797,6 +816,21 @@ export const SessionRow = memo(function SessionRow({
     onDelete?.(workspace.id);
   };
 
+  const handleStop = () => {
+    setContextMenu(null);
+    onStop?.(workspace.id);
+  };
+  // Mirror the TUI's `x` guard: a session that is already stopped or
+  // mid-lifecycle has nothing to stop, so hide the action for those.
+  const canStop = !["Stopped", "Deleting", "Creating"].includes(sessionStatus);
+
+  const handleStart = () => {
+    setContextMenu(null);
+    onStart?.(workspace.id);
+  };
+  // Start is the inverse of Stop: only offered for a stopped session.
+  const canStart = sessionStatus === "Stopped";
+
   if (renaming) {
     return (
       <div className={`py-1 ${indented ? "pl-6 pr-3" : "px-3"}`}>
@@ -1023,6 +1057,26 @@ export const SessionRow = memo(function SessionRow({
               >
                 <ArrowLeftRight className="h-3.5 w-3.5 shrink-0" />
                 Switch agent
+              </button>
+            )}
+            {!readOnly && canStop && (
+              <button
+                onClick={handleStop}
+                data-testid="sidebar-context-menu-stop"
+                className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+              >
+                <CircleStop className="h-3.5 w-3.5 shrink-0" />
+                Stop
+              </button>
+            )}
+            {!readOnly && canStart && (
+              <button
+                onClick={handleStart}
+                data-testid="sidebar-context-menu-start"
+                className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+              >
+                <Play className="h-3.5 w-3.5 shrink-0" />
+                Start
               </button>
             )}
             <div className="border-t border-surface-700/20 my-1" />
@@ -1881,6 +1935,8 @@ export function WorkspaceSidebar({
   onProjects,
   onProfiles,
   onDeleteSession,
+  onStopSession,
+  onStartSession,
   readOnly,
   sortMode,
   onSortModeChange,
@@ -1897,6 +1953,12 @@ export function WorkspaceSidebar({
   useSuppressClickAfterDrag(dragSuppressRef);
   const offline = useServerDown();
   const [width, setWidth] = useState(loadSavedWidth);
+  // Publish the live width so the TopBar's left zone can size itself to match
+  // the column, extending the sidebar's right border up through the header.
+  // Updates on every drag frame (cheap: a CSS var write, no React re-render).
+  useEffect(() => {
+    document.documentElement.style.setProperty("--aoe-sidebar-width", `${width}px`);
+  }, [width]);
   const [filterOpen, setFilterOpen] = useState(false);
   const [filterQuery, setFilterQuery] = useState("");
   const [sunkExpanded, setSunkExpanded] = useState<boolean>(loadSunkExpanded);
@@ -2434,6 +2496,8 @@ export function WorkspaceSidebar({
                                     isSelected={!readOnly && selection.selectedIds.has(v.workspace.id)}
                                     onActivate={(e) => handleRowActivate(v.workspace.id, e)}
                                     onDelete={onDeleteSession}
+                                    onStop={onStopSession}
+                                    onStart={onStartSession}
                                     readOnly={readOnly}
                                     optimistic={triage.optimisticFor(v.workspace.id)}
                                     onPinToggle={triage.pinToggle}
@@ -2535,6 +2599,8 @@ export function WorkspaceSidebar({
                                 isSelected={!readOnly && selection.selectedIds.has(v.workspace.id)}
                                 onActivate={(e) => handleRowActivate(v.workspace.id, e)}
                                 onDelete={onDeleteSession}
+                                onStop={onStopSession}
+                                onStart={onStartSession}
                                 readOnly={readOnly}
                                 optimistic={triage.optimisticFor(v.workspace.id)}
                                 onPinToggle={triage.pinToggle}
@@ -2601,6 +2667,8 @@ export function WorkspaceSidebar({
                       isSelected={!readOnly && selection.selectedIds.has(v.workspace.id)}
                       onActivate={(e) => handleRowActivate(v.workspace.id, e)}
                       onDelete={onDeleteSession}
+                      onStop={onStopSession}
+                      onStart={onStartSession}
                       readOnly={readOnly}
                       optimistic={triage.optimisticFor(v.workspace.id)}
                       onPinToggle={triage.pinToggle}
@@ -2712,11 +2780,13 @@ export function WorkspaceSidebar({
           </button>
         </div>
       </div>
-      {/* Resize handle (desktop only) */}
+      {/* Resize handle (desktop only). Gated on `open`: when the sidebar is
+          collapsed the panel is hidden, so the handle must hide too — otherwise
+          a dead drag bar lingers at the left edge with nothing to resize. */}
       <div
         data-testid="sidebar-resize-handle"
         onMouseDown={handleMouseDown}
-        className="hidden md:block w-1 cursor-col-resize shrink-0 bg-surface-800 hover:bg-brand-600/50 transition-colors duration-75"
+        className={`${open ? "hidden md:block" : "hidden"} w-1 cursor-col-resize shrink-0 bg-surface-800 hover:bg-brand-600/50 transition-colors duration-75`}
       />
     </>
   );

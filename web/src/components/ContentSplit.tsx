@@ -25,6 +25,12 @@ function loadSavedWidth(): number {
 
 export function ContentSplit({ left, right, collapsed, onToggleCollapse }: Props) {
   const [diffWidth, setDiffWidth] = useState(loadSavedWidth);
+  // Publish the live width so the TopBar's right zone can size itself to match
+  // the panel column and extend the divider up through the header, mirroring
+  // the sidebar. A CSS var write, no React re-render, so drag stays cheap.
+  useEffect(() => {
+    document.documentElement.style.setProperty("--aoe-right-panel-width", `${diffWidth}px`);
+  }, [diffWidth]);
   const containerRef = useRef<HTMLDivElement>(null);
   const dragging = useRef(false);
 
@@ -86,7 +92,7 @@ export function ContentSplit({ left, right, collapsed, onToggleCollapse }: Props
             data-testid="content-split-resize-handle"
             onMouseDown={handleMouseDown}
             onDoubleClick={onToggleCollapse}
-            className="hidden md:block w-1 cursor-col-resize shrink-0 bg-surface-800 hover:bg-brand-600/50 transition-colors duration-75"
+            className="hidden md:block w-1 cursor-col-resize shrink-0 hover:bg-brand-600/50 transition-colors duration-75"
           />
 
           {/* Right pane (inline). ContentSplit only renders at the md

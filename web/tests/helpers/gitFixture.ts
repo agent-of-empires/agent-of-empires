@@ -74,6 +74,34 @@ export function initWorkingRepo(repoPath: string, opts: { defaultBranch?: string
 }
 
 /**
+ * Create a throwaway bare repo that already contains one commit on
+ * `defaultBranch`. Unlike {@link createBareRepo}, this one has a branch to
+ * check out, so it can be cloned as a bare repo + worktree (cloning an
+ * empty bare repo leaves `git worktree add` with no reference to resolve).
+ * Built by committing into a temporary working repo, then cloning it bare.
+ *
+ * Returns the absolute path and the `file://` URL.
+ */
+export function createSeededBareRepo(
+  parentDir: string,
+  opts: { name?: string; defaultBranch?: string } = {},
+): BareRepoFixture {
+  const name = opts.name ?? "seeded-bare.git";
+  const branch = opts.defaultBranch ?? "main";
+  mkdirSync(parentDir, { recursive: true });
+  const path = join(parentDir, name);
+  const workdir = join(parentDir, `${name}.src`);
+  initWorkingRepo(workdir, { defaultBranch: branch });
+  const res = spawnSync("git", ["clone", "--bare", "--quiet", workdir, path], {
+    env: { ...process.env, ...GIT_ENV },
+  });
+  if (res.status !== 0) {
+    throw new Error(`git clone --bare failed: status=${res.status} stderr=${res.stderr?.toString() ?? "<none>"}`);
+  }
+  return { path, url: `file://${path}` };
+}
+
+/**
  * Write a set of files into a repo (uncommitted). Paths are joined onto
  * `repoPath`; nested directories are created automatically. Use to
  * stage uncommitted modifications visible to the diff endpoint, or as

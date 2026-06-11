@@ -33,8 +33,8 @@ pub struct BuiltinTheme {
 
 pub const BUILTIN_THEMES: &[BuiltinTheme] = &[
     BuiltinTheme {
-        name: "default",
-        source: include_str!("../../../themes/builtin/default.toml"),
+        name: "zinc",
+        source: include_str!("../../../themes/builtin/zinc.toml"),
     },
     BuiltinTheme {
         name: "empire",
@@ -166,14 +166,14 @@ pub fn load_theme(name: &str) -> Theme {
             }
         }
     }
-    warn!("Unknown theme '{}', falling back to default", name);
+    warn!("Unknown theme '{}', falling back to zinc", name);
     // Inline the default fallback rather than recursing through `load_theme`,
-    // so a future rename or removal of the "default" builtin would surface
-    // as a clear panic here instead of looping.
+    // so a future rename or removal of the fallback builtin would surface
+    // as a clear panic here instead of looping. `zinc` is the default theme.
     let default = BUILTIN_THEMES
         .iter()
-        .find(|b| b.name == "default")
-        .expect("'default' builtin missing from BUILTIN_THEMES");
+        .find(|b| b.name == "zinc")
+        .expect("'zinc' builtin missing from BUILTIN_THEMES");
     parse_builtin(default)
 }
 
@@ -223,7 +223,7 @@ mod tests {
     /// the rest. Adding a new builtin requires one row here.
     const BUILTIN_COLOR_ANCHORS: &[(&str, Color, Color)] = &[
         (
-            "default",
+            "zinc",
             Color::Rgb(0x1c, 0x1c, 0x1f),
             Color::Rgb(0xfb, 0xbf, 0x24),
         ),
@@ -444,7 +444,7 @@ border = "#414868"
     #[test]
     fn unknown_theme_falls_back_to_default() {
         let theme = load_theme("nonexistent-theme");
-        let default = load_theme("default");
+        let default = load_theme("zinc");
         assert_eq!(
             theme.color_fields(),
             default.color_fields(),
@@ -456,7 +456,7 @@ border = "#414868"
     fn test_builtin_themes_count() {
         assert_eq!(BUILTIN_THEMES.len(), 8);
         let names: Vec<&str> = builtin_theme_names().collect();
-        assert!(names.contains(&"default"));
+        assert!(names.contains(&"zinc"));
         assert!(names.contains(&"empire"));
         assert!(names.contains(&"phosphor"));
         assert!(names.contains(&"tokyo-night-storm"));

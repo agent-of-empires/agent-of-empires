@@ -22,7 +22,6 @@ import { clearStoredComments, sweepOrphanComments } from "./components/diff/comm
 import { SendCommentsDialog } from "./components/diff/comments/SendCommentsDialog";
 import { useCommandActions } from "./hooks/useCommandActions";
 import { useEdgeSwipe } from "./hooks/useEdgeSwipe";
-import { useMobileKeyboard } from "./hooks/useMobileKeyboard";
 import { useIsCoarsePointer } from "./hooks/useIsCoarsePointer";
 import { useIsWideViewport } from "./hooks/useIsWideViewport";
 import type { RightPanelView } from "./lib/rightPanelView";
@@ -30,6 +29,8 @@ import {
   loginStatus,
   logout,
   deleteSession,
+  stopSession,
+  startSession,
   fetchAbout,
   fetchSettings,
   fetchTelemetryStatus,
@@ -45,8 +46,10 @@ import { toastBus } from "./lib/toastBus";
 import { resolveToRepoRelative, type FileRef } from "./lib/fileRef";
 import { OPEN_SESSION_EVENT } from "./lib/sessionRoute";
 import { dispatchFocusTerminal, requestSessionInputFocus, setPendingTerminalFocus } from "./lib/terminalFocus";
+import { hydrateWebUiStateFromServer, initWebUiSync } from "./lib/webUiSync";
 import { WorkspaceSidebar } from "./components/WorkspaceSidebar";
 import { DeleteSessionDialog } from "./components/DeleteSessionDialog";
+import { StopSessionDialog } from "./components/StopSessionDialog";
 import { TopBar } from "./components/TopBar";
 import { ContentSplit } from "./components/ContentSplit";
 import { TerminalSessionStack } from "./components/TerminalSessionStack";
@@ -85,6 +88,7 @@ import { CommandPalette } from "./components/command-palette/CommandPalette";
 import { DisconnectBanner } from "./components/DisconnectBanner";
 import { ElevationPrompt } from "./components/ElevationPrompt";
 import { UpdateBanner } from "./components/UpdateBanner";
+import { DashboardUpdateBanner } from "./components/DashboardUpdateBanner";
 
 const RIGHT_PANEL_COLLAPSED_KEY = "aoe-right-collapsed";
 // Pre-#1832 per-browser tour-seen flag. Read once on load to migrate users who
@@ -155,6 +159,8 @@ export default function App() {
     setLoginAuthenticated(false);
   };
 
+  // Only hydrate once the user is past every auth gate, so the request runs as
+  // the authenticated user (and never against the login/token screens).
   // Token auth is the first factor; show token entry before anything else
   if (tokenExpired) {
     return <TokenEntryPage onSuccess={handleTokenSuccess} />;
@@ -193,6 +199,18 @@ function isInsideEditable(target: EventTarget | null): boolean {
 }
 
 function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLogout: () => void }) {
+  // Wire the localStorage write chokepoint and pull the server-side UI-state
+  // blob into localStorage. AppContent only mounts past auth, so this runs as
+  // the authenticated user. Background (does NOT gate render): blocking first
+  // paint on this fetch raced immediate interactions and could flash a blank
+  // screen if the endpoint were slow. A brand-new browser paints local defaults
+  // for the first session; hydration writes the synced values for the next
+  // mount/reload. Same-device loads (populated cache) are unaffected.
+  useEffect(() => {
+    initWebUiSync();
+    void hydrateWebUiStateFromServer();
+  }, []);
+
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const idleDecayWindowMs = useIdleDecayWindowMs();
@@ -428,16 +446,25 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     (sessionId: string) => {
       const ws = workspaces.find((w) => w.sessions.some((s) => s.id === sessionId));
       if (ws) {
+        const picked = ws.sessions.find((s) => s.id === sessionId);
         navigate(`/session/${encodeURIComponent(sessionId)}`);
-        // The proxy is a real textarea; focusing it inside the click gesture
-        // would pop the soft keyboard on touch devices, so skip it on coarse
-        // pointers (#1178), matching the focusAgentInput suppression.
-        if (!isCoarse) focusKeyboardProxy();
-        focusAgentInput(ws.sessions.find((s) => s.id === sessionId));
+        // On touch devices, raise the soft keyboard within the tap gesture and
+        // latch the terminal/composer to take focus once it mounts (keeping the
+        // keyboard up) — but only when the user opted into auto-open keyboard.
+        // On desktop the proxy is a no-op and we focus the real input directly.
+        if (isCoarse) {
+          if (webSettings.autoOpenKeyboard) {
+            focusKeyboardProxy();
+            setPendingTerminalFocus(picked?.view === "structured" ? "composer" : "agent");
+          }
+        } else {
+          focusKeyboardProxy();
+          focusAgentInput(picked);
+        }
         if (window.innerWidth < 768) setSidebarOpen(false);
       }
     },
-    [navigate, workspaces, focusAgentInput, isCoarse],
+    [navigate, workspaces, focusAgentInput, isCoarse, webSettings.autoOpenKeyboard],
   );
 
   const handleSelectWorkspace = (workspaceId: string) => {
@@ -447,12 +474,21 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       const picked = running ?? ws.sessions[0] ?? null;
       if (picked) {
         navigate(`/session/${encodeURIComponent(picked.id)}`);
-        focusAgentInput(picked);
+        // Mirror handleSelectSession: on touch, raise the keyboard + latch focus
+        // only when auto-open keyboard is enabled; on desktop focus directly.
+        if (isCoarse) {
+          if (webSettings.autoOpenKeyboard) {
+            focusKeyboardProxy();
+            setPendingTerminalFocus(picked.view === "structured" ? "composer" : "agent");
+          }
+        } else {
+          focusKeyboardProxy();
+          focusAgentInput(picked);
+        }
       } else {
         navigate("/");
       }
     }
-    if (!isCoarse) focusKeyboardProxy();
     if (window.innerWidth < 768) {
       setSidebarOpen(false);
     }
@@ -473,6 +509,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
 
   const [wizardPrefill, setWizardPrefill] = useState<WizardPrefill | undefined>(undefined);
   const [deletingWorkspaceId, setDeletingWorkspaceId] = useState<string | null>(null);
+  const [stoppingWorkspaceId, setStoppingWorkspaceId] = useState<string | null>(null);
   const [serverAbout, setServerAbout] = useState<ServerAbout | null>(null);
   // `serverAbout === null` conflates "not fetched yet" with "fetch failed", so
   // the tour gates auto-launch on an explicit loaded flag instead.
@@ -577,6 +614,50 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       toastBus.handler?.info(toast);
     },
     [deletingSession, activeSessionId, setSessionStatus, navigate],
+  );
+
+  const stoppingWorkspace = stoppingWorkspaceId ? workspaces.find((w) => w.id === stoppingWorkspaceId) : null;
+  const stoppingSession = stoppingWorkspace?.sessions[0] ?? null;
+
+  const handleStopSession = useCallback((workspaceId: string) => {
+    setStoppingWorkspaceId(workspaceId);
+  }, []);
+
+  const handleConfirmStop = useCallback(async () => {
+    if (!stoppingSession) return;
+    const sessionId = stoppingSession.id;
+
+    // Close the dialog and show "Stopped" immediately; the 2s status poller
+    // reconciles the true state and corrects this if the request fails.
+    setStoppingWorkspaceId(null);
+    setSessionStatus(sessionId, "Stopped");
+
+    const result = await stopSession(sessionId);
+    if (!result) {
+      setSessionStatus(sessionId, "Error");
+      toastBus.handler?.error("Failed to stop session");
+      return;
+    }
+    toastBus.handler?.info("Session stopped");
+  }, [stoppingSession, setSessionStatus]);
+
+  const handleStartSession = useCallback(
+    async (workspaceId: string) => {
+      const ws = workspaces.find((w) => w.id === workspaceId);
+      const session = ws?.sessions[0];
+      if (!session) return;
+
+      // Optimistic Starting; the status poller reconciles to the real state.
+      setSessionStatus(session.id, "Starting");
+      const result = await startSession(session.id);
+      if (!result) {
+        setSessionStatus(session.id, "Error");
+        toastBus.handler?.error("Failed to start session");
+        return;
+      }
+      toastBus.handler?.info("Session started");
+    },
+    [workspaces, setSessionStatus],
   );
 
   const handleCreateSession = useCallback(
@@ -712,6 +793,9 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     enabled: !sidebarOpen,
     onSwipe: openSidebar,
     blurOnSwipe: true,
+    // A swipe-right anywhere on screen opens the sidebar, not just from the
+    // left edge. The right-edge (diff) swipe stays edge-only below.
+    anywhere: true,
   });
   useEdgeSwipe({
     edge: "right",
@@ -810,6 +894,10 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
             setDeletingWorkspaceId(null);
             return;
           }
+          if (stoppingWorkspaceId) {
+            setStoppingWorkspaceId(null);
+            return;
+          }
           if (showPalette) {
             setShowPalette(false);
             return;
@@ -831,6 +919,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
         toggleDiff,
         showPalette,
         deletingWorkspaceId,
+        stoppingWorkspaceId,
         showSettings,
         handleCloseSettings,
         navigate,
@@ -1051,30 +1140,11 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     );
   };
 
-  // Lock the root height to the latched max innerHeight on mobile. Without
-  // this, iOS PWA / iOS 26 Safari / Android Chrome shrink innerHeight
-  // (and therefore 100dvh) when the soft keyboard opens, which would move
-  // the terminal pane by the full keyboard height on its own. Pinning the
-  // root to the no-keyboard height makes occlusion padding in TerminalView
-  // the single thing that resizes the terminal, so the keyboard behaves the
-  // same way on every platform (and not double-shrink on the shrinking ones).
-  //
-  // Acp substrate doesn't host xterm.js, so the SIGWINCH concern
-  // doesn't apply; leaving the pin on for acp traps the composer
-  // below the keyboard on Android Chrome PWA (#1177). Drop the pin when
-  // the active session is acp so `h-dvh` plus the viewport meta's
-  // `interactive-widget=resizes-content` shrink the container with the
-  // keyboard and lift the composer back into view.
-  //
-  // Exception: when the single-pane paired shell is the active mobile view,
-  // an xterm.js terminal owns the viewport even on an acp session, so it
-  // needs the pin (plus the reservation in PairedTerminal) for the same
-  // reason the agent terminal does (#1452).
-  const { isMobile, stableViewportHeight } = useMobileKeyboard();
-  const pairedFullViewport = singlePane && rightPanelView === "paired";
-  const pinRootHeight =
-    isMobile && stableViewportHeight > 0 && (activeSession?.view !== "structured" || pairedFullViewport);
-  const rootStyle = pinRootHeight ? { height: `${stableViewportHeight}px` } : undefined;
+  // No root-height pin remains: every mobile terminal surface (agent,
+  // paired host, paired container) is the capture-snapshot live view
+  // now, with no PTY to protect from keyboard-driven layout shrink. The
+  // natural `100dvh` shrink keeps bottom-anchored UI above the keyboard
+  // everywhere (#1177, #1452 are fully superseded).
 
   const acpPrefs = useMemo(
     () => ({
@@ -1169,10 +1239,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
 
   return (
     <AcpPrefsProvider value={acpPrefs}>
-      <div
-        className="h-dvh flex flex-col bg-surface-900 text-text-primary overflow-hidden safe-area-inset"
-        style={rootStyle}
-      >
+      <div className="h-dvh flex flex-col bg-surface-900 text-text-primary overflow-hidden safe-area-inset">
         <TopBar
           activeWorkspace={activeWorkspace}
           activeSession={activeSession ?? null}
@@ -1188,10 +1255,21 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
           isOffline={!!error}
           isDevBuild={isDebugBuild(serverAbout)}
           onGoDashboard={handleGoDashboard}
+          sidebarColumnVisible={!showSettings && !showProjects && sidebarOpen}
+          rightColumnVisible={
+            isMdUp &&
+            !showSettings &&
+            !showProjects &&
+            !showProfiles &&
+            !!activeWorkspace &&
+            !!activeSession &&
+            !diffCollapsed
+          }
         />
 
         <DisconnectBanner />
         <UpdateBanner />
+        <DashboardUpdateBanner />
 
         <div className="flex flex-1 min-h-0">
           {!showSettings && !showProjects && (
@@ -1216,6 +1294,8 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
               onProjects={handleOpenProjects}
               onProfiles={handleOpenProfiles}
               onDeleteSession={handleDeleteSession}
+              onStopSession={handleStopSession}
+              onStartSession={handleStartSession}
               readOnly={serverAbout?.read_only}
               sortMode={sidebarSortMode}
               onSortModeChange={setSidebarSortMode}
@@ -1265,6 +1345,14 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
             cleanupDefaults={deletingSession.cleanup_defaults}
             onConfirm={handleConfirmDelete}
             onCancel={() => setDeletingWorkspaceId(null)}
+          />
+        )}
+
+        {stoppingSession && (
+          <StopSessionDialog
+            sessionTitle={stoppingSession.title}
+            onConfirm={handleConfirmStop}
+            onCancel={() => setStoppingWorkspaceId(null)}
           />
         )}
 

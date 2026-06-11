@@ -31,6 +31,11 @@ struct DevArgs {
     /// Port for the Vite dev server
     #[arg(long, default_value_t = 5173)]
     web_port: u16,
+    /// Interface the Vite dev server binds to. Defaults to loopback; pass
+    /// `0.0.0.0` to reach the dashboard from other devices on the network. The
+    /// backend stays on 127.0.0.1 and is reached through Vite's proxy.
+    #[arg(long, default_value = "127.0.0.1")]
+    host: String,
     /// Watch `src/**`, `Cargo.toml`, and `Cargo.lock`; on change rebuild and
     /// restart `aoe serve` (Vite stays up). Unix-only, same as the base command.
     #[arg(long)]
@@ -66,6 +71,13 @@ fn build_serve() -> bool {
             eprintln!("[xtask dev] failed to run cargo build: {e}");
             false
         })
+}
+
+/// Whether a bind host keeps the dev servers off the network. Anything else
+/// (notably `0.0.0.0`) exposes them to other devices and warrants a warning.
+#[cfg(unix)]
+fn host_is_loopback(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1") || host.starts_with("127.")
 }
 
 #[cfg(unix)]
@@ -169,6 +181,11 @@ fn run_dev(args: DevArgs) {
     // child. Shutdown is driven by signals here, not per-server keystrokes,
     // so neither child needs the terminal.
     let serve_port = args.serve_port;
+    // The backend always stays on loopback: remote devices reach the dashboard
+    // through Vite, which proxies `/api` and the `/sessions/*/ws` relays to the
+    // backend over 127.0.0.1. Binding it to a public interface would also trip
+    // `aoe serve`'s refusal to run `--no-auth` off-loopback without a proxy.
+    let host = args.host.clone();
     let spawn_serve = || -> Child {
         Command::new(&bin)
             .args(["serve", "--no-auth", "--port", &serve_port.to_string()])
@@ -177,6 +194,26 @@ fn run_dev(args: DevArgs) {
             .spawn()
             .expect("failed to spawn `aoe serve`")
     };
+
+    // Clear any lingering serve already bound to the dev namespace before we
+    // spawn ours. An unclean prior `xtask dev` exit (or a stray dev daemon)
+    // leaves a serve PID file that makes the fresh foreground serve refuse to
+    // start with "already running", which then tears Vite down. Best-effort:
+    // ignore the "no daemon running" case and wait for the port to free up.
+    {
+        let stopped = Command::new(&bin)
+            .args(["serve", "--stop"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if stopped {
+            eprintln!("[xtask dev] stopped a pre-existing dev `aoe serve` on :{serve_port}");
+            wait_for_port(serve_port, Duration::from_secs(5));
+        }
+    }
 
     // Tracked as an Option so a backend that exits under --watch can be marked
     // dead and respawned on the next rebuild without tearing down Vite.
@@ -191,6 +228,8 @@ fn run_dev(args: DevArgs) {
             "--",
             "--port",
             &args.web_port.to_string(),
+            "--host",
+            &host,
         ])
         .env(
             "VITE_PROXY",
@@ -222,6 +261,14 @@ fn run_dev(args: DevArgs) {
             ""
         }
     );
+    if !host_is_loopback(&host) {
+        eprintln!(
+            "[xtask dev] WARNING: Vite is bound to {host}:{} and reachable from your \
+             network. The proxied backend runs with --no-auth, so anyone who can reach \
+             this port can control your agent sessions.",
+            args.web_port
+        );
+    }
 
     // Watch src/** plus the root Cargo.toml/Cargo.lock when --watch is set. The
     // watcher must stay bound for the loop's lifetime; dropping it ends delivery.

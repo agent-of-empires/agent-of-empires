@@ -2665,6 +2665,16 @@ impl HomeView {
         }
     }
 
+    /// Expire the settings view's transient "Settings saved" toast when its
+    /// window passes, so it fades even while the keyboard is idle. Returns true
+    /// when a redraw is needed. No-op when the settings overlay isn't open.
+    pub fn tick_settings_status(&mut self) -> bool {
+        self.settings_view
+            .as_mut()
+            .map(|view| view.tick_status())
+            .unwrap_or(false)
+    }
+
     /// Tick dialog animations/timers and drain hook progress.
     /// Returns true when a redraw is needed.
     pub fn tick_dialog(&mut self) -> bool {
@@ -2914,9 +2924,11 @@ impl HomeView {
     }
 
     /// Expand the synthetic Archived section if it is collapsed, persisting
-    /// the change. Used when archiving a session in the non-Attention sort so
-    /// the freshly archived row is visible and can stay selected under the
-    /// cursor. No-op (and no save) when the section is already open.
+    /// the change. Used when archiving a whole group, where the rows the
+    /// user was looking at all sink at once and revealing the section shows
+    /// where they went. Single-row archive does NOT reveal: the cursor
+    /// advances to the next active session instead and the section header's
+    /// count is the feedback. No-op (and no save) when already open.
     pub(super) fn reveal_archived_section(&mut self) {
         if !self.archived_section_collapsed {
             return;
@@ -4363,15 +4375,23 @@ impl HomeView {
         self.registered_projects = merged;
     }
 
-    /// The canonical repo path of the first live session under project header
-    /// `label`, or `None` when the header has no sessions (an empty pinned
-    /// header). This is the header's stable repo identity, so two repos that
-    /// merely share a basename are judged against their own paths rather than
-    /// the shared display label.
+    /// The canonical repo path of the first live (non-archived) session under
+    /// project header `label`, or `None` when no live session populates the
+    /// header (an empty pinned header). This is the header's stable repo
+    /// identity, so two repos that merely share a basename are judged against
+    /// their own paths rather than the shared display label.
+    ///
+    /// Archived sessions are excluded on purpose: an empty main-flow header is
+    /// injected by LABEL match against the registry, so its pin state and
+    /// unpin toggle must resolve by the same rule. Letting an archived row
+    /// lend the header its path made a registry entry with a different
+    /// recorded path (repo deleted or moved, so `canonical_key` compares raw
+    /// strings) render an unpinnable phantom header: pinned by label, judged
+    /// by path.
     pub(super) fn project_header_repo_path(&self, label: &str) -> Option<String> {
         self.instances
             .iter()
-            .find(|i| project_group_name(i) == label)
+            .find(|i| !i.is_archived() && project_group_name(i) == label)
             .map(|i| crate::session::projects::canonical_key(i.repo_path()))
     }
 

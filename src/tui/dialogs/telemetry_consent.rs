@@ -281,7 +281,7 @@ mod tests {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
         unsafe { std::env::remove_var("DO_NOT_TRACK") };
-        let theme = crate::tui::styles::load_theme("default");
+        let theme = crate::tui::styles::load_theme("zinc");
         let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
         let mut d = TelemetryConsentDialog::new();
         term.draw(|f| d.render(f, f.area(), &theme)).unwrap();

@@ -66,13 +66,13 @@ async function simulateKeyboardClose(page: Page) {
 async function openSession(page: Page) {
   await openMobileSidebar(page);
   await clickSidebarSession(page, "pinch-test");
-  await page.locator(".xterm").waitFor({ state: "visible", timeout: 10_000 });
+  await page.locator("[data-live-terminal]").waitFor({ state: "visible", timeout: 10_000 });
 }
 
 async function getKeyboardState(page: Page) {
   return page.evaluate(() => {
     const root = document.querySelector<HTMLElement>('[class*="flex-1 flex flex-col overflow-hidden relative"]');
-    const termContainer = document.querySelector<HTMLElement>(".xterm");
+    const termContainer = document.querySelector<HTMLElement>("[data-live-terminal]");
     return {
       rootHeight: root?.getBoundingClientRect().height ?? 0,
       rootPaddingBottom: root?.style.paddingBottom || "0",
@@ -93,7 +93,11 @@ test.describe("Mobile keyboard detection and layout", () => {
     await page.goto("/");
     // seedSettings writes to localStorage (needs page loaded), then reload
     // so the app picks up the seeded settings with mocks still active.
-    await seedSettings(page, { mobileFontSize: 10 });
+    // This suite exercises keyboard detection / layout / FAB mechanics, not the
+    // auto-open-on-select feature. Disable auto-open so the keyboard starts
+    // closed deterministically (otherwise the select handler focuses the input
+    // and the FAB would read "Close keyboard").
+    await seedSettings(page, { mobileFontSize: 10, autoOpenKeyboard: false });
     await page.reload();
     await page.waitForTimeout(500);
     await openSession(page);
@@ -116,24 +120,20 @@ test.describe("Mobile keyboard detection and layout", () => {
     expect(parseInt(after.rootPaddingBottom)).toBeGreaterThanOrEqual(250);
   });
 
-  test("auto-resizes when keyboard opens in PWA mode (innerHeight shrinks with keyboard)", async ({ page }) => {
+  test("PWA mode keyboard adds no inset (dvh shrink owns the layout)", async ({ page }) => {
     await setupAndOpen(page);
 
-    const before = await getKeyboardState(page);
-    expect(parseInt(before.rootPaddingBottom) || 0).toBe(0);
-
-    // PWA keyboard: vv.height AND window.innerHeight both shrink with the
-    // keyboard, but the full-height baseline (the real viewport) is unchanged.
-    // This is how iOS PWA / iOS 26 Safari / Android Chrome behave.
+    // PWA / iOS 26 / Android: innerHeight shrinks with the keyboard, so
+    // 100dvh shrinks the layout natively. The live view must not stack
+    // its own inset on top (that would double-shrink), and the agent
+    // pane root carries no inline padding in this mode. The dvh shrink
+    // itself is not simulable here; the assertable part is that the
+    // legacy occlusion machinery stays quiet.
     await simulateKeyboardOpen(page, 300, { innerHeightShrinks: true });
-    await page.waitForTimeout(800);
+    await page.waitForTimeout(600);
 
-    const after = await getKeyboardState(page);
-    // Occlusion is measured against the remembered full height, so the pane is
-    // padded (~300) even though innerHeight shrank with the keyboard. The old
-    // design left this at 0 because it keyed off keyboardHeight, which is 0 in
-    // PWA mode, so nothing resized there (#1432).
-    expect(parseInt(after.rootPaddingBottom)).toBeGreaterThanOrEqual(250);
+    const state = await getKeyboardState(page);
+    expect(state.rootPaddingBottom === "0" || state.rootPaddingBottom === "").toBe(true);
   });
 
   test("auto-resizes back when keyboard closes (occlusion releases)", async ({ page }) => {
@@ -158,7 +158,7 @@ test.describe("Mobile keyboard detection and layout", () => {
     await setupAndOpen(page);
     // On chromium headless, pointer:coarse may not match — toolbar only
     // renders when isMobile is true. Check that the terminal at least loaded.
-    await expect(page.locator(".xterm")).toBeVisible();
+    await expect(page.locator("[data-live-terminal]")).toBeVisible();
   });
 
   test("keyboard open button visible when keyboard closed", async ({ page }) => {
@@ -166,19 +166,21 @@ test.describe("Mobile keyboard detection and layout", () => {
     await expect(page.getByRole("button", { name: "Open keyboard" })).toBeVisible();
   });
 
-  test("keyboard open button hidden when proxy focused", async ({ page }) => {
+  test("keyboard FAB tracks input focus, not viewport heuristics", async ({ page }) => {
     await setupAndOpen(page);
 
-    // Focus the hidden proxy input to simulate keyboard opening
+    // On a touch device the keyboard is open exactly when the live input
+    // has focus; the FAB icon follows focus directly, so no viewport
+    // simulation is needed (or consulted).
+    await expect(page.getByRole("button", { name: "Open keyboard" })).toBeVisible();
     await page.evaluate(() => {
-      const proxy = document.querySelector<HTMLInputElement>('input[autocapitalize="none"]');
-      proxy?.focus();
+      document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Live terminal input"]')?.focus();
     });
-
-    await simulateKeyboardOpen(page, 300);
-    await page.waitForTimeout(200);
-
-    await expect(page.getByRole("button", { name: "Open keyboard" })).not.toBeVisible();
+    await expect(page.getByRole("button", { name: "Close keyboard" })).toBeVisible();
+    await page.evaluate(() => {
+      document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Live terminal input"]')?.blur();
+    });
+    await expect(page.getByRole("button", { name: "Open keyboard" })).toBeVisible();
   });
 
   test("scrollToBottom fires when keyboard opens", async ({ page }) => {
@@ -192,7 +194,7 @@ test.describe("Mobile keyboard detection and layout", () => {
           }
         ).__termScrollBottom;
         // Watch for scrollTop change on the terminal container
-        const wt = document.querySelector(".xterm");
+        const wt = document.querySelector("[data-live-terminal]");
         if (!wt) return resolve(false);
         // Watch for scroll events on the .xterm element
         const onScroll = () => {

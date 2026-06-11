@@ -1225,6 +1225,14 @@ impl App {
                 needs_full_refresh = true;
             }
 
+            // Fade the settings "Settings saved" toast once its window passes,
+            // even if the user has stopped typing. Fires at most once per save,
+            // so a full refresh here is free.
+            if self.home.tick_settings_status() {
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
             // Disk reload: heartbeat (defense-in-depth) plus the
             // file-watch-driven kick. Both gate on `live_send.is_none()`
             // so reloads never interrupt a paste-in-progress; the dirty

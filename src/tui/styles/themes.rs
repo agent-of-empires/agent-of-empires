@@ -131,54 +131,105 @@ pub struct Theme {
     pub syntax: ThemeSyntax,
 }
 
-impl Default for Theme {
-    fn default() -> Self {
-        // Hardcoded Empire palette used only as serde's per-field
-        // fallback for partial custom TOMLs. Must NOT round-trip
-        // through `load_theme("empire")` + `toml::from_str`: serde's
-        // container-level `#[serde(default)]` calls Theme::default()
-        // every time it deserializes a Theme (to seed the struct
-        // before overwriting present fields), so parsing any TOML
-        // would re-enter Default which would re-parse Empire which
-        // would re-enter Default... a self-referential deadlock. The
-        // values mirror `themes/builtin/empire.toml`; if Empire's
-        // palette ever drifts, sync this manually (or replace with a
-        // build-time codegen step).
+#[derive(Debug, Deserialize)]
+struct RawThemeDefaults {
+    #[serde(with = "hex_color")]
+    background: Color,
+    #[serde(with = "hex_color")]
+    border: Color,
+    #[serde(with = "hex_color")]
+    terminal_border: Color,
+    #[serde(with = "hex_color")]
+    selection: Color,
+    #[serde(with = "hex_color")]
+    session_selection: Color,
+    #[serde(with = "hex_color")]
+    title: Color,
+    #[serde(with = "hex_color")]
+    text: Color,
+    #[serde(with = "hex_color")]
+    dimmed: Color,
+    #[serde(with = "hex_color")]
+    hint: Color,
+    #[serde(with = "hex_color")]
+    running: Color,
+    #[serde(with = "hex_color")]
+    waiting: Color,
+    #[serde(with = "hex_color")]
+    fresh_idle: Color,
+    #[serde(with = "hex_color")]
+    idle: Color,
+    #[serde(with = "hex_color")]
+    error: Color,
+    #[serde(with = "hex_color")]
+    terminal_active: Color,
+    #[serde(with = "hex_color")]
+    group: Color,
+    #[serde(with = "hex_color")]
+    search: Color,
+    #[serde(with = "hex_color")]
+    accent: Color,
+    #[serde(with = "hex_color")]
+    diff_add: Color,
+    #[serde(with = "hex_color")]
+    diff_delete: Color,
+    #[serde(with = "hex_color")]
+    diff_modified: Color,
+    #[serde(with = "hex_color")]
+    diff_header: Color,
+    #[serde(with = "hex_color")]
+    help_key: Color,
+    #[serde(with = "hex_color")]
+    branch: Color,
+    #[serde(with = "hex_color")]
+    sandbox: Color,
+}
+
+impl From<RawThemeDefaults> for Theme {
+    fn from(raw: RawThemeDefaults) -> Self {
         Self {
-            background: Color::Rgb(0x0f, 0x17, 0x2a),
-            border: Color::Rgb(0x33, 0x41, 0x55),
-            terminal_border: Color::Rgb(0x0d, 0x94, 0x88),
-            selection: Color::Rgb(0x26, 0x32, 0x4b),
-            session_selection: Color::Rgb(0x37, 0x41, 0x5c),
-            title: Color::Rgb(0xfb, 0xbf, 0x24),
-            text: Color::Rgb(0xcb, 0xd5, 0xe1),
-            dimmed: Color::Rgb(0x64, 0x74, 0x8b),
-            hint: Color::Rgb(0x94, 0xa3, 0xb8),
-            running: Color::Rgb(0x22, 0xc5, 0x5e),
-            waiting: Color::Rgb(0xfb, 0xbf, 0x24),
-            fresh_idle: Color::Rgb(0xf5, 0x9e, 0x0b),
-            idle: Color::Rgb(0x64, 0x74, 0x8b),
-            error: Color::Rgb(0xef, 0x44, 0x44),
-            terminal_active: Color::Rgb(0x0d, 0x94, 0x88),
-            group: Color::Rgb(0xcb, 0xd5, 0xe1),
-            search: Color::Rgb(0xfb, 0xbf, 0x24),
-            accent: Color::Rgb(0xd9, 0x77, 0x06),
-            diff_add: Color::Rgb(0x22, 0xc5, 0x5e),
-            diff_delete: Color::Rgb(0xef, 0x44, 0x44),
-            diff_modified: Color::Rgb(0xfb, 0xbf, 0x24),
-            diff_header: Color::Rgb(0x0d, 0x94, 0x88),
-            help_key: Color::Rgb(0xd9, 0x77, 0x06),
-            branch: Color::Rgb(0x0d, 0x94, 0x88),
-            sandbox: Color::Rgb(0x94, 0xa3, 0xb8),
-            // appearance and syntax default to None / empty here,
-            // but the per-field `#[serde(default)]` attributes on
-            // those fields take precedence over this container
-            // default, so partial custom TOMLs that omit them still
-            // resolve to None rather than inheriting Empire's values
-            // (covered by `partial_custom_theme_does_not_inherit_metadata`).
+            background: raw.background,
+            border: raw.border,
+            terminal_border: raw.terminal_border,
+            selection: raw.selection,
+            session_selection: raw.session_selection,
+            title: raw.title,
+            text: raw.text,
+            dimmed: raw.dimmed,
+            hint: raw.hint,
+            running: raw.running,
+            waiting: raw.waiting,
+            fresh_idle: raw.fresh_idle,
+            idle: raw.idle,
+            error: raw.error,
+            terminal_active: raw.terminal_active,
+            group: raw.group,
+            search: raw.search,
+            accent: raw.accent,
+            diff_add: raw.diff_add,
+            diff_delete: raw.diff_delete,
+            diff_modified: raw.diff_modified,
+            diff_header: raw.diff_header,
+            help_key: raw.help_key,
+            branch: raw.branch,
+            sandbox: raw.sandbox,
             appearance: None,
             syntax: ThemeSyntax { shiki_theme: None },
         }
+    }
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        // Serde calls Theme::default() while deserializing partial custom
+        // TOMLs, so this must not call load_theme() or parse Theme itself.
+        // Parse the Empire builtin through a raw no-default shape instead:
+        // empire.toml stays the single source for fallback colors, while
+        // optional renderer metadata still defaults to None / empty here.
+        let raw: RawThemeDefaults =
+            toml::from_str(include_str!("../../../themes/builtin/empire.toml"))
+                .expect("embedded empire theme defaults must parse");
+        raw.into()
     }
 }
 

@@ -150,28 +150,7 @@ impl ToolSession {
     }
 
     pub fn capture_pane(&self, lines: usize) -> Result<String> {
-        if !self.exists() {
-            return Ok(String::new());
-        }
-
-        let target = format!("{}:^.0", self.name);
-        let output = Command::new("tmux")
-            .args([
-                "capture-pane",
-                "-t",
-                &target,
-                "-p",
-                "-e",
-                "-S",
-                &format!("-{}", lines),
-            ])
-            .output()?;
-
-        if output.status.success() {
-            Ok(String::from_utf8_lossy(&output.stdout).to_string())
-        } else {
-            Ok(String::new())
-        }
+        super::Session::from_name(&self.name).capture_pane(lines)
     }
 
     fn get_pane_pid(&self) -> Option<u32> {
