@@ -401,6 +401,19 @@ pub(crate) fn collect_environment(
         }
     }
 
+    // Host-minted `before_start` values are injected as inherited entries so the
+    // value is passed to docker via the process environment, never in argv.
+    // Placed before the configured entries so a freshly-minted secret wins over
+    // any same-keyed `sandbox.environment` / `extra_env` entry (first-wins).
+    for (key, value) in &sandbox_info.before_start_env {
+        if seen_keys.insert(key.clone()) {
+            result.push(EnvEntry::Inherit {
+                key: key.clone(),
+                value: value.clone(),
+            });
+        }
+    }
+
     for entry in entries {
         if let Some((key, value)) = entry.split_once('=') {
             if seen_keys.insert(key.to_string()) {
@@ -628,6 +641,7 @@ environment = ["GH_TOKEN=write_token"]
             container_name: "test".to_string(),
             extra_env: None,
             custom_instruction: None,
+            before_start_env: Vec::new(),
         };
         let project_path = temp_home.path().join("nonexistent_project");
 
@@ -881,6 +895,7 @@ environment = ["GH_TOKEN=write_token"]
             container_name: "test".to_string(),
             extra_env: None,
             custom_instruction: None,
+            before_start_env: Vec::new(),
         };
 
         let result = collect_environment(&config, &info);
@@ -888,6 +903,35 @@ environment = ["GH_TOKEN=write_token"]
         assert_eq!(entry.value(), "test_value");
         assert!(matches!(entry, EnvEntry::Inherit { .. }));
         std::env::remove_var("AOE_TEST_ENV_PT");
+    }
+
+    #[test]
+    fn test_collect_environment_before_start_is_inherited() {
+        // before_start-minted values are emitted as Inherit entries (so the
+        // value rides the process env, never argv) and win over a same-keyed
+        // sandbox.environment literal.
+        let config = SandboxConfig {
+            environment: vec!["GH_TOKEN=stale_literal".to_string()],
+            ..Default::default()
+        };
+        let info = SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test".to_string(),
+            container_name: "test".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: vec![("GH_TOKEN".to_string(), "ghs_fresh".to_string())],
+        };
+
+        let result = collect_environment(&config, &info);
+        let entries: Vec<_> = result.iter().filter(|e| e.key() == "GH_TOKEN").collect();
+        assert_eq!(entries.len(), 1, "deduped to a single GH_TOKEN entry");
+        assert_eq!(entries[0].value(), "ghs_fresh");
+        assert!(
+            matches!(entries[0], EnvEntry::Inherit { .. }),
+            "before_start values must be Inherit (leak-safe), not Literal"
+        );
     }
 
     #[test]
@@ -903,6 +947,7 @@ environment = ["GH_TOKEN=write_token"]
             container_name: "test".to_string(),
             extra_env: None,
             custom_instruction: None,
+            before_start_env: Vec::new(),
         };
 
         let result = collect_environment(&config, &info);
@@ -921,6 +966,7 @@ environment = ["GH_TOKEN=write_token"]
             container_name: "test".to_string(),
             extra_env: None,
             custom_instruction: None,
+            before_start_env: Vec::new(),
         };
 
         let result = collect_environment(&config, &info);
@@ -957,6 +1003,7 @@ environment = ["GH_TOKEN=write_token"]
                 "GIT_CONFIG_VALUE_1=/workspace/other".to_string(),
             ]),
             custom_instruction: None,
+            before_start_env: Vec::new(),
         };
 
         let result = collect_environment(&config, &info);
@@ -986,6 +1033,7 @@ environment = ["GH_TOKEN=write_token"]
             container_name: "test".to_string(),
             extra_env: Some(vec!["AOE_TEST_EXTRA".to_string(), "FOO=bar".to_string()]),
             custom_instruction: None,
+            before_start_env: Vec::new(),
         };
 
         let result = collect_environment(&config, &info);
@@ -1011,6 +1059,7 @@ environment = ["GH_TOKEN=write_token"]
             container_name: "test".to_string(),
             extra_env: Some(vec!["DUP_KEY=from_session".to_string()]),
             custom_instruction: None,
+            before_start_env: Vec::new(),
         };
 
         let result = collect_environment(&config, &info);
@@ -1032,6 +1081,7 @@ environment = ["GH_TOKEN=write_token"]
             container_name: "test".to_string(),
             extra_env: None,
             custom_instruction: None,
+            before_start_env: Vec::new(),
         };
 
         let result = collect_environment(&config, &info);
@@ -1053,6 +1103,7 @@ environment = ["GH_TOKEN=write_token"]
             container_name: "test".to_string(),
             extra_env: None,
             custom_instruction: None,
+            before_start_env: Vec::new(),
         };
 
         let result = collect_environment(&config, &info);
@@ -1075,6 +1126,7 @@ environment = ["GH_TOKEN=write_token"]
             container_name: "test".to_string(),
             extra_env: None,
             custom_instruction: None,
+            before_start_env: Vec::new(),
         };
 
         let result = collect_environment(&config, &info);
@@ -1205,6 +1257,7 @@ environment = ["GH_TOKEN=write_token"]
             container_name: "test".to_string(),
             extra_env: Some(vec!["AOE_TEST_TOKEN=$AOE_TEST_TOKEN".to_string()]),
             custom_instruction: None,
+            before_start_env: Vec::new(),
         };
         let result = build_docker_env_args("", &sandbox, std::path::Path::new("/nonexistent"));
         // docker_args should have the key but NOT the secret value
@@ -1240,6 +1293,7 @@ environment = ["GH_TOKEN=write_token"]
             container_name: "test".to_string(),
             extra_env: Some(vec!["MY_MAPPED=$AOE_TEST_SOURCE".to_string()]),
             custom_instruction: None,
+            before_start_env: Vec::new(),
         };
         let result = build_docker_env_args("", &sandbox, std::path::Path::new("/nonexistent"));
         assert!(
@@ -1275,6 +1329,7 @@ environment = ["GH_TOKEN=write_token"]
             container_name: "test".to_string(),
             extra_env: Some(vec!["AOE_TEST_BARE".to_string()]),
             custom_instruction: None,
+            before_start_env: Vec::new(),
         };
         let result = build_docker_env_args("", &sandbox, std::path::Path::new("/nonexistent"));
         assert!(
@@ -1309,6 +1364,7 @@ environment = ["GH_TOKEN=write_token"]
             container_name: "test".to_string(),
             extra_env: Some(vec!["MY_LITERAL=some_value".to_string()]),
             custom_instruction: None,
+            before_start_env: Vec::new(),
         };
         let result = build_docker_env_args("", &sandbox, std::path::Path::new("/nonexistent"));
         assert!(
@@ -1342,6 +1398,7 @@ environment = ["GH_TOKEN=write_token"]
                 "MY_LITERAL=public_val".to_string(),
             ]),
             custom_instruction: None,
+            before_start_env: Vec::new(),
         };
         let result = build_docker_env_args("", &sandbox, std::path::Path::new("/nonexistent"));
         // Secret: key only in docker_args, value in exports
@@ -1442,6 +1499,7 @@ environment = ["GH_TOKEN=write_token"]
             container_name: "test".to_string(),
             extra_env: None,
             custom_instruction: None,
+            before_start_env: Vec::new(),
         };
 
         let result = collect_environment(&config, &info);
@@ -1477,6 +1535,7 @@ environment = ["GH_TOKEN=write_token"]
             container_name: "test".to_string(),
             extra_env: None,
             custom_instruction: None,
+            before_start_env: Vec::new(),
         };
 
         let result = collect_environment(&config, &info);
@@ -1503,6 +1562,7 @@ environment = ["GH_TOKEN=write_token"]
             container_name: "test".to_string(),
             extra_env: None,
             custom_instruction: None,
+            before_start_env: Vec::new(),
         };
 
         let result = collect_environment(&config, &info);
@@ -1528,6 +1588,7 @@ environment = ["GH_TOKEN=write_token"]
             container_name: "test".to_string(),
             extra_env: None,
             custom_instruction: None,
+            before_start_env: Vec::new(),
         };
 
         let result = collect_environment(&config, &info);
@@ -1556,6 +1617,7 @@ environment = ["GH_TOKEN=write_token"]
             container_name: "test".to_string(),
             extra_env: None,
             custom_instruction: None,
+            before_start_env: Vec::new(),
         };
 
         let result = collect_environment(&config, &info);

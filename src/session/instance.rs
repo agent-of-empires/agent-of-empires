@@ -304,6 +304,15 @@ pub struct SandboxInfo {
     /// Custom instruction text to inject into agent launch command
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_instruction: Option<String>,
+    /// `KEY=VALUE` pairs minted on the host by `host_hooks.before_start` when
+    /// the container last came up. Injected into the container environment as
+    /// inherited (leak-safe) entries by [`super::environment::collect_environment`].
+    ///
+    /// Runtime-only and secret: never serialized (so short-lived tokens never
+    /// hit disk and a stale value never survives a restart) and re-minted on the
+    /// next container come-up. See [`Instance::ensure_before_start_env`].
+    #[serde(skip)]
+    pub before_start_env: Vec<(String, String)>,
 }
 
 /// Deserialize agent_session_id, treating empty/whitespace strings as None.
@@ -2406,20 +2415,26 @@ impl Instance {
     }
 
     pub fn get_container_for_instance(&mut self) -> Result<containers::DockerContainer> {
-        let sandbox = self
+        let image = self
             .sandbox_info
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Cannot ensure container for non-sandboxed session"))?;
-
-        let image = &sandbox.image;
-        let container = DockerContainer::new(&self.id, image);
+            .ok_or_else(|| anyhow::anyhow!("Cannot ensure container for non-sandboxed session"))?
+            .image
+            .clone();
+        let container = DockerContainer::new(&self.id, &image);
 
         if container.is_running()? {
+            // Already up: not a come-up, so don't re-mint. Fill lazily only if a
+            // fresh process attached to a running container with no values yet.
+            self.ensure_before_start_env(false)?;
             container_config::refresh_agent_configs();
             return Ok(container);
         }
 
         if container.exists()? {
+            // Restart of a stopped container is a come-up: refresh so a
+            // short-lived token is re-minted.
+            self.ensure_before_start_env(true)?;
             container_config::refresh_agent_configs();
             container.start()?;
             return Ok(container);
@@ -2427,8 +2442,11 @@ impl Instance {
 
         // Ensure image is available (always pulls to get latest)
         let runtime = containers::get_container_runtime();
-        runtime.ensure_image(image)?;
+        runtime.ensure_image(&image)?;
 
+        // Mint before building the container config so the docker-run env also
+        // carries the values (leak-safe via the inherit path in run_create).
+        self.ensure_before_start_env(true)?;
         let config = self.build_container_config()?;
         let container_id = container.create(&config)?;
 
@@ -2460,6 +2478,47 @@ impl Instance {
             self.workspace_info.as_ref(),
             &self.source_profile,
         )
+    }
+
+    /// Run `host_hooks.before_start` on the host and stash the resulting
+    /// `KEY=VALUE` pairs on `sandbox_info.before_start_env`, from where
+    /// [`super::environment::collect_environment`] injects them into the
+    /// container environment on every surface (docker run, the tmux `docker
+    /// exec` launch, and the structured-view worker).
+    ///
+    /// `force` re-mints unconditionally (a container come-up); when false the
+    /// hooks run only if no values are stashed yet, so attaching to an
+    /// already-running container backfills without re-minting on every relaunch.
+    /// A hook failure is propagated so the container does not come up without
+    /// the values the agent depends on. Hooks are resolved from profile/global
+    /// config only, never from the repo.
+    fn ensure_before_start_env(&mut self, force: bool) -> Result<()> {
+        if self.sandbox_info.is_none() {
+            return Ok(());
+        }
+        let commands = super::repo_config::resolve_before_start_hooks(&self.source_profile);
+        if commands.is_empty() {
+            if let Some(sb) = self.sandbox_info.as_mut() {
+                sb.before_start_env.clear();
+            }
+            return Ok(());
+        }
+        let already_minted = self
+            .sandbox_info
+            .as_ref()
+            .is_some_and(|s| !s.before_start_env.is_empty());
+        if !force && already_minted {
+            return Ok(());
+        }
+
+        let hook_env = super::repo_config::lifecycle_env_vars(self);
+        let project_path = PathBuf::from(&self.project_path);
+        let minted =
+            super::repo_config::run_before_start_hooks(&commands, &project_path, &hook_env)?;
+        if let Some(sb) = self.sandbox_info.as_mut() {
+            sb.before_start_env = minted;
+        }
+        Ok(())
     }
 
     pub fn maybe_start_poller(&mut self) {
@@ -4725,6 +4784,7 @@ mod tests {
             container_name: "test".to_string(),
             extra_env: None,
             custom_instruction: None,
+            before_start_env: Vec::new(),
         });
         assert!(!inst.is_sandboxed());
     }
@@ -4739,6 +4799,7 @@ mod tests {
             container_name: "test".to_string(),
             extra_env: None,
             custom_instruction: None,
+            before_start_env: Vec::new(),
         });
         assert!(inst.is_sandboxed());
     }
@@ -4844,6 +4905,7 @@ mod tests {
             container_name: "test_container".to_string(),
             extra_env: Some(vec!["MY_VAR".to_string(), "OTHER_VAR".to_string()]),
             custom_instruction: None,
+            before_start_env: Vec::new(),
         };
 
         let json = serde_json::to_string(&info).unwrap();

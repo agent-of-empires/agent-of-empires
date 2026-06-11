@@ -266,6 +266,7 @@ fn with_sandbox(mut inst: Instance, enabled: bool) -> Instance {
         container_name: "aoe_secret_container".to_string(),
         extra_env: None,
         custom_instruction: None,
+        before_start_env: Vec::new(),
     });
     inst
 }

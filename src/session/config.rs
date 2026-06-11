@@ -1,7 +1,7 @@
 //! User configuration management
 
 use super::get_app_dir;
-use super::repo_config::HooksConfig;
+use super::repo_config::{HooksConfig, HostHooksConfig};
 use anyhow::Result;
 use aoe_settings_derive::SettingsSection;
 use serde::{Deserialize, Serialize};
@@ -40,6 +40,11 @@ pub struct Config {
 
     #[serde(default)]
     pub hooks: HooksConfig,
+
+    /// Host-side lifecycle hooks. Profile/global only; never honored from a
+    /// repo's `.agent-of-empires/config.toml` (these run commands on the host).
+    #[serde(default)]
+    pub host_hooks: HostHooksConfig,
 
     #[serde(default)]
     pub sound: crate::sound::SoundConfig,

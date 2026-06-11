@@ -1443,6 +1443,7 @@ fn create_test_env_with_group_sessions() -> TestEnv {
         container_name: "test-container".to_string(),
         extra_env: None,
         custom_instruction: None,
+        before_start_env: Vec::new(),
     });
     instances.push(inst3);
 
@@ -1541,6 +1542,7 @@ fn test_group_has_containers() {
         container_name: "test-container".to_string(),
         extra_env: None,
         custom_instruction: None,
+        before_start_env: Vec::new(),
     });
 
     let mut inst2 = Instance::new("other-session", "/tmp/other");
@@ -1891,6 +1893,7 @@ fn test_delete_group_with_sessions_respects_container_option() {
         container_name: "test-container".to_string(),
         extra_env: None,
         custom_instruction: None,
+        before_start_env: Vec::new(),
     });
 
     {

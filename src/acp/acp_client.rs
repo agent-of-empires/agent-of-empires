@@ -6514,6 +6514,7 @@ mod tests {
             container_name: "aoe-sandbox-abc12345".into(),
             extra_env: Some(vec!["MY_LITERAL=hello".into()]),
             custom_instruction: None,
+            before_start_env: Vec::new(),
         };
         let config = SpawnConfig {
             agent_key: "claude".into(),
@@ -6580,6 +6581,7 @@ mod tests {
             container_name: "aoe-sandbox-abc12345".into(),
             extra_env: None,
             custom_instruction: None,
+            before_start_env: Vec::new(),
         };
         let config = SpawnConfig {
             agent_key: "claude".into(),
@@ -6650,6 +6652,7 @@ mod tests {
             container_name: "aoe-sandbox-cfgdir".into(),
             extra_env: None,
             custom_instruction: None,
+            before_start_env: Vec::new(),
         };
         let config = SpawnConfig {
             agent_key: "claude".into(),
