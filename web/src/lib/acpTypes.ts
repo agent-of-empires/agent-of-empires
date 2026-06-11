@@ -187,6 +187,73 @@ export interface Approval {
   } | null;
 }
 
+/** Mirror of `ElicitationFieldKind` in src/acp/elicitations.rs. */
+export type ElicitationFieldKind = "free_text" | "single_select" | "multi_select" | "number" | "integer" | "boolean";
+
+export interface ElicitationOption {
+  value: string;
+  label: string;
+}
+
+/** A pre-fill / submitted value. Mirror of `AnswerValue` (untagged): a
+ *  string for free-text / single-select, a list for multi-select, a number
+ *  for number / integer, a boolean for boolean. */
+export type AnswerValue = string | string[] | number | boolean;
+
+export interface ElicitationQuestion {
+  field_key: string;
+  title?: string | null;
+  description?: string | null;
+  required: boolean;
+  kind: ElicitationFieldKind;
+  options: ElicitationOption[];
+  /** Multi-select bounds. */
+  min_items?: number | null;
+  max_items?: number | null;
+  /** String bounds (free_text). */
+  min_length?: number | null;
+  max_length?: number | null;
+  /** Regex the string must match (free_text). */
+  pattern?: string | null;
+  /** Format annotation (`email` / `uri` / `date` / `date-time` / custom),
+   *  a UI hint mapped to an input type. */
+  format?: string | null;
+  /** Numeric bounds (number / integer). */
+  minimum?: number | null;
+  maximum?: number | null;
+  /** Pre-fill value, shaped to match the field kind. */
+  default?: AnswerValue | null;
+}
+
+/** Mirror of `Elicitation` in src/acp/elicitations.rs: a normalized,
+ *  form-mode elicitation the structured view renders. AskUserQuestion is
+ *  the common producer; MCP-server forms flow through the same path. */
+export interface Elicitation {
+  nonce: string;
+  message: string;
+  /** Schema-level heading (MCP forms may set one; AskUserQuestion does not). */
+  title?: string | null;
+  /** Schema-level description rendered under the message. */
+  description?: string | null;
+  tool_call_id?: string | null;
+  questions: ElicitationQuestion[];
+  requested_at: string;
+  resolved?: {
+    outcome: ElicitationOutcome;
+    resolved_at: string;
+  } | null;
+}
+
+export type ElicitationOutcome = "Accepted" | "Declined" | "Cancelled";
+
+/** Resolution payload POSTed to
+ *  `/api/sessions/{id}/acp/elicitations/{nonce}`. Mirror of
+ *  `ElicitationResolution` (tag = "action"). */
+export type ElicitationResolution =
+  | { action: "accept"; answers: Record<string, AnswerValue> }
+  | { action: "decline" }
+  | { action: "cancel" };
+
 /** Mirror of `StartupErrorDetail` in src/acp/state.rs. Serde's
  *  default for `#[serde(tag = "kind", ...)]` is internal tagging keyed
  *  on `kind`. Carries the structured remediation data the
@@ -290,6 +357,8 @@ export type AcpEvent =
     }
   | { ApprovalRequested: { approval: Approval } }
   | { ApprovalResolved: { nonce: string; decision: ApprovalDecision } }
+  | { ElicitationRequested: { elicitation: Elicitation } }
+  | { ElicitationResolved: { nonce: string; outcome: ElicitationOutcome } }
   | "SessionCleared"
   | "ConversationCompacted"
   | { DiffEmitted: { diff: DiffPreview } }
@@ -408,6 +477,14 @@ export interface AcpState {
   plan: Plan | null;
   inFlightTool: ToolCall | null;
   pendingApprovals: Approval[];
+  /** Pending AskUserQuestion elicitations awaiting a user answer. */
+  pendingElicitations: Elicitation[];
+  /** tool_call_ids that surfaced as an elicitation. The adapter emits an
+   *  AskUserQuestion tool call alongside the `elicitation/create`; the
+   *  elicitation card is the real UI, so its tool card is suppressed from
+   *  the transcript. Persisted across resolution so the completion frame
+   *  is dropped too. */
+  elicitationToolCallIds: string[];
   recentDiffs: DiffPreview[];
   thinking: boolean;
   rateLimit: RateLimitInfo | null;
@@ -726,6 +803,8 @@ export function emptyAcpState(): AcpState {
     plan: null,
     inFlightTool: null,
     pendingApprovals: [],
+    pendingElicitations: [],
+    elicitationToolCallIds: [],
     recentDiffs: [],
     thinking: false,
     rateLimit: null,
@@ -887,6 +966,8 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       next.plan = null;
       next.mode = "Default";
       next.pendingApprovals = [];
+      next.pendingElicitations = [];
+      next.elicitationToolCallIds = [];
       // Capture the agent's cumulative cost snapshot as the new
       // baseline so the next UsageUpdate reports cost-since-clear
       // instead of session-lifetime cumulative. `sessionUsage.cost`
@@ -907,6 +988,12 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   }
   if ("ToolCallStarted" in event) {
     const tc = event.ToolCallStarted.tool_call;
+    // An AskUserQuestion tool call is rendered by its elicitation card, not
+    // a transcript tool card. If the elicitation arrived first, drop the
+    // redundant start frame entirely. See ElicitationRequested.
+    if (tc.id && next.elicitationToolCallIds.includes(tc.id)) {
+      return next;
+    }
     next.inFlightTool = tc;
     // The reasoning block produced output (a tool call), so the agent is
     // no longer thinking. The adapter often skips ThinkingEnded when it
@@ -948,6 +1035,15 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   }
   if ("ToolCallCompleted" in event) {
     const { tool_call_id, is_error, content, output, completed_at } = event.ToolCallCompleted;
+    // The AskUserQuestion tool's completion is owned by its elicitation
+    // card; drop it so no transcript tool card materializes. Clear the
+    // in-flight pointer if it still points at this suppressed tool.
+    if (next.elicitationToolCallIds.includes(tool_call_id)) {
+      if (next.inFlightTool && next.inFlightTool.id === tool_call_id) {
+        next.inFlightTool = null;
+      }
+      return next;
+    }
     // #1713: a completion with no preceding start frame would render no
     // card (the render layer only attaches results to an existing
     // tool-call part). Synthesize a minimal start row first so the card
@@ -1053,6 +1149,30 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   if ("ApprovalResolved" in event) {
     const { nonce } = event.ApprovalResolved;
     next.pendingApprovals = next.pendingApprovals.filter((a) => a.nonce !== nonce);
+    return next;
+  }
+  if ("ElicitationRequested" in event) {
+    const e = event.ElicitationRequested.elicitation;
+    next.pendingElicitations = [...next.pendingElicitations, e];
+    // The adapter also emits an AskUserQuestion tool call for this
+    // elicitation. The card below replaces it, so remember the
+    // tool_call_id (to drop a later start/complete frame) and strip any
+    // tool row + in-flight pointer it already produced.
+    if (e.tool_call_id) {
+      const id = e.tool_call_id;
+      if (!next.elicitationToolCallIds.includes(id)) {
+        next.elicitationToolCallIds = [...next.elicitationToolCallIds, id];
+      }
+      next.activity = next.activity.filter((r) => r.toolCallId !== id);
+      if (next.inFlightTool && next.inFlightTool.id === id) {
+        next.inFlightTool = null;
+      }
+    }
+    return next;
+  }
+  if ("ElicitationResolved" in event) {
+    const { nonce } = event.ElicitationResolved;
+    next.pendingElicitations = next.pendingElicitations.filter((e) => e.nonce !== nonce);
     return next;
   }
   if ("DiffEmitted" in event) {
@@ -1528,6 +1648,8 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     sweepOpenToolCalls(next, frame.seq);
     next.thinking = false;
     next.pendingApprovals = [];
+    next.pendingElicitations = [];
+    next.elicitationToolCallIds = [];
     next.sessionUsage = null;
     // The new backend reports its own cumulative cost starting from
     // zero, so the prior agent's per-clear baseline does not apply.

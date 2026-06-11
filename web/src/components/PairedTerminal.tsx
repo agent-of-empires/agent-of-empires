@@ -117,7 +117,7 @@ function PairedTerminal({ sessionId, mode }: { sessionId: string; mode: ShellMod
   }
 
   return (
-    <div className="flex-1 flex flex-col min-h-0 overflow-hidden md:bg-surface-800">
+    <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
       <TerminalConnectionBanners
         connected={state.connected}
         reconnecting={state.reconnecting}
@@ -128,7 +128,7 @@ function PairedTerminal({ sessionId, mode }: { sessionId: string; mode: ShellMod
       />
       <div
         data-term="paired"
-        className={`flex-1 overflow-hidden bg-surface-950 relative md:rounded-lg term-panel${termFocused ? " term-focused" : ""}`}
+        className={`flex-1 overflow-hidden bg-[var(--term-bg)] relative term-panel${termFocused ? " term-focused" : ""}`}
         onFocus={() => setTermFocused(true)}
         onBlur={() => setTermFocused(false)}
       >

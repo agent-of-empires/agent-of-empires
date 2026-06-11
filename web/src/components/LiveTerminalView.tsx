@@ -196,7 +196,7 @@ export function LiveTerminalView({ session, active = true, surface = "agent" }: 
         onRetry={live.manualReconnect}
       />
 
-      <div className="flex-1 overflow-hidden bg-surface-950 relative">
+      <div className="flex-1 overflow-hidden bg-[var(--term-bg)] relative">
         <MobileLiveTerminal
           frame={live.state.frame}
           connected={live.state.connected}

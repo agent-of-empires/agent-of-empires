@@ -1,3 +1,4 @@
+/* eslint-disable react-refresh/only-export-components */
 // Structured view conversation surface, built on @assistant-ui/react primitives.
 //
 // The chat shell (scroll viewport, message list, message editing, keyboard
@@ -18,6 +19,7 @@ import { MessagePrimitive, ThreadPrimitive, useMessage } from "@assistant-ui/rea
 import { AlertTriangle, Check, ChevronDown, Clock, Info, ListChecks, Paperclip, RotateCcw, X } from "lucide-react";
 
 import { ApprovalCard } from "./ApprovalCard";
+import { AskUserQuestionCard } from "./AskUserQuestionCard";
 import { AcpFileRefContext } from "./AcpFileRefContext";
 import type { FileRef } from "../../lib/fileRef";
 import { ToolDensityToggle, ToolDisplayModeProvider, useToolDensityPref } from "./ToolDisplayMode";
@@ -45,6 +47,7 @@ import { AgentProfileProvider, useAgentProfile } from "../../lib/agentProfileCon
 import { isClearAlias } from "../../lib/agentProfiles";
 import { useApprovalSound } from "../../hooks/useApprovalSound";
 import { useIsCoarsePointer } from "../../hooks/useIsCoarsePointer";
+import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
 import type {
   Approval,
   ActivityRow,
@@ -132,6 +135,42 @@ export function StructuredView({ sessionId, acpWorkerState, tool, archivedAt, sn
   );
 }
 
+/** Inline style for the structured-view root, which is a fixed-height flex
+ *  column whose last child is the composer footer. On iOS regular Safari
+ *  neither `100dvh` nor the viewport meta's `interactive-widget=resizes-content`
+ *  shrink the layout when the soft keyboard opens, so without this reservation
+ *  the footer stays pinned to the full-height bottom edge and is occluded by
+ *  the keyboard (#2011). Reserving `keyboardHeight` at the bottom lets the
+ *  flex-1 chat viewport absorb the shrink and lifts the composer to the top of
+ *  the keyboard. `keyboardHeight` is 0 on platforms where innerHeight already
+ *  shrinks with the keyboard (iOS PWA, iOS 26 Safari, Android Chrome), so this
+ *  returns undefined there and the existing dvh / interactive-widget path is
+ *  untouched. Same value and rationale as `LiveTerminalView`'s `rootStyle`,
+ *  which reserves `keyboardHeight` for the mobile terminal surfaces; the
+ *  structured ACP view is the lone holdout that never adopted it.
+ *  Extracted as a pure helper so the layout decision can be unit-tested without
+ *  mounting the assistant-ui runtime. */
+export function structuredViewRootStyle(keyboardHeight: number): React.CSSProperties | undefined {
+  return keyboardHeight > 0 ? { paddingBottom: keyboardHeight } : undefined;
+}
+
+/** Fixed-height flex root for the structured view, owning the mobile-keyboard
+ *  reservation (see {@link structuredViewRootStyle}). Exported and kept tiny so
+ *  the hook-to-style wiring is testable without mounting the assistant-ui
+ *  runtime, mirroring the #1282 rate-limit-recovery extraction. */
+export function StructuredViewRoot({ children }: { children: React.ReactNode }) {
+  const { keyboardHeight } = useMobileKeyboard();
+  return (
+    <div
+      data-testid="structured-view-root"
+      className="flex h-full flex-col bg-surface-900 text-text-primary"
+      style={structuredViewRootStyle(keyboardHeight)}
+    >
+      {children}
+    </div>
+  );
+}
+
 function AcpChrome({
   sessionId,
   acpWorkerState,
@@ -150,6 +189,7 @@ function AcpChrome({
   maxRetries,
   manualReconnect,
   resolveApproval,
+  resolveElicitation,
   sendPrompt,
   pendingAttachments,
   setPendingAttachments,
@@ -232,6 +272,7 @@ function AcpChrome({
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const belowViewportRef = useRef<HTMLDivElement | null>(null);
   const wasAtBottomRef = useRef<boolean>(true);
+
   useLayoutEffect(() => {
     const vp = viewportRef.current;
     const below = belowViewportRef.current;
@@ -274,7 +315,7 @@ function AcpChrome({
     );
   }
   return (
-    <div className="flex h-full flex-col bg-surface-900 text-text-primary">
+    <StructuredViewRoot>
       <PlanStrip plan={state.plan} />
 
       <RateLimitRecoverySection sessionId={sessionId} currentAgent={state.agent} onPrefill={recoveryHandoffPrefill}>
@@ -381,6 +422,14 @@ function AcpChrome({
             {state.pendingApprovals.map((approval) => (
               <PendingApproval key={approval.nonce} approval={approval} onResolve={resolveApproval} />
             ))}
+
+            {state.pendingElicitations.map((elicitation) => (
+              <AskUserQuestionCard
+                key={elicitation.nonce}
+                elicitation={elicitation}
+                onResolve={(resolution) => resolveElicitation(elicitation.nonce, resolution)}
+              />
+            ))}
           </div>
         </ThreadPrimitive.Viewport>
 
@@ -444,7 +493,7 @@ function AcpChrome({
           />
         </div>
       </ThreadPrimitive.Root>
-    </div>
+    </StructuredViewRoot>
   );
 }
 

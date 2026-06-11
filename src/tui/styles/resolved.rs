@@ -90,7 +90,7 @@ pub fn resolve_theme(name: &str) -> ResolvedTheme {
     let source = classify_source(name);
     debug!("resolve_theme: classify_source -> {:?}", source);
     let resolved_name = if matches!(source, ResolvedThemeSource::Fallback) {
-        "default".to_string()
+        "zinc".to_string()
     } else {
         name.to_string()
     };
@@ -446,7 +446,7 @@ mod tests {
     fn unknown_theme_resolves_to_fallback() {
         let r = resolve_theme("does-not-exist");
         assert_eq!(r.source, ResolvedThemeSource::Fallback);
-        assert_eq!(r.name, "default");
+        assert_eq!(r.name, "zinc");
     }
 
     #[test]

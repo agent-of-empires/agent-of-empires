@@ -1,7 +1,7 @@
 //! Session operations for HomeView (create, delete, rename)
 
 use crate::session::builder::{self, InstanceParams};
-use crate::session::{list_profiles, GroupTree, Status, Storage};
+use crate::session::{list_profiles, GroupTree, Item, Status, Storage};
 use crate::tui::deletion_poller::DeletionRequest;
 use crate::tui::dialogs::{DeleteOptions, GroupDeleteOptions, NewSessionData};
 
@@ -1128,6 +1128,39 @@ impl HomeView {
         Ok(())
     }
 
+    /// The session the cursor should land on after the cursor's row is
+    /// archived away: the nearest non-archived session below the cursor,
+    /// else the nearest one above. `None` when no other active session is
+    /// VISIBLE (the caller falls back to an index clamp); active sessions
+    /// hidden inside collapsed groups are deliberately not candidates, so
+    /// archiving never yanks the cursor into a group the user folded away.
+    /// Scans the pre-archive flat list, so it walks the rows the
+    /// user sees; archived rows already parked under the Archived section
+    /// are skipped so the cursor never advances into it.
+    fn archive_successor_session(&self, archiving_id: &str) -> Option<String> {
+        let candidate = |item: &Item| -> Option<String> {
+            let Item::Session { id, .. } = item else {
+                return None;
+            };
+            if id == archiving_id {
+                return None;
+            }
+            let inst = self.instances.iter().find(|i| &i.id == id)?;
+            (!inst.is_archived()).then(|| id.clone())
+        };
+        for item in self.flat_items.iter().skip(self.cursor + 1) {
+            if let Some(id) = candidate(item) {
+                return Some(id);
+            }
+        }
+        for item in self.flat_items.iter().take(self.cursor).rev() {
+            if let Some(id) = candidate(item) {
+                return Some(id);
+            }
+        }
+        None
+    }
+
     /// Handle the archive keybind on the cursor's session. Symmetric toggle:
     /// archive an active row, unarchive an archived one. Killing the tmux
     /// pane on archive matches the CLI semantics (archived means "stop
@@ -1169,6 +1202,13 @@ impl HomeView {
             }
         }
 
+        // Decide where the cursor lands BEFORE the row sinks, against the
+        // pre-archive list the user is actually looking at. Only the
+        // non-Attention branch consumes it; Attention re-picks from the top.
+        let successor = (self.sort_order != crate::session::config::SortOrder::Attention)
+            .then(|| self.archive_successor_session(&id))
+            .flatten();
+
         self.apply_user_action(&id, |inst| inst.archive())?;
         if self.sort_order == crate::session::config::SortOrder::Attention {
             // Attention sort is a triage flow: archiving sinks the row and the
@@ -1177,16 +1217,39 @@ impl HomeView {
             // dead-pane/selection-swap jank the default sort did.
             self.flat_items = self.build_flat_items();
             self.select_top_attention(None);
+            // select_top_attention is a no-op when no session row is visible
+            // (the archived row sank into a collapsed Archived section and
+            // nothing else is left), which would strand `selected_session`
+            // on the now-invisible archived row and leave the cursor index
+            // past the shrunken list. Clamp and re-resolve, mirroring the
+            // non-Attention fallback below.
+            if self.selected_session.as_deref() == Some(id.as_str()) {
+                self.cursor = self.cursor.min(self.flat_items.len().saturating_sub(1));
+                self.update_selected();
+            }
         } else {
-            // Keep the just-archived session selected instead of letting the
-            // cursor snap to whatever neighbor slid into its slot. Reveal the
-            // Archived section so the row is visible, rebuild, then re-seat the
-            // cursor onto it. The preview then renders a calm "Archived"
-            // placeholder (render_archived_preview) instead of the killed
-            // pane's "No output available", and a second `z` unarchives it.
-            self.reveal_archived_section();
+            // Advance to the next session instead of following the archived
+            // row into the Archived section: archiving reads as "I'm done
+            // with this one", so the cursor stays up in the active list and
+            // moves on. The preview retargets on its own: `render_preview`
+            // re-derives the capture target from `selected_session` every
+            // frame, the cache gates on a session-id mismatch, and the
+            // capture worker drops stale frames on retarget, so the pane
+            // tracks the new selection without the dead-pane flash that
+            // motivated the old follow-the-row behavior (#2025). The
+            // Archived section is not auto-revealed; its header already
+            // shows the updated count as feedback.
             self.flat_items = self.build_flat_items();
-            self.select_session_by_id(&id);
+            match successor {
+                Some(next) => self.select_session_by_id(&next),
+                None => {
+                    // No other active session: clamp and let
+                    // `update_selected` resolve whatever sits at the cursor
+                    // now (typically the Archived section header).
+                    self.cursor = self.cursor.min(self.flat_items.len().saturating_sub(1));
+                    self.update_selected();
+                }
+            }
         }
         Ok(())
     }

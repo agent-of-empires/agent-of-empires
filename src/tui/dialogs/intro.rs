@@ -1049,14 +1049,14 @@ mod tests {
 
     #[test]
     fn opens_on_welcome_page() {
-        let dialog = IntroDialog::new("default");
+        let dialog = IntroDialog::new("zinc");
         assert_eq!(dialog.current_page(), Page::Welcome);
         assert_eq!(dialog.page_idx, 0);
     }
 
     #[test]
     fn enter_advances_through_pages_to_finish() {
-        let mut dialog = IntroDialog::new("default");
+        let mut dialog = IntroDialog::new("zinc");
         // Welcome -> Telemetry (marks telemetry_visited)
         assert!(matches!(
             dialog.handle_key(key(KeyCode::Enter)),
@@ -1097,7 +1097,7 @@ mod tests {
 
     #[test]
     fn left_arrow_goes_back() {
-        let mut dialog = IntroDialog::new("default");
+        let mut dialog = IntroDialog::new("zinc");
         dialog.handle_key(key(KeyCode::Enter)); // -> FirstSession
         dialog.handle_key(key(KeyCode::Left)); // -> Welcome
         assert_eq!(dialog.current_page(), Page::Welcome);
@@ -1108,14 +1108,14 @@ mod tests {
 
     #[test]
     fn esc_cancels_without_submit() {
-        let mut dialog = IntroDialog::new("default");
+        let mut dialog = IntroDialog::new("zinc");
         let result = dialog.handle_key(key(KeyCode::Esc));
         assert!(matches!(result, DialogResult::Cancel));
     }
 
     #[test]
     fn esc_reverts_preview_when_theme_was_visited() {
-        let mut dialog = IntroDialog::new("default");
+        let mut dialog = IntroDialog::new("zinc");
         // Walk to theme page (Welcome -> Telemetry -> FirstSession ->
         // AttachMode -> Theme).
         dialog.handle_key(key(KeyCode::Enter));
@@ -1131,13 +1131,13 @@ mod tests {
             assert!(dialog.take_pending_preview().is_some());
             // Cancel — caller should see a revert-to-original preview queued.
             let _ = dialog.handle_key(key(KeyCode::Esc));
-            assert_eq!(dialog.take_pending_preview().as_deref(), Some("default"));
+            assert_eq!(dialog.take_pending_preview().as_deref(), Some("zinc"));
         }
     }
 
     #[test]
     fn theme_arrow_keys_navigate_picker_and_queue_preview() {
-        let mut dialog = IntroDialog::new("default");
+        let mut dialog = IntroDialog::new("zinc");
         dialog.handle_key(key(KeyCode::Enter));
         dialog.handle_key(key(KeyCode::Enter));
         dialog.handle_key(key(KeyCode::Enter));
@@ -1156,7 +1156,7 @@ mod tests {
 
     #[test]
     fn submit_outcome_carries_final_theme_when_user_picks_a_new_one() {
-        let mut dialog = IntroDialog::new("default");
+        let mut dialog = IntroDialog::new("zinc");
         // Walk to ThemePicker (Welcome -> Telemetry -> FirstSession ->
         // AttachMode -> ThemePicker).
         dialog.handle_key(key(KeyCode::Enter));
@@ -1164,7 +1164,7 @@ mod tests {
         dialog.handle_key(key(KeyCode::Enter));
         dialog.handle_key(key(KeyCode::Enter));
         assert_eq!(dialog.current_page(), Page::ThemePicker);
-        // Move the cursor so the pick differs from the original "default";
+        // Move the cursor so the pick differs from the original "zinc";
         // outcome() suppresses identity picks to avoid an unnecessary
         // SetTheme dispatch + screen clear on close.
         if dialog.themes.len() > 1 {
@@ -1174,7 +1174,7 @@ mod tests {
         dialog.handle_key(key(KeyCode::Enter)); // submit
         let outcome = dialog.outcome();
         assert!(outcome.final_theme.is_some());
-        assert_ne!(outcome.final_theme.as_deref(), Some("default"));
+        assert_ne!(outcome.final_theme.as_deref(), Some("zinc"));
         // LiveSend is the wizard default, surfaced regardless of whether
         // the user toggled.
         assert_eq!(
@@ -1185,9 +1185,9 @@ mod tests {
 
     #[test]
     fn submit_outcome_omits_theme_when_user_lands_back_on_original() {
-        let mut dialog = IntroDialog::new("default");
+        let mut dialog = IntroDialog::new("zinc");
         // Walk through all pages without touching the cursor: it stays on
-        // "default", which equals the original; outcome() should report
+        // "zinc", which equals the original; outcome() should report
         // None so the close path skips a needless SetTheme dispatch.
         for _ in 0..6 {
             let _ = dialog.handle_key(key(KeyCode::Enter));
@@ -1198,7 +1198,7 @@ mod tests {
 
     #[test]
     fn outcome_has_no_theme_when_skipped_before_theme_page() {
-        let mut dialog = IntroDialog::new("default");
+        let mut dialog = IntroDialog::new("zinc");
         // Skip on page 0.
         let _ = dialog.handle_key(key(KeyCode::Esc));
         let outcome = dialog.outcome();
@@ -1208,7 +1208,7 @@ mod tests {
 
     #[test]
     fn attach_mode_toggle_switches_cursor() {
-        let mut dialog = IntroDialog::new("default");
+        let mut dialog = IntroDialog::new("zinc");
         dialog.handle_key(key(KeyCode::Enter));
         dialog.handle_key(key(KeyCode::Enter));
         dialog.handle_key(key(KeyCode::Enter));
@@ -1227,7 +1227,7 @@ mod tests {
         // natively. Lock that in for every page; a future maintainer
         // who flips this for "clickable buttons" should make a
         // conscious choice rather than regressing the copy flow.
-        let mut dialog = IntroDialog::new("default");
+        let mut dialog = IntroDialog::new("zinc");
         for _ in 0..6 {
             assert!(dialog.wants_text_selection());
             dialog.handle_key(key(KeyCode::Right));
@@ -1236,7 +1236,7 @@ mod tests {
 
     #[test]
     fn handle_hover_picks_up_attach_option_rects() {
-        let mut dialog = IntroDialog::new("default");
+        let mut dialog = IntroDialog::new("zinc");
         // Stub a rect on the second attach option so the hit-test has
         // something to find; the render path normally populates these.
         dialog.attach_mode_areas[1] = Rect {
@@ -1262,7 +1262,7 @@ mod tests {
 
     #[test]
     fn handle_hover_only_acts_on_theme_page_for_theme_rows() {
-        let mut dialog = IntroDialog::new("default");
+        let mut dialog = IntroDialog::new("zinc");
         // Stub a row rect, then check that hover is ignored off the theme
         // page (page check guards stale rects).
         dialog.theme_row_areas = vec![
@@ -1289,7 +1289,7 @@ mod tests {
 
     #[test]
     fn page_change_clears_per_page_hover_state() {
-        let mut dialog = IntroDialog::new("default");
+        let mut dialog = IntroDialog::new("zinc");
         dialog.theme_row_areas = vec![
             Rect {
                 x: 0,
@@ -1316,7 +1316,7 @@ mod tests {
 
     #[test]
     fn outcome_carries_tmux_when_user_picks_it() {
-        let mut dialog = IntroDialog::new("default");
+        let mut dialog = IntroDialog::new("zinc");
         // Walk to AttachMode, toggle to Tmux, then walk to the end.
         dialog.handle_key(key(KeyCode::Enter));
         dialog.handle_key(key(KeyCode::Enter));
@@ -1333,7 +1333,7 @@ mod tests {
 
     #[test]
     fn telemetry_toggle_switches_choice() {
-        let mut dialog = IntroDialog::new("default");
+        let mut dialog = IntroDialog::new("zinc");
         // Welcome -> Telemetry.
         dialog.handle_key(key(KeyCode::Enter));
         assert_eq!(dialog.current_page(), Page::Telemetry);
@@ -1347,7 +1347,7 @@ mod tests {
 
     #[test]
     fn outcome_carries_telemetry_opt_in_when_user_enables_it() {
-        let mut dialog = IntroDialog::new("default");
+        let mut dialog = IntroDialog::new("zinc");
         dialog.handle_key(key(KeyCode::Enter)); // -> Telemetry
         dialog.handle_key(key(KeyCode::Down)); // opt in
         for _ in 0..5 {
@@ -1359,7 +1359,7 @@ mod tests {
 
     #[test]
     fn outcome_carries_telemetry_decline_when_left_default() {
-        let mut dialog = IntroDialog::new("default");
+        let mut dialog = IntroDialog::new("zinc");
         // Walk the whole wizard without touching the telemetry choice.
         for _ in 0..6 {
             let _ = dialog.handle_key(key(KeyCode::Enter));
@@ -1371,7 +1371,7 @@ mod tests {
 
     #[test]
     fn outcome_omits_telemetry_when_skipped_before_the_page() {
-        let mut dialog = IntroDialog::new("default");
+        let mut dialog = IntroDialog::new("zinc");
         // Skip on the Welcome page, before reaching Telemetry.
         let _ = dialog.handle_key(key(KeyCode::Esc));
         assert_eq!(dialog.outcome().telemetry_opt_in, None);
@@ -1379,7 +1379,7 @@ mod tests {
 
     #[test]
     fn skip_button_click_cancels() {
-        let mut dialog = IntroDialog::new("default");
+        let mut dialog = IntroDialog::new("zinc");
         // Prime button rects via a render-equivalent: drive footer rects by
         // hand since render needs a Frame. Instead we exercise the keyboard
         // path here; the click handler is exercised by render-driven tests.

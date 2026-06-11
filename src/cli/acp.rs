@@ -872,6 +872,8 @@ fn event_kind(event: &crate::acp::Event) -> &'static str {
         Event::ToolCallUpdated { .. } => "tool_call_updated",
         Event::ApprovalRequested { .. } => "approval_requested",
         Event::ApprovalResolved { .. } => "approval_resolved",
+        Event::ElicitationRequested { .. } => "elicitation_requested",
+        Event::ElicitationResolved { .. } => "elicitation_resolved",
         Event::DiffEmitted { .. } => "diff_emitted",
         Event::ThinkingStarted => "thinking_started",
         Event::ThinkingEnded => "thinking_ended",

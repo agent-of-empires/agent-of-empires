@@ -32,6 +32,7 @@ use tracing::{debug, info, warn};
 use super::acp_client::{AcpClient, AcpError, DeleteSessionOutcome, SpawnConfig};
 use super::agent_registry::{AgentRegistry, AgentSpec};
 use super::approvals::{ApprovalDecision, Nonce};
+use super::elicitations::{ElicitationOutcome, ElicitationResolution};
 use super::state::{AcpSessionId, Event};
 use crate::session::SandboxInfo;
 
@@ -186,6 +187,14 @@ pub trait BroadcastSink: Send + Sync + 'static {
     /// Default returns empty so test sinks without an event store opt
     /// out cleanly.
     fn unresolved_approval_nonces(&self, _session_id: &str) -> Vec<Nonce> {
+        Vec::new()
+    }
+    /// Elicitation nonces from `ElicitationRequested` events on disk with
+    /// no matching `ElicitationResolved`. Used by `Supervisor::attach` to
+    /// cancel questions whose responder died with the previous daemon.
+    /// Default returns empty so test sinks without an event store opt out
+    /// cleanly.
+    fn unresolved_elicitation_nonces(&self, _session_id: &str) -> Vec<Nonce> {
         Vec::new()
     }
     /// Persist one prompt attachment blob keyed to the seq of the
@@ -2025,6 +2034,19 @@ impl<S: BroadcastSink> Supervisor<S> {
         Ok(())
     }
 
+    /// Resolve a pending `AskUserQuestion` elicitation by nonce, unblocking
+    /// the parked `elicitation/create` callback with the user's answer.
+    pub async fn resolve_elicitation(
+        &self,
+        session_id: &str,
+        nonce: Nonce,
+        resolution: ElicitationResolution,
+    ) -> Result<(), SupervisorError> {
+        let client = self.client_for_session(session_id).await?;
+        client.resolve_elicitation(nonce, resolution).await?;
+        Ok(())
+    }
+
     /// Shutdown a single structured view worker, preserving its agent-side
     /// transcript so the next respawn can resume it via `session/load`.
     ///
@@ -2376,6 +2398,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         self.worker_notify.notify_waiters();
 
         self.cancel_orphaned_approvals(&session_id);
+        self.cancel_orphaned_elicitations(&session_id);
         Ok(())
     }
 
@@ -2427,6 +2450,43 @@ impl<S: BroadcastSink> Supervisor<S> {
                 reason: "approval_cancelled_on_restart".to_string(),
             },
         );
+    }
+
+    /// Cancel elicitations (AskUserQuestion) that were on screen when the
+    /// previous daemon died. The parallel of [`Self::cancel_orphaned_approvals`]:
+    /// the responder oneshot was parked in the old daemon's
+    /// `pending_responders` map and dropped with the process, so a stale
+    /// `ElicitationRequested` would otherwise replay as a dead card that
+    /// 404s on submit. Publish a synthetic `ElicitationResolved { outcome:
+    /// Cancelled }` per dead nonce so the reducer drops the card. The
+    /// agent-side wedge is unblocked separately by the runner's
+    /// outstanding-request cancellation on detach; no synthetic `Stopped`
+    /// is needed here because `cancel_orphaned_approvals` already emits one
+    /// when the same restart had a parked approval, and an elicitation
+    /// without an approval rides whatever turn state the replay rebuilt.
+    /// No-op when there are no stale nonces.
+    fn cancel_orphaned_elicitations(&self, session_id: &str) {
+        let stale_nonces = self.sink.unresolved_elicitation_nonces(session_id);
+        if stale_nonces.is_empty() {
+            return;
+        }
+        info!(
+            target: "acp.supervisor",
+            session = %session_id,
+            stale = stale_nonces.len(),
+            "cancelling elicitations orphaned by daemon restart"
+        );
+        for nonce in stale_nonces {
+            let seq = next_seq(&self.next_seqs, session_id);
+            self.sink.publish(
+                session_id,
+                seq,
+                &Event::ElicitationResolved {
+                    nonce,
+                    outcome: ElicitationOutcome::Cancelled,
+                },
+            );
+        }
     }
 
     /// Whether this session has a running structured view worker, or a resume
@@ -2752,6 +2812,10 @@ impl BroadcastSink for ChannelSink {
         self.event_store.unresolved_approval_nonces(session_id)
     }
 
+    fn unresolved_elicitation_nonces(&self, session_id: &str) -> Vec<Nonce> {
+        self.event_store.unresolved_elicitation_nonces(session_id)
+    }
+
     fn record_attachment(
         &self,
         session_id: &str,
@@ -2870,18 +2934,28 @@ mod tests {
     struct VecSink {
         frames: std::sync::Mutex<Vec<(String, u64, Event)>>,
         stale_nonces: std::sync::Mutex<Vec<Nonce>>,
+        stale_elicitation_nonces: std::sync::Mutex<Vec<Nonce>>,
     }
     impl VecSink {
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 frames: std::sync::Mutex::new(Vec::new()),
                 stale_nonces: std::sync::Mutex::new(Vec::new()),
+                stale_elicitation_nonces: std::sync::Mutex::new(Vec::new()),
             })
         }
         fn with_stale_nonces(nonces: Vec<Nonce>) -> Arc<Self> {
             Arc::new(Self {
                 frames: std::sync::Mutex::new(Vec::new()),
                 stale_nonces: std::sync::Mutex::new(nonces),
+                stale_elicitation_nonces: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+        fn with_stale_elicitation_nonces(nonces: Vec<Nonce>) -> Arc<Self> {
+            Arc::new(Self {
+                frames: std::sync::Mutex::new(Vec::new()),
+                stale_nonces: std::sync::Mutex::new(Vec::new()),
+                stale_elicitation_nonces: std::sync::Mutex::new(nonces),
             })
         }
     }
@@ -2894,6 +2968,9 @@ mod tests {
         }
         fn unresolved_approval_nonces(&self, _session_id: &str) -> Vec<Nonce> {
             self.stale_nonces.lock().unwrap().clone()
+        }
+        fn unresolved_elicitation_nonces(&self, _session_id: &str) -> Vec<Nonce> {
+            self.stale_elicitation_nonces.lock().unwrap().clone()
         }
     }
 
@@ -4737,6 +4814,42 @@ mod tests {
             "seqs must be monotonic, got {:?}",
             frames.iter().map(|f| f.1).collect::<Vec<_>>()
         );
+    }
+
+    /// Orphaned-elicitation sweep publishes one `ElicitationResolved {
+    /// outcome: Cancelled }` per stale nonce so a dead question card does
+    /// not linger on replay. Unlike approvals it emits no synthetic
+    /// `Stopped` (see `cancel_orphaned_elicitations`).
+    #[tokio::test]
+    async fn cancel_orphaned_elicitations_publishes_resolved() {
+        let sink =
+            VecSink::with_stale_elicitation_nonces(vec![Nonce("e-a".into()), Nonce("e-b".into())]);
+        let sup = Supervisor::new(sink.clone());
+        sup.cancel_orphaned_elicitations("s-attach");
+        let frames = sink.frames.lock().unwrap().clone();
+        assert_eq!(
+            frames.len(),
+            2,
+            "expected 2 ElicitationResolved, got {frames:?}"
+        );
+        for (frame, expected) in frames.iter().zip(["e-a", "e-b"]) {
+            match &frame.2 {
+                Event::ElicitationResolved { nonce, outcome } => {
+                    assert_eq!(nonce.0, expected);
+                    assert!(matches!(outcome, ElicitationOutcome::Cancelled));
+                }
+                other => panic!("expected ElicitationResolved, got {other:?}"),
+            }
+        }
+        assert!(frames[0].1 < frames[1].1, "seqs must be monotonic");
+    }
+
+    #[tokio::test]
+    async fn cancel_orphaned_elicitations_noop_when_empty() {
+        let sink = VecSink::new();
+        let sup = Supervisor::new(sink.clone());
+        sup.cancel_orphaned_elicitations("s-attach");
+        assert!(sink.frames.lock().unwrap().is_empty());
     }
 
     /// Empty stale-nonce list must be a no-op: do NOT publish a stray

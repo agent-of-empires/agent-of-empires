@@ -234,21 +234,6 @@ const OPENCODE_MODE_CHOICES = [
 ];
 const opencodeModeBySession = new Map();
 
-// Unstable `session_model` channel (ACP unstable_session_model, #1820).
-// Agents like Claude can advertise their model selector via the
-// SessionModelState field on the session/new (and session/load) response
-// instead of a generic config_option. Tests opt in with
-// FAKE_ACP_EMIT_SESSION_MODEL=1 (usually alongside
-// FAKE_ACP_EMIT_CONFIG_OPTIONS=0 so the unstable channel is the only
-// model source) and drive a switch via the same cockpit/config-option
-// endpoint using the reserved synthetic id, which aoe routes to
-// session/set_model.
-const SESSION_MODEL_CHOICES = [
-  { modelId: "fake-sonnet", name: "Fake Sonnet" },
-  { modelId: "fake-opus", name: "Fake Opus" },
-];
-const sessionModelBySession = new Map();
-
 function makeOpencodeModeOption(currentValue) {
   return {
     id: "mode",
@@ -304,6 +289,33 @@ async function emitSessionUpdates(sessionId, updates) {
       });
       continue;
     }
+    if (u && u.sessionUpdate === "elicitation_request") {
+      // AskUserQuestion rides ACP's form-mode `elicitation/create` request
+      // (not session/update). Translate the scripted entry into a real
+      // request and wait for the client's accept/decline/cancel so the
+      // elicitation spec can observe the card and resolve it.
+      await sendRequest("elicitation/create", {
+        mode: "form",
+        sessionId,
+        message: u.message ?? "Pick one",
+        requestedSchema: u.requestedSchema ?? {
+          type: "object",
+          properties: {
+            question_0: {
+              type: "string",
+              title: u.message ?? "Pick one",
+              oneOf: [
+                { const: "Yes", title: "Yes" },
+                { const: "No", title: "No" },
+              ],
+            },
+          },
+        },
+      }).catch((err) => {
+        process.stderr.write(`[fakeAcpAgent] elicitation/create rejected: ${JSON.stringify(err)}\n`);
+      });
+      continue;
+    }
     sendNotification("session/update", { sessionId, update: u });
     // Inter-update tick so the structured view reducer can apply each event in
     // order rather than batching them. Bumped from 1ms to 5ms after
@@ -333,10 +345,11 @@ const INITIALIZE_RESULT = {
   },
   agentInfo: {
     name: "@agentclientprotocol/claude-agent-acp",
-    // Keep at (or above) the agent_compat floor in src/acp/agent_compat.rs;
-    // the gate rejects the fake's handshake otherwise, which fails every
-    // live Playwright acp spec and the acp live-daemon e2e suite (#2077
-    // bumped the floor without this fixture and broke both).
+    // Keep at (or above) the agent_compat floor in src/acp/agent_compat.rs
+    // (>=0.44.0, the release that routes AskUserQuestion through form
+    // elicitation); the gate rejects the fake's handshake otherwise, which
+    // fails every live Playwright acp spec and the acp live-daemon e2e
+    // suite (#2077 bumped the floor without this fixture and broke both).
     version: "0.44.0",
   },
   // No authMethods key at all. An empty array is interpreted by some
@@ -482,42 +495,7 @@ async function handleRequest(msg) {
         opencodeModeBySession.set(sessionId, current);
         result.configOptions = [...(result.configOptions ?? []), makeOpencodeModeOption(current)];
       }
-      if (process.env.FAKE_ACP_EMIT_SESSION_MODEL === "1") {
-        const current = sessionModelBySession.get(sessionId) ?? SESSION_MODEL_CHOICES[0].modelId;
-        sessionModelBySession.set(sessionId, current);
-        // ACP SessionModelState (camelCase wire shape per
-        // agent-client-protocol-schema unstable_session_model).
-        result.models = {
-          currentModelId: current,
-          availableModels: SESSION_MODEL_CHOICES.map((m) => ({
-            modelId: m.modelId,
-            name: m.name,
-          })),
-        };
-      }
       sendResult(id, result);
-      return;
-    }
-
-    case "session/setModel":
-    case "session/set_model": {
-      // Unstable model-switch channel (#1820). ACP wire method is
-      // `session/set_model` (snake_case); accept both spellings. The
-      // real adapter only acks with no state echo, so aoe synthesizes
-      // the follow-up ConfigOptionsUpdated itself. Tests opt into a
-      // rejection with FAKE_ACP_REJECT_SET_MODEL.
-      const sessionId = params?.sessionId;
-      const modelId = params?.modelId;
-      if (process.env.FAKE_ACP_REJECT_SET_MODEL) {
-        sendError(id, -32000, process.env.FAKE_ACP_REJECT_SET_MODEL);
-        return;
-      }
-      if (!SESSION_MODEL_CHOICES.some((m) => m.modelId === modelId)) {
-        sendError(id, -32000, `model not found: ${modelId}`);
-        return;
-      }
-      if (sessionId) sessionModelBySession.set(sessionId, modelId);
-      sendResult(id, {});
       return;
     }
 

@@ -34,6 +34,19 @@ destructive_require_double_confirm = true
 
 The card clears as soon as your decision is accepted. If it already resolved on the daemon (a concurrent decision or a watchdog), resolving again clears it quietly instead of erroring.
 
+## Questions (AskUserQuestion)
+
+Some agents ask a structured question mid-turn rather than guessing. With `claude-agent-acp` this is the built-in `AskUserQuestion` tool; the daemon advertises the ACP form-elicitation capability so the agent surfaces it as a question card in the web dashboard. The same capability also lets an MCP server attached to the agent collect arbitrary structured input, which renders through the same card:
+
+- **Single-choice** questions render as radio buttons, **multi-choice** as checkboxes, and a free-text "Other" field shows when the agent offers one. When an option carries an explanation, it renders as a second line under the option label.
+- MCP forms can also include **text** fields (typed by their format, so email / URL / date inputs get the matching control), **number** and **integer** fields, and **yes/no** checkboxes. Any field default the agent supplies is pre-filled.
+- **Submit** sends your answers back and the turn continues. **Skip** answers nothing (the agent proceeds without your input). **Cancel** aborts the tool call.
+- Required fields and every constraint the schema declares (selection min/max, text length, regex pattern, numeric range) are enforced before Submit; the daemon re-validates, so a stale or malformed answer never reaches the agent.
+
+The rich question form is web-only. In the native TUI the card shows the question with a pointer to answer it in the web dashboard, plus keys to skip or cancel from the transcript pane so a TUI-only session never stalls on a question.
+
+> AskUserQuestion options can carry a `preview` (a code snippet or mockup shown on focus in the Claude Code CLI/desktop). The `claude-agent-acp` adapter does not forward `preview` over ACP, so it cannot be shown here; this is an adapter limitation, not a dashboard one.
+
 ### Notifications and sound
 
 When an approval lands and you're away from the dashboard, two channels fire:

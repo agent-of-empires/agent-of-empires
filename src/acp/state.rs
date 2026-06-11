@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::approvals::{Approval, ApprovalDecision, Nonce};
+use super::elicitations::{Elicitation, ElicitationOutcome};
 
 /// Identifier for a structured view session. Distinct from `SessionId` in
 /// `src/session/` because structured view sessions are a separate `SessionBackend`.
@@ -351,6 +352,11 @@ pub struct AcpState {
     pub todos: Vec<Todo>,
     pub in_flight_tool: Option<ToolCall>,
     pub pending_approvals: Vec<Approval>,
+    /// Pending `AskUserQuestion` elicitations awaiting a user answer.
+    /// Parallel to `pending_approvals`; cleared on resolution, session
+    /// reset, or clear. See `Event::ElicitationRequested`.
+    #[serde(default)]
+    pub pending_elicitations: Vec<Elicitation>,
     pub recent_diffs: Vec<DiffPreview>,
     pub thinking: Option<ThinkingSignal>,
     pub rate_limit: Option<RateLimitInfo>,
@@ -410,6 +416,7 @@ impl AcpState {
             todos: Vec::new(),
             in_flight_tool: None,
             pending_approvals: Vec::new(),
+            pending_elicitations: Vec::new(),
             recent_diffs: Vec::new(),
             thinking: None,
             rate_limit: None,
@@ -601,6 +608,20 @@ pub enum Event {
     ApprovalResolved {
         nonce: Nonce,
         decision: ApprovalDecision,
+    },
+    /// Agent asked the user a structured question (the ACP
+    /// `AskUserQuestion` tool, surfaced as a form-mode
+    /// `elicitation/create`). The card stays until an
+    /// `ElicitationResolved` with the same nonce arrives.
+    ElicitationRequested {
+        elicitation: Elicitation,
+    },
+    /// An elicitation was answered, skipped, cancelled, or torn down. The
+    /// reducer drops the matching pending card. `outcome` records how it
+    /// ended for replay/debugging.
+    ElicitationResolved {
+        nonce: Nonce,
+        outcome: ElicitationOutcome,
     },
     DiffEmitted {
         diff: DiffPreview,
@@ -911,6 +932,15 @@ impl AcpState {
                     return Err(StateError::ApprovalAlreadyResolved(nonce.clone()));
                 }
             }
+            Event::ElicitationRequested { elicitation } => {
+                self.pending_elicitations.push(elicitation)
+            }
+            // Lenient on the nonce: a resolved/torn-down elicitation can be
+            // re-broadcast (cancel-on-teardown racing a user POST), so a
+            // missing nonce is a harmless no-op rather than a hard error.
+            Event::ElicitationResolved { ref nonce, .. } => {
+                self.pending_elicitations.retain(|e| e.nonce != *nonce);
+            }
             Event::DiffEmitted { diff } => {
                 self.recent_diffs.push(diff);
                 while self.recent_diffs.len() > Self::MAX_RECENT_DIFFS {
@@ -1021,6 +1051,7 @@ impl AcpState {
                 self.current_plan = None;
                 self.mode = SessionMode::Default;
                 self.pending_approvals = Vec::new();
+                self.pending_elicitations = Vec::new();
             }
             Event::ConversationCompacted => {
                 // /compact replaces the model's context with a summary
@@ -1054,6 +1085,7 @@ impl AcpState {
                 self.in_flight_tool = None;
                 self.thinking = None;
                 self.pending_approvals = Vec::new();
+                self.pending_elicitations = Vec::new();
                 self.usage = None;
                 self.available_commands = Vec::new();
                 self.current_plan = None;

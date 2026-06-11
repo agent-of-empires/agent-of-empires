@@ -20,6 +20,7 @@ pub mod agent_registry;
 pub mod approvals;
 pub mod client;
 pub mod context_primer;
+pub mod elicitations;
 pub mod event_store;
 pub mod fs_handler;
 pub mod install_hints;

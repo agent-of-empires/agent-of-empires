@@ -5450,6 +5450,8 @@ fn toggle_favorite_at_cursor_noop_with_no_selection() {
 #[serial]
 fn toggle_archive_at_cursor_round_trip() {
     let mut env = create_test_env_with_sessions(1);
+    // Keep the Archived section expanded so the archived row stays reachable.
+    env.view.archived_section_collapsed = false;
     let id = env.view.instances[0].id.clone();
     env.view.selected_session = Some(id.clone());
 
@@ -5459,6 +5461,10 @@ fn toggle_archive_at_cursor_round_trip() {
     env.view.toggle_archive_at_cursor().unwrap();
     assert!(env.view.instances[0].is_archived());
 
+    // Archiving moved the selection off the row (it advances to the next
+    // active session; here there is none). Navigate back onto the archived
+    // row, as a user would, before toggling it back.
+    env.view.select_session_by_id(&id);
     env.view.toggle_archive_at_cursor().unwrap();
     assert!(!env.view.instances[0].is_archived());
 }
@@ -5472,21 +5478,24 @@ fn toggle_archive_at_cursor_noop_with_no_selection() {
     env.view.toggle_archive_at_cursor().unwrap();
 }
 
-/// Approach 2: archiving in the default (non-Attention) sort keeps the cursor
-/// AND selection on the just-archived session instead of swapping to a
-/// neighbor, and reveals the Archived section so the row stays visible. This is
-/// what lets the preview render the calm "Archived" placeholder for the same
-/// row the user is looking at, rather than flashing a dead-pane warning and
-/// then snapping selection to the session below.
+/// Archiving in the default (non-Attention) sort advances the cursor to the
+/// next active session below instead of following the archived row into the
+/// Archived section. The section is NOT auto-revealed; its header count is
+/// the feedback. The preview follows the new selection through the normal
+/// per-frame retarget (cache gates on session id, worker drops stale frames).
 #[test]
 #[serial]
-fn archive_keeps_selection_and_reveals_section() {
-    let mut env = create_test_env_with_sessions(2);
-    // Start with the Archived section collapsed (the default / reported repro).
+fn archive_advances_cursor_to_next_session() {
+    let mut env = create_test_env_with_sessions(3);
+    // Start with the Archived section collapsed (the default).
     env.view.archived_section_collapsed = true;
     env.view.cursor = 0;
     env.view.update_selected();
     let id = env.view.selected_session.clone().unwrap();
+    let next_id = match env.view.flat_items.get(1) {
+        Some(Item::Session { id, .. }) => id.clone(),
+        other => panic!("expected a session row below the cursor, got {other:?}"),
+    };
 
     env.view.toggle_archive_at_cursor().unwrap();
 
@@ -5496,19 +5505,132 @@ fn archive_keeps_selection_and_reveals_section() {
     );
     assert_eq!(
         env.view.selected_session.as_deref(),
-        Some(id.as_str()),
-        "selection must stay on the archived session, not swap to a neighbor"
+        Some(next_id.as_str()),
+        "selection must advance to the next active session"
     );
     assert!(
-        !env.view.archived_section_collapsed,
-        "archiving must reveal the Archived section so the row stays visible"
+        env.view.archived_section_collapsed,
+        "single-row archive must not auto-reveal the Archived section"
     );
     match env.view.flat_items.get(env.view.cursor) {
         Some(Item::Session { id: cur, .. }) => {
-            assert_eq!(cur, &id, "cursor must land on the archived row")
+            assert_eq!(cur, &next_id, "cursor must sit on the next session's row")
         }
-        _ => panic!("cursor should be on the archived session row"),
+        _ => panic!("cursor should be on the next session row"),
     }
+}
+
+/// Archiving the bottom session has no row below to advance to, so the
+/// cursor falls back to the nearest active session above.
+#[test]
+#[serial]
+fn archive_bottom_row_falls_back_to_session_above() {
+    let mut env = create_test_env_with_sessions(2);
+    env.view.archived_section_collapsed = true;
+    let last = env.view.flat_items.len() - 1;
+    env.view.cursor = last;
+    env.view.update_selected();
+    let id = env.view.selected_session.clone().unwrap();
+    let above_id = match env.view.flat_items.get(last - 1) {
+        Some(Item::Session { id, .. }) => id.clone(),
+        other => panic!("expected a session row above the cursor, got {other:?}"),
+    };
+
+    env.view.toggle_archive_at_cursor().unwrap();
+
+    assert!(env.view.get_instance(&id).unwrap().is_archived());
+    assert_eq!(
+        env.view.selected_session.as_deref(),
+        Some(above_id.as_str()),
+        "with nothing below, selection must land on the session above"
+    );
+}
+
+/// Archiving the only active session leaves nothing to advance to: the
+/// cursor clamps into the remaining list (the Archived section header) and
+/// the selection clears instead of pointing at a vanished row.
+#[test]
+#[serial]
+fn archive_last_active_session_clears_selection() {
+    let mut env = create_test_env_with_sessions(1);
+    env.view.archived_section_collapsed = true;
+    env.view.cursor = 0;
+    env.view.update_selected();
+    let id = env.view.selected_session.clone().unwrap();
+
+    env.view.toggle_archive_at_cursor().unwrap();
+
+    assert!(env.view.get_instance(&id).unwrap().is_archived());
+    assert_eq!(
+        env.view.selected_session, None,
+        "no active session remains, so nothing should be selected"
+    );
+    assert!(
+        env.view.cursor < env.view.flat_items.len(),
+        "cursor must stay clamped inside the rebuilt list"
+    );
+}
+
+/// The successor scan must skip rows already parked under an EXPANDED
+/// Archived section: archiving the last active row with an archived row
+/// visible below clears the selection instead of advancing into the section.
+#[test]
+#[serial]
+fn archive_successor_skips_archived_rows() {
+    let mut env = create_test_env_with_sessions(2);
+    env.view.archived_section_collapsed = false;
+
+    // Park the second session first, so an archived row sits below.
+    let parked_id = match env.view.flat_items.get(1) {
+        Some(Item::Session { id, .. }) => id.clone(),
+        other => panic!("expected a second session row, got {other:?}"),
+    };
+    env.view.select_session_by_id(&parked_id);
+    env.view.toggle_archive_at_cursor().unwrap();
+    assert!(env.view.get_instance(&parked_id).unwrap().is_archived());
+
+    // Archive the remaining active session. The only session row left below
+    // the cursor is the parked one, which must NOT become the selection.
+    let id = env.view.selected_session.clone().unwrap();
+    assert_ne!(
+        id, parked_id,
+        "selection must have fallen back to the active row"
+    );
+    env.view.toggle_archive_at_cursor().unwrap();
+
+    assert!(env.view.get_instance(&id).unwrap().is_archived());
+    assert_eq!(
+        env.view.selected_session, None,
+        "the cursor must not advance onto a row inside the Archived section"
+    );
+}
+
+/// Attention sort: archiving the only active session with the Archived
+/// section collapsed leaves no session row for `select_top_attention` to
+/// land on. Selection must clear (not stay pinned to the invisible archived
+/// row) and the cursor must clamp into the shrunken list.
+#[test]
+#[serial]
+fn archive_last_active_session_attention_sort_clears_selection() {
+    let mut env = create_test_env_with_sessions(1);
+    env.view.sort_order = crate::session::config::SortOrder::Attention;
+    env.view.flat_items = env.view.build_flat_items();
+    env.view.archived_section_collapsed = true;
+    env.view.cursor = 0;
+    env.view.update_selected();
+    let id = env.view.selected_session.clone().unwrap();
+
+    env.view.toggle_archive_at_cursor().unwrap();
+
+    assert!(env.view.get_instance(&id).unwrap().is_archived());
+    assert_eq!(
+        env.view.selected_session, None,
+        "selection must not point at the archived row hidden in the collapsed section"
+    );
+    assert!(
+        env.view.cursor < env.view.flat_items.len(),
+        "cursor must stay clamped inside the rebuilt list"
+    );
 }
 
 /// Restoring with `z` unarchives the row and keeps it selected, following it
@@ -5526,6 +5648,9 @@ fn unarchive_keeps_selection() {
     env.view.toggle_archive_at_cursor().unwrap();
     assert!(env.view.get_instance(&id).unwrap().is_archived());
 
+    // The archive advanced the cursor to the neighbor; navigate back onto
+    // the archived row (visible because the section is expanded) to restore.
+    env.view.select_session_by_id(&id);
     env.view.toggle_archive_at_cursor().unwrap();
     assert!(
         !env.view.get_instance(&id).unwrap().is_archived(),

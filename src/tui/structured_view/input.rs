@@ -31,6 +31,12 @@ pub enum Intent {
     Scroll(i32),
     /// Resolve the focused approval card.
     ResolveApproval(ApprovalDecisionWire),
+    /// Skip the oldest pending elicitation (ACP `decline`): the agent
+    /// continues with no answer. The rich answer form is web-only.
+    SkipElicitation,
+    /// Cancel the oldest pending elicitation (ACP `cancel`): aborts the
+    /// agent's tool call.
+    CancelElicitation,
     /// Cancel the in-flight prompt (Ctrl-C style).
     CancelInFlight,
     /// Drop every queued (not-yet-sent) prompt.
@@ -65,6 +71,10 @@ pub enum Intent {
 #[derive(Debug, Clone, Copy)]
 pub struct InputContext {
     pub has_pending_approval: bool,
+    /// A pending `AskUserQuestion` elicitation exists. Gates the
+    /// transcript-focus skip/cancel keys; the answer form itself is
+    /// web-only.
+    pub has_pending_elicitation: bool,
     pub slash_picker_open: bool,
     pub mention_picker_open: bool,
 }
@@ -96,7 +106,9 @@ pub fn dispatch(focus: Focus, key: &KeyEvent, ctx: InputContext) -> Intent {
 
     match focus {
         Focus::Composer => composer_keys(key, ctx.slash_picker_open, ctx.mention_picker_open),
-        Focus::Transcript => transcript_keys(key, ctx.has_pending_approval),
+        Focus::Transcript => {
+            transcript_keys(key, ctx.has_pending_approval, ctx.has_pending_elicitation)
+        }
         Focus::Approval => approval_keys(key),
     }
 }
@@ -153,8 +165,21 @@ fn composer_keys(key: &KeyEvent, slash_picker_open: bool, mention_picker_open: b
     }
 }
 
-fn transcript_keys(key: &KeyEvent, has_pending_approval: bool) -> Intent {
+fn transcript_keys(
+    key: &KeyEvent,
+    has_pending_approval: bool,
+    has_pending_elicitation: bool,
+) -> Intent {
     match (key.modifiers, key.code) {
+        // Skip / cancel a pending elicitation (web-only answer form; the
+        // TUI offers only these two escapes). Gated on a pending
+        // elicitation so `s`/`c` stay free otherwise.
+        (m, KeyCode::Char('s')) if m.is_empty() && has_pending_elicitation => {
+            Intent::SkipElicitation
+        }
+        (m, KeyCode::Char('c')) if m.is_empty() && has_pending_elicitation => {
+            Intent::CancelElicitation
+        }
         // Exit / dismiss.
         (m, KeyCode::Esc) if m.is_empty() => Intent::Exit,
         // Switch to composer.
@@ -215,6 +240,7 @@ mod tests {
     fn ctx() -> InputContext {
         InputContext {
             has_pending_approval: false,
+            has_pending_elicitation: false,
             slash_picker_open: false,
             mention_picker_open: false,
         }
@@ -223,6 +249,7 @@ mod tests {
     fn ctx_pending() -> InputContext {
         InputContext {
             has_pending_approval: true,
+            has_pending_elicitation: false,
             slash_picker_open: false,
             mention_picker_open: false,
         }
@@ -231,6 +258,7 @@ mod tests {
     fn ctx_picker() -> InputContext {
         InputContext {
             has_pending_approval: false,
+            has_pending_elicitation: false,
             slash_picker_open: true,
             mention_picker_open: false,
         }
@@ -239,6 +267,7 @@ mod tests {
     fn ctx_mention() -> InputContext {
         InputContext {
             has_pending_approval: false,
+            has_pending_elicitation: false,
             slash_picker_open: false,
             mention_picker_open: true,
         }
@@ -295,6 +324,51 @@ mod tests {
         assert!(matches!(
             dispatch(Focus::Approval, &key(KeyCode::Char('d')), ctx_pending()),
             Intent::ResolveApproval(ApprovalDecisionWire::Deny)
+        ));
+    }
+
+    fn ctx_pending_elicitation() -> InputContext {
+        InputContext {
+            has_pending_approval: false,
+            has_pending_elicitation: true,
+            slash_picker_open: false,
+            mention_picker_open: false,
+        }
+    }
+
+    #[test]
+    fn elicitation_skip_cancel_keys_gated_on_pending() {
+        // s / c resolve a pending elicitation from transcript focus.
+        assert_eq!(
+            dispatch(
+                Focus::Transcript,
+                &key(KeyCode::Char('s')),
+                ctx_pending_elicitation()
+            ),
+            Intent::SkipElicitation
+        );
+        assert_eq!(
+            dispatch(
+                Focus::Transcript,
+                &key(KeyCode::Char('c')),
+                ctx_pending_elicitation()
+            ),
+            Intent::CancelElicitation
+        );
+        // Without a pending elicitation, s / c are not elicitation intents
+        // (c falls through to Ignore, s likewise) so they stay free.
+        assert!(!matches!(
+            dispatch(Focus::Transcript, &key(KeyCode::Char('s')), ctx()),
+            Intent::SkipElicitation
+        ));
+        // From the composer they must type, never resolve.
+        assert!(matches!(
+            dispatch(
+                Focus::Composer,
+                &key(KeyCode::Char('s')),
+                ctx_pending_elicitation()
+            ),
+            Intent::Compose(_)
         ));
     }
 

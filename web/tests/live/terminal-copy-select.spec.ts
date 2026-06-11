@@ -75,7 +75,11 @@ base("plain drag-select copies terminal text to the clipboard", async ({ page, c
       const box = await term.boundingBox();
       if (!box) return "";
       await page.evaluate(() => navigator.clipboard.writeText(""));
-      const startX = box.x + Math.min(12, box.width * 0.1);
+      // Start inside the first column. The terminal now sits flush to the
+      // panel edge (no .xterm padding), so the first character is at x≈0; a
+      // larger inset would start the drag on the second column and drop the
+      // leading character of the marker.
+      const startX = box.x + 3;
       const startY = box.y + box.height * 0.7;
       await page.mouse.move(startX, startY);
       await page.mouse.down();

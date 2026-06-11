@@ -26,8 +26,8 @@ mod telemetry;
 pub use acp::{
     acp_attachment, acp_cancel, acp_context_primer, acp_disable, acp_enable, acp_files,
     acp_force_end_turn, acp_prompt, acp_prompt_diff_comments, acp_replay, acp_set_config_option,
-    acp_set_mode, acp_worker_log, list_acp_agents, resolve_approval, shutdown_acp, spawn_acp,
-    switch_acp_agent,
+    acp_set_mode, acp_worker_log, list_acp_agents, resolve_approval, resolve_elicitation,
+    shutdown_acp, spawn_acp, switch_acp_agent,
 };
 
 #[cfg(feature = "serve")]
@@ -39,17 +39,18 @@ pub use projects::{create_project, delete_project, list_projects, update_project
 pub use sessions::{
     create_session, delete_session, ensure_container_terminal, ensure_session, ensure_terminal,
     list_sessions, preview_volume_ignores_globs, read_output, rename_session, send_message,
-    session_diff_file, session_diff_files, set_worktree_name, update_session_archive,
-    update_session_diff_base, update_session_group, update_session_notifications,
-    update_session_pin, update_session_snooze, update_workspace_ordering, CleanupDefaults,
-    OutputQuery, SendMessageRequest, SessionResponse,
+    session_diff_file, session_diff_files, set_worktree_name, start_session, stop_session,
+    update_session_archive, update_session_diff_base, update_session_group,
+    update_session_notifications, update_session_pin, update_session_snooze,
+    update_workspace_ordering, CleanupDefaults, OutputQuery, SendMessageRequest, SessionResponse,
 };
 pub use system::{
-    browse_filesystem, create_profile, default_profile, delete_profile, docker_status,
-    filesystem_home, get_about, get_current_theme, get_profile_settings, get_resolved_theme,
-    get_settings, get_settings_schema, get_update_status, list_agents, list_groups, list_profiles,
-    list_sounds, list_themes, mark_volume_ignores_globs_acknowledged, mark_web_tour_seen,
-    rename_profile, serve_sound_file, update_profile_settings, update_settings, update_theme,
+    browse_filesystem, create_profile, default_profile, delete_profile, dismiss_update,
+    docker_status, filesystem_home, get_about, get_current_theme, get_profile_settings,
+    get_resolved_theme, get_settings, get_settings_schema, get_update_status, get_web_ui_state,
+    list_agents, list_groups, list_profiles, list_sounds, list_themes,
+    mark_volume_ignores_globs_acknowledged, mark_web_tour_seen, patch_web_ui_state, rename_profile,
+    serve_sound_file, update_profile_settings, update_settings, update_theme,
 };
 pub use telemetry::{
     get_telemetry_status, post_telemetry_seen, post_telemetry_structured_interaction,
@@ -159,6 +160,8 @@ mod tests {
                     "update_session_pin",
                     "update_session_archive",
                     "update_session_snooze",
+                    "stop_session",
+                    "start_session",
                     "update_workspace_ordering",
                 ],
             ),
@@ -183,6 +186,8 @@ mod tests {
                 include_str!("system.rs"),
                 &[
                     "update_settings",
+                    "dismiss_update",
+                    "patch_web_ui_state",
                     "mark_web_tour_seen",
                     "mark_volume_ignores_globs_acknowledged",
                     "create_profile",
@@ -207,6 +212,7 @@ mod tests {
                     "acp_set_mode",
                     "acp_set_config_option",
                     "resolve_approval",
+                    "resolve_elicitation",
                 ],
             ),
             (
@@ -307,6 +313,8 @@ mod tests {
                     "update_session_pin",
                     "update_session_archive",
                     "update_session_snooze",
+                    "stop_session",
+                    "start_session",
                     "update_workspace_ordering",
                 ],
             ),
@@ -331,6 +339,8 @@ mod tests {
                 include_str!("system.rs"),
                 &[
                     "update_settings",
+                    "dismiss_update",
+                    "patch_web_ui_state",
                     "create_profile",
                     "delete_profile",
                     "rename_profile",
@@ -353,6 +363,7 @@ mod tests {
                     "acp_set_mode",
                     "acp_set_config_option",
                     "resolve_approval",
+                    "resolve_elicitation",
                 ],
             ),
             (

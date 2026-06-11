@@ -18,6 +18,7 @@ import {
   type AcpAttachment,
   type AcpFrame,
   type AcpState,
+  type ElicitationResolution,
   type PromptAttachmentInput,
   type QueuedPrompt,
 } from "../lib/acpTypes";
@@ -51,6 +52,7 @@ export type Action =
   | { kind: "error"; message: string }
   | { kind: "clear_error" }
   | { kind: "approval_resolved_locally"; nonce: string }
+  | { kind: "elicitation_resolved_locally"; nonce: string }
   | { kind: "lagged_resolved" }
   | { kind: "reset" }
   | { kind: "hydrate"; state: AcpState }
@@ -189,6 +191,7 @@ function persistState(sessionId: string, state: AcpState): void {
 // driving the full hook lifecycle. Not part of the public API.
 export const __test = {
   persistState,
+  loadPersistedState,
   evictOldestPersistedAcpState,
   STORAGE_KEY_PREFIX,
 };
@@ -211,10 +214,13 @@ function loadPersistedState(sessionId: string): AcpState | undefined {
       window.localStorage.removeItem(storageKey(sessionId));
       return undefined;
     }
-    // Backfill the seq-counter pair introduced by #1170 for entries
-    // persisted before the schema change; see `normaliseTurnCounters`
-    // for the rules.
-    return normaliseTurnCounters(state as AcpState);
+    // Merge over the current defaults so an entry persisted by an older
+    // bundle gains any fields added since (e.g. `pendingElicitations`);
+    // without this the new code reads `undefined` for a freshly-added
+    // array and crashes on `.map`. Then backfill the seq-counter pair
+    // introduced by #1170; see `normaliseTurnCounters` for the rules.
+    const merged: AcpState = { ...emptyAcpState(), ...(state as AcpState) };
+    return normaliseTurnCounters(merged);
   } catch {
     return undefined;
   }
@@ -385,6 +391,26 @@ export function classifyApprovalResolveResponse(
   };
 }
 
+/** Classify an elicitation-resolve response. Mirrors
+ *  `classifyApprovalResolveResponse`: a 204 or a 404 naming *this* nonce
+ *  (the question already resolved or was torn down server-side) both clear
+ *  the card; anything else surfaces an error. */
+export function classifyElicitationResolveResponse(
+  ok: boolean,
+  status: number,
+  detail: string,
+  nonce: string,
+): ApprovalResolveOutcome {
+  if (ok) return { kind: "resolved" };
+  if (status === 404 && /no pending elicitation/i.test(detail) && detail.includes(nonce)) {
+    return { kind: "resolved" };
+  }
+  return {
+    kind: "error",
+    message: `Could not resolve question (${status}). ${detail}`.trim(),
+  };
+}
+
 export function reducer(state: AcpState, action: Action): AcpState {
   if (action.kind === "frame") {
     return applyEvent(state, action.frame);
@@ -417,6 +443,18 @@ export function reducer(state: AcpState, action: Action): AcpState {
       ...state,
       lastError: removed ? null : state.lastError,
       pendingApprovals,
+    };
+  }
+  if (action.kind === "elicitation_resolved_locally") {
+    // Optimistically drop the elicitation card once the server accepts the
+    // resolution (204) or reports the nonce gone (404), instead of waiting
+    // on the ElicitationResolved broadcast, which the seq dedupe can drop.
+    const pendingElicitations = state.pendingElicitations.filter((e) => e.nonce !== action.nonce);
+    const removed = pendingElicitations.length !== state.pendingElicitations.length;
+    return {
+      ...state,
+      lastError: removed ? null : state.lastError,
+      pendingElicitations,
     };
   }
   if (action.kind === "hydrate") {
@@ -1135,6 +1173,43 @@ export function useAcpSession(
     [sessionId],
   );
 
+  const resolveElicitation = useCallback(
+    async (nonce: string, resolution: ElicitationResolution) => {
+      if (!sessionId) return;
+      let res: Response;
+      try {
+        res = await fetch(
+          `/api/sessions/${encodeURIComponent(sessionId)}/acp/elicitations/${encodeURIComponent(nonce)}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(resolution),
+          },
+        );
+      } catch (e) {
+        dispatch({
+          kind: "error",
+          message: `Network error resolving question: ${describeError(e)}`,
+        });
+        // Rethrow so the card re-enables (it can be resubmitted).
+        throw e;
+      }
+      const detail = res.ok ? "" : await safeText(res);
+      const outcome = classifyElicitationResolveResponse(res.ok, res.status, detail, nonce);
+      if (outcome.kind === "resolved") {
+        dispatch({ kind: "elicitation_resolved_locally", nonce });
+        return;
+      }
+      // A validation rejection (422) leaves the elicitation pending
+      // server-side, so surface the reason and rethrow: the card resets to
+      // its editable state and the user can correct and resubmit the same
+      // nonce instead of the question being stranded. See #2100.
+      dispatch({ kind: "error", message: outcome.message });
+      throw new Error(outcome.message);
+    },
+    [sessionId],
+  );
+
   // Dispatch a prompt immediately, no queueing. Internal helper used by
   // both sendPrompt (when the turn is idle) and the drain effect below
   // (when popping the head of queuedPrompts on Stopped). The result tells
@@ -1624,6 +1699,7 @@ export function useAcpSession(
      *  transcript and the recovery framing are honest). See #1106. */
     hasEverOpened,
     resolveApproval,
+    resolveElicitation,
     sendPrompt,
     cancelPrompt,
     forceEndTurn,

@@ -25,6 +25,15 @@ interface Props {
    *  `ServerAbout.build_flavor === "debug"`. See #1055. */
   isDevBuild: boolean;
   onGoDashboard: () => void;
+  /** When true (desktop, sidebar open, not in a full-width settings/projects
+   *  view), the header's left zone widens to match the sidebar column and the
+   *  divider runs vertically through the header instead of a bottom border, so
+   *  the top-left of the header reads as part of the sidebar. */
+  sidebarColumnVisible: boolean;
+  /** Mirror of `sidebarColumnVisible` for the right side: when the right panel
+   *  column is showing (desktop, active session, not collapsed), the header's
+   *  right zone widens to match it and the divider runs up through the header. */
+  rightColumnVisible: boolean;
 }
 
 export function TopBar({
@@ -42,6 +51,8 @@ export function TopBar({
   isOffline,
   isDevBuild,
   onGoDashboard,
+  sidebarColumnVisible,
+  rightColumnVisible,
 }: Props) {
   const overflowItems = useMemo<OverflowItem[]>(() => {
     const items: OverflowItem[] = [
@@ -54,12 +65,15 @@ export function TopBar({
   }, [onOpenHelp, onStartTutorial, onOpenAbout, onLogout, loginRequired]);
 
   return (
-    <header
-      {...tourAnchor(TOUR_ANCHORS.topbar)}
-      className="h-12 bg-surface-800 border-b border-surface-700/20 flex items-center px-3 shrink-0 gap-2"
-    >
-      {/* LEFT ZONE */}
-      <div className="flex items-center gap-2 min-w-0 shrink-0">
+    <header {...tourAnchor(TOUR_ANCHORS.topbar)} className="h-12 bg-surface-850 flex items-stretch shrink-0">
+      {/* LEFT ZONE — widens to the sidebar column when it's visible so the
+          divider runs vertically through the header instead of cutting across
+          it; otherwise it keeps the shared bottom border like the rest. */}
+      <div
+        className={`flex items-center gap-2 px-3 min-w-0 shrink-0 border-b border-surface-700/60 ${
+          sidebarColumnVisible ? "md:w-[var(--aoe-sidebar-width)] md:bg-surface-800 md:border-b-0 md:border-r" : ""
+        }`}
+      >
         <button
           onClick={onToggleSidebar}
           className="w-8 h-8 flex items-center justify-center cursor-pointer rounded-md transition-colors text-text-dim hover:text-text-secondary hover:bg-surface-700/50"
@@ -91,13 +105,22 @@ export function TopBar({
         </button>
       </div>
 
-      {/* CENTER ZONE — palette trigger */}
-      <div className="flex-1 flex justify-center px-2">
-        <PaletteTriggerPill onClick={onOpenPalette} />
+      {/* CENTER ZONE — palette trigger; carries the bottom border across the
+          middle, between the two column-aligned zones. */}
+      <div className="flex-1 flex items-center px-3 min-w-0 border-b border-surface-700/60">
+        <div className="flex-1 flex justify-center px-2">
+          <PaletteTriggerPill onClick={onOpenPalette} />
+        </div>
       </div>
 
-      {/* RIGHT ZONE */}
-      <div className="flex items-center gap-1.5 shrink-0">
+      {/* RIGHT ZONE — widens to the right-panel column when it's visible so the
+          divider runs vertically through the header instead of cutting across
+          it; otherwise it keeps the shared bottom border like the rest. */}
+      <div
+        className={`flex items-center justify-end gap-1.5 px-3 shrink-0 border-b border-surface-700/60 ${
+          rightColumnVisible ? "md:w-[var(--aoe-right-panel-width)] md:border-b-0 md:border-l" : ""
+        }`}
+      >
         {isDevBuild && (
           <span
             className="font-mono text-[11px] px-1.5 py-0.5 rounded-full bg-status-waiting/15 text-status-waiting ring-1 ring-status-waiting/30"

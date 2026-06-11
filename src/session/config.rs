@@ -693,6 +693,17 @@ pub struct AppStateConfig {
     /// shelved session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_section_collapsed: Option<bool>,
+
+    /// Server-side mirror of the web dashboard's syncable UI state, keyed by
+    /// the frontend's localStorage key (the value is the opaque string the
+    /// browser stored). Single-tenant: there is one user, so these prefs
+    /// (sidebar sort/axis, tool density, repo appearance/order, group collapse,
+    /// last-used tool, welcome-seen, etc.) live here so they follow the user
+    /// across browsers and devices instead of being trapped in per-browser
+    /// localStorage. The server never interprets the values; the web owns the
+    /// shape. See `GET`/`PATCH /api/app-state/web-ui-state`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub web_ui_state: std::collections::BTreeMap<String, String>,
 }
 
 /// Session-related configuration defaults
@@ -2056,12 +2067,12 @@ impl Config {
     }
 
     /// Effective theme name to paint, mapping the empty default to the
-    /// `default` builtin. Theme is a global preference (see
+    /// `zinc` builtin (the default theme). Theme is a global preference (see
     /// [`resolve_theme_name`]); callers read it from the global config, never
     /// the profile-merged config.
     pub fn effective_theme_name(&self) -> String {
         if self.theme.name.is_empty() {
-            "default".to_string()
+            "zinc".to_string()
         } else {
             self.theme.name.clone()
         }
@@ -2097,7 +2108,7 @@ pub fn save_config(config: &Config) -> Result<()> {
 /// the global theme on others let a per-profile override (which the web theme
 /// picker used to write) shadow the global pick on every Settings open/close,
 /// flipping the theme until the next restart. An empty name maps to the
-/// `default` builtin, matching the web dashboard's empty-name fallback.
+/// `zinc` builtin, matching the web dashboard's empty-name fallback.
 pub fn resolve_theme_name() -> String {
     Config::load_or_warn().effective_theme_name()
 }

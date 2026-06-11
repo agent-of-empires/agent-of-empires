@@ -442,6 +442,177 @@ pub async fn mark_web_tour_seen(State(state): State<Arc<AppState>>) -> impl Into
     }
 }
 
+#[derive(serde::Deserialize)]
+pub struct DismissUpdateBody {
+    pub version: String,
+}
+
+/// Records that the user dismissed the update banner for a specific version,
+/// persisting to the shared `app_state.dismissed_update_version` so the
+/// dismissal sticks across devices (and matches the TUI's snooze) rather than
+/// living in per-browser localStorage. Single-purpose write mirroring
+/// [`mark_web_tour_seen`]: exempt from the elevation wall, still blocked by
+/// `read_only`, and uses `Config::load()` so a corrupt config is not silently
+/// replaced with defaults.
+pub async fn dismiss_update(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<DismissUpdateBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(
+                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
+            ),
+        )
+            .into_response();
+    }
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(rej) => return rej.into_response(),
+    };
+    let version = body.version;
+    let persisted = version.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut config = crate::session::Config::load()?;
+        config.app_state.dismissed_update_version = Some(persisted);
+        crate::session::save_config(&config)?;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"dismissed_version": version})),
+        )
+            .into_response(),
+        Ok(Err(e)) => {
+            tracing::warn!(target: "http.api.system", "Dismissing update failed: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "save_failed", "message": "Failed to persist dismissal"})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!(target: "http.api.system", "Dismissing update panicked: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Return the web dashboard's server-side UI-state blob (`app_state.web_ui_state`):
+/// a flat map of the frontend's localStorage keys to their opaque string values.
+/// Single-tenant, so this is the one user's synced prefs. GET is unauthenticated
+/// beyond the normal token wall (it grants no capability and exposes only UI
+/// preferences).
+pub async fn get_web_ui_state(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
+    let result = tokio::task::spawn_blocking(|| {
+        let config = crate::session::Config::load()?;
+        Ok::<_, anyhow::Error>(config.app_state.web_ui_state)
+    })
+    .await;
+    match result {
+        Ok(Ok(map)) => (StatusCode::OK, Json(serde_json::json!(map))).into_response(),
+        // Best-effort: an unreadable config yields an empty blob rather than an
+        // error, so the dashboard just falls back to its localStorage cache.
+        _ => (StatusCode::OK, Json(serde_json::json!({}))).into_response(),
+    }
+}
+
+/// Merge a partial update into `app_state.web_ui_state`. The body is a flat JSON
+/// object keyed by the frontend's localStorage keys: a string value sets the
+/// key, `null` deletes it. Mirrors [`mark_web_tour_seen`]'s exemptions (off the
+/// elevation wall, still blocked by `read_only`, `Config::load()` to avoid
+/// clobbering a corrupt config). Non-string, non-null values are ignored since
+/// localStorage values are always strings.
+pub async fn patch_web_ui_state(
+    State(state): State<Arc<AppState>>,
+    body: Result<
+        Json<serde_json::Map<String, serde_json::Value>>,
+        axum::extract::rejection::JsonRejection,
+    >,
+) -> impl IntoResponse {
+    if state.read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(
+                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
+            ),
+        )
+            .into_response();
+    }
+    let Json(patch) = match body {
+        Ok(b) => b,
+        Err(rej) => return rej.into_response(),
+    };
+
+    // Values must be string (set) or null (delete); reject anything else
+    // explicitly so a client regression surfaces instead of silently dropping
+    // part of the sync.
+    let invalid: Vec<&String> = patch
+        .iter()
+        .filter(|(_, v)| !v.is_string() && !v.is_null())
+        .map(|(k, _)| k)
+        .collect();
+    if !invalid.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid_value_type",
+                "message": "web UI state values must be string or null",
+                "keys": invalid,
+            })),
+        )
+            .into_response();
+    }
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut config = crate::session::Config::load()?;
+        for (key, value) in patch {
+            match value {
+                serde_json::Value::Null => {
+                    config.app_state.web_ui_state.remove(&key);
+                }
+                serde_json::Value::String(s) => {
+                    config.app_state.web_ui_state.insert(key, s);
+                }
+                // Already rejected above; keep exhaustive for safety.
+                _ => {}
+            }
+        }
+        crate::session::save_config(&config)?;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
+        Ok(Err(e)) => {
+            tracing::warn!(target: "http.api.system", "Persisting web UI state failed: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "save_failed", "message": "Failed to persist UI state"})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!(target: "http.api.system", "Persisting web UI state panicked: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// Records that the user has acknowledged glob `volume_ignores` snapshot
 /// expansion (#2045), so the new-session wizard's confirm modal is shown once
 /// and never again. Single-purpose write mirroring [`mark_web_tour_seen`]: it
@@ -530,14 +701,14 @@ pub async fn get_resolved_theme(
             "GET /api/themes/{{name}} rejected: name exceeds {} bytes",
             MAX_THEME_NAME_LEN,
         );
-        return Json(crate::tui::styles::resolve_theme("default"));
+        return Json(crate::tui::styles::resolve_theme("zinc"));
     }
     tracing::debug!(theme = %name, "GET /api/themes/{{name}}");
     let resolved = tokio::task::spawn_blocking(move || crate::tui::styles::resolve_theme(&name))
         .await
         .unwrap_or_else(|e| {
             tracing::warn!(error = %e, "theme resolve task panicked, falling back to default");
-            crate::tui::styles::resolve_theme("default")
+            crate::tui::styles::resolve_theme("zinc")
         });
     Json(resolved)
 }
@@ -559,7 +730,7 @@ pub async fn get_current_theme(
     .await
     .unwrap_or_else(|e| {
         tracing::warn!(error = %e, "current theme resolve task panicked, falling back to default");
-        crate::tui::styles::resolve_theme("default")
+        crate::tui::styles::resolve_theme("zinc")
     });
     Json(resolved)
 }
@@ -894,6 +1065,11 @@ pub struct UpdateStatusResponse {
     /// hidden until a successful poll. The error is exposed so the
     /// settings UI can surface a one-liner if useful later.
     pub error: Option<String>,
+    /// The version the user has already dismissed the update banner for,
+    /// from the shared `app_state.dismissed_update_version`. Server-side so a
+    /// dismissal sticks across devices and matches the TUI (#release-notes
+    /// should only be acknowledged once, not per browser).
+    pub dismissed_version: Option<String>,
 }
 
 pub async fn get_update_status(State(state): State<Arc<AppState>>) -> Json<UpdateStatusResponse> {
@@ -910,6 +1086,7 @@ pub async fn get_update_status(State(state): State<Arc<AppState>>) -> Json<Updat
             release_url: None,
             web_poll_interval_minutes: cfg.updates.web_poll_interval_minutes,
             error: None,
+            dismissed_version: cfg.app_state.dismissed_update_version.clone(),
         });
     }
 
@@ -932,6 +1109,7 @@ pub async fn get_update_status(State(state): State<Arc<AppState>>) -> Json<Updat
                 release_url,
                 web_poll_interval_minutes: cfg.updates.web_poll_interval_minutes,
                 error: None,
+                dismissed_version: cfg.app_state.dismissed_update_version.clone(),
             })
         }
         Err(e) => Json(UpdateStatusResponse {
@@ -942,6 +1120,7 @@ pub async fn get_update_status(State(state): State<Arc<AppState>>) -> Json<Updat
             release_url: None,
             web_poll_interval_minutes: cfg.updates.web_poll_interval_minutes,
             error: Some(e.to_string()),
+            dismissed_version: cfg.app_state.dismissed_update_version.clone(),
         }),
     }
 }

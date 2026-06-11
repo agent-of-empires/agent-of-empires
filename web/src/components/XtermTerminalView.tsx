@@ -131,7 +131,7 @@ export function XtermTerminalView({ session, active = true }: Props) {
   }
 
   return (
-    <div className="flex-1 flex flex-col overflow-hidden relative md:bg-surface-800 md:pb-1.5">
+    <div className="flex-1 flex flex-col overflow-hidden relative">
       <TerminalConnectionBanners
         connected={state.connected}
         reconnecting={state.reconnecting}
@@ -143,7 +143,7 @@ export function XtermTerminalView({ session, active = true }: Props) {
 
       <div
         data-term="agent"
-        className={`flex-1 overflow-hidden bg-surface-950 relative md:rounded-lg term-panel${termFocused ? " term-focused" : ""}`}
+        className={`flex-1 overflow-hidden bg-[var(--term-bg)] relative term-panel${termFocused ? " term-focused" : ""}`}
         onFocus={() => setTermFocused(true)}
         onBlur={() => setTermFocused(false)}
       >

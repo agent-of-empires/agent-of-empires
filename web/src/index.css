@@ -39,13 +39,13 @@
 
 @import "tailwindcss";
 
-/* Build-time fallback palette. Mirrors the `default` builtin theme
-   (themes/builtin/default.toml) so the cold-load paint, before
+/* Build-time fallback palette. Mirrors the `zinc` builtin theme
+   (themes/builtin/zinc.toml) so the cold-load paint, before
    useResolvedTheme has fetched and applied the user's selection,
-   matches the resolved palette for default. Keep these values in
+   matches the resolved palette for zinc. Keep these values in
    sync with that TOML file. */
 @theme {
-  /* Brand, derived from default.accent */
+  /* Brand, derived from zinc.accent */
   --color-brand-100: #fdecce;
   --color-brand-200: #fcddaa;
   --color-brand-300: #faca79;
@@ -62,7 +62,7 @@
   --color-accent-600: #0d9488;
   --color-accent-700: #0f766e;
 
-  /* Surfaces, derived from default.background and border */
+  /* Surfaces, derived from zinc.background and border */
   --color-surface-500: #65656b;
   --color-surface-600: #525258;
   --color-surface-700: #3f3f46;
@@ -104,7 +104,7 @@
 
   /* Extended semantic tokens populated by the resolved theme
      projection (see src/tui/styles/resolved.rs). These build-time
-     defaults match the `default` builtin theme so cold-load paint
+     defaults match the `zinc` builtin theme so cold-load paint
      matches the post-fetch paint when no localStorage cache exists. */
   --color-selection: #3f3f46;
   --color-session-selection: #52525b;
@@ -119,10 +119,9 @@
   /* Embedded terminal cold-load defaults. useResolvedTheme refetches
      and overrides these once the resolved palette lands; the terminal
      hook reads them on construction and on `aoe:theme-changed` to
-     build xterm.js's ITheme. These match the `default` builtin
+     build xterm.js's ITheme. These match the `zinc` builtin
      projected by src/tui/styles/resolved.rs::terminal_projection so
-     the pre-fetch paint matches the post-fetch paint for the default
-     theme. */
+     the pre-fetch paint matches the post-fetch paint for the zinc theme. */
   --term-bg: #1c1c1f;
   --term-fg: #e4e4e7;
   --term-cursor: #f59e0b;
@@ -166,6 +165,13 @@ html {
      making the document taller than the viewport (which lets iOS scroll
      the page when the keyboard opens, breaking keyboard-height math). */
   --safe-area-bottom: env(safe-area-inset-bottom, 0px);
+  /* Live sidebar width, published by WorkspaceSidebar so the TopBar's left
+     zone can match the column and extend the divider up through the header.
+     Default mirrors WorkspaceSidebar's DEFAULT_WIDTH. */
+  --aoe-sidebar-width: 280px;
+  /* Live right-panel width, published by ContentSplit for the symmetric
+     treatment on the right. Default mirrors ContentSplit's DEFAULT_DIFF_WIDTH. */
+  --aoe-right-panel-width: 380px;
 }
 
 body {
@@ -397,7 +403,10 @@ select:focus-visible,
    on small touches that haven't yet crossed our gesture-lock
    threshold. */
 .xterm {
-  padding: 4px 8px;
+  /* No padding: an inset gutter shows the panel's --term-bg around the
+     viewport, which reads as a frame whenever the running program paints
+     its own background across the rows. Flush to the panel edge instead. */
+  padding: 0;
   border-radius: 0;
   box-shadow: none;
   overflow: hidden;

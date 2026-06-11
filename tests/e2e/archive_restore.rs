@@ -40,10 +40,12 @@ fn install_persistent_claude(h: &mut TuiTestHarness) {
 
 /// Drive a full archive -> unarchive cycle through the real TUI.
 ///
-/// Verifies the user-visible contract end to end: archiving keeps the row
-/// selected (its calm "Archived" placeholder is what the preview shows, even
-/// with another session present to swap to) and reveals the Archived section;
-/// unarchiving brings the row back to the active list and keeps it selected.
+/// Verifies the user-visible contract end to end: archiving advances the
+/// cursor to the next active session (the preview follows it; no "parked"
+/// placeholder for a row the user just dismissed) while the collapsed
+/// Archived section header appears with the count as feedback; navigating
+/// into the section and unarchiving brings the row back to the active list
+/// and keeps it selected.
 #[test]
 #[serial]
 fn test_archive_then_unarchive_cycle() {
@@ -53,8 +55,7 @@ fn test_archive_then_unarchive_cycle() {
     install_persistent_claude(&mut h);
 
     let project = h.project_path();
-    // Two sessions so "selection stays on the archived row" is meaningful: the
-    // pre-fix bug swapped the selection to the neighbour below.
+    // Two sessions so "cursor advances to the neighbour" is meaningful.
     seed_sessions(
         &h,
         project.to_str().unwrap(),
@@ -70,23 +71,31 @@ fn test_archive_then_unarchive_cycle() {
 
     // Archive the selected session.
     h.send_keys("z");
-    h.wait_for("Archived");
+    h.wait_for("Archived (");
     let after_archive = h.capture_screen();
 
-    // The calm placeholder proves the archived session is still the selected
-    // preview target (it did not swap to Neighbor) and the Archived section
-    // was revealed.
+    // The selection advanced to Neighbor, so the preview must NOT render the
+    // archived "parked" placeholder; the collapsed Archived section header
+    // (with its count) is the only trace of the dismissed row.
     assert!(
-        after_archive.contains("is parked"),
-        "archived preview should explain the parked state for the still-selected row\n{after_archive}"
-    );
-    assert!(
-        after_archive.contains("to unarchive"),
-        "archived preview should point at z to unarchive\n{after_archive}"
+        !after_archive.contains("is parked"),
+        "preview must follow the cursor to the next session, not the archived row\n{after_archive}"
     );
     assert!(
         after_archive.contains("Archived ("),
-        "the Archived section should be revealed\n{after_archive}"
+        "the Archived section header should appear with the count\n{after_archive}"
+    );
+
+    // Navigate into the Archived section: down to the header, expand it,
+    // down onto the parked row. Its preview shows the calm placeholder.
+    h.send_keys("j");
+    h.send_keys("l");
+    h.send_keys("j");
+    h.wait_for("is parked");
+    let parked = h.capture_screen();
+    assert!(
+        parked.contains("to unarchive"),
+        "archived preview should point at z to unarchive\n{parked}"
     );
 
     // Unarchive it; the row returns to the active list, still selected.

@@ -2743,3 +2743,104 @@ describe("applyEvent / RateLimitAutoResumed (#1722)", () => {
     expect(state.rateLimit).toBeNull();
   });
 });
+
+describe("applyEvent / elicitation", () => {
+  const elicitation = {
+    nonce: "e-1",
+    message: "Pick one",
+    tool_call_id: null,
+    questions: [
+      {
+        field_key: "question_0",
+        title: "Color?",
+        description: null,
+        required: true,
+        kind: "single_select" as const,
+        options: [{ value: "Red", label: "Red" }],
+        min_items: null,
+        max_items: null,
+      },
+    ],
+    requested_at: "2026-06-10T00:00:00Z",
+    resolved: null,
+  };
+
+  it("adds a pending elicitation on ElicitationRequested and drops it on resolve", () => {
+    let state = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: { ElicitationRequested: { elicitation } },
+    });
+    expect(state.pendingElicitations).toHaveLength(1);
+    expect(state.pendingElicitations[0].nonce).toBe("e-1");
+
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: { ElicitationResolved: { nonce: "e-1", outcome: "Accepted" } },
+    });
+    expect(state.pendingElicitations).toHaveLength(0);
+  });
+
+  it("suppresses the AskUserQuestion tool card when the tool call started first", () => {
+    const toolCall = {
+      id: "tc-ask",
+      name: "Asking for your input",
+      kind: "other",
+      args_preview: '{"questions":[]}',
+      started_at: "2026-06-10T00:00:00Z",
+    };
+    // Tool call arrives first -> a transcript row appears.
+    let state = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: { ToolCallStarted: { tool_call: toolCall } },
+    });
+    expect(state.activity.some((r) => r.toolCallId === "tc-ask")).toBe(true);
+
+    // The matching elicitation then arrives -> the row + in-flight pointer
+    // are stripped and the id is remembered.
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: { ElicitationRequested: { elicitation: { ...elicitation, tool_call_id: "tc-ask" } } },
+    });
+    expect(state.activity.some((r) => r.toolCallId === "tc-ask")).toBe(false);
+    expect(state.inFlightTool).toBeNull();
+
+    // A later completion for the same id produces no card.
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 3,
+      event: {
+        ToolCallCompleted: { tool_call_id: "tc-ask", is_error: false, content: "", output: [] },
+      },
+    });
+    expect(state.activity.some((r) => r.toolCallId === "tc-ask")).toBe(false);
+  });
+
+  it("suppresses the AskUserQuestion tool card when the elicitation arrived first", () => {
+    let state = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: { ElicitationRequested: { elicitation: { ...elicitation, tool_call_id: "tc-ask" } } },
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: {
+        ToolCallStarted: {
+          tool_call: {
+            id: "tc-ask",
+            name: "Asking for your input",
+            kind: "other",
+            args_preview: "{}",
+            started_at: "2026-06-10T00:00:00Z",
+          },
+        },
+      },
+    });
+    expect(state.activity.some((r) => r.toolCallId === "tc-ask")).toBe(false);
+    expect(state.inFlightTool).toBeNull();
+  });
+});

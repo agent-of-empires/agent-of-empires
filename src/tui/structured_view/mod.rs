@@ -33,6 +33,7 @@ use crate::acp::client::{
     require_daemon, ws_connect, DaemonEndpoint, HttpClient, HttpError, ManagerError, WsError,
     WsMessage, REPLAY_PAGE_SIZE,
 };
+use crate::acp::elicitations::ElicitationResolution;
 use crate::acp::protocol::ApprovalDecisionWire;
 use crate::session::config::{resolve_theme_name, resolve_theme_palette_mode};
 use crate::tui::styles::Theme;
@@ -369,6 +370,7 @@ async fn handle_terminal_event(
     let has_pending = !state.transcript.pending_approvals.is_empty();
     let ctx = InputContext {
         has_pending_approval: has_pending,
+        has_pending_elicitation: !state.transcript.pending_elicitations.is_empty(),
         slash_picker_open: state.slash_picker_open(),
         mention_picker_open: state.mention.is_some(),
     };
@@ -546,6 +548,37 @@ async fn handle_terminal_event(
                         state,
                         toast_deadline,
                         format!("approval failed: {e}"),
+                        ToastKind::Error,
+                    );
+                }
+            }
+            Ok(false)
+        }
+        Intent::SkipElicitation | Intent::CancelElicitation => {
+            let Some(pending) = state.transcript.pending_elicitations.first().cloned() else {
+                return Ok(false);
+            };
+            let (resolution, label) = if matches!(intent, Intent::SkipElicitation) {
+                (ElicitationResolution::Decline, "question skipped")
+            } else {
+                (ElicitationResolution::Cancel, "question cancelled")
+            };
+            match state
+                .http
+                .resolve_elicitation(&state.session_id, &pending.nonce, &resolution)
+                .await
+            {
+                Ok(()) | Err(HttpError::ApprovalGone) => {
+                    // Clear locally now; the ElicitationResolved broadcast
+                    // also clears it, but the seq dedupe can swallow that.
+                    state.transcript.resolve_elicitation_locally(&pending.nonce);
+                    set_toast(state, toast_deadline, label.into(), ToastKind::Info);
+                }
+                Err(e) => {
+                    set_toast(
+                        state,
+                        toast_deadline,
+                        format!("elicitation resolve failed: {e}"),
                         ToastKind::Error,
                     );
                 }

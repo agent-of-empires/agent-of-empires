@@ -13,6 +13,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use crate::acp::approvals::Nonce;
+use crate::acp::elicitations::ElicitationResolution;
 use crate::acp::event_store::AttachmentBlob;
 use crate::acp::protocol::{
     ApprovalDecisionWire, ContextPrimerQuery, ContextPrimerResponse, DiffCommentsPromptRequest,
@@ -1682,6 +1683,53 @@ pub async fn resolve_approval(
                 format!("no pending approval with nonce {nonce_str}"),
             )
                 .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("resolve failed: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+/// Resolve a pending `AskUserQuestion` elicitation. The body is an
+/// `ElicitationResolution` (`{"action":"accept","answers":{...}}`,
+/// `{"action":"decline"}`, or `{"action":"cancel"}`); answers are
+/// validated server-side before they reach the agent. Mirrors
+/// `resolve_approval`: 204 on success, 404 for an unknown session or
+/// nonce.
+pub async fn resolve_elicitation(
+    State(state): State<Arc<AppState>>,
+    Path((id, nonce_str)): Path<(String, String)>,
+    req: Result<Json<ElicitationResolution>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if let Some(resp) = read_only_block(&state) {
+        return resp;
+    }
+    let Json(resolution) = match req {
+        Ok(j) => j,
+        Err(rej) => return rej.into_response(),
+    };
+    let nonce = Nonce(nonce_str.clone());
+    match state
+        .acp_supervisor
+        .resolve_elicitation(&id, nonce, resolution)
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(SupervisorError::UnknownSession(_)) => {
+            (StatusCode::NOT_FOUND, "session has no running acp").into_response()
+        }
+        Err(SupervisorError::Acp(crate::acp::acp_client::AcpError::UnknownNonce)) => (
+            StatusCode::NOT_FOUND,
+            format!("no pending elicitation with nonce {nonce_str}"),
+        )
+            .into_response(),
+        // A failed server-side validation leaves the elicitation pending,
+        // so 422 (not 404): the client can correct the answer and resubmit
+        // the same nonce.
+        Err(SupervisorError::Acp(crate::acp::acp_client::AcpError::InvalidAnswer(msg))) => {
+            (StatusCode::UNPROCESSABLE_ENTITY, msg).into_response()
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
