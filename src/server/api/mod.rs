@@ -207,6 +207,7 @@ mod tests {
                     "acp_set_mode",
                     "acp_set_config_option",
                     "resolve_approval",
+                    "resolve_elicitation",
                 ],
             ),
             (
@@ -353,6 +354,7 @@ mod tests {
                     "acp_set_mode",
                     "acp_set_config_option",
                     "resolve_approval",
+                    "resolve_elicitation",
                 ],
             ),
             (
