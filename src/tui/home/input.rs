@@ -1785,6 +1785,7 @@ impl HomeView {
                                 &data.title,
                                 data.group.as_deref(),
                                 data.profile.as_deref(),
+                                data.rename_branch,
                             ) {
                                 tracing::error!(target: "tui.input", "Failed to rename session: {}", e);
                             }
@@ -3432,27 +3433,49 @@ impl HomeView {
     /// Shared by the `'r'` / `'R'` key handlers and the right-click
     /// context menu so all three entry points stay byte-identical.
     pub(super) fn open_rename_for_selected(&mut self) {
-        if let Some(id) = &self.selected_session {
-            if let Some(inst) = self.get_instance(id) {
-                if matches!(inst.status, Status::Deleting | Status::Creating) {
-                    return;
-                }
-                // Rename is anchored to the selected session, so the dialog
-                // must open against that session's profile, not the
-                // view-level active/config profile (which can differ in
-                // all-profiles mode).
-                let current_profile = inst.source_profile.clone();
-                let profiles = list_profiles().unwrap_or_else(|_| vec![current_profile.clone()]);
-                let existing_groups: Vec<String> =
-                    self.all_groups().iter().map(|g| g.path.clone()).collect();
-                self.rename_dialog = Some(RenameDialog::new(
-                    &inst.title,
-                    &inst.group_path,
-                    &current_profile,
-                    profiles,
-                    existing_groups,
-                ));
+        if let Some(id) = self.selected_session.clone() {
+            let Some(inst) = self.get_instance(&id) else {
+                return;
+            };
+            if matches!(inst.status, Status::Deleting | Status::Creating) {
+                return;
             }
+            // Rename is anchored to the selected session, so the dialog
+            // must open against that session's profile, not the
+            // view-level active/config profile (which can differ in
+            // all-profiles mode).
+            let current_profile = inst.source_profile.clone();
+            let title = inst.title.clone();
+            let group_path = inst.group_path.clone();
+            // Capture branch context up front; a tied aoe-managed worktree
+            // can opt to rename the branch alongside the directory.
+            let branch_ctx = inst
+                .worktree_info
+                .as_ref()
+                .map(|w| (w.branch.clone(), w.main_repo_path.clone()));
+
+            let profiles = list_profiles().unwrap_or_else(|_| vec![current_profile.clone()]);
+            let existing_groups: Vec<String> =
+                self.all_groups().iter().map(|g| g.path.clone()).collect();
+            let mut dialog = RenameDialog::new(
+                &title,
+                &group_path,
+                &current_profile,
+                profiles,
+                existing_groups,
+            );
+            if self.tie_workdir_applies_for(&id) {
+                if let Some((branch, main_repo)) = branch_ctx {
+                    // The upstream probe is a quick `git for-each-ref`; this
+                    // is a one-shot on dialog open, not a hot path.
+                    let upstream =
+                        crate::git::GitWorktree::new(std::path::PathBuf::from(&main_repo))
+                            .ok()
+                            .and_then(|g| g.branch_upstream(&branch));
+                    dialog = dialog.with_worktree_branch(&branch, upstream);
+                }
+            }
+            self.rename_dialog = Some(dialog);
         } else if let Some(group_path) = &self.selected_group {
             if self.group_by == GroupByMode::Project {
                 let hint = if self.strict_hotkeys {

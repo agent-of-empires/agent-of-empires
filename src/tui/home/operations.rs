@@ -882,6 +882,7 @@ impl HomeView {
         new_title: &str,
         new_group: Option<&str>,
         new_profile: Option<&str>,
+        rename_branch: bool,
     ) -> anyhow::Result<()> {
         if let Some(id) = &self.selected_session {
             let id = id.clone();
@@ -911,7 +912,13 @@ impl HomeView {
             // session surfaces a warning and nothing is renamed. Applied below
             // in both the profile-move and the standard persist paths.
             let mut new_path: Option<String> = None;
-            if current_title != effective_title && self.tie_workdir_applies_for(&id) {
+            let mut new_branch: Option<String> = None;
+            // Fire when the title changed (dir follows it) OR the user opted to
+            // rename the branch (which may be requested even with the title
+            // unchanged, to bring a drifted branch back in line with the dir).
+            if (current_title != effective_title || rename_branch)
+                && self.tie_workdir_applies_for(&id)
+            {
                 let snapshot = self.get_instance(&id).map(|i| {
                     (
                         i.worktree_info.clone(),
@@ -956,21 +963,27 @@ impl HomeView {
                             worktree_info: &worktree_info,
                             current_path: std::path::Path::new(&project_path),
                             new_name: &leaf,
-                            rename_branch: false,
+                            rename_branch,
                         },
                     ) {
                         Ok(outcome) => {
+                            // Discard the stale container only when the dir
+                            // actually moved. A branch-only rename (title
+                            // unchanged, toggle armed) leaves the path, and thus
+                            // the mount and working dir, valid, so there is
+                            // nothing stale to recreate.
+                            let dir_moved = outcome.new_path != std::path::Path::new(&project_path);
                             new_path = Some(outcome.new_path.to_string_lossy().to_string());
-                            // The dir moved; a sandbox container created against
-                            // the old path is now stale, so drop it to force a
-                            // fresh create on next start.
-                            crate::session::worktree_edit::discard_sandbox_container_after_move(
-                                &id,
-                                is_sandboxed,
-                            );
+                            new_branch = outcome.new_branch;
+                            if dir_moved {
+                                crate::session::worktree_edit::discard_sandbox_container_after_move(
+                                    &id,
+                                    is_sandboxed,
+                                );
+                            }
                         }
-                        // Leaf maps to the current dir: nothing to move, just
-                        // rename the title.
+                        // Leaf maps to the current dir and no branch rename was
+                        // requested: nothing to move, just rename the title.
                         Err(crate::session::worktree_edit::WorktreeEditError::Unchanged) => {}
                         Err(e) => {
                             self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
@@ -1036,6 +1049,7 @@ impl HomeView {
                     instance.source_profile = target_profile.to_string();
                     let new_title = instance.title.clone();
                     let moved_path = new_path.clone();
+                    let moved_branch = new_branch.clone();
                     self.move_to_profile(&id, target_profile, instance.group_path.clone())?;
                     // apply_user_action (not mutate_instance + save) so a tied
                     // worktree's moved project_path actually persists; save()
@@ -1044,6 +1058,11 @@ impl HomeView {
                         inst.title = new_title.clone();
                         if let Some(path) = &moved_path {
                             inst.project_path = path.clone();
+                        }
+                        if let Some(branch) = &moved_branch {
+                            if let Some(wt) = inst.worktree_info.as_mut() {
+                                wt.branch = branch.clone();
+                            }
                         }
                     })?;
 
@@ -1085,6 +1104,11 @@ impl HomeView {
                 inst.group_path = effective_group.clone();
                 if let Some(path) = &new_path {
                     inst.project_path = path.clone();
+                }
+                if let Some(branch) = &new_branch {
+                    if let Some(wt) = inst.worktree_info.as_mut() {
+                        wt.branch = branch.clone();
+                    }
                 }
             })?;
 

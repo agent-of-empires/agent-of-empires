@@ -22,6 +22,10 @@ pub struct RenameData {
     pub group: Option<String>,
     /// New profile (None means keep current, Some(name) means move to that profile)
     pub profile: Option<String>,
+    /// Whether to also rename the git branch to match the title. Only ever
+    /// true for a tied aoe-managed worktree session that opted into the
+    /// branch toggle; always false otherwise.
+    pub rename_branch: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +52,23 @@ pub struct RenameDialog {
     /// Hit rect per focusable field (title / group / profile), set by
     /// `render`. Drives click + hover routing.
     focusable_rects: Vec<(usize, Rect)>,
+    /// Set for a tied aoe-managed worktree session via
+    /// [`Self::with_worktree_branch`]. When present, the dialog grows a
+    /// fourth focusable field: an "Also rename git branch" toggle. The
+    /// payload is `(current_branch, upstream)`; `upstream` drives the
+    /// remote-orphan warning when the toggle is on.
+    worktree_branch: Option<WorktreeBranch>,
+    /// State of the branch toggle. Meaningless unless `worktree_branch` is set.
+    rename_branch: bool,
+}
+
+/// Branch context for a tied worktree session's rename toggle.
+struct WorktreeBranch {
+    /// The session's current git branch (shown in the toggle row).
+    current: String,
+    /// Short upstream ref (e.g. `origin/hi`) when the branch tracks a remote,
+    /// else `None`. Drives the "remote branch won't follow" warning.
+    upstream: Option<String>,
 }
 
 impl RenameDialog {
@@ -82,7 +103,22 @@ impl RenameDialog {
             group_ghost: None,
             validation_error: None,
             focusable_rects: Vec::new(),
+            worktree_branch: None,
+            rename_branch: false,
         }
+    }
+
+    /// Attach tied-worktree branch context, enabling the "Also rename git
+    /// branch" toggle. Call only for a Session-mode dialog whose session is a
+    /// tied aoe-managed worktree. `upstream` is the short tracking ref
+    /// (`origin/hi`) when the branch tracks a remote, used to warn that a
+    /// rename leaves that remote branch behind.
+    pub fn with_worktree_branch(mut self, current_branch: &str, upstream: Option<String>) -> Self {
+        self.worktree_branch = Some(WorktreeBranch {
+            current: current_branch.to_string(),
+            upstream,
+        });
+        self
     }
 
     pub fn new_for_group(
@@ -111,13 +147,32 @@ impl RenameDialog {
             group_ghost: None,
             validation_error: None,
             focusable_rects: Vec::new(),
+            worktree_branch: None,
+            rename_branch: false,
         }
+    }
+
+    /// Whether the "Also rename git branch" toggle is present (tied worktree
+    /// session only). When true it occupies focusable field index 3.
+    fn shows_branch_toggle(&self) -> bool {
+        self.mode == RenameMode::Session && self.worktree_branch.is_some()
+    }
+
+    fn is_branch_toggle_field(&self) -> bool {
+        self.shows_branch_toggle() && self.focused_field == 3
     }
 
     fn field_count(&self) -> usize {
         match self.mode {
-            RenameMode::Session => 3, // title, group, profile
-            RenameMode::Group => 2,   // group, profile
+            // title, group, profile, and the branch toggle when present.
+            RenameMode::Session => {
+                if self.shows_branch_toggle() {
+                    4
+                } else {
+                    3
+                }
+            }
+            RenameMode::Group => 2, // group, profile
         }
     }
 
@@ -145,9 +200,12 @@ impl RenameDialog {
             .find(|(_, rect)| rect.contains(pos))
             .map(|(f, _)| *f)?;
         self.focused_field = hit;
-        // Cycle the profile chip on click; text fields just take focus.
+        // Cycle the profile chip on click; flip the branch toggle on click;
+        // text fields just take focus.
         if self.is_profile_field() && !self.available_profiles.is_empty() {
             self.profile_index = (self.profile_index + 1) % self.available_profiles.len();
+        } else if self.is_branch_toggle_field() {
+            self.rename_branch = !self.rename_branch;
         }
         Some(DialogResult::Continue)
     }
@@ -268,8 +326,15 @@ impl RenameDialog {
                 let selected_profile = self.selected_profile();
                 let profile_changed = selected_profile != self.current_profile;
 
-                // If nothing has changed, cancel
-                if title_value.is_empty() && group_value == self.current_group && !profile_changed {
+                // If nothing has changed, cancel. Arming the branch toggle
+                // counts as a change even when title/group/profile are
+                // untouched (rename a drifted branch in place).
+                let branch_rename = self.shows_branch_toggle() && self.rename_branch;
+                if title_value.is_empty()
+                    && group_value == self.current_group
+                    && !profile_changed
+                    && !branch_rename
+                {
                     return DialogResult::Cancel;
                 }
 
@@ -309,6 +374,7 @@ impl RenameDialog {
                     title: title_value,
                     group,
                     profile,
+                    rename_branch: self.shows_branch_toggle() && self.rename_branch,
                 })
             }
             KeyCode::Tab => {
@@ -340,6 +406,10 @@ impl RenameDialog {
                 } else {
                     self.group_ghost = None;
                 }
+                DialogResult::Continue
+            }
+            KeyCode::Char(' ') if self.is_branch_toggle_field() => {
+                self.rename_branch = !self.rename_branch;
                 DialogResult::Continue
             }
             KeyCode::Left if self.is_profile_field() => {
@@ -387,8 +457,19 @@ impl RenameDialog {
 
     fn render_session(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         self.focusable_rects.clear();
+        let show_toggle = self.shows_branch_toggle();
+        // The remote-orphan warning only matters once the toggle is armed and
+        // the branch actually tracks a remote.
+        let show_warning = show_toggle
+            && self.rename_branch
+            && self
+                .worktree_branch
+                .as_ref()
+                .is_some_and(|w| w.upstream.is_some());
+
         let dialog_width = 50;
-        let dialog_area = super::centered_rect(area, dialog_width, 15);
+        let height = 15 + if show_toggle { 1 } else { 0 } + if show_warning { 2 } else { 0 };
+        let dialog_area = super::centered_rect(area, dialog_width, height);
 
         frame.render_widget(Clear, dialog_area);
 
@@ -402,20 +483,34 @@ impl RenameDialog {
         let inner = block.inner(dialog_area);
         frame.render_widget(block, dialog_area);
 
+        // Fixed rows first (current values, spacer, the three input fields),
+        // then the optional branch toggle / warning, then spacer + hint. The
+        // dynamic indices are tracked so the wiring below stays in sync.
+        let mut constraints = vec![
+            Constraint::Length(1), // 0 Current title
+            Constraint::Length(1), // 1 Current group
+            Constraint::Length(1), // 2 Current profile
+            Constraint::Length(1), // 3 Spacer
+            Constraint::Length(1), // 4 New title field
+            Constraint::Length(1), // 5 New group field
+            Constraint::Length(1), // 6 Profile selector
+        ];
+        let toggle_idx = show_toggle.then(|| {
+            constraints.push(Constraint::Length(1));
+            constraints.len() - 1
+        });
+        let warning_idx = show_warning.then(|| {
+            constraints.push(Constraint::Length(2));
+            constraints.len() - 1
+        });
+        constraints.push(Constraint::Length(1)); // Spacer
+        constraints.push(Constraint::Min(1)); // Hint
+        let hint_idx = constraints.len() - 1;
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .margin(1)
-            .constraints([
-                Constraint::Length(1), // Current title
-                Constraint::Length(1), // Current group
-                Constraint::Length(1), // Current profile
-                Constraint::Length(1), // Spacer
-                Constraint::Length(1), // New title field
-                Constraint::Length(1), // New group field
-                Constraint::Length(1), // Profile selector
-                Constraint::Length(1), // Spacer
-                Constraint::Min(1),    // Hint
-            ])
+            .constraints(constraints)
             .split(inner);
 
         // Current title
@@ -451,13 +546,65 @@ impl RenameDialog {
         self.render_profile_selector(frame, chunks[6], theme);
         self.focusable_rects.push((2, chunks[6]));
 
+        // Branch toggle + remote-orphan warning (tied worktree only)
+        if let Some(idx) = toggle_idx {
+            self.render_branch_toggle(frame, chunks[idx], theme);
+            self.focusable_rects.push((3, chunks[idx]));
+        }
+        if let Some(idx) = warning_idx {
+            self.render_branch_warning(frame, chunks[idx], theme);
+        }
+
         // Hint
-        self.render_hints(frame, chunks[8], theme);
+        self.render_hints(frame, chunks[hint_idx], theme);
 
         // Render group picker overlay
         if self.group_picker.is_active() {
             self.group_picker.render(frame, area, theme);
         }
+    }
+
+    fn render_branch_toggle(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        let focused = self.is_branch_toggle_field();
+        let checkbox = if self.rename_branch { "[x]" } else { "[ ]" };
+        let style = if focused {
+            Style::default().fg(theme.accent)
+        } else {
+            Style::default().fg(theme.text)
+        };
+        let mut spans = vec![
+            Span::styled(format!("{checkbox} "), style),
+            Span::styled("Also rename git branch", style),
+        ];
+        // Show the current branch dimmed so the user knows what is being
+        // renamed (and from what), since the title may already match the dir.
+        if let Some(wt) = &self.worktree_branch {
+            spans.push(Span::styled(
+                format!("  ({})", wt.current),
+                Style::default().fg(theme.dimmed),
+            ));
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    }
+
+    fn render_branch_warning(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        let Some(wt) = &self.worktree_branch else {
+            return;
+        };
+        let Some(upstream) = &wt.upstream else {
+            return;
+        };
+        let lines = vec![
+            Line::from(Span::styled(
+                format!("! branch '{}' tracks {};", wt.current, upstream),
+                Style::default().fg(theme.error),
+            )),
+            Line::from(Span::styled(
+                "  the remote branch won't follow",
+                Style::default().fg(theme.error),
+            )),
+        ];
+        frame.render_widget(Paragraph::new(lines), area);
     }
 
     fn render_group(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
@@ -608,6 +755,10 @@ impl RenameDialog {
             Span::styled("Tab", Style::default().fg(theme.hint)),
             Span::raw(" switch  "),
         ];
+        if self.is_branch_toggle_field() {
+            hint_spans.push(Span::styled("Space", Style::default().fg(theme.hint)));
+            hint_spans.push(Span::raw(" toggle  "));
+        }
         if self.is_group_field() && !self.existing_groups.is_empty() {
             if self.group_ghost_text().is_some() {
                 hint_spans.push(Span::styled("→", Style::default().fg(theme.hint)));
@@ -1492,6 +1643,101 @@ mod tests {
             dialog.validation_error.is_none(),
             "no validation error for own name"
         );
+    }
+
+    // --- Branch-rename toggle (tied worktree) tests ---
+
+    fn tied_dialog(upstream: Option<&str>) -> RenameDialog {
+        RenameDialog::new("hi", "", "default", default_profiles(), Vec::new())
+            .with_worktree_branch("thing", upstream.map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn test_branch_toggle_absent_without_worktree_context() {
+        // A plain session (no with_worktree_branch) has no 4th field and
+        // never emits rename_branch=true.
+        let mut dialog = RenameDialog::new("hi", "", "default", default_profiles(), Vec::new());
+        assert_eq!(dialog.field_count(), 3);
+        assert!(!dialog.shows_branch_toggle());
+        dialog.handle_key(key(KeyCode::Char('x')));
+        match dialog.handle_key(key(KeyCode::Enter)) {
+            DialogResult::Submit(data) => assert!(!data.rename_branch),
+            _ => panic!("expected submit"),
+        }
+    }
+
+    #[test]
+    fn test_branch_toggle_present_for_tied_worktree() {
+        let dialog = tied_dialog(Some("origin/thing"));
+        assert!(dialog.shows_branch_toggle());
+        assert_eq!(dialog.field_count(), 4);
+    }
+
+    #[test]
+    fn test_branch_toggle_defaults_off_and_flips_with_space() {
+        let mut dialog = tied_dialog(None);
+        // Tab title -> group -> profile -> toggle (index 3).
+        dialog.handle_key(key(KeyCode::Tab));
+        dialog.handle_key(key(KeyCode::Tab));
+        dialog.handle_key(key(KeyCode::Tab));
+        assert!(dialog.is_branch_toggle_field());
+        assert!(!dialog.rename_branch);
+        dialog.handle_key(key(KeyCode::Char(' ')));
+        assert!(dialog.rename_branch);
+        // Space again toggles back off.
+        dialog.handle_key(key(KeyCode::Char(' ')));
+        assert!(!dialog.rename_branch);
+    }
+
+    #[test]
+    fn test_branch_toggle_emitted_in_submit() {
+        let mut dialog = tied_dialog(Some("origin/thing"));
+        // Change the title so submit is not a no-op, then arm the toggle.
+        dialog.handle_key(key(KeyCode::Char('x')));
+        dialog.handle_key(key(KeyCode::Tab)); // group
+        dialog.handle_key(key(KeyCode::Tab)); // profile
+        dialog.handle_key(key(KeyCode::Tab)); // toggle
+        dialog.handle_key(key(KeyCode::Char(' ')));
+        match dialog.handle_key(key(KeyCode::Enter)) {
+            DialogResult::Submit(data) => {
+                assert_eq!(data.title, "x");
+                assert!(data.rename_branch);
+            }
+            _ => panic!("expected submit"),
+        }
+    }
+
+    #[test]
+    fn test_branch_toggle_can_rename_branch_without_title_change() {
+        // The toggle must be usable to bring a drifted branch in line with
+        // the title even when the title itself is unchanged: arming it makes
+        // the dialog submit (not cancel) so the rename flow runs.
+        let mut dialog = tied_dialog(None);
+        dialog.handle_key(key(KeyCode::Tab)); // group
+        dialog.handle_key(key(KeyCode::Tab)); // profile
+        dialog.handle_key(key(KeyCode::Tab)); // toggle
+        dialog.handle_key(key(KeyCode::Char(' ')));
+        match dialog.handle_key(key(KeyCode::Enter)) {
+            DialogResult::Submit(data) => {
+                assert_eq!(data.title, ""); // title unchanged
+                assert!(data.rename_branch);
+            }
+            _ => panic!("expected submit even with no title change"),
+        }
+    }
+
+    #[test]
+    fn test_space_still_cycles_profile_not_branch_toggle() {
+        // The branch-toggle space handler must not steal space from the
+        // profile chip.
+        let mut dialog = RenameDialog::new("hi", "", "default", multi_profiles(), Vec::new())
+            .with_worktree_branch("thing", None);
+        dialog.handle_key(key(KeyCode::Tab)); // group
+        dialog.handle_key(key(KeyCode::Tab)); // profile
+        assert!(dialog.is_profile_field());
+        dialog.handle_key(key(KeyCode::Char(' '))); // cycle profile
+        assert_eq!(dialog.profile_index, 1);
+        assert!(!dialog.rename_branch);
     }
 
     #[test]
