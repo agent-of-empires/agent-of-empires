@@ -799,10 +799,18 @@ pub async fn rename_session(
         // first; the setting is the escape hatch for free-form relabeling.
         // A sandbox session's container keeps the worktree dir mounted even
         // while the agent is Idle, so the move would fail with EBUSY; stopping
-        // the session tears the container down and releases the mount.
-        if status.blocks_worktree_edit()
-            || crate::session::worktree_edit::sandbox_container_holds_worktree(&id, is_sandboxed)
-        {
+        // the session tears the container down and releases the mount. The
+        // container probe is a subprocess, so it runs on the blocking pool
+        // like the other process-spawning work in this file.
+        let container_holds = {
+            let id = id.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::session::worktree_edit::sandbox_container_holds_worktree(&id, is_sandboxed)
+            })
+            .await
+            .unwrap_or(false)
+        };
+        if status.blocks_worktree_edit() || container_holds {
             return (
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({
@@ -835,12 +843,18 @@ pub async fn rename_session(
                 // The dir moved (path changed): a sandbox container created
                 // against the old path is now stale, so drop it to force a
                 // fresh create on next start. A branch-only edit leaves the
-                // path (and the mount) unchanged, so skip it then.
+                // path (and the mount) unchanged, so skip it then. Awaited so
+                // the response only lands once the stale container is gone; an
+                // immediate restart must not race the removal and revive it.
                 if path != current_path {
-                    crate::session::worktree_edit::discard_sandbox_container_after_move(
-                        &id,
-                        is_sandboxed,
-                    );
+                    let id = id.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        crate::session::worktree_edit::discard_sandbox_container_after_move(
+                            &id,
+                            is_sandboxed,
+                        )
+                    })
+                    .await;
                 }
                 new_path = Some(path);
                 new_branch = branch;
@@ -1074,10 +1088,18 @@ pub async fn set_worktree_name(
     }
     // A sandbox container keeps the worktree dir mounted even while the agent
     // is Idle, so the move would fail with EBUSY; stopping the session releases
-    // the mount, same as the active-status case.
-    if status.blocks_worktree_edit()
-        || crate::session::worktree_edit::sandbox_container_holds_worktree(&id, is_sandboxed)
-    {
+    // the mount, same as the active-status case. The container probe is a
+    // subprocess, so it runs on the blocking pool like the other
+    // process-spawning work in this file.
+    let container_holds = {
+        let id = id.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::session::worktree_edit::sandbox_container_holds_worktree(&id, is_sandboxed)
+        })
+        .await
+        .unwrap_or(false)
+    };
+    if status.blocks_worktree_edit() || container_holds {
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({
@@ -1123,9 +1145,18 @@ pub async fn set_worktree_name(
 
     // The dir moved (path changed): a sandbox container created against the old
     // path is now stale, so drop it to force a fresh create on next start. A
-    // branch-only edit leaves the path (and the mount) unchanged.
+    // branch-only edit leaves the path (and the mount) unchanged. Awaited so
+    // the response only lands once the stale container is gone; an immediate
+    // restart must not race the removal and revive it.
     if new_path != current_path {
-        crate::session::worktree_edit::discard_sandbox_container_after_move(&id, is_sandboxed);
+        let id_for_discard = id.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            crate::session::worktree_edit::discard_sandbox_container_after_move(
+                &id_for_discard,
+                is_sandboxed,
+            )
+        })
+        .await;
     }
 
     // The git move has already landed, so persist to disk BEFORE mutating
