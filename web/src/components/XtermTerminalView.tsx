@@ -22,7 +22,7 @@ interface Props {
 export function XtermTerminalView({ session, active = true }: Props) {
   const [ensureState, setEnsureState] = useState<"pending" | "ready" | "error">("pending");
   const [ensureError, setEnsureError] = useState<string | null>(null);
-  const { containerRef, termRef, state, manualReconnect, activate, maxRetries } = useTerminal(
+  const { containerRef, termRef, state, manualReconnect, activate, claim, maxRetries } = useTerminal(
     ensureState === "ready" ? session.id : null,
     "ws",
     active,
@@ -147,7 +147,17 @@ export function XtermTerminalView({ session, active = true }: Props) {
         onFocus={() => setTermFocused(true)}
         onBlur={() => setTermFocused(false)}
       >
-        <div ref={containerRef} className="absolute inset-0" onPointerDown={activate} />
+        <div
+          ref={containerRef}
+          className="absolute inset-0"
+          onPointerDown={() => {
+            activate();
+            // A click while another device owns the size is the explicit
+            // "take over" the banner advertises; activate alone never
+            // steals (it also fires on mount).
+            if (!state.isPrimary) claim();
+          }}
+        />
 
         {state.connected && !state.isPrimary && (
           <div

@@ -333,12 +333,25 @@ async fn handle_live_ws(
                                     want_rows,
                                     "pane drifted from live owner's grid; re-asserting"
                                 );
+                                // Verified resize: the local is_owner flag is
+                                // stale for up to a heartbeat after a steal,
+                                // and a drift seen in that window IS the new
+                                // owner's grid. Resizing unverified here would
+                                // stomp it; instead demote on the spot.
                                 let name = capture_tmux.clone();
-                                let _ = tokio::task::spawn_blocking(move || {
+                                let who = capture_owner.clone();
+                                let still_owner = tokio::task::spawn_blocking(move || {
                                     crate::tmux::Session::from_name(&name)
-                                        .resize_window(want_cols, want_rows);
+                                        .resize_window_if_owner(&who, want_cols, want_rows)
                                 })
-                                .await;
+                                .await
+                                .unwrap_or(false);
+                                if !still_owner {
+                                    capture_settings.is_owner.store(false, Ordering::Relaxed);
+                                    let _ = capture_tx
+                                        .send(Message::Text(size_owner_json(false).into()))
+                                        .await;
+                                }
                             }
                         }
                     }

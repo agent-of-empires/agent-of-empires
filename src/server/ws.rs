@@ -899,20 +899,26 @@ async fn handle_terminal_ws(
                         &client_id_for_recv,
                     )
                     .await;
-                    if became_primary {
+                    // Typing is an intentional take-over of the size lock,
+                    // gated on actually lacking it, NOT on became_primary: the
+                    // sole PTY client is always already primary in the
+                    // in-memory map, so a became_primary gate here would make
+                    // the lock unreachable while a live viewer holds it.
+                    let stole = !is_size_owner_for_recv.load(Ordering::Relaxed)
+                        && pty_steal_size(&tmux_name_for_recv, &client_id_for_recv).await;
+                    if stole {
+                        is_size_owner_for_recv.store(true, Ordering::Relaxed);
+                        assert_window_follows_client(&tmux_name_for_recv).await;
+                    }
+                    if became_primary || stole {
                         debug!(
                             target: "terminal.ws",
                             client = %recv_client,
                             tmux = %recv_tmux,
-                            "claimed primary on binary input"
+                            became_primary,
+                            stole_size = stole,
+                            "claimed control on binary input"
                         );
-                        // Typing is an intentional take-over: steal the size
-                        // lock from any other surface and make our client size
-                        // drive the window.
-                        if pty_steal_size(&tmux_name_for_recv, &client_id_for_recv).await {
-                            is_size_owner_for_recv.store(true, Ordering::Relaxed);
-                            assert_window_follows_client(&tmux_name_for_recv).await;
-                        }
                         if let Some((cols, rows)) = pending_size {
                             resize_pty(&master_for_resize, cols, rows).await;
                         }
@@ -955,10 +961,18 @@ async fn handle_terminal_ws(
                                     &client_id_for_recv,
                                 )
                                 .await;
-                                // Driving the window also requires the
-                                // cross-surface size-owner lock: a live viewer
-                                // (phone) may own it, in which case this attach
-                                // is a read-only viewer until it takes over.
+                                // The PTY is this client's own terminal; it
+                                // must always track the xterm grid or tmux
+                                // mis-clips this client's view. Ownership only
+                                // gates whether that grid DRIVES the shared
+                                // window (window-size latest below).
+                                if dominated {
+                                    resize_pty(&master_for_resize, cols, rows).await;
+                                }
+                                // A passive resize (browser window drag) may
+                                // claim a vacant/stale size lock but never
+                                // steals a live one; taking over is reserved
+                                // for explicit interaction (typing, activate).
                                 let acquired = dominated
                                     && pty_claim_size(&tmux_name_for_recv, &client_id_for_recv)
                                         .await;
@@ -967,9 +981,6 @@ async fn handle_terminal_ws(
                                         !is_size_owner_for_recv.swap(true, Ordering::Relaxed);
                                     if newly {
                                         assert_window_follows_client(&tmux_name_for_recv).await;
-                                    }
-                                    resize_pty(&master_for_resize, cols, rows).await;
-                                    if newly {
                                         let _ = ctrl_tx_for_recv
                                             .send(
                                                 r#"{"type":"primary_status","is_primary":true}"#
@@ -1016,15 +1027,49 @@ async fn handle_terminal_ws(
                                     &client_id_for_recv,
                                 )
                                 .await;
-                                if became_primary {
-                                    // Explicit take-over (banner click): steal
-                                    // the size lock and drive the window.
-                                    if pty_steal_size(&tmux_name_for_recv, &client_id_for_recv)
-                                        .await
-                                    {
-                                        is_size_owner_for_recv.store(true, Ordering::Relaxed);
-                                        assert_window_follows_client(&tmux_name_for_recv).await;
+                                // Activate also fires on mount, so it only
+                                // CLAIMS a vacant/stale size lock; it never
+                                // steals from a live owner (opening a session
+                                // on a second device must not stomp the
+                                // current owner's grid). Explicit take-over is
+                                // `claim` below, or typing.
+                                let acquired = !is_size_owner_for_recv.load(Ordering::Relaxed)
+                                    && pty_claim_size(&tmux_name_for_recv, &client_id_for_recv)
+                                        .await;
+                                if acquired {
+                                    is_size_owner_for_recv.store(true, Ordering::Relaxed);
+                                    assert_window_follows_client(&tmux_name_for_recv).await;
+                                }
+                                if became_primary || acquired {
+                                    if let Some((cols, rows)) = pending_size {
+                                        resize_pty(&master_for_resize, cols, rows).await;
                                     }
+                                    let _ = ctrl_tx_for_recv
+                                        .send(
+                                            r#"{"type":"primary_status","is_primary":true}"#.into(),
+                                        )
+                                        .await;
+                                }
+                            }
+                            ControlMessage::Claim => {
+                                debug!(
+                                    target: "terminal.ws",
+                                    client = %recv_client,
+                                    tmux = %recv_tmux,
+                                    "control: claim (explicit take-over)"
+                                );
+                                if read_only {
+                                    continue;
+                                }
+                                claim_primary(
+                                    &primaries_for_recv,
+                                    &tmux_name_for_recv,
+                                    &client_id_for_recv,
+                                )
+                                .await;
+                                if pty_steal_size(&tmux_name_for_recv, &client_id_for_recv).await {
+                                    is_size_owner_for_recv.store(true, Ordering::Relaxed);
+                                    assert_window_follows_client(&tmux_name_for_recv).await;
                                     if let Some((cols, rows)) = pending_size {
                                         resize_pty(&master_for_resize, cols, rows).await;
                                     }
@@ -1526,8 +1571,16 @@ enum ControlMessage {
     /// Sent by the browser when the terminal tab/window gains focus.
     /// Claims primary and applies the pending resize so the pane
     /// snaps to this client's viewport without requiring a keystroke.
+    /// Fires on mount too, so it must NOT steal a live size lock; only
+    /// an explicit `claim` (or typing) takes over another surface.
     #[serde(rename = "activate")]
     Activate,
+    /// Explicit take-over (banner click): steal the cross-surface size
+    /// lock even from a live holder. Separate from `activate` because
+    /// activate also fires on mount, and merely opening a session on a
+    /// second device must not stomp the current owner's grid.
+    #[serde(rename = "claim")]
+    Claim,
     /// Pause the pane's foreground process (SIGSTOP). Sent by mobile
     /// web clients when the user enters tmux scrollback — without
     /// pausing, claude's continued output keeps shifting scrollback

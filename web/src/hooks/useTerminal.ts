@@ -5,6 +5,7 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
 import type {
   ActivateMessage,
+  ClaimMessage,
   PauseOutputMessage,
   PrimaryStatusMessage,
   ResizeMessage,
@@ -1585,12 +1586,22 @@ export function useTerminal(
     }
   }, []);
 
+  /** Explicit take-over of the cross-surface size lock. Unlike activate
+   *  (which also fires on mount), this steals the size even from a live
+   *  owner on another device, so it must only fire on a user gesture. */
+  const claim = useCallback(() => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: "claim" } as ClaimMessage));
+    }
+  }, []);
+
   return {
     containerRef,
     termRef,
     state,
     manualReconnect,
     activate,
+    claim,
     maxRetries: MAX_RETRIES,
   };
 }

@@ -102,10 +102,15 @@
     },
     {
       "id": "terminal.live-size-owner",
-      "kind": "vitest",
+      "kind": "live-playwright",
       "risk": "high",
-      "specs": ["src/hooks/useLiveTerminal.sizeOwner.test.ts"],
-      "components": ["web/src/hooks/useLiveTerminal.ts", "web/src/components/LiveTerminalView.tsx"]
+      "specs": ["tests/live/live-size-owner-takeover.spec.ts", "src/hooks/useLiveTerminal.sizeOwner.test.ts"],
+      "components": [
+        "web/src/components/LiveTerminalView.tsx",
+        "web/src/components/XtermTerminalView.tsx",
+        "web/src/hooks/useLiveTerminal.ts",
+        "web/src/hooks/useTerminal.ts"
+      ]
     },
     {
       "id": "auth.no-auth",

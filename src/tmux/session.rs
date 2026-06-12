@@ -649,6 +649,24 @@ impl Session {
         matches!(self.size_owner(), Some((id, _)) if id == owner_id)
     }
 
+    /// Resize the window iff `owner_id` still holds the size-owner lock,
+    /// verifying ownership in the same call. Returns whether we still own it.
+    ///
+    /// This is the only resize entry point loops with a cached "am I owner"
+    /// flag may use: a local flag is stale for up to a heartbeat after another
+    /// client steals the lock, and an unverified resize in that window stomps
+    /// the new owner's grid (the flap this lock exists to kill). Re-reading
+    /// the lock here closes that window; the caller demotes itself on false.
+    pub fn resize_window_if_owner(&self, owner_id: &str, cols: u16, rows: u16) -> bool {
+        match self.size_owner() {
+            Some((id, _)) if id == owner_id => {
+                self.resize_window(cols, rows);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Whether a non-stale size owner currently holds the lock. A passive
     /// writer (the TUI's detached preview sync) checks this to defer to an
     /// active owner without claiming the lock itself.
@@ -949,6 +967,10 @@ mod tests {
             .output()
             .expect("tmux new-session");
         assert!(out.status.success());
+        // The session was created behind the existence cache's back; an
+        // earlier test may have warmed the cache without it, which would
+        // make every exists()-guarded lock call a false no-op.
+        refresh_session_cache();
         let session = Session::from_name(guard.name());
 
         // Vacant -> first claimer wins and is recorded.
