@@ -229,6 +229,49 @@ pub(crate) fn host_environment_prefix(entries: &[String]) -> String {
     out
 }
 
+/// Resolve a session's sandbox environment entries to concrete `(KEY, VALUE)`
+/// pairs on the host, for feeding into a host-side hook's process environment
+/// (so a `before_start` hook can read a per-session `$TEST_VAR`).
+///
+/// Mirrors [`collect_environment`]'s precedence (per-session `extra_env`
+/// overrides `sandbox.environment`) and the shared entry grammar, but resolves
+/// every entry to a plain host value: `KEY=value` is literal, `KEY=$VAR` reads
+/// the host env, `KEY=$$literal` escapes a `$`, and a bare `KEY` passes through
+/// from the host env. Unset host references and bare keys are skipped.
+/// Deduplicates by key (first wins).
+pub(crate) fn session_host_env_pairs(
+    profile: &str,
+    project_path: &std::path::Path,
+    sandbox_info: &SandboxInfo,
+) -> Vec<(String, String)> {
+    let sandbox_config = resolved_sandbox_config(profile, project_path);
+    let entries: &[String] = sandbox_info
+        .extra_env
+        .as_deref()
+        .unwrap_or(&sandbox_config.environment);
+    resolve_host_env_pairs(entries)
+}
+
+/// Resolve env entries to concrete host `(KEY, VALUE)` pairs (the pure core of
+/// [`session_host_env_pairs`], split out so it can be tested without touching
+/// config on disk).
+fn resolve_host_env_pairs(entries: &[String]) -> Vec<(String, String)> {
+    let mut seen = std::collections::HashSet::new();
+    let mut pairs = Vec::new();
+    for entry in entries {
+        let (key, value) = match entry.split_once('=') {
+            Some((k, v)) => (k.to_string(), resolve_env_value(v)),
+            None => (entry.clone(), std::env::var(entry).ok()),
+        };
+        if let Some(v) = value {
+            if seen.insert(key.clone()) {
+                pairs.push((key, v));
+            }
+        }
+    }
+    pairs
+}
+
 pub(crate) fn resolve_host_environment_value(
     entries: &[String],
     target_key: &str,
@@ -903,6 +946,36 @@ environment = ["GH_TOKEN=write_token"]
         assert_eq!(entry.value(), "test_value");
         assert!(matches!(entry, EnvEntry::Inherit { .. }));
         std::env::remove_var("AOE_TEST_ENV_PT");
+    }
+
+    #[test]
+    fn test_resolve_host_env_pairs_grammar() {
+        std::env::set_var("AOE_TEST_HOST_PAIR_REF", "from_host");
+        std::env::set_var("AOE_TEST_HOST_PAIR_BARE", "bare_val");
+        std::env::remove_var("AOE_TEST_HOST_PAIR_MISSING");
+        let entries = vec![
+            "TEST_VAR=literal".to_string(),
+            "FROM_HOST=$AOE_TEST_HOST_PAIR_REF".to_string(),
+            "ESCAPED=$$LIT".to_string(),
+            "AOE_TEST_HOST_PAIR_BARE".to_string(),
+            "MISSING=$AOE_TEST_HOST_PAIR_MISSING".to_string(), // unset host ref: skipped
+            "TEST_VAR=second".to_string(),                     // dup key: first wins
+        ];
+        let pairs = resolve_host_env_pairs(&entries);
+        assert_eq!(
+            pairs,
+            vec![
+                ("TEST_VAR".to_string(), "literal".to_string()),
+                ("FROM_HOST".to_string(), "from_host".to_string()),
+                ("ESCAPED".to_string(), "$LIT".to_string()),
+                (
+                    "AOE_TEST_HOST_PAIR_BARE".to_string(),
+                    "bare_val".to_string()
+                ),
+            ]
+        );
+        std::env::remove_var("AOE_TEST_HOST_PAIR_REF");
+        std::env::remove_var("AOE_TEST_HOST_PAIR_BARE");
     }
 
     #[test]

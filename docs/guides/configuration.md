@@ -221,10 +221,15 @@ The `[host_hooks]` block declares hooks that run on the **host** (not inside the
 
 ```toml
 [host_hooks]
-before_start = ['echo "GH_TOKEN=$(my-mint-tool $AOE_PROJECT_PATH)"']
+before_start = ['echo "GH_TOKEN=$(my-mint-tool "$AOE_REPO_SLUG")"']
 ```
 
-`before_start` runs each time a sandbox container comes up (on create and on restart, so short-lived values are refreshed before the agent launches). Each `KEY=VALUE` line the command prints to stdout is injected into the container environment as an **inherited** variable: the value is passed to the `docker` invocation through the process environment, never in argv, so it does not appear in `ps`. Lines that are not `KEY=VALUE` are ignored, and the hook's stdout is never logged, so it is safe to print a secret. A non-zero exit aborts bringing the container up. The lifecycle env vars (`AOE_PROJECT_PATH`, `AOE_SESSION_ID`, `AOE_PROFILE`, ...) are available to the command.
+`before_start` runs each time a sandbox container comes up (on create and on restart, so short-lived values are refreshed before the agent launches). Each `KEY=VALUE` line the command prints to stdout is injected into the container environment as an **inherited** variable: the value is passed to the `docker` invocation through the process environment, never in argv, so it does not appear in `ps`. Lines that are not `KEY=VALUE` are ignored, and the hook's stdout is never logged, so it is safe to print a secret. A non-zero exit aborts bringing the container up.
+
+The command's environment carries:
+
+- **Lifecycle vars:** `AOE_SESSION_ID`, `AOE_SESSION_TITLE`, `AOE_PROJECT_PATH`, `AOE_PROFILE`, `AOE_TOOL`, `AOE_GROUP_PATH`, `AOE_SESSION_BRANCH` (worktree sessions only), and `AOE_REPO_SLUG` (the `owner/repo` of the project's `origin` remote, when it parses; useful for minting a repo-scoped credential without parsing the path yourself).
+- **The session's resolved sandbox environment**, so a per-session value reaches the hook. Set `TEST_VAR=foo` in the session's sandbox env (the new-session dialog's env list accepts `KEY=VALUE`), and the hook reads `$TEST_VAR`; a different session can set a different value. This is the per-session input channel (the host process env, e.g. `TEST_VAR=foo aoe add ...`, only varies per CLI invocation, so in the long-running TUI it would otherwise be fixed for every session).
 
 The canonical use case is per-session, repo-scoped, short-lived credentials: mint a one-hour, single-repo token on the host (where the broad credential lives) and inject only the narrow token, so the minting tool and host credential never enter the container.
 

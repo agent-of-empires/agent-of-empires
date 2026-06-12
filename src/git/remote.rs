@@ -329,6 +329,40 @@ pub fn get_remote_owner(path: &Path) -> Option<String> {
     parse_owner_from_remote_url(url)
 }
 
+/// Extract the `owner/repo` slug from a git remote URL, stripping any `.git`
+/// suffix and trailing slash. Handles the same formats as
+/// [`parse_owner_from_remote_url`]. Returns `None` if either segment is missing.
+pub(crate) fn parse_slug_from_remote_url(url: &str) -> Option<String> {
+    // Reduce to the path after the host: `owner/repo(.git)`.
+    let path = if !url.contains("://") {
+        // SSH shorthand: git@host:owner/repo.git
+        let colon_pos = url.find(':')?;
+        if !url[..colon_pos].contains('@') {
+            return None;
+        }
+        &url[colon_pos + 1..]
+    } else {
+        let without_scheme = url.split("://").nth(1)?;
+        &without_scheme[without_scheme.find('/')? + 1..]
+    };
+    let path = path.trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let mut segments = path.split('/');
+    let owner = segments.next().filter(|s| !s.is_empty())?;
+    let repo = segments.next().filter(|s| !s.is_empty())?;
+    Some(format!("{}/{}", owner, repo))
+}
+
+/// Look up the `owner/repo` slug of a git repository by reading the `origin`
+/// remote URL. Returns `None` if the path is not a git repo, has no origin
+/// remote, or the URL cannot be parsed into an owner/repo pair.
+pub fn get_remote_slug(path: &Path) -> Option<String> {
+    let repo = open_repo_at(path).ok()?;
+    let remote = repo.find_remote("origin").ok()?;
+    let url = remote.url().ok()?;
+    parse_slug_from_remote_url(url)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,6 +373,31 @@ mod tests {
             parse_owner_from_remote_url("git@github.com:agent-of-empires/agent-of-empires.git"),
             Some("agent-of-empires".to_string()),
         );
+    }
+
+    #[test]
+    fn test_parse_slug_formats() {
+        for url in [
+            "git@github.com:mozilla-ai/any-llm.git",
+            "https://github.com/mozilla-ai/any-llm.git",
+            "ssh://git@github.com/mozilla-ai/any-llm.git",
+            "https://github.com/mozilla-ai/any-llm", // no .git suffix
+            "git@github.com:mozilla-ai/any-llm",
+        ] {
+            assert_eq!(
+                parse_slug_from_remote_url(url),
+                Some("mozilla-ai/any-llm".to_string()),
+                "failed for {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_slug_rejects_incomplete() {
+        assert_eq!(parse_slug_from_remote_url(""), None);
+        // Owner but no repo segment.
+        assert_eq!(parse_slug_from_remote_url("git@github.com:owner"), None);
+        assert_eq!(parse_slug_from_remote_url("https://github.com/owner"), None);
     }
 
     #[test]
