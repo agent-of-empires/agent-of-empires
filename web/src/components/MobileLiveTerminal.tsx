@@ -89,6 +89,12 @@ function segStyle(style: AnsiStyle): CSSProperties | undefined {
   return Object.keys(css).length ? css : undefined;
 }
 
+// Diagnostic overlay for cursor-alignment field reports: open the dashboard
+// with `?livedebug=1` and the live view shows the geometry the overlay math
+// ran on (frame rows/history, content lines, spacer, computed line index).
+// Screenshot-friendly; no behavior changes.
+const LIVE_DEBUG = typeof location !== "undefined" && new URLSearchParams(location.search).has("livedebug");
+
 const Row = memo(function Row({ segs }: { segs: AnsiSegment[] }) {
   if (segs.length === 0) {
     // Keep empty rows at full line height.
@@ -280,15 +286,17 @@ export function MobileLiveTerminal({
     const cursor = !reading ? (frame?.cursor ?? null) : null;
     let cursorTop = 0;
     let cursorLeft = 0;
+    let lineIdx = -1;
+    let baseRow = -1;
     if (cursor) {
-      const lineIdx = Math.max(0, lines.length - screenRows) + cursor.y;
-      const baseRow = visual.lineStartRow[lineIdx] ?? visual.rows.length;
+      lineIdx = Math.max(0, lines.length - screenRows) + cursor.y;
+      baseRow = visual.lineStartRow[lineIdx] ?? visual.rows.length;
       const cols = renderCols > 0 ? renderCols : Number.POSITIVE_INFINITY;
       const wrapOffset = Number.isFinite(cols) ? Math.floor(cursor.x / cols) : 0;
       cursorTop = (spacerLines + baseRow + wrapOffset) * lineH;
       cursorLeft = (Number.isFinite(cols) ? cursor.x % cols : cursor.x) * charW;
     }
-    return { cursor, cursorTop, cursorLeft };
+    return { cursor, cursorTop, cursorLeft, lineIdx, baseRow };
   }, [reading, frame, lines.length, screenRows, visual, renderCols, charW, spacerLines, lineH]);
 
   const atBottom = useCallback(() => {
@@ -629,6 +637,21 @@ export function MobileLiveTerminal({
           )}
         </div>
       </div>
+
+      {LIVE_DEBUG && (
+        <div
+          aria-hidden="true"
+          className="absolute top-1 left-1 z-20 font-mono text-[10px] leading-tight text-amber-300 bg-black/80 rounded px-1.5 py-1 pointer-events-none whitespace-pre"
+          data-live-debug
+        >
+          {[
+            `rows=${frame?.rows ?? "-"} hist=${frame?.history ?? "-"} lines=${lines.length}`,
+            `grid=${renderCols}cols spacer=${spacerLines}`,
+            `cur=${cursor ? `${cursor.x},${cursor.y}` : "null"} idx=${live.lineIdx} base=${live.baseRow}`,
+            `lineH=${lineH.toFixed(2)} charW=${charW.toFixed(3)} top=${cursorTop.toFixed(1)}`,
+          ].join("\n")}
+        </div>
+      )}
 
       {reading && (
         <button
