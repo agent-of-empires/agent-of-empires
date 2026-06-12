@@ -306,11 +306,78 @@ impl Storage {
             return Ok(Vec::new());
         }
 
-        let mut instances: Vec<Instance> = serde_json::from_str(&content)?;
-        for inst in &mut instances {
-            inst.set_file_watch(self.file_watch.clone());
+        // Two-phase parse: deserialise the outer array as opaque values
+        // first, then attempt `Instance` per row. A single unparseable row
+        // (forward-incompatible field, partial write, manual edit) degrades
+        // to "that one session is missing" instead of locking the user out
+        // of every session. Top-level corruption (not a valid JSON array)
+        // still propagates as `Err` so it is never silently masked.
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&content)?;
+        let mut instances = Vec::with_capacity(rows.len());
+        let mut corrupt: Vec<serde_json::Value> = Vec::new();
+        for (idx, row) in rows.into_iter().enumerate() {
+            match serde_json::from_value::<Instance>(row.clone()) {
+                Ok(mut inst) => {
+                    inst.set_file_watch(self.file_watch.clone());
+                    instances.push(inst);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        profile = %self.profile,
+                        row = idx,
+                        error = %e,
+                        path = %self.sessions_path.display(),
+                        "skipping corrupt session row"
+                    );
+                    corrupt.push(row);
+                }
+            }
         }
+
+        if !corrupt.is_empty() {
+            self.quarantine_corrupt_rows(&corrupt);
+        }
+
         Ok(instances)
+    }
+
+    /// Append corrupt session rows to a sibling `sessions.corrupt.jsonl`
+    /// quarantine file (one JSON object per line) for later inspection and
+    /// manual recovery. Best-effort: a failure to write the sidecar is
+    /// logged but never fails the load, since the whole point is to keep the
+    /// surviving sessions reachable.
+    fn quarantine_corrupt_rows(&self, rows: &[serde_json::Value]) {
+        let path = self.sessions_path.with_file_name("sessions.corrupt.jsonl");
+
+        let mut buf = String::new();
+        for row in rows {
+            match serde_json::to_string(row) {
+                Ok(line) => {
+                    buf.push_str(&line);
+                    buf.push('\n');
+                }
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "failed to serialise corrupt session row for quarantine"
+                ),
+            }
+        }
+        if buf.is_empty() {
+            return;
+        }
+
+        if let Err(e) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|mut f| f.write_all(buf.as_bytes()))
+        {
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "failed to write session quarantine file"
+            );
+        }
     }
 
     pub fn load_with_groups(&self) -> Result<(Vec<Instance>, Vec<Group>)> {
@@ -486,6 +553,72 @@ mod tests {
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0].title, "test1");
         assert_eq!(loaded[1].title, "test2");
+
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn test_load_skips_corrupt_row_and_quarantines() -> Result<()> {
+        let temp = tempdir()?;
+        setup_test_home(temp.path());
+        let storage = Storage::new_unwatched("test-profile")?;
+
+        // [ valid, malformed, valid ]: the malformed row is an object that
+        // is missing `Instance`'s required `id`/`project_path` fields.
+        let valid = [
+            Instance::new("alpha", "/tmp/alpha"),
+            Instance::new("beta", "/tmp/beta"),
+        ];
+        let mut rows: Vec<serde_json::Value> = valid
+            .iter()
+            .map(|i| serde_json::to_value(i).unwrap())
+            .collect();
+        rows.insert(1, serde_json::json!({ "title": "corrupt-no-id" }));
+
+        fs::create_dir_all(storage.sessions_path.parent().unwrap())?;
+        fs::write(&storage.sessions_path, serde_json::to_vec_pretty(&rows)?)?;
+
+        let loaded = storage.load()?;
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].title, "alpha");
+        assert_eq!(loaded[1].title, "beta");
+
+        let quarantine = storage
+            .sessions_path
+            .with_file_name("sessions.corrupt.jsonl");
+        assert!(quarantine.exists(), "quarantine sidecar should be created");
+        let q = fs::read_to_string(&quarantine)?;
+        assert_eq!(q.lines().count(), 1, "exactly one row quarantined");
+        assert!(q.contains("corrupt-no-id"), "malformed row is preserved");
+
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn test_load_top_level_corruption_still_errors() -> Result<()> {
+        let temp = tempdir()?;
+        setup_test_home(temp.path());
+        let storage = Storage::new_unwatched("test-profile")?;
+
+        fs::create_dir_all(storage.sessions_path.parent().unwrap())?;
+        // Not a valid JSON array: top-level corruption must not be silently
+        // masked by the per-row fallthrough.
+        fs::write(&storage.sessions_path, b"{ this is not valid json ]")?;
+
+        assert!(
+            storage.load().is_err(),
+            "top-level corruption should still surface as Err"
+        );
+
+        let quarantine = storage
+            .sessions_path
+            .with_file_name("sessions.corrupt.jsonl");
+        assert!(
+            !quarantine.exists(),
+            "no quarantine file for top-level corruption"
+        );
 
         Ok(())
     }
