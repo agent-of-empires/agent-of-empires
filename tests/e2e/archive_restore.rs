@@ -101,6 +101,12 @@ fn test_archive_then_unarchive_cycle() {
     // Unarchive it; the row returns to the active list, still selected.
     h.send_keys("z");
     h.wait_for_absent("is parked", Duration::from_secs(5));
+    // The unarchive triggers a full clear+redraw. `wait_for_absent` above can
+    // satisfy on the transient blank frame mid-redraw, so a bare capture here
+    // races the repaint and sometimes catches an empty screen (the same blank
+    // capture `assert_screen_contains` retries around). Poll for the row to
+    // actually repaint into the active list before asserting on a single frame.
+    h.wait_for("Archivo");
     let after_unarchive = h.capture_screen();
     assert!(
         after_unarchive.contains("Archivo"),
