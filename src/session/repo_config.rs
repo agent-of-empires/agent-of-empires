@@ -1435,12 +1435,12 @@ mod tests {
     #[test]
     fn test_run_before_start_hooks_collects_kv() {
         // Real host shell; multiple commands, later command's keys appended.
+        let tmp = tempfile::tempdir().unwrap();
         let cmds = vec![
             "echo GH_TOKEN=ghs_abc".to_string(),
             "printf 'FOO=bar\\nnoise line\\n'".to_string(),
         ];
-        let minted =
-            run_before_start_hooks(&cmds, Path::new("/tmp"), &[]).expect("hooks should succeed");
+        let minted = run_before_start_hooks(&cmds, tmp.path(), &[]).expect("hooks should succeed");
         assert_eq!(
             minted,
             vec![
@@ -1452,8 +1452,9 @@ mod tests {
 
     #[test]
     fn test_run_before_start_hooks_hard_fail() {
+        let tmp = tempfile::tempdir().unwrap();
         let cmds = vec!["exit 3".to_string()];
-        let err = run_before_start_hooks(&cmds, Path::new("/tmp"), &[])
+        let err = run_before_start_hooks(&cmds, tmp.path(), &[])
             .expect_err("non-zero exit must be an error");
         assert!(err.to_string().contains("exit code 3"), "got: {err}");
     }
@@ -1464,9 +1465,10 @@ mod tests {
         // must never appear in the error (which can be logged/displayed). The
         // secret is supplied via env so it lives only in the hook's stdout, not
         // in the command text (which is intentionally surfaced).
+        let tmp = tempfile::tempdir().unwrap();
         let cmds = vec!["echo \"GH_TOKEN=$SECRET_SRC\"; echo boom 1>&2; exit 1".to_string()];
         let extra_env = [("SECRET_SRC", "topsecret".to_string())];
-        let err = run_before_start_hooks(&cmds, Path::new("/tmp"), &extra_env)
+        let err = run_before_start_hooks(&cmds, tmp.path(), &extra_env)
             .expect_err("non-zero exit must be an error");
         let msg = err.to_string();
         assert!(!msg.contains("topsecret"), "stdout secret leaked: {msg}");

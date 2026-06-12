@@ -958,6 +958,17 @@ impl Instance {
         disk.retroactive_capture_excludes = std::mem::take(&mut self.retroactive_capture_excludes);
         disk.pane_dead_observed = self.pane_dead_observed;
         disk.source_profile = std::mem::take(&mut self.source_profile);
+        // `before_start_env` is `#[serde(skip)]`, so the disk snapshot always
+        // has it empty. Carry the live value forward; otherwise this reload
+        // (which runs before every launch) would wipe the host-minted cache and
+        // make `get_container_for_instance` re-run the before_start hook on each
+        // relaunch of an already-running container, defeating the one-time
+        // backfill and re-minting credentials needlessly.
+        if let (Some(disk_sandbox), Some(runtime_sandbox)) =
+            (disk.sandbox_info.as_mut(), self.sandbox_info.as_ref())
+        {
+            disk_sandbox.before_start_env = runtime_sandbox.before_start_env.clone();
+        }
 
         *self = disk;
     }
@@ -6006,6 +6017,57 @@ mod tests {
             assert_eq!(inst.agent_session_id.as_deref(), Some("old-sid"));
             inst.reconcile_from_disk();
             assert_eq!(inst.agent_session_id.as_deref(), Some("new-sid"));
+        }
+
+        #[test]
+        #[serial]
+        fn reconcile_from_disk_preserves_before_start_env() {
+            // `before_start_env` is `#[serde(skip)]`, so the disk snapshot has
+            // it empty. reconcile_from_disk (run before every launch) must carry
+            // the live host-minted cache forward, or an already-running
+            // container would re-mint on every relaunch.
+            let temp = tempdir().unwrap();
+            std::env::set_var("HOME", temp.path());
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+
+            let storage =
+                crate::session::storage::Storage::new_unwatched("reconcile-before-start").unwrap();
+            let mut inst = Instance::new("title", "/tmp/x");
+            inst.source_profile = "reconcile-before-start".to_string();
+            inst.sandbox_info = Some(crate::session::SandboxInfo {
+                enabled: true,
+                container_id: None,
+                image: "img".to_string(),
+                container_name: "ctr".to_string(),
+                extra_env: None,
+                custom_instruction: None,
+                before_start_env: Vec::new(),
+            });
+            let on_disk = inst.clone();
+            storage
+                .update(|i, g| {
+                    *i = vec![on_disk.clone()];
+                    *g = crate::session::GroupTree::new_with_groups(
+                        std::slice::from_ref(&on_disk),
+                        &[],
+                    )
+                    .get_all_groups();
+                    Ok(())
+                })
+                .unwrap();
+
+            // Stamp a freshly-minted value into the in-memory cache only.
+            inst.sandbox_info.as_mut().unwrap().before_start_env =
+                vec![("GH_TOKEN".to_string(), "ghs_minted".to_string())];
+
+            inst.reconcile_from_disk();
+
+            assert_eq!(
+                inst.sandbox_info.as_ref().unwrap().before_start_env,
+                vec![("GH_TOKEN".to_string(), "ghs_minted".to_string())],
+                "live before_start_env must survive the pre-launch disk reload"
+            );
         }
 
         #[test]
