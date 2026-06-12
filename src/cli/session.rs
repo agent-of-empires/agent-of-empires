@@ -1042,7 +1042,15 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
         let mut live = inst.clone();
         crate::tmux::refresh_session_cache();
         live.update_status();
-        if live.status.blocks_worktree_edit() {
+        // A sandbox session's container keeps the worktree dir mounted even
+        // while the agent is Idle, so `git worktree move` would fail with
+        // EBUSY; stopping the session tears the container down and releases it.
+        if live.status.blocks_worktree_edit()
+            || crate::session::worktree_edit::sandbox_container_holds_worktree(
+                &id,
+                live.is_sandboxed(),
+            )
+        {
             bail!("Stop the session before renaming it: its worktree directory moves to match the new name. Disable session.tie_workdir_to_name to relabel a running session.");
         }
         let leaf = crate::session::worktree_edit::worktree_leaf_from_title(&effective_title);
@@ -1180,7 +1188,12 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
     let mut live = inst.clone();
     crate::tmux::refresh_session_cache();
     live.update_status();
-    if live.status.blocks_worktree_edit() {
+    // A sandbox container keeps the worktree dir mounted even while the agent
+    // is Idle, so the move would fail with EBUSY; stopping the session releases
+    // the mount, same as the active-status case.
+    if live.status.blocks_worktree_edit()
+        || crate::session::worktree_edit::sandbox_container_holds_worktree(&id, live.is_sandboxed())
+    {
         bail!("Cannot edit the workdir name while the session is active; stop it first");
     }
 

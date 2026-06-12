@@ -40,6 +40,24 @@ pub fn worktree_leaf_from_title(title: &str) -> String {
     crate::session::builder::branch_name_from_title(title)
 }
 
+/// Whether a sandbox session's container is still running and therefore
+/// bind-mounting its worktree directory.
+///
+/// A sandbox container runs `sleep infinity` for the life of the session
+/// (`src/containers/runtime_base.rs`), so it holds the worktree dir as an
+/// active mount source even while the agent is Idle. A `git worktree move`
+/// then `rename(2)`s that dir and the kernel refuses with `EBUSY`, surfaced
+/// as `fatal: failed to move`. Callers about to move the worktree must refuse
+/// and have the user stop the session first, which tears the container down
+/// and releases the mount. `is_sandboxed` is taken so non-sandbox sessions
+/// skip the `docker inspect` subprocess entirely. See #1927 follow-up.
+pub fn sandbox_container_holds_worktree(session_id: &str, is_sandboxed: bool) -> bool {
+    is_sandboxed
+        && crate::containers::DockerContainer::from_session_id(session_id)
+            .is_running()
+            .unwrap_or(false)
+}
+
 /// Inputs for an in-place worktree workdir edit.
 pub struct WorktreeEditRequest<'a> {
     /// The session's current worktree metadata.

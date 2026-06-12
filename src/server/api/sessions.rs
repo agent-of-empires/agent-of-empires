@@ -764,7 +764,7 @@ pub async fn rename_session(
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
 
-    let (worktree_info, current_path, status, profile) = {
+    let (worktree_info, current_path, status, profile, is_sandboxed) = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
             return (
@@ -778,6 +778,7 @@ pub async fn rename_session(
             inst.project_path.clone(),
             inst.status,
             inst.source_profile.clone(),
+            inst.is_sandboxed(),
         )
     };
 
@@ -796,7 +797,12 @@ pub async fn rename_session(
         // The dir move is gated on a quiescent worktree, exactly like the
         // standalone worktree-name edit. A running session must be stopped
         // first; the setting is the escape hatch for free-form relabeling.
-        if status.blocks_worktree_edit() {
+        // A sandbox session's container keeps the worktree dir mounted even
+        // while the agent is Idle, so the move would fail with EBUSY; stopping
+        // the session tears the container down and releases the mount.
+        if status.blocks_worktree_edit()
+            || crate::session::worktree_edit::sandbox_container_holds_worktree(&id, is_sandboxed)
+        {
             return (
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({
@@ -1014,7 +1020,7 @@ pub async fn set_worktree_name(
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
 
-    let (worktree_info, current_path, status, profile) = {
+    let (worktree_info, current_path, status, profile, is_sandboxed) = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
             return (
@@ -1028,6 +1034,7 @@ pub async fn set_worktree_name(
             inst.project_path.clone(),
             inst.status,
             inst.source_profile.clone(),
+            inst.is_sandboxed(),
         )
     };
 
@@ -1055,7 +1062,12 @@ pub async fn set_worktree_name(
         )
             .into_response();
     }
-    if status.blocks_worktree_edit() {
+    // A sandbox container keeps the worktree dir mounted even while the agent
+    // is Idle, so the move would fail with EBUSY; stopping the session releases
+    // the mount, same as the active-status case.
+    if status.blocks_worktree_edit()
+        || crate::session::worktree_edit::sandbox_container_holds_worktree(&id, is_sandboxed)
+    {
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({

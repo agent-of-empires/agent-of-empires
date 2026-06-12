@@ -21,6 +21,39 @@ fn humanize_minutes(m: u32) -> String {
     }
 }
 
+/// Why a tied-worktree rename must refuse to move the worktree directory.
+///
+/// `git worktree move` does a `rename(2)` on the worktree dir, which the
+/// kernel refuses while anything holds it. Two distinct holders matter and
+/// they need different wording: an active agent (the session's `status`),
+/// and a sandbox session's container, which bind-mounts the worktree dir and
+/// stays alive on `sleep infinity` even while the agent is Idle. Both are
+/// cleared by stopping the session.
+#[derive(Debug, PartialEq, Eq)]
+enum WorktreeRenameBlock {
+    /// The session's agent is busy (running, starting, etc.).
+    ActiveAgent,
+    /// A sandbox container is running and mounting the worktree dir.
+    SandboxContainer,
+}
+
+/// Decide whether a tied-worktree rename must be blocked, and why. Status
+/// takes precedence so a busy agent reports as `ActiveAgent` rather than
+/// reaching for the container reason. Returns `None` when the move is safe.
+fn worktree_rename_block(
+    status: Status,
+    is_sandboxed: bool,
+    container_running: bool,
+) -> Option<WorktreeRenameBlock> {
+    if status.blocks_worktree_edit() {
+        Some(WorktreeRenameBlock::ActiveAgent)
+    } else if is_sandboxed && container_running {
+        Some(WorktreeRenameBlock::SandboxContainer)
+    } else {
+        None
+    }
+}
+
 impl HomeView {
     /// Pin or unpin the project header under the cursor (project view only).
     ///
@@ -879,14 +912,40 @@ impl HomeView {
             // in both the profile-move and the standard persist paths.
             let mut new_path: Option<String> = None;
             if current_title != effective_title && self.tie_workdir_applies_for(&id) {
-                let snapshot = self
-                    .get_instance(&id)
-                    .map(|i| (i.worktree_info.clone(), i.status, i.project_path.clone()));
-                if let Some((Some(worktree_info), status, project_path)) = snapshot {
-                    if status.blocks_worktree_edit() {
+                let snapshot = self.get_instance(&id).map(|i| {
+                    (
+                        i.worktree_info.clone(),
+                        i.status,
+                        i.project_path.clone(),
+                        i.is_sandboxed(),
+                    )
+                });
+                if let Some((Some(worktree_info), status, project_path, is_sandboxed)) = snapshot {
+                    // A sandbox session keeps its container alive (running
+                    // `sleep infinity`) even while the agent is Idle, and that
+                    // container bind-mounts the worktree directory. The move
+                    // below `git worktree move`s that dir, which the kernel
+                    // refuses while it is an active mount source (EBUSY ->
+                    // "fatal: failed to move"). Stopping the session tears the
+                    // container down and releases the mount. We only inspect
+                    // the container when the status check hasn't already
+                    // blocked, so the common non-sandbox path spawns no
+                    // `docker inspect`. See #1927 follow-up.
+                    let container_running = !status.blocks_worktree_edit()
+                        && crate::session::worktree_edit::sandbox_container_holds_worktree(
+                            &id,
+                            is_sandboxed,
+                        );
+                    if let Some(reason) =
+                        worktree_rename_block(status, is_sandboxed, container_running)
+                    {
+                        let body = match reason {
+                            WorktreeRenameBlock::ActiveAgent => "This worktree session's directory moves to match the new name, which can't happen while it's running. Stop the session first, or disable \"Tie Worktree Directory to Session Name\" to relabel it freely.",
+                            WorktreeRenameBlock::SandboxContainer => "This sandbox session's container is mounting the worktree directory, so it can't be moved to match the new name. Stop the session first, or disable \"Tie Worktree Directory to Session Name\" to relabel it freely.",
+                        };
                         self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
                             "Stop the Session to Rename",
-                            "This worktree session's directory moves to match the new name, which can't happen while it's running. Stop the session first, or disable \"Tie Worktree Directory to Session Name\" to relabel it freely.",
+                            body,
                         ));
                         return Ok(());
                     }
@@ -1325,5 +1384,62 @@ impl HomeView {
         }
         self.update_selected();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // An Idle sandbox session whose container is still running is the #1927
+    // follow-up bug: the worktree dir is an active bind-mount source, so
+    // `git worktree move` fails with EBUSY. Before the fix this returned
+    // `None` (the rename proceeded and the move blew up with "fatal: failed
+    // to move"); it must now block with the sandbox-specific reason.
+    #[test]
+    fn idle_sandbox_with_running_container_blocks() {
+        assert_eq!(
+            worktree_rename_block(Status::Idle, true, true),
+            Some(WorktreeRenameBlock::SandboxContainer)
+        );
+    }
+
+    #[test]
+    fn idle_sandbox_with_stopped_container_is_safe() {
+        // Stopping the session tears the container down, releasing the mount.
+        assert_eq!(worktree_rename_block(Status::Idle, true, false), None);
+    }
+
+    #[test]
+    fn idle_non_sandbox_is_safe() {
+        // No container, nothing holds the dir; the move proceeds.
+        assert_eq!(worktree_rename_block(Status::Idle, false, false), None);
+    }
+
+    #[test]
+    fn active_status_blocks_as_active_agent() {
+        for status in [
+            Status::Running,
+            Status::Waiting,
+            Status::Starting,
+            Status::Creating,
+            Status::Deleting,
+        ] {
+            assert_eq!(
+                worktree_rename_block(status, false, false),
+                Some(WorktreeRenameBlock::ActiveAgent),
+                "{status:?} should block as ActiveAgent"
+            );
+        }
+    }
+
+    #[test]
+    fn active_status_takes_precedence_over_container() {
+        // A busy agent reports as ActiveAgent even on a sandbox session with a
+        // live container; status is checked first.
+        assert_eq!(
+            worktree_rename_block(Status::Running, true, true),
+            Some(WorktreeRenameBlock::ActiveAgent)
+        );
     }
 }
