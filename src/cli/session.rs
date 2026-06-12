@@ -1063,6 +1063,16 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
             },
         ) {
             Ok(outcome) => {
+                // The dir moved (path changed): a sandbox container created
+                // against the old path is now stale, so drop it to force a
+                // fresh create on next start. A branch-only edit leaves the
+                // path (and the mount) unchanged.
+                if outcome.new_path != std::path::Path::new(&current_path) {
+                    crate::session::worktree_edit::discard_sandbox_container_after_move(
+                        &id,
+                        live.is_sandboxed(),
+                    );
+                }
                 new_path = Some(outcome.new_path.to_string_lossy().to_string());
                 new_branch = outcome.new_branch;
             }
@@ -1205,6 +1215,15 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
             rename_branch: args.rename_branch,
         },
     )?;
+    // The dir moved (path changed): a sandbox container created against the old
+    // path is now stale, so drop it to force a fresh create on next start. A
+    // branch-only edit leaves the path (and the mount) unchanged.
+    if outcome.new_path != std::path::Path::new(&current_path) {
+        crate::session::worktree_edit::discard_sandbox_container_after_move(
+            &id,
+            live.is_sandboxed(),
+        );
+    }
     let new_path = outcome.new_path.to_string_lossy().to_string();
     let new_branch = outcome.new_branch.clone();
 

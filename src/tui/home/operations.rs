@@ -960,7 +960,14 @@ impl HomeView {
                         },
                     ) {
                         Ok(outcome) => {
-                            new_path = Some(outcome.new_path.to_string_lossy().to_string())
+                            new_path = Some(outcome.new_path.to_string_lossy().to_string());
+                            // The dir moved; a sandbox container created against
+                            // the old path is now stale, so drop it to force a
+                            // fresh create on next start.
+                            crate::session::worktree_edit::discard_sandbox_container_after_move(
+                                &id,
+                                is_sandboxed,
+                            );
                         }
                         // Leaf maps to the current dir: nothing to move, just
                         // rename the title.

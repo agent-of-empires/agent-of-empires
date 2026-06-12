@@ -832,6 +832,16 @@ pub async fn rename_session(
 
         match edit {
             Ok(Ok((path, branch))) => {
+                // The dir moved (path changed): a sandbox container created
+                // against the old path is now stale, so drop it to force a
+                // fresh create on next start. A branch-only edit leaves the
+                // path (and the mount) unchanged, so skip it then.
+                if path != current_path {
+                    crate::session::worktree_edit::discard_sandbox_container_after_move(
+                        &id,
+                        is_sandboxed,
+                    );
+                }
                 new_path = Some(path);
                 new_branch = branch;
             }
@@ -1110,6 +1120,13 @@ pub async fn set_worktree_name(
                 .into_response();
         }
     };
+
+    // The dir moved (path changed): a sandbox container created against the old
+    // path is now stale, so drop it to force a fresh create on next start. A
+    // branch-only edit leaves the path (and the mount) unchanged.
+    if new_path != current_path {
+        crate::session::worktree_edit::discard_sandbox_container_after_move(&id, is_sandboxed);
+    }
 
     // The git move has already landed, so persist to disk BEFORE mutating
     // in-memory state. A silent persist failure here would leave stale

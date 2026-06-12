@@ -58,6 +58,49 @@ pub fn sandbox_container_holds_worktree(session_id: &str, is_sandboxed: bool) ->
             .unwrap_or(false)
 }
 
+/// Drop a sandbox session's container after its worktree directory has been
+/// moved by a rename.
+///
+/// A container's bind mounts and working dir are baked in at creation time
+/// (`src/containers/runtime_base.rs`); they do NOT follow a host-side
+/// `git worktree move`. `get_container_for_instance` reuses an existing
+/// stopped container as-is, so without this the restarted container would
+/// still mount (and `cd` into) the old path. Removing it here forces a fresh
+/// `create` with the new path on next start. `remove(force)` drops only the
+/// container and its anonymous volumes; named ignore volumes (node_modules,
+/// target) are keyed by session id and survive for the recreated container.
+///
+/// No-op for non-sandbox sessions. The rename gate requires a stopped session
+/// (see [`sandbox_container_holds_worktree`]), so the container is not running
+/// here. Best-effort: a failure is logged, not surfaced, since the rename
+/// itself has already succeeded. See #1927 follow-up.
+pub fn discard_sandbox_container_after_move(session_id: &str, is_sandboxed: bool) {
+    if !is_sandboxed {
+        return;
+    }
+    let container = crate::containers::DockerContainer::from_session_id(session_id);
+    match container.exists() {
+        Ok(true) => match container.remove(true) {
+            Ok(()) => tracing::info!(
+                target: "containers.runtime",
+                session = %session_id,
+                "removed stale sandbox container after worktree move; it will be recreated with the new path on next start"
+            ),
+            Err(e) => tracing::warn!(
+                target: "containers.runtime",
+                session = %session_id,
+                "failed to remove stale sandbox container after worktree move: {e}"
+            ),
+        },
+        Ok(false) => {}
+        Err(e) => tracing::warn!(
+            target: "containers.runtime",
+            session = %session_id,
+            "could not check sandbox container existence after worktree move: {e}"
+        ),
+    }
+}
+
 /// Inputs for an in-place worktree workdir edit.
 pub struct WorktreeEditRequest<'a> {
     /// The session's current worktree metadata.
