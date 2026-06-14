@@ -4657,6 +4657,10 @@ impl HomeView {
     /// rows from peer-deleted ones (which look identical at the disk
     /// layer: missing from sessions.json).
     pub(super) fn add_instance(&mut self, instance: Instance) {
+        // The single funnel every TUI session create passes through, so it is
+        // where the opt-in create-trend counter is bumped (#1897). Mirrors the
+        // serve side's increment in `create_session`; no-op when not opted in.
+        super::app::record_session_create();
         self.pending_added
             .entry(instance.source_profile.clone())
             .or_default()

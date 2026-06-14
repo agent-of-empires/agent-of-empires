@@ -693,15 +693,6 @@ pub async fn send_snapshot(snapshot: UsageSnapshot) -> bool {
     confirmed
 }
 
-/// Send a pre-built usage snapshot, detached. Returns immediately and never
-/// blocks the caller; the fingerprint is recorded inside the spawned task only
-/// on a confirmed send.
-pub fn spawn_snapshot(snapshot: UsageSnapshot) {
-    tokio::spawn(async move {
-        send_snapshot(snapshot).await;
-    });
-}
-
 /// Send the best-effort snapshot on graceful exit, awaiting delivery with a
 /// hard timeout so the final snapshot can flush without risking a hang, but
 /// skipping the send when the snapshot is identical (ignoring `sent_at`) to the
