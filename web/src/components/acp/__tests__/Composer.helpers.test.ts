@@ -6,7 +6,7 @@
 // are kept side-effect-free precisely so they can be exercised without
 // mounting the assistant-ui runtime; see the doc comments on each helper.
 
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   composerWrapperLayout,
   decideBeforeInputAction,
@@ -102,14 +102,21 @@ describe("composerWrapperLayout", () => {
   });
 });
 
+const mountedTextareas: HTMLTextAreaElement[] = [];
+
 function textareaRef(value: string, start: number, end = start) {
   const ta = document.createElement("textarea");
   ta.value = value;
   ta.selectionStart = start;
   ta.selectionEnd = end;
   document.body.appendChild(ta);
+  mountedTextareas.push(ta);
   return { current: ta } as React.RefObject<HTMLTextAreaElement | null>;
 }
+
+afterEach(() => {
+  for (const ta of mountedTextareas.splice(0)) ta.remove();
+});
 
 describe("insertNewlineAtCaret", () => {
   it("is a no-op when the ref is empty", () => {
