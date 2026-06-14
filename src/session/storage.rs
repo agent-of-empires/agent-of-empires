@@ -612,22 +612,24 @@ mod tests {
         let storage = Storage::new_unwatched("test-profile")?;
 
         fs::create_dir_all(storage.sessions_path.parent().unwrap())?;
-        // Not a valid JSON array: top-level corruption must not be silently
-        // masked by the per-row fallthrough.
-        fs::write(&storage.sessions_path, b"{ this is not valid json ]")?;
-
-        assert!(
-            storage.load().is_err(),
-            "top-level corruption should still surface as Err"
-        );
-
         let quarantine = storage
             .sessions_path
             .with_file_name("sessions.corrupt.jsonl");
-        assert!(
-            !quarantine.exists(),
-            "no quarantine file for top-level corruption"
-        );
+
+        // Both forms of top-level corruption must surface as Err and never be
+        // masked by the per-row fallthrough: valid JSON of the wrong shape (an
+        // object, not an array) and syntactically invalid JSON (a torn write).
+        for bad in [&b"{}"[..], &b"{ this is not valid json ]"[..]] {
+            fs::write(&storage.sessions_path, bad)?;
+            assert!(
+                storage.load().is_err(),
+                "top-level corruption should still surface as Err"
+            );
+            assert!(
+                !quarantine.exists(),
+                "no quarantine file for top-level corruption"
+            );
+        }
 
         Ok(())
     }
