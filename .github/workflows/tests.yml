@@ -123,7 +123,7 @@ jobs:
         run: npm ci
       - name: Run Vitest with coverage
         working-directory: web
-        run: npm run test:unit -- --coverage
+        run: npm run test:unit -- --coverage --reporter=default --reporter=junit --outputFile.junit=test-report.junit.xml
       # Vitest's v8 coverage reporter emits LCOV paths relative to the
       # vitest cwd (web/), so SF: lines read "SF:src/...". Codecov
       # matches file paths against the PR diff, which uses repo-root
@@ -152,6 +152,14 @@ jobs:
           flags: vitest
           name: vitest
           fail_ci_if_error: false
+      - name: Upload test results to Codecov (vitest)
+        if: ${{ !cancelled() }}
+        uses: codecov/test-results-action@0fa95f0e1eeaafde2c782583b36b28ad0d8c77d3 # v1.2.1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          disable_search: true
+          files: web/test-report.junit.xml
+          flags: vitest
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ !cancelled() }}
         with:
@@ -241,6 +249,14 @@ jobs:
           flags: playwright-mocked
           name: playwright-mocked
           fail_ci_if_error: false
+      - name: Upload test results to Codecov (playwright-mocked)
+        if: ${{ !cancelled() }}
+        uses: codecov/test-results-action@0fa95f0e1eeaafde2c782583b36b28ad0d8c77d3 # v1.2.1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          disable_search: true
+          files: web/test-report.junit.xml
+          flags: playwright-mocked
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ !cancelled() }}
         with:
@@ -338,6 +354,14 @@ jobs:
           flags: playwright-live
           name: playwright-live-shard-${{ matrix.shard }}
           fail_ci_if_error: false
+      - name: Upload test results to Codecov (playwright-live)
+        if: ${{ !cancelled() }}
+        uses: codecov/test-results-action@0fa95f0e1eeaafde2c782583b36b28ad0d8c77d3 # v1.2.1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          disable_search: true
+          files: web/test-report.junit.xml
+          flags: playwright-live
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ !cancelled() }}
         with:
