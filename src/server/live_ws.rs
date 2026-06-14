@@ -514,6 +514,8 @@ mod tests {
             pane_height: 46,
             history_size: 1200,
             pane_width: 74,
+            alternate_on: false,
+            mouse_tracking: false,
         };
         let json = frame_json("hello\nworld", Some(&cursor));
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -534,6 +536,8 @@ mod tests {
             pane_height: 46,
             history_size: 0,
             pane_width: 74,
+            alternate_on: false,
+            mouse_tracking: false,
         };
         let v: serde_json::Value = serde_json::from_str(&frame_json("x", Some(&cursor))).unwrap();
         assert!(v["cursor"].is_null());
