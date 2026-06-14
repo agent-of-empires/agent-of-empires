@@ -316,7 +316,7 @@ impl Storage {
         let mut instances = Vec::with_capacity(rows.len());
         let mut corrupt: Vec<serde_json::Value> = Vec::new();
         for (idx, row) in rows.into_iter().enumerate() {
-            match serde_json::from_value::<Instance>(row.clone()) {
+            match <Instance as serde::Deserialize>::deserialize(&row) {
                 Ok(mut inst) => {
                     inst.set_file_watch(self.file_watch.clone());
                     instances.push(inst);
@@ -341,11 +341,18 @@ impl Storage {
         Ok(instances)
     }
 
-    /// Append corrupt session rows to a sibling `sessions.corrupt.jsonl`
+    /// Write corrupt session rows to a sibling `sessions.corrupt.jsonl`
     /// quarantine file (one JSON object per line) for later inspection and
     /// manual recovery. Best-effort: a failure to write the sidecar is
     /// logged but never fails the load, since the whole point is to keep the
     /// surviving sessions reachable.
+    ///
+    /// Truncates rather than appends: `load()` runs on read-only refresh
+    /// paths (TUI reconcile, web list, CLI) that never rewrite
+    /// `sessions.json`, so a persistently corrupt row would otherwise be
+    /// re-appended on every load and grow the sidecar without bound. Each
+    /// load sees the full current corrupt set, so an overwrite is a
+    /// complete, deduplicated snapshot.
     fn quarantine_corrupt_rows(&self, rows: &[serde_json::Value]) {
         let path = self.sessions_path.with_file_name("sessions.corrupt.jsonl");
 
@@ -366,12 +373,7 @@ impl Storage {
             return;
         }
 
-        if let Err(e) = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .and_then(|mut f| f.write_all(buf.as_bytes()))
-        {
+        if let Err(e) = fs::write(&path, buf.as_bytes()) {
             tracing::warn!(
                 error = %e,
                 path = %path.display(),
@@ -591,6 +593,13 @@ mod tests {
         let q = fs::read_to_string(&quarantine)?;
         assert_eq!(q.lines().count(), 1, "exactly one row quarantined");
         assert!(q.contains("corrupt-no-id"), "malformed row is preserved");
+
+        // A second read-only load must not duplicate the row: load() runs on
+        // refresh paths that never rewrite sessions.json, so the sidecar is
+        // overwritten with the current corrupt set rather than appended to.
+        assert_eq!(storage.load()?.len(), 2);
+        let q = fs::read_to_string(&quarantine)?;
+        assert_eq!(q.lines().count(), 1, "repeated load must not duplicate");
 
         Ok(())
     }
