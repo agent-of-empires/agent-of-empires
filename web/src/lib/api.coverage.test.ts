@@ -101,7 +101,7 @@ function bodyOf(init: RequestInit | undefined): unknown {
   return JSON.parse(init!.body as string);
 }
 
-// --- Sessions ---
+// Sessions
 
 describe("fetchSessions", () => {
   it("GETs /api/sessions and returns the envelope", async () => {
@@ -243,7 +243,7 @@ describe("getSessionFileContents", () => {
   });
 });
 
-// --- Settings ---
+// Settings
 
 describe("fetchSettings", () => {
   it("GETs /api/settings with no profile", async () => {
@@ -321,7 +321,7 @@ describe("patchWebUiState", () => {
   });
 });
 
-// --- Sandbox volume ignores ---
+// Sandbox volume ignores
 
 describe("fetchVolumeIgnoresPreview", () => {
   it("GETs the preview with an encoded path, no profile", async () => {
@@ -367,7 +367,7 @@ describe("markVolumeIgnoresGlobsAcknowledged", () => {
   });
 });
 
-// --- Profiles ---
+// Profiles
 
 describe("createProfile", () => {
   it("POSTs the name to /api/profiles", async () => {
@@ -455,7 +455,7 @@ describe("getProfileSettings", () => {
   });
 });
 
-// --- Themes & Sounds ---
+// Themes & Sounds
 
 describe("fetchThemes", () => {
   it("returns the array on 200", async () => {
@@ -529,7 +529,7 @@ describe("fetchSoundBlob", () => {
   });
 });
 
-// --- Telemetry ---
+// Telemetry
 
 describe("fetchTelemetryStatus", () => {
   it("GETs the telemetry status endpoint", async () => {
@@ -602,7 +602,7 @@ describe("reportAcpInteraction", () => {
   });
 });
 
-// --- Update status ---
+// Update status
 
 describe("fetchUpdateStatus", () => {
   it("GETs the update status endpoint", async () => {
@@ -635,7 +635,7 @@ describe("dismissUpdate", () => {
   });
 });
 
-// --- Branches ---
+// Branches
 
 describe("fetchBranches", () => {
   it("GETs branches for a path, no include_remote by default", async () => {
@@ -659,7 +659,7 @@ describe("fetchBranches", () => {
   });
 });
 
-// --- Context primer ---
+// Context primer
 
 describe("fetchContextPrimer", () => {
   it("GETs the primer with an encoded id and before_seq", async () => {
@@ -683,7 +683,7 @@ describe("fetchContextPrimer", () => {
   });
 });
 
-// --- Devices ---
+// Devices
 
 describe("fetchDevices", () => {
   it("GETs /api/devices", async () => {
@@ -736,7 +736,7 @@ describe("signOutAllDevices", () => {
   });
 });
 
-// --- Wizard list helpers ---
+// Wizard list helpers
 
 describe("fetchAgents", () => {
   it("returns the array on 200", async () => {
@@ -941,7 +941,7 @@ describe("fetchDockerStatus", () => {
   });
 });
 
-// --- Create session ---
+// Create session
 
 describe("createSession", () => {
   const body = { path: "/repo", agent: "claude" } as unknown as CreateSessionRequest;
@@ -1003,7 +1003,7 @@ describe("createSession", () => {
   });
 });
 
-// --- Clone ---
+// Clone
 
 describe("cloneRepo", () => {
   it("POSTs just the url by default", async () => {
@@ -1036,7 +1036,7 @@ describe("cloneRepo", () => {
   });
 });
 
-// --- Login ---
+// Login
 
 describe("loginStatus", () => {
   it("returns the parsed status on 200", async () => {
@@ -1144,7 +1144,7 @@ describe("logout", () => {
   });
 });
 
-// --- Session mutations ---
+// Session mutations
 
 describe("renameSession", () => {
   it("PATCHes the title and returns ok on 200", async () => {
@@ -1334,7 +1334,7 @@ describe("deleteSession", () => {
   });
 });
 
-// --- MCP servers ---
+// MCP servers
 
 describe("fetchMcpServers", () => {
   it("GETs without an agent query by default", async () => {
