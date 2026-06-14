@@ -4657,10 +4657,16 @@ impl HomeView {
     /// rows from peer-deleted ones (which look identical at the disk
     /// layer: missing from sessions.json).
     pub(super) fn add_instance(&mut self, instance: Instance) {
-        // The single funnel every TUI session create passes through, so it is
-        // where the opt-in create-trend counter is bumped (#1897). Mirrors the
-        // serve side's increment in `create_session`; no-op when not opted in.
-        super::app::record_session_create();
+        // Count only finalized session inserts for the opt-in create-trend
+        // counter (#1897). `add_instance` is also the funnel for `Creating`
+        // placeholder stubs in the async creation flow (removed and replaced by
+        // the real row on success), so counting every call would double-count a
+        // successful background create and count a cancelled one that never
+        // finalized. A real create is never `Creating`. Mirrors the serve side's
+        // single increment in `create_session`; no-op when not opted in.
+        if instance.status != crate::session::Status::Creating {
+            super::app::record_session_create();
+        }
         self.pending_added
             .entry(instance.source_profile.clone())
             .or_default()

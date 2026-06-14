@@ -91,6 +91,15 @@ pub(super) fn record_session_create() {
     TUI_SESSION_CREATES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Test-only read of the process-local create counter, so the `home` module's
+/// `add_instance` gating test can assert real creates count and `Creating`
+/// stubs do not. Tests sharing the counter use the `telemetry_creates` serial
+/// group to avoid racing on this global.
+#[cfg(test)]
+pub(crate) fn session_create_count_for_test() -> u32 {
+    reported_session_creates()
+}
+
 struct UpdateStatus {
     text: String,
     expires_at: Option<std::time::Instant>,

@@ -44,6 +44,39 @@ fn create_test_env_empty() -> TestEnv {
     TestEnv { _temp: temp, view }
 }
 
+// #1897 / CodeRabbit follow-up: `add_instance` is the funnel for both the
+// `Creating` placeholder stub (async creation flow) and the finalized session
+// row. The opt-in create-trend counter must bump only for finalized inserts, or
+// a successful background create double-counts (stub + real) and a cancelled one
+// counts a session that never existed. Asserts deltas (not absolutes) since the
+// counter is a process-global shared with the `telemetry_creates` serial group.
+#[test]
+#[serial_test::serial(telemetry_creates)]
+fn add_instance_counts_only_finalized_creates() {
+    use crate::session::Status;
+    let mut env = create_test_env_empty();
+    let before = crate::tui::app::session_create_count_for_test();
+
+    let mut stub = Instance::new("stub", "/tmp/test");
+    stub.source_profile = "test".to_string();
+    stub.status = Status::Creating;
+    env.view.add_instance(stub);
+    assert_eq!(
+        crate::tui::app::session_create_count_for_test(),
+        before,
+        "a Creating placeholder stub must not bump the create counter"
+    );
+
+    let mut real = Instance::new("real", "/tmp/test");
+    real.source_profile = "test".to_string();
+    env.view.add_instance(real);
+    assert_eq!(
+        crate::tui::app::session_create_count_for_test(),
+        before + 1,
+        "a finalized session insert must bump the create counter exactly once"
+    );
+}
+
 #[test]
 #[serial]
 fn rewire_disk_subscriptions_is_noop_without_tokio_runtime() {
