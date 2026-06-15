@@ -1523,6 +1523,10 @@ fn build_router(state: Arc<AppState>) -> Router {
     let app = app
         .route("/sessions/{id}/acp/ws", get(acp_ws::acp_ws))
         .route("/api/sessions/{id}/acp/spawn", post(api::spawn_acp))
+        .route(
+            "/api/sessions/{id}/acp/install-agent",
+            post(api::install_agent),
+        )
         .route("/api/sessions/{id}/acp", delete(api::shutdown_acp))
         .route(
             "/api/sessions/{id}/acp/switch-agent",

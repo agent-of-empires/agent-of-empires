@@ -364,6 +364,144 @@ pub async fn spawn_acp(
     }
 }
 
+/// Result of a server-run agent install. The "& restart" half is the
+/// client's job: on `success` the web re-POSTs `/acp/spawn` (the same
+/// respawn path the Restart button uses), so this endpoint stays a pure
+/// install with no server-side respawn duplication. See #2109.
+#[derive(Serialize)]
+pub struct InstallAgentResponse {
+    pub session_id: String,
+    pub package: String,
+    pub success: bool,
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// `POST /api/sessions/{id}/acp/install-agent`: run `npm install -g <pkg>`
+/// for the session's agent on the host, then let the client respawn.
+///
+/// Hardened, opt-in (Tier 2 of #2109): blocked in read-only mode; gated on
+/// the `acp.allow_agent_install` setting (default off, `local_only`); the
+/// package is resolved server-side from the session's agent via a static
+/// npm-only table, never from client input; npm runs with fixed argv and no
+/// shell; the per-session instance lock serializes installs so a
+/// double-click cannot race the global npm prefix. Sandbox sessions are
+/// refused because a host install never reaches the containerized agent.
+pub async fn install_agent(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Some(resp) = read_only_block(&state) {
+        return resp;
+    }
+    if !crate::session::Config::load_or_warn()
+        .acp
+        .allow_agent_install
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "install_disabled",
+                "message": "Installing agents from the web is off. Enable acp.allow_agent_install (Settings, local only).",
+            })),
+        )
+            .into_response();
+    }
+
+    let instances = state.instances.read().await;
+    let Some(instance) = instances.iter().find(|i| i.id == id).cloned() else {
+        return (StatusCode::NOT_FOUND, "session not found").into_response();
+    };
+    drop(instances);
+
+    if instance.is_sandboxed() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "sandboxed",
+                "message": "This session runs in a sandbox container; a host install would not reach the agent. Install it inside the container or rebuild its image.",
+            })),
+        )
+            .into_response();
+    }
+
+    // Resolve the binary the session would spawn, then its npm package.
+    let agent = state
+        .acp_supervisor
+        .pick_agent_for_tool(
+            &instance.tool,
+            instance.agent_name.as_deref(),
+            &instance.source_profile,
+            std::path::Path::new(&instance.project_path),
+        )
+        .await;
+    let binary = match state.acp_supervisor.resolve_agent(&agent).await {
+        Ok(spec) => spec.command,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("could not resolve agent `{agent}`: {e}"),
+            )
+                .into_response();
+        }
+    };
+    let Some(package) = crate::acp::install_hints::npm_package_for(&binary) else {
+        let hint =
+            crate::acp::install_hints::install_hint_for(&binary).unwrap_or("(see project docs)");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "not_npm_installable",
+                "message": format!("`{binary}` cannot be installed via npm from the daemon. Install it manually: {hint}"),
+                "install_command": hint,
+            })),
+        )
+            .into_response();
+    };
+
+    // Serialize against concurrent installs / spawns for this session.
+    let _inst_lock = state.instance_lock(&id).await;
+
+    let Ok(npm) = which::which("npm") else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "npm_missing",
+                "message": "`npm` is not on the daemon's PATH. Start `aoe serve` from a shell where `which npm` resolves.",
+            })),
+        )
+            .into_response();
+    };
+
+    let output = match tokio::process::Command::new(&npm)
+        .arg("install")
+        .arg("-g")
+        .arg(package)
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("npm install failed to start: {e}"),
+            )
+                .into_response();
+        }
+    };
+
+    Json(InstallAgentResponse {
+        session_id: id,
+        package: package.to_string(),
+        success: output.status.success(),
+        exit_code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    })
+    .into_response()
+}
+
 pub async fn shutdown_acp(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
