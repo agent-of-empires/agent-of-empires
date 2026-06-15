@@ -7708,20 +7708,20 @@ mod scroll_pane_isolation {
         );
     }
 
-    /// Guard the encoding: a full-screen app with mouse tracking but in the
-    /// LEGACY (non-SGR) encoding must not get SGR bytes either; they would
-    /// be misparsed. Falls back to capture-window scroll. (Regression for
-    /// the CodeRabbit finding on #2123: mouse_any_flag is not SGR support.)
+    /// A full-screen app with mouse tracking but in the LEGACY (non-SGR)
+    /// encoding is still forwarded; the byte builder emits X10-encoded
+    /// bytes for it instead of SGR (see `wheel_mouse_bytes_legacy_encodes_x10`).
+    /// Forwarding pins the preview to the live edge like the SGR case.
     #[test]
     #[serial]
-    fn wheel_over_alt_screen_legacy_mouse_uses_capture_scroll() {
+    fn wheel_over_alt_screen_legacy_mouse_forwards() {
         let mut env = live_env_with_cursor(alt_screen_cursor(true, true, false));
 
         let up = env.view.handle_scroll_up(50, 10);
-        assert!(up);
-        assert!(
-            env.view.preview_scroll_offset > 10,
-            "legacy (non-SGR) mouse: keep the capture-window scroll"
+        assert!(up, "wheel over a full-screen legacy-mouse pane is handled");
+        assert_eq!(
+            env.view.preview_scroll_offset, 0,
+            "legacy mouse is forwarded too (X10 encoding), not dead-scrolled"
         );
     }
 
