@@ -690,6 +690,25 @@ function pickStartedAt(args: Record<string, unknown> | undefined, argsText: stri
   return null;
 }
 
+/** Validate and normalize a smuggled `_aoe_memory_recall` value before it
+ *  reaches MemoryRecallCard. A malformed payload (e.g. non-string
+ *  `synthesized_text`) would otherwise trigger runtime type errors in the
+ *  card. Returns undefined for anything that isn't shaped like a
+ *  MemoryRecall. */
+function asMemoryRecall(value: unknown): MemoryRecall | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const obj = value as Record<string, unknown>;
+  if (typeof obj.mode !== "string") return undefined;
+  const paths =
+    Array.isArray(obj.paths) && obj.paths.every((p) => typeof p === "string") ? (obj.paths as string[]) : undefined;
+  const synthesized_text = typeof obj.synthesized_text === "string" ? obj.synthesized_text : undefined;
+  return {
+    mode: obj.mode,
+    ...(paths ? { paths } : {}),
+    ...(synthesized_text !== undefined ? { synthesized_text } : {}),
+  };
+}
+
 /** Read the smuggled `_aoe_memory_recall` payload AcpRuntime stashes on
  *  the tool-call args so the structured-view card can dispatch to
  *  MemoryRecallCard. Returns undefined when absent or malformed; the
@@ -698,13 +717,13 @@ function pickMemoryRecall(
   args: Record<string, unknown> | undefined,
   argsText: string | undefined,
 ): MemoryRecall | undefined {
-  const fromObj = args?._aoe_memory_recall;
-  if (fromObj && typeof fromObj === "object") return fromObj as MemoryRecall;
+  const fromObj = asMemoryRecall(args?._aoe_memory_recall);
+  if (fromObj) return fromObj;
   if (argsText) {
     try {
       const parsed = JSON.parse(argsText) as Record<string, unknown>;
-      const mr = parsed?._aoe_memory_recall;
-      if (mr && typeof mr === "object") return mr as MemoryRecall;
+      const mr = asMemoryRecall(parsed?._aoe_memory_recall);
+      if (mr) return mr;
     } catch {
       // ignore
     }
@@ -790,6 +809,7 @@ function groupChildToItem(c: GroupChild): {
     kind: c.toolName,
     args_preview: c.argsText,
     started_at: startedAt,
+    memory_recall: pickMemoryRecall(parsedArgs, c.argsText),
   };
   const result =
     c.result !== undefined
@@ -855,6 +875,7 @@ function AssistantSubagentTask({ argsText }: { argsText?: string }) {
       kind: c.toolName,
       args_preview: c.argsText,
       started_at: startedAt,
+      memory_recall: pickMemoryRecall(parsedArgs, c.argsText),
     };
     const result =
       c.result !== undefined
