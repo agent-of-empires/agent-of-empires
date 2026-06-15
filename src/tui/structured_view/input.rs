@@ -134,6 +134,20 @@ pub fn dispatch(focus: Focus, key: &KeyEvent, ctx: InputContext) -> Intent {
 fn composer_keys(key: &KeyEvent, ctx: InputContext) -> Intent {
     let slash_picker_open = ctx.slash_picker_open;
     let mention_picker_open = ctx.mention_picker_open;
+    // While browsing the queue, recall navigation owns its core keys even
+    // when the recalled text would otherwise open the slash / `@` picker
+    // (e.g. a queued "/clear"). Without this the picker would steal
+    // Up/Down/Esc/Enter and break recall navigation, restore, and save.
+    // Typed characters still fall through below to narrow the picker.
+    if ctx.browsing_queue {
+        match (key.modifiers, key.code) {
+            (m, KeyCode::Up) if m.is_empty() => return Intent::RecallQueued(-1),
+            (m, KeyCode::Down) if m.is_empty() => return Intent::RecallQueued(1),
+            (m, KeyCode::Esc) if m.is_empty() => return Intent::RecallCancel,
+            (m, KeyCode::Enter) if m.is_empty() => return Intent::SubmitPrompt,
+            _ => {}
+        }
+    }
     // When a picker is open it claims navigation + accept/dismiss keys
     // so the user can drive it without the textarea swallowing them.
     // Everything else (typing, cursor motion the picker doesn't use)
@@ -664,6 +678,39 @@ mod tests {
             ),
             Intent::RecallQueued(1)
         );
+    }
+
+    #[test]
+    fn recall_keys_win_over_open_picker_while_browsing() {
+        // A recalled prompt that looks like a slash query opens the picker;
+        // recall navigation must still own Up/Down/Esc/Enter.
+        let ctx = InputContext {
+            slash_picker_open: true,
+            browsing_queue: true,
+            queue_len: 2,
+            ..InputContext::default()
+        };
+        assert_eq!(
+            dispatch(Focus::Composer, &key(KeyCode::Up), ctx),
+            Intent::RecallQueued(-1)
+        );
+        assert_eq!(
+            dispatch(Focus::Composer, &key(KeyCode::Down), ctx),
+            Intent::RecallQueued(1)
+        );
+        assert_eq!(
+            dispatch(Focus::Composer, &key(KeyCode::Esc), ctx),
+            Intent::RecallCancel
+        );
+        assert_eq!(
+            dispatch(Focus::Composer, &key(KeyCode::Enter), ctx),
+            Intent::SubmitPrompt
+        );
+        // Typed characters still fall through to narrow the picker.
+        assert!(matches!(
+            dispatch(Focus::Composer, &key(KeyCode::Char('a')), ctx),
+            Intent::Compose(_)
+        ));
     }
 
     #[test]
