@@ -54,6 +54,8 @@ import { classifyMcp, humanizeServer, humanizeVerb } from "../../lib/mcpClassify
 import { classifyMemory, parseMemoryFrontmatter, type MemoryHit } from "../../lib/memoryClassify";
 import { reclassifyBash } from "../../lib/toolReclassify";
 import { useAgentProfile } from "../../lib/agentProfileContext";
+import { useAcpFileRef } from "./AcpFileRefContext";
+import { relativeDisplayPath } from "../../lib/fileRef";
 import { useToolDisplayMode, type ToolDensity } from "./ToolDisplayMode";
 import type { AgentProfile, CardKind } from "../../lib/agentProfiles";
 
@@ -778,10 +780,11 @@ function ExecuteToolCard({ tool, result }: Props) {
 
 function ReadToolCard({ tool, result }: Props) {
   const status = statusFor(result);
+  const { fileRefSession } = useAcpFileRef();
   const args = parseJsonObject(tool.args_preview);
   const argPath = pickStr(args, "path", "file_path", "filePath", "filename");
   const title = pickStr(args, "_aoe_title");
-  const path = pickFirst(argPath, title, tool.name) ?? "(unknown file)";
+  const path = relativeDisplayPath(pickFirst(argPath, title, tool.name) ?? "(unknown file)", fileRefSession);
   const range = formatRange(args);
   const ext = argPath?.match(/\.([a-z0-9]+)$/i)?.[1]?.toLowerCase();
   const content = result?.text ?? "";
@@ -830,6 +833,7 @@ function formatRange(args: Record<string, unknown> | null): string | null {
 
 function EditToolCard({ tool, result }: Props) {
   const status = statusFor(result);
+  const { fileRefSession } = useAcpFileRef();
   const args = parseJsonObject(tool.args_preview);
   const argPath = pickStr(args, "path", "file_path", "filePath", "filename");
   const title = pickStr(args, "_aoe_title");
@@ -841,7 +845,10 @@ function EditToolCard({ tool, result }: Props) {
   const legacyOld = pickStr(args, "old_string", "oldString", "old_str") ?? "";
   const legacyNew = pickStr(args, "new_string", "newString", "new_str", "content") ?? "";
   const hasLegacyDiff = legacyOld !== "" || legacyNew !== "";
-  const path = pickFirst(structuredDiffs[0]?.path, argPath, title, tool.name) ?? "(unknown file)";
+  const path = relativeDisplayPath(
+    pickFirst(structuredDiffs[0]?.path, argPath, title, tool.name) ?? "(unknown file)",
+    fileRefSession,
+  );
   const [open, setOpen] = useToolCardExpansion(status);
   const hasDiff = hasStructuredDiffs || hasLegacyDiff;
   // "edit" when a prior version existed, "write" for a fresh file.
@@ -889,7 +896,11 @@ function EditToolCard({ tool, result }: Props) {
             <div className="border-t border-surface-800 bg-surface-950">
               {structuredDiffs.map((d, i) => (
                 <div key={`${d.path}-${i}`}>
-                  {multiFile && <div className="px-2 py-1 text-[11px] text-text-dim">{d.path}</div>}
+                  {multiFile && (
+                    <div className="px-2 py-1 text-[11px] text-text-dim">
+                      {relativeDisplayPath(d.path, fileRefSession)}
+                    </div>
+                  )}
                   <StringDiff oldText={d.old_text ?? ""} newText={d.new_text ?? ""} filePath={d.path} />
                 </div>
               ))}
@@ -911,10 +922,11 @@ function EditToolCard({ tool, result }: Props) {
 
 function DeleteToolCard({ tool, result }: Props) {
   const status = statusFor(result);
+  const { fileRefSession } = useAcpFileRef();
   const args = parseJsonObject(tool.args_preview);
   const argPath = pickStr(args, "path", "file_path", "filePath", "filename");
   const title = pickStr(args, "_aoe_title");
-  const path = pickFirst(argPath, title, tool.name) ?? "(unknown file)";
+  const path = relativeDisplayPath(pickFirst(argPath, title, tool.name) ?? "(unknown file)", fileRefSession);
   const [open, setOpen] = useToolCardExpansion(status);
   return (
     <CardChrome

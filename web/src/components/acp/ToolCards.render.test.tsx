@@ -32,10 +32,20 @@ vi.mock("../../hooks/useShikiTheme", () => ({
 
 import { ToolCard, TodoGroupCard } from "./ToolCards";
 import { AgentProfileProvider } from "../../lib/agentProfileContext";
+import { AcpFileRefContext } from "./AcpFileRefContext";
+import type { FileRefSession } from "../../lib/fileRef";
 import { fixtures, makeCompletion, makeError, makeStopped, makeToolCall } from "./__fixtures__/toolCalls";
 
 function Wrap({ toolKey, children }: { toolKey?: string; children: ReactNode }) {
   return <AgentProfileProvider toolKey={toolKey ?? null}>{children}</AgentProfileProvider>;
+}
+
+function WrapWithSession({ session, children }: { session: FileRefSession | null; children: ReactNode }) {
+  return (
+    <AcpFileRefContext.Provider value={{ fileRefSession: session }}>
+      <AgentProfileProvider toolKey={null}>{children}</AgentProfileProvider>
+    </AcpFileRefContext.Provider>
+  );
 }
 
 afterEach(() => {
@@ -696,5 +706,66 @@ describe("ToolCards failed-card folding (#1467)", () => {
     expect(container.textContent).not.toContain("hello world");
     fireEvent.click(getByRole("button"));
     expect(container.textContent).toContain("hello world");
+  });
+});
+
+describe("ToolCards repo-relative paths (#2143)", () => {
+  const session: FileRefSession = {
+    project_path: "/tmp",
+    main_repo_path: null,
+    workspace_repos: [],
+  };
+
+  it("renders an edit path repo-relative when it sits under the session root", () => {
+    const { container } = render(
+      <WrapWithSession session={session}>
+        <ToolCard tool={fixtures.edit} result={undefined} />
+      </WrapWithSession>,
+    );
+    expect(container.textContent).toContain("main.rs");
+    expect(container.textContent).not.toContain("/tmp/main.rs");
+  });
+
+  it("renders a read path repo-relative under the session root", () => {
+    const { container } = render(
+      <WrapWithSession session={session}>
+        <ToolCard tool={fixtures.read} result={undefined} />
+      </WrapWithSession>,
+    );
+    expect(container.textContent).toContain("main.rs");
+    expect(container.textContent).not.toContain("/tmp/main.rs");
+  });
+
+  it("prefixes the repo name in a multi-repo workspace", () => {
+    const multi: FileRefSession = {
+      project_path: "/tmp/ws",
+      main_repo_path: null,
+      workspace_repos: [{ name: "api", source_path: "/tmp/api" }],
+    };
+    const tool = makeToolCall({
+      id: "edit-multi-repo",
+      kind: "edit",
+      args_preview: JSON.stringify({ file_path: "/tmp/api/src/h.ts", old_string: "a", new_string: "b" }),
+    });
+    const { container } = render(
+      <WrapWithSession session={multi}>
+        <ToolCard tool={tool} result={undefined} />
+      </WrapWithSession>,
+    );
+    expect(container.textContent).toContain("api/src/h.ts");
+  });
+
+  it("falls back to the absolute path when outside every known root", () => {
+    const tool = makeToolCall({
+      id: "edit-outside",
+      kind: "edit",
+      args_preview: JSON.stringify({ file_path: "/etc/hosts", old_string: "a", new_string: "b" }),
+    });
+    const { container } = render(
+      <WrapWithSession session={session}>
+        <ToolCard tool={tool} result={undefined} />
+      </WrapWithSession>,
+    );
+    expect(container.textContent).toContain("/etc/hosts");
   });
 });
