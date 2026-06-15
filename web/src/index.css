@@ -449,7 +449,7 @@ body {
   }
   to {
     transform: translateY(110vh) rotate(540deg);
-    opacity: 0.9;
+    opacity: 0;
   }
 }
 @keyframes cheat-flash {

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Command } from "cmdk";
 import { StatusGlyph } from "../StatusGlyph";
 import { CheatOverlay } from "./CheatOverlay";
@@ -49,10 +49,18 @@ export function CommandPalette({ open, onClose, actions }: Props) {
     };
   }, [open]);
 
-  // Controlled input keeps its value across open/close, so clear it on close.
+  // Controlled input keeps its value across open/close, so reset it on close;
+  // also drop any in-flight cheat so reopening does not replay the last one.
   useEffect(() => {
-    if (!open) setSearch("");
+    if (!open) {
+      setSearch("");
+      setCheat(null);
+    }
   }, [open]);
+
+  // Stable so the overlay's cleanup timer is not reset by unrelated re-renders
+  // (e.g. the user typing again while an effect is still on screen).
+  const clearCheat = useCallback(() => setCheat(null), []);
 
   const grouped = useMemo(() => {
     const map = new Map<CommandActionGroup, CommandAction[]>();
@@ -163,7 +171,7 @@ export function CommandPalette({ open, onClose, actions }: Props) {
           </span>
         </div>
       </Command>
-      {cheat && <CheatOverlay key={cheat.id} effect={cheat.effect} onDone={() => setCheat(null)} />}
+      {cheat && <CheatOverlay key={cheat.id} effect={cheat.effect} onDone={clearCheat} />}
     </div>
   );
 }
