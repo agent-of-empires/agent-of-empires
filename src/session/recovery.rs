@@ -47,7 +47,7 @@
 //! the lock still releases when the direct child exits, but the orphan is
 //! the operator's to reap.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 #[cfg(feature = "serve")]
 use std::sync::Arc;
@@ -329,7 +329,7 @@ pub fn drain_recovery_pending(
 /// Blocks; callers must invoke it off the main event-loop thread. Worst
 /// case is `N_hooks * RECOVERY_HOOK_TIMEOUT + ~7 s` fallback latency.
 pub fn run_recovery_for_instance(inst: &mut Instance) -> Result<StartOutcome> {
-    let _scope = HookTimeoutScope::for_recovery();
+    let _scope = HookTimeoutScope::new(recovery_hook_timeout());
     inst.restart_with_size_opts(None, false)
 }
 
@@ -356,41 +356,32 @@ pub fn recovery_hook_timeout() -> Duration {
 }
 
 thread_local! {
-    static HOOK_TIMEOUT_STACK: RefCell<Vec<(u64, Duration)>> =
-        const { RefCell::new(Vec::new()) };
-    static NEXT_SLOT: Cell<u64> = const { Cell::new(0) };
+    static HOOK_TIMEOUT: Cell<Option<Duration>> = const { Cell::new(None) };
 }
 
-/// Top of the current thread's [`HookTimeoutScope`] stack, if any.
+/// The current thread's on_launch hook deadline, if a scope is active.
 pub(crate) fn current_hook_timeout() -> Option<Duration> {
-    HOOK_TIMEOUT_STACK.with(|s| s.borrow().last().map(|(_, t)| *t))
+    HOOK_TIMEOUT.with(|c| c.get())
 }
 
-/// Slot-keyed RAII guard for per-thread on_launch hook deadlines; non-LIFO
-/// drop safe.
+/// RAII guard for the per-thread on_launch hook deadline. Restores the
+/// previous value on drop, so nested scopes behave LIFO.
+// ponytail: save/restore covers LIFO nesting only; production installs a
+// single scope (recovery), so out-of-order drops never occur.
 pub struct HookTimeoutScope {
-    slot: u64,
+    previous: Option<Duration>,
 }
 
 impl HookTimeoutScope {
     pub fn new(timeout: Duration) -> Self {
-        let slot = NEXT_SLOT.with(|c| {
-            let n = c.get();
-            c.set(n.wrapping_add(1));
-            n
-        });
-        HOOK_TIMEOUT_STACK.with(|s| s.borrow_mut().push((slot, timeout)));
-        Self { slot }
-    }
-
-    pub fn for_recovery() -> Self {
-        Self::new(recovery_hook_timeout())
+        let previous = HOOK_TIMEOUT.with(|c| c.replace(Some(timeout)));
+        Self { previous }
     }
 }
 
 impl Drop for HookTimeoutScope {
     fn drop(&mut self) {
-        HOOK_TIMEOUT_STACK.with(|s| s.borrow_mut().retain(|(slot, _)| *slot != self.slot));
+        HOOK_TIMEOUT.with(|c| c.set(self.previous));
     }
 }
 
