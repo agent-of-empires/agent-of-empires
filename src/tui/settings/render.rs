@@ -1407,9 +1407,10 @@ mod tests {
     }
 
     /// `wrap_description_height` must agree with `wrap_description_lines().len()`
-    /// for every input; it is the allocation-free shortcut the render hot
-    /// path uses. If they ever drift, `field_height` will paint values on
-    /// top of (or below) the description in real renders.
+    /// for every input; it now delegates to `wrap_description_lines`, so this
+    /// guards against the delegation regressing. If they ever drift,
+    /// `field_height` will paint values on top of (or below) the description
+    /// in real renders.
     #[test]
     fn wrap_description_height_matches_wrap_description_lines() {
         let cases: &[(&str, u16)] = &[
