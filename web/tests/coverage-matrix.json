@@ -1804,6 +1804,13 @@
       "components": ["web/src/components/diff/DiffFileList.tsx"]
     },
     {
+      "id": "story.diff-empty-state",
+      "kind": "mocked-playwright",
+      "risk": "low",
+      "specs": ["tests/diff-empty-state.spec.ts", "src/components/diff/__tests__/DiffFileList.coverage.test.tsx"],
+      "components": ["web/src/components/diff/DiffFileList.tsx"]
+    },
+    {
       "id": "story.delete-session-with-worktree",
       "kind": "vitest",
       "risk": "high",
