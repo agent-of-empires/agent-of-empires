@@ -70,6 +70,9 @@ export interface AgentProfile {
     skillNames: string[];
     /** Exact title values matched for the Schedule cards. */
     scheduleNames: string[];
+    /** Exact title values matched for the harness-tool cards
+     *  (ToolSearch / Monitor / TaskStop). See #2139. */
+    harnessNames: string[];
   };
 }
 
@@ -89,6 +92,7 @@ const CLAUDE: AgentProfile = {
   specialTitles: {
     skillNames: ["skill", "claude-skill"],
     scheduleNames: ["ScheduleWakeup", "CronCreate", "CronList", "CronDelete"],
+    harnessNames: ["ToolSearch", "Monitor", "TaskStop"],
   },
 };
 
@@ -114,7 +118,7 @@ const CODEX: AgentProfile = {
     edit: ["apply_patch"],
     read: ["view_file", "read_file", "read"],
   },
-  specialTitles: { skillNames: [], scheduleNames: [] },
+  specialTitles: { skillNames: [], scheduleNames: [], harnessNames: [] },
 };
 
 const OPENCODE: AgentProfile = {
@@ -137,7 +141,7 @@ const OPENCODE: AgentProfile = {
     fetch: ["webfetch"],
     think: ["task"],
   },
-  specialTitles: { skillNames: [], scheduleNames: [] },
+  specialTitles: { skillNames: [], scheduleNames: [], harnessNames: [] },
 };
 
 const GEMINI: AgentProfile = {
@@ -159,7 +163,7 @@ const GEMINI: AgentProfile = {
     search: ["grep", "glob"],
     fetch: ["web_fetch"],
   },
-  specialTitles: { skillNames: [], scheduleNames: [] },
+  specialTitles: { skillNames: [], scheduleNames: [], harnessNames: [] },
 };
 
 const VIBE: AgentProfile = {
@@ -175,7 +179,7 @@ const VIBE: AgentProfile = {
   mcpPrefixes: ["mcp__"],
   clearAliases: [],
   aliases: {},
-  specialTitles: { skillNames: [], scheduleNames: [] },
+  specialTitles: { skillNames: [], scheduleNames: [], harnessNames: [] },
 };
 
 const PI: AgentProfile = {
@@ -191,7 +195,7 @@ const PI: AgentProfile = {
   mcpPrefixes: ["mcp__"],
   clearAliases: [],
   aliases: {},
-  specialTitles: { skillNames: [], scheduleNames: [] },
+  specialTitles: { skillNames: [], scheduleNames: [], harnessNames: [] },
 };
 
 const AOE_AGENT: AgentProfile = {
@@ -215,7 +219,7 @@ export const DEFAULT_AGENT_PROFILE: AgentProfile = {
   mcpPrefixes: ["mcp__"],
   clearAliases: [],
   aliases: {},
-  specialTitles: { skillNames: [], scheduleNames: [] },
+  specialTitles: { skillNames: [], scheduleNames: [], harnessNames: [] },
 };
 
 const PROFILES: Record<string, AgentProfile> = {

@@ -18,6 +18,7 @@ import {
   type SetStateAction,
 } from "react";
 import {
+  Activity,
   Brain,
   Calendar,
   CalendarPlus,
@@ -37,6 +38,7 @@ import {
   Plug,
   Search,
   Sparkles,
+  Square,
   Terminal,
   Trash2,
 } from "lucide-react";
@@ -274,6 +276,10 @@ function renderToolCard(tool: ToolCall, result: ActivityRow | undefined, profile
     if (schedule.kind) {
       return <ScheduleToolCard tool={tool} result={result} kind={schedule.kind} />;
     }
+  }
+  const harness = classifyHarnessTool(tool, profile);
+  if (harness.kind) {
+    return <HarnessToolCard tool={tool} result={result} kind={harness.kind} />;
   }
   const { kind, provenance } = reclassifyBash(tool);
   const effectiveKind = resolveEffectiveKind(tool, kind, profile);
@@ -1910,6 +1916,143 @@ function ScheduleToolCard({ tool, result, kind }: ScheduleProps) {
     icon = <CalendarX className="h-3.5 w-3.5" />;
     label = "cron schedule deleted";
     primary = id ? <span className="font-mono">{id}</span> : "deleted";
+  }
+
+  const hasBody = hasRawInput || Boolean(output) || status === "err";
+
+  return (
+    <CardChrome
+      status={status}
+      icon={icon}
+      label={label}
+      primary={primary}
+      meta={meta}
+      expanded={open}
+      onToggle={status === "err" || hasBody ? () => setOpen((v) => !v) : undefined}
+      startedAt={tool.started_at}
+      endedAt={result?.at}
+      body={
+        <ToolErrorBody status={status} errorText={result?.text}>
+          {hasRawInput && (
+            <div className="border-t border-surface-800 bg-surface-950 px-3 py-2">
+              <div className="mb-1 flex items-center justify-between text-[10px] uppercase tracking-wider text-text-dim">
+                <span>input</span>
+                <CopyButton text={inputJson} />
+              </div>
+              <pre className="overflow-x-auto font-mono text-[11px] text-text-muted whitespace-pre-wrap break-all">
+                {inputJson}
+              </pre>
+            </div>
+          )}
+          {output && status !== "err" && (
+            <div className="border-t border-surface-800 bg-surface-950 px-3 py-2">
+              <div className="mb-1 flex items-center justify-between text-[10px] uppercase tracking-wider text-text-dim">
+                <span>output</span>
+                <CopyButton text={output} />
+              </div>
+              <pre className="overflow-x-auto font-mono text-[11px] text-text-secondary whitespace-pre-wrap break-all">
+                {output}
+              </pre>
+            </div>
+          )}
+        </ToolErrorBody>
+      }
+    />
+  );
+}
+
+/* ── harness tools (ToolSearch / Monitor / TaskStop) ─────────────── */
+
+/** Classify Claude's agent-runtime harness tools by their well-known
+ *  names. Like the schedule family, claude-agent-acp routes them through
+ *  the generic `Other` arm with no structured kind, so we name-match
+ *  against the profile's `harnessNames` allowlist (empty for non-Claude
+ *  agents, so a coincidental `Monitor` tool elsewhere stays generic).
+ *  See #2139.
+ *
+ *  - `"tool_search"`: ToolSearch ({ query, max_results })
+ *  - `"monitor"`: Monitor ({ description, command, timeout_ms, persistent })
+ *  - `"task_stop"`: TaskStop ({ task_id })
+ */
+function classifyHarnessTool(
+  tool: ToolCall,
+  profile: AgentProfile,
+): { kind: "tool_search" | "monitor" | "task_stop" | null } {
+  if (tool.kind !== "other") return { kind: null };
+  const args = parseJsonObject(tool.args_preview);
+  const title = (pickStr(args, "_aoe_title") ?? tool.name ?? "").trim();
+  if (!profile.specialTitles.harnessNames.includes(title)) return { kind: null };
+  switch (title) {
+    case "ToolSearch":
+      return { kind: "tool_search" };
+    case "Monitor":
+      return { kind: "monitor" };
+    case "TaskStop":
+      return { kind: "task_stop" };
+    default:
+      return { kind: null };
+  }
+}
+
+interface HarnessProps extends Props {
+  kind: "tool_search" | "monitor" | "task_stop";
+}
+
+function HarnessToolCard({ tool, result, kind }: HarnessProps) {
+  const status = statusFor(result);
+  const [open, setOpen] = useToolCardExpansion(status);
+  const args = useMemo(() => parseJsonObject(tool.args_preview), [tool.args_preview]);
+  const output = result?.text ?? "";
+
+  const inputJson = useMemo<string>(() => {
+    if (!args) return tool.args_preview;
+    const rest: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(args)) {
+      if (isAcpBookkeepingKey(k)) continue;
+      rest[k] = v;
+    }
+    return JSON.stringify(rest, null, 2);
+  }, [args, tool.args_preview]);
+
+  const hasRawInput = useMemo(() => {
+    if (!args) return Boolean(tool.args_preview);
+    return Object.keys(args).some((k) => !isAcpBookkeepingKey(k));
+  }, [args, tool.args_preview]);
+
+  let icon: React.ReactNode;
+  let label: string;
+  let primary: React.ReactNode;
+  let meta: React.ReactNode = undefined;
+
+  if (kind === "tool_search") {
+    const query = pickStr(args, "query");
+    icon = <Search className="h-3.5 w-3.5" />;
+    label = "tool search";
+    primary = query ? <span className="font-mono">{query}</span> : "search tools";
+  } else if (kind === "monitor") {
+    const description = pickStr(args, "description");
+    const persistentRaw = args ? args["persistent"] : undefined;
+    const timeoutRaw = args ? args["timeout_ms"] : undefined;
+    const timeoutMs =
+      typeof timeoutRaw === "number" ? timeoutRaw : typeof timeoutRaw === "string" ? Number(timeoutRaw) : NaN;
+    icon = <Activity className="h-3.5 w-3.5" />;
+    label = "monitor";
+    primary = description ? <span>{description}</span> : "background watch";
+    const chip =
+      persistentRaw === true
+        ? "persistent"
+        : Number.isFinite(timeoutMs)
+          ? formatDurationSeconds(timeoutMs / 1000)
+          : null;
+    if (chip) {
+      meta = <span className="hidden md:inline text-[11px] text-text-dim tabular-nums">{chip}</span>;
+    }
+  } else {
+    // task_stop
+    const taskId = pickStr(args, "task_id", "shell_id");
+    icon = <Square className="h-3.5 w-3.5" />;
+    label = "task stop";
+    primary = taskId ? <span className="font-mono">{taskId}</span> : "stop task";
   }
 
   const hasBody = hasRawInput || Boolean(output) || status === "err";
