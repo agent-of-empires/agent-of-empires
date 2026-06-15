@@ -102,3 +102,23 @@ function installInMemoryStorage(): void {
 if (!storageWorks("localStorage") || !storageWorks("sessionStorage")) {
   installInMemoryStorage();
 }
+
+// jsdom ships neither ResizeObserver nor a real layout engine. cmdk (the
+// command-palette lib) constructs a ResizeObserver and calls scrollIntoView on
+// the selected item; both throw under jsdom. Stub them as no-ops so components
+// that mount cmdk can be exercised in Vitest.
+if (typeof globalThis.ResizeObserver === "undefined") {
+  class ResizeObserverStub {
+    observe(): void {}
+    unobserve(): void {}
+    disconnect(): void {}
+  }
+  Object.defineProperty(globalThis, "ResizeObserver", {
+    value: ResizeObserverStub,
+    configurable: true,
+    writable: true,
+  });
+}
+if (typeof Element !== "undefined" && !Element.prototype.scrollIntoView) {
+  Element.prototype.scrollIntoView = function scrollIntoView(): void {};
+}
