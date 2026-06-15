@@ -430,7 +430,7 @@ describe("ToolCards memory_recall (claude-agent-acp v0.37.0)", () => {
     expect(list.textContent).toContain("feedback_no_em_dashes.md");
   });
 
-  it("renders synthesize mode with the synthesized text body after expansion", () => {
+  it("renders synthesize mode as markdown with the system-reminder envelope and line numbers stripped", () => {
     const { container, getByRole, getByTestId } = render(
       <Wrap toolKey="claude">
         <ToolCard tool={fixtures.memoryRecallSynthesize} result={undefined} />
@@ -440,7 +440,15 @@ describe("ToolCards memory_recall (claude-agent-acp v0.37.0)", () => {
     expect(container.textContent).toContain("Synthesised memory");
     fireEvent.click(getByRole("button"));
     const body = getByTestId("memory-recall-synthesized");
+    // Body content survives.
     expect(body.textContent).toContain("User is a senior engineer working on agent-of-empires.");
+    expect(body.textContent).toContain("prefers terse output");
+    // Transport noise is gone: no envelope tag text, no cat -n line numbers.
+    expect(body.textContent).not.toContain("system-reminder");
+    expect(body.textContent).not.toMatch(/^\s*\d+\t/m);
+    // Markdown rendered to elements, not raw source.
+    expect(body.querySelector("h1")?.textContent).toBe("User profile");
+    expect(body.querySelectorAll("li").length).toBe(2);
   });
 });
 

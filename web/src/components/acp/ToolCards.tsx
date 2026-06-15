@@ -51,7 +51,8 @@ import { diffPair } from "../../lib/diffPair";
 import { StringDiff } from "../diff/StringDiff";
 import { ToolErrorBody } from "./ToolErrorBody";
 import { classifyMcp, humanizeServer, humanizeVerb } from "../../lib/mcpClassify";
-import { classifyMemory, parseMemoryFrontmatter, type MemoryHit } from "../../lib/memoryClassify";
+import { cleanRecalledMemory, classifyMemory, parseMemoryFrontmatter, type MemoryHit } from "../../lib/memoryClassify";
+import { marked } from "marked";
 import { reclassifyBash } from "../../lib/toolReclassify";
 import { useAgentProfile } from "../../lib/agentProfileContext";
 import { useToolDisplayMode, type ToolDensity } from "./ToolDisplayMode";
@@ -1711,8 +1712,14 @@ function MemoryRecallCard({ tool, result }: Props) {
     return <GenericToolCard tool={tool} result={result} />;
   }
   const paths = recall.paths ?? [];
-  const synthesized = recall.synthesized_text ?? "";
+  const synthesized = cleanRecalledMemory(recall.synthesized_text ?? "");
   const isSynthesize = recall.mode === "synthesize";
+  // Render the cleaned memory body as markdown. We use `marked` rather
+  // than the structured-view `<Markdown>` component because that one
+  // requires the assistant-ui runtime provider (it throws "requires an
+  // AuiProvider" outside the transcript), the same reason CommentMarkdown
+  // exists. The `.acp-markdown` class reuses the panel's prose styling.
+  const synthesizedHtml = isSynthesize ? (marked.parse(synthesized, { async: false }) as string) : "";
 
   const primary = isSynthesize ? (
     <span>Synthesised memory</span>
@@ -1742,12 +1749,11 @@ function MemoryRecallCard({ tool, result }: Props) {
           {status !== "err" && hasBody ? (
             <div className="border-t border-surface-800 bg-surface-950 px-3 py-2">
               {isSynthesize ? (
-                <pre
+                <div
                   data-testid="memory-recall-synthesized"
-                  className="whitespace-pre-wrap break-words text-[11px] text-text-secondary"
-                >
-                  {synthesized}
-                </pre>
+                  className="acp-markdown break-words text-[11px] text-text-secondary"
+                  dangerouslySetInnerHTML={{ __html: synthesizedHtml }}
+                />
               ) : (
                 <ul data-testid="memory-recall-paths" className="space-y-0.5 text-[11px] text-text-secondary">
                   {paths.map((p) => (
