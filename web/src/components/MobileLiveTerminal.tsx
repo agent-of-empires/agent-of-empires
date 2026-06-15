@@ -2,6 +2,7 @@ import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useStat
 import type { CSSProperties, RefObject } from "react";
 import type { AnsiSegment, AnsiStyle } from "../lib/ansi";
 import { ansiToLines, wrapLine } from "../lib/liveTermLines";
+import { wheelNotches } from "../lib/liveMouse";
 import type { LiveFrame } from "../hooks/useLiveTerminal";
 import { useWebSettings } from "../hooks/useWebSettings";
 
@@ -61,6 +62,10 @@ export interface MobileLiveTerminalProps {
   enterReading: (rows: number) => void;
   returnToLive: (rows: number) => void;
   sendData: (data: string) => void;
+  /** Forward a wheel notch to a full-screen mouse app (alternate screen).
+   *  Used instead of capture-window scrolling when the frame reports the
+   *  pane is such an app. */
+  forwardWheel: (up: boolean, sgr: boolean, col: number, row: number) => void;
   /** Virtual Ctrl modifier from the mobile toolbar. */
   ctrlActiveRef: RefObject<boolean>;
   clearCtrl: () => void;
@@ -116,6 +121,7 @@ export function MobileLiveTerminal({
   enterReading,
   returnToLive,
   sendData,
+  forwardWheel,
   ctrlActiveRef,
   clearCtrl,
   inputRef,
@@ -269,6 +275,24 @@ export function MobileLiveTerminal({
   const history = frame?.history ?? 0;
   const fetchedHistory = Math.max(0, lines.length - screenRows);
   const spacerLines = Math.max(0, history - fetchedHistory);
+  // Full-screen mouse app (alternate screen): its scrollback is not
+  // capturable, so the spacer of unrelated normal-buffer history is
+  // useless. Pin to the live edge (no spacer, no native scroll) and
+  // forward the wheel to the app instead; the next frame reflects its
+  // scroll. Mirrors the TUI's forward_wheel_to_live_pane.
+  const forwardMode = (frame?.altScreen ?? false) && (frame?.mouse ?? false);
+  const mouseSgr = frame?.mouseSgr ?? false;
+  const effectiveSpacerLines = forwardMode ? 0 : spacerLines;
+  const forwardModeRef = useRef(forwardMode);
+  const mouseSgrRef = useRef(mouseSgr);
+  useEffect(() => {
+    forwardModeRef.current = forwardMode;
+    mouseSgrRef.current = mouseSgr;
+  }, [forwardMode, mouseSgr]);
+  // Sub-notch scroll remainder (px) carried across events, and the last
+  // touch Y while forwarding a single-finger drag.
+  const wheelAccumRef = useRef(0);
+  const touchForwardYRef = useRef<number | null>(null);
   useEffect(() => {
     rowsRef.current = screenRows || rowsRef.current;
   }, [screenRows]);
@@ -285,11 +309,11 @@ export function MobileLiveTerminal({
       const baseRow = visual.lineStartRow[lineIdx] ?? visual.rows.length;
       const cols = renderCols > 0 ? renderCols : Number.POSITIVE_INFINITY;
       const wrapOffset = Number.isFinite(cols) ? Math.floor(cursor.x / cols) : 0;
-      cursorTop = (spacerLines + baseRow + wrapOffset) * lineH;
+      cursorTop = (effectiveSpacerLines + baseRow + wrapOffset) * lineH;
       cursorLeft = (Number.isFinite(cols) ? cursor.x % cols : cursor.x) * charW;
     }
     return { cursor, cursorTop, cursorLeft };
-  }, [reading, frame, lines.length, screenRows, visual, renderCols, charW, spacerLines, lineH]);
+  }, [reading, frame, lines.length, screenRows, visual, renderCols, charW, effectiveSpacerLines, lineH]);
 
   const atBottom = useCallback(() => {
     const el = scrollerRef.current;
@@ -301,6 +325,9 @@ export function MobileLiveTerminal({
   }, [lineH, liveScrollTarget]);
 
   const onScroll = useCallback(() => {
+    // Forward mode pins the live edge (overflow hidden); the wheel goes to
+    // the app, so there is no scrollback reading state to enter.
+    if (forwardModeRef.current) return;
     if (!atBottom()) {
       enterReading(rowsRef.current);
     } else if (!touchActiveRef.current) {
@@ -317,6 +344,47 @@ export function MobileLiveTerminal({
     returnToLive(rowsRef.current);
   }, [returnToLive, liveScrollTarget]);
 
+  // Map a viewport point to the app's 1-based pane cell for the forwarded
+  // wheel event (apps mostly ignore the exact cell, but send a sane one).
+  const pointerCell = useCallback(
+    (clientX: number, clientY: number) => {
+      const el = scrollerRef.current;
+      if (!el || charW <= 0 || lineH <= 0) return { col: 1, row: 1 };
+      const r = el.getBoundingClientRect();
+      const cols = renderCols > 0 ? renderCols : 1;
+      const rows = Math.max(1, screenRows || rowsRef.current);
+      const col = Math.min(cols, Math.max(1, Math.floor((clientX - r.left) / charW) + 1));
+      const row = Math.min(rows, Math.max(1, Math.floor((clientY - r.top) / lineH) + 1));
+      return { col, row };
+    },
+    [charW, lineH, renderCols, screenRows],
+  );
+
+  // Translate an accumulated pixel delta (positive = toward newer/down)
+  // into forwarded wheel notches, one per text row, carrying the leftover.
+  const forwardWheelDelta = useCallback(
+    (deltaPx: number, clientX: number, clientY: number) => {
+      wheelAccumRef.current += deltaPx;
+      const { notches, remainder } = wheelNotches(wheelAccumRef.current, lineH || 16, 8);
+      wheelAccumRef.current = remainder;
+      if (notches === 0) return;
+      const { col, row } = pointerCell(clientX, clientY);
+      const up = notches < 0;
+      for (let i = 0; i < Math.abs(notches); i++) forwardWheel(up, mouseSgrRef.current, col, row);
+    },
+    [lineH, pointerCell, forwardWheel],
+  );
+
+  const onWheel = useCallback(
+    (e: React.WheelEvent) => {
+      if (!forwardModeRef.current) return;
+      // Normalize line/page deltas to pixels so a notch is ~one row.
+      const factor = e.deltaMode === 1 ? lineH || 16 : e.deltaMode === 2 ? (lineH || 16) * (rowsRef.current || 1) : 1;
+      forwardWheelDelta(e.deltaY * factor, e.clientX, e.clientY);
+    },
+    [lineH, forwardWheelDelta],
+  );
+
   // --- pinch zoom (two-finger) ---------------------------------------------
   const pinchRef = useRef<{ startDist: number; startSize: number; changed: boolean } | null>(null);
   const persistTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -324,33 +392,55 @@ export function MobileLiveTerminal({
     (e: React.TouchEvent) => {
       touchActiveRef.current = true;
       if (e.touches.length === 2) {
-        const [a, b] = [e.touches[0]!, e.touches[1]!];
         pinchRef.current = {
-          startDist: Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY),
+          startDist: Math.hypot(
+            e.touches[0]!.clientX - e.touches[1]!.clientX,
+            e.touches[0]!.clientY - e.touches[1]!.clientY,
+          ),
           startSize: fontSize,
           changed: false,
         };
+        touchForwardYRef.current = null;
+      } else if (e.touches.length === 1 && forwardModeRef.current) {
+        // Single-finger drag drives the app's wheel in forward mode.
+        touchForwardYRef.current = e.touches[0]!.clientY;
+        wheelAccumRef.current = 0;
       }
     },
     [fontSize],
   );
-  const onTouchMove = useCallback((e: React.TouchEvent) => {
-    if (e.touches.length === 2 && pinchRef.current) {
-      e.preventDefault();
-      const [a, b] = [e.touches[0]!, e.touches[1]!];
-      const dist = Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
-      const { startDist, startSize } = pinchRef.current;
-      if (startDist > 0) {
-        const next = Math.round(Math.max(MIN_FONT_SIZE, Math.min(MAX_FONT_SIZE, startSize * (dist / startDist))));
-        if (next !== startSize) pinchRef.current.changed = true;
-        setFontSize(next);
+  const onTouchMove = useCallback(
+    (e: React.TouchEvent) => {
+      if (e.touches.length === 2 && pinchRef.current) {
+        e.preventDefault();
+        const [a, b] = [e.touches[0]!, e.touches[1]!];
+        const dist = Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+        const { startDist, startSize } = pinchRef.current;
+        if (startDist > 0) {
+          const next = Math.round(Math.max(MIN_FONT_SIZE, Math.min(MAX_FONT_SIZE, startSize * (dist / startDist))));
+          if (next !== startSize) pinchRef.current.changed = true;
+          setFontSize(next);
+        }
+        return;
       }
-    }
-  }, []);
+      if (e.touches.length === 1 && forwardModeRef.current && touchForwardYRef.current != null) {
+        // Stop the (overflow-hidden) container / page from scrolling and
+        // translate the drag into wheel notches. Finger moving DOWN reveals
+        // older content = wheel up, so the delta is negated.
+        e.preventDefault();
+        const y = e.touches[0]!.clientY;
+        const dy = y - touchForwardYRef.current;
+        touchForwardYRef.current = y;
+        forwardWheelDelta(-dy, e.touches[0]!.clientX, y);
+      }
+    },
+    [forwardWheelDelta],
+  );
   const onTouchEnd = useCallback(
     (e: React.TouchEvent) => {
       if (e.touches.length === 0) {
         touchActiveRef.current = false;
+        touchForwardYRef.current = null;
         // Settle the live-edge decision deferred by onScroll; momentum
         // scroll events after this keep re-evaluating via onScroll.
         if (atBottom()) {
@@ -579,11 +669,14 @@ export function MobileLiveTerminal({
       <div
         ref={scrollerRef}
         onScroll={onScroll}
+        onWheel={onWheel}
         onTouchStart={onTouchStart}
         onTouchMove={onTouchMove}
         onTouchEnd={onTouchEnd}
         onTouchCancel={onTouchEnd}
-        className="absolute inset-0 overflow-y-auto overflow-x-hidden font-mono"
+        className={`absolute inset-0 font-mono ${
+          forwardMode ? "overflow-hidden" : "overflow-y-auto overflow-x-hidden"
+        }`}
         style={{
           fontSize: `${fontSize}px`,
           lineHeight: `${lineH}px`,
@@ -608,7 +701,9 @@ export function MobileLiveTerminal({
           MMMMMMMMMMMMMMMMMMMM
         </span>
         <div className="relative whitespace-pre" data-live-content>
-          {spacerLines > 0 && <div style={{ height: `${spacerLines * lineH}px` }} aria-hidden="true" />}
+          {effectiveSpacerLines > 0 && (
+            <div style={{ height: `${effectiveSpacerLines * lineH}px` }} aria-hidden="true" />
+          )}
           {visual.rows.map((segs, i) => (
             <Row key={i} segs={segs} />
           ))}

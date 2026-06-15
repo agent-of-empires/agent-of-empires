@@ -229,6 +229,108 @@ pub(crate) fn host_environment_prefix(entries: &[String]) -> String {
     out
 }
 
+/// Resolve a session's sandbox environment entries to concrete `(KEY, VALUE)`
+/// pairs on the host, for feeding into a host-side hook's process environment
+/// (so a `before_start` hook can read a per-session `$TEST_VAR`).
+///
+/// Trust boundary: `before_start` hooks are profile/global only, so a repo's
+/// `.agent-of-empires/config.toml` `sandbox.environment` must never reach host
+/// execution (e.g. a repo setting `PATH`). Sources:
+/// - With a per-session `extra_env`: use it, but drop any entry the repo
+///   contributed. `extra_env` is seeded verbatim from the repo-aware config in
+///   the new-session dialog, so a submitted override can still carry repo
+///   entries; [`host_hook_entries`] filters those out. This is subtractive
+///   only and does not affect the container's env (which keeps `extra_env`
+///   verbatim via [`collect_environment`]).
+/// - Without one: the profile/global `sandbox.environment` baseline.
+///
+/// Each entry is resolved to a plain host value via the shared grammar:
+/// `KEY=value` is literal, `KEY=$VAR` reads the host env, `KEY=$$literal`
+/// escapes a `$`, and a bare `KEY` passes through from the host env. Unset host
+/// references and bare keys are skipped. Deduplicates by key (first wins).
+pub(crate) fn session_host_env_pairs(
+    profile: &str,
+    project_path: &std::path::Path,
+    sandbox_info: &SandboxInfo,
+) -> Vec<(String, String)> {
+    let resolved_profile = super::config::effective_profile(profile);
+    let trusted = super::profile_config::resolve_config_or_warn(&resolved_profile)
+        .sandbox
+        .environment;
+    let entries = match sandbox_info.extra_env.as_deref() {
+        None => trusted,
+        Some(extra) => {
+            let repo_aware = super::repo_config::resolve_config_with_repo_or_warn(
+                &resolved_profile,
+                project_path,
+            )
+            .sandbox
+            .environment;
+            host_hook_entries(extra, &trusted, &repo_aware)
+        }
+    };
+    resolve_host_env_pairs(&entries)
+}
+
+/// Filter a session's `extra_env` down to the entries safe to expose to a host
+/// hook: everything except entries the repo contributed (present in the
+/// repo-aware config but not in the profile/global `trusted` baseline). Repo
+/// entries are dropped, never added, so an untrusted repo cannot reach host
+/// execution even when the user submits a per-session override seeded from the
+/// repo-aware dialog. Pure, so it is unit-tested without touching disk.
+fn host_hook_entries(extra: &[String], trusted: &[String], repo_aware: &[String]) -> Vec<String> {
+    let trusted: std::collections::HashSet<&str> = trusted.iter().map(String::as_str).collect();
+    let repo_contributed: std::collections::HashSet<&str> = repo_aware
+        .iter()
+        .map(String::as_str)
+        .filter(|e| !trusted.contains(e))
+        .collect();
+    extra
+        .iter()
+        .filter(|e| !repo_contributed.contains(e.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Resolve env entries to concrete host `(KEY, VALUE)` pairs (the pure core of
+/// [`session_host_env_pairs`], split out so it can be tested without touching
+/// config on disk).
+fn resolve_host_env_pairs(entries: &[String]) -> Vec<(String, String)> {
+    let mut seen = std::collections::HashSet::new();
+    let mut pairs = Vec::new();
+    for entry in entries {
+        let (key, value) = match entry.split_once('=') {
+            Some((k, v)) => (k.to_string(), resolve_env_value(v)),
+            None => (entry.clone(), std::env::var(entry).ok()),
+        };
+        // A malformed key would fail at `Command::envs` when the hook spawns;
+        // skip it here (with a warning) rather than aborting the launch.
+        if !is_valid_env_key(&key) {
+            tracing::warn!(target: "session.create", "invalid env key '{}' for host hook; skipping", key);
+            continue;
+        }
+        if let Some(v) = value {
+            if seen.insert(key.clone()) {
+                pairs.push((key, v));
+            }
+        }
+    }
+    pairs
+}
+
+/// True when `key` is a valid environment variable name: an ASCII letter or `_`
+/// first, then ASCII alphanumerics or `_`. Shared by the host-env resolver and
+/// the `before_start` stdout parser so both reject the same malformed keys
+/// before they reach `Command::envs`.
+pub(crate) fn is_valid_env_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 pub(crate) fn resolve_host_environment_value(
     entries: &[String],
     target_key: &str,
@@ -903,6 +1005,98 @@ environment = ["GH_TOKEN=write_token"]
         assert_eq!(entry.value(), "test_value");
         assert!(matches!(entry, EnvEntry::Inherit { .. }));
         std::env::remove_var("AOE_TEST_ENV_PT");
+    }
+
+    #[test]
+    fn test_resolve_host_env_pairs_grammar() {
+        std::env::set_var("AOE_TEST_HOST_PAIR_REF", "from_host");
+        std::env::set_var("AOE_TEST_HOST_PAIR_BARE", "bare_val");
+        std::env::remove_var("AOE_TEST_HOST_PAIR_MISSING");
+        let entries = vec![
+            "TEST_VAR=literal".to_string(),
+            "FROM_HOST=$AOE_TEST_HOST_PAIR_REF".to_string(),
+            "ESCAPED=$$LIT".to_string(),
+            "AOE_TEST_HOST_PAIR_BARE".to_string(),
+            "MISSING=$AOE_TEST_HOST_PAIR_MISSING".to_string(), // unset host ref: skipped
+            "TEST_VAR=second".to_string(),                     // dup key: first wins
+        ];
+        let pairs = resolve_host_env_pairs(&entries);
+        assert_eq!(
+            pairs,
+            vec![
+                ("TEST_VAR".to_string(), "literal".to_string()),
+                ("FROM_HOST".to_string(), "from_host".to_string()),
+                ("ESCAPED".to_string(), "$LIT".to_string()),
+                (
+                    "AOE_TEST_HOST_PAIR_BARE".to_string(),
+                    "bare_val".to_string()
+                ),
+            ]
+        );
+        std::env::remove_var("AOE_TEST_HOST_PAIR_REF");
+        std::env::remove_var("AOE_TEST_HOST_PAIR_BARE");
+    }
+
+    #[test]
+    fn test_resolve_host_env_pairs_skips_invalid_keys() {
+        // Malformed keys (would fail at Command::envs) are dropped; valid ones
+        // pass through.
+        let entries = vec![
+            "GOOD=1".to_string(),
+            "1BAD=x".to_string(),      // starts with a digit
+            "HAS SPACE=y".to_string(), // contains a space
+            "=novalue".to_string(),    // empty key
+            "_OK=2".to_string(),
+        ];
+        assert_eq!(
+            resolve_host_env_pairs(&entries),
+            vec![
+                ("GOOD".to_string(), "1".to_string()),
+                ("_OK".to_string(), "2".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_host_hook_entries_drops_repo_contributed() {
+        // extra_env carries one user entry and two that came from config; the
+        // repo-only one (in repo_aware but not trusted) is dropped, the one also
+        // in the profile/global baseline is kept.
+        let extra = vec![
+            "TEST_VAR=foo".to_string(),  // user-typed
+            "NODE_ENV=test".to_string(), // repo-contributed
+            "SHARED=keep".to_string(),   // also in profile/global baseline
+        ];
+        let trusted = vec!["SHARED=keep".to_string()];
+        let repo_aware = vec!["NODE_ENV=test".to_string(), "SHARED=keep".to_string()];
+        assert_eq!(
+            host_hook_entries(&extra, &trusted, &repo_aware),
+            vec!["TEST_VAR=foo".to_string(), "SHARED=keep".to_string()],
+        );
+    }
+
+    #[test]
+    fn test_session_host_env_pairs_uses_extra_env() {
+        // With a per-session extra_env and no repo config at the path, every
+        // entry survives the repo filter and is resolved to a host pair.
+        let tmp = tempfile::tempdir().unwrap();
+        let info = SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "img".to_string(),
+            container_name: "ctr".to_string(),
+            extra_env: Some(vec!["TEST_VAR=foo".to_string(), "OTHER=bar".to_string()]),
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+        };
+        let pairs = session_host_env_pairs("any-profile", tmp.path(), &info);
+        assert_eq!(
+            pairs,
+            vec![
+                ("TEST_VAR".to_string(), "foo".to_string()),
+                ("OTHER".to_string(), "bar".to_string()),
+            ]
+        );
     }
 
     #[test]

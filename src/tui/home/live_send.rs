@@ -795,6 +795,16 @@ impl LiveCaptureWorker {
     pub(in crate::tui) fn current_cursor(&self) -> Option<crate::tmux::PaneCursor> {
         self.cursor.lock().ok().and_then(|guard| *guard)
     }
+
+    /// Inject a cursor without running a capture cycle, so scroll-routing
+    /// tests can exercise the alternate-screen / mouse-tracking branch
+    /// deterministically instead of standing up a real full-screen pane.
+    #[cfg(test)]
+    pub(in crate::tui) fn set_cursor_for_test(&self, cursor: Option<crate::tmux::PaneCursor>) {
+        if let Ok(mut guard) = self.cursor.lock() {
+            *guard = cursor;
+        }
+    }
 }
 
 /// Walk one drained batch and execute it as one-shot `tmux` subprocesses.
