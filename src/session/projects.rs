@@ -510,6 +510,23 @@ mod tests {
     }
 
     #[test]
+    fn is_git_probes_filesystem_per_call() {
+        let temp = tempdir().expect("tempdir");
+        let dir = temp.path().join("workspace");
+        std::fs::create_dir_all(&dir).expect("create dir");
+
+        let project = Project::new("workspace", dir.to_string_lossy(), ProjectScope::Global);
+        // A plain directory is not git-backed.
+        assert!(!project.is_git());
+
+        // `is_git` re-probes the filesystem on every call and caches nothing,
+        // so initializing a repo in place flips the result without rebuilding
+        // the Project.
+        git2::Repository::init(&dir).expect("git init");
+        assert!(project.is_git());
+    }
+
+    #[test]
     #[serial]
     fn default_base_branch_persists_through_add_and_load() -> Result<()> {
         let temp = tempdir()?;
