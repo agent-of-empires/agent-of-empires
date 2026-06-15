@@ -74,6 +74,11 @@ base("ApprovalCard Allow resolves and the turn continues", async ({ page }, test
     });
     await expect(approvalDialog).toBeVisible({ timeout: 10_000 });
 
+    // #2145: the approval branch of the spinner gate. The turn is still
+    // "running" while the card is pending, but the agent is parked on the
+    // decision, so the working spinner must not render beneath it.
+    await expect(page.getByTestId("acp-working-spinner")).toHaveCount(0);
+
     // The fake script gates the post-approval chunk on the user's
     // Allow click. Prove the gate works by asserting the
     // post-approval text is absent BEFORE clicking; otherwise this

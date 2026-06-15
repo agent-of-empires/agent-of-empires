@@ -101,6 +101,32 @@
       "components": ["web/src/hooks/useLiveTerminal.ts", "web/src/components/MobileLiveTerminal.tsx"]
     },
     {
+      "id": "terminal.mobile-live-wheel-forward",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/lib/__tests__/liveMouse.test.ts",
+        "src/hooks/useLiveTerminal.forward.test.ts",
+        "src/components/__tests__/MobileLiveTerminal.forward.test.tsx"
+      ],
+      "components": [
+        "web/src/lib/liveMouse.ts",
+        "web/src/components/MobileLiveTerminal.tsx",
+        "web/src/hooks/useLiveTerminal.ts"
+      ]
+    },
+    {
+      "id": "terminal.mobile-live-wheel-forward-e2e",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/live-wheel-forward.spec.ts"],
+      "components": [
+        "web/src/lib/liveMouse.ts",
+        "web/src/components/MobileLiveTerminal.tsx",
+        "web/src/hooks/useLiveTerminal.ts"
+      ]
+    },
+    {
       "id": "auth.no-auth",
       "kind": "live-playwright",
       "risk": "high",

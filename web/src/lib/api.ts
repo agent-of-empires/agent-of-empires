@@ -158,19 +158,6 @@ export function resetSettingsSchemaCache(): void {
   schemaPromise = null;
 }
 
-export async function updateSettings(updates: Record<string, unknown>): Promise<boolean> {
-  try {
-    const res = await fetch("/api/settings", {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(updates),
-    });
-    return res.ok;
-  } catch {
-    return false;
-  }
-}
-
 /**
  * Sets the global theme (name and/or color mode). Dedicated endpoint, not
  * `PATCH /api/settings`: the theme is a global preference but cosmetic, so it

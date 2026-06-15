@@ -3225,6 +3225,23 @@ impl HomeView {
                 if let Err(e) = self.reload() {
                     tracing::warn!(target: "tui.home", "Failed to reload session state: {e}");
                 }
+                // The creation poller may have minted `before_start_env` while
+                // bringing the container up. It is `#[serde(skip)]`, so the
+                // reload above dropped it; carry it back onto the live instance
+                // (mirroring the CLI's `merge_post_start` and the structured-view
+                // stamp-back) so the agent launch reuses it instead of re-minting.
+                let minted = instance
+                    .sandbox_info
+                    .as_mut()
+                    .map(|sb| std::mem::take(&mut sb.before_start_env))
+                    .unwrap_or_default();
+                if !minted.is_empty() {
+                    self.mutate_instance(&session_id, |inst| {
+                        if let Some(sb) = inst.sandbox_info.as_mut() {
+                            sb.before_start_env = minted.clone();
+                        }
+                    });
+                }
                 // reload()'s restore-previous-selection fallback lands
                 // the cursor on whichever flat_items index is closest
                 // to the now-removed stub, which in project-grouped

@@ -650,27 +650,6 @@ impl SettingsView {
         self.has_changes = false;
     }
 
-    /// Discard changes and reload
-    pub fn discard_changes(&mut self) -> anyhow::Result<()> {
-        self.global_config = crate::session::Config::load()?;
-        self.profile_config = crate::session::load_profile_config(&self.profile)?;
-        self.repo_config = self.project_path.as_ref().and_then(|p| {
-            crate::session::load_repo_config(std::path::Path::new(p))
-                .ok()
-                .flatten()
-        });
-        self.resolved_base =
-            crate::session::merge_configs(self.global_config.clone(), &self.profile_config);
-        self.repo_as_profile = self
-            .repo_config
-            .as_ref()
-            .map(crate::session::repo_config_to_profile)
-            .unwrap_or_default();
-        self.snapshot_baseline();
-        self.rebuild_fields();
-        Ok(())
-    }
-
     pub fn handle_paste(&mut self, text: &str) {
         if let Some(ref mut dialog) = self.custom_instruction_dialog {
             dialog.handle_paste(text);

@@ -84,10 +84,7 @@ export function installFetchErrorToasts(): void {
     let patchedInit = attachAuthHeader(sameOrigin, init);
     if (sameOrigin && isApi) {
       try {
-        const requestId =
-          typeof crypto !== "undefined" && "randomUUID" in crypto
-            ? crypto.randomUUID()
-            : Math.random().toString(36).slice(2);
+        const requestId = crypto.randomUUID();
         const h = new Headers(patchedInit?.headers ?? init?.headers);
         if (!h.has("X-Request-Id")) {
           h.set("X-Request-Id", requestId);

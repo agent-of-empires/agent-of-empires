@@ -208,6 +208,7 @@ export function LiveTerminalView({ session, active = true, surface = "agent" }: 
           enterReading={live.enterReading}
           returnToLive={live.returnToLive}
           sendData={live.sendData}
+          forwardWheel={live.forwardWheel}
           ctrlActiveRef={ctrlActiveRef}
           clearCtrl={() => setCtrlActive(false)}
           inputRef={inputRef}

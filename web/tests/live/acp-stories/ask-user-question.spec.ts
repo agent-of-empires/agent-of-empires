@@ -114,6 +114,13 @@ base("AskUserQuestion card submit resolves and the turn continues", async ({ pag
     });
     await expect(questionDialog).toBeVisible({ timeout: 10_000 });
 
+    // #2145: the turn is still "running" while the question is pending, but
+    // the agent is parked on the answer, not stalled. The working spinner
+    // (rattle verbs, "Waiting on model…", the Force end turn watchdog) must
+    // not render beneath the card. The spinner mounts immediately when shown,
+    // so a count of 0 is decisive without waiting for the stall threshold.
+    await expect(page.getByTestId("acp-working-spinner")).toHaveCount(0);
+
     // The fake gates the post-answer chunk on the user's submit. Assert it
     // is absent first so a no-op card couldn't pass this spec.
     const postAnswerChunk = page.getByText("Got your answer.");

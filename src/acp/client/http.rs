@@ -14,8 +14,8 @@ use thiserror::Error;
 use super::discovery::DaemonEndpoint;
 use crate::acp::elicitations::ElicitationResolution;
 use crate::acp::protocol::{
-    ApprovalDecisionWire, ContextPrimerResponse, FilesResponse, PromptRequest, ReplayResponse,
-    ResolveApprovalRequest, SwitchAgentRequest, SwitchAgentResponse,
+    ApprovalDecisionWire, FilesResponse, PromptRequest, ReplayResponse, ResolveApprovalRequest,
+    SwitchAgentRequest, SwitchAgentResponse,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -74,10 +74,6 @@ impl HttpClient {
             .user_agent(concat!("aoe-acp-client/", env!("CARGO_PKG_VERSION")))
             .build()?;
         Ok(Self { http, endpoint })
-    }
-
-    pub fn endpoint(&self) -> &DaemonEndpoint {
-        &self.endpoint
     }
 
     /// `GET /api/sessions/{id}/acp/replay?since=N`. Unbounded fetch
@@ -162,21 +158,6 @@ impl HttpClient {
             next_cursor: None,
             has_more: false,
         })
-    }
-
-    /// `GET /api/sessions/{id}/acp/context-primer?before_seq=N`.
-    pub async fn context_primer(
-        &self,
-        session_id: &str,
-        before_seq: u64,
-    ) -> Result<ContextPrimerResponse, HttpError> {
-        let url = format!(
-            "{}/api/sessions/{}/acp/context-primer?before_seq={}",
-            self.endpoint.base_url, session_id, before_seq
-        );
-        let res = self.auth(self.http.get(&url)).send().await?;
-        let res = check_status(res, session_id).await?;
-        Ok(res.json::<ContextPrimerResponse>().await?)
     }
 
     /// `GET /api/sessions/{id}/acp/files`. Workspace file list for
@@ -421,13 +402,13 @@ mod tests {
         // Smoke-check by reading endpoint back; full header inspection
         // requires a live request and lives in the integration tests
         // alongside the axum mock.
-        assert_eq!(client.endpoint().token.as_deref(), Some("tok"));
+        assert_eq!(client.endpoint.token.as_deref(), Some("tok"));
     }
 
     #[test]
     fn auth_skips_bearer_when_no_token() {
         let client = HttpClient::new(endpoint("http://127.0.0.1:8080", None)).unwrap();
-        assert!(client.endpoint().token.is_none());
+        assert!(client.endpoint.token.is_none());
     }
 
     // Regression test for #1525. The startup toast on a 401 from the

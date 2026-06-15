@@ -3302,7 +3302,7 @@ async fn daemon_startup_recovery_cascade(
                         &id,
                     );
                 }
-                Ok((mut updated, Err(e))) => {
+                Ok((updated, Err(e))) => {
                     tracing::warn!(
                         target: "session.startup_recovery",
                         instance_id = %id,
@@ -3310,28 +3310,6 @@ async fn daemon_startup_recovery_cascade(
                         error = %e,
                         "recovery cascade failed",
                     );
-                    // The cascade leaves last_error=None on every Err exit
-                    // (no failure path sets it) and self.status as either
-                    // `Status::Starting` (the common case: probe_settle
-                    // returned Dead, or Tier-2 failed after finalize_launch
-                    // ran at instance.rs:1403) or `Status::Idle` (rare:
-                    // kill_clean failed, or Tier-1 start_with_size_opts
-                    // failed before finalize_launch). In either case,
-                    // without an explicit Error transition the next
-                    // status_poll_loop tick falls through to
-                    // update_status_with_metadata and generates a generic
-                    // "tmux session is gone" message, hiding the
-                    // cascade-specific error.
-                    updated.status = crate::session::Status::Error;
-                    updated.last_error = Some(format!("recovery cascade: {}", e));
-                    // Stamp last_error_check so the in-memory error overlay
-                    // in status_poll_loop arms the 30s stickiness in
-                    // update_status_with_metadata_inner. Without this
-                    // (#[serde(skip)] would otherwise leave it None on the
-                    // next disk reload), the cascade-specific message is
-                    // overwritten by the generic "tmux session is gone" on
-                    // the very next poll tick.
-                    updated.last_error_check = Some(std::time::Instant::now());
                     let mut instances = inst_state.instances.write().await;
                     if let Some(slot) = instances.iter_mut().find(|i| i.id == id) {
                         *slot = updated;

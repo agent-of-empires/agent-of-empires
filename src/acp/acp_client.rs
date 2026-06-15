@@ -1986,14 +1986,7 @@ pub fn resolve_agent_command(command: &str) -> Option<(std::path::PathBuf, std::
 }
 
 fn find_in_path_env(binary: &str) -> Option<std::path::PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
-        let candidate = dir.join(binary);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
+    which::which(binary).ok()
 }
 
 /// Best-effort enumeration of node bin dirs the user is likely to have

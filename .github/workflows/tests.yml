@@ -34,7 +34,7 @@ jobs:
           - label: macos
             os: ${{ vars.RUNNER_CARGO_MACOS || 'macos-latest' }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
@@ -96,7 +96,7 @@ jobs:
     name: macOS acp e2e
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
@@ -114,7 +114,7 @@ jobs:
     name: Vitest
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: '22'
@@ -123,7 +123,7 @@ jobs:
         run: npm ci
       - name: Run Vitest with coverage
         working-directory: web
-        run: npm run test:unit -- --coverage
+        run: npm run test:unit -- --coverage --reporter=default --reporter=junit --outputFile.junit=test-report.junit.xml
       # Vitest's v8 coverage reporter emits LCOV paths relative to the
       # vitest cwd (web/), so SF: lines read "SF:src/...". Codecov
       # matches file paths against the PR diff, which uses repo-root
@@ -136,7 +136,7 @@ jobs:
         run: sed -i 's|^SF:src/|SF:web/src/|' web/coverage/vitest/lcov.info
       - name: Upload to Codecov (vitest flag)
         if: ${{ !cancelled() }}
-        uses: codecov/codecov-action@e79a6962e0d4c0c17b229090214935d2e33f8354 # v6.0.1
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           # The codecov-action's `files` input is additive, not restrictive:
@@ -152,6 +152,14 @@ jobs:
           flags: vitest
           name: vitest
           fail_ci_if_error: false
+      - name: Upload test results to Codecov (vitest)
+        if: ${{ !cancelled() }}
+        uses: codecov/test-results-action@0fa95f0e1eeaafde2c782583b36b28ad0d8c77d3 # v1.2.1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          disable_search: true
+          files: web/test-report.junit.xml
+          flags: vitest
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ !cancelled() }}
         with:
@@ -159,13 +167,35 @@ jobs:
           path: web/coverage/vitest/
           retention-days: 14
 
+  bundle-analysis:
+    name: Bundle Analysis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: '22'
+      - name: Install dependencies
+        working-directory: web
+        run: npm ci
+      # Clean production build, intentionally WITHOUT AOE_COVERAGE: istanbul
+      # instrumentation inflates chunk sizes and would report bogus bundle
+      # stats. The @codecov/vite-plugin uploads the bundle stats to Codecov
+      # when CODECOV_TOKEN is present (gated in web/vite.config.ts); without
+      # the token the plugin is a no-op, so forks still build cleanly.
+      - name: Build web bundle and upload stats to Codecov
+        working-directory: web
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        run: npm run build
+
   playwright:
     name: Playwright (mocked)
     # Same Blacksmith-with-fallback scheme as the cargo job: clear
     # RUNNER_PLAYWRIGHT_MOCKED to drop to the free GitHub runner.
     runs-on: ${{ vars.RUNNER_PLAYWRIGHT_MOCKED || 'ubuntu-latest' }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: '22'
@@ -207,7 +237,7 @@ jobs:
         run: npm run coverage:merge
       - name: Upload to Codecov (playwright-mocked flag)
         if: ${{ !cancelled() }}
-        uses: codecov/codecov-action@e79a6962e0d4c0c17b229090214935d2e33f8354 # v6.0.1
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           # See the matching comment in the vitest upload step: without
@@ -219,6 +249,14 @@ jobs:
           flags: playwright-mocked
           name: playwright-mocked
           fail_ci_if_error: false
+      - name: Upload test results to Codecov (playwright-mocked)
+        if: ${{ !cancelled() }}
+        uses: codecov/test-results-action@0fa95f0e1eeaafde2c782583b36b28ad0d8c77d3 # v1.2.1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          disable_search: true
+          files: web/test-report.junit.xml
+          flags: playwright-mocked
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ !cancelled() }}
         with:
@@ -246,7 +284,7 @@ jobs:
       matrix:
         shard: [1, 2]
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: '22'
@@ -303,7 +341,7 @@ jobs:
         run: npm run coverage:merge
       - name: Upload to Codecov (playwright-live flag)
         if: ${{ !cancelled() }}
-        uses: codecov/codecov-action@e79a6962e0d4c0c17b229090214935d2e33f8354 # v6.0.1
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           # See the matching comment in the vitest upload step: without
@@ -316,6 +354,14 @@ jobs:
           flags: playwright-live
           name: playwright-live-shard-${{ matrix.shard }}
           fail_ci_if_error: false
+      - name: Upload test results to Codecov (playwright-live)
+        if: ${{ !cancelled() }}
+        uses: codecov/test-results-action@0fa95f0e1eeaafde2c782583b36b28ad0d8c77d3 # v1.2.1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          disable_search: true
+          files: web/test-report.junit.xml
+          flags: playwright-live
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ !cancelled() }}
         with:

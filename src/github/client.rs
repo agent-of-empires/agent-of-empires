@@ -1,13 +1,11 @@
 //! Thin typed GitHub HTTP client built on the already-present `reqwest`.
 //!
 //! This is the single surface for talking to `api.github.com`. It owns the
-//! base URL, the standard headers, the optional bearer token, and the mapping
-//! from HTTP responses to the typed [`GitHubError`] taxonomy. Authenticated
-//! callers resolve a token via [`crate::github::auth`] and pass it to
-//! [`GitHubClient::authenticated`]; unauthenticated public reads (such as the
-//! update check) use [`GitHubClient::unauthenticated`].
+//! base URL, the standard headers, and the mapping from HTTP responses to the
+//! typed [`GitHubError`] taxonomy. Only unauthenticated public reads (such as
+//! the update check) are wired up today via [`GitHubClient::unauthenticated`].
 
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT};
 use reqwest::StatusCode;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -47,16 +45,6 @@ struct ApiErrorBody {
 impl GitHubClient {
     /// Client for public, unauthenticated requests.
     pub fn unauthenticated(config: GitHubClientConfig) -> Result<Self> {
-        Self::build(config, None)
-    }
-
-    /// Client that sends `Authorization: Bearer <token>` on every request.
-    /// Resolve the token with [`crate::github::auth::resolve_token_from_system`].
-    pub fn authenticated(config: GitHubClientConfig, token: &str) -> Result<Self> {
-        Self::build(config, Some(token))
-    }
-
-    fn build(config: GitHubClientConfig, token: Option<&str>) -> Result<Self> {
         let mut headers = HeaderMap::new();
         headers.insert(
             ACCEPT,
@@ -66,12 +54,6 @@ impl GitHubClient {
             HeaderName::from_static("x-github-api-version"),
             HeaderValue::from_static("2022-11-28"),
         );
-        if let Some(token) = token {
-            let mut value = HeaderValue::from_str(&format!("Bearer {token}"))
-                .map_err(|_| GitHubError::Unauthorized)?;
-            value.set_sensitive(true);
-            headers.insert(AUTHORIZATION, value);
-        }
 
         let http = reqwest::Client::builder()
             .user_agent(config.user_agent)
@@ -214,11 +196,6 @@ mod tests {
     #[test]
     fn unauthenticated_client_builds() {
         assert!(GitHubClient::unauthenticated(config()).is_ok());
-    }
-
-    #[test]
-    fn authenticated_client_builds_with_token() {
-        assert!(GitHubClient::authenticated(config(), "gho_token123").is_ok());
     }
 
     #[test]

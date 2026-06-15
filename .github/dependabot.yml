@@ -120,7 +120,7 @@ updates:
     labels:
       - "dependencies"
       - "javascript"
-      - "area:acp"
+      - "area:web"
     commit-message:
       prefix: "chore"
       include: "scope"
@@ -155,7 +155,7 @@ updates:
     labels:
       - "dependencies"
       - "javascript"
-      - "area:acp"
+      - "area:web"
     commit-message:
       prefix: "chore"
       include: "scope"

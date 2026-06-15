@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use anyhow::{bail, Result};
 use chrono::Utc;
 
-use crate::containers::{self, ContainerRuntimeInterface};
+use crate::containers;
 use crate::git::error::GitError;
 use crate::git::GitWorktree;
 
