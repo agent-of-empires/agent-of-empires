@@ -1251,17 +1251,10 @@ impl HomeView {
         None
     }
 
-    /// Handle the archive keybind on the cursor's session. Symmetric toggle:
-    /// archive an active row, unarchive an archived one. Killing the tmux
-    /// pane on archive matches the CLI semantics (archived means "stop
-    /// spending CPU on this") so a stale spinner can't keep advertising the
-    /// session as alive. Unarchive does NOT respawn the pane; the user
-    /// restarts explicitly if they want it back.
-    ///
-    /// Mirrors `toggle_snooze_at_cursor` but with no picker: archive is
-    /// indefinite, so there's nothing to ask the user before sinking the
-    /// row. The session reappears at its real tier on unarchive or when
-    /// the user sends a message (auto unarchive in `Instance::message_sent`).
+    /// Toggle the cursor's session: archive or unarchive. Archive tears down
+    /// all tmux sessions (agent + ancillary); worktree, branch, container
+    /// preserved. Unarchive does NOT respawn; press `e` to restart, or send
+    /// a message to auto-unarchive. See #1868.
     pub(super) fn toggle_archive_at_cursor(&mut self) -> anyhow::Result<()> {
         let Some(id) = self.selected_session.clone() else {
             return Ok(());
@@ -1277,19 +1270,15 @@ impl HomeView {
             // flat_items rebuild the row jumps from tier 99 to its real
             // tier, so without this the cursor stays at the old index and
             // ends up on whatever row slid into that slot. The session stays
-            // Stopped (archive killed its pane); the user restarts it with `e`
-            // when they want it back, same as any other stopped session.
+            // Stopped (archive killed its panes); the user restarts it with
+            // `e` when they want it back, same as any other stopped session.
             self.select_session_by_id(&id);
             return Ok(());
         }
 
-        // Kill the pane before flipping the archived bit. If the kill fails
-        // (tmux gone, pane already dead) we still archive: the row should
-        // sink regardless, since the user explicitly asked for it.
+        // Tear down all tmux before flipping archived. #1868.
         if let Some(inst) = self.instances.iter().find(|i| i.id == id) {
-            if let Err(e) = inst.kill() {
-                tracing::warn!("toggle_archive_at_cursor: kill failed (continuing): {}", e);
-            }
+            inst.kill_all_tmux_sessions();
         }
 
         // Decide where the cursor lands BEFORE the row sinks, against the
@@ -1389,21 +1378,35 @@ impl HomeView {
         }
     }
 
-    /// Archive every active session under the selected group. Mirrors the
-    /// single-row archive path in `toggle_archive_at_cursor`: kill each pane
-    /// before flipping the archived bit, then reveal the Archived section so
-    /// the rows stay visible. Triggered behind a confirmation prompt, so there
-    /// is no further guard here.
+    /// Archive every active session under the selected group: tmux teardown
+    /// runs off-thread, persist runs inline. Confirmation upstream. See #1868.
     pub(super) fn archive_selected_group(&mut self) -> anyhow::Result<()> {
         let ids = self.active_sessions_in_selected_group();
         if ids.is_empty() {
             return Ok(());
         }
-        for inst in self.instances.iter().filter(|i| ids.contains(&i.id)) {
-            if let Err(e) = inst.kill() {
-                tracing::warn!("archive_selected_group: kill failed (continuing): {}", e);
+        // Off-thread tmux teardown so N x 4 shellouts don't block the input
+        // thread. Mirrors `force_remove_session`.
+        let kill_targets: Vec<_> = self
+            .instances
+            .iter()
+            .filter(|i| ids.contains(&i.id))
+            .cloned()
+            .collect();
+        std::thread::spawn(move || {
+            for inst in kill_targets {
+                if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    inst.kill_all_tmux_sessions()
+                })) {
+                    tracing::error!(
+                        target: "session.tmux_cleanup",
+                        session_id = %inst.id,
+                        "archive_selected_group tmux teardown panicked: {:?}",
+                        panic
+                    );
+                }
             }
-        }
+        });
         self.bulk_apply_user_action(&ids, |inst| inst.archive())?;
         self.reveal_archived_section();
         self.flat_items = self.build_flat_items();

@@ -1,10 +1,9 @@
-// Live coverage for the sidebar archive flow (#1581):
-//   - Right-click a session row → context menu → Archive.
-//   - PATCH /api/sessions/{id}/archive lands with { archived: true, kill_pane: true }.
-//   - The row moves into the collapsible "Snoozed & archived" footer.
-//   - `archived_at` is set on the server and survives a reload.
-//   - Unarchive via the menu (after expanding the footer) round-trips back to live.
+// Live coverage for the sidebar archive flow (#1581, widened by #1868):
+// right-click → Archive → row sinks → reload preserves → unarchive
+// round-trips. Asserts the seeded agent session is gone from the isolated
+// tmux socket post-archive (cterm/tool covered by CLI e2e).
 
+import { spawnSync } from "node:child_process";
 import { test as base, expect } from "@playwright/test";
 import { spawnAoeServe, listSessions, seedSessionViaAoeAdd } from "../helpers/aoeServe";
 
@@ -51,6 +50,26 @@ base.describe("sidebar archive via context menu (#1581)", () => {
           { timeout: 5_000 },
         )
         .toBeTruthy();
+
+      // #1868: seeded agent session must be gone from the isolated socket.
+      const idShort = sessionId.slice(0, 8);
+      await expect
+        .poll(
+          () => {
+            const result = spawnSync("tmux", ["ls"], {
+              env: serve.env,
+              encoding: "utf8",
+            });
+            // Throw on spawn failure only. Status 1 is normal: `tmux ls`
+            // exits 1 when the socket has no sessions, which is our state.
+            if (result.error) {
+              throw result.error;
+            }
+            return result.stdout ?? "";
+          },
+          { timeout: 5_000 },
+        )
+        .not.toContain(idShort);
 
       // The row is no longer in the live tier; the collapsible footer
       // appears with the archived count.

@@ -1225,13 +1225,10 @@ export async function setSessionPin(id: string, pinned: boolean): Promise<Sessio
   }
 }
 
-/** Archive or unarchive a session. On archive, the server kills the tmux
- *  pane (when `killPane` is true or omitted, matching TUI/CLI semantics)
- *  and shuts down the acp worker for acp-mode sessions; the
- *  reconciler will not respawn it because archived sessions are excluded
- *  from the resume target list. Sending a message via the dashboard
- *  auto-unarchives via the existing `touch_last_accessed` invariant in
- *  the send handler. See #1581. */
+/** Archive or unarchive a session. On archive (with `killPane` true or
+ *  omitted), the server tears down all tmux sessions and shuts down the
+ *  ACP worker for acp-mode sessions. Sending a message auto-unarchives.
+ *  See #1581, #1868. */
 export async function setSessionArchive(
   id: string,
   archived: boolean,

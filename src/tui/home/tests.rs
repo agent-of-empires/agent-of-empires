@@ -1880,6 +1880,52 @@ fn test_archive_selected_group_archives_all_members() {
     }
 }
 
+/// Locks #1868: bulk archive persists synchronously even though tmux
+/// teardown runs off-thread. Real tmux state asserted in
+/// `tests/e2e/archive_restore.rs`.
+#[test]
+#[serial]
+fn test_archive_selected_group_widened_teardown_persists_synchronously() {
+    let mut env = create_test_env_with_group_sessions();
+
+    for (i, item) in env.view.flat_items.iter().enumerate() {
+        if let Item::Group { path, .. } = item {
+            if path == "work" {
+                env.view.cursor = i;
+                env.view.update_selected();
+                break;
+            }
+        }
+    }
+    assert_eq!(env.view.selected_group.as_deref(), Some("work"));
+    let work_ids: Vec<String> = env.view.active_sessions_in_selected_group();
+    assert_eq!(work_ids.len(), 3);
+
+    let result = env.view.archive_selected_group();
+    assert!(
+        result.is_ok(),
+        "archive_selected_group must return Ok even when the off-thread \
+         teardown is fire-and-forget; got {:?}",
+        result
+    );
+
+    for id in &work_ids {
+        let inst = env
+            .view
+            .instances()
+            .iter()
+            .find(|i| &i.id == id)
+            .expect("group member must still exist after archive");
+        assert!(
+            inst.is_archived(),
+            "session {} ({}) must have archived_at set synchronously \
+             on the input thread before archive_selected_group returns",
+            inst.title,
+            id
+        );
+    }
+}
+
 /// In project group-by mode, archiving a project header archives every live
 /// session that maps to that repo, even though their stored `group_path`
 /// values differ from the synthetic project name.

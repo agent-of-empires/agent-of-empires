@@ -55,10 +55,8 @@ export interface SessionResponse {
    *  `isPinned = pinned_at != null` client-side; no separate boolean is
    *  exposed (the timestamp itself is the source of truth). See #1581. */
   pinned_at?: string | null;
-  /** RFC3339 timestamp at which the session was archived, or null /
-   *  undefined when not archived. Archived workspaces sink into the
-   *  collapsible "Snoozed & archived" footer of their repo group and
-   *  their tmux pane is killed by the archive handler. See #1581. */
+  /** RFC3339 timestamp; null when not archived. Sinks into "Snoozed &
+   *  archived"; archive tears down all tmux. See #1581, #1868. */
   archived_at?: string | null;
   /** RFC3339 timestamp at which an active snooze expires, or null /
    *  undefined when not snoozed. The server gates this on

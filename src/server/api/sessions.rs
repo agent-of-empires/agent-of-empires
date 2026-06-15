@@ -1652,10 +1652,9 @@ pub struct UpdatePinBody {
 #[derive(Deserialize)]
 pub struct UpdateArchiveBody {
     pub archived: bool,
-    /// When `archived = true`, kill the tmux pane (parity with the TUI's
-    /// `z` keybind and the CLI's `aoe session archive` default). Omitted
-    /// or `true` means kill; `false` keeps the pane alive while still
-    /// marking the session archived. Ignored when `archived = false`.
+    /// On archive, tear down every tmux session this instance owns. `false`
+    /// keeps tmux state alive; structured-view supervisor shutdown is
+    /// unconditional. Ignored when `archived = false`. See #1868.
     #[serde(default = "default_kill_pane")]
     pub kill_pane: bool,
 }
@@ -1846,48 +1845,20 @@ pub async fn update_session_archive(
         let inst_snap = inst.clone();
         drop(instances);
 
-        // Stash the structured-view flag + clone + response and break out to do
-        // the side effects below. Return early on the non-archive path
-        // because we have no work left to do; the kill_pane=false case
-        // is NOT a short-circuit because structured view shutdown still has to
-        // run for structured view-mode sessions (kill_pane is a tmux-only
-        // switch, per the request-body documentation).
+        // Snapshot and drop the lock; run side effects below. Unarchive
+        // returns here; archive does NOT short-circuit on kill_pane=false
+        // because structured-view shutdown is unconditional.
         if !archived {
             return (StatusCode::OK, Json(serde_json::json!(response))).into_response();
         }
         (structured_view, inst_snap, body.kill_pane)
     };
 
-    // Best-effort tmux pane teardown for tmux-backed sessions. Mirrors
-    // `toggle_archive_at_cursor` in src/tui/home/operations.rs: if the
-    // kill fails (pane already dead, tmux gone), log and continue
-    // because the on-disk archived flag is the source of truth. The
-    // kill_pane=false body opt-out applies only here, so a caller can
-    // archive a tmux session without killing its pane while still
-    // unconditionally stopping a structured view worker on the other branch.
-    if !was_structured_view {
-        if kill_pane {
-            let inst_for_kill = inst_clone.clone();
-            match tokio::task::spawn_blocking(move || inst_for_kill.kill()).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => tracing::warn!(
-                    target: "http.api.sessions",
-                    "Archive: tmux kill failed: {e}"
-                ),
-                Err(e) => tracing::warn!(
-                    target: "http.api.sessions",
-                    "Archive: tmux kill join failed: {e}"
-                ),
-            }
-        }
-    } else {
-        // Acp sessions: shut down the worker so the supervisor's
-        // reconciler does not race to respawn it. The reconciler also
-        // skips archived sessions (see acp_reconciler.rs), but
-        // shutting down here gives an immediate teardown rather than
-        // waiting for the next poll tick. `shutdown` preserves the
-        // agent transcript (no session/delete), so unarchiving resumes
-        // the conversation instead of resetting it (#1710).
+    // Best-effort tmux teardown (helper logs at debug). #1868.
+    if was_structured_view {
+        // Worker shutdown before ancillary kill so in-flight tool output
+        // settles (mirrors acp.rs:1304-1310). shutdown() preserves the
+        // transcript (#1710).
         #[cfg(feature = "serve")]
         match state.acp_supervisor.shutdown(&id).await {
             Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
@@ -1896,6 +1867,28 @@ pub async fn update_session_archive(
                 session = %id,
                 "shutdown during archive failed: {e}"
             ),
+        }
+        if kill_pane {
+            let inst_for_kill = inst_clone.clone();
+            if let Err(e) =
+                tokio::task::spawn_blocking(move || inst_for_kill.kill_ancillary_tmux_sessions())
+                    .await
+            {
+                tracing::warn!(
+                    target: "http.api.sessions",
+                    "Archive: ancillary tmux kill join failed: {e}"
+                );
+            }
+        }
+    } else if kill_pane {
+        let inst_for_kill = inst_clone.clone();
+        if let Err(e) =
+            tokio::task::spawn_blocking(move || inst_for_kill.kill_all_tmux_sessions()).await
+        {
+            tracing::warn!(
+                target: "http.api.sessions",
+                "Archive: tmux kill join failed: {e}"
+            );
         }
     }
 
