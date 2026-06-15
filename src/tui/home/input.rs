@@ -187,6 +187,41 @@ fn split_bracketed_paste(text: &str) -> Vec<live_send::TmuxKey> {
     vec![live_send::TmuxKey::HexBytes(bytes)]
 }
 
+/// Build the mouse-wheel byte sequence to forward to a full-screen app
+/// under the live preview. `up` selects wheel-up (button 64) vs wheel-down
+/// (65); `sgr` selects the SGR (1006) encoding vs the legacy X10 encoding,
+/// matching whatever the app has enabled. The hovered screen cell
+/// `(col, row)` is mapped into the app's 1-based coordinate space relative
+/// to its pane `pane` (the live-send target is sized to the preview output
+/// rect, so this maps directly), clamped inside the pane; an unpopulated
+/// rect falls back to the top-left cell.
+fn wheel_mouse_bytes(
+    up: bool,
+    sgr: bool,
+    pane: ratatui::layout::Rect,
+    col: u16,
+    row: u16,
+) -> Vec<u8> {
+    let (cx, cy) = if pane.width == 0 || pane.height == 0 {
+        (1u16, 1u16)
+    } else {
+        let cx = col.saturating_sub(pane.x).min(pane.width - 1) + 1;
+        let cy = row.saturating_sub(pane.y).min(pane.height - 1) + 1;
+        (cx, cy)
+    };
+    let button: u16 = if up { 64 } else { 65 };
+    if sgr {
+        // SGR (1006): textual, press marker `M`. No coordinate limit.
+        format!("\x1b[<{button};{cx};{cy}M").into_bytes()
+    } else {
+        // Legacy X10: `ESC [ M` then three bytes, each the value + 32.
+        // Bytes top out at 255, so coordinates above 223 can't be
+        // encoded; clamp there (preview cells are far below that anyway).
+        let enc = |v: u16| (v.min(223) + 32) as u8;
+        vec![0x1b, b'[', b'M', enc(button), enc(cx), enc(cy)]
+    }
+}
+
 fn resolve_hook_install_agent(
     tool_name: &str,
     session_config: &crate::session::config::SessionConfig,
@@ -3084,6 +3119,40 @@ impl HomeView {
     /// redraw. Scrolls do not cross pane boundaries: a wheel over the
     /// preview never moves the list cursor, even when the preview is at
     /// its scroll boundary or has no session selected.
+    /// When a live-send target is a full-screen (alternate-screen) app
+    /// that has mouse tracking on, the preview's capture-window scroll is
+    /// useless: the alternate screen has no scrollback, so growing the
+    /// window only exposes the unrelated normal-buffer history underneath
+    /// and the view bottoms out at the session's start. Instead, forward
+    /// the wheel to the app as a mouse event, exactly as a terminal does
+    /// when you wheel over a mouse-tracking pane on attach, so the app
+    /// scrolls its OWN content.
+    ///
+    /// Gated on mouse tracking (`mouse_tracking`): with no mouse mode the
+    /// app would read the bytes as garbage keystrokes, so the caller keeps
+    /// the capture-window scroll. The encoding follows the app: SGR (1006)
+    /// when `mouse_sgr` is set, otherwise the legacy X10 encoding. Returns
+    /// true when the event was forwarded.
+    fn forward_wheel_to_live_pane(&self, up: bool, col: u16, row: u16) -> bool {
+        if self.live_send.is_none() {
+            return false;
+        }
+        let Some(worker) = &self.live_send_worker else {
+            return false;
+        };
+        let cursor = self
+            .preview_capture_worker
+            .as_ref()
+            .and_then(|w| w.current_cursor());
+        let Some(cursor) = cursor else { return false };
+        if !(cursor.alternate_on && cursor.mouse_tracking) {
+            return false;
+        }
+        let bytes = wheel_mouse_bytes(up, cursor.mouse_sgr, self.preview_text_view.pane, col, row);
+        worker.send(crate::tui::home::live_send::TmuxKey::HexBytes(bytes));
+        true
+    }
+
     pub fn handle_scroll_up(&mut self, col: u16, row: u16) -> bool {
         const STEP: u16 = 3;
         // A preview selection is anchored to absolute scrollback lines,
@@ -3118,6 +3187,12 @@ impl HomeView {
         }
         if self.selected_session.is_none() {
             return false;
+        }
+        // Full-screen mouse app under live-send: send the wheel to the app
+        // instead of scrolling the (irrelevant) normal-buffer capture.
+        if self.forward_wheel_to_live_pane(true, col, row) {
+            self.preview_scroll_offset = 0;
+            return true;
         }
 
         let active_cache = match self.view_mode {
@@ -3908,6 +3983,12 @@ impl HomeView {
         if self.selected_session.is_none() {
             return false;
         }
+        // Mirror handle_scroll_up: a full-screen mouse app gets the wheel
+        // forwarded rather than moving the preview's capture window.
+        if self.forward_wheel_to_live_pane(false, col, row) {
+            self.preview_scroll_offset = 0;
+            return true;
+        }
         if self.preview_scroll_offset == 0 {
             return false;
         }
@@ -4687,6 +4768,56 @@ impl HomeView {
 mod tests {
     use super::*;
     use crate::session::config::{SessionConfig, ToolSessionConfig};
+
+    #[test]
+    fn wheel_mouse_bytes_sgr_maps_cell_and_button() {
+        use ratatui::layout::Rect;
+        // Pane at (10,5), 80x24. Wheel up over screen cell (12,7) maps to
+        // 1-based pane cell (3,3): cx = 12-10+1, cy = 7-5+1.
+        let pane = Rect::new(10, 5, 80, 24);
+        assert_eq!(
+            wheel_mouse_bytes(true, true, pane, 12, 7),
+            b"\x1b[<64;3;3M".to_vec()
+        );
+        // Wheel down flips the button to 65.
+        assert_eq!(
+            wheel_mouse_bytes(false, true, pane, 12, 7),
+            b"\x1b[<65;3;3M".to_vec()
+        );
+        // A cell past the pane edge clamps to the last column/row.
+        assert_eq!(
+            wheel_mouse_bytes(true, true, pane, 999, 999),
+            b"\x1b[<64;80;24M".to_vec()
+        );
+        // An unpopulated rect falls back to the top-left cell.
+        assert_eq!(
+            wheel_mouse_bytes(true, true, Rect::new(0, 0, 0, 0), 40, 40),
+            b"\x1b[<64;1;1M".to_vec()
+        );
+    }
+
+    #[test]
+    fn wheel_mouse_bytes_legacy_encodes_x10() {
+        use ratatui::layout::Rect;
+        let pane = Rect::new(10, 5, 80, 24);
+        // Legacy X10: ESC [ M then (button+32, col+32, row+32). Cell (3,3),
+        // wheel up (button 64) => 0x60, 0x23, 0x23.
+        assert_eq!(
+            wheel_mouse_bytes(true, false, pane, 12, 7),
+            vec![0x1b, b'[', b'M', 64 + 32, 3 + 32, 3 + 32]
+        );
+        // Wheel down => button 65 => 0x61.
+        assert_eq!(
+            wheel_mouse_bytes(false, false, pane, 12, 7),
+            vec![0x1b, b'[', b'M', 65 + 32, 3 + 32, 3 + 32]
+        );
+        // Coordinates above 223 can't be encoded in one byte; clamp there.
+        let wide = Rect::new(0, 0, 400, 400);
+        assert_eq!(
+            wheel_mouse_bytes(true, false, wide, 300, 300),
+            vec![0x1b, b'[', b'M', 64 + 32, 223 + 32, 223 + 32]
+        );
+    }
 
     #[test]
     fn format_target_label_distinguishes_terminal_panes() {

@@ -7616,6 +7616,131 @@ mod scroll_pane_isolation {
         env.view.preview_area = Rect::new(30, 0, 100, 40);
     }
 
+    /// Build a live-send env whose preview-capture worker reports the
+    /// given cursor, so the alternate-screen wheel-forwarding branch can
+    /// be exercised without a real full-screen pane.
+    fn live_env_with_cursor(cursor: crate::tmux::PaneCursor) -> TestEnv {
+        use crate::tui::home::live_send::{LiveSendState, LiveSendTarget, LiveSendWorker};
+        let mut env = create_test_env_with_sessions(3);
+        setup_panes(&mut env);
+        env.view.cursor = 1;
+        env.view.update_selected();
+        env.view.preview_cache.dimensions = (80, 24);
+        env.view.preview_cache.captured_lines = 200;
+        env.view.preview_scroll_offset = 10;
+        env.view.live_send = Some(LiveSendState {
+            session_id: "fake".to_string(),
+            title: "fake".to_string(),
+            tmux_name: "fake".to_string(),
+            target: LiveSendTarget::Agent,
+            exit_chords: crate::tui::home::live_send::parse_chord_list(
+                crate::tui::home::live_send::DEFAULT_EXIT_CHORD,
+            ),
+            leader: None,
+        });
+        env.view.live_send_worker = Some(LiveSendWorker::spawn("fake".to_string(), None));
+        // Spawn the capture worker, then inject the cursor (set_target
+        // clears it, so the injection must come after).
+        env.view
+            .sync_preview_capture_worker(Some("fake".to_string()));
+        env.view
+            .preview_capture_worker
+            .as_ref()
+            .expect("capture worker spawned")
+            .set_cursor_for_test(Some(cursor));
+        env
+    }
+
+    fn alt_screen_cursor(
+        alternate_on: bool,
+        mouse_tracking: bool,
+        mouse_sgr: bool,
+    ) -> crate::tmux::PaneCursor {
+        crate::tmux::PaneCursor {
+            x: 0,
+            y: 0,
+            visible: true,
+            pane_height: 24,
+            history_size: 1800,
+            pane_width: 80,
+            alternate_on,
+            mouse_tracking,
+            mouse_sgr,
+        }
+    }
+
+    /// Live-send target is a full-screen app with SGR mouse tracking on:
+    /// the wheel is forwarded to the app (returns to the live edge) instead
+    /// of growing the useless normal-buffer capture window. This is the fix
+    /// for the "scroll up a little then snap to the very first part of the
+    /// session" report on alternate-screen agents.
+    #[test]
+    #[serial]
+    fn wheel_over_alt_screen_sgr_mouse_pane_forwards_instead_of_scrollback() {
+        let mut env = live_env_with_cursor(alt_screen_cursor(true, true, true));
+
+        let up = env.view.handle_scroll_up(50, 10);
+        assert!(up, "wheel over a full-screen SGR-mouse pane is handled");
+        assert_eq!(
+            env.view.preview_scroll_offset, 0,
+            "forwarding pins the preview to the live edge, never the normal-buffer history"
+        );
+
+        env.view.preview_scroll_offset = 10;
+        let down = env.view.handle_scroll_down(50, 10);
+        assert!(down);
+        assert_eq!(env.view.preview_scroll_offset, 0);
+    }
+
+    /// Guard the gate: a full-screen app WITHOUT any mouse tracking must
+    /// not get raw SGR bytes (it would read them as garbage keystrokes).
+    /// The wheel falls back to the existing capture-window scroll.
+    #[test]
+    #[serial]
+    fn wheel_over_alt_screen_without_mouse_uses_capture_scroll() {
+        let mut env = live_env_with_cursor(alt_screen_cursor(true, false, false));
+
+        let up = env.view.handle_scroll_up(50, 10);
+        assert!(up);
+        assert!(
+            env.view.preview_scroll_offset > 10,
+            "no mouse tracking: keep the capture-window scroll (offset advances)"
+        );
+    }
+
+    /// A full-screen app with mouse tracking but in the LEGACY (non-SGR)
+    /// encoding is still forwarded; the byte builder emits X10-encoded
+    /// bytes for it instead of SGR (see `wheel_mouse_bytes_legacy_encodes_x10`).
+    /// Forwarding pins the preview to the live edge like the SGR case.
+    #[test]
+    #[serial]
+    fn wheel_over_alt_screen_legacy_mouse_forwards() {
+        let mut env = live_env_with_cursor(alt_screen_cursor(true, true, false));
+
+        let up = env.view.handle_scroll_up(50, 10);
+        assert!(up, "wheel over a full-screen legacy-mouse pane is handled");
+        assert_eq!(
+            env.view.preview_scroll_offset, 0,
+            "legacy mouse is forwarded too (X10 encoding), not dead-scrolled"
+        );
+    }
+
+    /// And a normal-screen agent (no alternate screen) keeps the capture
+    /// scroll even if it happens to have SGR mouse on: the preview's
+    /// scrollback is genuinely useful there.
+    #[test]
+    #[serial]
+    fn wheel_over_normal_screen_pane_uses_capture_scroll() {
+        let mut env = live_env_with_cursor(alt_screen_cursor(false, true, true));
+
+        let up = env.view.handle_scroll_up(50, 10);
+        assert!(up);
+        assert!(
+            env.view.preview_scroll_offset > 10,
+            "normal screen: capture-window scroll still drives the preview"
+        );
+    }
+
     /// Wheel-down over preview when offset is already at the bottom (0)
     /// must NOT advance the list cursor.
     #[test]
