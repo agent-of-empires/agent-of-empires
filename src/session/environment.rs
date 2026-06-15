@@ -233,23 +233,32 @@ pub(crate) fn host_environment_prefix(entries: &[String]) -> String {
 /// pairs on the host, for feeding into a host-side hook's process environment
 /// (so a `before_start` hook can read a per-session `$TEST_VAR`).
 ///
-/// Mirrors [`collect_environment`]'s precedence (per-session `extra_env`
-/// overrides `sandbox.environment`) and the shared entry grammar, but resolves
-/// every entry to a plain host value: `KEY=value` is literal, `KEY=$VAR` reads
-/// the host env, `KEY=$$literal` escapes a `$`, and a bare `KEY` passes through
-/// from the host env. Unset host references and bare keys are skipped.
-/// Deduplicates by key (first wins).
+/// Trust boundary: this is resolved WITHOUT repo overrides. `before_start`
+/// hooks are profile/global only, so a repo's `.agent-of-empires/config.toml`
+/// `sandbox.environment` must never reach host execution; routing through the
+/// repo-aware `resolved_sandbox_config` would let an untrusted repo influence
+/// the host hook's environment (e.g. `PATH`). Sources, in precedence order:
+/// the per-session `extra_env` (explicit user input, never auto-seeded from
+/// repo config), else the profile/global `sandbox.environment`.
+///
+/// Each entry is resolved to a plain host value via the shared grammar:
+/// `KEY=value` is literal, `KEY=$VAR` reads the host env, `KEY=$$literal`
+/// escapes a `$`, and a bare `KEY` passes through from the host env. Unset host
+/// references and bare keys are skipped. Deduplicates by key (first wins).
 pub(crate) fn session_host_env_pairs(
     profile: &str,
-    project_path: &std::path::Path,
     sandbox_info: &SandboxInfo,
 ) -> Vec<(String, String)> {
-    let sandbox_config = resolved_sandbox_config(profile, project_path);
-    let entries: &[String] = sandbox_info
-        .extra_env
-        .as_deref()
-        .unwrap_or(&sandbox_config.environment);
-    resolve_host_env_pairs(entries)
+    match sandbox_info.extra_env.as_deref() {
+        Some(entries) => resolve_host_env_pairs(entries),
+        None => {
+            let resolved = super::config::effective_profile(profile);
+            let env = super::profile_config::resolve_config_or_warn(&resolved)
+                .sandbox
+                .environment;
+            resolve_host_env_pairs(&env)
+        }
+    }
 }
 
 /// Resolve env entries to concrete host `(KEY, VALUE)` pairs (the pure core of
@@ -976,6 +985,30 @@ environment = ["GH_TOKEN=write_token"]
         );
         std::env::remove_var("AOE_TEST_HOST_PAIR_REF");
         std::env::remove_var("AOE_TEST_HOST_PAIR_BARE");
+    }
+
+    #[test]
+    fn test_session_host_env_pairs_uses_extra_env_directly() {
+        // With a per-session extra_env, the host-hook env comes straight from it
+        // (resolved), without consulting repo-aware config. This keeps a repo's
+        // sandbox.environment out of host hook execution.
+        let info = SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "img".to_string(),
+            container_name: "ctr".to_string(),
+            extra_env: Some(vec!["TEST_VAR=foo".to_string(), "OTHER=bar".to_string()]),
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+        };
+        let pairs = session_host_env_pairs("any-profile", &info);
+        assert_eq!(
+            pairs,
+            vec![
+                ("TEST_VAR".to_string(), "foo".to_string()),
+                ("OTHER".to_string(), "bar".to_string()),
+            ]
+        );
     }
 
     #[test]

@@ -331,7 +331,10 @@ pub fn get_remote_owner(path: &Path) -> Option<String> {
 
 /// Extract the `owner/repo` slug from a git remote URL, stripping any `.git`
 /// suffix and trailing slash. Handles the same formats as
-/// [`parse_owner_from_remote_url`]. Returns `None` if either segment is missing.
+/// [`parse_owner_from_remote_url`]. Returns `None` unless the URL is a canonical
+/// hosted repo: a known remote scheme (`http`/`https`/`ssh`) or SSH shorthand,
+/// with exactly an `owner/repo` path. Local schemes like `file://` are rejected
+/// so they never produce a bogus slug.
 pub(crate) fn parse_slug_from_remote_url(url: &str) -> Option<String> {
     // Reduce to the path after the host: `owner/repo(.git)`.
     let path = if !url.contains("://") {
@@ -342,14 +345,22 @@ pub(crate) fn parse_slug_from_remote_url(url: &str) -> Option<String> {
         }
         &url[colon_pos + 1..]
     } else {
-        let without_scheme = url.split("://").nth(1)?;
+        let (scheme, without_scheme) = url.split_once("://")?;
+        if !matches!(scheme, "http" | "https" | "ssh") {
+            return None;
+        }
         &without_scheme[without_scheme.find('/')? + 1..]
     };
     let path = path.trim_end_matches('/');
     let path = path.strip_suffix(".git").unwrap_or(path);
-    let mut segments = path.split('/');
-    let owner = segments.next().filter(|s| !s.is_empty())?;
-    let repo = segments.next().filter(|s| !s.is_empty())?;
+    let mut segments = path.split('/').filter(|s| !s.is_empty());
+    let owner = segments.next()?;
+    let repo = segments.next()?;
+    // Reject deeper paths (e.g. `file://`-style or nested paths): a hosted repo
+    // is exactly `owner/repo`.
+    if segments.next().is_some() {
+        return None;
+    }
     Some(format!("{}/{}", owner, repo))
 }
 
@@ -398,6 +409,21 @@ mod tests {
         // Owner but no repo segment.
         assert_eq!(parse_slug_from_remote_url("git@github.com:owner"), None);
         assert_eq!(parse_slug_from_remote_url("https://github.com/owner"), None);
+    }
+
+    #[test]
+    fn test_parse_slug_rejects_non_remote_schemes_and_deep_paths() {
+        // file:// and other local schemes must not yield a slug.
+        assert_eq!(parse_slug_from_remote_url("file:///tmp/repo.git"), None);
+        assert_eq!(
+            parse_slug_from_remote_url("file://host/owner/repo.git"),
+            None
+        );
+        // Deeper paths are not a canonical hosted owner/repo.
+        assert_eq!(
+            parse_slug_from_remote_url("https://example.com/group/sub/repo.git"),
+            None
+        );
     }
 
     #[test]
