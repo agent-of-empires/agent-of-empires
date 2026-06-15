@@ -40,6 +40,7 @@ import { useAgentProfile } from "../../lib/agentProfileContext";
 import { resolveModeChannel } from "../../lib/modeChannel";
 import { useFocusTerminalTarget } from "../../hooks/useFocusTerminalTarget";
 import { useDictationBurstGuard } from "./useDictationBurstGuard";
+import { nextRecallTarget, recallBannerInfo, type RecallCursor, type RecallNav } from "./recallNav";
 
 export {
   DICTATION_BURST_TIMEOUT_MS,
@@ -471,23 +472,16 @@ export function Composer({
   // browsing. A ref (not state) so the synchronous keydown handler always
   // reads the live value with no stale closure. Anchored on the stable
   // queued-prompt id so a background drain never targets the wrong row.
-  const recallRef = useRef<{ id: string; stashedDraft: string } | null>(null);
+  const recallRef = useRef<RecallCursor | null>(null);
   // Render-visible mirror of the browse: drives the "Editing queued
   // message N of M" banner. recallRef stays the synchronous source of
   // truth for the keydown handler; applyRecall keeps the two in step.
   const [recallInfo, setRecallInfo] = useState<{ pos: number; total: number } | null>(null);
 
   const applyRecall = useCallback(
-    (next: { id: string; stashedDraft: string } | null) => {
+    (next: RecallCursor | null) => {
       recallRef.current = next;
-      if (!next) {
-        setRecallInfo(null);
-        return;
-      }
-      const idx = queuedPrompts.findIndex((p) => p.id === next.id);
-      // Position counts from the newest entry (1 = newest), matching the
-      // ArrowUp-from-newest browse order.
-      setRecallInfo(idx === -1 ? null : { pos: queuedPrompts.length - idx, total: queuedPrompts.length });
+      setRecallInfo(recallBannerInfo(queuedPrompts, next));
     },
     [queuedPrompts],
   );
@@ -515,61 +509,39 @@ export function Composer({
     [composerRuntime],
   );
 
-  // Browse toward older queued prompts. Entering from normal typing
-  // stashes the current draft and loads the newest entry; subsequent
-  // calls walk down the list and stop at the oldest (no wrap).
-  const recallOlder = useCallback(() => {
-    const q = queuedPrompts;
-    if (q.length === 0) {
-      // Queue drained out from under the browse; end it so the next
-      // ArrowUp moves the caret instead of being swallowed.
-      applyRecall(null);
-      return;
-    }
-    const cur = recallRef.current;
-    if (!cur) {
-      const target = q[q.length - 1];
-      if (!target) return;
-      applyRecall({ id: target.id, stashedDraft: composerRuntime.getState().text });
-      loadRecallText(target.text);
-      return;
-    }
-    const idx = q.findIndex((p) => p.id === cur.id);
-    if (idx === -1) {
-      // The browsed entry drained mid-browse; end browse, keep the text.
-      applyRecall(null);
-      return;
-    }
-    if (idx > 0) {
-      const target = q[idx - 1];
-      if (!target) return;
-      applyRecall({ ...cur, id: target.id });
-      loadRecallText(target.text);
-    }
-    // idx === 0 is the oldest entry: stay put.
-  }, [queuedPrompts, composerRuntime, loadRecallText, applyRecall]);
+  // Apply a pure recall navigation decision to the composer.
+  const applyNav = useCallback(
+    (nav: RecallNav) => {
+      switch (nav.kind) {
+        case "load":
+          applyRecall(nav.cursor);
+          loadRecallText(nav.text);
+          break;
+        case "restore":
+          loadRecallText(nav.text);
+          applyRecall(null);
+          break;
+        case "exit":
+          applyRecall(null);
+          break;
+        case "none":
+          break;
+      }
+    },
+    [applyRecall, loadRecallText],
+  );
 
-  // Browse toward newer queued prompts; past the newest, restore the
-  // stashed draft and exit browse.
+  // Browse toward older queued prompts (ArrowUp): enters recall stashing
+  // the current draft, then walks down and stops at the oldest.
+  const recallOlder = useCallback(() => {
+    applyNav(nextRecallTarget(queuedPrompts, recallRef.current, "older", composerRuntime.getState().text));
+  }, [queuedPrompts, composerRuntime, applyNav]);
+
+  // Browse toward newer queued prompts (ArrowDown); past the newest,
+  // restore the stashed draft and exit.
   const recallNewer = useCallback(() => {
-    const cur = recallRef.current;
-    if (!cur) return;
-    const q = queuedPrompts;
-    const idx = q.findIndex((p) => p.id === cur.id);
-    if (idx === -1) {
-      applyRecall(null);
-      return;
-    }
-    if (idx + 1 < q.length) {
-      const target = q[idx + 1];
-      if (!target) return;
-      applyRecall({ ...cur, id: target.id });
-      loadRecallText(target.text);
-    } else {
-      loadRecallText(cur.stashedDraft);
-      applyRecall(null);
-    }
-  }, [queuedPrompts, loadRecallText, applyRecall]);
+    applyNav(nextRecallTarget(queuedPrompts, recallRef.current, "newer", ""));
+  }, [queuedPrompts, applyNav]);
 
   // Esc while browsing restores the stashed draft and exits, matching the
   // banner's hint.
