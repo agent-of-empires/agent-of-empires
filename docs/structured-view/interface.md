@@ -50,6 +50,7 @@ banner at the bottom shows the current focus.
 | Composer    | `@`             | Open the file-mention picker; keep typing to filter   |
 | Composer    | `Enter` (empty) | Retry draining the queue when idle (e.g. after a failed send) |
 | Composer    | `/`             | Type a slash at the start of an empty line to open the command picker |
+| Composer    | `↑` / `↓`       | Recall queued prompts to edit (caret at start); `↓` past the newest restores your draft |
 | Composer    | `↑` / `↓`       | Move the picker highlight (picker open)               |
 | Composer    | `Ctrl+n` / `Ctrl+p` | Move the picker highlight down / up (picker open) |
 | Composer    | `Enter` / `Tab` | Insert the highlighted command or file (picker open)  |
@@ -204,6 +205,14 @@ the whole row is dropped on reload rather than draining a text-only
 prompt with the image missing. There is no server-side durability;
 clearing site data wipes the queue.
 
+**Editing a queued prompt.** Click any queued row to edit it inline, or,
+with the composer empty (caret at the start), press `↑` to pull the most
+recent queued prompt back into the composer; `↑` again walks toward older
+entries and `↓` walks back toward newer ones, restoring your in-progress
+draft once you step past the newest. Editing a recalled prompt and
+pressing `Enter` updates that entry in place rather than queueing a
+duplicate.
+
 **TUI structured view.** The TUI has the same client-side queue.
 Pressing `Enter` while a turn is active (or while the WebSocket is down)
 parks the prompt in a **Queued (N)** strip instead of sending; the queue
@@ -211,9 +220,12 @@ drains on the next `Stopped` per the daemon's `acp.queue_drain_mode`
 (read from `/api/about`, so a remote attach honors the remote daemon's
 setting). `Ctrl+X` clears the queue, and pressing `Enter` on an empty
 composer when idle retries the drain (useful if a send failed and left
-prompts parked). Two differences from the web composer: queued rows
-can't be edited in place (clear and retype), and the TUI queue is
-in-memory only, so it does not survive leaving the structured view.
+prompts parked). Queued prompts can be recalled for editing the same way
+as the web: with the composer empty (caret at the top-left), `↑` pulls
+the newest queued prompt back into the composer, `↑` / `↓` walk the queue,
+and editing then `Enter` updates that entry in place. One difference from
+the web composer remains: the TUI queue is in-memory only, so it does not
+survive leaving the structured view.
 
 ## Stopping a turn
 
