@@ -5,15 +5,31 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-parts.url = "github:hercules-ci/flake-parts";
     crane.url = "github:ipetkov/crane";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs = inputs @ { flake-parts, ... }:
     flake-parts.lib.mkFlake { inherit inputs; } {
       systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
 
-      perSystem = { config, self', inputs', pkgs, system, ... }:
+      perSystem = { config, self', inputs', system, ... }:
         let
-          craneLib = inputs.crane.mkLib pkgs;
+          pkgs = import inputs.nixpkgs {
+            inherit system;
+            overlays = [ (import inputs.rust-overlay) ];
+          };
+
+          # Pin an explicit stable rustc instead of inheriting whatever rustc
+          # the pinned nixpkgs happens to ship. nixpkgs lags stable, which
+          # broke the nix build when libsqlite3-sys 0.38.1 started using the
+          # cfg_select! macro (stable in rustc >= 1.93) while nixpkgs still
+          # shipped 1.92.0. Tracking latest stable here keeps the nix
+          # toolchain in step with the rustup-stable used by the regular CI.
+          rustToolchain = pkgs.rust-bin.stable.latest.default;
+          craneLib = (inputs.crane.mkLib pkgs).overrideToolchain rustToolchain;
 
           # git2 uses vendored-openssl (needs perl to build OpenSSL)
           # and libgit2-sys vendors libgit2 (needs cmake to build it)
