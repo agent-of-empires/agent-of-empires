@@ -3310,13 +3310,6 @@ async fn daemon_startup_recovery_cascade(
                         error = %e,
                         "recovery cascade failed",
                     );
-                    // `run_recovery_for_instance` already stamped
-                    // `Status::Error`, `last_error`, and `last_error_check`
-                    // on the cascade-mutated instance (see
-                    // `recovery::run_recovery_for_instance`). The TUI worker
-                    // path benefits from the same translation by virtue of
-                    // calling the same function, keeping daemon and TUI
-                    // chip behavior in lockstep.
                     let mut instances = inst_state.instances.write().await;
                     if let Some(slot) = instances.iter_mut().find(|i| i.id == id) {
                         *slot = updated;
