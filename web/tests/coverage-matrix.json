@@ -105,7 +105,11 @@
       "id": "terminal.live-size-owner",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": ["tests/live/live-size-owner-takeover.spec.ts", "src/hooks/useLiveTerminal.sizeOwner.test.ts"],
+      "specs": [
+        "tests/live/live-size-owner-takeover.spec.ts",
+        "src/hooks/useLiveTerminal.sizeOwner.test.ts",
+        "tests/live/mobile-live-no-flutter.spec.ts"
+      ],
       "components": [
         "web/src/components/LiveTerminalView.tsx",
         "web/src/components/XtermTerminalView.tsx",

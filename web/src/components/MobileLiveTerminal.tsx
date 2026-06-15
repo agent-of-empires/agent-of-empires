@@ -46,6 +46,10 @@ const MAX_FONT_SIZE = 28;
 const LINE_RATIO = 1.2;
 /** Resize debounce: one tmux resize per settled layout. */
 const RESIZE_DEBOUNCE_MS = 150;
+/** How long the meaningful-row scroll anchor must stay lower before it
+ *  shrinks, so a spinner toggling the lowest non-blank row can't flutter the
+ *  viewport. Comfortably longer than an agent's redraw cadence. */
+const SHRINK_DELAY_MS = 600;
 
 export interface MobileLiveTerminalProps {
   frame: LiveFrame | null;
@@ -279,13 +283,10 @@ export function MobileLiveTerminal({
     rowsRef.current = screenRows || rowsRef.current;
   }, [screenRows]);
 
-  // Cursor cell -> visual overlay position. Shown only at the live edge;
-  // reading scrollback hides it. The pinning layout effect also feeds
-  // this position into cursorAnchorRef for the keyboard-shrunk target.
   // Last visual row with real text. A fullscreen agent (Claude) only fills
   // part of a tall mobile pane and leaves the rest blank; this is where the
-  // meaningful screen ends. Cursor-independent so it can drive both the
-  // render trim and the cursor-in-the-void check below.
+  // meaningful screen ends. Cursor-independent so it drives both the
+  // cursor-in-the-void check below and the no-cursor scroll anchor.
   const lastNonBlankRow = useMemo(() => {
     for (let i = visual.rows.length - 1; i >= 0; i--) {
       if (visual.rows[i]!.some((s) => s.text.trim() !== "")) return i;
@@ -293,13 +294,38 @@ export function MobileLiveTerminal({
     return -1;
   }, [visual]);
 
-  // Render only through the last non-blank row so `mt-auto` can bottom-align
-  // the real content; the trailing blank rows would otherwise float the input
-  // box far above the keyboard behind a dead gap. This trims RENDERING only,
-  // not the scroll anchor (whose last-non-blank flutter under spinner redraws
-  // is why viewport-anchoring there was reverted, see liveScrollTarget).
-  const renderRowCount = Math.max(0, lastNonBlankRow + 1);
+  // Debounced count of rows to render: the last non-blank row + 1, but it
+  // GROWS instantly (follow appended output) and SHRINKS only after staying
+  // lower for SHRINK_DELAY_MS. Trimming the trailing blank rows lets `mt-auto`
+  // bottom-align a fullscreen agent that doesn't fill the tall mobile pane, so
+  // its input box sits just above the keyboard instead of floating over a dead
+  // gap. The debounce is essential: a spinner toggling the lowest non-blank
+  // row would otherwise change the rendered height every frame and bounce the
+  // whole block (the raw last-non-blank jitter #2087 reverted). State, not a
+  // ref, because the render depends on it.
+  const [renderRowCount, setRenderRowCount] = useState(0);
+  const shrinkTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    const target = Math.max(0, lastNonBlankRow + 1);
+    setRenderRowCount((current) => {
+      if (target >= current) {
+        if (shrinkTimerRef.current) clearTimeout(shrinkTimerRef.current);
+        shrinkTimerRef.current = null;
+        return target;
+      }
+      if (shrinkTimerRef.current == null) {
+        shrinkTimerRef.current = setTimeout(() => {
+          shrinkTimerRef.current = null;
+          setRenderRowCount(Math.max(0, lastNonBlankRow + 1));
+        }, SHRINK_DELAY_MS);
+      }
+      return current;
+    });
+  }, [lastNonBlankRow]);
 
+  // Cursor cell -> visual overlay position. Shown only at the live edge;
+  // reading scrollback hides it. The pinning layout effect also feeds
+  // this position into cursorAnchorRef for the keyboard-shrunk target.
   const live = useMemo(() => {
     let cursor = !reading ? (frame?.cursor ?? null) : null;
     let cursorTop = 0;
@@ -611,6 +637,12 @@ export function MobileLiveTerminal({
   // Cursor overlay geometry (computed in the `live` memo above).
   const { cursor, cursorTop, cursorLeft } = live;
 
+  // Trim trailing blank rows (for bottom-align) ONLY at the live edge. While
+  // reading scrollback the spacer model keeps above-viewport pixels invariant
+  // so the position holds as the agent streams; trimming there would change
+  // scrollHeight under the reader and snap the viewport.
+  const visibleRowCount = reading ? visual.rows.length : renderRowCount;
+
   return (
     <div className="absolute inset-0" data-live-terminal>
       <div
@@ -644,16 +676,16 @@ export function MobileLiveTerminal({
         >
           MMMMMMMMMMMMMMMMMMMM
         </span>
-        {/* `mt-auto` bottom-aligns the screen when it is shorter than the
-            viewport (a fullscreen agent like Claude only fills part of a tall
-            mobile pane), so its input box sits just above the keyboard instead
-            of floating mid-screen over a blank gap. When content overflows
-            (scrollback), the auto margin collapses and it scrolls normally,
-            avoiding the flex+overflow top-clipping bug. The absolute cursor
-            overlay is positioned within this box, so the shift moves with it. */}
+        {/* `mt-auto` bottom-aligns the screen when the rendered rows are
+            shorter than the viewport (a fullscreen agent only fills part of a
+            tall mobile pane), so its input box sits just above the keyboard
+            instead of floating over a dead gap. When content overflows
+            (scrollback) the auto margin collapses and it scrolls normally,
+            sidestepping the flex+overflow top-clip bug. The absolute cursor
+            overlay lives in this box, so the shift moves with it. */}
         <div className="relative whitespace-pre mt-auto" data-live-content>
           {spacerLines > 0 && <div style={{ height: `${spacerLines * lineH}px` }} aria-hidden="true" />}
-          {visual.rows.slice(0, renderRowCount).map((segs, i) => (
+          {visual.rows.slice(0, visibleRowCount).map((segs, i) => (
             <Row key={i} segs={segs} />
           ))}
           {connected && cursor && (
