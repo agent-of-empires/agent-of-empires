@@ -13,7 +13,7 @@ use tui_input::backend::crossterm::EventHandler;
 use tui_input::Input;
 
 use super::DialogResult;
-use crate::containers::{self, ContainerRuntimeInterface};
+use crate::containers;
 use crate::session::config::{load_config, save_config, DefaultTerminalMode, SandboxConfig};
 use crate::session::profile_config::resolve_config_or_warn;
 use crate::session::repo_config::HookProgress;

@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::containers::{self, ContainerRuntimeInterface, DockerContainer};
+use crate::containers::{self, DockerContainer};
 use crate::tmux;
 
 use super::container_config;

@@ -1703,7 +1703,6 @@ impl App {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.image_pull_rx = Some(rx);
         std::thread::spawn(move || {
-            use crate::containers::ContainerRuntimeInterface;
             let result = crate::containers::get_container_runtime()
                 .pull_image(&image)
                 .map_err(anyhow::Error::from);

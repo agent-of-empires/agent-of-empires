@@ -5,7 +5,7 @@
 //! - Container cleanup when deleting a sandboxed session
 //! - Docker availability validation
 
-use agent_of_empires::containers::{self, ContainerRuntimeInterface, DockerContainer};
+use agent_of_empires::containers::{self, DockerContainer};
 use agent_of_empires::session::{GroupTree, Instance, SandboxInfo, Storage};
 use serial_test::serial;
 

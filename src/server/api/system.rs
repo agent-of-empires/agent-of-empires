@@ -926,7 +926,6 @@ pub struct DockerStatus {
 
 pub async fn docker_status() -> Json<DockerStatus> {
     let result = tokio::task::spawn_blocking(|| {
-        use crate::containers::ContainerRuntimeInterface;
         let runtime = crate::containers::get_container_runtime();
         let available = runtime.is_available() && runtime.is_daemon_running();
         let runtime_name = if available {
