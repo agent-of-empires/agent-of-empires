@@ -22,25 +22,22 @@ pub enum GitHubError {
     },
 
     #[error(
-        "GitHub rejected the credentials (HTTP 401).\n\
-         The token is missing, invalid, or expired.\n\
-         Re-authenticate with: gh auth login, or set a fresh GITHUB_TOKEN."
+        "GitHub rejected the request (HTTP 401).\n\
+         AoE only makes unauthenticated public requests, so this usually means \
+         the resource is private or the endpoint requires sign-in."
     )]
     Unauthorized,
 
     #[error(
-        "GitHub token is missing a required scope (HTTP 403).\n\
-         This operation needs one of: {scopes}.\n\
-         Re-authenticate with a token that carries it, for example:\n\
-           gh auth login --scopes {scopes}\n\
-         or set GITHUB_TOKEN to a personal access token with that scope."
+        "GitHub refused the request for lack of an authorized scope (HTTP 403): {scopes}.\n\
+         AoE makes unauthenticated requests, so it cannot satisfy this; the \
+         resource needs a signed-in client."
     )]
     InsufficientScope { scopes: String },
 
     #[error(
         "GitHub API rate limit exceeded.\n\
-         Wait for the limit to reset (see the X-RateLimit-Reset header) and retry.\n\
-         Authenticating raises the limit: set GITHUB_TOKEN or run gh auth login."
+         Wait for the limit to reset (see the X-RateLimit-Reset header) and retry."
     )]
     RateLimited,
 
@@ -73,9 +70,11 @@ mod tests {
     }
 
     #[test]
-    fn unauthorized_hint_mentions_reauthenticate() {
+    fn unauthorized_hint_does_not_push_a_token_path() {
+        // The client is unauthenticated-only, so a 401 hint must not send the
+        // user down a dead token/gh-auth recovery path.
         let auth = GitHubError::Unauthorized.to_string();
-        assert!(auth.contains("Re-authenticate"));
+        assert!(!auth.contains("GITHUB_TOKEN") && !auth.contains("gh auth login"));
     }
 
     #[test]
