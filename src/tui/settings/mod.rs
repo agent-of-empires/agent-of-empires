@@ -649,11 +649,6 @@ impl SettingsView {
         }
     }
 
-    /// Check if there are unsaved changes
-    pub fn has_unsaved_changes(&self) -> bool {
-        self.has_changes
-    }
-
     /// Check if currently in an editing state (text field, list, dialog, etc.)
     pub fn is_editing(&self) -> bool {
         self.editing_input.is_some()

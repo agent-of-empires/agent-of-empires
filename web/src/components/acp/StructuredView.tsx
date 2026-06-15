@@ -407,16 +407,24 @@ function AcpChrome({
             />
 
             <ThreadPrimitive.If running>
-              <div className="mt-3 ml-1">
-                <WorkingSpinner
-                  thinking={state.thinking}
-                  tool={state.inFlightTool?.name ?? null}
-                  cancelling={state.cancelling}
-                  cancelEscalatesAt={state.cancelEscalatesAt}
-                  lastActivityRef={lastActivityRef}
-                  onForceEndTurn={forceEndTurn}
-                />
-              </div>
+              {/* The turn is "running" while an elicitation or approval card is
+                  on screen, but the agent is parked on the user's answer, not
+                  stalled. Suppress the spinner (rattle verbs, "Waiting on
+                  model…", and the Force end turn watchdog) so the actionable
+                  card stands alone; it returns once the turn resumes. See
+                  #2145. */}
+              {state.pendingElicitations.length === 0 && state.pendingApprovals.length === 0 ? (
+                <div className="mt-3 ml-1">
+                  <WorkingSpinner
+                    thinking={state.thinking}
+                    tool={state.inFlightTool?.name ?? null}
+                    cancelling={state.cancelling}
+                    cancelEscalatesAt={state.cancelEscalatesAt}
+                    lastActivityRef={lastActivityRef}
+                    onForceEndTurn={forceEndTurn}
+                  />
+                </div>
+              ) : null}
             </ThreadPrimitive.If>
 
             {state.pendingApprovals.map((approval) => (
@@ -1041,7 +1049,7 @@ export function WorkingSpinner({
   const showForceEnd = !cancelling && showStalled && !toolInFlight;
 
   return (
-    <div className="flex flex-col gap-2 text-sm italic text-text-muted">
+    <div data-testid="acp-working-spinner" className="flex flex-col gap-2 text-sm italic text-text-muted">
       <div className="flex items-center gap-2">
         <span className="inline-block w-3 text-center font-mono text-brand-500" aria-hidden="true">
           {SPINNER_FRAMES[frame]}

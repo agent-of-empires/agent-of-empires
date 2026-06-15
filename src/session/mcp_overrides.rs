@@ -136,15 +136,6 @@ pub fn upsert_global_server(server: &ProjectMcpServer) -> Result<()> {
     })
 }
 
-/// Remove a server from the global `mcp.json` by name. A no-op if it is not
-/// present. Used by the surface to delete a `global`-provenance entry.
-pub fn remove_global_server(name: &str) -> Result<()> {
-    let name = name.to_string();
-    mutate_servers(move |servers| {
-        servers.remove(&name);
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,19 +211,6 @@ mod tests {
         let servers = load_global_mcp_servers(&app_dir).unwrap();
         let names: Vec<_> = servers.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, vec!["added", "keepme"]);
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn remove_deletes_by_name() {
-        let _home = set_tmp_home();
-        let app_dir = crate::session::get_app_dir().unwrap();
-        upsert_global_server(&stdio("a", "x")).unwrap();
-        upsert_global_server(&stdio("b", "y")).unwrap();
-        remove_global_server("a").unwrap();
-        let servers = load_global_mcp_servers(&app_dir).unwrap();
-        let names: Vec<_> = servers.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, vec!["b"]);
     }
 
     #[test]

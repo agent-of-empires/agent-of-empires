@@ -1,24 +1,22 @@
-import { useMemo } from "react";
-import { marked } from "marked";
+import ReactMarkdown from "react-markdown";
+import remarkBreaks from "remark-breaks";
+import remarkGfm from "remark-gfm";
 
 interface Props {
   text: string;
 }
 
-/// Render markdown for diff-comment bodies. We deliberately do NOT
-/// reuse the structured view `<Markdown>` component because that one depends
-/// on `@assistant-ui/react-markdown`'s `<AssistantRuntimeProvider>`
-/// which is only mounted under the structured view panel. The diff viewer is
-/// a sibling of that panel, so calling the structured view Markdown component
-/// here throws "requires an AuiProvider" and unmounts the tree.
-///
-/// `marked` is configured with HTML disabled (`sanitize` is dropped in
-/// modern marked but `breaks: false` + no `html` extension keeps user
-/// input safe enough for local-only review notes; comments never leave
-/// the user's browser until they're posted as plaintext to the agent).
+/// Render markdown for diff-comment bodies with react-markdown, the same
+/// engine the structured view's `<Markdown>` wraps. We deliberately do NOT
+/// reuse that component because it depends on `@assistant-ui/react-markdown`'s
+/// `<AssistantRuntimeProvider>`, which is only mounted under the structured
+/// view panel; the diff viewer is a sibling, so it would throw "requires an
+/// AuiProvider". react-markdown renders to React elements (no raw HTML), so
+/// user input is escaped without `dangerouslySetInnerHTML`.
 export function CommentMarkdown({ text }: Props) {
-  const html = useMemo(() => {
-    return marked.parse(text, { async: false, breaks: true }) as string;
-  }, [text]);
-  return <div className="diff-comment-md text-[13px] leading-relaxed" dangerouslySetInnerHTML={{ __html: html }} />;
+  return (
+    <div className="diff-comment-md text-[13px] leading-relaxed">
+      <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks]}>{text}</ReactMarkdown>
+    </div>
+  );
 }

@@ -13,7 +13,7 @@ use tui_input::backend::crossterm::EventHandler;
 use tui_input::Input;
 
 use super::DialogResult;
-use crate::containers::{self, ContainerRuntimeInterface};
+use crate::containers;
 use crate::session::config::{load_config, save_config, DefaultTerminalMode, SandboxConfig};
 use crate::session::profile_config::resolve_config_or_warn;
 use crate::session::repo_config::HookProgress;
@@ -525,16 +525,6 @@ impl NewSessionDialog {
     #[cfg(test)]
     pub fn group_value(&self) -> &str {
         self.group.value()
-    }
-
-    #[cfg(test)]
-    pub fn profile_value(&self) -> &str {
-        &self.profile
-    }
-
-    /// Set whether hooks will be executed during session creation
-    pub fn set_has_hooks(&mut self, has_hooks: bool) {
-        self.has_hooks = has_hooks;
     }
 
     /// Push a hook progress message into the dialog state

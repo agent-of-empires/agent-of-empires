@@ -86,35 +86,11 @@ pub(super) fn wrap_description_lines(text: &str, width: u16) -> Vec<String> {
     lines
 }
 
-/// Allocation-free twin of [`wrap_description_lines`]: walks the same
-/// greedy word-wrap and returns the line count. Used by
-/// `field_height`, which runs in the render hot path once per field
-/// and only cares about the row count, not the wrapped text.
+/// Line count of [`wrap_description_lines`], used by `field_height`.
+// ponytail: allocates the wrapped Vec just to count it; settings render is
+// not hot enough to warrant a second copy of the wrap algorithm.
 pub(super) fn wrap_description_height(text: &str, width: u16) -> u16 {
-    if text.is_empty() {
-        return 0;
-    }
-    if width == 0 {
-        return 1;
-    }
-    let max_width = width as usize;
-    let mut lines: u16 = 0;
-    let mut current_w: usize = 0;
-    for word in text.split_whitespace() {
-        let w = word.width();
-        if current_w == 0 {
-            current_w = w;
-        } else if current_w + 1 + w <= max_width {
-            current_w += 1 + w;
-        } else {
-            lines = lines.saturating_add(1);
-            current_w = w;
-        }
-    }
-    if current_w > 0 {
-        lines = lines.saturating_add(1);
-    }
-    lines.max(1)
+    wrap_description_lines(text, width).len() as u16
 }
 
 impl SettingsView {
@@ -1431,9 +1407,10 @@ mod tests {
     }
 
     /// `wrap_description_height` must agree with `wrap_description_lines().len()`
-    /// for every input; it is the allocation-free shortcut the render hot
-    /// path uses. If they ever drift, `field_height` will paint values on
-    /// top of (or below) the description in real renders.
+    /// for every input; it now delegates to `wrap_description_lines`, so this
+    /// guards against the delegation regressing. If they ever drift,
+    /// `field_height` will paint values on top of (or below) the description
+    /// in real renders.
     #[test]
     fn wrap_description_height_matches_wrap_description_lines() {
         let cases: &[(&str, u16)] = &[

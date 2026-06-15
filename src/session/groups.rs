@@ -416,13 +416,21 @@ fn sort_groups<T, N, P, A>(
     }
 }
 
+/// Sessions (direct and nested) that belong to `path` and are not archived.
+fn group_members<'a>(
+    path: &'a str,
+    instances: &'a [Instance],
+) -> impl Iterator<Item = &'a Instance> + 'a {
+    let prefix = format!("{}/", path);
+    instances.iter().filter(move |i| {
+        (i.group_path == path || i.group_path.starts_with(&prefix)) && !i.is_archived()
+    })
+}
+
 /// Get the most recent created_at among all sessions (direct and nested) in a group.
 /// Returns DateTime::MIN_UTC if the group has no sessions.
 fn max_created_at_in_group(path: &str, instances: &[Instance]) -> DateTime<Utc> {
-    let prefix = format!("{}/", path);
-    instances
-        .iter()
-        .filter(|i| (i.group_path == path || i.group_path.starts_with(&prefix)) && !i.is_archived())
+    group_members(path, instances)
         .map(|i| i.created_at)
         .max()
         .unwrap_or(DateTime::<Utc>::MIN_UTC)
@@ -431,10 +439,7 @@ fn max_created_at_in_group(path: &str, instances: &[Instance]) -> DateTime<Utc> 
 /// Get the oldest created_at among all sessions (direct and nested) in a group.
 /// Returns DateTime::MAX_UTC if the group has no sessions (so empty groups sink to the bottom).
 fn min_created_at_in_group(path: &str, instances: &[Instance]) -> DateTime<Utc> {
-    let prefix = format!("{}/", path);
-    instances
-        .iter()
-        .filter(|i| (i.group_path == path || i.group_path.starts_with(&prefix)) && !i.is_archived())
+    group_members(path, instances)
         .map(|i| i.created_at)
         .min()
         .unwrap_or(DateTime::<Utc>::MAX_UTC)
@@ -444,10 +449,7 @@ fn min_created_at_in_group(path: &str, instances: &[Instance]) -> DateTime<Utc> 
 /// Groups with no sessions (or whose sessions have never reported activity) sort to the bottom
 /// for descending order.
 fn max_last_accessed_in_group(path: &str, instances: &[Instance]) -> Option<DateTime<Utc>> {
-    let prefix = format!("{}/", path);
-    instances
-        .iter()
-        .filter(|i| (i.group_path == path || i.group_path.starts_with(&prefix)) && !i.is_archived())
+    group_members(path, instances)
         .filter_map(|i| i.last_accessed_at)
         .max()
 }

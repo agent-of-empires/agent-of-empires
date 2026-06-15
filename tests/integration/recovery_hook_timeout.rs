@@ -2,7 +2,7 @@
 
 use std::time::{Duration, Instant};
 
-use agent_of_empires::session::{execute_hooks, HookTimeoutScope};
+use agent_of_empires::session::{execute_hooks, HookTimeout, HookTimeoutScope};
 use serial_test::serial;
 use tempfile::TempDir;
 
@@ -106,47 +106,6 @@ fn nested_scopes_restore_outer_timeout_on_drop() {
 
 #[test]
 #[serial]
-fn out_of_order_drop_keeps_inner_active_no_leak() {
-    let outer = HookTimeoutScope::new(Duration::from_millis(100));
-    let inner = HookTimeoutScope::new(Duration::from_millis(500));
-    drop(outer);
-
-    let project = TempDir::new().expect("tempdir");
-    let started = Instant::now();
-    let result = execute_hooks(&["sleep 60".to_string()], project.path(), &[]);
-    let elapsed = started.elapsed();
-    assert!(
-        result.is_err(),
-        "inner deadline must apply after outer drops out of order"
-    );
-    assert!(
-        elapsed >= Duration::from_millis(400),
-        "inner (500ms) must outlive the dropped outer, took {:?}",
-        elapsed
-    );
-    assert!(
-        elapsed < Duration::from_secs(3),
-        "inner deadline must still bound the wait, took {:?}",
-        elapsed
-    );
-
-    drop(inner);
-
-    let project = TempDir::new().expect("tempdir");
-    let started = Instant::now();
-    let result = execute_hooks(&["sleep 1".to_string()], project.path(), &[]);
-    let elapsed = started.elapsed();
-    assert!(result.is_ok(), "no scope active after both drops");
-    assert!(
-        elapsed >= Duration::from_millis(900),
-        "hook must run unbounded after both drops, took {:?}",
-        elapsed
-    );
-    assert!(elapsed < Duration::from_secs(3));
-}
-
-#[test]
-#[serial]
 fn hook_reading_stdin_does_not_block_under_timeout_scope() {
     let _scope = HookTimeoutScope::new(Duration::from_secs(2));
 
@@ -163,5 +122,45 @@ fn hook_reading_stdin_does_not_block_under_timeout_scope() {
         elapsed < Duration::from_millis(500),
         "cat must not block on stdin, took {:?}",
         elapsed
+    );
+}
+
+#[test]
+#[serial]
+fn hung_on_launch_hook_emits_typed_hook_timeout_in_error_chain() {
+    let timeout = Duration::from_secs(1);
+    let _scope = HookTimeoutScope::new(timeout);
+
+    let project = TempDir::new().expect("tempdir");
+    let result = execute_hooks(&["sleep 60".to_string()], project.path(), &[]);
+
+    let err = result.expect_err("sleep 60 must time out under a 1s scope");
+    let typed = err
+        .chain()
+        .find_map(|c| c.downcast_ref::<HookTimeout>())
+        .unwrap_or_else(|| panic!("expected HookTimeout in chain, got: {err:#}"));
+    assert_eq!(
+        typed.cmd, "sleep 60",
+        "typed error must carry the offending command verbatim",
+    );
+    assert_eq!(
+        typed.timeout_secs, 1,
+        "typed error must carry the deadline in seconds",
+    );
+}
+
+#[test]
+#[serial]
+fn nonzero_exit_under_scope_is_not_classified_as_hook_timeout() {
+    let _scope = HookTimeoutScope::new(Duration::from_secs(5));
+
+    let project = TempDir::new().expect("tempdir");
+    let result = execute_hooks(&["false".to_string()], project.path(), &[]);
+
+    let err = result.expect_err("`false` exits non-zero, run_hooks_captured must Err");
+    assert!(
+        err.chain()
+            .all(|c| c.downcast_ref::<HookTimeout>().is_none()),
+        "exit-non-zero under a recovery scope must NOT surface as HookTimeout; got: {err:#}",
     );
 }

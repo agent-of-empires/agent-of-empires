@@ -205,8 +205,10 @@ container (rather than bind-mounting from the host).
 If the agent finished a turn but the working spinner is still rattling, a small
 **Force end turn** button appears beneath it. Click it to clear the spinner and
 cancel the agent. It only appears for a silent model with no tool running, and
-the view auto-recovers on its own if you do nothing. During a healthy turn, or
-while a tool is in flight, the button stays hidden.
+the view auto-recovers on its own if you do nothing. During healthy streaming, or
+while a tool is in flight, the spinner keeps running but the button stays hidden.
+While a question or approval card is awaiting your input, both the spinner and the
+button are hidden, so the actionable card stands alone.
 
 ### Editing settings asks for the passphrase again
 

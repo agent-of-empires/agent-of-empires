@@ -283,7 +283,6 @@ pub async fn check_for_image_update(image: &str) -> Result<Option<ImageUpdate>> 
     // async worker threads.
     let image_owned = image.to_string();
     let local = tokio::task::spawn_blocking(move || {
-        use crate::containers::ContainerRuntimeInterface;
         crate::containers::get_container_runtime().local_image_digest(&image_owned)
     })
     .await

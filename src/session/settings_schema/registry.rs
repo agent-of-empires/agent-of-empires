@@ -86,7 +86,6 @@ mod tests {
             matches!(d.web_write, WebWritePolicy::LocalOnly { .. }),
             "node_path must stay local-only: it is a host binary execution surface"
         );
-        assert!(!d.web_write.is_web_writable());
     }
 
     #[test]

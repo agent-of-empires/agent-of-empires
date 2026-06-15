@@ -20,6 +20,28 @@ pub enum HookProgress {
     Output(String),
 }
 
+/// Typed marker for hook commands that exceeded the deadline imposed by the
+/// active [`crate::session::recovery::HookTimeoutScope`].
+///
+/// `run_hook_with_timeout` is the sole producer of this value, and it only
+/// runs when [`crate::session::recovery::current_hook_timeout`] returns
+/// `Some`, which production code installs only inside the startup-recovery
+/// cascade (`run_recovery_for_instance`). Current production callers rely on
+/// this invariant: observing a `HookTimeout` in the error chain implies the
+/// failure occurred under a recovery scope.
+///
+/// Carried inside `anyhow::Error` so the existing `Result<_, anyhow::Error>`
+/// signatures stay unchanged; recovery sites recover the payload with
+/// `e.downcast_ref::<HookTimeout>()`. Adding `.context("...: {e}")` over a
+/// `HookTimeout` is safe (anyhow preserves the source); replacing it with
+/// `anyhow!("...: {e}")` is not (re-stringifies and detaches the source).
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("hook timed out after {timeout_secs}s: {cmd}")]
+pub struct HookTimeout {
+    pub cmd: String,
+    pub timeout_secs: u64,
+}
+
 use super::config::Config;
 use super::profile_config::ProfileConfig;
 use super::project_mcp::ProjectMcpServer;
@@ -982,7 +1004,10 @@ fn run_hook_with_timeout(
                 "hook timed out; killing process tree to release recovery lock"
             );
             crate::process::kill_process_tree(pid);
-            anyhow::bail!("hook timed out after {}s: {}", timeout.as_secs(), cmd_label)
+            Err(anyhow::Error::new(HookTimeout {
+                cmd: cmd_label.to_string(),
+                timeout_secs: timeout.as_secs(),
+            }))
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => anyhow::bail!(
             "hook drain thread disconnected before reporting result: {}",

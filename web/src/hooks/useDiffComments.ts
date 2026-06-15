@@ -157,8 +157,5 @@ export function useDiffComments(sessionId: string | null): UseDiffCommentsResult
 }
 
 function cryptoRandomId(): string {
-  const c = globalThis.crypto;
-  if (c && typeof c.randomUUID === "function") return c.randomUUID();
-  // Fallback for environments without crypto.randomUUID (older Safari, jsdom).
-  return `dc_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+  return globalThis.crypto.randomUUID();
 }

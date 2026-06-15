@@ -18,7 +18,6 @@ import {
   getSessionDiffFiles,
   getSessionFileContents,
   fetchSettings,
-  updateSettings,
   getWebUiState,
   patchWebUiState,
   fetchVolumeIgnoresPreview,
@@ -261,28 +260,6 @@ describe("fetchSettings", () => {
   it("returns null on non-2xx", async () => {
     fetchSpy.mockResolvedValueOnce(new Response("", { status: 500 }));
     expect(await fetchSettings()).toBeNull();
-  });
-});
-
-describe("updateSettings", () => {
-  it("PATCHes /api/settings with the update map", async () => {
-    fetchSpy.mockResolvedValueOnce(new Response("", { status: 200 }));
-    const ok = await updateSettings({ "theme.idle_decay_minutes": 5 });
-    expect(ok).toBe(true);
-    const [url, init] = lastCall();
-    expect(url).toBe("/api/settings");
-    expect(init?.method).toBe("PATCH");
-    expect(bodyOf(init)).toEqual({ "theme.idle_decay_minutes": 5 });
-  });
-
-  it("returns false on non-2xx", async () => {
-    fetchSpy.mockResolvedValueOnce(new Response("", { status: 403 }));
-    expect(await updateSettings({})).toBe(false);
-  });
-
-  it("returns false on network failure", async () => {
-    fetchSpy.mockRejectedValueOnce(new Error("offline"));
-    expect(await updateSettings({})).toBe(false);
   });
 });
 
