@@ -149,6 +149,17 @@ export function AcpRuntime({
     () => (historyStart === 0 ? acp.state.activity : acp.state.activity.slice(historyStart)),
     [acp.state.activity, historyStart],
   );
+  // Index of the latest `/clear` divider when cleared turns are folded.
+  // Rows before it are already hidden behind the ClearedTurnsBanner, so
+  // "Load earlier" must not offer to reveal them, that click would be a
+  // no-op. See #2144.
+  const lastClearIndex = useMemo(() => {
+    if (showClearedTurns) return -1;
+    for (let i = acp.state.activity.length - 1; i >= 0; i -= 1) {
+      if (acp.state.activity[i]!.kind === "session_cleared") return i;
+    }
+    return -1;
+  }, [acp.state.activity, showClearedTurns]);
 
   // Memoise the activity → ThreadMessageLike conversion. The function
   // walks the activity array, allocates a new AssistantBuilder
@@ -228,7 +239,7 @@ export function AcpRuntime({
         dismissModeSwitchFailed: acp.dismissModeSwitchFailed,
         setConfigOption: acp.setConfigOption,
         dismissConfigOptionSwitchFailed: acp.dismissConfigOptionSwitchFailed,
-        canLoadEarlierHistory: historyStart > 0,
+        canLoadEarlierHistory: lastClearIndex < 0 ? historyStart > 0 : historyStart > lastClearIndex,
         loadEarlierHistory: () => setVisibleRows((v) => v + HISTORY_WINDOW_STEP),
       })}
     </AssistantRuntimeProvider>
