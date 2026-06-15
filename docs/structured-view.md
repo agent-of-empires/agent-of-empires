@@ -95,6 +95,8 @@ Non-ACP tools always run in the terminal view, with no toggle.
 
 `aoe add` does not prompt for a name by default: it uses `--title`, else the worktree branch name, else a generated name. Pass `-i`/`--interactive` for the same name prompt the TUI and wizard show. Set per-agent defaults for web-created sessions under `[session.acp_defaults.<agent>]`:
 
+When a structured view session keeps its generated civilization name (no `--title`, no branch name), AoE auto-renames it from your first message using the session's own agent in one-shot mode (`claude -p`, `codex exec`, `opencode run`, `gemini -p`). This is on by default and controlled by `session.smart_rename`. It renames the title only, never the worktree directory (the running agent holds it), and never touches a session you named yourself. Sandboxed sessions, agents with no one-shot mode, and command-overridden agents keep the generated name. See [Configuration: Session](guides/configuration.md#session).
+
 ```toml
 [session.acp_defaults.opencode]
 model = "openai/gpt-5.5"
