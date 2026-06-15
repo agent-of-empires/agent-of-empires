@@ -1830,6 +1830,11 @@ impl Instance {
                         &workdir,
                         &hook_env,
                     ) {
+                        if e.downcast_ref::<super::repo_config::HookTimeout>()
+                            .is_some()
+                        {
+                            return Err(e);
+                        }
                         tracing::warn!(target: "session.store", "on_launch hook failed in container: {}", e);
                     }
                 }
@@ -1889,7 +1894,7 @@ impl Instance {
                 is_existing,
             )
         } else {
-            self.build_host_command(agent, &on_launch_hooks)
+            self.build_host_command(agent, &on_launch_hooks)?
         };
 
         Ok((cmd, is_existing))
@@ -2007,21 +2012,22 @@ impl Instance {
         crate::hooks::codex_config_path_for_host_environment(&self.profile_host_environment())
     }
 
-    /// Build the tmux command for a sandboxed (Docker) session.
-    ///
-    /// Runs on_launch hooks inside the container, constructs the tool command
-    /// with yolo mode / custom instructions / session flags, and wraps it in a
-    /// `docker exec` invocation.
     /// Build the tmux command for a host (non-sandboxed) session.
     ///
     /// Runs on_launch hooks on the host, then constructs the command from either
     /// the agent's default binary or a user-supplied custom command, applying
     /// yolo mode, session flags, and the AOE_INSTANCE_ID env prefix.
+    ///
+    /// Returns `Err` only when an on_launch hook timed out under an active
+    /// `HookTimeoutScope` (recovery path). Generic hook failures continue to
+    /// be logged at `warn` and the cascade proceeds with whatever partial
+    /// setup the hook produced, matching the historical behavior for
+    /// non-recovery callers (`aoe add`, manual restart).
     fn build_host_command(
         &mut self,
         agent: Option<&'static crate::agents::AgentDef>,
         on_launch_hooks: &Option<Vec<String>>,
-    ) -> (Option<String>, bool) {
+    ) -> Result<(Option<String>, bool)> {
         if let Some(ref hook_cmds) = on_launch_hooks {
             let hook_env = super::repo_config::lifecycle_env_vars(self);
             if let Err(e) = super::repo_config::execute_hooks(
@@ -2029,6 +2035,11 @@ impl Instance {
                 Path::new(&self.project_path),
                 &hook_env,
             ) {
+                if e.downcast_ref::<super::repo_config::HookTimeout>()
+                    .is_some()
+                {
+                    return Err(e);
+                }
                 tracing::warn!(target: "session.store", "on_launch hook failed: {}", e);
             }
         }
@@ -2063,15 +2074,15 @@ impl Instance {
                     }
                     let is_existing = self.apply_session_flags(&mut cmd, "host agent");
                     apply_agent_launch_env(&mut cmd, agent);
-                    (
+                    Ok((
                         Some(wrap_command_ignore_suspend(&format!(
                             "{}{}",
                             env_prefix, cmd
                         ))),
                         is_existing,
-                    )
+                    ))
                 }
-                None => (None, false),
+                None => Ok((None, false)),
             }
         } else {
             let mut cmd = self.command.clone();
@@ -2085,13 +2096,13 @@ impl Instance {
             }
             let is_existing = self.apply_session_flags(&mut cmd, "host custom");
             apply_agent_launch_env(&mut cmd, agent);
-            (
+            Ok((
                 Some(wrap_command_ignore_suspend(&format!(
                     "{}{}",
                     env_prefix, cmd
                 ))),
                 is_existing,
-            )
+            ))
         }
     }
 
@@ -5430,7 +5441,9 @@ mod tests {
     fn test_build_host_command_basic() {
         let mut inst = Instance::new("test", "/tmp/test");
         inst.tool = "codex".to_string();
-        let (cmd, _) = inst.build_host_command(crate::agents::get_agent("codex"), &None);
+        let (cmd, _) = inst
+            .build_host_command(crate::agents::get_agent("codex"), &None)
+            .unwrap();
         assert!(cmd.is_some());
         assert!(cmd.as_ref().unwrap().contains("codex"));
     }
@@ -5440,7 +5453,9 @@ mod tests {
         let mut inst = Instance::new("test", "/tmp/test");
         inst.tool = "codex".to_string();
         inst.yolo_mode = true;
-        let (cmd, _) = inst.build_host_command(crate::agents::get_agent("codex"), &None);
+        let (cmd, _) = inst
+            .build_host_command(crate::agents::get_agent("codex"), &None)
+            .unwrap();
         let cmd_str = cmd.unwrap();
         let agent = crate::agents::get_agent("codex").unwrap();
         match agent.yolo.as_ref().unwrap() {
@@ -5455,7 +5470,9 @@ mod tests {
         let mut inst = Instance::new("test", "/tmp/test");
         inst.tool = "claude".to_string();
         inst.agent_session_id = Some("ses_abc123def456".to_string());
-        let (cmd, _) = inst.build_host_command(crate::agents::get_agent("claude"), &None);
+        let (cmd, _) = inst
+            .build_host_command(crate::agents::get_agent("claude"), &None)
+            .unwrap();
         let cmd_str = cmd.unwrap();
         assert!(cmd_str.contains("ses_abc123def456"));
         assert!(cmd_str.contains("--session-id") || cmd_str.contains("--resume"));
@@ -5465,7 +5482,9 @@ mod tests {
     fn test_build_host_command_antigravity_forces_color() {
         let mut inst = Instance::new("test", "/tmp/test");
         inst.tool = "antigravity".to_string();
-        let (cmd, _) = inst.build_host_command(crate::agents::get_agent("antigravity"), &None);
+        let (cmd, _) = inst
+            .build_host_command(crate::agents::get_agent("antigravity"), &None)
+            .unwrap();
         let cmd_str = cmd.unwrap();
 
         assert!(cmd_str.contains("env -u NO_COLOR"));
@@ -5479,7 +5498,9 @@ mod tests {
         let mut inst = Instance::new("test", "/tmp/test");
         inst.tool = "antigravity".to_string();
         inst.command = "agy --some-flag".to_string();
-        let (cmd, _) = inst.build_host_command(crate::agents::get_agent("antigravity"), &None);
+        let (cmd, _) = inst
+            .build_host_command(crate::agents::get_agent("antigravity"), &None)
+            .unwrap();
         let cmd_str = cmd.unwrap();
 
         assert!(cmd_str.contains("env -u NO_COLOR"));
@@ -5492,7 +5513,9 @@ mod tests {
     fn test_build_host_command_codex_forces_color() {
         let mut inst = Instance::new("test", "/tmp/test");
         inst.tool = "codex".to_string();
-        let (cmd, _) = inst.build_host_command(crate::agents::get_agent("codex"), &None);
+        let (cmd, _) = inst
+            .build_host_command(crate::agents::get_agent("codex"), &None)
+            .unwrap();
         let cmd_str = cmd.unwrap();
 
         assert!(cmd_str.contains("env -u NO_COLOR"));
@@ -5505,7 +5528,9 @@ mod tests {
     fn test_build_host_command_color_env_is_limited_to_color_sensitive_agents() {
         let mut inst = Instance::new("test", "/tmp/test");
         inst.tool = "cursor".to_string();
-        let (cmd, _) = inst.build_host_command(crate::agents::get_agent("cursor"), &None);
+        let (cmd, _) = inst
+            .build_host_command(crate::agents::get_agent("cursor"), &None)
+            .unwrap();
         let cmd_str = cmd.unwrap();
 
         assert!(!cmd_str.contains("env -u NO_COLOR"));

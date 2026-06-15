@@ -2,7 +2,7 @@
 
 use std::time::{Duration, Instant};
 
-use agent_of_empires::session::{execute_hooks, HookTimeoutScope};
+use agent_of_empires::session::{execute_hooks, HookTimeout, HookTimeoutScope};
 use serial_test::serial;
 use tempfile::TempDir;
 
@@ -163,5 +163,46 @@ fn hook_reading_stdin_does_not_block_under_timeout_scope() {
         elapsed < Duration::from_millis(500),
         "cat must not block on stdin, took {:?}",
         elapsed
+    );
+}
+
+#[test]
+#[serial]
+fn hung_on_launch_hook_emits_typed_hook_timeout_in_error_chain() {
+    let timeout = Duration::from_millis(300);
+    let _scope = HookTimeoutScope::new(timeout);
+
+    let project = TempDir::new().expect("tempdir");
+    let result = execute_hooks(&["sleep 60".to_string()], project.path(), &[]);
+
+    let err = result.expect_err("sleep 60 must time out under a 300ms scope");
+    let typed = err
+        .chain()
+        .find_map(|c| c.downcast_ref::<HookTimeout>())
+        .unwrap_or_else(|| panic!("expected HookTimeout in chain, got: {err:#}"));
+    assert_eq!(
+        typed.cmd, "sleep 60",
+        "typed error must carry the offending command verbatim",
+    );
+    assert_eq!(
+        typed.timeout_secs,
+        timeout.as_secs(),
+        "typed error must carry the deadline in seconds",
+    );
+}
+
+#[test]
+#[serial]
+fn nonzero_exit_under_scope_is_not_classified_as_hook_timeout() {
+    let _scope = HookTimeoutScope::new(Duration::from_secs(5));
+
+    let project = TempDir::new().expect("tempdir");
+    let result = execute_hooks(&["false".to_string()], project.path(), &[]);
+
+    let err = result.expect_err("`false` exits non-zero, run_hooks_captured must Err");
+    assert!(
+        err.chain()
+            .all(|c| c.downcast_ref::<HookTimeout>().is_none()),
+        "exit-non-zero under a recovery scope must NOT surface as HookTimeout; got: {err:#}",
     );
 }

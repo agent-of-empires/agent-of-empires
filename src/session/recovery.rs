@@ -326,11 +326,48 @@ pub fn drain_recovery_pending(
 /// after a reboot. The Tier-2 retry in `start_with_resume_fallback`
 /// hardcodes `true` internally to prevent double-firing.
 ///
+/// On failure, stamps `Status::Error`, `last_error`, and `last_error_check`
+/// on the instance before propagating the error so daemon and TUI workers
+/// share the same translation. The `last_error` for hook-timeout failures
+/// is `"on_launch hook timed out after Ns: <cmd>"` (#1889); generic cascade
+/// failures keep the historical `"recovery cascade: <e>"` shape.
+///
 /// Blocks; callers must invoke it off the main event-loop thread. Worst
 /// case is `N_hooks * RECOVERY_HOOK_TIMEOUT + ~7 s` fallback latency.
 pub fn run_recovery_for_instance(inst: &mut Instance) -> Result<StartOutcome> {
     let _scope = HookTimeoutScope::for_recovery();
-    inst.restart_with_size_opts(None, false)
+    let result = inst.restart_with_size_opts(None, false);
+    if let Err(ref e) = result {
+        inst.status = super::Status::Error;
+        inst.last_error = Some(format_recovery_last_error(e));
+        inst.last_error_check = Some(std::time::Instant::now());
+    }
+    result
+}
+
+/// Project a cascade `anyhow::Error` onto the operator-facing `last_error`
+/// string. A `HookTimeout` carried in the error chain produces the exact
+/// `"on_launch hook timed out after Ns: <cmd>"` shape called out by #1889;
+/// every other error keeps the daemon's historical `"recovery cascade: <e>"`
+/// wrapping so non-timeout failures stay unambiguously cascade-attributed.
+///
+/// Walks the full chain (not just the root) so that a future `.context(...)`
+/// wrap somewhere in the cascade does not silently regress the timeout
+/// classification. Replacing `.context()` with `anyhow!("...: {e}")` would
+/// detach the source and is the only way to defeat this; the `HookTimeout`
+/// type's docstring calls that pattern out.
+fn format_recovery_last_error(e: &anyhow::Error) -> String {
+    if let Some(t) = e
+        .chain()
+        .find_map(|c| c.downcast_ref::<super::repo_config::HookTimeout>())
+    {
+        format!(
+            "on_launch hook timed out after {}s: {}",
+            t.timeout_secs, t.cmd
+        )
+    } else {
+        format!("recovery cascade: {}", e)
+    }
 }
 
 /// 30 s default; the operational guidance for non-interactive on_launch
@@ -668,5 +705,48 @@ mod tests {
         drop(first);
         let second = try_acquire_recovery_lock_at(&path).unwrap();
         assert!(second.is_some(), "re-acquisition after drop should succeed");
+    }
+
+    /// `HookTimeout` carries the lifecycle-agnostic shape; the helper adds the
+    /// `on_launch` framing that the recovery cascade is the only producer of
+    /// today. AC #3 of #1889 specifies the exact `last_error` text.
+    #[test]
+    fn format_recovery_last_error_renders_hook_timeout_with_on_launch_prefix() {
+        let err = anyhow::Error::new(super::super::repo_config::HookTimeout {
+            cmd: "sleep 60".to_string(),
+            timeout_secs: 30,
+        });
+        assert_eq!(
+            format_recovery_last_error(&err),
+            "on_launch hook timed out after 30s: sleep 60",
+        );
+    }
+
+    /// Non-timeout cascade failures keep the historical wrapper so they stay
+    /// unambiguously cascade-attributed in operator logs.
+    #[test]
+    fn format_recovery_last_error_falls_back_to_recovery_cascade_wrapper() {
+        let err = anyhow::anyhow!("tmux session is gone");
+        assert_eq!(
+            format_recovery_last_error(&err),
+            "recovery cascade: tmux session is gone",
+        );
+    }
+
+    /// A future `.context("...")` wrap somewhere in the cascade must not
+    /// regress the timeout classification: the helper walks the full chain,
+    /// not just the root, so a contextualized `HookTimeout` still produces
+    /// the timeout-shaped message.
+    #[test]
+    fn format_recovery_last_error_walks_chain_through_context() {
+        let err = anyhow::Error::new(super::super::repo_config::HookTimeout {
+            cmd: "echo hi && sleep 60".to_string(),
+            timeout_secs: 12,
+        })
+        .context("recovery cascade tier 1");
+        assert_eq!(
+            format_recovery_last_error(&err),
+            "on_launch hook timed out after 12s: echo hi && sleep 60",
+        );
     }
 }
