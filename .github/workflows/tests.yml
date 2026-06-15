@@ -123,7 +123,7 @@ jobs:
         run: npm ci
       - name: Run Vitest with coverage
         working-directory: web
-        run: npm run test:unit -- --coverage
+        run: npm run test:unit -- --coverage --reporter=default --reporter=junit --outputFile.junit=test-report.junit.xml
       # Vitest's v8 coverage reporter emits LCOV paths relative to the
       # vitest cwd (web/), so SF: lines read "SF:src/...". Codecov
       # matches file paths against the PR diff, which uses repo-root
@@ -152,12 +152,42 @@ jobs:
           flags: vitest
           name: vitest
           fail_ci_if_error: false
+      - name: Upload test results to Codecov (vitest)
+        if: ${{ !cancelled() }}
+        uses: codecov/test-results-action@0fa95f0e1eeaafde2c782583b36b28ad0d8c77d3 # v1.2.1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          disable_search: true
+          files: web/test-report.junit.xml
+          flags: vitest
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ !cancelled() }}
         with:
           name: vitest-coverage
           path: web/coverage/vitest/
           retention-days: 14
+
+  bundle-analysis:
+    name: Bundle Analysis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: '22'
+      - name: Install dependencies
+        working-directory: web
+        run: npm ci
+      # Clean production build, intentionally WITHOUT AOE_COVERAGE: istanbul
+      # instrumentation inflates chunk sizes and would report bogus bundle
+      # stats. The @codecov/vite-plugin uploads the bundle stats to Codecov
+      # when CODECOV_TOKEN is present (gated in web/vite.config.ts); without
+      # the token the plugin is a no-op, so forks still build cleanly.
+      - name: Build web bundle and upload stats to Codecov
+        working-directory: web
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        run: npm run build
 
   playwright:
     name: Playwright (mocked)
@@ -219,6 +249,14 @@ jobs:
           flags: playwright-mocked
           name: playwright-mocked
           fail_ci_if_error: false
+      - name: Upload test results to Codecov (playwright-mocked)
+        if: ${{ !cancelled() }}
+        uses: codecov/test-results-action@0fa95f0e1eeaafde2c782583b36b28ad0d8c77d3 # v1.2.1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          disable_search: true
+          files: web/test-report.junit.xml
+          flags: playwright-mocked
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ !cancelled() }}
         with:
@@ -316,6 +354,14 @@ jobs:
           flags: playwright-live
           name: playwright-live-shard-${{ matrix.shard }}
           fail_ci_if_error: false
+      - name: Upload test results to Codecov (playwright-live)
+        if: ${{ !cancelled() }}
+        uses: codecov/test-results-action@0fa95f0e1eeaafde2c782583b36b28ad0d8c77d3 # v1.2.1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          disable_search: true
+          files: web/test-report.junit.xml
+          flags: playwright-live
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ !cancelled() }}
         with:

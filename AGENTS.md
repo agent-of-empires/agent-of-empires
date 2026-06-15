@@ -143,6 +143,10 @@ When deciding which suite to use:
 
 **Coverage reports.** Vitest uses `@vitest/coverage-v8`; Playwright uses `vite-plugin-istanbul` gated by `AOE_COVERAGE=1`. The merge script (`web/scripts/merge-coverage.mjs`, via `npm run coverage:merge`) feeds both into `monocart-coverage-reports` and writes `web/coverage/merged/` (LCOV + HTML + summary). The CI `coverage` job posts a PR comment with deltas via `davelosert/vitest-coverage-report-action`; baseline is the most recent main-branch artifact.
 
+**Test analytics.** Vitest and both Playwright suites emit JUnit XML (`web/test-report.junit.xml`; Playwright via the CI-gated `junit` reporter in the configs, Vitest via `--reporter=junit` in the CI step). Each test job uploads it with `codecov/test-results-action` (reuses `CODECOV_TOKEN`, runs `if: !cancelled()` so failures still report) under the matching `vitest` / `playwright-mocked` / `playwright-live` flag, feeding Codecov's flaky-test + failure analytics.
+
+**Bundle analysis.** The `bundle-analysis` CI job runs a clean `npm run build` (no `AOE_COVERAGE`, which would inflate chunk sizes) so `@codecov/vite-plugin` uploads bundle stats to Codecov. It is gated in `web/vite.config.ts` on `command === "build"`, not instrumented, and `CODECOV_TOKEN` present, so dev/test builds and forks without the token are a no-op. The plugin's vite peer caps at 6.x while the repo is on vite 8, so a `package.json` `overrides` entry (`"@codecov/vite-plugin": { "vite": "$vite" }`) keeps `npm ci` resolving; the plugin runs on the stable unplugin API regardless.
+
 Full recipe, harness API, and fake-ACP-agent details live in `docs/development/playwright.md`.
 
 **Legacy mobile/touch recipe (still applies for the mocked specs under `tests/`):**

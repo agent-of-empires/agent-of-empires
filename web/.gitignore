@@ -2,3 +2,5 @@ node_modules/
 dist/
 test-results/
 playwright-report/
+playwright-live-report/
+test-report.junit.xml
