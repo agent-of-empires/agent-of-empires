@@ -16,7 +16,7 @@ import {
   type Unstable_TriggerItem,
 } from "@assistant-ui/core";
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
-import { AtSign, ChevronUp, Paperclip, Slash, Square, X } from "lucide-react";
+import { AtSign, ChevronUp, Paperclip, Pencil, Slash, Square, X } from "lucide-react";
 
 import { useFilesIndex, fuzzyFilter } from "./useFilesIndex";
 import { SessionConfigControls } from "./SessionConfigControls";
@@ -472,6 +472,25 @@ export function Composer({
   // reads the live value with no stale closure. Anchored on the stable
   // queued-prompt id so a background drain never targets the wrong row.
   const recallRef = useRef<{ id: string; stashedDraft: string } | null>(null);
+  // Render-visible mirror of the browse: drives the "Editing queued
+  // message N of M" banner. recallRef stays the synchronous source of
+  // truth for the keydown handler; applyRecall keeps the two in step.
+  const [recallInfo, setRecallInfo] = useState<{ pos: number; total: number } | null>(null);
+
+  const applyRecall = useCallback(
+    (next: { id: string; stashedDraft: string } | null) => {
+      recallRef.current = next;
+      if (!next) {
+        setRecallInfo(null);
+        return;
+      }
+      const idx = queuedPrompts.findIndex((p) => p.id === next.id);
+      // Position counts from the newest entry (1 = newest), matching the
+      // ArrowUp-from-newest browse order.
+      setRecallInfo(idx === -1 ? null : { pos: queuedPrompts.length - idx, total: queuedPrompts.length });
+    },
+    [queuedPrompts],
+  );
 
   // Load `text` into the composer with the caret at the end, mirroring
   // the primer-prefill effect's focus + resize dance (setText alone does
@@ -504,31 +523,31 @@ export function Composer({
     if (q.length === 0) {
       // Queue drained out from under the browse; end it so the next
       // ArrowUp moves the caret instead of being swallowed.
-      recallRef.current = null;
+      applyRecall(null);
       return;
     }
     const cur = recallRef.current;
     if (!cur) {
       const target = q[q.length - 1];
       if (!target) return;
-      recallRef.current = { id: target.id, stashedDraft: composerRuntime.getState().text };
+      applyRecall({ id: target.id, stashedDraft: composerRuntime.getState().text });
       loadRecallText(target.text);
       return;
     }
     const idx = q.findIndex((p) => p.id === cur.id);
     if (idx === -1) {
       // The browsed entry drained mid-browse; end browse, keep the text.
-      recallRef.current = null;
+      applyRecall(null);
       return;
     }
     if (idx > 0) {
       const target = q[idx - 1];
       if (!target) return;
-      recallRef.current = { ...cur, id: target.id };
+      applyRecall({ ...cur, id: target.id });
       loadRecallText(target.text);
     }
     // idx === 0 is the oldest entry: stay put.
-  }, [queuedPrompts, composerRuntime, loadRecallText]);
+  }, [queuedPrompts, composerRuntime, loadRecallText, applyRecall]);
 
   // Browse toward newer queued prompts; past the newest, restore the
   // stashed draft and exit browse.
@@ -538,19 +557,28 @@ export function Composer({
     const q = queuedPrompts;
     const idx = q.findIndex((p) => p.id === cur.id);
     if (idx === -1) {
-      recallRef.current = null;
+      applyRecall(null);
       return;
     }
     if (idx + 1 < q.length) {
       const target = q[idx + 1];
       if (!target) return;
-      recallRef.current = { ...cur, id: target.id };
+      applyRecall({ ...cur, id: target.id });
       loadRecallText(target.text);
     } else {
       loadRecallText(cur.stashedDraft);
-      recallRef.current = null;
+      applyRecall(null);
     }
-  }, [queuedPrompts, loadRecallText]);
+  }, [queuedPrompts, loadRecallText, applyRecall]);
+
+  // Esc while browsing restores the stashed draft and exits, matching the
+  // banner's hint.
+  const cancelRecallToDraft = useCallback(() => {
+    const cur = recallRef.current;
+    if (!cur) return;
+    loadRecallText(cur.stashedDraft);
+    applyRecall(null);
+  }, [loadRecallText, applyRecall]);
 
   // Unified submit for the custom Send / QueueSend buttons and the
   // mid-turn Enter path: drains the textarea text + staged attachments
@@ -561,7 +589,7 @@ export function Composer({
   const submitComposer = useCallback(() => {
     const cur = recallRef.current;
     if (cur) {
-      recallRef.current = null;
+      applyRecall(null);
       const text = composerRuntime.getState().text.trim();
       // Submitting while browsing edits that queued entry in place rather
       // than enqueuing a duplicate. If it drained since recall (id gone),
@@ -584,6 +612,7 @@ export function Composer({
     supportedPendingAttachments,
     queuedPrompts,
     editQueuedPrompt,
+    applyRecall,
   ]);
 
   // Manual agent switch dialog. Opened from the sidebar row context menu
@@ -778,6 +807,19 @@ export function Composer({
               "transition-colors duration-150",
             ].join(" ")}
           >
+            {/* Queue-recall banner (#2147): signals that the composer is
+                editing an existing queued prompt rather than composing a
+                new one. */}
+            {recallInfo && (
+              <div className="flex items-center justify-between gap-2 rounded-t-xl border-b border-brand-600/40 bg-brand-600/10 px-3 py-1.5 text-xs text-brand-200">
+                <span className="flex items-center gap-1.5 font-medium">
+                  <Pencil className="h-3.5 w-3.5" />
+                  Editing queued message {recallInfo.pos} of {recallInfo.total}
+                </span>
+                <span className="text-brand-300/70">Enter saves · Esc restores draft · ↑ ↓ to browse</span>
+              </div>
+            )}
+
             {/* @ file picker — Directive behavior chips the path into
                 the prompt text using the default formatter. */}
             <ComposerPrimitive.Unstable_TriggerPopover
@@ -893,6 +935,15 @@ export function Composer({
                 // toward newer entries and the stashed draft. Decided by
                 // decideArrowRecall so multi-line caret movement is never
                 // hijacked. Runs before the Enter matrix below.
+                //
+                // Esc while browsing restores the stashed draft and exits,
+                // intercepted before ComposerPrimitive.Input's cancelOnEscape.
+                if (e.key === "Escape" && recallRef.current != null) {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  cancelRecallToDraft();
+                  return;
+                }
                 const el = taRef.current;
                 const caretAtStart = !!el && el.selectionStart === 0 && el.selectionEnd === 0;
                 const recallAction = decideArrowRecall(

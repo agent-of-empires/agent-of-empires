@@ -524,6 +524,10 @@ async fn handle_terminal_event(
             state.recall_step(delta);
             Ok(false)
         }
+        Intent::RecallCancel => {
+            state.recall_cancel_restore();
+            Ok(false)
+        }
         Intent::Scroll(delta) => {
             apply_scroll(state, delta);
             Ok(false)

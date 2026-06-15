@@ -277,6 +277,15 @@ impl StructuredViewState {
         self.recall = None;
     }
 
+    /// Abandon a queue-recall browse and restore the draft that was in the
+    /// composer before browsing began (the `Esc` while browsing).
+    pub fn recall_cancel_restore(&mut self) {
+        if let Some(r) = self.recall.take() {
+            let draft = r.stashed_draft;
+            self.set_composer_text(&draft);
+        }
+    }
+
     /// The current single-line slash query (without the leading slash),
     /// or `None` when the composer doesn't hold one.
     pub fn slash_query(&self) -> Option<String> {
@@ -495,6 +504,18 @@ mod tests {
         // The browsed entry is gone: browse cancelled, edited text retained.
         assert!(state.recall.is_none());
         assert_eq!(composer_text(&state), browsed);
+    }
+
+    #[test]
+    fn recall_cancel_restore_brings_back_the_draft() {
+        let mut state = test_state(None);
+        state.queue.push("queued".into());
+        state.composer.insert_str("draft");
+        state.recall_step(-1);
+        assert_eq!(composer_text(&state), "queued");
+        state.recall_cancel_restore();
+        assert!(state.recall.is_none());
+        assert_eq!(composer_text(&state), "draft");
     }
 
     #[test]

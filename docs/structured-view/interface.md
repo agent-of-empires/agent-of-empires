@@ -209,9 +209,11 @@ clearing site data wipes the queue.
 with the composer empty (caret at the start), press `↑` to pull the most
 recent queued prompt back into the composer; `↑` again walks toward older
 entries and `↓` walks back toward newer ones, restoring your in-progress
-draft once you step past the newest. Editing a recalled prompt and
-pressing `Enter` updates that entry in place rather than queueing a
-duplicate.
+draft once you step past the newest. While recalling, a banner above the
+composer reads **Editing queued message N of M** so the mode is
+unmistakable; `Esc` abandons the edit and restores your draft. Editing a
+recalled prompt and pressing `Enter` updates that entry in place rather
+than queueing a duplicate.
 
 **TUI structured view.** The TUI has the same client-side queue.
 Pressing `Enter` while a turn is active (or while the WebSocket is down)
@@ -223,9 +225,11 @@ composer when idle retries the drain (useful if a send failed and left
 prompts parked). Queued prompts can be recalled for editing the same way
 as the web: with the composer empty (caret at the top-left), `↑` pulls
 the newest queued prompt back into the composer, `↑` / `↓` walk the queue,
-and editing then `Enter` updates that entry in place. One difference from
-the web composer remains: the TUI queue is in-memory only, so it does not
-survive leaving the structured view.
+and editing then `Enter` updates that entry in place. While recalling, the
+composer border title reads **Editing queued message N of M**, and `Esc`
+restores your draft. One difference from the web composer remains: the TUI
+queue is in-memory only, so it does not survive leaving the structured
+view.
 
 ## Stopping a turn
 

@@ -22,7 +22,7 @@ const SCRIPT = {
           sessionUpdate: "agent_message_chunk",
           content: { type: "text", text: "Working on turn 1..." },
         },
-        { sessionUpdate: "wait_ms", ms: 10_000 },
+        { sessionUpdate: "wait_ms", ms: 30_000 },
       ],
       stopReason: "end_turn",
     },
@@ -73,22 +73,36 @@ base("recall queued prompts with ArrowUp and edit in place", async ({ page }, te
     await queueButton.click();
     await expect(page.getByRole("button", { name: /^second queued$/ })).toBeVisible({ timeout: 5_000 });
 
-    // Composer is empty; ArrowUp loads the newest queued prompt.
+    // Composer empty: ArrowUp enters recall, loading the newest prompt and
+    // surfacing the editing banner.
     await expect(composer).toHaveValue("");
     await composer.press("ArrowUp");
     await expect(composer).toHaveValue("second queued");
+    await expect(page.getByText(/Editing queued message 1 of 2/)).toBeVisible();
 
     // ArrowUp again walks to the older entry.
     await composer.press("ArrowUp");
     await expect(composer).toHaveValue("first queued");
+    await expect(page.getByText(/Editing queued message 2 of 2/)).toBeVisible();
 
     // ArrowDown walks back toward newer.
     await composer.press("ArrowDown");
     await expect(composer).toHaveValue("second queued");
 
-    // Edit it and submit: the queued row updates in place, no duplicate.
+    // Esc abandons the browse and restores the stashed draft (empty here),
+    // clearing the banner.
+    await composer.press("Escape");
+    await expect(composer).toHaveValue("");
+    await expect(page.getByText(/Editing queued message/)).toHaveCount(0);
+
+    // Re-enter and edit: submitting while browsing updates the queued entry
+    // in place, no duplicate, and the editing banner clears.
+    await composer.press("ArrowUp");
+    await expect(composer).toHaveValue("second queued");
+    await expect(page.getByText(/Editing queued message 1 of 2/)).toBeVisible();
     await composer.fill("second queued edited");
     await composer.press("Enter");
+    await expect(page.getByText(/Editing queued message/)).toHaveCount(0);
     await expect(page.getByRole("button", { name: /^second queued edited$/ })).toBeVisible({ timeout: 5_000 });
     await expect(page.getByRole("button", { name: /^second queued$/ })).toHaveCount(0);
     // The other entry is untouched and the queue still holds exactly two.

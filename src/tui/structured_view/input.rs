@@ -46,6 +46,9 @@ pub enum Intent {
     /// newer (ArrowDown). The view layer loads the entry into the composer
     /// for editing.
     RecallQueued(i32),
+    /// Abandon an in-progress queue browse, restoring the stashed draft to
+    /// the composer (the `Esc` while browsing).
+    RecallCancel,
     /// Open the daemon URL for this session in the user's browser.
     OpenInBrowser,
     /// Move focus to the named region.
@@ -179,6 +182,9 @@ fn composer_keys(key: &KeyEvent, ctx: InputContext) -> Intent {
             Intent::RecallQueued(-1)
         }
         (m, KeyCode::Down) if m.is_empty() && ctx.browsing_queue => Intent::RecallQueued(1),
+        // Esc while browsing the queue restores the stashed draft instead
+        // of leaving the composer.
+        (m, KeyCode::Esc) if m.is_empty() && ctx.browsing_queue => Intent::RecallCancel,
         // Plain Enter submits.
         (m, KeyCode::Enter) if m.is_empty() => Intent::SubmitPrompt,
         // Shift+Enter inserts a newline (passed through to textarea).
@@ -657,6 +663,23 @@ mod tests {
                 ctx_recall(false, true, 2)
             ),
             Intent::RecallQueued(1)
+        );
+    }
+
+    #[test]
+    fn esc_while_browsing_cancels_recall() {
+        assert_eq!(
+            dispatch(
+                Focus::Composer,
+                &key(KeyCode::Esc),
+                ctx_recall(false, true, 2)
+            ),
+            Intent::RecallCancel
+        );
+        // Not browsing: Esc still returns focus to the transcript.
+        assert_eq!(
+            dispatch(Focus::Composer, &key(KeyCode::Esc), ctx()),
+            Intent::SetFocus(Focus::Transcript)
         );
     }
 
