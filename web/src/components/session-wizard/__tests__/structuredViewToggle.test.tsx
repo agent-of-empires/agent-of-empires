@@ -101,6 +101,14 @@ describe("AgentStep structured-view view card", () => {
     expect(onChange).toHaveBeenCalledWith("useStructuredView", false);
   });
 
+  it("toggling via the card row (not just the switch) flips useStructuredView", () => {
+    // The card is a full-row clickable label (#2101), so clicking the
+    // heading must drive the same onChange the switch does.
+    const { onChange, getByText } = renderAgentStep({ tool: "claude" });
+    fireEvent.click(getByText("Structured view"));
+    expect(onChange).toHaveBeenCalledWith("useStructuredView", false);
+  });
+
   it("reflects useStructuredView=false as an unchecked switch", () => {
     const { getByRole } = renderAgentStep({
       tool: "claude",
