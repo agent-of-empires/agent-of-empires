@@ -27,7 +27,7 @@
 //!     non-owner client.
 //!   `{"type":"resize","cols":..,"rows":..}`: claim the size-owner lock
 //!     and, if won, resize the (detached) tmux window to the client's
-//!     grid. The lock lives in tmux user options so the web PTY attach
+//!     grid. The lock lives in tmux user options so the web desktop view
 //!     and the native TUI honor the same owner; it is released (and
 //!     `window-size latest` restored) when the owner disconnects.
 //!   `{"type":"claim"}`: explicit take-over from a non-owner; steals the
@@ -52,7 +52,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tracing::{debug, warn};
 
-use super::ws::{
+use super::pane::{
     close_early, wait_for_tmux_ready, PaneReadiness, CLOSE_CODE_GOING_AWAY, CLOSE_CODE_PTY_DEAD,
     CLOSE_CODE_TRY_AGAIN_LATER,
 };
@@ -155,7 +155,7 @@ pub async fn live_paired_terminal_ws(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     live_shell_ws(ws, state, id, "paired-live", |state, id, inst| {
-        Box::pin(super::ws::respawn_paired_if_dead(state, id, inst))
+        Box::pin(super::pane::respawn_paired_if_dead(state, id, inst))
     })
     .await
 }
@@ -167,7 +167,7 @@ pub async fn live_container_terminal_ws(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     live_shell_ws(ws, state, id, "container-live", |state, id, inst| {
-        Box::pin(super::ws::respawn_container_if_dead(state, id, inst))
+        Box::pin(super::pane::respawn_container_if_dead(state, id, inst))
     })
     .await
 }
