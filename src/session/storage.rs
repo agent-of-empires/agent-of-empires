@@ -373,7 +373,14 @@ impl Storage {
             return;
         }
 
-        if let Err(e) = fs::write(&path, buf.as_bytes()) {
+        // `atomic_write` (not `fs::write`) so the sidecar matches the
+        // durability and privacy guarantees of `sessions.json`: a crash
+        // mid-write cannot tear the only surviving copy of the lost row,
+        // the file lands at 0o600 (it can echo tokens from
+        // `Instance.command`) instead of umask-default 0o644, and the
+        // unlocked, concurrently-reachable `load()` callers collapse to a
+        // benign last-writer-wins instead of interleaving bytes.
+        if let Err(e) = atomic_write(&path, buf.as_bytes()) {
             tracing::warn!(
                 error = %e,
                 path = %path.display(),
@@ -593,6 +600,15 @@ mod tests {
         let q = fs::read_to_string(&quarantine)?;
         assert_eq!(q.lines().count(), 1, "exactly one row quarantined");
         assert!(q.contains("corrupt-no-id"), "malformed row is preserved");
+
+        // The sidecar can echo tokens carried in `Instance.command`, so it
+        // must be written 0o600 like `sessions.json`, not umask-default 0o644.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&quarantine)?.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "quarantine sidecar must be owner-only");
+        }
 
         // A second read-only load must not duplicate the row: load() runs on
         // refresh paths that never rewrite sessions.json, so the sidecar is
