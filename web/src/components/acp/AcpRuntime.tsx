@@ -40,6 +40,7 @@ import type {
   ToolCall,
 } from "../../lib/acpTypes";
 import { hasTodoItemsArgsText, parseJsonObject } from "../../lib/acpArgs";
+import { DEFAULT_HISTORY_WINDOW, HISTORY_WINDOW_STEP, historyWindowStart } from "../../lib/acpHistoryWindow";
 import { useAgentProfile } from "../../lib/agentProfileContext";
 
 interface Props {
@@ -98,6 +99,11 @@ export interface AcpContext {
   dismissModeSwitchFailed: () => void;
   setConfigOption: (configId: string, value: string) => Promise<void>;
   dismissConfigOptionSwitchFailed: () => void;
+  /** True when older activity rows exist above the rendered window, so
+   *  the view can offer a "Load earlier" control. See #2144. */
+  canLoadEarlierHistory: boolean;
+  /** Reveal an additional chunk of older history. */
+  loadEarlierHistory: () => void;
 }
 
 /**
@@ -124,21 +130,41 @@ export function AcpRuntime({
   useEffect(() => {
     pendingAttachmentsRef.current = pendingAttachments;
   }, [pendingAttachments]);
+  // Render only the most recent slice of the transcript so a long
+  // session does not block first paint on mobile; older rows stay in
+  // reducer state and are revealed via "Load earlier". Reset the window
+  // on session switch (adjust-state-on-prop-change, no effect, per the
+  // react-you-might-not-need-an-effect lint). See #2144.
+  const [visibleRows, setVisibleRows] = useState(DEFAULT_HISTORY_WINDOW);
+  const [windowSessionId, setWindowSessionId] = useState(sessionId);
+  if (windowSessionId !== sessionId) {
+    setWindowSessionId(sessionId);
+    setVisibleRows(DEFAULT_HISTORY_WINDOW);
+  }
+  const historyStart = useMemo(
+    () => historyWindowStart(acp.state.activity, visibleRows),
+    [acp.state.activity, visibleRows],
+  );
+  const windowedActivity = useMemo(
+    () => (historyStart === 0 ? acp.state.activity : acp.state.activity.slice(historyStart)),
+    [acp.state.activity, historyStart],
+  );
+
   // Memoise the activity → ThreadMessageLike conversion. The function
-  // walks the entire activity array, allocates a new AssistantBuilder
+  // walks the activity array, allocates a new AssistantBuilder
   // per turn, and produces brand-new message objects. Without
   // useMemo, every parent re-render (e.g. WS heartbeat, hover state)
-  // re-builds the entire transcript and assistant-ui treats every
+  // re-builds the transcript and assistant-ui treats every
   // message as changed. Memo on the inputs the function reads.
   const messages = useMemo(
     () =>
       activityToThreadMessages(
-        acp.state.activity,
+        windowedActivity,
         acp.state.turnActive,
         showClearedTurns,
         agentProfile.capabilities.todos,
       ),
-    [acp.state.activity, acp.state.turnActive, showClearedTurns, agentProfile.capabilities.todos],
+    [windowedActivity, acp.state.turnActive, showClearedTurns, agentProfile.capabilities.todos],
   );
 
   const runtime = useExternalStoreRuntime<ThreadMessageLike>({
@@ -202,6 +228,8 @@ export function AcpRuntime({
         dismissModeSwitchFailed: acp.dismissModeSwitchFailed,
         setConfigOption: acp.setConfigOption,
         dismissConfigOptionSwitchFailed: acp.dismissConfigOptionSwitchFailed,
+        canLoadEarlierHistory: historyStart > 0,
+        loadEarlierHistory: () => setVisibleRows((v) => v + HISTORY_WINDOW_STEP),
       })}
     </AssistantRuntimeProvider>
   );
