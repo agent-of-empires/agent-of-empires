@@ -692,7 +692,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     async (repoPath: string) => {
       const res = await createProject({ path: repoPath, scope: "global" });
       if (!res.ok) {
-        toastBus.push(res.error ?? "Failed to pin project", "error");
+        toastBus.handler?.error(res.error ?? "Failed to pin project");
         return;
       }
       await refreshProjects();
@@ -707,7 +707,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       const results = await Promise.all(group.registeredProjects.map((p) => deleteProject(p.name, p.scope)));
       const failed = results.find((r) => !r.ok);
       if (failed) {
-        toastBus.push(failed.error ?? "Failed to unpin project", "error");
+        toastBus.handler?.error(failed.error ?? "Failed to unpin project");
       }
       await refreshProjects();
     },

@@ -66,6 +66,7 @@ export function mergeRegisteredProjects(
   for (const [key, registrations] of byKey) {
     if (seen.has(key)) continue;
     const primary = registrations[0];
+    if (!primary) continue;
     const defaultDisplayName = primary.path.split("/").pop() || primary.path;
     const alias = resolve?.alias(primary.path) ?? null;
     merged.push({
