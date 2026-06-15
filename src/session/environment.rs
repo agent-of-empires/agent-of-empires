@@ -233,13 +233,16 @@ pub(crate) fn host_environment_prefix(entries: &[String]) -> String {
 /// pairs on the host, for feeding into a host-side hook's process environment
 /// (so a `before_start` hook can read a per-session `$TEST_VAR`).
 ///
-/// Trust boundary: this is resolved WITHOUT repo overrides. `before_start`
-/// hooks are profile/global only, so a repo's `.agent-of-empires/config.toml`
-/// `sandbox.environment` must never reach host execution; routing through the
-/// repo-aware `resolved_sandbox_config` would let an untrusted repo influence
-/// the host hook's environment (e.g. `PATH`). Sources, in precedence order:
-/// the per-session `extra_env` (explicit user input, never auto-seeded from
-/// repo config), else the profile/global `sandbox.environment`.
+/// Trust boundary: `before_start` hooks are profile/global only, so a repo's
+/// `.agent-of-empires/config.toml` `sandbox.environment` must never reach host
+/// execution (e.g. a repo setting `PATH`). Sources:
+/// - With a per-session `extra_env`: use it, but drop any entry the repo
+///   contributed. `extra_env` is seeded verbatim from the repo-aware config in
+///   the new-session dialog, so a submitted override can still carry repo
+///   entries; [`host_hook_entries`] filters those out. This is subtractive
+///   only and does not affect the container's env (which keeps `extra_env`
+///   verbatim via [`collect_environment`]).
+/// - Without one: the profile/global `sandbox.environment` baseline.
 ///
 /// Each entry is resolved to a plain host value via the shared grammar:
 /// `KEY=value` is literal, `KEY=$VAR` reads the host env, `KEY=$$literal`
@@ -247,18 +250,46 @@ pub(crate) fn host_environment_prefix(entries: &[String]) -> String {
 /// references and bare keys are skipped. Deduplicates by key (first wins).
 pub(crate) fn session_host_env_pairs(
     profile: &str,
+    project_path: &std::path::Path,
     sandbox_info: &SandboxInfo,
 ) -> Vec<(String, String)> {
-    match sandbox_info.extra_env.as_deref() {
-        Some(entries) => resolve_host_env_pairs(entries),
-        None => {
-            let resolved = super::config::effective_profile(profile);
-            let env = super::profile_config::resolve_config_or_warn(&resolved)
-                .sandbox
-                .environment;
-            resolve_host_env_pairs(&env)
+    let resolved_profile = super::config::effective_profile(profile);
+    let trusted = super::profile_config::resolve_config_or_warn(&resolved_profile)
+        .sandbox
+        .environment;
+    let entries = match sandbox_info.extra_env.as_deref() {
+        None => trusted,
+        Some(extra) => {
+            let repo_aware = super::repo_config::resolve_config_with_repo_or_warn(
+                &resolved_profile,
+                project_path,
+            )
+            .sandbox
+            .environment;
+            host_hook_entries(extra, &trusted, &repo_aware)
         }
-    }
+    };
+    resolve_host_env_pairs(&entries)
+}
+
+/// Filter a session's `extra_env` down to the entries safe to expose to a host
+/// hook: everything except entries the repo contributed (present in the
+/// repo-aware config but not in the profile/global `trusted` baseline). Repo
+/// entries are dropped, never added, so an untrusted repo cannot reach host
+/// execution even when the user submits a per-session override seeded from the
+/// repo-aware dialog. Pure, so it is unit-tested without touching disk.
+fn host_hook_entries(extra: &[String], trusted: &[String], repo_aware: &[String]) -> Vec<String> {
+    let trusted: std::collections::HashSet<&str> = trusted.iter().map(String::as_str).collect();
+    let repo_contributed: std::collections::HashSet<&str> = repo_aware
+        .iter()
+        .map(String::as_str)
+        .filter(|e| !trusted.contains(e))
+        .collect();
+    extra
+        .iter()
+        .filter(|e| !repo_contributed.contains(e.as_str()))
+        .cloned()
+        .collect()
 }
 
 /// Resolve env entries to concrete host `(KEY, VALUE)` pairs (the pure core of
@@ -988,10 +1019,28 @@ environment = ["GH_TOKEN=write_token"]
     }
 
     #[test]
-    fn test_session_host_env_pairs_uses_extra_env_directly() {
-        // With a per-session extra_env, the host-hook env comes straight from it
-        // (resolved), without consulting repo-aware config. This keeps a repo's
-        // sandbox.environment out of host hook execution.
+    fn test_host_hook_entries_drops_repo_contributed() {
+        // extra_env carries one user entry and two that came from config; the
+        // repo-only one (in repo_aware but not trusted) is dropped, the one also
+        // in the profile/global baseline is kept.
+        let extra = vec![
+            "TEST_VAR=foo".to_string(),  // user-typed
+            "NODE_ENV=test".to_string(), // repo-contributed
+            "SHARED=keep".to_string(),   // also in profile/global baseline
+        ];
+        let trusted = vec!["SHARED=keep".to_string()];
+        let repo_aware = vec!["NODE_ENV=test".to_string(), "SHARED=keep".to_string()];
+        assert_eq!(
+            host_hook_entries(&extra, &trusted, &repo_aware),
+            vec!["TEST_VAR=foo".to_string(), "SHARED=keep".to_string()],
+        );
+    }
+
+    #[test]
+    fn test_session_host_env_pairs_uses_extra_env() {
+        // With a per-session extra_env and no repo config at the path, every
+        // entry survives the repo filter and is resolved to a host pair.
+        let tmp = tempfile::tempdir().unwrap();
         let info = SandboxInfo {
             enabled: true,
             container_id: None,
@@ -1001,7 +1050,7 @@ environment = ["GH_TOKEN=write_token"]
             custom_instruction: None,
             before_start_env: Vec::new(),
         };
-        let pairs = session_host_env_pairs("any-profile", &info);
+        let pairs = session_host_env_pairs("any-profile", tmp.path(), &info);
         assert_eq!(
             pairs,
             vec![
