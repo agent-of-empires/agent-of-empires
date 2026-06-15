@@ -78,7 +78,8 @@
       "specs": [
         "tests/mobile-dom-renderer.spec.ts",
         "tests/keyboard-auto-resize.spec.ts",
-        "tests/mobile-keyboard.spec.ts"
+        "tests/mobile-keyboard.spec.ts",
+        "tests/mobile-fullscreen-agent-layout.spec.ts"
       ],
       "components": [
         "web/src/components/MobileLiveTerminal.tsx",

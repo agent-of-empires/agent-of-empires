@@ -456,10 +456,21 @@ impl Session {
         };
         let before = PaneCursor::parse(cursor_line);
         let after = PaneCursor::parse(after_line);
-        // Cursor moved, screen scrolled, or pane resized mid-frame: the
-        // header does not describe this content. Suppress the cursor.
+        // Only the VERTICAL-mapping inputs must be stable across the capture:
+        // if `history_size` or `pane_height` changed, the screen scrolled or
+        // resized mid-capture and the cursor's row no longer indexes the
+        // captured content (the row-drift bug). A blinking cursor or a
+        // horizontal jitter from an animated TUI (claude's spinner) changes
+        // `visible`/`x` every frame but never moves the row, so comparing the
+        // whole struct would suppress the cursor on every frame of an
+        // actively repainting agent. Keep the post-capture cursor (closest to
+        // the freshest content) when the mapping is stable.
         let cursor = match (before, after) {
-            (Some(b), Some(a)) if b == a => Some(b),
+            (Some(b), Some(a))
+                if b.history_size == a.history_size && b.pane_height == a.pane_height =>
+            {
+                Some(a)
+            }
             _ => None,
         };
         Ok((content.to_string(), cursor))

@@ -282,22 +282,51 @@ export function MobileLiveTerminal({
   // Cursor cell -> visual overlay position. Shown only at the live edge;
   // reading scrollback hides it. The pinning layout effect also feeds
   // this position into cursorAnchorRef for the keyboard-shrunk target.
+  // Last visual row with real text. A fullscreen agent (Claude) only fills
+  // part of a tall mobile pane and leaves the rest blank; this is where the
+  // meaningful screen ends. Cursor-independent so it can drive both the
+  // render trim and the cursor-in-the-void check below.
+  const lastNonBlankRow = useMemo(() => {
+    for (let i = visual.rows.length - 1; i >= 0; i--) {
+      if (visual.rows[i]!.some((s) => s.text.trim() !== "")) return i;
+    }
+    return -1;
+  }, [visual]);
+
+  // Render only through the last non-blank row so `mt-auto` can bottom-align
+  // the real content; the trailing blank rows would otherwise float the input
+  // box far above the keyboard behind a dead gap. This trims RENDERING only,
+  // not the scroll anchor (whose last-non-blank flutter under spinner redraws
+  // is why viewport-anchoring there was reverted, see liveScrollTarget).
+  const renderRowCount = Math.max(0, lastNonBlankRow + 1);
+
   const live = useMemo(() => {
-    const cursor = !reading ? (frame?.cursor ?? null) : null;
+    let cursor = !reading ? (frame?.cursor ?? null) : null;
     let cursorTop = 0;
     let cursorLeft = 0;
     let lineIdx = -1;
     let baseRow = -1;
     if (cursor) {
       lineIdx = Math.max(0, lines.length - screenRows) + cursor.y;
-      baseRow = visual.lineStartRow[lineIdx] ?? visual.rows.length;
       const cols = renderCols > 0 ? renderCols : Number.POSITIVE_INFINITY;
       const wrapOffset = Number.isFinite(cols) ? Math.floor(cursor.x / cols) : 0;
-      cursorTop = (spacerLines + baseRow + wrapOffset) * lineH;
-      cursorLeft = (Number.isFinite(cols) ? cursor.x % cols : cursor.x) * charW;
+      baseRow = lineIdx >= 0 && lineIdx < lines.length ? (visual.lineStartRow[lineIdx] ?? -1) : -1;
+      const visualRow = baseRow + wrapOffset;
+      // The agent can park the hardware cursor in a trailing BLANK row below
+      // its drawn UI (Claude draws its own caret in the input box higher up).
+      // Painting the overlay there pins it to the bottom of the pane, far
+      // from the input box (the reported "cursor stuck at the bottom"). When
+      // the cursor lands past the last non-blank row, suppress the overlay
+      // rather than paint it in the void; the agent's own caret remains.
+      if (baseRow < 0 || visualRow > lastNonBlankRow) {
+        cursor = null;
+      } else {
+        cursorTop = (spacerLines + visualRow) * lineH;
+        cursorLeft = (Number.isFinite(cols) ? cursor.x % cols : cursor.x) * charW;
+      }
     }
     return { cursor, cursorTop, cursorLeft, lineIdx, baseRow };
-  }, [reading, frame, lines.length, screenRows, visual, renderCols, charW, spacerLines, lineH]);
+  }, [reading, frame, lines.length, screenRows, visual, renderCols, charW, spacerLines, lineH, lastNonBlankRow]);
 
   const atBottom = useCallback(() => {
     const el = scrollerRef.current;
@@ -591,7 +620,7 @@ export function MobileLiveTerminal({
         onTouchMove={onTouchMove}
         onTouchEnd={onTouchEnd}
         onTouchCancel={onTouchEnd}
-        className="absolute inset-0 overflow-y-auto overflow-x-hidden font-mono"
+        className="absolute inset-0 overflow-y-auto overflow-x-hidden font-mono flex flex-col"
         style={{
           fontSize: `${fontSize}px`,
           lineHeight: `${lineH}px`,
@@ -615,9 +644,16 @@ export function MobileLiveTerminal({
         >
           MMMMMMMMMMMMMMMMMMMM
         </span>
-        <div className="relative whitespace-pre" data-live-content>
+        {/* `mt-auto` bottom-aligns the screen when it is shorter than the
+            viewport (a fullscreen agent like Claude only fills part of a tall
+            mobile pane), so its input box sits just above the keyboard instead
+            of floating mid-screen over a blank gap. When content overflows
+            (scrollback), the auto margin collapses and it scrolls normally,
+            avoiding the flex+overflow top-clipping bug. The absolute cursor
+            overlay is positioned within this box, so the shift moves with it. */}
+        <div className="relative whitespace-pre mt-auto" data-live-content>
           {spacerLines > 0 && <div style={{ height: `${spacerLines * lineH}px` }} aria-hidden="true" />}
-          {visual.rows.map((segs, i) => (
+          {visual.rows.slice(0, renderRowCount).map((segs, i) => (
             <Row key={i} segs={segs} />
           ))}
           {connected && cursor && (
