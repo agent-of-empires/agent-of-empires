@@ -730,9 +730,9 @@ mod tests {
             approval["approved_at"] = Value::String(SENTINEL.into());
             // Re-render canary: render_hermes_allowlist's retain+push path
             // re-emits only its 4 canonical fields, so this stripped key
-            // distinguishes "re-render ran" from "re-render skipped" — the
-            // latter would leave the planted canary intact and let the
-            // sentinel assertion below pass without proving anything.
+            // distinguishes "re-render ran" from "re-render skipped". A
+            // skipped re-render would leave the planted canary intact and
+            // let the sentinel assertion below pass without proving anything.
             approval["__reentry_canary"] = Value::Bool(true);
         }
         fs::write(&allow_path, serde_json::to_string_pretty(&data).unwrap()).unwrap();
