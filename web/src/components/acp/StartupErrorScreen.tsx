@@ -1,7 +1,12 @@
+import { useEffect, useState } from "react";
+
 import type { IncompatibleAgentDetail } from "../../lib/acpTypes";
+import { fetchSettings, installAcpAgent } from "../../lib/api";
+import { useRespawnSession } from "../../hooks/useRespawnSession";
 
 interface Props {
   detail: IncompatibleAgentDetail;
+  sessionId: string;
 }
 
 /** Dedicated full-region replacement for the structured view chat layout when
@@ -10,11 +15,58 @@ interface Props {
  *  layered on top of the chat for free-form handshake failures. This
  *  screen surfaces the structured detail (installed vs required
  *  version, the exact remediation command) so the user can copy-paste
- *  it into a shell without parsing prose. */
-export function StartupErrorScreen({ detail }: Props) {
+ *  it into a shell without parsing prose, and offers in-UI recovery:
+ *  "Restart agent" respawns the worker (re-running the handshake after a
+ *  manual reinstall), and, when the agent is npm-installable and the
+ *  `acp.allow_agent_install` setting is on, "Update & restart" runs the
+ *  install on the host then respawns. See #2109. */
+export function StartupErrorScreen({ detail, sessionId }: Props) {
   const heading = headingFor(detail);
   const summary = summaryFor(detail);
   const installCommand = installCommandFor(detail);
+  const autoInstallable = "auto_install" in detail && detail.auto_install;
+
+  const { state: respawnState, error: respawnError, respawn } = useRespawnSession(sessionId);
+  const [allowInstall, setAllowInstall] = useState(false);
+  const [installState, setInstallState] = useState<"idle" | "installing" | "failed">("idle");
+  const [installError, setInstallError] = useState<string | null>(null);
+  const [installOutput, setInstallOutput] = useState<string | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    fetchSettings().then((s) => {
+      if (alive) {
+        setAllowInstall(Boolean((s as { acp?: { allow_agent_install?: boolean } } | null)?.acp?.allow_agent_install));
+      }
+    });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const busy = respawnState === "retrying" || installState === "installing";
+
+  const handleUpdateAndRestart = async () => {
+    setInstallState("installing");
+    setInstallError(null);
+    setInstallOutput(null);
+    try {
+      const res = await installAcpAgent(sessionId);
+      const log = `${res.stdout}\n${res.stderr}`.trim();
+      setInstallOutput(log || null);
+      if (!res.success) {
+        setInstallState("failed");
+        setInstallError(`Install exited with code ${res.exit_code ?? "unknown"}.`);
+        return;
+      }
+      setInstallState("idle");
+      // Re-run the handshake against the freshly installed version.
+      await respawn();
+    } catch (e) {
+      setInstallState("failed");
+      setInstallError(e instanceof Error ? e.message : String(e));
+    }
+  };
 
   return (
     <div
@@ -33,7 +85,7 @@ export function StartupErrorScreen({ detail }: Props) {
         {installCommand && (
           <div className="mt-4">
             <div className="text-[11px] font-medium uppercase tracking-wide text-text-dim">
-              Run this, then restart the session
+              Run this, then restart the agent
             </div>
             <pre
               data-testid="startup-error-install-command"
@@ -46,11 +98,52 @@ export function StartupErrorScreen({ detail }: Props) {
 
         <DetailRows detail={detail} />
 
+        <div className="mt-5 flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            data-testid="startup-error-restart"
+            onClick={respawn}
+            disabled={busy}
+            className="rounded-md border border-surface-700 bg-surface-800 px-3 py-1.5 text-xs font-medium text-text-primary hover:bg-surface-700 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {respawnState === "retrying" ? "Restarting…" : "Restart agent"}
+          </button>
+          {autoInstallable && allowInstall && (
+            <button
+              type="button"
+              data-testid="startup-error-update-restart"
+              onClick={handleUpdateAndRestart}
+              disabled={busy}
+              className="rounded-md border border-status-error/60 bg-status-error/20 px-3 py-1.5 text-xs font-medium text-text-primary hover:bg-status-error/30 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {installState === "installing" ? "Updating…" : "Update & restart"}
+            </button>
+          )}
+        </div>
+
+        {respawnState === "ok" && (
+          <div className="mt-2 text-xs text-emerald-200/90">
+            Restart requested. The agent re-runs the compatibility check on the next handshake.
+          </div>
+        )}
+        {respawnState === "failed" && respawnError && (
+          <div className="mt-2 text-xs text-status-error">Restart failed: {respawnError}</div>
+        )}
+        {installState === "failed" && installError && (
+          <div className="mt-2 text-xs text-status-error">{installError}</div>
+        )}
+        {installOutput && (
+          <pre className="mt-2 max-h-40 overflow-auto rounded-md border border-surface-700 bg-surface-950 p-2 font-mono text-[11px] text-text-secondary">
+            {installOutput}
+          </pre>
+        )}
+
         <div className="mt-4 text-xs text-text-dim">
-          The session is paused until the adapter satisfies the required version. Once you have run the command above,
-          restart <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">aoe serve</code> (or spawn a fresh
-          structured view session) and the check re-runs at the next ACP{" "}
-          <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">initialize</code> handshake.
+          The session is paused until the adapter satisfies the required version. After installing, use{" "}
+          <span className="font-medium text-text-secondary">Restart agent</span> above (no full restart of{" "}
+          <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">aoe serve</code> needed) and the check
+          re-runs at the next ACP <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">initialize</code>{" "}
+          handshake.
         </div>
       </div>
     </div>
