@@ -407,7 +407,7 @@ function AcpChrome({
                   type="button"
                   onClick={loadEarlierHistory}
                   data-testid="acp-load-earlier"
-                  className="rounded-full border border-surface-700 bg-surface-800 px-3 py-1 text-xs text-text-secondary hover:bg-surface-700 hover:text-text-primary cursor-pointer"
+                  className="h-8 rounded-md border border-surface-700 bg-surface-800 px-3 text-xs text-text-secondary hover:bg-surface-700 hover:text-text-primary transition-colors cursor-pointer"
                 >
                   Load earlier messages
                 </button>
