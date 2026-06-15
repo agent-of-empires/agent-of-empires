@@ -450,6 +450,30 @@ describe("ToolCards memory_recall (claude-agent-acp v0.37.0)", () => {
     expect(body.querySelector("h1")?.textContent).toBe("User profile");
     expect(body.querySelectorAll("li").length).toBe(2);
   });
+
+  it("sanitizes dangerous HTML in synthesized memory before rendering", () => {
+    const tool = makeToolCall({
+      id: "mem-xss",
+      name: "Recalled synthesized memory",
+      kind: "read",
+      args_preview: "{}",
+      memory_recall: {
+        mode: "synthesize",
+        synthesized_text: 'Hi <img src=x onerror="alert(1)"> <a href="javascript:alert(2)">link</a>',
+      },
+    });
+    const { getByRole, getByTestId } = render(
+      <Wrap toolKey="claude">
+        <ToolCard tool={tool} result={undefined} />
+      </Wrap>,
+    );
+    fireEvent.click(getByRole("button"));
+    const body = getByTestId("memory-recall-synthesized");
+    // DOMPurify strips the event handler and the javascript: URL.
+    expect(body.querySelector("img")?.getAttribute("onerror")).toBeNull();
+    expect(body.innerHTML).not.toContain("onerror");
+    expect(body.innerHTML).not.toContain("javascript:");
+  });
 });
 
 describe("ToolCards MCP", () => {

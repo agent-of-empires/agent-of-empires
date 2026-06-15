@@ -52,6 +52,7 @@ import { StringDiff } from "../diff/StringDiff";
 import { ToolErrorBody } from "./ToolErrorBody";
 import { classifyMcp, humanizeServer, humanizeVerb } from "../../lib/mcpClassify";
 import { cleanRecalledMemory, classifyMemory, parseMemoryFrontmatter, type MemoryHit } from "../../lib/memoryClassify";
+import DOMPurify from "dompurify";
 import { marked } from "marked";
 import { reclassifyBash } from "../../lib/toolReclassify";
 import { useAgentProfile } from "../../lib/agentProfileContext";
@@ -1719,7 +1720,10 @@ function MemoryRecallCard({ tool, result }: Props) {
   // requires the assistant-ui runtime provider (it throws "requires an
   // AuiProvider" outside the transcript), the same reason CommentMarkdown
   // exists. The `.acp-markdown` class reuses the panel's prose styling.
-  const synthesizedHtml = isSynthesize ? (marked.parse(synthesized, { async: false }) as string) : "";
+  // `marked` does not sanitize HTML, so the parsed output is run through
+  // DOMPurify before it reaches dangerouslySetInnerHTML; the recalled
+  // text is agent-surfaced and could carry an injected payload.
+  const synthesizedHtml = isSynthesize ? DOMPurify.sanitize(marked.parse(synthesized, { async: false }) as string) : "";
 
   const primary = isSynthesize ? (
     <span>Synthesised memory</span>
