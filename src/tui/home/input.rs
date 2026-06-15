@@ -2500,6 +2500,18 @@ impl HomeView {
             .worktree_info
             .as_ref()
             .and_then(|w| w.base_branch.clone());
+
+        // A session on a non-git project runs in place, so there is no repo to
+        // diff against. Show a clear message instead of letting the git layer
+        // surface a raw "could not open repository" error.
+        if !crate::git::GitWorktree::is_git_repo(&repo_path) {
+            self.info_dialog = Some(InfoDialog::new(
+                "No Git Repository",
+                "This session runs in place in a non-git directory, so there is no diff to show.",
+            ));
+            return;
+        }
+
         match DiffView::new_for_session(
             repo_path,
             Some(session_id_owned),

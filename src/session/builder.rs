@@ -529,7 +529,11 @@ pub fn build_instance(
             // Single worktree mode (existing logic)
             let path = PathBuf::from(&params.path);
             if !GitWorktree::is_git_repo(&path) {
-                bail!("Path is not in a git repository");
+                bail!(
+                    "Worktree mode requires a git repository, but this path is not one: {}\n\
+                     Tip: start an in-place session (no worktree) here, or point at a git repository.",
+                    path.display()
+                );
             }
             let main_repo_path_raw = GitWorktree::find_main_repo(&path)?;
             let main_repo_path = main_repo_path_raw

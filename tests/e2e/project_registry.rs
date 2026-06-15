@@ -100,21 +100,53 @@ fn test_project_add_list_remove_round_trip() {
 
 #[test]
 #[serial]
-fn test_project_add_rejects_non_git_path() {
+fn test_project_add_accepts_non_git_dir() {
     let h = TuiTestHarness::new("project_non_git");
     let plain = h.home_path().join("plain-dir");
     std::fs::create_dir_all(&plain).expect("create plain dir");
 
     let out = h.run_cli(&["project", "add", plain.to_str().unwrap()]);
     assert!(
+        out.status.success(),
+        "expected non-git dir to be accepted, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Registered project"),
+        "expected registration confirmation, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("not a git repository"),
+        "expected non-git note in output, got: {stdout}"
+    );
+
+    // It should now be listed.
+    let list = h.run_cli(&["project", "list"]);
+    assert!(list.status.success());
+    let list_stdout = String::from_utf8_lossy(&list.stdout);
+    assert!(
+        list_stdout.contains("plain-dir"),
+        "expected non-git project in list, got: {list_stdout}"
+    );
+}
+
+#[test]
+#[serial]
+fn test_project_add_rejects_nonexistent_path() {
+    let h = TuiTestHarness::new("project_nonexistent");
+    let missing = h.home_path().join("does-not-exist");
+
+    let out = h.run_cli(&["project", "add", missing.to_str().unwrap()]);
+    assert!(
         !out.status.success(),
-        "expected failure for non-git path, stdout: {}",
+        "expected failure for nonexistent path, stdout: {}",
         String::from_utf8_lossy(&out.stdout)
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("not a git repository"),
-        "expected 'not a git repository' message, got: {stderr}"
+        stderr.contains("does not exist or is not a directory"),
+        "expected directory-validation message, got: {stderr}"
     );
 }
 

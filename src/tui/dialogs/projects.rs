@@ -152,8 +152,13 @@ impl ProjectsDialog {
                 }
                 let path_buf = std::path::PathBuf::from(&path);
                 let canonical = path_buf.canonicalize().unwrap_or_else(|_| path_buf.clone());
-                if !crate::git::GitWorktree::is_git_repo(&canonical) {
-                    self.error = Some(format!("Not a git repository: {}", canonical.display()));
+                // Non-git directories are allowed (sessions run in place); only
+                // reject paths that don't resolve to a directory.
+                if !canonical.is_dir() {
+                    self.error = Some(format!(
+                        "Path does not exist or is not a directory: {}",
+                        canonical.display()
+                    ));
                     return DialogResult::Continue;
                 }
                 let name = canonical

@@ -751,7 +751,7 @@ Add a project to the registry
 
 ###### **Arguments:**
 
-* `<PATH>` — Path to the git repository
+* `<PATH>` — Path to the project directory: a git repository, or any directory to run sessions in place
 
 ###### **Options:**
 

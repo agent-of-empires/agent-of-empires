@@ -293,7 +293,12 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         } else {
             // Single worktree mode (existing logic)
             if !GitWorktree::is_git_repo(&path) {
-                bail!("Path is not in a git repository\nTip: Navigate to a git repository first");
+                bail!(
+                    "Worktree mode requires a git repository, but this path is not one: {}\n\
+                     Tip: omit --worktree-branch to start an in-place session here, \
+                     or point at a git repository.",
+                    path.display()
+                );
             }
 
             let main_repo_path = GitWorktree::find_main_repo(&path)?;
