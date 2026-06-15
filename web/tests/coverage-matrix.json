@@ -2121,6 +2121,13 @@
       "components": ["web/src/components/session-wizard/steps/ProjectStep.tsx"]
     },
     {
+      "id": "story.wizard-saved-projects",
+      "kind": "mocked-playwright",
+      "risk": "low",
+      "specs": ["tests/wizard-project-step.spec.ts"],
+      "components": ["web/src/components/session-wizard/steps/ProjectStep.tsx"]
+    },
+    {
       "id": "story.wizard-browse-disk",
       "kind": "mocked-playwright",
       "risk": "low",
