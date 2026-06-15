@@ -402,7 +402,7 @@ const RESUME_IDLE_GRACE_DEFAULT: std::time::Duration = std::time::Duration::from
 /// claude-agent-acp >=0.41.0 (upstream #680) also force-resolves a
 /// prompt loop wedged in a `TaskOutput { block: true }` poll against a
 /// hung background task: ~30s after the first cancel it returns
-/// `cancelled` instead of hanging forever. The 0.44.0 floor (see
+/// `cancelled` instead of hanging forever. The floor (see
 /// `agent_compat`) guarantees that path, so a cancel during off-protocol
 /// background work no longer rides the 30-minute
 /// `OFF_PROTOCOL_WORK_GRACE_FLOOR` below before recovering.
