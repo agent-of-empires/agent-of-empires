@@ -1449,6 +1449,8 @@ fn render_hermes_allowlist(config_dir: &Path) -> Result<(std::path::PathBuf, Str
         let cmd = hook_command(status);
         // Preserve the original `approved_at` when an entry with the same
         // (event, command) already exists; only fresh entries get `now`.
+        // A `null` value is preserved verbatim: the field records
+        // first-approval time, so a null stays a null on re-render.
         let preserved = approvals.iter().find_map(|entry| {
             let same = entry.get("event").and_then(|v| v.as_str()) == Some(*event)
                 && entry.get("command").and_then(|v| v.as_str()) == Some(&cmd);

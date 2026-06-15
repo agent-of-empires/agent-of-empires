@@ -65,6 +65,25 @@
 //! `mixed_user_aoe_matcher_group_documents_double_firing`. Closing the
 //! gap requires in-place string rewrite inside non-AoE matcher groups;
 //! tracked as a follow-up.
+//!
+//! ### Power-loss durability asymmetry across formats
+//!
+//! Only Codex routes its rewrite through `crate::session::atomic_write`
+//! (`hooks/mod.rs::write_codex_config`). JSON settings, settl, Hermes,
+//! and Kiro use `std::fs::write` (truncate+write). Power loss in that
+//! window leaves a 0-byte file; the v015 gate then fails closed on the
+//! corrupted parse and never auto-recovers. Recovery:
+//! `aoe uninstall && aoe add --cmd <agent>`. Routing every install path
+//! through `atomic_write` is tracked as a follow-up.
+//!
+//! ### Sandbox-image hooks are not rewritten
+//!
+//! v015 walks host-reachable paths only. Hooks installed via
+//! `HookInstallTarget::Sandbox` (baked into a Docker / Podman / Apple-
+//! Containers image) keep the legacy bytes until the image is rebuilt;
+//! the next `aoe sandbox rebuild` (or equivalent) will pick up the
+//! current canonical bytes. Defense-in-depth bound: container isolation
+//! already gates the `AOE_INSTANCE_ID` injection surface PR #1803 closed.
 
 use anyhow::Result;
 use std::fs;
@@ -261,6 +280,13 @@ mod tests {
         };
         let parsed: Value = serde_json::from_str(&fs::read_to_string(claude).unwrap()).unwrap();
         let hooks = parsed["hooks"].as_object().expect("hooks present");
+        // An empty `hooks: {}` would silently pass the per-event loop below.
+        // Catches a regression where v015 strips every AoE entry to nothing.
+        assert!(
+            !hooks.is_empty(),
+            "v015 wrote an empty hooks object; canonical check would be vacuous on {}",
+            claude.display(),
+        );
         let claude_events = crate::agents::AGENTS
             .iter()
             .find(|a| a.name == "claude")
@@ -328,6 +354,11 @@ mod tests {
 
         let content: Value = serde_json::from_str(&fs::read_to_string(&claude).unwrap()).unwrap();
         let pre_tool = content["hooks"]["PreToolUse"].as_array().unwrap();
+        assert!(
+            pre_tool.len() >= 2,
+            "v015 must keep the user matcher group AND append the AoE group; got {} block(s)",
+            pre_tool.len(),
+        );
         assert_eq!(pre_tool[0]["matcher"], "Bash");
         assert_eq!(pre_tool[0]["hooks"][0]["command"], "echo user-hook");
         // Byte-for-byte canonical check (issue #1845 acceptance #4); catches
@@ -553,6 +584,46 @@ mod tests {
 
     #[test]
     #[serial_test::serial(shell_env)]
+    fn codex_features_codex_hooks_alias_false_skipped() {
+        // `features.codex_hooks = false` is the deprecated alias for
+        // `features.hooks = false`. Locks the alias support in
+        // `codex_hooks_feature_is_disabled` (`hooks/mod.rs::or_else` fallback)
+        // so a refactor cannot drop it without flipping a test red.
+        let _g = EnvGuard::unset_all();
+        let (_tmp, home, app_dir) = setup_dirs();
+        let codex = home.join(".codex/config.toml");
+        fs::create_dir_all(codex.parent().unwrap()).unwrap();
+        fs::write(
+            &codex,
+            format!(
+                "[features]\n\
+                 codex_hooks = false\n\
+                 \n\
+                 [[hooks.SessionStart]]\n\
+                 [[hooks.SessionStart.hooks]]\n\
+                 type = \"command\"\n\
+                 command = {LEGACY_STATUS_CMD:?}\n"
+            ),
+        )
+        .unwrap();
+        let before = fs::read(&codex).unwrap();
+
+        run_in(&home, &app_dir).unwrap();
+
+        assert_eq!(
+            fs::read(&codex).unwrap(),
+            before,
+            "features.codex_hooks=false (deprecated alias) must short-circuit",
+        );
+        let text = String::from_utf8(before).unwrap();
+        assert!(
+            !text.contains("case \"$AOE_INSTANCE_ID\""),
+            "no hardening must be applied when the legacy alias is disabled"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(shell_env)]
     fn settl_marker_only_rewrites_aoe_lines() {
         let _g = EnvGuard::unset_all();
         let (_tmp, home, app_dir) = setup_dirs();
@@ -657,6 +728,12 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(&allow_path).unwrap()).unwrap();
         for approval in data["approvals"].as_array_mut().unwrap() {
             approval["approved_at"] = Value::String(SENTINEL.into());
+            // Re-render canary: render_hermes_allowlist's retain+push path
+            // re-emits only its 4 canonical fields, so this stripped key
+            // distinguishes "re-render ran" from "re-render skipped" — the
+            // latter would leave the planted canary intact and let the
+            // sentinel assertion below pass without proving anything.
+            approval["__reentry_canary"] = Value::Bool(true);
         }
         fs::write(&allow_path, serde_json::to_string_pretty(&data).unwrap()).unwrap();
 
@@ -674,6 +751,10 @@ mod tests {
         let approvals = after["approvals"].as_array().unwrap();
         assert!(!approvals.is_empty(), "allowlist must not be wiped");
         for approval in approvals {
+            assert!(
+                approval.get("__reentry_canary").is_none(),
+                "v015 must re-render the allowlist on the second run; canary survived: {approval}"
+            );
             assert_eq!(
                 approval["approved_at"].as_str(),
                 Some(SENTINEL),
