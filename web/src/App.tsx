@@ -22,6 +22,7 @@ import { useDiffComments } from "./hooks/useDiffComments";
 import { clearStoredComments, sweepOrphanComments } from "./components/diff/comments/storage";
 import { SendCommentsDialog } from "./components/diff/comments/SendCommentsDialog";
 import { useCommandActions } from "./hooks/useCommandActions";
+import { useSettingsCommands } from "./hooks/useSettingsCommands";
 import { useEdgeSwipe } from "./hooks/useEdgeSwipe";
 import { useIsCoarsePointer } from "./hooks/useIsCoarsePointer";
 import { useIsWideViewport } from "./hooks/useIsWideViewport";
@@ -981,6 +982,13 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     onLogout,
   });
 
+  const openSettingsTab = useCallback((tab: string) => navigate(`/settings/${tab}`), [navigate]);
+  const settingsCommands = useSettingsCommands({
+    open: showPalette,
+    readOnly: !!serverAbout?.read_only,
+    onOpenSettingsTab: openSettingsTab,
+  });
+
   const renderContent = () => {
     if (showSettings) {
       return (
@@ -1392,7 +1400,11 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
           />
         )}
 
-        <CommandPalette open={showPalette} onClose={() => setShowPalette(false)} actions={commandActions} />
+        <CommandPalette
+          open={showPalette}
+          onClose={() => setShowPalette(false)}
+          actions={[...commandActions, ...settingsCommands]}
+        />
 
         {activeWorkspace && activeSession && (
           <MobileRightPanelPicker

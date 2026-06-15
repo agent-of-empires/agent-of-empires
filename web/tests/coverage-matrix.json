@@ -1558,6 +1558,13 @@
       "components": ["web/src/components/command-palette/CommandPalette.tsx", "web/src/hooks/useKeyboardShortcuts.ts"]
     },
     {
+      "id": "settings.palette-entries",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/hooks/__tests__/useSettingsCommands.test.tsx"],
+      "components": ["web/src/hooks/useSettingsCommands.ts", "web/src/App.tsx"]
+    },
+    {
       "id": "story.shortcut-toggle-sidebar",
       "kind": "mocked-playwright",
       "risk": "medium",
