@@ -1,5 +1,5 @@
 import type { RepoColor } from "./repoAppearance";
-import type { RepoGroup, SessionResponse, Workspace, WorkspaceStatus } from "./types";
+import type { ProjectInfo, RepoGroup, SessionResponse, Workspace, WorkspaceStatus } from "./types";
 import { isSessionActive } from "./session";
 import { compareWorkspacesForComputedSortMode, type SidebarSortMode, workspaceIsSunk } from "./sidebarSort";
 import { MULTI_REPO_GROUP_ID, SCRATCH_GROUP_ID } from "../hooks/useRepoGroups";
@@ -50,6 +50,14 @@ export interface SidebarGroup {
   repoPath?: string;
   /** Set when `kind === "sessionGroup"`. Empty string for Ungrouped. */
   groupPath?: string;
+  /** Registry entries for this repo path (the "pin"); empty when unpinned.
+   *  Repo axis only. See #2047. */
+  registeredProjects: ProjectInfo[];
+  /** Derived: the repo is registered (pinned). */
+  pinned: boolean;
+  /** Derived: registered with no live workspace, so it shows as an empty
+   *  header that only the pin keeps visible. */
+  pinnedEmpty: boolean;
 }
 
 function isSyntheticRepoGroup(id: string): boolean {
@@ -62,6 +70,7 @@ function isSyntheticRepoGroup(id: string): boolean {
 // repo path); real repos create directly in their repo.
 export function repoGroupToSidebarGroup(group: RepoGroup): SidebarGroup {
   const synthetic = isSyntheticRepoGroup(group.id);
+  const pinned = !synthetic && group.registeredProjects.length > 0;
   return {
     id: group.id,
     kind: "repo",
@@ -82,6 +91,9 @@ export function repoGroupToSidebarGroup(group: RepoGroup): SidebarGroup {
       create: synthetic ? "generic" : "repo",
     },
     repoPath: group.repoPath,
+    registeredProjects: synthetic ? [] : group.registeredProjects,
+    pinned,
+    pinnedEmpty: pinned && group.workspaces.length === 0,
   };
 }
 
@@ -174,6 +186,9 @@ export function buildSessionGroups(
       collapsed: opts.isCollapsed(id, gp),
       capabilities: { appearance: false, reorder: false, create: "generic" },
       groupPath: gp,
+      registeredProjects: [],
+      pinned: false,
+      pinnedEmpty: false,
     });
   }
 
@@ -191,6 +206,14 @@ export function buildSessionGroups(
 // footer, so an all-sunk group's header is not rendered empty.
 export function sidebarGroupHasLiveWorkspace(group: SidebarGroup): boolean {
   return group.workspaces.some((v) => !workspaceIsSunk(v.workspace));
+}
+
+// Whether a group's header should render at all. A pinned-but-empty project
+// has no live rows but must still show its header (that is the whole point
+// of pinning), so it renders even though `sidebarGroupHasLiveWorkspace` is
+// false. See #2047.
+export function sidebarGroupShouldRender(group: SidebarGroup): boolean {
+  return group.pinnedEmpty || sidebarGroupHasLiveWorkspace(group);
 }
 
 // The workspaces an "archive all in group" action would act on: every member
@@ -259,4 +282,11 @@ export function buildNestedSidebarGroups(
 // rendered as an empty header.
 export function nestedSidebarGroupHasLiveWorkspace(group: NestedSidebarGroup): boolean {
   return group.subgroups.some(sidebarGroupHasLiveWorkspace);
+}
+
+// Nested-axis equivalent of `sidebarGroupShouldRender`: a pinned-but-empty
+// repo has no subgroups (no sessions), so it would fail the live check, but
+// its header must still render. See #2047.
+export function nestedSidebarGroupShouldRender(group: NestedSidebarGroup): boolean {
+  return group.repo.pinnedEmpty || group.subgroups.some(sidebarGroupShouldRender);
 }
