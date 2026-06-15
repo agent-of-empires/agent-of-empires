@@ -101,15 +101,6 @@ pub enum WebWritePolicy {
     LocalOnly { reason: String },
 }
 
-impl WebWritePolicy {
-    pub fn is_web_writable(&self) -> bool {
-        matches!(
-            self,
-            WebWritePolicy::Allow | WebWritePolicy::RequiresElevation { .. }
-        )
-    }
-}
-
 /// Server-authoritative validation applied to an incoming value before it is
 /// merged. Min/max in [`WidgetKind`] is advisory UI metadata; this is the gate.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

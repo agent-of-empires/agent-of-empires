@@ -33,12 +33,6 @@ impl Nonce {
     }
 }
 
-impl Default for Nonce {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Tiny hex helper local to this module to avoid pulling in a crate just for
 /// nonce display. Lowercase, no separators, no prefix.
 mod hex {

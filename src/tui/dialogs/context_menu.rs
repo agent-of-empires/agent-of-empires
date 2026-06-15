@@ -160,14 +160,6 @@ impl ContextMenuDialog {
         &self.items
     }
 
-    /// Test-only accessor: returns the area the menu rendered into
-    /// last frame. Lets a cross-module test compute the row of a given
-    /// item without re-deriving the layout math.
-    #[cfg(test)]
-    pub fn last_area_for_test(&self) -> Rect {
-        self.last_area
-    }
-
     /// Returns true when `(col, row)` falls outside the last rendered area.
     /// Lets the mouse router close the menu on any click that isn't on it,
     /// matching the sidebar's web behavior in `WorkspaceSidebar.tsx`.

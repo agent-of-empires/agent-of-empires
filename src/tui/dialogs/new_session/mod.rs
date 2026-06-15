@@ -527,16 +527,6 @@ impl NewSessionDialog {
         self.group.value()
     }
 
-    #[cfg(test)]
-    pub fn profile_value(&self) -> &str {
-        &self.profile
-    }
-
-    /// Set whether hooks will be executed during session creation
-    pub fn set_has_hooks(&mut self, has_hooks: bool) {
-        self.has_hooks = has_hooks;
-    }
-
     /// Push a hook progress message into the dialog state
     pub fn push_hook_progress(&mut self, progress: HookProgress) {
         match progress {

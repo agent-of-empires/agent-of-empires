@@ -41,12 +41,6 @@ pub struct RateLimiter {
     failures: RwLock<HashMap<IpAddr, FailureRecord>>,
 }
 
-impl Default for RateLimiter {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl RateLimiter {
     pub fn new() -> Self {
         Self {

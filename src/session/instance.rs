@@ -1293,10 +1293,6 @@ impl Instance {
         self.parent_session_id.is_some()
     }
 
-    pub fn is_workspace(&self) -> bool {
-        self.workspace_info.is_some()
-    }
-
     pub fn is_sandboxed(&self) -> bool {
         self.sandbox_info.as_ref().is_some_and(|s| s.enabled)
     }

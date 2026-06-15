@@ -129,12 +129,6 @@ impl SessionTeeLayer {
     }
 }
 
-impl Default for SessionTeeLayer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl<S> Layer<S> for SessionTeeLayer
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
