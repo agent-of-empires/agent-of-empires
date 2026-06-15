@@ -943,9 +943,9 @@
     },
     {
       "id": "acp.history-window",
-      "kind": "vitest",
+      "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": ["src/lib/acpHistoryWindow.test.ts"],
+      "specs": ["tests/acp-history-window.spec.ts", "src/lib/acpHistoryWindow.test.ts"],
       "components": [
         "web/src/lib/acpHistoryWindow.ts",
         "web/src/components/acp/AcpRuntime.tsx",
