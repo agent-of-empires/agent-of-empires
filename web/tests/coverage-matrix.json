@@ -1958,6 +1958,13 @@
       "components": ["web/src/components/acp/StructuredView.tsx"]
     },
     {
+      "id": "acp.story.queue-recall-arrow",
+      "kind": "live-playwright",
+      "risk": "medium",
+      "specs": ["tests/live/acp-stories/queue-recall-arrow.spec.ts"],
+      "components": ["web/src/components/acp/Composer.tsx", "web/src/components/acp/StructuredView.tsx"]
+    },
+    {
       "id": "acp.story.composer-toolbar-insert",
       "kind": "vitest",
       "risk": "low",

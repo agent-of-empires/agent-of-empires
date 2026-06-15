@@ -498,6 +498,8 @@ function AcpChrome({
             pendingAttachments={pendingAttachments}
             setPendingAttachments={setPendingAttachments}
             primerPrefill={primerPrefill}
+            queuedPrompts={state.queuedPrompts}
+            editQueuedPrompt={editQueuedPrompt}
           />
         </div>
       </ThreadPrimitive.Root>
