@@ -281,6 +281,12 @@ export interface RepoGroup {
   workspaces: Workspace[];
   status: WorkspaceStatus;
   collapsed: boolean;
+  /** Registry entries (the "pin") for this repo path, keyed by normalized
+   *  path. Empty when the repo is not pinned. More than one entry means the
+   *  same path is registered under multiple scopes (global + profile); the
+   *  group is rendered pinned and unpin removes every entry. A group with
+   *  entries but no workspaces is a pinned-but-empty project. See #2047. */
+  registeredProjects: ProjectInfo[];
 }
 
 /** Workspace: a group of sessions sharing the same project + branch */
