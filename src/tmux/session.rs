@@ -44,13 +44,32 @@ pub struct PaneCursor {
     /// preview sync) resizing the window out from under it. Optional in
     /// the format line; parses as 0 when absent.
     pub pane_width: u16,
+    /// `#{alternate_on}`: the pane is on the alternate screen (a
+    /// full-screen / TUI app). The alternate screen has no scrollback, so
+    /// the live preview's capture-window scroll can't reach the app's own
+    /// history; the TUI forwards the wheel to the app instead. Optional in
+    /// the format line; parses as `false` when absent.
+    pub alternate_on: bool,
+    /// `#{mouse_any_flag}`: the foreground app has requested some mouse
+    /// tracking mode (it wants mouse events at all). Optional; parses as
+    /// `false`.
+    pub mouse_tracking: bool,
+    /// `#{mouse_sgr_flag}`: the app is in SGR (1006) mouse encoding, so it
+    /// will parse the `\e[<..M` wheel bytes the TUI forwards as a mouse
+    /// event rather than garbage keystrokes. The wheel is only forwarded
+    /// when BOTH this and `mouse_tracking` are set: `mouse_tracking` alone
+    /// can mean the legacy X10 encoding, which our SGR bytes would corrupt.
+    /// Optional; parses as `false`.
+    pub mouse_sgr: bool,
 }
 
 impl PaneCursor {
     /// Parse the single space-separated line emitted by the
     /// `#{cursor_x} #{cursor_y} #{cursor_flag} #{pane_height}
-    /// #{history_size} #{pane_width}` format. The trailing fields are
-    /// optional so an older four-field line still parses (as 0).
+    /// #{history_size} #{pane_width} #{alternate_on} #{mouse_any_flag}
+    /// #{mouse_sgr_flag}` format. The trailing fields are optional so an
+    /// older four-field line still parses (numeric fields as 0, flag
+    /// fields as `false`).
     fn parse(line: &str) -> Option<Self> {
         let mut fields = line.split_whitespace();
         let x = fields.next()?.parse().ok()?;
@@ -59,6 +78,9 @@ impl PaneCursor {
         let pane_height = fields.next()?.parse().ok()?;
         let history_size = fields.next().and_then(|f| f.parse().ok()).unwrap_or(0);
         let pane_width = fields.next().and_then(|f| f.parse().ok()).unwrap_or(0);
+        let alternate_on = fields.next().map(|f| f != "0").unwrap_or(false);
+        let mouse_tracking = fields.next().map(|f| f != "0").unwrap_or(false);
+        let mouse_sgr = fields.next().map(|f| f != "0").unwrap_or(false);
         Some(Self {
             x,
             y,
@@ -66,6 +88,9 @@ impl PaneCursor {
             pane_height,
             history_size,
             pane_width,
+            alternate_on,
+            mouse_tracking,
+            mouse_sgr,
         })
     }
 }
@@ -371,7 +396,7 @@ impl Session {
                 "-t",
                 &target,
                 "-F",
-                "#{cursor_x} #{cursor_y} #{cursor_flag} #{pane_height} #{history_size} #{pane_width}",
+                "#{cursor_x} #{cursor_y} #{cursor_flag} #{pane_height} #{history_size} #{pane_width} #{alternate_on} #{mouse_any_flag} #{mouse_sgr_flag}",
                 ";",
                 "capture-pane",
                 "-t",
@@ -756,7 +781,7 @@ mod tests {
 
     #[test]
     fn pane_cursor_parses_format_line() {
-        let c = PaneCursor::parse("3 2 1 24 120 74").expect("parses");
+        let c = PaneCursor::parse("3 2 1 24 120 74 1 1 1").expect("parses");
         assert_eq!(
             c,
             PaneCursor {
@@ -766,13 +791,29 @@ mod tests {
                 pane_height: 24,
                 history_size: 120,
                 pane_width: 74,
+                alternate_on: true,
+                mouse_tracking: true,
+                mouse_sgr: true,
             }
         );
+        // Legacy mouse (tracking on, SGR off) parses with mouse_sgr false.
+        let c = PaneCursor::parse("3 2 1 24 120 74 1 1 0").expect("parses");
+        assert!(c.mouse_tracking);
+        assert!(!c.mouse_sgr);
+        // The six-field (pre-alternate/mouse) line still parses, the new
+        // flags defaulting to false.
+        let c = PaneCursor::parse("3 2 1 24 120 74").expect("parses");
+        assert!(!c.alternate_on);
+        assert!(!c.mouse_tracking);
+        assert!(!c.mouse_sgr);
         // Four-field (pre-history) lines still parse, trailing fields 0.
         let c = PaneCursor::parse("3 2 0 24").expect("parses");
         assert!(!c.visible);
         assert_eq!(c.history_size, 0);
         assert_eq!(c.pane_width, 0);
+        assert!(!c.alternate_on);
+        assert!(!c.mouse_tracking);
+        assert!(!c.mouse_sgr);
         // cursor_flag 0 => hidden.
         assert!(!PaneCursor::parse("0 0 0 10").unwrap().visible);
         // Garbage / short input yields None rather than a bogus cursor.

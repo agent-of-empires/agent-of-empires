@@ -2881,6 +2881,9 @@ mod tests {
             pane_height,
             history_size: 0,
             pane_width: 0,
+            alternate_on: false,
+            mouse_tracking: false,
+            mouse_sgr: false,
         }
     }
 
