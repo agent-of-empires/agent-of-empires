@@ -391,7 +391,10 @@ pub struct RecentProjectsResponse {
 /// side-effect free.
 pub async fn get_recent_projects() -> Json<RecentProjectsResponse> {
     let projects = crate::session::load_recent_projects()
-        .unwrap_or_default()
+        .unwrap_or_else(|e| {
+            tracing::warn!(target: "http.api.sessions", "failed to load recent projects: {e}");
+            Vec::new()
+        })
         .into_iter()
         .filter(|p| std::path::Path::new(&p.path).is_dir())
         .collect();

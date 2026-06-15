@@ -2492,25 +2492,25 @@ impl HomeView {
 
         if let Some(result) = self.deletion_poller.try_recv_result() {
             if result.success {
-                // Keep the project in the new-session wizard Recent tab after
-                // its last session is deleted (#2141). Look it up before the
-                // remove; best-effort, never blocks the delete.
-                if let Some(entry) = self
+                // Captured before the remove (the instance is still in
+                // `self.instances`); recorded only after the deletion is
+                // durably saved, so a failed save leaves no tombstone (#2141).
+                let recent_entry = self
                     .instances
                     .iter()
                     .find(|i| i.id == result.session_id)
-                    .and_then(crate::session::recent_project_entry_for)
-                {
-                    if let Err(e) = crate::session::record_recent_project(entry) {
-                        tracing::warn!(target: "tui.home",
-                            "recording recent project after delete failed: {e}");
-                    }
-                }
+                    .and_then(crate::session::recent_project_entry_for);
                 self.remove_instance(&result.session_id);
                 self.rebuild_group_trees();
 
                 if let Err(e) = self.save() {
                     tracing::error!(target: "tui.home", "Failed to save after deletion: {}", e);
+                } else if let Some(entry) = recent_entry {
+                    // Best-effort; keeps the project in the wizard Recent tab.
+                    if let Err(e) = crate::session::record_recent_project(entry) {
+                        tracing::warn!(target: "tui.home",
+                            "recording recent project after delete failed: {e}");
+                    }
                 }
                 if let Err(e) = self.reload() {
                     tracing::warn!(target: "tui.home", "Failed to reload session state: {e}");
