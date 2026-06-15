@@ -174,6 +174,15 @@ fn hook_command(status: &str) -> String {
     hook_command_with_base(status, HOOK_STATUS_BASE)
 }
 
+/// Test-only shim exposing the canonical status-writer command bytes.
+/// Tests assert byte-for-byte equality between the command v015 wrote and
+/// what the live install path emits today (issue #1845 acceptance criterion
+/// #4). Cfg-gated so no production caller can grow up around it.
+#[cfg(test)]
+pub(crate) fn canonical_status_command(status: &str) -> String {
+    hook_command(status)
+}
+
 fn hook_command_with_base(status: &str, base: &str) -> String {
     // `[ -n ]` is load-bearing: `*[!...]*` does not match the empty
     // string. `exit 0` on rejection: a non-zero hook exit blocks the
@@ -208,6 +217,16 @@ fn hook_command_session_id(target: HookInstallTarget) -> String {
     }
 }
 
+/// Test-only shim exposing the canonical session-id-capture command bytes.
+/// Used by v015 tests to assert byte-equality on the session_id_capture
+/// branch of Claude's hook table; that branch emits a DIFFERENT command
+/// than `hook_command(status)` (no `case` allowlist guard, just a trailing
+/// `# aoe-hooks` marker), so a single-status canonicality check would miss it.
+#[cfg(test)]
+pub(crate) fn canonical_session_id_command(target: HookInstallTarget) -> String {
+    hook_command_session_id(target)
+}
+
 fn hook_command_session_id_host() -> String {
     format!(
         "sh -c '[ -n \"$AOE_INSTANCE_ID\" ] || exit 0; \
@@ -233,7 +252,7 @@ fn is_aoe_hook_command(cmd: &str) -> bool {
 
 /// Per-agent dispatch shape for the hook target enumerator. Each kind picks a
 /// different installer/uninstaller and a different marker-presence walker.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum HookTargetKind {
     /// Generic JSON settings (Claude/OpenCode/Cursor/Gemini/Qwen/Kiro):
     /// `hooks.<event>[].hooks[].command`.
@@ -250,6 +269,7 @@ pub(crate) enum HookTargetKind {
 ///
 /// Produced by [`iter_hook_targets`] (single source of truth for both
 /// `uninstall_all_hooks` and the v015 hook-rewrite migration).
+#[derive(Debug)]
 pub(crate) struct HookTarget {
     pub agent_name: &'static str,
     pub kind: HookTargetKind,
@@ -599,7 +619,19 @@ fn build_aoe_hooks(events: &[crate::agents::HookEvent], target: HookInstallTarge
     Value::Object(hooks_obj)
 }
 
-/// Remove any existing AoE hooks from an event's matcher array.
+/// Drops a matcher group only when EVERY hook in it is AoE-marked.
+/// A hand-merged user+AoE group is left intact, which means a stale
+/// pre-#1803 unhardened AoE entry inside a mixed group is NOT rewritten
+/// by v015 (which calls through `install_hooks` -> here). This is a
+/// documented limitation: distinguishing "legacy AoE in a mixed group"
+/// from "user copy-pasted an AoE-shaped hook into their own block" would
+/// require comparing against historical AoE bytes (multiple versions),
+/// which is more drift surface than the threat model warrants. The
+/// PR #1803 launch-gate validates `AOE_INSTANCE_ID` before any hook
+/// fires, so the unhardened command's blast radius is bounded.
+///
+/// Locked by `mixed_user_aoe_matcher_group_unchanged_documented_limitation`
+/// in `src/migrations/v015_rewrite_hook_strings.rs`.
 fn remove_aoe_entries(matchers: &mut Vec<Value>) {
     matchers.retain(|matcher| {
         let Some(hooks_arr) = matcher.get("hooks").and_then(|h| h.as_array()) else {

@@ -17,13 +17,21 @@
 //!
 //! ## Failure policy
 //!
-//! Per `AGENTS.md > Data Migrations`, a returned `Err` aborts boot. Per-file
-//! errors (parse failure, permission denied, lock contention, broken
-//! symlink) are therefore caught and logged at `tracing::warn!`; only
+//! Per `AGENTS.md > Data Migrations`, a returned `Err` aborts boot. Per-target
+//! failures are therefore caught and either silently skipped (parse-error
+//! gate, fails closed by design: see `crate::hooks::has_aoe_marker`) or
+//! logged at `tracing::warn!` (rewrite-stage failures: locked file,
+//! permission denied, broken symlink, transient I/O). Only
 //! `dirs::home_dir() == None` propagates as an aggregate failure. The
 //! migration's job is "reconcile what we own"; the schema version bumps
 //! after attempting all known paths regardless of partial-failure warnings,
 //! so a single corrupt file never blocks AoE boot indefinitely.
+//!
+//! Gate-stage parse errors are intentionally silent: a user with a
+//! persistently-corrupt config file would otherwise be warned on every AoE
+//! boot until they fix it, and we cannot prove the file is ours without
+//! parsing it. Rewrite-stage failures are warned because by then the gate
+//! has confirmed the file is AoE-owned.
 //!
 //! ## Known limitations
 //!
@@ -37,27 +45,52 @@
 //!
 //! ### Transient per-target failures are not retried
 //!
-//! A per-target failure (locked file, unexpected parse error, permission
-//! denied, broken symlink, transient I/O) is logged at `tracing::warn!` and
-//! the migration moves on. The schema version still bumps to 15, so v015
-//! runs at most once per install. To re-attempt for a specific agent after
-//! fixing the underlying condition, run
-//! `aoe uninstall && aoe add --cmd <agent>`: this re-invokes the install
-//! path on the current canonical bytes. There is no migration-level retry
-//! mechanism on purpose: a corrupt file that cannot be parsed must not
-//! block AoE boot indefinitely.
+//! A per-target rewrite failure (locked file, permission denied, broken
+//! symlink, transient I/O) is logged at `tracing::warn!` and the migration
+//! moves on. The schema version still bumps to 15, so v015 runs at most
+//! once per install. To re-attempt for a specific agent after fixing the
+//! underlying condition, run `aoe uninstall && aoe add --cmd <agent>`:
+//! this re-invokes the install path on the current canonical bytes. There
+//! is no migration-level retry mechanism on purpose: a corrupt file that
+//! cannot be parsed must not block AoE boot indefinitely.
 //!
-//! ### TOCTOU on non-Codex paths under concurrent uninstall
+//! ### TOCTOU on the gate path (all formats, including Codex)
 //!
-//! For JSON-settings and sidecar formats, the `has_aoe_marker` gate is
-//! read without a file lock; the subsequent `install_*` write is also
-//! unlocked. A concurrent `aoe uninstall` invocation during this
-//! once-per-upgrade migration run can resurrect just-uninstalled hooks.
-//! The race window is the few hundred ms of v015 execution; the
-//! user-visible recovery is re-running `aoe uninstall`. Codex paths are
-//! protected by the existing `with_codex_config_lock`. A defense-in-depth
-//! fix would lock all install/uninstall paths uniformly; tracked as a
-//! follow-up to this PR.
+//! `has_aoe_marker` is read without a file lock for every format. The
+//! subsequent rewrite path is locked only for Codex (via
+//! `with_codex_config_lock`); JSON-settings and sidecar formats run
+//! unlocked end-to-end. Concurrent racers fall into three windows:
+//!
+//! 1. **Gate -> write.** A concurrent `aoe uninstall` between gate read
+//!    and rewrite-path entry can resurrect just-uninstalled hooks. All
+//!    formats.
+//! 2. **Codex snapshot -> install gap.** `rewrite_one` for Codex calls
+//!    `snapshot_codex_hooks_state` (acquires the lock, reads state, drops
+//!    the lock) and then `install_codex_hooks_with_preserved_state`
+//!    (re-acquires the lock to write). A concurrent locked writer in
+//!    between can lose state added in that gap.
+//! 3. **JSON / sidecar gate-vs-write.** No lock in the migration path or
+//!    the live install path. Same TOCTOU as (1), no Codex-style mitigation.
+//!
+//! User-visible recovery for any of these: re-run `aoe uninstall` (or
+//! `aoe add --cmd <agent>` for re-install). The race window is the few
+//! hundred ms of v015 execution; this is a once-per-upgrade migration. A
+//! defense-in-depth fix would gate the marker check inside the same lock
+//! used for the rewrite (and add equivalent locks for JSON and sidecar
+//! installers); tracked as a follow-up to this PR.
+//!
+//! ### Mixed user+AoE matcher groups
+//!
+//! When a user has hand-merged a single matcher group containing BOTH
+//! their own hook and a legacy AoE hook, v015 leaves that group untouched
+//! (`remove_aoe_entries` only drops a matcher group when every hook in it
+//! is AoE) and appends a fresh AoE-only matcher group with the hardened
+//! command. Result: the legacy unhardened bytes persist alongside a fresh
+//! hardened entry, both firing per event. Hardening is partially achieved
+//! (the new group is hardened); the legacy bytes' defense-in-depth gap is
+//! bounded by PR #1803's host-side `AOE_INSTANCE_ID` validator in
+//! `Instance::start_with_size_opts`. Closing this requires in-place
+//! string rewrite inside non-AoE matcher groups; tracked as a follow-up.
 
 use anyhow::Result;
 use std::fs;
@@ -144,10 +177,13 @@ fn rewrite_one(target: &HookTarget) -> Result<()> {
 }
 
 /// Migration-local env-list reader. Intentionally does NOT share code with
-/// `crate::hooks::collect_env_lists_from_session`: that path goes through
-/// `Config::load()`, which has side effects (e.g. v008 default-profile
-/// lock-in) we cannot incur during early-boot migration execution. If the
-/// `environment` schema key is renamed, both sites must update.
+/// `crate::hooks::collect_env_lists_from_session`: migrations run before
+/// the running AoE process is committed to the current `Config` schema,
+/// so we deliberately avoid `Config::load()` here and read the
+/// `environment` array directly from each on-disk TOML. This keeps the
+/// migration's coupling to the rest of the session module minimal and
+/// makes the function trivially home-injectable for tests via `app_dir`.
+/// If the `environment` schema key is renamed, both sites must update.
 fn collect_env_lists(app_dir: &Path) -> Vec<Vec<String>> {
     let mut out = Vec::new();
     if let Some(env) = read_environment_from_toml(&app_dir.join("config.toml")) {
@@ -182,7 +218,6 @@ fn read_environment_from_toml(path: &Path) -> Option<Vec<String>> {
 mod tests {
     use super::*;
     use serde_json::Value;
-    use serial_test::serial;
     use std::fs;
     use tempfile::TempDir;
 
@@ -245,8 +280,60 @@ mod tests {
         fs::write(path, serde_json::to_string_pretty(value).unwrap()).unwrap();
     }
 
+    /// Walk every AoE-marked command in a Claude-shape settings file and
+    /// assert it is byte-equal to the canonical bytes the live install path
+    /// emits today for that `(event, status, session_id_capture)` tuple.
+    /// Closes issue #1845 acceptance criterion #4: rewritten files match
+    /// the current emitter byte-for-byte for aoe-managed lines, not just
+    /// "contains the hardened guard substring."
+    fn assert_claude_canonical(claude: &Path) {
+        use crate::hooks::{
+            canonical_session_id_command, canonical_status_command, HookInstallTarget,
+        };
+        let parsed: Value = serde_json::from_str(&fs::read_to_string(claude).unwrap()).unwrap();
+        let hooks = parsed["hooks"].as_object().expect("hooks present");
+        let claude_events = crate::agents::AGENTS
+            .iter()
+            .find(|a| a.name == "claude")
+            .and_then(|a| a.hook_config.as_ref())
+            .map(|hc| hc.events)
+            .expect("Claude must declare hook_config");
+        for (event_name, matchers) in hooks {
+            let Some(arr) = matchers.as_array() else {
+                continue;
+            };
+            for matcher in arr {
+                let Some(hooks_arr) = matcher["hooks"].as_array() else {
+                    continue;
+                };
+                for hook in hooks_arr {
+                    let cmd = hook["command"].as_str().unwrap_or_default();
+                    if !cmd.contains("aoe-hooks") {
+                        continue;
+                    }
+                    let event_def = claude_events
+                        .iter()
+                        .find(|e| e.name == event_name)
+                        .unwrap_or_else(|| panic!("unknown Claude event: {event_name}"));
+                    let mut canonical_set: Vec<String> = Vec::new();
+                    if event_def.session_id_capture {
+                        canonical_set.push(canonical_session_id_command(HookInstallTarget::Host));
+                    }
+                    if let Some(status) = event_def.status {
+                        canonical_set.push(canonical_status_command(status));
+                    }
+                    assert!(
+                        canonical_set.iter().any(|c| c == cmd),
+                        "non-canonical AoE command on {event_name}: \
+                         got {cmd:?}, expected one of {canonical_set:?}",
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
-    #[serial]
+    #[serial_test::serial(shell_env)]
     fn claude_legacy_settings_rewritten_user_preserved() {
         let _g = EnvGuard::unset_all();
         let (_tmp, home, app_dir) = setup_dirs();
@@ -274,21 +361,16 @@ mod tests {
         let pre_tool = content["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(pre_tool[0]["matcher"], "Bash");
         assert_eq!(pre_tool[0]["hooks"][0]["command"], "echo user-hook");
-        let aoe_cmd = pre_tool
-            .iter()
-            .filter_map(|m| m["hooks"].as_array())
-            .flatten()
-            .filter_map(|h| h["command"].as_str())
-            .find(|c| c.contains("aoe-hooks"))
-            .expect("AoE entry must be present after rewrite");
-        assert!(
-            aoe_cmd.contains("case \"$AOE_INSTANCE_ID\""),
-            "rewritten AoE command must carry the PR #1803 allowlist guard"
-        );
+        // Byte-for-byte canonical-bytes check (issue #1845 acceptance #4)
+        // walks every AoE-marked command across every event written into
+        // the file and asserts equality with the live install path's
+        // canonical output. This catches wrong-status, wrong-shape, and
+        // wrong-agent-bytes regressions that a substring check would miss.
+        assert_claude_canonical(&claude);
     }
 
     #[test]
-    #[serial]
+    #[serial_test::serial(shell_env)]
     fn claude_no_marker_untouched() {
         let _g = EnvGuard::unset_all();
         let (_tmp, home, app_dir) = setup_dirs();
@@ -315,8 +397,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
-    fn claude_idempotent_byte_identical() {
+    #[serial_test::serial(shell_env)]
+    fn claude_idempotent_byte_identical_and_canonical() {
         let _g = EnvGuard::unset_all();
         let (_tmp, home, app_dir) = setup_dirs();
         let claude = home.join(".claude/settings.json");
@@ -331,6 +413,12 @@ mod tests {
 
         run_in(&home, &app_dir).unwrap();
         let after_first = fs::read(&claude).unwrap();
+
+        // Post-run-1 must be canonical: catches the `{}` regression where
+        // run-2 sees no marker and skips, leaving run1==run2 byte-equal on
+        // a totally broken output.
+        assert_claude_canonical(&claude);
+
         run_in(&home, &app_dir).unwrap();
         let after_second = fs::read(&claude).unwrap();
 
@@ -338,15 +426,30 @@ mod tests {
         // alphabetical order (BTreeMap-backed). If serde_json gains a
         // `preserve_order` default, switch this to a parsed-Value equality.
         assert_eq!(after_first, after_second, "v015 must be byte-idempotent");
+
+        // Post-run-2 also canonical: catches the failure mode where
+        // idempotency holds but on the wrong fixed point.
+        assert_claude_canonical(&claude);
     }
 
     #[test]
-    #[serial]
-    fn mixed_user_aoe_matcher_group_unchanged_documented_limitation() {
-        // remove_aoe_entries drops a matcher group only when *every* hook in
-        // it is AoE; a hand-merged user+AoE group is left intact, so the AoE
-        // entry inside is NOT rewritten. This test locks that contract so a
-        // future change to remove_aoe_entries deliberately reconsiders it.
+    #[serial_test::serial(shell_env)]
+    fn mixed_user_aoe_matcher_group_documents_double_firing() {
+        // CONTRACT: when a user has hand-merged a matcher group containing
+        // BOTH their own hook and a legacy AoE hook, v015 leaves the mixed
+        // group unchanged (`remove_aoe_entries` drops a matcher group only
+        // when every hook in it is AoE) AND appends a fresh AoE-only matcher
+        // group with the hardened command. The user's PreToolUse therefore
+        // fires the AoE status hook TWICE per event: once from the legacy
+        // unhardened command, once from the fresh hardened command.
+        //
+        // This is a known limitation of the v015 reuse-the-install-path
+        // strategy. The hardening goal is partially met (the new group has
+        // the PR #1803 guard); the legacy bytes' defense-in-depth gap is
+        // bounded by the host-side `AOE_INSTANCE_ID` validator in
+        // `Instance::start_with_size_opts` (PR #1803). Closing this fully
+        // requires walking the JSON to replace AoE command strings in-place
+        // inside non-AoE matcher groups; tracked as a follow-up.
         let _g = EnvGuard::unset_all();
         let (_tmp, home, app_dir) = setup_dirs();
         let claude = home.join(".claude/settings.json");
@@ -362,16 +465,23 @@ mod tests {
                 }]}
             }),
         );
-        let before = fs::read(&claude).unwrap();
 
         run_in(&home, &app_dir).unwrap();
 
-        // The mixed group survives unchanged in PreToolUse; v015 may still
-        // *append* canonical AoE matcher groups for other events that lacked
-        // any prior AoE entry. Assert: PreToolUse still has the original
-        // mixed group at index 0, byte-identical.
         let after: Value = serde_json::from_str(&fs::read_to_string(&claude).unwrap()).unwrap();
         let pre_tool = after["hooks"]["PreToolUse"].as_array().unwrap();
+
+        // (1) Two matcher groups: the original mixed group at index 0 PLUS
+        // a fresh canonical AoE-only group at index >= 1. This explicitly
+        // locks the double-firing behaviour.
+        assert!(
+            pre_tool.len() >= 2,
+            "v015 must APPEND a fresh canonical AoE matcher block alongside \
+             the legacy mixed group; got {} matcher block(s)",
+            pre_tool.len(),
+        );
+
+        // (2) The mixed group at index 0 is byte-identical to its input shape.
         let mixed = &pre_tool[0];
         assert_eq!(mixed["matcher"], "Bash");
         let inner = mixed["hooks"].as_array().unwrap();
@@ -379,15 +489,31 @@ mod tests {
         assert_eq!(inner[0]["command"], "echo user");
         assert_eq!(
             inner[1]["command"], LEGACY_STATUS_CMD,
-            "AoE entry inside a mixed group must NOT be rewritten (existing contract)"
+            "legacy AoE bytes inside the mixed group are NOT rewritten",
         );
-        // sanity: the file *was* changed (other events got fresh AoE blocks),
-        // so this test is meaningful even though the mixed group was preserved.
-        assert_ne!(fs::read(&claude).unwrap(), before);
+
+        // (3) Some subsequent matcher group (index >= 1) carries a fresh
+        // canonical hardened AoE entry. This locks the dual invariant: the
+        // legacy entry is preserved AND v015 still installs the current
+        // canonical bytes adjacent to it (so live status detection works
+        // for the next session).
+        use crate::hooks::canonical_status_command;
+        let canonical_running = canonical_status_command("running");
+        let found_hardened = pre_tool.iter().skip(1).any(|m| {
+            m["hooks"].as_array().is_some_and(|arr| {
+                arr.iter()
+                    .any(|h| h["command"].as_str() == Some(canonical_running.as_str()))
+            })
+        });
+        assert!(
+            found_hardened,
+            "v015 must append a fresh canonical AoE matcher block alongside \
+             the legacy mixed group: {pre_tool:#?}",
+        );
     }
 
     #[test]
-    #[serial]
+    #[serial_test::serial(shell_env)]
     fn codex_state_preserved_across_rewrite() {
         let _g = EnvGuard::unset_all();
         let (_tmp, home, app_dir) = setup_dirs();
@@ -423,7 +549,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial_test::serial(shell_env)]
     fn codex_features_hooks_false_skipped() {
         let _g = EnvGuard::unset_all();
         let (_tmp, home, app_dir) = setup_dirs();
@@ -456,10 +582,25 @@ mod tests {
             !text.contains("case \"$AOE_INSTANCE_ID\""),
             "no hardening must be applied when feature is disabled"
         );
+        // Lock file IS acquired even when features.hooks=false:
+        // `with_codex_config_lock` opens the .toml.lock sidecar with
+        // `O_CREAT` BEFORE running its closure, and the feature gate
+        // (`codex_hooks_feature_is_disabled`) runs INSIDE the closure on
+        // the parsed document. Lock the existing behaviour so a future
+        // refactor that relaxes this invariant has to reconsider the
+        // TOCTOU windows documented in the module's Known Limitations.
+        let lock_path = codex.with_extension("toml.lock");
+        assert!(
+            lock_path.exists(),
+            "Codex lock sidecar is acquired unconditionally during snapshot \
+             (snapshot_codex_hooks_state takes the lock without checking \
+             features.hooks); if you are about to relax this, also update \
+             the TOCTOU note in v015's module doc",
+        );
     }
 
     #[test]
-    #[serial]
+    #[serial_test::serial(shell_env)]
     fn settl_marker_only_rewrites_aoe_lines() {
         let _g = EnvGuard::unset_all();
         let (_tmp, home, app_dir) = setup_dirs();
@@ -500,7 +641,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial_test::serial(shell_env)]
     fn hermes_config_and_allowlist_both_rewritten() {
         let _g = EnvGuard::unset_all();
         let (_tmp, home, app_dir) = setup_dirs();
@@ -533,7 +674,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial_test::serial(shell_env)]
     fn hermes_allowlist_approved_at_preserved_on_idempotency() {
         let _g = EnvGuard::unset_all();
         let (_tmp, home, app_dir) = setup_dirs();
@@ -590,7 +731,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial_test::serial(shell_env)]
     fn kiro_rewrite_preserves_extra_keys() {
         let _g = EnvGuard::unset_all();
         let (_tmp, home, app_dir) = setup_dirs();
@@ -631,7 +772,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial_test::serial(shell_env)]
     fn missing_files_noop() {
         let _g = EnvGuard::unset_all();
         let (_tmp, home, app_dir) = setup_dirs();
@@ -648,8 +789,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
-    fn malformed_json_warn_and_skip() {
+    #[serial_test::serial(shell_env)]
+    fn malformed_json_gate_fails_closed_silently() {
         let _g = EnvGuard::unset_all();
         let (_tmp, home, app_dir) = setup_dirs();
         let claude = home.join(".claude/settings.json");
@@ -666,8 +807,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
-    fn malformed_toml_warn_and_skip() {
+    #[serial_test::serial(shell_env)]
+    fn malformed_toml_gate_fails_closed_silently() {
         let _g = EnvGuard::unset_all();
         let (_tmp, home, app_dir) = setup_dirs();
         let settl = home.join(".settl/config.toml");
@@ -684,7 +825,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial_test::serial(shell_env)]
     fn profile_codex_home_path_is_rewritten() {
         let _g = EnvGuard::unset_all();
         let (_tmp, home, app_dir) = setup_dirs();
@@ -728,7 +869,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial_test::serial(shell_env)]
     fn profile_claude_config_dir_path_is_rewritten() {
         let _g = EnvGuard::unset_all();
         let (_tmp, home, app_dir) = setup_dirs();
@@ -779,8 +920,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
-    fn malformed_yaml_warn_and_skip() {
+    #[serial_test::serial(shell_env)]
+    fn malformed_yaml_gate_fails_closed_silently() {
         let _g = EnvGuard::unset_all();
         let (_tmp, home, app_dir) = setup_dirs();
         let hermes = home.join(".hermes/config.yaml");

@@ -45,6 +45,7 @@ pub enum ResumeStrategy {
 }
 
 /// A single hook event that AoE registers in an agent's settings file.
+#[derive(Debug)]
 pub struct HookEvent {
     /// Event name as the agent expects it (e.g. `"PreToolUse"` for Claude Code).
     pub name: &'static str,
@@ -59,6 +60,7 @@ pub struct HookEvent {
 }
 
 /// Configuration for installing status-detection hooks into an agent's settings file.
+#[derive(Debug)]
 pub struct AgentHookConfig {
     /// Path relative to the home dir where the agent's settings live
     /// (e.g. `.claude/settings.json`).
@@ -80,6 +82,7 @@ pub struct AgentHookConfig {
 /// call site (`status_hook_env_prefix`, host install, sandbox install,
 /// `uninstall_all_hooks`) dispatch through one field instead of matching agent
 /// names. An agent has at most one of `hook_config` or `sidecar_hooks`.
+#[derive(Debug)]
 pub struct SidecarHooks {
     /// Config path relative to the home directory for a host session
     /// (e.g. `.hermes/config.yaml`).
