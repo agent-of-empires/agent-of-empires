@@ -3423,11 +3423,11 @@ impl HomeView {
                 }
             }
             ContextMenuAction::NewSession => self.open_new_session_dialog(),
-            // The right-click already moved the cursor onto the group row, so
-            // reuse the "new from selection" path: with a group selected it
-            // prefills the project's repo path (and group) the same way `'N'`
-            // does on a session.
-            ContextMenuAction::NewFromGroup => self.open_new_from_selection(),
+            // The right-click already moved the cursor onto the row, so reuse
+            // the "new from selection" path: a session row prefills its own repo
+            // path and group, a group/project row borrows a member's path, the
+            // same way `'N'` does.
+            ContextMenuAction::NewFromSelection => self.open_new_from_selection(),
             ContextMenuAction::OpenSortPicker => self.show_sort_picker(),
             ContextMenuAction::OpenGroupPicker => self.show_group_picker(),
             ContextMenuAction::TogglePin => {

@@ -4018,12 +4018,12 @@ fn test_group_context_menu_new_session_prefills_path() {
 
     // The group right-click menu's "New Session" routes here.
     env.view
-        .dispatch_context_menu_action(ContextMenuAction::NewFromGroup);
+        .dispatch_context_menu_action(ContextMenuAction::NewFromSelection);
     let dialog = env
         .view
         .new_dialog
         .as_ref()
-        .expect("NewFromGroup should open the new-session dialog");
+        .expect("NewFromSelection should open the new-session dialog");
     assert_eq!(dialog.path_value(), "/tmp/work");
     assert_eq!(dialog.group_value(), "work");
 }
@@ -4046,7 +4046,7 @@ fn test_group_context_menu_new_session_shows_no_agents_without_tools() {
     env.view.update_selected();
 
     env.view
-        .dispatch_context_menu_action(ContextMenuAction::NewFromGroup);
+        .dispatch_context_menu_action(ContextMenuAction::NewFromSelection);
     assert!(
         env.view.new_dialog.is_none(),
         "no agents means the new-session form must not open"
@@ -4079,17 +4079,54 @@ fn test_group_context_menu_new_session_prefills_path_in_project_mode() {
     env.view.update_selected();
 
     env.view
-        .dispatch_context_menu_action(ContextMenuAction::NewFromGroup);
+        .dispatch_context_menu_action(ContextMenuAction::NewFromSelection);
     let dialog = env
         .view
         .new_dialog
         .as_ref()
-        .expect("NewFromGroup should open the new-session dialog");
+        .expect("NewFromSelection should open the new-session dialog");
     assert_eq!(
         dialog.path_value(),
         "/tmp/work",
         "project-mode prefill should borrow the member repo path"
     );
+}
+
+#[test]
+#[serial]
+fn test_session_context_menu_new_session_prefills_from_session() {
+    use crate::tui::dialogs::ContextMenuAction;
+
+    let mut env = create_test_env_with_groups();
+
+    // Move cursor onto the "work-project" session row, as a right-click would.
+    let target_id = env
+        .view
+        .instances
+        .iter()
+        .find(|i| i.repo_path() == "/tmp/work")
+        .map(|i| i.id.clone())
+        .expect("work-project instance should exist");
+    let session_idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|item| matches!(item, Item::Session { id, .. } if *id == target_id))
+        .expect("work-project session row should exist in flat_items");
+    env.view.cursor = session_idx;
+    env.view.update_selected();
+
+    // The session right-click menu's "New Session" routes here, prefilling the
+    // dialog from the right-clicked session's repo path and group (issue #2023).
+    env.view
+        .dispatch_context_menu_action(ContextMenuAction::NewFromSelection);
+    let dialog = env
+        .view
+        .new_dialog
+        .as_ref()
+        .expect("NewFromSelection should open the new-session dialog");
+    assert_eq!(dialog.path_value(), "/tmp/work");
+    assert_eq!(dialog.group_value(), "work");
 }
 
 #[test]
@@ -11421,7 +11458,7 @@ mod right_click_context_menu {
             .context_menu
             .as_ref()
             .expect("context_menu should be open");
-        assert_eq!(menu.selected_action(), ContextMenuAction::Rename);
+        assert_eq!(menu.selected_action(), ContextMenuAction::NewFromSelection);
         // The selected item is a session, not a group.
         assert!(matches!(
             env.view.flat_items[env.view.cursor],
@@ -11469,7 +11506,8 @@ mod right_click_context_menu {
         setup_inner(&mut env);
         env.view.handle_right_click(5, 1);
         assert!(env.view.context_menu.is_some());
-        // First item is Rename; Enter submits it.
+        // First item is New Session; Rename is one Down away. Enter submits it.
+        env.view.handle_key(key(KeyCode::Down), None);
         env.view.handle_key(key(KeyCode::Enter), None);
         assert!(
             env.view.context_menu.is_none(),
@@ -11486,11 +11524,12 @@ mod right_click_context_menu {
     fn down_then_enter_in_menu_opens_delete_dialog() {
         let mut env = create_test_env_with_sessions(2);
         setup_inner(&mut env);
-        // Attention sort surfaces the full session menu (Rename / Archive /
-        // Snooze / Delete), so Delete is three Downs away.
+        // Attention sort surfaces the full session menu (New Session / Rename /
+        // Archive / Snooze / Delete), so Delete is four Downs away.
         env.view.sort_order = SortOrder::Attention;
         env.view.flat_items = env.view.build_flat_items();
         env.view.handle_right_click(5, 1);
+        env.view.handle_key(key(KeyCode::Down), None);
         env.view.handle_key(key(KeyCode::Down), None);
         env.view.handle_key(key(KeyCode::Down), None);
         env.view.handle_key(key(KeyCode::Down), None);
@@ -11514,9 +11553,9 @@ mod right_click_context_menu {
         assert!(env.view.unified_delete_dialog.is_none());
     }
 
-    /// Right-click a session, pick the Archive item (Rename -> Archive is one
-    /// Down), and the row gets archived through the same `z` codepath. No
-    /// follow-up dialog: archiving is immediate.
+    /// Right-click a session, pick the Archive item (New Session -> Rename ->
+    /// Archive is two Downs), and the row gets archived through the same `z`
+    /// codepath. No follow-up dialog: archiving is immediate.
     #[test]
     #[serial]
     fn right_click_archive_action_archives_session() {
@@ -11529,6 +11568,7 @@ mod right_click_context_menu {
             "precondition: session starts unarchived"
         );
 
+        env.view.handle_key(key(KeyCode::Down), None); // New Session -> Rename
         env.view.handle_key(key(KeyCode::Down), None); // Rename -> Archive
         env.view.handle_key(key(KeyCode::Enter), None);
 
@@ -11573,9 +11613,10 @@ mod right_click_context_menu {
             .map(|(_, l)| *l)
             .collect();
         // Default sort here is Newest, where Snooze is gated out, so the
-        // archived-row menu is just Rename / Unarchive / Delete.
-        assert_eq!(labels, vec!["Rename", "Unarchive", "Delete"]);
+        // archived-row menu is just New Session / Rename / Unarchive / Delete.
+        assert_eq!(labels, vec!["New Session", "Rename", "Unarchive", "Delete"]);
 
+        env.view.handle_key(key(KeyCode::Down), None); // New Session -> Rename
         env.view.handle_key(key(KeyCode::Down), None); // Rename -> Unarchive
         env.view.handle_key(key(KeyCode::Enter), None);
         assert!(
@@ -11848,18 +11889,22 @@ mod right_click_context_menu {
 
     #[test]
     #[serial]
-    fn session_menu_n_hotkey_is_inert() {
-        // Sanity: the session-row menu only has Rename/Delete actions,
-        // so 'n' must NOT submit NewSession when the wrong menu is open.
-        // This proves the hotkey gate (action must be in items) holds.
+    fn session_menu_n_hotkey_opens_new_session() {
+        // The session-row menu now carries a New Session entry (issue #2023),
+        // so 'n' submits NewFromSelection just like the group/project menus,
+        // closing the menu and opening the new-session dialog prefilled from
+        // the right-clicked session.
         let mut env = create_test_env_with_sessions(2);
         setup_inner(&mut env);
         env.view.handle_right_click(5, 1); // row 1 = first session
         send_key(&mut env, crossterm::event::KeyCode::Char('n'));
-        assert!(env.view.context_menu.is_some(), "menu should stay open");
         assert!(
-            env.view.new_dialog.is_none(),
-            "n on session menu must not open new-session"
+            env.view.context_menu.is_none(),
+            "menu should close on submit"
+        );
+        assert!(
+            env.view.new_dialog.is_some(),
+            "n on session menu must open the new-session dialog"
         );
     }
 }

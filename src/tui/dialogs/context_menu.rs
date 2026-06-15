@@ -21,10 +21,11 @@ pub enum ContextMenuAction {
     ToggleSnooze,
     /// Open the new-session dialog (mirrors the `'n'` hotkey).
     NewSession,
-    /// Open the new-session dialog prefilled from the right-clicked
-    /// project/group (mirrors `'N'` "new from selection" on a group),
+    /// Open the new-session dialog prefilled from the right-clicked row
+    /// (mirrors `'N'` "new from selection"): a session row inherits its
+    /// repo path and group, a project/group row borrows a member's path,
     /// so the mouse path matches the web sidebar's per-project "+".
-    NewFromGroup,
+    NewFromSelection,
     /// Open the sort-order picker (mirrors `'o'`).
     OpenSortPicker,
     /// Open the group-by mode picker (mirrors `'g'`).
@@ -80,6 +81,7 @@ impl ContextMenuDialog {
     pub fn for_session(anchor: (u16, u16), is_archived: bool, snooze: Option<bool>) -> Self {
         let archive_label = if is_archived { "Unarchive" } else { "Archive" };
         let mut items = vec![
+            (ContextMenuAction::NewFromSelection, "New Session"),
             (ContextMenuAction::Rename, "Rename"),
             (ContextMenuAction::ToggleArchive, archive_label),
         ];
@@ -95,7 +97,7 @@ impl ContextMenuDialog {
         Self::new(
             anchor,
             vec![
-                (ContextMenuAction::NewFromGroup, "New Session"),
+                (ContextMenuAction::NewFromSelection, "New Session"),
                 (ContextMenuAction::Rename, "Rename Group"),
                 (ContextMenuAction::Delete, "Delete Group"),
             ],
@@ -117,7 +119,7 @@ impl ContextMenuDialog {
         Self::new(
             anchor,
             vec![
-                (ContextMenuAction::NewFromGroup, "New Session"),
+                (ContextMenuAction::NewFromSelection, "New Session"),
                 (ContextMenuAction::TogglePin, pin_label),
             ],
         )
@@ -158,6 +160,14 @@ impl ContextMenuDialog {
     #[cfg(test)]
     pub fn items_for_test(&self) -> &[(ContextMenuAction, &'static str)] {
         &self.items
+    }
+
+    /// Test-only accessor: returns the area the menu rendered into
+    /// last frame. Lets a cross-module test compute the row of a given
+    /// item without re-deriving the layout math.
+    #[cfg(test)]
+    pub fn last_area_for_test(&self) -> Rect {
+        self.last_area
     }
 
     /// Returns true when `(col, row)` falls outside the last rendered area.
@@ -239,16 +249,16 @@ impl ContextMenuDialog {
                     'z' | 'Z' => Some(ContextMenuAction::ToggleArchive),
                     'h' | 'H' => Some(ContextMenuAction::ToggleSnooze),
                     // `n` opens a new session from whichever new-session entry
-                    // the current menu carries: the group/project menu prefills
-                    // from the row (NewFromGroup), the empty-sidebar menu opens
-                    // a blank one (NewSession).
+                    // the current menu carries: the session/group/project menu
+                    // prefills from the row (NewFromSelection), the empty-sidebar
+                    // menu opens a blank one (NewSession).
                     'n' | 'N' => {
                         if self
                             .items
                             .iter()
-                            .any(|(item, _)| *item == ContextMenuAction::NewFromGroup)
+                            .any(|(item, _)| *item == ContextMenuAction::NewFromSelection)
                         {
-                            Some(ContextMenuAction::NewFromGroup)
+                            Some(ContextMenuAction::NewFromSelection)
                         } else {
                             Some(ContextMenuAction::NewSession)
                         }
@@ -341,14 +351,14 @@ mod tests {
     }
 
     #[test]
-    fn session_menu_starts_on_rename() {
+    fn session_menu_starts_on_new_session() {
         let menu = ContextMenuDialog::for_session((0, 0), false, Some(false));
-        assert_eq!(menu.selected_action(), ContextMenuAction::Rename);
+        assert_eq!(menu.selected_action(), ContextMenuAction::NewFromSelection);
     }
 
     #[test]
-    fn down_then_enter_selects_toggle_archive() {
-        // Rename -> ToggleArchive is one Down in the 3-item session menu.
+    fn down_then_enter_selects_rename() {
+        // NewFromSelection -> Rename is one Down in the session menu.
         let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false));
         assert!(matches!(
             menu.handle_key(key(KeyCode::Down)),
@@ -357,14 +367,16 @@ mod tests {
         let result = menu.handle_key(key(KeyCode::Enter));
         assert!(matches!(
             result,
-            DialogResult::Submit(ContextMenuAction::ToggleArchive)
+            DialogResult::Submit(ContextMenuAction::Rename)
         ));
     }
 
     #[test]
-    fn down_twice_then_enter_selects_snooze() {
-        // Rename -> Archive -> Snooze is two Downs in the 4-item session menu.
+    fn down_thrice_then_enter_selects_snooze() {
+        // NewSession -> Rename -> Archive -> Snooze is three Downs in the
+        // 5-item session menu.
         let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false));
+        menu.handle_key(key(KeyCode::Down));
         menu.handle_key(key(KeyCode::Down));
         menu.handle_key(key(KeyCode::Down));
         let result = menu.handle_key(key(KeyCode::Enter));
@@ -375,8 +387,9 @@ mod tests {
     }
 
     #[test]
-    fn down_thrice_then_enter_selects_delete() {
+    fn down_four_times_then_enter_selects_delete() {
         let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false));
+        menu.handle_key(key(KeyCode::Down));
         menu.handle_key(key(KeyCode::Down));
         menu.handle_key(key(KeyCode::Down));
         menu.handle_key(key(KeyCode::Down));
@@ -398,7 +411,7 @@ mod tests {
         assert_eq!(
             items,
             vec![
-                (ContextMenuAction::NewFromGroup, "New Session"),
+                (ContextMenuAction::NewFromSelection, "New Session"),
                 (ContextMenuAction::Rename, "Rename Group"),
                 (ContextMenuAction::Delete, "Delete Group"),
             ]
@@ -406,21 +419,21 @@ mod tests {
     }
 
     #[test]
-    fn n_hotkey_in_group_menu_submits_new_from_group() {
+    fn n_hotkey_in_group_menu_submits_new_from_selection() {
         let mut menu = ContextMenuDialog::for_group((0, 0));
         // Pre-select Delete to prove the hotkey wins over the cursor.
         menu.handle_key(key(KeyCode::Up));
         let result = menu.handle_key(key(KeyCode::Char('n')));
         assert!(matches!(
             result,
-            DialogResult::Submit(ContextMenuAction::NewFromGroup)
+            DialogResult::Submit(ContextMenuAction::NewFromSelection)
         ));
     }
 
     #[test]
     fn n_hotkey_in_empty_sidebar_menu_submits_new_session() {
         // The empty-sidebar menu carries the blank NewSession entry, so `n`
-        // must resolve there and never to the group-scoped NewFromGroup.
+        // must resolve there and never to the row-scoped NewFromSelection.
         let mut menu = ContextMenuDialog::for_empty_sidebar((0, 0));
         let result = menu.handle_key(key(KeyCode::Char('n')));
         assert!(matches!(
@@ -433,29 +446,51 @@ mod tests {
     fn archived_session_menu_labels_unarchive() {
         let menu = ContextMenuDialog::for_session((0, 0), true, Some(false));
         let labels: Vec<&str> = menu.items_for_test().iter().map(|(_, l)| *l).collect();
-        assert_eq!(labels, vec!["Rename", "Unarchive", "Snooze", "Delete"]);
+        assert_eq!(
+            labels,
+            vec!["New Session", "Rename", "Unarchive", "Snooze", "Delete"]
+        );
     }
 
     #[test]
     fn snoozed_session_menu_labels_unsnooze() {
         let menu = ContextMenuDialog::for_session((0, 0), false, Some(true));
         let labels: Vec<&str> = menu.items_for_test().iter().map(|(_, l)| *l).collect();
-        assert_eq!(labels, vec!["Rename", "Archive", "Unsnooze", "Delete"]);
+        assert_eq!(
+            labels,
+            vec!["New Session", "Rename", "Archive", "Unsnooze", "Delete"]
+        );
     }
 
     #[test]
-    fn active_session_menu_lists_all_four_actions() {
+    fn active_session_menu_lists_all_five_actions() {
         let menu = ContextMenuDialog::for_session((0, 0), false, Some(false));
         let items: Vec<ContextMenuAction> = menu.items_for_test().iter().map(|(a, _)| *a).collect();
         assert_eq!(
             items,
             vec![
+                ContextMenuAction::NewFromSelection,
                 ContextMenuAction::Rename,
                 ContextMenuAction::ToggleArchive,
                 ContextMenuAction::ToggleSnooze,
                 ContextMenuAction::Delete,
             ]
         );
+    }
+
+    #[test]
+    fn n_hotkey_in_session_menu_submits_new_from_selection() {
+        // The session menu carries the prefill-from-row entry, so `n`/`N` must
+        // resolve to NewFromSelection, matching the `'N'` keybinding's
+        // new-from-selection behavior on a session.
+        let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false));
+        // Pre-select Delete to prove the hotkey wins over the cursor.
+        menu.handle_key(key(KeyCode::Up));
+        let result = menu.handle_key(key(KeyCode::Char('n')));
+        assert!(matches!(
+            result,
+            DialogResult::Submit(ContextMenuAction::NewFromSelection)
+        ));
     }
 
     #[test]
@@ -475,7 +510,7 @@ mod tests {
         // Snooze item to resolve to), matching the Attention-gated keybinding.
         let mut menu = ContextMenuDialog::for_session((0, 0), false, None);
         let labels: Vec<&str> = menu.items_for_test().iter().map(|(_, l)| *l).collect();
-        assert_eq!(labels, vec!["Rename", "Archive", "Delete"]);
+        assert_eq!(labels, vec!["New Session", "Rename", "Archive", "Delete"]);
         assert!(matches!(
             menu.handle_key(key(KeyCode::Char('h'))),
             DialogResult::Continue
@@ -493,12 +528,12 @@ mod tests {
     }
 
     #[test]
-    fn enter_on_default_submits_rename() {
+    fn enter_on_default_submits_new_session() {
         let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false));
         let result = menu.handle_key(key(KeyCode::Enter));
         assert!(matches!(
             result,
-            DialogResult::Submit(ContextMenuAction::Rename)
+            DialogResult::Submit(ContextMenuAction::NewFromSelection)
         ));
     }
 
@@ -523,8 +558,9 @@ mod tests {
     #[test]
     fn down_wraps_from_last_to_first() {
         let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false));
-        // 4 items: Down x4 walks Rename -> Archive -> Snooze -> Delete -> back
-        // to Rename.
+        // 5 items: Down x5 walks NewSession -> Rename -> Archive -> Snooze ->
+        // Delete -> back to NewSession.
+        menu.handle_key(key(KeyCode::Down));
         menu.handle_key(key(KeyCode::Down));
         menu.handle_key(key(KeyCode::Down));
         menu.handle_key(key(KeyCode::Down));
@@ -532,15 +568,16 @@ mod tests {
         let result = menu.handle_key(key(KeyCode::Enter));
         assert!(matches!(
             result,
-            DialogResult::Submit(ContextMenuAction::Rename)
+            DialogResult::Submit(ContextMenuAction::NewFromSelection)
         ));
     }
 
     #[test]
     fn r_hotkey_submits_rename() {
         let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false));
-        // Pre-select Delete to prove the hotkey wins over the cursor.
-        menu.handle_key(key(KeyCode::Down));
+        // Pre-select Delete (Up wraps to the last item) to prove the hotkey
+        // wins over the cursor.
+        menu.handle_key(key(KeyCode::Up));
         let result = menu.handle_key(key(KeyCode::Char('r')));
         assert!(matches!(
             result,
@@ -610,12 +647,23 @@ mod tests {
     }
 
     #[test]
-    fn click_on_first_row_submits_rename() {
+    fn click_on_first_row_submits_new_session() {
         let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false));
-        stub_render(&mut menu, 10, 10, 14, 4);
+        stub_render(&mut menu, 10, 10, 14, 7);
         // Item rows live inside the bordered block, so row y+1 is the
         // first item and y+2 is the second.
         let result = menu.handle_click(12, 11);
+        assert!(matches!(
+            result,
+            Some(DialogResult::Submit(ContextMenuAction::NewFromSelection))
+        ));
+    }
+
+    #[test]
+    fn click_on_second_row_submits_rename() {
+        let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false));
+        stub_render(&mut menu, 10, 10, 14, 7);
+        let result = menu.handle_click(12, 12);
         assert!(matches!(
             result,
             Some(DialogResult::Submit(ContextMenuAction::Rename))
@@ -623,10 +671,10 @@ mod tests {
     }
 
     #[test]
-    fn click_on_second_row_submits_toggle_archive() {
+    fn click_on_third_row_submits_toggle_archive() {
         let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false));
-        stub_render(&mut menu, 10, 10, 14, 5);
-        let result = menu.handle_click(12, 12);
+        stub_render(&mut menu, 10, 10, 14, 7);
+        let result = menu.handle_click(12, 13);
         assert!(matches!(
             result,
             Some(DialogResult::Submit(ContextMenuAction::ToggleArchive))
@@ -634,24 +682,13 @@ mod tests {
     }
 
     #[test]
-    fn click_on_third_row_submits_toggle_snooze() {
+    fn click_on_fourth_row_submits_toggle_snooze() {
         let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false));
-        stub_render(&mut menu, 10, 10, 14, 6);
-        let result = menu.handle_click(12, 13);
-        assert!(matches!(
-            result,
-            Some(DialogResult::Submit(ContextMenuAction::ToggleSnooze))
-        ));
-    }
-
-    #[test]
-    fn click_on_fourth_row_submits_delete() {
-        let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false));
-        stub_render(&mut menu, 10, 10, 14, 6);
+        stub_render(&mut menu, 10, 10, 14, 7);
         let result = menu.handle_click(12, 14);
         assert!(matches!(
             result,
-            Some(DialogResult::Submit(ContextMenuAction::Delete))
+            Some(DialogResult::Submit(ContextMenuAction::ToggleSnooze))
         ));
     }
 
@@ -698,11 +735,11 @@ mod tests {
     #[test]
     fn hover_moves_highlight() {
         let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false));
-        stub_render(&mut menu, 10, 10, 14, 5);
-        assert_eq!(menu.selected_action(), ContextMenuAction::Rename);
+        stub_render(&mut menu, 10, 10, 14, 7);
+        assert_eq!(menu.selected_action(), ContextMenuAction::NewFromSelection);
         let changed = menu.handle_hover(12, 12);
         assert!(changed, "hover onto second row should change highlight");
-        assert_eq!(menu.selected_action(), ContextMenuAction::ToggleArchive);
+        assert_eq!(menu.selected_action(), ContextMenuAction::Rename);
     }
 
     #[test]
@@ -718,8 +755,8 @@ mod tests {
     #[test]
     fn hover_off_menu_leaves_selection_alone() {
         let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false));
-        stub_render(&mut menu, 10, 10, 14, 6);
-        menu.handle_hover(12, 14); // Delete (fourth/last row)
+        stub_render(&mut menu, 10, 10, 14, 7);
+        menu.handle_hover(12, 15); // Delete (fifth/last row)
         assert_eq!(menu.selected_action(), ContextMenuAction::Delete);
         assert!(!menu.handle_hover(40, 40));
         assert_eq!(
