@@ -4,7 +4,7 @@ import type { CheatEffect, CheatEffectKind } from "../../lib/cheats";
 
 // How long each effect lives before it self-cleans. Matches the CSS animation
 // durations in index.css; the overlay unmounts when the longest piece ends.
-export const CHEAT_DURATION_MS: Record<CheatEffectKind, number> = {
+const CHEAT_DURATION_MS: Record<CheatEffectKind, number> = {
   fly: 1600,
   confetti: 2200,
   flash: 600,

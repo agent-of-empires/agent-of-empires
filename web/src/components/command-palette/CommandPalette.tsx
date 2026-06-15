@@ -49,14 +49,18 @@ export function CommandPalette({ open, onClose, actions }: Props) {
     };
   }, [open]);
 
-  // Controlled input keeps its value across open/close, so reset it on close;
-  // also drop any in-flight cheat so reopening does not replay the last one.
-  useEffect(() => {
+  // Controlled input keeps its value across open/close, so reset it when the
+  // palette closes; also drop any in-flight cheat so reopening does not replay
+  // the last one. Adjusting during render on the open->closed edge is the
+  // React-recommended pattern, no effect needed.
+  const [wasOpen, setWasOpen] = useState(open);
+  if (open !== wasOpen) {
+    setWasOpen(open);
     if (!open) {
       setSearch("");
       setCheat(null);
     }
-  }, [open]);
+  }
 
   // Stable so the overlay's cleanup timer is not reset by unrelated re-renders
   // (e.g. the user typing again while an effect is still on screen).
