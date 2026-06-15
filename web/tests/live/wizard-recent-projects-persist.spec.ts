@@ -12,9 +12,7 @@
 import { test, expect } from "@playwright/test";
 import { listSessions, spawnAoeServe, seedSessionViaAoeAdd } from "../helpers/aoeServe";
 
-test("project stays in the wizard Recent tab after its last session is deleted (#2141)", async ({
-  page,
-}, testInfo) => {
+test("project stays in the wizard Recent tab after its last session is deleted (#2141)", async ({ page }, testInfo) => {
   const serve = await spawnAoeServe({
     authMode: "none",
     workerIndex: testInfo.workerIndex,
