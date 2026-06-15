@@ -445,6 +445,7 @@ fn render_composer(frame: &mut Frame, area: Rect, theme: &Theme, state: &Structu
     };
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .title(title)
         .border_style(composer_border);
     // ratatui-textarea borrows the Frame's buffer indirectly via
