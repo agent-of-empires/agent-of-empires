@@ -2146,6 +2146,18 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/lib/sidebarSort.ts"]
     },
     {
+      "id": "sidebar.project-pin",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/project-pin.spec.ts"],
+      "components": [
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/lib/registeredProjects.ts",
+        "web/src/hooks/useRepoGroups.ts",
+        "web/src/hooks/useProjects.ts"
+      ]
+    },
+    {
       "id": "triage.archive-toggle",
       "kind": "live-playwright",
       "risk": "high",
