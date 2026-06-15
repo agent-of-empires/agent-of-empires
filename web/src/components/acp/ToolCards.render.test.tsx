@@ -753,6 +753,9 @@ describe("ToolCards repo-relative paths (#2143)", () => {
       </WrapWithSession>,
     );
     expect(container.textContent).toContain("api/src/h.ts");
+    // The visible label must not be the absolute path; the absolute form
+    // only survives in the title tooltip (an attribute, not textContent).
+    expect(container.textContent).not.toContain("/tmp/api/src/h.ts");
   });
 
   it("falls back to the absolute path when outside every known root", () => {
@@ -767,5 +770,37 @@ describe("ToolCards repo-relative paths (#2143)", () => {
       </WrapWithSession>,
     );
     expect(container.textContent).toContain("/etc/hosts");
+  });
+
+  it("renders a delete path repo-relative under the session root", () => {
+    const { container } = render(
+      <WrapWithSession session={session}>
+        <ToolCard tool={fixtures.del} result={undefined} />
+      </WrapWithSession>,
+    );
+    expect(container.textContent).toContain("delete");
+    expect(container.textContent).toContain("gone.rs");
+    expect(container.textContent).not.toContain("/tmp/gone.rs");
+  });
+
+  it("renders a write path repo-relative under the session root", () => {
+    const { container } = render(
+      <WrapWithSession session={session}>
+        <ToolCard tool={fixtures.write} result={undefined} />
+      </WrapWithSession>,
+    );
+    expect(container.textContent).toContain("new.rs");
+    expect(container.textContent).not.toContain("/tmp/new.rs");
+  });
+
+  it("keeps the absolute path in the title tooltip while showing the relative label", () => {
+    const { container } = render(
+      <WrapWithSession session={session}>
+        <ToolCard tool={fixtures.edit} result={undefined} />
+      </WrapWithSession>,
+    );
+    const titled = container.querySelector('[title="/tmp/main.rs"]');
+    expect(titled).not.toBeNull();
+    expect(titled!.textContent).toContain("main.rs");
   });
 });
