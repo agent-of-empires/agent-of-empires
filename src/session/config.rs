@@ -444,6 +444,22 @@ pub struct AcpConfig {
     #[serde(default = "default_rate_limit_auto_resume_grace_secs")]
     #[setting(label = "Auto-resume grace (s)", widget = "number", min = 0, advanced)]
     pub rate_limit_auto_resume_grace_secs: u32,
+    /// Allow the web dashboard's "Update & restart" control to run the
+    /// agent's `npm install -g <pkg>` on the host and respawn the worker.
+    /// Off by default: the daemon executing a global package install is a
+    /// host-level capability (it runs arbitrary npm lifecycle scripts as the
+    /// daemon user), so it stays opt-in, is always blocked in read-only mode,
+    /// and is `local_only` so a remote dashboard client cannot flip it on.
+    /// Only npm-installable agents are eligible; others keep the manual
+    /// install hint. See #2109.
+    #[serde(default)]
+    #[setting(
+        label = "Allow agent install from web",
+        widget = "toggle",
+        web = "local_only:runs npm install on the host as the daemon user",
+        advanced
+    )]
+    pub allow_agent_install: bool,
 }
 
 fn default_rate_limit_auto_resume_grace_secs() -> u32 {
@@ -520,6 +536,7 @@ impl Default for AcpConfig {
             auto_stop_idle_secs: default_auto_stop_idle_secs(),
             rate_limit_auto_resume: false,
             rate_limit_auto_resume_grace_secs: default_rate_limit_auto_resume_grace_secs(),
+            allow_agent_install: false,
         }
     }
 }
