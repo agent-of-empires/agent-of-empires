@@ -2883,6 +2883,7 @@ mod tests {
             pane_width: 0,
             alternate_on: false,
             mouse_tracking: false,
+            mouse_sgr: false,
         }
     }
 

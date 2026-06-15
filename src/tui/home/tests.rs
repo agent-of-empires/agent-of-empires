@@ -7651,7 +7651,11 @@ mod scroll_pane_isolation {
         env
     }
 
-    fn alt_screen_cursor(alternate_on: bool, mouse_tracking: bool) -> crate::tmux::PaneCursor {
+    fn alt_screen_cursor(
+        alternate_on: bool,
+        mouse_tracking: bool,
+        mouse_sgr: bool,
+    ) -> crate::tmux::PaneCursor {
         crate::tmux::PaneCursor {
             x: 0,
             y: 0,
@@ -7661,21 +7665,22 @@ mod scroll_pane_isolation {
             pane_width: 80,
             alternate_on,
             mouse_tracking,
+            mouse_sgr,
         }
     }
 
-    /// Live-send target is a full-screen app with mouse tracking on: the
-    /// wheel is forwarded to the app (returns to the live edge) instead of
-    /// growing the useless normal-buffer capture window. This is the fix
+    /// Live-send target is a full-screen app with SGR mouse tracking on:
+    /// the wheel is forwarded to the app (returns to the live edge) instead
+    /// of growing the useless normal-buffer capture window. This is the fix
     /// for the "scroll up a little then snap to the very first part of the
     /// session" report on alternate-screen agents.
     #[test]
     #[serial]
-    fn wheel_over_alt_screen_mouse_pane_forwards_instead_of_scrollback() {
-        let mut env = live_env_with_cursor(alt_screen_cursor(true, true));
+    fn wheel_over_alt_screen_sgr_mouse_pane_forwards_instead_of_scrollback() {
+        let mut env = live_env_with_cursor(alt_screen_cursor(true, true, true));
 
         let up = env.view.handle_scroll_up(50, 10);
-        assert!(up, "wheel over a full-screen mouse pane is handled");
+        assert!(up, "wheel over a full-screen SGR-mouse pane is handled");
         assert_eq!(
             env.view.preview_scroll_offset, 0,
             "forwarding pins the preview to the live edge, never the normal-buffer history"
@@ -7687,13 +7692,13 @@ mod scroll_pane_isolation {
         assert_eq!(env.view.preview_scroll_offset, 0);
     }
 
-    /// Guard the gate: a full-screen app WITHOUT mouse tracking must not
-    /// get raw SGR bytes (it would read them as garbage keystrokes). The
-    /// wheel falls back to the existing capture-window scroll.
+    /// Guard the gate: a full-screen app WITHOUT any mouse tracking must
+    /// not get raw SGR bytes (it would read them as garbage keystrokes).
+    /// The wheel falls back to the existing capture-window scroll.
     #[test]
     #[serial]
     fn wheel_over_alt_screen_without_mouse_uses_capture_scroll() {
-        let mut env = live_env_with_cursor(alt_screen_cursor(true, false));
+        let mut env = live_env_with_cursor(alt_screen_cursor(true, false, false));
 
         let up = env.view.handle_scroll_up(50, 10);
         assert!(up);
@@ -7703,13 +7708,30 @@ mod scroll_pane_isolation {
         );
     }
 
+    /// Guard the encoding: a full-screen app with mouse tracking but in the
+    /// LEGACY (non-SGR) encoding must not get SGR bytes either; they would
+    /// be misparsed. Falls back to capture-window scroll. (Regression for
+    /// the CodeRabbit finding on #2123: mouse_any_flag is not SGR support.)
+    #[test]
+    #[serial]
+    fn wheel_over_alt_screen_legacy_mouse_uses_capture_scroll() {
+        let mut env = live_env_with_cursor(alt_screen_cursor(true, true, false));
+
+        let up = env.view.handle_scroll_up(50, 10);
+        assert!(up);
+        assert!(
+            env.view.preview_scroll_offset > 10,
+            "legacy (non-SGR) mouse: keep the capture-window scroll"
+        );
+    }
+
     /// And a normal-screen agent (no alternate screen) keeps the capture
-    /// scroll even if it happens to have mouse tracking on: the preview's
+    /// scroll even if it happens to have SGR mouse on: the preview's
     /// scrollback is genuinely useful there.
     #[test]
     #[serial]
     fn wheel_over_normal_screen_pane_uses_capture_scroll() {
-        let mut env = live_env_with_cursor(alt_screen_cursor(false, true));
+        let mut env = live_env_with_cursor(alt_screen_cursor(false, true, true));
 
         let up = env.view.handle_scroll_up(50, 10);
         assert!(up);

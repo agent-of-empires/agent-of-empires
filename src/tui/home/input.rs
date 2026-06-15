@@ -3112,10 +3112,12 @@ impl HomeView {
     /// does when you wheel over a mouse-tracking pane on attach, so the
     /// app scrolls its OWN content.
     ///
-    /// Gated on `mouse_tracking` so we never send `\e[<..M` bytes to an
-    /// app that hasn't asked for mouse input (it would read them as
-    /// garbage keystrokes); in that case the caller keeps the existing
-    /// capture-window scroll. Returns true when the event was forwarded.
+    /// Gated on mouse tracking AND SGR encoding (`mouse_sgr`) so we never
+    /// send `\e[<..M` bytes to an app that wouldn't parse them as a mouse
+    /// event: an app in the legacy X10 encoding, or no mouse mode at all,
+    /// would read them as garbage keystrokes. In those cases the caller
+    /// keeps the existing capture-window scroll. Returns true when the
+    /// event was forwarded.
     fn forward_wheel_to_live_pane(&self, up: bool, col: u16, row: u16) -> bool {
         if self.live_send.is_none() {
             return false;
@@ -3128,7 +3130,7 @@ impl HomeView {
             .as_ref()
             .and_then(|w| w.current_cursor());
         let Some(cursor) = cursor else { return false };
-        if !(cursor.alternate_on && cursor.mouse_tracking) {
+        if !(cursor.alternate_on && cursor.mouse_tracking && cursor.mouse_sgr) {
             return false;
         }
         let bytes = wheel_sgr_bytes(up, self.preview_text_view.pane, col, row);
