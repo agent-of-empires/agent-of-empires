@@ -793,6 +793,32 @@ describe("ToolCards repo-relative paths (#2143)", () => {
     expect(container.textContent).not.toContain("/tmp/new.rs");
   });
 
+  it("renders a multi-file edit with each diff header repo-relative", () => {
+    const tool = makeToolCall({
+      id: "edit-multi-file",
+      name: "apply_patch",
+      kind: "edit",
+      args_preview: "{}",
+      diffs: [
+        { path: "/tmp/src/alpha.rs", old_text: "a", new_text: "b", created_at: "2026-05-21T00:00:00Z" },
+        { path: "/tmp/src/beta.rs", old_text: null, new_text: "c", created_at: "2026-05-21T00:00:00Z" },
+      ],
+    });
+    const { container, getByRole } = render(
+      <WrapWithSession session={session}>
+        <ToolCard tool={tool} result={undefined} />
+      </WrapWithSession>,
+    );
+    // Collapsed: primary shows the first path relative + "+N more".
+    expect(container.textContent).toContain("src/alpha.rs");
+    expect(container.textContent).toContain("+1 more");
+    expect(container.textContent).not.toContain("/tmp/src/alpha.rs");
+    // Expanded: each per-file diff header renders its path relative too.
+    fireEvent.click(getByRole("button"));
+    expect(container.textContent).toContain("src/beta.rs");
+    expect(container.textContent).not.toContain("/tmp/src/beta.rs");
+  });
+
   it("keeps the absolute path in the title tooltip while showing the relative label", () => {
     const { container } = render(
       <WrapWithSession session={session}>
