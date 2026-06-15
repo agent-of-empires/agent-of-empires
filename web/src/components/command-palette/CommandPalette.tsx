@@ -1,8 +1,11 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Command } from "cmdk";
 import { StatusGlyph } from "../StatusGlyph";
+import { CheatOverlay } from "./CheatOverlay";
 import { GROUP_ORDER } from "./groups";
 import type { CommandAction, CommandActionGroup } from "./types";
+import { matchCheat, type CheatEffect } from "../../lib/cheats";
+import { reportInfo } from "../../lib/toastBus";
 
 interface Props {
   open: boolean;
@@ -13,6 +16,23 @@ interface Props {
 export function CommandPalette({ open, onClose, actions }: Props) {
   const inputRef = useRef<HTMLInputElement>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
+  const [search, setSearch] = useState("");
+  // Active easter-egg effect plus a monotonic id so retyping the same cheat
+  // replays the animation (the id is the overlay's React key).
+  const [cheat, setCheat] = useState<{ effect: CheatEffect; id: number } | null>(null);
+
+  // A full-string match on a known Age of Empires cheat code fires a toast and
+  // a one-off visual, then clears the input. Anything else is a normal search.
+  const onSearchChange = (value: string) => {
+    const hit = matchCheat(value);
+    if (hit) {
+      reportInfo(hit.toast);
+      setCheat((prev) => ({ effect: hit.effect, id: (prev?.id ?? 0) + 1 }));
+      setSearch("");
+      return;
+    }
+    setSearch(value);
+  };
 
   // Capture the launcher before moving focus into the palette, then restore
   // it on close so Esc / backdrop-close return keyboard users to where they
@@ -27,6 +47,11 @@ export function CommandPalette({ open, onClose, actions }: Props) {
       const prev = previousFocusRef.current;
       if (prev?.isConnected) prev.focus();
     };
+  }, [open]);
+
+  // Controlled input keeps its value across open/close, so clear it on close.
+  useEffect(() => {
+    if (!open) setSearch("");
   }, [open]);
 
   const grouped = useMemo(() => {
@@ -78,6 +103,8 @@ export function CommandPalette({ open, onClose, actions }: Props) {
           </svg>
           <Command.Input
             ref={inputRef}
+            value={search}
+            onValueChange={onSearchChange}
             placeholder="Search actions, sessions, settings…"
             className="flex-1 bg-transparent outline-none text-[15px] text-text-primary placeholder:text-text-muted"
           />
@@ -136,6 +163,7 @@ export function CommandPalette({ open, onClose, actions }: Props) {
           </span>
         </div>
       </Command>
+      {cheat && <CheatOverlay key={cheat.id} effect={cheat.effect} onDone={() => setCheat(null)} />}
     </div>
   );
 }

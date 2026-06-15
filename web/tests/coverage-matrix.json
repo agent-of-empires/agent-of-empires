@@ -1921,6 +1921,13 @@
       "components": ["web/src/hooks/useSettingsCommands.ts", "web/src/App.tsx"]
     },
     {
+      "id": "story.cmdk-cheat-codes",
+      "kind": "mocked-playwright",
+      "risk": "low",
+      "specs": ["tests/command-palette.spec.ts"],
+      "components": ["web/src/components/command-palette/CommandPalette.tsx", "web/src/components/command-palette/CheatOverlay.tsx"]
+    },
+    {
       "id": "story.shortcut-toggle-sidebar",
       "kind": "mocked-playwright",
       "risk": "medium",
