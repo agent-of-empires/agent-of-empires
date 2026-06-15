@@ -21,7 +21,7 @@ import { AlertTriangle, Check, ChevronDown, Clock, Info, ListChecks, Paperclip, 
 import { ApprovalCard } from "./ApprovalCard";
 import { AskUserQuestionCard } from "./AskUserQuestionCard";
 import { AcpFileRefContext } from "./AcpFileRefContext";
-import type { FileRef } from "../../lib/fileRef";
+import type { FileRef, FileRefSession } from "../../lib/fileRef";
 import { ToolDensityToggle, ToolDisplayModeProvider, useToolDensityPref } from "./ToolDisplayMode";
 import { AcpRuntime, SUBAGENT_TASK_NAME, TODO_GROUP_NAME, TOOL_GROUP_NAME, type AcpContext } from "./AcpRuntime";
 import { Composer } from "./Composer";
@@ -87,6 +87,9 @@ interface Props {
    *  instead of navigating away. Omit to leave such links as normal
    *  anchors. See #1718. */
   onOpenFileRef?: (ref: FileRef) => void;
+  /** Repo roots for this session, forwarded to the tool cards so file
+   *  paths render repo-relative instead of absolute. See #2143. */
+  fileRefSession?: FileRefSession | null;
 }
 
 const STARTER_PROMPTS = [
@@ -95,7 +98,15 @@ const STARTER_PROMPTS = [
   "What does the build pipeline do?",
 ];
 
-export function StructuredView({ sessionId, acpWorkerState, tool, archivedAt, snoozedUntil, onOpenFileRef }: Props) {
+export function StructuredView({
+  sessionId,
+  acpWorkerState,
+  tool,
+  archivedAt,
+  snoozedUntil,
+  onOpenFileRef,
+  fileRefSession,
+}: Props) {
   // Folds rows above the most recent `/clear` divider out of the
   // thread by default; the disclosure banner toggles this. Lives on
   // the view (not the reducer) because it's a UI preference, not
@@ -105,7 +116,7 @@ export function StructuredView({ sessionId, acpWorkerState, tool, archivedAt, sn
   // not reducer state and not a daemon config field. See #1767.
   const [toolDensity, toggleToolDensity] = useToolDensityPref();
   return (
-    <AcpFileRefContext.Provider value={{ onOpenFileRef }}>
+    <AcpFileRefContext.Provider value={{ onOpenFileRef, fileRefSession }}>
       <AgentProfileProvider toolKey={tool}>
         <ToolDisplayModeProvider density={toolDensity}>
           <AcpRuntime
