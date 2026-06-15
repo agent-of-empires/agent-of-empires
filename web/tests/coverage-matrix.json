@@ -1152,6 +1152,17 @@
       "components": ["web/src/components/acp/StructuredView.tsx"]
     },
     {
+      "id": "acp.composer-queue-recall",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/acp-composer-recall.spec.ts",
+        "src/components/acp/recallNav.test.ts",
+        "src/components/acp/Composer.recall.test.ts"
+      ],
+      "components": ["web/src/components/acp/Composer.tsx", "web/src/components/acp/recallNav.ts"]
+    },
+    {
       "id": "acp.config-pickers",
       "kind": "live-playwright",
       "risk": "medium",
