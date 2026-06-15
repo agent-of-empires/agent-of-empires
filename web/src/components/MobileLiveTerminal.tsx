@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import type { CSSProperties, RefObject } from "react";
+import type { CSSProperties, ReactNode, RefObject } from "react";
 import type { AnsiSegment, AnsiStyle } from "../lib/ansi";
 import { ansiToLines, wrapLine } from "../lib/liveTermLines";
 import type { LiveFrame } from "../hooks/useLiveTerminal";
@@ -99,20 +99,80 @@ function segStyle(style: AnsiStyle): CSSProperties | undefined {
 // Screenshot-friendly; no behavior changes.
 const LIVE_DEBUG = typeof location !== "undefined" && new URLSearchParams(location.search).has("livedebug");
 
-const Row = memo(function Row({ segs }: { segs: AnsiSegment[] }) {
-  if (segs.length === 0) {
-    // Keep empty rows at full line height.
-    return <div> </div>;
+// Hollow-box cursor drawn AS A CELL inside the text flow, the way a real
+// terminal (and the desktop xterm view) renders it, rather than a separate
+// absolutely-positioned block whose pixel row we reconstruct from cursor.y and
+// line-height. Tying it to the actual rendered cell means it cannot drift off
+// its row (wrapping, row-height, offset assumptions). `outline` instead of
+// `border` so the box does not reflow the line by a pixel.
+const CURSOR_CELL_STYLE: CSSProperties = {
+  outline: "1px solid var(--term-cursor, #f59e0b)",
+  outlineOffset: "-1px",
+};
+
+const Row = memo(function Row({ segs, cursorCol }: { segs: AnsiSegment[]; cursorCol: number | null }) {
+  if (cursorCol == null) {
+    if (segs.length === 0) return <div> </div>; // keep empty rows at full height
+    return (
+      <div>
+        {segs.map((seg, i) => (
+          <span key={i} style={segStyle(seg.style)}>
+            {seg.text}
+          </span>
+        ))}
+      </div>
+    );
   }
-  return (
-    <div>
-      {segs.map((seg, i) => (
-        <span key={i} style={segStyle(seg.style)}>
-          {seg.text}
-        </span>
-      ))}
-    </div>
-  );
+  // Render the row with the single cell at `cursorCol` boxed. Walk segments by
+  // column; split the one that straddles the cursor.
+  const out: ReactNode[] = [];
+  let col = 0;
+  let placed = false;
+  let key = 0;
+  for (const seg of segs) {
+    const t = seg.text;
+    if (!placed && cursorCol >= col && cursorCol < col + t.length) {
+      const off = cursorCol - col;
+      if (off > 0) {
+        out.push(
+          <span key={key++} style={segStyle(seg.style)}>
+            {t.slice(0, off)}
+          </span>,
+        );
+      }
+      out.push(
+        <span key={key++} data-live-cursor style={{ ...segStyle(seg.style), ...CURSOR_CELL_STYLE }}>
+          {t[off]}
+        </span>,
+      );
+      if (off + 1 < t.length) {
+        out.push(
+          <span key={key++} style={segStyle(seg.style)}>
+            {t.slice(off + 1)}
+          </span>,
+        );
+      }
+      placed = true;
+    } else {
+      out.push(
+        <span key={key++} style={segStyle(seg.style)}>
+          {t}
+        </span>,
+      );
+    }
+    col += t.length;
+  }
+  if (!placed) {
+    // Cursor sits past the row's text (blank input cell): pad to the column
+    // and box a space.
+    if (cursorCol > col) out.push(<span key="pad">{" ".repeat(cursorCol - col)}</span>);
+    out.push(
+      <span key="cursor" data-live-cursor style={CURSOR_CELL_STYLE}>
+        {" "}
+      </span>,
+    );
+  }
+  return <div>{out}</div>;
 });
 
 export function MobileLiveTerminal({
@@ -323,36 +383,29 @@ export function MobileLiveTerminal({
     });
   }, [lastNonBlankRow]);
 
-  // Cursor cell -> visual overlay position. Shown only at the live edge;
-  // reading scrollback hides it. The pinning layout effect also feeds
-  // this position into cursorAnchorRef for the keyboard-shrunk target.
+  // Cursor cell -> the VISUAL ROW + COLUMN to box inline (see Row). Shown only
+  // at the live edge; reading scrollback hides it. `top` is the row's pixel
+  // top, fed to cursorAnchorRef so the keyboard-shrunk scroll target can keep
+  // the input row above the keyboard.
   const live = useMemo(() => {
-    let cursor = !reading ? (frame?.cursor ?? null) : null;
-    let cursorTop = 0;
-    let cursorLeft = 0;
-    let lineIdx = -1;
-    let baseRow = -1;
-    if (cursor) {
-      lineIdx = Math.max(0, lines.length - screenRows) + cursor.y;
-      const cols = renderCols > 0 ? renderCols : Number.POSITIVE_INFINITY;
-      const wrapOffset = Number.isFinite(cols) ? Math.floor(cursor.x / cols) : 0;
-      baseRow = lineIdx >= 0 && lineIdx < lines.length ? (visual.lineStartRow[lineIdx] ?? -1) : -1;
-      const visualRow = baseRow + wrapOffset;
-      // The agent can park the hardware cursor in a trailing BLANK row below
-      // its drawn UI (Claude draws its own caret in the input box higher up).
-      // Painting the overlay there pins it to the bottom of the pane, far
-      // from the input box (the reported "cursor stuck at the bottom"). When
-      // the cursor lands past the last non-blank row, suppress the overlay
-      // rather than paint it in the void; the agent's own caret remains.
-      if (baseRow < 0 || visualRow > lastNonBlankRow) {
-        cursor = null;
-      } else {
-        cursorTop = (spacerLines + visualRow) * lineH;
-        cursorLeft = (Number.isFinite(cols) ? cursor.x % cols : cursor.x) * charW;
-      }
-    }
-    return { cursor, cursorTop, cursorLeft, lineIdx, baseRow };
-  }, [reading, frame, lines.length, screenRows, visual, renderCols, charW, spacerLines, lineH, lastNonBlankRow]);
+    const cursor = !reading ? (frame?.cursor ?? null) : null;
+    if (!cursor) return { row: -1, col: -1, top: null as number | null };
+    const lineIdx = Math.max(0, lines.length - screenRows) + cursor.y;
+    if (lineIdx < 0 || lineIdx >= lines.length) return { row: -1, col: -1, top: null };
+    const cols = renderCols > 0 ? renderCols : Number.POSITIVE_INFINITY;
+    const baseRow = visual.lineStartRow[lineIdx] ?? -1;
+    if (baseRow < 0) return { row: -1, col: -1, top: null };
+    const wrapOffset = Number.isFinite(cols) ? Math.floor(cursor.x / cols) : 0;
+    const row = baseRow + wrapOffset;
+    // The agent can park the hardware cursor in a trailing BLANK row below its
+    // drawn UI (Claude draws its own caret in the input box higher up). Boxing
+    // a cell there would put the cursor far below the input box (the reported
+    // "filled rectangle 10 rows below"). When the cursor lands past the last
+    // non-blank row, draw nothing; the agent's own caret stays visible.
+    if (row > lastNonBlankRow) return { row: -1, col: -1, top: null };
+    const col = Number.isFinite(cols) ? cursor.x % cols : cursor.x;
+    return { row, col, top: (spacerLines + row) * lineH };
+  }, [reading, frame, lines.length, screenRows, visual, renderCols, spacerLines, lineH, lastNonBlankRow]);
 
   const atBottom = useCallback(() => {
     const el = scrollerRef.current;
@@ -506,7 +559,7 @@ export function MobileLiveTerminal({
     // mid-redraw capture that momentarily hides the cursor keeps the
     // last known anchor instead of flapping the target to the literal
     // bottom and back.
-    if (live.cursor) cursorAnchorRef.current = live.cursorTop;
+    if (live.top != null) cursorAnchorRef.current = live.top;
     pinIfWasAtBottom();
     // When not pinned, scrollTop is left alone. Above-viewport height is
     // invariant (spacer rows convert to content rows 1:1; appends only
@@ -634,8 +687,9 @@ export function MobileLiveTerminal({
     [sendKeys, inputRef],
   );
 
-  // Cursor overlay geometry (computed in the `live` memo above).
-  const { cursor, cursorTop, cursorLeft } = live;
+  // The cursor is rendered inline by Row (see below): this is the visual row
+  // to box, and the column within it. -1 means draw nothing.
+  const cursorRow = connected && !reading ? live.row : -1;
 
   // Trim trailing blank rows (for bottom-align) ONLY at the live edge. While
   // reading scrollback the spacer model keeps above-viewport pixels invariant
@@ -681,28 +735,12 @@ export function MobileLiveTerminal({
             tall mobile pane), so its input box sits just above the keyboard
             instead of floating over a dead gap. When content overflows
             (scrollback) the auto margin collapses and it scrolls normally,
-            sidestepping the flex+overflow top-clip bug. The absolute cursor
-            overlay lives in this box, so the shift moves with it. */}
+            sidestepping the flex+overflow top-clip bug. */}
         <div className="relative whitespace-pre mt-auto" data-live-content>
           {spacerLines > 0 && <div style={{ height: `${spacerLines * lineH}px` }} aria-hidden="true" />}
           {visual.rows.slice(0, visibleRowCount).map((segs, i) => (
-            <Row key={i} segs={segs} />
+            <Row key={i} segs={segs} cursorCol={i === cursorRow ? live.col : null} />
           ))}
-          {connected && cursor && (
-            <div
-              aria-hidden="true"
-              className="absolute motion-safe:animate-pulse"
-              data-live-cursor
-              style={{
-                top: `${cursorTop}px`,
-                left: `${cursorLeft}px`,
-                width: `${charW}px`,
-                height: `${lineH}px`,
-                background: "var(--term-cursor, #f59e0b)",
-                opacity: 0.8,
-              }}
-            />
-          )}
         </div>
       </div>
 
@@ -714,9 +752,9 @@ export function MobileLiveTerminal({
         >
           {[
             `rows=${frame?.rows ?? "-"} hist=${frame?.history ?? "-"} lines=${lines.length}`,
-            `grid=${renderCols}cols spacer=${spacerLines}`,
-            `cur=${cursor ? `${cursor.x},${cursor.y}` : "null"} idx=${live.lineIdx} base=${live.baseRow}`,
-            `lineH=${lineH.toFixed(2)} charW=${charW.toFixed(3)} top=${cursorTop.toFixed(1)}`,
+            `grid=${renderCols}cols spacer=${spacerLines} lastNonBlank=${lastNonBlankRow}`,
+            `cur=${frame?.cursor ? `${frame.cursor.x},${frame.cursor.y}` : "null"} -> row=${live.row} col=${live.col}`,
+            `lineH=${lineH.toFixed(2)} charW=${charW.toFixed(3)}`,
           ].join("\n")}
         </div>
       )}
