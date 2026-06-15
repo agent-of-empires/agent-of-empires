@@ -23,6 +23,12 @@ const NONCE_BYTES: usize = 16;
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Nonce(pub String);
 
+impl Default for Nonce {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Nonce {
     pub fn new() -> Self {
         let mut buf = [0u8; NONCE_BYTES];

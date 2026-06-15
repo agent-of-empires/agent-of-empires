@@ -75,6 +75,12 @@ struct Entry {
     last_used: u64,
 }
 
+impl Default for SessionTeeLayer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SessionTeeLayer {
     pub fn new() -> Self {
         Self {
