@@ -811,12 +811,12 @@ export function Composer({
                 editing an existing queued prompt rather than composing a
                 new one. */}
             {recallInfo && (
-              <div className="flex items-center justify-between gap-2 rounded-t-xl border-b border-brand-600/40 bg-brand-600/10 px-3 py-1.5 text-xs text-brand-200">
-                <span className="flex items-center gap-1.5 font-medium">
-                  <Pencil className="h-3.5 w-3.5" />
+              <div className="flex items-center justify-between gap-2 rounded-t-lg border-b border-surface-700 bg-surface-800 px-3 py-1.5 text-xs text-text-secondary">
+                <span className="flex items-center gap-1.5 font-medium text-text-primary">
+                  <Pencil className="h-3.5 w-3.5 text-brand-400" />
                   Editing queued message {recallInfo.pos} of {recallInfo.total}
                 </span>
-                <span className="text-brand-300/70">Enter saves · Esc restores draft · ↑ ↓ to browse</span>
+                <span className="text-text-dim">Enter saves · Esc restores draft · ↑ ↓ to browse</span>
               </div>
             )}
 
