@@ -249,11 +249,13 @@ function AcpChrome({
       text,
     });
 
-  // Browser-side approval chime. Fires once on the 0 -> >=1 edge of
-  // pendingApprovals; complements the OS push (delivered via the SW
-  // when the dashboard is backgrounded) and the in-app toast (when
-  // foregrounded). See #1038.
-  useApprovalSound(state.pendingApprovals.length);
+  // Browser-side attention chime. Fires once on the 0 -> >=1 edge of the
+  // combined pending approvals + questions count; complements the OS push
+  // (delivered via the SW when the dashboard is backgrounded) and the
+  // in-app toast (when foregrounded). A question arriving while an approval
+  // is already pending does not re-chime, but its OS push still fires on
+  // the live event edge regardless. See #1038, #2146.
+  useApprovalSound(state.pendingApprovals.length + state.pendingElicitations.length);
 
   // Re-pin the chat viewport to the bottom when the composer (or any
   // sibling below it: queued strip, primer banner) grows. assistant-ui's
