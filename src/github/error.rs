@@ -1,4 +1,4 @@
-//! Typed errors for the GitHub client and auth layer.
+//! Typed errors for the GitHub client.
 //!
 //! Each failure case carries its own actionable hint so the TUI toast and the
 //! web error banner can show the user exactly what to do, never a generic
@@ -8,49 +8,9 @@
 use reqwest::StatusCode;
 use thiserror::Error;
 
-/// Failures while resolving a GitHub token from the environment or the `gh`
-/// CLI. Every variant maps to a distinct, actionable hint.
-#[derive(Debug, Error)]
-pub enum GitHubAuthError {
-    #[error(
-        "No GitHub token found and the GitHub CLI is not installed.\n\
-         Set a token: export GITHUB_TOKEN=<token> (or GH_TOKEN).\n\
-         Or install the GitHub CLI and sign in:\n\
-           macOS:  brew install gh\n\
-           Linux:  see https://github.com/cli/cli#installation\n\
-         then run: gh auth login"
-    )]
-    NoTokenNoGh,
-
-    #[error(
-        "The GitHub CLI is installed but not authenticated.\n\
-         Sign in with:\n\
-           gh auth login\n\
-         Or set a token directly: export GITHUB_TOKEN=<token>."
-    )]
-    GhNotAuthenticated,
-
-    #[error(
-        "The GitHub CLI returned an empty token.\n\
-         Re-authenticate with:\n\
-           gh auth login\n\
-         Or set a token directly: export GITHUB_TOKEN=<token>."
-    )]
-    GhReturnedEmptyToken,
-
-    #[error(
-        "Failed to run the GitHub CLI: {0}\n\
-         Set a token directly to bypass it: export GITHUB_TOKEN=<token>."
-    )]
-    GhCommandFailed(String),
-}
-
 /// Top-level error for any GitHub client operation.
 #[derive(Debug, Error)]
 pub enum GitHubError {
-    #[error("{0}")]
-    Auth(#[from] GitHubAuthError),
-
     #[error(
         "GitHub API is unreachable.\n\
          Check your network connection or GitHub status: https://www.githubstatus.com/\n\
@@ -102,29 +62,6 @@ pub type Result<T> = std::result::Result<T, GitHubError>;
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn no_token_no_gh_hint_mentions_token_and_install_not_just_gh_login() {
-        let msg = GitHubAuthError::NoTokenNoGh.to_string();
-        assert!(
-            msg.contains("GITHUB_TOKEN"),
-            "should suggest setting a token"
-        );
-        assert!(
-            msg.contains("install the GitHub CLI") || msg.contains("brew install gh"),
-            "should suggest installing gh"
-        );
-    }
-
-    #[test]
-    fn gh_not_authenticated_hint_says_login_not_install() {
-        let msg = GitHubAuthError::GhNotAuthenticated.to_string();
-        assert!(msg.contains("gh auth login"), "should tell user to log in");
-        assert!(
-            !msg.contains("brew install") && !msg.contains("install the GitHub CLI"),
-            "must not tell an installed-gh user to install gh"
-        );
-    }
 
     #[test]
     fn insufficient_scope_names_the_scope() {
