@@ -706,6 +706,9 @@ export async function installAcpAgent(sessionId: string): Promise<InstallAgentRe
   if (!res.ok) {
     throw new Error(body?.message || body?.error || `Server returned ${res.status}`);
   }
+  if (!body) {
+    throw new Error("Server returned an invalid or empty response");
+  }
   return body as InstallAgentResponse;
 }
 

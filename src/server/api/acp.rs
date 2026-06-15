@@ -460,8 +460,12 @@ pub async fn install_agent(
             .into_response();
     };
 
-    // Serialize against concurrent installs / spawns for this session.
-    let _inst_lock = state.instance_lock(&id).await;
+    // Serialize against concurrent installs / spawns for this session: a
+    // double-click must not run two installs against the global npm prefix.
+    // `instance_lock` returns the lock handle; hold the guard across the
+    // install.
+    let inst_lock = state.instance_lock(&id).await;
+    let _guard = inst_lock.lock().await;
 
     let Ok(npm) = which::which("npm") else {
         return (
@@ -474,18 +478,35 @@ pub async fn install_agent(
             .into_response();
     };
 
-    let output = match tokio::process::Command::new(&npm)
-        .arg("install")
-        .arg("-g")
-        .arg(package)
-        .output()
-        .await
+    // Bound the install so a network stall or a wedged lifecycle script
+    // cannot hang the request (and the held lock) forever. kill_on_drop
+    // reaps the child if the timeout fires.
+    let output = match tokio::time::timeout(
+        std::time::Duration::from_secs(180),
+        tokio::process::Command::new(&npm)
+            .arg("install")
+            .arg("-g")
+            .arg(package)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
     {
-        Ok(o) => o,
-        Err(e) => {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("npm install failed to start: {e}"),
+            )
+                .into_response();
+        }
+        Err(_) => {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(serde_json::json!({
+                    "error": "install_timeout",
+                    "message": "`npm install -g` did not finish within 180s.",
+                })),
             )
                 .into_response();
         }
