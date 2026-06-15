@@ -2423,6 +2423,17 @@ pub struct DeleteSessionBody {
     pub keep_scratch: bool,
 }
 
+/// Flip a session out of `Status::Deleting` into `Status::Error` so a
+/// bookkeeping failure after teardown does not strand it greyed-out and
+/// unclickable, the exact state this detached-task delete exists to prevent.
+async fn mark_delete_error(state: &AppState, id: &str, message: String) {
+    let mut instances = state.instances.write().await;
+    if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+        inst.status = Status::Error;
+        inst.last_error = Some(message);
+    }
+}
+
 pub async fn delete_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -2544,15 +2555,15 @@ pub async fn delete_session(
                 let storage = match Storage::new(&profile, state.file_watch.clone()) {
                     Ok(s) => s,
                     Err(e) => {
+                        let msg = format!("Session was torn down but storage init failed: {e}");
+                        mark_delete_error(&state, &id, msg.clone()).await;
                         tracing::error!(target: "http.api.sessions",
                         "Storage::new failed after deletion: {e}");
                         return (
                             StatusCode::INTERNAL_SERVER_ERROR,
                             Json(serde_json::json!({
                                 "error": "persist_failed",
-                                "message": format!(
-                                    "Session was torn down but storage init failed: {e}"
-                                ),
+                                "message": msg,
                             })),
                         );
                     }
@@ -2581,20 +2592,23 @@ pub async fn delete_session(
                         )
                     }
                     Ok(Err(e)) => {
+                        let msg = format!(
+                            "Session deletion completed on disk, but \
+                             sessions.json could not be updated: {e}"
+                        );
+                        mark_delete_error(&state, &id, msg.clone()).await;
                         tracing::error!(target: "http.api.sessions",
                         "Failed to save after deletion: {e}");
                         (
                             StatusCode::INTERNAL_SERVER_ERROR,
                             Json(serde_json::json!({
                                 "error": "persist_failed",
-                                "message": format!(
-                                    "Session deletion completed on disk, but \
-                                     sessions.json could not be updated: {e}"
-                                ),
+                                "message": msg,
                             })),
                         )
                     }
                     Err(join_err) => {
+                        mark_delete_error(&state, &id, "Persist task panicked".to_string()).await;
                         tracing::error!(target: "http.api.sessions",
                         "Persist task panicked: {join_err}");
                         (
@@ -2629,13 +2643,17 @@ pub async fn delete_session(
                     })),
                 )
             }
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": "internal",
-                    "message": format!("Deletion task failed: {e}"),
-                })),
-            ),
+            Err(e) => {
+                let msg = format!("Deletion task failed: {e}");
+                mark_delete_error(&state, &id, msg.clone()).await;
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": "internal",
+                        "message": msg,
+                    })),
+                )
+            }
         }
     });
 
