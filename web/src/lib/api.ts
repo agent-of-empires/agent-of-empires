@@ -37,6 +37,26 @@ export function fetchSessions(): Promise<SessionsEnvelope | null> {
   return fetchJson<SessionsEnvelope>("/api/sessions");
 }
 
+// --- Recent projects ---
+
+export interface RecentProjectEntry {
+  path: string;
+  display_name: string;
+  tool: string;
+  last_used_at: string;
+}
+
+export interface RecentProjectsEnvelope {
+  projects: RecentProjectEntry[];
+}
+
+// Persisted recent projects (newest first), so a project stays in the wizard
+// Recent tab after its last session is deleted. Merged with the live
+// session-derived list in ProjectStep.
+export function fetchRecentProjects(): Promise<RecentProjectsEnvelope | null> {
+  return fetchJson<RecentProjectsEnvelope>("/api/recent-projects");
+}
+
 export async function updateWorkspaceOrdering(order: string[]): Promise<boolean> {
   try {
     const res = await fetch("/api/workspace-ordering", {
