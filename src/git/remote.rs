@@ -343,7 +343,13 @@ pub(crate) fn parse_slug_from_remote_url(url: &str) -> Option<String> {
         if !url[..colon_pos].contains('@') {
             return None;
         }
-        &url[colon_pos + 1..]
+        let scp_path = &url[colon_pos + 1..];
+        // An absolute path (`git@host:/foo/bar.git`) is a filesystem path, not a
+        // hosted owner/repo slug; reject it.
+        if scp_path.starts_with('/') {
+            return None;
+        }
+        scp_path
     } else {
         let (scheme, without_scheme) = url.split_once("://")?;
         if !matches!(scheme, "http" | "https" | "ssh") {
@@ -424,6 +430,8 @@ mod tests {
             parse_slug_from_remote_url("https://example.com/group/sub/repo.git"),
             None
         );
+        // Absolute-path SSH shorthand is a filesystem path, not owner/repo.
+        assert_eq!(parse_slug_from_remote_url("git@host:/foo/bar.git"), None);
     }
 
     #[test]

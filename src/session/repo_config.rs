@@ -1115,16 +1115,6 @@ pub fn resolve_before_start_hooks(profile: &str) -> Vec<String> {
         .before_start
 }
 
-/// A character may start an environment variable name: ASCII letter or `_`.
-fn is_valid_env_key(key: &str) -> bool {
-    let mut chars = key.chars();
-    match chars.next() {
-        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
-        _ => return false,
-    }
-    key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
 /// Parse `KEY=VALUE` lines from a hook's stdout, ignoring blank lines, lines
 /// with no `=`, and lines whose key is not a valid env var name. Later entries
 /// override earlier ones for the same key. The value is preserved verbatim
@@ -1136,7 +1126,7 @@ fn parse_env_kv_lines(stdout: &str) -> Vec<(String, String)> {
             continue;
         };
         let key = key.trim();
-        if !is_valid_env_key(key) {
+        if !super::environment::is_valid_env_key(key) {
             continue;
         }
         out.retain(|(k, _)| k != key);

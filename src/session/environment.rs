@@ -303,6 +303,12 @@ fn resolve_host_env_pairs(entries: &[String]) -> Vec<(String, String)> {
             Some((k, v)) => (k.to_string(), resolve_env_value(v)),
             None => (entry.clone(), std::env::var(entry).ok()),
         };
+        // A malformed key would fail at `Command::envs` when the hook spawns;
+        // skip it here (with a warning) rather than aborting the launch.
+        if !is_valid_env_key(&key) {
+            tracing::warn!(target: "session.create", "invalid env key '{}' for host hook; skipping", key);
+            continue;
+        }
         if let Some(v) = value {
             if seen.insert(key.clone()) {
                 pairs.push((key, v));
@@ -310,6 +316,19 @@ fn resolve_host_env_pairs(entries: &[String]) -> Vec<(String, String)> {
         }
     }
     pairs
+}
+
+/// True when `key` is a valid environment variable name: an ASCII letter or `_`
+/// first, then ASCII alphanumerics or `_`. Shared by the host-env resolver and
+/// the `before_start` stdout parser so both reject the same malformed keys
+/// before they reach `Command::envs`.
+pub(crate) fn is_valid_env_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 pub(crate) fn resolve_host_environment_value(
@@ -1016,6 +1035,26 @@ environment = ["GH_TOKEN=write_token"]
         );
         std::env::remove_var("AOE_TEST_HOST_PAIR_REF");
         std::env::remove_var("AOE_TEST_HOST_PAIR_BARE");
+    }
+
+    #[test]
+    fn test_resolve_host_env_pairs_skips_invalid_keys() {
+        // Malformed keys (would fail at Command::envs) are dropped; valid ones
+        // pass through.
+        let entries = vec![
+            "GOOD=1".to_string(),
+            "1BAD=x".to_string(),      // starts with a digit
+            "HAS SPACE=y".to_string(), // contains a space
+            "=novalue".to_string(),    // empty key
+            "_OK=2".to_string(),
+        ];
+        assert_eq!(
+            resolve_host_env_pairs(&entries),
+            vec![
+                ("GOOD".to_string(), "1".to_string()),
+                ("_OK".to_string(), "2".to_string()),
+            ]
+        );
     }
 
     #[test]
