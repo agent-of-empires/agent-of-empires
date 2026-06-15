@@ -1242,6 +1242,14 @@ const HERMES_HOOKS: &[(&str, &str)] = &[
 /// our status-writing hooks under the configured events. Also pre-populates
 /// `<config_dir>/shell-hooks-allowlist.json` so Hermes registers the hooks
 /// without prompting for first-use consent.
+///
+/// **Atomicity caveat.** The two writes (config.yaml then allowlist.json)
+/// are sequential, not atomic. A crash between them leaves config.yaml in
+/// the hardened shape with the allowlist not yet updated; the next install
+/// re-runs both, so re-convergence happens on the next session creation.
+/// Hermes itself tolerates a missing/stale allowlist by re-prompting for
+/// consent, which is recoverable. Hardening to atomic-write across both
+/// files is tracked as a follow-up.
 pub fn install_hermes_hooks(config_path: &Path) -> Result<()> {
     let mut config: serde_yaml::Value = if config_path.exists() {
         let content = std::fs::read_to_string(config_path)?;

@@ -25,13 +25,39 @@
 //! after attempting all known paths regardless of partial-failure warnings,
 //! so a single corrupt file never blocks AoE boot indefinitely.
 //!
-//! ## Known limitation
+//! ## Known limitations
+//!
+//! ### Env vars set in interactive shell only
 //!
 //! A `CLAUDE_CONFIG_DIR` (or similar) set only in the user's interactive
 //! shell, and not in any profile's `environment` list, is not visible at
 //! migration time. Such hooks stay on the legacy string until the next
 //! relaunch under that env, or until the user runs
 //! `aoe uninstall && aoe add --cmd <agent>` to force a clean install.
+//!
+//! ### Transient per-target failures are not retried
+//!
+//! A per-target failure (locked file, unexpected parse error, permission
+//! denied, broken symlink, transient I/O) is logged at `tracing::warn!` and
+//! the migration moves on. The schema version still bumps to 15, so v015
+//! runs at most once per install. To re-attempt for a specific agent after
+//! fixing the underlying condition, run
+//! `aoe uninstall && aoe add --cmd <agent>`: this re-invokes the install
+//! path on the current canonical bytes. There is no migration-level retry
+//! mechanism on purpose: a corrupt file that cannot be parsed must not
+//! block AoE boot indefinitely.
+//!
+//! ### TOCTOU on non-Codex paths under concurrent uninstall
+//!
+//! For JSON-settings and sidecar formats, the `has_aoe_marker` gate is
+//! read without a file lock; the subsequent `install_*` write is also
+//! unlocked. A concurrent `aoe uninstall` invocation during this
+//! once-per-upgrade migration run can resurrect just-uninstalled hooks.
+//! The race window is the few hundred ms of v015 execution; the
+//! user-visible recovery is re-running `aoe uninstall`. Codex paths are
+//! protected by the existing `with_codex_config_lock`. A defense-in-depth
+//! fix would lock all install/uninstall paths uniformly; tracked as a
+//! follow-up to this PR.
 
 use anyhow::Result;
 use std::fs;
@@ -53,7 +79,7 @@ pub fn run() -> Result<()> {
 pub(crate) fn run_in(home: &Path, app_dir: &Path) -> Result<()> {
     let env_lists = collect_env_lists(app_dir);
     debug!(
-        target: "migrations",
+        target: "migrations.v015",
         home = %home.display(),
         app_dir = %app_dir.display(),
         env_lists = env_lists.len(),
@@ -69,7 +95,7 @@ pub(crate) fn run_in(home: &Path, app_dir: &Path) -> Result<()> {
             Ok(()) => {
                 rewritten += 1;
                 info!(
-                    target: "migrations",
+                    target: "migrations.v015",
                     agent = target.agent_name,
                     path = %target.path.display(),
                     "v015: rewrote AoE hook entries to current canonical form"
@@ -77,7 +103,7 @@ pub(crate) fn run_in(home: &Path, app_dir: &Path) -> Result<()> {
             }
             Err(e) => {
                 warn!(
-                    target: "migrations",
+                    target: "migrations.v015",
                     agent = target.agent_name,
                     path = %target.path.display(),
                     error = %e,
@@ -87,10 +113,17 @@ pub(crate) fn run_in(home: &Path, app_dir: &Path) -> Result<()> {
         }
     }
 
-    info!(target: "migrations", count = rewritten, "v015: done");
+    info!(target: "migrations.v015", count = rewritten, "v015: done");
     Ok(())
 }
 
+/// Reuses the live `install_*` functions to rewrite all canonical AoE entries.
+/// As a consequence, files that had hooks for only a *subset* of the agent's
+/// declared events end up with the full canonical set after this runs (per
+/// plan §3.3, the install path is the source of truth for "what AoE hooks
+/// look like today"). We do not preserve a historical narrower-set state
+/// because there is no reliable way to distinguish "user removed event X"
+/// from "AoE never installed event X."
 fn rewrite_one(target: &HookTarget) -> Result<()> {
     match target.kind {
         HookTargetKind::JsonSettings => {
@@ -110,6 +143,11 @@ fn rewrite_one(target: &HookTarget) -> Result<()> {
     }
 }
 
+/// Migration-local env-list reader. Intentionally does NOT share code with
+/// `crate::hooks::collect_env_lists_from_session`: that path goes through
+/// `Config::load()`, which has side effects (e.g. v008 default-profile
+/// lock-in) we cannot incur during early-boot migration execution. If the
+/// `environment` schema key is renamed, both sites must update.
 fn collect_env_lists(app_dir: &Path) -> Vec<Vec<String>> {
     let mut out = Vec::new();
     if let Some(env) = read_environment_from_toml(&app_dir.join("config.toml")) {
@@ -296,6 +334,9 @@ mod tests {
         run_in(&home, &app_dir).unwrap();
         let after_second = fs::read(&claude).unwrap();
 
+        // Byte-equality holds because serde_json serializes object keys in
+        // alphabetical order (BTreeMap-backed). If serde_json gains a
+        // `preserve_order` default, switch this to a parsed-Value equality.
         assert_eq!(after_first, after_second, "v015 must be byte-idempotent");
     }
 
@@ -497,6 +538,7 @@ mod tests {
         let _g = EnvGuard::unset_all();
         let (_tmp, home, app_dir) = setup_dirs();
         let cfg = home.join(".hermes/config.yaml");
+        let allow_path = home.join(".hermes/shell-hooks-allowlist.json");
         fs::create_dir_all(cfg.parent().unwrap()).unwrap();
         fs::write(
             &cfg,
@@ -504,15 +546,47 @@ mod tests {
         )
         .unwrap();
 
+        // First run rewrites legacy YAML to hardened form and creates the
+        // canonical allowlist with current `approved_at` values.
         run_in(&home, &app_dir).unwrap();
-        let after_first = fs::read(home.join(".hermes/shell-hooks-allowlist.json")).unwrap();
-        run_in(&home, &app_dir).unwrap();
-        let after_second = fs::read(home.join(".hermes/shell-hooks-allowlist.json")).unwrap();
 
-        assert_eq!(
-            after_first, after_second,
-            "Hermes allowlist must be byte-idempotent across re-runs (approved_at preserved)"
-        );
+        // Plant a sentinel timestamp on every approval. Because the entries
+        // now carry the HARDENED command (the same bytes a re-run of
+        // render_hermes_allowlist will match on), a subsequent rewrite must
+        // hit the (event, command) collision branch and preserve approved_at.
+        // Without this trick (e.g. running run_in twice back-to-back without
+        // the sentinel injection), the test would pass even if preservation
+        // were reverted to per-call `Utc::now()`, because to_rfc3339_opts
+        // collapses sub-second timestamps to the same string within one
+        // wall-clock second.
+        const SENTINEL: &str = "2020-01-01T00:00:00Z";
+        let mut data: Value =
+            serde_json::from_str(&fs::read_to_string(&allow_path).unwrap()).unwrap();
+        for approval in data["approvals"].as_array_mut().unwrap() {
+            approval["approved_at"] = Value::String(SENTINEL.into());
+        }
+        fs::write(&allow_path, serde_json::to_string_pretty(&data).unwrap()).unwrap();
+
+        // Re-plant the legacy YAML so the marker gate fires again and v015
+        // genuinely re-enters the rewrite path.
+        fs::write(
+            &cfg,
+            format!("hooks:\n  pre_tool_call:\n    - command: {LEGACY_STATUS_CMD:?}\n"),
+        )
+        .unwrap();
+
+        run_in(&home, &app_dir).unwrap();
+
+        let after: Value = serde_json::from_str(&fs::read_to_string(&allow_path).unwrap()).unwrap();
+        let approvals = after["approvals"].as_array().unwrap();
+        assert!(!approvals.is_empty(), "allowlist must not be wiped");
+        for approval in approvals {
+            assert_eq!(
+                approval["approved_at"].as_str(),
+                Some(SENTINEL),
+                "approved_at must be preserved on (event, hardened_command) collision: {approval}"
+            );
+        }
     }
 
     #[test]
@@ -526,6 +600,9 @@ mod tests {
             &serde_json::json!({
                 "name": "my-custom-agent",
                 "tools": ["Read", "Bash"],
+                "description": "user description that must survive",
+                "model": "claude-3-5-sonnet",
+                "custom_user_field": {"nested": [1, 2, 3]},
                 "hooks": {
                     "preToolUse": [{"command": LEGACY_STATUS_CMD}]
                 }
@@ -535,12 +612,15 @@ mod tests {
         run_in(&home, &app_dir).unwrap();
 
         let parsed: Value = serde_json::from_str(&fs::read_to_string(&kiro).unwrap()).unwrap();
-        assert_eq!(
-            parsed["name"].as_str(),
-            Some("my-custom-agent"),
-            "user-set `name` must be preserved"
-        );
+        assert_eq!(parsed["name"].as_str(), Some("my-custom-agent"));
         assert_eq!(parsed["tools"][0], "Read");
+        assert_eq!(
+            parsed["description"].as_str(),
+            Some("user description that must survive"),
+            "arbitrary user-set keys must be preserved"
+        );
+        assert_eq!(parsed["model"].as_str(), Some("claude-3-5-sonnet"));
+        assert_eq!(parsed["custom_user_field"]["nested"][2], 3);
         let cmd = parsed["hooks"]["preToolUse"][0]["command"]
             .as_str()
             .unwrap();
@@ -640,6 +720,84 @@ mod tests {
         assert!(
             text.contains("case \"$AOE_INSTANCE_ID\""),
             "profile-overridden Codex path must be reached and rewritten"
+        );
+        assert!(
+            !home.join(".codex/config.toml").exists(),
+            "default ~/.codex/config.toml must not be magicked into existence"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn profile_claude_config_dir_path_is_rewritten() {
+        let _g = EnvGuard::unset_all();
+        let (_tmp, home, app_dir) = setup_dirs();
+        // CLAUDE_CONFIG_DIR replaces the whole `~/.claude` dir, so the
+        // override file lands at `<override>/settings.json` (basename of
+        // `settings_rel_path`), matching `agent_settings_path_in`'s behavior.
+        let claude_override = home.join("work-claude");
+        fs::create_dir_all(&claude_override).unwrap();
+        write_json(
+            &claude_override.join("settings.json"),
+            &serde_json::json!({
+                "hooks": {
+                    "PreToolUse": [
+                        {"hooks": [{"type": "command", "command": LEGACY_STATUS_CMD}]}
+                    ]
+                }
+            }),
+        );
+
+        let profile_dir = app_dir.join("profiles/work");
+        fs::create_dir_all(&profile_dir).unwrap();
+        fs::write(
+            profile_dir.join("config.toml"),
+            format!(
+                "environment = [\"CLAUDE_CONFIG_DIR={}\"]\n",
+                claude_override.display()
+            ),
+        )
+        .unwrap();
+
+        run_in(&home, &app_dir).unwrap();
+
+        let parsed: Value = serde_json::from_str(
+            &fs::read_to_string(claude_override.join("settings.json")).unwrap(),
+        )
+        .unwrap();
+        let cmd = parsed["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .expect("AoE command must be present at the override path");
+        assert!(
+            cmd.contains("case \"$AOE_INSTANCE_ID\""),
+            "profile-overridden Claude path must be reached and rewritten; got: {cmd}"
+        );
+        assert!(
+            !home.join(".claude/settings.json").exists(),
+            "default ~/.claude/settings.json must not be magicked into existence"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn malformed_yaml_warn_and_skip() {
+        let _g = EnvGuard::unset_all();
+        let (_tmp, home, app_dir) = setup_dirs();
+        let hermes = home.join(".hermes/config.yaml");
+        fs::create_dir_all(hermes.parent().unwrap()).unwrap();
+        let original = "hooks:\n  pre_tool_call:\n    - command: 'unterminated\n";
+        fs::write(&hermes, original).unwrap();
+
+        run_in(&home, &app_dir).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&hermes).unwrap(),
+            original,
+            "malformed YAML must stay byte-identical (gate fails closed)"
+        );
+        assert!(
+            !home.join(".hermes/shell-hooks-allowlist.json").exists(),
+            "no allowlist may be written when the YAML gate fails closed"
         );
     }
 }
