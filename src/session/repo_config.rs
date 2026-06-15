@@ -25,10 +25,10 @@ pub enum HookProgress {
 ///
 /// `run_hook_with_timeout` is the sole producer of this value, and it only
 /// runs when [`crate::session::recovery::current_hook_timeout`] returns
-/// `Some`, which today only happens inside the startup-recovery cascade
-/// (`run_recovery_for_instance`). That gives a structural invariant
-/// callers rely on: observing a `HookTimeout` in the error chain implies
-/// the failure occurred under a recovery scope.
+/// `Some`, which production code installs only inside the startup-recovery
+/// cascade (`run_recovery_for_instance`). Current production callers rely on
+/// this invariant: observing a `HookTimeout` in the error chain implies the
+/// failure occurred under a recovery scope.
 ///
 /// Carried inside `anyhow::Error` so the existing `Result<_, anyhow::Error>`
 /// signatures stay unchanged; recovery sites recover the payload with

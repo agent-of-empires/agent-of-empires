@@ -338,11 +338,15 @@ pub fn run_recovery_for_instance(inst: &mut Instance) -> Result<StartOutcome> {
     let _scope = HookTimeoutScope::for_recovery();
     let result = inst.restart_with_size_opts(None, false);
     if let Err(ref e) = result {
-        inst.status = super::Status::Error;
-        inst.last_error = Some(format_recovery_last_error(e));
-        inst.last_error_check = Some(std::time::Instant::now());
+        stamp_recovery_error(inst, e);
     }
     result
+}
+
+fn stamp_recovery_error(inst: &mut Instance, e: &anyhow::Error) {
+    inst.status = super::Status::Error;
+    inst.last_error = Some(format_recovery_last_error(e));
+    inst.last_error_check = Some(std::time::Instant::now());
 }
 
 /// Project a cascade `anyhow::Error` onto the operator-facing `last_error`
@@ -719,6 +723,29 @@ mod tests {
         assert_eq!(
             format_recovery_last_error(&err),
             "on_launch hook timed out after 30s: sleep 60",
+        );
+    }
+
+    #[test]
+    fn stamp_recovery_error_sets_error_status_and_operator_fields() {
+        let mut inst = Instance::new("timeout", "/tmp/test");
+        let before = std::time::Instant::now();
+        let err = anyhow::Error::new(super::super::repo_config::HookTimeout {
+            cmd: "sleep 60".to_string(),
+            timeout_secs: 30,
+        });
+
+        stamp_recovery_error(&mut inst, &err);
+
+        assert_eq!(inst.status, super::super::Status::Error);
+        assert_eq!(
+            inst.last_error.as_deref(),
+            Some("on_launch hook timed out after 30s: sleep 60"),
+        );
+        assert!(
+            inst.last_error_check
+                .is_some_and(|checked| checked >= before),
+            "last_error_check must arm sticky error handling",
         );
     }
 

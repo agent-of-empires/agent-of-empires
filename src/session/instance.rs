@@ -1830,9 +1830,10 @@ impl Instance {
                         &workdir,
                         &hook_env,
                     ) {
-                        if e.downcast_ref::<super::repo_config::HookTimeout>()
-                            .is_some()
-                        {
+                        if e.chain().any(|c| {
+                            c.downcast_ref::<super::repo_config::HookTimeout>()
+                                .is_some()
+                        }) {
                             return Err(e);
                         }
                         tracing::warn!(target: "session.store", "on_launch hook failed in container: {}", e);
@@ -2035,9 +2036,10 @@ impl Instance {
                 Path::new(&self.project_path),
                 &hook_env,
             ) {
-                if e.downcast_ref::<super::repo_config::HookTimeout>()
-                    .is_some()
-                {
+                if e.chain().any(|c| {
+                    c.downcast_ref::<super::repo_config::HookTimeout>()
+                        .is_some()
+                }) {
                     return Err(e);
                 }
                 tracing::warn!(target: "session.store", "on_launch hook failed: {}", e);

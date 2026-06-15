@@ -169,13 +169,13 @@ fn hook_reading_stdin_does_not_block_under_timeout_scope() {
 #[test]
 #[serial]
 fn hung_on_launch_hook_emits_typed_hook_timeout_in_error_chain() {
-    let timeout = Duration::from_millis(300);
+    let timeout = Duration::from_secs(1);
     let _scope = HookTimeoutScope::new(timeout);
 
     let project = TempDir::new().expect("tempdir");
     let result = execute_hooks(&["sleep 60".to_string()], project.path(), &[]);
 
-    let err = result.expect_err("sleep 60 must time out under a 300ms scope");
+    let err = result.expect_err("sleep 60 must time out under a 1s scope");
     let typed = err
         .chain()
         .find_map(|c| c.downcast_ref::<HookTimeout>())
@@ -185,8 +185,7 @@ fn hung_on_launch_hook_emits_typed_hook_timeout_in_error_chain() {
         "typed error must carry the offending command verbatim",
     );
     assert_eq!(
-        typed.timeout_secs,
-        timeout.as_secs(),
+        typed.timeout_secs, 1,
         "typed error must carry the deadline in seconds",
     );
 }
