@@ -2524,8 +2524,23 @@ impl Instance {
 
         let hook_env = super::repo_config::lifecycle_env_vars(self);
         let project_path = PathBuf::from(&self.project_path);
-        let minted =
-            super::repo_config::run_before_start_hooks(&commands, &project_path, &hook_env)?;
+        // Feed the session's sandbox env into the hook so it can read a
+        // per-session value (e.g. `$TEST_VAR`) to scope what it mints.
+        // Repo-contributed env is filtered out so an untrusted repo can't
+        // influence the host hook's environment.
+        let session_env = self
+            .sandbox_info
+            .as_ref()
+            .map(|sb| {
+                super::environment::session_host_env_pairs(&self.source_profile, &project_path, sb)
+            })
+            .unwrap_or_default();
+        let minted = super::repo_config::run_before_start_hooks(
+            &commands,
+            &project_path,
+            &hook_env,
+            &session_env,
+        )?;
         if let Some(sb) = self.sandbox_info.as_mut() {
             sb.before_start_env = minted;
         }

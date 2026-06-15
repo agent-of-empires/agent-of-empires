@@ -844,8 +844,9 @@ fn build_hook_command(
 ///
 /// Mirrors the naming in [`crate::status_hooks::StatusHookContext::env_vars`]
 /// so a single vocabulary covers both hook surfaces. `AOE_SESSION_BRANCH` is
-/// only present when the session has a worktree; other fields may be empty
-/// strings (e.g., `AOE_GROUP_PATH` for ungrouped sessions).
+/// only present when the session has a worktree; `AOE_REPO_SLUG` only when the
+/// project has an `origin` remote that parses to `owner/repo`; other fields may
+/// be empty strings (e.g., `AOE_GROUP_PATH` for ungrouped sessions).
 pub(crate) fn lifecycle_env_vars(instance: &super::Instance) -> Vec<(&'static str, String)> {
     let mut env = vec![
         ("AOE_SESSION_ID", instance.id.clone()),
@@ -857,6 +858,12 @@ pub(crate) fn lifecycle_env_vars(instance: &super::Instance) -> Vec<(&'static st
     ];
     if let Some(wt) = instance.worktree_info.as_ref() {
         env.push(("AOE_SESSION_BRANCH", wt.branch.clone()));
+    }
+    // The `owner/repo` slug from the origin remote, so a hook can mint a
+    // repo-scoped credential (e.g. `mint "$AOE_REPO_SLUG"`) without parsing the
+    // filesystem path itself. Omitted when there is no parseable origin remote.
+    if let Some(slug) = crate::git::get_remote_slug(std::path::Path::new(&instance.project_path)) {
+        env.push(("AOE_REPO_SLUG", slug));
     }
     env
 }
@@ -1108,16 +1115,6 @@ pub fn resolve_before_start_hooks(profile: &str) -> Vec<String> {
         .before_start
 }
 
-/// A character may start an environment variable name: ASCII letter or `_`.
-fn is_valid_env_key(key: &str) -> bool {
-    let mut chars = key.chars();
-    match chars.next() {
-        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
-        _ => return false,
-    }
-    key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
 /// Parse `KEY=VALUE` lines from a hook's stdout, ignoring blank lines, lines
 /// with no `=`, and lines whose key is not a valid env var name. Later entries
 /// override earlier ones for the same key. The value is preserved verbatim
@@ -1129,7 +1126,7 @@ fn parse_env_kv_lines(stdout: &str) -> Vec<(String, String)> {
             continue;
         };
         let key = key.trim();
-        if !is_valid_env_key(key) {
+        if !super::environment::is_valid_env_key(key) {
             continue;
         }
         out.retain(|(k, _)| k != key);
@@ -1147,10 +1144,16 @@ fn parse_env_kv_lines(stdout: &str) -> Vec<(String, String)> {
 /// without the values the agent depends on); the error message includes stderr
 /// but never stdout. Honors the shared hook timeout so a hanging mint command
 /// cannot wedge a session launch.
+///
+/// `extra_env` carries the session lifecycle vars (`AOE_*`); `session_env`
+/// carries the session's resolved sandbox environment so the hook can read a
+/// per-session value (e.g. `$TEST_VAR`) to scope what it mints. `session_env`
+/// is applied last, so it overrides the inherited process env for the same key.
 pub fn run_before_start_hooks(
     commands: &[String],
     project_path: &Path,
     extra_env: &[(&'static str, String)],
+    session_env: &[(String, String)],
 ) -> Result<Vec<(String, String)>> {
     let timeout = crate::session::recovery::current_hook_timeout();
     let mut collected: Vec<(String, String)> = Vec::new();
@@ -1170,6 +1173,7 @@ pub fn run_before_start_hooks(
             },
             extra_env,
         );
+        command.envs(session_env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
         command
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -1440,7 +1444,8 @@ mod tests {
             "echo GH_TOKEN=ghs_abc".to_string(),
             "printf 'FOO=bar\\nnoise line\\n'".to_string(),
         ];
-        let minted = run_before_start_hooks(&cmds, tmp.path(), &[]).expect("hooks should succeed");
+        let minted =
+            run_before_start_hooks(&cmds, tmp.path(), &[], &[]).expect("hooks should succeed");
         assert_eq!(
             minted,
             vec![
@@ -1451,10 +1456,24 @@ mod tests {
     }
 
     #[test]
+    fn test_run_before_start_hooks_reads_session_env() {
+        // A per-session value reaches the hook and can scope what it mints.
+        let tmp = tempfile::tempdir().unwrap();
+        let cmds = vec!["echo \"GH_TOKEN=tok-$TEST_VAR\"".to_string()];
+        let session_env = [("TEST_VAR".to_string(), "alpha".to_string())];
+        let minted = run_before_start_hooks(&cmds, tmp.path(), &[], &session_env)
+            .expect("hooks should succeed");
+        assert_eq!(
+            minted,
+            vec![("GH_TOKEN".to_string(), "tok-alpha".to_string())]
+        );
+    }
+
+    #[test]
     fn test_run_before_start_hooks_hard_fail() {
         let tmp = tempfile::tempdir().unwrap();
         let cmds = vec!["exit 3".to_string()];
-        let err = run_before_start_hooks(&cmds, tmp.path(), &[])
+        let err = run_before_start_hooks(&cmds, tmp.path(), &[], &[])
             .expect_err("non-zero exit must be an error");
         assert!(err.to_string().contains("exit code 3"), "got: {err}");
     }
@@ -1468,7 +1487,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let cmds = vec!["echo \"GH_TOKEN=$SECRET_SRC\"; echo boom 1>&2; exit 1".to_string()];
         let extra_env = [("SECRET_SRC", "topsecret".to_string())];
-        let err = run_before_start_hooks(&cmds, tmp.path(), &extra_env)
+        let err = run_before_start_hooks(&cmds, tmp.path(), &extra_env, &[])
             .expect_err("non-zero exit must be an error");
         let msg = err.to_string();
         assert!(!msg.contains("topsecret"), "stdout secret leaked: {msg}");
