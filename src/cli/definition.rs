@@ -26,6 +26,7 @@ use super::serve::ServeArgs;
 use super::session::SessionCommands;
 use super::sounds::SoundsCommands;
 use super::status::StatusArgs;
+use super::stop_all::StopAllArgs;
 use super::telemetry::TelemetryCommands;
 use super::theme::ThemeCommands;
 use super::tmux::TmuxCommands;
@@ -97,6 +98,10 @@ pub enum Commands {
 
     /// Show session status summary
     Status(StatusArgs),
+
+    /// Force-stop everything aoe is running: the serve daemon, all agent
+    /// workers, and all aoe tmux sessions. Destructive and unprompted.
+    StopAll(StopAllArgs),
 
     /// Manage session lifecycle (start, stop, attach, etc.)
     Session {
@@ -219,6 +224,7 @@ pub const CLI_COMMAND_NAMES: &[&str] = &[
     "remove",
     "send",
     "status",
+    "stop_all",
     "session",
     "group",
     "profile",
@@ -259,6 +265,7 @@ pub fn command_name(command: &Commands) -> Option<&'static str> {
         Commands::Remove(_) => "remove",
         Commands::Send(_) => "send",
         Commands::Status(_) => "status",
+        Commands::StopAll(_) => "stop_all",
         Commands::Session { .. } => "session",
         Commands::Group { .. } => "group",
         Commands::Profile { .. } => "profile",

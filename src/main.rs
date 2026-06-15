@@ -307,6 +307,7 @@ async fn main() -> Result<()> {
         Some(Commands::Remove(args)) => cli::remove::run(&profile, args).await,
         Some(Commands::Send(args)) => cli::send::run(&profile, args).await,
         Some(Commands::Status(args)) => cli::status::run(&profile, args).await,
+        Some(Commands::StopAll(args)) => cli::stop_all::run(args).await,
         Some(Commands::Session { command }) => cli::session::run(&profile, command).await,
         Some(Commands::Group { command }) => cli::group::run(&profile, command).await,
         Some(Commands::Profile { command }) => cli::profile::run(command).await,
