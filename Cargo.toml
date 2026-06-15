@@ -125,7 +125,7 @@ which = "8.0"
 # system libsqlite3 dependency. Used to read session state without spawning
 # `opencode session list`, which leaks a 4.5MB /tmp/.<hash>.so per invocation
 # via opencode's bun:ffi OpenTUI extract path (see anomalyco/opencode#6523).
-rusqlite = { version = "0.39", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 # Web server (optional, behind "serve" feature)
 axum = { version = "0.8", features = ["ws"], optional = true }
