@@ -40,8 +40,9 @@ import type { SessionResponse, SessionStatus, Workspace } from "../lib/types";
 import type { SidebarAxis } from "../lib/sidebarAxis";
 import {
   archivableWorkspaces,
-  nestedSidebarGroupHasLiveWorkspace,
+  nestedSidebarGroupShouldRender,
   sidebarGroupHasLiveWorkspace,
+  sidebarGroupShouldRender,
   type NestedSidebarGroup,
   type SidebarGroup,
 } from "../lib/sidebarGroups";
@@ -150,6 +151,10 @@ interface Props {
   onUpdateRepoAppearance: (repoId: string, update: RepoAppearanceUpdate) => void;
   onNew: () => void;
   onCreateSession: (repoPath: string) => void;
+  /** Pin a repo (register it) so it persists with zero sessions. See #2047. */
+  onPinProject?: (repoPath: string) => void;
+  /** Unpin a repo: remove every registry entry for its path. See #2047. */
+  onUnpinProject?: (group: SidebarGroup) => void;
   onSettings: () => void;
   onProjects: () => void;
   onProfiles: () => void;
@@ -1585,6 +1590,8 @@ const SidebarGroupHeader = memo(function SidebarGroupHeader({
   onNewSession,
   onUpdateAppearance,
   onArchiveAll,
+  onPin,
+  onUnpin,
   offline,
   dragHandle,
 }: {
@@ -1596,6 +1603,12 @@ const SidebarGroupHeader = memo(function SidebarGroupHeader({
   /** Archive every active session under this group. Omitted (read-only /
    *  offline) hides the action; the parent owns the confirmation. */
   onArchiveAll?: () => void;
+  /** Register this repo in the pin registry so it persists with zero
+   *  sessions. Repo axis only; omitted (read-only / offline) hides it. */
+  onPin?: (repoPath: string) => void;
+  /** Remove every registry entry for this repo path (unpin). Omitted
+   *  (read-only / offline) hides it. */
+  onUnpin?: (group: SidebarGroup) => void;
   offline: boolean;
   dragHandle?: DragHandleProps;
 }) {
@@ -1609,7 +1622,11 @@ const SidebarGroupHeader = memo(function SidebarGroupHeader({
   // action hides once everything is already archived.
   const archivableCount = onArchiveAll ? archivableWorkspaces(group).length : 0;
   const canArchiveAll = archivableCount > 0;
-  const hasMenu = canAppearance || canArchiveAll;
+  // Pin/unpin is repo-axis only and needs a concrete repo path. Pin shows
+  // when the repo is not yet registered; unpin when it is. See #2047.
+  const canPin = !!onPin && group.capabilities.create === "repo" && !!group.repoPath && !group.pinned;
+  const canUnpin = !!onUnpin && group.kind === "repo" && group.pinned;
+  const hasMenu = canAppearance || canArchiveAll || canPin || canUnpin;
   const headerTitle = group.groupPath ?? group.repoPath;
   const [contextMenu, setContextMenu] = useState<{
     x: number;
@@ -1760,6 +1777,16 @@ const SidebarGroupHeader = memo(function SidebarGroupHeader({
             />
           </svg>
           <OwnerAvatar owner={group.remoteOwner} size={16} />
+          {group.pinned && (
+            <span
+              className="shrink-0 text-[10px] leading-none text-text-dim"
+              data-testid="sidebar-group-pinned-marker"
+              title="Pinned project (persists without sessions)"
+              aria-label="Pinned project"
+            >
+              ◆
+            </span>
+          )}
           <span className="text-[13px] md:text-[14px] font-medium truncate flex-1" title={headerTitle}>
             {group.displayName}
           </span>
@@ -1799,6 +1826,33 @@ const SidebarGroupHeader = memo(function SidebarGroupHeader({
               maxHeight: "calc(100vh - 16px)",
             }}
           >
+            {canPin && (
+              <button
+                onClick={() => {
+                  setContextMenu(null);
+                  if (group.repoPath) onPin?.(group.repoPath);
+                }}
+                data-testid="sidebar-group-context-menu-pin"
+                className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors"
+              >
+                Pin project
+              </button>
+            )}
+            {canUnpin && (
+              <button
+                onClick={() => {
+                  setContextMenu(null);
+                  onUnpin?.(group);
+                }}
+                data-testid="sidebar-group-context-menu-unpin"
+                className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors"
+              >
+                Unpin project
+              </button>
+            )}
+            {(canPin || canUnpin) && (canArchiveAll || canAppearance) && (
+              <div className="border-t border-surface-700/20 my-1" />
+            )}
             {canArchiveAll && (
               <button
                 onClick={() => {
@@ -1931,6 +1985,8 @@ export function WorkspaceSidebar({
   onUpdateRepoAppearance,
   onNew,
   onCreateSession,
+  onPinProject,
+  onUnpinProject,
   onSettings,
   onProjects,
   onProfiles,
@@ -2439,7 +2495,7 @@ export function WorkspaceSidebar({
                 onDragEnd={reorderDisabled ? undefined : handleDragEnd}
               >
                 {(() => {
-                  const liveGroups = filteredGroups.filter(sidebarGroupHasLiveWorkspace);
+                  const liveGroups = filteredGroups.filter(sidebarGroupShouldRender);
                   // Every visible group is sortable, synthetic Multi-repo /
                   // Scratch included: they default to the bottom but can be
                   // dragged to any position. Group drag is off while a filter
@@ -2465,6 +2521,8 @@ export function WorkspaceSidebar({
                           onClick={() => !q && onToggleGroup(group.id)}
                           onUpdateAppearance={onUpdateRepoAppearance}
                           onArchiveAll={readOnly || offline ? undefined : () => onArchiveGroup(fullGroup)}
+                          onPin={readOnly || offline ? undefined : onPinProject}
+                          onUnpin={readOnly || offline ? undefined : onUnpinProject}
                           onNewSession={() =>
                             group.capabilities.create === "repo" && group.repoPath
                               ? onCreateSession(group.repoPath)
@@ -2540,7 +2598,7 @@ export function WorkspaceSidebar({
             </DragSuppressContext.Provider>
           )}
           {isNested &&
-            filteredNested.filter(nestedSidebarGroupHasLiveWorkspace).map((ng) => {
+            filteredNested.filter(nestedSidebarGroupShouldRender).map((ng) => {
               const repo = ng.repo;
               const repoExpanded = q ? true : !repo.collapsed;
               const repoHasActiveChild = ng.subgroups.some((sg) =>
@@ -2554,6 +2612,8 @@ export function WorkspaceSidebar({
                     onClick={() => !q && onToggleGroup(repo.id)}
                     onUpdateAppearance={onUpdateRepoAppearance}
                     onArchiveAll={readOnly || offline ? undefined : () => onArchiveGroup(repo)}
+                    onPin={readOnly || offline ? undefined : onPinProject}
+                    onUnpin={readOnly || offline ? undefined : onUnpinProject}
                     onNewSession={() =>
                       repo.capabilities.create === "repo" && repo.repoPath ? onCreateSession(repo.repoPath) : onNew()
                     }

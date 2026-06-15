@@ -12,7 +12,8 @@ import { useSessionGroups } from "./hooks/useSessionGroups";
 import { useNestedSidebarGroups } from "./hooks/useNestedSidebarGroups";
 import { useSidebarSortMode } from "./hooks/useSidebarSortMode";
 import { useSidebarAxis } from "./hooks/useSidebarAxis";
-import { repoGroupToSidebarGroup } from "./lib/sidebarGroups";
+import { repoGroupToSidebarGroup, type SidebarGroup } from "./lib/sidebarGroups";
+import { useProjects } from "./hooks/useProjects";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useResolvedTheme } from "./hooks/useResolvedTheme";
 import { useWebSettings } from "./hooks/useWebSettings";
@@ -39,6 +40,8 @@ import {
   isDebugBuild,
   markWebTourSeen,
   updateWorkspaceOrdering,
+  createProject,
+  deleteProject,
 } from "./lib/api";
 import type { DeleteSessionOptions, ServerAbout } from "./lib/api";
 import { IdleDecayWindowContext, parseIdleDecayWindowMs, useIdleDecayWindowMs } from "./lib/idleDecay";
@@ -269,12 +272,13 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   const [sidebarSortMode, setSidebarSortMode] = useSidebarSortMode();
   const [sidebarAxis, setSidebarAxis] = useSidebarAxis();
 
+  const { projects, refresh: refreshProjects } = useProjects();
   const {
     groups: repoGroups,
     toggleRepoCollapsed,
     updateRepoAppearance,
     reorderRepoGroups,
-  } = useRepoGroups(workspaces, workspaceOrdering, sidebarSortMode);
+  } = useRepoGroups(workspaces, workspaceOrdering, sidebarSortMode, projects);
   const { groups: sessionGroups, toggleGroupCollapsed } = useSessionGroups(workspaces, sidebarSortMode);
   // The nested `repo+group` axis reuses the already-built repo groups for
   // its top level (so repo collapse, appearance, and ordering are shared
@@ -679,6 +683,35 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       setShowSessionWizard(true);
     },
     [sessions],
+  );
+
+  // Pin a repo: register it (scope global, matching the TUI's global
+  // registry) so its header persists with zero sessions, then refresh so the
+  // diamond / empty header reflects it. See #2047.
+  const handlePinProject = useCallback(
+    async (repoPath: string) => {
+      const res = await createProject({ path: repoPath, scope: "global" });
+      if (!res.ok) {
+        toastBus.push(res.error ?? "Failed to pin project", "error");
+        return;
+      }
+      await refreshProjects();
+    },
+    [refreshProjects],
+  );
+
+  // Unpin a repo: remove every registry entry for its path (a path can be
+  // registered under both global and profile scope), then refresh. See #2047.
+  const handleUnpinProject = useCallback(
+    async (group: SidebarGroup) => {
+      const results = await Promise.all(group.registeredProjects.map((p) => deleteProject(p.name, p.scope)));
+      const failed = results.find((r) => !r.ok);
+      if (failed) {
+        toastBus.push(failed.error ?? "Failed to unpin project", "error");
+      }
+      await refreshProjects();
+    },
+    [refreshProjects],
   );
 
   // The right-panel control toggles the desktop split, but on mobile there
@@ -1290,6 +1323,8 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
                 setShowSessionWizard(true);
               }}
               onCreateSession={handleCreateSession}
+              onPinProject={handlePinProject}
+              onUnpinProject={handleUnpinProject}
               onSettings={handleOpenSettings}
               onProjects={handleOpenProjects}
               onProfiles={handleOpenProfiles}
