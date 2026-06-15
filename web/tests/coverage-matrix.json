@@ -104,7 +104,11 @@
       "id": "terminal.mobile-live-wheel-forward",
       "kind": "vitest",
       "risk": "high",
-      "specs": ["src/lib/__tests__/liveMouse.test.ts", "src/components/__tests__/MobileLiveTerminal.forward.test.tsx"],
+      "specs": [
+        "src/lib/__tests__/liveMouse.test.ts",
+        "src/hooks/useLiveTerminal.forward.test.ts",
+        "src/components/__tests__/MobileLiveTerminal.forward.test.tsx"
+      ],
       "components": [
         "web/src/lib/liveMouse.ts",
         "web/src/components/MobileLiveTerminal.tsx",

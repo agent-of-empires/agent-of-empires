@@ -76,6 +76,13 @@ describe("MobileLiveTerminal wheel forwarding", () => {
     expect(lastUp).toBe(true);
   });
 
+  it("normalizes line-mode wheel deltas (deltaMode 1)", () => {
+    const { scroller, forwardWheel } = renderTerm(frame({ altScreen: true, mouse: true, mouseSgr: true }));
+    // deltaMode 1 = lines; a few lines should still forward at least one notch.
+    fireEvent.wheel(scroller, { deltaY: 3, deltaMode: 1 });
+    expect(forwardWheel).toHaveBeenCalled();
+  });
+
   it("does NOT forward when the app has no mouse mode (keeps capture scroll)", () => {
     const { scroller, forwardWheel } = renderTerm(frame({ altScreen: true, mouse: false }));
     expect(scroller.className).toContain("overflow-y-auto");
@@ -87,5 +94,42 @@ describe("MobileLiveTerminal wheel forwarding", () => {
     const { scroller, forwardWheel } = renderTerm(frame({ altScreen: false, mouse: true, mouseSgr: true }));
     fireEvent.wheel(scroller, { deltaY: 120 });
     expect(forwardWheel).not.toHaveBeenCalled();
+  });
+
+  it("forwards a single-finger drag as wheel notches", () => {
+    const { scroller, forwardWheel } = renderTerm(frame({ altScreen: true, mouse: true, mouseSgr: true }));
+    const touch = (y: number) => ({ clientX: 100, clientY: y }) as Touch;
+    // Finger moves UP (y decreases) => content scrolls down => wheel down.
+    fireEvent.touchStart(scroller, { touches: [touch(300)] });
+    fireEvent.touchMove(scroller, { touches: [touch(220)] });
+    fireEvent.touchEnd(scroller, { touches: [] });
+    expect(forwardWheel).toHaveBeenCalled();
+    expect(forwardWheel.mock.calls[0][0]).toBe(false); // up === false (wheel down)
+  });
+
+  it("does not enter reading mode on scroll while forwarding", () => {
+    const enterReading = vi.fn();
+    const utils = render(
+      <MobileLiveTerminal
+        frame={frame({ altScreen: true, mouse: true, mouseSgr: true })}
+        connected
+        active
+        reading={false}
+        sendResize={vi.fn()}
+        setWindow={vi.fn()}
+        setCadence={vi.fn()}
+        enterReading={enterReading}
+        returnToLive={vi.fn()}
+        sendData={vi.fn()}
+        forwardWheel={vi.fn()}
+        ctrlActiveRef={createRef<boolean>() as React.RefObject<boolean>}
+        clearCtrl={vi.fn()}
+        inputRef={createRef<HTMLTextAreaElement>()}
+        onInputFocusChange={vi.fn()}
+      />,
+    );
+    const scroller = utils.container.querySelector("[data-live-terminal] > div") as HTMLElement;
+    fireEvent.scroll(scroller);
+    expect(enterReading).not.toHaveBeenCalled();
   });
 });
