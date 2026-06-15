@@ -59,6 +59,15 @@ describe("useLiveTerminal forwardWheel", () => {
     expect(hit).toBe(true);
   });
 
+  it("does not send when the socket is not open", () => {
+    const { result } = renderHook(() => useLiveTerminal("s", "live-ws"));
+    const ws = FakeWS.last!;
+    ws.readyState = FakeWS.CLOSED;
+    ws.sent.length = 0;
+    act(() => result.current.forwardWheel(true, true, 3, 3));
+    expect(sentBytes(ws).length).toBe(0);
+  });
+
   it("surfaces altScreen / mouse / mouseSgr from incoming frames", () => {
     const { result } = renderHook(() => useLiveTerminal("s", "live-ws"));
     const ws = FakeWS.last!;

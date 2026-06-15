@@ -59,6 +59,22 @@ test("swipe over a full-screen SGR-mouse app forwards SGR wheel bytes", async ({
   await expect.poll(() => scroller(page).getAttribute("class")).toContain("overflow-hidden");
   await swipeUp(page);
   await expect.poll(() => texts(handle).some((s) => s.includes("\x1b[<65;"))).toBe(true);
+
+  // Downward swipe forwards wheel UP (button 64).
+  await fireTouches(page, "touchstart", [{ x: 100, y: 120 }]);
+  await fireTouches(page, "touchmove", [{ x: 100, y: 300 }]);
+  await fireTouches(page, "touchend", [{ x: 100, y: 300 }]);
+  await expect.poll(() => texts(handle).some((s) => s.includes("\x1b[<64;"))).toBe(true);
+
+  // Wheel events in all three deltaModes (px / line / page) + a sub-notch
+  // delta (no-op) + a scroll (which must NOT enter reading in forward mode).
+  await scroller(page).dispatchEvent("wheel", { deltaY: 120, deltaMode: 0 });
+  await scroller(page).dispatchEvent("wheel", { deltaY: 3, deltaMode: 1 });
+  await scroller(page).dispatchEvent("wheel", { deltaY: 1, deltaMode: 2 });
+  await scroller(page).dispatchEvent("wheel", { deltaY: 1, deltaMode: 0 });
+  await scroller(page).dispatchEvent("scroll", {});
+  // Still forwarding, still pinned, still no "Back to live" affordance.
+  await expect(page.getByRole("button", { name: "Back to live" })).toHaveCount(0);
 });
 
 test("swipe over a full-screen LEGACY-mouse app forwards X10 wheel bytes", async ({ page }) => {
