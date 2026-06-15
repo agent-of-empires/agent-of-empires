@@ -144,6 +144,22 @@ impl AcpError {
         }
         AcpError::Spawn(format!("{err} (command `{spawn_command}`)"))
     }
+
+    /// Build the enriched "binary not found" spawn error for a bare-command
+    /// ENOENT (no PATH resolution, cwd present). Appends the exact install
+    /// command when the binary is a known ACP adapter so the web banner can
+    /// show a copyable line instead of making the user guess. See #2109.
+    fn missing_binary_spawn_error(err: &std::io::Error, command: &str) -> Self {
+        let hint = crate::acp::install_hints::install_hint_for(command)
+            .map(|cmd| format!(". Install with: {cmd}"))
+            .unwrap_or_default();
+        AcpError::Spawn(format!(
+            "{err} (binary `{command}` not found on the daemon's PATH or in \
+             any known node-manager bin dir; install it where the daemon can \
+             see it, or restart `aoe serve` from a shell where `which \
+             {command}` resolves){hint}"
+        ))
+    }
 }
 
 /// Inspect an ACP-level error response from a `session/prompt` request
@@ -2570,13 +2586,7 @@ fn spawn_subprocess(config: &SpawnConfig) -> Result<tokio::process::Child, AcpEr
         //      Spawn message hinting at the frozen-PATH cause. See #1048.
         //   3. fallback → generic Spawn classification.
         if e.kind() == std::io::ErrorKind::NotFound && config.cwd.exists() && resolved.is_none() {
-            AcpError::Spawn(format!(
-                "{} (binary `{}` not found on the daemon's PATH or in any \
-                 known node-manager bin dir; install it where the daemon \
-                 can see it, or restart `aoe serve` from a shell where \
-                 `which {}` resolves)",
-                e, config.spec.command, config.spec.command
-            ))
+            AcpError::missing_binary_spawn_error(&e, &config.spec.command)
         } else {
             AcpError::classify_spawn_error(e, &config.cwd, &spawn_command)
         }
@@ -6840,6 +6850,36 @@ mod tests {
                     msg.contains("/nonexistent/bin/foo"),
                     "spawn message should echo command: {msg}"
                 );
+            }
+            other => panic!("expected Spawn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_binary_spawn_error_appends_install_hint_for_known_agent() {
+        let io_err = std::io::Error::from(std::io::ErrorKind::NotFound);
+        match AcpError::missing_binary_spawn_error(&io_err, "codex-acp") {
+            AcpError::Spawn(msg) => {
+                assert!(msg.contains("codex-acp"), "should echo the binary: {msg}");
+                assert!(
+                    msg.contains("Install with: npm install -g @zed-industries/codex-acp"),
+                    "should append the exact install command: {msg}"
+                );
+            }
+            other => panic!("expected Spawn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_binary_spawn_error_omits_hint_for_unknown_binary() {
+        let io_err = std::io::Error::from(std::io::ErrorKind::NotFound);
+        match AcpError::missing_binary_spawn_error(&io_err, "totally-unknown-bin") {
+            AcpError::Spawn(msg) => {
+                assert!(
+                    msg.contains("totally-unknown-bin"),
+                    "should echo binary: {msg}"
+                );
+                assert!(!msg.contains("Install with:"), "no hint for unknown: {msg}");
             }
             other => panic!("expected Spawn, got {other:?}"),
         }
