@@ -24,7 +24,7 @@ export const CHEATS: Record<string, Cheat> = {
   // Age of Empires 1
   wololo: {
     toast: "Wololo. The agent in the next worktree converts to your cause.",
-    effect: { kind: "flash", color: "#3b82f6" },
+    effect: { kind: "flash", color: "var(--color-terminal-active)" },
   },
   "photon man": {
     toast: "A Photon Man vaporizes your merge conflicts.",
@@ -54,7 +54,7 @@ export const CHEATS: Record<string, Cheat> = {
   },
   aegis: {
     toast: "AEGIS on. Worktrees build instantly. (cargo still takes 4 min.)",
-    effect: { kind: "flash", color: "#eab308" },
+    effect: { kind: "flash", color: "var(--color-status-waiting)" },
   },
   "rock on": {
     toast: "+1000 stone. Spent it on rate limits.",
@@ -78,7 +78,7 @@ export const CHEATS: Record<string, Cheat> = {
   },
   "black death": {
     toast: "Black Death. All flaky tests eliminated. (They'll be back.)",
-    effect: { kind: "flash", color: "#1f2937" },
+    effect: { kind: "flash", color: "var(--color-surface-800)" },
   },
 
   // Age of Empires 3
@@ -104,7 +104,7 @@ export const CHEATS: Record<string, Cheat> = {
   },
   "speed always wins": {
     toast: "Research speed x100. CI still queued.",
-    effect: { kind: "flash", color: "#22c55e" },
+    effect: { kind: "flash", color: "var(--color-status-running)" },
   },
   "x marks the spot": {
     toast: "Map revealed. The bug was in your code all along.",
