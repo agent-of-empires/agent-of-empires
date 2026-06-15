@@ -1347,6 +1347,7 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/api/sessions",
             get(api::list_sessions).post(api::create_session),
         )
+        .route("/api/recent-projects", get(api::get_recent_projects))
         .route(
             "/api/workspace-ordering",
             put(api::update_workspace_ordering),

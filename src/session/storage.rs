@@ -525,6 +525,121 @@ fn save_workspace_ordering(ordering: &WorkspaceOrdering) -> Result<()> {
     Ok(())
 }
 
+// Recent projects is a global most-recently-used store, written when a
+// session is deleted so the project it lived in survives in the new-session
+// wizard's Recent tab after its last session is gone (#2141). Live projects
+// still come from the session list directly; this file is only the tombstone
+// + recency for projects that no longer have any session. Stored at the
+// app-data root for the same cross-profile reason as workspace ordering.
+const RECENT_PROJECTS_LOCK_FILENAME: &str = ".recent-projects.lock";
+const RECENT_PROJECTS_CAP: usize = 20;
+
+fn recent_projects_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn recent_projects_path() -> Result<PathBuf> {
+    Ok(get_app_dir()?.join("recent-projects.json"))
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug, PartialEq)]
+pub struct RecentProjectEntry {
+    pub path: String,
+    pub display_name: String,
+    pub tool: String,
+    /// RFC 3339, always UTC, so lexical order equals chronological order.
+    pub last_used_at: String,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Default)]
+struct RecentProjects {
+    projects: Vec<RecentProjectEntry>,
+}
+
+/// Build a recent-project entry from a session being deleted, or `None` for
+/// sessions that must never appear in the wizard Recent list: scratch
+/// sessions (transient dirs) and multi-repo workspaces (they collapse to a
+/// single path and re-selecting one would silently drop the other repos).
+/// Mirrors the web client filter in `ProjectStep.tsx::collectRecentProjects`.
+/// The path is the worktree's main repo when present, else the project path,
+/// with any trailing slash trimmed so it keys identically to the client.
+pub fn recent_project_entry_for(inst: &Instance) -> Option<RecentProjectEntry> {
+    if inst.scratch || inst.is_workspace() {
+        return None;
+    }
+    let raw = inst
+        .worktree_info
+        .as_ref()
+        .map(|w| w.main_repo_path.as_str())
+        .unwrap_or(inst.project_path.as_str());
+    let trimmed = raw.trim_end_matches('/');
+    let path = if trimmed.is_empty() { "/" } else { trimmed };
+    let display_name = path
+        .rsplit('/')
+        .find(|s| !s.is_empty())
+        .unwrap_or(path)
+        .to_string();
+    let last_used_at = inst
+        .last_accessed_at
+        .unwrap_or(inst.created_at)
+        .to_rfc3339();
+    Some(RecentProjectEntry {
+        path: path.to_string(),
+        display_name,
+        tool: inst.tool.clone(),
+        last_used_at,
+    })
+}
+
+/// Upsert a recently used project, keyed by normalized path (newest
+/// `last_used_at` wins), capped to the most recent `RECENT_PROJECTS_CAP`.
+/// Best-effort from the caller's view: delete flows log and ignore errors.
+pub fn record_recent_project(entry: RecentProjectEntry) -> Result<()> {
+    let _mu = recent_projects_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let app_dir = get_app_dir()?;
+    let _flock = acquire_storage_flock(&app_dir, RECENT_PROJECTS_LOCK_FILENAME)?;
+    let mut store = load_recent_projects_inner()?;
+    store.projects.retain(|p| p.path != entry.path);
+    store.projects.push(entry);
+    store
+        .projects
+        .sort_by(|a, b| b.last_used_at.cmp(&a.last_used_at));
+    store.projects.truncate(RECENT_PROJECTS_CAP);
+    save_recent_projects(&store)?;
+    Ok(())
+}
+
+/// Persisted recent projects, newest first. Lock-free read; `atomic_write`
+/// guarantees a consistent document. Callers still filter dead directories.
+pub fn load_recent_projects() -> Result<Vec<RecentProjectEntry>> {
+    Ok(load_recent_projects_inner()?.projects)
+}
+
+fn load_recent_projects_inner() -> Result<RecentProjects> {
+    let path = recent_projects_path()?;
+    if !path.exists() {
+        return Ok(RecentProjects::default());
+    }
+    let content = fs::read_to_string(&path)?;
+    if content.trim().is_empty() {
+        return Ok(RecentProjects::default());
+    }
+    Ok(serde_json::from_str(&content)?)
+}
+
+fn save_recent_projects(store: &RecentProjects) -> Result<()> {
+    let path = recent_projects_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let content = serde_json::to_string_pretty(store)?;
+    atomic_write(&path, content.as_bytes())?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1494,6 +1609,79 @@ mod tests {
         let loaded = storage_after.load()?;
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].title, "after-poison");
+        Ok(())
+    }
+
+    #[test]
+    fn recent_entry_normalizes_and_uses_basename() {
+        let mut inst = Instance::new("s", "/home/me/projects/frontend/");
+        inst.tool = "claude".to_string();
+        let e = recent_project_entry_for(&inst).expect("single-repo session recorded");
+        assert_eq!(e.path, "/home/me/projects/frontend");
+        assert_eq!(e.display_name, "frontend");
+        assert_eq!(e.tool, "claude");
+    }
+
+    #[test]
+    fn recent_entry_skips_scratch() {
+        // Workspaces hit the same `is_workspace()` early-return branch.
+        let mut inst = Instance::new("s", "/tmp/scratch/x");
+        inst.scratch = true;
+        assert!(recent_project_entry_for(&inst).is_none());
+    }
+
+    #[test]
+    fn recent_entry_prefers_last_accessed_over_created() {
+        let mut inst = Instance::new("s", "/repo");
+        let accessed = inst.created_at + chrono::Duration::hours(5);
+        inst.last_accessed_at = Some(accessed);
+        let e = recent_project_entry_for(&inst).unwrap();
+        assert_eq!(e.last_used_at, accessed.to_rfc3339());
+    }
+
+    #[test]
+    #[serial]
+    fn record_recent_project_upserts_sorts_and_caps() -> Result<()> {
+        let temp = tempdir()?;
+        setup_test_home(temp.path());
+
+        // Capacity + 5 distinct projects, oldest first.
+        for i in 0..(RECENT_PROJECTS_CAP + 5) {
+            record_recent_project(RecentProjectEntry {
+                path: format!("/p/{i}"),
+                display_name: format!("{i}"),
+                tool: "claude".to_string(),
+                last_used_at: format!("2026-06-15T00:{:02}:00+00:00", i),
+            })?;
+        }
+        let loaded = load_recent_projects()?;
+        assert_eq!(loaded.len(), RECENT_PROJECTS_CAP, "capped");
+        // Newest first; the 5 oldest were evicted.
+        assert_eq!(loaded[0].path, format!("/p/{}", RECENT_PROJECTS_CAP + 4));
+        assert!(loaded.iter().all(|p| p.path != "/p/0"));
+
+        // Re-recording an existing path dedupes and refreshes recency.
+        record_recent_project(RecentProjectEntry {
+            path: format!("/p/{}", RECENT_PROJECTS_CAP + 1),
+            display_name: "x".to_string(),
+            tool: "claude".to_string(),
+            last_used_at: "2026-06-15T23:59:00+00:00".to_string(),
+        })?;
+        let loaded = load_recent_projects()?;
+        assert_eq!(
+            loaded.len(),
+            RECENT_PROJECTS_CAP,
+            "still capped after upsert"
+        );
+        assert_eq!(loaded[0].path, format!("/p/{}", RECENT_PROJECTS_CAP + 1));
+        assert_eq!(
+            loaded
+                .iter()
+                .filter(|p| p.path == format!("/p/{}", RECENT_PROJECTS_CAP + 1))
+                .count(),
+            1,
+            "no duplicate entry"
+        );
         Ok(())
     }
 }

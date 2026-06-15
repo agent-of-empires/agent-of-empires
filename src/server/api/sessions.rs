@@ -380,6 +380,24 @@ fn custom_agent_acp_capable(
         .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(tool, cmd).is_ok())
 }
 
+#[derive(serde::Serialize)]
+pub struct RecentProjectsResponse {
+    pub projects: Vec<crate::session::RecentProjectEntry>,
+}
+
+/// Persisted recent projects for the new-session wizard, newest first.
+/// Read-time pruning drops entries whose directory no longer exists; the
+/// stored file (capped at write time) is left untouched, so a GET stays
+/// side-effect free.
+pub async fn get_recent_projects() -> Json<RecentProjectsResponse> {
+    let projects = crate::session::load_recent_projects()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| std::path::Path::new(&p.path).is_dir())
+        .collect();
+    Json(RecentProjectsResponse { projects })
+}
+
 pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsEnvelope> {
     let instances = state.instances.read().await;
     let claude_fullscreen = crate::claude_settings::read_tui_fullscreen();
@@ -2471,6 +2489,10 @@ pub async fn delete_session(
     };
 
     let profile = instance.source_profile.clone();
+    // Captured before `instance` moves into the deletion task; recorded into
+    // the persisted recent-projects store only once the delete fully
+    // succeeds, so the project survives in the wizard Recent tab (#2141).
+    let recent_entry = crate::session::recent_project_entry_for(&instance);
 
     // Run the whole teardown + bookkeeping in a detached task. The
     // git / docker / tmux teardown below is irreversible once it starts, but
@@ -2583,6 +2605,12 @@ pub async fn delete_session(
                             instances.retain(|i| i.id != id);
                         }
                         state.instance_locks.write().await.remove(&id);
+                        if let Some(entry) = recent_entry {
+                            if let Err(e) = crate::session::record_recent_project(entry) {
+                                tracing::warn!(target: "http.api.sessions",
+                                    "recording recent project after delete failed: {e}");
+                            }
+                        }
                         (
                             StatusCode::OK,
                             Json(serde_json::json!({
