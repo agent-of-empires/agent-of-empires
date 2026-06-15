@@ -99,7 +99,6 @@ dependencies = [
  "axum",
  "base64",
  "cargo-husky",
- "cfg-if",
  "chrono",
  "clap",
  "clap_complete",
