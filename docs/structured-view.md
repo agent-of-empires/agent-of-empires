@@ -67,6 +67,10 @@ aoe add . --agent aoe-agent --model gpt-5   # pick an ACP agent + model (implies
 
 `--agent` for an uninstalled adapter errors with an install hint; `--structured-view` (no `--agent`) falls back to the terminal view with a warning so the command still succeeds.
 
+## Transcript history
+
+Opening a session renders the most recent slice of the transcript first, so a long conversation lands you at the latest message instead of painting the whole backlog (noticeable on mobile). Earlier turns stay loaded; a "Load earlier messages" button at the top of the transcript reveals more, a chunk at a time. The window resets to recent when you switch sessions. The full transcript is still fetched in the background, so search, scrollback, and `aoe acp history <id>` see everything.
+
 ## Requirements
 
 - aoe built with `--features serve`.
