@@ -114,7 +114,7 @@ content preview; a delete shows the target path. The diff is capped at
 20 changed lines and previews at 12 lines, with a "+N more" footer when
 there is more; press `o` to open the web dashboard for the full diff and
 output. A single patch touching several files shows each file's path and
-diff in one card. Claude's harness tools render as dedicated cards too:
+diff in one card. In the web dashboard, Claude's harness tools render as dedicated cards too:
 a tool search shows its query, a background monitor shows its description
 and command, and a task stop shows the stopped task id. Other tool kinds
 fall back to a generic one-liner (name, arguments, output).
