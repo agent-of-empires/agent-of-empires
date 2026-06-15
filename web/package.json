@@ -42,6 +42,7 @@
     "tailwindcss": "^4.2.2"
   },
   "devDependencies": {
+    "@codecov/vite-plugin": "^2.0.1",
     "@eslint/js": "^10.0.1",
     "@playwright/test": "^1.59.1",
     "@testing-library/dom": "^10.4.1",
@@ -68,5 +69,10 @@
     "vite": "8.0.16",
     "vite-plugin-istanbul": "^9.0.1",
     "vitest": "^4.1.6"
+  },
+  "overrides": {
+    "@codecov/vite-plugin": {
+      "vite": "$vite"
+    }
   }
 }

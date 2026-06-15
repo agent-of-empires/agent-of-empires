@@ -101,6 +101,7 @@ component_management:
         - "web/src/components/SecuritySettings.tsx"
         - "web/src/components/SettingsView.tsx"
         - "web/src/components/TerminalSettings.tsx"
+        - "web/src/components/McpServers.tsx"
 
     # ============================================================
     # AUTH (LoginPage, TokenEntryPage, ElevationPrompt)
@@ -121,6 +122,10 @@ component_management:
         - "web/src/components/Dashboard.tsx"
         - "web/src/components/WorkspaceSidebar.tsx"
         - "web/src/components/DeleteSessionDialog.tsx"
+        - "web/src/components/StopSessionDialog.tsx"
+        - "web/src/components/SessionGroupModal.tsx"
+        - "web/src/components/BulkActionBar.tsx"
+        - "web/src/components/SidebarSortPicker.tsx"
         - "web/src/components/TopBar.tsx"
         - "web/src/components/ProjectsView.tsx"
 
@@ -132,11 +137,17 @@ component_management:
       paths:
         - "web/src/components/RightPanel.tsx"
         - "web/src/components/TerminalView.tsx"
+        - "web/src/components/XtermTerminalView.tsx"
+        - "web/src/components/LiveTerminalView.tsx"
+        - "web/src/components/MobileLiveTerminal.tsx"
+        - "web/src/components/TerminalSessionStack.tsx"
+        - "web/src/components/PairedTerminal.tsx"
+        - "web/src/components/TerminalConnectionBanners.tsx"
         - "web/src/components/ContentSplit.tsx"
+        - "web/src/components/MobileMainPane.tsx"
+        - "web/src/components/MobileRightPanelPicker.tsx"
         - "web/src/components/MobileTerminalToolbar.tsx"
         - "web/src/components/KeyboardFab.tsx"
-        - "web/src/components/BackToLiveButton.tsx"
-        - "web/src/components/ViewportFullscreenFab.tsx"
 
     # ============================================================
     # DIRECTORY BROWSER + CONNECTED DEVICES + DISCONNECT BANNER
@@ -148,6 +159,7 @@ component_management:
         - "web/src/components/ConnectedDevices.tsx"
         - "web/src/components/DisconnectBanner.tsx"
         - "web/src/components/UpdateBanner.tsx"
+        - "web/src/components/DashboardUpdateBanner.tsx"
 
     # ============================================================
     # MODALS
@@ -157,6 +169,7 @@ component_management:
       paths:
         - "web/src/components/AboutModal.tsx"
         - "web/src/components/HelpOverlay.tsx"
+        - "web/src/components/TelemetryConsentModal.tsx"
 
     # ============================================================
     # COMMAND PALETTE
@@ -175,10 +188,12 @@ component_management:
       paths:
         - "web/src/App.tsx"
         - "web/src/main.tsx"
+        - "web/src/logging-init.ts"
         - "web/src/components/ErrorBoundary.tsx"
         - "web/src/components/OverflowMenu.tsx"
         - "web/src/components/OwnerAvatar.tsx"
         - "web/src/components/StatusGlyph.tsx"
+        - "web/src/components/Tooltip.tsx"
         - "web/src/components/Toasts.tsx"
 
     # ============================================================

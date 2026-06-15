@@ -2423,6 +2423,17 @@ pub struct DeleteSessionBody {
     pub keep_scratch: bool,
 }
 
+/// Flip a session out of `Status::Deleting` into `Status::Error` so a
+/// bookkeeping failure after teardown does not strand it greyed-out and
+/// unclickable, the exact state this detached-task delete exists to prevent.
+async fn mark_delete_error(state: &AppState, id: &str, message: String) {
+    let mut instances = state.instances.write().await;
+    if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+        inst.status = Status::Error;
+        inst.last_error = Some(message);
+    }
+}
+
 pub async fn delete_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -2439,9 +2450,12 @@ pub async fn delete_session(
 
     let body = body.map(|Json(b)| b).unwrap_or_default();
 
-    // Acquire per-instance lock to serialize concurrent mutations
+    // Acquire per-instance lock to serialize concurrent mutations.
+    // Owned guard so it can move into the detached deletion task below and
+    // stay held until the bookkeeping finishes, rather than only until this
+    // request future is dropped.
     let lock = state.instance_lock(&id).await;
-    let _guard = lock.lock().await;
+    let guard = lock.lock_owned().await;
 
     // Find and clone the instance (need the full Instance for deletion)
     let instance = {
@@ -2458,168 +2472,204 @@ pub async fn delete_session(
 
     let profile = instance.source_profile.clone();
 
-    // Mark as Deleting so polling clients see the status change
-    {
-        let mut instances = state.instances.write().await;
-        if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-            inst.status = Status::Deleting;
-        }
-    }
+    // Run the whole teardown + bookkeeping in a detached task. The
+    // git / docker / tmux teardown below is irreversible once it starts, but
+    // the disk-removal and in-memory cleanup that must follow it live in this
+    // request future. If the client disconnects mid-delete (e.g. closes the
+    // tab during a multi-second worktree removal), dropping the request future
+    // would abandon that bookkeeping after the session was already physically
+    // gone, stranding it greyed-out in the "Deleting" state forever. A
+    // detached task is not cancelled when the request future drops, so it
+    // always runs to completion; the owned lock guard moves in and is held
+    // until the bookkeeping finishes.
+    let join = tokio::spawn(async move {
+        let _guard = guard;
 
-    // Tear down the structured view worker FIRST so the ACP subprocess + its
-    // claude-agent-acp child don't leak past the session delete. The
-    // supervisor's shutdown is best-effort: sessions without a worker
-    // (tmux-mode, or structured view sessions whose worker never spawned)
-    // return UnknownSession, which we ignore.
-    #[cfg(feature = "serve")]
-    if instance.is_structured() {
-        // Permanent removal: release the agent's persisted transcript
-        // too, since the session is going away for good. See #1710.
-        match state.acp_supervisor.shutdown_and_delete(&id).await {
-            Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
-            Err(e) => {
-                tracing::warn!(
-                    target: "acp.supervisor",
-                    session = %id,
-                    "shutdown during delete failed: {e}"
-                );
+        // Mark as Deleting so polling clients see the status change
+        {
+            let mut instances = state.instances.write().await;
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+                inst.status = Status::Deleting;
             }
         }
-        // Drop the per-session seq counter so a recreated session
-        // with the same id (rare, but possible) starts cleanly from
-        // seq=1.
-        state.acp_supervisor.forget_session(&id);
-        // On-disk history is the durable mirror; without this purge a
-        // recreated session with the same id would inherit the deleted
-        // session's transcript and the seq=1 first publish would
-        // collide with a row already in the store.
-        state.acp_event_store.delete_session(&id);
-    }
 
-    // Run deletion on a blocking thread (may do git/docker/tmux operations)
-    let deletion_id = id.clone();
-    let deletion_result = tokio::task::spawn_blocking(move || {
-        crate::session::deletion::perform_deletion(&crate::session::deletion::DeletionRequest {
-            session_id: deletion_id,
-            instance,
-            delete_worktree: body.delete_worktree,
-            delete_branch: body.delete_branch,
-            delete_sandbox: body.delete_sandbox,
-            force_delete: body.force_delete,
-            detach_hooks: true,
-            keep_scratch: body.keep_scratch,
-        })
-    })
-    .await;
-
-    match deletion_result {
-        Ok(result) if result.success => {
-            // `perform_deletion` may have produced user-facing messages
-            // (e.g. "Scratch directory kept at: <path>" when
-            // `--keep-scratch` is set). Capture them now so the
-            // success branch can echo them back; the result moves into
-            // the spawn_blocking below.
-            let messages = result.messages.clone();
-            // Disk first: if persistence fails, the in-memory state is left
-            // intact and we return 500. Otherwise the status poll loop
-            // would silently re-add the entry from disk on the next tick
-            // and the user would see "deleted" then the session
-            // reappearing seconds later.
-            let storage = match Storage::new(&profile, state.file_watch.clone()) {
-                Ok(s) => s,
+        // Tear down the structured view worker FIRST so the ACP subprocess + its
+        // claude-agent-acp child don't leak past the session delete. The
+        // supervisor's shutdown is best-effort: sessions without a worker
+        // (tmux-mode, or structured view sessions whose worker never spawned)
+        // return UnknownSession, which we ignore.
+        #[cfg(feature = "serve")]
+        if instance.is_structured() {
+            // Permanent removal: release the agent's persisted transcript
+            // too, since the session is going away for good. See #1710.
+            match state.acp_supervisor.shutdown_and_delete(&id).await {
+                Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
                 Err(e) => {
-                    tracing::error!(target: "http.api.sessions",
-                        "Storage::new failed after deletion: {e}");
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({
-                            "error": "persist_failed",
-                            "message": format!(
-                                "Session was torn down but storage init failed: {e}"
-                            ),
-                        })),
+                    tracing::warn!(
+                        target: "acp.supervisor",
+                        session = %id,
+                        "shutdown during delete failed: {e}"
                     );
                 }
-            };
-            let id_for_save = id.clone();
-            let persist_result = tokio::task::spawn_blocking(move || {
-                storage.update(|instances, _groups| {
-                    instances.retain(|i| i.id != id_for_save);
-                    Ok(())
-                })
+            }
+            // Drop the per-session seq counter so a recreated session
+            // with the same id (rare, but possible) starts cleanly from
+            // seq=1.
+            state.acp_supervisor.forget_session(&id);
+            // On-disk history is the durable mirror; without this purge a
+            // recreated session with the same id would inherit the deleted
+            // session's transcript and the seq=1 first publish would
+            // collide with a row already in the store.
+            state.acp_event_store.delete_session(&id);
+        }
+
+        // Run deletion on a blocking thread (may do git/docker/tmux operations)
+        let deletion_id = id.clone();
+        let deletion_result = tokio::task::spawn_blocking(move || {
+            crate::session::deletion::perform_deletion(&crate::session::deletion::DeletionRequest {
+                session_id: deletion_id,
+                instance,
+                delete_worktree: body.delete_worktree,
+                delete_branch: body.delete_branch,
+                delete_sandbox: body.delete_sandbox,
+                force_delete: body.force_delete,
+                detach_hooks: true,
+                keep_scratch: body.keep_scratch,
             })
-            .await;
-            match persist_result {
-                Ok(Ok(())) => {
-                    {
-                        let mut instances = state.instances.write().await;
-                        instances.retain(|i| i.id != id);
+        })
+        .await;
+
+        match deletion_result {
+            Ok(result) if result.success => {
+                // `perform_deletion` may have produced user-facing messages
+                // (e.g. "Scratch directory kept at: <path>" when
+                // `--keep-scratch` is set). Capture them now so the
+                // success branch can echo them back; the result moves into
+                // the spawn_blocking below.
+                let messages = result.messages.clone();
+                // Disk first: if persistence fails, the in-memory state is left
+                // intact and we return 500. Otherwise the status poll loop
+                // would silently re-add the entry from disk on the next tick
+                // and the user would see "deleted" then the session
+                // reappearing seconds later.
+                let storage = match Storage::new(&profile, state.file_watch.clone()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let msg = format!("Session was torn down but storage init failed: {e}");
+                        mark_delete_error(&state, &id, msg.clone()).await;
+                        tracing::error!(target: "http.api.sessions",
+                        "Storage::new failed after deletion: {e}");
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "error": "persist_failed",
+                                "message": msg,
+                            })),
+                        );
                     }
-                    state.instance_locks.write().await.remove(&id);
-                    (
-                        StatusCode::OK,
-                        Json(serde_json::json!({
-                            "status": "deleted",
-                            "messages": messages,
-                        })),
-                    )
-                }
-                Ok(Err(e)) => {
-                    tracing::error!(target: "http.api.sessions",
+                };
+                let id_for_save = id.clone();
+                let persist_result = tokio::task::spawn_blocking(move || {
+                    storage.update(|instances, _groups| {
+                        instances.retain(|i| i.id != id_for_save);
+                        Ok(())
+                    })
+                })
+                .await;
+                match persist_result {
+                    Ok(Ok(())) => {
+                        {
+                            let mut instances = state.instances.write().await;
+                            instances.retain(|i| i.id != id);
+                        }
+                        state.instance_locks.write().await.remove(&id);
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "status": "deleted",
+                                "messages": messages,
+                            })),
+                        )
+                    }
+                    Ok(Err(e)) => {
+                        let msg = format!(
+                            "Session deletion completed on disk, but \
+                             sessions.json could not be updated: {e}"
+                        );
+                        mark_delete_error(&state, &id, msg.clone()).await;
+                        tracing::error!(target: "http.api.sessions",
                         "Failed to save after deletion: {e}");
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({
-                            "error": "persist_failed",
-                            "message": format!(
-                                "Session deletion completed on disk, but \
-                                 sessions.json could not be updated: {e}"
-                            ),
-                        })),
-                    )
-                }
-                Err(join_err) => {
-                    tracing::error!(target: "http.api.sessions",
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "error": "persist_failed",
+                                "message": msg,
+                            })),
+                        )
+                    }
+                    Err(join_err) => {
+                        mark_delete_error(&state, &id, "Persist task panicked".to_string()).await;
+                        tracing::error!(target: "http.api.sessions",
                         "Persist task panicked: {join_err}");
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({
-                            "error": "persist_failed",
-                            "message": "Persist task panicked",
-                        })),
-                    )
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "error": "persist_failed",
+                                "message": "Persist task panicked",
+                            })),
+                        )
+                    }
                 }
+            }
+            Ok(result) => {
+                // Deletion had errors; set status to Error
+                let error_msg = if result.errors.is_empty() {
+                    "Unknown error".to_string()
+                } else {
+                    result.errors.join("; ")
+                };
+                {
+                    let mut instances = state.instances.write().await;
+                    if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+                        inst.status = Status::Error;
+                        inst.last_error = Some(error_msg.clone());
+                    }
+                }
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": "deletion_failed",
+                        "message": error_msg,
+                    })),
+                )
+            }
+            Err(e) => {
+                let msg = format!("Deletion task failed: {e}");
+                mark_delete_error(&state, &id, msg.clone()).await;
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": "internal",
+                        "message": msg,
+                    })),
+                )
             }
         }
-        Ok(result) => {
-            // Deletion had errors; set status to Error
-            let error_msg = if result.errors.is_empty() {
-                "Unknown error".to_string()
-            } else {
-                result.errors.join("; ")
-            };
-            {
-                let mut instances = state.instances.write().await;
-                if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                    inst.status = Status::Error;
-                    inst.last_error = Some(error_msg.clone());
-                }
-            }
+    });
+
+    match join.await {
+        Ok(resp) => resp,
+        Err(e) => {
+            tracing::error!(target: "http.api.sessions",
+                "Deletion task panicked or was cancelled: {e}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
-                    "error": "deletion_failed",
-                    "message": error_msg,
+                    "error": "internal",
+                    "message": "Deletion task failed",
                 })),
             )
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": "internal",
-                "message": format!("Deletion task failed: {e}"),
-            })),
-        ),
     }
 }
 
