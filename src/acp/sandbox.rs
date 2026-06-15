@@ -83,8 +83,12 @@ pub async fn ensure_container_for_session(
         .await
         .context("docker ensure task failed to join")??;
 
-    // Phase 3: brief write lock to stamp the resolved container_id
-    // back onto the live Instance so subsequent reads observe it.
+    // Phase 3: brief write lock to stamp the resolved container_id (and the
+    // host-minted before_start env) back onto the live Instance so subsequent
+    // reads observe them. Carrying `before_start_env` back matters because the
+    // mint ran on the cloned instance above; without this, the next
+    // ensure_container_for_session would clone an empty cache and re-run the
+    // before_start hook on every view switch / spawn, re-minting credentials.
     if let Some(info) = &sandbox_info {
         let mut guard = instances.write().await;
         if let Some(inst) = guard.iter_mut().find(|i| i.id == session_id_owned) {
@@ -92,6 +96,7 @@ pub async fn ensure_container_for_session(
                 if sb.container_id.is_none() {
                     sb.container_id = info.container_id.clone();
                 }
+                sb.before_start_env = info.before_start_env.clone();
             }
         }
     }

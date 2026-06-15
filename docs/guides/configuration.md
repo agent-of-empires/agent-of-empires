@@ -215,6 +215,21 @@ environment = ["GH_TOKEN=$AOE_GH_TOKEN"]                      # env vars forward
 
 See [Docker Sandbox](sandbox.md) for the full key reference (`cpu_limit`, `memory_limit`, `port_mappings`, `extra_volumes`, `volume_ignores`, `volume_ignores_strategy`, `auto_cleanup`, `default_terminal_mode`), the `environment` grammar, and credential handling. For env vars on host (non-sandboxed) sessions, use [Host Environment](#host-environment) instead; the two lists are disjoint.
 
+## Host Hooks
+
+The `[host_hooks]` block declares hooks that run on the **host** (not inside the sandbox container). Unlike `[hooks]`, which for sandboxed sessions runs inside the container, host hooks run in your host shell and can compute a value with host-only tooling and credentials, then hand only that value to the container.
+
+```toml
+[host_hooks]
+before_start = ['echo "GH_TOKEN=$(my-mint-tool $AOE_PROJECT_PATH)"']
+```
+
+`before_start` runs each time a sandbox container comes up (on create and on restart, so short-lived values are refreshed before the agent launches). Each `KEY=VALUE` line the command prints to stdout is injected into the container environment as an **inherited** variable: the value is passed to the `docker` invocation through the process environment, never in argv, so it does not appear in `ps`. Lines that are not `KEY=VALUE` are ignored, and the hook's stdout is never logged, so it is safe to print a secret. A non-zero exit aborts bringing the container up. The lifecycle env vars (`AOE_PROJECT_PATH`, `AOE_SESSION_ID`, `AOE_PROFILE`, ...) are available to the command.
+
+The canonical use case is per-session, repo-scoped, short-lived credentials: mint a one-hour, single-repo token on the host (where the broad credential lives) and inject only the narrow token, so the minting tool and host credential never enter the container.
+
+`host_hooks` is **global/profile only**: it is never honored from a repo's `.agent-of-empires/config.toml`, because a checked-out repository must not be able to run host commands. Declare it in your global or profile `config.toml`.
+
 ## tmux
 
 ```toml

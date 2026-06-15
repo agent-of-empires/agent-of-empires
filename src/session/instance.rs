@@ -304,6 +304,15 @@ pub struct SandboxInfo {
     /// Custom instruction text to inject into agent launch command
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_instruction: Option<String>,
+    /// `KEY=VALUE` pairs minted on the host by `host_hooks.before_start` when
+    /// the container last came up. Injected into the container environment as
+    /// inherited (leak-safe) entries by [`super::environment::collect_environment`].
+    ///
+    /// Runtime-only and secret: never serialized (so short-lived tokens never
+    /// hit disk and a stale value never survives a restart) and re-minted on the
+    /// next container come-up. See [`Instance::ensure_before_start_env`].
+    #[serde(skip)]
+    pub before_start_env: Vec<(String, String)>,
 }
 
 /// Deserialize agent_session_id, treating empty/whitespace strings as None.
@@ -949,6 +958,17 @@ impl Instance {
         disk.retroactive_capture_excludes = std::mem::take(&mut self.retroactive_capture_excludes);
         disk.pane_dead_observed = self.pane_dead_observed;
         disk.source_profile = std::mem::take(&mut self.source_profile);
+        // `before_start_env` is `#[serde(skip)]`, so the disk snapshot always
+        // has it empty. Carry the live value forward; otherwise this reload
+        // (which runs before every launch) would wipe the host-minted cache and
+        // make `get_container_for_instance` re-run the before_start hook on each
+        // relaunch of an already-running container, defeating the one-time
+        // backfill and re-minting credentials needlessly.
+        if let (Some(disk_sandbox), Some(runtime_sandbox)) =
+            (disk.sandbox_info.as_mut(), self.sandbox_info.as_ref())
+        {
+            disk_sandbox.before_start_env = runtime_sandbox.before_start_env.clone();
+        }
 
         *self = disk;
     }
@@ -2406,20 +2426,26 @@ impl Instance {
     }
 
     pub fn get_container_for_instance(&mut self) -> Result<containers::DockerContainer> {
-        let sandbox = self
+        let image = self
             .sandbox_info
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Cannot ensure container for non-sandboxed session"))?;
-
-        let image = &sandbox.image;
-        let container = DockerContainer::new(&self.id, image);
+            .ok_or_else(|| anyhow::anyhow!("Cannot ensure container for non-sandboxed session"))?
+            .image
+            .clone();
+        let container = DockerContainer::new(&self.id, &image);
 
         if container.is_running()? {
+            // Already up: not a come-up, so don't re-mint. Fill lazily only if a
+            // fresh process attached to a running container with no values yet.
+            self.ensure_before_start_env(false)?;
             container_config::refresh_agent_configs();
             return Ok(container);
         }
 
         if container.exists()? {
+            // Restart of a stopped container is a come-up: refresh so a
+            // short-lived token is re-minted.
+            self.ensure_before_start_env(true)?;
             container_config::refresh_agent_configs();
             container.start()?;
             return Ok(container);
@@ -2427,8 +2453,11 @@ impl Instance {
 
         // Ensure image is available (always pulls to get latest)
         let runtime = containers::get_container_runtime();
-        runtime.ensure_image(image)?;
+        runtime.ensure_image(&image)?;
 
+        // Mint before building the container config so the docker-run env also
+        // carries the values (leak-safe via the inherit path in run_create).
+        self.ensure_before_start_env(true)?;
         let config = self.build_container_config()?;
         let container_id = container.create(&config)?;
 
@@ -2460,6 +2489,47 @@ impl Instance {
             self.workspace_info.as_ref(),
             &self.source_profile,
         )
+    }
+
+    /// Run `host_hooks.before_start` on the host and stash the resulting
+    /// `KEY=VALUE` pairs on `sandbox_info.before_start_env`, from where
+    /// [`super::environment::collect_environment`] injects them into the
+    /// container environment on every surface (docker run, the tmux `docker
+    /// exec` launch, and the structured-view worker).
+    ///
+    /// `force` re-mints unconditionally (a container come-up); when false the
+    /// hooks run only if no values are stashed yet, so attaching to an
+    /// already-running container backfills without re-minting on every relaunch.
+    /// A hook failure is propagated so the container does not come up without
+    /// the values the agent depends on. Hooks are resolved from profile/global
+    /// config only, never from the repo.
+    fn ensure_before_start_env(&mut self, force: bool) -> Result<()> {
+        if self.sandbox_info.is_none() {
+            return Ok(());
+        }
+        let commands = super::repo_config::resolve_before_start_hooks(&self.source_profile);
+        if commands.is_empty() {
+            if let Some(sb) = self.sandbox_info.as_mut() {
+                sb.before_start_env.clear();
+            }
+            return Ok(());
+        }
+        let already_minted = self
+            .sandbox_info
+            .as_ref()
+            .is_some_and(|s| !s.before_start_env.is_empty());
+        if !force && already_minted {
+            return Ok(());
+        }
+
+        let hook_env = super::repo_config::lifecycle_env_vars(self);
+        let project_path = PathBuf::from(&self.project_path);
+        let minted =
+            super::repo_config::run_before_start_hooks(&commands, &project_path, &hook_env)?;
+        if let Some(sb) = self.sandbox_info.as_mut() {
+            sb.before_start_env = minted;
+        }
+        Ok(())
     }
 
     pub fn maybe_start_poller(&mut self) {
@@ -4725,6 +4795,7 @@ mod tests {
             container_name: "test".to_string(),
             extra_env: None,
             custom_instruction: None,
+            before_start_env: Vec::new(),
         });
         assert!(!inst.is_sandboxed());
     }
@@ -4739,6 +4810,7 @@ mod tests {
             container_name: "test".to_string(),
             extra_env: None,
             custom_instruction: None,
+            before_start_env: Vec::new(),
         });
         assert!(inst.is_sandboxed());
     }
@@ -4844,6 +4916,7 @@ mod tests {
             container_name: "test_container".to_string(),
             extra_env: Some(vec!["MY_VAR".to_string(), "OTHER_VAR".to_string()]),
             custom_instruction: None,
+            before_start_env: Vec::new(),
         };
 
         let json = serde_json::to_string(&info).unwrap();
@@ -5944,6 +6017,57 @@ mod tests {
             assert_eq!(inst.agent_session_id.as_deref(), Some("old-sid"));
             inst.reconcile_from_disk();
             assert_eq!(inst.agent_session_id.as_deref(), Some("new-sid"));
+        }
+
+        #[test]
+        #[serial]
+        fn reconcile_from_disk_preserves_before_start_env() {
+            // `before_start_env` is `#[serde(skip)]`, so the disk snapshot has
+            // it empty. reconcile_from_disk (run before every launch) must carry
+            // the live host-minted cache forward, or an already-running
+            // container would re-mint on every relaunch.
+            let temp = tempdir().unwrap();
+            std::env::set_var("HOME", temp.path());
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+
+            let storage =
+                crate::session::storage::Storage::new_unwatched("reconcile-before-start").unwrap();
+            let mut inst = Instance::new("title", "/tmp/x");
+            inst.source_profile = "reconcile-before-start".to_string();
+            inst.sandbox_info = Some(crate::session::SandboxInfo {
+                enabled: true,
+                container_id: None,
+                image: "img".to_string(),
+                container_name: "ctr".to_string(),
+                extra_env: None,
+                custom_instruction: None,
+                before_start_env: Vec::new(),
+            });
+            let on_disk = inst.clone();
+            storage
+                .update(|i, g| {
+                    *i = vec![on_disk.clone()];
+                    *g = crate::session::GroupTree::new_with_groups(
+                        std::slice::from_ref(&on_disk),
+                        &[],
+                    )
+                    .get_all_groups();
+                    Ok(())
+                })
+                .unwrap();
+
+            // Stamp a freshly-minted value into the in-memory cache only.
+            inst.sandbox_info.as_mut().unwrap().before_start_env =
+                vec![("GH_TOKEN".to_string(), "ghs_minted".to_string())];
+
+            inst.reconcile_from_disk();
+
+            assert_eq!(
+                inst.sandbox_info.as_ref().unwrap().before_start_env,
+                vec![("GH_TOKEN".to_string(), "ghs_minted".to_string())],
+                "live before_start_env must survive the pre-launch disk reload"
+            );
         }
 
         #[test]
