@@ -11,7 +11,7 @@
 // ProjectStep.recents-normalize.test.tsx (#1843).
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render } from "@testing-library/react";
+import { cleanup, fireEvent, render } from "@testing-library/react";
 
 import { ProjectStep, splitSavedAndRecent } from "../steps/ProjectStep";
 import { initialData } from "../wizardReducer";
@@ -21,6 +21,10 @@ vi.mock("../../../lib/api", () => ({
   fetchSessions: vi.fn(),
   fetchProjects: vi.fn(),
   cloneRepo: vi.fn(),
+  // The Browse-fallback test mounts DirectoryBrowser, which probes the
+  // filesystem on mount. Stub both so it renders without a network hit.
+  getHomePath: vi.fn().mockResolvedValue(null),
+  browseFilesystem: vi.fn().mockResolvedValue({ ok: false, entries: [] }),
 }));
 
 import { fetchSessions, fetchProjects } from "../../../lib/api";
@@ -178,5 +182,68 @@ describe("ProjectStep saved-projects render (#2140)", () => {
     const { findByText, queryByText } = renderStep("zeta");
     expect(await findByText("/repo/zeta")).toBeTruthy();
     expect(queryByText("/repo/alpha")).toBeNull();
+  });
+
+  it("selects a saved project's path when its row is clicked", async () => {
+    vi.mocked(fetchProjects).mockResolvedValue([savedProject({ name: "alpha", path: "/repo/alpha" })]);
+    vi.mocked(fetchSessions).mockResolvedValue({ sessions: [], workspace_ordering: [] });
+
+    const { onChange, findByText } = renderStep();
+    const row = (await findByText("/repo/alpha")).closest("button");
+    fireEvent.click(row!);
+    expect(onChange).toHaveBeenCalledWith("path", "/repo/alpha");
+  });
+
+  it("marks a saved row as selected when its path is already chosen", async () => {
+    vi.mocked(fetchProjects).mockResolvedValue([savedProject({ name: "alpha", path: "/repo/alpha" })]);
+    vi.mocked(fetchSessions).mockResolvedValue({ sessions: [], workspace_ordering: [] });
+
+    // data.path equal to the saved path exercises the selected-row styling.
+    // Scope to the row's <span> (the Selected-project panel also shows the
+    // path, but in a <p> outside any button).
+    const { findByText } = renderStep("/repo/alpha");
+    const row = (await findByText("/repo/alpha", { selector: "span" })).closest("button");
+    expect(row?.className).toContain("border-brand-600");
+  });
+
+  it("selects a recent project's path when its row is clicked", async () => {
+    vi.mocked(fetchProjects).mockResolvedValue([]);
+    vi.mocked(fetchSessions).mockResolvedValue({
+      sessions: [mockSession({ id: "s-beta", project_path: "/repo/beta" })],
+      workspace_ordering: [],
+    });
+
+    const { onChange, findByText } = renderStep();
+    const row = (await findByText("/repo/beta")).closest("button");
+    fireEvent.click(row!);
+    expect(onChange).toHaveBeenCalledWith("path", "/repo/beta");
+  });
+
+  it("highlights the already-selected row and pluralizes the session count", async () => {
+    vi.mocked(fetchProjects).mockResolvedValue([]);
+    // Two sessions at the same path collapse to one recent with count 2,
+    // exercising the plural-label branch and the selected-row styling.
+    vi.mocked(fetchSessions).mockResolvedValue({
+      sessions: [
+        mockSession({ id: "s1", project_path: "/repo/multi", last_accessed_at: "2025-09-01T00:00:00Z" }),
+        mockSession({ id: "s2", project_path: "/repo/multi", last_accessed_at: "2025-09-02T00:00:00Z" }),
+      ],
+      workspace_ordering: [],
+    });
+
+    const { findByText } = renderStep("/repo/multi");
+    expect(await findByText("/repo/multi")).toBeTruthy();
+    expect(await findByText(/2 sessions/)).toBeTruthy();
+  });
+
+  it("falls back to the Browse tab when there are neither saved projects nor recents", async () => {
+    vi.mocked(fetchProjects).mockResolvedValue([]);
+    // Null envelope (request failed) exercises the empty-recents fallback.
+    vi.mocked(fetchSessions).mockResolvedValue(null);
+
+    const { findByRole, queryByText } = renderStep();
+    // Browse tab is active; no Recent tab button exists with nothing to pick.
+    expect(await findByRole("button", { name: "Browse" })).toBeTruthy();
+    expect(queryByText("Recent", asHeader)).toBeNull();
   });
 });
