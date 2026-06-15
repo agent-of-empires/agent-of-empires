@@ -42,23 +42,3 @@ export function useServerDown(): boolean {
 
 /** Tooltip text to surface on a control disabled because the server is down. */
 export const OFFLINE_TITLE = "Disconnected — reconnect to use";
-
-/**
- * Convenience: returns the props an interactive control needs to
- * surface the offline state — `disabled` plus a swapped tooltip.
- * Used by buttons (`<button {...offline} title={offline.title ?? "..."} />`)
- * and tooltipped wrappers so each call site doesn't re-implement the
- * "is offline ? swap title : default title" pattern.
- */
-export function useOfflineDisabled(activeTitle?: string): {
-  offline: boolean;
-  disabled: boolean;
-  title: string | undefined;
-} {
-  const offline = useServerDown();
-  return {
-    offline,
-    disabled: offline,
-    title: offline ? OFFLINE_TITLE : activeTitle,
-  };
-}
