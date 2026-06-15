@@ -51,6 +51,9 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.runOnlyPendingTimers();
+  // Restore at teardown so a window.confirm spy can't leak into later tests
+  // if an assertion throws before the per-test mockRestore runs.
+  vi.restoreAllMocks();
   vi.useRealTimers();
 });
 
@@ -179,7 +182,6 @@ describe("ConnectedDevices", () => {
     expect(mockSignOutAllDevices).toHaveBeenCalledTimes(1);
     expect(mockFetchDevices).toHaveBeenCalledTimes(2);
     expect(screen.getByText("No signed-in devices")).toBeTruthy();
-    confirmSpy.mockRestore();
   });
 
   it("aborts sign-out-all when the confirm dialog is dismissed", async () => {
@@ -197,7 +199,6 @@ describe("ConnectedDevices", () => {
     expect(confirmSpy).toHaveBeenCalledTimes(1);
     expect(mockSignOutAllDevices).not.toHaveBeenCalled();
     expect(mockFetchDevices).toHaveBeenCalledTimes(1);
-    confirmSpy.mockRestore();
   });
 
   it("re-fetches devices when the polling interval fires", async () => {

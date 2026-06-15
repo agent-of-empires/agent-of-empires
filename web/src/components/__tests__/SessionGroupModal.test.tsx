@@ -147,7 +147,7 @@ describe("SessionGroupModal", () => {
   it("disables both buttons while a save is in flight", async () => {
     let resolveSave: ((ok: boolean) => void) | null = null;
     const onSave = vi.fn(() => new Promise<boolean>((resolve) => (resolveSave = resolve)));
-    const { input, saveBtn, cancelBtn } = setup({ currentGroup: "", onSave });
+    const { input, saveBtn, cancelBtn, onClose } = setup({ currentGroup: "", onSave });
     fireEvent.change(input, { target: { value: "work" } });
     fireEvent.click(saveBtn);
     await Promise.resolve();
@@ -155,18 +155,22 @@ describe("SessionGroupModal", () => {
     expect(cancelBtn.disabled).toBe(true);
     expect(saveBtn.textContent).toContain("Saving...");
     resolveSave?.(true);
+    // Let the post-resolution state settle (modal closes on success) so the
+    // update doesn't land outside the test window and flake.
+    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
   });
 
   it("does not fire a second save while one is in flight", async () => {
     let resolveSave: ((ok: boolean) => void) | null = null;
     const onSave = vi.fn(() => new Promise<boolean>((resolve) => (resolveSave = resolve)));
-    const { input } = setup({ currentGroup: "", onSave });
+    const { input, onClose } = setup({ currentGroup: "", onSave });
     fireEvent.change(input, { target: { value: "work" } });
     fireEvent.keyDown(input, { key: "Enter" });
     await Promise.resolve();
     fireEvent.keyDown(input, { key: "Enter" });
     expect(onSave).toHaveBeenCalledTimes(1);
     resolveSave?.(true);
+    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
   });
 
   it("Cancel button closes without saving", () => {

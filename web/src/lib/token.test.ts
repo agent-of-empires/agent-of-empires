@@ -5,7 +5,7 @@
 // and setters: getToken reads localStorage, saveToken trims and skips empty,
 // clearToken removes the key.
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { getToken, saveToken, clearToken } from "./token";
 
@@ -40,5 +40,31 @@ describe("token helpers", () => {
     saveToken("gone");
     clearToken();
     expect(getToken()).toBeNull();
+  });
+
+  // The catch paths exist so a blocked / quota-exceeded localStorage never
+  // locks the user out: reads degrade to null and writes are best-effort.
+  it("getToken returns null when localStorage throws", () => {
+    const spy = vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
+      throw new Error("blocked");
+    });
+    expect(getToken()).toBeNull();
+    spy.mockRestore();
+  });
+
+  it("saveToken does not throw when the write fails", () => {
+    const spy = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new Error("quota");
+    });
+    expect(() => saveToken("abc123")).not.toThrow();
+    spy.mockRestore();
+  });
+
+  it("clearToken does not throw when the remove fails", () => {
+    const spy = vi.spyOn(Storage.prototype, "removeItem").mockImplementation(() => {
+      throw new Error("blocked");
+    });
+    expect(() => clearToken()).not.toThrow();
+    spy.mockRestore();
   });
 });

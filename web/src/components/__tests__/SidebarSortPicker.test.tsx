@@ -87,13 +87,12 @@ describe("SidebarSortPicker", () => {
     expect(container.querySelector('[data-testid="sidebar-sort-menu"]')).toBeNull();
   });
 
-  it("tints the trigger brand for non-manual modes and dims it for manual", () => {
+  it("dims the trigger in manual mode", () => {
+    // Only the manual-mode dim is asserted; the non-manual chrome color is
+    // left to the design system (brand amber is reserved for cursor / active
+    // border / focus rings, not general chrome), so it is not pinned here.
     const { container: manualC } = setup("manual");
     expect(toggle(manualC).className).toContain("text-text-dim");
-    expect(toggle(manualC).className).not.toContain("text-brand-500");
-
-    const { container: attnC } = setup("attention");
-    expect(toggle(attnC).className).toContain("text-brand-500");
   });
 
   it("closes on an outside mousedown", () => {
