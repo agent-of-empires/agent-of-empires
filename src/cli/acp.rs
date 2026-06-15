@@ -520,13 +520,31 @@ async fn stop(session: Option<String>, all: bool, timeout_secs: u64) -> Result<(
         println!("No matching agent workers.");
         return Ok(());
     }
-    for record in &targets {
+    stop_worker_records(&targets, timeout_secs).await;
+    Ok(())
+}
+
+/// Stop every registered agent worker. Returns the number stopped. Shared by
+/// `aoe acp stop --all` and the top-level `aoe stop-all` panic command.
+pub(crate) async fn stop_all_workers(timeout_secs: u64) -> usize {
+    use crate::acp::worker_registry;
+    let targets = worker_registry::list().unwrap_or_default();
+    stop_worker_records(&targets, timeout_secs).await;
+    targets.len()
+}
+
+async fn stop_worker_records(
+    targets: &[crate::acp::worker_registry::WorkerRecord],
+    timeout_secs: u64,
+) {
+    use crate::acp::worker_registry;
+    for record in targets {
         // Delete the registry entry BEFORE SIGTERM. The running daemon
         // (if any) uses the registry-gone signal in `restart_decision`
         // to distinguish a user-initiated stop from a crash; without
         // this ordering, the daemon's drain task sees socket EOF first,
         // observes the registry still present, and respawns the runner
-        // — which immediately gets killed by our SIGTERM, racing into a
+        // which immediately gets killed by our SIGTERM, racing into a
         // crash loop that burns the restart budget and surfaces the
         // "ACP agent crashed more than N times" banner.
         worker_registry::delete(&record.session_id).ok();
@@ -536,7 +554,6 @@ async fn stop(session: Option<String>, all: bool, timeout_secs: u64) -> Result<(
             record.session_id, record.pid
         );
     }
-    Ok(())
 }
 
 fn kill_now(session: &str) -> Result<()> {
