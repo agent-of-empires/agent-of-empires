@@ -44,7 +44,9 @@ async function cursorToPromptDelta(page: Page): Promise<number> {
 async function takeOver(page: Page) {
   const banner = page.locator("[data-live-takeover]");
   await banner.waitFor({ state: "visible", timeout: 10_000 });
-  await banner.tap();
+  // click (not tap) so this works on both touch and fine-pointer contexts now
+  // that the live view renders on desktop too.
+  await banner.click();
   await banner.waitFor({ state: "detached", timeout: 10_000 });
 }
 
@@ -124,45 +126,7 @@ test("ownership ping-pong keeps the cursor on the prompt row", async ({ browser 
   }
 });
 
-test("desktop click takes the size lock back from a live phone", async ({ browser }, testInfo) => {
-  test.setTimeout(120_000);
-  const serve = await spawnAoeServe({
-    authMode: "none",
-    workerIndex: testInfo.workerIndex,
-    parallelIndex: testInfo.parallelIndex,
-    seedFn: seedPromptbox,
-  });
-  try {
-    const phoneCtx = await browser.newContext({ ...devices["iPhone 13"] });
-    const desktopCtx = await browser.newContext({ viewport: { width: 1280, height: 800 } });
-    const phone = await phoneCtx.newPage();
-    const desktop = await desktopCtx.newPage();
-
-    // Phone first: it owns the session's size.
-    await openLiveView(phone, serve.baseUrl);
-    await expect(phone.locator("[data-live-takeover]")).toHaveCount(0);
-
-    // Desktop opens the same session on the PTY path; the phone holds the
-    // size lock, so the desktop is a viewer with the take-over hint.
-    await desktop.goto(serve.baseUrl);
-    await clickSidebarSession(desktop, "takeover-test");
-    const desktopBanner = desktop.getByText("Viewing from another device");
-    await desktopBanner.waitFor({ state: "visible", timeout: 15_000 });
-
-    // The regression: this click used to be a no-op because the sole PTY
-    // client is always already "primary" and the steal was gated on
-    // becoming primary. Clicking the terminal must steal the size lock.
-    await desktop.locator('[data-term="agent"]').click();
-    await desktopBanner.waitFor({ state: "hidden", timeout: 10_000 });
-
-    // The phone is demoted (its heartbeat notices the loss) and can take
-    // the lock back, which re-demotes the desktop.
-    await takeOver(phone);
-    await desktopBanner.waitFor({ state: "visible", timeout: 10_000 });
-
-    await phoneCtx.close();
-    await desktopCtx.close();
-  } finally {
-    await serve.stop();
-  }
-});
+// (The former "desktop click takes the size lock back" test is gone: with the
+// xterm/PTY renderer removed, every client is a live client, so that scenario
+// is just live-vs-live ownership handoff, covered by the ping-pong test above.
+// "Desktop renders the live view" is covered by backspace-autorepeat.spec.ts.)

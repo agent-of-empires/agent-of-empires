@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
 import { getOrCreateDeviceBindingSecret } from "../lib/deviceBinding";
 import { getToken } from "../lib/token";
-import { retryDelayMs } from "./useTerminal";
+import { retryDelayMs } from "../lib/wsBackoff";
 
 // Capture-snapshot live view transport (mobile). Mirrors the TUI's
 // live-send model: the server polls `tmux capture-pane` and pushes ANSI

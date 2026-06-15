@@ -25,7 +25,6 @@
         "web/src/components/Dashboard.tsx",
         "web/src/components/TerminalView.tsx",
         "web/src/components/ContentSplit.tsx",
-        "web/src/components/XtermTerminalView.tsx",
         "web/src/components/TerminalConnectionBanners.tsx"
       ]
     },
@@ -37,32 +36,11 @@
       "components": ["web/src/components/session-wizard/steps/ReviewStep.tsx"]
     },
     {
-      "id": "terminal.live-output-resize",
-      "kind": "vitest",
-      "risk": "medium",
-      "specs": ["src/hooks/useTerminal.lifecycle.test.ts"],
-      "components": ["web/src/hooks/useTerminal.ts"]
-    },
-    {
-      "id": "terminal.copy-on-select",
-      "kind": "live-playwright",
-      "risk": "high",
-      "specs": ["tests/live/terminal-copy-select.spec.ts"],
-      "components": ["web/src/hooks/useTerminal.ts"]
-    },
-    {
-      "id": "terminal.ws-reconnect",
-      "kind": "mocked-playwright",
-      "risk": "high",
-      "specs": ["tests/ws-reconnect.spec.ts"],
-      "components": ["web/src/hooks/useTerminal.ts"]
-    },
-    {
       "id": "terminal.mobile-backspace-autorepeat",
       "kind": "mocked-playwright",
       "risk": "medium",
       "specs": ["tests/backspace-autorepeat.spec.ts"],
-      "components": ["web/src/hooks/useTerminal.ts"]
+      "components": ["web/src/components/MobileLiveTerminal.tsx", "web/src/components/LiveTerminalView.tsx"]
     },
     {
       "id": "app-shell.dashboard-update-banner",
@@ -88,11 +66,11 @@
       ]
     },
     {
-      "id": "terminal.webgl-gate-units",
+      "id": "terminal.live-line-wrap-units",
       "kind": "vitest",
       "risk": "high",
-      "specs": ["src/hooks/useTerminal.webgl.test.ts", "src/lib/liveTermLines.test.ts"],
-      "components": ["web/src/hooks/useTerminal.ts"]
+      "specs": ["src/lib/liveTermLines.test.ts"],
+      "components": ["web/src/components/MobileLiveTerminal.tsx"]
     },
     {
       "id": "terminal.mobile-live-scrollback",
@@ -110,12 +88,7 @@
         "src/hooks/useLiveTerminal.sizeOwner.test.ts",
         "tests/live/mobile-live-no-flutter.spec.ts"
       ],
-      "components": [
-        "web/src/components/LiveTerminalView.tsx",
-        "web/src/components/XtermTerminalView.tsx",
-        "web/src/hooks/useLiveTerminal.ts",
-        "web/src/hooks/useTerminal.ts"
-      ]
+      "components": ["web/src/components/LiveTerminalView.tsx", "web/src/hooks/useLiveTerminal.ts"]
     },
     {
       "id": "auth.no-auth",
@@ -217,7 +190,6 @@
       "specs": ["tests/live/feature-usage-signals.spec.ts", "tests/diff-comments.spec.ts"],
       "components": [
         "web/src/hooks/useDiffFiles.ts",
-        "web/src/hooks/useTerminal.ts",
         "web/src/components/diff/comments/SendCommentsDialog.tsx",
         "web/src/lib/api.ts"
       ]
@@ -963,7 +935,6 @@
       "specs": [
         "src/components/__tests__/MobileMainPane.test.tsx",
         "src/components/__tests__/MobileRightPanelPicker.test.tsx",
-        "src/components/__tests__/PairedTerminal.test.tsx",
         "src/hooks/__tests__/useIsWideViewport.test.tsx"
       ],
       "components": [

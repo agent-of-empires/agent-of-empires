@@ -104,13 +104,14 @@ afterEach(() => {
   ensureTerminal.mockReset();
 });
 
-describe("RightPanel PairedTerminal", () => {
-  it("renders the 'Starting terminal...' placeholder while ensure is pending", () => {
-    // Never-resolving promise pins `ready` at false so the placeholder
-    // branch stays mounted.
+describe("RightPanel PairedShellPane", () => {
+  it("renders the ensure-pending placeholder while the shell starts", () => {
+    // Never-resolving promise pins ensureState at "pending" so the
+    // LiveTerminalView placeholder branch stays mounted (the paired shell
+    // now renders the unified live view).
     ensureTerminal.mockReturnValue(new Promise(() => {}));
     render(<RightPanel {...baseProps} />);
-    expect(screen.getByText(/Starting terminal/i)).toBeDefined();
+    expect(screen.getByText(/Starting session/i)).toBeDefined();
   });
 
   it("renders the shell mode picker with Host preselected", () => {

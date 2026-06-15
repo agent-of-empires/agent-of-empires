@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useIsCoarsePointer } from "../hooks/useIsCoarsePointer";
 import { useLiveTerminal } from "../hooks/useLiveTerminal";
 import { useMobileKeyboard } from "../hooks/useMobileKeyboard";
 import { MobileTerminalToolbar } from "./MobileTerminalToolbar";
@@ -46,6 +47,10 @@ const SURFACES = {
  */
 export function LiveTerminalView({ session, active = true, surface = "agent" }: Props) {
   const { wsPath, focusTarget, dataTerm } = SURFACES[surface];
+  // Touch-only chrome (the soft-keyboard toolbar and its toggle FAB) is
+  // pointless with a physical keyboard, so it stays off fine-pointer devices
+  // now that this view also renders on desktop.
+  const coarse = useIsCoarsePointer();
   const [ensureState, setEnsureState] = useState<"pending" | "ready" | "error">("pending");
   const [ensureError, setEnsureError] = useState<string | null>(null);
   const live = useLiveTerminal(ensureState === "ready" ? session.id : null, wsPath);
@@ -226,10 +231,10 @@ export function LiveTerminalView({ session, active = true, surface = "agent" }: 
           inputRef={inputRef}
           onInputFocusChange={setInputFocused}
         />
-        {live.state.connected && <KeyboardFab keyboardOpen={inputFocused} onToggle={toggleKeyboard} />}
+        {coarse && live.state.connected && <KeyboardFab keyboardOpen={inputFocused} onToggle={toggleKeyboard} />}
       </div>
 
-      {live.state.connected && (
+      {coarse && live.state.connected && (
         <MobileTerminalToolbar
           sendData={live.sendData}
           inputElRef={inputRef}

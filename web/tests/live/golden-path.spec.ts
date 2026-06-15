@@ -42,7 +42,7 @@ base("create, view, delete a session via live backend", async ({ page }, testInf
     // The web attach hides the tmux status line (the dashboard renders
     // its own chrome), so the "Ctrl+b d to detach" footer must never
     // appear in any web terminal surface.
-    await page.locator(".xterm").first().waitFor({ state: "visible", timeout: 10_000 });
+    await page.locator("[data-live-terminal]").first().waitFor({ state: "visible", timeout: 10_000 });
     await page.waitForTimeout(1_000);
     await expect(page.locator("body")).not.toContainText("to detach");
 
