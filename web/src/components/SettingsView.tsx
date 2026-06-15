@@ -505,17 +505,24 @@ export function SettingsView({ onClose, tab, onSelectTab, onServerAboutRefresh, 
         }
         const acp = (settings.acp ?? {}) as Record<string, unknown>;
         return (
-          <SchemaSection
-            section="acp"
-            schema={schema}
-            values={acp}
-            onSaveField={saveSubField}
-            // The acp section mirrors three fields into serverAbout, which
-            // ToolCards and the composer read live; refresh it after any acp
-            // save so those surfaces pick up the change without a reload.
-            onAfterSave={() => onServerAboutRefresh()}
-            advancedSubtitle="Replay retention caps and daemon watchdog tuning. Touch only when triaging a specific failure mode."
-          />
+          <div className="space-y-4">
+            <p className="text-xs text-text-dim">
+              Defaults for structured-view (ACP) sessions: which agent starts, how many workers run at once, and how
+              much history is replayed on reconnect. These apply when a session renders in the structured view instead
+              of a raw terminal.
+            </p>
+            <SchemaSection
+              section="acp"
+              schema={schema}
+              values={acp}
+              onSaveField={saveSubField}
+              // The acp section mirrors three fields into serverAbout, which
+              // ToolCards and the composer read live; refresh it after any acp
+              // save so those surfaces pick up the change without a reload.
+              onAfterSave={() => onServerAboutRefresh()}
+              advancedSubtitle="Replay retention caps and daemon watchdog tuning. Touch only when triaging a specific failure mode."
+            />
+          </div>
         );
       }
     }
