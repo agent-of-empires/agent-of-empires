@@ -20,7 +20,7 @@ aoe ships an ACP registry entry for each tool whose ACP server we've verified. F
 
 | Agent | ACP adapter | Install | Auth |
 |-------|-------------|---------|------|
-| `claude` | `claude-agent-acp` (Zed, requires ≥0.44.0) | `npm install -g @agentclientprotocol/claude-agent-acp@latest` | `claude login`, or `ANTHROPIC_API_KEY` |
+| `claude` | `claude-agent-acp` (Zed, recent version required) | `npm install -g @agentclientprotocol/claude-agent-acp@latest` | `claude login`, or `ANTHROPIC_API_KEY` |
 | `codex` | `codex-acp` (Zed) | `npm install -g @zed-industries/codex-acp` | `OPENAI_API_KEY`, or ChatGPT login (local-only) |
 | `opencode` | `opencode acp` (native, ≥1.16.0 recommended) | `curl -fsSL https://opencode.ai/install \| bash` | `opencode auth` / provider env |
 | `gemini` | `gemini --acp` (native) | `npm install -g @google/gemini-cli` | `GEMINI_API_KEY`, OAuth, or Vertex |
