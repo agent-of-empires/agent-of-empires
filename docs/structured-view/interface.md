@@ -223,7 +223,7 @@ drains on the next `Stopped` per the daemon's `acp.queue_drain_mode`
 setting). `Ctrl+X` clears the queue, and pressing `Enter` on an empty
 composer when idle retries the drain (useful if a send failed and left
 prompts parked). Queued prompts can be recalled for editing the same way
-as the web: with the composer empty (caret at the top-left), `↑` pulls
+as the web: with the composer empty (caret at the start), `↑` pulls
 the newest queued prompt back into the composer, `↑` / `↓` walk the queue,
 and editing then `Enter` updates that entry in place. While recalling, the
 composer border title reads **Editing queued message N of M**, and `Esc`
