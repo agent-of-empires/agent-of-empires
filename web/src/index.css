@@ -492,6 +492,14 @@ body {
 .animate-cheat-pulse {
   animation: cheat-pulse 1s ease-out forwards;
 }
+/* Respect reduced-motion: drop the visual flourish entirely (the toast still
+   fires as the functional signal). Hiding the overlay avoids a static
+   full-screen flash that animation:none would otherwise leave behind. */
+@media (prefers-reduced-motion: reduce) {
+  [data-testid="cheat-overlay"] {
+    display: none;
+  }
+}
 
 /* Focus indicators for keyboard navigation */
 button:focus-visible,
