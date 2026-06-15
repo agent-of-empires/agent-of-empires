@@ -155,6 +155,28 @@ export const fixtures = {
       reason: "checking deploy",
     }),
   }),
+  toolSearch: makeToolCall({
+    id: "toolsearch-1",
+    name: "ToolSearch",
+    kind: "other",
+    args_preview: JSON.stringify({ query: "select:Read,Edit", max_results: 5 }),
+  }),
+  monitor: makeToolCall({
+    id: "monitor-1",
+    name: "Monitor",
+    kind: "other",
+    args_preview: JSON.stringify({
+      description: "errors in deploy.log",
+      command: "tail -f deploy.log",
+      persistent: true,
+    }),
+  }),
+  taskStop: makeToolCall({
+    id: "taskstop-1",
+    name: "TaskStop",
+    kind: "other",
+    args_preview: JSON.stringify({ task_id: "task-abc123" }),
+  }),
   mcp: makeToolCall({
     id: "mcp-1",
     name: "mcp__slack__send_message",

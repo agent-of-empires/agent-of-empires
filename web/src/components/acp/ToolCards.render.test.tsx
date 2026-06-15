@@ -232,6 +232,52 @@ describe("ToolCards profile-gated dispatch (claude)", () => {
     );
     expect(container.textContent).toContain("checking deploy");
   });
+
+  it("routes ToolSearch to the harness card under the claude profile", () => {
+    const { container } = render(
+      <Wrap toolKey="claude">
+        <ToolCard tool={fixtures.toolSearch} result={undefined} />
+      </Wrap>,
+    );
+    expect(container.textContent).toContain("tool search");
+    expect(container.textContent).toContain("select:Read,Edit");
+  });
+
+  it("routes Monitor to the harness card under the claude profile", () => {
+    const { container } = render(
+      <Wrap toolKey="claude">
+        <ToolCard tool={fixtures.monitor} result={undefined} />
+      </Wrap>,
+    );
+    expect(container.textContent).toContain("monitor");
+    expect(container.textContent).toContain("errors in deploy.log");
+    expect(container.textContent).toContain("persistent");
+  });
+
+  it("routes TaskStop to the harness card under the claude profile", () => {
+    const { container } = render(
+      <Wrap toolKey="claude">
+        <ToolCard tool={fixtures.taskStop} result={undefined} />
+      </Wrap>,
+    );
+    expect(container.textContent).toContain("task stop");
+    expect(container.textContent).toContain("task-abc123");
+  });
+});
+
+describe("ToolCards harness-tool gating (non-claude)", () => {
+  it("does not fire the harness card for a coincidental Monitor name under codex", () => {
+    const { container } = render(
+      <Wrap toolKey="codex">
+        <ToolCard tool={fixtures.monitor} result={undefined} />
+      </Wrap>,
+    );
+    // Generic fallback: header shows the raw name + "other" kind, and the
+    // collapsed body keeps the description (`errors in deploy.log`) out of
+    // the DOM. The harness card would have surfaced it in the header.
+    expect(container.textContent).toContain("Monitor");
+    expect(container.textContent).not.toContain("errors in deploy.log");
+  });
 });
 
 describe("ToolCards profile-gated dispatch (opencode)", () => {
