@@ -53,6 +53,7 @@ import type {
   ActivityRow,
   ApprovalDecision,
   AcpState,
+  MemoryRecall,
   Plan,
   QueuedPrompt,
   RejectedPrompt,
@@ -644,6 +645,7 @@ function AssistantToolCall(props: ToolCallProps) {
     kind: props.toolName,
     args_preview: props.argsText ?? safeStringify(props.args ?? null),
     started_at: startedAt,
+    memory_recall: pickMemoryRecall(props.args, props.argsText),
   };
   const resultContent =
     props.result && typeof props.result === "object" && "content" in (props.result as Record<string, unknown>)
@@ -686,6 +688,28 @@ function pickStartedAt(args: Record<string, unknown> | undefined, argsText: stri
     }
   }
   return null;
+}
+
+/** Read the smuggled `_aoe_memory_recall` payload AcpRuntime stashes on
+ *  the tool-call args so the structured-view card can dispatch to
+ *  MemoryRecallCard. Returns undefined when absent or malformed; the
+ *  card then renders as a generic read. See #2142. */
+function pickMemoryRecall(
+  args: Record<string, unknown> | undefined,
+  argsText: string | undefined,
+): MemoryRecall | undefined {
+  const fromObj = args?._aoe_memory_recall;
+  if (fromObj && typeof fromObj === "object") return fromObj as MemoryRecall;
+  if (argsText) {
+    try {
+      const parsed = JSON.parse(argsText) as Record<string, unknown>;
+      const mr = parsed?._aoe_memory_recall;
+      if (mr && typeof mr === "object") return mr as MemoryRecall;
+    } catch {
+      // ignore
+    }
+  }
+  return undefined;
 }
 
 /** Read the smuggled `endedAt` field set by AssistantBuilder.completeToolCall. */

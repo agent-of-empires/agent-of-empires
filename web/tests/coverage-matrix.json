@@ -1066,6 +1066,13 @@
       ]
     },
     {
+      "id": "acp.memory-recall",
+      "kind": "live-playwright",
+      "risk": "medium",
+      "specs": ["tests/live/acp-memory-recall.spec.ts"],
+      "components": ["web/src/components/acp/ToolCards.tsx", "web/src/lib/memoryClassify.ts"]
+    },
+    {
       "id": "acp.attachments",
       "kind": "live-playwright",
       "risk": "high",

@@ -473,6 +473,13 @@ class AssistantBuilder {
     if (tool.parent_tool_call_id) {
       argsObj._aoe_parent_tool_call_id = tool.parent_tool_call_id;
     }
+    // Smuggle the structured memory-recall payload so StructuredView can
+    // rebuild it onto the reconstructed ToolCall; without this the
+    // synthesize/recall card is unreachable through the assistant-ui
+    // part shape and falls back to a generic read card. See #2142.
+    if (tool.memory_recall) {
+      argsObj._aoe_memory_recall = tool.memory_recall;
+    }
     this.parts.push({
       type: "tool-call",
       toolCallId: tool.id,
