@@ -1,0 +1,645 @@
+//! Migration v015: rewrite previously-installed AoE hook shell strings to the
+//! hardened shape introduced by PR #1803 (quoted `"$AOE_INSTANCE_ID"` plus a
+//! POSIX allowlist guard before any path operation). Hooks are written into
+//! agent config files under `~/` and never reconciled afterwards, so installs
+//! that pre-date PR #1803 keep the legacy unhardened bytes forever. This
+//! migration runs once on first launch after upgrade and converges every
+//! aoe-managed entry to the current canonical string emitted by
+//! `crate::hooks`.
+//!
+//! ## Strategy
+//!
+//! Per-file marker-presence gate guards a reuse of the existing `install_*`
+//! functions. The gate ensures we never resurrect hooks the user explicitly
+//! uninstalled (the install path creates files when absent). The reuse
+//! ensures the migration cannot drift from the live install path: every byte
+//! we write is produced by the same builder the runtime install path uses.
+//!
+//! ## Failure policy
+//!
+//! Per `AGENTS.md > Data Migrations`, a returned `Err` aborts boot. Per-file
+//! errors (parse failure, permission denied, lock contention, broken
+//! symlink) are therefore caught and logged at `tracing::warn!`; only
+//! `dirs::home_dir() == None` propagates as an aggregate failure. The
+//! migration's job is "reconcile what we own"; the schema version bumps
+//! after attempting all known paths regardless of partial-failure warnings,
+//! so a single corrupt file never blocks AoE boot indefinitely.
+//!
+//! ## Known limitation
+//!
+//! A `CLAUDE_CONFIG_DIR` (or similar) set only in the user's interactive
+//! shell, and not in any profile's `environment` list, is not visible at
+//! migration time. Such hooks stay on the legacy string until the next
+//! relaunch under that env, or until the user runs
+//! `aoe uninstall && aoe add --cmd <agent>` to force a clean install.
+
+use anyhow::Result;
+use std::fs;
+use std::path::Path;
+use tracing::{debug, info, warn};
+
+use crate::hooks::{
+    has_aoe_marker, install_codex_hooks_with_preserved_state, install_hooks, iter_hook_targets_in,
+    snapshot_codex_hooks_state, HookInstallTarget, HookTarget, HookTargetKind,
+};
+
+pub fn run() -> Result<()> {
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+    let app_dir = crate::session::get_app_dir()?;
+    run_in(&home, &app_dir)
+}
+
+pub(crate) fn run_in(home: &Path, app_dir: &Path) -> Result<()> {
+    let env_lists = collect_env_lists(app_dir);
+    debug!(
+        target: "migrations",
+        home = %home.display(),
+        app_dir = %app_dir.display(),
+        env_lists = env_lists.len(),
+        "v015: scanning hook targets"
+    );
+
+    let mut rewritten = 0usize;
+    for target in iter_hook_targets_in(home, &env_lists) {
+        if !has_aoe_marker(&target) {
+            continue;
+        }
+        match rewrite_one(&target) {
+            Ok(()) => {
+                rewritten += 1;
+                info!(
+                    target: "migrations",
+                    agent = target.agent_name,
+                    path = %target.path.display(),
+                    "v015: rewrote AoE hook entries to current canonical form"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    target: "migrations",
+                    agent = target.agent_name,
+                    path = %target.path.display(),
+                    error = %e,
+                    "v015: skipped (rewrite failed)"
+                );
+            }
+        }
+    }
+
+    info!(target: "migrations", count = rewritten, "v015: done");
+    Ok(())
+}
+
+fn rewrite_one(target: &HookTarget) -> Result<()> {
+    match target.kind {
+        HookTargetKind::JsonSettings => {
+            install_hooks(&target.path, target.events, HookInstallTarget::Host)
+        }
+        HookTargetKind::CodexToml => {
+            let preserved = snapshot_codex_hooks_state(&target.path)?;
+            install_codex_hooks_with_preserved_state(&target.path, target.events, preserved)
+        }
+        HookTargetKind::Sidecar(sidecar) => {
+            // We deliberately do NOT invoke `sidecar.post_install_host`:
+            // Kiro's `set_kiro_default_agent_if_builtin` shells out to
+            // `kiro-cli`, which is launcher-state mutation, not file-content
+            // reconciliation.
+            (sidecar.install)(&target.path)
+        }
+    }
+}
+
+fn collect_env_lists(app_dir: &Path) -> Vec<Vec<String>> {
+    let mut out = Vec::new();
+    if let Some(env) = read_environment_from_toml(&app_dir.join("config.toml")) {
+        out.push(env);
+    }
+    let profiles_dir = app_dir.join("profiles");
+    let Ok(entries) = fs::read_dir(&profiles_dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            if let Some(env) = read_environment_from_toml(&entry.path().join("config.toml")) {
+                out.push(env);
+            }
+        }
+    }
+    out
+}
+
+fn read_environment_from_toml(path: &Path) -> Option<Vec<String>> {
+    let content = fs::read_to_string(path).ok()?;
+    let table: toml::Value = toml::from_str(&content).ok()?;
+    let env = table.get("environment")?.as_array()?;
+    Some(
+        env.iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+    use serial_test::serial;
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// A pre-#1803 unquoted, unguarded `mkdir`/`printf` snippet. Contains the
+    /// `aoe-hooks` substring via the path, so `is_aoe_hook_command` flags it.
+    const LEGACY_STATUS_CMD: &str = "sh -c '[ -n \"$AOE_INSTANCE_ID\" ] || exit 0; \
+        mkdir -p /tmp/aoe-hooks/$AOE_INSTANCE_ID && \
+        printf running > /tmp/aoe-hooks/$AOE_INSTANCE_ID/status'";
+
+    /// `EnvGuard` clears CODEX_HOME, CLAUDE_CONFIG_DIR, etc. for the test
+    /// duration so the migration's path resolution sees only the explicit
+    /// fixtures in `home` / `app_dir`.
+    struct EnvGuard {
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+    impl EnvGuard {
+        fn unset_all() -> Self {
+            let keys = [
+                "CODEX_HOME",
+                "CLAUDE_CONFIG_DIR",
+                "CURSOR_CONFIG_DIR",
+                "GEMINI_CONFIG_DIR",
+                "QWEN_CONFIG_DIR",
+            ];
+            let saved = keys
+                .iter()
+                .map(|k| {
+                    let prev = std::env::var(k).ok();
+                    std::env::remove_var(k);
+                    (*k, prev)
+                })
+                .collect();
+            Self { saved }
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.saved {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    fn setup_dirs() -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let app_dir = tmp.path().join("app");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&app_dir).unwrap();
+        (tmp, home, app_dir)
+    }
+
+    fn write_json(path: &Path, value: &Value) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, serde_json::to_string_pretty(value).unwrap()).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn claude_legacy_settings_rewritten_user_preserved() {
+        let _g = EnvGuard::unset_all();
+        let (_tmp, home, app_dir) = setup_dirs();
+        let claude = home.join(".claude/settings.json");
+        write_json(
+            &claude,
+            &serde_json::json!({
+                "hooks": {
+                    "PreToolUse": [
+                        {
+                            "matcher": "Bash",
+                            "hooks": [{"type": "command", "command": "echo user-hook"}]
+                        },
+                        {
+                            "hooks": [{"type": "command", "command": LEGACY_STATUS_CMD}]
+                        }
+                    ]
+                }
+            }),
+        );
+
+        run_in(&home, &app_dir).unwrap();
+
+        let content: Value = serde_json::from_str(&fs::read_to_string(&claude).unwrap()).unwrap();
+        let pre_tool = content["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre_tool[0]["matcher"], "Bash");
+        assert_eq!(pre_tool[0]["hooks"][0]["command"], "echo user-hook");
+        let aoe_cmd = pre_tool
+            .iter()
+            .filter_map(|m| m["hooks"].as_array())
+            .flatten()
+            .filter_map(|h| h["command"].as_str())
+            .find(|c| c.contains("aoe-hooks"))
+            .expect("AoE entry must be present after rewrite");
+        assert!(
+            aoe_cmd.contains("case \"$AOE_INSTANCE_ID\""),
+            "rewritten AoE command must carry the PR #1803 allowlist guard"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn claude_no_marker_untouched() {
+        let _g = EnvGuard::unset_all();
+        let (_tmp, home, app_dir) = setup_dirs();
+        let claude = home.join(".claude/settings.json");
+        write_json(
+            &claude,
+            &serde_json::json!({
+                "hooks": {
+                    "PreToolUse": [
+                        {"hooks": [{"type": "command", "command": "echo only-user"}]}
+                    ]
+                }
+            }),
+        );
+        let before = fs::read(&claude).unwrap();
+
+        run_in(&home, &app_dir).unwrap();
+
+        assert_eq!(
+            fs::read(&claude).unwrap(),
+            before,
+            "files without an AoE marker must be byte-untouched"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn claude_idempotent_byte_identical() {
+        let _g = EnvGuard::unset_all();
+        let (_tmp, home, app_dir) = setup_dirs();
+        let claude = home.join(".claude/settings.json");
+        write_json(
+            &claude,
+            &serde_json::json!({
+                "hooks": { "PreToolUse": [
+                    {"hooks": [{"type": "command", "command": LEGACY_STATUS_CMD}]}
+                ]}
+            }),
+        );
+
+        run_in(&home, &app_dir).unwrap();
+        let after_first = fs::read(&claude).unwrap();
+        run_in(&home, &app_dir).unwrap();
+        let after_second = fs::read(&claude).unwrap();
+
+        assert_eq!(after_first, after_second, "v015 must be byte-idempotent");
+    }
+
+    #[test]
+    #[serial]
+    fn mixed_user_aoe_matcher_group_unchanged_documented_limitation() {
+        // remove_aoe_entries drops a matcher group only when *every* hook in
+        // it is AoE; a hand-merged user+AoE group is left intact, so the AoE
+        // entry inside is NOT rewritten. This test locks that contract so a
+        // future change to remove_aoe_entries deliberately reconsiders it.
+        let _g = EnvGuard::unset_all();
+        let (_tmp, home, app_dir) = setup_dirs();
+        let claude = home.join(".claude/settings.json");
+        write_json(
+            &claude,
+            &serde_json::json!({
+                "hooks": { "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [
+                        {"type": "command", "command": "echo user"},
+                        {"type": "command", "command": LEGACY_STATUS_CMD}
+                    ]
+                }]}
+            }),
+        );
+        let before = fs::read(&claude).unwrap();
+
+        run_in(&home, &app_dir).unwrap();
+
+        // The mixed group survives unchanged in PreToolUse; v015 may still
+        // *append* canonical AoE matcher groups for other events that lacked
+        // any prior AoE entry. Assert: PreToolUse still has the original
+        // mixed group at index 0, byte-identical.
+        let after: Value = serde_json::from_str(&fs::read_to_string(&claude).unwrap()).unwrap();
+        let pre_tool = after["hooks"]["PreToolUse"].as_array().unwrap();
+        let mixed = &pre_tool[0];
+        assert_eq!(mixed["matcher"], "Bash");
+        let inner = mixed["hooks"].as_array().unwrap();
+        assert_eq!(inner.len(), 2);
+        assert_eq!(inner[0]["command"], "echo user");
+        assert_eq!(
+            inner[1]["command"], LEGACY_STATUS_CMD,
+            "AoE entry inside a mixed group must NOT be rewritten (existing contract)"
+        );
+        // sanity: the file *was* changed (other events got fresh AoE blocks),
+        // so this test is meaningful even though the mixed group was preserved.
+        assert_ne!(fs::read(&claude).unwrap(), before);
+    }
+
+    #[test]
+    #[serial]
+    fn codex_state_preserved_across_rewrite() {
+        let _g = EnvGuard::unset_all();
+        let (_tmp, home, app_dir) = setup_dirs();
+        let codex = home.join(".codex/config.toml");
+        fs::create_dir_all(codex.parent().unwrap()).unwrap();
+        fs::write(
+            &codex,
+            format!(
+                "[hooks.state]\n\
+                 existing = {{ enabled = true, trusted_hash = \"keep-me\" }}\n\
+                 \n\
+                 [[hooks.SessionStart]]\n\
+                 [[hooks.SessionStart.hooks]]\n\
+                 type = \"command\"\n\
+                 command = {LEGACY_STATUS_CMD:?}\n"
+            ),
+        )
+        .unwrap();
+
+        run_in(&home, &app_dir).unwrap();
+
+        let text = fs::read_to_string(&codex).unwrap();
+        let parsed: toml::Value = toml::from_str(&text).unwrap();
+        assert_eq!(
+            parsed["hooks"]["state"]["existing"]["trusted_hash"].as_str(),
+            Some("keep-me"),
+            "[hooks.state] must survive the rewrite"
+        );
+        assert!(
+            text.contains("case \"$AOE_INSTANCE_ID\""),
+            "Codex hook command must be rewritten to the hardened form"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn codex_features_hooks_false_skipped() {
+        let _g = EnvGuard::unset_all();
+        let (_tmp, home, app_dir) = setup_dirs();
+        let codex = home.join(".codex/config.toml");
+        fs::create_dir_all(codex.parent().unwrap()).unwrap();
+        fs::write(
+            &codex,
+            format!(
+                "[features]\n\
+                 hooks = false\n\
+                 \n\
+                 [[hooks.SessionStart]]\n\
+                 [[hooks.SessionStart.hooks]]\n\
+                 type = \"command\"\n\
+                 command = {LEGACY_STATUS_CMD:?}\n"
+            ),
+        )
+        .unwrap();
+        let before = fs::read(&codex).unwrap();
+
+        run_in(&home, &app_dir).unwrap();
+
+        assert_eq!(
+            fs::read(&codex).unwrap(),
+            before,
+            "features.hooks=false must short-circuit; file must be byte-untouched"
+        );
+        let text = String::from_utf8(before).unwrap();
+        assert!(
+            !text.contains("case \"$AOE_INSTANCE_ID\""),
+            "no hardening must be applied when feature is disabled"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn settl_marker_only_rewrites_aoe_lines() {
+        let _g = EnvGuard::unset_all();
+        let (_tmp, home, app_dir) = setup_dirs();
+        let settl = home.join(".settl/config.toml");
+        fs::create_dir_all(settl.parent().unwrap()).unwrap();
+        fs::write(
+            &settl,
+            format!(
+                "[[hooks]]\n\
+                 event = \"GameWon\"\n\
+                 command = \"echo user-only\"\n\
+                 \n\
+                 [[hooks]]\n\
+                 event = \"TurnStarted\"\n\
+                 command = {LEGACY_STATUS_CMD:?}\n"
+            ),
+        )
+        .unwrap();
+
+        run_in(&home, &app_dir).unwrap();
+
+        let parsed: toml::Value = toml::from_str(&fs::read_to_string(&settl).unwrap()).unwrap();
+        let hooks = parsed["hooks"].as_array().unwrap();
+        let user = hooks
+            .iter()
+            .find(|h| h["command"].as_str() == Some("echo user-only"))
+            .expect("user hook must survive");
+        assert_eq!(user["event"].as_str(), Some("GameWon"));
+        let aoe: Vec<_> = hooks
+            .iter()
+            .filter_map(|h| h["command"].as_str())
+            .filter(|c| c.contains("aoe-hooks"))
+            .collect();
+        assert!(
+            aoe.iter().all(|c| c.contains("case \"$AOE_INSTANCE_ID\"")),
+            "every AoE line must carry the hardened guard"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn hermes_config_and_allowlist_both_rewritten() {
+        let _g = EnvGuard::unset_all();
+        let (_tmp, home, app_dir) = setup_dirs();
+        let cfg = home.join(".hermes/config.yaml");
+        fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+        fs::write(
+            &cfg,
+            format!("hooks:\n  pre_tool_call:\n    - command: {LEGACY_STATUS_CMD:?}\n"),
+        )
+        .unwrap();
+
+        run_in(&home, &app_dir).unwrap();
+
+        let yaml = fs::read_to_string(&cfg).unwrap();
+        assert!(
+            yaml.contains("case \"$AOE_INSTANCE_ID\""),
+            "Hermes YAML must be rewritten to hardened form"
+        );
+        let allow = home.join(".hermes/shell-hooks-allowlist.json");
+        assert!(allow.exists(), "allowlist must be created alongside config");
+        let parsed: Value = serde_json::from_str(&fs::read_to_string(&allow).unwrap()).unwrap();
+        let approvals = parsed["approvals"].as_array().unwrap();
+        for approval in approvals {
+            let cmd = approval["command"].as_str().unwrap();
+            assert!(
+                cmd.contains("case \"$AOE_INSTANCE_ID\""),
+                "allowlist must key on the new hardened command"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn hermes_allowlist_approved_at_preserved_on_idempotency() {
+        let _g = EnvGuard::unset_all();
+        let (_tmp, home, app_dir) = setup_dirs();
+        let cfg = home.join(".hermes/config.yaml");
+        fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+        fs::write(
+            &cfg,
+            format!("hooks:\n  pre_tool_call:\n    - command: {LEGACY_STATUS_CMD:?}\n"),
+        )
+        .unwrap();
+
+        run_in(&home, &app_dir).unwrap();
+        let after_first = fs::read(home.join(".hermes/shell-hooks-allowlist.json")).unwrap();
+        run_in(&home, &app_dir).unwrap();
+        let after_second = fs::read(home.join(".hermes/shell-hooks-allowlist.json")).unwrap();
+
+        assert_eq!(
+            after_first, after_second,
+            "Hermes allowlist must be byte-idempotent across re-runs (approved_at preserved)"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn kiro_rewrite_preserves_extra_keys() {
+        let _g = EnvGuard::unset_all();
+        let (_tmp, home, app_dir) = setup_dirs();
+        let kiro = home.join(".kiro/agents/aoe-hooks.json");
+        write_json(
+            &kiro,
+            &serde_json::json!({
+                "name": "my-custom-agent",
+                "tools": ["Read", "Bash"],
+                "hooks": {
+                    "preToolUse": [{"command": LEGACY_STATUS_CMD}]
+                }
+            }),
+        );
+
+        run_in(&home, &app_dir).unwrap();
+
+        let parsed: Value = serde_json::from_str(&fs::read_to_string(&kiro).unwrap()).unwrap();
+        assert_eq!(
+            parsed["name"].as_str(),
+            Some("my-custom-agent"),
+            "user-set `name` must be preserved"
+        );
+        assert_eq!(parsed["tools"][0], "Read");
+        let cmd = parsed["hooks"]["preToolUse"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(
+            cmd.contains("case \"$AOE_INSTANCE_ID\""),
+            "Kiro hook command must be rewritten"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn missing_files_noop() {
+        let _g = EnvGuard::unset_all();
+        let (_tmp, home, app_dir) = setup_dirs();
+
+        run_in(&home, &app_dir).unwrap();
+
+        assert!(
+            !home.join(".claude/settings.json").exists(),
+            "no AoE config existed; migration must NOT create new files"
+        );
+        assert!(!home.join(".codex/config.toml").exists());
+        assert!(!home.join(".hermes/config.yaml").exists());
+        assert!(!home.join(".settl/config.toml").exists());
+    }
+
+    #[test]
+    #[serial]
+    fn malformed_json_warn_and_skip() {
+        let _g = EnvGuard::unset_all();
+        let (_tmp, home, app_dir) = setup_dirs();
+        let claude = home.join(".claude/settings.json");
+        fs::create_dir_all(claude.parent().unwrap()).unwrap();
+        fs::write(&claude, "{not json").unwrap();
+
+        run_in(&home, &app_dir).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&claude).unwrap(),
+            "{not json",
+            "malformed file must stay byte-identical (gate fails closed)"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn malformed_toml_warn_and_skip() {
+        let _g = EnvGuard::unset_all();
+        let (_tmp, home, app_dir) = setup_dirs();
+        let settl = home.join(".settl/config.toml");
+        fs::create_dir_all(settl.parent().unwrap()).unwrap();
+        fs::write(&settl, "[[hooks\n# unclosed").unwrap();
+
+        run_in(&home, &app_dir).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&settl).unwrap(),
+            "[[hooks\n# unclosed",
+            "malformed TOML must stay byte-identical (gate fails closed)"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn profile_codex_home_path_is_rewritten() {
+        let _g = EnvGuard::unset_all();
+        let (_tmp, home, app_dir) = setup_dirs();
+        let codex_override = home.join("work-codex");
+        fs::create_dir_all(&codex_override).unwrap();
+        fs::write(
+            codex_override.join("config.toml"),
+            format!(
+                "[[hooks.SessionStart]]\n\
+                 [[hooks.SessionStart.hooks]]\n\
+                 type = \"command\"\n\
+                 command = {LEGACY_STATUS_CMD:?}\n"
+            ),
+        )
+        .unwrap();
+
+        // Profile config in app_dir/profiles/work/config.toml that pins
+        // CODEX_HOME at the override location.
+        let profile_dir = app_dir.join("profiles/work");
+        fs::create_dir_all(&profile_dir).unwrap();
+        fs::write(
+            profile_dir.join("config.toml"),
+            format!(
+                "environment = [\"CODEX_HOME={}\"]\n",
+                codex_override.display()
+            ),
+        )
+        .unwrap();
+
+        run_in(&home, &app_dir).unwrap();
+
+        let text = fs::read_to_string(codex_override.join("config.toml")).unwrap();
+        assert!(
+            text.contains("case \"$AOE_INSTANCE_ID\""),
+            "profile-overridden Codex path must be reached and rewritten"
+        );
+    }
+}
