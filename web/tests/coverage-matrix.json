@@ -1069,8 +1069,14 @@
       "id": "acp.memory-recall",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": ["tests/live/acp-memory-recall.spec.ts"],
-      "components": ["web/src/components/acp/ToolCards.tsx", "web/src/lib/memoryClassify.ts"]
+      "specs": ["tests/live/acp-memory-recall.spec.ts", "tests/acp-memory-recall.spec.ts"],
+      "components": [
+        "web/src/components/acp/ToolCards.tsx",
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/components/acp/AcpRuntime.tsx",
+        "web/src/lib/memoryClassify.ts",
+        "web/src/lib/memoryRecall.ts"
+      ]
     },
     {
       "id": "acp.attachments",
