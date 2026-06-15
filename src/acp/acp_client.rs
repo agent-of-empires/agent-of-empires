@@ -585,6 +585,15 @@ pub(crate) enum OffProtocolWorkKind {
     /// `ToolCall` completes immediately while the underlying subprocess
     /// keeps running off-protocol; the agent polls later via `BashOutput`.
     BackgroundCommand,
+    /// Claude SDK `ScheduleWakeup` tool: the agent deliberately parks the
+    /// turn until a future wake time (a monitor or `/loop` run). The turn
+    /// stays in-flight while the agent is intentionally idle, so the
+    /// silent-orphan watchdog must not treat the quiet window as a wedge.
+    /// Like `AsyncAgent` (and unlike `BackgroundCommand`) this survives a
+    /// `TerminalUsage` marker, because a scheduled wake legitimately
+    /// outlasts the turn's final accounting frame. See #1360, #1401, and
+    /// the monitor-killed-by-watchdog regression.
+    ScheduledWakeup,
 }
 
 /// Per-tool metadata stored in the silent-orphan watchdog's
@@ -727,9 +736,10 @@ impl SilentOrphanWatchdog {
                 // continues, the next Progress / ToolStarted /
                 // ToolCompleted clears `cost_seen` and the next
                 // backgrounded tool re-arms suppression. An AsyncAgent
-                // await blocks the turn (the agent idles waiting and
-                // resumes in-band), so its floor is left intact to
-                // preserve the #1360 fix.
+                // await or a ScheduledWakeup blocks the turn (the agent
+                // idles waiting and resumes in-band), so their floor is
+                // left intact to preserve the #1360 fix and the monitor
+                // fix; only the fire-and-forget BackgroundCommand drops.
                 if self.off_protocol_work_seen == Some(OffProtocolWorkKind::BackgroundCommand) {
                     self.off_protocol_work_seen = None;
                 }
@@ -738,19 +748,30 @@ impl SilentOrphanWatchdog {
                 self.saw_first_progress = true;
                 self.last_progress_at = Some(now);
                 self.cost_seen = false;
+                // A scheduled wake is deliberate off-protocol idling, not
+                // a wedge: mark the turn so the fast grace (cost_seen)
+                // never applies and the post-`at` grace is the generous
+                // 30-minute off-protocol floor. Overwrite any prior kind
+                // so a later `TerminalUsage` cannot clear it (only
+                // `BackgroundCommand` is dropped there). Without this a
+                // monitor / `/loop` turn that emitted a cost-bearing
+                // `UsageUpdate` was killed ~20s after the wake window
+                // lapsed even though the agent intended to keep going.
+                self.off_protocol_work_seen = Some(OffProtocolWorkKind::ScheduledWakeup);
                 // Convert the wall-clock `at` to a monotonic `Instant`
                 // deadline now, so wall-clock jumps between signal
                 // receipt and the next firing check can't perturb
-                // suppression. Add the base grace as a tail so the
-                // watchdog doesn't snap-fire the instant the sleep
-                // ends; the agent needs time after `at` to actually
-                // emit the wake's first `UserPromptSent` or other
-                // progress. See #1401.
+                // suppression. Add the off-protocol floor as a tail so
+                // the watchdog doesn't snap-fire the instant the sleep
+                // ends; the agent needs room after `at` to emit the
+                // wake's first progress, and a monitor whose wake `at`
+                // is itself further out than the floor stays suppressed
+                // the whole time. See #1401 and the monitor regression.
                 let until_wakeup = at
                     .signed_duration_since(wall_now)
                     .to_std()
                     .unwrap_or(std::time::Duration::ZERO);
-                let deadline = now + until_wakeup + cfg.base_grace;
+                let deadline = now + until_wakeup + cfg.off_protocol_grace_floor;
                 // Multiple wakeups should EXTEND (not shorten)
                 // suppression. The agent may re-issue a longer
                 // ScheduleWakeup mid-turn; only the later deadline
@@ -6286,7 +6307,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn watchdog_wakeup_suppresses_until_at_plus_base_grace() {
+    async fn watchdog_wakeup_suppresses_until_at_plus_off_protocol_floor() {
         let cfg = watchdog_test_cfg();
         let t0 = tokio::time::Instant::now();
         let wall = chrono::Utc::now();
@@ -6301,15 +6322,57 @@ mod tests {
             wall,
             cfg,
         );
-        // 1 second after wakeup ARMED (i.e. at the wakeup `at` itself):
-        // suppression must still hold for the tail.
+        // A scheduled wake marks the turn as deliberate off-protocol
+        // idling; the fast grace must never apply to it.
+        assert_eq!(
+            w.off_protocol_work_seen(),
+            Some(OffProtocolWorkKind::ScheduledWakeup)
+        );
+        // At the wakeup `at` itself: suppressed.
         assert!(!w.should_fire(t0 + std::time::Duration::from_secs(2), cfg));
-        // 30 seconds after `at`: still inside the 120s base-grace tail.
-        assert!(!w.should_fire(t0 + std::time::Duration::from_secs(30), cfg));
-        // Past `at + base_grace`: watchdog rearms with normal elapsed
-        // semantics; elapsed since last progress (122s) > base_grace
-        // (120s) → fires.
-        assert!(w.should_fire(t0 + std::time::Duration::from_secs(125), cfg));
+        // Well past the old 120s base-grace tail: the monitor turn must
+        // still be suppressed now that the tail is the 30-minute
+        // off-protocol floor (regression: a monitor used to die ~125s in).
+        assert!(!w.should_fire(t0 + std::time::Duration::from_secs(125), cfg));
+        // Just inside `at + floor` (≈1802s): still suppressed.
+        assert!(!w.should_fire(t0 + std::time::Duration::from_secs(1800), cfg));
+        // Past `at + floor`: watchdog finally rearms (transport-wedge
+        // backstop). elapsed since last progress (1805s) > floor (1800s).
+        assert!(w.should_fire(t0 + std::time::Duration::from_secs(1805), cfg));
+    }
+
+    #[tokio::test]
+    async fn watchdog_wakeup_after_cost_does_not_use_fast_grace() {
+        // Regression for the monitor-killed-by-watchdog bug: a `/loop`
+        // turn emits a cost-bearing `UsageUpdate` (cost_seen → fast
+        // grace) and then schedules a wake. Before the fix the watchdog
+        // fired ~20s after the wake window lapsed; now the scheduled-wake
+        // off-protocol mark must override fast grace entirely.
+        let cfg = watchdog_test_cfg();
+        let t0 = tokio::time::Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::new();
+        w.apply_signal(LifecycleSignal::Progress, t0, wall, cfg);
+        // Terminal accounting frame arrives first (flips cost_seen).
+        w.apply_signal(
+            LifecycleSignal::TerminalUsage,
+            t0 + std::time::Duration::from_secs(1),
+            wall,
+            cfg,
+        );
+        // Then the agent schedules a wake 2s out.
+        w.apply_signal(
+            LifecycleSignal::WakeupPending {
+                at: wall + chrono::Duration::seconds(2),
+            },
+            t0 + std::time::Duration::from_secs(2),
+            wall,
+            cfg,
+        );
+        // 25s in (well past the 20s fast grace): must NOT fire.
+        assert!(!w.should_fire(t0 + std::time::Duration::from_secs(25), cfg));
+        // 200s in (past the old 120s base grace too): still suppressed.
+        assert!(!w.should_fire(t0 + std::time::Duration::from_secs(200), cfg));
     }
 
     #[tokio::test]
@@ -6361,14 +6424,14 @@ mod tests {
             wall,
             cfg,
         );
-        // At t0 + 50s: the first wakeup's tail (10s + 120s = 130s) is
-        // still alive, AND the second wakeup's tail (100s + 120s =
-        // 220s) is alive. Watchdog must be suppressed by the larger.
+        // At t0 + 50s: the first wakeup's tail (10s + 1800s) is still
+        // alive, AND the second wakeup's tail (100s + 1800s = 1902s)
+        // is alive. Watchdog must be suppressed by the larger.
         assert!(!w.should_fire(t0 + std::time::Duration::from_secs(50), cfg));
-        // At t0 + 215s: still inside the second wakeup's tail.
-        assert!(!w.should_fire(t0 + std::time::Duration::from_secs(215), cfg));
-        // At t0 + 225s: past the second wakeup's tail.
-        assert!(w.should_fire(t0 + std::time::Duration::from_secs(225), cfg));
+        // At t0 + 1900s: still inside the second wakeup's tail (1902s).
+        assert!(!w.should_fire(t0 + std::time::Duration::from_secs(1900), cfg));
+        // At t0 + 1905s: past the second wakeup's tail.
+        assert!(w.should_fire(t0 + std::time::Duration::from_secs(1905), cfg));
     }
 
     #[tokio::test]
@@ -6396,10 +6459,10 @@ mod tests {
             wall,
             cfg,
         );
-        // First wakeup's tail still wins.
+        // First wakeup's tail (100s + 1800s = 1901s) still wins.
         assert!(!w.should_fire(t0 + std::time::Duration::from_secs(50), cfg));
-        assert!(!w.should_fire(t0 + std::time::Duration::from_secs(200), cfg));
-        assert!(w.should_fire(t0 + std::time::Duration::from_secs(225), cfg));
+        assert!(!w.should_fire(t0 + std::time::Duration::from_secs(1900), cfg));
+        assert!(w.should_fire(t0 + std::time::Duration::from_secs(1905), cfg));
     }
 
     #[tokio::test]
