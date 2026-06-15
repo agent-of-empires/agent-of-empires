@@ -53,12 +53,12 @@ import type {
   ActivityRow,
   ApprovalDecision,
   AcpState,
-  MemoryRecall,
   Plan,
   QueuedPrompt,
   RejectedPrompt,
   ToolCall,
 } from "../../lib/acpTypes";
+import { pickMemoryRecall } from "../../lib/memoryRecall";
 
 interface Props {
   sessionId: string;
@@ -688,47 +688,6 @@ function pickStartedAt(args: Record<string, unknown> | undefined, argsText: stri
     }
   }
   return null;
-}
-
-/** Validate and normalize a smuggled `_aoe_memory_recall` value before it
- *  reaches MemoryRecallCard. A malformed payload (e.g. non-string
- *  `synthesized_text`) would otherwise trigger runtime type errors in the
- *  card. Returns undefined for anything that isn't shaped like a
- *  MemoryRecall. */
-function asMemoryRecall(value: unknown): MemoryRecall | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-  const obj = value as Record<string, unknown>;
-  if (typeof obj.mode !== "string") return undefined;
-  const paths =
-    Array.isArray(obj.paths) && obj.paths.every((p) => typeof p === "string") ? (obj.paths as string[]) : undefined;
-  const synthesized_text = typeof obj.synthesized_text === "string" ? obj.synthesized_text : undefined;
-  return {
-    mode: obj.mode,
-    ...(paths ? { paths } : {}),
-    ...(synthesized_text !== undefined ? { synthesized_text } : {}),
-  };
-}
-
-/** Read the smuggled `_aoe_memory_recall` payload AcpRuntime stashes on
- *  the tool-call args so the structured-view card can dispatch to
- *  MemoryRecallCard. Returns undefined when absent or malformed; the
- *  card then renders as a generic read. See #2142. */
-function pickMemoryRecall(
-  args: Record<string, unknown> | undefined,
-  argsText: string | undefined,
-): MemoryRecall | undefined {
-  const fromObj = asMemoryRecall(args?._aoe_memory_recall);
-  if (fromObj) return fromObj;
-  if (argsText) {
-    try {
-      const parsed = JSON.parse(argsText) as Record<string, unknown>;
-      const mr = asMemoryRecall(parsed?._aoe_memory_recall);
-      if (mr) return mr;
-    } catch {
-      // ignore
-    }
-  }
-  return undefined;
 }
 
 /** Read the smuggled `endedAt` field set by AssistantBuilder.completeToolCall. */
