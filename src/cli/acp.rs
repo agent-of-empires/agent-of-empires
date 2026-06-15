@@ -525,12 +525,15 @@ async fn stop(session: Option<String>, all: bool, timeout_secs: u64) -> Result<(
 }
 
 /// Stop every registered agent worker. Returns the number stopped. Shared by
-/// `aoe acp stop --all` and the top-level `aoe stop-all` panic command.
-pub(crate) async fn stop_all_workers(timeout_secs: u64) -> usize {
+/// `aoe acp stop --all` and the top-level `aoe stop-all` panic command. A
+/// failure to read the worker registry is surfaced as `Err` so callers can
+/// reflect it in their exit status instead of silently reporting zero workers;
+/// per-worker signaling stays best-effort.
+pub(crate) async fn stop_all_workers(timeout_secs: u64) -> Result<usize> {
     use crate::acp::worker_registry;
-    let targets = worker_registry::list().unwrap_or_default();
+    let targets = worker_registry::list()?;
     stop_worker_records(&targets, timeout_secs).await;
-    targets.len()
+    Ok(targets.len())
 }
 
 async fn stop_worker_records(

@@ -144,29 +144,33 @@ fn is_aoe_session(name: &str) -> bool {
 /// but sweeps the whole `SESSION_PREFIX` namespace. Returns the number of
 /// sessions killed. Refreshes the session cache once at the end.
 ///
+/// `Err` means the `tmux list-sessions` process could not be spawned (e.g.
+/// tmux is not installed), which callers should treat as a failed surface. A
+/// non-zero exit (no server running, hence no sessions) is `Ok(0)`, and
+/// per-session kills stay best-effort.
+///
 /// ponytail: per-session `kill_process_tree` is sequential and each does a
 /// fixed 100ms SIGTERM grace, so a sweep of N sessions blocks ~N*100ms. Fine
 /// for a panic button with a handful of sessions; if counts grow, batch the
 /// SIGTERM across all pids, wait once, then SIGKILL survivors.
-pub fn stop_all_sessions() -> usize {
+pub fn stop_all_sessions() -> anyhow::Result<usize> {
     let output = Command::new("tmux")
         .args(["list-sessions", "-F", "#{session_name}"])
-        .output();
+        .output()
+        .map_err(|e| anyhow::anyhow!("tmux list-sessions spawn failed: {e}"))?;
 
     let mut killed = 0;
-    if let Ok(out) = output {
-        if out.status.success() {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            for line in stdout.lines() {
-                if is_aoe_session(line) {
-                    if let Some(pid) = crate::process::get_pane_pid(line) {
-                        crate::process::kill_process_tree(pid);
-                    }
-                    let _ = Command::new("tmux")
-                        .args(["kill-session", "-t", line])
-                        .output();
-                    killed += 1;
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            if is_aoe_session(line) {
+                if let Some(pid) = crate::process::get_pane_pid(line) {
+                    crate::process::kill_process_tree(pid);
                 }
+                let _ = Command::new("tmux")
+                    .args(["kill-session", "-t", line])
+                    .output();
+                killed += 1;
             }
         }
     }
@@ -174,7 +178,7 @@ pub fn stop_all_sessions() -> usize {
     if killed > 0 {
         refresh_session_cache();
     }
-    killed
+    Ok(killed)
 }
 
 /// Batch-fetch pane metadata for all aoe sessions in a single tmux subprocess call.

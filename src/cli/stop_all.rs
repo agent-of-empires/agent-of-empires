@@ -23,13 +23,12 @@ pub struct StopAllArgs {
 }
 
 pub async fn run(args: StopAllArgs) -> Result<()> {
-    // The daemon and workers are the only fallible, serve-gated surfaces, so
-    // the error aggregation lives entirely under `serve`. In a TUI-only build
-    // `run` just sweeps tmux and always succeeds.
+    // Every surface is best-effort: each is attempted independently and its
+    // failure is collected here rather than aborting the rest. In a TUI-only
+    // build only the tmux sweep runs, so `args` carries no fields.
     #[cfg(not(feature = "serve"))]
     let _ = args;
 
-    #[cfg(feature = "serve")]
     let mut errors: Vec<String> = Vec::new();
 
     // Daemon first. Removing the orchestrator means the worker sweep below
@@ -48,15 +47,16 @@ pub async fn run(args: StopAllArgs) -> Result<()> {
     }
 
     #[cfg(feature = "serve")]
-    {
-        let n = crate::cli::acp::stop_all_workers(args.timeout_secs).await;
-        println!("Stopped {n} agent worker(s).");
+    match crate::cli::acp::stop_all_workers(args.timeout_secs).await {
+        Ok(n) => println!("Stopped {n} agent worker(s)."),
+        Err(e) => errors.push(format!("workers: {e}")),
     }
 
-    let sessions = crate::tmux::stop_all_sessions();
-    println!("Stopped {sessions} tmux session(s).");
+    match crate::tmux::stop_all_sessions() {
+        Ok(n) => println!("Stopped {n} tmux session(s)."),
+        Err(e) => errors.push(format!("tmux: {e}")),
+    }
 
-    #[cfg(feature = "serve")]
     if !errors.is_empty() {
         for e in &errors {
             eprintln!("stop-all error: {e}");
