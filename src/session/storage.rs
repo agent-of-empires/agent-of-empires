@@ -573,11 +573,14 @@ pub fn recent_project_entry_for(inst: &Instance) -> Option<RecentProjectEntry> {
         .as_ref()
         .map(|w| w.main_repo_path.as_str())
         .unwrap_or(inst.project_path.as_str());
-    let trimmed = raw.trim_end_matches('/');
+    let trimmed = raw.trim_end_matches(['/', '\\']);
     let path = if trimmed.is_empty() { "/" } else { trimmed };
-    let display_name = path
-        .rsplit('/')
-        .find(|s| !s.is_empty())
+    // `file_name` resolves the basename with the host platform's separator
+    // rules, so a Windows path like `C:\repo\proj` yields `proj` rather than
+    // the whole string. Falls back to the path itself for roots (`/`, `C:\`).
+    let display_name = std::path::Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
         .unwrap_or(path)
         .to_string();
     let last_used_at = inst
