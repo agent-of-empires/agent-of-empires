@@ -12,9 +12,9 @@ Three status-driven events, each independently toggleable in Settings:
 
 A 60-second per-session cooldown prevents rapid re-buzzing when a session flickers between states. Per-session overrides beat the server-wide defaults (e.g. enable `Idle` only on the one long-running session you care about).
 
-A fourth event, **structured view approval**, fires immediately when a tool needs your permission. It bypasses the suppression rules below: even with the dashboard or TUI foregrounded, the service worker shows an in-app toast so you still get a cue. The structured view also plays a browser-side chime; see [Sound effects](sounds.md).
+Two more events, **structured view approval** and **structured view question** (`AskUserQuestion`), fire immediately when a tool needs your permission or the agent asks you something. They bypass the suppression rules below: even with the dashboard or TUI foregrounded, the service worker shows an in-app toast so you still get a cue. The structured view also plays a browser-side chime; see [Sound effects](sounds.md).
 
-Status notifications are suppressed when you're already looking at aoe (approvals ignore this):
+Status notifications are suppressed when you're already looking at aoe (approvals and questions ignore this):
 
 - **Dashboard focused (per-device):** if the PWA tab is visible and focused, that device shows an in-app toast instead of an OS notification.
 - **TUI active (all devices):** if the `aoe` TUI is running on the server machine, all pushes are suppressed.

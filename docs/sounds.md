@@ -48,7 +48,7 @@ Configure via the TUI (press `s`, select Sound), or edit TOML directly. Toggle t
 enabled = true
 mode = "random"
 on_error = "error"          # specific sound for errors
-on_approval = "approval"    # structured view only; browser-side chime
+on_approval = "approval"    # structured view only; browser-side chime for approvals and questions
 ```
 
 **Profile**: `~/.config/agent-of-empires/profiles/<profile>/config.toml`
@@ -77,7 +77,7 @@ Status transition sounds play on the **server host** using platform-native playe
 - **macOS**: `afplay`
 - **Linux**: `aplay` (ALSA) or `paplay` (PulseAudio)
 
-The `on_approval` sound is the exception: it plays in the **browser** where the dashboard is open, not on the host. Browsers enforce an autoplay policy, so the first approval after a fresh page load may stay silent until you interact with the structured view tab; the OS push notification still surfaces the approval.
+The `on_approval` sound is the exception: it plays in the **browser** where the dashboard is open, not on the host, and covers both tool approvals and `AskUserQuestion` questions. Browsers enforce an autoplay policy, so the first one after a fresh page load may stay silent until you interact with the structured view tab; the OS push notification still surfaces it.
 
 If sounds don't play, ensure audio tools are installed:
 
