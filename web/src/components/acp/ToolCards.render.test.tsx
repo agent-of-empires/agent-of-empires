@@ -280,6 +280,53 @@ describe("ToolCards harness-tool gating (non-claude)", () => {
   });
 });
 
+describe("ToolCards harness-tool details", () => {
+  it("shows a timeout chip and the expanded body for a non-persistent Monitor", () => {
+    const tool = makeToolCall({
+      id: "monitor-timeout",
+      name: "Monitor",
+      kind: "other",
+      args_preview: JSON.stringify({
+        description: "watch the build",
+        command: "npm run build",
+        timeout_ms: 90000,
+      }),
+    });
+    const { container } = render(
+      <Wrap toolKey="claude">
+        <ToolCard
+          tool={tool}
+          result={makeCompletion({ id: "m-done", toolCallId: "monitor-timeout", text: "build ok" })}
+        />
+      </Wrap>,
+    );
+    // timeout_ms 90000 -> formatted as "1m 30s" in the header chip.
+    expect(container.textContent).toContain("1m 30s");
+    fireEvent.click(container.querySelector("button")!);
+    expect(container.textContent).toContain("npm run build");
+    expect(container.textContent).toContain("build ok");
+  });
+
+  it("falls back to default primaries when harness args are empty", () => {
+    for (const [name, expected] of [
+      ["ToolSearch", "search tools"],
+      ["Monitor", "background watch"],
+      ["TaskStop", "stop task"],
+    ] as const) {
+      const { container } = render(
+        <Wrap toolKey="claude">
+          <ToolCard
+            tool={makeToolCall({ id: `empty-${name}`, name, kind: "other", args_preview: "{}" })}
+            result={undefined}
+          />
+        </Wrap>,
+      );
+      expect(container.textContent).toContain(expected);
+      cleanup();
+    }
+  });
+});
+
 describe("ToolCards profile-gated dispatch (opencode)", () => {
   it("routes OpenCode todowrite payloads to the todos card", () => {
     const { container } = render(
