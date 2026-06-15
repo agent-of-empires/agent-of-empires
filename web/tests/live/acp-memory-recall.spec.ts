@@ -101,6 +101,8 @@ base("structured view renders synthesize memory recall as cleaned markdown", asy
     await expect(body).toContainText("prefers terse output");
     // Transport noise is stripped.
     await expect(body).not.toContainText("system-reminder");
+    // No cat -n numeric-tab line-number prefixes survive.
+    expect(await body.innerText()).not.toMatch(/\d+\t/);
     // Markdown rendered to elements, not raw source.
     await expect(body.locator("h1")).toHaveText("User profile");
     await expect(body.locator("li")).toHaveCount(2);
