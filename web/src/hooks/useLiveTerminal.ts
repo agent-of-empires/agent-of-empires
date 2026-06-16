@@ -3,6 +3,7 @@ import { getOrCreateDeviceBindingSecret } from "../lib/deviceBinding";
 import { getToken } from "../lib/token";
 import { wheelMouseBytes } from "../lib/liveMouse";
 import { retryDelayMs } from "../lib/wsBackoff";
+import { reportTelemetrySeen } from "../lib/api";
 
 // Capture-snapshot live view transport (mobile). Mirrors the TUI's
 // live-send model: the server polls `tmux capture-pane` and pushes ANSI
@@ -92,6 +93,11 @@ export function useLiveTerminal(sessionId: string | null, wsPath: string = "live
   // Whether the user is reading scrollback (off the live edge). Guards
   // enterReading/returnToLive against repeat fires from scroll events.
   const readingRef = useRef(false);
+  // Fire the `web_terminal` usage signal once per hook lifetime, not on every
+  // reconnect: onopen runs again after a WiFi blip, and the telemetry intent is
+  // "this terminal was opened", not "the socket reconnected N times". Ported
+  // from the removed xterm useTerminal hook.
+  const telemetrySeenRef = useRef(false);
 
   const storeRef = useRef<{
     snapshot: LiveTerminalState;
@@ -154,6 +160,10 @@ export function useLiveTerminal(sessionId: string | null, wsPath: string = "live
       wsRef.current = ws;
 
       ws.onopen = () => {
+        if (!telemetrySeenRef.current) {
+          telemetrySeenRef.current = true;
+          reportTelemetrySeen("web_terminal");
+        }
         setState((prev) => ({
           ...prev,
           connected: true,

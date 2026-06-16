@@ -124,8 +124,11 @@ base.describe("ensure_session restart flow", () => {
       await expect(sessionButton).toBeVisible();
       await sessionButton.click();
 
-      await expect(page.getByText("Starting session...")).toBeVisible();
-      await expect(page.getByText("Starting session...")).toBeHidden({
+      // The desktop layout mounts both the agent pane and the paired shell
+      // pane (each a LiveTerminalView), so the placeholder renders twice; only
+      // the agent's /ensure is delayed above, and it is first in the DOM.
+      await expect(page.getByText("Starting session...").first()).toBeVisible();
+      await expect(page.getByText("Starting session...").first()).toBeHidden({
         timeout: 15_000,
       });
     } finally {
