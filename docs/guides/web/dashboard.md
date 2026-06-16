@@ -32,6 +32,10 @@ The command palette (top-bar button or keyboard shortcut) is a fuzzy launcher fo
 
 Individual settings also appear in the palette under `Settings`. A writable toggle flips inline from the palette (a toast confirms, and the subtitle shows its current state and scope); every other setting opens the settings view on its tab. Read-only servers and settings that need elevation jump to the settings view instead of writing.
 
+## Settings search
+
+The search box in the Settings header filters every setting by name and description as you type, with the same fuzzy matching as the command palette (so `mcw` finds **Max Concurrent Workers**). Picking a result jumps to that setting's tab, scrolls the field into view, and briefly highlights it, opening the **Advanced** fold when the setting lives inside it. Search spans every tab, so you can find a setting without knowing which tab it is on. The TUI settings screen has the same fuzzy search behind the `/` key.
+
 ## First-run onboarding
 
 The first time you open the dashboard in a browser, a **Choose your theme** card appears before anything else. Picking a theme applies it live and saves it to your default profile; you can switch freely, then click **Continue**. Change it later in Settings > Appearance. The card is skipped in read-only mode and for anyone who already finished the tutorial.
