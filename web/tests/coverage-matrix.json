@@ -796,6 +796,13 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
+      "id": "sidebar.longpress-slop",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/lib/__tests__/longPress.test.ts"],
+      "components": ["web/src/lib/longPress.ts", "web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
       "id": "sidebar.favorite-indicator",
       "kind": "deferred",
       "issue": "https://github.com/agent-of-empires/agent-of-empires/issues/986",
