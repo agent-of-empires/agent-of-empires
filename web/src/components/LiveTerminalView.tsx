@@ -207,9 +207,22 @@ export function LiveTerminalView({ session, active = true, surface = "agent" }: 
             type="button"
             onClick={live.claim}
             data-live-takeover
-            className="font-mono text-[11px] text-text-dim bg-surface-800/90 border border-surface-700/50 rounded-md px-3 py-1.5 backdrop-blur-sm active:bg-surface-700/90"
+            className="flex items-center gap-1.5 text-xs font-semibold text-white bg-brand-600 hover:bg-brand-500 active:bg-brand-700 border border-brand-400/50 rounded-full px-4 py-2 shadow-lg cursor-pointer motion-safe:animate-[fadeIn_200ms_ease-out]"
           >
-            Live on another device. Tap to take over.
+            <svg
+              width="13"
+              height="13"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2.5"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden="true"
+            >
+              <path d="M9 18l6-6-6-6" />
+            </svg>
+            Live on another device. Take over
           </button>
         </div>
       )}
