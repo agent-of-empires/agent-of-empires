@@ -121,7 +121,10 @@ fn test_session_name_format() {
 ///
 /// This guards the production sequence around the attach closure:
 /// leave TUI mode, release the EventStream stdin reader, run the
-/// attach closure, recreate the EventStream, and restore TUI mode.
+/// attach closure, restore TUI mode, then recreate the EventStream and
+/// clear. The EventStream is recreated only after raw mode and the
+/// alternate screen are restored so the fresh reader is born into raw
+/// mode rather than attached to a briefly-cooked tty.
 #[test]
 fn test_terminal_mode_sequence_documented() {
     let source = std::fs::read_to_string("src/tui/app.rs").expect("Failed to read app.rs");
@@ -138,20 +141,14 @@ fn test_terminal_mode_sequence_documented() {
             "Write::flush",
             "event_stream.take",
             "let result = f()",
-        ],
-    );
-
-    assert_contains_in_order(
-        helper_body,
-        &[
-            "self.event_stream = Some(EventStream::new())",
             "enable_raw_mode",
             "EnterAlternateScreen",
             "EnableBracketedPaste",
             "cursor::Hide",
             "sync_mouse_capture",
             "Write::flush",
-            "terminal.clear",
+            "self.event_stream = Some(EventStream::new())",
+            "clear_terminal",
         ],
     );
 }
