@@ -76,13 +76,17 @@ aoe project add /repo/foo                              # global
 aoe -p other project add /repo/foo --allow-override    # profile shadows global
 ```
 
+### Saved projects versus pinned projects
+
+A registered (saved) project is a registry entry: it shows in the Projects view and the new-session wizard's multi-select picker, whether or not it has any sessions. Pinning is a separate decision: it keeps the project's header visible in the sidebar / project view even with zero sessions. So a saved project is not forced into the sidebar, and unpinning a project does not delete it; it stays saved and only its sessionless header goes away. Removing a project (the Projects view's "Remove", or `aoe project remove`) is the one action that deletes the registry entry.
+
 ### Pinning a project from the TUI
 
-In the TUI's project view (press `g` and pick Project grouping), a project header normally disappears once its last session is gone. Press `p` on a project header, or pick "Pin project" from its right-click menu, to register that repo in the global registry. A pinned project keeps its header (marked with a `◆`) even with zero sessions, so you can launch new work under it later, mirroring the web dashboard, where a project is a registry entry independent of any session. Press `p` again to unpin; an unpinned project drops from the view once it has no sessions.
+In the TUI's project view (press `g` and pick Project grouping), a project header normally disappears once its last session is gone. Press `p` on a project header, or pick "Pin project" from its right-click menu, to pin it (registering the repo in the global registry if it is not already saved). A pinned project keeps its header (marked with a `◆`) even with zero sessions, so you can launch new work under it later. Press `p` again to unpin; the project stays saved (still in the picker), and its header drops from the view once it has no sessions.
 
 ### Pinning a project from the web dashboard
 
-The web sidebar's project (repository) grouping mirrors the TUI. A pinned project shows a `◆` next to its name and keeps its header even with zero sessions; its `+` New session button launches work under that repo. Open a project header's actions menu (right-click, or the menu on the header) and choose "Pin project" to register the repo (global scope) or "Unpin project" to remove every registry entry for it. Pinned-but-empty projects sort below your active repositories. A pin made in the TUI shows up here when the dashboard regains focus, and vice versa.
+The web sidebar's project (repository) grouping mirrors the TUI. A pinned project shows a `◆` next to its name and keeps its header even with zero sessions; its `+` New session button launches work under that repo. Open a project header's actions menu (right-click, or the menu on the header) and choose "Pin project" to pin it (registering the repo, global scope, if needed) or "Unpin project" to clear the pin while keeping the saved project. Pinned-but-empty projects sort below your active repositories. The pin is stored in the registry, so a pin made in the TUI shows up here when the dashboard regains focus, and vice versa.
 
 ## CLI Reference
 
