@@ -11,10 +11,35 @@ const ALLOW = { policy: "allow" };
 const NONE = { rule: "none" };
 
 const SCHEMA = [
-  { section: "sandbox", field: "enabled_by_default", label: "Enabled by Default", widget: { kind: "toggle" }, advanced: false },
-  { section: "acp", field: "show_tool_durations", label: "Show tool-call durations", widget: { kind: "toggle" }, advanced: false },
-  { section: "acp", field: "replay_bytes", label: "Replay buffer bytes", widget: { kind: "number", min: 0 }, advanced: true },
-].map((d) => ({ category: d.section, description: "", profile_overridable: true, validation: NONE, web_write: ALLOW, ...d }));
+  {
+    section: "sandbox",
+    field: "enabled_by_default",
+    label: "Enabled by Default",
+    widget: { kind: "toggle" },
+    advanced: false,
+  },
+  {
+    section: "acp",
+    field: "show_tool_durations",
+    label: "Show tool-call durations",
+    widget: { kind: "toggle" },
+    advanced: false,
+  },
+  {
+    section: "acp",
+    field: "replay_bytes",
+    label: "Replay buffer bytes",
+    widget: { kind: "number", min: 0 },
+    advanced: true,
+  },
+].map((d) => ({
+  category: d.section,
+  description: "",
+  profile_overridable: true,
+  validation: NONE,
+  web_write: ALLOW,
+  ...d,
+}));
 
 async function installMocks(page: Page) {
   await page.route(

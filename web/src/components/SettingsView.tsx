@@ -21,7 +21,6 @@ import { DiffSettings } from "./settings/DiffSettings";
 import { TelemetrySettings } from "./settings/TelemetrySettings";
 import { SettingsHeader } from "./settings/SettingsHeader";
 import { ProfilesSection } from "./profiles/ProfilesSection";
-import { SettingsSearch } from "./settings/SettingsSearch";
 import type { SettingsSearchHit } from "./settings/settingsSearchIndex";
 
 export type TabId =
@@ -612,6 +611,9 @@ export function SettingsView({
         saveError={saveError}
         selectedProfile={selectedProfile}
         onSelectProfile={handleSelectProfile}
+        schema={schema}
+        schemaLoading={schemaLoading}
+        onSearchJump={handleSearchJump}
       />
 
       {/* Mobile tabs (horizontal scroll) */}
@@ -671,8 +673,6 @@ export function SettingsView({
         <div className="flex-1 overflow-y-auto">
           <div className="p-6 max-w-2xl mx-auto space-y-5">
             <h2 className="text-lg font-semibold text-text-bright">{currentTabLabel}</h2>
-
-            <SettingsSearch schema={schema} loading={schemaLoading} onJump={handleSearchJump} />
 
             {offline && (
               <div className="text-sm text-status-error bg-status-error/10 rounded-lg p-3">

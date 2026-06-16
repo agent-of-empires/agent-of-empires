@@ -29,7 +29,12 @@ function descriptor(
 
 const SCHEMA: SettingsFieldDescriptor[] = [
   descriptor({ section: "theme", field: "name", label: "Theme", category: "Theme" }),
-  descriptor({ section: "acp", field: "show_tool_durations", label: "Show tool-call durations", category: "Structured view" }),
+  descriptor({
+    section: "acp",
+    field: "show_tool_durations",
+    label: "Show tool-call durations",
+    category: "Structured view",
+  }),
 ];
 
 describe("SettingsSearch", () => {

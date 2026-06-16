@@ -9,7 +9,7 @@ interface Props {
   onJump: (hit: SettingsSearchHit) => void;
 }
 
-// Full-text settings search. Sits above the tab content and filters the
+// Full-text settings search. Sits in the settings header and filters the
 // schema-backed settings as you type, mirroring the TUI `/` overlay: selecting
 // a hit jumps to that field's tab (SettingsView scrolls it into view). cmdk
 // provides the fuzzy filtering and arrow/Enter keyboard navigation; the index
