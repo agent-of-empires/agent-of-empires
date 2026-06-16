@@ -2577,6 +2577,7 @@ mod tests {
                 &Event::ElicitationResolved {
                     nonce: nonce_a,
                     outcome: ElicitationOutcome::Accepted,
+                    answers: Vec::new(),
                 },
             )
             .unwrap();
@@ -2617,6 +2618,7 @@ mod tests {
                 &Event::ElicitationResolved {
                     nonce: nonce_a,
                     outcome: ElicitationOutcome::Accepted,
+                    answers: Vec::new(),
                 },
             )
             .unwrap();

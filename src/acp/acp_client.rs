@@ -46,7 +46,8 @@ use super::agent_profiles;
 use super::agent_registry::AgentSpec;
 use super::approvals::{is_destructive, ApprovalDecision, Nonce};
 use super::elicitations::{
-    build_response, parse_elicitation, Elicitation, ElicitationOutcome, ElicitationResolution,
+    build_response, parse_elicitation, summarize_answers, Elicitation, ElicitationAnswer,
+    ElicitationOutcome, ElicitationResolution,
 };
 use super::event_store::AttachmentBlob;
 use super::fs_handler::{self, FsPolicy, SandboxPathMap};
@@ -1122,7 +1123,7 @@ enum PendingResolver {
     /// just forwards them. Boxed to keep the enum small.
     Elicitation {
         elicitation: Box<Elicitation>,
-        resolver: oneshot::Sender<(CreateElicitationResponse, ElicitationOutcome)>,
+        resolver: oneshot::Sender<ElicitationResolutionMessage>,
     },
 }
 
@@ -1131,6 +1132,16 @@ enum PendingResolver {
 enum ApprovalResolutionMessage {
     Decision { decision: ApprovalDecision },
     Cancelled,
+}
+
+/// Message sent over the elicitation resolver oneshot. Carries the
+/// validated wire response for the agent, the outcome for status
+/// derivation, and the display-ready answers for the transcript
+/// (`Event::ElicitationResolved.answers`). See #2209.
+struct ElicitationResolutionMessage {
+    response: CreateElicitationResponse,
+    outcome: ElicitationOutcome,
+    answers: Vec<ElicitationAnswer>,
 }
 
 type PendingResponders = Arc<Mutex<HashMap<Nonce, PendingResponder>>>;
@@ -1833,6 +1844,13 @@ impl AcpClient {
         // Validate against the parked form while it is still borrowed; on
         // failure the nonce stays in the map untouched.
         let outcome = resolution.outcome();
+        // Render the submitted answers for the transcript before
+        // `build_response` consumes `resolution`. The parked form supplies
+        // question titles; selects carry the clean label. See #2209.
+        let answers = match &resolution {
+            ElicitationResolution::Accept { answers } => summarize_answers(elicitation, answers),
+            ElicitationResolution::Decline | ElicitationResolution::Cancel => Vec::new(),
+        };
         let response = build_response(elicitation, resolution)
             .map_err(|e| AcpError::InvalidAnswer(e.to_string()))?;
         // Valid: now consume the responder and forward the built response.
@@ -1841,7 +1859,11 @@ impl AcpClient {
             unreachable!("checked above");
         };
         resolver
-            .send((response, outcome))
+            .send(ElicitationResolutionMessage {
+                response,
+                outcome,
+                answers,
+            })
             .map_err(|_| AcpError::AgentExited)
     }
 
@@ -5974,8 +5996,7 @@ async fn handle_elicitation_request(
         }
     };
 
-    let (resolve_tx, resolve_rx) =
-        oneshot::channel::<(CreateElicitationResponse, ElicitationOutcome)>();
+    let (resolve_tx, resolve_rx) = oneshot::channel::<ElicitationResolutionMessage>();
     pending.lock().await.insert(
         nonce.clone(),
         PendingResponder {
@@ -6001,17 +6022,23 @@ async fn handle_elicitation_request(
     // before sending, so whatever arrives here is already a built, valid
     // response. A dropped resolver (daemon teardown, agent cancel) cancels
     // the tool call.
-    let (response, outcome) = resolve_rx.await.unwrap_or_else(|_| {
-        (
-            CreateElicitationResponse::new(ElicitationAction::Cancel),
-            ElicitationOutcome::Cancelled,
-        )
-    });
+    let ElicitationResolutionMessage {
+        response,
+        outcome,
+        answers,
+    } = resolve_rx
+        .await
+        .unwrap_or_else(|_| ElicitationResolutionMessage {
+            response: CreateElicitationResponse::new(ElicitationAction::Cancel),
+            outcome: ElicitationOutcome::Cancelled,
+            answers: Vec::new(),
+        });
 
     let _ = event_tx
         .send(Event::ElicitationResolved {
             nonce: nonce.clone(),
             outcome,
+            answers,
         })
         .await;
 

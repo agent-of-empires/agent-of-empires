@@ -4452,6 +4452,7 @@ mod tests {
             derive_acp_status(&Event::ElicitationResolved {
                 nonce: Nonce("e-1".into()),
                 outcome: crate::acp::elicitations::ElicitationOutcome::Accepted,
+                answers: Vec::new(),
             }),
             Some(StatusIntent::Set(Status::Running))
         );

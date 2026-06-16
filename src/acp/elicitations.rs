@@ -124,6 +124,54 @@ pub struct ResolvedElicitation {
     pub resolved_at: DateTime<Utc>,
 }
 
+/// One answered question, rendered for the transcript. `question` is the
+/// human-readable prompt (the question title, or the field key as a
+/// fallback); `answer` is the display value the user submitted. Computed
+/// server-side at resolve time and carried on `Event::ElicitationResolved`
+/// so the structured view can show what the user picked after the card
+/// closes. See #2209.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ElicitationAnswer {
+    pub question: String,
+    pub answer: String,
+}
+
+/// Render the user's submitted answers into display-ready pairs, in the
+/// form's question order. Only answered questions are included (an
+/// optional question left blank is omitted). Single/multi selects carry
+/// the option value, which for AskUserQuestion is already the clean
+/// label (see `ElicitationOption::value`), so no option lookup is needed.
+pub fn summarize_answers(
+    elicitation: &Elicitation,
+    answers: &BTreeMap<String, AnswerValue>,
+) -> Vec<ElicitationAnswer> {
+    let mut out = Vec::new();
+    for question in &elicitation.questions {
+        let Some(value) = answers.get(&question.field_key) else {
+            continue;
+        };
+        let answer = match value {
+            AnswerValue::Bool(b) => {
+                if *b {
+                    "Yes".to_string()
+                } else {
+                    "No".to_string()
+                }
+            }
+            AnswerValue::Integer(i) => i.to_string(),
+            AnswerValue::Number(n) => n.to_string(),
+            AnswerValue::Text(s) => s.clone(),
+            AnswerValue::List(values) => values.join(", "),
+        };
+        let question = question
+            .title
+            .clone()
+            .unwrap_or_else(|| question.field_key.clone());
+        out.push(ElicitationAnswer { question, answer });
+    }
+    out
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ElicitationOutcome {
     /// User submitted answers (ACP `accept`).
@@ -931,6 +979,74 @@ mod tests {
         assert_eq!(
             content.get("tags"),
             Some(&ElicitationContentValue::StringArray(vec!["a".into()]))
+        );
+    }
+
+    #[test]
+    fn summarize_renders_answers_in_question_order() {
+        let e = sample_elicitation();
+        let mut answers = BTreeMap::new();
+        answers.insert(
+            "tags".to_string(),
+            AnswerValue::List(vec!["a".into(), "b".into()]),
+        );
+        answers.insert("question_0".to_string(), AnswerValue::Text("Yes".into()));
+        let summary = summarize_answers(&e, &answers);
+        // Question order from the form, not BTreeMap key order.
+        assert_eq!(summary.len(), 2);
+        assert_eq!(summary[0].question, "question_0");
+        assert_eq!(summary[0].answer, "Yes");
+        assert_eq!(summary[1].question, "tags");
+        assert_eq!(summary[1].answer, "a, b");
+    }
+
+    #[test]
+    fn summarize_omits_unanswered_and_renders_scalar_kinds() {
+        let e = Elicitation {
+            nonce: Nonce::new(),
+            message: "q".into(),
+            title: None,
+            description: None,
+            tool_call_id: None,
+            questions: vec![
+                ElicitationQuestion {
+                    title: Some("Your name".into()),
+                    ..empty_question("name", ElicitationFieldKind::FreeText, false)
+                },
+                ElicitationQuestion {
+                    title: Some("Enable it".into()),
+                    ..empty_question("flag", ElicitationFieldKind::Boolean, false)
+                },
+                ElicitationQuestion {
+                    title: Some("Count".into()),
+                    ..empty_question("count", ElicitationFieldKind::Integer, false)
+                },
+                empty_question("skipped", ElicitationFieldKind::FreeText, false),
+            ],
+            requested_at: Utc::now(),
+            resolved: None,
+        };
+        let mut answers = BTreeMap::new();
+        answers.insert("name".to_string(), AnswerValue::Text("Ada".into()));
+        answers.insert("flag".to_string(), AnswerValue::Bool(false));
+        answers.insert("count".to_string(), AnswerValue::Integer(3));
+        let summary = summarize_answers(&e, &answers);
+        assert_eq!(
+            summary,
+            vec![
+                ElicitationAnswer {
+                    question: "Your name".into(),
+                    answer: "Ada".into()
+                },
+                ElicitationAnswer {
+                    question: "Enable it".into(),
+                    answer: "No".into()
+                },
+                ElicitationAnswer {
+                    question: "Count".into(),
+                    answer: "3".into()
+                },
+            ]
         );
     }
 
