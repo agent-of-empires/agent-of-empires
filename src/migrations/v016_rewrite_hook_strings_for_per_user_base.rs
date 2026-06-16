@@ -573,8 +573,8 @@ mod tests {
                     }
                     status_writers += 1;
                     assert!(
-                        cmd.contains("d*------|d*------.|d*------+|d*------@"),
-                        "v016 must bake the tolerant mode pattern: {cmd}"
+                        cmd.contains("drwx------|drwx------.|drwx------+|drwx------@"),
+                        "v016 must bake the strict 0700 mode pattern: {cmd}"
                     );
                     assert!(
                         cmd.contains("unset IFS")

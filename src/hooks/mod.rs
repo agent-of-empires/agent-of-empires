@@ -23,7 +23,9 @@ use serde_json::Value;
 pub(crate) use dir_guard::{
     clear_base_override_for_test, hook_base_path, override_base_for_test, reset_for_test,
 };
-pub(crate) use dir_guard::{ensure_instance_dir_path, write_session_id_via_guard};
+pub(crate) use dir_guard::{
+    ensure_instance_dir_path, unlink_session_id_via_guard, write_session_id_via_guard,
+};
 pub use status_file::{
     cleanup_hook_status_dir, hook_status_dir, read_hook_session_id, read_hook_status,
     read_hook_urgent,
@@ -213,10 +215,23 @@ pub(crate) fn canonical_status_command(status: &str, target: HookInstallTarget) 
 fn hook_command_with_base(status: &str, base: &str, target: HookInstallTarget) -> String {
     let parent_check = match target {
         HookInstallTarget::Host => {
+            // mkdir -p $B is the wipe-recovery primitive for the
+            // systemd-tmpfiles / manual /tmp reaper case. Safe because:
+            //   - umask 077 (set above) makes a created $B mode 0700.
+            //   - /tmp has the sticky bit, so cross-uid attackers cannot
+            //     rename or unlink $B once we own it.
+            //   - The LS check that follows still rejects squatted bases
+            //     (mode != drwx------ or wrong owner uid), so mkdir -p
+            //     hitting an existing-but-hostile dir does not lower the
+            //     bar.
+            // If the base ever moves outside /tmp (e.g., honoring
+            // XDG_RUNTIME_DIR), this snippet must be re-audited because it
+            // relies on the sticky-bit invariant of the parent.
             "\
+             mkdir -p \"$B\" 2>/dev/null || exit 0; \
              LS=$(LC_ALL=C ls -ldn \"$B\" 2>/dev/null) || exit 0; \
              set -- $LS; M=\"$1\"; \
-             case \"$M\" in d*------|d*------.|d*------+|d*------@) ;; *) exit 0 ;; esac; \
+             case \"$M\" in drwx------|drwx------.|drwx------+|drwx------@) ;; *) exit 0 ;; esac; \
              ME=$(id -u 2>/dev/null) || exit 0; \
              [ \"$3\" = \"$ME\" ] || exit 0; "
         }
@@ -235,7 +250,7 @@ fn hook_command_with_base(status: &str, base: &str, target: HookInstallTarget) -
          mkdir -p \"$D\" 2>/dev/null; \
          LS=$(LC_ALL=C ls -ldn \"$D\" 2>/dev/null) || exit 0; \
          set -- $LS; M=\"$1\"; \
-         case \"$M\" in d*------|d*------.|d*------+|d*------@) ;; *) exit 0 ;; esac; \
+         case \"$M\" in drwx------|drwx------.|drwx------+|drwx------@) ;; *) exit 0 ;; esac; \
          {owner_recheck}\
          printf {status} > \"$D/status\" 2>/dev/null; \
          exit 0 # {AOE_HOOK_MARKER}'"
@@ -290,7 +305,7 @@ fn hook_command_session_id_sandbox(base: &str) -> String {
          D=\"{base}/$AOE_INSTANCE_ID\"; mkdir -p \"$D\" 2>/dev/null; \
          LS=$(LC_ALL=C ls -ldn \"$D\" 2>/dev/null) || exit 0; \
          set -- $LS; M=\"$1\"; \
-         case \"$M\" in d*------|d*------.|d*------+|d*------@) ;; *) exit 0 ;; esac; \
+         case \"$M\" in drwx------|drwx------.|drwx------+|drwx------@) ;; *) exit 0 ;; esac; \
          SID=$(tr -d \"\\n\" | grep -oE \"[{{,][[:space:]]*\\\"session_id\\\"[[:space:]]*:[[:space:]]*\\\"[0-9a-fA-F]{{8}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{12}}\\\"\" | head -1 | grep -oE \"[0-9a-fA-F]{{8}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{12}}\"); \
          [ -n \"$SID\" ] && printf \"%s\" \"$SID\" > \"$D/.session_id.$$.tmp\" 2>/dev/null && mv \"$D/.session_id.$$.tmp\" \"$D/session_id\" 2>/dev/null; \
          exit 0'"
@@ -3407,8 +3422,8 @@ hooks_auto_accept: false
             "missing locale-pinned ls: {cmd}"
         );
         assert!(
-            cmd.contains("d*------|d*------.|d*------+|d*------@"),
-            "missing tolerant mode pattern: {cmd}"
+            cmd.contains("drwx------|drwx------.|drwx------+|drwx------@"),
+            "missing strict 0700 mode pattern: {cmd}"
         );
         assert!(
             cmd.contains("ME=$(id -u 2>/dev/null)"),
@@ -3453,7 +3468,7 @@ hooks_auto_accept: false
             "B=/tmp/aoe-hooks;",
             "D=\"$B/$AOE_INSTANCE_ID\"",
             "LC_ALL=C ls -ldn",
-            "d*------|d*------.|d*------+|d*------@",
+            "drwx------|drwx------.|drwx------+|drwx------@",
             "printf running",
         ] {
             assert!(cmd.contains(token), "missing token {token:?}: {cmd}");

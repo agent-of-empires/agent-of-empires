@@ -344,15 +344,41 @@ pub(crate) fn open_instance_dir_read_only(instance_id: &str) -> Result<Option<Ow
 
 // Per-file I/O.
 
+/// Reject leaf names that could escape the verified parent dirfd via
+/// `openat`. Absolute leaves (`/...`) cause the kernel to ignore the
+/// dirfd entirely; relative components like `subdir/file` would
+/// traverse into nested entries; `..` walks up; `.` is the parent
+/// itself. NUL is rejected because `openat` would fail with `EINVAL`
+/// on it anyway, but checking ahead surfaces the error cleanly.
+///
+/// Leading `.` is allowed because `write_atomic` constructs tmpfile
+/// names of the form `.{name}.tmp.{pid}.{counter}`. The agent-side
+/// shell snippet uses the same pattern. Validating here is
+/// defense-in-depth for future callers; today every call site passes
+/// a hardcoded literal (`status`, `session_id`, `attention.json`).
+fn validate_hook_leaf(name: &str) -> Result<()> {
+    if name.is_empty() || name == "." || name == ".." {
+        bail!("invalid hook leaf name: {name:?}");
+    }
+    if name.as_bytes().iter().any(|&b| b == b'/' || b == 0) {
+        bail!("hook leaf name contains separator or NUL: {name:?}");
+    }
+    Ok(())
+}
+
 /// Open a file inside an already-verified per-instance dir for reading.
 /// `O_NOFOLLOW` forbids the leaf being a symlink. `ENOENT` / `ELOOP` map to
-/// `Ok(None)`.
+/// `Ok(None)`. Non-regular leaves (directory, FIFO, device, socket) also
+/// map to `Ok(None)`: only regular files are valid hook sidecars and the
+/// fstat-on-fd check is symmetric with the `S_IFREG` gate in
+/// `remove_instance_dir`.
 pub(crate) fn read_file_at(
     dir: BorrowedFd<'_>,
     name: &str,
     max_bytes: usize,
 ) -> Result<Option<Vec<u8>>> {
     use std::io::Read;
+    validate_hook_leaf(name)?;
     let fd = match openat(
         dir,
         name,
@@ -364,6 +390,9 @@ pub(crate) fn read_file_at(
         Err(e) => return Err(e).with_context(|| format!("openat read {name}")),
     };
     let mut file = std::fs::File::from(fd);
+    if !file.metadata()?.is_file() {
+        return Ok(None);
+    }
     let mut buf = Vec::with_capacity(max_bytes.min(4096));
     let limit = u64::try_from(max_bytes).unwrap_or(u64::MAX);
     file.by_ref().take(limit).read_to_end(&mut buf)?;
@@ -373,6 +402,7 @@ pub(crate) fn read_file_at(
 /// `fstatat(AT_SYMLINK_NOFOLLOW)` view for mtime gating. Returns `Ok(None)` on
 /// missing or symlinked entries.
 pub(crate) fn metadata_at(dir: BorrowedFd<'_>, name: &str) -> Result<Option<Metadata>> {
+    validate_hook_leaf(name)?;
     let fd = match openat(
         dir,
         name,
@@ -401,6 +431,7 @@ pub(crate) fn metadata_at(dir: BorrowedFd<'_>, name: &str) -> Result<Option<Meta
 #[cfg(test)]
 pub(crate) fn write_short(dir: BorrowedFd<'_>, name: &str, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
+    validate_hook_leaf(name)?;
     let fd = openat(
         dir,
         name,
@@ -435,6 +466,7 @@ pub(crate) fn write_short(dir: BorrowedFd<'_>, name: &str, bytes: &[u8]) -> Resu
 pub(crate) fn write_atomic(dir: BorrowedFd<'_>, name: &str, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
+    validate_hook_leaf(name)?;
     static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
     let tmp = format!(
         ".{name}.tmp.{}.{}",
@@ -471,6 +503,27 @@ pub(crate) fn write_atomic(dir: BorrowedFd<'_>, name: &str, bytes: &[u8]) -> Res
 pub(crate) fn write_session_id_via_guard(instance_id: &str, session_id: &str) -> Result<()> {
     let dir = open_instance_dir(instance_id)?;
     write_atomic(dir.as_fd(), "session_id", session_id.as_bytes())
+}
+
+/// Symlink-safe deletion of the `session_id` sidecar via `unlinkat` against
+/// a `dir_guard`-verified per-instance dirfd. Replaces path-based
+/// `std::fs::remove_file(dir.join("session_id"))` so deletion participates
+/// in the same `*at`-anchored, mode-checked, owner-checked discipline as
+/// every other hook write.
+///
+/// Idempotent: a missing dir or missing leaf returns `Ok(())`. Returns
+/// `Err` only on guard-validation failure (squatted/wrong-mode base) or
+/// hard `unlinkat` errors. Caller policy on `Err`: best-effort cleanup
+/// (the next hook fire overwrites the sidecar anyway).
+pub(crate) fn unlink_session_id_via_guard(instance_id: &str) -> Result<()> {
+    let Some(dir) = open_instance_dir_read_only(instance_id)? else {
+        return Ok(());
+    };
+    match unlinkat(dir.as_fd(), "session_id", UnlinkatFlags::NoRemoveDir) {
+        Ok(()) => Ok(()),
+        Err(Errno::ENOENT) => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("unlinkat session_id in {instance_id}")),
+    }
 }
 
 /// Ensure the per-instance hook directory exists with `dir_guard` discipline

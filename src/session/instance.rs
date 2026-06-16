@@ -1776,9 +1776,12 @@ impl Instance {
         );
 
         if self.tool == "claude" {
-            if let Ok(dir) = crate::hooks::hook_status_dir(&self.id) {
-                let _ = std::fs::remove_file(dir.join("session_id"));
-            }
+            // Route through dir_guard so the session_id removal participates
+            // in the same `*at`-anchored, mode-checked, owner-checked
+            // discipline as every other hook I/O. Path-join + remove_file
+            // would have bypassed base verification on the first launch
+            // before any other hook code ran (#1844 follow-up).
+            let _ = crate::hooks::unlink_session_id_via_guard(&self.id);
         }
 
         session.create_with_size(&self.project_path, cmd.as_deref(), size)?;
@@ -3040,9 +3043,11 @@ impl Instance {
             .with_context(|| format!("kill_clean before resume fallback for {}", self.id))?;
 
         self.agent_session_id = None;
-        if let Ok(dir) = crate::hooks::hook_status_dir(&self.id) {
-            let _ = std::fs::remove_file(dir.join("session_id"));
-        }
+        // See sibling call in `start_with_size_opts`: route through dir_guard
+        // so resume-fallback's stale-sid clear cannot follow a squatted
+        // intermediate symlink in `/tmp/aoe-hooks-<euid>` if the base was
+        // never validated by an earlier hook fire.
+        let _ = crate::hooks::unlink_session_id_via_guard(&self.id);
         // Populate the poller exclusion before calling
         // `clear_session_for_resume_fallback` so its `Failed` bail
         // still keeps the bad sid out of the next retroactive capture
