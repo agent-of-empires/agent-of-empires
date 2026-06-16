@@ -235,11 +235,19 @@ impl ProjectsDialog {
 
     /// Show the one-time "not a git repository" notice, unless the user has
     /// already seen it. Latches `app_state.has_seen_non_git_project_warning` so
-    /// it never repeats. A config load/save failure is non-fatal: the worst
-    /// case is showing the notice again on a future add.
+    /// it never repeats.
+    ///
+    /// Reads the latch with `Config::load()` rather than `load_or_warn()`: the
+    /// latter falls back to a default `Config` when an existing file fails to
+    /// parse, and persisting that would atomically overwrite the user's real
+    /// config with defaults. On a load failure we show the notice (harmless to
+    /// repeat) but skip persistence entirely.
     fn maybe_warn_non_git(&mut self, project_name: &str) {
-        let mut config = Config::load_or_warn();
-        if config.app_state.has_seen_non_git_project_warning {
+        let config = Config::load().ok();
+        if config
+            .as_ref()
+            .is_some_and(|c| c.app_state.has_seen_non_git_project_warning)
+        {
             return;
         }
         self.non_git_notice = Some(InfoDialog::sized_to_fit(
@@ -250,8 +258,10 @@ impl ProjectsDialog {
                  session, branches, and the diff view) won't be available here."
             ),
         ));
-        config.app_state.has_seen_non_git_project_warning = true;
-        let _ = save_config(&config);
+        if let Some(mut config) = config {
+            config.app_state.has_seen_non_git_project_warning = true;
+            let _ = save_config(&config);
+        }
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
@@ -540,6 +550,44 @@ mod tests {
         assert!(
             dialog.non_git_notice.is_none(),
             "notice must not repeat once seen"
+        );
+    }
+
+    /// A config file that fails to parse must not be clobbered with defaults
+    /// when a non-git project is added: persistence is skipped on load failure,
+    /// and the notice still shows (harmless to repeat).
+    #[test]
+    #[serial]
+    fn malformed_config_is_not_clobbered_on_non_git_add() {
+        let temp = tempdir().unwrap();
+        isolate_home(temp.path());
+
+        // First add creates a real config.toml (with the latch set).
+        let mut dialog = ProjectsDialog::new("test");
+        let first = temp.path().join("first");
+        std::fs::create_dir_all(&first).unwrap();
+        add_dir(&mut dialog, &first);
+        let cfg_path = crate::session::config::config_path().expect("config path");
+        assert!(cfg_path.exists(), "first add should write a config");
+
+        // Corrupt it so Config::load() returns Err.
+        let garbage = "this is = not ] valid [[ toml";
+        std::fs::write(&cfg_path, garbage).unwrap();
+
+        // A second non-git add must NOT overwrite the corrupt file...
+        let mut dialog = ProjectsDialog::new("test");
+        let second = temp.path().join("second");
+        std::fs::create_dir_all(&second).unwrap();
+        add_dir(&mut dialog, &second);
+        assert_eq!(
+            std::fs::read_to_string(&cfg_path).unwrap(),
+            garbage,
+            "malformed config must be left untouched"
+        );
+        // ...and, unable to confirm the latch, it shows the notice.
+        assert!(
+            dialog.non_git_notice.is_some(),
+            "notice should show when the latch can't be read"
         );
     }
 
