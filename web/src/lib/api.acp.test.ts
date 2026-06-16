@@ -8,7 +8,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { fetchAcpAgents, switchAcpAgent, type SwitchAgentResponse } from "./api";
+import { fetchAcpAgents, installAcpAgent, switchAcpAgent, type SwitchAgentResponse } from "./api";
 
 const originalFetch = globalThis.fetch;
 
@@ -122,5 +122,56 @@ describe("switchAcpAgent", () => {
     (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(new Response("conflict", { status: 409 }));
     const result = await switchAcpAgent("s-1", "codex");
     expect(result).toBeNull();
+  });
+});
+
+describe("installAcpAgent", () => {
+  it("POSTs to /api/sessions/:id/acp/install-agent and returns the parsed body", async () => {
+    const body = {
+      session_id: "s-1",
+      package: "@zed-industries/codex-acp",
+      success: true,
+      exit_code: 0,
+      stdout: "added 1 package",
+      stderr: "",
+    };
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(ok(body));
+    const result = await installAcpAgent("s-1");
+    expect(result).toEqual(body);
+    const [url, init] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(String(url)).toContain("/api/sessions/s-1/acp/install-agent");
+    expect((init as RequestInit).method).toBe("POST");
+  });
+
+  it("encodes the session id in the URL path", async () => {
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      ok({ session_id: "weird/id", package: "p", success: true, exit_code: 0, stdout: "", stderr: "" }),
+    );
+    await installAcpAgent("weird/id");
+    const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0]?.[0];
+    expect(String(url)).toContain("weird%2Fid");
+  });
+
+  it("throws the server message on a non-2xx response", async () => {
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      new Response(JSON.stringify({ error: "install_disabled", message: "Installing agents from the web is off." }), {
+        status: 403,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    await expect(installAcpAgent("s-1")).rejects.toThrow("Installing agents from the web is off.");
+  });
+
+  it("falls back to the status code when the error body has no message", async () => {
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(new Response("boom", { status: 500 }));
+    await expect(installAcpAgent("s-1")).rejects.toThrow("Server returned 500");
+  });
+
+  it("throws on a 2xx response with an empty/invalid body", async () => {
+    // 200 but unparseable JSON -> body is null -> must throw, not return null.
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      new Response("not json", { status: 200, headers: { "content-type": "application/json" } }),
+    );
+    await expect(installAcpAgent("s-1")).rejects.toThrow("invalid or empty response");
   });
 });

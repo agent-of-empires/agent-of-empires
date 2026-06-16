@@ -164,4 +164,29 @@ describe("StartupErrorScreen", () => {
     await waitFor(() => expect(container.textContent).toContain("npm is not on the daemon's PATH"));
     expect(fetch).not.toHaveBeenCalled();
   });
+
+  it("Update & restart shows the exit code and skips respawn when the install fails", async () => {
+    fetchSettings.mockResolvedValue({ acp: { allow_agent_install: true } });
+    installAcpAgent.mockResolvedValue({
+      session_id: "s1",
+      package: "@agentclientprotocol/claude-agent-acp@latest",
+      success: false,
+      exit_code: 243,
+      stdout: "",
+      stderr: "npm ERR! EACCES",
+    });
+    const { findByTestId, container } = render(<StartupErrorScreen detail={incompatible(true)} sessionId="s1" />);
+    const btn = await findByTestId("startup-error-update-restart");
+    fireEvent.click(btn);
+    await waitFor(() => expect(container.textContent).toContain("Install exited with code 243"));
+    expect(container.textContent).toContain("npm ERR! EACCES");
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("Restart agent surfaces a failed respawn", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 500, text: () => Promise.resolve("boom") }));
+    const { getByTestId, container } = render(<StartupErrorScreen detail={incompatible()} sessionId="s1" />);
+    fireEvent.click(getByTestId("startup-error-restart"));
+    await waitFor(() => expect(container.textContent).toContain("Restart failed"));
+  });
 });
