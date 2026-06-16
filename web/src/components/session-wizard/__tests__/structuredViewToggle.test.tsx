@@ -31,6 +31,14 @@ vi.mock("../../../lib/api", () => ({
   fetchGroups: vi.fn().mockResolvedValue([]),
   fetchDockerStatus: vi.fn().mockResolvedValue({ available: false }),
   fetchProfiles: vi.fn().mockResolvedValue([]),
+  // The single-screen wizard mounts ProjectStep on open (#2210), so its
+  // recent-project fetches need stubs. Seed one recent so the step stays on
+  // the Recent tab instead of falling back to the directory browser.
+  fetchSessions: vi.fn().mockResolvedValue({ sessions: [] }),
+  fetchRecentProjects: vi.fn().mockResolvedValue({
+    projects: [{ path: "/tmp/proj", display_name: "proj", tool: "claude", last_used_at: "2026-01-01T00:00:00Z" }],
+  }),
+  fetchProjects: vi.fn().mockResolvedValue([]),
   createSession: (...args: unknown[]) => createSession(...args),
 }));
 
