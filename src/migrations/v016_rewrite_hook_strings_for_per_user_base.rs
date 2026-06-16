@@ -40,13 +40,54 @@
 
 use anyhow::Result;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
 use crate::hooks::{
     has_aoe_marker, install_codex_hooks_with_preserved_state, install_hooks, iter_hook_targets_in,
     snapshot_codex_hooks_state, HookInstallTarget, HookTarget, HookTargetKind,
 };
+
+/// Path of the legacy world-known hook directory swept by this migration.
+/// Production callers always reach `/tmp/aoe-hooks`; tests substitute a
+/// tempdir via `override_legacy_for_test`.
+const PRODUCTION_LEGACY_PATH: &str = "/tmp/aoe-hooks";
+
+#[cfg(test)]
+thread_local! {
+    static LEGACY_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+    static FORCE_REWRITE_FAILURE_FOR: std::cell::RefCell<Option<&'static str>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn override_legacy_for_test(p: PathBuf) {
+    LEGACY_OVERRIDE.with(|c| *c.borrow_mut() = Some(p));
+}
+
+#[cfg(test)]
+pub(crate) fn clear_legacy_override_for_test() {
+    LEGACY_OVERRIDE.with(|c| *c.borrow_mut() = None);
+}
+
+#[cfg(test)]
+pub(crate) fn force_rewrite_failure_for_test(agent: &'static str) {
+    FORCE_REWRITE_FAILURE_FOR.with(|c| *c.borrow_mut() = Some(agent));
+}
+
+#[cfg(test)]
+pub(crate) fn clear_rewrite_failure_for_test() {
+    FORCE_REWRITE_FAILURE_FOR.with(|c| *c.borrow_mut() = None);
+}
+
+fn legacy_path() -> PathBuf {
+    #[cfg(test)]
+    if let Some(p) = LEGACY_OVERRIDE.with(|c| c.borrow().clone()) {
+        return p;
+    }
+    PathBuf::from(PRODUCTION_LEGACY_PATH)
+}
 
 pub fn run() -> Result<()> {
     let home =
@@ -106,7 +147,7 @@ pub(crate) fn run_in(home: &Path, app_dir: &Path) -> Result<()> {
              the legacy directory is left for manual recovery"
         );
     } else {
-        sweep_legacy_base();
+        sweep_legacy_base_in(&legacy_path());
     }
 
     info!(target: "migrations.v016", count = rewritten, "v016: done");
@@ -114,6 +155,10 @@ pub(crate) fn run_in(home: &Path, app_dir: &Path) -> Result<()> {
 }
 
 fn rewrite_one(target: &HookTarget) -> Result<()> {
+    #[cfg(test)]
+    if FORCE_REWRITE_FAILURE_FOR.with(|c| c.borrow().as_deref() == Some(target.agent_name)) {
+        anyhow::bail!("test-injected rewrite failure for {}", target.agent_name);
+    }
     match target.kind {
         HookTargetKind::JsonSettings => {
             install_hooks(&target.path, target.events, HookInstallTarget::Host)
@@ -133,7 +178,7 @@ fn rewrite_one(target: &HookTarget) -> Result<()> {
     }
 }
 
-/// Best-effort removal of the legacy world-known `/tmp/aoe-hooks` directory.
+/// Best-effort removal of the legacy world-known hook directory.
 ///
 /// Multi-tenant safe: walks the directory with `O_NOFOLLOW`, checks each
 /// entry's owner via `fstatat(AT_SYMLINK_NOFOLLOW)`, unlinks only entries we
@@ -141,12 +186,12 @@ fn rewrite_one(target: &HookTarget) -> Result<()> {
 /// itself is `rmdir`'d only if it is empty after our sweep AND owned by us.
 ///
 /// Failure modes (all logged, none propagate):
-/// - `/tmp/aoe-hooks` is a symlink: `O_NOFOLLOW` open returns `ELOOP`, we exit.
-/// - `/tmp/aoe-hooks` is not a directory: open returns `ENOTDIR`, we exit.
+/// - legacy is a symlink: `O_NOFOLLOW` open returns `ELOOP`, we exit.
+/// - legacy is not a directory: open returns `ENOTDIR`, we exit.
 /// - We do not own a child entry: `tracing::debug!` and skip.
 /// - Parent dir not empty after sweep: `rmdir` returns `ENOTEMPTY`, we leave
 ///   the dir for whichever co-tenant still has entries there to clean up.
-fn sweep_legacy_base() {
+fn sweep_legacy_base_in(legacy: &Path) {
     use nix::errno::Errno;
     use nix::fcntl::{open, AtFlags, OFlag};
     use nix::sys::stat::{fstat, fstatat, Mode};
@@ -154,11 +199,9 @@ fn sweep_legacy_base() {
     use std::ffi::CString;
     use std::os::fd::AsFd;
 
-    const LEGACY: &str = "/tmp/aoe-hooks";
-
     let euid = geteuid().as_raw();
     let dir_fd = match open(
-        LEGACY,
+        legacy,
         OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
         Mode::empty(),
     ) {
@@ -166,7 +209,7 @@ fn sweep_legacy_base() {
         Err(Errno::ENOENT) => return,
         Err(e) => {
             debug!(target: "migrations.v016",
-                "v016: skipped legacy {} sweep (open: {})", LEGACY, e);
+                "v016: skipped legacy {} sweep (open: {})", legacy.display(), e);
             return;
         }
     };
@@ -174,7 +217,8 @@ fn sweep_legacy_base() {
     let parent_st = match fstat(&dir_fd) {
         Ok(st) => st,
         Err(e) => {
-            warn!(target: "migrations.v016", "v016: fstat legacy {} failed: {}", LEGACY, e);
+            warn!(target: "migrations.v016",
+                "v016: fstat legacy {} failed: {}", legacy.display(), e);
             return;
         }
     };
@@ -221,43 +265,52 @@ fn sweep_legacy_base() {
         if st.st_uid != euid {
             debug!(target: "migrations.v016",
                 "v016: legacy {}/{} owned by uid={}, skipping (multi-tenant)",
-                LEGACY, name_str, st.st_uid);
+                legacy.display(), name_str, st.st_uid);
             continue;
         }
-        match unlink_child(&dir_fd, name_str, &st) {
-            Ok(()) => debug!(target: "migrations.v016", "v016: removed {}/{}", LEGACY, name_str),
+        match unlink_subtree(&dir_fd, name_str, &st) {
+            Ok(()) => debug!(target: "migrations.v016",
+                "v016: removed {}/{}", legacy.display(), name_str),
             Err(e) => warn!(target: "migrations.v016",
-                "v016: failed to remove {}/{}: {}", LEGACY, name_str, e),
+                "v016: failed to remove {}/{}: {}", legacy.display(), name_str, e),
         }
     }
 
     if parent_is_ours {
         drop(dir_fd);
-        let legacy_c = CString::new(LEGACY).expect("legacy path is fixed ASCII");
+        let legacy_str = legacy
+            .to_str()
+            .expect("legacy path must be UTF-8 for libc::rmdir");
+        let legacy_c = CString::new(legacy_str).expect("legacy path must not contain NUL");
         let rc = unsafe { nix::libc::rmdir(legacy_c.as_ptr()) };
         if rc == 0 {
-            info!(target: "migrations.v016", "v016: removed legacy {}", LEGACY);
+            info!(target: "migrations.v016", "v016: removed legacy {}", legacy.display());
         } else {
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() == Some(nix::libc::ENOTEMPTY) {
                 debug!(target: "migrations.v016",
-                    "v016: legacy {} non-empty (other-user entries remain)", LEGACY);
+                    "v016: legacy {} non-empty (other-user entries remain)",
+                    legacy.display());
             } else {
                 debug!(target: "migrations.v016",
-                    "v016: rmdir legacy {}: {}", LEGACY, err);
+                    "v016: rmdir legacy {}: {}", legacy.display(), err);
             }
         }
     } else {
         debug!(target: "migrations.v016",
             "v016: legacy {} owner uid={} != euid={}, leaving parent",
-            LEGACY, parent_st.st_uid, euid);
+            legacy.display(), parent_st.st_uid, euid);
     }
 }
 
-/// Recursive owner-checked removal of a single legacy child entry. Refuses
-/// to traverse symlinks; subdirs are walked entry-by-entry. Cycle protection
-/// via `O_NOFOLLOW` plus parent-uid check at every level.
-fn unlink_child(
+/// Iterative owner-checked subtree removal under a verified parent fd.
+///
+/// Replaces a recursive walker. Bounded depth (`MAX_DEPTH = 32`) defends
+/// against an attacker-planted deep tree under a same-uid entry; AoE itself
+/// never creates nested subdirs, so 32 is generous in practice. On overflow
+/// we leave the remaining subtree intact and warn so the operator can
+/// inspect manually.
+fn unlink_subtree(
     parent_fd: &std::os::fd::OwnedFd,
     name: &str,
     st: &nix::sys::stat::FileStat,
@@ -267,48 +320,123 @@ fn unlink_child(
     use nix::unistd::{unlinkat, UnlinkatFlags};
     use std::os::fd::AsFd;
 
-    if (st.st_mode & nix::libc::S_IFMT) == nix::libc::S_IFDIR {
-        let child_fd = openat(
-            parent_fd.as_fd(),
-            name,
-            OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
-            Mode::empty(),
-        )?;
-        let dup = child_fd
-            .try_clone()
-            .map_err(|e| nix::errno::Errno::from_raw(e.raw_os_error().unwrap_or(nix::libc::EIO)))?;
-        let mut sub = nix::dir::Dir::from_fd(dup)?;
-        let names: Vec<std::ffi::CString> = sub
-            .iter()
-            .flatten()
-            .filter_map(|entry| {
-                let n = entry.file_name().to_owned();
-                let b = n.to_bytes();
-                if b == b"." || b == b".." {
-                    None
-                } else {
-                    Some(n)
-                }
-            })
-            .collect();
-        drop(sub);
-        for child_name in names {
-            let cn_str = match child_name.to_str() {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-            let cst =
-                nix::sys::stat::fstatat(child_fd.as_fd(), cn_str, AtFlags::AT_SYMLINK_NOFOLLOW)?;
-            if cst.st_uid != nix::unistd::geteuid().as_raw() {
-                continue;
-            }
-            unlink_child(&child_fd, cn_str, &cst)?;
-        }
-        drop(child_fd);
-        unlinkat(parent_fd.as_fd(), name, UnlinkatFlags::RemoveDir)
-    } else {
-        unlinkat(parent_fd.as_fd(), name, UnlinkatFlags::NoRemoveDir)
+    const MAX_DEPTH: usize = 32;
+
+    if (st.st_mode & nix::libc::S_IFMT) != nix::libc::S_IFDIR {
+        return unlinkat(parent_fd.as_fd(), name, UnlinkatFlags::NoRemoveDir);
     }
+
+    enum Phase {
+        Enter,
+        Exit,
+    }
+    struct Frame {
+        parent: std::os::fd::OwnedFd,
+        name: std::ffi::CString,
+        depth: usize,
+        phase: Phase,
+    }
+
+    let initial_parent = parent_fd
+        .try_clone()
+        .map_err(|e| nix::errno::Errno::from_raw(e.raw_os_error().unwrap_or(nix::libc::EIO)))?;
+    let initial_name = std::ffi::CString::new(name).map_err(|_| nix::errno::Errno::EINVAL)?;
+    let mut stack: Vec<Frame> = Vec::with_capacity(8);
+    stack.push(Frame {
+        parent: initial_parent,
+        name: initial_name,
+        depth: 0,
+        phase: Phase::Enter,
+    });
+
+    while let Some(frame) = stack.pop() {
+        match frame.phase {
+            Phase::Enter => {
+                if frame.depth >= MAX_DEPTH {
+                    warn!(
+                        target: "migrations.v016",
+                        depth = frame.depth,
+                        "v016: depth cap reached, leaving subtree intact"
+                    );
+                    continue;
+                }
+                let name_str = match frame.name.to_str() {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let child_fd = openat(
+                    frame.parent.as_fd(),
+                    name_str,
+                    OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
+                    Mode::empty(),
+                )?;
+                let dup = child_fd.try_clone().map_err(|e| {
+                    nix::errno::Errno::from_raw(e.raw_os_error().unwrap_or(nix::libc::EIO))
+                })?;
+                let mut sub = nix::dir::Dir::from_fd(dup)?;
+                let entries: Vec<std::ffi::CString> = sub
+                    .iter()
+                    .flatten()
+                    .filter_map(|entry| {
+                        let n = entry.file_name().to_owned();
+                        let b = n.to_bytes();
+                        if b == b"." || b == b".." {
+                            None
+                        } else {
+                            Some(n)
+                        }
+                    })
+                    .collect();
+                drop(sub);
+                let exit_parent = frame.parent.try_clone().map_err(|e| {
+                    nix::errno::Errno::from_raw(e.raw_os_error().unwrap_or(nix::libc::EIO))
+                })?;
+                stack.push(Frame {
+                    parent: exit_parent,
+                    name: frame.name,
+                    depth: frame.depth,
+                    phase: Phase::Exit,
+                });
+                let euid = nix::unistd::geteuid().as_raw();
+                for entry_name in entries {
+                    let en_str = match entry_name.to_str() {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+                    let cst = nix::sys::stat::fstatat(
+                        child_fd.as_fd(),
+                        en_str,
+                        AtFlags::AT_SYMLINK_NOFOLLOW,
+                    )?;
+                    if cst.st_uid != euid {
+                        continue;
+                    }
+                    if (cst.st_mode & nix::libc::S_IFMT) == nix::libc::S_IFDIR {
+                        let new_parent = child_fd.try_clone().map_err(|e| {
+                            nix::errno::Errno::from_raw(e.raw_os_error().unwrap_or(nix::libc::EIO))
+                        })?;
+                        stack.push(Frame {
+                            parent: new_parent,
+                            name: entry_name,
+                            depth: frame.depth + 1,
+                            phase: Phase::Enter,
+                        });
+                    } else {
+                        unlinkat(child_fd.as_fd(), en_str, UnlinkatFlags::NoRemoveDir)?;
+                    }
+                }
+                drop(child_fd);
+            }
+            Phase::Exit => {
+                let name_str = match frame.name.to_str() {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                unlinkat(frame.parent.as_fd(), name_str, UnlinkatFlags::RemoveDir)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Read `environment` arrays from raw TOML (global config + each profile).
@@ -524,25 +652,122 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_failure_leaves_legacy_dir_untouched_for_recovery() {
-        // Locks C3 (rewrite-first sweep-last). Build a target whose rewrite
-        // is impossible (read-only parent), pre-create a legacy entry we own,
-        // run v016. The rewrite logs a warn and continues; the legacy entry
-        // must STILL exist so the user can find and clean up manually.
-        // (We cannot test the C3 path on the real /tmp/aoe-hooks here without
-        // privdrop; this test locks the structural contract via stub files.)
+    fn rewrite_failure_keeps_legacy_dir_intact_for_manual_recovery() {
+        use std::os::unix::fs::PermissionsExt;
         let _env = EnvGuard::unset_all();
         let (_tmp, home, app_dir) = setup_dirs();
 
-        // Target 1: claude settings with AoE marker — will rewrite cleanly.
         let claude = home.join(".claude").join("settings.json");
         write_json(&claude, &pre_v016_claude_settings());
 
+        let legacy = _tmp.path().join("legacy-aoe-hooks");
+        fs::create_dir(&legacy).unwrap();
+        fs::set_permissions(&legacy, fs::Permissions::from_mode(0o700)).unwrap();
+        let preserved_inst = legacy.join("inst-must-survive");
+        fs::create_dir(&preserved_inst).unwrap();
+        fs::write(preserved_inst.join("status"), b"running").unwrap();
+
+        super::override_legacy_for_test(legacy.clone());
+        super::force_rewrite_failure_for_test("claude");
+        let result = run_in(&home, &app_dir);
+        super::clear_rewrite_failure_for_test();
+        super::clear_legacy_override_for_test();
+        result.unwrap();
+
+        assert!(
+            legacy.exists(),
+            "legacy directory must remain when any rewrite failed"
+        );
+        assert!(
+            preserved_inst.exists(),
+            "owned legacy entries must remain so the operator can recover them"
+        );
+    }
+
+    #[test]
+    fn legacy_sweep_full_success_removes_owned_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let _env = EnvGuard::unset_all();
+        let (_tmp, home, app_dir) = setup_dirs();
+
+        let claude = home.join(".claude").join("settings.json");
+        write_json(&claude, &pre_v016_claude_settings());
+
+        let legacy = _tmp.path().join("legacy-aoe-hooks-clean");
+        fs::create_dir(&legacy).unwrap();
+        fs::set_permissions(&legacy, fs::Permissions::from_mode(0o700)).unwrap();
+        let inst_dir = legacy.join("inst-to-sweep");
+        fs::create_dir(&inst_dir).unwrap();
+        fs::write(inst_dir.join("status"), b"idle").unwrap();
+        fs::write(inst_dir.join("session_id"), b"deadbeef").unwrap();
+
+        super::override_legacy_for_test(legacy.clone());
+        let result = run_in(&home, &app_dir);
+        super::clear_legacy_override_for_test();
+        result.unwrap();
+
+        assert!(
+            !legacy.exists(),
+            "owned legacy directory must be swept on full rewrite success"
+        );
+    }
+
+    #[test]
+    fn legacy_sweep_handles_symlink_at_legacy_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let _env = EnvGuard::unset_all();
+        let (_tmp, home, app_dir) = setup_dirs();
+
+        let canary = _tmp.path().join("canary");
+        fs::create_dir(&canary).unwrap();
+        fs::write(canary.join("file"), b"do not delete").unwrap();
+
+        let legacy_link = _tmp.path().join("legacy-aoe-hooks-link");
+        std::os::unix::fs::symlink(&canary, &legacy_link).unwrap();
+
+        let claude = home.join(".claude").join("settings.json");
+        write_json(&claude, &pre_v016_claude_settings());
+        fs::set_permissions(&_tmp.path().join("home"), fs::Permissions::from_mode(0o755)).ok();
+
+        super::override_legacy_for_test(legacy_link.clone());
+        let result = run_in(&home, &app_dir);
+        super::clear_legacy_override_for_test();
+        result.unwrap();
+
+        assert!(
+            canary.join("file").exists(),
+            "symlink target must be untouched"
+        );
+    }
+
+    #[test]
+    fn sandbox_baked_hooks_under_aoe_sandbox_subpath_are_untouched() {
+        let _env = EnvGuard::unset_all();
+        let (_tmp, home, app_dir) = setup_dirs();
+
+        let claude = home.join(".claude").join("settings.json");
+        write_json(&claude, &pre_v016_claude_settings());
+
+        let sandbox_settings = home.join(".claude").join("sandbox").join("settings.json");
+        let sandbox_baked = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "hooks": [{
+                        "type": "command",
+                        "command": PRE_V016_STATUS_CMD
+                    }]
+                }]
+            }
+        });
+        write_json(&sandbox_settings, &sandbox_baked);
+        let sandbox_before = fs::read_to_string(&sandbox_settings).unwrap();
+
         run_in(&home, &app_dir).unwrap();
 
-        // Schema bumped, claude rewritten. The "rewrite-first" property is
-        // structural: we only test the order at the source level (`run_in`
-        // runs the iter_hook_targets loop, then sweep_legacy_base).
-        assert_post_v016_canonical(&claude);
+        let sandbox_after = fs::read_to_string(&sandbox_settings).unwrap();
+        assert_eq!(
+            sandbox_before, sandbox_after,
+            "v016 must not touch settings under .claude/sandbox/ (baked into image)"
+        );
     }
 }
