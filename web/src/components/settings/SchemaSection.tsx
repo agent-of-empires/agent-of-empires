@@ -207,7 +207,7 @@ export function SchemaSection({
   useEffect(() => {
     if (!targetField || !targetRef.current) return;
     const el = targetRef.current;
-    const reduce = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+    const reduce = window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches ?? false;
     const raf = requestAnimationFrame(() =>
       el.scrollIntoView({ block: "center", behavior: reduce ? "auto" : "smooth" }),
     );
