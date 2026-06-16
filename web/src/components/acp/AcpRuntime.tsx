@@ -40,7 +40,7 @@ import type {
   ToolCall,
 } from "../../lib/acpTypes";
 import { hasTodoItemsArgsText, parseJsonObject } from "../../lib/acpArgs";
-import { DEFAULT_HISTORY_WINDOW, HISTORY_WINDOW_STEP, historyWindow } from "../../lib/acpHistoryWindow";
+import { useHistoryWindow } from "../../hooks/useHistoryWindow";
 import { useAgentProfile } from "../../lib/agentProfileContext";
 
 interface Props {
@@ -132,22 +132,11 @@ export function AcpRuntime({
   }, [pendingAttachments]);
   // Render only the most recent slice of the transcript so a long
   // session does not block first paint on mobile; older rows stay in
-  // reducer state and are revealed via "Load earlier". Reset the window
-  // on session switch (adjust-state-on-prop-change, no effect, per the
-  // react-you-might-not-need-an-effect lint). See #2144.
-  const [visibleRows, setVisibleRows] = useState(DEFAULT_HISTORY_WINDOW);
-  const [windowSessionId, setWindowSessionId] = useState(sessionId);
-  if (windowSessionId !== sessionId) {
-    setWindowSessionId(sessionId);
-    setVisibleRows(DEFAULT_HISTORY_WINDOW);
-  }
-  const { start: historyStart, canLoadEarlier } = useMemo(
-    () => historyWindow(acp.state.activity, visibleRows, showClearedTurns),
-    [acp.state.activity, visibleRows, showClearedTurns],
-  );
-  const windowedActivity = useMemo(
-    () => (historyStart === 0 ? acp.state.activity : acp.state.activity.slice(historyStart)),
-    [acp.state.activity, historyStart],
+  // reducer state and are revealed via "Load earlier". See #2144.
+  const { windowedActivity, canLoadEarlier, loadEarlier } = useHistoryWindow(
+    sessionId,
+    acp.state.activity,
+    showClearedTurns,
   );
 
   // Memoise the activity → ThreadMessageLike conversion. The function
@@ -229,7 +218,7 @@ export function AcpRuntime({
         setConfigOption: acp.setConfigOption,
         dismissConfigOptionSwitchFailed: acp.dismissConfigOptionSwitchFailed,
         canLoadEarlierHistory: canLoadEarlier,
-        loadEarlierHistory: () => setVisibleRows((v) => v + HISTORY_WINDOW_STEP),
+        loadEarlierHistory: loadEarlier,
       })}
     </AssistantRuntimeProvider>
   );

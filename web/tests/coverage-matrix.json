@@ -945,9 +945,14 @@
       "id": "acp.history-window",
       "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": ["tests/acp-history-window.spec.ts", "src/lib/acpHistoryWindow.test.ts"],
+      "specs": [
+        "tests/acp-history-window.spec.ts",
+        "src/lib/acpHistoryWindow.test.ts",
+        "src/hooks/__tests__/useHistoryWindow.test.tsx"
+      ],
       "components": [
         "web/src/lib/acpHistoryWindow.ts",
+        "web/src/hooks/useHistoryWindow.ts",
         "web/src/components/acp/AcpRuntime.tsx",
         "web/src/components/acp/StructuredView.tsx"
       ]
