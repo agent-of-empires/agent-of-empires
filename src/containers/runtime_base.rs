@@ -1,6 +1,67 @@
 use super::container_interface::{docker_env_args, ContainerConfig};
 use super::error::{DockerError, Result};
-use std::process::Command;
+use std::io::Read;
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
+/// Upper bound on a single `docker pull`. `docker pull` has no overall timeout
+/// of its own, so a stalled registry connection blocks the caller forever
+/// (observed as the TUI freezing mid-pull on a sandbox restart). Sized
+/// generously so a genuinely large
+/// image on a slow link still completes; it only fires on a wedged pull.
+const PULL_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Wait for `child` to exit, killing it if it outlives `timeout`.
+///
+/// stdout/stderr are drained on dedicated threads so a full pipe buffer cannot
+/// wedge the child (and thus this wait) before the deadline. Returns `Ok(None)`
+/// when the timeout fired and the child was killed.
+fn wait_with_timeout(mut child: Child, timeout: Duration) -> std::io::Result<Option<Output>> {
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    let (otx, orx) = mpsc::channel();
+    let (etx, erx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(ref mut p) = stdout_pipe {
+            let _ = p.read_to_end(&mut buf);
+        }
+        let _ = otx.send(buf);
+    });
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(ref mut p) = stderr_pipe {
+            let _ = p.read_to_end(&mut buf);
+        }
+        let _ = etx.send(buf);
+    });
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            // The child exited, but if it spawned a grandchild that inherited
+            // the pipe, `read_to_end` (and thus an unbounded `recv`) would block
+            // forever. Cap the drain at the remaining deadline so the timeout
+            // guarantee holds even then; the exit status is already in hand.
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let stdout = orx.recv_timeout(remaining).unwrap_or_default();
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let stderr = erx.recv_timeout(remaining).unwrap_or_default();
+            return Ok(Some(Output {
+                status,
+                stdout,
+                stderr,
+            }));
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
 
 /// Shared implementation for container runtimes.
 ///
@@ -102,9 +163,31 @@ impl RuntimeBase {
         let mut cmd = self.command();
         cmd.args(self.pull_prefix);
         cmd.arg(image);
-        let start = std::time::Instant::now();
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        let start = Instant::now();
         tracing::info!(target: "containers.image", runtime = %self.name, %image, "pulling image");
-        let output = cmd.output()?;
+        let child = cmd.spawn()?;
+        let output = match wait_with_timeout(child, PULL_TIMEOUT)? {
+            Some(output) => output,
+            None => {
+                let dur_ms = start.elapsed().as_millis() as u64;
+                tracing::warn!(
+                    target: "containers.image",
+                    runtime = %self.name,
+                    %image,
+                    duration_ms = dur_ms,
+                    timeout_s = PULL_TIMEOUT.as_secs(),
+                    "image pull timed out; killed",
+                );
+                return Err(DockerError::ImageNotFound(format!(
+                    "{}: pull timed out after {}s",
+                    image,
+                    PULL_TIMEOUT.as_secs()
+                )));
+            }
+        };
         let dur_ms = start.elapsed().as_millis() as u64;
 
         if !output.status.success() {
@@ -751,5 +834,69 @@ mod tests {
         const { assert!(RuntimeBase::DOCKER.supports_named_volumes) };
         const { assert!(RuntimeBase::PODMAN.supports_named_volumes) };
         const { assert!(!RuntimeBase::APPLE_CONTAINER.supports_named_volumes) };
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn wait_with_timeout_kills_child_that_outlives_deadline() {
+        // A `docker pull` that wedges on the network has no timeout of its own
+        // and blocked the caller forever. `sleep 30` stands in for
+        // the wedged child; the timeout must fire and kill it.
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::null());
+        let child = cmd.spawn().unwrap();
+
+        let start = Instant::now();
+        let result = wait_with_timeout(child, Duration::from_millis(300)).unwrap();
+        assert!(
+            result.is_none(),
+            "expected the timeout to fire and kill the child"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "wait should return promptly after the deadline, not block on the child"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn wait_with_timeout_bounds_drain_when_grandchild_holds_pipe() {
+        // The immediate child (sh) exits fast but backgrounds a `sleep` that
+        // inherits stdout, so the pipe never closes. The drain must still
+        // return by the deadline rather than blocking on read_to_end. `sleep 30`
+        // (>> the 5s assertion) ensures an unbounded recv would visibly fail.
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("sleep 30 >&1 & printf done");
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        let child = cmd.spawn().unwrap();
+
+        let start = Instant::now();
+        let output = wait_with_timeout(child, Duration::from_millis(500))
+            .unwrap()
+            .expect("the sh child exits quickly, so an Output is produced");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "drain must be bounded by the deadline even while the pipe stays open"
+        );
+        assert!(output.status.success());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn wait_with_timeout_returns_output_for_fast_child() {
+        let mut cmd = Command::new("printf");
+        cmd.arg("hello");
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        let child = cmd.spawn().unwrap();
+
+        let output = wait_with_timeout(child, Duration::from_secs(10))
+            .unwrap()
+            .expect("fast child should complete before the timeout");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"hello");
     }
 }

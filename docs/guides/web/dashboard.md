@@ -30,7 +30,7 @@ Choosing a profile seeds the agent-step defaults. If you have already edited a f
 
 The command palette (top-bar button or keyboard shortcut) is a fuzzy launcher for global actions: jump to a session, open settings, start a new session, toggle the right panel.
 
-Individual settings also appear in the palette under `Settings`. A writable toggle flips inline from the palette (a toast confirms, and the subtitle shows its current state and scope); every other setting opens the settings view on its tab. Read-only servers and settings that need elevation jump to the settings view instead of writing.
+Individual settings also appear in the palette under `Settings`. A writable toggle flips inline from the palette (a toast confirms, and the subtitle shows its current state and scope); every other setting opens the settings view on its tab. Read-only servers and settings that need elevation jump to the settings view instead of writing. The Settings header also has its own search box (and the TUI settings screen the `/` key) that filters settings across every tab and jumps to the one you pick.
 
 ## First-run onboarding
 

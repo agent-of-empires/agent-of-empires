@@ -95,6 +95,13 @@ pub struct SessionResponse {
     /// responses leave it `false` and the sidebar reads the list value. #1927.
     #[serde(default)]
     pub tie_workdir_to_name: bool,
+    /// Smart-rename indicator state for structured view sessions: `pending`
+    /// (still default-named and eligible, will auto-name on the next prompt),
+    /// `running` (a one-shot title call is in flight), or `inactive`. Populated
+    /// by `list_sessions`; single-session responses leave it `inactive`. See
+    /// `session::smart_rename`.
+    #[serde(default)]
+    pub smart_rename: crate::session::smart_rename::SmartRenameState,
     pub has_terminal: bool,
     pub profile: String,
     pub cleanup_defaults: CleanupDefaults,
@@ -264,6 +271,8 @@ impl SessionResponse {
                 .is_some_and(|w| w.managed_by_aoe),
             // Overlaid per-profile in list_sessions; see the field doc.
             tie_workdir_to_name: false,
+            // Overlaid in list_sessions; single-session responses stay inactive.
+            smart_rename: crate::session::smart_rename::SmartRenameState::Inactive,
             has_terminal: inst.terminal_info.is_some(),
             profile: inst.source_profile.clone(),
             cleanup_defaults: CleanupDefaults {
@@ -517,6 +526,58 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
                     .tie_workdir_to_name
             });
             session.tie_workdir_to_name = tied;
+        }
+    }
+
+    // Overlay the smart-rename indicator. `running` comes from the live
+    // in-flight set; `pending` from the shared eligibility predicate, so the
+    // chip cannot drift from the runtime gate. Config resolved once per profile.
+    {
+        use crate::session::smart_rename::{check_eligible, SmartRenameState};
+        use std::collections::{HashMap, HashSet};
+        let inflight: HashSet<String> = state
+            .smart_rename_inflight
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        let attempted: HashSet<String> = state
+            .smart_rename_attempted
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        let mut cfg_cache: HashMap<String, (bool, HashMap<String, String>)> = HashMap::new();
+        for (resp, inst) in sessions.iter_mut().zip(instances.iter()) {
+            if inflight.contains(&inst.id) {
+                resp.smart_rename = SmartRenameState::Running;
+                continue;
+            }
+            // A session whose one-shot already ran (and failed, since the name
+            // is still default) will not retry, so it is not pending either.
+            if attempted.contains(&inst.id) {
+                continue;
+            }
+            let (setting_on, overrides) = cfg_cache
+                .entry(inst.source_profile.clone())
+                .or_insert_with(|| {
+                    let cfg = crate::session::profile_config::resolve_config_or_warn(
+                        &inst.source_profile,
+                    )
+                    .session;
+                    (cfg.smart_rename, cfg.agent_command_override)
+                });
+            let eligible = check_eligible(
+                inst.is_structured(),
+                *setting_on,
+                &inst.title,
+                crate::agents::get_agent(&inst.tool),
+                inst.is_sandboxed(),
+                &inst.command,
+                overrides.contains_key(&inst.tool),
+            )
+            .is_ok();
+            if eligible {
+                resp.smart_rename = SmartRenameState::Pending;
+            }
         }
     }
 
@@ -6336,6 +6397,7 @@ mod workspace_ordering_tests {
             scratch: false,
             has_managed_worktree: false,
             tie_workdir_to_name: false,
+            smart_rename: crate::session::smart_rename::SmartRenameState::Inactive,
             has_terminal: false,
             profile: "default".to_string(),
             cleanup_defaults: CleanupDefaults {

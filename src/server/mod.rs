@@ -295,6 +295,17 @@ pub struct AppState {
     /// first use and live for the lifetime of the process — there are only
     /// as many as the user has sessions.
     pub instance_locks: RwLock<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Session ids with an in-flight smart-rename one-shot, so a burst of rapid
+    /// first prompts cannot spawn concurrent title generators for the same
+    /// session. Synchronous mutex: critical sections are tiny and never span an
+    /// `await`. See `session::smart_rename`.
+    pub smart_rename_inflight: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Session ids that have already had a smart-rename one-shot attempt this
+    /// process lifetime (success or failure). A failed or unusable first try
+    /// leaves the name default, so without this every later prompt would
+    /// respawn a one-shot agent; one attempt per session bounds that cost and
+    /// clears the `pending` sidebar chip once an attempt has run.
+    pub smart_rename_attempted: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Suppression set for the startup-recovery cascade. While an entry is
     /// present and younger than `recovery::RECENTLY_RESTARTED_TTL`, the
     /// `status_poll_loop` skips `update_status_with_metadata` for that
@@ -943,6 +954,8 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         auth_mode,
         serve_mode,
         instance_locks: RwLock::new(std::collections::HashMap::new()),
+        smart_rename_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
+        smart_rename_attempted: std::sync::Mutex::new(std::collections::HashSet::new()),
         recently_restarted: crate::session::recovery::new_recently_restarted(),
         recovery_pending: crate::session::recovery::new_recovery_pending(),
         cleanup_defaults_cache: RwLock::new(CleanupDefaultsCache {
@@ -3781,6 +3794,8 @@ pub mod test_support {
             auth_mode: "none",
             serve_mode: "local",
             instance_locks: RwLock::new(HashMap::new()),
+            smart_rename_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            smart_rename_attempted: std::sync::Mutex::new(std::collections::HashSet::new()),
             recently_restarted: crate::session::recovery::new_recently_restarted(),
             recovery_pending: crate::session::recovery::new_recovery_pending(),
             cleanup_defaults_cache: RwLock::new(CleanupDefaultsCache {

@@ -1265,6 +1265,11 @@ impl App {
                 needs_full_refresh = true;
             }
 
+            if self.home.apply_restart_results() {
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
             if let Some(session_id) = self.home.apply_creation_results() {
                 self.dispatch_new_session_attach(&session_id, terminal)?;
                 refresh_needed = true;
@@ -1482,6 +1487,10 @@ impl App {
         }
 
         self.home.apply_session_id_updates();
+        // Drain any restart result that completed since the last tick so the
+        // post-cascade snapshot (cleared stale sid, container id, final status)
+        // is persisted instead of the stale `Starting` row.
+        self.home.apply_restart_results();
         self.home.cleanup_pending_creation();
 
         if let Err(e) = self.home.save() {

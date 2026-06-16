@@ -29,6 +29,9 @@ describe("SettingsHeader", () => {
     saveError: null as string | null,
     selectedProfile: "default",
     onSelectProfile: () => {},
+    schema: [],
+    schemaLoading: false,
+    onSearchJump: () => {},
   };
 
   it("renders Back button and Settings title", () => {

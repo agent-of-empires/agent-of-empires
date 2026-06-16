@@ -109,6 +109,32 @@ pub fn generate_random_title(existing_titles: &[&str]) -> String {
     format!("{} {}", base, chrono::Utc::now().timestamp())
 }
 
+/// True when `title` is one this module could have produced via
+/// [`generate_random_title`]: a bare civilization name, or a civilization
+/// followed by a Roman-numeral suffix (`Britons II`) or a numeric timestamp
+/// suffix (`Britons 1700000000`). Civilization names are all single words, so
+/// the split on the last space is unambiguous. Used by `session::smart_rename`
+/// to decide whether a session still carries its auto-generated name and is
+/// therefore eligible for an automatic rename.
+pub fn is_default_civ_name(title: &str) -> bool {
+    let t = title.trim();
+    if CIVILIZATIONS.contains(&t) {
+        return true;
+    }
+    if let Some((base, suffix)) = t.rsplit_once(' ') {
+        if CIVILIZATIONS.contains(&base) && !suffix.is_empty() {
+            // Match only the exact suffixes generate_random_title emits: a Roman
+            // numeral in 2..=1000, or a timestamp (Unix seconds, >= 9 digits).
+            // A looser check (any IVXLCDM run, any digits) would treat
+            // user-chosen titles like "Vikings 2" or "Britons IM" as default.
+            let is_roman = (2..=1000).any(|n| to_roman(n) == suffix);
+            let is_timestamp = suffix.len() >= 9 && suffix.chars().all(|c| c.is_ascii_digit());
+            return is_roman || is_timestamp;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,5 +173,25 @@ mod tests {
         let existing: Vec<&str> = CIVILIZATIONS.to_vec();
         let title = generate_random_title(&existing);
         assert!(title.contains(" II"));
+    }
+
+    #[test]
+    fn test_is_default_civ_name() {
+        // Bare civ names and every shape generate_random_title can emit.
+        assert!(is_default_civ_name("Vikings"));
+        assert!(is_default_civ_name("  Vikings  "));
+        assert!(is_default_civ_name("Britons II"));
+        assert!(is_default_civ_name("Franks XLIX"));
+        assert!(is_default_civ_name("Mongols 1700000000"));
+        // Not default: user-chosen titles, even ones embedding a civ word.
+        assert!(!is_default_civ_name("Fix login bug"));
+        assert!(!is_default_civ_name("My Vikings"));
+        assert!(!is_default_civ_name("Vikings raid plan"));
+        assert!(!is_default_civ_name("Vikings 2.0"));
+        assert!(!is_default_civ_name("Notaciv II"));
+        // Suffixes generate_random_title can never emit: invalid roman, short numeric.
+        assert!(!is_default_civ_name("Britons IM"));
+        assert!(!is_default_civ_name("Vikings 2"));
+        assert!(!is_default_civ_name(""));
     }
 }

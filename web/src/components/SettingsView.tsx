@@ -21,8 +21,9 @@ import { DiffSettings } from "./settings/DiffSettings";
 import { TelemetrySettings } from "./settings/TelemetrySettings";
 import { SettingsHeader } from "./settings/SettingsHeader";
 import { ProfilesSection } from "./profiles/ProfilesSection";
+import type { SettingsSearchHit } from "./settings/settingsSearchIndex";
 
-type TabId =
+export type TabId =
   | "profiles"
   | "session"
   | "sandbox"
@@ -226,6 +227,19 @@ export function SettingsView({
   const [schema, setSchema] = useState<SettingsFieldDescriptor[]>([]);
   const [schemaLoading, setSchemaLoading] = useState(true);
   const [schemaError, setSchemaError] = useState<string | null>(null);
+  // Set when a settings-search hit is chosen: switch to the hit's tab and ask
+  // the matching SchemaSection to scroll the field into view and highlight it.
+  // The nonce bumps on every jump so re-selecting the same field (or jumping to
+  // an advanced field on the current tab) re-triggers the scroll and reopens
+  // the Advanced fold via the content-subtree remount key.
+  const [focusRequest, setFocusRequest] = useState<{ section: string; field: string; nonce: number } | null>(null);
+  const handleSearchJump = useCallback(
+    (hit: SettingsSearchHit) => {
+      setFocusRequest((prev) => ({ section: hit.section, field: hit.field, nonce: (prev?.nonce ?? 0) + 1 }));
+      onSelectTab(hit.tab);
+    },
+    [onSelectTab],
+  );
 
   useEffect(() => {
     fetchProfiles().then((p) => {
@@ -436,6 +450,7 @@ export function SettingsView({
               <SchemaSection
                 section="session"
                 schema={schema}
+                focusRequest={focusRequest}
                 values={session}
                 onSaveField={saveSubField}
                 advancedSubtitle="Idle auto-stop, attach modes, live-send, and other session tuning."
@@ -449,6 +464,7 @@ export function SettingsView({
           <SchemaSection
             section="sandbox"
             schema={schema}
+            focusRequest={focusRequest}
             values={sandbox}
             onSaveField={saveSubField}
             advancedSubtitle="Resource limits, custom instructions, environment, volumes, and ports."
@@ -460,6 +476,7 @@ export function SettingsView({
           <SchemaSection
             section="worktree"
             schema={schema}
+            focusRequest={focusRequest}
             values={worktree}
             onSaveField={saveSubField}
             advancedSubtitle="Bare-repo and workspace path templates, branch cleanup, and submodules."
@@ -471,6 +488,7 @@ export function SettingsView({
           <SchemaSection
             section="theme"
             schema={schema}
+            focusRequest={focusRequest}
             values={(settings?.theme ?? {}) as Record<string, unknown>}
             onSaveField={saveThemeField}
           />
@@ -482,6 +500,7 @@ export function SettingsView({
           <SchemaSection
             section="sound"
             schema={schema}
+            focusRequest={focusRequest}
             values={(settings?.sound ?? {}) as Record<string, unknown>}
             onSaveField={saveSubField}
           />
@@ -491,6 +510,7 @@ export function SettingsView({
           <SchemaSection
             section="tmux"
             schema={schema}
+            focusRequest={focusRequest}
             values={(settings?.tmux ?? {}) as Record<string, unknown>}
             onSaveField={saveSubField}
           />
@@ -500,6 +520,7 @@ export function SettingsView({
           <SchemaSection
             section="updates"
             schema={schema}
+            focusRequest={focusRequest}
             values={(settings?.updates ?? {}) as Record<string, unknown>}
             onSaveField={saveSubField}
           />
@@ -511,6 +532,7 @@ export function SettingsView({
           <SchemaSection
             section="logging"
             schema={schema}
+            focusRequest={focusRequest}
             values={(settings?.logging ?? {}) as Record<string, unknown>}
             onSaveField={saveSubField}
             advancedSubtitle="Sink and rotation; some fields require restarting aoe to take effect."
@@ -528,7 +550,15 @@ export function SettingsView({
                 Controls which session events trigger push notifications on the server.
               </p>
               {schemaGuard() ??
-                (settings && <SchemaSection section="web" schema={schema} values={web} onSaveField={saveSubField} />)}
+                (settings && (
+                  <SchemaSection
+                    section="web"
+                    schema={schema}
+                    focusRequest={focusRequest}
+                    values={web}
+                    onSaveField={saveSubField}
+                  />
+                ))}
             </div>
           </div>
         );
@@ -556,6 +586,7 @@ export function SettingsView({
             <SchemaSection
               section="acp"
               schema={schema}
+              focusRequest={focusRequest}
               values={acp}
               onSaveField={saveSubField}
               // The acp section mirrors three fields into serverAbout, which
@@ -580,6 +611,9 @@ export function SettingsView({
         saveError={saveError}
         selectedProfile={selectedProfile}
         onSelectProfile={handleSelectProfile}
+        schema={schema}
+        schemaLoading={schemaLoading}
+        onSearchJump={handleSearchJump}
       />
 
       {/* Mobile tabs (horizontal scroll) */}
@@ -657,7 +691,7 @@ export function SettingsView({
                 selectedProfile from its "" seed to the default does not remount
                 mid-interaction and collapse a just-expanded fold. */}
             <fieldset
-              key={`${activeTab}-${profileEpoch}`}
+              key={`${activeTab}-${profileEpoch}-${focusRequest?.nonce ?? 0}`}
               disabled={offline}
               className="space-y-5 disabled:opacity-50 border-0 m-0 p-0 min-w-0"
             >

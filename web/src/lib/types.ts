@@ -88,6 +88,11 @@ export interface SessionResponse {
    *  the supervisor holds a live worker. Drives the sidebar `Resuming…`
    *  chip and the per-session banner in the acp view. See #1088. */
   acp_worker_state?: AcpWorkerState;
+  /** Smart-rename indicator for structured view sessions. `pending`: still
+   *  default-named and eligible, will auto-name on the next prompt; `running`:
+   *  a one-shot title call is in flight; `inactive`/absent otherwise. Drives
+   *  the sidebar auto-name chip. See session::smart_rename. */
+  smart_rename?: "inactive" | "pending" | "running";
   /** True when this session's agent can run in acp: a built-in with
    *  an ACP adapter, or a custom agent whose profile config declares a
    *  valid `agent_acp_cmd`. The terminal view's "switch to acp"

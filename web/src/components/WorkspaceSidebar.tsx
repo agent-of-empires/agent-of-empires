@@ -24,6 +24,7 @@ import {
   Pin,
   Play,
   Plus,
+  Sparkles,
 } from "lucide-react";
 import {
   DndContext,
@@ -983,6 +984,26 @@ export const SessionRow = memo(function SessionRow({
                 >
                   <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-amber-400/80" />
                   Resuming
+                </span>
+              )}
+              {firstSession?.smart_rename === "pending" && (
+                <span
+                  title="Will auto-name this session from your first message"
+                  aria-label="Will auto-name"
+                  className="inline-flex shrink-0 items-center gap-0.5 rounded border border-surface-700/40 bg-surface-800/40 px-1 py-0 text-[10px] font-mono font-medium text-text-dim"
+                >
+                  <Sparkles className="h-3 w-3" />
+                  <span className="hidden sm:inline">Auto-name</span>
+                </span>
+              )}
+              {firstSession?.smart_rename === "running" && (
+                <span
+                  title="Generating a name from your first message"
+                  aria-label="Naming"
+                  className="inline-flex shrink-0 items-center gap-0.5 rounded border border-amber-700/40 bg-amber-950/30 px-1 py-0 text-[10px] font-medium text-amber-300"
+                >
+                  <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-amber-400/80" />
+                  Naming…
                 </span>
               )}
               {firstSession?.next_wakeup_at && (

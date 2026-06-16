@@ -784,6 +784,17 @@ pub struct SessionConfig {
     #[setting(label = "Agent Status Hooks", widget = "toggle", category = "Agents")]
     pub agent_status_hooks: bool,
 
+    /// Auto-rename a new structured-view (ACP) session from its first message,
+    /// using the session's own agent in one-shot mode (e.g. `claude -p`). Only
+    /// applies while the session still carries its auto-generated name; a
+    /// manually named session is never touched. Title only: the worktree
+    /// directory is not moved (the running agent holds it). Agents without a
+    /// one-shot mode, sandboxed sessions, and command-overridden agents keep
+    /// the generated name.
+    #[serde(default = "default_true")]
+    #[setting(label = "Smart Session Rename", widget = "toggle", category = "Agents")]
+    pub smart_rename: bool,
+
     /// Request xterm mouse tracking so the TUI handles the scroll wheel
     /// (preview-pane scroll) and click-to-select rows. Disable to hand the
     /// wheel and text selection back to the terminal, e.g. iOS Mosh +
@@ -1112,6 +1123,7 @@ impl Default for SessionConfig {
             agent_extra_args: HashMap::new(),
             agent_command_override: HashMap::new(),
             agent_status_hooks: true,
+            smart_rename: true,
             mouse_capture: true,
             custom_agents: HashMap::new(),
             agent_detect_as: HashMap::new(),

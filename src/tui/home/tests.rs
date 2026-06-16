@@ -6064,6 +6064,58 @@ fn restart_selected_session_debounces_via_cooldown_map() {
     );
 }
 
+/// A second restart press while the first cascade is still running on the
+/// poller worker must be dropped. The cascade is off the event loop, so the
+/// 1.5s keyboard-repeat debounce does not cover a deliberate press during a
+/// multi-second pull; without the in-flight guard the worker would enqueue a
+/// duplicate request and restart the row twice.
+#[test]
+#[serial]
+fn restart_selected_session_skips_when_already_in_flight() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances[0].id.clone();
+    env.view.selected_session = Some(id.clone());
+    env.view.restart_in_flight.insert(id.clone());
+
+    let result = env.view.restart_selected_session(None, None, None, None);
+    assert!(result.is_ok());
+    assert!(
+        env.view.restart_cooldown_at.is_empty(),
+        "an in-flight restart must drop the press before any bookkeeping"
+    );
+    assert_ne!(
+        env.view.instances[0].status,
+        crate::session::Status::Starting,
+        "the row must not be re-flipped to Starting by a dropped duplicate press"
+    );
+}
+
+/// Deleting a row whose restart cascade is still running would fire docker
+/// commands against the container the worker is mid-creating. The delete must
+/// be refused (and surfaced) rather than racing the restart worker.
+#[test]
+#[serial]
+fn delete_selected_refused_during_restart() {
+    use crate::tui::dialogs::DeleteOptions;
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances[0].id.clone();
+    env.view.selected_session = Some(id.clone());
+    env.view.restart_in_flight.insert(id.clone());
+
+    let result = env.view.delete_selected(&DeleteOptions::default());
+    assert!(result.is_ok());
+    assert_ne!(
+        env.view.instances[0].status,
+        crate::session::Status::Deleting,
+        "delete must be refused while a restart is in flight"
+    );
+    assert!(
+        env.view.info_dialog.is_some(),
+        "the refused delete must surface a dialog, not silently no-op"
+    );
+}
+
 /// Build a HomeView seeded with two distinct projects, each containing
 /// sessions with different attention statuses. Helper for the Project +
 /// Attention combination tests below.

@@ -73,6 +73,7 @@ The schema is flat and every field is optional. Missing color fields fall back t
 default_tool = "claude"   # any supported agent name
 yolo_mode_default = false
 agent_status_hooks = true
+smart_rename = true
 auto_stop_idle_secs = 0   # 0 disables; e.g. 7200 = stop after 2h idle
 
 [session.acp_defaults.opencode]
@@ -86,6 +87,7 @@ effort = "high"
 | `auto_stop_idle_secs` | `0` | Seconds a plain tmux session may sit `Idle` before it is auto-stopped: its tmux session and any sandbox container are killed, leaving a restartable `Stopped` row. `0` disables it; no session is ever auto-stopped for inactivity. Idle age is measured from the later of the last transition into `Idle` and the last user interaction, and a session with an attached tmux client is always spared, so a session you are reading is never reaped. Evaluated about once a minute (by the TUI and by `aoe serve`), so the stop can lag the threshold by up to a minute. Structured view workers use the separate `acp.auto_stop_idle_secs`. See #1689 and #1690. |
 | `yolo_mode_default` | `false` | Enable YOLO mode by default for new sessions (skip permission prompts). Works with or without sandbox. In tmux mode this passes `--dangerously-skip-permissions` to the agent CLI; in structured view it maps to ACP `bypassPermissions` (see [Structured view: Permission modes and YOLO](../structured-view/controls.md#permission-modes-and-yolo) for the adapter caveat). |
 | `agent_status_hooks` | `true` | Install status-detection hooks into the agent's config file. Codex uses the `[hooks]` table in its resolved `config.toml` (typically `~/.codex/config.toml`); other JSON-based agents use their settings JSON. Config-dir overrides are honored: `CODEX_HOME` (Codex), `CLAUDE_CONFIG_DIR` (Claude), or `CURSOR_CONFIG_DIR` (Cursor) set in the session's profile environment or in AoE's own environment redirects hooks to that directory instead of the `~/.codex` / `~/.claude` / `~/.cursor` default. When disabled, status detection falls back to tmux pane content parsing. Codex is hook-first, but known hook gaps are reconciled from pane content. |
+| `smart_rename` | `true` | Auto-rename a new structured view (ACP) session from its first message, using the session's own agent in one-shot mode (`claude -p`, `codex exec`, `opencode run`, `gemini -p`). Runs only while the session still carries its auto-generated civilization name; a manually named session is never touched. Title only: the worktree directory is not moved, since the running agent holds it. Skipped for sandboxed sessions (a host one-shot lacks the container's auth), agents with no one-shot mode, and command-overridden agents. Best-effort: a failed or timed-out call leaves the generated name and never affects the prompt. |
 | `agent_extra_args` | `{}` | Per-agent extra arguments appended after the binary (e.g., `{ opencode = "--port 8080" }`). |
 | `agent_command_override` | `{}` | Per-agent command override replacing the binary entirely (e.g., `{ claude = "my-claude-wrapper" }`). |
 | `custom_agents` | `{}` | User-defined agents: name to command mapping. Custom agent names appear in the TUI agent picker alongside built-in agents. |

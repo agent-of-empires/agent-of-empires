@@ -3,7 +3,8 @@
 use crate::session::builder::{self, InstanceParams};
 use crate::session::{list_profiles, GroupTree, Item, Status, Storage};
 use crate::tui::deletion_poller::DeletionRequest;
-use crate::tui::dialogs::{DeleteOptions, GroupDeleteOptions, NewSessionData};
+use crate::tui::dialogs::{DeleteOptions, GroupDeleteOptions, InfoDialog, NewSessionData};
+use crate::tui::restart_poller::RestartRequest;
 
 use super::HomeView;
 
@@ -289,17 +290,16 @@ impl HomeView {
     /// the field is updated before respawn so the new agent binary starts
     /// on the next launch.
     ///
-    /// Restart goes through `try_mutate_instance_writeback_on_err` so all
-    /// of `restart_with_size`'s mutations (cleared stale `agent_session_id`
-    /// on Tier-2 resume fallback, `last_accessed_at` bumps, etc.) are
-    /// preserved on the live instance.
+    /// The start cascade itself runs on the `RestartPoller` worker thread (it
+    /// shells out to docker and runs the before_start host hook, which can
+    /// block for seconds), so the TUI event loop never blocks. The post-cascade
+    /// `Instance` (with `restart_with_size`'s mutations: cleared stale
+    /// `agent_session_id` on Tier-2 resume fallback, container id, etc.) is
+    /// written back via `apply_restart_results`.
     ///
     /// The wake-up message is read from the resolved config
     /// (`session.restart_wake_message`); an empty value disables the
     /// wake-up entirely while still running the restart.
-    ///
-    /// The readiness probe + send-keys runs on a background OS thread so
-    /// the TUI event loop never blocks.
     pub(super) fn restart_selected_session(
         &mut self,
         new_profile: Option<&str>,
@@ -312,12 +312,20 @@ impl HomeView {
             None => return Ok(()),
         };
 
-        // Skip transient + sunk rows. Pull the snapshot details we need on
-        // the worker thread in the same borrow so we don't re-look up the
-        // instance under different conditions later. Snoozed rows only
-        // skip when the user is in Attention sort; see method doc.
+        // A restart cascade for this row is already running on the poller
+        // worker. The cascade is off the event loop now, so the 1.5s
+        // keyboard-repeat debounce below does not cover a deliberate second
+        // press during a multi-second pull. Without this guard the worker would
+        // enqueue a duplicate request and, running serially, restart the row a
+        // second time, tearing down the container the first restart just built.
+        if self.restart_in_flight.contains(&id) {
+            return Ok(());
+        }
+
+        // Skip transient + sunk rows. Snoozed rows only skip when the user is
+        // in Attention sort; see method doc.
         let in_attention = self.sort_order == crate::session::config::SortOrder::Attention;
-        let (skip, wake_snooze, title, tool) = match self.get_instance(&id) {
+        let (skip, wake_snooze) = match self.get_instance(&id) {
             Some(inst) => {
                 let snoozed = inst.is_snoozed();
                 let skip = matches!(inst.status, Status::Creating | Status::Deleting)
@@ -325,7 +333,7 @@ impl HomeView {
                     || (snoozed && in_attention)
                     || inst.pane_dead_observed;
                 let wake_snooze = snoozed && !in_attention;
-                (skip, wake_snooze, inst.title.clone(), inst.tool.clone())
+                (skip, wake_snooze)
             }
             None => return Ok(()),
         };
@@ -431,85 +439,63 @@ impl HomeView {
             }
         }
 
-        // Restart the live instance (not a detached clone) so all
-        // non-status fields restart_with_size touches are kept.
+        // The start cascade shells out to docker (image pull, container
+        // create/start) and runs the before_start host hook, any of which can
+        // block for seconds. Running it inline froze the TUI
+        // event loop, so mirror the recovery/stop paths: flip the row to
+        // Starting for immediate feedback, then run the cascade on the restart
+        // poller's worker thread. The post-cascade snapshot (and the wake-up)
+        // are handled via `apply_restart_results`.
         let size = crate::terminal::get_size();
-        self.try_mutate_instance_writeback_on_err(&id, |inst| {
-            inst.restart_with_size(size).map(|_| ())
-        })?;
 
-        // Stamp touch_last_accessed on the user's gesture (the row should
-        // visibly bump immediately). save() pushes both the restart-side
-        // mutations and the touch.
-        self.mutate_instance(&id, |inst| inst.touch_last_accessed());
+        // Status::Starting + a fresh last_start_time keeps the StatusPoller from
+        // flipping the row to Error before the worker finishes (the same grace
+        // startup recovery relies on); touch bumps the row on the user gesture.
+        self.mutate_instance(&id, |inst| {
+            inst.status = Status::Starting;
+            inst.last_error = None;
+            inst.last_start_time = Some(std::time::Instant::now());
+            inst.touch_last_accessed();
+        });
         self.save()?;
 
-        // Resolve the wake message via the moved session's profile config
-        // (already merges global + profile overrides). Empty string is the
-        // documented opt-out.
-        let profile = self
-            .get_instance(&id)
-            .map(|i| i.source_profile.clone())
-            .unwrap_or_else(|| {
-                self.active_profile
-                    .clone()
-                    .unwrap_or_else(|| "default".to_string())
-            });
-        let wake_msg = crate::session::resolve_config(&profile)
+        let Some(instance) = self.get_instance(&id).cloned() else {
+            return Ok(());
+        };
+
+        // Resolve the wake message on the main thread (config access). Empty is
+        // the documented opt-out; the worker skips the wake-up then.
+        let wake_message = crate::session::resolve_config(&instance.source_profile)
             .map(|c| c.session.restart_wake_message.clone())
             .unwrap_or_else(|_| "wake up: pick up what you were doing".to_string());
-        if wake_msg.is_empty() {
-            return Ok(());
-        }
 
-        // Background worker: wait for the pane to be live + past the boot
-        // shell, then send the wake-up keys. Failure to even spawn is
-        // logged so the user can correlate a missing wake-up with a real
-        // OS-level failure rather than silent loss.
-        let worker_session_id = id.clone();
-        let worker_title = title;
-        let worker_tool = tool;
-        let spawn_result = std::thread::Builder::new()
-            .name(format!("aoe-restart-wake/{}", id))
-            .stack_size(128 * 1024)
-            .spawn(move || {
-                let Ok(tmux_session) = crate::tmux::Session::new(&worker_session_id, &worker_title)
-                else {
-                    return;
-                };
-                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(3000);
-                loop {
-                    if !tmux_session.exists() {
-                        return;
-                    }
-                    let pane_alive = !tmux_session.is_pane_dead();
-                    let hook_active = crate::hooks::read_hook_status(&worker_session_id).is_some();
-                    if pane_alive && (hook_active || !tmux_session.is_pane_running_shell()) {
-                        break;
-                    }
-                    if std::time::Instant::now() >= deadline {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-
-                if !tmux_session.exists() {
-                    return;
-                }
-                let delay = crate::agents::send_keys_enter_delay(&worker_tool);
-                if let Err(e) = tmux_session.send_keys_with_delay(&wake_msg, delay) {
-                    tracing::warn!("failed to send wake-up message after restart: {}", e);
-                }
-            });
-        if let Err(err) = spawn_result {
-            tracing::warn!(?err, "failed to spawn restart wake-up worker");
-        }
+        self.restart_in_flight.insert(id.clone());
+        self.restart_poller.request_restart(RestartRequest {
+            session_id: id,
+            instance,
+            size,
+            wake_message,
+        });
         Ok(())
     }
 
     pub(super) fn delete_selected(&mut self, options: &DeleteOptions) -> anyhow::Result<()> {
         if let Some(id) = &self.selected_session {
             let id = id.clone();
+
+            // Refuse to delete a row whose restart cascade is still running on
+            // the worker: deletion would fire docker commands against the same
+            // container the restart worker is mid-creating, orphaning resources
+            // non-deterministically. The old synchronous cascade made this race
+            // impossible (the UI thread could not accept a delete mid-restart);
+            // off-threading the cascade removed that implicit lock.
+            if self.restart_in_flight.contains(&id) {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Restart in progress",
+                    "This session is still restarting. Wait for it to finish before deleting.",
+                ));
+                return Ok(());
+            }
 
             self.set_instance_status(&id, Status::Deleting);
 
@@ -584,6 +570,22 @@ impl HomeView {
                 })
                 .map(|i| i.id.clone())
                 .collect();
+
+            // Refuse the whole group delete if any member is mid-restart (same
+            // concurrent-docker race as delete_selected). Restore the selection
+            // we `take()`'d above so the group stays put.
+            if sessions_to_delete
+                .iter()
+                .any(|sid| self.restart_in_flight.contains(sid))
+            {
+                self.selected_group = Some(group_path);
+                self.selected_group_profile = owning_profile;
+                self.info_dialog = Some(InfoDialog::new(
+                    "Restart in progress",
+                    "A session in this group is still restarting. Wait for it to finish before deleting the group.",
+                ));
+                return Ok(());
+            }
 
             self.bulk_apply_user_action(&sessions_to_delete, |inst| {
                 inst.status = Status::Deleting;

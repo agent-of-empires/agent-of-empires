@@ -29,6 +29,41 @@ fn config_to_json<T: serde::Serialize>(value: &T) -> serde_json::Value {
     serde_json::to_value(value).unwrap_or(serde_json::Value::Null)
 }
 
+/// Fuzzy-score a field's searchable text against a settings-search query.
+/// The query is split on whitespace and every token must fuzzy-match the
+/// haystack (AND semantics, preserving the old substring search's behavior so
+/// "max workers" still matches "Max Concurrent Workers"); the per-token scores
+/// are summed so closer matches rank higher. An empty query scores every field
+/// 0, which keeps the overlay listing all fields in their natural order. The
+/// fuzzy match also covers acronyms, so "mcw" finds "Max Concurrent Workers".
+/// Reuses the same nucleo pattern as the command palette.
+fn fuzzy_settings_score(query: &str, haystack: &str) -> Option<u32> {
+    use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization};
+    use nucleo_matcher::{Config, Matcher, Utf32Str};
+
+    let tokens: Vec<&str> = query.split_whitespace().collect();
+    if tokens.is_empty() {
+        return Some(0);
+    }
+
+    let mut matcher = Matcher::new(Config::DEFAULT);
+    let mut buf = Vec::new();
+    let mut total: u32 = 0;
+    for token in tokens {
+        let atom = Atom::new(
+            token,
+            CaseMatching::Ignore,
+            Normalization::Smart,
+            AtomKind::Fuzzy,
+            false,
+        );
+        let h = Utf32Str::new(haystack, &mut buf);
+        let score = atom.score(h, &mut matcher)?;
+        total += score as u32;
+    }
+    Some(total)
+}
+
 /// Which scope of settings is being edited
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SettingsScope {
@@ -689,7 +724,6 @@ impl SettingsView {
             .as_ref()
             .map(|i| i.value().to_string())
             .unwrap_or_default();
-        let tokens: Vec<String> = query.split_whitespace().map(|t| t.to_lowercase()).collect();
 
         let (scope_for_fields, global_ref, profile_ref) = match self.scope {
             SettingsScope::Global => (
@@ -709,7 +743,7 @@ impl SettingsView {
             ),
         };
 
-        let mut hits: Vec<SearchHit> = Vec::new();
+        let mut scored: Vec<(SearchHit, u32)> = Vec::new();
         for category in self.categories.iter().filter_map(|r| r.as_tab()) {
             let fields = fields::build_fields_for_category(
                 category,
@@ -721,24 +755,26 @@ impl SettingsView {
                 if field.is_section_header() {
                     continue;
                 }
-                let label_lower = field.label.to_lowercase();
-                let desc_lower = field.description.to_lowercase();
-                let matches_all = tokens
-                    .iter()
-                    .all(|t| label_lower.contains(t) || desc_lower.contains(t));
-                if !matches_all {
+                let haystack = format!("{} {}", field.label, field.description);
+                let Some(score) = fuzzy_settings_score(&query, &haystack) else {
                     continue;
-                }
-                hits.push(SearchHit {
-                    category,
-                    field_ident: field.ident(),
-                    field_label: field.label.clone(),
-                    category_label: category.label(),
-                });
+                };
+                scored.push((
+                    SearchHit {
+                        category,
+                        field_ident: field.ident(),
+                        field_label: field.label.clone(),
+                        category_label: category.label(),
+                    },
+                    score,
+                ));
             }
         }
 
-        self.search_hits = hits;
+        // Stable sort by score descending: ties (and the empty-query case where
+        // every field scores 0) keep their natural (category, field) order.
+        scored.sort_by_key(|(_, score)| std::cmp::Reverse(*score));
+        self.search_hits = scored.into_iter().map(|(hit, _)| hit).collect();
         if self.search_selected >= self.search_hits.len() {
             self.search_selected = self.search_hits.len().saturating_sub(1);
         }
@@ -835,6 +871,49 @@ mod dirty_tracking_tests {
         assert!(
             view.has_changes,
             "the post-save baseline tracks the saved value"
+        );
+    }
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::fuzzy_settings_score;
+
+    const HAYSTACK: &str = "Max Concurrent Workers How many agents run at once";
+
+    /// An empty query scores every field 0 so the overlay lists all of them.
+    #[test]
+    fn empty_query_matches_everything() {
+        assert_eq!(fuzzy_settings_score("", HAYSTACK), Some(0));
+        assert_eq!(fuzzy_settings_score("   ", HAYSTACK), Some(0));
+    }
+
+    /// The acronym story: "mcw" must fuzzy-match "Max Concurrent Workers" and
+    /// rank above a weaker match, which the old substring search could not do.
+    #[test]
+    fn acronym_matches_and_ranks_top() {
+        let target = fuzzy_settings_score("mcw", HAYSTACK);
+        assert!(
+            target.is_some(),
+            "'mcw' should match Max Concurrent Workers"
+        );
+
+        let weaker = fuzzy_settings_score("mcw", "Theme How the dashboard looks");
+        assert!(
+            weaker.is_none(),
+            "'mcw' should not match an unrelated field"
+        );
+    }
+
+    /// Multi-token queries keep AND semantics: every whitespace token must
+    /// match, so "max workers" still finds the field even out of order.
+    #[test]
+    fn multi_token_requires_all_tokens() {
+        assert!(fuzzy_settings_score("max workers", HAYSTACK).is_some());
+        assert!(fuzzy_settings_score("workers max", HAYSTACK).is_some());
+        assert!(
+            fuzzy_settings_score("max banana", HAYSTACK).is_none(),
+            "a token with no match drops the field"
         );
     }
 }

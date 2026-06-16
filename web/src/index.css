@@ -387,6 +387,28 @@ body {
   animation: slide-in-right 0.2s ease-out;
 }
 
+/* One-shot flash for the field a settings-search jump lands on. The target
+   wrapper remounts on each jump (SettingsView keys the content subtree on the
+   focus nonce), so the animation replays without any JS timer or state. */
+@keyframes settings-search-highlight {
+  0%,
+  60% {
+    box-shadow: 0 0 0 2px var(--color-brand-500);
+  }
+  100% {
+    box-shadow: 0 0 0 2px transparent;
+  }
+}
+.animate-settings-highlight {
+  animation: settings-search-highlight 300ms cubic-bezier(0.16, 1, 0.3, 1);
+  border-radius: 0.5rem;
+}
+@media (prefers-reduced-motion: reduce) {
+  .animate-settings-highlight {
+    animation: none;
+  }
+}
+
 /* Focus indicators for keyboard navigation */
 button:focus-visible,
 a:focus-visible,

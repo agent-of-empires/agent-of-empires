@@ -1,3 +1,4 @@
+import { useEffect, useRef } from "react";
 import type { SettingsFieldDescriptor, SettingsValidation } from "../../lib/types";
 import {
   CollapsibleSection,
@@ -28,6 +29,12 @@ interface Props {
    *  (consumed live by ToolCards / the composer); widget-specific effects
    *  (e.g. theme repaint) live in the custom widget itself, not here. */
   onAfterSave?: (descriptor: SettingsFieldDescriptor, value: unknown) => Promise<void> | void;
+  /** Set by a settings-search jump. When `section` matches this section, the
+   *  named field is scrolled into view and briefly highlighted, and the
+   *  Advanced fold opens if the target lives inside it. The `nonce` only
+   *  participates in the SettingsView remount key; this component reacts to the
+   *  fresh mount. */
+  focusRequest?: { section: string; field: string; nonce: number } | null;
 }
 
 /** Client-side list-entry validator derived from the server's validation rule,
@@ -176,10 +183,50 @@ function renderField(
  * grouped under an "Advanced" fold to match the TUI. `custom` widgets render
  * via the custom-widget registry (`customWidgets.tsx`).
  */
-export function SchemaSection({ section, schema, values, onSaveField, advancedSubtitle, onAfterSave }: Props) {
+export function SchemaSection({
+  section,
+  schema,
+  values,
+  onSaveField,
+  advancedSubtitle,
+  onAfterSave,
+  focusRequest,
+}: Props) {
   const fields = schema.filter((d) => d.section === section && d.web_write.policy !== "local_only");
   const primary = fields.filter((d) => !d.advanced);
   const advanced = fields.filter((d) => d.advanced);
+
+  // A settings-search jump targeting this section: scroll the field into view
+  // (effect below) and open the Advanced fold if the field lives there. The
+  // flash is a one-shot CSS animation on the target wrapper, which replays on
+  // every jump because SettingsView remounts this subtree on the focus nonce.
+  const targetField = focusRequest && focusRequest.section === section ? focusRequest.field : null;
+  const targetAdvanced = !!targetField && advanced.some((d) => d.field === targetField);
+  const targetRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!targetField || !targetRef.current) return;
+    const el = targetRef.current;
+    const reduce = window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches ?? false;
+    const raf = requestAnimationFrame(() =>
+      el.scrollIntoView({ block: "center", behavior: reduce ? "auto" : "smooth" }),
+    );
+    return () => cancelAnimationFrame(raf);
+  }, [targetField]);
+
+  const wrap = (d: SettingsFieldDescriptor, node: React.ReactNode) => {
+    const isTarget = d.field === targetField;
+    return (
+      <div
+        key={d.field}
+        ref={isTarget ? targetRef : undefined}
+        data-settings-field={`${d.section}.${d.field}`}
+        className={isTarget ? "animate-settings-highlight" : undefined}
+      >
+        {node}
+      </div>
+    );
+  };
 
   // Wrap onSaveField so a successful save in this section runs the optional
   // section-level hook once. Custom widgets receive this same `save`, so their
@@ -204,10 +251,10 @@ export function SchemaSection({ section, schema, values, onSaveField, advancedSu
 
   return (
     <div className="space-y-4">
-      {primary.map((d) => renderField(d, values, makeSave(d)))}
+      {primary.map((d) => wrap(d, renderField(d, values, makeSave(d))))}
       {advanced.length > 0 && (
-        <CollapsibleSection title="Advanced" subtitle={advancedSubtitle}>
-          {advanced.map((d) => renderField(d, values, makeSave(d)))}
+        <CollapsibleSection title="Advanced" subtitle={advancedSubtitle} defaultOpen={targetAdvanced}>
+          {advanced.map((d) => wrap(d, renderField(d, values, makeSave(d))))}
         </CollapsibleSection>
       )}
     </div>

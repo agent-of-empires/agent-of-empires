@@ -990,6 +990,14 @@ pub async fn acp_prompt(
         .acp_supervisor
         .publish_user_prompt_with_attachments(&id, req.text.clone(), &attachments)
         .await;
+    // Best-effort: auto-rename a still-default-named session from this first
+    // message via the agent's one-shot mode. Detached so it never blocks or
+    // fails the prompt; all gating lives inside. See session::smart_rename.
+    tokio::spawn(crate::session::smart_rename::try_smart_rename(
+        state.clone(),
+        id.clone(),
+        req.text.clone(),
+    ));
     match state
         .acp_supervisor
         .send_prompt(&id, &req.text, &attachments)
