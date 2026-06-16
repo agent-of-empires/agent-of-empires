@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::containers::{ContainerConfig, EnvEntry, NamedVolumeMount, VolumeMount};
 use crate::git::GitWorktree;
