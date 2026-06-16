@@ -457,6 +457,7 @@ pub struct AcpConfig {
         label = "Allow agent install from web",
         widget = "toggle",
         web = "local_only:runs npm install on the host as the daemon user",
+        global_only,
         advanced
     )]
     pub allow_agent_install: bool,
