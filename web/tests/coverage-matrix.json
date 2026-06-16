@@ -728,6 +728,13 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
+      "id": "sidebar.new-session-tooltips",
+      "kind": "mocked-playwright",
+      "risk": "low",
+      "specs": ["tests/sidebar-new-session-tooltips.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
       "id": "sidebar.reorder-stationary-click",
       "kind": "mocked-playwright",
       "risk": "medium",
