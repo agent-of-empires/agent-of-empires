@@ -837,6 +837,7 @@ fn with_config_lock<T>(
     lock_extension: &str,
     f: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
+    use std::os::unix::fs::OpenOptionsExt;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -846,6 +847,7 @@ fn with_config_lock<T>(
         .write(true)
         .create(true)
         .truncate(false)
+        .mode(0o600)
         .open(&lock_path)
         .with_context(|| format!("Failed to open config lock {}", lock_path.display()))?;
 
@@ -1349,10 +1351,12 @@ const HERMES_HOOKS: &[(&str, &str)] = &[
 /// without prompting for first-use consent.
 ///
 /// **Atomicity caveat.** The two writes (config.yaml then allowlist.json)
-/// are sequential, not atomic. A crash between them leaves config.yaml in
-/// the hardened shape with the allowlist not yet updated; the next install
-/// re-runs both, so re-convergence happens on the next session creation.
-/// Hermes itself tolerates a missing/stale allowlist by re-prompting for
+/// are sequential, not atomic. The `with_config_lock` wrapper around this
+/// function eliminates the cross-process interleaving leg of the caveat
+/// (two `aoe` processes can no longer race on the pair); only an
+/// in-process crash between the two writes can still leave config.yaml
+/// in the hardened shape with the allowlist not yet updated. Hermes
+/// itself tolerates a missing/stale allowlist by re-prompting for
 /// consent, which is recoverable. Hardening to atomic-write across both
 /// files is tracked as a follow-up.
 pub fn install_hermes_hooks(config_path: &Path, target: HookInstallTarget) -> Result<()> {
@@ -2502,9 +2506,11 @@ command = "echo user-hook"
 
     #[test]
     fn test_hook_command_tolerates_unwritable_base_dir() {
-        // Regression for #1390: if /tmp/aoe-hooks/<id> disappears mid-session
-        // (OS /tmp cleanup, transient FS hiccup, external tooling), the hook
-        // must still exit 0 so the agent doesn't treat it as blocking and
+        // Regression for #1390 (issue title quotes the pre-#1844 path
+        // `/tmp/aoe-hooks/<id>`; the modern path is `/tmp/aoe-hooks-<euid>/<id>`):
+        // if the per-instance hook dir disappears mid-session (OS /tmp
+        // cleanup, transient FS hiccup, external tooling), the hook must
+        // still exit 0 so the agent doesn't treat it as blocking and
         // freeze further tool calls.
         use std::process::Command;
 

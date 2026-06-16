@@ -162,6 +162,11 @@ where
     I: FnOnce() -> std::result::Result<OwnedFd, Arc<anyhow::Error>>,
     A: FnOnce(&std::result::Result<OwnedFd, Arc<anyhow::Error>>) -> Result<T>,
 {
+    // The `RefCell::borrow_mut` is held for the whole call, so a closure
+    // that recursively re-enters `with_hook_base` from inside `apply`
+    // would `BorrowMutError`-panic. No production caller does this and
+    // every existing test invokes `with_hook_base` linearly; the comment
+    // is a guard for future refactors only.
     HOOK_BASE_TEST_CELL.with(|cell| {
         let mut slot = cell.borrow_mut();
         if slot.is_none() {
@@ -408,8 +413,11 @@ pub(crate) fn write_short(dir: BorrowedFd<'_>, name: &str, bytes: &[u8]) -> Resu
     Ok(())
 }
 
-/// Atomic write via `O_CREAT|O_EXCL` tmpfile + `renameat`. Used for files that
-/// must never be observed torn (`session_id`, `attention.json`).
+/// Atomic write via `O_CREAT|O_EXCL` tmpfile + `renameat`. Used for
+/// `session_id` sidecar writes (see [`write_session_id_via_guard`]).
+/// `attention.json` is written by the host shell snippet
+/// `cx-script attention-urgent`, not through this Rust helper, but the
+/// same atomicity-not-durability contract applies on its `mv` rename.
 ///
 /// Atomicity, not durability: there is no `fsync`/`sync_data` before the
 /// rename. After a power loss the file may revert to the previous version
@@ -963,23 +971,38 @@ mod tests {
         let (_g, base, _tmp) = BaseGuard::ready();
         let dir = open_instance_dir("conc").unwrap();
         let dir_fd = dir.as_fd();
-        let payload = b"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        // Each thread writes a DISTINCT 36-byte payload so the post-condition
+        // catches torn writes: a regression that drops the rename and just
+        // truncates would leave whatever the last (interleaved) writer wrote
+        // partway through, which would not match any single thread's full
+        // 36-byte payload byte-for-byte.
+        let payloads: Vec<[u8; 36]> = (0..8u8)
+            .map(|tid| {
+                let s = format!("aaaaaaaa-bbbb-cccc-dddd-{tid:012x}");
+                let mut buf = [0u8; 36];
+                buf.copy_from_slice(s.as_bytes());
+                buf
+            })
+            .collect();
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
         std::thread::scope(|s| {
-            for _ in 0..8 {
+            for (tid, payload) in payloads.iter().enumerate() {
                 let b = barrier.clone();
+                let p = *payload;
                 s.spawn(move || {
                     b.wait();
                     for _ in 0..200 {
-                        write_atomic(dir_fd, "session_id", payload).unwrap();
+                        write_atomic(dir_fd, "session_id", &p).unwrap();
                     }
+                    let _ = tid;
                 });
             }
         });
         let got = read_file_at(dir_fd, "session_id", 64).unwrap().unwrap();
-        assert_eq!(
-            got, payload,
-            "final state must equal what every writer wrote"
+        assert_eq!(got.len(), 36, "torn write: got {} bytes", got.len());
+        assert!(
+            payloads.iter().any(|p| p.as_slice() == got.as_slice()),
+            "final state must equal exactly one writer's payload, got: {got:?}"
         );
         let leaked: Vec<_> = std::fs::read_dir(base.join("conc"))
             .unwrap()
