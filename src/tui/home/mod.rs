@@ -2893,6 +2893,7 @@ impl HomeView {
                 Ok(result) => {
                     let crate::session::restart::RestartResult {
                         session_id,
+                        before,
                         mut instance,
                         outcome,
                     } = result;
@@ -2936,7 +2937,16 @@ impl HomeView {
                     }
 
                     if let Some(slot) = self.instances.iter_mut().find(|i| i.id == session_id) {
-                        *slot = *instance;
+                        slot.merge_post_restart_with_baseline(&before, &instance);
+                        slot.last_error = if instance.status == Status::Error {
+                            instance.last_error.clone()
+                        } else {
+                            None
+                        };
+                        slot.last_error_check = instance.last_error_check;
+                        slot.last_start_time = instance.last_start_time;
+                        slot.retroactive_capture_excludes =
+                            instance.retroactive_capture_excludes.clone();
                         touched = true;
                     }
                 }

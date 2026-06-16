@@ -6138,6 +6138,92 @@ fn restart_selected_session_surfaces_resume_failed_after_async_restart() {
     assert!(row.last_accessed_at.is_some());
 }
 
+#[test]
+#[serial]
+fn apply_restart_results_preserves_peer_sid_and_marker() {
+    use crate::session::StartOutcome;
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances[0].id.clone();
+    env.view.restart_in_flight.insert(id.clone());
+    env.view.instances[0].agent_session_id = Some("peer-fresh-sid".to_string());
+    env.view.instances[0].resume_probe_failed_sid = Some("peer-fresh-sid".to_string());
+
+    let mut worker = env.view.instances[0].clone();
+    worker.status = crate::session::Status::Error;
+    worker.agent_session_id = Some("phase1-stale-sid".to_string());
+    worker.resume_probe_failed_sid = Some("phase1-stale-sid".to_string());
+    worker.last_error =
+        Some("resume failed for sid phase1-stale-sid; preserved for explicit retry".to_string());
+
+    env.view.restart_poller = crate::tui::restart_poller::RestartPoller::with_result_for_test(
+        crate::session::restart::RestartResult {
+            session_id: id.clone(),
+            before: Box::new(worker.clone()),
+            instance: Box::new(worker),
+            outcome: Ok(StartOutcome::ResumeFailed {
+                sid: "phase1-stale-sid".to_string(),
+            }),
+        },
+    );
+
+    assert!(env.view.apply_restart_results());
+
+    let row = env
+        .view
+        .get_instance(&id)
+        .expect("instance remains visible");
+    assert_eq!(row.status, crate::session::Status::Error);
+    assert_eq!(row.agent_session_id.as_deref(), Some("peer-fresh-sid"));
+    assert_eq!(
+        row.resume_probe_failed_sid.as_deref(),
+        Some("peer-fresh-sid")
+    );
+    assert!(env.view.restart_in_flight.is_empty());
+    let dialog = env
+        .view
+        .info_dialog
+        .as_ref()
+        .expect("resume failure dialog");
+    assert!(dialog.message().contains("phase1-stale-sid"));
+}
+
+#[test]
+#[serial]
+fn apply_restart_results_propagates_worker_sid_without_peer_write() {
+    use crate::session::StartOutcome;
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances[0].id.clone();
+    env.view.restart_in_flight.insert(id.clone());
+    env.view.instances[0].agent_session_id = Some("sid-before".to_string());
+
+    let before = env.view.instances[0].clone();
+    let mut worker = before.clone();
+    worker.agent_session_id = Some("sid-after".to_string());
+    worker.status = crate::session::Status::Running;
+
+    env.view.restart_poller = crate::tui::restart_poller::RestartPoller::with_result_for_test(
+        crate::session::restart::RestartResult {
+            session_id: id.clone(),
+            before: Box::new(before),
+            instance: Box::new(worker),
+            outcome: Ok(StartOutcome::Resumed),
+        },
+    );
+
+    assert!(env.view.apply_restart_results());
+
+    let row = env
+        .view
+        .get_instance(&id)
+        .expect("instance remains visible");
+    assert_eq!(row.status, crate::session::Status::Running);
+    assert_eq!(row.agent_session_id.as_deref(), Some("sid-after"));
+    assert_eq!(row.resume_probe_failed_sid, None);
+    assert!(env.view.restart_in_flight.is_empty());
+}
+
 /// A second restart press while the first cascade is still running on the
 /// poller worker must be dropped. The cascade is off the event loop, so the
 /// 1.5s keyboard-repeat debounce does not cover a deliberate press during a

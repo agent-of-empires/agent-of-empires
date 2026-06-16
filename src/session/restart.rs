@@ -21,6 +21,9 @@ pub struct RestartRequest {
 
 pub struct RestartResult {
     pub session_id: String,
+    /// Pre-cascade snapshot used as a compare-and-swap baseline when merging
+    /// peer-writable identity fields back into a live row.
+    pub before: Box<Instance>,
     /// Post-cascade instance snapshot. Written back into the TUI's in-memory
     /// copy so `#[serde(skip)]` fields (e.g. `last_start_time`) and the
     /// cascade's mutations (cleared stale `agent_session_id`, container id)
@@ -39,6 +42,7 @@ pub fn perform_restart(request: RestartRequest) -> RestartResult {
 
     let title = instance.title.clone();
     let tool = instance.tool.clone();
+    let before = instance.clone();
 
     // Honor the same on_launch / before_start hook timeout the startup-recovery
     // worker installs (`run_recovery_for_instance`). Without it, a hanging
@@ -65,6 +69,7 @@ pub fn perform_restart(request: RestartRequest) -> RestartResult {
 
     RestartResult {
         session_id,
+        before: Box::new(before),
         instance: Box::new(instance),
         outcome,
     }

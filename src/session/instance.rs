@@ -914,6 +914,24 @@ impl Instance {
         }
     }
 
+    /// Baseline-aware sibling for async restart workers. Copies worker-produced
+    /// identity only when the live row still matches the pre-restart snapshot;
+    /// peer writes that land while the worker is blocked remain authoritative.
+    pub fn merge_post_restart_with_baseline(&mut self, before: &Self, src: &Self) {
+        self.merge_post_start(src);
+        let sid_unchanged = self.agent_session_id == before.agent_session_id;
+        let marker_unchanged = self.resume_probe_failed_sid == before.resume_probe_failed_sid;
+
+        if sid_unchanged {
+            self.agent_session_id = src.agent_session_id.clone();
+            self.session_id_poller = src.session_id_poller.clone();
+        }
+
+        if marker_unchanged && self.agent_session_id == src.agent_session_id {
+            self.resume_probe_failed_sid = src.resume_probe_failed_sid.clone();
+        }
+    }
+
     /// Reload this instance from disk before a launch that would re-persist
     /// peer-writable fields. Refreshes `agent_session_id` (poller-observed)
     /// and `resume_intent` (user-set) from disk; carries runtime-only fields
