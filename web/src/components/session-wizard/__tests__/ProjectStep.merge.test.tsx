@@ -63,6 +63,20 @@ describe("mergeRecentProjects (#2141)", () => {
     expect(merged[0].sessionCount).toBe(0);
   });
 
+  it("derives the display name from the path when the persisted entry has none", () => {
+    const merged = mergeRecentProjects([], [persisted({ path: "/repo/backend", display_name: "" })]);
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0].displayName).toBe("backend");
+  });
+
+  it("falls back to the raw path for a root-only persisted entry with no name", () => {
+    const merged = mergeRecentProjects([], [persisted({ path: "/", display_name: "" })]);
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0].displayName).toBe("/");
+  });
+
   it("lets the session-derived entry win on a path collision (keeps the real count)", () => {
     const sessionDerived = collectRecentProjects([
       mockSession({ id: "a", project_path: "/repo/frontend", last_accessed_at: "2025-09-05T00:00:00Z" }),
