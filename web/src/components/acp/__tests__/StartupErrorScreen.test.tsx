@@ -28,6 +28,7 @@ const incompatible = (auto_install = true) => ({
 });
 
 beforeEach(() => {
+  fetchSettings.mockReset();
   fetchSettings.mockResolvedValue({});
   installAcpAgent.mockReset();
   vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, text: () => Promise.resolve("") }));
