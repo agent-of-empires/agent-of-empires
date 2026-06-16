@@ -45,7 +45,7 @@ import {
 import { useAcpPrefs } from "../../lib/acpPrefs";
 import { AgentProfileProvider, useAgentProfile } from "../../lib/agentProfileContext";
 import { isClearAlias } from "../../lib/agentProfiles";
-import { useApprovalSound } from "../../hooks/useApprovalSound";
+import { AttentionChime } from "./AttentionChime";
 import { useIsCoarsePointer } from "../../hooks/useIsCoarsePointer";
 import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
 import type {
@@ -249,14 +249,6 @@ function AcpChrome({
       text,
     });
 
-  // Browser-side attention chime. Fires once on the 0 -> >=1 edge of the
-  // combined pending approvals + questions count; complements the OS push
-  // (delivered via the SW when the dashboard is backgrounded) and the
-  // in-app toast (when foregrounded). A question arriving while an approval
-  // is already pending does not re-chime, but its OS push still fires on
-  // the live event edge regardless. See #1038, #2146.
-  useApprovalSound(state.pendingApprovals.length + state.pendingElicitations.length);
-
   // Re-pin the chat viewport to the bottom when the composer (or any
   // sibling below it: queued strip, primer banner) grows. assistant-ui's
   // `autoScroll` only re-pins on message updates, not on viewport
@@ -318,6 +310,7 @@ function AcpChrome({
   }
   return (
     <StructuredViewRoot>
+      <AttentionChime approvals={state.pendingApprovals.length} elicitations={state.pendingElicitations.length} />
       <PlanStrip plan={state.plan} />
 
       <RateLimitRecoverySection sessionId={sessionId} currentAgent={state.agent} onPrefill={recoveryHandoffPrefill}>

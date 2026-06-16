@@ -1094,8 +1094,8 @@
       "id": "acp.attention-chime",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/hooks/__tests__/useApprovalSound.test.ts"],
-      "components": ["web/src/components/acp/StructuredView.tsx"]
+      "specs": ["src/components/acp/__tests__/AttentionChime.test.tsx"],
+      "components": ["web/src/components/acp/AttentionChime.tsx", "web/src/components/acp/StructuredView.tsx"]
     },
     {
       "id": "acp.elicitation-card",
