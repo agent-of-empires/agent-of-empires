@@ -40,7 +40,7 @@ import type {
   ToolCall,
 } from "../../lib/acpTypes";
 import { hasTodoItemsArgsText, parseJsonObject } from "../../lib/acpArgs";
-import { DEFAULT_HISTORY_WINDOW, HISTORY_WINDOW_STEP, historyWindowStart } from "../../lib/acpHistoryWindow";
+import { DEFAULT_HISTORY_WINDOW, HISTORY_WINDOW_STEP, historyWindow } from "../../lib/acpHistoryWindow";
 import { useAgentProfile } from "../../lib/agentProfileContext";
 
 interface Props {
@@ -141,25 +141,14 @@ export function AcpRuntime({
     setWindowSessionId(sessionId);
     setVisibleRows(DEFAULT_HISTORY_WINDOW);
   }
-  const historyStart = useMemo(
-    () => historyWindowStart(acp.state.activity, visibleRows),
-    [acp.state.activity, visibleRows],
+  const { start: historyStart, canLoadEarlier } = useMemo(
+    () => historyWindow(acp.state.activity, visibleRows, showClearedTurns),
+    [acp.state.activity, visibleRows, showClearedTurns],
   );
   const windowedActivity = useMemo(
     () => (historyStart === 0 ? acp.state.activity : acp.state.activity.slice(historyStart)),
     [acp.state.activity, historyStart],
   );
-  // Index of the latest `/clear` divider when cleared turns are folded.
-  // Rows before it are already hidden behind the ClearedTurnsBanner, so
-  // "Load earlier" must not offer to reveal them, that click would be a
-  // no-op. See #2144.
-  const lastClearIndex = useMemo(() => {
-    if (showClearedTurns) return -1;
-    for (let i = acp.state.activity.length - 1; i >= 0; i -= 1) {
-      if (acp.state.activity[i]!.kind === "session_cleared") return i;
-    }
-    return -1;
-  }, [acp.state.activity, showClearedTurns]);
 
   // Memoise the activity → ThreadMessageLike conversion. The function
   // walks the activity array, allocates a new AssistantBuilder
@@ -239,7 +228,7 @@ export function AcpRuntime({
         dismissModeSwitchFailed: acp.dismissModeSwitchFailed,
         setConfigOption: acp.setConfigOption,
         dismissConfigOptionSwitchFailed: acp.dismissConfigOptionSwitchFailed,
-        canLoadEarlierHistory: lastClearIndex < 0 ? historyStart > 0 : historyStart > lastClearIndex,
+        canLoadEarlierHistory: canLoadEarlier,
         loadEarlierHistory: () => setVisibleRows((v) => v + HISTORY_WINDOW_STEP),
       })}
     </AssistantRuntimeProvider>

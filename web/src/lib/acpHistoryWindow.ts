@@ -39,3 +39,35 @@ export function historyWindowStart(rows: readonly ActivityRow[], visibleRows: nu
   }
   return cap;
 }
+
+/** Index of the latest `/clear` divider, or -1 when cleared turns are
+ *  shown (folding off) or there is no clear. Rows before it are hidden
+ *  behind the ClearedTurnsBanner, not by the history window. */
+function lastClearedIndex(rows: readonly ActivityRow[], showClearedTurns: boolean): number {
+  if (showClearedTurns) return -1;
+  for (let i = rows.length - 1; i >= 0; i -= 1) {
+    if (rows[i]!.kind === "session_cleared") return i;
+  }
+  return -1;
+}
+
+export interface HistoryWindow {
+  /** Index to start rendering from; 0 renders the whole transcript. */
+  start: number;
+  /** Whether older rows remain that "Load earlier" would actually
+   *  reveal. False when the only hidden rows are pre-`/clear` (those are
+   *  reached via the ClearedTurnsBanner), so the control is not a no-op. */
+  canLoadEarlier: boolean;
+}
+
+/** Resolve the render window for the structured-view transcript. */
+export function historyWindow(
+  rows: readonly ActivityRow[],
+  visibleRows: number,
+  showClearedTurns: boolean,
+): HistoryWindow {
+  const start = historyWindowStart(rows, visibleRows);
+  const clearIndex = lastClearedIndex(rows, showClearedTurns);
+  const canLoadEarlier = clearIndex < 0 ? start > 0 : start > clearIndex;
+  return { start, canLoadEarlier };
+}
