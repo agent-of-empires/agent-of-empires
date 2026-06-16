@@ -190,7 +190,10 @@ fn resolve_config_dir_override(var: &str, host_env: &[String]) -> Option<String>
 ///
 /// Both variants share the SELinux/ACL/xattr-tolerant mode pattern
 /// (`d*------|d*------.|d*------+|d*------@`) and an environment-pinning
-/// preamble (`unset IFS; umask 077; LC_ALL=C ls -ldn`).
+/// preamble (`unset IFS; set -f; umask 077; LC_ALL=C ls -ldn`). The
+/// `set -f` glob disable closes the `set -- $LS` pathname-expansion vector
+/// (no field could expand today, but a future change to the path format
+/// could re-expose it).
 fn hook_command(status: &str, target: HookInstallTarget) -> String {
     let base = match target {
         HookInstallTarget::Host => dir_guard::hook_base_path().display().to_string(),
@@ -221,7 +224,7 @@ fn hook_command_with_base(status: &str, base: &str, target: HookInstallTarget) -
         HookInstallTarget::Sandbox => "",
     };
     format!(
-        "sh -c 'unset IFS; umask 077; \
+        "sh -c 'unset IFS; set -f; umask 077; \
          [ -n \"$AOE_INSTANCE_ID\" ] || exit 0; \
          case \"$AOE_INSTANCE_ID\" in *[!0-9a-zA-Z_-]*) exit 0 ;; esac; \
          B={base}; {parent_check}\
@@ -278,7 +281,7 @@ fn hook_command_session_id_host() -> String {
 
 fn hook_command_session_id_sandbox(base: &str) -> String {
     format!(
-        "sh -c 'unset IFS; umask 077; \
+        "sh -c 'unset IFS; set -f; umask 077; \
          [ -n \"$AOE_INSTANCE_ID\" ] || exit 0; \
          case \"$AOE_INSTANCE_ID\" in *[!0-9a-zA-Z_-]*) exit 0 ;; esac; \
          D=\"{base}/$AOE_INSTANCE_ID\"; mkdir -p \"$D\" 2>/dev/null; \
@@ -3370,6 +3373,7 @@ hooks_auto_accept: false
             "missing instance-id allowlist: {cmd}"
         );
         assert!(cmd.contains("unset IFS"), "missing IFS pin: {cmd}");
+        assert!(cmd.contains("set -f"), "missing globbing pin: {cmd}");
         assert!(cmd.contains("umask 077"), "missing umask pin: {cmd}");
         assert!(
             cmd.contains("LC_ALL=C ls -ldn"),
@@ -3406,6 +3410,9 @@ hooks_auto_accept: false
         let cmd = hook_command_session_id_sandbox("/tmp/aoe-hooks");
         assert!(cmd.contains("case \"$AOE_INSTANCE_ID\" in *[!0-9a-zA-Z_-]*"));
         assert!(cmd.contains("D=\"/tmp/aoe-hooks/$AOE_INSTANCE_ID\""));
+        assert!(cmd.contains("unset IFS"), "missing IFS pin: {cmd}");
+        assert!(cmd.contains("set -f"), "missing globbing pin: {cmd}");
+        assert!(cmd.contains("umask 077"), "missing umask pin: {cmd}");
     }
 
     #[test]
@@ -3553,5 +3560,61 @@ hooks_auto_accept: false
             mode, 0o700,
             "snippet must override caller umask 022 to mkdir 0o700; got {mode:o}"
         );
+    }
+
+    #[test]
+    fn host_shell_set_f_blocks_glob_expansion_in_cwd() {
+        // Belt-and-suspenders functional test: even though `set -- $LS`
+        // would never word-split a glob character today (uid/gid are
+        // integers, the mode glyphs and date format are fixed by
+        // LC_ALL=C, the path is controlled), we plant decoy files in
+        // cwd that any glob expansion would match. With `set -f` in the
+        // preamble, no decoy is touched. A future regression that drops
+        // `set -f` AND introduces a glob vector would surface as a
+        // missing decoy or a hung process.
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("aoe-hooks-glob");
+        std::fs::create_dir(&base).unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let cwd = tmp.path().join("cwd_with_decoys");
+        std::fs::create_dir(&cwd).unwrap();
+        for name in [
+            "glob-decoy-1",
+            "glob-decoy-2",
+            "drwxrwxrwx",
+            "1000",
+            "65534",
+        ] {
+            std::fs::write(cwd.join(name), b"untouched").unwrap();
+        }
+        let cmd =
+            hook_command_with_base("running", base.to_str().unwrap(), HookInstallTarget::Host);
+        let output = std::process::Command::new("sh")
+            .args(["-c", &cmd])
+            .current_dir(&cwd)
+            .env("AOE_INSTANCE_ID", "glob_bait")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "snippet must exit 0");
+        let status_path = base.join("glob_bait").join("status");
+        assert_eq!(
+            std::fs::read_to_string(&status_path).unwrap(),
+            "running",
+            "status file must be written despite cwd full of glob bait"
+        );
+        for name in [
+            "glob-decoy-1",
+            "glob-decoy-2",
+            "drwxrwxrwx",
+            "1000",
+            "65534",
+        ] {
+            assert_eq!(
+                std::fs::read_to_string(cwd.join(name)).unwrap(),
+                "untouched",
+                "decoy {name} must be untouched"
+            );
+        }
     }
 }

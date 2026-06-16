@@ -274,6 +274,16 @@ fn verify_dir_metadata(fd: &OwnedFd, label: &std::path::Path) -> Result<()> {
             label.display()
         );
     }
+    if mode & 0o7000 != 0 {
+        bail!(
+            "{} mode {:o} has setuid/setgid/sticky bits set (expected 0o700). \
+             We never set these on hook directories; presence indicates a hostile \
+             or misconfigured pre-creation. Recover: rm -rf {}",
+            label.display(),
+            mode,
+            label.display()
+        );
+    }
     Ok(())
 }
 
@@ -705,6 +715,48 @@ mod tests {
         let err = with_hook_base(|_| Ok(())).unwrap_err();
         let s = format!("{err:#}");
         assert!(s.contains("mode"), "expected mode rejection, got: {s}");
+    }
+
+    #[test]
+    #[serial(hook_base)]
+    fn init_rejects_setgid_dir() {
+        let (_g, base, _tmp) = BaseGuard::fresh();
+        std::fs::create_dir(&base).unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o2700)).unwrap();
+        let err = with_hook_base(|_| Ok(())).unwrap_err();
+        let s = format!("{err:#}");
+        assert!(
+            s.contains("setuid/setgid/sticky"),
+            "expected setgid rejection, got: {s}"
+        );
+    }
+
+    #[test]
+    #[serial(hook_base)]
+    fn init_rejects_setuid_dir() {
+        let (_g, base, _tmp) = BaseGuard::fresh();
+        std::fs::create_dir(&base).unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o4700)).unwrap();
+        let err = with_hook_base(|_| Ok(())).unwrap_err();
+        let s = format!("{err:#}");
+        assert!(
+            s.contains("setuid/setgid/sticky"),
+            "expected setuid rejection, got: {s}"
+        );
+    }
+
+    #[test]
+    #[serial(hook_base)]
+    fn init_rejects_sticky_dir() {
+        let (_g, base, _tmp) = BaseGuard::fresh();
+        std::fs::create_dir(&base).unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o1700)).unwrap();
+        let err = with_hook_base(|_| Ok(())).unwrap_err();
+        let s = format!("{err:#}");
+        assert!(
+            s.contains("setuid/setgid/sticky"),
+            "expected sticky rejection, got: {s}"
+        );
     }
 
     #[test]
