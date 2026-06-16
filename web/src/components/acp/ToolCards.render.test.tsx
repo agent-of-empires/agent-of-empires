@@ -819,6 +819,21 @@ describe("ToolCards repo-relative paths (#2143)", () => {
     expect(container.textContent).not.toContain("/tmp/src/beta.rs");
   });
 
+  it.each([
+    ["read", "read"],
+    ["edit", "write"],
+    ["delete", "delete"],
+  ])("falls back to (unknown file) for a path-less %s tool", (kind, label) => {
+    const tool = makeToolCall({ id: `${kind}-no-path`, name: "", kind, args_preview: "{}" });
+    const { container } = render(
+      <WrapWithSession session={session}>
+        <ToolCard tool={tool} result={undefined} />
+      </WrapWithSession>,
+    );
+    expect(container.textContent).toContain(label);
+    expect(container.textContent).toContain("(unknown file)");
+  });
+
   it("keeps the absolute path in the title tooltip while showing the relative label", () => {
     const { container } = render(
       <WrapWithSession session={session}>
