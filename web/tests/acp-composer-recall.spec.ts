@@ -110,6 +110,19 @@ test.describe("Structured-view composer queue recall (#2147)", () => {
     await expect(composer).toHaveValue("second queued");
     await expect(page.getByText(/Editing queued message 1 of 2/)).toBeVisible();
 
+    // ArrowDown past the newest restores the stashed (empty) draft and exits.
+    await composer.press("ArrowDown");
+    await expect(composer).toHaveValue("");
+    await expect(page.getByText(/Editing queued message/)).toHaveCount(0);
+
+    // Re-enter and walk to the oldest.
+    await composer.press("ArrowUp");
+    await expect(composer).toHaveValue("second queued");
+    await composer.press("ArrowUp");
+    await expect(composer).toHaveValue("first queued");
+    await expect(page.getByText(/Editing queued message 2 of 2/)).toBeVisible();
+
+    // ArrowUp at the oldest is a no-op (no wrap): stays on the oldest.
     await composer.press("ArrowUp");
     await expect(composer).toHaveValue("first queued");
     await expect(page.getByText(/Editing queued message 2 of 2/)).toBeVisible();
