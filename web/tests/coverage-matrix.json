@@ -680,6 +680,13 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
+      "id": "sidebar.project-row-header",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/__tests__/SidebarGroupHeader.test.tsx"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
       "id": "sidebar.empty-state",
       "kind": "mocked-playwright",
       "risk": "low",

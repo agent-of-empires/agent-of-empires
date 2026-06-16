@@ -1626,7 +1626,7 @@ export function SnoozeModal({
   );
 }
 
-const SidebarGroupHeader = memo(function SidebarGroupHeader({
+export const SidebarGroupHeader = memo(function SidebarGroupHeader({
   group,
   hasActiveChild,
   onClick,
