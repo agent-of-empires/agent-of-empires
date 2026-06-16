@@ -1155,11 +1155,17 @@
       "id": "acp.elicitation-answer",
       "kind": "vitest",
       "risk": "high",
-      "specs": ["src/lib/acpTypes.reducer.test.ts", "src/hooks/__tests__/useAcpResolveApproval.test.ts"],
+      "specs": [
+        "src/lib/acpTypes.reducer.test.ts",
+        "src/hooks/__tests__/useAcpResolveApproval.test.ts",
+        "src/components/acp/ElicitationAnswerCard.test.tsx"
+      ],
       "components": [
         "web/src/lib/acpTypes.ts",
         "web/src/hooks/useAcpSession.ts",
-        "web/src/components/acp/AcpRuntime.tsx"
+        "web/src/components/acp/AcpRuntime.tsx",
+        "web/src/components/acp/ElicitationAnswerCard.tsx",
+        "web/src/components/acp/StructuredView.tsx"
       ]
     },
     {

@@ -263,6 +263,22 @@ export interface ElicitationAnswer {
   answer: string;
 }
 
+/** Narrow a message-metadata payload to a non-empty answer list, so
+ *  UserText can pick the card over the plain-text fallback. */
+export function isElicitationAnswersPayload(value: unknown): value is ElicitationAnswer[] {
+  return (
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.every(
+      (x) =>
+        typeof x === "object" &&
+        x !== null &&
+        typeof (x as ElicitationAnswer).question === "string" &&
+        typeof (x as ElicitationAnswer).answer === "string",
+    )
+  );
+}
+
 /** Render a submitted answer value for display. Selects carry the option
  *  value, which for AskUserQuestion is already the clean label. */
 function renderAnswerValue(value: AnswerValue): string {
