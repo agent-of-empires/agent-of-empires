@@ -14,6 +14,86 @@
 //! visible session title is what gains meaning here.
 
 use crate::agents;
+use crate::session::civilizations::is_default_civ_name;
+use serde::Serialize;
+
+/// Per-session smart-rename state surfaced to the dashboard so the sidebar can
+/// show that a session will be (or is being) auto-named. `Inactive` for
+/// sessions that are not eligible or already renamed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SmartRenameState {
+    #[default]
+    Inactive,
+    /// Eligible and still default-named: will auto-name on the next prompt.
+    Pending,
+    /// A one-shot title call is in flight for this session right now.
+    Running,
+}
+
+/// Why a session is not eligible for smart rename, for logging and to gate the
+/// `Pending` indicator. The same predicate drives both the runtime gate and the
+/// sidebar state so they cannot drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipReason {
+    NotStructured,
+    Disabled,
+    NameNotDefault,
+    Sandboxed,
+    NoOneshot,
+    CommandOverridden,
+}
+
+impl SkipReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SkipReason::NotStructured => "not_structured",
+            SkipReason::Disabled => "disabled",
+            SkipReason::NameNotDefault => "name_not_default",
+            SkipReason::Sandboxed => "sandboxed",
+            SkipReason::NoOneshot => "no_oneshot",
+            SkipReason::CommandOverridden => "command_overridden",
+        }
+    }
+}
+
+/// Single source of truth for "is this session eligible to be auto-named right
+/// now". `Ok(())` means a first prompt would trigger a rename; `Err` carries the
+/// disqualifying reason. `command_override_in_cfg` is whether the profile config
+/// replaces this agent's binary; `command` is the instance's launch command (a
+/// non-empty value differing from the agent binary is also an override).
+pub fn check_eligible(
+    structured: bool,
+    setting_on: bool,
+    title: &str,
+    agent: Option<&agents::AgentDef>,
+    sandboxed: bool,
+    command: &str,
+    command_override_in_cfg: bool,
+) -> Result<(), SkipReason> {
+    if !structured {
+        return Err(SkipReason::NotStructured);
+    }
+    if !setting_on {
+        return Err(SkipReason::Disabled);
+    }
+    if !is_default_civ_name(title) {
+        return Err(SkipReason::NameNotDefault);
+    }
+    if sandboxed {
+        return Err(SkipReason::Sandboxed);
+    }
+    let Some(agent) = agent else {
+        return Err(SkipReason::NoOneshot);
+    };
+    if agent.oneshot_flag.is_none() {
+        return Err(SkipReason::NoOneshot);
+    }
+    if command_override_in_cfg || (!command.is_empty() && command != agent.binary) {
+        return Err(SkipReason::CommandOverridden);
+    }
+    Ok(())
+}
 
 /// Hard cap on how much of the user's first message is handed to the one-shot
 /// call. A title needs only the opening intent, and very large argv values can
@@ -91,9 +171,7 @@ pub fn sanitize_title(raw: &str, user_message: &str) -> Option<String> {
 fn clean_line(line: &str) -> String {
     let mut s = line.trim();
     // Leading markdown markers: bullets, headings, blockquote.
-    s = s
-        .trim_start_matches(|c| matches!(c, '#' | '-' | '*' | '>' | '+'))
-        .trim_start();
+    s = s.trim_start_matches(['#', '-', '*', '>', '+']).trim_start();
     // Leading list numbering like "1." or "2)".
     let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
     if !digits.is_empty() {
@@ -103,9 +181,9 @@ fn clean_line(line: &str) -> String {
         }
     }
     // Wrapping quotes / backticks / stray markdown emphasis.
-    let s = s.trim_matches(|c| matches!(c, '"' | '\'' | '`' | '*' | '_'));
+    let s = s.trim_matches(['"', '\'', '`', '*', '_']);
     // Trailing sentence punctuation.
-    let s = s.trim_end_matches(|c: char| matches!(c, '.' | ',' | ':' | ';' | '!'));
+    let s = s.trim_end_matches(['.', ',', ':', ';', '!']);
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -165,7 +243,6 @@ pub use serve::try_smart_rename;
 mod serve {
     use super::*;
     use crate::server::AppState;
-    use crate::session::civilizations::is_default_civ_name;
     use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -211,7 +288,7 @@ mod serve {
             return;
         }
 
-        let Some((profile, tool, command, project_path, sandboxed, title)) = ({
+        let Some((profile, tool, command, project_path, sandboxed, title, structured)) = ({
             let instances = state.instances.read().await;
             instances.iter().find(|i| i.id == session_id).map(|i| {
                 (
@@ -221,42 +298,29 @@ mod serve {
                     i.project_path.clone(),
                     i.is_sandboxed(),
                     i.title.clone(),
+                    i.is_structured(),
                 )
             })
         }) else {
             return;
         };
 
-        if !is_default_civ_name(&title) {
-            return;
-        }
-        if sandboxed {
-            tracing::debug!(target: "smart_rename", session = %session_id, "skip: sandboxed session (host one-shot lacks container auth)");
-            return;
-        }
-
         let config = crate::session::profile_config::resolve_config_or_warn(&profile);
-        if !config.session.smart_rename {
+        let agent = agents::get_agent(&tool);
+        let command_override_in_cfg = config.session.agent_command_override.contains_key(&tool);
+        if let Err(reason) = check_eligible(
+            structured,
+            config.session.smart_rename,
+            &title,
+            agent,
+            sandboxed,
+            &command,
+            command_override_in_cfg,
+        ) {
+            tracing::debug!(target: "smart_rename", session = %session_id, tool = %tool, reason = reason.as_str(), "skip");
             return;
         }
-
-        let Some(agent) = agents::get_agent(&tool) else {
-            tracing::debug!(target: "smart_rename", session = %session_id, tool = %tool, "skip: no built-in agent");
-            return;
-        };
-        if agent.oneshot_flag.is_none() {
-            tracing::debug!(target: "smart_rename", session = %session_id, tool = %tool, "skip: agent has no one-shot mode");
-            return;
-        }
-
-        // A replaced binary (config override or a custom instance command) makes
-        // appending the one-shot token unsafe, so bail rather than guess.
-        let overridden = config.session.agent_command_override.contains_key(&tool)
-            || (!command.is_empty() && command != agent.binary);
-        if overridden {
-            tracing::debug!(target: "smart_rename", session = %session_id, tool = %tool, "skip: agent command overridden");
-            return;
-        }
+        let agent = agent.expect("check_eligible Ok implies a built-in agent");
 
         let Some(_guard) = InflightGuard::acquire(&state.smart_rename_inflight, &session_id) else {
             return;
@@ -386,6 +450,56 @@ mod tests {
     fn argv_none_for_agent_without_oneshot() {
         let cursor = agents::get_agent("cursor").expect("cursor agent exists");
         assert!(build_oneshot_argv(cursor, "hello").is_none());
+    }
+
+    #[test]
+    fn check_eligible_reasons() {
+        let c = Some(claude());
+        // Happy path.
+        assert!(check_eligible(true, true, "Vikings", c, false, "", false).is_ok());
+        // Each disqualifier maps to its reason.
+        assert_eq!(
+            check_eligible(false, true, "Vikings", c, false, "", false),
+            Err(SkipReason::NotStructured)
+        );
+        assert_eq!(
+            check_eligible(true, false, "Vikings", c, false, "", false),
+            Err(SkipReason::Disabled)
+        );
+        assert_eq!(
+            check_eligible(true, true, "Fix login bug", c, false, "", false),
+            Err(SkipReason::NameNotDefault)
+        );
+        assert_eq!(
+            check_eligible(true, true, "Vikings", c, true, "", false),
+            Err(SkipReason::Sandboxed)
+        );
+        assert_eq!(
+            check_eligible(true, true, "Vikings", None, false, "", false),
+            Err(SkipReason::NoOneshot)
+        );
+        assert_eq!(
+            check_eligible(
+                true,
+                true,
+                "Vikings",
+                Some(agents::get_agent("cursor").unwrap()),
+                false,
+                "",
+                false
+            ),
+            Err(SkipReason::NoOneshot)
+        );
+        assert_eq!(
+            check_eligible(true, true, "Vikings", c, false, "", true),
+            Err(SkipReason::CommandOverridden)
+        );
+        assert_eq!(
+            check_eligible(true, true, "Vikings", c, false, "my-wrapper", false),
+            Err(SkipReason::CommandOverridden)
+        );
+        // Command equal to the agent binary is not an override.
+        assert!(check_eligible(true, true, "Vikings", c, false, "claude", false).is_ok());
     }
 
     #[test]
