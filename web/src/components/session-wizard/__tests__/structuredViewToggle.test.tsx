@@ -65,7 +65,12 @@ const custom: AgentInfo = {
   install_hint: "Configured custom agent",
 };
 
-function renderAgentStep(overrides: { tool?: string; agents?: AgentInfo[]; useStructuredView?: boolean }) {
+function renderAgentStep(overrides: {
+  tool?: string;
+  agents?: AgentInfo[];
+  useStructuredView?: boolean;
+  sandboxEnabled?: boolean;
+}) {
   const onChange = vi.fn();
   const utils = render(
     <AgentStep
@@ -73,11 +78,12 @@ function renderAgentStep(overrides: { tool?: string; agents?: AgentInfo[]; useSt
         ...initialData,
         tool: overrides.tool ?? "claude",
         useStructuredView: overrides.useStructuredView ?? true,
+        sandboxEnabled: overrides.sandboxEnabled ?? false,
       }}
       onChange={onChange}
       agents={overrides.agents ?? [claude, nonAcpBuiltin, custom]}
       profiles={[] as ProfileInfo[]}
-      dockerAvailable={false}
+      dockerAvailable={overrides.sandboxEnabled ?? false}
       onApplyProfileDefaults={() => {}}
     />,
   );
@@ -107,6 +113,12 @@ describe("AgentStep structured-view view card", () => {
     const { onChange, getByText } = renderAgentStep({ tool: "claude" });
     fireEvent.click(getByText("Structured view"));
     expect(onChange).toHaveBeenCalledWith("useStructuredView", false);
+  });
+
+  it("shows the sandboxed-structured-view copy when both are on", () => {
+    // Structured view + container takes a distinct description branch (#2101).
+    const { getByText } = renderAgentStep({ tool: "claude", sandboxEnabled: true });
+    expect(getByText(/the agent runs inside the sandbox container/)).toBeTruthy();
   });
 
   it("reflects useStructuredView=false as an unchecked switch", () => {
