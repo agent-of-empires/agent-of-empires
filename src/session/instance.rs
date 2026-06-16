@@ -102,10 +102,6 @@ pub enum StartOutcome {
     /// observed an explicit invalid-resume signal. The sid was preserved and
     /// marked so startup recovery does not retry it automatically.
     ResumeFailed { sid: String },
-    /// Resume was explicitly invalidated, the bad sid was cleared, and a
-    /// fresh start succeeded. Caller should surface this: the user's prior
-    /// conversation is gone. `stale_sid` is the sid that was cleared.
-    Restarted { stale_sid: String },
     /// No resume cascade ran. Either no prior sid, the agent doesn't support
     /// resume, the sid was invalid, the session is structured view-mode (no tmux
     /// pane), or the tmux session was already alive when entered (so
@@ -177,15 +173,11 @@ pub enum EnsureReadyOutcome {
     /// Pane was already alive; no action taken.
     AlreadyAlive,
     /// Pane was dead (`#{pane_dead}=1`) and was respawned via the restart path.
-    /// `stale_sid` is `Some` only when a resume target was explicitly reset
-    /// before a fresh launch; ambiguous probe failures use `ResumeFailed`.
-    Respawned { stale_sid: Option<String> },
+    Respawned,
     /// Tmux session did not exist and was started via the resume-fallback
-    /// path. `stale_sid` is `Some` only when a resume target was explicitly
-    /// invalidated before a fresh launch; ambiguous probe failures use
-    /// `ResumeFailed` instead. `None` means healthy resume or fresh launch
-    /// without resume. Same surface-to-user contract as `Respawned`.
-    Started { stale_sid: Option<String> },
+    /// path. Healthy resume and fresh launch both use this outcome;
+    /// ambiguous probe failures use `ResumeFailed` instead.
+    Started,
     /// Resume failed ambiguously while trying to start or respawn the pane.
     /// The durable sid remains stored for an explicit retry.
     ResumeFailed { sid: String },
@@ -912,20 +904,13 @@ impl Instance {
         self.sandbox_info = src.sandbox_info.clone();
     }
 
-    /// Same fields as `merge_post_start`. When `stale_sid` is `Some`, an
-    /// explicit resume reset just invalidated that exact sid; replace
-    /// `self.agent_session_id` only if it still matches the stale value, so
-    /// a peer poller's freshly-discovered sid (landed between phase 2 and
-    /// phase 3 of the restart) survives intact.
-    pub fn merge_post_restart(&mut self, src: &Self, stale_sid: Option<&str>) {
+    /// Same fields as `merge_post_start`. Resume-probe failure markers are
+    /// copied only when the sid still matches so peer poller writes that land
+    /// between phase 2 and phase 3 of the restart remain authoritative.
+    pub fn merge_post_restart(&mut self, src: &Self) {
         self.merge_post_start(src);
         if self.agent_session_id == src.agent_session_id {
             self.resume_probe_failed_sid = src.resume_probe_failed_sid.clone();
-        }
-        if let Some(stale) = stale_sid {
-            if self.agent_session_id.as_deref() == Some(stale) {
-                self.agent_session_id = src.agent_session_id.clone();
-            }
         }
     }
 
@@ -3100,29 +3085,27 @@ impl Instance {
             let outcome = self
                 .start_with_resume_fallback(size, false)
                 .map_err(EnsureReadyError::Tmux)?;
-            let stale_sid = match outcome {
-                StartOutcome::Restarted { stale_sid } => Some(stale_sid),
+            match outcome {
                 StartOutcome::ResumeFailed { sid } => {
                     return Ok(EnsureReadyOutcome::ResumeFailed { sid });
                 }
-                StartOutcome::Resumed | StartOutcome::Fresh => None,
-            };
+                StartOutcome::Resumed | StartOutcome::Fresh => {}
+            }
             self.wait_for_pane_ready(&session);
-            return Ok(EnsureReadyOutcome::Started { stale_sid });
+            return Ok(EnsureReadyOutcome::Started);
         }
         if session.is_pane_dead() {
             let outcome = self
                 .restart_with_size(size)
                 .map_err(EnsureReadyError::Tmux)?;
-            let stale_sid = match outcome {
-                StartOutcome::Restarted { stale_sid } => Some(stale_sid),
+            match outcome {
                 StartOutcome::ResumeFailed { sid } => {
                     return Ok(EnsureReadyOutcome::ResumeFailed { sid });
                 }
-                StartOutcome::Resumed | StartOutcome::Fresh => None,
-            };
+                StartOutcome::Resumed | StartOutcome::Fresh => {}
+            }
             self.wait_for_pane_ready(&session);
-            return Ok(EnsureReadyOutcome::Respawned { stale_sid });
+            return Ok(EnsureReadyOutcome::Respawned);
         }
         Ok(EnsureReadyOutcome::AlreadyAlive)
     }
@@ -3967,7 +3950,7 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_post_restart_no_fallback_preserves_sid() {
+    fn test_merge_post_restart_preserves_peer_sid() {
         let mut stored = Instance::new("session", "/tmp/test");
         stored.agent_session_id = Some("peer-fresh-sid".to_string());
         stored.snooze(15);
@@ -3977,51 +3960,62 @@ mod tests {
         working.status = Status::Idle;
         working.agent_session_id = Some("phase1-stale-sid".to_string());
 
-        stored.merge_post_restart(&working, None);
+        stored.merge_post_restart(&working);
 
         assert_eq!(stored.status, Status::Idle);
         assert_eq!(
             stored.agent_session_id.as_deref(),
             Some("peer-fresh-sid"),
-            "no-fallback restart must not clobber peer sid write"
+            "restart merge must not clobber peer sid write"
         );
         assert!(stored.is_snoozed(), "peer snooze must survive merge");
     }
 
     #[test]
-    fn test_merge_post_restart_fallback_clears_matching_sid() {
+    fn test_merge_post_restart_copies_resume_failed_marker_when_sid_matches() {
         let mut stored = Instance::new("session", "/tmp/test");
-        stored.agent_session_id = Some("phase1-stale-sid".to_string());
+        stored.agent_session_id = Some("failed-sid".to_string());
+        stored.resume_probe_failed_sid = None;
 
         let mut working = Instance::new("session", "/tmp/test");
         working.id = stored.id.clone();
-        working.status = Status::Starting;
-        working.agent_session_id = None;
+        working.status = Status::Error;
+        working.agent_session_id = Some("failed-sid".to_string());
+        working.resume_probe_failed_sid = Some("failed-sid".to_string());
 
-        stored.merge_post_restart(&working, Some("phase1-stale-sid"));
+        stored.merge_post_restart(&working);
 
-        assert!(
-            stored.agent_session_id.is_none(),
-            "stored sid still equals stale; cascade invalidation propagates"
+        assert_eq!(stored.status, Status::Error);
+        assert_eq!(stored.agent_session_id.as_deref(), Some("failed-sid"));
+        assert_eq!(
+            stored.resume_probe_failed_sid.as_deref(),
+            Some("failed-sid")
         );
     }
 
     #[test]
-    fn test_merge_post_restart_preserves_poller_sid_landed_during_phase_2() {
+    fn test_merge_post_restart_preserves_peer_marker_when_sid_mismatches() {
         let mut stored = Instance::new("session", "/tmp/test");
         stored.agent_session_id = Some("poller-fresh-sid".to_string());
+        stored.resume_probe_failed_sid = Some("poller-fresh-sid".to_string());
 
         let mut working = Instance::new("session", "/tmp/test");
         working.id = stored.id.clone();
         working.status = Status::Starting;
-        working.agent_session_id = None;
+        working.agent_session_id = Some("phase1-stale-sid".to_string());
+        working.resume_probe_failed_sid = Some("phase1-stale-sid".to_string());
 
-        stored.merge_post_restart(&working, Some("phase1-stale-sid"));
+        stored.merge_post_restart(&working);
 
         assert_eq!(
             stored.agent_session_id.as_deref(),
             Some("poller-fresh-sid"),
-            "poller wrote a fresh sid between phase 2 and phase 3; CAS preserves it"
+            "poller wrote a fresh sid between phase 2 and phase 3; merge preserves it"
+        );
+        assert_eq!(
+            stored.resume_probe_failed_sid.as_deref(),
+            Some("poller-fresh-sid"),
+            "marker for peer sid remains authoritative"
         );
     }
 

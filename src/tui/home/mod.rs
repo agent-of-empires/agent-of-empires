@@ -2759,15 +2759,6 @@ impl HomeView {
                                 "resumed",
                             );
                         }
-                        Ok(crate::session::StartOutcome::Restarted { stale_sid }) => {
-                            tracing::warn!(
-                                target: "session.startup_recovery",
-                                id = %instance_id,
-                                %title,
-                                %stale_sid,
-                                "restarted fresh after explicit resume reset",
-                            );
-                        }
                         Ok(crate::session::StartOutcome::ResumeFailed { sid }) => {
                             tracing::warn!(
                                 target: "session.startup_recovery",
@@ -4079,10 +4070,7 @@ impl HomeView {
     /// the keystrokes. Errors are surfaced via `info_dialog` so the caller
     /// (`execute_action`) only has to clear its transient status.
     ///
-    /// Returns `Some(stale_sid)` when the resume-fallback cascade fired
-    /// during the implicit respawn so the caller can toast the user about
-    /// the lost history; `None` otherwise.
-    pub fn execute_send_message(&mut self, session_id: &str, message: &str) -> Option<String> {
+    pub fn execute_send_message(&mut self, session_id: &str, message: &str) {
         let target = std::mem::replace(
             &mut self.pending_send_target,
             live_send::LiveSendTarget::Agent,
@@ -4095,32 +4083,26 @@ impl HomeView {
         // live-send does (see `ensure_pane_ready_with_size`): otherwise it
         // boots at tmux's 80x24 default and runs narrow until something
         // resizes it.
-        let stale_sid = match target {
+        match target {
             live_send::LiveSendTarget::Agent => {
                 let outcome = self.try_mutate_instance_writeback_on_err(session_id, |inst| {
                     inst.ensure_pane_ready_with_size(size).map_err(Into::into)
                 });
                 match outcome {
-                    Ok(Some(EnsureReadyOutcome::Respawned {
-                        stale_sid: Some(sid),
-                    }))
-                    | Ok(Some(EnsureReadyOutcome::Started {
-                        stale_sid: Some(sid),
-                    })) => Some(sid),
                     Ok(Some(EnsureReadyOutcome::ResumeFailed { sid })) => {
                         self.info_dialog = Some(InfoDialog::new(
                             "Send Failed",
                             &format!("Resume failed for sid {sid}; preserved for explicit retry"),
                         ));
-                        return None;
+                        return;
                     }
-                    Ok(_) => None,
+                    Ok(_) => {}
                     Err(err) => {
                         self.info_dialog = Some(InfoDialog::new(
                             "Send Failed",
                             &format!("Cannot prepare session: {}", err),
                         ));
-                        return None;
+                        return;
                     }
                 }
             }
@@ -4130,9 +4112,8 @@ impl HomeView {
                         "Send Failed",
                         &format!("Cannot prepare terminal: {}", e),
                     ));
-                    return None;
+                    return;
                 }
-                None
             }
             live_send::LiveSendTarget::ContainerTerminal => {
                 if let Err(e) = self.ensure_container_terminal_pane_ready(session_id, size) {
@@ -4140,12 +4121,13 @@ impl HomeView {
                         "Send Failed",
                         &format!("Cannot prepare container terminal: {}", e),
                     ));
-                    return None;
+                    return;
                 }
-                None
             }
         };
-        let inst = self.get_instance(session_id)?;
+        let Some(inst) = self.get_instance(session_id) else {
+            return;
+        };
         let tmux_session = match target {
             live_send::LiveSendTarget::Agent => {
                 match crate::tmux::Session::new(&inst.id, &inst.title) {
@@ -4155,7 +4137,7 @@ impl HomeView {
                             "Send Failed",
                             &format!("Failed to resolve session: {}", e),
                         ));
-                        return None;
+                        return;
                     }
                 }
             }
@@ -4178,7 +4160,7 @@ impl HomeView {
                 "Send Failed",
                 &format!("Failed to send message: {}", e),
             ));
-            return None;
+            return;
         }
         self.stamp_last_accessed(session_id);
         if let Err(e) = self.save() {
@@ -4188,7 +4170,6 @@ impl HomeView {
             self.select_top_attention(None);
             self.selected_session = None;
         }
-        stale_sid
     }
 
     /// Size to boot a cold/dead agent pane at on live-send entry: the visible
@@ -4227,11 +4208,9 @@ impl HomeView {
     /// the post-toast frame, and the agent's first capture rendered
     /// shifted up.
     ///
-    /// Returns `Ok(Some(stale_sid))` when the resume-fallback cascade
-    /// fired during respawn, `Ok(None)` on a clean ready, and `Err(())`
-    /// if the pane could not be readied (`info_dialog` is set with the
-    /// underlying error so the caller only has to clear its toast).
-    pub fn prepare_live_send(&mut self, session_id: &str) -> Result<Option<String>, ()> {
+    /// Returns `Err(())` if the pane could not be readied (`info_dialog` is
+    /// set with the underlying error so the caller only has to clear its toast).
+    pub fn prepare_live_send(&mut self, session_id: &str) -> Result<(), ()> {
         let target = self.pending_live_send_target;
         self.pending_live_send_target = live_send::LiveSendTarget::Agent;
         let size = crate::terminal::get_size();
@@ -4248,19 +4227,13 @@ impl HomeView {
         // lost, leaves the pane pinned at ~50% width until live mode is
         // re-entered. See `Instance::ensure_pane_ready_with_size`.
         let agent_boot_size = self.live_send_boot_size();
-        let stale_sid = match target {
+        match target {
             live_send::LiveSendTarget::Agent => {
                 let outcome = self.try_mutate_instance_writeback_on_err(session_id, |inst| {
                     inst.ensure_pane_ready_with_size(agent_boot_size)
                         .map_err(Into::into)
                 });
                 match outcome {
-                    Ok(Some(EnsureReadyOutcome::Respawned {
-                        stale_sid: Some(sid),
-                    }))
-                    | Ok(Some(EnsureReadyOutcome::Started {
-                        stale_sid: Some(sid),
-                    })) => Some(sid),
                     Ok(Some(EnsureReadyOutcome::ResumeFailed { sid })) => {
                         self.info_dialog = Some(InfoDialog::new(
                             "Live send failed",
@@ -4268,7 +4241,7 @@ impl HomeView {
                         ));
                         return Err(());
                     }
-                    Ok(_) => None,
+                    Ok(_) => {}
                     Err(err) => {
                         self.info_dialog = Some(InfoDialog::new(
                             "Live send failed",
@@ -4286,7 +4259,6 @@ impl HomeView {
                     ));
                     return Err(());
                 }
-                None
             }
             live_send::LiveSendTarget::ContainerTerminal => {
                 if let Err(e) = self.ensure_container_terminal_pane_ready(session_id, size) {
@@ -4296,7 +4268,6 @@ impl HomeView {
                     ));
                     return Err(());
                 }
-                None
             }
         };
         let inst = match self.get_instance(session_id) {
@@ -4443,7 +4414,7 @@ impl HomeView {
         // preview dedup so exiting re-asserts the preview geometry cleanly.
         self.preview_pane_synced = None;
         self.stamp_last_accessed(session_id);
-        Ok(stale_sid)
+        Ok(())
     }
 
     /// Synchronously resize the live-send pane to match `self.preview_pane_area`,

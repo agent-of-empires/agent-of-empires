@@ -7,10 +7,6 @@ use std::collections::HashSet;
 
 use crate::session::{GroupTree, StartOutcome, Storage};
 
-pub(crate) fn stale_history_suffix(stale_sid: &str) -> String {
-    format!(" (resume target {stale_sid} was reset; started fresh, prior history not loaded)")
-}
-
 #[derive(Subcommand)]
 pub enum SessionCommands {
     /// Start a session's tmux process
@@ -580,28 +576,21 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
         });
     }
 
-    let mut succeeded: Vec<(String, String, Option<String>)> = Vec::new();
+    let mut succeeded: Vec<(String, String)> = Vec::new();
     let mut failed: Vec<(String, String)> = Vec::new();
-    let mut restarted: Vec<(crate::session::Instance, Option<String>)> = Vec::new();
+    let mut restarted: Vec<crate::session::Instance> = Vec::new();
     while let Some(joined) = join_set.join_next().await {
         let (title, inst_opt, result) = joined.expect("JoinSet shouldn't panic on join itself");
-        let stale_sid = match &result {
-            Ok(StartOutcome::Restarted { stale_sid }) => Some(stale_sid.clone()),
-            _ => None,
-        };
         let id = inst_opt.as_ref().map(|i| i.id.clone()).unwrap_or_default();
         if let Some(inst) = inst_opt {
-            restarted.push((inst, stale_sid.clone()));
+            restarted.push(inst);
         }
         match result {
-            Ok(StartOutcome::Restarted { stale_sid }) => {
-                succeeded.push((id, title, Some(stale_sid)))
-            }
             Ok(StartOutcome::ResumeFailed { sid }) => failed.push((
                 title,
                 format!("resume failed for sid {sid}; preserved for explicit retry"),
             )),
-            Ok(StartOutcome::Resumed | StartOutcome::Fresh) => succeeded.push((id, title, None)),
+            Ok(StartOutcome::Resumed | StartOutcome::Fresh) => succeeded.push((id, title)),
             Err(e) => failed.push((title, e.to_string())),
         }
     }
@@ -613,9 +602,9 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
     // closure receives the latest disk state.
     let orphaned: Vec<(String, String)> = storage.update(|instances, _groups| {
         let mut orphaned = Vec::new();
-        for (restarted_inst, stale_sid) in restarted {
+        for restarted_inst in restarted {
             if let Some(stored) = instances.iter_mut().find(|i| i.id == restarted_inst.id) {
-                stored.merge_post_restart(&restarted_inst, stale_sid.as_deref());
+                stored.merge_post_restart(&restarted_inst);
             } else {
                 tracing::warn!(
                     target: "session.cli",
@@ -630,24 +619,11 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
 
     // Sessions can share a title across paths; orphan filter keys on id.
     let orphaned_ids: HashSet<&String> = orphaned.iter().map(|(id, _)| id).collect();
-    succeeded.retain(|(id, _, _)| !orphaned_ids.contains(id));
+    succeeded.retain(|(id, _)| !orphaned_ids.contains(id));
 
-    let stale_count = succeeded.iter().filter(|(_, _, s)| s.is_some()).count();
-    if stale_count == 0 {
-        println!("✓ Restarted {}/{} sessions:", succeeded.len(), total);
-    } else {
-        println!(
-            "✓ Restarted {}/{} sessions ({} after explicit resume reset):",
-            succeeded.len(),
-            total,
-            stale_count,
-        );
-    }
-    for (_id, title, stale) in &succeeded {
-        match stale {
-            Some(sid) => println!("  · {}{}", title, stale_history_suffix(sid)),
-            None => println!("  · {}", title),
-        }
+    println!("✓ Restarted {}/{} sessions:", succeeded.len(), total);
+    for (_id, title) in &succeeded {
+        println!("  · {}", title);
     }
     if !orphaned.is_empty() {
         println!(
@@ -745,13 +721,9 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
 
     // touch_last_accessed runs on `stored`, not `working`: its fields are
     // peer-mutable and do not belong in `merge_post_restart`.
-    let stale_sid = match &outcome {
-        StartOutcome::Restarted { stale_sid } => Some(stale_sid.as_str()),
-        StartOutcome::ResumeFailed { .. } | StartOutcome::Resumed | StartOutcome::Fresh => None,
-    };
     let landed = storage.update(|instances, _groups| {
         if let Some(stored) = instances.iter_mut().find(|i| i.id == session_id) {
-            stored.merge_post_restart(&working, stale_sid);
+            stored.merge_post_restart(&working);
             if wake_succeeded {
                 stored.touch_last_accessed();
             }
@@ -773,13 +745,6 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     }
 
     match outcome {
-        StartOutcome::Restarted { stale_sid } => {
-            println!(
-                "✓ Restarted session: {}{}",
-                title,
-                stale_history_suffix(&stale_sid),
-            );
-        }
         StartOutcome::ResumeFailed { sid } => {
             bail!("Resume failed for sid {sid}; preserved for explicit retry");
         }
@@ -1549,35 +1514,6 @@ mod target_filter_tests {
     #[test]
     fn empty_input_yields_empty_targets() {
         assert!(pick_targets_for_restart_all(&[]).is_empty());
-    }
-}
-
-#[cfg(test)]
-mod stale_history_suffix_tests {
-    use super::stale_history_suffix;
-
-    #[test]
-    fn matches_single_session_wording() {
-        let suffix = stale_history_suffix("11111111-1111-1111-1111-111111111111");
-        assert_eq!(
-            suffix,
-            " (resume target 11111111-1111-1111-1111-111111111111 was reset; \
-             started fresh, prior history not loaded)"
-        );
-    }
-
-    #[test]
-    fn renders_inline_with_title_correctly() {
-        let line = format!(
-            "  · {}{}",
-            "alpha",
-            stale_history_suffix("22222222-2222-2222-2222-222222222222"),
-        );
-        assert_eq!(
-            line,
-            "  · alpha (resume target 22222222-2222-2222-2222-222222222222 was reset; \
-             started fresh, prior history not loaded)"
-        );
     }
 }
 

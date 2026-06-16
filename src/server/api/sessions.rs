@@ -3908,7 +3908,6 @@ pub async fn ensure_session(
             }
             let resume_outcome = match &outcome {
                 crate::session::StartOutcome::Resumed => "resumed",
-                crate::session::StartOutcome::Restarted { .. } => "restarted",
                 crate::session::StartOutcome::ResumeFailed { .. } => "resume_failed",
                 crate::session::StartOutcome::Fresh => "fresh",
             };
@@ -3916,9 +3915,6 @@ pub async fn ensure_session(
                 "status": "restarted",
                 "resume_outcome": resume_outcome,
             });
-            if let crate::session::StartOutcome::Restarted { stale_sid } = &outcome {
-                body["stale_session_id"] = serde_json::Value::String(stale_sid.clone());
-            }
             if let crate::session::StartOutcome::ResumeFailed { sid } = &outcome {
                 body["status"] = serde_json::Value::String("resume_failed".to_string());
                 body["error"] = serde_json::Value::String("resume_failed".to_string());
@@ -6246,29 +6242,14 @@ pub async fn send_message(
                     }
                 }
             });
-            let mut body = serde_json::json!({"sent": true});
-            let stale_sid = match &outcome {
-                EnsureReadyOutcome::Respawned {
-                    stale_sid: Some(sid),
-                }
-                | EnsureReadyOutcome::Started {
-                    stale_sid: Some(sid),
-                } => Some(sid.clone()),
-                _ => None,
-            };
-            if let Some(sid) = stale_sid {
-                body["stale_session_id"] = serde_json::Value::String(sid);
-            }
-            (StatusCode::OK, Json(body)).into_response()
+            (StatusCode::OK, Json(serde_json::json!({"sent": true}))).into_response()
         }
         Ok(Err(boxed)) => {
             let (started, outcome, send_err) = *boxed;
             // ensure_pane_ready did mutate state when the outcome is
-            // anything other than AlreadyAlive. The cascade itself only
-            // runs in `Respawned { stale_sid: Some(_) }`, but `Started`
-            // and `Respawned { stale_sid: None }` also touch fields the
-            // live entry needs to reflect (fresh sid from acquire,
-            // last_start_time, etc.). Sync only when work happened.
+            // anything other than AlreadyAlive. `Started` and `Respawned`
+            // touch fields the live entry needs to reflect (fresh sid from
+            // acquire, last_start_time, etc.). Sync only when work happened.
             let did_work = !matches!(outcome, EnsureReadyOutcome::AlreadyAlive);
             match send_err {
                 SendKeysError::NotRunning => {
