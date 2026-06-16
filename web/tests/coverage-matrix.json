@@ -368,7 +368,12 @@
       "kind": "mocked-playwright",
       "risk": "high",
       "specs": ["tests/profiles-page.spec.ts"],
-      "components": ["web/src/components/profiles/ProfilesPage.tsx"]
+      "components": [
+        "web/src/components/profiles/ProfilesSection.tsx",
+        "web/src/components/SettingsView.tsx",
+        "web/src/App.tsx",
+        "web/src/components/WorkspaceSidebar.tsx"
+      ]
     },
     {
       "id": "profiles.hooks-readonly",
@@ -381,15 +386,15 @@
       "id": "profiles.write-guard",
       "kind": "vitest",
       "risk": "high",
-      "specs": ["src/lib/api.test.ts", "src/components/profiles/__tests__/ProfilesPage.test.tsx"],
-      "components": ["web/src/components/profiles/ProfilesPage.tsx"]
+      "specs": ["src/lib/api.test.ts", "src/components/profiles/__tests__/ProfilesSection.test.tsx"],
+      "components": ["web/src/components/profiles/ProfilesSection.tsx"]
     },
     {
       "id": "profiles.description-edit-race",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/components/profiles/__tests__/ProfilesPage.test.tsx"],
-      "components": ["web/src/components/profiles/ProfilesPage.tsx"]
+      "specs": ["src/components/profiles/__tests__/ProfilesSection.test.tsx"],
+      "components": ["web/src/components/profiles/ProfilesSection.tsx"]
     },
     {
       "id": "profiles.override",

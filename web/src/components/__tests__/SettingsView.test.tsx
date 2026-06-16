@@ -17,8 +17,14 @@ import { buildSidebar, resolveSelectedProfile } from "../SettingsView";
 // across surfaces. Asserting the pure config is more robust than querying the
 // DOM, which renders the same list twice (mobile strip + desktop nav).
 describe("buildSidebar", () => {
-  it("matches the TUI grouping order", () => {
-    expect(buildSidebar()).toEqual([
+  it("matches the TUI grouping order, with Profiles pinned first", () => {
+    // Strip the Profiles tab's icon (a ReactNode) so the order assertion stays
+    // a plain structural compare; the icon presence is asserted separately.
+    const order = buildSidebar().map((item) =>
+      item.kind === "tab" ? { kind: item.kind, id: item.id, label: item.label } : item,
+    );
+    expect(order).toEqual([
+      { kind: "tab", id: "profiles", label: "Profiles" },
       { kind: "divider", label: "Appearance" },
       { kind: "tab", id: "theme", label: "Theme" },
       { kind: "tab", id: "diff", label: "Diff" },
@@ -42,6 +48,11 @@ describe("buildSidebar", () => {
       { kind: "tab", id: "telemetry", label: "Telemetry" },
       { kind: "tab", id: "logging", label: "Logging" },
     ]);
+  });
+
+  it("gives the Profiles tab an icon", () => {
+    const profiles = buildSidebar().find((item) => item.kind === "tab" && item.id === "profiles");
+    expect(profiles && "icon" in profiles && profiles.icon).toBeTruthy();
   });
 });
 
