@@ -31,8 +31,9 @@ const isStandalone = (): boolean => {
  *    narrow fine-pointer client (small desktop window) both stay `desktop`;
  *  - `desktop` otherwise. */
 export function clientFormFactor(): ClientFormFactor {
-  const pwa = isStandalone();
   const mobile = matchesMedia("(pointer: coarse)") && !matchesMedia("(min-width: 768px)");
-  const base = mobile ? "mobile" : "desktop";
-  return pwa ? `${base}_pwa` : base;
+  if (isStandalone()) {
+    return mobile ? "mobile_pwa" : "desktop_pwa";
+  }
+  return mobile ? "mobile" : "desktop";
 }

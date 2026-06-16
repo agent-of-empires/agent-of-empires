@@ -19,6 +19,68 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
+/// Filesystem identity recorded at watch-install time, used to detect
+/// peer-driven `rm -rf X && mkdir X` of the same canonical path. The
+/// canonical path string survives that race (the new dir resolves to
+/// the same string), and on ext4/overlayfs the freed inode number is
+/// routinely recycled by the immediate recreate, so `(dev, ino)` alone
+/// is insufficient; the identity also carries the birth time
+/// (`fs::Metadata::created`, statx btime on Linux), which a recycled
+/// inode cannot reproduce. On filesystems without btime the third
+/// component is `None` on both sides and the comparison degrades to
+/// `(dev, ino)`, leaving the residual hazard only where no-btime and
+/// inode recycling coincide. On non-Unix platforms `WatchIdentity` is
+/// `()`, so identity comparisons trivially match and the watch-install
+/// logic falls back to canonical-path probes alone; Windows still
+/// carries the original same-name recreate hazard since
+/// `ReadDirectoryChangesW` keys watches by `HANDLE` rather than
+/// `(dev, ino)`. Tracking that gap separately.
+///
+/// Storage convention: the primitive (`DirState`) wraps this in
+/// `Option<WatchIdentity>` because the entry is inserted with
+/// `refcount=0` before `watcher.watch` runs, so `None` represents the
+/// pre-install transient state. Consumers (e.g. `DiskWatchEntry` in
+/// `tui/home/mod.rs`) only construct their entries after a successful
+/// `subscribe_channel`, so they store a bare `WatchIdentity` and use
+/// `unwrap_or_default()` to record `(0, 0, None)` / `()` when the
+/// install-time stat fails; that sentinel self-heals on the next
+/// rewire because a real `(dev, ino)` will mismatch and force an
+/// entry rebuild.
+#[cfg(unix)]
+pub type WatchIdentity = (u64, u64, Option<std::time::SystemTime>);
+/// See [`WatchIdentity`] (Unix variant).
+#[cfg(not(unix))]
+pub type WatchIdentity = ();
+
+/// Read the filesystem identity of `path` for watch-invalidation
+/// comparisons. On Unix returns `(dev, ino, btime)` from
+/// `fs::metadata`, with `btime` as `None` where the filesystem does
+/// not report a creation time; on other platforms `Ok(())` indicates
+/// the path exists (the metadata call is used only to surface a
+/// missing path as `Err`; no metadata fields are read). Errors
+/// propagate so callers can treat stat-failed as "identity unknown"
+/// rather than synthesizing a value.
+///
+/// # Errors
+///
+/// Returns `Err` if `fs::metadata(path)` fails (path missing,
+/// permission denied, or any other I/O failure). Callers that treat
+/// stat-failed as "identity unknown" should call `.ok()` at the use
+/// site.
+pub fn capture_watch_identity(path: &Path) -> std::io::Result<WatchIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata(path)?;
+        Ok((m.dev(), m.ino(), m.created().ok()))
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::metadata(path)?;
+        Ok(())
+    }
+}
+
 /// Sentinel id for handles produced by the noop service. Live services
 /// allocate ids starting at 1.
 const NOOP_SENTINEL: SubscriptionId = SubscriptionId(0);
@@ -144,6 +206,17 @@ struct SubscriptionId(u64);
 #[derive(Debug)]
 struct DirState {
     refcount: usize,
+    /// Filesystem identity captured immediately before each successful
+    /// `watcher.watch` call (initial install or drift rewatch) and
+    /// stored after the call returns `Ok`. `None` between insertion
+    /// and the first install (transient), `Some` once watched.
+    /// Re-stat on every `subscribe_channel`; mismatch against this
+    /// stored value forces a rewatch even when refcount > 0, since
+    /// notify NonRecursive watches do not auto-reattach across the
+    /// inode change a same-path recreate produces. A rewatch failure
+    /// clears this back to `None` so a permanently failing watch
+    /// does not retry on every subsequent subscribe.
+    installed_identity: Option<WatchIdentity>,
 }
 
 struct DeliverySink(mpsc::Sender<FileEvent>);
@@ -467,22 +540,49 @@ impl FileWatchService {
         let mut spec = spec;
         spec.dir = canonical_dir.clone();
         let dir = canonical_dir;
+        let current_identity = capture_watch_identity(&dir).ok();
+        let drift_against_existing = match (current_identity, inner.dirs.get(&dir)) {
+            (Some(curr), Some(state)) => match state.installed_identity {
+                Some(stored) => stored != curr,
+                None => false,
+            },
+            (None, Some(state)) => state.installed_identity.is_some(),
+            _ => false,
+        };
         let pre_bump = inner
             .dirs
             .entry(dir.clone())
-            .or_insert(DirState { refcount: 0 })
+            .or_insert(DirState {
+                refcount: 0,
+                installed_identity: None,
+            })
             .refcount;
         // Release the immutable borrow before re-borrowing mutably below.
         inner.dirs.get_mut(&dir).expect("just inserted").refcount = pre_bump + 1;
-        if pre_bump == 0 {
-            // Need to start watching. Lock STAYS HELD across the watch call
-            // to preserve the invariant: another subscriber must not
-            // observe refcount==1 mid-rollback.
+        let needs_install = pre_bump == 0;
+        if needs_install || drift_against_existing {
+            // Lock STAYS HELD across the watch call to preserve the
+            // invariant: another subscriber must not observe
+            // refcount==1 mid-rollback. Re-arming on inode drift
+            // calls `Watcher::watch` a second time on the same path;
+            // notify-rs is expected to install a fresh kernel
+            // descriptor against the new inode (inotify allocates a
+            // new wd, FSEvents starts a new stream, kqueue reopens
+            // the fd).
             let watcher = inner.watcher.as_mut().expect(
                 "watcher initialized in FileWatchService::new; noop path short-circuits above",
             );
             if let Err(e) = watcher.watch(&dir, RecursiveMode::NonRecursive) {
-                inner.dirs.remove(&dir);
+                if needs_install {
+                    inner.dirs.remove(&dir);
+                } else {
+                    let state = inner
+                        .dirs
+                        .get_mut(&dir)
+                        .expect("entry exists during drift rewatch");
+                    state.refcount = pre_bump;
+                    state.installed_identity = None;
+                }
                 let kind = classify_notify_err(&e);
                 return Err(WatchError::Watch {
                     dir: dir.clone(),
@@ -490,6 +590,13 @@ impl FileWatchService {
                     message: format!("notify watch failed: {e}"),
                     source: Some(e),
                 });
+            }
+            if let Some(curr) = current_identity {
+                inner
+                    .dirs
+                    .get_mut(&dir)
+                    .expect("entry exists post-watch")
+                    .installed_identity = Some(curr);
             }
         }
 
@@ -1618,5 +1725,87 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    /// Locks the primitive's self-heal contract: a peer-driven
+    /// `rm -rf X && mkdir X` of the same canonical path leaves the
+    /// kernel watch in IN_IGNORED limbo, so a subsequent
+    /// `subscribe_channel` on the same path (refcount > 0) MUST
+    /// detect the inode drift and re-arm the watch.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial(file_watch)]
+    async fn subscribe_rewatches_when_inode_changed_with_refcount_above_zero() {
+        let root = TempDir::new().unwrap();
+        let dir = root.path().join("watched");
+        std::fs::create_dir_all(&dir).unwrap();
+        let svc = FileWatchService::new().expect("init");
+        let target = dir.join("file");
+
+        let (_rx_keepalive, _h_keepalive) = svc
+            .subscribe_channel(
+                WatchSpec {
+                    dir: dir.clone(),
+                    matcher: FileMatcher::Exact(target.clone()),
+                    debounce: None,
+                },
+                4,
+            )
+            .expect("first subscribe installs watch");
+
+        let canonical = std::fs::canonicalize(&dir).unwrap();
+        let identity_before = {
+            let inner = svc.inner.lock().unwrap();
+            let state = inner.dirs.get(&canonical).expect("entry exists");
+            assert_eq!(state.refcount, 1);
+            state
+                .installed_identity
+                .expect("identity recorded on install")
+        };
+
+        // ext4/overlayfs recycle the freed inode number for an immediate
+        // same-path recreate, and inode timestamps come from the kernel's
+        // coarse clock (jiffy resolution, up to 10ms at HZ=100), so a
+        // recreate landing in the same tick as the original create would
+        // tie on (dev, ino, btime) and hide the drift from the identity
+        // check. Real recreates are seconds away from the original
+        // install; the sleep models that gap without flaking on fast
+        // filesystems.
+        std::thread::sleep(Duration::from_millis(50));
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let (mut rx, _h2) = svc
+            .subscribe_channel(
+                WatchSpec {
+                    dir: dir.clone(),
+                    matcher: FileMatcher::Exact(target.clone()),
+                    debounce: None,
+                },
+                4,
+            )
+            .expect("second subscribe re-arms watch on inode drift");
+
+        let identity_after = {
+            let inner = svc.inner.lock().unwrap();
+            let state = inner.dirs.get(&canonical).expect("entry exists");
+            assert_eq!(state.refcount, 2, "second subscribe bumps refcount");
+            state
+                .installed_identity
+                .expect("identity refreshed after rewatch")
+        };
+        assert_ne!(
+            identity_before, identity_after,
+            "remove + recreate of the same path must yield a distinct identity \
+             (btime breaks the tie when the filesystem recycles the inode number)"
+        );
+
+        write_file(&dir, "file", "payload");
+        let evt = timeout(KERNEL_WAIT, rx.recv())
+            .await
+            .expect("event arrives within budget after watch re-arm")
+            .expect("channel open");
+        let expected = std::fs::canonicalize(&target).expect("target exists post-write");
+        assert_eq!(evt.path, expected);
     }
 }

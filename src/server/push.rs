@@ -634,18 +634,22 @@ async fn fire_due_pushes(
             continue;
         }
 
-        // Acp approval pushes are dispatched immediately from
-        // `acp_event_listener` with their own tag and bypass the
+        // Acp approval and question pushes are dispatched immediately from
+        // `acp_event_listener` with their own tags and bypass the
         // TUI/web active-session suppression. If the session has any
-        // unresolved structured view approvals, the user has already been
-        // notified through that channel; a second status-change push
-        // five seconds later for the same underlying event would just
-        // be noise. See #1038.
+        // unresolved structured view approval or elicitation, the user has
+        // already been notified through that channel; a second
+        // status-change push five seconds later for the same underlying
+        // event would just be noise. See #1038, #2146.
         if event == NotificationEvent::Waiting
-            && !app_state
+            && (!app_state
                 .acp_event_store
                 .unresolved_approval_nonces(&instance_id)
                 .is_empty()
+                || !app_state
+                    .acp_event_store
+                    .unresolved_elicitation_nonces(&instance_id)
+                    .is_empty())
         {
             continue;
         }

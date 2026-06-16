@@ -420,14 +420,34 @@ fn render_status(frame: &mut Frame, area: Rect, theme: &Theme, state: &Structure
 }
 
 fn render_composer(frame: &mut Frame, area: Rect, theme: &Theme, state: &StructuredViewState) {
-    let title = match state.focus {
-        Focus::Composer => " Composer (Enter=send, Shift+Enter=newline, Esc=back) ",
-        _ => " Composer (Tab/i to focus) ",
+    // While browsing the queue, the title signals that an existing queued
+    // prompt is being edited (and where it sits), so the composer does not
+    // look like it merely copied text in. Position counts from the newest
+    // entry (1 = newest), matching the ArrowUp-from-newest browse order.
+    let title: String = if let Some(recall) = &state.recall {
+        let total = state.queue.len();
+        let pos = total.saturating_sub(recall.index);
+        format!(
+            " Editing queued message {pos} of {total} (Enter=save, Esc=restore draft, ↑/↓=browse) "
+        )
+    } else {
+        match state.focus {
+            Focus::Composer => " Composer (Enter=send, Shift+Enter=newline, Esc=back) ".to_string(),
+            _ => " Composer (Tab/i to focus) ".to_string(),
+        }
+    };
+    // Highlight the border while editing a queued prompt so the mode is
+    // obvious at a glance.
+    let composer_border = if state.recall.is_some() {
+        Style::default().fg(theme.title)
+    } else {
+        border_style(theme, state, Focus::Composer)
     };
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .title(title)
-        .border_style(border_style(theme, state, Focus::Composer));
+        .border_style(composer_border);
     // ratatui-textarea borrows the Frame's buffer indirectly via
     // widget impl; render the block first, then the textarea inside.
     let inner = block.inner(area);

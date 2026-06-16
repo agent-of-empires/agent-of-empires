@@ -61,7 +61,7 @@ Three layers recover a turn that stops progressing, in increasing depth:
 - `Agent` tool `isAsync: true` (#1360): detected from completion text `Async agent launched successfully`. Blocks the turn, so the floor stays intact.
 - `Bash` `run_in_background: true` (#1401): detected from `raw_input.run_in_background` at start AND the `Command running in background with ID:` completion text (defense in depth). Fire-and-forget, so once a cost-populated `UsageUpdate` arrives the suppression is dropped and recovery falls back to the fast grace (#1858).
 
-**Scheduled-wakeup suppression (#1401).** A `ScheduleWakeup` with `delaySeconds: N` suppresses the watchdog until `wakeup_at + silent_orphan_grace_secs`, computed as a monotonic `Instant` so wall-clock jumps don't perturb it. Multiple wakeups extend, never shorten. A daemon crash during sleep tears the prompt loop down, so the next attach starts fresh.
+**Scheduled-wakeup suppression (#1401).** A `ScheduleWakeup` with `delaySeconds: N` is deliberate off-protocol idling (a monitor or `/loop` run), so it is treated like the off-protocol kinds above: the watchdog is suppressed until `wakeup_at + OFF_PROTOCOL_WORK_GRACE_FLOOR` (30 min), and for the rest of the prompt the effective grace stays at that floor rather than dropping to the 20s fast grace even after a cost-populated `UsageUpdate` lands. The deadline is a monotonic `Instant` so wall-clock jumps don't perturb it. Multiple wakeups extend, never shorten. A daemon crash during sleep tears the prompt loop down, so the next attach starts fresh. Earlier this suppressed only until `wakeup_at + silent_orphan_grace_secs` and then re-armed with the fast grace, which killed monitor turns ~20s after the wake window lapsed.
 
 ## Rate-limit handling
 

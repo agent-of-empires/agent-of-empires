@@ -373,6 +373,9 @@ async fn handle_terminal_event(
         has_pending_elicitation: !state.transcript.pending_elicitations.is_empty(),
         slash_picker_open: state.slash_picker_open(),
         mention_picker_open: state.mention.is_some(),
+        caret_at_origin: state.caret_at_origin(),
+        browsing_queue: state.browsing_queue(),
+        queue_len: state.queue.len(),
     };
     let intent = input::dispatch(state.focus, &key, ctx);
     match intent {
@@ -386,6 +389,11 @@ async fn handle_terminal_event(
             } else {
                 focus
             };
+            // Leaving the composer ends any queue-recall browse; the
+            // in-progress text stays put as a draft.
+            if state.focus != Focus::Composer {
+                state.cancel_recall();
+            }
             state.reconcile_selection();
             Ok(false)
         }
@@ -436,7 +444,28 @@ async fn handle_terminal_event(
             Ok(false)
         }
         Intent::SubmitPrompt => {
+            // Capture the browse target before take_composer_text resets
+            // the recall state.
+            let recall = state.recall.take();
             let text = state.take_composer_text();
+            // Submitting while browsing edits that queued entry in place,
+            // preserving its position rather than enqueuing a duplicate.
+            // If the entry drained between recall and now, the index is
+            // stale; fall through to the normal send / queue path so the
+            // edited text is never lost.
+            if !text.is_empty() {
+                if let Some(r) = recall {
+                    if state.queue.replace(r.index, text.clone()) {
+                        set_toast(
+                            state,
+                            toast_deadline,
+                            format!("edited queued prompt ({} waiting)", state.queue.len()),
+                            ToastKind::Info,
+                        );
+                        return Ok(false);
+                    }
+                }
+            }
             if text.is_empty() {
                 // Empty Enter is a manual flush: if the agent is idle and
                 // prompts are stuck in the queue (e.g. a drain POST failed
@@ -480,12 +509,23 @@ async fn handle_terminal_event(
                 return Ok(false);
             }
             state.queue.clear();
+            // The browsed entry no longer exists; end the browse but keep
+            // whatever text is in the composer as a draft.
+            state.cancel_recall();
             set_toast(
                 state,
                 toast_deadline,
                 "queue cleared".into(),
                 ToastKind::Info,
             );
+            Ok(false)
+        }
+        Intent::RecallQueued(delta) => {
+            state.recall_step(delta);
+            Ok(false)
+        }
+        Intent::RecallCancel => {
+            state.recall_cancel_restore();
             Ok(false)
         }
         Intent::Scroll(delta) => {
@@ -838,6 +878,9 @@ async fn maybe_drain(state: &mut StructuredViewState, toast_deadline: &mut Optio
     };
     if send_prompt_now(state, toast_deadline, &text).await {
         state.queue.drop_front(count);
+        // Keep an in-progress ArrowUp/ArrowDown browse pointing at the
+        // right entry now that the front of the queue shifted.
+        state.reconcile_recall_after_drain(count);
         let remaining = state.queue.len();
         let msg = if remaining == 0 {
             "queue drained".to_string()

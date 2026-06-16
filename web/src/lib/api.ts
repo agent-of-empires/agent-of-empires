@@ -37,6 +37,26 @@ export function fetchSessions(): Promise<SessionsEnvelope | null> {
   return fetchJson<SessionsEnvelope>("/api/sessions");
 }
 
+// --- Recent projects ---
+
+export interface RecentProjectEntry {
+  path: string;
+  display_name: string;
+  tool: string;
+  last_used_at: string;
+}
+
+export interface RecentProjectsEnvelope {
+  projects: RecentProjectEntry[];
+}
+
+// Persisted recent projects (newest first), so a project stays in the wizard
+// Recent tab after its last session is deleted. Merged with the live
+// session-derived list in ProjectStep.
+export function fetchRecentProjects(): Promise<RecentProjectsEnvelope | null> {
+  return fetchJson<RecentProjectsEnvelope>("/api/recent-projects");
+}
+
 export async function updateWorkspaceOrdering(order: string[]): Promise<boolean> {
   try {
     const res = await fetch("/api/workspace-ordering", {
@@ -156,19 +176,6 @@ export function getSettingsSchema(): Promise<SettingsFieldDescriptor[] | null> {
 /** Test-only seam: drop the cached schema so each test starts cold. */
 export function resetSettingsSchemaCache(): void {
   schemaPromise = null;
-}
-
-export async function updateSettings(updates: Record<string, unknown>): Promise<boolean> {
-  try {
-    const res = await fetch("/api/settings", {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(updates),
-    });
-    return res.ok;
-  } catch {
-    return false;
-  }
 }
 
 /**
@@ -1238,13 +1245,10 @@ export async function setSessionPin(id: string, pinned: boolean): Promise<Sessio
   }
 }
 
-/** Archive or unarchive a session. On archive, the server kills the tmux
- *  pane (when `killPane` is true or omitted, matching TUI/CLI semantics)
- *  and shuts down the acp worker for acp-mode sessions; the
- *  reconciler will not respawn it because archived sessions are excluded
- *  from the resume target list. Sending a message via the dashboard
- *  auto-unarchives via the existing `touch_last_accessed` invariant in
- *  the send handler. See #1581. */
+/** Archive or unarchive a session. On archive (with `killPane` true or
+ *  omitted), the server tears down all tmux sessions and shuts down the
+ *  ACP worker for acp-mode sessions. Sending a message auto-unarchives.
+ *  See #1581, #1868. */
 export async function setSessionArchive(
   id: string,
   archived: boolean,

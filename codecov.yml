@@ -23,17 +23,24 @@ comment:
   hide_project_coverage: false
 
 codecov:
-  disable_default_path_fixes: false
+  # Both LCOV sources already emit repo-root paths ("web/src/..."): the vitest
+  # job rewrites SF: prefixes and the Playwright merge script writes them
+  # directly. Codecov's default path fixer was re-mapping those and dropping
+  # per-line hits for changed web/src files (patch coverage showed freshly
+  # tested lines, and even comment lines, as missed). Disabling it makes
+  # Codecov trust the paths as uploaded. (#2157)
+  disable_default_path_fixes: true
   # Hold all Codecov notifications (PR comment + status checks) until every
-  # flag has reported. Our CI uploads three separate LCOVs (vitest,
-  # playwright-mocked, playwright-live); without this Codecov evaluates and
-  # posts after the first one lands, then re-evaluates and re-posts on each
-  # subsequent upload, causing patch/project numbers to churn live during CI.
+  # coverage upload has landed. Counts UPLOADS, not flags: vitest (1) +
+  # playwright-mocked (1) + playwright-live (2, one per shard) = 4. With a
+  # lower number Codecov posts mid-run, before the last live shard reports,
+  # so the comment/status reflect partial coverage. Keep this in sync with
+  # the playwright-live shard count (`shard: [1, 2]` in tests.yml).
   # `wait_for_ci: true` additionally holds notifications until GitHub Actions
   # reports the workflow done, so a hung uploader cannot trigger a premature
   # evaluation either.
   notify:
-    after_n_builds: 3
+    after_n_builds: 4
     wait_for_ci: true
 
 # One flag per test type. Each CI job uploads its own LCOV with its own
@@ -101,6 +108,7 @@ component_management:
         - "web/src/components/SecuritySettings.tsx"
         - "web/src/components/SettingsView.tsx"
         - "web/src/components/TerminalSettings.tsx"
+        - "web/src/components/McpServers.tsx"
 
     # ============================================================
     # AUTH (LoginPage, TokenEntryPage, ElevationPrompt)
@@ -121,6 +129,10 @@ component_management:
         - "web/src/components/Dashboard.tsx"
         - "web/src/components/WorkspaceSidebar.tsx"
         - "web/src/components/DeleteSessionDialog.tsx"
+        - "web/src/components/StopSessionDialog.tsx"
+        - "web/src/components/SessionGroupModal.tsx"
+        - "web/src/components/BulkActionBar.tsx"
+        - "web/src/components/SidebarSortPicker.tsx"
         - "web/src/components/TopBar.tsx"
         - "web/src/components/ProjectsView.tsx"
 
@@ -132,11 +144,17 @@ component_management:
       paths:
         - "web/src/components/RightPanel.tsx"
         - "web/src/components/TerminalView.tsx"
+        - "web/src/components/XtermTerminalView.tsx"
+        - "web/src/components/LiveTerminalView.tsx"
+        - "web/src/components/MobileLiveTerminal.tsx"
+        - "web/src/components/TerminalSessionStack.tsx"
+        - "web/src/components/PairedTerminal.tsx"
+        - "web/src/components/TerminalConnectionBanners.tsx"
         - "web/src/components/ContentSplit.tsx"
+        - "web/src/components/MobileMainPane.tsx"
+        - "web/src/components/MobileRightPanelPicker.tsx"
         - "web/src/components/MobileTerminalToolbar.tsx"
         - "web/src/components/KeyboardFab.tsx"
-        - "web/src/components/BackToLiveButton.tsx"
-        - "web/src/components/ViewportFullscreenFab.tsx"
 
     # ============================================================
     # DIRECTORY BROWSER + CONNECTED DEVICES + DISCONNECT BANNER
@@ -148,6 +166,7 @@ component_management:
         - "web/src/components/ConnectedDevices.tsx"
         - "web/src/components/DisconnectBanner.tsx"
         - "web/src/components/UpdateBanner.tsx"
+        - "web/src/components/DashboardUpdateBanner.tsx"
 
     # ============================================================
     # MODALS
@@ -157,6 +176,7 @@ component_management:
       paths:
         - "web/src/components/AboutModal.tsx"
         - "web/src/components/HelpOverlay.tsx"
+        - "web/src/components/TelemetryConsentModal.tsx"
 
     # ============================================================
     # COMMAND PALETTE
@@ -175,10 +195,12 @@ component_management:
       paths:
         - "web/src/App.tsx"
         - "web/src/main.tsx"
+        - "web/src/logging-init.ts"
         - "web/src/components/ErrorBoundary.tsx"
         - "web/src/components/OverflowMenu.tsx"
         - "web/src/components/OwnerAvatar.tsx"
         - "web/src/components/StatusGlyph.tsx"
+        - "web/src/components/Tooltip.tsx"
         - "web/src/components/Toasts.tsx"
 
     # ============================================================

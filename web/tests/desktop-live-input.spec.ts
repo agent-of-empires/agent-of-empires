@@ -38,9 +38,7 @@ test.describe("Desktop live terminal input", () => {
     await clickSidebarSession(page, "pinch-test");
     const content = page.locator("[data-live-content]").first();
     await content.waitFor({ state: "visible", timeout: 10_000 });
-    const px = await content.evaluate(
-      (el) => getComputedStyle(el.closest("[data-live-terminal] > div")!).fontSize,
-    );
+    const px = await content.evaluate((el) => getComputedStyle(el.closest("[data-live-terminal] > div")!).fontSize);
     expect(px).toBe("14px");
   });
 });

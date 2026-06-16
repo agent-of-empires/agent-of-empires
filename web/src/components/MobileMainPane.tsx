@@ -110,6 +110,7 @@ export function MobileMainPane({
                 archivedAt={activeSession.archived_at ?? null}
                 snoozedUntil={activeSession.snoozed_until ?? null}
                 onOpenFileRef={onOpenFileRef}
+                fileRefSession={activeSession}
               />
             </Suspense>
           ) : (

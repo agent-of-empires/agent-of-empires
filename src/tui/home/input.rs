@@ -187,6 +187,41 @@ fn split_bracketed_paste(text: &str) -> Vec<live_send::TmuxKey> {
     vec![live_send::TmuxKey::HexBytes(bytes)]
 }
 
+/// Build the mouse-wheel byte sequence to forward to a full-screen app
+/// under the live preview. `up` selects wheel-up (button 64) vs wheel-down
+/// (65); `sgr` selects the SGR (1006) encoding vs the legacy X10 encoding,
+/// matching whatever the app has enabled. The hovered screen cell
+/// `(col, row)` is mapped into the app's 1-based coordinate space relative
+/// to its pane `pane` (the live-send target is sized to the preview output
+/// rect, so this maps directly), clamped inside the pane; an unpopulated
+/// rect falls back to the top-left cell.
+fn wheel_mouse_bytes(
+    up: bool,
+    sgr: bool,
+    pane: ratatui::layout::Rect,
+    col: u16,
+    row: u16,
+) -> Vec<u8> {
+    let (cx, cy) = if pane.width == 0 || pane.height == 0 {
+        (1u16, 1u16)
+    } else {
+        let cx = col.saturating_sub(pane.x).min(pane.width - 1) + 1;
+        let cy = row.saturating_sub(pane.y).min(pane.height - 1) + 1;
+        (cx, cy)
+    };
+    let button: u16 = if up { 64 } else { 65 };
+    if sgr {
+        // SGR (1006): textual, press marker `M`. No coordinate limit.
+        format!("\x1b[<{button};{cx};{cy}M").into_bytes()
+    } else {
+        // Legacy X10: `ESC [ M` then three bytes, each the value + 32.
+        // Bytes top out at 255, so coordinates above 223 can't be
+        // encoded; clamp there (preview cells are far below that anyway).
+        let enc = |v: u16| (v.min(223) + 32) as u8;
+        vec![0x1b, b'[', b'M', enc(button), enc(cx), enc(cy)]
+    }
+}
+
 fn resolve_hook_install_agent(
     tool_name: &str,
     session_config: &crate::session::config::SessionConfig,
@@ -1310,7 +1345,7 @@ impl HomeView {
                 SettingsAction::Close => {
                     self.settings_view = None;
                     // Refresh config-dependent state in case settings changed
-                    self.refresh_from_config();
+                    self.refresh_from_config(crate::tui::home::ConfigRefreshOrigin::Interactive);
                     // Reload the theme from the global config (theme is a global
                     // preference, not profile-merged) so the repaint matches boot.
                     return Some(Action::SetTheme(
@@ -1785,6 +1820,7 @@ impl HomeView {
                                 &data.title,
                                 data.group.as_deref(),
                                 data.profile.as_deref(),
+                                data.rename_branch,
                             ) {
                                 tracing::error!(target: "tui.input", "Failed to rename session: {}", e);
                             }
@@ -1952,9 +1988,7 @@ impl HomeView {
                     ProfilePickerAction::Deleted(name) => {
                         match crate::session::delete_profile(&name) {
                             Ok(()) => {
-                                if let Some(entry) = self.disk_watch_handles.remove(&name) {
-                                    super::drop_disk_watch_entry(entry);
-                                }
+                                self.rewire_after_profile_delete(&name);
                                 self.show_profile_picker();
                             }
                             Err(e) => {
@@ -3085,6 +3119,40 @@ impl HomeView {
     /// redraw. Scrolls do not cross pane boundaries: a wheel over the
     /// preview never moves the list cursor, even when the preview is at
     /// its scroll boundary or has no session selected.
+    /// When a live-send target is a full-screen (alternate-screen) app
+    /// that has mouse tracking on, the preview's capture-window scroll is
+    /// useless: the alternate screen has no scrollback, so growing the
+    /// window only exposes the unrelated normal-buffer history underneath
+    /// and the view bottoms out at the session's start. Instead, forward
+    /// the wheel to the app as a mouse event, exactly as a terminal does
+    /// when you wheel over a mouse-tracking pane on attach, so the app
+    /// scrolls its OWN content.
+    ///
+    /// Gated on mouse tracking (`mouse_tracking`): with no mouse mode the
+    /// app would read the bytes as garbage keystrokes, so the caller keeps
+    /// the capture-window scroll. The encoding follows the app: SGR (1006)
+    /// when `mouse_sgr` is set, otherwise the legacy X10 encoding. Returns
+    /// true when the event was forwarded.
+    fn forward_wheel_to_live_pane(&self, up: bool, col: u16, row: u16) -> bool {
+        if self.live_send.is_none() {
+            return false;
+        }
+        let Some(worker) = &self.live_send_worker else {
+            return false;
+        };
+        let cursor = self
+            .preview_capture_worker
+            .as_ref()
+            .and_then(|w| w.current_cursor());
+        let Some(cursor) = cursor else { return false };
+        if !(cursor.alternate_on && cursor.mouse_tracking) {
+            return false;
+        }
+        let bytes = wheel_mouse_bytes(up, cursor.mouse_sgr, self.preview_text_view.pane, col, row);
+        worker.send(crate::tui::home::live_send::TmuxKey::HexBytes(bytes));
+        true
+    }
+
     pub fn handle_scroll_up(&mut self, col: u16, row: u16) -> bool {
         const STEP: u16 = 3;
         // A preview selection is anchored to absolute scrollback lines,
@@ -3119,6 +3187,12 @@ impl HomeView {
         }
         if self.selected_session.is_none() {
             return false;
+        }
+        // Full-screen mouse app under live-send: send the wheel to the app
+        // instead of scrolling the (irrelevant) normal-buffer capture.
+        if self.forward_wheel_to_live_pane(true, col, row) {
+            self.preview_scroll_offset = 0;
+            return true;
         }
 
         let active_cache = match self.view_mode {
@@ -3349,11 +3423,11 @@ impl HomeView {
                 }
             }
             ContextMenuAction::NewSession => self.open_new_session_dialog(),
-            // The right-click already moved the cursor onto the group row, so
-            // reuse the "new from selection" path: with a group selected it
-            // prefills the project's repo path (and group) the same way `'N'`
-            // does on a session.
-            ContextMenuAction::NewFromGroup => self.open_new_from_selection(),
+            // The right-click already moved the cursor onto the row, so reuse
+            // the "new from selection" path: a session row prefills its own repo
+            // path and group, a group/project row borrows a member's path, the
+            // same way `'N'` does.
+            ContextMenuAction::NewFromSelection => self.open_new_from_selection(),
             ContextMenuAction::OpenSortPicker => self.show_sort_picker(),
             ContextMenuAction::OpenGroupPicker => self.show_group_picker(),
             ContextMenuAction::TogglePin => {
@@ -3434,27 +3508,49 @@ impl HomeView {
     /// Shared by the `'r'` / `'R'` key handlers and the right-click
     /// context menu so all three entry points stay byte-identical.
     pub(super) fn open_rename_for_selected(&mut self) {
-        if let Some(id) = &self.selected_session {
-            if let Some(inst) = self.get_instance(id) {
-                if matches!(inst.status, Status::Deleting | Status::Creating) {
-                    return;
-                }
-                // Rename is anchored to the selected session, so the dialog
-                // must open against that session's profile, not the
-                // view-level active/config profile (which can differ in
-                // all-profiles mode).
-                let current_profile = inst.source_profile.clone();
-                let profiles = list_profiles().unwrap_or_else(|_| vec![current_profile.clone()]);
-                let existing_groups: Vec<String> =
-                    self.all_groups().iter().map(|g| g.path.clone()).collect();
-                self.rename_dialog = Some(RenameDialog::new(
-                    &inst.title,
-                    &inst.group_path,
-                    &current_profile,
-                    profiles,
-                    existing_groups,
-                ));
+        if let Some(id) = self.selected_session.clone() {
+            let Some(inst) = self.get_instance(&id) else {
+                return;
+            };
+            if matches!(inst.status, Status::Deleting | Status::Creating) {
+                return;
             }
+            // Rename is anchored to the selected session, so the dialog
+            // must open against that session's profile, not the
+            // view-level active/config profile (which can differ in
+            // all-profiles mode).
+            let current_profile = inst.source_profile.clone();
+            let title = inst.title.clone();
+            let group_path = inst.group_path.clone();
+            // Capture branch context up front; a tied aoe-managed worktree
+            // can opt to rename the branch alongside the directory.
+            let branch_ctx = inst
+                .worktree_info
+                .as_ref()
+                .map(|w| (w.branch.clone(), w.main_repo_path.clone()));
+
+            let profiles = list_profiles().unwrap_or_else(|_| vec![current_profile.clone()]);
+            let existing_groups: Vec<String> =
+                self.all_groups().iter().map(|g| g.path.clone()).collect();
+            let mut dialog = RenameDialog::new(
+                &title,
+                &group_path,
+                &current_profile,
+                profiles,
+                existing_groups,
+            );
+            if self.tie_workdir_applies_for(&id) {
+                if let Some((branch, main_repo)) = branch_ctx {
+                    // The upstream probe is a quick `git for-each-ref`; this
+                    // is a one-shot on dialog open, not a hot path.
+                    let upstream =
+                        crate::git::GitWorktree::new(std::path::PathBuf::from(&main_repo))
+                            .ok()
+                            .and_then(|g| g.branch_upstream(&branch));
+                    dialog = dialog.with_worktree_branch(&branch, upstream);
+                }
+            }
+            self.rename_dialog = Some(dialog);
         } else if let Some(group_path) = &self.selected_group {
             if self.group_by == GroupByMode::Project {
                 let hint = if self.strict_hotkeys {
@@ -3886,6 +3982,12 @@ impl HomeView {
         }
         if self.selected_session.is_none() {
             return false;
+        }
+        // Mirror handle_scroll_up: a full-screen mouse app gets the wheel
+        // forwarded rather than moving the preview's capture window.
+        if self.forward_wheel_to_live_pane(false, col, row) {
+            self.preview_scroll_offset = 0;
+            return true;
         }
         if self.preview_scroll_offset == 0 {
             return false;
@@ -4666,6 +4768,56 @@ impl HomeView {
 mod tests {
     use super::*;
     use crate::session::config::{SessionConfig, ToolSessionConfig};
+
+    #[test]
+    fn wheel_mouse_bytes_sgr_maps_cell_and_button() {
+        use ratatui::layout::Rect;
+        // Pane at (10,5), 80x24. Wheel up over screen cell (12,7) maps to
+        // 1-based pane cell (3,3): cx = 12-10+1, cy = 7-5+1.
+        let pane = Rect::new(10, 5, 80, 24);
+        assert_eq!(
+            wheel_mouse_bytes(true, true, pane, 12, 7),
+            b"\x1b[<64;3;3M".to_vec()
+        );
+        // Wheel down flips the button to 65.
+        assert_eq!(
+            wheel_mouse_bytes(false, true, pane, 12, 7),
+            b"\x1b[<65;3;3M".to_vec()
+        );
+        // A cell past the pane edge clamps to the last column/row.
+        assert_eq!(
+            wheel_mouse_bytes(true, true, pane, 999, 999),
+            b"\x1b[<64;80;24M".to_vec()
+        );
+        // An unpopulated rect falls back to the top-left cell.
+        assert_eq!(
+            wheel_mouse_bytes(true, true, Rect::new(0, 0, 0, 0), 40, 40),
+            b"\x1b[<64;1;1M".to_vec()
+        );
+    }
+
+    #[test]
+    fn wheel_mouse_bytes_legacy_encodes_x10() {
+        use ratatui::layout::Rect;
+        let pane = Rect::new(10, 5, 80, 24);
+        // Legacy X10: ESC [ M then (button+32, col+32, row+32). Cell (3,3),
+        // wheel up (button 64) => 0x60, 0x23, 0x23.
+        assert_eq!(
+            wheel_mouse_bytes(true, false, pane, 12, 7),
+            vec![0x1b, b'[', b'M', 64 + 32, 3 + 32, 3 + 32]
+        );
+        // Wheel down => button 65 => 0x61.
+        assert_eq!(
+            wheel_mouse_bytes(false, false, pane, 12, 7),
+            vec![0x1b, b'[', b'M', 65 + 32, 3 + 32, 3 + 32]
+        );
+        // Coordinates above 223 can't be encoded in one byte; clamp there.
+        let wide = Rect::new(0, 0, 400, 400);
+        assert_eq!(
+            wheel_mouse_bytes(true, false, wide, 300, 300),
+            vec![0x1b, b'[', b'M', 64 + 32, 223 + 32, 223 + 32]
+        );
+    }
 
     #[test]
     fn format_target_label_distinguishes_terminal_panes() {

@@ -40,6 +40,67 @@ pub fn worktree_leaf_from_title(title: &str) -> String {
     crate::session::builder::branch_name_from_title(title)
 }
 
+/// Whether a sandbox session's container is still running and therefore
+/// bind-mounting its worktree directory.
+///
+/// A sandbox container runs `sleep infinity` for the life of the session
+/// (`src/containers/runtime_base.rs`), so it holds the worktree dir as an
+/// active mount source even while the agent is Idle. A `git worktree move`
+/// then `rename(2)`s that dir and the kernel refuses with `EBUSY`, surfaced
+/// as `fatal: failed to move`. Callers about to move the worktree must refuse
+/// and have the user stop the session first, which tears the container down
+/// and releases the mount. `is_sandboxed` is taken so non-sandbox sessions
+/// skip the `docker inspect` subprocess entirely. See #1927 follow-up.
+pub fn sandbox_container_holds_worktree(session_id: &str, is_sandboxed: bool) -> bool {
+    is_sandboxed
+        && crate::containers::DockerContainer::from_session_id(session_id)
+            .is_running()
+            .unwrap_or(false)
+}
+
+/// Drop a sandbox session's container after its worktree directory has been
+/// moved by a rename.
+///
+/// A container's bind mounts and working dir are baked in at creation time
+/// (`src/containers/runtime_base.rs`); they do NOT follow a host-side
+/// `git worktree move`. `get_container_for_instance` reuses an existing
+/// stopped container as-is, so without this the restarted container would
+/// still mount (and `cd` into) the old path. Removing it here forces a fresh
+/// `create` with the new path on next start. `remove(force)` drops only the
+/// container and its anonymous volumes; named ignore volumes (node_modules,
+/// target) are keyed by session id and survive for the recreated container.
+///
+/// No-op for non-sandbox sessions. The rename gate requires a stopped session
+/// (see [`sandbox_container_holds_worktree`]), so the container is not running
+/// here. Best-effort: a failure is logged, not surfaced, since the rename
+/// itself has already succeeded. See #1927 follow-up.
+pub fn discard_sandbox_container_after_move(session_id: &str, is_sandboxed: bool) {
+    if !is_sandboxed {
+        return;
+    }
+    let container = crate::containers::DockerContainer::from_session_id(session_id);
+    match container.exists() {
+        Ok(true) => match container.remove(true) {
+            Ok(()) => tracing::info!(
+                target: "containers.runtime",
+                session = %session_id,
+                "removed stale sandbox container after worktree move; it will be recreated with the new path on next start"
+            ),
+            Err(e) => tracing::warn!(
+                target: "containers.runtime",
+                session = %session_id,
+                "failed to remove stale sandbox container after worktree move: {e}"
+            ),
+        },
+        Ok(false) => {}
+        Err(e) => tracing::warn!(
+            target: "containers.runtime",
+            session = %session_id,
+            "could not check sandbox container existence after worktree move: {e}"
+        ),
+    }
+}
+
 /// Inputs for an in-place worktree workdir edit.
 pub struct WorktreeEditRequest<'a> {
     /// The session's current worktree metadata.

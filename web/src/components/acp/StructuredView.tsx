@@ -21,7 +21,7 @@ import { AlertTriangle, Check, ChevronDown, Clock, Info, ListChecks, Paperclip, 
 import { ApprovalCard } from "./ApprovalCard";
 import { AskUserQuestionCard } from "./AskUserQuestionCard";
 import { AcpFileRefContext } from "./AcpFileRefContext";
-import type { FileRef } from "../../lib/fileRef";
+import type { FileRef, FileRefSession } from "../../lib/fileRef";
 import { ToolDensityToggle, ToolDisplayModeProvider, useToolDensityPref } from "./ToolDisplayMode";
 import { AcpRuntime, SUBAGENT_TASK_NAME, TODO_GROUP_NAME, TOOL_GROUP_NAME, type AcpContext } from "./AcpRuntime";
 import { Composer } from "./Composer";
@@ -45,7 +45,7 @@ import {
 import { useAcpPrefs } from "../../lib/acpPrefs";
 import { AgentProfileProvider, useAgentProfile } from "../../lib/agentProfileContext";
 import { isClearAlias } from "../../lib/agentProfiles";
-import { useApprovalSound } from "../../hooks/useApprovalSound";
+import { AttentionChime } from "./AttentionChime";
 import { useIsCoarsePointer } from "../../hooks/useIsCoarsePointer";
 import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
 import type {
@@ -58,6 +58,7 @@ import type {
   RejectedPrompt,
   ToolCall,
 } from "../../lib/acpTypes";
+import { pickMemoryRecall } from "../../lib/memoryRecall";
 
 interface Props {
   sessionId: string;
@@ -87,6 +88,9 @@ interface Props {
    *  instead of navigating away. Omit to leave such links as normal
    *  anchors. See #1718. */
   onOpenFileRef?: (ref: FileRef) => void;
+  /** Repo roots for this session, forwarded to the tool cards so file
+   *  paths render repo-relative instead of absolute. See #2143. */
+  fileRefSession?: FileRefSession | null;
 }
 
 const STARTER_PROMPTS = [
@@ -95,7 +99,8 @@ const STARTER_PROMPTS = [
   "What does the build pipeline do?",
 ];
 
-export function StructuredView({ sessionId, acpWorkerState, tool, archivedAt, snoozedUntil, onOpenFileRef }: Props) {
+export function StructuredView(props: Props) {
+  const { sessionId, acpWorkerState, tool, archivedAt, snoozedUntil, onOpenFileRef, fileRefSession } = props;
   // Folds rows above the most recent `/clear` divider out of the
   // thread by default; the disclosure banner toggles this. Lives on
   // the view (not the reducer) because it's a UI preference, not
@@ -105,7 +110,7 @@ export function StructuredView({ sessionId, acpWorkerState, tool, archivedAt, sn
   // not reducer state and not a daemon config field. See #1767.
   const [toolDensity, toggleToolDensity] = useToolDensityPref();
   return (
-    <AcpFileRefContext.Provider value={{ onOpenFileRef }}>
+    <AcpFileRefContext.Provider value={{ onOpenFileRef, fileRefSession }}>
       <AgentProfileProvider toolKey={tool}>
         <ToolDisplayModeProvider density={toolDensity}>
           <AcpRuntime
@@ -204,6 +209,8 @@ function AcpChrome({
   dismissModeSwitchFailed,
   setConfigOption,
   dismissConfigOptionSwitchFailed,
+  canLoadEarlierHistory,
+  loadEarlierHistory,
 }: AcpContext & {
   sessionId: string;
   acpWorkerState: "absent" | "resuming" | "running";
@@ -248,12 +255,6 @@ function AcpChrome({
       id: `rate-limit-recovery-${Date.now()}`,
       text,
     });
-
-  // Browser-side approval chime. Fires once on the 0 -> >=1 edge of
-  // pendingApprovals; complements the OS push (delivered via the SW
-  // when the dashboard is backgrounded) and the in-app toast (when
-  // foregrounded). See #1038.
-  useApprovalSound(state.pendingApprovals.length);
 
   // Re-pin the chat viewport to the bottom when the composer (or any
   // sibling below it: queued strip, primer banner) grows. assistant-ui's
@@ -316,6 +317,7 @@ function AcpChrome({
   }
   return (
     <StructuredViewRoot>
+      <AttentionChime approvals={state.pendingApprovals.length} elicitations={state.pendingElicitations.length} />
       <PlanStrip plan={state.plan} />
 
       <RateLimitRecoverySection sessionId={sessionId} currentAgent={state.agent} onPrefill={recoveryHandoffPrefill}>
@@ -399,6 +401,19 @@ function AcpChrome({
               />
             )}
 
+            {canLoadEarlierHistory && (
+              <div className="mb-3 flex justify-center">
+                <button
+                  type="button"
+                  onClick={loadEarlierHistory}
+                  data-testid="acp-load-earlier"
+                  className="h-8 rounded-md border border-surface-700 bg-surface-800 px-3 text-xs text-text-secondary hover:bg-surface-700 hover:text-text-primary transition-colors cursor-pointer"
+                >
+                  Load earlier messages
+                </button>
+              </div>
+            )}
+
             <ThreadPrimitive.Messages
               components={{
                 UserMessage,
@@ -407,16 +422,24 @@ function AcpChrome({
             />
 
             <ThreadPrimitive.If running>
-              <div className="mt-3 ml-1">
-                <WorkingSpinner
-                  thinking={state.thinking}
-                  tool={state.inFlightTool?.name ?? null}
-                  cancelling={state.cancelling}
-                  cancelEscalatesAt={state.cancelEscalatesAt}
-                  lastActivityRef={lastActivityRef}
-                  onForceEndTurn={forceEndTurn}
-                />
-              </div>
+              {/* The turn is "running" while an elicitation or approval card is
+                  on screen, but the agent is parked on the user's answer, not
+                  stalled. Suppress the spinner (rattle verbs, "Waiting on
+                  model…", and the Force end turn watchdog) so the actionable
+                  card stands alone; it returns once the turn resumes. See
+                  #2145. */}
+              {state.pendingElicitations.length === 0 && state.pendingApprovals.length === 0 ? (
+                <div className="mt-3 ml-1">
+                  <WorkingSpinner
+                    thinking={state.thinking}
+                    tool={state.inFlightTool?.name ?? null}
+                    cancelling={state.cancelling}
+                    cancelEscalatesAt={state.cancelEscalatesAt}
+                    lastActivityRef={lastActivityRef}
+                    onForceEndTurn={forceEndTurn}
+                  />
+                </div>
+              ) : null}
             </ThreadPrimitive.If>
 
             {state.pendingApprovals.map((approval) => (
@@ -490,6 +513,8 @@ function AcpChrome({
             pendingAttachments={pendingAttachments}
             setPendingAttachments={setPendingAttachments}
             primerPrefill={primerPrefill}
+            queuedPrompts={state.queuedPrompts}
+            editQueuedPrompt={editQueuedPrompt}
           />
         </div>
       </ThreadPrimitive.Root>
@@ -636,6 +661,7 @@ function AssistantToolCall(props: ToolCallProps) {
     kind: props.toolName,
     args_preview: props.argsText ?? safeStringify(props.args ?? null),
     started_at: startedAt,
+    memory_recall: pickMemoryRecall(props.args, props.argsText),
   };
   const resultContent =
     props.result && typeof props.result === "object" && "content" in (props.result as Record<string, unknown>)
@@ -758,6 +784,7 @@ function groupChildToItem(c: GroupChild): {
     kind: c.toolName,
     args_preview: c.argsText,
     started_at: startedAt,
+    memory_recall: pickMemoryRecall(parsedArgs, c.argsText),
   };
   const result =
     c.result !== undefined
@@ -823,6 +850,7 @@ function AssistantSubagentTask({ argsText }: { argsText?: string }) {
       kind: c.toolName,
       args_preview: c.argsText,
       started_at: startedAt,
+      memory_recall: pickMemoryRecall(parsedArgs, c.argsText),
     };
     const result =
       c.result !== undefined
@@ -1041,7 +1069,7 @@ export function WorkingSpinner({
   const showForceEnd = !cancelling && showStalled && !toolInFlight;
 
   return (
-    <div className="flex flex-col gap-2 text-sm italic text-text-muted">
+    <div data-testid="acp-working-spinner" className="flex flex-col gap-2 text-sm italic text-text-muted">
       <div className="flex items-center gap-2">
         <span className="inline-block w-3 text-center font-mono text-brand-500" aria-hidden="true">
           {SPINNER_FRAMES[frame]}

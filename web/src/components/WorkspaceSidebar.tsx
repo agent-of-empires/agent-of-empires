@@ -23,6 +23,7 @@ import {
   Pencil,
   Pin,
   Play,
+  Plus,
 } from "lucide-react";
 import {
   DndContext,
@@ -40,8 +41,9 @@ import type { SessionResponse, SessionStatus, Workspace } from "../lib/types";
 import type { SidebarAxis } from "../lib/sidebarAxis";
 import {
   archivableWorkspaces,
-  nestedSidebarGroupHasLiveWorkspace,
+  nestedSidebarGroupShouldRender,
   sidebarGroupHasLiveWorkspace,
+  sidebarGroupShouldRender,
   type NestedSidebarGroup,
   type SidebarGroup,
 } from "../lib/sidebarGroups";
@@ -150,6 +152,10 @@ interface Props {
   onUpdateRepoAppearance: (repoId: string, update: RepoAppearanceUpdate) => void;
   onNew: () => void;
   onCreateSession: (repoPath: string) => void;
+  /** Pin a repo (register it) so it persists with zero sessions. See #2047. */
+  onPinProject?: (repoPath: string) => void;
+  /** Unpin a repo: remove every registry entry for its path. See #2047. */
+  onUnpinProject?: (group: SidebarGroup) => void;
   onSettings: () => void;
   onProjects: () => void;
   onProfiles: () => void;
@@ -396,6 +402,7 @@ function SortableSessionRow({
   onDelete?: (workspaceId: string) => void;
   onStop?: (workspaceId: string) => void;
   onStart?: (workspaceId: string) => void;
+  onCreateSession?: (repoPath: string) => void;
   readOnly?: boolean;
   dragDisabled?: boolean;
   optimistic: OptimisticTriage;
@@ -515,6 +522,7 @@ export const SessionRow = memo(function SessionRow({
   onDelete,
   onStop,
   onStart,
+  onCreateSession,
   readOnly,
   indented,
   optimistic,
@@ -533,6 +541,9 @@ export const SessionRow = memo(function SessionRow({
   onDelete?: (workspaceId: string) => void;
   onStop?: (workspaceId: string) => void;
   onStart?: (workspaceId: string) => void;
+  // Open the session wizard prefilled from this row's project (path, agent,
+  // and the latest session's options), mirroring the per-project "+" button.
+  onCreateSession?: (repoPath: string) => void;
   readOnly?: boolean;
   indented?: boolean;
   // Optimistic triage overlay for this row plus the parent-owned mutation
@@ -554,6 +565,9 @@ export const SessionRow = memo(function SessionRow({
     idleDecayWindowMs,
   );
   const firstSession = workspace.sessions[0];
+  // Repo path used to prefill a "New Session" launched from this row, matching
+  // the per-project "+" button (handleCreateSession keys off this same path).
+  const newSessionRepoPath = firstSession?.main_repo_path || firstSession?.project_path || null;
   // The structured view session backing this row, if any. Drives the "Switch
   // agent" context-menu item, which only makes sense for an ACP structured view
   // session (tmux rows have no agent to hand off). Multi-session rows are
@@ -1024,6 +1038,19 @@ export const SessionRow = memo(function SessionRow({
               maxHeight: "calc(100vh - 16px)",
             }}
           >
+            {!readOnly && onCreateSession && newSessionRepoPath && (
+              <button
+                onClick={() => {
+                  setContextMenu(null);
+                  onCreateSession(newSessionRepoPath);
+                }}
+                data-testid="sidebar-context-menu-new-session"
+                className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+              >
+                <Plus className="h-3.5 w-3.5 shrink-0" />
+                New Session
+              </button>
+            )}
             <button
               onClick={startRename}
               data-testid="sidebar-context-menu-rename"
@@ -1585,6 +1612,8 @@ const SidebarGroupHeader = memo(function SidebarGroupHeader({
   onNewSession,
   onUpdateAppearance,
   onArchiveAll,
+  onPin,
+  onUnpin,
   offline,
   dragHandle,
 }: {
@@ -1596,6 +1625,12 @@ const SidebarGroupHeader = memo(function SidebarGroupHeader({
   /** Archive every active session under this group. Omitted (read-only /
    *  offline) hides the action; the parent owns the confirmation. */
   onArchiveAll?: () => void;
+  /** Register this repo in the pin registry so it persists with zero
+   *  sessions. Repo axis only; omitted (read-only / offline) hides it. */
+  onPin?: (repoPath: string) => void;
+  /** Remove every registry entry for this repo path (unpin). Omitted
+   *  (read-only / offline) hides it. */
+  onUnpin?: (group: SidebarGroup) => void;
   offline: boolean;
   dragHandle?: DragHandleProps;
 }) {
@@ -1609,7 +1644,11 @@ const SidebarGroupHeader = memo(function SidebarGroupHeader({
   // action hides once everything is already archived.
   const archivableCount = onArchiveAll ? archivableWorkspaces(group).length : 0;
   const canArchiveAll = archivableCount > 0;
-  const hasMenu = canAppearance || canArchiveAll;
+  // Pin/unpin is repo-axis only and needs a concrete repo path. Pin shows
+  // when the repo is not yet registered; unpin when it is. See #2047.
+  const canPin = !!onPin && group.capabilities.create === "repo" && !!group.repoPath && !group.pinned;
+  const canUnpin = !!onUnpin && group.kind === "repo" && group.pinned;
+  const hasMenu = canAppearance || canArchiveAll || canPin || canUnpin;
   const headerTitle = group.groupPath ?? group.repoPath;
   const [contextMenu, setContextMenu] = useState<{
     x: number;
@@ -1760,6 +1799,16 @@ const SidebarGroupHeader = memo(function SidebarGroupHeader({
             />
           </svg>
           <OwnerAvatar owner={group.remoteOwner} size={16} />
+          {group.pinned && (
+            <span
+              className="shrink-0 text-[10px] leading-none text-text-dim"
+              data-testid="sidebar-group-pinned-marker"
+              title="Pinned project (persists without sessions)"
+              aria-label="Pinned project"
+            >
+              ◆
+            </span>
+          )}
           <span className="text-[13px] md:text-[14px] font-medium truncate flex-1" title={headerTitle}>
             {group.displayName}
           </span>
@@ -1799,6 +1848,33 @@ const SidebarGroupHeader = memo(function SidebarGroupHeader({
               maxHeight: "calc(100vh - 16px)",
             }}
           >
+            {canPin && (
+              <button
+                onClick={() => {
+                  setContextMenu(null);
+                  if (group.repoPath) onPin?.(group.repoPath);
+                }}
+                data-testid="sidebar-group-context-menu-pin"
+                className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors"
+              >
+                Pin project
+              </button>
+            )}
+            {canUnpin && (
+              <button
+                onClick={() => {
+                  setContextMenu(null);
+                  onUnpin?.(group);
+                }}
+                data-testid="sidebar-group-context-menu-unpin"
+                className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors"
+              >
+                Unpin project
+              </button>
+            )}
+            {(canPin || canUnpin) && (canArchiveAll || canAppearance) && (
+              <div className="border-t border-surface-700/20 my-1" />
+            )}
             {canArchiveAll && (
               <button
                 onClick={() => {
@@ -1931,6 +2007,8 @@ export function WorkspaceSidebar({
   onUpdateRepoAppearance,
   onNew,
   onCreateSession,
+  onPinProject,
+  onUnpinProject,
   onSettings,
   onProjects,
   onProfiles,
@@ -2439,7 +2517,7 @@ export function WorkspaceSidebar({
                 onDragEnd={reorderDisabled ? undefined : handleDragEnd}
               >
                 {(() => {
-                  const liveGroups = filteredGroups.filter(sidebarGroupHasLiveWorkspace);
+                  const liveGroups = filteredGroups.filter(sidebarGroupShouldRender);
                   // Every visible group is sortable, synthetic Multi-repo /
                   // Scratch included: they default to the bottom but can be
                   // dragged to any position. Group drag is off while a filter
@@ -2465,6 +2543,8 @@ export function WorkspaceSidebar({
                           onClick={() => !q && onToggleGroup(group.id)}
                           onUpdateAppearance={onUpdateRepoAppearance}
                           onArchiveAll={readOnly || offline ? undefined : () => onArchiveGroup(fullGroup)}
+                          onPin={readOnly || offline ? undefined : onPinProject}
+                          onUnpin={readOnly || offline ? undefined : onUnpinProject}
                           onNewSession={() =>
                             group.capabilities.create === "repo" && group.repoPath
                               ? onCreateSession(group.repoPath)
@@ -2498,6 +2578,7 @@ export function WorkspaceSidebar({
                                     onDelete={onDeleteSession}
                                     onStop={onStopSession}
                                     onStart={onStartSession}
+                                    onCreateSession={onCreateSession}
                                     readOnly={readOnly}
                                     optimistic={triage.optimisticFor(v.workspace.id)}
                                     onPinToggle={triage.pinToggle}
@@ -2540,7 +2621,7 @@ export function WorkspaceSidebar({
             </DragSuppressContext.Provider>
           )}
           {isNested &&
-            filteredNested.filter(nestedSidebarGroupHasLiveWorkspace).map((ng) => {
+            filteredNested.filter(nestedSidebarGroupShouldRender).map((ng) => {
               const repo = ng.repo;
               const repoExpanded = q ? true : !repo.collapsed;
               const repoHasActiveChild = ng.subgroups.some((sg) =>
@@ -2554,6 +2635,8 @@ export function WorkspaceSidebar({
                     onClick={() => !q && onToggleGroup(repo.id)}
                     onUpdateAppearance={onUpdateRepoAppearance}
                     onArchiveAll={readOnly || offline ? undefined : () => onArchiveGroup(repo)}
+                    onPin={readOnly || offline ? undefined : onPinProject}
+                    onUnpin={readOnly || offline ? undefined : onUnpinProject}
                     onNewSession={() =>
                       repo.capabilities.create === "repo" && repo.repoPath ? onCreateSession(repo.repoPath) : onNew()
                     }

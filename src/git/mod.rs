@@ -23,7 +23,7 @@ mod remote;
 pub mod template;
 mod worktree;
 
-pub use remote::{clone_bare_repo, clone_repo, get_remote_owner};
+pub use remote::{clone_bare_repo, clone_repo, get_remote_owner, get_remote_slug};
 pub use worktree::{GitWorktree, WorktreeEntry};
 
 /// Open a git repository at the given path without searching parent directories.

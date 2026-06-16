@@ -60,11 +60,14 @@ pub use recovery::HookTimeoutScope;
 pub use repo_config::{
     check_repo_trust, execute_hooks, execute_hooks_in_container, load_repo_config,
     merge_repo_config, profile_to_repo_config, repo_config_to_profile, resolve_config_with_repo,
-    resolve_config_with_repo_or_warn, save_repo_config, trust_repo, HooksConfig, RepoConfig,
-    RepoTrust, TrustSurface,
+    resolve_config_with_repo_or_warn, save_repo_config, trust_repo, HookTimeout, HooksConfig,
+    RepoConfig, RepoTrust, TrustSurface,
 };
 pub(crate) use storage::atomic_write;
-pub use storage::{load_workspace_ordering, update_workspace_ordering, Storage, WorkspaceOrdering};
+pub use storage::{
+    load_recent_projects, load_workspace_ordering, recent_project_entry_for, record_recent_project,
+    update_workspace_ordering, RecentProjectEntry, Storage, WorkspaceOrdering,
+};
 
 use anyhow::Result;
 use std::fs;
@@ -302,6 +305,14 @@ pub fn get_profile_dir_path(profile: &str) -> Result<PathBuf> {
 }
 
 pub fn list_profiles() -> Result<Vec<String>> {
+    // Test-only failure injection: when set, the next call returns
+    // Err and the flag clears. Used by the file-watch regression test
+    // that locks the rewire-after-mutation error-handling path
+    // without requiring a platform-fragile permission denial.
+    #[cfg(test)]
+    if FAIL_NEXT_LIST_PROFILES.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        anyhow::bail!("list_profiles failure injected for test");
+    }
     let base = get_app_dir()?;
     let profiles_dir = base.join("profiles");
 
@@ -310,6 +321,32 @@ pub fn list_profiles() -> Result<Vec<String>> {
     }
 
     list_profile_names_in(&profiles_dir)
+}
+
+#[cfg(test)]
+pub(crate) static FAIL_NEXT_LIST_PROFILES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// RAII guard for the `FAIL_NEXT_LIST_PROFILES` test seam. `new` sets
+/// the flag; `drop` clears it unconditionally so a panic between set
+/// and the next `list_profiles` call does not leak the seam into a
+/// subsequent test that picks up the stale `true` value.
+#[cfg(test)]
+pub(crate) struct FailNextListProfilesGuard;
+
+#[cfg(test)]
+impl FailNextListProfilesGuard {
+    pub(crate) fn new() -> Self {
+        FAIL_NEXT_LIST_PROFILES.store(true, std::sync::atomic::Ordering::SeqCst);
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for FailNextListProfilesGuard {
+    fn drop(&mut self) {
+        FAIL_NEXT_LIST_PROFILES.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// Enumerate profile directory names in `profiles_dir`, skipping symlinks.

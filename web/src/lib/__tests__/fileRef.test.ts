@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseFileRef, resolveToRepoRelative, type FileRefSession } from "../fileRef";
+import { parseFileRef, relativeDisplayPath, resolveToRepoRelative, type FileRefSession } from "../fileRef";
 
 describe("parseFileRef", () => {
   it("parses an absolute path with a line suffix", () => {
@@ -157,5 +157,36 @@ describe("resolveToRepoRelative", () => {
       relativePath: "src/app.ts",
       repoName: "web",
     });
+  });
+});
+
+describe("relativeDisplayPath", () => {
+  const single: FileRefSession = {
+    project_path: "/Users/me/.aoe/worktrees/feat",
+    main_repo_path: "/Users/me/repo",
+    workspace_repos: [],
+  };
+
+  it("strips the worktree root to a bare relative path", () => {
+    expect(relativeDisplayPath("/Users/me/.aoe/worktrees/feat/src/hooks/mod.rs", single)).toBe("src/hooks/mod.rs");
+  });
+
+  it("prefixes the repo name in a multi-repo workspace", () => {
+    const workspace: FileRefSession = {
+      project_path: "/Users/me/.aoe/worktrees/ws",
+      main_repo_path: null,
+      workspace_repos: [{ name: "api", source_path: "/Users/me/api" }],
+    };
+    expect(relativeDisplayPath("/Users/me/api/src/h.ts", workspace)).toBe("api/src/h.ts");
+  });
+
+  it("returns the raw absolute path when outside every known root", () => {
+    expect(relativeDisplayPath("/etc/hosts", single)).toBe("/etc/hosts");
+  });
+
+  it("returns the raw path when there is no session", () => {
+    expect(relativeDisplayPath("/Users/me/.aoe/worktrees/feat/src/app.ts", null)).toBe(
+      "/Users/me/.aoe/worktrees/feat/src/app.ts",
+    );
   });
 });

@@ -5,7 +5,7 @@ use serial_test::serial;
 use tempfile::TempDir;
 use tui_input::Input;
 
-use super::{HomeView, ViewMode};
+use super::{ConfigRefreshOrigin, ConfigWatchKey, HomeView, ViewMode};
 use crate::session::{GroupTree, Instance, Item, Storage};
 use crate::tmux::AvailableTools;
 use crate::tui::app::Action;
@@ -44,6 +44,39 @@ fn create_test_env_empty() -> TestEnv {
     TestEnv { _temp: temp, view }
 }
 
+// #1897 / CodeRabbit follow-up: `add_instance` is the funnel for both the
+// `Creating` placeholder stub (async creation flow) and the finalized session
+// row. The opt-in create-trend counter must bump only for finalized inserts, or
+// a successful background create double-counts (stub + real) and a cancelled one
+// counts a session that never existed. Asserts deltas (not absolutes) since the
+// counter is a process-global shared with the `telemetry_creates` serial group.
+#[test]
+#[serial_test::serial(telemetry_creates)]
+fn add_instance_counts_only_finalized_creates() {
+    use crate::session::Status;
+    let mut env = create_test_env_empty();
+    let before = crate::tui::app::session_create_count_for_test();
+
+    let mut stub = Instance::new("stub", "/tmp/test");
+    stub.source_profile = "test".to_string();
+    stub.status = Status::Creating;
+    env.view.add_instance(stub);
+    assert_eq!(
+        crate::tui::app::session_create_count_for_test(),
+        before,
+        "a Creating placeholder stub must not bump the create counter"
+    );
+
+    let mut real = Instance::new("real", "/tmp/test");
+    real.source_profile = "test".to_string();
+    env.view.add_instance(real);
+    assert_eq!(
+        crate::tui::app::session_create_count_for_test(),
+        before + 1,
+        "a finalized session insert must bump the create counter exactly once"
+    );
+}
+
 #[test]
 #[serial]
 fn rewire_disk_subscriptions_is_noop_without_tokio_runtime() {
@@ -63,7 +96,7 @@ fn rewire_disk_subscriptions_is_noop_without_tokio_runtime() {
         view.disk_watch_handles.is_empty(),
         "construction outside a tokio runtime must not prewire subscriptions"
     );
-    view.rewire_disk_subscriptions(&current).unwrap();
+    view.rewire_disk_subscriptions(&current);
     assert!(
         view.disk_watch_handles.is_empty(),
         "rewire outside a tokio runtime must stay a no-op for lib tests"
@@ -71,6 +104,234 @@ fn rewire_disk_subscriptions_is_noop_without_tokio_runtime() {
     assert!(
         !view.disk_dirty.load(std::sync::atomic::Ordering::Acquire),
         "the noop branch must leave disk_dirty clear outside a runtime"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn config_watch_keys_distinguish_global_from_profile_named_global() {
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let profile_name = "<global>";
+    let _storage = Storage::new_unwatched(profile_name).unwrap();
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let view = HomeView::new(
+        Some(profile_name.to_string()),
+        tools,
+        crate::file_watch::FileWatchService::new().unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(view.config_watch_handles.len(), 2);
+    assert!(view
+        .config_watch_handles
+        .contains_key(&ConfigWatchKey::Global));
+    assert!(view
+        .config_watch_handles
+        .contains_key(&ConfigWatchKey::profile(profile_name)));
+}
+
+#[test]
+#[serial]
+fn watcher_refresh_does_not_reopen_hotkey_warning_dialog() {
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let _storage = Storage::new_unwatched("test").unwrap();
+    let global_config = crate::session::get_app_dir().unwrap().join("config.toml");
+    std::fs::write(
+        &global_config,
+        "[tools.alpha]\ncommand = \"alpha\"\nhotkey = \"Ctrl+g\"\n",
+    )
+    .unwrap();
+
+    let tools = AvailableTools::with_tools(&["alpha"]);
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    assert!(
+        view.info_dialog.is_some(),
+        "precondition: initial load shows warning dialog"
+    );
+    view.info_dialog = None;
+
+    view.refresh_from_config(super::ConfigRefreshOrigin::Watcher);
+    assert!(
+        view.info_dialog.is_none(),
+        "watcher-driven refresh must not reopen the hotkey warning dialog"
+    );
+}
+
+#[test]
+#[serial]
+fn interactive_refresh_reopens_hotkey_warning_dialog() {
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let _storage = Storage::new_unwatched("test").unwrap();
+    let global_config = crate::session::get_app_dir().unwrap().join("config.toml");
+    std::fs::write(
+        &global_config,
+        "[tools.alpha]\ncommand = \"alpha\"\nhotkey = \"Ctrl+g\"\n",
+    )
+    .unwrap();
+
+    let tools = AvailableTools::with_tools(&["alpha"]);
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    view.info_dialog = None;
+
+    view.refresh_from_config(super::ConfigRefreshOrigin::Interactive);
+    assert!(
+        view.info_dialog.is_some(),
+        "interactive refresh must still surface the hotkey warning dialog"
+    );
+}
+
+#[test]
+#[serial]
+fn watcher_refresh_stashes_pending_watcher_theme() {
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let _storage = Storage::new_unwatched("test").unwrap();
+    let global_config = crate::session::get_app_dir().unwrap().join("config.toml");
+    std::fs::write(&global_config, "[theme]\nname = \"dracula\"\n").unwrap();
+
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    assert!(
+        view.pending_watcher_theme.is_none(),
+        "precondition: HomeView::new must not stash a pending watcher theme"
+    );
+
+    view.refresh_from_config(super::ConfigRefreshOrigin::Watcher);
+    assert_eq!(
+        view.pending_watcher_theme.as_deref(),
+        Some("dracula"),
+        "watcher-driven refresh must stash the resolved theme name so the tick loop can dispatch App::set_theme"
+    );
+}
+
+#[test]
+#[serial]
+fn interactive_refresh_does_not_stash_pending_watcher_theme() {
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let _storage = Storage::new_unwatched("test").unwrap();
+    let global_config = crate::session::get_app_dir().unwrap().join("config.toml");
+    std::fs::write(&global_config, "[theme]\nname = \"dracula\"\n").unwrap();
+
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    assert!(
+        view.pending_watcher_theme.is_none(),
+        "precondition: HomeView::new must not stash a pending watcher theme"
+    );
+
+    view.refresh_from_config(super::ConfigRefreshOrigin::Interactive);
+    assert!(
+        view.pending_watcher_theme.is_none(),
+        "interactive refresh must not stash a pending theme; settings/intro input handlers dispatch Action::SetTheme directly"
+    );
+}
+
+#[test]
+#[serial]
+fn take_pending_watcher_theme_clears_the_field() {
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let _storage = Storage::new_unwatched("test").unwrap();
+
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    view.pending_watcher_theme = Some("zinc".to_string());
+
+    let first = view.take_pending_watcher_theme();
+    let second = view.take_pending_watcher_theme();
+    assert_eq!(first.as_deref(), Some("zinc"));
+    assert!(
+        second.is_none(),
+        "take must drain the pending field so a single watcher refresh dispatches at most one set_theme"
+    );
+}
+
+#[test]
+#[serial]
+fn watcher_refresh_stashes_global_theme_not_profile_override() {
+    use crate::session::profile_config::{save_profile_config, ProfileConfig};
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let _storage = Storage::new_unwatched("test").unwrap();
+
+    let global_config = crate::session::get_app_dir().unwrap().join("config.toml");
+    std::fs::write(&global_config, "[theme]\nname = \"dracula\"\n").unwrap();
+
+    let profile_overrides: ProfileConfig =
+        serde_json::from_value(serde_json::json!({"theme": {"name": "empire"}}))
+            .expect("legacy hand-edited overrides may carry a theme key even though theme is global by contract");
+    save_profile_config("test", &profile_overrides).unwrap();
+
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    assert!(
+        view.pending_watcher_theme.is_none(),
+        "precondition: HomeView::new must not stash a pending watcher theme"
+    );
+
+    view.refresh_from_config(super::ConfigRefreshOrigin::Watcher);
+    assert_eq!(
+        view.pending_watcher_theme.as_deref(),
+        Some("dracula"),
+        "watcher path must stash the global theme name via resolve_theme_name; a stale per-profile theme override (legacy or hand-edited) must not mask the global value"
+    );
+}
+
+#[test]
+#[serial]
+fn second_watcher_refresh_overwrites_stale_stash() {
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let _storage = Storage::new_unwatched("test").unwrap();
+
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+
+    let global_config = crate::session::get_app_dir().unwrap().join("config.toml");
+    std::fs::write(&global_config, "[theme]\nname = \"dracula\"\n").unwrap();
+    view.refresh_from_config(super::ConfigRefreshOrigin::Watcher);
+    assert_eq!(view.pending_watcher_theme.as_deref(), Some("dracula"));
+
+    std::fs::write(&global_config, "[theme]\nname = \"empire\"\n").unwrap();
+    view.refresh_from_config(super::ConfigRefreshOrigin::Watcher);
+    assert_eq!(
+        view.pending_watcher_theme.as_deref(),
+        Some("empire"),
+        "second watcher refresh must overwrite the stale stash; first-write-wins would silently drop the latest theme change"
     );
 }
 
@@ -1443,6 +1704,7 @@ fn create_test_env_with_group_sessions() -> TestEnv {
         container_name: "test-container".to_string(),
         extra_env: None,
         custom_instruction: None,
+        before_start_env: Vec::new(),
     });
     instances.push(inst3);
 
@@ -1541,6 +1803,7 @@ fn test_group_has_containers() {
         container_name: "test-container".to_string(),
         extra_env: None,
         custom_instruction: None,
+        before_start_env: Vec::new(),
     });
 
     let mut inst2 = Instance::new("other-session", "/tmp/other");
@@ -1646,6 +1909,52 @@ fn test_archive_selected_group_archives_all_members() {
             "session {} (group {:?}) archived state should match group membership",
             inst.title,
             inst.group_path
+        );
+    }
+}
+
+/// Locks #1868: bulk archive persists synchronously even though tmux
+/// teardown runs off-thread. Real tmux state asserted in
+/// `tests/e2e/archive_restore.rs`.
+#[test]
+#[serial]
+fn test_archive_selected_group_widened_teardown_persists_synchronously() {
+    let mut env = create_test_env_with_group_sessions();
+
+    for (i, item) in env.view.flat_items.iter().enumerate() {
+        if let Item::Group { path, .. } = item {
+            if path == "work" {
+                env.view.cursor = i;
+                env.view.update_selected();
+                break;
+            }
+        }
+    }
+    assert_eq!(env.view.selected_group.as_deref(), Some("work"));
+    let work_ids: Vec<String> = env.view.active_sessions_in_selected_group();
+    assert_eq!(work_ids.len(), 3);
+
+    let result = env.view.archive_selected_group();
+    assert!(
+        result.is_ok(),
+        "archive_selected_group must return Ok even when the off-thread \
+         teardown is fire-and-forget; got {:?}",
+        result
+    );
+
+    for id in &work_ids {
+        let inst = env
+            .view
+            .instances()
+            .iter()
+            .find(|i| &i.id == id)
+            .expect("group member must still exist after archive");
+        assert!(
+            inst.is_archived(),
+            "session {} ({}) must have archived_at set synchronously \
+             on the input thread before archive_selected_group returns",
+            inst.title,
+            id
         );
     }
 }
@@ -1891,6 +2200,7 @@ fn test_delete_group_with_sessions_respects_container_option() {
         container_name: "test-container".to_string(),
         extra_env: None,
         custom_instruction: None,
+        before_start_env: Vec::new(),
     });
 
     {
@@ -3787,12 +4097,12 @@ fn test_group_context_menu_new_session_prefills_path() {
 
     // The group right-click menu's "New Session" routes here.
     env.view
-        .dispatch_context_menu_action(ContextMenuAction::NewFromGroup);
+        .dispatch_context_menu_action(ContextMenuAction::NewFromSelection);
     let dialog = env
         .view
         .new_dialog
         .as_ref()
-        .expect("NewFromGroup should open the new-session dialog");
+        .expect("NewFromSelection should open the new-session dialog");
     assert_eq!(dialog.path_value(), "/tmp/work");
     assert_eq!(dialog.group_value(), "work");
 }
@@ -3815,7 +4125,7 @@ fn test_group_context_menu_new_session_shows_no_agents_without_tools() {
     env.view.update_selected();
 
     env.view
-        .dispatch_context_menu_action(ContextMenuAction::NewFromGroup);
+        .dispatch_context_menu_action(ContextMenuAction::NewFromSelection);
     assert!(
         env.view.new_dialog.is_none(),
         "no agents means the new-session form must not open"
@@ -3848,17 +4158,54 @@ fn test_group_context_menu_new_session_prefills_path_in_project_mode() {
     env.view.update_selected();
 
     env.view
-        .dispatch_context_menu_action(ContextMenuAction::NewFromGroup);
+        .dispatch_context_menu_action(ContextMenuAction::NewFromSelection);
     let dialog = env
         .view
         .new_dialog
         .as_ref()
-        .expect("NewFromGroup should open the new-session dialog");
+        .expect("NewFromSelection should open the new-session dialog");
     assert_eq!(
         dialog.path_value(),
         "/tmp/work",
         "project-mode prefill should borrow the member repo path"
     );
+}
+
+#[test]
+#[serial]
+fn test_session_context_menu_new_session_prefills_from_session() {
+    use crate::tui::dialogs::ContextMenuAction;
+
+    let mut env = create_test_env_with_groups();
+
+    // Move cursor onto the "work-project" session row, as a right-click would.
+    let target_id = env
+        .view
+        .instances
+        .iter()
+        .find(|i| i.repo_path() == "/tmp/work")
+        .map(|i| i.id.clone())
+        .expect("work-project instance should exist");
+    let session_idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|item| matches!(item, Item::Session { id, .. } if *id == target_id))
+        .expect("work-project session row should exist in flat_items");
+    env.view.cursor = session_idx;
+    env.view.update_selected();
+
+    // The session right-click menu's "New Session" routes here, prefilling the
+    // dialog from the right-clicked session's repo path and group (issue #2023).
+    env.view
+        .dispatch_context_menu_action(ContextMenuAction::NewFromSelection);
+    let dialog = env
+        .view
+        .new_dialog
+        .as_ref()
+        .expect("NewFromSelection should open the new-session dialog");
+    assert_eq!(dialog.path_value(), "/tmp/work");
+    assert_eq!(dialog.group_value(), "work");
 }
 
 #[test]
@@ -7385,6 +7732,131 @@ mod scroll_pane_isolation {
         env.view.preview_area = Rect::new(30, 0, 100, 40);
     }
 
+    /// Build a live-send env whose preview-capture worker reports the
+    /// given cursor, so the alternate-screen wheel-forwarding branch can
+    /// be exercised without a real full-screen pane.
+    fn live_env_with_cursor(cursor: crate::tmux::PaneCursor) -> TestEnv {
+        use crate::tui::home::live_send::{LiveSendState, LiveSendTarget, LiveSendWorker};
+        let mut env = create_test_env_with_sessions(3);
+        setup_panes(&mut env);
+        env.view.cursor = 1;
+        env.view.update_selected();
+        env.view.preview_cache.dimensions = (80, 24);
+        env.view.preview_cache.captured_lines = 200;
+        env.view.preview_scroll_offset = 10;
+        env.view.live_send = Some(LiveSendState {
+            session_id: "fake".to_string(),
+            title: "fake".to_string(),
+            tmux_name: "fake".to_string(),
+            target: LiveSendTarget::Agent,
+            exit_chords: crate::tui::home::live_send::parse_chord_list(
+                crate::tui::home::live_send::DEFAULT_EXIT_CHORD,
+            ),
+            leader: None,
+        });
+        env.view.live_send_worker = Some(LiveSendWorker::spawn("fake".to_string(), None));
+        // Spawn the capture worker, then inject the cursor (set_target
+        // clears it, so the injection must come after).
+        env.view
+            .sync_preview_capture_worker(Some("fake".to_string()));
+        env.view
+            .preview_capture_worker
+            .as_ref()
+            .expect("capture worker spawned")
+            .set_cursor_for_test(Some(cursor));
+        env
+    }
+
+    fn alt_screen_cursor(
+        alternate_on: bool,
+        mouse_tracking: bool,
+        mouse_sgr: bool,
+    ) -> crate::tmux::PaneCursor {
+        crate::tmux::PaneCursor {
+            x: 0,
+            y: 0,
+            visible: true,
+            pane_height: 24,
+            history_size: 1800,
+            pane_width: 80,
+            alternate_on,
+            mouse_tracking,
+            mouse_sgr,
+        }
+    }
+
+    /// Live-send target is a full-screen app with SGR mouse tracking on:
+    /// the wheel is forwarded to the app (returns to the live edge) instead
+    /// of growing the useless normal-buffer capture window. This is the fix
+    /// for the "scroll up a little then snap to the very first part of the
+    /// session" report on alternate-screen agents.
+    #[test]
+    #[serial]
+    fn wheel_over_alt_screen_sgr_mouse_pane_forwards_instead_of_scrollback() {
+        let mut env = live_env_with_cursor(alt_screen_cursor(true, true, true));
+
+        let up = env.view.handle_scroll_up(50, 10);
+        assert!(up, "wheel over a full-screen SGR-mouse pane is handled");
+        assert_eq!(
+            env.view.preview_scroll_offset, 0,
+            "forwarding pins the preview to the live edge, never the normal-buffer history"
+        );
+
+        env.view.preview_scroll_offset = 10;
+        let down = env.view.handle_scroll_down(50, 10);
+        assert!(down);
+        assert_eq!(env.view.preview_scroll_offset, 0);
+    }
+
+    /// Guard the gate: a full-screen app WITHOUT any mouse tracking must
+    /// not get raw SGR bytes (it would read them as garbage keystrokes).
+    /// The wheel falls back to the existing capture-window scroll.
+    #[test]
+    #[serial]
+    fn wheel_over_alt_screen_without_mouse_uses_capture_scroll() {
+        let mut env = live_env_with_cursor(alt_screen_cursor(true, false, false));
+
+        let up = env.view.handle_scroll_up(50, 10);
+        assert!(up);
+        assert!(
+            env.view.preview_scroll_offset > 10,
+            "no mouse tracking: keep the capture-window scroll (offset advances)"
+        );
+    }
+
+    /// A full-screen app with mouse tracking but in the LEGACY (non-SGR)
+    /// encoding is still forwarded; the byte builder emits X10-encoded
+    /// bytes for it instead of SGR (see `wheel_mouse_bytes_legacy_encodes_x10`).
+    /// Forwarding pins the preview to the live edge like the SGR case.
+    #[test]
+    #[serial]
+    fn wheel_over_alt_screen_legacy_mouse_forwards() {
+        let mut env = live_env_with_cursor(alt_screen_cursor(true, true, false));
+
+        let up = env.view.handle_scroll_up(50, 10);
+        assert!(up, "wheel over a full-screen legacy-mouse pane is handled");
+        assert_eq!(
+            env.view.preview_scroll_offset, 0,
+            "legacy mouse is forwarded too (X10 encoding), not dead-scrolled"
+        );
+    }
+
+    /// And a normal-screen agent (no alternate screen) keeps the capture
+    /// scroll even if it happens to have SGR mouse on: the preview's
+    /// scrollback is genuinely useful there.
+    #[test]
+    #[serial]
+    fn wheel_over_normal_screen_pane_uses_capture_scroll() {
+        let mut env = live_env_with_cursor(alt_screen_cursor(false, true, true));
+
+        let up = env.view.handle_scroll_up(50, 10);
+        assert!(up);
+        assert!(
+            env.view.preview_scroll_offset > 10,
+            "normal screen: capture-window scroll still drives the preview"
+        );
+    }
+
     /// Wheel-down over preview when offset is already at the bottom (0)
     /// must NOT advance the list cursor.
     #[test]
@@ -10447,7 +10919,8 @@ mod default_attach_mode {
             "cache should initialize to the historical Tmux default"
         );
         write_global_default_attach_mode(NewSessionAttachMode::LiveSend);
-        env.view.refresh_from_config();
+        env.view
+            .refresh_from_config(ConfigRefreshOrigin::Interactive);
         assert_eq!(
             env.view.profile_default_attach_mode,
             NewSessionAttachMode::LiveSend,
@@ -11064,7 +11537,7 @@ mod right_click_context_menu {
             .context_menu
             .as_ref()
             .expect("context_menu should be open");
-        assert_eq!(menu.selected_action(), ContextMenuAction::Rename);
+        assert_eq!(menu.selected_action(), ContextMenuAction::NewFromSelection);
         // The selected item is a session, not a group.
         assert!(matches!(
             env.view.flat_items[env.view.cursor],
@@ -11112,7 +11585,8 @@ mod right_click_context_menu {
         setup_inner(&mut env);
         env.view.handle_right_click(5, 1);
         assert!(env.view.context_menu.is_some());
-        // First item is Rename; Enter submits it.
+        // First item is New Session; Rename is one Down away. Enter submits it.
+        env.view.handle_key(key(KeyCode::Down), None);
         env.view.handle_key(key(KeyCode::Enter), None);
         assert!(
             env.view.context_menu.is_none(),
@@ -11129,11 +11603,12 @@ mod right_click_context_menu {
     fn down_then_enter_in_menu_opens_delete_dialog() {
         let mut env = create_test_env_with_sessions(2);
         setup_inner(&mut env);
-        // Attention sort surfaces the full session menu (Rename / Archive /
-        // Snooze / Delete), so Delete is three Downs away.
+        // Attention sort surfaces the full session menu (New Session / Rename /
+        // Archive / Snooze / Delete), so Delete is four Downs away.
         env.view.sort_order = SortOrder::Attention;
         env.view.flat_items = env.view.build_flat_items();
         env.view.handle_right_click(5, 1);
+        env.view.handle_key(key(KeyCode::Down), None);
         env.view.handle_key(key(KeyCode::Down), None);
         env.view.handle_key(key(KeyCode::Down), None);
         env.view.handle_key(key(KeyCode::Down), None);
@@ -11157,9 +11632,9 @@ mod right_click_context_menu {
         assert!(env.view.unified_delete_dialog.is_none());
     }
 
-    /// Right-click a session, pick the Archive item (Rename -> Archive is one
-    /// Down), and the row gets archived through the same `z` codepath. No
-    /// follow-up dialog: archiving is immediate.
+    /// Right-click a session, pick the Archive item (New Session -> Rename ->
+    /// Archive is two Downs), and the row gets archived through the same `z`
+    /// codepath. No follow-up dialog: archiving is immediate.
     #[test]
     #[serial]
     fn right_click_archive_action_archives_session() {
@@ -11172,6 +11647,7 @@ mod right_click_context_menu {
             "precondition: session starts unarchived"
         );
 
+        env.view.handle_key(key(KeyCode::Down), None); // New Session -> Rename
         env.view.handle_key(key(KeyCode::Down), None); // Rename -> Archive
         env.view.handle_key(key(KeyCode::Enter), None);
 
@@ -11216,9 +11692,10 @@ mod right_click_context_menu {
             .map(|(_, l)| *l)
             .collect();
         // Default sort here is Newest, where Snooze is gated out, so the
-        // archived-row menu is just Rename / Unarchive / Delete.
-        assert_eq!(labels, vec!["Rename", "Unarchive", "Delete"]);
+        // archived-row menu is just New Session / Rename / Unarchive / Delete.
+        assert_eq!(labels, vec!["New Session", "Rename", "Unarchive", "Delete"]);
 
+        env.view.handle_key(key(KeyCode::Down), None); // New Session -> Rename
         env.view.handle_key(key(KeyCode::Down), None); // Rename -> Unarchive
         env.view.handle_key(key(KeyCode::Enter), None);
         assert!(
@@ -11491,18 +11968,22 @@ mod right_click_context_menu {
 
     #[test]
     #[serial]
-    fn session_menu_n_hotkey_is_inert() {
-        // Sanity: the session-row menu only has Rename/Delete actions,
-        // so 'n' must NOT submit NewSession when the wrong menu is open.
-        // This proves the hotkey gate (action must be in items) holds.
+    fn session_menu_n_hotkey_opens_new_session() {
+        // The session-row menu now carries a New Session entry (issue #2023),
+        // so 'n' submits NewFromSelection just like the group/project menus,
+        // closing the menu and opening the new-session dialog prefilled from
+        // the right-clicked session.
         let mut env = create_test_env_with_sessions(2);
         setup_inner(&mut env);
         env.view.handle_right_click(5, 1); // row 1 = first session
         send_key(&mut env, crossterm::event::KeyCode::Char('n'));
-        assert!(env.view.context_menu.is_some(), "menu should stay open");
         assert!(
-            env.view.new_dialog.is_none(),
-            "n on session menu must not open new-session"
+            env.view.context_menu.is_none(),
+            "menu should close on submit"
+        );
+        assert!(
+            env.view.new_dialog.is_some(),
+            "n on session menu must open the new-session dialog"
         );
     }
 }

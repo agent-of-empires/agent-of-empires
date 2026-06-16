@@ -90,16 +90,6 @@ impl RuntimeBase {
             .unwrap_or(false)
     }
 
-    pub fn get_version(&self) -> Result<String> {
-        let output = self.command().arg("--version").output()?;
-
-        if !output.status.success() {
-            return Err(DockerError::NotInstalled);
-        }
-
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    }
-
     pub fn image_exists_locally(&self, image: &str) -> bool {
         self.command()
             .args(["image", "inspect", image])

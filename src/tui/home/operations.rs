@@ -21,6 +21,39 @@ fn humanize_minutes(m: u32) -> String {
     }
 }
 
+/// Why a tied-worktree rename must refuse to move the worktree directory.
+///
+/// `git worktree move` does a `rename(2)` on the worktree dir, which the
+/// kernel refuses while anything holds it. Two distinct holders matter and
+/// they need different wording: an active agent (the session's `status`),
+/// and a sandbox session's container, which bind-mounts the worktree dir and
+/// stays alive on `sleep infinity` even while the agent is Idle. Both are
+/// cleared by stopping the session.
+#[derive(Debug, PartialEq, Eq)]
+enum WorktreeRenameBlock {
+    /// The session's agent is busy (running, starting, etc.).
+    ActiveAgent,
+    /// A sandbox container is running and mounting the worktree dir.
+    SandboxContainer,
+}
+
+/// Decide whether a tied-worktree rename must be blocked, and why. Status
+/// takes precedence so a busy agent reports as `ActiveAgent` rather than
+/// reaching for the container reason. Returns `None` when the move is safe.
+fn worktree_rename_block(
+    status: Status,
+    is_sandboxed: bool,
+    container_running: bool,
+) -> Option<WorktreeRenameBlock> {
+    if status.blocks_worktree_edit() {
+        Some(WorktreeRenameBlock::ActiveAgent)
+    } else if is_sandboxed && container_running {
+        Some(WorktreeRenameBlock::SandboxContainer)
+    } else {
+        None
+    }
+}
+
 impl HomeView {
     /// Pin or unpin the project header under the cursor (project view only).
     ///
@@ -849,6 +882,7 @@ impl HomeView {
         new_title: &str,
         new_group: Option<&str>,
         new_profile: Option<&str>,
+        rename_branch: bool,
     ) -> anyhow::Result<()> {
         if let Some(id) = &self.selected_session {
             let id = id.clone();
@@ -878,15 +912,47 @@ impl HomeView {
             // session surfaces a warning and nothing is renamed. Applied below
             // in both the profile-move and the standard persist paths.
             let mut new_path: Option<String> = None;
-            if current_title != effective_title && self.tie_workdir_applies_for(&id) {
-                let snapshot = self
-                    .get_instance(&id)
-                    .map(|i| (i.worktree_info.clone(), i.status, i.project_path.clone()));
-                if let Some((Some(worktree_info), status, project_path)) = snapshot {
-                    if status.blocks_worktree_edit() {
+            let mut new_branch: Option<String> = None;
+            // Fire when the title changed (dir follows it) OR the user opted to
+            // rename the branch (which may be requested even with the title
+            // unchanged, to bring a drifted branch back in line with the dir).
+            if (current_title != effective_title || rename_branch)
+                && self.tie_workdir_applies_for(&id)
+            {
+                let snapshot = self.get_instance(&id).map(|i| {
+                    (
+                        i.worktree_info.clone(),
+                        i.status,
+                        i.project_path.clone(),
+                        i.is_sandboxed(),
+                    )
+                });
+                if let Some((Some(worktree_info), status, project_path, is_sandboxed)) = snapshot {
+                    // A sandbox session keeps its container alive (running
+                    // `sleep infinity`) even while the agent is Idle, and that
+                    // container bind-mounts the worktree directory. The move
+                    // below `git worktree move`s that dir, which the kernel
+                    // refuses while it is an active mount source (EBUSY ->
+                    // "fatal: failed to move"). Stopping the session tears the
+                    // container down and releases the mount. We only inspect
+                    // the container when the status check hasn't already
+                    // blocked, so the common non-sandbox path spawns no
+                    // `docker inspect`. See #1927 follow-up.
+                    let container_running = !status.blocks_worktree_edit()
+                        && crate::session::worktree_edit::sandbox_container_holds_worktree(
+                            &id,
+                            is_sandboxed,
+                        );
+                    if let Some(reason) =
+                        worktree_rename_block(status, is_sandboxed, container_running)
+                    {
+                        let body = match reason {
+                            WorktreeRenameBlock::ActiveAgent => "This worktree session's directory moves to match the new name, which can't happen while it's running. Stop the session first, or disable \"Tie Worktree Directory to Session Name\" to relabel it freely.",
+                            WorktreeRenameBlock::SandboxContainer => "This sandbox session's container is mounting the worktree directory, so it can't be moved to match the new name. Stop the session first, or disable \"Tie Worktree Directory to Session Name\" to relabel it freely.",
+                        };
                         self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
                             "Stop the Session to Rename",
-                            "This worktree session's directory moves to match the new name, which can't happen while it's running. Stop the session first, or disable \"Tie Worktree Directory to Session Name\" to relabel it freely.",
+                            body,
                         ));
                         return Ok(());
                     }
@@ -897,14 +963,27 @@ impl HomeView {
                             worktree_info: &worktree_info,
                             current_path: std::path::Path::new(&project_path),
                             new_name: &leaf,
-                            rename_branch: false,
+                            rename_branch,
                         },
                     ) {
                         Ok(outcome) => {
-                            new_path = Some(outcome.new_path.to_string_lossy().to_string())
+                            // Discard the stale container only when the dir
+                            // actually moved. A branch-only rename (title
+                            // unchanged, toggle armed) leaves the path, and thus
+                            // the mount and working dir, valid, so there is
+                            // nothing stale to recreate.
+                            let dir_moved = outcome.new_path != std::path::Path::new(&project_path);
+                            new_path = Some(outcome.new_path.to_string_lossy().to_string());
+                            new_branch = outcome.new_branch;
+                            if dir_moved {
+                                crate::session::worktree_edit::discard_sandbox_container_after_move(
+                                    &id,
+                                    is_sandboxed,
+                                );
+                            }
                         }
-                        // Leaf maps to the current dir: nothing to move, just
-                        // rename the title.
+                        // Leaf maps to the current dir and no branch rename was
+                        // requested: nothing to move, just rename the title.
                         Err(crate::session::worktree_edit::WorktreeEditError::Unchanged) => {}
                         Err(e) => {
                             self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
@@ -970,6 +1049,7 @@ impl HomeView {
                     instance.source_profile = target_profile.to_string();
                     let new_title = instance.title.clone();
                     let moved_path = new_path.clone();
+                    let moved_branch = new_branch.clone();
                     self.move_to_profile(&id, target_profile, instance.group_path.clone())?;
                     // apply_user_action (not mutate_instance + save) so a tied
                     // worktree's moved project_path actually persists; save()
@@ -978,6 +1058,11 @@ impl HomeView {
                         inst.title = new_title.clone();
                         if let Some(path) = &moved_path {
                             inst.project_path = path.clone();
+                        }
+                        if let Some(branch) = &moved_branch {
+                            if let Some(wt) = inst.worktree_info.as_mut() {
+                                wt.branch = branch.clone();
+                            }
                         }
                     })?;
 
@@ -1019,6 +1104,11 @@ impl HomeView {
                 inst.group_path = effective_group.clone();
                 if let Some(path) = &new_path {
                     inst.project_path = path.clone();
+                }
+                if let Some(branch) = &new_branch {
+                    if let Some(wt) = inst.worktree_info.as_mut() {
+                        wt.branch = branch.clone();
+                    }
                 }
             })?;
 
@@ -1161,17 +1251,10 @@ impl HomeView {
         None
     }
 
-    /// Handle the archive keybind on the cursor's session. Symmetric toggle:
-    /// archive an active row, unarchive an archived one. Killing the tmux
-    /// pane on archive matches the CLI semantics (archived means "stop
-    /// spending CPU on this") so a stale spinner can't keep advertising the
-    /// session as alive. Unarchive does NOT respawn the pane; the user
-    /// restarts explicitly if they want it back.
-    ///
-    /// Mirrors `toggle_snooze_at_cursor` but with no picker: archive is
-    /// indefinite, so there's nothing to ask the user before sinking the
-    /// row. The session reappears at its real tier on unarchive or when
-    /// the user sends a message (auto unarchive in `Instance::message_sent`).
+    /// Toggle the cursor's session: archive or unarchive. Archive tears down
+    /// all tmux sessions (agent + ancillary); worktree, branch, container
+    /// preserved. Unarchive does NOT respawn; press `e` to restart, or send
+    /// a message to auto-unarchive. See #1868.
     pub(super) fn toggle_archive_at_cursor(&mut self) -> anyhow::Result<()> {
         let Some(id) = self.selected_session.clone() else {
             return Ok(());
@@ -1187,19 +1270,15 @@ impl HomeView {
             // flat_items rebuild the row jumps from tier 99 to its real
             // tier, so without this the cursor stays at the old index and
             // ends up on whatever row slid into that slot. The session stays
-            // Stopped (archive killed its pane); the user restarts it with `e`
-            // when they want it back, same as any other stopped session.
+            // Stopped (archive killed its panes); the user restarts it with
+            // `e` when they want it back, same as any other stopped session.
             self.select_session_by_id(&id);
             return Ok(());
         }
 
-        // Kill the pane before flipping the archived bit. If the kill fails
-        // (tmux gone, pane already dead) we still archive: the row should
-        // sink regardless, since the user explicitly asked for it.
+        // Tear down all tmux before flipping archived. #1868.
         if let Some(inst) = self.instances.iter().find(|i| i.id == id) {
-            if let Err(e) = inst.kill() {
-                tracing::warn!("toggle_archive_at_cursor: kill failed (continuing): {}", e);
-            }
+            inst.kill_all_tmux_sessions();
         }
 
         // Decide where the cursor lands BEFORE the row sinks, against the
@@ -1299,21 +1378,35 @@ impl HomeView {
         }
     }
 
-    /// Archive every active session under the selected group. Mirrors the
-    /// single-row archive path in `toggle_archive_at_cursor`: kill each pane
-    /// before flipping the archived bit, then reveal the Archived section so
-    /// the rows stay visible. Triggered behind a confirmation prompt, so there
-    /// is no further guard here.
+    /// Archive every active session under the selected group: tmux teardown
+    /// runs off-thread, persist runs inline. Confirmation upstream. See #1868.
     pub(super) fn archive_selected_group(&mut self) -> anyhow::Result<()> {
         let ids = self.active_sessions_in_selected_group();
         if ids.is_empty() {
             return Ok(());
         }
-        for inst in self.instances.iter().filter(|i| ids.contains(&i.id)) {
-            if let Err(e) = inst.kill() {
-                tracing::warn!("archive_selected_group: kill failed (continuing): {}", e);
+        // Off-thread tmux teardown so N x 4 shellouts don't block the input
+        // thread. Mirrors `force_remove_session`.
+        let kill_targets: Vec<_> = self
+            .instances
+            .iter()
+            .filter(|i| ids.contains(&i.id))
+            .cloned()
+            .collect();
+        std::thread::spawn(move || {
+            for inst in kill_targets {
+                if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    inst.kill_all_tmux_sessions()
+                })) {
+                    tracing::error!(
+                        target: "session.tmux_cleanup",
+                        session_id = %inst.id,
+                        "archive_selected_group tmux teardown panicked: {:?}",
+                        panic
+                    );
+                }
             }
-        }
+        });
         self.bulk_apply_user_action(&ids, |inst| inst.archive())?;
         self.reveal_archived_section();
         self.flat_items = self.build_flat_items();
@@ -1325,5 +1418,62 @@ impl HomeView {
         }
         self.update_selected();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // An Idle sandbox session whose container is still running is the #1927
+    // follow-up bug: the worktree dir is an active bind-mount source, so
+    // `git worktree move` fails with EBUSY. Before the fix this returned
+    // `None` (the rename proceeded and the move blew up with "fatal: failed
+    // to move"); it must now block with the sandbox-specific reason.
+    #[test]
+    fn idle_sandbox_with_running_container_blocks() {
+        assert_eq!(
+            worktree_rename_block(Status::Idle, true, true),
+            Some(WorktreeRenameBlock::SandboxContainer)
+        );
+    }
+
+    #[test]
+    fn idle_sandbox_with_stopped_container_is_safe() {
+        // Stopping the session tears the container down, releasing the mount.
+        assert_eq!(worktree_rename_block(Status::Idle, true, false), None);
+    }
+
+    #[test]
+    fn idle_non_sandbox_is_safe() {
+        // No container, nothing holds the dir; the move proceeds.
+        assert_eq!(worktree_rename_block(Status::Idle, false, false), None);
+    }
+
+    #[test]
+    fn active_status_blocks_as_active_agent() {
+        for status in [
+            Status::Running,
+            Status::Waiting,
+            Status::Starting,
+            Status::Creating,
+            Status::Deleting,
+        ] {
+            assert_eq!(
+                worktree_rename_block(status, false, false),
+                Some(WorktreeRenameBlock::ActiveAgent),
+                "{status:?} should block as ActiveAgent"
+            );
+        }
+    }
+
+    #[test]
+    fn active_status_takes_precedence_over_container() {
+        // A busy agent reports as ActiveAgent even on a sandbox session with a
+        // live container; status is checked first.
+        assert_eq!(
+            worktree_rename_block(Status::Running, true, true),
+            Some(WorktreeRenameBlock::ActiveAgent)
+        );
     }
 }

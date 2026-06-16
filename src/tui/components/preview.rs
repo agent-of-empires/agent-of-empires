@@ -770,6 +770,7 @@ mod tests {
                 container_name: "ctr".into(),
                 extra_env: None,
                 custom_instruction: None,
+                before_start_env: Vec::new(),
             }
         }
 
@@ -835,6 +836,7 @@ mod tests {
                 container_name: "ctr".into(),
                 extra_env: None,
                 custom_instruction: None,
+                before_start_env: Vec::new(),
             }
         }
 

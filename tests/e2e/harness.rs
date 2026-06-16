@@ -646,6 +646,54 @@ last_seen_version = "{}"
         p
     }
 
+    /// Set `AOE_E2E_DEBUG=1` so the spawned TUI exports its
+    /// watcher-config-refresh counter to
+    /// `<app_dir>/.aoe_e2e_refresh_count` after every watcher-driven
+    /// `apply_config_to_state`. Tests that poll the counter via
+    /// `wait_for_watcher_config_refresh_above` must call this before
+    /// `spawn_tui`; the env var is read by the TUI process.
+    pub fn enable_e2e_debug_signals(&mut self) {
+        self.set_env("AOE_E2E_DEBUG", "1");
+    }
+
+    /// Read the current watcher-config-refresh counter exported by the
+    /// TUI. Returns 0 when the file is missing (TUI has not run any
+    /// watcher refresh yet, or `AOE_E2E_DEBUG` was not set on the
+    /// process).
+    pub fn read_watcher_config_refresh_count(&self) -> u64 {
+        let path = app_dir_in(self.home_dir.path()).join(".aoe_e2e_refresh_count");
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|c| c.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// Poll the watcher-config-refresh counter until it exceeds
+    /// `baseline` or `timeout` elapses. Returns the new count on
+    /// success and panics on timeout. Tests must take the baseline
+    /// before triggering the config write so a subsequent
+    /// watcher-driven refresh is the only way the counter climbs
+    /// above it. Requires `enable_e2e_debug_signals` before
+    /// `spawn_tui`.
+    pub fn wait_for_watcher_config_refresh_above(&self, baseline: u64, timeout: Duration) -> u64 {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let current = self.read_watcher_config_refresh_count();
+            if current > baseline {
+                return current;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "timed out after {:?} waiting for watcher_config_refresh_count > {} (current = {}); \
+                     check that enable_e2e_debug_signals() was called before spawn_tui and that the watcher \
+                     subscription is wired",
+                    timeout, baseline, current
+                );
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
     /// Check whether the tmux session is still alive.
     pub fn session_alive(&self) -> bool {
         Command::new("tmux")

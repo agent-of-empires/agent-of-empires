@@ -16,12 +16,12 @@
     "node": ">=22.0.0"
   },
   "dependencies": {
-    "@agentclientprotocol/sdk": "^0.22.1",
+    "@agentclientprotocol/sdk": "^0.23.0",
     "@ai-sdk/anthropic": "^3.0.81",
-    "@ai-sdk/openai": "^3.0.67",
+    "@ai-sdk/openai": "^3.0.68",
     "@ai-sdk/google": "^3.0.80",
     "@ai-sdk/openai-compatible": "^2.0.48",
-    "ai": "^6.0.193",
+    "ai": "^6.0.197",
     "zod": "^4.4.3"
   },
   "license": "MIT"

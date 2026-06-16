@@ -1,6 +1,7 @@
 /* eslint-disable react-refresh/only-export-components */
 import { useEffect, useMemo, useState } from "react";
-import { fetchSessions, cloneRepo } from "../../../lib/api";
+import { fetchSessions, fetchRecentProjects, cloneRepo } from "../../../lib/api";
+import type { RecentProjectEntry } from "../../../lib/api";
 import type { SessionResponse } from "../../../lib/types";
 import { DirectoryBrowser } from "../../DirectoryBrowser";
 import { ExtraReposPicker } from "./ExtraReposPicker";
@@ -104,6 +105,29 @@ export function collectRecentProjects(sessions: SessionResponse[]): RecentProjec
   return Array.from(map.values()).sort((a, b) => (b.lastAccessedAt ?? "").localeCompare(a.lastAccessedAt ?? ""));
 }
 
+// Fold the persisted recent-projects store (projects whose sessions are gone,
+// #2141) into the live session-derived list. Session-derived entries win on a
+// normalized-path collision, so an active project keeps its real session count
+// and freshness; persisted-only projects are appended with a zero count. The
+// merged list is sorted newest-first; the caller still slices to the visible
+// cap.
+export function mergeRecentProjects(sessionDerived: RecentProject[], persisted: RecentProjectEntry[]): RecentProject[] {
+  const byPath = new Map<string, RecentProject>();
+  for (const r of sessionDerived) byPath.set(r.path, r);
+  for (const p of persisted) {
+    const path = p.path.replace(/\/+$/, "") || "/";
+    if (byPath.has(path)) continue;
+    byPath.set(path, {
+      path,
+      displayName: p.display_name || path.split("/").filter(Boolean).pop() || path,
+      lastAccessedAt: p.last_used_at,
+      tool: p.tool,
+      sessionCount: 0,
+    });
+  }
+  return Array.from(byPath.values()).sort((a, b) => (b.lastAccessedAt ?? "").localeCompare(a.lastAccessedAt ?? ""));
+}
+
 function timeAgo(ts: string | null): string {
   if (!ts) return "";
   const diff = Date.now() - new Date(ts).getTime();
@@ -131,9 +155,10 @@ export function ProjectStep({ data, onChange, initialTab }: Props) {
   const [showAdvanced, setShowAdvanced] = useState(false);
 
   useEffect(() => {
-    fetchSessions().then((envelope) => {
+    Promise.all([fetchSessions(), fetchRecentProjects()]).then(([envelope, recentEnvelope]) => {
       if (envelope) {
-        const projects = collectRecentProjects(envelope.sessions).slice(0, 6);
+        const sessionDerived = collectRecentProjects(envelope.sessions);
+        const projects = mergeRecentProjects(sessionDerived, recentEnvelope?.projects ?? []).slice(0, 6);
         setRecent(projects);
         if (projects.length === 0 && !initialTab) {
           setActiveTab("browse");

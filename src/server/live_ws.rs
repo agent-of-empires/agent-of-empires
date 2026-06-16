@@ -11,11 +11,16 @@
 //! Protocol (one WS per viewer, route `/sessions/{id}/live-ws`):
 //!
 //! Server -> client, JSON text frames:
-//!   `{"type":"frame","content":"<ANSI text>","cursor":{"x":..,"y":..,
-//!     "visible":..,"screen_rows":..}|null}`
+//!   `{"type":"frame","content":"<ANSI text>","rows":..,"history":..,
+//!     "cursor":{"x":..,"y":..}|null,
+//!     "altScreen":bool,"mouse":bool,"mouseSgr":bool}`
 //!   `content` is verbatim `capture-pane -e` output for the requested
-//!   window: history lines first, the live screen as the last
-//!   `screen_rows` lines (trailing blank screen rows preserved).
+//!   window: history lines first, the live screen as the last `rows`
+//!   lines (trailing blank screen rows preserved). `altScreen` /`mouse` /
+//!   `mouseSgr` mirror tmux's `#{alternate_on}` / `#{mouse_any_flag}` /
+//!   `#{mouse_sgr_flag}`: when the pane is a full-screen mouse app the
+//!   client forwards the wheel to it (as input bytes) instead of widening
+//!   the capture window, since the alternate screen has no scrollback.
 //!   `{"type":"size_owner","is_owner":bool}`: whether this client holds
 //!     the session's size-owner lock. Only the owner resizes the shared
 //!     tmux window and may type; a non-owner renders best-effort at the
@@ -603,6 +608,12 @@ fn frame_json(content: &str, cursor: Option<&crate::tmux::PaneCursor>) -> String
         "rows": cursor.map(|c| c.pane_height).unwrap_or(0),
         "history": cursor.map(|c| c.history_size).unwrap_or(0),
         "cursor": cursor_value,
+        // Full-screen (alternate-screen) mouse apps have no capturable
+        // scrollback; the client forwards the wheel to the app instead of
+        // widening the capture window. `mouseSgr` picks the wire encoding.
+        "altScreen": cursor.map(|c| c.alternate_on).unwrap_or(false),
+        "mouse": cursor.map(|c| c.mouse_tracking).unwrap_or(false),
+        "mouseSgr": cursor.map(|c| c.mouse_sgr).unwrap_or(false),
     })
     .to_string()
 }
@@ -620,6 +631,9 @@ mod tests {
             pane_height: 46,
             history_size: 1200,
             pane_width: 74,
+            alternate_on: false,
+            mouse_tracking: false,
+            mouse_sgr: false,
         };
         let json = frame_json("hello\nworld", Some(&cursor));
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -629,6 +643,28 @@ mod tests {
         assert_eq!(v["history"], 1200);
         assert_eq!(v["cursor"]["x"], 3);
         assert_eq!(v["cursor"]["y"], 7);
+        assert_eq!(v["altScreen"], false);
+        assert_eq!(v["mouse"], false);
+        assert_eq!(v["mouseSgr"], false);
+    }
+
+    #[test]
+    fn frame_json_reports_alt_screen_mouse_flags() {
+        let cursor = crate::tmux::PaneCursor {
+            x: 0,
+            y: 0,
+            visible: true,
+            pane_height: 40,
+            history_size: 0,
+            pane_width: 80,
+            alternate_on: true,
+            mouse_tracking: true,
+            mouse_sgr: false,
+        };
+        let v: serde_json::Value = serde_json::from_str(&frame_json("x", Some(&cursor))).unwrap();
+        assert_eq!(v["altScreen"], true);
+        assert_eq!(v["mouse"], true);
+        assert_eq!(v["mouseSgr"], false);
     }
 
     #[test]
@@ -640,6 +676,9 @@ mod tests {
             pane_height: 46,
             history_size: 0,
             pane_width: 74,
+            alternate_on: false,
+            mouse_tracking: false,
+            mouse_sgr: false,
         };
         let v: serde_json::Value = serde_json::from_str(&frame_json("x", Some(&cursor))).unwrap();
         assert!(v["cursor"].is_null());

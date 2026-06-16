@@ -75,7 +75,10 @@
             pname = "agent-of-empires-web";
             version = "0";
             src = ./web;
-            npmDepsHash = "sha256-gm0MvpjQflmYWg9AVmGVsDL3APwSGraF6ee2Z4RmffY=";
+            # Regenerate after this merge: the lockfile combines main's dep
+            # bumps with the @xterm removal, so neither pre-merge hash applies.
+            # Build once (or `nix-update aoe-with-web`) and copy the got: hash.
+            npmDepsHash = pkgs.lib.fakeHash;
             # tsc -b && vite build; output goes to web/dist
             installPhase = ''
               mkdir $out

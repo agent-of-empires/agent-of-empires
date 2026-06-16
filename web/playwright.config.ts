@@ -31,7 +31,9 @@ export default defineConfig({
     port: 4173,
     reuseExistingServer: !process.env.CI,
   },
-  reporter: process.env.CI ? [["html", { open: "never" }], ["github"]] : "list",
+  reporter: process.env.CI
+    ? [["html", { open: "never" }], ["github"], ["junit", { outputFile: "test-report.junit.xml" }]]
+    : "list",
   projects: [
     {
       name: "chromium",

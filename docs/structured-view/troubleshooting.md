@@ -53,15 +53,17 @@ install is incomplete. Reinstall aoe via your package manager (e.g.,
 
 ### `aoe acp doctor` says claude-code adapter is missing
 
-aoe requires `claude-agent-acp` v0.44.0 or newer. Install the official adapter:
+aoe requires a recent `claude-agent-acp`. If your installed adapter is too old,
+aoe refuses to start the session and reports the exact required version. Install
+the official adapter:
 
 ```bash
 npm install -g @agentclientprotocol/claude-agent-acp@latest
 ```
 
 Then run `claude login` if you haven't already. If an older version is pinned by
-an internal mirror, ship 0.44.0 from the mirror or run the `@latest` install
-above before starting `aoe serve`.
+an internal mirror, ship the required floor from the mirror or run the `@latest`
+install above before starting `aoe serve`.
 
 ### "Failed to start structured view agent" while the adapter is installed
 
@@ -205,8 +207,10 @@ container (rather than bind-mounting from the host).
 If the agent finished a turn but the working spinner is still rattling, a small
 **Force end turn** button appears beneath it. Click it to clear the spinner and
 cancel the agent. It only appears for a silent model with no tool running, and
-the view auto-recovers on its own if you do nothing. During a healthy turn, or
-while a tool is in flight, the button stays hidden.
+the view auto-recovers on its own if you do nothing. During healthy streaming, or
+while a tool is in flight, the spinner keeps running but the button stays hidden.
+While a question or approval card is awaiting your input, both the spinner and the
+button are hidden, so the actionable card stands alone.
 
 ### Editing settings asks for the passphrase again
 

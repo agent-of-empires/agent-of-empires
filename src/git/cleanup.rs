@@ -688,6 +688,7 @@ mod tests {
             container_name: "aoe-sandbox-doesnotexist".to_string(),
             extra_env: None,
             custom_instruction: None,
+            before_start_env: Vec::new(),
         });
 
         let worktree = std::path::PathBuf::from("/tmp/aoe-cleanup-test-nonexistent");
@@ -760,6 +761,7 @@ mod tests {
             container_name: "aoe-cruft-doesnotexist".to_string(),
             extra_env: None,
             custom_instruction: None,
+            before_start_env: Vec::new(),
         });
 
         let git_wt = GitWorktree::new(main_repo.clone()).unwrap();

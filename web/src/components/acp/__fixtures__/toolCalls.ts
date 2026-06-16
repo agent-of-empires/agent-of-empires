@@ -155,6 +155,28 @@ export const fixtures = {
       reason: "checking deploy",
     }),
   }),
+  toolSearch: makeToolCall({
+    id: "toolsearch-1",
+    name: "ToolSearch",
+    kind: "other",
+    args_preview: JSON.stringify({ query: "select:Read,Edit", max_results: 5 }),
+  }),
+  monitor: makeToolCall({
+    id: "monitor-1",
+    name: "Monitor",
+    kind: "other",
+    args_preview: JSON.stringify({
+      description: "errors in deploy.log",
+      command: "tail -f deploy.log",
+      persistent: true,
+    }),
+  }),
+  taskStop: makeToolCall({
+    id: "taskstop-1",
+    name: "TaskStop",
+    kind: "other",
+    args_preview: JSON.stringify({ task_id: "task-abc123" }),
+  }),
   mcp: makeToolCall({
     id: "mcp-1",
     name: "mcp__slack__send_message",
@@ -184,8 +206,10 @@ export const fixtures = {
       ],
     },
   }),
-  // Synthesize mode: adapter packed the summary into ToolCall.content
-  // instead of locations. Renderer shows the body verbatim.
+  // Synthesize mode: adapter packed the recalled file content into
+  // ToolCall.content. The SDK wraps it in a <system-reminder> envelope
+  // and prefixes each line with a cat -n line number; the card strips
+  // both and renders the markdown body. See #2142.
   memoryRecallSynthesize: makeToolCall({
     id: "mem-2",
     name: "Recalled synthesized memory",
@@ -193,7 +217,8 @@ export const fixtures = {
     args_preview: "{}",
     memory_recall: {
       mode: "synthesize",
-      synthesized_text: "User is a senior engineer working on agent-of-empires.",
+      synthesized_text:
+        "<system-reminder>\n     1\t# User profile\n     2\t\n     3\tUser is a senior engineer working on agent-of-empires.\n     4\t\n     5\t- prefers terse output\n     6\t- no em dashes\n</system-reminder>",
     },
   }),
 };

@@ -120,6 +120,15 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
         Ok(())
     })?;
 
+    // Keep the project in the new-session wizard's Recent tab after its last
+    // session is gone (#2141). Best-effort; a failure must not fail the remove.
+    if let Some(entry) = crate::session::recent_project_entry_for(&inst) {
+        if let Err(e) = crate::session::record_recent_project(entry) {
+            tracing::warn!(target: "session.delete",
+                "recording recent project after remove failed: {e}");
+        }
+    }
+
     println!(
         "  Removed session: {} (from profile '{}')",
         removed_title,

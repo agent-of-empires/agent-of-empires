@@ -191,6 +191,7 @@ describe("repoGroupToSidebarGroup", () => {
       workspaces: [workspace("w1", [session({ id: "s1" })])],
       status: "idle",
       collapsed: false,
+      registeredProjects: [],
       ...over,
     };
   }
@@ -228,6 +229,7 @@ describe("buildNestedSidebarGroups", () => {
       workspaces: [],
       status: "idle",
       collapsed: false,
+      registeredProjects: [],
       ...over,
     };
   }

@@ -84,9 +84,6 @@ reqwest = { version = "0.13", features = ["json", "rustls", "stream"], default-f
 # Unix sockets + futures-compat for ACP byte streams
 tokio-util = { version = "0.7", features = ["codec", "compat"] }
 
-# Platform detection
-cfg-if = "1.0"
-
 # Process handling
 nix = { version = "0.31", features = ["signal", "process", "net", "fs", "resource"] }
 
@@ -125,7 +122,7 @@ which = "8.0"
 # system libsqlite3 dependency. Used to read session state without spawning
 # `opencode session list`, which leaks a 4.5MB /tmp/.<hash>.so per invocation
 # via opencode's bun:ffi OpenTUI extract path (see anomalyco/opencode#6523).
-rusqlite = { version = "0.39", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 # Web server (optional, behind "serve" feature)
 axum = { version = "0.8", features = ["ws"], optional = true }

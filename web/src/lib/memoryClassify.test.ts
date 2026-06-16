@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { classifyMemory, isMemoryPath, parseMemoryFrontmatter } from "./memoryClassify";
+import { cleanRecalledMemory, classifyMemory, isMemoryPath, parseMemoryFrontmatter } from "./memoryClassify";
 import type { ToolCall } from "./acpTypes";
 
 function tool(name: string, kind: ToolCall["kind"], args: Record<string, unknown> = {}): ToolCall {
@@ -125,5 +125,32 @@ describe("parseMemoryFrontmatter", () => {
     const r = parseMemoryFrontmatter(text);
     expect(r.name).toBeNull();
     expect(r.body).toBe(text);
+  });
+});
+
+describe("cleanRecalledMemory", () => {
+  it("strips the <system-reminder> envelope tags", () => {
+    const text = "<system-reminder>\nrecalled body\n</system-reminder>";
+    expect(cleanRecalledMemory(text)).toBe("recalled body");
+  });
+
+  it("strips cat -n line-number prefixes", () => {
+    const text = "     1\t# Title\n     2\t\n     3\tbody line";
+    expect(cleanRecalledMemory(text)).toBe("# Title\n\nbody line");
+  });
+
+  it("strips both the envelope and the line numbers together", () => {
+    const text = "<system-reminder>\n     1\t# Title\n     2\t- item\n</system-reminder>";
+    expect(cleanRecalledMemory(text)).toBe("# Title\n- item");
+  });
+
+  it("leaves clean markdown untouched", () => {
+    const text = "# Title\n\nplain body";
+    expect(cleanRecalledMemory(text)).toBe(text);
+  });
+
+  it("does not strip digits that are not a line-number prefix", () => {
+    const text = "version 12 shipped\n3 retries left";
+    expect(cleanRecalledMemory(text)).toBe(text);
   });
 });

@@ -41,6 +41,14 @@ pub enum Intent {
     CancelInFlight,
     /// Drop every queued (not-yet-sent) prompt.
     ClearQueue,
+    /// Browse the prompt queue from the composer (shell-history style):
+    /// negative steps toward older entries (ArrowUp), positive toward
+    /// newer (ArrowDown). The view layer loads the entry into the composer
+    /// for editing.
+    RecallQueued(i32),
+    /// Abandon an in-progress queue browse, restoring the stashed draft to
+    /// the composer (the `Esc` while browsing).
+    RecallCancel,
     /// Open the daemon URL for this session in the user's browser.
     OpenInBrowser,
     /// Move focus to the named region.
@@ -68,7 +76,7 @@ pub enum Intent {
 /// `@`-mention picker is currently open (each claims navigation keys in
 /// the composer). Passed as a struct instead of positional bools so call
 /// sites stay readable.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct InputContext {
     pub has_pending_approval: bool,
     /// A pending `AskUserQuestion` elicitation exists. Gates the
@@ -77,6 +85,16 @@ pub struct InputContext {
     pub has_pending_elicitation: bool,
     pub slash_picker_open: bool,
     pub mention_picker_open: bool,
+    /// Composer caret is at row 0, col 0. Gates ArrowUp entry into
+    /// queue-recall so multi-line caret movement keeps working until the
+    /// user reaches the top-left.
+    pub caret_at_origin: bool,
+    /// A queue-recall browse is already active; while browsing, ArrowUp /
+    /// ArrowDown navigate the queue regardless of caret position.
+    pub browsing_queue: bool,
+    /// Number of queued prompts; ArrowUp only enters recall when there is
+    /// something to recall.
+    pub queue_len: usize,
 }
 
 /// Translate a key event into an [`Intent`] based on the current
@@ -105,7 +123,7 @@ pub fn dispatch(focus: Focus, key: &KeyEvent, ctx: InputContext) -> Intent {
     }
 
     match focus {
-        Focus::Composer => composer_keys(key, ctx.slash_picker_open, ctx.mention_picker_open),
+        Focus::Composer => composer_keys(key, ctx),
         Focus::Transcript => {
             transcript_keys(key, ctx.has_pending_approval, ctx.has_pending_elicitation)
         }
@@ -113,7 +131,23 @@ pub fn dispatch(focus: Focus, key: &KeyEvent, ctx: InputContext) -> Intent {
     }
 }
 
-fn composer_keys(key: &KeyEvent, slash_picker_open: bool, mention_picker_open: bool) -> Intent {
+fn composer_keys(key: &KeyEvent, ctx: InputContext) -> Intent {
+    let slash_picker_open = ctx.slash_picker_open;
+    let mention_picker_open = ctx.mention_picker_open;
+    // While browsing the queue, recall navigation owns its core keys even
+    // when the recalled text would otherwise open the slash / `@` picker
+    // (e.g. a queued "/clear"). Without this the picker would steal
+    // Up/Down/Esc/Enter and break recall navigation, restore, and save.
+    // Typed characters still fall through below to narrow the picker.
+    if ctx.browsing_queue {
+        match (key.modifiers, key.code) {
+            (m, KeyCode::Up) if m.is_empty() => return Intent::RecallQueued(-1),
+            (m, KeyCode::Down) if m.is_empty() => return Intent::RecallQueued(1),
+            (m, KeyCode::Esc) if m.is_empty() => return Intent::RecallCancel,
+            (m, KeyCode::Enter) if m.is_empty() => return Intent::SubmitPrompt,
+            _ => {}
+        }
+    }
     // When a picker is open it claims navigation + accept/dismiss keys
     // so the user can drive it without the textarea swallowing them.
     // Everything else (typing, cursor motion the picker doesn't use)
@@ -149,6 +183,22 @@ fn composer_keys(key: &KeyEvent, slash_picker_open: bool, mention_picker_open: b
         }
     }
     match (key.modifiers, key.code) {
+        // Queue recall: ArrowUp browses toward older queued prompts when
+        // already browsing, or when the caret is at the top-left and the
+        // queue is non-empty; ArrowDown walks back toward newer entries
+        // (and the stashed draft) only while browsing. Outside those
+        // conditions Up / Down fall through to normal textarea caret
+        // movement so multi-line editing is unaffected.
+        (m, KeyCode::Up)
+            if m.is_empty()
+                && (ctx.browsing_queue || (ctx.caret_at_origin && ctx.queue_len > 0)) =>
+        {
+            Intent::RecallQueued(-1)
+        }
+        (m, KeyCode::Down) if m.is_empty() && ctx.browsing_queue => Intent::RecallQueued(1),
+        // Esc while browsing the queue restores the stashed draft instead
+        // of leaving the composer.
+        (m, KeyCode::Esc) if m.is_empty() && ctx.browsing_queue => Intent::RecallCancel,
         // Plain Enter submits.
         (m, KeyCode::Enter) if m.is_empty() => Intent::SubmitPrompt,
         // Shift+Enter inserts a newline (passed through to textarea).
@@ -238,38 +288,27 @@ mod tests {
     /// No pending approval, pickers closed: the common case for the
     /// pre-existing focus tests.
     fn ctx() -> InputContext {
-        InputContext {
-            has_pending_approval: false,
-            has_pending_elicitation: false,
-            slash_picker_open: false,
-            mention_picker_open: false,
-        }
+        InputContext::default()
     }
 
     fn ctx_pending() -> InputContext {
         InputContext {
             has_pending_approval: true,
-            has_pending_elicitation: false,
-            slash_picker_open: false,
-            mention_picker_open: false,
+            ..InputContext::default()
         }
     }
 
     fn ctx_picker() -> InputContext {
         InputContext {
-            has_pending_approval: false,
-            has_pending_elicitation: false,
             slash_picker_open: true,
-            mention_picker_open: false,
+            ..InputContext::default()
         }
     }
 
     fn ctx_mention() -> InputContext {
         InputContext {
-            has_pending_approval: false,
-            has_pending_elicitation: false,
-            slash_picker_open: false,
             mention_picker_open: true,
+            ..InputContext::default()
         }
     }
 
@@ -329,10 +368,17 @@ mod tests {
 
     fn ctx_pending_elicitation() -> InputContext {
         InputContext {
-            has_pending_approval: false,
             has_pending_elicitation: true,
-            slash_picker_open: false,
-            mention_picker_open: false,
+            ..InputContext::default()
+        }
+    }
+
+    fn ctx_recall(caret_at_origin: bool, browsing_queue: bool, queue_len: usize) -> InputContext {
+        InputContext {
+            caret_at_origin,
+            browsing_queue,
+            queue_len,
+            ..InputContext::default()
         }
     }
 
@@ -572,6 +618,128 @@ mod tests {
             dispatch(Focus::Composer, &key(KeyCode::Esc), ctx()),
             Intent::SetFocus(Focus::Transcript)
         );
+    }
+
+    #[test]
+    fn arrow_up_recalls_when_caret_at_origin_with_a_queue() {
+        assert_eq!(
+            dispatch(
+                Focus::Composer,
+                &key(KeyCode::Up),
+                ctx_recall(true, false, 2)
+            ),
+            Intent::RecallQueued(-1)
+        );
+    }
+
+    #[test]
+    fn arrow_up_moves_caret_when_not_at_origin() {
+        // Multi-line draft, caret mid-text: Up is normal caret movement,
+        // never a recall, even with a non-empty queue.
+        assert!(matches!(
+            dispatch(
+                Focus::Composer,
+                &key(KeyCode::Up),
+                ctx_recall(false, false, 2)
+            ),
+            Intent::Compose(_)
+        ));
+    }
+
+    #[test]
+    fn arrow_up_does_not_recall_with_empty_queue() {
+        assert!(matches!(
+            dispatch(
+                Focus::Composer,
+                &key(KeyCode::Up),
+                ctx_recall(true, false, 0)
+            ),
+            Intent::Compose(_)
+        ));
+    }
+
+    #[test]
+    fn arrows_navigate_queue_while_browsing_regardless_of_caret() {
+        // Once browsing, both arrows own navigation even though the caret
+        // is not at the origin (it sits at the end of the loaded prompt).
+        assert_eq!(
+            dispatch(
+                Focus::Composer,
+                &key(KeyCode::Up),
+                ctx_recall(false, true, 2)
+            ),
+            Intent::RecallQueued(-1)
+        );
+        assert_eq!(
+            dispatch(
+                Focus::Composer,
+                &key(KeyCode::Down),
+                ctx_recall(false, true, 2)
+            ),
+            Intent::RecallQueued(1)
+        );
+    }
+
+    #[test]
+    fn recall_keys_win_over_open_picker_while_browsing() {
+        // A recalled prompt that looks like a slash query opens the picker;
+        // recall navigation must still own Up/Down/Esc/Enter.
+        let ctx = InputContext {
+            slash_picker_open: true,
+            browsing_queue: true,
+            queue_len: 2,
+            ..InputContext::default()
+        };
+        assert_eq!(
+            dispatch(Focus::Composer, &key(KeyCode::Up), ctx),
+            Intent::RecallQueued(-1)
+        );
+        assert_eq!(
+            dispatch(Focus::Composer, &key(KeyCode::Down), ctx),
+            Intent::RecallQueued(1)
+        );
+        assert_eq!(
+            dispatch(Focus::Composer, &key(KeyCode::Esc), ctx),
+            Intent::RecallCancel
+        );
+        assert_eq!(
+            dispatch(Focus::Composer, &key(KeyCode::Enter), ctx),
+            Intent::SubmitPrompt
+        );
+        // Typed characters still fall through to narrow the picker.
+        assert!(matches!(
+            dispatch(Focus::Composer, &key(KeyCode::Char('a')), ctx),
+            Intent::Compose(_)
+        ));
+    }
+
+    #[test]
+    fn esc_while_browsing_cancels_recall() {
+        assert_eq!(
+            dispatch(
+                Focus::Composer,
+                &key(KeyCode::Esc),
+                ctx_recall(false, true, 2)
+            ),
+            Intent::RecallCancel
+        );
+        // Not browsing: Esc still returns focus to the transcript.
+        assert_eq!(
+            dispatch(Focus::Composer, &key(KeyCode::Esc), ctx()),
+            Intent::SetFocus(Focus::Transcript)
+        );
+    }
+
+    #[test]
+    fn arrow_down_does_not_recall_when_not_browsing() {
+        assert!(matches!(
+            dispatch(
+                Focus::Composer,
+                &key(KeyCode::Down),
+                ctx_recall(true, false, 2)
+            ),
+            Intent::Compose(_)
+        ));
     }
 
     #[test]

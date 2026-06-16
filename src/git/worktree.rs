@@ -1000,6 +1000,28 @@ impl GitWorktree {
         }
     }
 
+    /// The short upstream tracking ref for a local branch (e.g. `origin/hi`),
+    /// or `None` when the branch has no upstream configured.
+    ///
+    /// Used to warn before a branch rename: `git branch -m` only touches the
+    /// local ref, so a branch that tracks a remote leaves that remote branch
+    /// behind (and any open PR pinned to it) until the new name is pushed and
+    /// the old one deleted. `for-each-ref` is quiet, it prints an empty line
+    /// rather than erroring when there is no upstream.
+    pub fn branch_upstream(&self, branch: &str) -> Option<String> {
+        let refname = format!("refs/heads/{branch}");
+        let output = super::command::run_git(
+            &self.repo_path,
+            ["for-each-ref", "--format=%(upstream:short)", &refname],
+        )
+        .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let upstream = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        (!upstream.is_empty()).then_some(upstream)
+    }
+
     /// Move a managed worktree directory via `git worktree move`, which
     /// relocates the checkout and updates the linked-worktree gitdir
     /// metadata. A plain filesystem rename would leave git's bookkeeping

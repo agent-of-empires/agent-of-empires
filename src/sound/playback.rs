@@ -20,12 +20,12 @@ fn get_audio_command(path: &str, volume: f64) -> Result<(String, Vec<String>), s
 
         if ext.eq_ignore_ascii_case("ogg") {
             // Check if paplay is available
-            if which_command("paplay").is_ok() {
+            if which::which("paplay").is_ok() {
                 Ok((
                     "paplay".to_string(),
                     vec![format!("--volume={}", pa_volume), path.to_string()],
                 ))
-            } else if which_command("aplay").is_ok() {
+            } else if which::which("aplay").is_ok() {
                 tracing::warn!(target: "sound.playback", "paplay not found, using aplay (may not support .ogg files)");
                 warn_aplay_volume_once(volume);
                 Ok(("aplay".to_string(), vec![path.to_string()]))
@@ -37,10 +37,10 @@ fn get_audio_command(path: &str, volume: f64) -> Result<(String, Vec<String>), s
             }
         } else {
             // WAV files
-            if which_command("aplay").is_ok() {
+            if which::which("aplay").is_ok() {
                 warn_aplay_volume_once(volume);
                 Ok(("aplay".to_string(), vec![path.to_string()]))
-            } else if which_command("paplay").is_ok() {
+            } else if which::which("paplay").is_ok() {
                 Ok((
                     "paplay".to_string(),
                     vec![format!("--volume={}", pa_volume), path.to_string()],
@@ -67,25 +67,6 @@ fn warn_aplay_volume_once(volume: f64) {
             volume
         );
     }
-}
-
-/// Check if a command exists in PATH
-fn which_command(cmd: &str) -> Result<(), std::io::Error> {
-    std::process::Command::new("which")
-        .arg(cmd)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .and_then(|status| {
-            if status.success() {
-                Ok(())
-            } else {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("{} not found", cmd),
-                ))
-            }
-        })
 }
 
 /// Play a sound file by name (blocking version for testing)

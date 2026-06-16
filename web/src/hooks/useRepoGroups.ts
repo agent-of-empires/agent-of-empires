@@ -1,5 +1,6 @@
 import { useCallback, useMemo, useState } from "react";
-import type { Workspace, RepoGroup } from "../lib/types";
+import type { ProjectInfo, Workspace, RepoGroup } from "../lib/types";
+import { mergeRegisteredProjects } from "../lib/registeredProjects";
 import { safeGetItem, safeRemoveItem, safeSetItem } from "../lib/safeStorage";
 import {
   applyRepoAppearanceUpdate,
@@ -59,6 +60,7 @@ export function useRepoGroups(
   workspaces: Workspace[],
   workspaceOrdering: readonly string[] = [],
   sortMode: SidebarSortMode = "manual",
+  projects: readonly ProjectInfo[] = [],
 ): {
   groups: RepoGroup[];
   toggleRepoCollapsed: (repoId: string) => void;
@@ -154,6 +156,9 @@ export function useRepoGroups(
         workspaces: sorted,
         status: hasActive ? "active" : "idle",
         collapsed,
+        // Filled by mergeRegisteredProjects below; populated groups get
+        // their registry entries (if any) keyed by path there.
+        registeredProjects: [],
       });
     }
 
@@ -174,6 +179,9 @@ export function useRepoGroups(
         workspaces: sorted,
         status: hasActive ? "active" : "idle",
         collapsed,
+        // Filled by mergeRegisteredProjects below; populated groups get
+        // their registry entries (if any) keyed by path there.
+        registeredProjects: [],
       });
     }
 
@@ -194,12 +202,32 @@ export function useRepoGroups(
         workspaces: sorted,
         status: hasActive ? "active" : "idle",
         collapsed,
+        // Filled by mergeRegisteredProjects below; populated groups get
+        // their registry entries (if any) keyed by path there.
+        registeredProjects: [],
       });
     }
 
-    const isSyntheticGroup = (id: string) => id === MULTI_REPO_GROUP_ID || id === SCRATCH_GROUP_ID;
+    // Fold the registry in: populated groups gain their entries, and every
+    // registered repo with no live group is appended as a zero-workspace
+    // header. Appended groups inherit the per-browser alias/color/collapse
+    // for their path, so a repo that empties out but stays pinned keeps its
+    // look. See #2047.
+    const merged = mergeRegisteredProjects(repoGroups, [...projects], {
+      alias: (repoPath) => appearanceMap[repoPath]?.alias ?? null,
+      color: (repoPath) => appearanceMap[repoPath]?.color ?? null,
+      collapsed: (repoPath) => collapsedMap[repoPath] ?? loadCollapsed(repoPath),
+    });
 
-    repoGroups.sort((a, b) => {
+    const isSyntheticGroup = (id: string) => id === MULTI_REPO_GROUP_ID || id === SCRATCH_GROUP_ID;
+    // A pinned-but-empty project: registered, with no live workspace. It
+    // sorts below populated real repos but above the synthetic Multi-repo /
+    // Scratch buckets, so a stale pin never leapfrogs active work. This only
+    // governs the unranked fallback: an explicit drag rank still wins for any
+    // group (preserving the dragged-synthetic-above-real behavior). See #2047.
+    const isRegisteredEmpty = (g: RepoGroup) => g.workspaces.length === 0 && g.registeredProjects.length > 0;
+
+    merged.sort((a, b) => {
       if (sortMode === "attention") {
         // Computed order, like lastActivity: manual group drag does not
         // apply and synthetic groups stay pinned to the bottom in a stable
@@ -213,6 +241,9 @@ export function useRepoGroups(
         if (b.id === SCRATCH_GROUP_ID) return -1;
         if (a.id === MULTI_REPO_GROUP_ID) return 1;
         if (b.id === MULTI_REPO_GROUP_ID) return -1;
+        const ae = isRegisteredEmpty(a);
+        const be = isRegisteredEmpty(b);
+        if (ae !== be) return ae ? 1 : -1;
         const au = repoGroupIsUrgent(a.workspaces);
         const bu = repoGroupIsUrgent(b.workspaces);
         if (au !== bu) return au ? -1 : 1;
@@ -235,6 +266,9 @@ export function useRepoGroups(
         if (b.id === SCRATCH_GROUP_ID) return -1;
         if (a.id === MULTI_REPO_GROUP_ID) return 1;
         if (b.id === MULTI_REPO_GROUP_ID) return -1;
+        const ae = isRegisteredEmpty(a);
+        const be = isRegisteredEmpty(b);
+        if (ae !== be) return ae ? 1 : -1;
         const ak = repoGroupLastActivityMs(a.workspaces);
         const bk = repoGroupLastActivityMs(b.workspaces);
         if (ak !== bk) return bk - ak;
@@ -249,10 +283,16 @@ export function useRepoGroups(
       const ag = groupRank.get(a.id);
       const bg = groupRank.get(b.id);
       const SYNTHETIC_BOTTOM = Number.MAX_SAFE_INTEGER;
-      const keyOf = (id: string, rank: number | undefined) =>
-        rank != null ? rank : isSyntheticGroup(id) ? SYNTHETIC_BOTTOM : -1;
-      const ka = keyOf(a.id, ag);
-      const kb = keyOf(b.id, bg);
+      // Unranked fallback by type: a brand-new real project floats to the top
+      // (-1, matching new-workspace behavior), a pinned-but-empty project
+      // sinks below real repos but above synthetic, and an untouched
+      // synthetic group sits at the bottom. A stored rank overrides all of
+      // this. See #1644, #2047.
+      const fallbackRank = (g: RepoGroup) =>
+        isSyntheticGroup(g.id) ? SYNTHETIC_BOTTOM : isRegisteredEmpty(g) ? SYNTHETIC_BOTTOM - 1 : -1;
+      const keyOf = (g: RepoGroup, rank: number | undefined) => (rank != null ? rank : fallbackRank(g));
+      const ka = keyOf(a, ag);
+      const kb = keyOf(b, bg);
       if (ka !== kb) return ka - kb;
       if (ka === SYNTHETIC_BOTTOM) {
         // Two untouched synthetic groups: multi-repo above scratch.
@@ -268,8 +308,8 @@ export function useRepoGroups(
       return a.repoPath.localeCompare(b.repoPath);
     });
 
-    return repoGroups;
-  }, [workspaces, workspaceOrdering, sortMode, collapsedMap, appearanceMap, groupOrder]);
+    return merged;
+  }, [workspaces, workspaceOrdering, sortMode, projects, collapsedMap, appearanceMap, groupOrder]);
 
   const toggleRepoCollapsed = useCallback((repoId: string) => {
     setCollapsedMap((prev) => {

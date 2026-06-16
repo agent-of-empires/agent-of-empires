@@ -296,23 +296,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
-/// Resolve Node, attempting an automated download if nothing is found
-/// and `auto_download` is true.
-pub async fn resolve_or_download(
-    settings_node_path: &str,
-    app_dir: &Path,
-    auto_download: bool,
-) -> Result<ResolvedNode, NodeError> {
-    match resolve(settings_node_path, app_dir) {
-        Ok(found) => {
-            info!(target: "acp.node", "using node {} at {}", found.version, found.path.display());
-            Ok(found)
-        }
-        Err(NodeError::NoNode(_)) if auto_download => download(app_dir).await,
-        Err(e) => Err(e),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

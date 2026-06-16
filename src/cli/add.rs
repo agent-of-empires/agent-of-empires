@@ -5,7 +5,7 @@ use clap::Args;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
-use crate::containers::{self, ContainerRuntimeInterface};
+use crate::containers;
 use crate::session::builder;
 use crate::session::repo_config;
 use crate::session::{civilizations, GroupTree, Instance, SandboxInfo, Storage};
@@ -723,6 +723,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 container_name,
                 extra_env: None,
                 custom_instruction: config.sandbox.custom_instruction.clone(),
+                before_start_env: Vec::new(),
             });
         }
     }

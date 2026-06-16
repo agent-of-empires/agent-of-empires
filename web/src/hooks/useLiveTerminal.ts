@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
 import { getOrCreateDeviceBindingSecret } from "../lib/deviceBinding";
 import { getToken } from "../lib/token";
+import { wheelMouseBytes } from "../lib/liveMouse";
 import { retryDelayMs } from "../lib/wsBackoff";
 
 // Capture-snapshot live view transport (mobile). Mirrors the TUI's
@@ -29,6 +30,16 @@ export interface LiveFrame {
   history: number;
   /** Cursor cell, or null when hidden (DECTCEM off) or unavailable. */
   cursor: LiveCursor | null;
+  /** Pane is on the alternate screen (a full-screen / TUI app). Its
+   *  scrollback is not capturable, so scroll gestures forward the wheel
+   *  to the app instead of widening the capture window. */
+  altScreen: boolean;
+  /** App has some mouse tracking mode on (it will consume forwarded wheel
+   *  events). Forwarding only happens when this AND altScreen are set. */
+  mouse: boolean;
+  /** App is in SGR (1006) mouse encoding; picks the forwarded wire format
+   *  (SGR vs legacy X10). */
+  mouseSgr: boolean;
 }
 
 export interface LiveTerminalState {
@@ -170,6 +181,9 @@ export function useLiveTerminal(sessionId: string | null, wsPath: string = "live
           history?: number;
           cursor?: LiveCursor | null;
           is_owner?: boolean;
+          altScreen?: boolean;
+          mouse?: boolean;
+          mouseSgr?: boolean;
         };
         try {
           msg = JSON.parse(event.data) as typeof msg;
@@ -193,6 +207,9 @@ export function useLiveTerminal(sessionId: string | null, wsPath: string = "live
           rows: msg.rows ?? 0,
           history: msg.history ?? 0,
           cursor: msg.cursor ?? null,
+          altScreen: msg.altScreen ?? false,
+          mouse: msg.mouse ?? false,
+          mouseSgr: msg.mouseSgr ?? false,
         };
         // While reading, keep the capture window covering the FULL
         // history as the agent appends: the window was sized at entry,
@@ -311,6 +328,17 @@ export function useLiveTerminal(sessionId: string | null, wsPath: string = "live
     }
   }, []);
 
+  /** Forward a wheel notch to a full-screen mouse app (alternate screen),
+   *  encoded as the app expects. Sent as raw input bytes, NOT as a window
+   *  request: the alternate screen has no capturable scrollback, so the
+   *  app scrolls its own content and the next frame reflects it. */
+  const forwardWheel = useCallback((up: boolean, sgr: boolean, col: number, row: number) => {
+    const ws = wsRef.current;
+    if (ws?.readyState === WebSocket.OPEN) {
+      ws.send(wheelMouseBytes(up, sgr, col, row));
+    }
+  }, []);
+
   const sendResize = useCallback((cols: number, rows: number) => {
     // Dedup: the sizing observer recomputes on every container change,
     // but rows are latched to the no-keyboard height, so keyboard cycles
@@ -387,6 +415,7 @@ export function useLiveTerminal(sessionId: string | null, wsPath: string = "live
   return {
     state,
     sendData,
+    forwardWheel,
     sendResize,
     setWindow,
     setCadence,

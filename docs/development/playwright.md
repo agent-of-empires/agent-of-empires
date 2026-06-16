@@ -156,9 +156,11 @@ Add a new surface to the matrix at the same time you add the spec. Add a new com
 
 Vitest writes `coverage/vitest/` via `@vitest/coverage-v8` (set in `web/vite.config.ts`'s `test.coverage` block).
 
-Playwright collects `window.__coverage__` after each test when `AOE_COVERAGE=1` is set. The instrumentation is added by `vite-plugin-istanbul`, conditionally registered in `web/vite.config.ts`. `build.rs` honors the same env so the embedded web bundle in the `aoe` binary carries instrumentation when requested.
+Playwright collects raw Chromium V8 coverage via `page.coverage.startJSCoverage()` / `stopJSCoverage()` (started in the `page` fixture before the test, written after) when `AOE_COVERAGE=1` is set. That env makes `web/vite.config.ts` build the bundle with inline sourcemaps (`build.sourcemap: "inline"`), which travel inside the `.js` so they survive `build.rs` embedding the bundle into the `aoe` binary. The capture strips the (identical, multi-MB) bundle `source` from each per-test file to keep them small; the merge script re-reads each script's source from `dist/` once.
 
-`npm run coverage:merge` runs `web/scripts/merge-coverage.mjs`, which feeds both inputs into `monocart-coverage-reports` and emits:
+Collecting V8 (not istanbul-on-bundle) is deliberate: both Vitest and Playwright then remap to the same `web/src` source line map. Codecov reconciles each file to one line map, so the old istanbul-bundle Playwright coverage, which numbered the bundle differently, made Codecov drop Vitest's hits and tanked patch coverage (#2157).
+
+`npm run coverage:merge` runs `web/scripts/merge-coverage.mjs`, which converts the Playwright V8 to istanbul-shape through the inline sourcemap, merges it with Vitest's coverage in `monocart-coverage-reports`, and emits:
 
 - `web/coverage/merged/lcov.info`
 - `web/coverage/merged/coverage-summary.json` and `coverage-final.json`

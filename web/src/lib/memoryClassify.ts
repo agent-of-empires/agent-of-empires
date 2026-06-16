@@ -121,3 +121,20 @@ export function parseMemoryFrontmatter(content: string): ParsedMemory {
     body,
   };
 }
+
+/** Strip the transport noise the SDK wraps around synthesize-mode
+ *  recall text before it reaches the card. The recalled file content
+ *  arrives inside a `<system-reminder>` envelope and carries `cat -n`
+ *  style line-number prefixes (the Read tool's `<spaces>N<tab>` form),
+ *  both of which leak into the UI when rendered verbatim. We drop the
+ *  envelope tags and the per-line number prefixes, leaving the markdown
+ *  body intact for rendering. See #2142.
+ *
+ *  ponytail: only the tab-separated `cat -n` prefix is stripped; if the
+ *  SDK ever switches to an arrow (`N→`) separator, extend the line regex. */
+export function cleanRecalledMemory(text: string): string {
+  return text
+    .replace(/<\/?system-reminder>/g, "")
+    .replace(/^[ \t]*\d+\t/gm, "")
+    .trim();
+}

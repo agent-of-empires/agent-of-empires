@@ -312,7 +312,7 @@ Manage session lifecycle (start, stop, attach, etc.)
 * `unsnooze` — Wake a snoozed session immediately
 * `favorite` — Mark a session as a favorite. Favorited rows pin to the top of their status tier in the Attention sort and render with a leading `* ` glyph plus bold + underline
 * `unfavorite` — Clear the favorite flag on a session
-* `archive` — Archive a session (sinks it to the bottom of the Attention sort). Kills the tmux pane unless `--no-kill` is passed. The worktree, branch, and container are preserved; use `aoe remove` (optionally with `--delete-worktree` / `--delete-branch`) to fully destroy a session
+* `archive` — Archive a session: sink it in the Attention sort and tear down its tmux sessions. Worktree, branch, container preserved. `--no-kill` skips tmux teardown. See #1868
 * `unarchive` — Unarchive a session (restores it to its tier in the Attention sort)
 
 
@@ -540,7 +540,7 @@ Clear the favorite flag on a session
 
 ## `aoe session archive`
 
-Archive a session (sinks it to the bottom of the Attention sort). Kills the tmux pane unless `--no-kill` is passed. The worktree, branch, and container are preserved; use `aoe remove` (optionally with `--delete-worktree` / `--delete-branch`) to fully destroy a session
+Archive a session: sink it in the Attention sort and tear down its tmux sessions. Worktree, branch, container preserved. `--no-kill` skips tmux teardown. See #1868
 
 **Usage:** `aoe session archive [OPTIONS] <IDENTIFIER>`
 
@@ -550,7 +550,7 @@ Archive a session (sinks it to the bottom of the Attention sort). Kills the tmux
 
 ###### **Options:**
 
-* `--no-kill` — Skip killing the tmux pane. By default archiving stops the running agent so the row renders as truly parked; pass this to keep the pane alive while still marking the session archived
+* `--no-kill` — Skip tmux teardown on archive
 
 
 

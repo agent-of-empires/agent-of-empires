@@ -11,10 +11,10 @@
 //                        navigating.
 //   - `serveReadOnly`  : --read-only flag set on aoe serve.
 //
-// The `page` fixture is wrapped so that when `AOE_COVERAGE=1` is set, the
-// `window.__coverage__` object emitted by `vite-plugin-istanbul` is read
-// once per test and written as JSON under `web/coverage/playwright/`.
-// `web/scripts/merge-coverage.mjs` picks those JSONs up.
+// The `page` fixture is wrapped so that when `AOE_COVERAGE=1` is set, raw
+// Chromium V8 coverage is started before the test and written as JSON under
+// `web/coverage/playwright/` after it. `web/scripts/merge-coverage.mjs` picks
+// those JSONs up and remaps them via the bundle's inline sourcemap.
 //
 // Specs do:
 //
@@ -27,7 +27,7 @@
 
 import { test as base, expect, type Page } from "@playwright/test";
 import { spawnAoeServe, type ServeHandle } from "./aoeServe";
-import { captureCoverage } from "./coverageCapture";
+import { startCoverage, stopAndWriteCoverage } from "./coverageCapture";
 
 type LiveFixtures = {
   serve: ServeHandle;
@@ -139,8 +139,9 @@ export const test = base.extend<LiveFixtures>({
     await h.stop();
   },
   page: async ({ page }, use, testInfo) => {
+    const started = await startCoverage(page);
     await use(page);
-    await captureCoverage(page, testInfo.titlePath.join(" > "));
+    await stopAndWriteCoverage(page, testInfo.titlePath.join(" > "), started);
   },
 });
 

@@ -70,11 +70,9 @@ pub enum SessionCommands {
     /// Clear the favorite flag on a session.
     Unfavorite(SessionIdArgs),
 
-    /// Archive a session (sinks it to the bottom of the Attention sort).
-    /// Kills the tmux pane unless `--no-kill` is passed. The worktree,
-    /// branch, and container are preserved; use `aoe remove` (optionally
-    /// with `--delete-worktree` / `--delete-branch`) to fully destroy a
-    /// session.
+    /// Archive a session: sink it in the Attention sort and tear down its
+    /// tmux sessions. Worktree, branch, container preserved. `--no-kill`
+    /// skips tmux teardown. See #1868.
     Archive(ArchiveArgs),
 
     /// Unarchive a session (restores it to its tier in the Attention sort)
@@ -97,9 +95,7 @@ pub struct ArchiveArgs {
     /// Session ID or title
     pub identifier: String,
 
-    /// Skip killing the tmux pane. By default archiving stops the running
-    /// agent so the row renders as truly parked; pass this to keep the
-    /// pane alive while still marking the session archived.
+    /// Skip tmux teardown on archive.
     #[arg(long = "no-kill")]
     pub no_kill: bool,
 }
@@ -307,11 +303,13 @@ async fn archive_session(profile: &str, args: ArchiveArgs) -> Result<()> {
     let title = inst.title.clone();
     let inst = inst.clone();
 
-    // Phase 2 (unlocked): tmux work; Storage::update closures must stay CPU-only.
+    // Phase 2 (unlocked): tmux work. Agent kill split from ancillary so
+    // the CLI prints a warn on agent failure. #1868.
     if !args.no_kill {
         if let Err(e) = inst.kill() {
-            eprintln!("Warning: failed to kill tmux session: {}", e);
+            eprintln!("Warning: failed to kill agent tmux session: {}", e);
         }
+        inst.kill_ancillary_tmux_sessions();
     }
 
     // Phase 3 (locked, fast): set archived_at by id.
@@ -1042,7 +1040,15 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
         let mut live = inst.clone();
         crate::tmux::refresh_session_cache();
         live.update_status();
-        if live.status.blocks_worktree_edit() {
+        // A sandbox session's container keeps the worktree dir mounted even
+        // while the agent is Idle, so `git worktree move` would fail with
+        // EBUSY; stopping the session tears the container down and releases it.
+        if live.status.blocks_worktree_edit()
+            || crate::session::worktree_edit::sandbox_container_holds_worktree(
+                &id,
+                live.is_sandboxed(),
+            )
+        {
             bail!("Stop the session before renaming it: its worktree directory moves to match the new name. Disable session.tie_workdir_to_name to relabel a running session.");
         }
         let leaf = crate::session::worktree_edit::worktree_leaf_from_title(&effective_title);
@@ -1055,6 +1061,16 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
             },
         ) {
             Ok(outcome) => {
+                // The dir moved (path changed): a sandbox container created
+                // against the old path is now stale, so drop it to force a
+                // fresh create on next start. A branch-only edit leaves the
+                // path (and the mount) unchanged.
+                if outcome.new_path != std::path::Path::new(&current_path) {
+                    crate::session::worktree_edit::discard_sandbox_container_after_move(
+                        &id,
+                        live.is_sandboxed(),
+                    );
+                }
                 new_path = Some(outcome.new_path.to_string_lossy().to_string());
                 new_branch = outcome.new_branch;
             }
@@ -1180,7 +1196,12 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
     let mut live = inst.clone();
     crate::tmux::refresh_session_cache();
     live.update_status();
-    if live.status.blocks_worktree_edit() {
+    // A sandbox container keeps the worktree dir mounted even while the agent
+    // is Idle, so the move would fail with EBUSY; stopping the session releases
+    // the mount, same as the active-status case.
+    if live.status.blocks_worktree_edit()
+        || crate::session::worktree_edit::sandbox_container_holds_worktree(&id, live.is_sandboxed())
+    {
         bail!("Cannot edit the workdir name while the session is active; stop it first");
     }
 
@@ -1192,6 +1213,15 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
             rename_branch: args.rename_branch,
         },
     )?;
+    // The dir moved (path changed): a sandbox container created against the old
+    // path is now stale, so drop it to force a fresh create on next start. A
+    // branch-only edit leaves the path (and the mount) unchanged.
+    if outcome.new_path != std::path::Path::new(&current_path) {
+        crate::session::worktree_edit::discard_sandbox_container_after_move(
+            &id,
+            live.is_sandboxed(),
+        );
+    }
     let new_path = outcome.new_path.to_string_lossy().to_string();
     let new_branch = outcome.new_branch.clone();
 
