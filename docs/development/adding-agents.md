@@ -80,7 +80,7 @@ Each entry in `events: &[HookEvent]` carries:
 | `name` | Agent's event name (e.g. `"PreToolUse"`). |
 | `matcher` | Optional pattern for events that need it (e.g. Claude's `Notification` matcher). |
 | `status` | `Some("running"\|"waiting"\|"idle")` to install a status-writer on this event, or `None` for a purely lifecycle event. |
-| `session_id_capture` | `true` installs a command that extracts `session_id` from the agent's stdin JSON and writes it to `/tmp/aoe-hooks/<AOE_INSTANCE_ID>/session_id`, read by [session-resume](../guides/session-resume.md). Currently only Claude (`SessionStart`, `UserPromptSubmit`). With `status` also set, both commands share the matcher block and the session-id command runs first so it consumes stdin before the status writer. |
+| `session_id_capture` | `true` installs a command that extracts `session_id` from the agent's stdin JSON and writes it to `/tmp/aoe-hooks-<euid>/<AOE_INSTANCE_ID>/session_id` (host) or `/tmp/aoe-hooks/<AOE_INSTANCE_ID>/session_id` (sandbox; see issue #1844 for the host/container path split), read by [session-resume](../guides/session-resume.md). Currently only Claude (`SessionStart`, `UserPromptSubmit`). With `status` also set, both commands share the matcher block and the session-id command runs first so it consumes stdin before the status writer. |
 
 ### Codex (custom TOML)
 
@@ -119,6 +119,6 @@ hooks:
 ## Common pitfalls
 
 - **Missing `status_hook_env_prefix`:** without `AOE_INSTANCE_ID`, hooks write nothing.
-- **Wrong hook format:** test that hooks fire by sending a message and checking `/tmp/aoe-hooks/*/status`.
+- **Wrong hook format:** test that hooks fire by sending a message and checking `/tmp/aoe-hooks-$(id -u)/*/status` (host) or `/tmp/aoe-hooks/*/status` (inside the sandbox).
 - **Sandbox hooks are separate:** host installation skips containers; wire into `build_container_config` too.
 - **Waiting status needs a dedicated event:** not all agents expose an approval/permission event. If none exists, document it as a limitation and consider filing upstream.
