@@ -44,6 +44,13 @@ use std::sync::mpsc::{channel, Sender};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+/// Distinguishes successive live-send workers in the size-owner lock, so a
+/// rapid live-mode toggle's old worker can't release a lock the new worker
+/// already re-stole. Process-local; combined with the pid for cross-process
+/// uniqueness.
+static LIVE_SEND_WORKER_COUNTER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Default exit chord set when the user hasn't configured one.
 /// `Ctrl+q` is the sole default: works on mobile / restrictive SSH
 /// clients (Termius), reachable on every keyboard layout we ship to,
@@ -419,22 +426,48 @@ impl LiveSendWorker {
     pub(super) fn spawn(tmux_name: String, capture_wake: Option<LiveCaptureWake>) -> Self {
         let (tx, rx) = channel::<WorkerMsg>();
         std::thread::spawn(move || {
-            // Block until the first message, then drain anything else
-            // that piled up during the previous flush. The drain plus
-            // `coalesce` collapses paste-bursts and held-key autorepeat
-            // into one fork per literal run, so typing a long sentence
-            // costs one `tmux send-keys -l` invocation, not one per
-            // character.
-            while let Ok(first) = rx.recv() {
-                let mut batch = vec![first];
-                while let Ok(msg) = rx.try_recv() {
-                    batch.push(msg);
-                }
-                dispatch_batch(&tmux_name, batch);
-                if let Some(wake) = &capture_wake {
-                    wake.wake();
+            use std::sync::atomic::Ordering;
+            use std::sync::mpsc::RecvTimeoutError;
+
+            // TUI live-send is an active take-over: own the session's size for
+            // the lifetime of this worker so the web PTY relay and the mobile
+            // live view defer to it. Steal on entry and on each active input
+            // batch; refresh on a heartbeat so an idle-but-attached live
+            // session is not stolen from. Released (and `window-size latest`
+            // restored) when live mode exits and the channel closes.
+            let owner_id = format!(
+                "tui-{}-{}",
+                std::process::id(),
+                LIVE_SEND_WORKER_COUNTER.fetch_add(1, Ordering::Relaxed)
+            );
+            let session = crate::tmux::Session::from_name(&tmux_name);
+            session.steal_size_owner(&owner_id);
+
+            // Block (up to a heartbeat) for the first message, then drain
+            // anything else that piled up. The drain plus `coalesce` collapses
+            // paste-bursts and held-key autorepeat into one fork per literal
+            // run, so typing a long sentence costs one `tmux send-keys -l`
+            // invocation, not one per character.
+            loop {
+                match rx.recv_timeout(crate::tmux::SIZE_OWNER_HEARTBEAT) {
+                    Ok(first) => {
+                        let mut batch = vec![first];
+                        while let Ok(msg) = rx.try_recv() {
+                            batch.push(msg);
+                        }
+                        session.steal_size_owner(&owner_id);
+                        dispatch_batch(&tmux_name, batch);
+                        if let Some(wake) = &capture_wake {
+                            wake.wake();
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) => {
+                        session.refresh_size_owner(&owner_id);
+                    }
+                    Err(RecvTimeoutError::Disconnected) => break,
                 }
             }
+            session.release_size_owner(&owner_id);
         });
         Self { tx }
     }

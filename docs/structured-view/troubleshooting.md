@@ -65,6 +65,37 @@ Then run `claude login` if you haven't already. If an older version is pinned by
 an internal mirror, ship the required floor from the mirror or run the `@latest`
 install above before starting `aoe serve`.
 
+### Recovering a missing or out-of-date agent from the web dashboard
+
+When the structured view refuses a session because the agent is missing or too
+old, the web dashboard surfaces the reason inline instead of leaving you to read
+the logs:
+
+- The compatibility screen shows the installed vs required version and the exact
+  install command to copy.
+- A missing-binary error message includes the install command for the agent it
+  could not find.
+
+Two recovery controls sit on the compatibility screen:
+
+- **Restart agent** respawns the worker and re-runs the version check at the next
+  handshake. Use it after you have installed or updated the adapter in a shell;
+  no full restart of `aoe serve` is needed.
+- **Update & restart** runs the agent's `npm install -g` on the host (as the
+  user running the daemon) and then respawns. It appears only for
+  npm-installable agents (`claude-agent-acp`, `codex-acp`, `gemini`) and only
+  when `acp.allow_agent_install` is enabled.
+
+`acp.allow_agent_install` is **off by default**: running a global package install
+from the daemon is a host-level capability that executes the package's npm
+lifecycle scripts as the daemon user. It is always blocked in `--read-only` mode,
+and the setting is `local_only` (you can only turn it on from a dashboard
+connection to localhost, not a remote one). For agents that install some other
+way (`opencode`, `vibe-acp`, `pi-acp`), the screen shows the manual command
+instead of an Update button. Inside a sandbox session, a host install would not
+reach the containerized agent, so the action is refused; install the agent in the
+container image instead.
+
 ### "Failed to start structured view agent" while the adapter is installed
 
 `aoe serve` captures the launching shell's PATH at startup. If the adapter lives

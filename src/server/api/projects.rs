@@ -11,7 +11,6 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::git::GitWorktree;
 use crate::session::projects::{self, RegistryError};
 use crate::session::{Project, ProjectScope};
 
@@ -157,17 +156,6 @@ pub async fn create_project(
 
     let path_buf = std::path::PathBuf::from(&body.path);
     let canonical = path_buf.canonicalize().unwrap_or_else(|_| path_buf.clone());
-    if !GitWorktree::is_git_repo(&canonical) {
-        tracing::warn!(target: "http.api.projects", path = %canonical.display(), "rejected non-git-repo");
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "not_a_git_repo",
-                "message": format!("Path is not a git repository: {}", canonical.display()),
-            })),
-        )
-            .into_response();
-    }
 
     let name = body.name.unwrap_or_else(|| {
         canonical
@@ -175,6 +163,21 @@ pub async fn create_project(
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "project".to_string())
     });
+
+    // Non-git directories are allowed: their sessions run in place, with no
+    // worktrees or branches. We still reject paths that don't resolve to a
+    // directory, which the previous git-repo gate rejected implicitly.
+    if !canonical.is_dir() {
+        tracing::warn!(target: "http.api.projects", path = %canonical.display(), "rejected non-directory path");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "not_a_directory",
+                "message": format!("Path does not exist or is not a directory: {}", canonical.display()),
+            })),
+        )
+            .into_response();
+    }
 
     let project = Project::new(name, canonical.to_string_lossy(), scope)
         .with_base_branch(body.default_base_branch);

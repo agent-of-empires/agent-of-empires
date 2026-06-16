@@ -711,11 +711,10 @@ export function Composer({
     };
   }, [composerRuntime, sessionId]);
 
-  // xterm.js's autoFocus path in the right pane focuses its hidden
-  // textarea ~200-500ms after mount and steals focus from us. Re-claim
-  // a couple of times so the agent input wins; only when focus is on
-  // body or inside .xterm so an intentional click into the host shell
-  // sticks.
+  // Claim focus on mount, then re-claim a couple of times if focus fell to
+  // <body> (some surfaces grab and release focus shortly after mount). Only
+  // when focus is on body or this element, so an intentional click elsewhere
+  // (e.g. the live terminal input) keeps it.
   //
   // Mobile skips this entirely (#1178): auto-focusing the textarea pops
   // the soft keyboard on every session open / switch, which is the wrong
@@ -729,10 +728,6 @@ export function Composer({
     const reclaim = () => {
       const active = document.activeElement as HTMLElement | null;
       if (!active || active === document.body || active === el) {
-        el.focus();
-        return;
-      }
-      if (active.closest?.(".xterm")) {
         el.focus();
       }
     };

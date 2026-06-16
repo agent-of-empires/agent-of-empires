@@ -30,6 +30,8 @@ Choosing a profile seeds the agent-step defaults. If you have already edited a f
 
 The command palette (top-bar button or keyboard shortcut) is a fuzzy launcher for global actions: jump to a session, open settings, start a new session, toggle the right panel.
 
+Individual settings also appear in the palette under `Settings`. A writable toggle flips inline from the palette (a toast confirms, and the subtitle shows its current state and scope); every other setting opens the settings view on its tab. Read-only servers and settings that need elevation jump to the settings view instead of writing.
+
 ## First-run onboarding
 
 The first time you open the dashboard in a browser, a **Choose your theme** card appears before anything else. Picking a theme applies it live and saves it to your default profile; you can switch freely, then click **Continue**. Change it later in Settings > Appearance. The card is skipped in read-only mode and for anyone who already finished the tutorial.
@@ -84,7 +86,7 @@ With a selection active, a bulk action bar shows the count and applicable action
 
 ## Profiles
 
-The Profiles entry in the sidebar footer opens `/profiles` for managing configuration profiles: a left rail lists every profile with a **default** badge; the detail panel lets you create, rename, delete, set the default, and edit a description. **Edit configuration** buttons deep-link into the matching Settings tab scoped to that profile (`/settings/<tab>?profile=<name>`).
+The **Profiles** tab in Settings (`/settings/profiles`, the first entry in the Settings sidebar) manages configuration profiles: a left rail lists every profile with a **default** badge; the detail panel lets you create, rename, delete, set the default, and edit a description. **Edit configuration** buttons deep-link into the matching Settings tab scoped to that profile (`/settings/<tab>?profile=<name>`). The old `/profiles` URL redirects here.
 
 Lifecycle hooks are shown **read-only** here, each labeled with its source (profile override, an override disabling inherited commands, inherited global commands, or none). Hooks run arbitrary shell commands, so they are never writable from the web; edit them in your config file or the TUI. The same applies to the agent-command and environment fields. In read-only mode the create / rename / delete / set-default / description controls are hidden.
 

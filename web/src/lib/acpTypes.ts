@@ -265,17 +265,23 @@ export type IncompatibleAgentDetail =
       installed: string;
       required: string;
       install_command: string;
+      /** True when the daemon can `npm install -g` this agent itself, so
+       *  the web can offer "Update & restart" (gated on the
+       *  `acp.allow_agent_install` setting). See #2109. */
+      auto_install: boolean;
     }
   | {
       kind: "missing_agent_info";
       expected_package: string;
       install_command: string;
+      auto_install: boolean;
     }
   | {
       kind: "mismatched_agent_name";
       expected: string;
       received: string;
       install_command: string;
+      auto_install: boolean;
     }
   | {
       kind: "unparseable_agent_version";
@@ -283,6 +289,7 @@ export type IncompatibleAgentDetail =
       raw_version: string;
       required: string;
       install_command: string;
+      auto_install: boolean;
     }
   | {
       kind: "unsupported_protocol_version";

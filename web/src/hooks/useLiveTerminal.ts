@@ -2,7 +2,8 @@ import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
 import { getOrCreateDeviceBindingSecret } from "../lib/deviceBinding";
 import { getToken } from "../lib/token";
 import { wheelMouseBytes } from "../lib/liveMouse";
-import { retryDelayMs } from "./useTerminal";
+import { MAX_RETRIES, retryDelayMs } from "../lib/wsBackoff";
+import { reportTelemetrySeen } from "../lib/api";
 
 // Capture-snapshot live view transport (mobile). Mirrors the TUI's
 // live-send model: the server polls `tmux capture-pane` and pushes ANSI
@@ -11,8 +12,7 @@ import { retryDelayMs } from "./useTerminal";
 // component renders frames as DOM text and scrolls natively. See
 // src/server/live_ws.rs for the protocol.
 
-const MAX_RETRIES = 7;
-/** Mirrors CLOSE_CODE_PTY_DEAD in src/server/ws.rs. */
+/** Mirrors CLOSE_CODE_PTY_DEAD in src/server/pane.rs. */
 const CLOSE_CODE_PTY_DEAD = 4001;
 
 export interface LiveCursor {
@@ -55,6 +55,14 @@ export interface LiveTerminalState {
    *  return: widens the capture window and drives the jump-to-latest
    *  affordance. */
   reading: boolean;
+  /** Whether this client holds the session's size-owner lock and may
+   *  resize/type. Only one client at a time owns it across every surface
+   *  (web PTY attach, mobile live view, native TUI); a non-owner renders
+   *  best-effort at the owner's grid and shows a "take over" banner.
+   *  Defaults true so a lone client (and an older server that never sends
+   *  `size_owner`) behaves as owner; the server corrects it within a
+   *  round-trip of the first resize. */
+  isOwner: boolean;
 }
 
 const INITIAL_STATE: LiveTerminalState = {
@@ -64,6 +72,7 @@ const INITIAL_STATE: LiveTerminalState = {
   retryCountdown: 0,
   frame: null,
   reading: false,
+  isOwner: true,
 };
 
 export function useLiveTerminal(sessionId: string | null, wsPath: string = "live-ws") {
@@ -83,6 +92,11 @@ export function useLiveTerminal(sessionId: string | null, wsPath: string = "live
   // Whether the user is reading scrollback (off the live edge). Guards
   // enterReading/returnToLive against repeat fires from scroll events.
   const readingRef = useRef(false);
+  // Fire the `web_terminal` usage signal once per hook lifetime, not on every
+  // reconnect: onopen runs again after a WiFi blip, and the telemetry intent is
+  // "this terminal was opened", not "the socket reconnected N times". Ported
+  // from the removed xterm useTerminal hook.
+  const telemetrySeenRef = useRef(false);
 
   const storeRef = useRef<{
     snapshot: LiveTerminalState;
@@ -145,6 +159,10 @@ export function useLiveTerminal(sessionId: string | null, wsPath: string = "live
       wsRef.current = ws;
 
       ws.onopen = () => {
+        if (!telemetrySeenRef.current) {
+          telemetrySeenRef.current = true;
+          reportTelemetrySeen("web_terminal");
+        }
         setState((prev) => ({
           ...prev,
           connected: true,
@@ -171,6 +189,7 @@ export function useLiveTerminal(sessionId: string | null, wsPath: string = "live
           rows?: number;
           history?: number;
           cursor?: LiveCursor | null;
+          is_owner?: boolean;
           altScreen?: boolean;
           mouse?: boolean;
           mouseSgr?: boolean;
@@ -178,6 +197,11 @@ export function useLiveTerminal(sessionId: string | null, wsPath: string = "live
         try {
           msg = JSON.parse(event.data) as typeof msg;
         } catch {
+          return;
+        }
+        if (msg.type === "size_owner") {
+          const owner = msg.is_owner ?? true;
+          setState((prev) => (prev.isOwner === owner ? prev : { ...prev, isOwner: owner }));
           return;
         }
         if (msg.type !== "frame") return;
@@ -295,9 +319,21 @@ export function useLiveTerminal(sessionId: string | null, wsPath: string = "live
   }, [sessionId, wsPath, setState]);
 
   const sendData = useCallback((data: string) => {
+    // Only the size owner may type; the server drops a non-owner's input
+    // anyway, but gating here keeps the wire quiet and matches the banner.
+    if (!storeRef.current!.snapshot.isOwner) return;
     const ws = wsRef.current;
     if (ws?.readyState === WebSocket.OPEN) {
       ws.send(new TextEncoder().encode(data));
+    }
+  }, []);
+
+  /** Explicit take-over from a read-only viewer: steal the size-owner lock
+   *  even from a live holder, then size the window to this client. */
+  const claim = useCallback(() => {
+    const ws = wsRef.current;
+    if (ws?.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "claim" }));
     }
   }, []);
 
@@ -395,6 +431,7 @@ export function useLiveTerminal(sessionId: string | null, wsPath: string = "live
     enterReading,
     returnToLive,
     manualReconnect,
+    claim,
     maxRetries: MAX_RETRIES,
   };
 }

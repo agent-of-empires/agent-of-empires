@@ -59,7 +59,7 @@ test("right panel width persists across reload after dragging the handle", async
   await page.setViewportSize({ width: 1400, height: 900 });
   await page.goto("/");
   await clickSidebarSession(page, "pinch-test");
-  await page.locator(".xterm").first().waitFor({ state: "visible", timeout: 10_000 });
+  await page.locator("[data-live-terminal]").first().waitFor({ state: "visible", timeout: 10_000 });
 
   const handle = page.locator('[data-testid="content-split-resize-handle"]');
   await expect(handle).toBeVisible({ timeout: 10_000 });

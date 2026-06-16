@@ -364,6 +364,198 @@ pub async fn spawn_acp(
     }
 }
 
+/// Process-wide guard so concurrent `npm install -g` runs (across any
+/// sessions) never race the daemon user's shared global npm prefix. See #2109.
+static INSTALL_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+/// Cap per stream on the npm output echoed back to the web. `npm install -g`
+/// runs arbitrary lifecycle scripts; a verbose or hostile package could emit
+/// huge output, so truncate what we serialize and mark it. See #2109.
+const MAX_INSTALL_LOG_BYTES: usize = 64 * 1024;
+
+fn truncate_install_log(raw: &[u8]) -> String {
+    let text = String::from_utf8_lossy(raw);
+    if text.len() <= MAX_INSTALL_LOG_BYTES {
+        return text.into_owned();
+    }
+    let mut cut = MAX_INSTALL_LOG_BYTES;
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!(
+        "{}\n... [truncated, output exceeded {MAX_INSTALL_LOG_BYTES} bytes]",
+        &text[..cut]
+    )
+}
+
+/// Result of a server-run agent install. The "& restart" half is the
+/// client's job: on `success` the web re-POSTs `/acp/spawn` (the same
+/// respawn path the Restart button uses), so this endpoint stays a pure
+/// install with no server-side respawn duplication. See #2109.
+#[derive(Serialize)]
+pub struct InstallAgentResponse {
+    pub session_id: String,
+    pub package: String,
+    pub success: bool,
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// `POST /api/sessions/{id}/acp/install-agent`: run `npm install -g <pkg>`
+/// for the session's agent on the host, then let the client respawn.
+///
+/// Hardened, opt-in (Tier 2 of #2109): blocked in read-only mode; gated on
+/// the `acp.allow_agent_install` setting (default off, `local_only`); the
+/// package is resolved server-side from the session's agent via a static
+/// npm-only table, never from client input; npm runs with fixed argv and no
+/// shell; the per-session instance lock serializes installs so a
+/// double-click cannot race the global npm prefix. Sandbox sessions are
+/// refused because a host install never reaches the containerized agent.
+pub async fn install_agent(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Some(resp) = read_only_block(&state) {
+        return resp;
+    }
+    if !crate::session::Config::load_or_warn()
+        .acp
+        .allow_agent_install
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "install_disabled",
+                "message": "Installing agents from the web is off. Enable acp.allow_agent_install (Settings, local only).",
+            })),
+        )
+            .into_response();
+    }
+
+    let instances = state.instances.read().await;
+    let Some(instance) = instances.iter().find(|i| i.id == id).cloned() else {
+        return (StatusCode::NOT_FOUND, "session not found").into_response();
+    };
+    drop(instances);
+
+    if instance.is_sandboxed() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "sandboxed",
+                "message": "This session runs in a sandbox container; a host install would not reach the agent. Install it inside the container or rebuild its image.",
+            })),
+        )
+            .into_response();
+    }
+
+    // Resolve the binary the session would spawn, then its npm package.
+    let agent = state
+        .acp_supervisor
+        .pick_agent_for_tool(
+            &instance.tool,
+            instance.agent_name.as_deref(),
+            &instance.source_profile,
+            std::path::Path::new(&instance.project_path),
+        )
+        .await;
+    let binary = match state.acp_supervisor.resolve_agent(&agent).await {
+        Ok(spec) => spec.command,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "agent_resolve_failed",
+                    "message": format!("could not resolve agent `{agent}`: {e}"),
+                })),
+            )
+                .into_response();
+        }
+    };
+    let Some(package) = crate::acp::install_hints::npm_package_for(&binary) else {
+        let hint =
+            crate::acp::install_hints::install_hint_for(&binary).unwrap_or("(see project docs)");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "not_npm_installable",
+                "message": format!("`{binary}` cannot be installed via npm from the daemon. Install it manually: {hint}"),
+                "install_command": hint,
+            })),
+        )
+            .into_response();
+    };
+
+    // `npm install -g` mutates the daemon user's shared global prefix, so two
+    // *different* sessions installing at once would race. Serialize all
+    // installs process-wide, and also hold the per-session lock so a same-
+    // session spawn cannot run mid-install. `instance_lock` returns the lock
+    // handle; hold the guard across the install.
+    let _install_guard = INSTALL_LOCK.lock().await;
+    let inst_lock = state.instance_lock(&id).await;
+    let _guard = inst_lock.lock().await;
+
+    let Ok(npm) = which::which("npm") else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "npm_missing",
+                "message": "`npm` is not on the daemon's PATH. Start `aoe serve` from a shell where `which npm` resolves.",
+            })),
+        )
+            .into_response();
+    };
+
+    // Bound the install so a network stall or a wedged lifecycle script
+    // cannot hang the request (and the held lock) forever. kill_on_drop
+    // reaps the child if the timeout fires.
+    let output = match tokio::time::timeout(
+        std::time::Duration::from_secs(180),
+        tokio::process::Command::new(&npm)
+            .arg("install")
+            .arg("-g")
+            .arg(package)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "npm_start_failed",
+                    "message": format!("npm install failed to start: {e}"),
+                })),
+            )
+                .into_response();
+        }
+        Err(_) => {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(serde_json::json!({
+                    "error": "install_timeout",
+                    "message": "`npm install -g` did not finish within 180s.",
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    Json(InstallAgentResponse {
+        session_id: id,
+        package: package.to_string(),
+        success: output.status.success(),
+        exit_code: output.status.code(),
+        stdout: truncate_install_log(&output.stdout),
+        stderr: truncate_install_log(&output.stderr),
+    })
+    .into_response()
+}
+
 pub async fn shutdown_acp(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,

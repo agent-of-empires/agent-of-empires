@@ -6,7 +6,6 @@ use clap::{Args, Subcommand, ValueEnum, ValueHint};
 use serde::Serialize;
 use std::path::PathBuf;
 
-use crate::git::GitWorktree;
 use crate::session::projects;
 use crate::session::{Project, ProjectScope};
 
@@ -50,7 +49,7 @@ pub enum ScopeArg {
 
 #[derive(Args)]
 pub struct ProjectAddArgs {
-    /// Path to the git repository
+    /// Path to the project directory: a git repository, or any directory to run sessions in place
     #[arg(value_hint = ValueHint::DirPath)]
     path: PathBuf,
 
@@ -174,11 +173,13 @@ async fn add(profile: &str, profile_explicit: bool, args: ProjectAddArgs) -> Res
         .path
         .canonicalize()
         .unwrap_or_else(|_| args.path.clone());
-    if !GitWorktree::is_git_repo(&canonical) {
+
+    // Non-git directories are allowed: their sessions run in place, with no
+    // worktrees or branches. We still reject paths that don't resolve to a
+    // directory, which the previous git-repo gate rejected implicitly.
+    if !canonical.is_dir() {
         bail!(
-            "Path is not a git repository: {}\n\
-             Tip: pass the path to a directory that contains a `.git` folder \
-             (i.e. the root of a cloned repository).",
+            "Path does not exist or is not a directory: {}",
             canonical.display()
         );
     }
@@ -192,6 +193,7 @@ async fn add(profile: &str, profile_explicit: bool, args: ProjectAddArgs) -> Res
 
     let project = Project::new(name.clone(), canonical.to_string_lossy(), scope)
         .with_base_branch(args.base_branch);
+    let is_git = project.is_git();
     let saved = projects::add(profile, scope, project, args.allow_override)?;
     println!(
         "✓ Registered project '{}' [{}] at {}",
@@ -201,6 +203,12 @@ async fn add(profile: &str, profile_explicit: bool, args: ProjectAddArgs) -> Res
     );
     if let Some(base) = &saved.default_base_branch {
         println!("  Default base branch: {base}");
+    }
+    if !is_git {
+        println!(
+            "  Note: not a git repository; sessions open directly in this folder \
+             (no worktree per session, branches, or diff view)."
+        );
     }
     Ok(())
 }

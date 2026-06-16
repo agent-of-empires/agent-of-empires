@@ -56,6 +56,7 @@ function renderTerm(f: LiveFrame, forwardWheel = vi.fn()) {
       clearCtrl={vi.fn()}
       inputRef={createRef<HTMLTextAreaElement>()}
       onInputFocusChange={vi.fn()}
+      bottomAlign
     />,
   );
   const scroller = utils.container.querySelector("[data-live-terminal] > div") as HTMLElement;
@@ -126,6 +127,7 @@ describe("MobileLiveTerminal wheel forwarding", () => {
         clearCtrl={vi.fn()}
         inputRef={createRef<HTMLTextAreaElement>()}
         onInputFocusChange={vi.fn()}
+        bottomAlign
       />,
     );
     const scroller = utils.container.querySelector("[data-live-terminal] > div") as HTMLElement;

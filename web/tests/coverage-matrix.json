@@ -25,7 +25,6 @@
         "web/src/components/Dashboard.tsx",
         "web/src/components/TerminalView.tsx",
         "web/src/components/ContentSplit.tsx",
-        "web/src/components/XtermTerminalView.tsx",
         "web/src/components/TerminalConnectionBanners.tsx"
       ]
     },
@@ -37,32 +36,11 @@
       "components": ["web/src/components/session-wizard/steps/ReviewStep.tsx"]
     },
     {
-      "id": "terminal.live-output-resize",
-      "kind": "vitest",
-      "risk": "medium",
-      "specs": ["src/hooks/useTerminal.lifecycle.test.ts"],
-      "components": ["web/src/hooks/useTerminal.ts"]
-    },
-    {
-      "id": "terminal.copy-on-select",
-      "kind": "live-playwright",
-      "risk": "high",
-      "specs": ["tests/live/terminal-copy-select.spec.ts"],
-      "components": ["web/src/hooks/useTerminal.ts"]
-    },
-    {
-      "id": "terminal.ws-reconnect",
-      "kind": "mocked-playwright",
-      "risk": "high",
-      "specs": ["tests/ws-reconnect.spec.ts"],
-      "components": ["web/src/hooks/useTerminal.ts"]
-    },
-    {
       "id": "terminal.mobile-backspace-autorepeat",
       "kind": "mocked-playwright",
       "risk": "medium",
       "specs": ["tests/backspace-autorepeat.spec.ts"],
-      "components": ["web/src/hooks/useTerminal.ts"]
+      "components": ["web/src/components/MobileLiveTerminal.tsx", "web/src/components/LiveTerminalView.tsx"]
     },
     {
       "id": "app-shell.dashboard-update-banner",
@@ -78,7 +56,8 @@
       "specs": [
         "tests/mobile-dom-renderer.spec.ts",
         "tests/keyboard-auto-resize.spec.ts",
-        "tests/mobile-keyboard.spec.ts"
+        "tests/mobile-keyboard.spec.ts",
+        "tests/mobile-fullscreen-agent-layout.spec.ts"
       ],
       "components": [
         "web/src/components/MobileLiveTerminal.tsx",
@@ -87,11 +66,11 @@
       ]
     },
     {
-      "id": "terminal.webgl-gate-units",
+      "id": "terminal.live-line-wrap-units",
       "kind": "vitest",
       "risk": "high",
-      "specs": ["src/hooks/useTerminal.webgl.test.ts", "src/lib/liveTermLines.test.ts"],
-      "components": ["web/src/hooks/useTerminal.ts"]
+      "specs": ["src/lib/liveTermLines.test.ts"],
+      "components": ["web/src/components/MobileLiveTerminal.tsx"]
     },
     {
       "id": "terminal.mobile-live-scrollback",
@@ -99,6 +78,17 @@
       "risk": "high",
       "specs": ["tests/scrollback-exit.spec.ts"],
       "components": ["web/src/hooks/useLiveTerminal.ts", "web/src/components/MobileLiveTerminal.tsx"]
+    },
+    {
+      "id": "terminal.live-size-owner",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": [
+        "tests/live/live-size-owner-takeover.spec.ts",
+        "src/hooks/useLiveTerminal.sizeOwner.test.ts",
+        "tests/live/mobile-live-no-flutter.spec.ts"
+      ],
+      "components": ["web/src/components/LiveTerminalView.tsx", "web/src/hooks/useLiveTerminal.ts"]
     },
     {
       "id": "terminal.mobile-live-wheel-forward",
@@ -114,6 +104,13 @@
         "web/src/components/MobileLiveTerminal.tsx",
         "web/src/hooks/useLiveTerminal.ts"
       ]
+    },
+    {
+      "id": "terminal.mobile-live-align",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/__tests__/MobileLiveTerminal.align.test.tsx"],
+      "components": ["web/src/components/MobileLiveTerminal.tsx", "web/src/components/LiveTerminalView.tsx"]
     },
     {
       "id": "terminal.mobile-live-wheel-forward-e2e",
@@ -226,7 +223,6 @@
       "specs": ["tests/live/feature-usage-signals.spec.ts", "tests/diff-comments.spec.ts"],
       "components": [
         "web/src/hooks/useDiffFiles.ts",
-        "web/src/hooks/useTerminal.ts",
         "web/src/components/diff/comments/SendCommentsDialog.tsx",
         "web/src/lib/api.ts"
       ]
@@ -357,6 +353,13 @@
       "components": []
     },
     {
+      "id": "app-shell.last-session-restore",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/hooks/useLastSessionRestore.test.tsx"],
+      "components": []
+    },
+    {
       "id": "profiles.lifecycle",
       "kind": "mocked-playwright",
       "risk": "high",
@@ -368,7 +371,12 @@
       "kind": "mocked-playwright",
       "risk": "high",
       "specs": ["tests/profiles-page.spec.ts"],
-      "components": ["web/src/components/profiles/ProfilesPage.tsx"]
+      "components": [
+        "web/src/components/profiles/ProfilesSection.tsx",
+        "web/src/components/SettingsView.tsx",
+        "web/src/App.tsx",
+        "web/src/components/WorkspaceSidebar.tsx"
+      ]
     },
     {
       "id": "profiles.hooks-readonly",
@@ -381,15 +389,15 @@
       "id": "profiles.write-guard",
       "kind": "vitest",
       "risk": "high",
-      "specs": ["src/lib/api.test.ts", "src/components/profiles/__tests__/ProfilesPage.test.tsx"],
-      "components": ["web/src/components/profiles/ProfilesPage.tsx"]
+      "specs": ["src/lib/api.test.ts", "src/components/profiles/__tests__/ProfilesSection.test.tsx"],
+      "components": ["web/src/components/profiles/ProfilesSection.tsx"]
     },
     {
       "id": "profiles.description-edit-race",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/components/profiles/__tests__/ProfilesPage.test.tsx"],
-      "components": ["web/src/components/profiles/ProfilesPage.tsx"]
+      "specs": ["src/components/profiles/__tests__/ProfilesSection.test.tsx"],
+      "components": ["web/src/components/profiles/ProfilesSection.tsx"]
     },
     {
       "id": "profiles.override",
@@ -995,7 +1003,6 @@
       "specs": [
         "src/components/__tests__/MobileMainPane.test.tsx",
         "src/components/__tests__/MobileRightPanelPicker.test.tsx",
-        "src/components/__tests__/PairedTerminal.test.tsx",
         "src/hooks/__tests__/useIsWideViewport.test.tsx"
       ],
       "components": [
@@ -1556,6 +1563,13 @@
       "risk": "medium",
       "specs": ["tests/command-palette.spec.ts"],
       "components": ["web/src/components/command-palette/CommandPalette.tsx", "web/src/hooks/useKeyboardShortcuts.ts"]
+    },
+    {
+      "id": "settings.palette-entries",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/hooks/__tests__/useSettingsCommands.test.tsx"],
+      "components": ["web/src/hooks/useSettingsCommands.ts", "web/src/App.tsx"]
     },
     {
       "id": "story.shortcut-toggle-sidebar",
@@ -2406,6 +2420,13 @@
       "risk": "high",
       "specs": ["tests/live/file-watch-peer-propagation.spec.ts"],
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
+      "id": "terminal.desktop-live-input",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/desktop-live-input.spec.ts"],
+      "components": ["web/src/components/LiveTerminalView.tsx"]
     }
   ]
 }

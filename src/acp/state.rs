@@ -319,21 +319,31 @@ pub enum StartupErrorDetail {
         installed: String,
         required: String,
         install_command: String,
+        /// True when the web "Update & restart" action can install this
+        /// agent via `npm install -g`; false means the manual hint only.
+        #[serde(default)]
+        auto_install: bool,
     },
     MissingAgentInfo {
         expected_package: String,
         install_command: String,
+        #[serde(default)]
+        auto_install: bool,
     },
     MismatchedAgentName {
         expected: String,
         received: String,
         install_command: String,
+        #[serde(default)]
+        auto_install: bool,
     },
     UnparseableAgentVersion {
         package_name: String,
         raw_version: String,
         required: String,
         install_command: String,
+        #[serde(default)]
+        auto_install: bool,
     },
     UnsupportedProtocolVersion {
         expected: String,

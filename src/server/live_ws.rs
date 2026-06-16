@@ -21,13 +21,22 @@
 //!   `#{mouse_sgr_flag}`: when the pane is a full-screen mouse app the
 //!   client forwards the wheel to it (as input bytes) instead of widening
 //!   the capture window, since the alternate screen has no scrollback.
+//!   `{"type":"size_owner","is_owner":bool}`: whether this client holds
+//!     the session's size-owner lock. Only the owner resizes the shared
+//!     tmux window and may type; a non-owner renders best-effort at the
+//!     owner's grid and shows a "take over" affordance.
 //!
 //! Client -> server:
 //!   Binary frames: raw bytes for the pane (keystrokes, escape
-//!     sequences, bracketed paste). Dropped in read-only mode.
-//!   `{"type":"resize","cols":..,"rows":..}`: resize the (detached)
-//!     tmux window to the client's grid. Restored to `window-size
-//!     latest` when the last live client that resized disconnects.
+//!     sequences, bracketed paste). Dropped in read-only mode and for a
+//!     non-owner client.
+//!   `{"type":"resize","cols":..,"rows":..}`: claim the size-owner lock
+//!     and, if won, resize the (detached) tmux window to the client's
+//!     grid. The lock lives in tmux user options so the web desktop view
+//!     and the native TUI honor the same owner; it is released (and
+//!     `window-size latest` restored) when the owner disconnects.
+//!   `{"type":"claim"}`: explicit take-over from a non-owner; steals the
+//!     lock even from a live holder and sizes the window to this client.
 //!   `{"type":"window","lines":N}`: total capture window (history +
 //!     screen). Clamped to [screen rows, MAX_WINDOW_LINES].
 //!   `{"type":"cadence","fast":bool}`: capture cadence. Fast while the
@@ -48,11 +57,12 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tracing::{debug, warn};
 
-use super::ws::{
+use super::pane::{
     close_early, wait_for_tmux_ready, PaneReadiness, CLOSE_CODE_GOING_AWAY, CLOSE_CODE_PTY_DEAD,
     CLOSE_CODE_TRY_AGAIN_LATER,
 };
 use super::AppState;
+use crate::tmux::{SIZE_OWNER_HEARTBEAT, SIZE_OWNER_TTL};
 
 /// Capture cadence while the client is at the live edge. Matches the
 /// TUI's live-send fast interval: tight enough that typed echo feels
@@ -83,6 +93,11 @@ enum LiveControlMessage {
     Window { lines: usize },
     #[serde(rename = "cadence")]
     Cadence { fast: bool },
+    /// Explicit "take over" from a non-owner client: steal the size-owner
+    /// lock even from a live holder (a user tap is intentional, unlike the
+    /// passive flap the heartbeat guards against).
+    #[serde(rename = "claim")]
+    Claim,
 }
 
 /// Shared per-connection knobs the recv loop writes and the capture
@@ -95,10 +110,19 @@ struct LiveSettings {
     /// dimensions feed the drift re-assert below.
     screen_rows: AtomicU64,
     screen_cols: AtomicU64,
-    /// Set once any resize has been applied; the disconnect path then
-    /// restores `window-size latest`.
-    resized: AtomicBool,
+    /// True while this connection holds the cross-process size-owner lock.
+    /// Only the owner resizes the tmux window and accepts input; the capture
+    /// loop flips this false when the lock is lost to another client.
+    is_owner: AtomicBool,
 }
+
+/// JSON control frame telling the client whether it currently owns the
+/// session's size (and may resize/type) or is a read-only viewer.
+fn size_owner_json(is_owner: bool) -> String {
+    serde_json::json!({ "type": "size_owner", "is_owner": is_owner }).to_string()
+}
+
+static LIVE_CLIENT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub async fn live_terminal_ws(
     ws: WebSocketUpgrade,
@@ -136,7 +160,7 @@ pub async fn live_paired_terminal_ws(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     live_shell_ws(ws, state, id, "paired-live", |state, id, inst| {
-        Box::pin(super::ws::respawn_paired_if_dead(state, id, inst))
+        Box::pin(super::pane::respawn_paired_if_dead(state, id, inst))
     })
     .await
 }
@@ -148,7 +172,7 @@ pub async fn live_container_terminal_ws(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     live_shell_ws(ws, state, id, "container-live", |state, id, inst| {
-        Box::pin(super::ws::respawn_container_if_dead(state, id, inst))
+        Box::pin(super::pane::respawn_container_if_dead(state, id, inst))
     })
     .await
 }
@@ -222,8 +246,14 @@ async fn handle_live_ws(
         fast: AtomicBool::new(true),
         screen_rows: AtomicU64::new(0),
         screen_cols: AtomicU64::new(0),
-        resized: AtomicBool::new(false),
+        is_owner: AtomicBool::new(false),
     });
+    // Identifies this connection in the cross-process size-owner lock (shared
+    // with the web PTY attach and the native TUI via tmux user options).
+    let owner_id = format!(
+        "live-{}",
+        LIVE_CLIENT_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
     // Wakes the capture loop out of its inter-capture sleep: after
     // dispatched input (echo latency) and after cadence/window changes.
     let nudge = Arc::new(tokio::sync::Notify::new());
@@ -240,10 +270,12 @@ async fn handle_live_ws(
     let capture_nudge = Arc::clone(&nudge);
     let capture_tx = out_tx.clone();
     let capture_tmux = tmux_name.clone();
+    let capture_owner = owner_id.clone();
     let capture_task = tokio::spawn(async move {
         let mut last_published: Option<(String, Option<crate::tmux::PaneCursor>)> = None;
         let mut dead_probes: u32 = 0;
         let mut last_reassert = std::time::Instant::now() - REASSERT_MIN_INTERVAL;
+        let mut last_heartbeat = std::time::Instant::now() - SIZE_OWNER_HEARTBEAT;
         loop {
             let lines = capture_settings.window_lines.load(Ordering::Relaxed);
             let name = capture_tmux.clone();
@@ -256,40 +288,76 @@ async fn handle_live_ws(
             match captured {
                 Ok(Ok((content, cursor))) if !content.is_empty() || cursor.is_some() => {
                     dead_probes = 0;
-                    // Another writer (most commonly the TUI's preview sync,
-                    // which sizes the selected session's window to ITS
-                    // preview area) can resize the window out from under
-                    // this viewer; capture lines then exceed the phone's
-                    // grid and render clipped. Both writers dedup their own
-                    // sends, so re-asserting here converges on the active
-                    // viewer instead of flapping. Rate-limited as a guard
-                    // against an unknown third writer.
-                    if let Some(c) = cursor.as_ref() {
-                        let want_cols = capture_settings.screen_cols.load(Ordering::Relaxed) as u16;
-                        let want_rows = capture_settings.screen_rows.load(Ordering::Relaxed) as u16;
-                        let drifted = want_cols > 0
-                            && want_rows > 0
-                            && c.pane_width > 0
-                            && (c.pane_width != want_cols || c.pane_height != want_rows);
-                        if drifted && last_reassert.elapsed() >= REASSERT_MIN_INTERVAL {
-                            last_reassert = std::time::Instant::now();
-                            warn!(
-                                target: "terminal.ws",
-                                tmux = %capture_tmux,
-                                kind = "live",
-                                pane_cols = c.pane_width,
-                                pane_rows = c.pane_height,
-                                want_cols,
-                                want_rows,
-                                "pane drifted from live viewer's grid; re-asserting"
-                            );
-                            let name = capture_tmux.clone();
-                            capture_settings.resized.store(true, Ordering::Relaxed);
-                            let _ = tokio::task::spawn_blocking(move || {
-                                crate::tmux::Session::from_name(&name)
-                                    .resize_window(want_cols, want_rows);
-                            })
-                            .await;
+                    // Keep the size-owner lock alive while we hold it, and
+                    // notice promptly if another client took over (then we
+                    // demote ourselves to a read-only viewer).
+                    if capture_settings.is_owner.load(Ordering::Relaxed)
+                        && last_heartbeat.elapsed() >= SIZE_OWNER_HEARTBEAT
+                    {
+                        last_heartbeat = std::time::Instant::now();
+                        let name = capture_tmux.clone();
+                        let who = capture_owner.clone();
+                        let still_owner = tokio::task::spawn_blocking(move || {
+                            crate::tmux::Session::from_name(&name).refresh_size_owner(&who)
+                        })
+                        .await
+                        .unwrap_or(false);
+                        if !still_owner {
+                            capture_settings.is_owner.store(false, Ordering::Relaxed);
+                            let _ = capture_tx
+                                .send(Message::Text(size_owner_json(false).into()))
+                                .await;
+                        }
+                    }
+                    // Only the owner drives the window size. Another writer
+                    // (most commonly the TUI's preview sync) can resize the
+                    // window out from under this viewer; the owner's capture
+                    // lines then exceed its grid and render clipped, so the
+                    // owner re-asserts. Non-owners render best-effort instead
+                    // (the client hard-wraps drifted frames). Rate-limited as
+                    // a guard against an unknown third writer.
+                    if capture_settings.is_owner.load(Ordering::Relaxed) {
+                        if let Some(c) = cursor.as_ref() {
+                            let want_cols =
+                                capture_settings.screen_cols.load(Ordering::Relaxed) as u16;
+                            let want_rows =
+                                capture_settings.screen_rows.load(Ordering::Relaxed) as u16;
+                            let drifted = want_cols > 0
+                                && want_rows > 0
+                                && c.pane_width > 0
+                                && (c.pane_width != want_cols || c.pane_height != want_rows);
+                            if drifted && last_reassert.elapsed() >= REASSERT_MIN_INTERVAL {
+                                last_reassert = std::time::Instant::now();
+                                warn!(
+                                    target: "terminal.ws",
+                                    tmux = %capture_tmux,
+                                    kind = "live",
+                                    pane_cols = c.pane_width,
+                                    pane_rows = c.pane_height,
+                                    want_cols,
+                                    want_rows,
+                                    "pane drifted from live owner's grid; re-asserting"
+                                );
+                                // Verified resize: the local is_owner flag is
+                                // stale for up to a heartbeat after a steal,
+                                // and a drift seen in that window IS the new
+                                // owner's grid. Resizing unverified here would
+                                // stomp it; instead demote on the spot.
+                                let name = capture_tmux.clone();
+                                let who = capture_owner.clone();
+                                let still_owner = tokio::task::spawn_blocking(move || {
+                                    crate::tmux::Session::from_name(&name)
+                                        .resize_window_if_owner(&who, want_cols, want_rows)
+                                })
+                                .await
+                                .unwrap_or(false);
+                                if !still_owner {
+                                    capture_settings.is_owner.store(false, Ordering::Relaxed);
+                                    let _ = capture_tx
+                                        .send(Message::Text(size_owner_json(false).into()))
+                                        .await;
+                                }
+                            }
                         }
                     }
                     let frame = (content, cursor);
@@ -378,7 +446,12 @@ async fn handle_live_ws(
             msg = ws_receiver.next() => {
                 match msg {
                     Some(Ok(Message::Binary(data))) => {
-                        if read_only || data.is_empty() {
+                        // Only the size owner may type; a non-owner is a
+                        // read-only viewer until it explicitly takes over.
+                        if read_only
+                            || data.is_empty()
+                            || !settings.is_owner.load(Ordering::Relaxed)
+                        {
                             continue;
                         }
                         let name = tmux_name.clone();
@@ -402,10 +475,6 @@ async fn handle_live_ws(
                         };
                         match control {
                             LiveControlMessage::Resize { cols, rows } => {
-                                // read_only blocks pane input (the binary
-                                // branch above), not viewport negotiation:
-                                // a read-only viewer still publishes its
-                                // grid, like the desktop attach.
                                 if cols == 0 || rows == 0 {
                                     continue;
                                 }
@@ -416,12 +485,27 @@ async fn handle_live_ws(
                                 if settings.window_lines.load(Ordering::Relaxed) < floor {
                                     settings.window_lines.store(floor, Ordering::Relaxed);
                                 }
+                                // Claim the cross-process size-owner lock; only
+                                // the owner resizes the shared window. A
+                                // non-owner keeps rendering best-effort at the
+                                // owner's grid and shows a "take over" banner.
                                 let name = tmux_name.clone();
-                                let _ = tokio::task::spawn_blocking(move || {
-                                    crate::tmux::Session::from_name(&name).resize_window(cols, rows);
+                                let who = owner_id.clone();
+                                let owned = tokio::task::spawn_blocking(move || {
+                                    let session = crate::tmux::Session::from_name(&name);
+                                    if session.claim_size_owner(&who, SIZE_OWNER_TTL) {
+                                        session.resize_window(cols, rows);
+                                        true
+                                    } else {
+                                        false
+                                    }
                                 })
-                                .await;
-                                settings.resized.store(true, Ordering::Relaxed);
+                                .await
+                                .unwrap_or(false);
+                                settings.is_owner.store(owned, Ordering::Relaxed);
+                                let _ = out_tx
+                                    .send(Message::Text(size_owner_json(owned).into()))
+                                    .await;
                                 nudge.notify_one();
                             }
                             LiveControlMessage::Window { lines } => {
@@ -436,6 +520,33 @@ async fn handle_live_ws(
                                 if fast {
                                     nudge.notify_one();
                                 }
+                            }
+                            LiveControlMessage::Claim => {
+                                // Explicit take-over: steal the lock even from
+                                // a live holder, then size the window to our
+                                // grid so this client renders correctly.
+                                let name = tmux_name.clone();
+                                let who = owner_id.clone();
+                                let cols = settings.screen_cols.load(Ordering::Relaxed) as u16;
+                                let rows = settings.screen_rows.load(Ordering::Relaxed) as u16;
+                                let owned = tokio::task::spawn_blocking(move || {
+                                    let session = crate::tmux::Session::from_name(&name);
+                                    if session.steal_size_owner(&who) {
+                                        if cols > 0 && rows > 0 {
+                                            session.resize_window(cols, rows);
+                                        }
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                })
+                                .await
+                                .unwrap_or(false);
+                                settings.is_owner.store(owned, Ordering::Relaxed);
+                                let _ = out_tx
+                                    .send(Message::Text(size_owner_json(owned).into()))
+                                    .await;
+                                nudge.notify_one();
                             }
                         }
                     }
@@ -463,21 +574,16 @@ async fn handle_live_ws(
     drop(out_tx);
     let _ = send_task.await;
 
-    // Live-view resizes flip the window-size option to manual (tmux
-    // behavior); restore automatic sizing so a later full-size attach
-    // isn't pinned at phone dimensions. Mirrors the TUI's live-send exit.
-    //
-    // `resized` is per-socket, so with two live viewers on one session the
-    // first disconnect resets sizing out from under the survivor. That
-    // self-heals: the survivor's capture loop re-asserts its grid on the
-    // next drift check (<= REASSERT_MIN_INTERVAL), so the survivor renders
-    // at the wrong wrap width for at most that interval (and the client
-    // hard-wraps drifted frames rather than clipping). Tracking
-    // last-resizer-standing across sockets isn't worth that transient.
-    if settings.resized.load(Ordering::Relaxed) {
+    // Release the size-owner lock if we held it. `release_size_owner` is a
+    // no-op for a non-owner, and restores `window-size latest` once the lock
+    // is vacant so a later full-size attach isn't pinned at phone dimensions.
+    // With another live viewer still connected, the lock stays held by
+    // whoever owns it; this disconnect doesn't disturb the survivor.
+    {
         let name = tmux_name.clone();
+        let who = owner_id.clone();
         let _ = tokio::task::spawn_blocking(move || {
-            crate::tmux::Session::from_name(&name).reset_size_to_latest_client();
+            crate::tmux::Session::from_name(&name).release_size_owner(&who);
         })
         .await;
     }
@@ -600,5 +706,7 @@ mod tests {
         let m: LiveControlMessage =
             serde_json::from_str(r#"{"type":"cadence","fast":false}"#).unwrap();
         assert!(matches!(m, LiveControlMessage::Cadence { fast: false }));
+        let m: LiveControlMessage = serde_json::from_str(r#"{"type":"claim"}"#).unwrap();
+        assert!(matches!(m, LiveControlMessage::Claim));
     }
 }

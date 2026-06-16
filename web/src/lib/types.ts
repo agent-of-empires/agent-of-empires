@@ -162,6 +162,13 @@ export interface ActivateMessage {
   type: "activate";
 }
 
+/** Explicit take-over of the cross-surface size lock (banner click).
+ *  Separate from `activate`, which also fires on mount and must not
+ *  steal the size from a live owner on another device. */
+export interface ClaimMessage {
+  type: "claim";
+}
+
 /** Pause the pane's foreground process (SIGSTOP). Sent by mobile web
  *  clients when entering tmux scrollback so claude's continued output
  *  doesn't shift what the user is reading. Paired with `resume_output`. */

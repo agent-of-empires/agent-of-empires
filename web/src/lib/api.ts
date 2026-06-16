@@ -678,6 +678,40 @@ export async function switchAcpAgent(
   });
 }
 
+// --- Acp install agent (Tier 2 of #2109) ---
+
+export interface InstallAgentResponse {
+  session_id: string;
+  package: string;
+  success: boolean;
+  exit_code: number | null;
+  stdout: string;
+  stderr: string;
+}
+
+/** Run `npm install -g` for the session's agent on the host. Opt-in and
+ *  hardened server-side (see `install_agent` in src/server/api/acp.rs).
+ *  Resolves with the parsed body on 2xx; throws with the server's error
+ *  message on failure (disabled, sandboxed, not npm-installable, npm
+ *  missing) so the caller can surface why. The caller respawns the worker
+ *  separately via `useRespawnSession` on `success`. */
+export async function installAcpAgent(sessionId: string): Promise<InstallAgentResponse> {
+  const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/acp/install-agent`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+  });
+  const body = (await res.json().catch(() => null)) as
+    | (Partial<InstallAgentResponse> & { error?: string; message?: string })
+    | null;
+  if (!res.ok) {
+    throw new Error(body?.message || body?.error || `Server returned ${res.status}`);
+  }
+  if (!body) {
+    throw new Error("Server returned an invalid or empty response");
+  }
+  return body as InstallAgentResponse;
+}
+
 /** Fetch a markdown primer built from events `seq < beforeSeq`. Used
  *  after a `session/load` failure: the agent's model context is empty
  *  but the transcript is intact in SQLite, so the user can opt in to

@@ -46,6 +46,7 @@ import { useAcpPrefs } from "../../lib/acpPrefs";
 import { AgentProfileProvider, useAgentProfile } from "../../lib/agentProfileContext";
 import { isClearAlias } from "../../lib/agentProfiles";
 import { AttentionChime } from "./AttentionChime";
+import { useRespawnSession } from "../../hooks/useRespawnSession";
 import { useIsCoarsePointer } from "../../hooks/useIsCoarsePointer";
 import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
 import type {
@@ -311,7 +312,7 @@ function AcpChrome({
   if (state.incompatibleAgent) {
     return (
       <div className="flex h-full flex-col bg-surface-900 text-text-primary">
-        <StartupErrorScreen detail={state.incompatibleAgent} />
+        <StartupErrorScreen detail={state.incompatibleAgent} sessionId={sessionId} />
       </div>
     );
   }
@@ -1473,32 +1474,9 @@ function ScheduledWakeupBanner({ wakeAt, reason }: { wakeAt: string; reason: str
 }
 
 function WorkerStoppedBanner({ sessionId }: { sessionId: string }) {
-  const [retryState, setRetryState] = useState<"idle" | "retrying" | "ok" | "failed">("idle");
-  const [retryError, setRetryError] = useState<string | null>(null);
-
-  const handleReconnect = async () => {
-    setRetryState("retrying");
-    setRetryError(null);
-    try {
-      const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/acp/spawn`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({}),
-      });
-      if (res.ok) {
-        // The next AcpSessionAssigned (or UserPromptSent) clears
-        // workerStopped on the reducer side and this banner unmounts.
-        setRetryState("ok");
-      } else {
-        const detail = (await res.text().catch(() => "")).slice(0, 200);
-        setRetryState("failed");
-        setRetryError(`Server returned ${res.status}. ${detail}`.trim());
-      }
-    } catch (e) {
-      setRetryState("failed");
-      setRetryError(e instanceof Error ? e.message : String(e));
-    }
-  };
+  // The next AcpSessionAssigned (or UserPromptSent) clears workerStopped on
+  // the reducer side and this banner unmounts.
+  const { state: retryState, error: retryError, respawn: handleReconnect } = useRespawnSession(sessionId);
 
   return (
     <div className="border-b border-amber-900/60 bg-amber-950/40 px-4 py-3 text-amber-200">
@@ -1591,33 +1569,10 @@ export function StartupErrorBanner({ sessionId, message }: { sessionId: string; 
   // node_modules whose binary doesn't match the container arch. See
   // #1449.
   const isNativeBinaryLaunchFail = /native binary at .* exists but failed to launch/i.test(message);
-  const [retryState, setRetryState] = useState<"idle" | "retrying" | "ok" | "failed">("idle");
-  const [retryError, setRetryError] = useState<string | null>(null);
-
-  const handleRetry = async () => {
-    setRetryState("retrying");
-    setRetryError(null);
-    try {
-      const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/acp/spawn`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({}),
-      });
-      if (res.ok) {
-        // The supervisor's drain task will start emitting events
-        // shortly; the banner will disappear when the next user
-        // prompt clears `startupError`.
-        setRetryState("ok");
-      } else {
-        const detail = (await res.text().catch(() => "")).slice(0, 200);
-        setRetryState("failed");
-        setRetryError(`Server returned ${res.status}. ${detail}`.trim());
-      }
-    } catch (e) {
-      setRetryState("failed");
-      setRetryError(e instanceof Error ? e.message : String(e));
-    }
-  };
+  // The supervisor's drain task starts emitting events shortly after a
+  // successful respawn; the banner disappears when the next user prompt
+  // clears `startupError`.
+  const { state: retryState, error: retryError, respawn: handleRetry } = useRespawnSession(sessionId);
 
   return (
     <div className="border-b border-rose-900/60 bg-rose-950/40 px-4 py-3 text-rose-200">

@@ -11,7 +11,7 @@
 // timer once the server is finally ready. See #1455.
 
 import { describe, expect, it } from "vitest";
-import { retryDelayMs } from "./useTerminal";
+import { retryDelayMs } from "./wsBackoff";
 
 describe("retryDelayMs", () => {
   it("uses the fast-start schedule for the first attempts", () => {
