@@ -226,7 +226,7 @@ impl IntroDialog {
     fn outcome(&self) -> IntroOutcome {
         // Only report a theme when the user picked something different from
         // what was active when the wizard opened. Dispatching SetTheme for
-        // an identity change flips `needs_redraw` → `terminal.clear()` on
+        // an identity change flips `needs_redraw` → `clear_terminal` on
         // the next loop iteration, which the user sees as a flash when the
         // wizard closes.
         let final_theme = if self.theme_visited {

@@ -888,7 +888,7 @@ impl HomeView {
                         // No pending_intro_theme: the live preview
                         // already applied the chosen theme to
                         // `app.theme`; re-applying would force a
-                        // terminal.clear() (the close-flash). Same
+                        // `clear_terminal` (the close-flash). Same
                         // rationale as the keyboard Submit branch.
                     }
                 }
@@ -1472,7 +1472,7 @@ impl HomeView {
                     // applied the chosen theme to `app.theme` while the
                     // user was on the picker page. Re-dispatching here
                     // would only re-trigger `set_theme → needs_redraw`,
-                    // which forces a `terminal.clear()` on the next loop
+                    // which forces a `clear_terminal` on the next loop
                     // iteration — the close-flash the user sees.
                     return None;
                 }

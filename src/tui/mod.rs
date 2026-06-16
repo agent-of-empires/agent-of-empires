@@ -57,6 +57,36 @@ fn env_mouse_capture_allows() -> bool {
 use crate::session::get_update_settings;
 use crate::update::check_for_update;
 
+/// Clear the screen and force a full redraw on the next frame, without the
+/// `ESC[6n` cursor-position round-trip that ratatui's `Terminal::clear` does.
+///
+/// ratatui 0.30's `Terminal::clear` snapshots the cursor via
+/// `get_cursor_position` before clearing. That read shares crossterm's internal
+/// event reader with our live `EventStream`; around stream lifecycle changes the
+/// reader's poll wakes early and the cursor read completes with no matching
+/// event, which surfaces as "cursor position could not be read within a normal
+/// duration" (an immediate 0 ms failure, not the 2 s timeout the message
+/// implies). Clearing the backend directly via `clear_region(ClearType::All)`
+/// (the same call ratatui's Fullscreen `clear_viewport` issues) and resetting
+/// the diff baseline repaints every cell on the next `draw` with no cursor
+/// query.
+///
+/// A free function rather than an `App` method so both the local home view and
+/// the remote home view route through one definition, keeping the "no clear
+/// path calls `get_cursor_position`" invariant true across the whole TUI.
+/// `ClearType::All` is correct for the `Viewport::Fullscreen` the TUI uses; an
+/// inline or fixed viewport would need a different clear.
+pub(crate) fn clear_terminal<B: Backend>(terminal: &mut Terminal<B>) -> Result<(), B::Error> {
+    terminal
+        .backend_mut()
+        .clear_region(ratatui::backend::ClearType::All)?;
+    // Reset both buffers so the next draw diffs against an empty baseline and
+    // repaints the whole viewport.
+    terminal.current_buffer_mut().reset();
+    terminal.swap_buffers();
+    Ok(())
+}
+
 pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
     // Cross-machine entrypoint: when `AOE_DAEMON_URL` is set, swap the
     // local home view for the remote structured view picker so the user never
@@ -223,6 +253,47 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
     terminal.show_cursor()?;
 
     result
+}
+
+#[cfg(test)]
+mod clear_terminal_tests {
+    use super::clear_terminal;
+    use ratatui::{backend::TestBackend, buffer::Cell, widgets::Paragraph, Terminal};
+
+    fn all_blank(terminal: &Terminal<TestBackend>) -> bool {
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .all(|c| c == &Cell::default())
+    }
+
+    /// `clear_terminal` must wipe the backend AND reset ratatui's diff baseline,
+    /// so a clear followed by an identical redraw repaints every cell instead of
+    /// diffing to a no-op and leaving a blank screen.
+    #[test]
+    fn clears_backend_and_repaints_on_next_identical_draw() {
+        let mut terminal = Terminal::new(TestBackend::new(20, 3)).unwrap();
+
+        terminal
+            .draw(|f| f.render_widget(Paragraph::new("HELLO"), f.area()))
+            .unwrap();
+        assert!(!all_blank(&terminal), "draw should paint the backend");
+
+        clear_terminal(&mut terminal).unwrap();
+        assert!(
+            all_blank(&terminal),
+            "clear_terminal should wipe the backend"
+        );
+
+        // Same content again: without the diff-baseline reset the diff would be
+        // empty and the screen would stay blank after the clear.
+        terminal
+            .draw(|f| f.render_widget(Paragraph::new("HELLO"), f.area()))
+            .unwrap();
+        assert!(!all_blank(&terminal), "redraw after clear must repaint");
+    }
 }
 
 #[cfg(test)]
