@@ -1,6 +1,6 @@
 import { test, expect } from "./helpers/mockedTest";
 import { Page } from "@playwright/test";
-import { openWizard, expandMoreOptions, launch, wizard } from "./helpers/wizard";
+import { openWizard, expandMoreOptions, wizard } from "./helpers/wizard";
 
 // Wizard scratch-session stories (#1324), on the single-screen wizard (#2210).
 // Covers:

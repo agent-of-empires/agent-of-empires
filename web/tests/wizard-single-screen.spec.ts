@@ -1,6 +1,6 @@
 import { test, expect } from "./helpers/mockedTest";
 import { Page } from "@playwright/test";
-import { openWizard, selectProject, selectAgent, expandMoreOptions, launch, wizard } from "./helpers/wizard";
+import { openWizard, selectProject, expandMoreOptions, launch, wizard } from "./helpers/wizard";
 
 // Single-screen new-session wizard acceptance stories (#2210). The 4-step
 // wizard collapsed into one screen: project + agent + structured-view +
