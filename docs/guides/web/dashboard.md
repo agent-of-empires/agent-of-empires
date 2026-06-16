@@ -42,7 +42,9 @@ Completing or skipping the tour records `app_state.has_seen_web_tour` on the ser
 
 ## Sidebar sort
 
-By default the sidebar shows your manually-ordered list. Drag a row (press-and-hold) to move it; the order persists across browsers and devices via `workspace-ordering.json`. To reorder whole projects, drag a project/group header by its left-side handle; this group order is per-browser (localStorage), not synced. Group drag is disabled while a filter is active or a computed sort mode is selected.
+By default the sidebar shows your manually-ordered list. Drag a row (press-and-hold) to move it; the order persists across browsers and devices via `workspace-ordering.json`. To reorder whole projects, press-and-drag the project/group header itself (there is no separate handle); this group order is per-browser (localStorage), not synced. Group drag is disabled while a filter is active or a computed sort mode is selected.
+
+Each project header shows the project icon next to its name, with a count of the sessions it holds. Hovering the header swaps the icon for a fold chevron; clicking the header collapses or expands the project's sessions.
 
 A sort picker next to the filter button offers three modes:
 
