@@ -3469,4 +3469,89 @@ hooks_auto_accept: false
             tmp.path()
         );
     }
+
+    fn dash_available() -> bool {
+        std::process::Command::new("dash")
+            .arg("-c")
+            .arg("exit 0")
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn host_shell_in_dash_refuses_wrong_mode() {
+        if !dash_available() {
+            eprintln!("skipping: dash not available");
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("aoe-hooks-mode");
+        std::fs::create_dir(&base).unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cmd =
+            hook_command_with_base("running", base.to_str().unwrap(), HookInstallTarget::Host);
+        let output = std::process::Command::new("dash")
+            .args(["-c", &cmd])
+            .env("AOE_INSTANCE_ID", "dash_wrong_mode")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "hook must exit 0 even on rejection"
+        );
+        assert!(
+            !base.join("dash_wrong_mode").exists(),
+            "dash must reject 0o755 parent and refuse to mkdir under it"
+        );
+    }
+
+    #[test]
+    fn host_shell_handles_hostile_ifs() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("aoe-hooks-ifs");
+        std::fs::create_dir(&base).unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let cmd =
+            hook_command_with_base("running", base.to_str().unwrap(), HookInstallTarget::Host);
+        let output = std::process::Command::new("sh")
+            .args(["-c", &cmd])
+            .env("AOE_INSTANCE_ID", "ifs_hostile")
+            .env("IFS", "d")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let status_path = base.join("ifs_hostile").join("status");
+        assert_eq!(
+            std::fs::read_to_string(&status_path).unwrap(),
+            "running",
+            "snippet must reset IFS and write status despite hostile inherited IFS=d"
+        );
+    }
+
+    #[test]
+    fn host_shell_handles_hostile_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("aoe-hooks-umask");
+        std::fs::create_dir(&base).unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let cmd =
+            hook_command_with_base("running", base.to_str().unwrap(), HookInstallTarget::Host);
+        let output = std::process::Command::new("sh")
+            .args(["-c", &format!("umask 022; {cmd}")])
+            .env("AOE_INSTANCE_ID", "umask_hostile")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let inst = base.join("umask_hostile");
+        assert!(inst.exists(), "instance dir must be created");
+        let mode = std::fs::metadata(&inst).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "snippet must override caller umask 022 to mkdir 0o700; got {mode:o}"
+        );
+    }
 }
