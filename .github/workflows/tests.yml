@@ -178,9 +178,10 @@ jobs:
       - name: Install dependencies
         working-directory: web
         run: npm ci
-      # Clean production build, intentionally WITHOUT AOE_COVERAGE: istanbul
-      # instrumentation inflates chunk sizes and would report bogus bundle
-      # stats. The @codecov/vite-plugin uploads the bundle stats to Codecov
+      # Clean production build, intentionally WITHOUT AOE_COVERAGE: the inline
+      # sourcemaps the coverage build emits inflate chunk sizes and would
+      # report bogus bundle stats. The @codecov/vite-plugin uploads bundle
+      # stats to Codecov
       # when CODECOV_TOKEN is present (gated in web/vite.config.ts); without
       # the token the plugin is a no-op, so forks still build cleanly.
       - name: Build web bundle and upload stats to Codecov
