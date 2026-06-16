@@ -52,6 +52,7 @@ import { safeGetItem, safeSetItem } from "../lib/safeStorage";
 import { REPO_COLOR_OPTIONS, type RepoAppearanceUpdate, type RepoColor } from "../lib/repoAppearance";
 import { STATUS_DOT_CLASS, getStatusTextClass, isSessionActive } from "../lib/session";
 import { useIdleDecayWindowMs } from "../lib/idleDecay";
+import { exceedsTouchSlop } from "../lib/longPress";
 import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
 import { renameSession, setSessionNotifications, setWorktreeName, updateSessionGroup } from "../lib/api";
 import { useServerDown, OFFLINE_TITLE } from "../lib/connectionState";
@@ -705,6 +706,7 @@ export const SessionRow = memo(function SessionRow({
   const longPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const longPressFired = useRef(false);
   const touchOpenedAt = useRef(0);
+  const touchStart = useRef<{ x: number; y: number } | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -766,12 +768,24 @@ export const SessionRow = memo(function SessionRow({
     if (!touch) return;
     const tx = touch.clientX;
     const ty = touch.clientY;
+    touchStart.current = { x: tx, y: ty };
     longPressTimer.current = setTimeout(() => {
       longPressFired.current = true;
       touchOpenedAt.current = Date.now();
       closeOtherContextMenus();
       setContextMenu({ x: tx, y: ty });
     }, 500);
+  };
+
+  // Cancel the pending long-press only once the finger moves past the slop, so
+  // a normal jittery hold still opens the menu while a deliberate drag
+  // (scroll/reorder) cancels it. See exceedsTouchSlop (#2232).
+  const handleTouchMove = (e: React.TouchEvent) => {
+    const touch = e.touches[0];
+    if (!touch || !touchStart.current) return;
+    if (exceedsTouchSlop(touchStart.current, { x: touch.clientX, y: touch.clientY })) {
+      clearLongPress();
+    }
   };
 
   const handleTouchEnd = (e: React.TouchEvent) => {
@@ -897,7 +911,7 @@ export const SessionRow = memo(function SessionRow({
         onContextMenu={handleContextMenu}
         onTouchStart={handleTouchStart}
         onTouchEnd={handleTouchEnd}
-        onTouchMove={clearLongPress}
+        onTouchMove={handleTouchMove}
         onTouchCancel={clearLongPress}
         data-selected={isSelected || undefined}
         className={`block w-full text-left py-2 cursor-pointer select-none [-webkit-touch-callout:none] transition-colors duration-75 ${
