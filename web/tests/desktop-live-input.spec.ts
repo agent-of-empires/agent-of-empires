@@ -29,6 +29,24 @@ test.describe("Desktop live terminal input", () => {
       .toBeGreaterThan(before);
   });
 
+  test("the focused pane is marked selected, like the TUI's active border", async ({ page }) => {
+    // On a multi-pane desktop it must be obvious which box keystrokes go to.
+    // LiveTerminalView frames the focused pane with the teal `terminal-active`
+    // ring and flags it `data-pane-focused`; blurring drops the marker.
+    await mockTerminalApis(page);
+    await page.goto("/");
+    await clickSidebarSession(page, "pinch-test");
+    const pane = page.locator('[data-term="agent"]').first();
+    await pane.waitFor({ state: "visible", timeout: 10_000 });
+
+    await page.locator("[data-live-terminal]").first().click();
+    await expect(page.locator('textarea[aria-label="Live terminal input"]').first()).toBeFocused();
+    await expect(pane).toHaveAttribute("data-pane-focused", "true");
+
+    await page.locator('textarea[aria-label="Live terminal input"]').first().blur();
+    await expect(pane).not.toHaveAttribute("data-pane-focused", "true");
+  });
+
   test("renders at the desktop font size, not the small mobile default", async ({ page }) => {
     // The live view used to always read `mobileFontSize` (default 8px), so on
     // desktop it came up tiny and ignored the dashboard's terminal font-size

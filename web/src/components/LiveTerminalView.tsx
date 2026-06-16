@@ -191,7 +191,26 @@ export function LiveTerminalView({ session, active = true, surface = "agent" }: 
   const rootStyle = keyboardHeight > 0 ? { paddingBottom: keyboardHeight } : undefined;
 
   return (
-    <div className="flex-1 flex flex-col overflow-hidden relative" style={rootStyle} data-term={dataTerm}>
+    <div
+      className="flex-1 flex flex-col overflow-hidden relative"
+      style={rootStyle}
+      data-term={dataTerm}
+      data-pane-focused={inputFocused || undefined}
+    >
+      {/* Frame the pane like the TUI does: a faint always-on border marks the
+          box edges and brightens to the teal `terminal-active` color when this
+          pane is selected (its input has focus), so on a multi-pane desktop it
+          is obvious which box keystrokes go to. This is a pointer-events-none
+          overlay (not a ring on the container) because the terminal scroller is
+          an `absolute inset-0` element with an opaque background that would
+          paint over an inset ring on any ancestor. */}
+      <div
+        aria-hidden="true"
+        className={`pointer-events-none absolute inset-0 z-10 ring-inset transition-shadow ${
+          inputFocused ? "ring-2 ring-terminal-active" : "ring-1 ring-surface-700/40"
+        }`}
+      />
+
       <TerminalConnectionBanners
         connected={live.state.connected}
         reconnecting={live.state.reconnecting}
@@ -258,6 +277,7 @@ export function LiveTerminalView({ session, active = true, surface = "agent" }: 
           clearCtrl={() => setCtrlActive(false)}
           inputRef={inputRef}
           onInputFocusChange={setInputFocused}
+          bottomAlign={surface === "agent"}
         />
         {coarse && live.state.connected && <KeyboardFab keyboardOpen={inputFocused} onToggle={toggleKeyboard} />}
       </div>

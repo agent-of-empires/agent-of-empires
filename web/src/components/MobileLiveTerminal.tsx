@@ -81,6 +81,10 @@ export interface MobileLiveTerminalProps {
    *  keyboard visible, the deterministic alternative to occlusion
    *  heuristics. */
   onInputFocusChange: (focused: boolean) => void;
+  /** Bottom-align the screen chat-style (agent surface) so a short screen's
+   *  prompt sits just above the keyboard. The paired host/container shells are
+   *  ordinary terminals, so they top-align like a normal bash window. */
+  bottomAlign: boolean;
 }
 
 function segStyle(style: AnsiStyle): CSSProperties | undefined {
@@ -197,6 +201,7 @@ export function MobileLiveTerminal({
   clearCtrl,
   inputRef,
   onInputFocusChange,
+  bottomAlign,
 }: MobileLiveTerminalProps) {
   const { settings, update } = useWebSettings();
   // The live view now renders on desktop too, so it honors the right font-size
@@ -845,8 +850,10 @@ export function MobileLiveTerminal({
             tall mobile pane), so its input box sits just above the keyboard
             instead of floating over a dead gap. When content overflows
             (scrollback) the auto margin collapses and it scrolls normally,
-            sidestepping the flex+overflow top-clip bug. */}
-        <div className="relative whitespace-pre mt-auto" data-live-content>
+            sidestepping the flex+overflow top-clip bug. The paired shells
+            opt out (`bottomAlign=false`) so a near-empty bash prompt sits at
+            the top like a normal terminal. */}
+        <div className={`relative whitespace-pre ${bottomAlign ? "mt-auto" : ""}`} data-live-content>
           {effectiveSpacerLines > 0 && (
             <div style={{ height: `${effectiveSpacerLines * lineH}px` }} aria-hidden="true" />
           )}
