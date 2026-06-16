@@ -19,7 +19,7 @@ Each sidebar row carries an animated braille glyph encoding the session's state:
 
 The **New session** wizard walks four steps:
 
-- **Project**: pick the working directory from recent and registered projects, or start a scratch session with no path. The Recent list keeps a project around after its last session is deleted, so you can quickly start there again; entries whose directory no longer exists are dropped.
+- **Project**: pick the working directory from the Recent tab, browse for one, clone a URL, or start a scratch session with no path. The Recent tab lists your saved projects under a "Saved projects" section above the directories of your recent sessions. The recent list keeps a project around after its last session is deleted, so you can quickly start there again; entries whose directory no longer exists are dropped.
 - **Session**: set the title (auto-slugifies into a worktree branch name unless you edit the branch), or attach an existing branch instead.
 - **Agent**: select the tool and profile, plus per-session knobs (auto-approve / YOLO mode, "Run in a safe container" sandbox, command override, extra args / env).
 - **Review**: confirm before the session spawns.
