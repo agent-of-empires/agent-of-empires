@@ -1685,21 +1685,26 @@ const SidebarGroupHeader = memo(function SidebarGroupHeader({
   const sessionCount = group.workspaces.reduce((n, v) => n + v.workspace.sessions.length, 0);
 
   // The whole header row is the drag activator now (no grip handle), so a
-  // drag ends with the pointer over the toggle. Suppress the trailing click
-  // for a beat after a drag so reordering a group doesn't also collapse it.
-  // Mirrors the SessionRow suppression.
+  // drag ends with the pointer over one of the row's controls. Suppress the
+  // trailing click for a beat after a drag so reordering a group doesn't also
+  // collapse it or fire the New Session button. The window stays open for the
+  // whole drag (Infinity), so even a multi-second drag can't leak the click,
+  // then closes 250ms after release. Enforced row-wide via onClickCapture so
+  // every control is covered, not just the toggle.
   const dragSuppressRef = useRef(0);
   const isDragging = dragHandle?.isDragging ?? false;
   useEffect(() => {
     if (isDragging) {
-      dragSuppressRef.current = Date.now() + 1000;
+      dragSuppressRef.current = Number.POSITIVE_INFINITY;
     } else if (dragSuppressRef.current > Date.now()) {
       dragSuppressRef.current = Date.now() + 250;
     }
   }, [isDragging]);
-  const handleToggle = () => {
-    if (dragSuppressRef.current > Date.now()) return;
-    onClick();
+  const suppressClickAfterDrag = (e: React.MouseEvent) => {
+    if (dragSuppressRef.current > Date.now()) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
   };
 
   const openMenuAt = useCallback((x: number, y: number) => {
@@ -1793,6 +1798,7 @@ const SidebarGroupHeader = memo(function SidebarGroupHeader({
             : undefined
         }
         onKeyDown={hasMenu ? handleHeaderKeyDown : undefined}
+        onClickCapture={suppressClickAfterDrag}
         className={`group flex items-center gap-2 px-3 py-2 transition-colors duration-75 text-text-secondary focus:outline-none focus:ring-2 focus:ring-brand-600 ${headerHoverClass} ${
           hasActiveChild ? "border-l-2 border-brand-600" : ""
         }`}
@@ -1806,14 +1812,14 @@ const SidebarGroupHeader = memo(function SidebarGroupHeader({
       >
         <span className={`w-2 h-2 rounded-full shrink-0 ${dotClass}`} />
         <button
-          onClick={handleToggle}
+          onClick={onClick}
           aria-expanded={!group.collapsed}
           className="flex items-center gap-2 flex-1 min-w-0 text-left cursor-pointer"
         >
           <span className="relative h-4 w-4 shrink-0">
             <span
               data-testid="sidebar-group-icon"
-              className="absolute inset-0 flex items-center justify-center transition-opacity duration-75 group-hover:opacity-0"
+              className="absolute inset-0 flex items-center justify-center transition-opacity duration-75 group-hover:opacity-0 group-focus-within:opacity-0"
             >
               {group.remoteOwner ? (
                 <OwnerAvatar owner={group.remoteOwner} size={16} />
@@ -1823,7 +1829,7 @@ const SidebarGroupHeader = memo(function SidebarGroupHeader({
             </span>
             <span
               data-testid="sidebar-group-fold-chevron"
-              className="absolute inset-0 flex items-center justify-center opacity-0 transition-opacity duration-75 group-hover:opacity-100"
+              className="absolute inset-0 flex items-center justify-center opacity-0 transition-opacity duration-75 group-hover:opacity-100 group-focus-within:opacity-100"
             >
               <svg
                 width="10"

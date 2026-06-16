@@ -61,4 +61,29 @@ test.describe("sidebar project row rework (#2207)", () => {
     await page.locator(COUNT).click();
     await expect(page.locator(ROW)).toHaveCount(3);
   });
+
+  test("a drag on the header does not collapse it (trailing click suppressed)", async ({ page }) => {
+    await installSidebarMocks(page, { sessions: threeSessionsInOneRepo() });
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await page.goto("/");
+
+    await expect(page.locator(ROW)).toHaveCount(3);
+
+    const box = await page.locator(HEADER).boundingBox();
+    if (!box) throw new Error("header box missing");
+    const x = box.x + 60;
+    const y = box.y + box.height / 2;
+
+    // Press, move past the 8px dnd activation threshold and back, then
+    // release over the header. The trailing release-click must be swallowed
+    // so the project stays expanded rather than collapsing.
+    await page.mouse.move(x, y);
+    await page.mouse.down();
+    await page.mouse.move(x + 16, y, { steps: 6 });
+    await page.mouse.move(x, y, { steps: 6 });
+    await page.mouse.up();
+
+    await expect(page.locator(ROW)).toHaveCount(3);
+    await expect(page.locator(COUNT)).toHaveText("(3)");
+  });
 });
