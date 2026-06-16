@@ -435,6 +435,32 @@ impl App {
         Ok(())
     }
 
+    /// Clear the screen and force a full redraw on the next frame.
+    ///
+    /// NOTE: this deliberately avoids ratatui's `Terminal::clear`, which
+    /// snapshots the cursor with a `get_cursor_position` (`ESC[6n`) round-trip.
+    /// That read goes through crossterm's shared internal event reader and is
+    /// unreliable around `EventStream` lifecycle changes: dropping the stream
+    /// fires crossterm's waker, so the next read returns "cursor position could
+    /// not be read within a normal duration" immediately. Clearing the backend
+    /// directly (the same `ClearType::All` ratatui's Fullscreen `clear_viewport`
+    /// uses) and resetting the diff baseline via `swap_buffers` repaints every
+    /// cell on the next `draw` without any cursor query.
+    fn clear_terminal(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    ) -> Result<()> {
+        crossterm::execute!(
+            terminal.backend_mut(),
+            crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+        )?;
+        // Reset both buffers so the next draw diffs against an empty baseline
+        // and repaints the whole viewport.
+        terminal.current_buffer_mut().reset();
+        terminal.swap_buffers();
+        Ok(())
+    }
+
     /// Temporarily leave TUI mode, run a closure, and restore TUI mode.
     /// Drops the EventStream before the closure so child processes (tmux,
     /// editors) have exclusive access to stdin, then creates a fresh one.
@@ -466,10 +492,6 @@ impl App {
 
         let result = f();
 
-        // Recreate the event stream with a fresh reader before re-entering
-        // the event loop.
-        self.event_stream = Some(EventStream::new());
-
         crossterm::terminal::enable_raw_mode()?;
         crossterm::execute!(
             terminal.backend_mut(),
@@ -484,7 +506,10 @@ impl App {
         self.sync_mouse_capture(terminal)?;
         std::io::Write::flush(terminal.backend_mut())?;
 
-        terminal.clear()?;
+        // Recreate the event stream with a fresh reader before re-entering the
+        // event loop, then force a full redraw of the home screen.
+        self.event_stream = Some(EventStream::new());
+        self.clear_terminal(terminal)?;
 
         Ok(result)
     }
@@ -539,7 +564,7 @@ impl App {
         terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     ) -> Result<()> {
         // Initial render
-        terminal.clear()?;
+        self.clear_terminal(terminal)?;
         // Sync mouse capture before the first paint so any onboarding
         // surface that wants native drag-to-select (intro Welcome page,
         // changelog, info dialog) gets capture turned off on frame 1.
@@ -671,7 +696,7 @@ impl App {
             // with_raw_mode_disabled drops and recreates the EventStream, so
             // there are no stale events to drain.
             if self.needs_redraw {
-                terminal.clear()?;
+                self.clear_terminal(terminal)?;
                 self.needs_redraw = false;
             }
 
@@ -2315,10 +2340,10 @@ impl App {
         let result =
             crate::tui::structured_view::run(terminal, &mut stream, &self.theme, session_id).await;
         self.event_stream = Some(stream);
-        // Forcing a full redraw on return so the home screen redraws
-        // any cells the acp view painted over.
+        // Force a full redraw so the home screen repaints any cells the acp
+        // view painted over.
         self.needs_redraw = true;
-        terminal.clear()?;
+        self.clear_terminal(terminal)?;
         if let Err(e) = result {
             self.update_status = Some(UpdateStatus::transient(format!("acp closed: {e}")));
         }
