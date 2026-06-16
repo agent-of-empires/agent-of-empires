@@ -31,12 +31,11 @@ codecov:
   # Codecov trust the paths as uploaded. (#2157)
   disable_default_path_fixes: true
   # Hold all Codecov notifications (PR comment + status checks) until every
-  # upload has reported. Our CI produces four LCOV uploads: vitest,
-  # playwright-mocked, and playwright-live (sharded 2 ways, so it uploads
-  # twice under the same flag). With this set too low, Codecov evaluates
-  # after the first uploads land, then re-posts on each later one, churning
-  # patch/project numbers; worse, a line hit only by a later-arriving upload
-  # can be scored as missed when evaluation fires before that upload merges.
+  # coverage upload has landed. Counts UPLOADS, not flags: vitest (1) +
+  # playwright-mocked (1) + playwright-live (2, one per shard) = 4. With a
+  # lower number Codecov posts mid-run, before the last live shard reports,
+  # so the comment/status reflect partial coverage. Keep this in sync with
+  # the playwright-live shard count (`shard: [1, 2]` in tests.yml).
   # `wait_for_ci: true` additionally holds notifications until GitHub Actions
   # reports the workflow done, so a hung uploader cannot trigger a premature
   # evaluation either.
