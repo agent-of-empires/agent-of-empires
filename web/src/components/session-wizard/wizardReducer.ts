@@ -63,7 +63,6 @@ export interface WizardData {
 }
 
 export interface WizardState {
-  currentStep: number;
   data: WizardData;
   isSubmitting: boolean;
   error: string | null;
@@ -75,7 +74,6 @@ export interface WizardState {
 
 export type Action =
   | { type: "SET_FIELD"; field: string; value: unknown }
-  | { type: "SET_STEP"; step: number }
   | { type: "SUBMIT_START" }
   | { type: "SUBMIT_ERROR"; error: string }
   | { type: "SUBMIT_SUCCESS" }
@@ -168,8 +166,6 @@ export function reducer(state: WizardState, action: Action): WizardState {
       }
       return { ...state, data: newData, error: null };
     }
-    case "SET_STEP":
-      return { ...state, currentStep: action.step };
     case "SUBMIT_START":
       return { ...state, isSubmitting: true, error: null };
     case "SUBMIT_ERROR":

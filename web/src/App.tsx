@@ -682,7 +682,6 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
         sandboxEnabled: latest?.is_sandboxed ?? false,
         profile: latest?.profile || undefined,
         group: latest?.group_path || undefined,
-        skipToReview: true,
       });
       setShowSessionWizard(true);
     },
@@ -857,7 +856,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
 
   const handleNewScratch = useCallback(() => {
     if (serverAbout?.read_only) return;
-    setWizardPrefill({ scratch: true, skipToReview: true });
+    setWizardPrefill({ scratch: true });
     setShowSessionWizard(true);
   }, [serverAbout?.read_only]);
 

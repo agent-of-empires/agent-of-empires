@@ -41,11 +41,7 @@ const HOOKS_REFUSAL = {
 
 function renderWizard(onCreated: (session: unknown) => void = () => {}) {
   return render(
-    <SessionWizard
-      onClose={() => {}}
-      onCreated={onCreated}
-      prefill={{ skipToReview: true, path: "/tmp/proj", tool: "claude" }}
-    />,
+    <SessionWizard onClose={() => {}} onCreated={onCreated} prefill={{ path: "/tmp/proj", tool: "claude" }} />,
   );
 }
 

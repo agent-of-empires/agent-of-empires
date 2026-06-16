@@ -153,19 +153,11 @@ describe("SessionWizard structured_view payload", () => {
   });
 
   function renderWizard(tool = "claude") {
-    return render(
-      <SessionWizard
-        onClose={() => {}}
-        onCreated={() => {}}
-        prefill={{ skipToReview: true, path: "/tmp/proj", tool }}
-      />,
-    );
+    return render(<SessionWizard onClose={() => {}} onCreated={() => {}} prefill={{ path: "/tmp/proj", tool }} />);
   }
 
   function renderWizardWithoutToolPrefill() {
-    return render(
-      <SessionWizard onClose={() => {}} onCreated={() => {}} prefill={{ skipToReview: true, path: "/tmp/proj" }} />,
-    );
+    return render(<SessionWizard onClose={() => {}} onCreated={() => {}} prefill={{ path: "/tmp/proj" }} />);
   }
 
   it("sends the structured view for an ACP tool when the toggle is left on (default)", async () => {
@@ -177,11 +169,9 @@ describe("SessionWizard structured_view payload", () => {
 
   it("sends the terminal view when the user opts out via the toggle", async () => {
     const { getByText, getByRole } = renderWizard();
-    // Jump from review back to the agent step via the Interface row,
-    // flip the structured-view switch off, return to review, and launch.
-    fireEvent.click(getByText("Interface"));
+    // The structured-view switch is an always-visible essential on the
+    // single screen (#2210): flip it off, then launch.
     fireEvent.click(getByRole("switch", { name: "Use structured view" }));
-    fireEvent.click(getByText("Next"));
     fireEvent.click(getByText(/Launch session/));
     await waitFor(() => expect(createSession).toHaveBeenCalled());
     expect(createSession).toHaveBeenCalledWith(expect.objectContaining({ tool: "claude", view: "terminal" }));
@@ -198,8 +188,11 @@ describe("SessionWizard structured_view payload", () => {
       sandbox: {},
     } as never);
     const { getAllByText, getByText } = renderWizardWithoutToolPrefill();
-    // "opencode" now renders in both the Agent row and the resolved
-    // Launch command row (#1911), so match either occurrence.
+    // The resolved launch command (#1911) lives in the agent options under
+    // the More options fold; expand it, then wait for the profile-resolved
+    // "opencode" command to confirm APPLY_PROFILE_DEFAULTS landed before we
+    // launch.
+    fireEvent.click(getByText("More options"));
     await waitFor(() => expect(getAllByText(/opencode/).length).toBeGreaterThan(0));
     fireEvent.click(getByText(/Launch session/));
     await waitFor(() => expect(createSession).toHaveBeenCalled());

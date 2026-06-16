@@ -14,7 +14,6 @@ import { initialData, reducer, type WizardState } from "./wizardReducer";
 
 function makeState(overrides: Partial<WizardState> = {}): WizardState {
   return {
-    currentStep: 0,
     data: { ...initialData },
     isSubmitting: false,
     error: null,
