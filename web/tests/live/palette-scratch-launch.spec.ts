@@ -25,10 +25,10 @@ test("palette 'New scratch session' opens the wizard and launches a scratch sess
   const wizard = page.locator('div.fixed.inset-0.z-50:has(h1:has-text("New session"))');
   await expect(wizard).toBeVisible({ timeout: 10_000 });
 
-  // skipToReview lands the wizard on Review with scratch enabled; the Launch
-  // button + scratch project marker prove the prefill plumbing fired.
+  // The palette command opens the single-screen wizard with scratch enabled;
+  // the Launch button + scratch callout prove the prefill plumbing fired.
   await expect(wizard.getByRole("button", { name: /Launch session/ })).toBeVisible({ timeout: 10_000 });
-  await expect(wizard.getByText(/Scratch directory \(provisioned on create\)/)).toBeVisible();
+  await expect(wizard.getByText("Scratch session")).toBeVisible();
 
   await page.keyboard.press("ControlOrMeta+Enter");
 
