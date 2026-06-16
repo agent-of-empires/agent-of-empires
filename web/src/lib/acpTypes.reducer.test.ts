@@ -118,6 +118,75 @@ describe("applyEvent / approval lifecycle", () => {
   });
 });
 
+describe("applyEvent / elicitation answer (#2209)", () => {
+  const elicitation = {
+    nonce: "el-1",
+    message: "Pick",
+    questions: [],
+    requested_at: "2026-01-01T00:00:00Z",
+  };
+
+  it("records an elicitation_answered row on ElicitationResolved and clears the card", () => {
+    let state = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: { ElicitationRequested: { elicitation } },
+    });
+    expect(state.pendingElicitations).toHaveLength(1);
+
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: {
+        ElicitationResolved: {
+          nonce: "el-1",
+          outcome: "Accepted",
+          answers: [{ question: "Proceed?", answer: "Yes" }],
+        },
+      },
+    });
+    expect(state.pendingElicitations).toHaveLength(0);
+    const row = state.activity.find((r) => r.kind === "elicitation_answered");
+    expect(row?.id).toBe("elicitation-el-1");
+    expect(row?.elicitationAnswers).toEqual([{ question: "Proceed?", answer: "Yes" }]);
+  });
+
+  it("dedupes by id so a re-broadcast does not add a second row", () => {
+    let state = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: {
+        ElicitationResolved: {
+          nonce: "el-1",
+          outcome: "Accepted",
+          answers: [{ question: "Q", answer: "A" }],
+        },
+      },
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: {
+        ElicitationResolved: {
+          nonce: "el-1",
+          outcome: "Accepted",
+          answers: [{ question: "Q", answer: "A" }],
+        },
+      },
+    });
+    expect(state.activity.filter((r) => r.kind === "elicitation_answered")).toHaveLength(1);
+  });
+
+  it("adds no row when the elicitation was skipped or cancelled (empty answers)", () => {
+    const state = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: { ElicitationResolved: { nonce: "el-1", outcome: "Declined", answers: [] } },
+    });
+    expect(state.activity.some((r) => r.kind === "elicitation_answered")).toBe(false);
+  });
+});
+
 describe("applyEvent / DiffEmitted", () => {
   it("appends diffs and caps the buffer at 16 most-recent", () => {
     let state = emptyAcpState();

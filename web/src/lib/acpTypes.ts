@@ -254,6 +254,40 @@ export type ElicitationResolution =
   | { action: "decline" }
   | { action: "cancel" };
 
+/** One answered question rendered for the transcript. Mirror of
+ *  `ElicitationAnswer` in src/acp/elicitations.rs. Carried on
+ *  `ElicitationResolved` (server-rendered) and rebuilt locally by the
+ *  optimistic path. See #2209. */
+export interface ElicitationAnswer {
+  question: string;
+  answer: string;
+}
+
+/** Render a submitted answer value for display. Selects carry the option
+ *  value, which for AskUserQuestion is already the clean label. */
+function renderAnswerValue(value: AnswerValue): string {
+  if (typeof value === "boolean") return value ? "Yes" : "No";
+  if (Array.isArray(value)) return value.join(", ");
+  return String(value);
+}
+
+/** Build display-ready answer pairs from a form and the submitted answers,
+ *  in question order, omitting unanswered questions. Mirrors
+ *  `summarize_answers` in src/acp/elicitations.rs so the optimistic local
+ *  path renders the same row the server broadcasts. */
+export function summarizeAnswers(elicitation: Elicitation, answers: Record<string, AnswerValue>): ElicitationAnswer[] {
+  const out: ElicitationAnswer[] = [];
+  for (const question of elicitation.questions) {
+    const value = answers[question.field_key];
+    if (value === undefined) continue;
+    out.push({
+      question: question.title || question.field_key,
+      answer: renderAnswerValue(value),
+    });
+  }
+  return out;
+}
+
 /** Mirror of `StartupErrorDetail` in src/acp/state.rs. Serde's
  *  default for `#[serde(tag = "kind", ...)]` is internal tagging keyed
  *  on `kind`. Carries the structured remediation data the
@@ -358,7 +392,13 @@ export type AcpEvent =
   | { ApprovalRequested: { approval: Approval } }
   | { ApprovalResolved: { nonce: string; decision: ApprovalDecision } }
   | { ElicitationRequested: { elicitation: Elicitation } }
-  | { ElicitationResolved: { nonce: string; outcome: ElicitationOutcome } }
+  | {
+      ElicitationResolved: {
+        nonce: string;
+        outcome: ElicitationOutcome;
+        answers?: ElicitationAnswer[];
+      };
+    }
   | "SessionCleared"
   | "ConversationCompacted"
   | { DiffEmitted: { diff: DiffPreview } }
@@ -745,6 +785,7 @@ export interface ActivityRow {
     | "thinking"
     | "user_prompt"
     | "user_diff_comments"
+    | "elicitation_answered"
     | "empty_output"
     | "context_reset"
     | "session_cleared"
@@ -774,6 +815,10 @@ export interface ActivityRow {
    *  ships them only at completion. Absent for text-only completions
    *  (those render from `text`). See #1818. */
   output?: ToolOutputBlock[];
+  /** Display-ready answers on an `elicitation_answered` row (the user's
+   *  reply to an AskUserQuestion / elicitation form). `text` holds a flat
+   *  fallback; the card renders the structured pairs. See #2209. */
+  elicitationAnswers?: ElicitationAnswer[];
   at: string; // ISO-8601
 }
 
@@ -1171,8 +1216,13 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     return next;
   }
   if ("ElicitationResolved" in event) {
-    const { nonce } = event.ElicitationResolved;
+    const { nonce, answers } = event.ElicitationResolved;
     next.pendingElicitations = next.pendingElicitations.filter((e) => e.nonce !== nonce);
+    // Record the picked answer so it survives the card closing. Deduped by
+    // id, so this is a no-op if the optimistic local clear already added it
+    // (and the safety net when that clear never ran: cold replay, a second
+    // device). See #2209.
+    next.activity = appendElicitationAnswerRow(next.activity, nonce, answers ?? []);
     return next;
   }
   if ("DiffEmitted" in event) {
@@ -1781,6 +1831,29 @@ function pushActivity(rows: ActivityRow[], row: ActivityRow): ActivityRow[] {
     return next.slice(next.length - activityLimit);
   }
   return next;
+}
+
+/** Append an `elicitation_answered` row recording the user's answers,
+ *  keyed by `elicitation-<nonce>` and deduped by id. Shared by the
+ *  optimistic local clear (renders from the pending card) and the
+ *  server-event handler (renders from the broadcast), so whichever lands
+ *  first wins and the other is a no-op even when the broadcast survives
+ *  seq dedupe. No row for empty answers (skip / cancel / teardown). See
+ *  #2209. */
+export function appendElicitationAnswerRow(
+  rows: ActivityRow[],
+  nonce: string,
+  answers: ElicitationAnswer[],
+): ActivityRow[] {
+  const id = `elicitation-${nonce}`;
+  if (answers.length === 0 || rows.some((r) => r.id === id)) return rows;
+  return pushActivity(rows, {
+    id,
+    kind: "elicitation_answered",
+    text: answers.map((a) => `${a.question}: ${a.answer}`).join("\n"),
+    elicitationAnswers: answers,
+    at: new Date().toISOString(),
+  });
 }
 
 /** Close any `tool_start` rows that never received a matching terminal

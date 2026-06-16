@@ -311,6 +311,23 @@ export function activityToThreadMessages(
       continue;
     }
 
+    if (row.kind === "elicitation_answered") {
+      // The user's answer to an AskUserQuestion / elicitation form. Render
+      // as a user-authored message so the picked answer reads like the
+      // user's turn (mirrors how Claude Code shows it), but keep it a
+      // distinct row kind so it never folds into prompt grouping. The
+      // structured pairs ride on metadata for richer rendering. See #2209.
+      flushAssistant();
+      messages.push({
+        id: row.id,
+        role: "user",
+        content: [{ type: "text", text: row.text }],
+        metadata: row.elicitationAnswers ? { custom: { elicitationAnswers: row.elicitationAnswers } } : undefined,
+        createdAt: parseDate(row.at),
+      });
+      continue;
+    }
+
     if (row.kind === "user_diff_comments") {
       // A typed diff-comments prompt. The assembled markdown is the
       // user-visible / agent body (and the fallback if the card can't

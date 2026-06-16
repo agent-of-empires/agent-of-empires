@@ -1152,6 +1152,17 @@
       ]
     },
     {
+      "id": "acp.elicitation-answer",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/lib/acpTypes.reducer.test.ts", "src/hooks/__tests__/useAcpResolveApproval.test.ts"],
+      "components": [
+        "web/src/lib/acpTypes.ts",
+        "web/src/hooks/useAcpSession.ts",
+        "web/src/components/acp/AcpRuntime.tsx"
+      ]
+    },
+    {
       "id": "acp.force-end-turn-gate",
       "kind": "vitest",
       "risk": "medium",
