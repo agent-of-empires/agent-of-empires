@@ -1,5 +1,5 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useLocation, useMatch, useNavigate, useSearchParams } from "react-router-dom";
+import { useMatch, useNavigate, useSearchParams } from "react-router-dom";
 import { IDLE_DECAY_WINDOW_MS, isSessionActive } from "./lib/session";
 import { useSessions } from "./hooks/useSessions";
 import { clearAcpCache } from "./hooks/useAcpSession";
@@ -7,6 +7,7 @@ import { clearDraft, sweepOrphanDrafts } from "./lib/acpDrafts";
 import { AcpPrefsProvider } from "./lib/acpPrefs";
 import { safeGetItem, safeRemoveItem, safeSetItem } from "./lib/safeStorage";
 import { useWorkspaces } from "./hooks/useWorkspaces";
+import { useLastSessionRestore } from "./hooks/useLastSessionRestore";
 import { useRepoGroups } from "./hooks/useRepoGroups";
 import { useSessionGroups } from "./hooks/useSessionGroups";
 import { useNestedSidebarGroups } from "./hooks/useNestedSidebarGroups";
@@ -94,11 +95,6 @@ import { UpdateBanner } from "./components/UpdateBanner";
 import { DashboardUpdateBanner } from "./components/DashboardUpdateBanner";
 
 const RIGHT_PANEL_COLLAPSED_KEY = "aoe-right-collapsed";
-// Device-local id of the last session the user had open, so an installed PWA
-// reopens to it instead of the dashboard (#2103). Not registered in webUiSync:
-// sessions/worktrees are host-specific, so syncing this across devices would
-// redirect to ids that don't exist locally.
-const LAST_SESSION_KEY = "aoe-last-session-id";
 // Pre-#1832 per-browser tour-seen flag. Read once on load to migrate users who
 // already dismissed the tour to the backend; no longer written.
 const LEGACY_TOUR_SEEN_KEY = "aoe-tour-seen";
@@ -220,7 +216,6 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   }, []);
 
   const navigate = useNavigate();
-  const location = useLocation();
   const [searchParams, setSearchParams] = useSearchParams();
   const idleDecayWindowMs = useIdleDecayWindowMs();
   const { settings: webSettings } = useWebSettings();
@@ -247,35 +242,8 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   } = useSessions();
   const workspaces = useWorkspaces(sessions);
 
-  // Remember the active session so a relaunched PWA can restore it (#2103).
-  // Clearing only fires on an in-app return to the dashboard (`key !== "default"`),
-  // never on the initial entry, so the restore effect below still sees the
-  // stored id on a cold launch that lands on "/".
-  useEffect(() => {
-    if (activeSessionId) {
-      safeSetItem(LAST_SESSION_KEY, activeSessionId);
-    } else if (location.pathname === "/" && location.key !== "default") {
-      safeRemoveItem(LAST_SESSION_KEY);
-    }
-  }, [activeSessionId, location.pathname, location.key]);
-
-  // Restore the last session on a cold launch that lands on the dashboard root
-  // (#2103): an installed PWA reopens at its install URL "/", losing the session
-  // the user was in. Scoped to the initial history entry (`key === "default"`)
-  // so an in-app navigation to "/" never bounces the user back. A stored id that
-  // no longer matches a loaded session is dropped instead of redirected to.
-  useEffect(() => {
-    if (location.key !== "default" || activeSessionId || location.pathname !== "/" || !sessionsLoaded) {
-      return;
-    }
-    const saved = safeGetItem(LAST_SESSION_KEY);
-    if (!saved) return;
-    if (sessions.some((s) => s.id === saved)) {
-      navigate(`/session/${encodeURIComponent(saved)}`, { replace: true });
-    } else {
-      safeRemoveItem(LAST_SESSION_KEY);
-    }
-  }, [location.key, location.pathname, activeSessionId, sessionsLoaded, sessions, navigate]);
+  // Remember the active session and restore it on a PWA relaunch (#2103).
+  useLastSessionRestore({ activeSessionId, sessions, sessionsLoaded });
 
   // One-shot orphan-draft sweep once useSessions has settled its first
   // fetch (success or null). Catches acp:draft:<id> keys left behind

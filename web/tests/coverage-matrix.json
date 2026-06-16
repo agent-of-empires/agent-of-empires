@@ -357,6 +357,13 @@
       "components": []
     },
     {
+      "id": "app-shell.last-session-restore",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/hooks/useLastSessionRestore.test.tsx"],
+      "components": []
+    },
+    {
       "id": "profiles.lifecycle",
       "kind": "mocked-playwright",
       "risk": "high",
