@@ -63,6 +63,9 @@ pub async fn run(profile: &str, args: SendArgs) -> Result<()> {
                         stale_history_suffix(&sid),
                     );
                 }
+                Ok(EnsureReadyOutcome::ResumeFailed { sid }) => {
+                    bail!("Resume failed for sid {sid}; preserved for explicit retry")
+                }
                 Ok(EnsureReadyOutcome::AlreadyAlive) => {}
                 Err(EnsureReadyError::Transient(status)) => {
                     bail!("Session is mid-lifecycle ({status:?}); cannot send right now")
