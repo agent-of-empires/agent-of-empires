@@ -2681,8 +2681,14 @@ impl App {
                 }
                 Ok(crate::session::StartOutcome::Restarted { stale_sid }) => {
                     self.update_status = Some(UpdateStatus::transient(format!(
-                        "Resume failed for sid {stale_sid}; started fresh (history not loaded)"
+                        "Resume target {stale_sid} was reset; started fresh (history not loaded)"
                     )));
+                }
+                Ok(crate::session::StartOutcome::ResumeFailed { sid }) => {
+                    self.update_status = Some(UpdateStatus::transient(format!(
+                        "Resume failed for sid {sid}; preserved for retry"
+                    )));
+                    return Ok(());
                 }
                 Ok(_) => {}
             }

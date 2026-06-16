@@ -6064,6 +6064,69 @@ fn restart_selected_session_debounces_via_cooldown_map() {
     );
 }
 
+#[test]
+#[serial]
+fn restart_selected_session_surfaces_resume_failed_without_touching_last_accessed() {
+    if std::process::Command::new("tmux")
+        .arg("-V")
+        .output()
+        .is_err()
+    {
+        eprintln!("Skipping: tmux not available");
+        return;
+    }
+
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let profile = "restart-resume-failed";
+    let storage = Storage::new_unwatched(profile).unwrap();
+    let stale_sid = "11111111-2222-3333-4444-555555555555";
+
+    let mut inst = Instance::new("restart-resume-failed", "/tmp/x");
+    inst.source_profile = profile.to_string();
+    inst.tool = "claude".to_string();
+    inst.command = "/bin/false".to_string();
+    inst.agent_session_id = Some(stale_sid.to_string());
+    let id = inst.id.clone();
+    let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+    let _ = std::process::Command::new("tmux")
+        .args(["kill-session", "-t", &tmux_name])
+        .output();
+
+    storage
+        .update(|instances, groups| {
+            *instances = vec![inst.clone()];
+            *groups = GroupTree::new_with_groups(std::slice::from_ref(&inst), &[]).get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(
+        Some(profile.to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    view.update_selected();
+    view.selected_session = Some(id.clone());
+
+    let result = view.restart_selected_session(None, None, None, None);
+    let _ = std::process::Command::new("tmux")
+        .args(["kill-session", "-t", &tmux_name])
+        .output();
+
+    assert!(result.is_ok());
+    let dialog = view.info_dialog.as_ref().expect("resume failure dialog");
+    assert_eq!(dialog.title(), "Restart Failed");
+    assert!(dialog.message().contains(stale_sid));
+    let row = view.get_instance(&id).expect("instance remains visible");
+    assert_eq!(row.agent_session_id.as_deref(), Some(stale_sid));
+    assert_eq!(row.resume_probe_failed_sid.as_deref(), Some(stale_sid));
+    assert_eq!(row.status, crate::session::Status::Error);
+    assert!(row.last_accessed_at.is_none());
+}
+
 /// Build a HomeView seeded with two distinct projects, each containing
 /// sessions with different attention statuses. Helper for the Project +
 /// Attention combination tests below.

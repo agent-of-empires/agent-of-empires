@@ -3,7 +3,7 @@
 use crate::session::builder::{self, InstanceParams};
 use crate::session::{list_profiles, GroupTree, Item, Status, Storage};
 use crate::tui::deletion_poller::DeletionRequest;
-use crate::tui::dialogs::{DeleteOptions, GroupDeleteOptions, NewSessionData};
+use crate::tui::dialogs::{DeleteOptions, GroupDeleteOptions, InfoDialog, NewSessionData};
 
 use super::HomeView;
 
@@ -290,9 +290,8 @@ impl HomeView {
     /// on the next launch.
     ///
     /// Restart goes through `try_mutate_instance_writeback_on_err` so all
-    /// of `restart_with_size`'s mutations (cleared stale `agent_session_id`
-    /// on Tier-2 resume fallback, `last_accessed_at` bumps, etc.) are
-    /// preserved on the live instance.
+    /// of `restart_with_size`'s mutations (`resume_probe_failed_sid`,
+    /// `last_error`, etc.) are preserved on the live instance.
     ///
     /// The wake-up message is read from the resolved config
     /// (`session.restart_wake_message`); an empty value disables the
@@ -434,9 +433,19 @@ impl HomeView {
         // Restart the live instance (not a detached clone) so all
         // non-status fields restart_with_size touches are kept.
         let size = crate::terminal::get_size();
-        self.try_mutate_instance_writeback_on_err(&id, |inst| {
-            inst.restart_with_size(size).map(|_| ())
-        })?;
+        let restart_outcome =
+            self.try_mutate_instance_writeback_on_err(&id, |inst| inst.restart_with_size(size))?;
+        let Some(restart_outcome) = restart_outcome else {
+            return Ok(());
+        };
+        if let crate::session::StartOutcome::ResumeFailed { sid } = restart_outcome {
+            self.info_dialog = Some(InfoDialog::new(
+                "Restart Failed",
+                &format!("Resume failed for sid {sid}; preserved for explicit retry"),
+            ));
+            self.save()?;
+            return Ok(());
+        }
 
         // Stamp touch_last_accessed on the user's gesture (the row should
         // visibly bump immediately). save() pushes both the restart-side

@@ -2577,13 +2577,12 @@ impl HomeView {
                     filtered_ids.insert(inst.id.clone());
                     continue;
                 };
-                // Defense-in-depth against the resume-fallback cascade: a sid
-                // the cascade just cleared can still live on disk for several
-                // minutes (opencode db, vibe meta.json, codex/gemini/pi/hermes
-                // state). The poller closures filter via `compose_exclusion`,
-                // but if a closure factory ever forgets to thread the per-
-                // instance excludes, this guard prevents the cleared sid from
-                // being re-imported into memory and disk.
+                // Defense-in-depth against explicit resume-target invalidation:
+                // an invalidated sid can still live on disk for several minutes
+                // (opencode db, vibe meta.json, codex/gemini/pi/hermes state).
+                // The poller closures filter via `compose_exclusion`, but if a
+                // closure factory ever forgets to thread the per-instance
+                // excludes, this guard prevents the sid from being re-imported.
                 if inst.retroactive_capture_excludes.contains(&session_id) {
                     tracing::debug!(
                         target: "tui.home",
@@ -2607,7 +2606,7 @@ impl HomeView {
         }
 
         let mut to_apply: Vec<(String, String)> = Vec::new();
-        let mut to_rollback: Vec<(String, Option<String>)> = Vec::new();
+        let mut to_rollback: Vec<(String, Option<String>, Option<String>)> = Vec::new();
 
         for (id, session_id, expected_prior) in &updates {
             let Some(profile) = self.instance_map.get(id).map(|i| i.source_profile.clone()) else {
@@ -2630,7 +2629,11 @@ impl HomeView {
                     {
                         if let Ok(disk_insts) = storage.load() {
                             if let Some(disk_inst) = disk_insts.iter().find(|i| i.id == *id) {
-                                to_rollback.push((id.clone(), disk_inst.agent_session_id.clone()));
+                                to_rollback.push((
+                                    id.clone(),
+                                    disk_inst.agent_session_id.clone(),
+                                    disk_inst.resume_probe_failed_sid.clone(),
+                                ));
                                 reloaded = true;
                             }
                         }
@@ -2655,19 +2658,22 @@ impl HomeView {
         for (id, session_id) in &to_apply {
             self.mutate_instance(id, |inst| {
                 inst.agent_session_id = Some(session_id.clone());
+                inst.resume_probe_failed_sid = None;
             });
         }
-        for (id, disk_sid) in &to_rollback {
+        for (id, disk_sid, disk_failed_sid) in &to_rollback {
             let disk_sid = disk_sid.clone();
+            let disk_failed_sid = disk_failed_sid.clone();
             self.mutate_instance(id, |inst| {
                 inst.agent_session_id = disk_sid.clone();
+                inst.resume_probe_failed_sid = disk_failed_sid.clone();
             });
         }
 
         let touched_ids: Vec<&str> = to_apply
             .iter()
             .map(|(id, _)| id.as_str())
-            .chain(to_rollback.iter().map(|(id, _)| id.as_str()))
+            .chain(to_rollback.iter().map(|(id, _, _)| id.as_str()))
             .chain(filtered_ids.iter().map(|s| s.as_str()))
             .collect();
         let mut set_batch: Vec<(String, String, String)> = Vec::new();
@@ -2759,7 +2765,16 @@ impl HomeView {
                                 id = %instance_id,
                                 %title,
                                 %stale_sid,
-                                "restarted fresh after resume failure",
+                                "restarted fresh after explicit resume reset",
+                            );
+                        }
+                        Ok(crate::session::StartOutcome::ResumeFailed { sid }) => {
+                            tracing::warn!(
+                                target: "session.startup_recovery",
+                                id = %instance_id,
+                                %title,
+                                %sid,
+                                "resume failed; sid preserved for explicit retry",
                             );
                         }
                         Ok(crate::session::StartOutcome::Fresh) => {}
@@ -4092,6 +4107,13 @@ impl HomeView {
                     | Ok(Some(EnsureReadyOutcome::Started {
                         stale_sid: Some(sid),
                     })) => Some(sid),
+                    Ok(Some(EnsureReadyOutcome::ResumeFailed { sid })) => {
+                        self.info_dialog = Some(InfoDialog::new(
+                            "Send Failed",
+                            &format!("Resume failed for sid {sid}; preserved for explicit retry"),
+                        ));
+                        return None;
+                    }
                     Ok(_) => None,
                     Err(err) => {
                         self.info_dialog = Some(InfoDialog::new(
@@ -4239,6 +4261,13 @@ impl HomeView {
                     | Ok(Some(EnsureReadyOutcome::Started {
                         stale_sid: Some(sid),
                     })) => Some(sid),
+                    Ok(Some(EnsureReadyOutcome::ResumeFailed { sid })) => {
+                        self.info_dialog = Some(InfoDialog::new(
+                            "Live send failed",
+                            &format!("Resume failed for sid {sid}; preserved for explicit retry"),
+                        ));
+                        return Err(());
+                    }
                     Ok(_) => None,
                     Err(err) => {
                         self.info_dialog = Some(InfoDialog::new(
@@ -4957,15 +4986,12 @@ impl HomeView {
     /// when `f` returns `Err`.
     ///
     /// Required for callers of `Instance::restart_with_size_opts` /
-    /// `ensure_pane_ready`, because the resume-fallback cascade mutates
-    /// `agent_session_id` and `retroactive_capture_excludes` BEFORE
-    /// returning `Err` on Tier-2 failure. The default `try_mutate_instance`
-    /// drops the mutated clone on `Err`, leaving the live entry with the
-    /// stale sid in memory while disk has been cleared. Subsequent restarts
-    /// then loop indefinitely on the same bad sid (the TUI's `reload()`
-    /// merge prefers in-memory, so even the 5s disk refresh does not
-    /// recover). This helper preserves the cascade's partial mutations so
-    /// the live state stays consistent with disk.
+    /// `ensure_pane_ready`, because the resume path can mutate
+    /// `agent_session_id`, `resume_probe_failed_sid`, and
+    /// `retroactive_capture_excludes` before returning `Err`. The default
+    /// `try_mutate_instance` drops the mutated clone on `Err`, leaving live
+    /// state inconsistent with disk until a later reload. This helper keeps
+    /// the live state consistent with the attempted restart.
     pub(super) fn try_mutate_instance_writeback_on_err<T>(
         &mut self,
         id: &str,
