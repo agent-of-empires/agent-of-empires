@@ -15,13 +15,12 @@ import { buildEffectiveHooks } from "../../lib/profileHooks";
 import { HooksReadOnlyPanel } from "./HooksReadOnlyPanel";
 
 interface Props {
-  onClose: () => void;
   readOnly?: boolean;
 }
 
-// Sections deep-linked into the existing Settings page (scoped to the
+// Sections deep-linked into the rest of the Settings tabs (scoped to the
 // selected profile via ?profile=). Per-section editing, including the
-// passphrase-gated sandbox/worktree saves, stays in SettingsView; this page
+// passphrase-gated sandbox/worktree saves, stays in those tabs; this section
 // owns profile-management metadata only.
 const EDIT_SECTIONS: ReadonlyArray<{ tab: string; label: string }> = [
   { tab: "session", label: "Session" },
@@ -36,7 +35,7 @@ function validateName(name: string): string | null {
   return null;
 }
 
-export function ProfilesPage({ onClose, readOnly }: Props) {
+export function ProfilesSection({ readOnly }: Props) {
   const navigate = useNavigate();
   const [profiles, setProfiles] = useState<ProfileInfo[]>([]);
   const [selected, setSelected] = useState<string>("");
@@ -189,83 +188,68 @@ export function ProfilesPage({ onClose, readOnly }: Props) {
   const hookGroups = buildEffectiveHooks(profileSettings?.hooks, globalHooks);
 
   return (
-    <div className="flex flex-col h-full bg-surface-900">
-      <div className="flex items-center justify-between px-4 py-3 border-b border-surface-700/30">
-        <div>
-          <h1 className="text-lg font-semibold text-text-primary">Profiles</h1>
-          <p className="text-xs text-text-dim">Manage configuration profiles and inspect their lifecycle hooks.</p>
-        </div>
-        <div className="flex gap-2">
-          {!readOnly && !creating && !renaming && (
-            <button
-              type="button"
-              onClick={() => {
-                setCreating(true);
-                setInputValue("");
-                setError(null);
-              }}
-              className="px-3 py-1.5 text-sm bg-brand-600 hover:bg-brand-700 text-surface-900 rounded-md cursor-pointer font-medium"
-            >
-              + New profile
-            </button>
-          )}
-          <button
-            type="button"
-            onClick={onClose}
-            className="px-3 py-1.5 text-sm border border-surface-700 text-text-secondary hover:bg-surface-800 rounded-md cursor-pointer"
-          >
-            Close
-          </button>
-        </div>
-      </div>
+    <div className="space-y-3" data-testid="profiles-section">
+      <p className="text-xs text-text-dim">Manage configuration profiles and inspect their lifecycle hooks.</p>
+
+      {!readOnly && !creating && !renaming && (
+        <button
+          type="button"
+          onClick={() => {
+            setCreating(true);
+            setInputValue("");
+            setError(null);
+          }}
+          className="px-3 py-1.5 text-sm bg-brand-600 hover:bg-brand-700 text-surface-900 rounded-md cursor-pointer font-medium"
+        >
+          + New profile
+        </button>
+      )}
 
       {error && (
-        <div className="mx-4 mt-3 px-3 py-2 bg-red-900/20 border border-red-700/30 rounded-md">
+        <div className="px-3 py-2 bg-red-900/20 border border-red-700/30 rounded-md">
           <p className="text-sm text-red-400">{error}</p>
         </div>
       )}
 
       {(creating || renaming) && (
-        <div className="px-4 pt-3">
-          <div className="flex gap-2 bg-surface-850 border border-surface-700 rounded-lg p-3">
-            <input
-              type="text"
-              value={inputValue}
-              autoFocus
-              onChange={(e) => {
-                setInputValue(e.target.value);
-                setError(null);
-              }}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") {
-                  if (creating) handleCreate();
-                  else handleRename();
-                }
-                if (e.key === "Escape") closeInput();
-              }}
-              placeholder={creating ? "Profile name" : "New name"}
-              className="flex-1 bg-surface-900 border border-surface-700 rounded-md px-2 py-1.5 text-sm text-text-primary focus:border-brand-600 focus:outline-none"
-            />
-            <button
-              type="button"
-              onClick={creating ? handleCreate : handleRename}
-              className="px-3 py-1.5 rounded-md bg-brand-600 hover:bg-brand-500 text-xs font-medium text-surface-950 cursor-pointer"
-            >
-              {creating ? "Create" : "Rename"}
-            </button>
-            <button
-              type="button"
-              onClick={closeInput}
-              className="px-3 py-1.5 rounded-md border border-surface-700 text-xs text-text-secondary hover:bg-surface-800 cursor-pointer"
-            >
-              Cancel
-            </button>
-          </div>
+        <div className="flex gap-2 bg-surface-850 border border-surface-700 rounded-lg p-3">
+          <input
+            type="text"
+            value={inputValue}
+            autoFocus
+            onChange={(e) => {
+              setInputValue(e.target.value);
+              setError(null);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                if (creating) handleCreate();
+                else handleRename();
+              }
+              if (e.key === "Escape") closeInput();
+            }}
+            placeholder={creating ? "Profile name" : "New name"}
+            className="flex-1 bg-surface-900 border border-surface-700 rounded-md px-2 py-1.5 text-sm text-text-primary focus:border-brand-600 focus:outline-none"
+          />
+          <button
+            type="button"
+            onClick={creating ? handleCreate : handleRename}
+            className="px-3 py-1.5 rounded-md bg-brand-600 hover:bg-brand-500 text-xs font-medium text-surface-950 cursor-pointer"
+          >
+            {creating ? "Create" : "Rename"}
+          </button>
+          <button
+            type="button"
+            onClick={closeInput}
+            className="px-3 py-1.5 rounded-md border border-surface-700 text-xs text-text-secondary hover:bg-surface-800 cursor-pointer"
+          >
+            Cancel
+          </button>
         </div>
       )}
 
-      <div className="flex flex-1 min-h-0 gap-4 p-4">
-        <nav className="w-56 shrink-0 flex flex-col gap-1 overflow-y-auto">
+      <div className="flex gap-4">
+        <nav className="w-44 shrink-0 flex flex-col gap-1">
           {profiles.map((p) => (
             <button
               key={p.name}
@@ -288,7 +272,7 @@ export function ProfilesPage({ onClose, readOnly }: Props) {
           ))}
         </nav>
 
-        <div className="flex-1 min-w-0 overflow-y-auto">
+        <div className="flex-1 min-w-0">
           {selectedInfo ? (
             <div className="flex flex-col gap-4">
               <div className="flex items-center gap-2">

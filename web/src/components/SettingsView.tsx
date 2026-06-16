@@ -1,5 +1,5 @@
 /* eslint-disable react-refresh/only-export-components */
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { useServerDown, OFFLINE_TITLE } from "../lib/connectionState";
 import { ConnectedDevices } from "./ConnectedDevices";
 import { McpServers } from "./McpServers";
@@ -20,8 +20,10 @@ import { SelectField } from "./settings/FormFields";
 import { DiffSettings } from "./settings/DiffSettings";
 import { TelemetrySettings } from "./settings/TelemetrySettings";
 import { SettingsHeader } from "./settings/SettingsHeader";
+import { ProfilesSection } from "./profiles/ProfilesSection";
 
 type TabId =
+  | "profiles"
   | "session"
   | "sandbox"
   | "worktree"
@@ -39,7 +41,31 @@ type TabId =
   | "mcp"
   | "logging";
 
-type SidebarItem = { kind: "tab"; id: TabId; label: string } | { kind: "divider"; label: string };
+type SidebarItem = { kind: "tab"; id: TabId; label: string; icon?: ReactNode } | { kind: "divider"; label: string };
+
+// ID-card / badge glyph for the Profiles tab. Profiles is the only Settings
+// tab that carries an icon; it sits at the top as a meta-section over the
+// config tabs below it.
+const PROFILES_ICON = (
+  <svg
+    width="14"
+    height="14"
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="1.5"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    aria-hidden="true"
+    className="shrink-0"
+  >
+    <rect x="3" y="4" width="18" height="16" rx="2" />
+    <circle cx="9" cy="10" r="2" />
+    <path d="M6 16a3 3 0 0 1 6 0" />
+    <path d="M15 9h3" />
+    <path d="M15 13h3" />
+  </svg>
+);
 
 // Sidebar groups mirror the TUI Settings layout (Appearance / Sessions /
 // Environment / Notifications / Web Dashboard / System) so muscle memory
@@ -52,6 +78,7 @@ type SidebarItem = { kind: "tab"; id: TabId; label: string } | { kind: "divider"
 // tab strips in the DOM.
 export function buildSidebar(): SidebarItem[] {
   return [
+    { kind: "tab", id: "profiles", label: "Profiles", icon: PROFILES_ICON },
     { kind: "divider", label: "Appearance" },
     { kind: "tab", id: "theme", label: "Theme" },
     { kind: "tab", id: "diff", label: "Diff" },
@@ -88,9 +115,12 @@ interface Props {
   /** Notifies the host when the profile changes via the header dropdown,
    *  so it can keep `?profile=` in sync for shareable/refreshable URLs. */
   onSelectProfile?: (profile: string) => void;
+  /** Read-only server: the Profiles tab hides its create/edit controls. */
+  readOnly?: boolean;
 }
 
 const ALL_TAB_IDS = new Set<TabId>([
+  "profiles",
   "session",
   "sandbox",
   "worktree",
@@ -143,7 +173,15 @@ export function resolveSelectedProfile(current: string, profiles: ProfileInfo[])
   return profiles.find((p) => p.is_default)?.name ?? "default";
 }
 
-export function SettingsView({ onClose, tab, onSelectTab, onServerAboutRefresh, profile, onSelectProfile }: Props) {
+export function SettingsView({
+  onClose,
+  tab,
+  onSelectTab,
+  onServerAboutRefresh,
+  profile,
+  onSelectProfile,
+  readOnly,
+}: Props) {
   const offline = useServerDown();
   const [settings, setSettings] = useState<Record<string, unknown> | null>(null);
   const [saving, setSaving] = useState(false);
@@ -329,6 +367,7 @@ export function SettingsView({ onClose, tab, onSelectTab, onServerAboutRefresh, 
   const renderTabContent = () => {
     if (
       !settings &&
+      activeTab !== "profiles" &&
       activeTab !== "notifications" &&
       activeTab !== "terminal" &&
       activeTab !== "security" &&
@@ -373,6 +412,9 @@ export function SettingsView({ onClose, tab, onSelectTab, onServerAboutRefresh, 
     }
 
     switch (activeTab) {
+      case "profiles":
+        return <ProfilesSection readOnly={readOnly} />;
+
       case "session":
         return (
           <div className="space-y-4">
@@ -543,12 +585,13 @@ export function SettingsView({ onClose, tab, onSelectTab, onServerAboutRefresh, 
               <button
                 key={item.id}
                 onClick={() => onSelectTab(item.id)}
-                className={`px-4 py-2.5 text-xs font-medium whitespace-nowrap cursor-pointer transition-colors ${
+                className={`flex items-center gap-1.5 px-4 py-2.5 text-xs font-medium whitespace-nowrap cursor-pointer transition-colors ${
                   activeTab === item.id
                     ? "text-brand-500 border-b-2 border-brand-500"
                     : "text-text-secondary hover:text-text-primary"
                 }`}
               >
+                {item.icon}
                 {item.label}
               </button>
             ),
@@ -572,12 +615,13 @@ export function SettingsView({ onClose, tab, onSelectTab, onServerAboutRefresh, 
               <button
                 key={item.id}
                 onClick={() => onSelectTab(item.id)}
-                className={`px-4 py-2 text-sm text-left cursor-pointer transition-colors ${
+                className={`flex items-center gap-2 px-4 py-2 text-sm text-left cursor-pointer transition-colors ${
                   activeTab === item.id
                     ? "text-brand-500 bg-surface-800 border-r-2 border-brand-500"
                     : "text-text-secondary hover:text-text-primary hover:bg-surface-800/50"
                 }`}
               >
+                {item.icon}
                 {item.label}
               </button>
             ),
