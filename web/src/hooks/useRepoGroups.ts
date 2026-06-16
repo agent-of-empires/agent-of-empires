@@ -220,17 +220,14 @@ export function useRepoGroups(
     });
 
     const isSyntheticGroup = (id: string) => id === MULTI_REPO_GROUP_ID || id === SCRATCH_GROUP_ID;
-    // Sort category: populated real repos first, then pinned-but-empty
-    // projects, then the synthetic Multi-repo / Scratch buckets. Keeps an
-    // empty pinned project from leapfrogging active work in every mode while
-    // still sitting above the synthetic buckets. See #2047.
+    // A pinned-but-empty project: registered, with no live workspace. It
+    // sorts below populated real repos but above the synthetic Multi-repo /
+    // Scratch buckets, so a stale pin never leapfrogs active work. This only
+    // governs the unranked fallback: an explicit drag rank still wins for any
+    // group (preserving the dragged-synthetic-above-real behavior). See #2047.
     const isRegisteredEmpty = (g: RepoGroup) => g.workspaces.length === 0 && g.registeredProjects.length > 0;
-    const groupCategory = (g: RepoGroup) => (isSyntheticGroup(g.id) ? 2 : isRegisteredEmpty(g) ? 1 : 0);
 
     merged.sort((a, b) => {
-      const ca = groupCategory(a);
-      const cb = groupCategory(b);
-      if (ca !== cb) return ca - cb;
       if (sortMode === "attention") {
         // Computed order, like lastActivity: manual group drag does not
         // apply and synthetic groups stay pinned to the bottom in a stable
@@ -244,6 +241,9 @@ export function useRepoGroups(
         if (b.id === SCRATCH_GROUP_ID) return -1;
         if (a.id === MULTI_REPO_GROUP_ID) return 1;
         if (b.id === MULTI_REPO_GROUP_ID) return -1;
+        const ae = isRegisteredEmpty(a);
+        const be = isRegisteredEmpty(b);
+        if (ae !== be) return ae ? 1 : -1;
         const au = repoGroupIsUrgent(a.workspaces);
         const bu = repoGroupIsUrgent(b.workspaces);
         if (au !== bu) return au ? -1 : 1;
@@ -266,6 +266,9 @@ export function useRepoGroups(
         if (b.id === SCRATCH_GROUP_ID) return -1;
         if (a.id === MULTI_REPO_GROUP_ID) return 1;
         if (b.id === MULTI_REPO_GROUP_ID) return -1;
+        const ae = isRegisteredEmpty(a);
+        const be = isRegisteredEmpty(b);
+        if (ae !== be) return ae ? 1 : -1;
         const ak = repoGroupLastActivityMs(a.workspaces);
         const bk = repoGroupLastActivityMs(b.workspaces);
         if (ak !== bk) return bk - ak;
@@ -280,10 +283,16 @@ export function useRepoGroups(
       const ag = groupRank.get(a.id);
       const bg = groupRank.get(b.id);
       const SYNTHETIC_BOTTOM = Number.MAX_SAFE_INTEGER;
-      const keyOf = (id: string, rank: number | undefined) =>
-        rank != null ? rank : isSyntheticGroup(id) ? SYNTHETIC_BOTTOM : -1;
-      const ka = keyOf(a.id, ag);
-      const kb = keyOf(b.id, bg);
+      // Unranked fallback by type: a brand-new real project floats to the top
+      // (-1, matching new-workspace behavior), a pinned-but-empty project
+      // sinks below real repos but above synthetic, and an untouched
+      // synthetic group sits at the bottom. A stored rank overrides all of
+      // this. See #1644, #2047.
+      const fallbackRank = (g: RepoGroup) =>
+        isSyntheticGroup(g.id) ? SYNTHETIC_BOTTOM : isRegisteredEmpty(g) ? SYNTHETIC_BOTTOM - 1 : -1;
+      const keyOf = (g: RepoGroup, rank: number | undefined) => (rank != null ? rank : fallbackRank(g));
+      const ka = keyOf(a, ag);
+      const kb = keyOf(b, bg);
       if (ka !== kb) return ka - kb;
       if (ka === SYNTHETIC_BOTTOM) {
         // Two untouched synthetic groups: multi-repo above scratch.

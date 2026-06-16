@@ -70,6 +70,7 @@ function repoGroup(): RepoGroup {
     workspaces: [workspace("team-a")],
     status: "idle",
     collapsed: false,
+    registeredProjects: [],
   };
 }
 
