@@ -392,6 +392,10 @@ export interface ProjectInfo {
   scope: "global" | "profile";
   /** Default base branch for new worktree branches against this project's repo. */
   default_base_branch?: string;
+  /** Whether the project is pinned: shown as a sessionless sidebar header. A
+   *  registry entry is the saved project; the pin is the separate decision to
+   *  keep its header visible without sessions. See #2208. */
+  pinned: boolean;
 }
 
 /** Docker status returned by /api/docker/status */

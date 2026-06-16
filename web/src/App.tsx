@@ -43,9 +43,10 @@ import {
   markWebTourSeen,
   updateWorkspaceOrdering,
   createProject,
-  deleteProject,
+  setProjectPinned,
 } from "./lib/api";
 import type { DeleteSessionOptions, ServerAbout } from "./lib/api";
+import { normalizeProjectPathKey } from "./lib/registeredProjects";
 import { IdleDecayWindowContext, parseIdleDecayWindowMs, useIdleDecayWindowMs } from "./lib/idleDecay";
 import { toastBus } from "./lib/toastBus";
 import { resolveToRepoRelative, type FileRef } from "./lib/fileRef";
@@ -688,26 +689,39 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     [sessions],
   );
 
-  // Pin a repo: register it (scope global, matching the TUI's global
-  // registry) so its header persists with zero sessions, then refresh so the
-  // diamond / empty header reflects it. See #2047.
+  // Pin a repo so its header persists with zero sessions. If the repo is
+  // already a saved project, just set its pin flag (PATCH); otherwise register
+  // it pinned (scope global, matching the TUI's global registry). Then refresh
+  // so the diamond / empty header reflects it. See #2047, #2208.
   const handlePinProject = useCallback(
     async (repoPath: string) => {
-      const res = await createProject({ path: repoPath, scope: "global" });
-      if (!res.ok) {
-        toastBus.handler?.error(res.error ?? "Failed to pin project");
+      const key = normalizeProjectPathKey(repoPath);
+      const existing = projects.filter((p) => normalizeProjectPathKey(p.path) === key);
+      let failed: { error?: string } | undefined;
+      if (existing.length > 0) {
+        const results = await Promise.all(existing.map((p) => setProjectPinned(p.name, p.scope, true)));
+        failed = results.find((r) => !r.ok);
+      } else {
+        const res = await createProject({ path: repoPath, scope: "global", pinned: true });
+        if (!res.ok) failed = res;
+      }
+      if (failed) {
+        toastBus.handler?.error(failed.error ?? "Failed to pin project");
         return;
       }
       await refreshProjects();
     },
-    [refreshProjects],
+    [projects, refreshProjects],
   );
 
-  // Unpin a repo: remove every registry entry for its path (a path can be
-  // registered under both global and profile scope), then refresh. See #2047.
+  // Unpin a repo: clear the pin flag on every pinned registry entry for its
+  // path (a path can be registered under both global and profile scope),
+  // keeping the saved project so it stays in the Projects view and the wizard.
+  // Only the Projects view's Remove deletes the entry. See #2208.
   const handleUnpinProject = useCallback(
     async (group: SidebarGroup) => {
-      const results = await Promise.all(group.registeredProjects.map((p) => deleteProject(p.name, p.scope)));
+      const pinned = group.registeredProjects.filter((p) => p.pinned);
+      const results = await Promise.all(pinned.map((p) => setProjectPinned(p.name, p.scope, false)));
       const failed = results.find((r) => !r.ok);
       if (failed) {
         toastBus.handler?.error(failed.error ?? "Failed to unpin project");

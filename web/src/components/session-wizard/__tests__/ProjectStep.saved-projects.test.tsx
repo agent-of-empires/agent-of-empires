@@ -43,6 +43,7 @@ function savedProject(overrides: Partial<ProjectInfo> = {}): ProjectInfo {
     path: overrides.path ?? "/repo/alpha",
     scope: overrides.scope ?? "global",
     default_base_branch: overrides.default_base_branch,
+    pinned: overrides.pinned ?? false,
   };
 }
 

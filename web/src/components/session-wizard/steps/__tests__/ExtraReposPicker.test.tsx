@@ -18,9 +18,9 @@ vi.mock("../../../../lib/api", () => ({
 }));
 
 const PROJECTS: ProjectInfo[] = [
-  { name: "primary", path: "/repos/primary", scope: "global" },
-  { name: "alpha", path: "/repos/alpha", scope: "global" },
-  { name: "beta", path: "/repos/beta", scope: "profile" },
+  { name: "primary", path: "/repos/primary", scope: "global", pinned: false },
+  { name: "alpha", path: "/repos/alpha", scope: "global", pinned: false },
+  { name: "beta", path: "/repos/beta", scope: "profile", pinned: false },
 ];
 
 function setup(overrides?: { selectedPaths?: string[]; primaryPath?: string }) {
