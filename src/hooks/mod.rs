@@ -52,18 +52,25 @@ pub fn codex_config_path() -> Result<PathBuf> {
 }
 
 /// Home-injectable variant of [`codex_config_path_for_host_environment`]:
-/// resolves the Codex config under the given `home` directory, honoring an
-/// explicit `CODEX_HOME` in `host_env` (or the AoE process env), then
-/// falling back to `<home>/.codex/config.toml`.
+/// resolves a file inside the Codex config directory (e.g. `hooks.json` or
+/// `config.toml`) under the given `home` directory, honoring an explicit
+/// `CODEX_HOME` in `host_env` (or the AoE process env), then falling back
+/// to `<home>/.codex/<filename>`.
 pub(crate) fn codex_config_path_in(home: &Path, host_env: &[String]) -> PathBuf {
+    codex_config_file_in(home, host_env, "config.toml")
+}
+
+/// Like [`codex_config_path_in`] but accepts an explicit filename so callers
+/// can resolve `hooks.json` (or any other Codex-home-relative file).
+fn codex_config_file_in(home: &Path, host_env: &[String], filename: &str) -> PathBuf {
     if let Some(codex_home) =
         crate::session::environment::resolve_host_environment_value(host_env, "CODEX_HOME")
             .or_else(|| std::env::var("CODEX_HOME").ok())
             .filter(|v| !v.is_empty())
     {
-        return PathBuf::from(codex_home).join("config.toml");
+        return PathBuf::from(codex_home).join(filename);
     }
-    home.join(".codex").join("config.toml")
+    home.join(".codex").join(filename)
 }
 
 pub fn codex_config_path_display() -> String {
@@ -258,6 +265,10 @@ pub(crate) enum HookTargetKind {
     /// Codex `config.toml`: file-locked, symlink-resolved, with a user-trust
     /// `[hooks].state` block to preserve.
     CodexToml,
+    /// Codex `hooks.json`: standalone JSON hooks file next to `config.toml`.
+    /// Same JSON schema as `JsonSettings`, but resolved through the Codex
+    /// config-path machinery (`CODEX_HOME` support, symlink resolution).
+    CodexJson,
     /// settl/hermes/kiro: a config format the JSON path cannot emit; install
     /// goes through the agent's bundled `SidecarHooks` function pointers.
     Sidecar(&'static crate::agents::SidecarHooks),
@@ -301,17 +312,17 @@ pub(crate) fn iter_hook_targets_in(home: &Path, env_lists: &[Vec<String>]) -> Ve
     let mut out: Vec<HookTarget> = Vec::new();
     for agent in crate::agents::AGENTS {
         if let Some(hook_cfg) = agent.hook_config.as_ref() {
-            let kind = if agent.name == "codex" {
-                HookTargetKind::CodexToml
-            } else {
-                HookTargetKind::JsonSettings
+            let kind = match hook_cfg.format {
+                crate::agents::HookFormat::JsonSettings => HookTargetKind::JsonSettings,
+                crate::agents::HookFormat::CodexToml => HookTargetKind::CodexToml,
+                crate::agents::HookFormat::CodexJson => HookTargetKind::CodexJson,
             };
             let mut paths: Vec<PathBuf> = Vec::new();
             let resolve = |env: &[String]| -> PathBuf {
-                if matches!(kind, HookTargetKind::CodexToml) {
-                    codex_config_path_in(home, env)
-                } else {
-                    agent_settings_path_in(home, hook_cfg, env)
+                match kind {
+                    HookTargetKind::CodexToml => codex_config_path_in(home, env),
+                    HookTargetKind::CodexJson => codex_config_file_in(home, env, "hooks.json"),
+                    _ => agent_settings_path_in(home, hook_cfg, env),
                 }
             };
             push_unique_target_path(&mut paths, resolve(&[]));
@@ -384,7 +395,9 @@ pub(crate) fn has_aoe_marker(target: &HookTarget) -> bool {
         return false;
     }
     match target.kind {
-        HookTargetKind::JsonSettings => json_settings_has_aoe_marker(&target.path),
+        HookTargetKind::JsonSettings | HookTargetKind::CodexJson => {
+            json_settings_has_aoe_marker(&target.path)
+        }
         HookTargetKind::CodexToml => codex_config_has_aoe_marker(&target.path),
         HookTargetKind::Sidecar(sidecar) => {
             let sub = sidecar.host_config_subpath;
@@ -1657,7 +1670,9 @@ pub fn uninstall_kiro_hooks(agent_config_path: &Path) -> Result<bool> {
 pub fn uninstall_all_hooks() {
     for target in iter_hook_targets() {
         let result = match target.kind {
-            HookTargetKind::JsonSettings => uninstall_hooks(&target.path),
+            HookTargetKind::JsonSettings | HookTargetKind::CodexJson => {
+                uninstall_hooks(&target.path)
+            }
             HookTargetKind::CodexToml => uninstall_codex_hooks(&target.path),
             HookTargetKind::Sidecar(sidecar) => (sidecar.uninstall)(&target.path),
         };
@@ -2059,8 +2074,8 @@ mod tests {
             .map(|t| t.path)
             .collect();
 
-        assert!(codex_paths.contains(&tmp.path().join(".codex").join("config.toml")));
-        assert!(codex_paths.contains(&codex_home.join("config.toml")));
+        assert!(codex_paths.contains(&tmp.path().join(".codex").join("hooks.json")));
+        assert!(codex_paths.contains(&codex_home.join("hooks.json")));
     }
 
     #[test]

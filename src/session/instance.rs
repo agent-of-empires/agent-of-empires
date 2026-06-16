@@ -1964,8 +1964,10 @@ impl Instance {
                     }
                 }
             }
-        } else if agent.is_some_and(|a| a.name == "codex") && !self.is_sandboxed() {
-            if let Some(hook_cfg) = agent.and_then(|a| a.hook_config.as_ref()) {
+        } else if let Some(hook_cfg) = agent.and_then(|a| a.hook_config.as_ref()) {
+            if self.is_sandboxed() {
+                // For sandboxed sessions, hooks are installed via build_container_config
+            } else if hook_cfg.format == crate::agents::HookFormat::CodexToml {
                 match self.codex_config_path_for_launch_env() {
                     Ok(config_path) => {
                         if let Err(e) =
@@ -1976,10 +1978,32 @@ impl Instance {
                     }
                     Err(e) => tracing::warn!("Failed to resolve codex config path: {}", e),
                 }
-            }
-        } else if let Some(hook_cfg) = agent.and_then(|a| a.hook_config.as_ref()) {
-            if self.is_sandboxed() {
-                // For sandboxed sessions, hooks are installed via build_container_config
+            } else if hook_cfg.format == crate::agents::HookFormat::CodexJson {
+                let json_path = self
+                    .codex_config_path_for_launch_env()
+                    .map(|p| p.with_file_name("hooks.json"))
+                    .or_else(|_| {
+                        crate::hooks::agent_settings_path_for_host_environment(
+                            hook_cfg,
+                            &self.profile_host_environment(),
+                        )
+                    });
+                match json_path {
+                    Ok(path) => {
+                        if let Err(e) = crate::hooks::install_hooks(
+                            &path,
+                            hook_cfg.events,
+                            crate::hooks::HookInstallTarget::Host,
+                        ) {
+                            tracing::warn!(target: "session.store",
+                                "Failed to install codex hooks.json hooks: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "session.store",
+                            "Failed to resolve codex hooks.json path: {}", e)
+                    }
+                }
             } else {
                 // Install hooks in the agent's host settings file, honoring a
                 // config-dir override env var (e.g. CLAUDE_CONFIG_DIR) so hooks
@@ -3862,11 +3886,11 @@ mod tests {
         inst.detect_as = "codex".to_string();
         inst.install_agent_status_hooks(crate::agents::get_agent(&inst.detect_as));
 
-        let config_path = tmp.path().join(".codex").join("config.toml");
+        let config_path = tmp.path().join(".codex").join("hooks.json");
         let config = std::fs::read_to_string(config_path).unwrap();
-        assert!(config.contains("[[hooks.PreToolUse]]"));
+        assert!(config.contains("\"PreToolUse\""));
         assert!(config.contains("aoe-hooks"));
-        assert!(!tmp.path().join(".codex").join("hooks.json").exists());
+        assert!(!tmp.path().join(".codex").join("config.toml").exists());
     }
 
     #[test]
@@ -3892,11 +3916,11 @@ mod tests {
         inst.source_profile = "codex-profile".to_string();
         inst.install_agent_status_hooks(crate::agents::get_agent(&inst.detect_as));
 
-        let config_path = codex_home.join("config.toml");
+        let config_path = codex_home.join("hooks.json");
         let config = std::fs::read_to_string(config_path).unwrap();
-        assert!(config.contains("[[hooks.PreToolUse]]"));
+        assert!(config.contains("\"PreToolUse\""));
         assert!(config.contains("aoe-hooks"));
-        assert!(!tmp.path().join(".codex").join("config.toml").exists());
+        assert!(!tmp.path().join(".codex").join("hooks.json").exists());
     }
 
     #[test]
@@ -3921,7 +3945,7 @@ mod tests {
         inst.source_profile = "hooks-disabled".to_string();
         inst.install_agent_status_hooks(crate::agents::get_agent(&inst.detect_as));
 
-        assert!(!tmp.path().join(".codex").join("config.toml").exists());
+        assert!(!tmp.path().join(".codex").join("hooks.json").exists());
     }
 
     #[test]
@@ -3950,9 +3974,9 @@ mod tests {
         inst.source_profile = "hooks-enabled".to_string();
         inst.install_agent_status_hooks(crate::agents::get_agent(&inst.detect_as));
 
-        let config_path = tmp.path().join(".codex").join("config.toml");
+        let config_path = tmp.path().join(".codex").join("hooks.json");
         let config = std::fs::read_to_string(config_path).unwrap();
-        assert!(config.contains("[[hooks.PreToolUse]]"));
+        assert!(config.contains("\"PreToolUse\""));
         assert!(config.contains("aoe-hooks"));
     }
 

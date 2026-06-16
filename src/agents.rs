@@ -59,6 +59,24 @@ pub struct HookEvent {
     pub session_id_capture: bool,
 }
 
+/// The on-disk format an agent uses for its hook configuration.
+///
+/// Replaces the ad-hoc string-based dispatch (`agent.name == "codex"`) with an
+/// explicit enum so each agent declares how its hooks are serialized.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HookFormat {
+    /// Generic JSON settings file (Claude, OpenCode, Cursor, Gemini, Qwen, Kiro).
+    /// Hooks live under `hooks.<event>[].hooks[].command`.
+    JsonSettings,
+    /// Codex `config.toml` — inline `[[hooks.<Event>]]` TOML tables with
+    /// `[hooks.state]` trust-hash preservation and file-locked atomic writes.
+    CodexToml,
+    /// Codex `hooks.json` — standalone JSON hooks file next to `config.toml`.
+    /// Same schema as `JsonSettings` but resolved through the Codex config-path
+    /// machinery (`CODEX_HOME` support, symlink resolution).
+    CodexJson,
+}
+
 /// Configuration for installing status-detection hooks into an agent's settings file.
 #[derive(Debug)]
 pub struct AgentHookConfig {
@@ -73,6 +91,8 @@ pub struct AgentHookConfig {
     pub config_dir_env_var: Option<&'static str>,
     /// Hook events to register (status transitions and session lifecycle).
     pub events: &'static [HookEvent],
+    /// How hooks are serialized (JSON, Codex TOML, Codex JSON).
+    pub format: HookFormat,
 }
 
 /// Installer for an agent whose status hooks live in a config format the
@@ -320,6 +340,7 @@ pub const AGENTS: &[AgentDef] = &[
             settings_rel_path: ".claude/settings.json",
             config_dir_env_var: Some("CLAUDE_CONFIG_DIR"),
             events: CLAUDE_HOOK_EVENTS,
+            format: HookFormat::JsonSettings,
         }),
         sidecar_hooks: None,
         resume_strategy: ResumeStrategy::FlagPair {
@@ -377,11 +398,12 @@ pub const AGENTS: &[AgentDef] = &[
         detect_status: status_detection::detect_codex_status,
         container_env: &[],
         hook_config: Some(AgentHookConfig {
-            settings_rel_path: ".codex/config.toml",
-            // Codex resolves its config dir via `CODEX_HOME` through a bespoke
-            // path pair; install/uninstall are special-cased on agent name.
+            settings_rel_path: ".codex/hooks.json",
+            // Codex resolves its config dir via `CODEX_HOME`; hooks land in
+            // hooks.json alongside config.toml (Codex's recommended format).
             config_dir_env_var: None,
             events: CODEX_HOOK_EVENTS,
+            format: HookFormat::CodexJson,
         }),
         sidecar_hooks: None,
         resume_strategy: ResumeStrategy::Subcommand("resume"),
@@ -431,6 +453,7 @@ pub const AGENTS: &[AgentDef] = &[
                     session_id_capture: false,
                 },
             ],
+            format: HookFormat::JsonSettings,
         }),
         sidecar_hooks: None,
         resume_strategy: ResumeStrategy::Flag("--resume"),
@@ -452,6 +475,7 @@ pub const AGENTS: &[AgentDef] = &[
             settings_rel_path: ".cursor/settings.json",
             config_dir_env_var: Some("CURSOR_CONFIG_DIR"),
             events: CURSOR_HOOK_EVENTS,
+            format: HookFormat::JsonSettings,
         }),
         sidecar_hooks: None,
         resume_strategy: ResumeStrategy::Unsupported,
@@ -613,6 +637,7 @@ pub const AGENTS: &[AgentDef] = &[
             settings_rel_path: ".qwen/settings.json",
             config_dir_env_var: None,
             events: QWEN_HOOK_EVENTS,
+            format: HookFormat::JsonSettings,
         }),
         sidecar_hooks: None,
         resume_strategy: ResumeStrategy::FlagPair {
