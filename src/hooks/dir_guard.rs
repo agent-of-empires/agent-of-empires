@@ -625,37 +625,11 @@ fn walk_and_unlink_entries(dir_fd: &OwnedFd) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hooks::test_support::{make_correct_base, BaseGuard};
     use serial_test::serial;
     use std::io::Read;
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
-
-    /// RAII: install an override + reset cell + restore on drop. Tests using
-    /// `with_hook_base` MUST hold one; `serial_test::serial(hook_base)` gates
-    /// the tests so the thread-local override stays consistent.
-    struct BaseGuard;
-
-    impl BaseGuard {
-        fn fresh() -> (Self, PathBuf, TempDir) {
-            let tmp = TempDir::new().unwrap();
-            let base = tmp.path().join("aoe-hooks");
-            override_base_for_test(base.clone());
-            reset_for_test();
-            (Self, base, tmp)
-        }
-    }
-
-    impl Drop for BaseGuard {
-        fn drop(&mut self) {
-            clear_base_override_for_test();
-            reset_for_test();
-        }
-    }
-
-    fn make_correct_base(p: &std::path::Path) {
-        std::fs::create_dir(p).unwrap();
-        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700)).unwrap();
-    }
 
     #[test]
     #[serial(hook_base)]
@@ -963,5 +937,79 @@ mod tests {
             "production hook base must live under /tmp; got {}",
             path.display()
         );
+    }
+
+    #[test]
+    #[serial(hook_base)]
+    fn cleanup_rejects_subdir_symlink_at_leaf() {
+        let (_g, base, tmp) = BaseGuard::ready();
+        let _ = open_instance_dir("subdir_sym").unwrap();
+        let target = tmp.path().join("decoy_subdir");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("witness"), b"keep").unwrap();
+        std::os::unix::fs::symlink(&target, base.join("subdir_sym").join("escape")).unwrap();
+        remove_instance_dir("subdir_sym").unwrap();
+        assert!(target.is_dir(), "decoy directory must survive cleanup");
+        assert_eq!(
+            std::fs::read_to_string(target.join("witness")).unwrap(),
+            "keep",
+            "decoy contents must be intact"
+        );
+    }
+
+    #[test]
+    #[serial(hook_base)]
+    fn concurrent_writers_no_corruption() {
+        let (_g, base, _tmp) = BaseGuard::ready();
+        let dir = open_instance_dir("conc").unwrap();
+        let dir_fd = dir.as_fd();
+        let payload = b"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                let b = barrier.clone();
+                s.spawn(move || {
+                    b.wait();
+                    for _ in 0..200 {
+                        write_atomic(dir_fd, "session_id", payload).unwrap();
+                    }
+                });
+            }
+        });
+        let got = read_file_at(dir_fd, "session_id", 64).unwrap().unwrap();
+        assert_eq!(
+            got, payload,
+            "final state must equal what every writer wrote"
+        );
+        let leaked: Vec<_> = std::fs::read_dir(base.join("conc"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".session_id.tmp.")
+            })
+            .collect();
+        assert!(leaked.is_empty(), "tmp files leaked: {leaked:?}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[serial(hook_base)]
+    fn macos_tmp_prefix_symlink_works() {
+        // /tmp -> /private/tmp on macOS. O_NOFOLLOW only checks the FINAL
+        // component, so a prefix symlink must not block init. Locks the
+        // platform-specific resolution behavior the existing code relies on.
+        let tmp = TempDir::new().unwrap();
+        let real_parent = tmp.path().join("real-parent");
+        std::fs::create_dir(&real_parent).unwrap();
+        let symlink_parent = tmp.path().join("via-symlink");
+        std::os::unix::fs::symlink(&real_parent, &symlink_parent).unwrap();
+        let base = symlink_parent.join("aoe-hooks");
+        override_base_for_test(base.clone());
+        reset_for_test();
+        with_hook_base(|_| Ok(())).expect("prefix symlink must not block init");
+        clear_base_override_for_test();
+        reset_for_test();
     }
 }

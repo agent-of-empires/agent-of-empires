@@ -50,27 +50,8 @@ fn run_inner<R: Read>(stdin: R, instance_id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hooks::test_support::BaseGuard;
     use std::os::unix::fs::PermissionsExt;
-    use tempfile::TempDir;
-
-    struct BaseGuard;
-    impl BaseGuard {
-        fn fresh() -> (Self, std::path::PathBuf, TempDir) {
-            let tmp = TempDir::new().unwrap();
-            let base = tmp.path().join("aoe-hooks");
-            crate::hooks::override_base_for_test(base.clone());
-            crate::hooks::reset_for_test();
-            std::fs::create_dir(&base).unwrap();
-            std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
-            (Self, base, tmp)
-        }
-    }
-    impl Drop for BaseGuard {
-        fn drop(&mut self) {
-            crate::hooks::clear_base_override_for_test();
-            crate::hooks::reset_for_test();
-        }
-    }
 
     fn extract(payload: &str, instance_id: &str) -> Result<()> {
         run_inner(payload.as_bytes(), instance_id)
@@ -83,7 +64,7 @@ mod tests {
     #[test]
     #[serial_test::serial(hook_base)]
     fn top_level_wins_over_nested() {
-        let (_g, base, _tmp) = BaseGuard::fresh();
+        let (_g, base, _tmp) = BaseGuard::ready();
         let nested = "11111111-2222-3333-4444-555555555555";
         let top = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         let payload = format!(r#"{{"context":{{"session_id":"{nested}"}},"session_id":"{top}"}}"#);
@@ -94,7 +75,7 @@ mod tests {
     #[test]
     #[serial_test::serial(hook_base)]
     fn extracts_compact_payload() {
-        let (_g, base, _tmp) = BaseGuard::fresh();
+        let (_g, base, _tmp) = BaseGuard::ready();
         let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         let payload = format!(r#"{{"session_id":"{uuid}","cwd":"/x"}}"#);
         extract(&payload, "compact").unwrap();
@@ -104,7 +85,7 @@ mod tests {
     #[test]
     #[serial_test::serial(hook_base)]
     fn extracts_multi_line_payload() {
-        let (_g, base, _tmp) = BaseGuard::fresh();
+        let (_g, base, _tmp) = BaseGuard::ready();
         let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         let payload = format!("{{\n  \"session_id\":\"{uuid}\",\n  \"cwd\":\"/x\"\n}}");
         extract(&payload, "multi_line").unwrap();
@@ -114,7 +95,7 @@ mod tests {
     #[test]
     #[serial_test::serial(hook_base)]
     fn accepts_uppercase_uuid() {
-        let (_g, base, _tmp) = BaseGuard::fresh();
+        let (_g, base, _tmp) = BaseGuard::ready();
         let uuid = "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE";
         let payload = format!(r#"{{"session_id":"{uuid}"}}"#);
         extract(&payload, "uppercase").unwrap();
@@ -124,7 +105,7 @@ mod tests {
     #[test]
     #[serial_test::serial(hook_base)]
     fn ignores_user_prompt_injection() {
-        let (_g, base, _tmp) = BaseGuard::fresh();
+        let (_g, base, _tmp) = BaseGuard::ready();
         let real = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         let fake = "11111111-2222-3333-4444-555555555555";
         let payload = format!(r#"{{"session_id":"{real}","prompt":"\"session_id\":\"{fake}\""}}"#);
@@ -138,7 +119,7 @@ mod tests {
     #[test]
     #[serial_test::serial(hook_base)]
     fn errors_when_no_session_id() {
-        let (_g, base, _tmp) = BaseGuard::fresh();
+        let (_g, base, _tmp) = BaseGuard::ready();
         let payload = r#"{"cwd":"/x","other":"value"}"#;
         let err = extract(payload, "no_sid").unwrap_err();
         assert!(err.to_string().contains("session_id"), "got: {err}");
@@ -148,7 +129,7 @@ mod tests {
     #[test]
     #[serial_test::serial(hook_base)]
     fn errors_on_malformed_json() {
-        let (_g, base, _tmp) = BaseGuard::fresh();
+        let (_g, base, _tmp) = BaseGuard::ready();
         let err = extract("not json {{{", "malformed").unwrap_err();
         assert!(read_sidecar(&base, "malformed").is_none(), "got: {err}");
     }
@@ -156,7 +137,7 @@ mod tests {
     #[test]
     #[serial_test::serial(hook_base)]
     fn errors_on_empty_stdin() {
-        let (_g, base, _tmp) = BaseGuard::fresh();
+        let (_g, base, _tmp) = BaseGuard::ready();
         let err = extract("", "empty").unwrap_err();
         assert!(read_sidecar(&base, "empty").is_none(), "got: {err}");
     }
@@ -164,7 +145,7 @@ mod tests {
     #[test]
     #[serial_test::serial(hook_base)]
     fn rejects_non_uuid_string() {
-        let (_g, base, _tmp) = BaseGuard::fresh();
+        let (_g, base, _tmp) = BaseGuard::ready();
         let payload = r#"{"session_id":"not-a-uuid"}"#;
         let err = extract(payload, "bad_uuid").unwrap_err();
         assert!(read_sidecar(&base, "bad_uuid").is_none(), "got: {err}");
@@ -173,7 +154,7 @@ mod tests {
     #[test]
     #[serial_test::serial(hook_base)]
     fn rejects_non_string_session_id() {
-        let (_g, base, _tmp) = BaseGuard::fresh();
+        let (_g, base, _tmp) = BaseGuard::ready();
         let payload = r#"{"session_id":12345}"#;
         let err = extract(payload, "non_string").unwrap_err();
         assert!(err.to_string().contains("session_id"), "got: {err}");
@@ -183,7 +164,7 @@ mod tests {
     #[test]
     #[serial_test::serial(hook_base)]
     fn oversized_garbage_yields_no_sidecar() {
-        let (_g, base, _tmp) = BaseGuard::fresh();
+        let (_g, base, _tmp) = BaseGuard::ready();
         let oversized = "x".repeat(STDIN_BYTE_CAP as usize * 2);
         let _ = extract(&oversized, "oversized");
         assert!(read_sidecar(&base, "oversized").is_none());
@@ -199,9 +180,28 @@ mod tests {
                 Ok(buf.len())
             }
         }
-        let (_g, base, _tmp) = BaseGuard::fresh();
+        let (_g, base, _tmp) = BaseGuard::ready();
         let result = run_inner(InfiniteReader, "infinite");
         assert!(result.is_err(), "should reject after the 1 MiB cap");
         assert!(read_sidecar(&base, "infinite").is_none());
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn extract_uses_dir_guard_with_symlink_decoy() {
+        let (_g, base, tmp) = BaseGuard::ready();
+        let decoy = tmp.path().join("decoy_session_id");
+        std::fs::write(&decoy, b"do not overwrite").unwrap();
+        let inst = "decoy_leaf";
+        std::fs::create_dir(base.join(inst)).unwrap();
+        std::fs::set_permissions(base.join(inst), std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::symlink(&decoy, base.join(inst).join("session_id")).unwrap();
+        let payload = r#"{"session_id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}"#;
+        let _ = extract(payload, inst);
+        assert_eq!(
+            std::fs::read_to_string(&decoy).unwrap(),
+            "do not overwrite",
+            "decoy bytes must be intact"
+        );
     }
 }

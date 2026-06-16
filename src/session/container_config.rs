@@ -1503,33 +1503,9 @@ fn common_ancestor(a: &Path, b: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hooks::test_support::BaseGuard;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
-
-    /// Sets up a per-test hook base override at 0o700 ours-owned, so that
-    /// `ensure_instance_dir_path` succeeds and `build_container_config`
-    /// pushes the bind-mount volume. Restores the global state on Drop.
-    struct HookBaseGuard {
-        _tmp: TempDir,
-    }
-    impl HookBaseGuard {
-        fn new() -> Self {
-            let tmp = TempDir::new().unwrap();
-            let base = tmp.path().join("aoe-hooks");
-            fs::create_dir(&base).unwrap();
-            fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).unwrap();
-            crate::hooks::override_base_for_test(base);
-            crate::hooks::reset_for_test();
-            Self { _tmp: tmp }
-        }
-    }
-    impl Drop for HookBaseGuard {
-        fn drop(&mut self) {
-            crate::hooks::clear_base_override_for_test();
-            crate::hooks::reset_for_test();
-        }
-    }
 
     // --- compute_volume_paths tests ---
 
@@ -2996,7 +2972,7 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
     #[test]
     #[serial_test::serial]
     fn test_build_container_config_installs_codex_hooks_files() {
-        let _hg = HookBaseGuard::new();
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -3069,7 +3045,7 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
     #[test]
     #[serial_test::serial]
     fn test_build_container_config_installs_sidecar_hooks_files() {
-        let _hg = HookBaseGuard::new();
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -3244,7 +3220,7 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
     #[test]
     #[serial_test::serial]
     fn test_build_container_config_uses_detected_codex_for_custom_wrapper_hooks() {
-        let _hg = HookBaseGuard::new();
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
         #[cfg(any(target_os = "linux", target_os = "macos"))]

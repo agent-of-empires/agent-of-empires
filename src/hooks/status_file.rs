@@ -129,28 +129,9 @@ pub fn cleanup_hook_status_dir(instance_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hooks::test_support::BaseGuard;
     use std::os::fd::AsFd;
-    use std::os::unix::fs::PermissionsExt;
-    use tempfile::TempDir;
-
-    struct BaseGuard;
-    impl BaseGuard {
-        fn fresh() -> (Self, std::path::PathBuf, TempDir) {
-            let tmp = TempDir::new().unwrap();
-            let base = tmp.path().join("aoe-hooks");
-            super::dir_guard::override_base_for_test(base.clone());
-            super::dir_guard::reset_for_test();
-            std::fs::create_dir(&base).unwrap();
-            std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
-            (Self, base, tmp)
-        }
-    }
-    impl Drop for BaseGuard {
-        fn drop(&mut self) {
-            super::dir_guard::clear_base_override_for_test();
-            super::dir_guard::reset_for_test();
-        }
-    }
+    use std::time::Duration;
 
     fn write_status_via_guard(instance_id: &str, content: &str) {
         let dir = dir_guard::open_instance_dir(instance_id).unwrap();
@@ -160,7 +141,7 @@ mod tests {
     #[test]
     #[serial_test::serial(hook_base)]
     fn test_read_running_status() {
-        let (_g, _, _tmp) = BaseGuard::fresh();
+        let (_g, _, _tmp) = BaseGuard::ready();
         write_status_via_guard("read_running", "running");
         assert_eq!(read_hook_status("read_running"), Some(Status::Running));
     }
@@ -168,7 +149,7 @@ mod tests {
     #[test]
     #[serial_test::serial(hook_base)]
     fn test_read_waiting_status() {
-        let (_g, _, _tmp) = BaseGuard::fresh();
+        let (_g, _, _tmp) = BaseGuard::ready();
         write_status_via_guard("read_waiting", "waiting");
         assert_eq!(read_hook_status("read_waiting"), Some(Status::Waiting));
     }
@@ -176,7 +157,7 @@ mod tests {
     #[test]
     #[serial_test::serial(hook_base)]
     fn test_read_idle_status() {
-        let (_g, _, _tmp) = BaseGuard::fresh();
+        let (_g, _, _tmp) = BaseGuard::ready();
         write_status_via_guard("read_idle", "idle");
         assert_eq!(read_hook_status("read_idle"), Some(Status::Idle));
     }
@@ -184,7 +165,7 @@ mod tests {
     #[test]
     #[serial_test::serial(hook_base)]
     fn test_read_error_status() {
-        let (_g, _, _tmp) = BaseGuard::fresh();
+        let (_g, _, _tmp) = BaseGuard::ready();
         write_status_via_guard("read_err", "error");
         assert_eq!(read_hook_status("read_err"), Some(Status::Error));
     }
@@ -192,7 +173,7 @@ mod tests {
     #[test]
     #[serial_test::serial(hook_base)]
     fn test_read_waiting_with_newline() {
-        let (_g, _, _tmp) = BaseGuard::fresh();
+        let (_g, _, _tmp) = BaseGuard::ready();
         write_status_via_guard("read_nl", "waiting\n");
         assert_eq!(read_hook_status("read_nl"), Some(Status::Waiting));
     }
@@ -200,14 +181,14 @@ mod tests {
     #[test]
     #[serial_test::serial(hook_base)]
     fn test_read_missing_file() {
-        let (_g, _, _tmp) = BaseGuard::fresh();
+        let (_g, _, _tmp) = BaseGuard::ready();
         assert_eq!(read_hook_status("nonexistent_instance_id"), None);
     }
 
     #[test]
     #[serial_test::serial(hook_base)]
     fn test_read_dangling_symlink() {
-        let (_g, base, _tmp) = BaseGuard::fresh();
+        let (_g, base, _tmp) = BaseGuard::ready();
         let dir = dir_guard::open_instance_dir("dangling").unwrap();
         drop(dir);
         std::os::unix::fs::symlink("/nonexistent/target", base.join("dangling").join("status"))
@@ -218,7 +199,7 @@ mod tests {
     #[test]
     #[serial_test::serial(hook_base)]
     fn test_read_unexpected_content() {
-        let (_g, _, _tmp) = BaseGuard::fresh();
+        let (_g, _, _tmp) = BaseGuard::ready();
         write_status_via_guard("read_unexpected", "something_else");
         assert_eq!(read_hook_status("read_unexpected"), None);
     }
@@ -226,7 +207,7 @@ mod tests {
     #[test]
     #[serial_test::serial(hook_base)]
     fn test_cleanup_existing_dir() {
-        let (_g, base, _tmp) = BaseGuard::fresh();
+        let (_g, base, _tmp) = BaseGuard::ready();
         write_status_via_guard("cleanup_existing", "running");
         let dir = base.join("cleanup_existing");
         assert!(dir.exists());
@@ -237,14 +218,14 @@ mod tests {
     #[test]
     #[serial_test::serial(hook_base)]
     fn test_cleanup_nonexistent_dir() {
-        let (_g, _, _tmp) = BaseGuard::fresh();
+        let (_g, _, _tmp) = BaseGuard::ready();
         cleanup_hook_status_dir("nonexistent_cleanup_test");
     }
 
     #[test]
     #[serial_test::serial(hook_base)]
     fn test_hook_status_dir_path() {
-        let (_g, base, _tmp) = BaseGuard::fresh();
+        let (_g, base, _tmp) = BaseGuard::ready();
         let dir = hook_status_dir("abc123").expect("test id must be allowlist-safe");
         assert_eq!(dir, base.join("abc123"));
     }
@@ -257,7 +238,7 @@ mod tests {
     #[test]
     #[serial_test::serial(hook_base)]
     fn test_read_hook_urgent_true() {
-        let (_g, _, _tmp) = BaseGuard::fresh();
+        let (_g, _, _tmp) = BaseGuard::ready();
         write_attention_json("urgent_true", r#"{"urgent":true,"urgent_reason":"x"}"#);
         assert!(read_hook_urgent("urgent_true"));
     }
@@ -265,7 +246,7 @@ mod tests {
     #[test]
     #[serial_test::serial(hook_base)]
     fn test_read_hook_urgent_false_when_flag_missing() {
-        let (_g, _, _tmp) = BaseGuard::fresh();
+        let (_g, _, _tmp) = BaseGuard::ready();
         write_attention_json("urgent_missing", r#"{"tier":0}"#);
         assert!(!read_hook_urgent("urgent_missing"));
     }
@@ -273,14 +254,14 @@ mod tests {
     #[test]
     #[serial_test::serial(hook_base)]
     fn test_read_hook_urgent_false_when_file_absent() {
-        let (_g, _, _tmp) = BaseGuard::fresh();
+        let (_g, _, _tmp) = BaseGuard::ready();
         assert!(!read_hook_urgent("urgent_no_file"));
     }
 
     #[test]
     #[serial_test::serial(hook_base)]
     fn test_read_hook_urgent_false_when_malformed_json() {
-        let (_g, _, _tmp) = BaseGuard::fresh();
+        let (_g, _, _tmp) = BaseGuard::ready();
         write_attention_json("urgent_bad_json", "{ this is not json");
         assert!(!read_hook_urgent("urgent_bad_json"));
     }
@@ -288,7 +269,7 @@ mod tests {
     #[test]
     #[serial_test::serial(hook_base)]
     fn test_read_hook_urgent_false_when_expires_passed() {
-        let (_g, _, _tmp) = BaseGuard::fresh();
+        let (_g, _, _tmp) = BaseGuard::ready();
         write_attention_json("urgent_expired", r#"{"urgent":true,"urgent_expires_at":1}"#);
         assert!(!read_hook_urgent("urgent_expired"));
     }
@@ -296,7 +277,7 @@ mod tests {
     #[test]
     #[serial_test::serial(hook_base)]
     fn test_read_hook_urgent_true_when_expires_future() {
-        let (_g, _, _tmp) = BaseGuard::fresh();
+        let (_g, _, _tmp) = BaseGuard::ready();
         let future = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -315,7 +296,7 @@ mod tests {
     #[test]
     #[serial_test::serial(hook_base)]
     fn test_read_hook_session_id_returns_some_when_fresh_uuid() {
-        let (_g, _, _tmp) = BaseGuard::fresh();
+        let (_g, _, _tmp) = BaseGuard::ready();
         let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         write_session_id_sidecar("session_id_fresh", uuid);
         assert_eq!(
@@ -327,7 +308,7 @@ mod tests {
     #[test]
     #[serial_test::serial(hook_base)]
     fn test_read_hook_session_id_returns_none_when_absent() {
-        let (_g, _, _tmp) = BaseGuard::fresh();
+        let (_g, _, _tmp) = BaseGuard::ready();
         assert_eq!(
             read_hook_session_id("nonexistent_session_id_instance"),
             None
@@ -337,7 +318,7 @@ mod tests {
     #[test]
     #[serial_test::serial(hook_base)]
     fn test_read_hook_session_id_rejects_non_uuid() {
-        let (_g, _, _tmp) = BaseGuard::fresh();
+        let (_g, _, _tmp) = BaseGuard::ready();
         write_session_id_sidecar("session_id_garbage", "not-a-uuid");
         assert_eq!(read_hook_session_id("session_id_garbage"), None);
     }
@@ -345,7 +326,7 @@ mod tests {
     #[test]
     #[serial_test::serial(hook_base)]
     fn test_read_hook_session_id_rejects_stale_file() {
-        let (_g, base, _tmp) = BaseGuard::fresh();
+        let (_g, base, _tmp) = BaseGuard::ready();
         let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         write_session_id_sidecar("session_id_stale", uuid);
         let stale = std::time::SystemTime::now() - Duration::from_secs(10 * 60);
@@ -361,7 +342,7 @@ mod tests {
     #[test]
     #[serial_test::serial(hook_base)]
     fn test_read_hook_session_id_trims_trailing_whitespace() {
-        let (_g, _, _tmp) = BaseGuard::fresh();
+        let (_g, _, _tmp) = BaseGuard::ready();
         let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         write_session_id_sidecar("session_id_trim", &format!("{uuid}\n"));
         assert_eq!(
@@ -373,7 +354,7 @@ mod tests {
     #[test]
     #[serial_test::serial(hook_base)]
     fn hook_status_dir_returns_err_for_unsafe_id() {
-        let (_g, _, _tmp) = BaseGuard::fresh();
+        let (_g, _, _tmp) = BaseGuard::ready();
         assert!(hook_status_dir("../etc").is_err());
         assert!(hook_status_dir("").is_err());
     }
@@ -381,7 +362,7 @@ mod tests {
     #[test]
     #[serial_test::serial(hook_base)]
     fn read_hook_status_returns_none_for_unsafe_id() {
-        let (_g, _, _tmp) = BaseGuard::fresh();
+        let (_g, _, _tmp) = BaseGuard::ready();
         assert_eq!(read_hook_status("../etc"), None);
         assert_eq!(read_hook_status(""), None);
         assert_eq!(read_hook_status("foo/bar"), None);
@@ -390,21 +371,21 @@ mod tests {
     #[test]
     #[serial_test::serial(hook_base)]
     fn read_hook_session_id_returns_none_for_unsafe_id() {
-        let (_g, _, _tmp) = BaseGuard::fresh();
+        let (_g, _, _tmp) = BaseGuard::ready();
         assert_eq!(read_hook_session_id("../etc"), None);
     }
 
     #[test]
     #[serial_test::serial(hook_base)]
     fn read_hook_urgent_returns_false_for_unsafe_id() {
-        let (_g, _, _tmp) = BaseGuard::fresh();
+        let (_g, _, _tmp) = BaseGuard::ready();
         assert!(!read_hook_urgent("../etc"));
     }
 
     #[test]
     #[serial_test::serial(hook_base)]
     fn cleanup_hook_status_dir_is_noop_for_unsafe_id() {
-        let (_g, _, _tmp) = BaseGuard::fresh();
+        let (_g, _, _tmp) = BaseGuard::ready();
         cleanup_hook_status_dir("../etc");
         cleanup_hook_status_dir("");
     }

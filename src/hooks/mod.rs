@@ -10,6 +10,9 @@
 mod dir_guard;
 mod status_file;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -3413,6 +3416,51 @@ hooks_auto_accept: false
         assert!(cmd.contains("unset IFS"), "missing IFS pin: {cmd}");
         assert!(cmd.contains("set -f"), "missing globbing pin: {cmd}");
         assert!(cmd.contains("umask 077"), "missing umask pin: {cmd}");
+    }
+
+    #[test]
+    fn sandbox_shell_byte_equality() {
+        let cmd = canonical_status_command("running", HookInstallTarget::Sandbox);
+        for token in [
+            "unset IFS",
+            "set -f",
+            "umask 077",
+            "case \"$AOE_INSTANCE_ID\" in *[!0-9a-zA-Z_-]*)",
+            "B=/tmp/aoe-hooks;",
+            "D=\"$B/$AOE_INSTANCE_ID\"",
+            "LC_ALL=C ls -ldn",
+            "d*------|d*------.|d*------+|d*------@",
+            "printf running",
+        ] {
+            assert!(cmd.contains(token), "missing token {token:?}: {cmd}");
+        }
+        for forbidden in ["ME=$(id -u", "[ \"$3\" = \"$ME\" ]", "/tmp/aoe-hooks-"] {
+            assert!(
+                !cmd.contains(forbidden),
+                "sandbox snippet must NOT contain {forbidden:?}: {cmd}"
+            );
+        }
+        assert!(cmd.contains(&format!("# {AOE_HOOK_MARKER}")));
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn host_shell_bakes_per_user_base_byte_stable_across_mocks() {
+        for euid in [1000u32, 65534u32, 0u32] {
+            let mock_base = std::path::PathBuf::from(format!("/tmp/aoe-hooks-{euid}"));
+            crate::hooks::dir_guard::override_base_for_test(mock_base.clone());
+            let cmd = canonical_status_command("running", HookInstallTarget::Host);
+            let want = format!("B=/tmp/aoe-hooks-{euid};");
+            assert!(
+                cmd.contains(&want),
+                "euid {euid}: expected {want:?} in: {cmd}"
+            );
+            assert!(
+                cmd.contains("ME=$(id -u 2>/dev/null)"),
+                "host hook must include id-u uid check: {cmd}"
+            );
+        }
+        crate::hooks::dir_guard::clear_base_override_for_test();
     }
 
     #[test]
