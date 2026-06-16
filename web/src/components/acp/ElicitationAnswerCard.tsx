@@ -11,7 +11,10 @@ interface Props {
  *  structured pick reads as a tidy card, not a flat "Q: A" line. See #2209. */
 export function ElicitationAnswerCard({ answers }: Props) {
   return (
-    <div className="w-full max-w-3xl rounded-2xl rounded-br-sm border border-surface-700 bg-surface-800/70 px-4 py-3 text-sm">
+    <div
+      data-testid="elicitation-answer-card"
+      className="w-full max-w-3xl rounded-2xl rounded-br-sm border border-surface-700 bg-surface-800/70 px-4 py-3 text-sm"
+    >
       <div className="mb-2 flex items-center gap-2 text-[11px] uppercase tracking-wider text-text-dim">
         <span className="rounded bg-brand-600/15 px-1.5 py-0.5 font-mono text-brand-300">answer</span>
         <span>
