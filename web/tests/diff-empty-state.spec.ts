@@ -37,10 +37,12 @@ test.describe("Diff empty state (#2152)", () => {
       ],
       warning: null,
     });
-    await expect(page.getByText("No changes in any repo")).toBeVisible({ timeout: 10000 });
-    await expect(page.getByText("taskrunner")).toBeVisible();
+    // Multi-repo empty routes through MultiRepoGroups: each member shows a
+    // header (name + "vs <base>") and a per-repo "no changes" note.
+    await expect(page.getByText("taskrunner")).toBeVisible({ timeout: 10000 });
     await expect(page.getByText("MessageManager")).toBeVisible();
     await expect(page.getByText("SmartCaller")).toBeVisible();
     await expect(page.getByText("vs origin/main")).toBeVisible();
+    await expect(page.getByText("No changes in this repo.").first()).toBeVisible();
   });
 });

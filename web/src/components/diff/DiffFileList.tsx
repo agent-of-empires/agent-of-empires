@@ -219,44 +219,6 @@ function scrollToIndex(container: HTMLDivElement | null, index: number) {
   container?.querySelector(`[data-index="${index}"]`)?.scrollIntoView({ block: "nearest" });
 }
 
-// Empty changes panel. Names the base branch so a clean tree reads as
-// "checked, nothing to show" rather than a broken diff. Multi-repo
-// sessions list every member with its base so the user sees each was
-// checked and is clean (#2152).
-function DiffEmptyState({ perRepoBases, isMultiRepo }: { perRepoBases: RepoBase[]; isMultiRepo: boolean }) {
-  if (isMultiRepo) {
-    return (
-      <div className="flex items-center justify-center h-full text-text-dim">
-        <div className="px-4 w-full max-w-xs">
-          <p className="text-xs text-center mb-2">No changes in any repo</p>
-          <ul className="space-y-1">
-            {perRepoBases.map((repo) => (
-              <li
-                key={repo.repo_name ?? "_default"}
-                className="flex items-center justify-between gap-2 font-mono text-[11px]"
-              >
-                <span className="truncate text-text-muted">{repo.repo_name ?? "(default)"}</span>
-                <span className="shrink-0 text-text-dim">vs {repo.base_branch}</span>
-              </li>
-            ))}
-          </ul>
-        </div>
-      </div>
-    );
-  }
-  const base = perRepoBases[0]?.base_branch ?? "main";
-  return (
-    <div className="flex items-center justify-center h-full text-text-dim">
-      <div className="text-center px-4">
-        <div className="font-mono text-xl text-surface-700 mb-1">0</div>
-        <p className="text-xs">
-          No changes vs <span className="font-mono">{base}</span>
-        </p>
-      </div>
-    </div>
-  );
-}
-
 export function DiffFileList({
   files,
   perRepoBases,
@@ -473,8 +435,14 @@ export function DiffFileList({
           <div className="flex items-center justify-center h-full text-text-dim">
             <span className="text-xs">Loading files...</span>
           </div>
-        ) : files.length === 0 ? (
-          <DiffEmptyState perRepoBases={perRepoBases} isMultiRepo={isMultiRepo} />
+        ) : files.length === 0 && !isMultiRepo ? (
+          // Single-repo empty: name the base so a clean tree reads as
+          // "checked, nothing to show" rather than a broken diff (#2152).
+          // Multi-repo empty falls through to MultiRepoGroups below, which
+          // already lists every member with its base and a per-repo note.
+          <div className="flex items-center justify-center h-full text-text-dim text-xs">
+            No changes vs <span className="font-mono ml-1">{singleBaseBranch}</span>
+          </div>
         ) : isMultiRepo ? (
           <MultiRepoGroups
             perRepoBases={perRepoBases}

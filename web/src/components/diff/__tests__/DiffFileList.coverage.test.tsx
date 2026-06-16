@@ -83,6 +83,8 @@ describe("DiffFileList state branches", () => {
   });
 
   it("lists every repo with its base in the multi-repo empty state (#2152)", () => {
+    // Multi-repo empty routes through MultiRepoGroups, which shows each
+    // member's header (name + "vs <base>") and a per-repo "no changes" note.
     renderList({
       files: [],
       perRepoBases: [
@@ -91,12 +93,12 @@ describe("DiffFileList state branches", () => {
         { repo_name: "SmartCaller", base_branch: "origin/main" },
       ],
     });
-    expect(screen.getByText("No changes in any repo")).toBeTruthy();
     expect(screen.getByText("taskrunner")).toBeTruthy();
     expect(screen.getByText("MessageManager")).toBeTruthy();
     expect(screen.getByText("SmartCaller")).toBeTruthy();
     expect(screen.getAllByText("vs origin/develop")).toHaveLength(2);
     expect(screen.getByText("vs origin/main")).toBeTruthy();
+    expect(screen.getAllByText("No changes in this repo.")).toHaveLength(3);
   });
 
   it("renders the warning banner when provided", () => {
