@@ -62,14 +62,7 @@ export function Tooltip({ text, children }: { text: string; children: ReactNode 
   }, [open]);
 
   return (
-    <span
-      ref={triggerRef}
-      className="inline-flex"
-      onMouseEnter={show}
-      onMouseLeave={hide}
-      onFocus={show}
-      onBlur={hide}
-    >
+    <span ref={triggerRef} className="inline-flex" onMouseEnter={show} onMouseLeave={hide} onFocus={show} onBlur={hide}>
       {children}
       {open &&
         createPortal(
