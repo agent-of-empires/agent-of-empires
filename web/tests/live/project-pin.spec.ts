@@ -128,7 +128,7 @@ base.describe("pin a project from the web sidebar (#2047, #2208)", () => {
       // The #2208 regression: unpin must NOT delete the saved project. The
       // registry still lists projectA (it would be in the Projects view / wizard).
       const afterUnpin = await (await page.request.get(`${serve.baseUrl}/api/projects`)).json();
-      expect(afterUnpin.some((p: { name: string }) => p.path === repoA)).toBe(true);
+      expect(afterUnpin.some((p: { path: string }) => p.path === repoA)).toBe(true);
     } finally {
       await serve.stop();
     }

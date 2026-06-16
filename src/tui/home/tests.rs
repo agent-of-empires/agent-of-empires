@@ -6287,10 +6287,12 @@ fn p_key_pins_project_on_header() {
     // See #2208.
     env.view.toggle_project_pin_at_cursor();
     assert!(!env.view.is_project_label_pinned("alpha"));
-    assert!(
-        !crate::session::projects::load_global().unwrap().is_empty(),
-        "unpin must keep the registry entry, not delete it"
-    );
+    // The specific entry is kept (not just "registry non-empty") with its pin
+    // flag cleared: unpin keeps the saved project, only Remove deletes it.
+    let after = crate::session::projects::load_global().unwrap();
+    assert_eq!(after.len(), 1, "unpin must keep the registry entry");
+    assert_eq!(after[0].name, "alpha");
+    assert!(!after[0].pinned, "unpin must clear the pin flag");
 }
 
 /// Off a project header (here: in Manual grouping), `p` keeps its original
