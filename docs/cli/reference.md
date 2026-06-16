@@ -14,7 +14,7 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe remove`↴](#aoe-remove)
 * [`aoe send`↴](#aoe-send)
 * [`aoe status`↴](#aoe-status)
-* [`aoe stop-all`↴](#aoe-stop-all)
+* [`aoe killall`↴](#aoe-killall)
 * [`aoe session`↴](#aoe-session)
 * [`aoe session start`↴](#aoe-session-start)
 * [`aoe session stop`↴](#aoe-session-stop)
@@ -110,7 +110,7 @@ Run without arguments to launch the TUI dashboard.
 * `remove` — Remove a session
 * `send` — Send a message to a running agent session
 * `status` — Show session status summary
-* `stop-all` — Force-stop everything aoe is running: the serve daemon, all agent workers, and all aoe tmux sessions. Destructive and unprompted
+* `killall` — Force-stop everything aoe is running: the serve daemon, all agent workers, and all aoe tmux sessions. Destructive and unprompted
 * `session` — Manage session lifecycle (start, stop, attach, etc.)
 * `group` — Manage groups for organizing sessions
 * `profile` — Manage profiles (separate workspaces)
@@ -291,11 +291,11 @@ Show session status summary
 
 
 
-## `aoe stop-all`
+## `aoe killall`
 
 Force-stop everything aoe is running: the serve daemon, all agent workers, and all aoe tmux sessions. Destructive and unprompted
 
-**Usage:** `aoe stop-all [OPTIONS]`
+**Usage:** `aoe killall [OPTIONS]`
 
 ###### **Options:**
 

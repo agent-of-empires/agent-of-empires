@@ -1512,3 +1512,21 @@ fn test_cli_add_scratch_conflicts_with_worktree_flag() {
         stderr,
     );
 }
+
+/// `aoe stop` (with or without args) is a hidden trap, not a real command: it
+/// must exit non-zero and redirect the user to the scoped stop verbs and
+/// `killall` rather than silently doing nothing or triggering a teardown.
+#[test]
+#[serial]
+fn test_cli_stop_trap_redirects() {
+    let h = TuiTestHarness::new("cli_stop_trap");
+    for argv in [vec!["stop"], vec!["stop", "abc123"], vec!["stop", "--all"]] {
+        let output = h.run_cli(&argv);
+        assert!(!output.status.success(), "aoe {argv:?} must exit non-zero");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("aoe killall") && stderr.contains("aoe session stop"),
+            "aoe {argv:?} should redirect to killall and session stop, got:\n{stderr}"
+        );
+    }
+}
