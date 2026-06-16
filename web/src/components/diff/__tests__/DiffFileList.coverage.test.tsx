@@ -72,12 +72,33 @@ describe("DiffFileList state branches", () => {
     expect(screen.getByText("Loading files...")).toBeTruthy();
   });
 
-  it("shows the empty state and hides file count / toggle when there are no files", () => {
+  it("shows the empty state naming the base and hides file count / toggle when there are no files", () => {
     renderList();
-    expect(screen.getByText("No changes yet")).toBeTruthy();
+    // Single-repo empty state names the base (#2152) instead of a base-less line.
+    expect(screen.getByText(/No changes vs/)).toBeTruthy();
+    expect(screen.getByText("main")).toBeTruthy();
     // No file-count chip, totals, or view toggle without files.
     expect(screen.queryByTitle("Switch to tree view")).toBeNull();
     expect(screen.queryByTitle("Switch to flat list")).toBeNull();
+  });
+
+  it("lists every repo with its base in the multi-repo empty state (#2152)", () => {
+    // Multi-repo empty routes through MultiRepoGroups, which shows each
+    // member's header (name + "vs <base>") and a per-repo "no changes" note.
+    renderList({
+      files: [],
+      perRepoBases: [
+        { repo_name: "taskrunner", base_branch: "origin/develop" },
+        { repo_name: "MessageManager", base_branch: "origin/develop" },
+        { repo_name: "SmartCaller", base_branch: "origin/main" },
+      ],
+    });
+    expect(screen.getByText("taskrunner")).toBeTruthy();
+    expect(screen.getByText("MessageManager")).toBeTruthy();
+    expect(screen.getByText("SmartCaller")).toBeTruthy();
+    expect(screen.getAllByText("vs origin/develop")).toHaveLength(2);
+    expect(screen.getByText("vs origin/main")).toBeTruthy();
+    expect(screen.getAllByText("No changes in this repo.")).toHaveLength(3);
   });
 
   it("renders the warning banner when provided", () => {
@@ -229,7 +250,7 @@ describe("DiffFileList keyboard navigation", () => {
     const el = document.querySelector('[tabindex="0"]') as HTMLElement;
     // Should not throw.
     fireEvent.keyDown(el, { key: "ArrowDown" });
-    expect(screen.getByText("No changes yet")).toBeTruthy();
+    expect(screen.getByText(/No changes vs/)).toBeTruthy();
   });
 });
 

@@ -76,7 +76,15 @@ function Wrap({ children }: { children: ReactNode }) {
 // so bulk actions can share them, see #1724), so the row + hook are
 // exercised together here rather than the row owning the mutation. Returns
 // `null` while the workspace has no row to render.
-function Row({ ws, readOnly }: { ws: Workspace; readOnly?: boolean }) {
+function Row({
+  ws,
+  readOnly,
+  onCreateSession,
+}: {
+  ws: Workspace;
+  readOnly?: boolean;
+  onCreateSession?: (repoPath: string) => void;
+}) {
   const workspaces = useMemo(() => [ws], [ws]);
   const triage = useSidebarTriage(workspaces);
   return (
@@ -85,6 +93,7 @@ function Row({ ws, readOnly }: { ws: Workspace; readOnly?: boolean }) {
       isActive={false}
       isSelected={false}
       onActivate={() => {}}
+      onCreateSession={onCreateSession}
       readOnly={readOnly}
       optimistic={triage.optimisticFor(ws.id)}
       onPinToggle={triage.pinToggle}
@@ -451,5 +460,34 @@ describe("SessionRow triage actions", () => {
       window.removeEventListener(OPEN_SESSION_EVENT, onOpen);
       window.removeEventListener(OPEN_SWITCH_AGENT_EVENT, onSwitch);
     }
+  });
+
+  it("New Session click calls onCreateSession with the row's repo path", () => {
+    // main_repo_path wins over project_path, matching handleCreateSession's
+    // own project key (`main_repo_path || project_path`), so the wizard
+    // prefills from the right-clicked session's project (issue #2023).
+    const ws = workspace("w-new", [session({ id: "sess-new", project_path: "/p", main_repo_path: "/repos/work" })]);
+    const onCreateSession = vi.fn();
+    render(
+      <Wrap>
+        <Row ws={ws} onCreateSession={onCreateSession} />
+      </Wrap>,
+    );
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    fireEvent.click(screen.getByTestId("sidebar-context-menu-new-session"));
+    expect(onCreateSession).toHaveBeenCalledWith("/repos/work");
+    // It's a client-side wizard open, not a server mutation.
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("hides New Session in read-only mode", () => {
+    const ws = workspace("w-ro", [session({ id: "sess-ro", project_path: "/p" })]);
+    render(
+      <Wrap>
+        <Row ws={ws} readOnly onCreateSession={vi.fn()} />
+      </Wrap>,
+    );
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    expect(screen.queryByTestId("sidebar-context-menu-new-session")).toBeNull();
   });
 });

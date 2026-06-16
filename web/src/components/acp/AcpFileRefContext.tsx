@@ -6,13 +6,17 @@
 // Markdown.tsx consumes it. See #1718.
 
 import { createContext, useContext } from "react";
-import type { FileRef } from "../../lib/fileRef";
+import type { FileRef, FileRefSession } from "../../lib/fileRef";
 
 export interface AcpFileRefContextValue {
   /** Open a local file reference cited in the transcript. Absent when
    *  the structured view is rendered without a file-open target, in which case
    *  the anchor override leaves links as normal (new-tab) anchors. */
   onOpenFileRef?: (ref: FileRef) => void;
+  /** Repo roots for the active session, used to render tool-card file
+   *  paths repo-relative (strip the worktree prefix). Absent when no
+   *  session is mounted, in which case cards show the raw path. See #2143. */
+  fileRefSession?: FileRefSession | null;
 }
 
 export const AcpFileRefContext = createContext<AcpFileRefContextValue>({});

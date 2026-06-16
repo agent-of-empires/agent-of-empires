@@ -3480,6 +3480,21 @@ async fn acp_event_listener(state: Arc<AppState>) {
             });
         }
 
+        // Question push: an `AskUserQuestion` (ElicitationRequested) blocks
+        // the turn on the user just like an approval, so it gets the same
+        // dedicated, suppression-bypassing push instead of only the generic
+        // Waiting one. Same live-event-only path as the approval push above.
+        // See #2146.
+        if let crate::acp::state::Event::ElicitationRequested { elicitation } = frame.event.as_ref()
+        {
+            let state_for_push = state.clone();
+            let session_id = frame.session_id.clone();
+            let question = elicitation.message.clone();
+            tokio::spawn(async move {
+                acp_ws::trigger_question_push(&state_for_push, &session_id, &question).await;
+            });
+        }
+
         let status_intent = derive_acp_status(frame.event.as_ref());
         let acp_change = derive_acp_session_change(frame.event.as_ref());
         if status_intent.is_none() && acp_change.is_none() {

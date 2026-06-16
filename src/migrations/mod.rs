@@ -22,13 +22,14 @@ mod v011_relocate_sandbox_image;
 mod v012_acp_rename;
 mod v013_strip_profile_theme;
 mod v014_rename_default_theme;
+mod v015_rewrite_hook_strings;
 
 use anyhow::Result;
 use std::fs;
 use std::path::PathBuf;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 14;
+const CURRENT_VERSION: u32 = 15;
 const VERSION_FILE: &str = ".schema_version";
 
 struct Migration {
@@ -107,6 +108,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 14,
         name: "rename_default_theme",
         run: v014_rename_default_theme::run,
+    },
+    Migration {
+        version: 15,
+        name: "rewrite_hook_strings",
+        run: v015_rewrite_hook_strings::run,
     },
 ];
 

@@ -435,12 +435,13 @@ export function DiffFileList({
           <div className="flex items-center justify-center h-full text-text-dim">
             <span className="text-xs">Loading files...</span>
           </div>
-        ) : files.length === 0 ? (
-          <div className="flex items-center justify-center h-full text-text-dim">
-            <div className="text-center px-4">
-              <div className="font-mono text-xl text-surface-700 mb-1">0</div>
-              <p className="text-xs">No changes yet</p>
-            </div>
+        ) : files.length === 0 && !isMultiRepo ? (
+          // Single-repo empty: name the base so a clean tree reads as
+          // "checked, nothing to show" rather than a broken diff (#2152).
+          // Multi-repo empty falls through to MultiRepoGroups below, which
+          // already lists every member with its base and a per-repo note.
+          <div className="flex items-center justify-center h-full text-text-dim text-xs">
+            No changes vs <span className="font-mono ml-1">{singleBaseBranch}</span>
           </div>
         ) : isMultiRepo ? (
           <MultiRepoGroups

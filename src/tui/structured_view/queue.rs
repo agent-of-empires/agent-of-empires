@@ -34,6 +34,27 @@ impl PromptQueue {
         self.items.push(text);
     }
 
+    /// Borrow the queued entry at `index` (0 = oldest / front), or `None`
+    /// when out of range. Used by the composer's ArrowUp/ArrowDown recall
+    /// to load a queued prompt back for editing.
+    pub fn get(&self, index: usize) -> Option<&String> {
+        self.items.get(index)
+    }
+
+    /// Replace the entry at `index` in place, preserving its queue
+    /// position. Returns `false` when the index is out of range, e.g. the
+    /// browsed entry drained between recall and submit; the caller then
+    /// treats the edited text as a fresh prompt.
+    pub fn replace(&mut self, index: usize, text: String) -> bool {
+        match self.items.get_mut(index) {
+            Some(slot) => {
+                *slot = text;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Drop the whole queue (the user hit the clear-queue hotkey).
     pub fn clear(&mut self) {
         self.items.clear();
@@ -189,5 +210,29 @@ mod tests {
         let mut q = queue(&["x", "y"]);
         q.clear();
         assert!(q.is_empty());
+    }
+
+    #[test]
+    fn get_borrows_by_index_or_none() {
+        let q = queue(&["a", "b"]);
+        assert_eq!(q.get(0).map(String::as_str), Some("a"));
+        assert_eq!(q.get(1).map(String::as_str), Some("b"));
+        assert_eq!(q.get(2), None);
+    }
+
+    #[test]
+    fn replace_edits_in_place_and_reports_hit() {
+        let mut q = queue(&["a", "b", "c"]);
+        assert!(q.replace(1, "B".to_string()));
+        let items: Vec<&String> = q.iter().collect();
+        assert_eq!(items, vec!["a", "B", "c"]);
+    }
+
+    #[test]
+    fn replace_out_of_range_is_a_miss() {
+        let mut q = queue(&["only"]);
+        assert!(!q.replace(3, "x".to_string()));
+        let items: Vec<&String> = q.iter().collect();
+        assert_eq!(items, vec!["only"]);
     }
 }

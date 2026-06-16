@@ -23,6 +23,7 @@ import {
   Pencil,
   Pin,
   Play,
+  Plus,
 } from "lucide-react";
 import {
   DndContext,
@@ -396,6 +397,7 @@ function SortableSessionRow({
   onDelete?: (workspaceId: string) => void;
   onStop?: (workspaceId: string) => void;
   onStart?: (workspaceId: string) => void;
+  onCreateSession?: (repoPath: string) => void;
   readOnly?: boolean;
   dragDisabled?: boolean;
   optimistic: OptimisticTriage;
@@ -515,6 +517,7 @@ export const SessionRow = memo(function SessionRow({
   onDelete,
   onStop,
   onStart,
+  onCreateSession,
   readOnly,
   indented,
   optimistic,
@@ -533,6 +536,9 @@ export const SessionRow = memo(function SessionRow({
   onDelete?: (workspaceId: string) => void;
   onStop?: (workspaceId: string) => void;
   onStart?: (workspaceId: string) => void;
+  // Open the session wizard prefilled from this row's project (path, agent,
+  // and the latest session's options), mirroring the per-project "+" button.
+  onCreateSession?: (repoPath: string) => void;
   readOnly?: boolean;
   indented?: boolean;
   // Optimistic triage overlay for this row plus the parent-owned mutation
@@ -554,6 +560,9 @@ export const SessionRow = memo(function SessionRow({
     idleDecayWindowMs,
   );
   const firstSession = workspace.sessions[0];
+  // Repo path used to prefill a "New Session" launched from this row, matching
+  // the per-project "+" button (handleCreateSession keys off this same path).
+  const newSessionRepoPath = firstSession?.main_repo_path || firstSession?.project_path || null;
   // The structured view session backing this row, if any. Drives the "Switch
   // agent" context-menu item, which only makes sense for an ACP structured view
   // session (tmux rows have no agent to hand off). Multi-session rows are
@@ -1024,6 +1033,19 @@ export const SessionRow = memo(function SessionRow({
               maxHeight: "calc(100vh - 16px)",
             }}
           >
+            {!readOnly && onCreateSession && newSessionRepoPath && (
+              <button
+                onClick={() => {
+                  setContextMenu(null);
+                  onCreateSession(newSessionRepoPath);
+                }}
+                data-testid="sidebar-context-menu-new-session"
+                className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+              >
+                <Plus className="h-3.5 w-3.5 shrink-0" />
+                New Session
+              </button>
+            )}
             <button
               onClick={startRename}
               data-testid="sidebar-context-menu-rename"
@@ -2498,6 +2520,7 @@ export function WorkspaceSidebar({
                                     onDelete={onDeleteSession}
                                     onStop={onStopSession}
                                     onStart={onStartSession}
+                                    onCreateSession={onCreateSession}
                                     readOnly={readOnly}
                                     optimistic={triage.optimisticFor(v.workspace.id)}
                                     onPinToggle={triage.pinToggle}

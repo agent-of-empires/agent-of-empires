@@ -306,12 +306,6 @@ pub async fn trigger_approval_push(
     approval_title: &str,
     destructive: bool,
 ) {
-    let Some(push) = state.push.as_ref() else {
-        return;
-    };
-    if !state.push_enabled {
-        return;
-    }
     let badge = if destructive {
         "DESTRUCTIVE"
     } else {
@@ -323,8 +317,53 @@ pub async fn trigger_approval_push(
     } else {
         approval_title.to_string()
     };
-    let path = format!("/sessions/{session_id}/acp");
     let tag = format!("acp-approval-{session_id}");
+    send_acp_attention_push(state, session_id, title, body, tag).await;
+}
+
+/// Push-notification trigger for "agent asked you a question." Called by
+/// the worker supervisor when it observes an `ElicitationRequested`
+/// (`AskUserQuestion`) structured view event. A question blocks the turn
+/// on the user exactly like an approval, so it gets the same dedicated,
+/// suppression-bypassing push rather than only the generic Waiting one.
+/// See #2146.
+pub async fn trigger_question_push(state: &AppState, session_id: &str, question: &str) {
+    let title = format!("{} has a question", session_id);
+    let tag = format!("acp-question-{session_id}");
+    send_acp_attention_push(state, session_id, title, push_body_snippet(question), tag).await;
+}
+
+/// Question text can be long and lands on a lock screen, so collapse
+/// whitespace and cap it before it goes into a push payload.
+fn push_body_snippet(s: &str) -> String {
+    const MAX: usize = 120;
+    let compact = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() > MAX {
+        format!("{}…", compact.chars().take(MAX).collect::<String>())
+    } else {
+        compact
+    }
+}
+
+/// Shared sender for the dedicated ACP "needs your attention" pushes
+/// (approval and question). Snapshots subscribers and sends one encrypted
+/// payload each, deep-linking to the session's structured view. Bypasses
+/// the status-push active-session suppression on purpose: these are
+/// precise, turn-blocking events, not the coarse Waiting heuristic.
+async fn send_acp_attention_push(
+    state: &AppState,
+    session_id: &str,
+    title: String,
+    body: String,
+    tag: String,
+) {
+    let Some(push) = state.push.as_ref() else {
+        return;
+    };
+    if !state.push_enabled {
+        return;
+    }
+    let path = format!("/sessions/{session_id}/acp");
     let subs = push.store.snapshot().await;
     if subs.is_empty() {
         return;
@@ -383,6 +422,21 @@ pub async fn trigger_approval_push(
 #[cfg(all(test, feature = "serve"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn push_body_snippet_collapses_whitespace_and_caps_length() {
+        // Short text passes through with whitespace collapsed.
+        assert_eq!(
+            push_body_snippet("Which   env?\n staging\tor prod"),
+            "Which env? staging or prod"
+        );
+        // Long text is truncated and gets an ellipsis. The cap counts
+        // chars, not bytes, so the result is at most MAX + the ellipsis.
+        let long = "word ".repeat(100);
+        let snippet = push_body_snippet(&long);
+        assert!(snippet.ends_with('…'));
+        assert_eq!(snippet.chars().count(), 120 + 1);
+    }
 
     #[tokio::test]
     async fn publish_with_no_receivers_does_not_panic() {

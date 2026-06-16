@@ -32,10 +32,20 @@ vi.mock("../../hooks/useShikiTheme", () => ({
 
 import { ToolCard, TodoGroupCard } from "./ToolCards";
 import { AgentProfileProvider } from "../../lib/agentProfileContext";
+import { AcpFileRefContext } from "./AcpFileRefContext";
+import type { FileRefSession } from "../../lib/fileRef";
 import { fixtures, makeCompletion, makeError, makeStopped, makeToolCall } from "./__fixtures__/toolCalls";
 
 function Wrap({ toolKey, children }: { toolKey?: string; children: ReactNode }) {
   return <AgentProfileProvider toolKey={toolKey ?? null}>{children}</AgentProfileProvider>;
+}
+
+function WrapWithSession({ session, children }: { session: FileRefSession | null; children: ReactNode }) {
+  return (
+    <AcpFileRefContext.Provider value={{ fileRefSession: session }}>
+      <AgentProfileProvider toolKey={null}>{children}</AgentProfileProvider>
+    </AcpFileRefContext.Provider>
+  );
 }
 
 afterEach(() => {
@@ -231,6 +241,99 @@ describe("ToolCards profile-gated dispatch (claude)", () => {
       </Wrap>,
     );
     expect(container.textContent).toContain("checking deploy");
+  });
+
+  it("routes ToolSearch to the harness card under the claude profile", () => {
+    const { container } = render(
+      <Wrap toolKey="claude">
+        <ToolCard tool={fixtures.toolSearch} result={undefined} />
+      </Wrap>,
+    );
+    expect(container.textContent).toContain("tool search");
+    expect(container.textContent).toContain("select:Read,Edit");
+  });
+
+  it("routes Monitor to the harness card under the claude profile", () => {
+    const { container } = render(
+      <Wrap toolKey="claude">
+        <ToolCard tool={fixtures.monitor} result={undefined} />
+      </Wrap>,
+    );
+    expect(container.textContent).toContain("monitor");
+    expect(container.textContent).toContain("errors in deploy.log");
+    expect(container.textContent).toContain("persistent");
+  });
+
+  it("routes TaskStop to the harness card under the claude profile", () => {
+    const { container } = render(
+      <Wrap toolKey="claude">
+        <ToolCard tool={fixtures.taskStop} result={undefined} />
+      </Wrap>,
+    );
+    expect(container.textContent).toContain("task stop");
+    expect(container.textContent).toContain("task-abc123");
+  });
+});
+
+describe("ToolCards harness-tool gating (non-claude)", () => {
+  it("does not fire the harness card for a coincidental Monitor name under codex", () => {
+    const { container } = render(
+      <Wrap toolKey="codex">
+        <ToolCard tool={fixtures.monitor} result={undefined} />
+      </Wrap>,
+    );
+    // Generic fallback: header shows the raw name + "other" kind, and the
+    // collapsed body keeps the description (`errors in deploy.log`) out of
+    // the DOM. The harness card would have surfaced it in the header.
+    expect(container.textContent).toContain("Monitor");
+    expect(container.textContent).not.toContain("errors in deploy.log");
+  });
+});
+
+describe("ToolCards harness-tool details", () => {
+  it("shows a timeout chip and the expanded body for a non-persistent Monitor", () => {
+    const tool = makeToolCall({
+      id: "monitor-timeout",
+      name: "Monitor",
+      kind: "other",
+      args_preview: JSON.stringify({
+        description: "watch the build",
+        command: "npm run build",
+        timeout_ms: 90000,
+      }),
+    });
+    const { container } = render(
+      <Wrap toolKey="claude">
+        <ToolCard
+          tool={tool}
+          result={makeCompletion({ id: "m-done", toolCallId: "monitor-timeout", text: "build ok" })}
+        />
+      </Wrap>,
+    );
+    // timeout_ms 90000 -> formatted as "1m 30s" in the header chip.
+    expect(container.textContent).toContain("1m 30s");
+    fireEvent.click(container.querySelector("button")!);
+    expect(container.textContent).toContain("npm run build");
+    expect(container.textContent).toContain("build ok");
+  });
+
+  it("falls back to default primaries when harness args are empty", () => {
+    for (const [name, expected] of [
+      ["ToolSearch", "search tools"],
+      ["Monitor", "background watch"],
+      ["TaskStop", "stop task"],
+    ] as const) {
+      const { container } = render(
+        <Wrap toolKey="claude">
+          <ToolCard
+            tool={makeToolCall({ id: `empty-${name}`, name, kind: "other", args_preview: "{}" })}
+            result={undefined}
+          />
+        </Wrap>,
+      );
+      expect(container.textContent).toContain(expected);
+      cleanup();
+    }
   });
 });
 
@@ -430,7 +533,7 @@ describe("ToolCards memory_recall (claude-agent-acp v0.37.0)", () => {
     expect(list.textContent).toContain("feedback_no_em_dashes.md");
   });
 
-  it("renders synthesize mode with the synthesized text body after expansion", () => {
+  it("renders synthesize mode as markdown with the system-reminder envelope and line numbers stripped", () => {
     const { container, getByRole, getByTestId } = render(
       <Wrap toolKey="claude">
         <ToolCard tool={fixtures.memoryRecallSynthesize} result={undefined} />
@@ -440,7 +543,39 @@ describe("ToolCards memory_recall (claude-agent-acp v0.37.0)", () => {
     expect(container.textContent).toContain("Synthesised memory");
     fireEvent.click(getByRole("button"));
     const body = getByTestId("memory-recall-synthesized");
+    // Body content survives.
     expect(body.textContent).toContain("User is a senior engineer working on agent-of-empires.");
+    expect(body.textContent).toContain("prefers terse output");
+    // Transport noise is gone: no envelope tag text, no cat -n line numbers.
+    expect(body.textContent).not.toContain("system-reminder");
+    expect(body.textContent).not.toMatch(/^\s*\d+\t/m);
+    // Markdown rendered to elements, not raw source.
+    expect(body.querySelector("h1")?.textContent).toBe("User profile");
+    expect(body.querySelectorAll("li").length).toBe(2);
+  });
+
+  it("sanitizes dangerous HTML in synthesized memory before rendering", () => {
+    const tool = makeToolCall({
+      id: "mem-xss",
+      name: "Recalled synthesized memory",
+      kind: "read",
+      args_preview: "{}",
+      memory_recall: {
+        mode: "synthesize",
+        synthesized_text: 'Hi <img src=x onerror="alert(1)"> <a href="javascript:alert(2)">link</a>',
+      },
+    });
+    const { getByRole, getByTestId } = render(
+      <Wrap toolKey="claude">
+        <ToolCard tool={tool} result={undefined} />
+      </Wrap>,
+    );
+    fireEvent.click(getByRole("button"));
+    const body = getByTestId("memory-recall-synthesized");
+    // DOMPurify strips the event handler and the javascript: URL.
+    expect(body.querySelector("img")?.getAttribute("onerror")).toBeNull();
+    expect(body.innerHTML).not.toContain("onerror");
+    expect(body.innerHTML).not.toContain("javascript:");
   });
 });
 
@@ -696,5 +831,142 @@ describe("ToolCards failed-card folding (#1467)", () => {
     expect(container.textContent).not.toContain("hello world");
     fireEvent.click(getByRole("button"));
     expect(container.textContent).toContain("hello world");
+  });
+});
+
+describe("ToolCards repo-relative paths (#2143)", () => {
+  const session: FileRefSession = {
+    project_path: "/tmp",
+    main_repo_path: null,
+    workspace_repos: [],
+  };
+
+  it("renders an edit path repo-relative when it sits under the session root", () => {
+    const { container } = render(
+      <WrapWithSession session={session}>
+        <ToolCard tool={fixtures.edit} result={undefined} />
+      </WrapWithSession>,
+    );
+    expect(container.textContent).toContain("main.rs");
+    expect(container.textContent).not.toContain("/tmp/main.rs");
+  });
+
+  it("renders a read path repo-relative under the session root", () => {
+    const { container } = render(
+      <WrapWithSession session={session}>
+        <ToolCard tool={fixtures.read} result={undefined} />
+      </WrapWithSession>,
+    );
+    expect(container.textContent).toContain("main.rs");
+    expect(container.textContent).not.toContain("/tmp/main.rs");
+  });
+
+  it("prefixes the repo name in a multi-repo workspace", () => {
+    const multi: FileRefSession = {
+      project_path: "/tmp/ws",
+      main_repo_path: null,
+      workspace_repos: [{ name: "api", source_path: "/tmp/api" }],
+    };
+    const tool = makeToolCall({
+      id: "edit-multi-repo",
+      kind: "edit",
+      args_preview: JSON.stringify({ file_path: "/tmp/api/src/h.ts", old_string: "a", new_string: "b" }),
+    });
+    const { container } = render(
+      <WrapWithSession session={multi}>
+        <ToolCard tool={tool} result={undefined} />
+      </WrapWithSession>,
+    );
+    expect(container.textContent).toContain("api/src/h.ts");
+    // The visible label must not be the absolute path; the absolute form
+    // only survives in the title tooltip (an attribute, not textContent).
+    expect(container.textContent).not.toContain("/tmp/api/src/h.ts");
+  });
+
+  it("falls back to the absolute path when outside every known root", () => {
+    const tool = makeToolCall({
+      id: "edit-outside",
+      kind: "edit",
+      args_preview: JSON.stringify({ file_path: "/etc/hosts", old_string: "a", new_string: "b" }),
+    });
+    const { container } = render(
+      <WrapWithSession session={session}>
+        <ToolCard tool={tool} result={undefined} />
+      </WrapWithSession>,
+    );
+    expect(container.textContent).toContain("/etc/hosts");
+  });
+
+  it("renders a delete path repo-relative under the session root", () => {
+    const { container } = render(
+      <WrapWithSession session={session}>
+        <ToolCard tool={fixtures.del} result={undefined} />
+      </WrapWithSession>,
+    );
+    expect(container.textContent).toContain("delete");
+    expect(container.textContent).toContain("gone.rs");
+    expect(container.textContent).not.toContain("/tmp/gone.rs");
+  });
+
+  it("renders a write path repo-relative under the session root", () => {
+    const { container } = render(
+      <WrapWithSession session={session}>
+        <ToolCard tool={fixtures.write} result={undefined} />
+      </WrapWithSession>,
+    );
+    expect(container.textContent).toContain("new.rs");
+    expect(container.textContent).not.toContain("/tmp/new.rs");
+  });
+
+  it("renders a multi-file edit with each diff header repo-relative", () => {
+    const tool = makeToolCall({
+      id: "edit-multi-file",
+      name: "apply_patch",
+      kind: "edit",
+      args_preview: "{}",
+      diffs: [
+        { path: "/tmp/src/alpha.rs", old_text: "a", new_text: "b", created_at: "2026-05-21T00:00:00Z" },
+        { path: "/tmp/src/beta.rs", old_text: null, new_text: "c", created_at: "2026-05-21T00:00:00Z" },
+      ],
+    });
+    const { container, getByRole } = render(
+      <WrapWithSession session={session}>
+        <ToolCard tool={tool} result={undefined} />
+      </WrapWithSession>,
+    );
+    // Collapsed: primary shows the first path relative + "+N more".
+    expect(container.textContent).toContain("src/alpha.rs");
+    expect(container.textContent).toContain("+1 more");
+    expect(container.textContent).not.toContain("/tmp/src/alpha.rs");
+    // Expanded: each per-file diff header renders its path relative too.
+    fireEvent.click(getByRole("button"));
+    expect(container.textContent).toContain("src/beta.rs");
+    expect(container.textContent).not.toContain("/tmp/src/beta.rs");
+  });
+
+  it.each([
+    ["read", "read"],
+    ["edit", "write"],
+    ["delete", "delete"],
+  ])("falls back to (unknown file) for a path-less %s tool", (kind, label) => {
+    const tool = makeToolCall({ id: `${kind}-no-path`, name: "", kind, args_preview: "{}" });
+    const { container } = render(
+      <WrapWithSession session={session}>
+        <ToolCard tool={tool} result={undefined} />
+      </WrapWithSession>,
+    );
+    expect(container.textContent).toContain(label);
+    expect(container.textContent).toContain("(unknown file)");
+  });
+
+  it("keeps the absolute path in the title tooltip while showing the relative label", () => {
+    const { container } = render(
+      <WrapWithSession session={session}>
+        <ToolCard tool={fixtures.edit} result={undefined} />
+      </WrapWithSession>,
+    );
+    const titled = container.querySelector('[title="/tmp/main.rs"]');
+    expect(titled).not.toBeNull();
+    expect(titled!.textContent).toContain("main.rs");
   });
 });

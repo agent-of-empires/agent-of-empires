@@ -1060,6 +1060,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
                       archivedAt={activeSession.archived_at ?? null}
                       snoozedUntil={activeSession.snoozed_until ?? null}
                       onOpenFileRef={handleOpenFileRef}
+                      fileRefSession={activeSession}
                     />
                   </Suspense>
                 ) : (

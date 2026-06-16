@@ -942,6 +942,22 @@
       ]
     },
     {
+      "id": "acp.history-window",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/acp-history-window.spec.ts",
+        "src/lib/acpHistoryWindow.test.ts",
+        "src/hooks/__tests__/useHistoryWindow.test.tsx"
+      ],
+      "components": [
+        "web/src/lib/acpHistoryWindow.ts",
+        "web/src/hooks/useHistoryWindow.ts",
+        "web/src/components/acp/AcpRuntime.tsx",
+        "web/src/components/acp/StructuredView.tsx"
+      ]
+    },
+    {
       "id": "diff-comments.storage-cleanup",
       "kind": "vitest",
       "risk": "medium",
@@ -1066,6 +1082,19 @@
       ]
     },
     {
+      "id": "acp.memory-recall",
+      "kind": "live-playwright",
+      "risk": "medium",
+      "specs": ["tests/live/acp-memory-recall.spec.ts", "tests/acp-memory-recall.spec.ts"],
+      "components": [
+        "web/src/components/acp/ToolCards.tsx",
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/components/acp/AcpRuntime.tsx",
+        "web/src/lib/memoryClassify.ts",
+        "web/src/lib/memoryRecall.ts"
+      ]
+    },
+    {
       "id": "acp.attachments",
       "kind": "live-playwright",
       "risk": "high",
@@ -1089,6 +1118,13 @@
       "risk": "high",
       "specs": ["src/hooks/__tests__/useAcpResolveApproval.test.ts"],
       "components": ["web/src/hooks/useAcpSession.ts"]
+    },
+    {
+      "id": "acp.attention-chime",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/acp/__tests__/AttentionChime.test.tsx"],
+      "components": ["web/src/components/acp/AttentionChime.tsx", "web/src/components/acp/StructuredView.tsx"]
     },
     {
       "id": "acp.elicitation-card",
@@ -1150,6 +1186,18 @@
         "src/components/acp/__tests__/StructuredViewRoot.test.tsx"
       ],
       "components": ["web/src/components/acp/StructuredView.tsx"]
+    },
+    {
+      "id": "acp.composer-queue-recall",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/acp-composer-recall.spec.ts",
+        "src/components/acp/recallNav.test.ts",
+        "src/components/acp/Composer.recall.test.ts",
+        "src/components/acp/Composer.recall.dom.test.tsx"
+      ],
+      "components": ["web/src/components/acp/Composer.tsx", "web/src/components/acp/recallNav.ts"]
     },
     {
       "id": "acp.config-pickers",
@@ -1804,6 +1852,13 @@
       "components": ["web/src/components/diff/DiffFileList.tsx"]
     },
     {
+      "id": "story.diff-empty-state",
+      "kind": "mocked-playwright",
+      "risk": "low",
+      "specs": ["tests/diff-empty-state.spec.ts", "src/components/diff/__tests__/DiffFileList.coverage.test.tsx"],
+      "components": ["web/src/components/diff/DiffFileList.tsx"]
+    },
+    {
       "id": "story.delete-session-with-worktree",
       "kind": "vitest",
       "risk": "high",
@@ -1956,6 +2011,13 @@
       "risk": "medium",
       "specs": ["tests/live/acp-stories/queue-delete-message.spec.ts"],
       "components": ["web/src/components/acp/StructuredView.tsx"]
+    },
+    {
+      "id": "acp.story.queue-recall-arrow",
+      "kind": "live-playwright",
+      "risk": "medium",
+      "specs": ["tests/live/acp-stories/queue-recall-arrow.spec.ts"],
+      "components": ["web/src/components/acp/Composer.tsx", "web/src/components/acp/StructuredView.tsx"]
     },
     {
       "id": "acp.story.composer-toolbar-insert",
@@ -2196,6 +2258,13 @@
     },
     {
       "id": "triage.session-row-chips",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/__tests__/SessionRowTriage.test.tsx"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
+      "id": "sidebar.session-new-session",
       "kind": "vitest",
       "risk": "medium",
       "specs": ["src/components/__tests__/SessionRowTriage.test.tsx"],

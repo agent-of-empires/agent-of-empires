@@ -18,6 +18,7 @@ import {
   type SetStateAction,
 } from "react";
 import {
+  Activity,
   Brain,
   Calendar,
   CalendarPlus,
@@ -37,6 +38,7 @@ import {
   Plug,
   Search,
   Sparkles,
+  Square,
   Terminal,
   Trash2,
 } from "lucide-react";
@@ -51,9 +53,13 @@ import { diffPair } from "../../lib/diffPair";
 import { StringDiff } from "../diff/StringDiff";
 import { ToolErrorBody } from "./ToolErrorBody";
 import { classifyMcp, humanizeServer, humanizeVerb } from "../../lib/mcpClassify";
-import { classifyMemory, parseMemoryFrontmatter, type MemoryHit } from "../../lib/memoryClassify";
+import { cleanRecalledMemory, classifyMemory, parseMemoryFrontmatter, type MemoryHit } from "../../lib/memoryClassify";
+import DOMPurify from "dompurify";
+import { marked } from "marked";
 import { reclassifyBash } from "../../lib/toolReclassify";
 import { useAgentProfile } from "../../lib/agentProfileContext";
+import { useAcpFileRef } from "./AcpFileRefContext";
+import { relativeDisplayPath } from "../../lib/fileRef";
 import { useToolDisplayMode, type ToolDensity } from "./ToolDisplayMode";
 import type { AgentProfile, CardKind } from "../../lib/agentProfiles";
 
@@ -274,6 +280,10 @@ function renderToolCard(tool: ToolCall, result: ActivityRow | undefined, profile
     if (schedule.kind) {
       return <ScheduleToolCard tool={tool} result={result} kind={schedule.kind} />;
     }
+  }
+  const harness = classifyHarnessTool(tool, profile);
+  if (harness.kind) {
+    return <HarnessToolCard tool={tool} result={result} kind={harness.kind} />;
   }
   const { kind, provenance } = reclassifyBash(tool);
   const effectiveKind = resolveEffectiveKind(tool, kind, profile);
@@ -778,10 +788,12 @@ function ExecuteToolCard({ tool, result }: Props) {
 
 function ReadToolCard({ tool, result }: Props) {
   const status = statusFor(result);
+  const { fileRefSession } = useAcpFileRef();
   const args = parseJsonObject(tool.args_preview);
   const argPath = pickStr(args, "path", "file_path", "filePath", "filename");
   const title = pickStr(args, "_aoe_title");
-  const path = pickFirst(argPath, title, tool.name) ?? "(unknown file)";
+  const rawPath = pickFirst(argPath, title, tool.name) ?? "(unknown file)";
+  const path = relativeDisplayPath(rawPath, fileRefSession);
   const range = formatRange(args);
   const ext = argPath?.match(/\.([a-z0-9]+)$/i)?.[1]?.toLowerCase();
   const content = result?.text ?? "";
@@ -798,7 +810,7 @@ function ReadToolCard({ tool, result }: Props) {
       endedAt={result?.at}
       icon={<FileText className="h-3.5 w-3.5" />}
       label="read"
-      primary={path}
+      primary={<span title={rawPath}>{path}</span>}
       meta={
         <>
           {range && <span className="text-[11px] text-text-dim">{range}</span>}
@@ -830,6 +842,7 @@ function formatRange(args: Record<string, unknown> | null): string | null {
 
 function EditToolCard({ tool, result }: Props) {
   const status = statusFor(result);
+  const { fileRefSession } = useAcpFileRef();
   const args = parseJsonObject(tool.args_preview);
   const argPath = pickStr(args, "path", "file_path", "filePath", "filename");
   const title = pickStr(args, "_aoe_title");
@@ -841,7 +854,8 @@ function EditToolCard({ tool, result }: Props) {
   const legacyOld = pickStr(args, "old_string", "oldString", "old_str") ?? "";
   const legacyNew = pickStr(args, "new_string", "newString", "new_str", "content") ?? "";
   const hasLegacyDiff = legacyOld !== "" || legacyNew !== "";
-  const path = pickFirst(structuredDiffs[0]?.path, argPath, title, tool.name) ?? "(unknown file)";
+  const rawPath = pickFirst(structuredDiffs[0]?.path, argPath, title, tool.name) ?? "(unknown file)";
+  const path = relativeDisplayPath(rawPath, fileRefSession);
   const [open, setOpen] = useToolCardExpansion(status);
   const hasDiff = hasStructuredDiffs || hasLegacyDiff;
   // "edit" when a prior version existed, "write" for a fresh file.
@@ -879,7 +893,7 @@ function EditToolCard({ tool, result }: Props) {
       endedAt={result?.at}
       icon={<Pencil className="h-3.5 w-3.5" />}
       label={verb}
-      primary={multiFile ? `${path} +${structuredDiffs.length - 1} more` : path}
+      primary={<span title={rawPath}>{multiFile ? `${path} +${structuredDiffs.length - 1} more` : path}</span>}
       meta={errorChip ? undefined : meta}
       expanded={open}
       onToggle={status === "err" || hasDiff ? () => setOpen((v) => !v) : undefined}
@@ -889,7 +903,11 @@ function EditToolCard({ tool, result }: Props) {
             <div className="border-t border-surface-800 bg-surface-950">
               {structuredDiffs.map((d, i) => (
                 <div key={`${d.path}-${i}`}>
-                  {multiFile && <div className="px-2 py-1 text-[11px] text-text-dim">{d.path}</div>}
+                  {multiFile && (
+                    <div className="px-2 py-1 text-[11px] text-text-dim" title={d.path}>
+                      {relativeDisplayPath(d.path, fileRefSession)}
+                    </div>
+                  )}
                   <StringDiff oldText={d.old_text ?? ""} newText={d.new_text ?? ""} filePath={d.path} />
                 </div>
               ))}
@@ -911,10 +929,12 @@ function EditToolCard({ tool, result }: Props) {
 
 function DeleteToolCard({ tool, result }: Props) {
   const status = statusFor(result);
+  const { fileRefSession } = useAcpFileRef();
   const args = parseJsonObject(tool.args_preview);
   const argPath = pickStr(args, "path", "file_path", "filePath", "filename");
   const title = pickStr(args, "_aoe_title");
-  const path = pickFirst(argPath, title, tool.name) ?? "(unknown file)";
+  const rawPath = pickFirst(argPath, title, tool.name) ?? "(unknown file)";
+  const path = relativeDisplayPath(rawPath, fileRefSession);
   const [open, setOpen] = useToolCardExpansion(status);
   return (
     <CardChrome
@@ -923,7 +943,7 @@ function DeleteToolCard({ tool, result }: Props) {
       endedAt={result?.at}
       icon={<Trash2 className="h-3.5 w-3.5 text-rose-400" />}
       label="delete"
-      primary={path}
+      primary={<span title={rawPath}>{path}</span>}
       expanded={open}
       onToggle={status === "err" ? () => setOpen((v) => !v) : undefined}
       body={
@@ -1711,8 +1731,17 @@ function MemoryRecallCard({ tool, result }: Props) {
     return <GenericToolCard tool={tool} result={result} />;
   }
   const paths = recall.paths ?? [];
-  const synthesized = recall.synthesized_text ?? "";
+  const synthesized = cleanRecalledMemory(recall.synthesized_text ?? "");
   const isSynthesize = recall.mode === "synthesize";
+  // Render the cleaned memory body as markdown. We use `marked` rather
+  // than the structured-view `<Markdown>` component because that one
+  // requires the assistant-ui runtime provider (it throws "requires an
+  // AuiProvider" outside the transcript), the same reason CommentMarkdown
+  // exists. The `.acp-markdown` class reuses the panel's prose styling.
+  // `marked` does not sanitize HTML, so the parsed output is run through
+  // DOMPurify before it reaches dangerouslySetInnerHTML; the recalled
+  // text is agent-surfaced and could carry an injected payload.
+  const synthesizedHtml = isSynthesize ? DOMPurify.sanitize(marked.parse(synthesized, { async: false }) as string) : "";
 
   const primary = isSynthesize ? (
     <span>Synthesised memory</span>
@@ -1742,12 +1771,11 @@ function MemoryRecallCard({ tool, result }: Props) {
           {status !== "err" && hasBody ? (
             <div className="border-t border-surface-800 bg-surface-950 px-3 py-2">
               {isSynthesize ? (
-                <pre
+                <div
                   data-testid="memory-recall-synthesized"
-                  className="whitespace-pre-wrap break-words text-[11px] text-text-secondary"
-                >
-                  {synthesized}
-                </pre>
+                  className="acp-markdown break-words text-[11px] text-text-secondary"
+                  dangerouslySetInnerHTML={{ __html: synthesizedHtml }}
+                />
               ) : (
                 <ul data-testid="memory-recall-paths" className="space-y-0.5 text-[11px] text-text-secondary">
                   {paths.map((p) => (
@@ -1910,6 +1938,143 @@ function ScheduleToolCard({ tool, result, kind }: ScheduleProps) {
     icon = <CalendarX className="h-3.5 w-3.5" />;
     label = "cron schedule deleted";
     primary = id ? <span className="font-mono">{id}</span> : "deleted";
+  }
+
+  const hasBody = hasRawInput || Boolean(output) || status === "err";
+
+  return (
+    <CardChrome
+      status={status}
+      icon={icon}
+      label={label}
+      primary={primary}
+      meta={meta}
+      expanded={open}
+      onToggle={status === "err" || hasBody ? () => setOpen((v) => !v) : undefined}
+      startedAt={tool.started_at}
+      endedAt={result?.at}
+      body={
+        <ToolErrorBody status={status} errorText={result?.text}>
+          {hasRawInput && (
+            <div className="border-t border-surface-800 bg-surface-950 px-3 py-2">
+              <div className="mb-1 flex items-center justify-between text-[10px] uppercase tracking-wider text-text-dim">
+                <span>input</span>
+                <CopyButton text={inputJson} />
+              </div>
+              <pre className="overflow-x-auto font-mono text-[11px] text-text-muted whitespace-pre-wrap break-all">
+                {inputJson}
+              </pre>
+            </div>
+          )}
+          {output && status !== "err" && (
+            <div className="border-t border-surface-800 bg-surface-950 px-3 py-2">
+              <div className="mb-1 flex items-center justify-between text-[10px] uppercase tracking-wider text-text-dim">
+                <span>output</span>
+                <CopyButton text={output} />
+              </div>
+              <pre className="overflow-x-auto font-mono text-[11px] text-text-secondary whitespace-pre-wrap break-all">
+                {output}
+              </pre>
+            </div>
+          )}
+        </ToolErrorBody>
+      }
+    />
+  );
+}
+
+/* ── harness tools (ToolSearch / Monitor / TaskStop) ─────────────── */
+
+/** Classify Claude's agent-runtime harness tools by their well-known
+ *  names. Like the schedule family, claude-agent-acp routes them through
+ *  the generic `Other` arm with no structured kind, so we name-match
+ *  against the profile's `harnessNames` allowlist (empty for non-Claude
+ *  agents, so a coincidental `Monitor` tool elsewhere stays generic).
+ *  See #2139.
+ *
+ *  - `"tool_search"`: ToolSearch ({ query, max_results })
+ *  - `"monitor"`: Monitor ({ description, command, timeout_ms, persistent })
+ *  - `"task_stop"`: TaskStop ({ task_id })
+ */
+function classifyHarnessTool(
+  tool: ToolCall,
+  profile: AgentProfile,
+): { kind: "tool_search" | "monitor" | "task_stop" | null } {
+  if (tool.kind !== "other") return { kind: null };
+  const args = parseJsonObject(tool.args_preview);
+  const title = (pickStr(args, "_aoe_title") ?? tool.name ?? "").trim();
+  if (!profile.specialTitles.harnessNames.includes(title)) return { kind: null };
+  switch (title) {
+    case "ToolSearch":
+      return { kind: "tool_search" };
+    case "Monitor":
+      return { kind: "monitor" };
+    case "TaskStop":
+      return { kind: "task_stop" };
+    default:
+      return { kind: null };
+  }
+}
+
+interface HarnessProps extends Props {
+  kind: "tool_search" | "monitor" | "task_stop";
+}
+
+function HarnessToolCard({ tool, result, kind }: HarnessProps) {
+  const status = statusFor(result);
+  const [open, setOpen] = useToolCardExpansion(status);
+  const args = useMemo(() => parseJsonObject(tool.args_preview), [tool.args_preview]);
+  const output = result?.text ?? "";
+
+  const inputJson = useMemo<string>(() => {
+    if (!args) return tool.args_preview;
+    const rest: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(args)) {
+      if (isAcpBookkeepingKey(k)) continue;
+      rest[k] = v;
+    }
+    return JSON.stringify(rest, null, 2);
+  }, [args, tool.args_preview]);
+
+  const hasRawInput = useMemo(() => {
+    if (!args) return Boolean(tool.args_preview);
+    return Object.keys(args).some((k) => !isAcpBookkeepingKey(k));
+  }, [args, tool.args_preview]);
+
+  let icon: React.ReactNode;
+  let label: string;
+  let primary: React.ReactNode;
+  let meta: React.ReactNode = undefined;
+
+  if (kind === "tool_search") {
+    const query = pickStr(args, "query");
+    icon = <Search className="h-3.5 w-3.5" />;
+    label = "tool search";
+    primary = query ? <span className="font-mono">{query}</span> : "search tools";
+  } else if (kind === "monitor") {
+    const description = pickStr(args, "description");
+    const persistentRaw = args ? args["persistent"] : undefined;
+    const timeoutRaw = args ? args["timeout_ms"] : undefined;
+    const timeoutMs =
+      typeof timeoutRaw === "number" ? timeoutRaw : typeof timeoutRaw === "string" ? Number(timeoutRaw) : NaN;
+    icon = <Activity className="h-3.5 w-3.5" />;
+    label = "monitor";
+    primary = description ? <span>{description}</span> : "background watch";
+    const chip =
+      persistentRaw === true
+        ? "persistent"
+        : Number.isFinite(timeoutMs)
+          ? formatDurationSeconds(timeoutMs / 1000)
+          : null;
+    if (chip) {
+      meta = <span className="hidden md:inline text-[11px] text-text-dim tabular-nums">{chip}</span>;
+    }
+  } else {
+    // task_stop
+    const taskId = pickStr(args, "task_id", "shell_id");
+    icon = <Square className="h-3.5 w-3.5" />;
+    label = "task stop";
+    primary = taskId ? <span className="font-mono">{taskId}</span> : "stop task";
   }
 
   const hasBody = hasRawInput || Boolean(output) || status === "err";

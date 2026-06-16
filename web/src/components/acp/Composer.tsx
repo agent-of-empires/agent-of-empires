@@ -16,7 +16,7 @@ import {
   type Unstable_TriggerItem,
 } from "@assistant-ui/core";
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
-import { AtSign, ChevronUp, Paperclip, Slash, Square, X } from "lucide-react";
+import { AtSign, ChevronUp, Paperclip, Pencil, Slash, Square, X } from "lucide-react";
 
 import { useFilesIndex, fuzzyFilter } from "./useFilesIndex";
 import { SessionConfigControls } from "./SessionConfigControls";
@@ -26,7 +26,13 @@ import {
   getPendingSwitchAgent,
   subscribePendingSwitchAgent,
 } from "../../lib/switchAgentTrigger";
-import type { AcpState, PromptAttachmentInput, PromptAttachmentKind, PromptCapabilities } from "../../lib/acpTypes";
+import type {
+  AcpState,
+  PromptAttachmentInput,
+  PromptAttachmentKind,
+  PromptCapabilities,
+  QueuedPrompt,
+} from "../../lib/acpTypes";
 import { getDraft, setDraft } from "../../lib/acpDrafts";
 import { TOUR_ANCHORS, tourAnchor } from "../../lib/tourSteps";
 import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
@@ -34,6 +40,7 @@ import { useAgentProfile } from "../../lib/agentProfileContext";
 import { resolveModeChannel } from "../../lib/modeChannel";
 import { useFocusTerminalTarget } from "../../hooks/useFocusTerminalTarget";
 import { useDictationBurstGuard } from "./useDictationBurstGuard";
+import { nextRecallTarget, recallBannerInfo, type RecallCursor, type RecallNav } from "./recallNav";
 
 export {
   DICTATION_BURST_TIMEOUT_MS,
@@ -81,6 +88,43 @@ export function decideEnterAction(
   // "send" queue path below.
   if (ctx.isMobile) return "default";
   if (ctx.turnActive) return "send";
+  return "default";
+}
+
+/** Decision returned by {@link decideArrowRecall} for an ArrowUp /
+ *  ArrowDown keystroke on the composer textarea.
+ *  - `older`: browse toward older queued prompts (ArrowUp).
+ *  - `newer`: browse toward newer queued prompts, or the stashed draft
+ *    past the newest (ArrowDown).
+ *  - `default`: let the textarea move the caret as usual. */
+export type ArrowRecallAction = "older" | "newer" | "default";
+
+/** Pure decision helper for shell-history-style queue recall. ArrowUp
+ *  enters recall only when the caret is at the very start and the queue
+ *  is non-empty, so multi-line caret movement is never hijacked; once
+ *  browsing, both arrows own navigation regardless of caret. Extracted
+ *  so the matrix is unit-testable without mounting the composer. */
+export function decideArrowRecall(
+  event: {
+    key: string;
+    shiftKey: boolean;
+    ctrlKey: boolean;
+    metaKey: boolean;
+    altKey: boolean;
+    isComposing: boolean;
+  },
+  ctx: { caretAtStart: boolean; browsing: boolean; queueLen: number },
+): ArrowRecallAction {
+  if (event.isComposing) return "default";
+  if (event.shiftKey || event.ctrlKey || event.metaKey || event.altKey) return "default";
+  if (event.key === "ArrowUp") {
+    if (ctx.browsing || (ctx.caretAtStart && ctx.queueLen > 0)) return "older";
+    return "default";
+  }
+  if (event.key === "ArrowDown") {
+    if (ctx.browsing) return "newer";
+    return "default";
+  }
   return "default";
 }
 
@@ -246,6 +290,14 @@ interface Props {
    *  a fresh nonce per insertion so the effect re-fires even when
    *  the same text is inserted twice. See #1004. */
   primerPrefill?: { id: string; text: string } | null;
+  /** The prompt queue, oldest first. Drives ArrowUp/ArrowDown recall:
+   *  ArrowUp on an origin caret loads the newest entry for editing,
+   *  further arrows walk the queue shell-history style. */
+  queuedPrompts: QueuedPrompt[];
+  /** Edit a queued prompt in place by id, preserving its position. Used
+   *  when the user submits while browsing the queue, so an edit does not
+   *  enqueue a duplicate. */
+  editQueuedPrompt: (id: string, text: string) => void;
 }
 
 export function Composer({
@@ -267,6 +319,8 @@ export function Composer({
   pendingAttachments,
   setPendingAttachments,
   primerPrefill,
+  queuedPrompts,
+  editQueuedPrompt,
 }: Props) {
   const taRef = useRef<HTMLTextAreaElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -412,6 +466,92 @@ export function Composer({
 
   const composerRuntime = useComposerRuntime();
 
+  // ArrowUp/ArrowDown queue recall (shell-history style). recallRef holds
+  // the id of the queued prompt currently loaded into the composer plus
+  // the draft that was there before browsing began; null when not
+  // browsing. A ref (not state) so the synchronous keydown handler always
+  // reads the live value with no stale closure. Anchored on the stable
+  // queued-prompt id so a background drain never targets the wrong row.
+  const recallRef = useRef<RecallCursor | null>(null);
+  // Render-visible mirror of the browse: drives the "Editing queued
+  // message N of M" banner. recallRef stays the synchronous source of
+  // truth for the keydown handler; applyRecall keeps the two in step.
+  const [recallInfo, setRecallInfo] = useState<{ pos: number; total: number } | null>(null);
+
+  const applyRecall = useCallback(
+    (next: RecallCursor | null) => {
+      recallRef.current = next;
+      setRecallInfo(recallBannerInfo(queuedPrompts, next));
+    },
+    [queuedPrompts],
+  );
+
+  // Load `text` into the composer with the caret at the end, mirroring
+  // the primer-prefill effect's focus + resize dance (setText alone does
+  // not fire onInput, so auto-grow has to be nudged manually).
+  const loadRecallText = useCallback(
+    (text: string) => {
+      composerRuntime.setText(text);
+      requestAnimationFrame(() => {
+        const el = taRef.current;
+        if (!el) return;
+        el.focus();
+        const len = el.value.length;
+        try {
+          el.setSelectionRange(len, len);
+        } catch {
+          // ignore: setSelectionRange can throw on detached nodes
+        }
+        el.style.height = "auto";
+        el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
+      });
+    },
+    [composerRuntime],
+  );
+
+  // Apply a pure recall navigation decision to the composer.
+  const applyNav = useCallback(
+    (nav: RecallNav) => {
+      switch (nav.kind) {
+        case "load":
+          applyRecall(nav.cursor);
+          loadRecallText(nav.text);
+          break;
+        case "restore":
+          loadRecallText(nav.text);
+          applyRecall(null);
+          break;
+        case "exit":
+          applyRecall(null);
+          break;
+        case "none":
+          break;
+      }
+    },
+    [applyRecall, loadRecallText],
+  );
+
+  // Browse toward older queued prompts (ArrowUp): enters recall stashing
+  // the current draft, then walks down and stops at the oldest.
+  const recallOlder = useCallback(() => {
+    applyNav(nextRecallTarget(queuedPrompts, recallRef.current, "older", composerRuntime.getState().text));
+  }, [queuedPrompts, composerRuntime, applyNav]);
+
+  // Browse toward newer queued prompts (ArrowDown); past the newest,
+  // restore the stashed draft and exit.
+  const recallNewer = useCallback(() => {
+    applyNav(nextRecallTarget(queuedPrompts, recallRef.current, "newer", ""));
+  }, [queuedPrompts, applyNav]);
+
+  // Esc while browsing restores the stashed draft and exits, matching the
+  // banner's hint.
+  const cancelRecallToDraft = useCallback(() => {
+    const cur = recallRef.current;
+    if (!cur) return;
+    loadRecallText(cur.stashedDraft);
+    applyRecall(null);
+  }, [loadRecallText, applyRecall]);
+
   // Unified submit for the custom Send / QueueSend buttons and the
   // mid-turn Enter path: drains the textarea text + staged attachments
   // through `enqueuePrompt` (which is the structured view `sendPrompt`), then
@@ -419,10 +559,33 @@ export function Composer({
   // runtime's `onNew`, which reads the same staged attachments from
   // AcpRuntime. See #1000 / #965.
   const submitComposer = useCallback(() => {
+    const cur = recallRef.current;
+    if (cur) {
+      applyRecall(null);
+      const text = composerRuntime.getState().text.trim();
+      // Submitting while browsing edits that queued entry in place rather
+      // than enqueuing a duplicate. If it drained since recall (id gone),
+      // fall through to a normal send so the edited text is never lost.
+      if (text && queuedPrompts.some((p) => p.id === cur.id)) {
+        editQueuedPrompt(cur.id, text);
+        composerRuntime.setText("");
+        const el = taRef.current;
+        if (el) el.style.height = "auto";
+        return;
+      }
+    }
     void sendFromTextarea(taRef, composerRuntime, enqueuePrompt, supportedPendingAttachments, () =>
       setPendingAttachments([]),
     );
-  }, [composerRuntime, enqueuePrompt, setPendingAttachments, supportedPendingAttachments]);
+  }, [
+    composerRuntime,
+    enqueuePrompt,
+    setPendingAttachments,
+    supportedPendingAttachments,
+    queuedPrompts,
+    editQueuedPrompt,
+    applyRecall,
+  ]);
 
   // Manual agent switch dialog. Opened from the sidebar row context menu
   // (see WorkspaceSidebar's "Switch agent" item) via the cross-component
@@ -616,6 +779,19 @@ export function Composer({
               "transition-colors duration-150",
             ].join(" ")}
           >
+            {/* Queue-recall banner (#2147): signals that the composer is
+                editing an existing queued prompt rather than composing a
+                new one. */}
+            {recallInfo && (
+              <div className="flex items-center justify-between gap-2 rounded-t-lg border-b border-surface-700 bg-surface-800 px-3 py-1.5 text-xs text-text-secondary">
+                <span className="flex items-center gap-1.5 font-medium text-text-primary">
+                  <Pencil className="h-3.5 w-3.5 text-brand-400" />
+                  Editing queued message {recallInfo.pos} of {recallInfo.total}
+                </span>
+                <span className="text-text-dim">Enter saves · Esc restores draft · ↑ ↓ to browse</span>
+              </div>
+            )}
+
             {/* @ file picker — Directive behavior chips the path into
                 the prompt text using the default formatter. */}
             <ComposerPrimitive.Unstable_TriggerPopover
@@ -725,6 +901,45 @@ export function Composer({
                 dictationGuard.flushOnBlur();
               }}
               onKeyDown={(e) => {
+                // Queue recall (#2147). ArrowUp at the caret origin (or
+                // while already browsing) walks toward older queued
+                // prompts and loads them for editing; ArrowDown walks back
+                // toward newer entries and the stashed draft. Decided by
+                // decideArrowRecall so multi-line caret movement is never
+                // hijacked. Runs before the Enter matrix below.
+                //
+                // Esc while browsing restores the stashed draft and exits,
+                // intercepted before ComposerPrimitive.Input's cancelOnEscape.
+                if (e.key === "Escape" && recallRef.current != null) {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  cancelRecallToDraft();
+                  return;
+                }
+                const el = taRef.current;
+                const caretAtStart = !!el && el.selectionStart === 0 && el.selectionEnd === 0;
+                const recallAction = decideArrowRecall(
+                  {
+                    key: e.key,
+                    shiftKey: e.shiftKey,
+                    ctrlKey: e.ctrlKey,
+                    metaKey: e.metaKey,
+                    altKey: e.altKey,
+                    isComposing: e.nativeEvent.isComposing,
+                  },
+                  {
+                    caretAtStart,
+                    browsing: recallRef.current != null,
+                    queueLen: queuedPrompts.length,
+                  },
+                );
+                if (recallAction !== "default") {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  if (recallAction === "older") recallOlder();
+                  else recallNewer();
+                  return;
+                }
                 // Two-way Enter dispatch. See decideEnterAction for
                 // the full matrix; the inline branches below handle
                 // each outcome:

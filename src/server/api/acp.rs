@@ -748,14 +748,22 @@ pub async fn acp_prompt(
         Ok(a) => a,
         Err((code, msg)) => return (code, msg).into_response(),
     };
-    // Idle-dormant wake: the worker was auto-stopped for inactivity
-    // (#1689) and the reconciler will not respawn it until its next ~2s
-    // tick. Reserve the resume slot synchronously and drive a fresh spawn
-    // in a detached task NOW, so the `send_prompt` below blocks on
+    // Resume a worker that is not currently live. Two cases:
+    //   - Idle-dormant wake: the worker was auto-stopped for inactivity
+    //     (#1689) and the reconciler will not respawn it until its next
+    //     ~2s tick.
+    //   - Dead worker: the worker exited for another reason (e.g. the
+    //     silent-orphan watchdog escalated a monitor / `/loop` turn) and
+    //     is neither dormant nor mid-respawn, so a send would otherwise
+    //     404 and force a manual `aoe acp restart`.
+    // Either way, reserve the resume slot synchronously and drive a fresh
+    // spawn in a detached task NOW so the `send_prompt` below blocks on
     // `wait_for_worker` until the worker is live instead of racing ahead
     // to a 404. The detached task survives this request being cancelled on
-    // client disconnect. See #1748.
-    if woke_idle_dormant {
+    // client disconnect. `is_running` is true for a live or mid-respawn
+    // worker, so a healthy session never double-spawns. See #1748.
+    let needs_resume = woke_idle_dormant || !state.acp_supervisor.is_running(&id).await;
+    if needs_resume {
         use crate::server::acp_reconciler::ResumeTrigger;
         match crate::server::acp_reconciler::trigger_resume_background(&state, &id).await {
             Ok(ResumeTrigger::NotFound) => {
@@ -797,7 +805,7 @@ pub async fn acp_prompt(
     {
         Ok(()) => StatusCode::ACCEPTED.into_response(),
         Err(SupervisorError::UnknownSession(_)) => {
-            if woke_idle_dormant {
+            if needs_resume {
                 // The respawn we kicked above did not finish within
                 // `send_prompt`'s wait window (slow sandbox / spawn). The
                 // worker is still coming; signal a retryable typed status

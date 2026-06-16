@@ -25,15 +25,17 @@ comment:
 codecov:
   disable_default_path_fixes: false
   # Hold all Codecov notifications (PR comment + status checks) until every
-  # flag has reported. Our CI uploads three separate LCOVs (vitest,
-  # playwright-mocked, playwright-live); without this Codecov evaluates and
-  # posts after the first one lands, then re-evaluates and re-posts on each
-  # subsequent upload, causing patch/project numbers to churn live during CI.
+  # upload has reported. Our CI produces four LCOV uploads: vitest,
+  # playwright-mocked, and playwright-live (sharded 2 ways, so it uploads
+  # twice under the same flag). With this set too low, Codecov evaluates
+  # after the first uploads land, then re-posts on each later one, churning
+  # patch/project numbers; worse, a line hit only by a later-arriving upload
+  # can be scored as missed when evaluation fires before that upload merges.
   # `wait_for_ci: true` additionally holds notifications until GitHub Actions
   # reports the workflow done, so a hung uploader cannot trigger a premature
   # evaluation either.
   notify:
-    after_n_builds: 3
+    after_n_builds: 4
     wait_for_ci: true
 
 # One flag per test type. Each CI job uploads its own LCOV with its own
