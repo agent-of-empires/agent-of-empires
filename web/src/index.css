@@ -397,44 +397,6 @@ select:focus-visible,
   outline-offset: 2px;
 }
 
-/* xterm.js overrides: strip default chrome for embedded use.
-   `overflow: hidden` (not auto): xterm.js manages its own viewport
-   scroll, and `auto` gives iOS Safari a target for native rubber-band
-   on small touches that haven't yet crossed our gesture-lock
-   threshold. */
-.xterm {
-  /* No padding: an inset gutter shows the panel's --term-bg around the
-     viewport, which reads as a frame whenever the running program paints
-     its own background across the rows. Flush to the panel edge instead. */
-  padding: 0;
-  border-radius: 0;
-  box-shadow: none;
-  overflow: hidden;
-}
-
-.xterm ::selection {
-  background: color-mix(in srgb, var(--color-text-secondary) 20%, transparent);
-}
-
-/* Subtle focus ring for terminal panels (desktop only).
-   Uses a pseudo-element overlay so it paints above xterm's background. */
-@media (pointer: fine) {
-  .term-panel::after {
-    content: "";
-    position: absolute;
-    inset: 0;
-    border: 1px solid color-mix(in srgb, var(--color-brand-600) 45%, transparent);
-    border-radius: inherit;
-    pointer-events: none;
-    z-index: 20;
-    opacity: 0;
-    transition: opacity 0.15s ease-out;
-  }
-  .term-panel.term-focused::after {
-    opacity: 1;
-  }
-}
-
 .safe-area-inset {
   padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
 }
