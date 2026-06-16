@@ -706,5 +706,7 @@ mod tests {
         let m: LiveControlMessage =
             serde_json::from_str(r#"{"type":"cadence","fast":false}"#).unwrap();
         assert!(matches!(m, LiveControlMessage::Cadence { fast: false }));
+        let m: LiveControlMessage = serde_json::from_str(r#"{"type":"claim"}"#).unwrap();
+        assert!(matches!(m, LiveControlMessage::Claim));
     }
 }

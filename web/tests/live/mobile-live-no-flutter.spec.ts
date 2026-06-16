@@ -80,6 +80,10 @@ done
       if (y != null) ys.push(y);
       await page.waitForTimeout(100);
     }
+    // Guard against a false green: if the HEADER row never sampled, the
+    // jitter math below would be Math.max(...[]) - Math.min(...[]) = -Infinity,
+    // which trivially passes the assertion without measuring anything.
+    expect(ys.length).toBeGreaterThan(0);
     const jitter = Math.max(...ys) - Math.min(...ys);
     // Sub-row stability: 1px sampling slop is fine, a row (~10px) bounce is
     // the bug.

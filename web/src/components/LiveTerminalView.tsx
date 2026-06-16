@@ -226,7 +226,7 @@ export function LiveTerminalView({ session, active = true, surface = "agent" }: 
             type="button"
             onClick={live.claim}
             data-live-takeover
-            className="flex items-center gap-1.5 text-xs font-semibold text-white bg-brand-600 hover:bg-brand-500 active:bg-brand-700 border border-brand-400/50 rounded-full px-4 py-2 shadow-lg cursor-pointer motion-safe:animate-[fadeIn_200ms_ease-out]"
+            className="flex items-center gap-1.5 text-xs font-semibold text-white bg-brand-600 hover:bg-brand-500 active:bg-brand-700 border border-brand-400/50 rounded-full px-4 py-2 shadow-lg cursor-pointer animate-fade-in"
           >
             <svg
               width="13"

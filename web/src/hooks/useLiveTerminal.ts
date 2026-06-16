@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
 import { getOrCreateDeviceBindingSecret } from "../lib/deviceBinding";
 import { getToken } from "../lib/token";
 import { wheelMouseBytes } from "../lib/liveMouse";
-import { retryDelayMs } from "../lib/wsBackoff";
+import { MAX_RETRIES, retryDelayMs } from "../lib/wsBackoff";
 import { reportTelemetrySeen } from "../lib/api";
 
 // Capture-snapshot live view transport (mobile). Mirrors the TUI's
@@ -12,8 +12,7 @@ import { reportTelemetrySeen } from "../lib/api";
 // component renders frames as DOM text and scrolls natively. See
 // src/server/live_ws.rs for the protocol.
 
-const MAX_RETRIES = 7;
-/** Mirrors CLOSE_CODE_PTY_DEAD in src/server/ws.rs. */
+/** Mirrors CLOSE_CODE_PTY_DEAD in src/server/pane.rs. */
 const CLOSE_CODE_PTY_DEAD = 4001;
 
 export interface LiveCursor {

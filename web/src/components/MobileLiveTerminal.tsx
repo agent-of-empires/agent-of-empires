@@ -429,6 +429,17 @@ export function MobileLiveTerminal({
     });
   }, [lastNonBlankRow]);
 
+  // Clear a pending shrink timer on unmount so it can't fire setRenderRowCount
+  // after the component is gone. Separate from the debounce effect above so
+  // its grow/shrink timing is unaffected (a deps-driven cleanup there would
+  // reset the debounce on every row change).
+  useEffect(
+    () => () => {
+      if (shrinkTimerRef.current) clearTimeout(shrinkTimerRef.current);
+    },
+    [],
+  );
+
   // Cursor cell -> the VISUAL ROW + COLUMN to box inline (see Row). Shown only
   // at the live edge; reading scrollback hides it. `top` is the row's pixel
   // top, fed to cursorAnchorRef so the keyboard-shrunk scroll target can keep
