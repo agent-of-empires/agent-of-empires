@@ -59,10 +59,7 @@ pub fn perform_restart(request: RestartRequest) -> RestartResult {
     // On a successful restart, send the wake-up keys on a detached thread so
     // the result (and the row's status update) propagate back immediately
     // rather than waiting out the up-to-3s pane-readiness probe.
-    let should_wake = match &outcome {
-        Ok(StartOutcome::Fresh | StartOutcome::Resumed) => true,
-        Ok(StartOutcome::ResumeFailed { .. }) | Err(_) => false,
-    };
+    let should_wake = should_send_restart_wake(&outcome);
     if should_wake && !wake_message.is_empty() {
         spawn_wake_worker(session_id.clone(), title, tool, wake_message);
     }
@@ -73,6 +70,10 @@ pub fn perform_restart(request: RestartRequest) -> RestartResult {
         instance: Box::new(instance),
         outcome,
     }
+}
+
+fn should_send_restart_wake(outcome: &Result<StartOutcome, String>) -> bool {
+    matches!(outcome, Ok(StartOutcome::Fresh | StartOutcome::Resumed))
 }
 
 /// Wait for the restarted pane to become live and past its boot shell, then
@@ -142,5 +143,14 @@ mod tests {
         }
         assert_eq!(result.session_id, id);
         assert_eq!(result.instance.id, id);
+    }
+
+    #[test]
+    fn restart_wake_is_suppressed_for_resume_failed() {
+        let outcome = Ok(StartOutcome::ResumeFailed {
+            sid: "11111111-2222-3333-4444-555555555555".to_string(),
+        });
+
+        assert!(!should_send_restart_wake(&outcome));
     }
 }
