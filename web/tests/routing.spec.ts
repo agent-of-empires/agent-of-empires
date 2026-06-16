@@ -243,4 +243,17 @@ test.describe("PWA last-session restore", () => {
     await expect(page).toHaveURL("/session/known-session");
     await expect.poll(() => page.evaluate((k) => localStorage.getItem(k), LAST_SESSION_KEY)).toBe("known-session");
   });
+
+  test("returning to the dashboard in-app clears the stored last session", async ({ page }) => {
+    await stubSessions(page, ["known-session"]);
+
+    await page.goto("/session/known-session");
+    await expect.poll(() => page.evaluate((k) => localStorage.getItem(k), LAST_SESSION_KEY)).toBe("known-session");
+
+    await page.getByRole("button", { name: "Go to dashboard" }).click();
+    await expect(page).toHaveURL("/");
+    // Leaving for the dashboard makes the dashboard the remembered view, so a
+    // later cold launch should not bounce the user back into the session.
+    await expect.poll(() => page.evaluate((k) => localStorage.getItem(k), LAST_SESSION_KEY)).toBe(null);
+  });
 });
