@@ -2297,6 +2297,13 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
+      "id": "sidebar.smart-rename-chip",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/__tests__/SessionRowTriage.test.tsx"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
       "id": "sidebar.multi-select-logic",
       "kind": "vitest",
       "risk": "high",

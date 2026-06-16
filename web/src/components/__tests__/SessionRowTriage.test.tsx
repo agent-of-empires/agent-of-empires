@@ -187,6 +187,41 @@ describe("SessionRow chips", () => {
   });
 });
 
+describe("SessionRow smart-rename chip", () => {
+  it("renders the Auto-name chip when smart_rename is pending", () => {
+    const ws = workspace("w-pending", [session({ view: "structured", smart_rename: "pending" })]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    expect(screen.queryByLabelText("Will auto-name")).not.toBeNull();
+    expect(screen.queryByLabelText("Naming")).toBeNull();
+  });
+
+  it("renders the Naming chip when smart_rename is running", () => {
+    const ws = workspace("w-running", [session({ view: "structured", smart_rename: "running" })]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    expect(screen.queryByLabelText("Naming")).not.toBeNull();
+    expect(screen.queryByLabelText("Will auto-name")).toBeNull();
+  });
+
+  it("renders no smart-rename chip when inactive", () => {
+    const ws = workspace("w-inactive", [session({ view: "structured", smart_rename: "inactive" })]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    expect(screen.queryByLabelText("Will auto-name")).toBeNull();
+    expect(screen.queryByLabelText("Naming")).toBeNull();
+  });
+});
+
 describe("SessionRow context menu", () => {
   it("shows only the Unpin toggle when pinned", () => {
     const ws = workspace("w-pinned", [session({ pinned_at: "2026-01-01T00:00:00Z" })]);
