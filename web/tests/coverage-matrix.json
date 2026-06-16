@@ -2243,9 +2243,17 @@
       "components": [
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/lib/registeredProjects.ts",
+        "web/src/lib/sidebarGroups.ts",
         "web/src/hooks/useRepoGroups.ts",
         "web/src/hooks/useProjects.ts"
       ]
+    },
+    {
+      "id": "sidebar.project-pin-handlers",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/sidebar-project-pin.spec.ts"],
+      "components": ["web/src/App.tsx", "web/src/lib/api.ts"]
     },
     {
       "id": "triage.archive-toggle",
