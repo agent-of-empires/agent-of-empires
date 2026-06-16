@@ -727,7 +727,7 @@ mod tests {
 
         let claude = home.join(".claude").join("settings.json");
         write_json(&claude, &pre_v016_claude_settings());
-        fs::set_permissions(&_tmp.path().join("home"), fs::Permissions::from_mode(0o755)).ok();
+        fs::set_permissions(_tmp.path().join("home"), fs::Permissions::from_mode(0o755)).ok();
 
         super::override_legacy_for_test(legacy_link.clone());
         let result = run_in(&home, &app_dir);
