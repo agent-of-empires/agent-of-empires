@@ -40,8 +40,14 @@ fn wait_with_timeout(mut child: Child, timeout: Duration) -> std::io::Result<Opt
     let deadline = Instant::now() + timeout;
     loop {
         if let Some(status) = child.try_wait()? {
-            let stdout = orx.recv().unwrap_or_default();
-            let stderr = erx.recv().unwrap_or_default();
+            // The child exited, but if it spawned a grandchild that inherited
+            // the pipe, `read_to_end` (and thus an unbounded `recv`) would block
+            // forever. Cap the drain at the remaining deadline so the timeout
+            // guarantee holds even then; the exit status is already in hand.
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let stdout = orx.recv_timeout(remaining).unwrap_or_default();
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let stderr = erx.recv_timeout(remaining).unwrap_or_default();
             return Ok(Some(Output {
                 status,
                 stdout,
@@ -852,6 +858,30 @@ mod tests {
             start.elapsed() < Duration::from_secs(5),
             "wait should return promptly after the deadline, not block on the child"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn wait_with_timeout_bounds_drain_when_grandchild_holds_pipe() {
+        // The immediate child (sh) exits fast but backgrounds a `sleep` that
+        // inherits stdout, so the pipe never closes. The drain must still
+        // return by the deadline rather than blocking on read_to_end. `sleep 30`
+        // (>> the 5s assertion) ensures an unbounded recv would visibly fail.
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("sleep 30 >&1 & printf done");
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        let child = cmd.spawn().unwrap();
+
+        let start = Instant::now();
+        let output = wait_with_timeout(child, Duration::from_millis(500))
+            .unwrap()
+            .expect("the sh child exits quickly, so an Output is produced");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "drain must be bounded by the deadline even while the pipe stays open"
+        );
+        assert!(output.status.success());
     }
 
     #[test]

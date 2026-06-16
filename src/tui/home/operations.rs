@@ -429,9 +429,9 @@ impl HomeView {
             }
         }
 
-        // The start cascade shells out to docker (image pull with no built-in
-        // timeout, container create/start) and runs the before_start host hook,
-        // any of which can block for seconds. Running it inline froze the TUI
+        // The start cascade shells out to docker (image pull, container
+        // create/start) and runs the before_start host hook, any of which can
+        // block for seconds. Running it inline froze the TUI
         // event loop, so mirror the recovery/stop paths: flip the row to
         // Starting for immediate feedback, then run the cascade on the restart
         // poller's worker thread. The post-cascade snapshot (and the wake-up)

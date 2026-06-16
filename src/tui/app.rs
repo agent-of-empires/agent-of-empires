@@ -1436,6 +1436,10 @@ impl App {
         }
 
         self.home.apply_session_id_updates();
+        // Drain any restart result that completed since the last tick so the
+        // post-cascade snapshot (cleared stale sid, container id, final status)
+        // is persisted instead of the stale `Starting` row.
+        self.home.apply_restart_results();
         self.home.cleanup_pending_creation();
 
         if let Err(e) = self.home.save() {

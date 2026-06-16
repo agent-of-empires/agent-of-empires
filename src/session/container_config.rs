@@ -500,7 +500,18 @@ fn copy_dir_recursive_inner(
             }
         };
         if metadata.is_dir() {
-            copy_dir_recursive_inner(&entry.path(), &target, visited)?;
+            // Catch-and-skip rather than `?`: an unreadable subdirectory (e.g.
+            // a Permission-denied dir under ~/.claude/plugins) must not abort
+            // the whole copy, matching how the metadata and file-copy errors
+            // above are handled.
+            if let Err(e) = copy_dir_recursive_inner(&entry.path(), &target, visited) {
+                tracing::warn!(
+                    target: "session.profile",
+                    "skipping dir {}: {}",
+                    entry.path().display(),
+                    e
+                );
+            }
         } else if let Err(e) = std::fs::copy(entry.path(), &target) {
             tracing::warn!(
                 target: "session.profile",
