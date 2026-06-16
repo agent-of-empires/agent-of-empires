@@ -41,9 +41,10 @@ Some agents ask a structured question mid-turn rather than guessing. With `claud
 - **Single-choice** questions render as radio buttons, **multi-choice** as checkboxes, and a free-text "Other" field shows when the agent offers one. When an option carries an explanation, it renders as a second line under the option label.
 - MCP forms can also include **text** fields (typed by their format, so email / URL / date inputs get the matching control), **number** and **integer** fields, and **yes/no** checkboxes. Any field default the agent supplies is pre-filled.
 - **Submit** sends your answers back and the turn continues. **Skip** answers nothing (the agent proceeds without your input). **Cancel** aborts the tool call.
+- After you answer, the card closes and your picked answer is recorded in the transcript as your turn, so the history shows what you chose instead of jumping straight to the next agent output. Skipping leaves a short "skipped" note; cancelling adds nothing.
 - Required fields and every constraint the schema declares (selection min/max, text length, regex pattern, numeric range) are enforced before Submit; the daemon re-validates, so a stale or malformed answer never reaches the agent.
 
-The rich question form is web-only. In the native TUI the card shows the question with a pointer to answer it in the web dashboard, plus keys to skip or cancel from the transcript pane so a TUI-only session never stalls on a question.
+The rich question form is web-only. In the native TUI the card shows the question with a pointer to answer it in the web dashboard, plus keys to skip or cancel from the transcript pane so a TUI-only session never stalls on a question. Once answered (from any surface) the TUI transcript records the chosen answer too.
 
 > AskUserQuestion options can carry a `preview` (a code snippet or mockup shown on focus in the Claude Code CLI/desktop). The `claude-agent-acp` adapter does not forward `preview` over ACP, so it cannot be shown here; this is an adapter limitation, not a dashboard one.
 
