@@ -49,10 +49,10 @@ fn parse_session_id(add_stdout: &str) -> String {
         .unwrap_or_else(|| panic!("could not find session ID in `aoe add` output:\n{add_stdout}"))
 }
 
-/// Retry `aoe acp prompt` until accepted. The prompt POST 404s while no worker
-/// is live; a successful call proves the reconciler recovered the orphaned
-/// runner. With the bug present this never succeeds and the loop panics at the
-/// deadline, which is the regression oracle.
+/// Retry `aoe acp prompt` until accepted. The prompt POST does not land a live
+/// worker immediately; a successful call proves the reconciler recovered the
+/// orphaned runner. With the bug present this never succeeds and the loop
+/// panics at the deadline, which is the regression oracle.
 fn prompt_until_accepted(h: &TuiTestHarness, session_id: &str, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
@@ -60,13 +60,15 @@ fn prompt_until_accepted(h: &TuiTestHarness, session_id: &str, timeout: Duration
         if out.status.success() {
             return;
         }
-        // Only the "no live worker yet" 404 is an expected transient while the
-        // reconciler recovers the orphaned runner; the client renders every
-        // such 404 as "... not found on the daemon". Any other failure (a 500,
-        // a transport error, a real regression) should fail fast instead of
-        // being masked as a 45s timeout.
+        // Two "no live worker yet" transients are expected while the daemon
+        // recovers the orphaned runner: a 404 (rendered "... not found on the
+        // daemon") when no respawn is in flight, or a 503 `worker_not_ready`
+        // once a send drives a respawn that has not finished within the wait
+        // window. Any other failure (a 500, a transport error, a real
+        // regression) should fail fast instead of being masked as a 45s
+        // timeout.
         let stderr = String::from_utf8_lossy(&out.stderr);
-        if !stderr.contains("not found on the daemon") {
+        if !stderr.contains("not found on the daemon") && !stderr.contains("worker_not_ready") {
             panic!(
                 "acp prompt failed with an unexpected error before recovery.\n\
                  stdout: {}\n stderr: {}",
