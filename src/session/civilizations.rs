@@ -123,8 +123,12 @@ pub fn is_default_civ_name(title: &str) -> bool {
     }
     if let Some((base, suffix)) = t.rsplit_once(' ') {
         if CIVILIZATIONS.contains(&base) && !suffix.is_empty() {
-            let is_roman = suffix.chars().all(|c| "IVXLCDM".contains(c));
-            let is_timestamp = suffix.chars().all(|c| c.is_ascii_digit());
+            // Match only the exact suffixes generate_random_title emits: a Roman
+            // numeral in 2..=1000, or a timestamp (Unix seconds, >= 9 digits).
+            // A looser check (any IVXLCDM run, any digits) would treat
+            // user-chosen titles like "Vikings 2" or "Britons IM" as default.
+            let is_roman = (2..=1000).any(|n| to_roman(n) == suffix);
+            let is_timestamp = suffix.len() >= 9 && suffix.chars().all(|c| c.is_ascii_digit());
             return is_roman || is_timestamp;
         }
     }
@@ -185,6 +189,9 @@ mod tests {
         assert!(!is_default_civ_name("Vikings raid plan"));
         assert!(!is_default_civ_name("Vikings 2.0"));
         assert!(!is_default_civ_name("Notaciv II"));
+        // Suffixes generate_random_title can never emit: invalid roman, short numeric.
+        assert!(!is_default_civ_name("Britons IM"));
+        assert!(!is_default_civ_name("Vikings 2"));
         assert!(!is_default_civ_name(""));
     }
 }
