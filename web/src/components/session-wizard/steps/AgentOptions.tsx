@@ -329,7 +329,7 @@ export function AgentOptions({
       {isHostOnly && (
         <p className="text-xs text-status-warning mt-3 mb-3">
           {selectedAgent?.name} can only run on the host. Container is disabled
-          {data.useWorktree ? "; go back and turn off “Create a worktree” too." : "."}
+          {data.useWorktree ? "; turn off “Create a worktree” under More options too." : "."}
         </p>
       )}
 
@@ -339,7 +339,9 @@ export function AgentOptions({
           <button
             onClick={() => {
               setShowAdvanced(!showAdvanced);
-              if (!showAdvanced) onChange("advancedEnabled", true);
+              // Keep the persisted flag in sync on both expand and collapse so
+              // it never drifts from the disclosure state.
+              onChange("advancedEnabled", !showAdvanced);
             }}
             className="flex items-center gap-2 text-sm text-text-dim hover:text-text-secondary py-2 cursor-pointer w-full"
           >
