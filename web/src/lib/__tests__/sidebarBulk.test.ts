@@ -29,8 +29,10 @@ describe("bucketSelectionForBulk", () => {
     ];
     const b = bucketSelectionForBulk(workspaces, noOverride);
     expect(b.pinnable.map((w) => w.id)).toEqual(["live"]);
-    expect(b.archivable.map((w) => w.id)).toEqual(["live"]);
-    expect(b.snoozable.map((w) => w.id)).toEqual(["live"]);
+    // Pinned rows are archivable/snoozable too: the backend clears the
+    // pin on either transition, so bulk Archive/Snooze includes them.
+    expect(b.archivable.map((w) => w.id)).toEqual(["live", "pinned"]);
+    expect(b.snoozable.map((w) => w.id)).toEqual(["live", "pinned"]);
     expect(b.unpinnable.map((w) => w.id)).toEqual(["pinned"]);
     expect(b.unarchivable.map((w) => w.id)).toEqual(["archived"]);
     expect(b.unsnoozable.map((w) => w.id)).toEqual(["snoozed"]);

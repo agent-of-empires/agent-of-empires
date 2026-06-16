@@ -2407,7 +2407,11 @@
         "src/lib/__tests__/sidebarOptimistic.test.ts",
         "src/lib/__tests__/sidebarBulk.test.ts"
       ],
-      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/BulkActionBar.tsx"]
+      "components": [
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/BulkActionBar.tsx",
+        "web/src/lib/sidebarBulk.ts"
+      ]
     },
     {
       "id": "sidebar.multi-select-gestures",

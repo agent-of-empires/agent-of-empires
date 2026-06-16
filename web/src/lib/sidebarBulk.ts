@@ -53,7 +53,12 @@ export function bucketSelectionForBulk(
         buckets.snoozable.push(ws);
         break;
       case "pinned":
+        // Pinned rows can be unpinned, and also archived or snoozed
+        // directly: the backend clears the pin on either transition,
+        // matching the single-row menu (triageMenuShape) and the TUI.
         buckets.unpinnable.push(ws);
+        buckets.archivable.push(ws);
+        buckets.snoozable.push(ws);
         break;
       case "archived":
         buckets.unarchivable.push(ws);

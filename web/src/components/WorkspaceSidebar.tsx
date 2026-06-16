@@ -1153,11 +1153,13 @@ export const SessionRow = memo(function SessionRow({
                 <div className="px-3 py-1 text-[11px] font-mono uppercase tracking-widest text-text-muted">Triage</div>
                 {(() => {
                   // Menu actions are gated by the row's current triage
-                  // state so contradictory transitions never appear in
-                  // the UI: an archived row only offers Unarchive, a
-                  // pinned row only offers Unpin, etc. The shape helper
-                  // lives in `lib/sidebarSort.ts` so it can be unit
-                  // tested. See #1581.
+                  // state so contradictory toggles never appear in the
+                  // UI: an archived row only offers Unarchive, a snoozed
+                  // row only offers Unsnooze. A pinned row also offers
+                  // Archive/Snooze, since those are valid transitions
+                  // (the backend clears the pin) and match the TUI. The
+                  // shape helper lives in `lib/sidebarSort.ts` so it can
+                  // be unit tested. See #1581.
                   const shape = triageMenuShape(
                     triageStateOf({
                       isPinned: effectivePinned,
