@@ -20,6 +20,9 @@ import type { ProjectInfo, SessionResponse } from "../../../lib/types";
 vi.mock("../../../lib/api", () => ({
   fetchSessions: vi.fn(),
   fetchProjects: vi.fn(),
+  // Persisted recent-projects store (#2141); these tests drive recents
+  // through fetchSessions, so default it to an empty store.
+  fetchRecentProjects: vi.fn().mockResolvedValue({ projects: [] }),
   cloneRepo: vi.fn(),
   // The Browse-fallback test mounts DirectoryBrowser, which probes the
   // filesystem on mount. Stub both so it renders without a network hit.
