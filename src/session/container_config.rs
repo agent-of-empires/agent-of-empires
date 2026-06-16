@@ -330,7 +330,13 @@ fn sync_agent_config(
         };
 
         if metadata.is_dir() {
-            if copy_dirs.iter().any(|&d| d == name_str.as_ref()) {
+            // copy_dirs (e.g. plugins, skills) are host -> sandbox pushes. Like
+            // the general file copy below, skip them once the sandbox has prior
+            // session data: re-copying a large tree (plugins can hold full git
+            // clones) on every restart stalled startup for tens of seconds and
+            // would clobber container-side changes. A fresh sandbox still gets
+            // them on its first launch.
+            if !has_prior_data && copy_dirs.iter().any(|&d| d == name_str.as_ref()) {
                 let dest = sandbox_dir.join(&name);
                 if let Err(e) = copy_dir_recursive(&entry.path(), &dest) {
                     tracing::warn!(target: "session.profile", "Failed to copy dir {}: {}", name_str, e);
@@ -448,16 +454,60 @@ fn rewrite_plugin_value_paths(
 
 /// Recursively copy a directory tree, following symlinks.
 fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
+    let mut visited = std::collections::HashSet::new();
+    copy_dir_recursive_inner(src, dest, &mut visited)
+}
+
+fn copy_dir_recursive_inner(
+    src: &Path,
+    dest: &Path,
+    visited: &mut std::collections::HashSet<PathBuf>,
+) -> Result<()> {
+    // Break symlink cycles. We follow symlinks (a legitimately symlinked config
+    // dir should be copied), but a link that points back up its own tree would
+    // otherwise recurse forever; a real cycle under ~/.claude/plugins churned
+    // for 30s before aborting. Keying on the canonical (symlink-
+    // resolved) source path stops the second visit.
+    if let Ok(real) = std::fs::canonicalize(src) {
+        if !visited.insert(real) {
+            tracing::warn!(
+                target: "session.profile",
+                "skipping already-visited dir (symlink cycle?): {}",
+                src.display()
+            );
+            return Ok(());
+        }
+    }
     std::fs::create_dir_all(dest)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
         let target = dest.join(entry.file_name());
-        // Follow symlinks so symlinked dirs/files are handled correctly.
-        let metadata = std::fs::metadata(entry.path())?;
+        // Follow symlinks so symlinked dirs/files are handled correctly; the
+        // visited-set guard above stops a cycle from looping forever. A single
+        // unreadable or dangling entry is skipped rather than aborting the whole
+        // copy: one Permission-denied file under ~/.claude/plugins used to fail
+        // the entire sync.
+        let metadata = match std::fs::metadata(entry.path()) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    target: "session.profile",
+                    "skipping {}: {}",
+                    entry.path().display(),
+                    e
+                );
+                continue;
+            }
+        };
         if metadata.is_dir() {
-            copy_dir_recursive(&entry.path(), &target)?;
-        } else {
-            std::fs::copy(entry.path(), &target)?;
+            copy_dir_recursive_inner(&entry.path(), &target, visited)?;
+        } else if let Err(e) = std::fs::copy(entry.path(), &target) {
+            tracing::warn!(
+                target: "session.profile",
+                "skipping file {}: {}",
+                entry.path().display(),
+                e
+            );
         }
     }
     Ok(())
@@ -2556,6 +2606,64 @@ mod tests {
             fs::read_to_string(sandbox.join("settings.json")).unwrap(),
             r#"{"theme":"dark"}"#,
             "container-side settings must not be overwritten when projects/ sentinel exists"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_copy_dir_recursive_terminates_on_symlink_cycle() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("src");
+        fs::create_dir_all(src.join("sub")).unwrap();
+        fs::write(src.join("sub").join("file.txt"), "data").unwrap();
+        // Cycle: src/sub/loop -> src. The old code followed it and recursed
+        // forever; the visited-set guard must break it.
+        std::os::unix::fs::symlink(&src, src.join("sub").join("loop")).unwrap();
+
+        let dest = dir.path().join("dest");
+        // Must return rather than infinite-loop / stack-overflow.
+        copy_dir_recursive(&src, &dest).unwrap();
+        assert_eq!(
+            fs::read_to_string(dest.join("sub").join("file.txt")).unwrap(),
+            "data"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_copy_dir_recursive_skips_bad_entry_inside_subdir() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("good.txt"), "good").unwrap();
+        // Dangling symlink inside the copied tree. The old code propagated the
+        // stat error with `?` and aborted the whole copy (the log's "Failed to
+        // copy dir plugins: Permission denied"); now a single bad entry is
+        // skipped and the rest still copies.
+        std::os::unix::fs::symlink("/nonexistent/target", src.join("dangling")).unwrap();
+
+        let dest = dir.path().join("dest");
+        copy_dir_recursive(&src, &dest).unwrap();
+        assert_eq!(fs::read_to_string(dest.join("good.txt")).unwrap(), "good");
+        assert!(!dest.join("dangling").exists());
+    }
+
+    #[test]
+    fn test_copy_dirs_skipped_when_prior_data() {
+        let dir = TempDir::new().unwrap();
+        let host = dir.path().join("host");
+        fs::create_dir_all(host.join("plugins")).unwrap();
+        fs::write(host.join("plugins").join("p.txt"), "host-plugin").unwrap();
+        let sandbox = dir.path().join("sandbox");
+
+        // Prior container session sentinel.
+        fs::create_dir_all(sandbox.join("projects")).unwrap();
+
+        sync_agent_config(&host, &sandbox, &[], &[], &["plugins"], &[]).unwrap();
+        assert!(
+            !sandbox.join("plugins").exists(),
+            "copy_dirs must be skipped once the sandbox has prior session data, \
+             so a restart no longer re-copies the whole plugins tree"
         );
     }
 
