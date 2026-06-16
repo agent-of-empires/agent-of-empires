@@ -24,9 +24,12 @@ impl RestartPoller {
         let (request_tx, request_rx) = mpsc::channel::<RestartRequest>();
         let (result_tx, result_rx) = mpsc::channel::<RestartResult>();
 
-        let handle = thread::spawn(move || {
-            Self::restart_loop(request_rx, result_tx);
-        });
+        let handle = thread::Builder::new()
+            .name("aoe-restart-poller".to_string())
+            .spawn(move || {
+                Self::restart_loop(request_rx, result_tx);
+            })
+            .expect("failed to spawn restart poller thread");
 
         Self {
             request_tx,
@@ -53,8 +56,13 @@ impl RestartPoller {
         }
     }
 
-    pub fn try_recv_result(&self) -> Option<RestartResult> {
-        self.result_rx.try_recv().ok()
+    /// Non-blocking poll for a completed restart. Surfaces `Disconnected`
+    /// (returned forever once the worker thread is gone, e.g. after a panic in
+    /// `perform_restart`) rather than collapsing it into `None`, so the caller
+    /// can clear stuck in-flight state instead of leaving rows pinned on
+    /// `Status::Starting` forever.
+    pub fn try_recv_result(&self) -> Result<RestartResult, mpsc::TryRecvError> {
+        self.result_rx.try_recv()
     }
 }
 
@@ -87,8 +95,8 @@ mod tests {
 
         let mut result = None;
         for _ in 0..100 {
-            result = poller.try_recv_result();
-            if result.is_some() {
+            if let Ok(r) = poller.try_recv_result() {
+                result = Some(r);
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -104,8 +112,11 @@ mod tests {
     }
 
     #[test]
-    fn restart_poller_try_recv_returns_none_when_empty() {
+    fn restart_poller_try_recv_returns_empty_when_no_result() {
         let poller = RestartPoller::new();
-        assert!(poller.try_recv_result().is_none());
+        assert!(matches!(
+            poller.try_recv_result(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
     }
 }

@@ -39,7 +39,18 @@ pub fn perform_restart(request: RestartRequest) -> RestartResult {
 
     let title = instance.title.clone();
     let tool = instance.tool.clone();
-    let outcome = instance.restart_with_size(size).map_err(|e| e.to_string());
+
+    // Honor the same on_launch / before_start hook timeout the startup-recovery
+    // worker installs (`run_recovery_for_instance`). Without it, a hanging
+    // before_start hook (e.g. a `mint` script waiting on the network) runs with
+    // no kill timer and wedges this serial worker thread forever, taking every
+    // future restart down with it.
+    let outcome = {
+        let _scope = crate::session::recovery::HookTimeoutScope::new(
+            crate::session::recovery::recovery_hook_timeout(),
+        );
+        instance.restart_with_size(size).map_err(|e| e.to_string())
+    };
 
     // On a successful restart, send the wake-up keys on a detached thread so
     // the result (and the row's status update) propagate back immediately
@@ -87,11 +98,11 @@ fn spawn_wake_worker(session_id: String, title: String, tool: String, wake_messa
             }
             let delay = crate::agents::send_keys_enter_delay(&tool);
             if let Err(e) = tmux_session.send_keys_with_delay(&wake_message, delay) {
-                tracing::warn!("failed to send wake-up message after restart: {}", e);
+                tracing::warn!(target: "session.restart", "failed to send wake-up message after restart: {}", e);
             }
         });
     if let Err(err) = spawn_result {
-        tracing::warn!(?err, "failed to spawn restart wake-up worker");
+        tracing::warn!(target: "session.restart", ?err, "failed to spawn restart wake-up worker");
     }
 }
 

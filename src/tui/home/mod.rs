@@ -2860,38 +2860,70 @@ impl HomeView {
     /// Apply results from the restart poller. Writes the post-cascade `Instance`
     /// snapshot back into memory (so `restart_with_size`'s mutations and the
     /// `#[serde(skip)]` `last_start_time` survive), clears the in-flight marker,
-    /// and persists. A failed cascade surfaces as `Status::Error` with the
-    /// error text. Returns true if any instance changed.
+    /// and persists. A failed cascade surfaces as `Status::Error` plus a
+    /// "Restart Failed" dialog (the user explicitly initiated the restart).
+    /// Returns true if any instance changed.
     pub fn apply_restart_results(&mut self) -> bool {
         use crate::session::Status;
+        use std::sync::mpsc::TryRecvError;
 
         let mut touched = false;
-        while let Some(result) = self.restart_poller.try_recv_result() {
-            let crate::session::restart::RestartResult {
-                session_id,
-                mut instance,
-                outcome,
-            } = result;
+        loop {
+            match self.restart_poller.try_recv_result() {
+                Ok(result) => {
+                    let crate::session::restart::RestartResult {
+                        session_id,
+                        mut instance,
+                        outcome,
+                    } = result;
 
-            self.restart_in_flight.remove(&session_id);
+                    self.restart_in_flight.remove(&session_id);
 
-            match outcome {
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!(
-                        target: "tui.home",
-                        id = %session_id,
-                        error = %e,
-                        "restart cascade failed",
-                    );
-                    instance.status = Status::Error;
-                    instance.last_error = Some(e);
+                    match outcome {
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "session.restart",
+                                id = %session_id,
+                                error = %e,
+                                "restart cascade failed",
+                            );
+                            instance.status = Status::Error;
+                            instance.last_error = Some(e.clone());
+                            // Surface it: a cascade failure now arrives async, so
+                            // the input handler's "Restart Failed" dialog can no
+                            // longer catch it (restart_selected_session returned
+                            // Ok once the work was enqueued).
+                            self.info_dialog = Some(InfoDialog::new(
+                                "Restart Failed",
+                                &format!("Could not restart session: {e}"),
+                            ));
+                        }
+                    }
+
+                    if let Some(slot) = self.instances.iter_mut().find(|i| i.id == session_id) {
+                        *slot = *instance;
+                        touched = true;
+                    }
                 }
-            }
-
-            if let Some(slot) = self.instances.iter_mut().find(|i| i.id == session_id) {
-                *slot = *instance;
-                touched = true;
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    // The single worker thread is gone (a panic in
+                    // perform_restart dropped result_tx). Clear the in-flight set
+                    // defensively so the stuck rows fall back to the StatusPoller
+                    // (which marks them Error) instead of being filtered out of
+                    // polling forever by `pollable_instances`. Mirrors the
+                    // Disconnected handling in `apply_recovery_updates`.
+                    if !self.restart_in_flight.is_empty() {
+                        tracing::error!(
+                            target: "session.restart",
+                            "restart poller worker gone; clearing in-flight set",
+                        );
+                        self.restart_in_flight.clear();
+                        touched = true;
+                    }
+                    break;
+                }
             }
         }
 

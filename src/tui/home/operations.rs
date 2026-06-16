@@ -3,7 +3,7 @@
 use crate::session::builder::{self, InstanceParams};
 use crate::session::{list_profiles, GroupTree, Item, Status, Storage};
 use crate::tui::deletion_poller::DeletionRequest;
-use crate::tui::dialogs::{DeleteOptions, GroupDeleteOptions, NewSessionData};
+use crate::tui::dialogs::{DeleteOptions, GroupDeleteOptions, InfoDialog, NewSessionData};
 use crate::tui::restart_poller::RestartRequest;
 
 use super::HomeView;
@@ -312,6 +312,16 @@ impl HomeView {
             None => return Ok(()),
         };
 
+        // A restart cascade for this row is already running on the poller
+        // worker. The cascade is off the event loop now, so the 1.5s
+        // keyboard-repeat debounce below does not cover a deliberate second
+        // press during a multi-second pull. Without this guard the worker would
+        // enqueue a duplicate request and, running serially, restart the row a
+        // second time, tearing down the container the first restart just built.
+        if self.restart_in_flight.contains(&id) {
+            return Ok(());
+        }
+
         // Skip transient + sunk rows. Snoozed rows only skip when the user is
         // in Attention sort; see method doc.
         let in_attention = self.sort_order == crate::session::config::SortOrder::Attention;
@@ -473,6 +483,20 @@ impl HomeView {
         if let Some(id) = &self.selected_session {
             let id = id.clone();
 
+            // Refuse to delete a row whose restart cascade is still running on
+            // the worker: deletion would fire docker commands against the same
+            // container the restart worker is mid-creating, orphaning resources
+            // non-deterministically. The old synchronous cascade made this race
+            // impossible (the UI thread could not accept a delete mid-restart);
+            // off-threading the cascade removed that implicit lock.
+            if self.restart_in_flight.contains(&id) {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Restart in progress",
+                    "This session is still restarting. Wait for it to finish before deleting.",
+                ));
+                return Ok(());
+            }
+
             self.set_instance_status(&id, Status::Deleting);
 
             if let Some(inst) = self.get_instance(&id) {
@@ -546,6 +570,22 @@ impl HomeView {
                 })
                 .map(|i| i.id.clone())
                 .collect();
+
+            // Refuse the whole group delete if any member is mid-restart (same
+            // concurrent-docker race as delete_selected). Restore the selection
+            // we `take()`'d above so the group stays put.
+            if sessions_to_delete
+                .iter()
+                .any(|sid| self.restart_in_flight.contains(sid))
+            {
+                self.selected_group = Some(group_path);
+                self.selected_group_profile = owning_profile;
+                self.info_dialog = Some(InfoDialog::new(
+                    "Restart in progress",
+                    "A session in this group is still restarting. Wait for it to finish before deleting the group.",
+                ));
+                return Ok(());
+            }
 
             self.bulk_apply_user_action(&sessions_to_delete, |inst| {
                 inst.status = Status::Deleting;

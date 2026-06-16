@@ -458,6 +458,18 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
     copy_dir_recursive_inner(src, dest, &mut visited)
 }
 
+/// Whether an I/O error during the copy means the destination filesystem can no
+/// longer accept writes, in which case continuing would silently produce a
+/// partial copy (a sandbox missing arbitrary files, reported as success). Those
+/// must abort the whole copy. Everything else (a single unreadable or dangling
+/// source entry) is skipped best-effort.
+fn is_fatal_copy_error(e: &std::io::Error) -> bool {
+    // ENOSPC (no space), EROFS (read-only fs), EDQUOT (quota). EDQUOT differs by
+    // platform (122 on Linux, 69 on macOS). raw_os_error covers all three more
+    // portably than the (partly unstable) ErrorKind variants.
+    matches!(e.raw_os_error(), Some(28) | Some(30) | Some(69) | Some(122))
+}
+
 fn copy_dir_recursive_inner(
     src: &Path,
     dest: &Path,
@@ -466,21 +478,66 @@ fn copy_dir_recursive_inner(
     // Break symlink cycles. We follow symlinks (a legitimately symlinked config
     // dir should be copied), but a link that points back up its own tree would
     // otherwise recurse forever; a real cycle under ~/.claude/plugins churned
-    // for 30s before aborting. Keying on the canonical (symlink-
-    // resolved) source path stops the second visit.
-    if let Ok(real) = std::fs::canonicalize(src) {
-        if !visited.insert(real) {
+    // for 30s before aborting. Keying on the canonical (symlink-resolved) source
+    // path stops the second visit. A canonicalize failure (e.g. ELOOP) is
+    // exactly when we most need the guard, so skip the dir rather than descend
+    // blindly.
+    match std::fs::canonicalize(src) {
+        Ok(real) => {
+            if !visited.insert(real) {
+                tracing::warn!(
+                    target: "session.profile",
+                    "skipping already-visited dir (symlink cycle?): {}",
+                    src.display()
+                );
+                return Ok(());
+            }
+        }
+        Err(e) => {
             tracing::warn!(
                 target: "session.profile",
-                "skipping already-visited dir (symlink cycle?): {}",
-                src.display()
+                "skipping dir (cannot resolve, possible symlink loop): {}: {}",
+                src.display(),
+                e
             );
             return Ok(());
         }
     }
-    std::fs::create_dir_all(dest)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
+    // create_dir_all / read_dir failures: a filesystem that can't accept writes
+    // is fatal (silent partial copy); anything else means we just skip this
+    // subtree. This keeps the fail-soft behavior errno-aware and consistent.
+    if let Err(e) = std::fs::create_dir_all(dest) {
+        if is_fatal_copy_error(&e) {
+            return Err(e).with_context(|| format!("creating {}", dest.display()));
+        }
+        tracing::warn!(
+            target: "session.profile",
+            "skipping dir (cannot create destination): {}: {}",
+            dest.display(),
+            e
+        );
+        return Ok(());
+    }
+    let entries = match std::fs::read_dir(src) {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::warn!(
+                target: "session.profile",
+                "skipping dir (cannot read): {}: {}",
+                src.display(),
+                e
+            );
+            return Ok(());
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                tracing::warn!(target: "session.profile", "skipping entry in {}: {}", src.display(), e);
+                continue;
+            }
+        };
         let target = dest.join(entry.file_name());
         // Follow symlinks so symlinked dirs/files are handled correctly; the
         // visited-set guard above stops a cycle from looping forever. A single
@@ -500,19 +557,15 @@ fn copy_dir_recursive_inner(
             }
         };
         if metadata.is_dir() {
-            // Catch-and-skip rather than `?`: an unreadable subdirectory (e.g.
-            // a Permission-denied dir under ~/.claude/plugins) must not abort
-            // the whole copy, matching how the metadata and file-copy errors
-            // above are handled.
-            if let Err(e) = copy_dir_recursive_inner(&entry.path(), &target, visited) {
-                tracing::warn!(
-                    target: "session.profile",
-                    "skipping dir {}: {}",
-                    entry.path().display(),
-                    e
-                );
-            }
+            // Propagate with `?`: the child only returns Err for a fatal
+            // (filesystem-full) error, so a cycle / unreadable subdir resolves to
+            // Ok inside the child and is skipped there, while a real out-of-space
+            // condition aborts the whole copy.
+            copy_dir_recursive_inner(&entry.path(), &target, visited)?;
         } else if let Err(e) = std::fs::copy(entry.path(), &target) {
+            if is_fatal_copy_error(&e) {
+                return Err(e).with_context(|| format!("copying {}", entry.path().display()));
+            }
             tracing::warn!(
                 target: "session.profile",
                 "skipping file {}: {}",
@@ -2618,6 +2671,29 @@ mod tests {
             r#"{"theme":"dark"}"#,
             "container-side settings must not be overwritten when projects/ sentinel exists"
         );
+    }
+
+    #[test]
+    fn test_is_fatal_copy_error_discriminates_storage_exhaustion() {
+        use std::io::Error;
+        // ENOSPC / EROFS / EDQUOT mean the destination can't accept writes;
+        // continuing would silently produce a partial copy, so these abort.
+        assert!(is_fatal_copy_error(&Error::from_raw_os_error(28)), "ENOSPC");
+        assert!(is_fatal_copy_error(&Error::from_raw_os_error(30)), "EROFS");
+        assert!(
+            is_fatal_copy_error(&Error::from_raw_os_error(69)),
+            "EDQUOT (macOS)"
+        );
+        assert!(
+            is_fatal_copy_error(&Error::from_raw_os_error(122)),
+            "EDQUOT (Linux)"
+        );
+        // A single unreadable / missing source entry is best-effort skippable.
+        assert!(
+            !is_fatal_copy_error(&Error::from_raw_os_error(13)),
+            "EACCES"
+        );
+        assert!(!is_fatal_copy_error(&Error::from_raw_os_error(2)), "ENOENT");
     }
 
     #[test]
