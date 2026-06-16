@@ -97,6 +97,21 @@ impl Project {
         self.default_base_branch = base.map(|b| b.trim().to_string()).filter(|b| !b.is_empty());
         self
     }
+
+    /// Whether this project's path is currently a git repository (a working
+    /// tree, a bare repo, or a linked worktree). This is the single source of
+    /// truth for the registry-level "is this project git-backed?" question;
+    /// the registration gates (CLI, web API, TUI) all route through here.
+    ///
+    /// Probed fresh from the filesystem on every call rather than stored on the
+    /// struct: a path's git status can change after registration (a later
+    /// `git init`, a clone into the dir, or a deleted `.git`), so the
+    /// filesystem is the only reliable source of truth.
+    pub fn is_git(&self) -> bool {
+        let path = PathBuf::from(&self.path);
+        let canonical = path.canonicalize().unwrap_or(path);
+        crate::git::GitWorktree::is_git_repo(&canonical)
+    }
 }
 
 fn global_path() -> Result<PathBuf> {
@@ -492,6 +507,23 @@ mod tests {
                 .default_base_branch,
             Some("develop".to_string())
         );
+    }
+
+    #[test]
+    fn is_git_probes_filesystem_per_call() {
+        let temp = tempdir().expect("tempdir");
+        let dir = temp.path().join("workspace");
+        std::fs::create_dir_all(&dir).expect("create dir");
+
+        let project = Project::new("workspace", dir.to_string_lossy(), ProjectScope::Global);
+        // A plain directory is not git-backed.
+        assert!(!project.is_git());
+
+        // `is_git` re-probes the filesystem on every call and caches nothing,
+        // so initializing a repo in place flips the result without rebuilding
+        // the Project.
+        git2::Repository::init(&dir).expect("git init");
+        assert!(project.is_git());
     }
 
     #[test]

@@ -8,7 +8,7 @@ From the main screen, press `D` to open the diff view. It shows:
 - **Left panel**: List of changed files with status indicators (M=modified, A=added, D=deleted)
 - **Right panel**: Diff content for the selected file
 
-The diff is computed against the base branch (defaults to `main` or your repo's default branch). Auto-detection considers every configured remote, not just `origin`, so a fork plus `upstream` layout compares against the branch point rather than a stale fork-main.
+The diff is computed against the base branch (defaults to `main` or your repo's default branch). Auto-detection considers every configured remote, not just `origin`, so a fork plus `upstream` layout compares against the branch point rather than a stale fork-main. When the base resolves to a local branch that is strictly behind its `origin/` tracking counterpart (your local `main` drifted behind `origin/main`), the diff compares against the remote tip, so upstream commits you haven't pulled don't show up as session changes.
 
 ## Navigation
 

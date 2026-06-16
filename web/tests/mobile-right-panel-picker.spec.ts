@@ -145,7 +145,7 @@ test.describe("Desktop right panel split is unchanged (#1452)", () => {
     await mockTerminalApis(page);
     await page.goto("/");
     await clickSidebarSession(page, "pinch-test");
-    await page.locator(".xterm").first().waitFor({ state: "visible", timeout: 10_000 });
+    await page.locator("[data-live-terminal]").first().waitFor({ state: "visible", timeout: 10_000 });
 
     // The desktop split renders the resize handle and never the picker.
     await expect(page.getByTestId("content-split-resize-handle")).toBeVisible();

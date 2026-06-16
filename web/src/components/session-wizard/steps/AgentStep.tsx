@@ -80,24 +80,29 @@ function ViewPickerCard({
   sandboxEnabled: boolean;
 }) {
   const sandboxedStructuredView = checked && sandboxEnabled;
+  // Styled to match the sibling Core toggles (sandbox / auto-approve) below:
+  // a full-row clickable label, so the whole card is a hit target, not just
+  // the 12px switch. See #2101.
   return (
-    <div className="mb-5 rounded-lg border border-surface-700 bg-surface-900 px-3 py-2.5">
-      <div className="flex items-center justify-between gap-3">
-        <div className="flex-1">
-          <div className="flex items-center gap-2">
-            <span className="text-sm font-semibold text-text-primary">Structured view</span>
-          </div>
-          <p className="mt-1 text-xs text-text-dim leading-snug">
-            {sandboxedStructuredView
-              ? "Structured view + container: the agent runs inside the sandbox container, so its file and terminal access stay inside the container's mounts. Turn off to run this session in the terminal view instead."
-              : checked
-                ? "Renders the agent's plan, tool calls, and diffs in the structured view. Turn off to run this session in the terminal view instead."
-                : "This session will run in the terminal view (raw tmux). Turn on to use the structured view; you can also switch views from the session later."}
-          </p>
-        </div>
-        <Toggle checked={checked} onChange={onChange} label="Use structured view" />
+    <label
+      className="mb-5 flex items-center justify-between gap-3 p-3 bg-surface-900 border border-surface-700 rounded-lg cursor-pointer"
+      onClick={(e) => {
+        if ((e.target as HTMLElement).closest('button[role="switch"]')) return;
+        onChange(!checked);
+      }}
+    >
+      <div className="flex-1">
+        <div className="text-sm font-medium text-text-primary">Structured view</div>
+        <p className="text-xs text-text-dim mt-0.5 leading-snug">
+          {sandboxedStructuredView
+            ? "Structured view + container: the agent runs inside the sandbox container, so its file and terminal access stay inside the container's mounts. Turn off to run this session in the terminal view instead."
+            : checked
+              ? "Renders the agent's plan, tool calls, and diffs in the structured view. Turn off to run this session in the terminal view instead."
+              : "This session will run in the terminal view (raw tmux). Turn on to use the structured view; you can also switch views from the session later."}
+        </p>
       </div>
-    </div>
+      <Toggle checked={checked} onChange={onChange} label="Use structured view" />
+    </label>
   );
 }
 

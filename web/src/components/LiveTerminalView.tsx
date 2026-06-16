@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useIsCoarsePointer } from "../hooks/useIsCoarsePointer";
 import { useLiveTerminal } from "../hooks/useLiveTerminal";
 import { useMobileKeyboard } from "../hooks/useMobileKeyboard";
 import { MobileTerminalToolbar } from "./MobileTerminalToolbar";
@@ -46,6 +47,10 @@ const SURFACES = {
  */
 export function LiveTerminalView({ session, active = true, surface = "agent" }: Props) {
   const { wsPath, focusTarget, dataTerm } = SURFACES[surface];
+  // Touch-only chrome (the soft-keyboard toolbar and its toggle FAB) is
+  // pointless with a physical keyboard, so it stays off fine-pointer devices
+  // now that this view also renders on desktop.
+  const coarse = useIsCoarsePointer();
   const [ensureState, setEnsureState] = useState<"pending" | "ready" | "error">("pending");
   const [ensureError, setEnsureError] = useState<string | null>(null);
   const live = useLiveTerminal(ensureState === "ready" ? session.id : null, wsPath);
@@ -186,7 +191,26 @@ export function LiveTerminalView({ session, active = true, surface = "agent" }: 
   const rootStyle = keyboardHeight > 0 ? { paddingBottom: keyboardHeight } : undefined;
 
   return (
-    <div className="flex-1 flex flex-col overflow-hidden relative" style={rootStyle} data-term={dataTerm}>
+    <div
+      className="flex-1 flex flex-col overflow-hidden relative"
+      style={rootStyle}
+      data-term={dataTerm}
+      data-pane-focused={inputFocused || undefined}
+    >
+      {/* Frame the pane like the TUI does: a faint always-on border marks the
+          box edges and brightens to the teal `terminal-active` color when this
+          pane is selected (its input has focus), so on a multi-pane desktop it
+          is obvious which box keystrokes go to. This is a pointer-events-none
+          overlay (not a ring on the container) because the terminal scroller is
+          an `absolute inset-0` element with an opaque background that would
+          paint over an inset ring on any ancestor. */}
+      <div
+        aria-hidden="true"
+        className={`pointer-events-none absolute inset-0 z-10 ring-inset transition-shadow ${
+          inputFocused ? "ring-2 ring-terminal-active" : "ring-1 ring-surface-700/40"
+        }`}
+      />
+
       <TerminalConnectionBanners
         connected={live.state.connected}
         reconnecting={live.state.reconnecting}
@@ -196,7 +220,47 @@ export function LiveTerminalView({ session, active = true, surface = "agent" }: 
         onRetry={live.manualReconnect}
       />
 
-      <div className="flex-1 overflow-hidden bg-[var(--term-bg)] relative">
+      {live.state.connected && !live.state.isOwner && (
+        <div className="absolute left-0 right-0 top-3 flex justify-center z-20 px-3">
+          <button
+            type="button"
+            onClick={live.claim}
+            data-live-takeover
+            className="flex items-center gap-1.5 text-xs font-semibold text-white bg-brand-600 hover:bg-brand-500 active:bg-brand-700 border border-brand-400/50 rounded-full px-4 py-2 shadow-lg cursor-pointer animate-fade-in"
+          >
+            <svg
+              width="13"
+              height="13"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2.5"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden="true"
+            >
+              <path d="M9 18l6-6-6-6" />
+            </svg>
+            Live on another device. Take over
+          </button>
+        </div>
+      )}
+
+      <div
+        className="flex-1 overflow-hidden bg-[var(--term-bg)] relative"
+        // Click-to-type, like every terminal. The rendered pane is plain
+        // (non-focusable) DOM text, so clicking it blurs the hidden input to
+        // <body> and the session reads as view-only. On a fine pointer, a
+        // plain click refocuses the input; a click that ends a text selection
+        // is left alone so select-to-copy still works. Touch devices focus via
+        // the keyboard toggle, not taps (which scroll).
+        onClick={() => {
+          if (coarse) return;
+          const sel = window.getSelection();
+          if (sel && !sel.isCollapsed) return;
+          focusSelf();
+        }}
+      >
         <MobileLiveTerminal
           frame={live.state.frame}
           connected={live.state.connected}
@@ -213,11 +277,12 @@ export function LiveTerminalView({ session, active = true, surface = "agent" }: 
           clearCtrl={() => setCtrlActive(false)}
           inputRef={inputRef}
           onInputFocusChange={setInputFocused}
+          bottomAlign={surface === "agent"}
         />
-        {live.state.connected && <KeyboardFab keyboardOpen={inputFocused} onToggle={toggleKeyboard} />}
+        {coarse && live.state.connected && <KeyboardFab keyboardOpen={inputFocused} onToggle={toggleKeyboard} />}
       </div>
 
-      {live.state.connected && (
+      {coarse && live.state.connected && (
         <MobileTerminalToolbar
           sendData={live.sendData}
           inputElRef={inputRef}

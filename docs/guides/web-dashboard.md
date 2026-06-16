@@ -176,6 +176,8 @@ The dashboard installs as a Progressive Web App for an app-like, standalone wind
 
 The PWA needs the server running; use `--daemon` to keep it up (`aoe serve --stop` to stop). For a stable URL that survives restarts, install from a Tailscale Funnel or named-Cloudflare URL, not a quick tunnel.
 
+When you leave the PWA and come back, it reopens to the session you last had open rather than the dashboard. The last session is remembered per device (not synced across devices); if you were on the dashboard when you left, or that session no longer exists, you land on the dashboard.
+
 `Ctrl-C` on a foreground server, or `aoe serve --stop` against a daemon, both exit within ~5 seconds even with open tabs. Live clients receive a `1001` ("going away") close frame and reconnect once a fresh server is running.
 
 For build, architecture, and frontend-development details, see [Web Dashboard Development](../development/web-dashboard.md).

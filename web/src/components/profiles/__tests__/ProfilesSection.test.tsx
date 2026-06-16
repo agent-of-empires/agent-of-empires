@@ -1,15 +1,15 @@
 // @vitest-environment jsdom
 //
-// Contract + interaction tests for the Profiles page. The security-critical
-// invariant: even though the profile settings GET returns a `hooks` section
-// (unfiltered on reads), no PATCH the page issues may ever carry it. Also
-// exercises the CRUD / set-default / deep-link / read-only paths so the
-// page's handlers are covered without a live backend.
+// Contract + interaction tests for the Profiles settings section. The
+// security-critical invariant: even though the profile settings GET returns a
+// `hooks` section (unfiltered on reads), no PATCH the section issues may ever
+// carry it. Also exercises the CRUD / set-default / deep-link / read-only
+// paths so the section's handlers are covered without a live backend.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, waitFor } from "@testing-library/react";
 import { MemoryRouter, useLocation } from "react-router-dom";
-import { ProfilesPage } from "../ProfilesPage";
+import { ProfilesSection } from "../ProfilesSection";
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -79,8 +79,8 @@ function LocationProbe() {
 
 function mount(props: { readOnly?: boolean } = {}) {
   return render(
-    <MemoryRouter initialEntries={["/profiles"]}>
-      <ProfilesPage onClose={() => {}} readOnly={props.readOnly} />
+    <MemoryRouter initialEntries={["/settings/profiles"]}>
+      <ProfilesSection readOnly={props.readOnly} />
       <LocationProbe />
     </MemoryRouter>,
   );
@@ -93,7 +93,7 @@ async function selectWork(api: ReturnType<typeof mount>) {
   fireEvent.click(api.getByRole("button", { name: "work", exact: true }));
 }
 
-describe("ProfilesPage", () => {
+describe("ProfilesSection", () => {
   it("lists profiles with a default badge", async () => {
     const api = mount();
     await waitFor(() => api.getByRole("button", { name: "work", exact: true }));

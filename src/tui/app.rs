@@ -466,10 +466,6 @@ impl App {
 
         let result = f();
 
-        // Recreate the event stream with a fresh reader before re-entering
-        // the event loop.
-        self.event_stream = Some(EventStream::new());
-
         crossterm::terminal::enable_raw_mode()?;
         crossterm::execute!(
             terminal.backend_mut(),
@@ -484,7 +480,12 @@ impl App {
         self.sync_mouse_capture(terminal)?;
         std::io::Write::flush(terminal.backend_mut())?;
 
-        terminal.clear()?;
+        // Recreate the event stream with a fresh reader before re-entering the
+        // event loop, then force a full redraw of the home screen. The stream is
+        // recreated after raw mode and the alternate screen are restored so it is
+        // born into raw mode rather than attached to a briefly-cooked tty.
+        self.event_stream = Some(EventStream::new());
+        crate::tui::clear_terminal(terminal)?;
 
         Ok(result)
     }
@@ -539,7 +540,7 @@ impl App {
         terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     ) -> Result<()> {
         // Initial render
-        terminal.clear()?;
+        crate::tui::clear_terminal(terminal)?;
         // Sync mouse capture before the first paint so any onboarding
         // surface that wants native drag-to-select (intro Welcome page,
         // changelog, info dialog) gets capture turned off on frame 1.
@@ -671,7 +672,7 @@ impl App {
             // with_raw_mode_disabled drops and recreates the EventStream, so
             // there are no stale events to drain.
             if self.needs_redraw {
-                terminal.clear()?;
+                crate::tui::clear_terminal(terminal)?;
                 self.needs_redraw = false;
             }
 
@@ -1184,7 +1185,7 @@ impl App {
             // and the pointer sits at the edge.
             //
             // Request a normal (diffed) redraw via `refresh_needed`, NOT
-            // `needs_redraw`: the latter forces a `terminal.clear()` at the
+            // `needs_redraw`: the latter forces a `clear_terminal` at the
             // top of the loop, and clearing every ticker frame while the
             // scroll runs strobes the screen blank-then-repaint. The diffed
             // draw at the bottom of the loop repaints smoothly.
@@ -2239,7 +2240,7 @@ impl App {
             // restarts; the banner returns automatically when a newer
             // release ships (per #1140).
             //
-            // No `needs_redraw = true` here: that forces a `terminal.clear()`
+            // No `needs_redraw = true` here: that forces a `clear_terminal`
             // before the next event arrives, so the whole screen blanks for
             // a beat (visible flash). Ratatui's diff renderer handles the
             // 1-row layout shrink on the next normal draw.
@@ -2315,10 +2316,10 @@ impl App {
         let result =
             crate::tui::structured_view::run(terminal, &mut stream, &self.theme, session_id).await;
         self.event_stream = Some(stream);
-        // Forcing a full redraw on return so the home screen redraws
-        // any cells the acp view painted over.
+        // Force a full redraw so the home screen repaints any cells the acp
+        // view painted over. The main loop's redraw branch runs `clear_terminal`
+        // on the next iteration, so don't clear again here.
         self.needs_redraw = true;
-        terminal.clear()?;
         if let Err(e) = result {
             self.update_status = Some(UpdateStatus::transient(format!("acp closed: {e}")));
         }

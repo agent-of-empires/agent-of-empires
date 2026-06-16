@@ -1,10 +1,11 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import type { CSSProperties, RefObject } from "react";
+import type { CSSProperties, ReactNode, RefObject } from "react";
 import type { AnsiSegment, AnsiStyle } from "../lib/ansi";
 import { ansiToLines, wrapLine } from "../lib/liveTermLines";
 import { wheelNotches } from "../lib/liveMouse";
 import type { LiveFrame } from "../hooks/useLiveTerminal";
 import { useWebSettings } from "../hooks/useWebSettings";
+import { useIsCoarsePointer } from "../hooks/useIsCoarsePointer";
 
 // Mobile rendering of a tmux agent pane, mirroring the TUI's live mode:
 // the server streams `capture-pane` snapshots (src/server/live_ws.rs)
@@ -47,6 +48,10 @@ const MAX_FONT_SIZE = 28;
 const LINE_RATIO = 1.2;
 /** Resize debounce: one tmux resize per settled layout. */
 const RESIZE_DEBOUNCE_MS = 150;
+/** How long the meaningful-row scroll anchor must stay lower before it
+ *  shrinks, so a spinner toggling the lowest non-blank row can't flutter the
+ *  viewport. Comfortably longer than an agent's redraw cadence. */
+const SHRINK_DELAY_MS = 600;
 
 export interface MobileLiveTerminalProps {
   frame: LiveFrame | null;
@@ -76,6 +81,10 @@ export interface MobileLiveTerminalProps {
    *  keyboard visible, the deterministic alternative to occlusion
    *  heuristics. */
   onInputFocusChange: (focused: boolean) => void;
+  /** Bottom-align the screen chat-style (agent surface) so a short screen's
+   *  prompt sits just above the keyboard. The paired host/container shells are
+   *  ordinary terminals, so they top-align like a normal bash window. */
+  bottomAlign: boolean;
 }
 
 function segStyle(style: AnsiStyle): CSSProperties | undefined {
@@ -94,20 +103,86 @@ function segStyle(style: AnsiStyle): CSSProperties | undefined {
   return Object.keys(css).length ? css : undefined;
 }
 
-const Row = memo(function Row({ segs }: { segs: AnsiSegment[] }) {
-  if (segs.length === 0) {
-    // Keep empty rows at full line height.
-    return <div> </div>;
+// Diagnostic overlay for cursor-alignment field reports: open the dashboard
+// with `?livedebug=1` and the live view shows the geometry the overlay math
+// ran on (frame rows/history, content lines, spacer, computed line index).
+// Screenshot-friendly; no behavior changes.
+const LIVE_DEBUG = typeof location !== "undefined" && new URLSearchParams(location.search).has("livedebug");
+
+// Hollow-box cursor drawn AS A CELL inside the text flow, the way a real
+// terminal (and the desktop xterm view) renders it, rather than a separate
+// absolutely-positioned block whose pixel row we reconstruct from cursor.y and
+// line-height. Tying it to the actual rendered cell means it cannot drift off
+// its row (wrapping, row-height, offset assumptions). `outline` instead of
+// `border` so the box does not reflow the line by a pixel.
+const CURSOR_CELL_STYLE: CSSProperties = {
+  outline: "1px solid var(--term-cursor, #f59e0b)",
+  outlineOffset: "-1px",
+};
+
+const Row = memo(function Row({ segs, cursorCol }: { segs: AnsiSegment[]; cursorCol: number | null }) {
+  if (cursorCol == null) {
+    if (segs.length === 0) return <div> </div>; // keep empty rows at full height
+    return (
+      <div>
+        {segs.map((seg, i) => (
+          <span key={i} style={segStyle(seg.style)}>
+            {seg.text}
+          </span>
+        ))}
+      </div>
+    );
   }
-  return (
-    <div>
-      {segs.map((seg, i) => (
-        <span key={i} style={segStyle(seg.style)}>
-          {seg.text}
-        </span>
-      ))}
-    </div>
-  );
+  // Render the row with the single cell at `cursorCol` boxed. Walk segments by
+  // column; split the one that straddles the cursor.
+  const out: ReactNode[] = [];
+  let col = 0;
+  let placed = false;
+  let key = 0;
+  for (const seg of segs) {
+    const t = seg.text;
+    if (!placed && cursorCol >= col && cursorCol < col + t.length) {
+      const off = cursorCol - col;
+      if (off > 0) {
+        out.push(
+          <span key={key++} style={segStyle(seg.style)}>
+            {t.slice(0, off)}
+          </span>,
+        );
+      }
+      out.push(
+        <span key={key++} data-live-cursor style={{ ...segStyle(seg.style), ...CURSOR_CELL_STYLE }}>
+          {t[off]}
+        </span>,
+      );
+      if (off + 1 < t.length) {
+        out.push(
+          <span key={key++} style={segStyle(seg.style)}>
+            {t.slice(off + 1)}
+          </span>,
+        );
+      }
+      placed = true;
+    } else {
+      out.push(
+        <span key={key++} style={segStyle(seg.style)}>
+          {t}
+        </span>,
+      );
+    }
+    col += t.length;
+  }
+  if (!placed) {
+    // Cursor sits past the row's text (blank input cell): pad to the column
+    // and box a space.
+    if (cursorCol > col) out.push(<span key="pad">{" ".repeat(cursorCol - col)}</span>);
+    out.push(
+      <span key="cursor" data-live-cursor style={CURSOR_CELL_STYLE}>
+        {" "}
+      </span>,
+    );
+  }
+  return <div>{out}</div>;
 });
 
 export function MobileLiveTerminal({
@@ -126,9 +201,26 @@ export function MobileLiveTerminal({
   clearCtrl,
   inputRef,
   onInputFocusChange,
+  bottomAlign,
 }: MobileLiveTerminalProps) {
   const { settings, update } = useWebSettings();
-  const [fontSize, setFontSize] = useState(() => settings.mobileFontSize);
+  // The live view now renders on desktop too, so it honors the right font-size
+  // setting per device: the desktop terminal size on a fine pointer, the
+  // (smaller) mobile size on touch. Reading the wrong one is why the desktop
+  // pane came up tiny and ignored the dashboard's font-size control.
+  const coarse = useIsCoarsePointer();
+  const fontKey = coarse ? "mobileFontSize" : "desktopFontSize";
+  const configuredFontSize = settings[fontKey];
+  const [fontSize, setFontSize] = useState(() => configuredFontSize);
+  // Adopt the persisted setting when it changes (settings panel, or the
+  // pointer class flipping which font key applies) via the adjust-state-
+  // during-render pattern. Pinch-zoom on touch still drives fontSize live
+  // below; mid-gesture the setting is unchanged so this never clobbers it.
+  const [lastConfiguredFontSize, setLastConfiguredFontSize] = useState(configuredFontSize);
+  if (configuredFontSize !== lastConfiguredFontSize) {
+    setLastConfiguredFontSize(configuredFontSize);
+    setFontSize(configuredFontSize);
+  }
   const scrollerRef = useRef<HTMLDivElement>(null);
   const measureRef = useRef<HTMLSpanElement>(null);
 
@@ -297,23 +389,80 @@ export function MobileLiveTerminal({
     rowsRef.current = screenRows || rowsRef.current;
   }, [screenRows]);
 
-  // Cursor cell -> visual overlay position. Shown only at the live edge;
-  // reading scrollback hides it. The pinning layout effect also feeds
-  // this position into cursorAnchorRef for the keyboard-shrunk target.
+  // Last visual row with real text. A fullscreen agent (Claude) only fills
+  // part of a tall mobile pane and leaves the rest blank; this is where the
+  // meaningful screen ends. Cursor-independent so it drives both the
+  // cursor-in-the-void check below and the no-cursor scroll anchor.
+  const lastNonBlankRow = useMemo(() => {
+    for (let i = visual.rows.length - 1; i >= 0; i--) {
+      if (visual.rows[i]!.some((s) => s.text.trim() !== "")) return i;
+    }
+    return -1;
+  }, [visual]);
+
+  // Debounced count of rows to render: the last non-blank row + 1, but it
+  // GROWS instantly (follow appended output) and SHRINKS only after staying
+  // lower for SHRINK_DELAY_MS. Trimming the trailing blank rows lets `mt-auto`
+  // bottom-align a fullscreen agent that doesn't fill the tall mobile pane, so
+  // its input box sits just above the keyboard instead of floating over a dead
+  // gap. The debounce is essential: a spinner toggling the lowest non-blank
+  // row would otherwise change the rendered height every frame and bounce the
+  // whole block (the raw last-non-blank jitter #2087 reverted). State, not a
+  // ref, because the render depends on it.
+  const [renderRowCount, setRenderRowCount] = useState(0);
+  const shrinkTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    const target = Math.max(0, lastNonBlankRow + 1);
+    setRenderRowCount((current) => {
+      if (target >= current) {
+        if (shrinkTimerRef.current) clearTimeout(shrinkTimerRef.current);
+        shrinkTimerRef.current = null;
+        return target;
+      }
+      if (shrinkTimerRef.current == null) {
+        shrinkTimerRef.current = setTimeout(() => {
+          shrinkTimerRef.current = null;
+          setRenderRowCount(Math.max(0, lastNonBlankRow + 1));
+        }, SHRINK_DELAY_MS);
+      }
+      return current;
+    });
+  }, [lastNonBlankRow]);
+
+  // Clear a pending shrink timer on unmount so it can't fire setRenderRowCount
+  // after the component is gone. Separate from the debounce effect above so
+  // its grow/shrink timing is unaffected (a deps-driven cleanup there would
+  // reset the debounce on every row change).
+  useEffect(
+    () => () => {
+      if (shrinkTimerRef.current) clearTimeout(shrinkTimerRef.current);
+    },
+    [],
+  );
+
+  // Cursor cell -> the VISUAL ROW + COLUMN to box inline (see Row). Shown only
+  // at the live edge; reading scrollback hides it. `top` is the row's pixel
+  // top, fed to cursorAnchorRef so the keyboard-shrunk scroll target can keep
+  // the input row above the keyboard.
   const live = useMemo(() => {
     const cursor = !reading ? (frame?.cursor ?? null) : null;
-    let cursorTop = 0;
-    let cursorLeft = 0;
-    if (cursor) {
-      const lineIdx = Math.max(0, lines.length - screenRows) + cursor.y;
-      const baseRow = visual.lineStartRow[lineIdx] ?? visual.rows.length;
-      const cols = renderCols > 0 ? renderCols : Number.POSITIVE_INFINITY;
-      const wrapOffset = Number.isFinite(cols) ? Math.floor(cursor.x / cols) : 0;
-      cursorTop = (effectiveSpacerLines + baseRow + wrapOffset) * lineH;
-      cursorLeft = (Number.isFinite(cols) ? cursor.x % cols : cursor.x) * charW;
-    }
-    return { cursor, cursorTop, cursorLeft };
-  }, [reading, frame, lines.length, screenRows, visual, renderCols, charW, effectiveSpacerLines, lineH]);
+    if (!cursor) return { row: -1, col: -1, top: null as number | null };
+    const lineIdx = Math.max(0, lines.length - screenRows) + cursor.y;
+    if (lineIdx < 0 || lineIdx >= lines.length) return { row: -1, col: -1, top: null };
+    const cols = renderCols > 0 ? renderCols : Number.POSITIVE_INFINITY;
+    const baseRow = visual.lineStartRow[lineIdx] ?? -1;
+    if (baseRow < 0) return { row: -1, col: -1, top: null };
+    const wrapOffset = Number.isFinite(cols) ? Math.floor(cursor.x / cols) : 0;
+    const row = baseRow + wrapOffset;
+    // The agent can park the hardware cursor in a trailing BLANK row below its
+    // drawn UI (Claude draws its own caret in the input box higher up). Boxing
+    // a cell there would put the cursor far below the input box (the reported
+    // "filled rectangle 10 rows below"). When the cursor lands past the last
+    // non-blank row, draw nothing; the agent's own caret stays visible.
+    if (row > lastNonBlankRow) return { row: -1, col: -1, top: null };
+    const col = Number.isFinite(cols) ? cursor.x % cols : cursor.x;
+    return { row, col, top: (effectiveSpacerLines + row) * lineH };
+  }, [reading, frame, lines.length, screenRows, visual, renderCols, effectiveSpacerLines, lineH, lastNonBlankRow]);
 
   const atBottom = useCallback(() => {
     const el = scrollerRef.current;
@@ -453,11 +602,11 @@ export function MobileLiveTerminal({
         if (!changed) return;
         if (persistTimerRef.current) clearTimeout(persistTimerRef.current);
         persistTimerRef.current = setTimeout(() => {
-          update({ mobileFontSize: fontSize });
+          update({ [fontKey]: fontSize });
         }, 400);
       }
     },
-    [fontSize, update, returnToLive, atBottom],
+    [fontKey, fontSize, update, returnToLive, atBottom],
   );
   useEffect(
     () => () => {
@@ -533,7 +682,7 @@ export function MobileLiveTerminal({
     // mid-redraw capture that momentarily hides the cursor keeps the
     // last known anchor instead of flapping the target to the literal
     // bottom and back.
-    if (live.cursor) cursorAnchorRef.current = live.cursorTop;
+    if (live.top != null) cursorAnchorRef.current = live.top;
     pinIfWasAtBottom();
     // When not pinned, scrollTop is left alone. Above-viewport height is
     // invariant (spacer rows convert to content rows 1:1; appends only
@@ -661,8 +810,15 @@ export function MobileLiveTerminal({
     [sendKeys, inputRef],
   );
 
-  // Cursor overlay geometry (computed in the `live` memo above).
-  const { cursor, cursorTop, cursorLeft } = live;
+  // The cursor is rendered inline by Row (see below): this is the visual row
+  // to box, and the column within it. -1 means draw nothing.
+  const cursorRow = connected && !reading ? live.row : -1;
+
+  // Trim trailing blank rows (for bottom-align) ONLY at the live edge. While
+  // reading scrollback the spacer model keeps above-viewport pixels invariant
+  // so the position holds as the agent streams; trimming there would change
+  // scrollHeight under the reader and snap the viewport.
+  const visibleRowCount = reading ? visual.rows.length : renderRowCount;
 
   return (
     <div className="absolute inset-0" data-live-terminal>
@@ -674,7 +830,7 @@ export function MobileLiveTerminal({
         onTouchMove={onTouchMove}
         onTouchEnd={onTouchEnd}
         onTouchCancel={onTouchEnd}
-        className={`absolute inset-0 font-mono ${
+        className={`absolute inset-0 font-mono flex flex-col ${
           forwardMode ? "overflow-hidden" : "overflow-y-auto overflow-x-hidden"
         }`}
         style={{
@@ -700,30 +856,38 @@ export function MobileLiveTerminal({
         >
           MMMMMMMMMMMMMMMMMMMM
         </span>
-        <div className="relative whitespace-pre" data-live-content>
+        {/* `mt-auto` bottom-aligns the screen when the rendered rows are
+            shorter than the viewport (a fullscreen agent only fills part of a
+            tall mobile pane), so its input box sits just above the keyboard
+            instead of floating over a dead gap. When content overflows
+            (scrollback) the auto margin collapses and it scrolls normally,
+            sidestepping the flex+overflow top-clip bug. The paired shells
+            opt out (`bottomAlign=false`) so a near-empty bash prompt sits at
+            the top like a normal terminal. */}
+        <div className={`relative whitespace-pre ${bottomAlign ? "mt-auto" : ""}`} data-live-content>
           {effectiveSpacerLines > 0 && (
             <div style={{ height: `${effectiveSpacerLines * lineH}px` }} aria-hidden="true" />
           )}
-          {visual.rows.map((segs, i) => (
-            <Row key={i} segs={segs} />
+          {visual.rows.slice(0, visibleRowCount).map((segs, i) => (
+            <Row key={i} segs={segs} cursorCol={i === cursorRow ? live.col : null} />
           ))}
-          {connected && cursor && (
-            <div
-              aria-hidden="true"
-              className="absolute motion-safe:animate-pulse"
-              data-live-cursor
-              style={{
-                top: `${cursorTop}px`,
-                left: `${cursorLeft}px`,
-                width: `${charW}px`,
-                height: `${lineH}px`,
-                background: "var(--term-cursor, #f59e0b)",
-                opacity: 0.8,
-              }}
-            />
-          )}
         </div>
       </div>
+
+      {LIVE_DEBUG && (
+        <div
+          aria-hidden="true"
+          className="absolute top-1 left-1 z-20 font-mono text-[10px] leading-tight text-amber-300 bg-black/80 rounded px-1.5 py-1 pointer-events-none whitespace-pre"
+          data-live-debug
+        >
+          {[
+            `rows=${frame?.rows ?? "-"} hist=${frame?.history ?? "-"} lines=${lines.length}`,
+            `grid=${renderCols}cols spacer=${spacerLines} lastNonBlank=${lastNonBlankRow}`,
+            `cur=${frame?.cursor ? `${frame.cursor.x},${frame.cursor.y}` : "null"} -> row=${live.row} col=${live.col}`,
+            `lineH=${lineH.toFixed(2)} charW=${charW.toFixed(3)}`,
+          ].join("\n")}
+        </div>
+      )}
 
       {reading && (
         <button

@@ -7,6 +7,7 @@ import { clearDraft, sweepOrphanDrafts } from "./lib/acpDrafts";
 import { AcpPrefsProvider } from "./lib/acpPrefs";
 import { safeGetItem, safeRemoveItem, safeSetItem } from "./lib/safeStorage";
 import { useWorkspaces } from "./hooks/useWorkspaces";
+import { useLastSessionRestore } from "./hooks/useLastSessionRestore";
 import { useRepoGroups } from "./hooks/useRepoGroups";
 import { useSessionGroups } from "./hooks/useSessionGroups";
 import { useNestedSidebarGroups } from "./hooks/useNestedSidebarGroups";
@@ -22,6 +23,7 @@ import { useDiffComments } from "./hooks/useDiffComments";
 import { clearStoredComments, sweepOrphanComments } from "./components/diff/comments/storage";
 import { SendCommentsDialog } from "./components/diff/comments/SendCommentsDialog";
 import { useCommandActions } from "./hooks/useCommandActions";
+import { useSettingsCommands } from "./hooks/useSettingsCommands";
 import { useEdgeSwipe } from "./hooks/useEdgeSwipe";
 import { useIsCoarsePointer } from "./hooks/useIsCoarsePointer";
 import { useIsWideViewport } from "./hooks/useIsWideViewport";
@@ -72,7 +74,6 @@ import { MobileMainPane } from "./components/MobileMainPane";
 import { DiffFileViewer } from "./components/diff/DiffFileViewer";
 import { SettingsView } from "./components/SettingsView";
 import { ProjectsView } from "./components/ProjectsView";
-import { ProfilesPage } from "./components/profiles/ProfilesPage";
 import { HelpOverlay } from "./components/HelpOverlay";
 import { useTour } from "./hooks/useTour";
 import { useWelcomePhase } from "./hooks/useWelcomePhase";
@@ -226,7 +227,6 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   const activeSessionId = sessionMatch?.params.sessionId ?? null;
   const showSettings = settingsRootMatch !== null || settingsTabMatch !== null;
   const showProjects = projectsMatch !== null;
-  const showProfiles = profilesMatch !== null;
   const settingsTab = settingsTabMatch?.params.tab ?? null;
 
   const {
@@ -240,6 +240,9 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     setSessionStatus,
   } = useSessions();
   const workspaces = useWorkspaces(sessions);
+
+  // Remember the active session and restore it on a PWA relaunch (#2103).
+  useLastSessionRestore({ activeSessionId, sessions, sessionsLoaded });
 
   // One-shot orphan-draft sweep once useSessions has settled its first
   // fetch (success or null). Catches acp:draft:<id> keys left behind
@@ -780,18 +783,11 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     }
   }, [navigate, activeSessionId]);
 
-  const handleOpenProfiles = useCallback(() => {
-    navigate("/profiles");
-    if (window.innerWidth < 768) setSidebarOpen(false);
-  }, [navigate]);
-
-  const handleCloseProfiles = useCallback(() => {
-    if (activeSessionId) {
-      navigate(`/session/${encodeURIComponent(activeSessionId)}`);
-    } else {
-      navigate("/");
-    }
-  }, [navigate, activeSessionId]);
+  // Profiles moved into Settings as a tab; redirect the retired standalone
+  // route so old bookmarks and links still land somewhere valid.
+  useEffect(() => {
+    if (profilesMatch) navigate(`/settings/profiles${window.location.search}`, { replace: true });
+  }, [profilesMatch, navigate]);
 
   const handleCloseSettings = useCallback(() => {
     if (activeSessionId) {
@@ -981,6 +977,13 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     onLogout,
   });
 
+  const openSettingsTab = useCallback((tab: string) => navigate(`/settings/${tab}`), [navigate]);
+  const settingsCommands = useSettingsCommands({
+    open: showPalette,
+    readOnly: !!serverAbout?.read_only,
+    onOpenSettingsTab: openSettingsTab,
+  });
+
   const renderContent = () => {
     if (showSettings) {
       return (
@@ -998,16 +1001,13 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
             next.set("profile", p);
             setSearchParams(next, { replace: true });
           }}
+          readOnly={serverAbout?.read_only}
         />
       );
     }
 
     if (showProjects) {
       return <ProjectsView onClose={handleCloseProjects} readOnly={serverAbout?.read_only} />;
-    }
-
-    if (showProfiles) {
-      return <ProfilesPage onClose={handleCloseProfiles} readOnly={serverAbout?.read_only} />;
     }
 
     // Refresh on `/session/<id>` paints once with `sessions === []` before
@@ -1246,7 +1246,6 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     !activeSessionId &&
     !showSettings &&
     !showProjects &&
-    !showProfiles &&
     !showSessionWizard &&
     !showHelp &&
     !showAbout &&
@@ -1291,13 +1290,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
           onGoDashboard={handleGoDashboard}
           sidebarColumnVisible={!showSettings && !showProjects && sidebarOpen}
           rightColumnVisible={
-            isMdUp &&
-            !showSettings &&
-            !showProjects &&
-            !showProfiles &&
-            !!activeWorkspace &&
-            !!activeSession &&
-            !diffCollapsed
+            isMdUp && !showSettings && !showProjects && !!activeWorkspace && !!activeSession && !diffCollapsed
           }
         />
 
@@ -1328,7 +1321,6 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
               onUnpinProject={handleUnpinProject}
               onSettings={handleOpenSettings}
               onProjects={handleOpenProjects}
-              onProfiles={handleOpenProfiles}
               onDeleteSession={handleDeleteSession}
               onStopSession={handleStopSession}
               onStartSession={handleStartSession}
@@ -1392,7 +1384,11 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
           />
         )}
 
-        <CommandPalette open={showPalette} onClose={() => setShowPalette(false)} actions={commandActions} />
+        <CommandPalette
+          open={showPalette}
+          onClose={() => setShowPalette(false)}
+          actions={[...commandActions, ...settingsCommands]}
+        />
 
         {activeWorkspace && activeSession && (
           <MobileRightPanelPicker
