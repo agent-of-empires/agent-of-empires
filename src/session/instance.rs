@@ -3333,16 +3333,10 @@ impl Instance {
         // Archived sessions have their tmux torn down on purpose (#1868), so
         // probing tmux here only ever produces a spurious "tmux session is
         // gone" Error transition (#2206). Short-circuit so the poller never
-        // re-probes a row whose tmux is gone by design; archive/unarchive must
-        // stay status-preserving, so only the bug's own footprint (Error with
-        // the tmux-gone message) is healed back to Idle.
+        // re-probes a row whose tmux is gone by design; this keeps
+        // archive/unarchive status-preserving. Rows already persisted as Error
+        // by a pre-fix build are cleaned up once by the v016 migration.
         if self.is_archived() {
-            if self.status == Status::Error
-                && self.last_error.as_deref() == Some(TMUX_SESSION_GONE_ERROR)
-            {
-                self.status = Status::Idle;
-                self.last_error = None;
-            }
             return;
         }
 
@@ -4000,8 +3994,8 @@ mod tests {
     fn test_archived_session_not_marked_error_when_tmux_gone() {
         // #2206: archiving kills the session's tmux on purpose. A subsequent
         // status poll must not flip the archived row to Error for the missing
-        // tmux; archive is status-preserving, so an idle row stays Idle with
-        // no tmux-gone error recorded.
+        // tmux; the archived guard short-circuits, so an idle row stays Idle.
+        // Red on the pre-fix tree, where the tmux probe stamps Error.
         let mut inst = Instance::new("test", "/tmp/test");
         inst.archive();
         inst.update_status_with_metadata(None);
@@ -4011,28 +4005,32 @@ mod tests {
     }
 
     #[test]
-    fn test_archived_session_heals_stale_tmux_gone_error() {
-        // #2206: a session archived by an older build may already be persisted
-        // as Error with the tmux-gone message. The next poll heals exactly
-        // that footprint back to Idle and clears the stale error.
-        let mut inst = Instance::new("test", "/tmp/test");
-        inst.archive();
-        inst.status = Status::Error;
-        inst.last_error = Some(TMUX_SESSION_GONE_ERROR.to_string());
-        inst.update_status_with_metadata(None);
-        assert_eq!(inst.status, Status::Idle);
-        assert_eq!(inst.last_error, None);
-    }
-
-    #[test]
     fn test_archived_session_preserves_genuine_error() {
-        // #2206: a session that genuinely errored (a non-tmux-gone message)
-        // and was then archived must keep its Error status, so archive then
-        // unarchive stays status-preserving for real failures.
+        // #2206 regression guard (passes on both trees): the archived guard
+        // never mutates status, so a genuinely errored session keeps its Error
+        // state while archived. The legacy on-disk footprint is cleaned up by
+        // the v016 migration, not by the poller.
         let mut inst = Instance::new("test", "/tmp/test");
         inst.archive();
         inst.status = Status::Error;
         inst.last_error = Some("agent crashed".to_string());
+        inst.update_status_with_metadata(None);
+        assert_eq!(inst.status, Status::Error);
+        assert_eq!(inst.last_error.as_deref(), Some("agent crashed"));
+    }
+
+    #[test]
+    fn test_archived_unarchived_genuine_error_roundtrips() {
+        // #2206: archive then unarchive must stay status-preserving for a real
+        // failure. The archived guard leaves Error untouched; after unarchive
+        // the tmux probe re-stamps Error and its is_none() guard preserves the
+        // original message regardless of whether tmux is installed on the box.
+        let mut inst = Instance::new("test", "/tmp/test");
+        inst.archive();
+        inst.status = Status::Error;
+        inst.last_error = Some("agent crashed".to_string());
+        inst.update_status_with_metadata(None);
+        inst.unarchive();
         inst.update_status_with_metadata(None);
         assert_eq!(inst.status, Status::Error);
         assert_eq!(inst.last_error.as_deref(), Some("agent crashed"));
