@@ -91,8 +91,11 @@ pub struct SidecarHooks {
     /// (e.g. `.hermes/sandbox/config.yaml`). The `sandbox` segment mirrors the
     /// container staging dir. Empty (and unused) for `host_only` agents.
     pub sandbox_config_subpath: &'static str,
-    /// Write AoE status hooks into the config file at the given path.
-    pub install: fn(&std::path::Path) -> anyhow::Result<()>,
+    /// Write AoE status hooks into the config file at the given path. The
+    /// `target` parameter selects which `{base}` is baked into the hook
+    /// command string (`/tmp/aoe-hooks-<euid>` for host, `/tmp/aoe-hooks` for
+    /// sandbox; see `crate::hooks::HookInstallTarget`).
+    pub install: fn(&std::path::Path, crate::hooks::HookInstallTarget) -> anyhow::Result<()>,
     /// Remove AoE status hooks from the config file at the given path.
     /// Returns whether anything was changed.
     pub uninstall: fn(&std::path::Path) -> anyhow::Result<bool>,

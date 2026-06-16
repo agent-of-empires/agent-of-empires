@@ -157,14 +157,19 @@ fn rewrite_one(target: &HookTarget) -> Result<()> {
         }
         HookTargetKind::CodexToml => {
             let preserved = snapshot_codex_hooks_state(&target.path)?;
-            install_codex_hooks_with_preserved_state(&target.path, target.events, preserved)
+            install_codex_hooks_with_preserved_state(
+                &target.path,
+                target.events,
+                preserved,
+                HookInstallTarget::Host,
+            )
         }
         HookTargetKind::Sidecar(sidecar) => {
             // We deliberately do NOT invoke `sidecar.post_install_host`:
             // Kiro's `set_kiro_default_agent_if_builtin` shells out to
             // `kiro-cli`, which is launcher-state mutation, not file-content
             // reconciliation.
-            (sidecar.install)(&target.path)
+            (sidecar.install)(&target.path, HookInstallTarget::Host)
         }
     }
 }
@@ -315,7 +320,8 @@ mod tests {
                         canonical_set.push(canonical_session_id_command(HookInstallTarget::Host));
                     }
                     if let Some(status) = event_def.status {
-                        canonical_set.push(canonical_status_command(status));
+                        canonical_set
+                            .push(canonical_status_command(status, HookInstallTarget::Host));
                     }
                     assert!(
                         canonical_set.iter().any(|c| c == cmd),
@@ -485,7 +491,8 @@ mod tests {
         // canonical bytes adjacent to it (so live status detection works
         // for the next session).
         use crate::hooks::canonical_status_command;
-        let canonical_running = canonical_status_command("running");
+        let canonical_running =
+            canonical_status_command("running", crate::hooks::HookInstallTarget::Host);
         let found_hardened = pre_tool.iter().skip(1).any(|m| {
             m["hooks"].as_array().is_some_and(|arr| {
                 arr.iter()

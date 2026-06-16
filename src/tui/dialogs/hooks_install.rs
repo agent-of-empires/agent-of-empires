@@ -157,9 +157,10 @@ impl HooksInstallDialog {
             "Each hook runs:",
             Style::default().bold(),
         )));
-        lines.push(Line::from(
-            "  printf {status} > /tmp/aoe-hooks/$AOE_INSTANCE_ID/status",
-        ));
+        lines.push(Line::from(format!(
+            "  printf {{status}} > /tmp/aoe-hooks-{}/$AOE_INSTANCE_ID/status",
+            nix::unistd::geteuid().as_raw()
+        )));
 
         lines.push(Line::from(""));
         lines.push(Line::from(
@@ -435,12 +436,19 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            text.contains("/tmp/aoe-hooks/$AOE_INSTANCE_ID/status"),
-            "example command must reference the real env var: {text}"
+            text.contains(&format!(
+                "/tmp/aoe-hooks-{}/$AOE_INSTANCE_ID/status",
+                nix::unistd::geteuid().as_raw()
+            )),
+            "example command must reference the per-user (issue #1844) path: {text}"
         );
         assert!(
             !text.contains("/tmp/aoe-hooks/$ID/"),
             "example command must not use the bogus $ID placeholder: {text}"
+        );
+        assert!(
+            !text.contains("/tmp/aoe-hooks/$AOE_INSTANCE_ID/status"),
+            "example must not use the legacy multi-tenant-vulnerable path: {text}"
         );
     }
 

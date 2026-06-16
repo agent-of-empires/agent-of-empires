@@ -85,7 +85,7 @@ reqwest = { version = "0.13", features = ["json", "rustls", "stream"], default-f
 tokio-util = { version = "0.7", features = ["codec", "compat"] }
 
 # Process handling
-nix = { version = "0.31", features = ["signal", "process", "net", "fs", "resource"] }
+nix = { version = "0.31", features = ["signal", "process", "net", "fs", "resource", "dir", "user"] }
 
 # Unicode width + normalization (NFKD used to fold accents in title-derived branch names)
 unicode-normalization = "0.1"

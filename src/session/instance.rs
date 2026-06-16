@@ -1953,7 +1953,7 @@ impl Instance {
             if !self.is_sandboxed() {
                 if let Some(home) = dirs::home_dir() {
                     let config_path = home.join(sidecar.host_config_subpath);
-                    match (sidecar.install)(&config_path) {
+                    match (sidecar.install)(&config_path, crate::hooks::HookInstallTarget::Host) {
                         Ok(()) => {
                             if let Some(post_install) = sidecar.post_install_host {
                                 post_install();
@@ -1968,9 +1968,11 @@ impl Instance {
             if let Some(hook_cfg) = agent.and_then(|a| a.hook_config.as_ref()) {
                 match self.codex_config_path_for_launch_env() {
                     Ok(config_path) => {
-                        if let Err(e) =
-                            crate::hooks::install_codex_hooks(&config_path, hook_cfg.events)
-                        {
+                        if let Err(e) = crate::hooks::install_codex_hooks(
+                            &config_path,
+                            hook_cfg.events,
+                            crate::hooks::HookInstallTarget::Host,
+                        ) {
                             tracing::warn!("Failed to install codex hooks: {}", e);
                         }
                     }
@@ -6301,9 +6303,16 @@ mod tests {
         }
 
         fn write_sidecar(instance_id: &str, sid: &str) -> std::path::PathBuf {
+            use std::os::unix::fs::PermissionsExt;
+            let base = crate::hooks::hook_base_path();
+            if !base.exists() {
+                std::fs::create_dir_all(&base).ok();
+            }
+            std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).ok();
             let dir =
                 crate::hooks::hook_status_dir(instance_id).expect("test id must be allowlist-safe");
             std::fs::create_dir_all(&dir).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).ok();
             std::fs::write(dir.join("session_id"), sid).unwrap();
             dir
         }
@@ -7729,8 +7738,15 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
         );
 
         // The clobbered hook state that produced the green row.
+        use std::os::unix::fs::PermissionsExt;
+        let base = crate::hooks::hook_base_path();
+        if !base.exists() {
+            std::fs::create_dir_all(&base).ok();
+        }
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).ok();
         let dir = crate::hooks::hook_status_dir(&inst.id).expect("hook dir");
         std::fs::create_dir_all(&dir).expect("create hook dir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).ok();
         std::fs::write(dir.join("status"), "running").expect("write status");
         assert_eq!(
             crate::hooks::read_hook_status(&inst.id),

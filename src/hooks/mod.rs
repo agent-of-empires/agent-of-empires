@@ -7,6 +7,7 @@
 //!
 //! Hook events are agent-specific and defined in `AgentHookConfig::events`.
 
+mod dir_guard;
 mod status_file;
 
 use std::path::{Path, PathBuf};
@@ -15,13 +16,22 @@ use anyhow::{Context, Result};
 use fs2::FileExt as _;
 use serde_json::Value;
 
+pub(crate) use dir_guard::write_session_id_via_guard;
+#[cfg(test)]
+pub(crate) use dir_guard::{
+    clear_base_override_for_test, hook_base_path, override_base_for_test, reset_for_test,
+};
 pub use status_file::{
     cleanup_hook_status_dir, hook_status_dir, read_hook_session_id, read_hook_status,
     read_hook_urgent,
 };
 
-/// Base directory for all AoE hook status files.
-pub(crate) const HOOK_STATUS_BASE: &str = "/tmp/aoe-hooks";
+/// Fixed base path used inside the sandbox image, where the multi-tenant
+/// threat does not apply (per-container, single-tenant). The host bind-mounts
+/// `/tmp/aoe-hooks-<euid>/<id>` from `dir_guard::hook_base_path()` to this
+/// fixed path inside the container so the sandbox shell can bake a single
+/// canonical string regardless of the host's effective uid (R4, R5).
+pub(crate) const HOOK_STATUS_BASE_IN_CONTAINER: &str = "/tmp/aoe-hooks";
 
 /// Marker substring used to identify AoE-managed hooks in settings.json.
 /// Any hook command containing this string is considered ours.
@@ -165,33 +175,60 @@ fn resolve_config_dir_override(var: &str, host_env: &[String]) -> Option<String>
 /// Build the shell command for a hook that writes a status value.
 ///
 /// The command must never exit non-zero, otherwise the agent treats the hook
-/// as a blocking failure and refuses to run further tool calls. `/tmp/aoe-hooks/<id>`
-/// can disappear mid-session (OS /tmp cleanup, transient FS hiccup, external
-/// tooling), so both mkdir and printf must tolerate a missing parent dir. We
-/// swallow stderr and force a final `exit 0`: at worst the status file is one
-/// tick stale and the next hook call recreates the dir.
-fn hook_command(status: &str) -> String {
-    hook_command_with_base(status, HOOK_STATUS_BASE)
+/// as a blocking failure and refuses to run further tool calls. Every reject
+/// path is `exit 0`; at worst the status file is one tick stale and the next
+/// hook call recovers.
+///
+/// Per `HookInstallTarget`:
+/// - `Host`: bakes `/tmp/aoe-hooks-<euid>` (per-user, R1) and adds an
+///   `id -u` ownership self-check (defence-in-depth, the Rust-side
+///   `dir_guard` is the authoritative gate).
+/// - `Sandbox`: bakes `/tmp/aoe-hooks` (R5, fixed inside the container; the
+///   host bind-mounts `/tmp/aoe-hooks-<euid>/<id>` -> `/tmp/aoe-hooks/<id>`)
+///   and drops the uid check because the in-container UID is unpredictable
+///   and the bind-mount source has already been validated host-side (R6).
+///
+/// Both variants share the SELinux/ACL/xattr-tolerant mode pattern (R11)
+/// and an environment-pinning preamble (R12).
+fn hook_command(status: &str, target: HookInstallTarget) -> String {
+    let base = match target {
+        HookInstallTarget::Host => dir_guard::hook_base_path().display().to_string(),
+        HookInstallTarget::Sandbox => HOOK_STATUS_BASE_IN_CONTAINER.to_string(),
+    };
+    hook_command_with_base(status, &base, target)
 }
 
-/// Test-only access to the canonical status-writer bytes for byte-equality
-/// assertions (issue #1845 acceptance criterion #4). cfg-gated so no
-/// production caller can grow up around it.
 #[cfg(test)]
-pub(crate) fn canonical_status_command(status: &str) -> String {
-    hook_command(status)
+pub(crate) fn canonical_status_command(status: &str, target: HookInstallTarget) -> String {
+    hook_command(status, target)
 }
 
-fn hook_command_with_base(status: &str, base: &str) -> String {
-    // `[ -n ]` is load-bearing: `*[!...]*` does not match the empty
-    // string. `exit 0` on rejection: a non-zero hook exit blocks the
-    // agent's tool calls.
+fn hook_command_with_base(status: &str, base: &str, target: HookInstallTarget) -> String {
+    let owner_check = match target {
+        HookInstallTarget::Host => {
+            "ME=$(id -u 2>/dev/null) || exit 0; \
+             [ \"$3\" = \"$ME\" ] || exit 0; "
+        }
+        HookInstallTarget::Sandbox => "",
+    };
+    let owner_recheck = owner_check;
     format!(
-        "sh -c '[ -n \"$AOE_INSTANCE_ID\" ] || exit 0; \
+        "sh -c 'unset IFS; umask 077; \
+         [ -n \"$AOE_INSTANCE_ID\" ] || exit 0; \
          case \"$AOE_INSTANCE_ID\" in *[!0-9a-zA-Z_-]*) exit 0 ;; esac; \
-         mkdir -p \"{base}/$AOE_INSTANCE_ID\" 2>/dev/null; \
-         printf {status} > \"{base}/$AOE_INSTANCE_ID/status\" 2>/dev/null; \
-         exit 0'"
+         B={base}; \
+         LS=$(LC_ALL=C ls -ldn \"$B\" 2>/dev/null) || exit 0; \
+         set -- $LS; M=\"$1\"; \
+         case \"$M\" in d*------|d*------.|d*------+|d*------@) ;; *) exit 0 ;; esac; \
+         {owner_check}\
+         D=\"$B/$AOE_INSTANCE_ID\"; \
+         mkdir -p \"$D\" 2>/dev/null; \
+         LS=$(LC_ALL=C ls -ldn \"$D\" 2>/dev/null) || exit 0; \
+         set -- $LS; M=\"$1\"; \
+         case \"$M\" in d*------|d*------.|d*------+|d*------@) ;; *) exit 0 ;; esac; \
+         {owner_recheck}\
+         printf {status} > \"$D/status\" 2>/dev/null; \
+         exit 0 # {AOE_HOOK_MARKER}'"
     )
 }
 
@@ -212,7 +249,9 @@ fn hook_command_with_base(status: &str, base: &str) -> String {
 fn hook_command_session_id(target: HookInstallTarget) -> String {
     match target {
         HookInstallTarget::Host => hook_command_session_id_host(),
-        HookInstallTarget::Sandbox => hook_command_session_id_sandbox(HOOK_STATUS_BASE),
+        HookInstallTarget::Sandbox => {
+            hook_command_session_id_sandbox(HOOK_STATUS_BASE_IN_CONTAINER)
+        }
     }
 }
 
@@ -235,9 +274,13 @@ fn hook_command_session_id_host() -> String {
 
 fn hook_command_session_id_sandbox(base: &str) -> String {
     format!(
-        "sh -c '[ -n \"$AOE_INSTANCE_ID\" ] || exit 0; \
+        "sh -c 'unset IFS; umask 077; \
+         [ -n \"$AOE_INSTANCE_ID\" ] || exit 0; \
          case \"$AOE_INSTANCE_ID\" in *[!0-9a-zA-Z_-]*) exit 0 ;; esac; \
          D=\"{base}/$AOE_INSTANCE_ID\"; mkdir -p \"$D\" 2>/dev/null; \
+         LS=$(LC_ALL=C ls -ldn \"$D\" 2>/dev/null) || exit 0; \
+         set -- $LS; M=\"$1\"; \
+         case \"$M\" in d*------|d*------.|d*------+|d*------@) ;; *) exit 0 ;; esac; \
          SID=$(tr -d \"\\n\" | grep -oE \"[{{,][[:space:]]*\\\"session_id\\\"[[:space:]]*:[[:space:]]*\\\"[0-9a-fA-F]{{8}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{12}}\\\"\" | head -1 | grep -oE \"[0-9a-fA-F]{{8}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{12}}\"); \
          [ -n \"$SID\" ] && printf \"%s\" \"$SID\" > \"$D/.session_id.$$.tmp\" 2>/dev/null && mv \"$D/.session_id.$$.tmp\" \"$D/session_id\" 2>/dev/null; \
          exit 0'"
@@ -588,7 +631,7 @@ fn build_aoe_hooks(events: &[crate::agents::HookEvent], target: HookInstallTarge
             commands.push(hook_command_session_id(target));
         }
         if let Some(status) = event.status {
-            commands.push(hook_command(status));
+            commands.push(hook_command(status, target));
         }
         if commands.is_empty() {
             continue;
@@ -717,8 +760,12 @@ const CODEX_HOOK_EVENT_NAMES: &[&str] = &[
 /// Codex also stores hook trust state in this file. Keep every AoE mutation
 /// behind the lock and atomic replace below so repeated launches cannot leave
 /// duplicated hook blocks or torn TOML.
-pub fn install_codex_hooks(config_path: &Path, events: &[crate::agents::HookEvent]) -> Result<()> {
-    install_codex_hooks_with_preserved_state(config_path, events, None)
+pub fn install_codex_hooks(
+    config_path: &Path,
+    events: &[crate::agents::HookEvent],
+    target: HookInstallTarget,
+) -> Result<()> {
+    install_codex_hooks_with_preserved_state(config_path, events, None, target)
 }
 
 pub(crate) fn snapshot_codex_hooks_state(config_path: &Path) -> Result<Option<toml_edit::Item>> {
@@ -740,6 +787,7 @@ pub(crate) fn install_codex_hooks_with_preserved_state(
     config_path: &Path,
     events: &[crate::agents::HookEvent],
     preserved_state: Option<toml_edit::Item>,
+    target: HookInstallTarget,
 ) -> Result<()> {
     with_codex_config_lock(config_path, || {
         let mut config = read_codex_config(config_path)?;
@@ -754,7 +802,7 @@ pub(crate) fn install_codex_hooks_with_preserved_state(
             }
         }
         remove_codex_aoe_hooks(&mut config)?;
-        merge_codex_hooks(&mut config, events)?;
+        merge_codex_hooks(&mut config, events, target)?;
         write_codex_config(config_path, &config)?;
         Ok(())
     })?;
@@ -917,6 +965,7 @@ fn ensure_codex_event_array<'a>(
 fn merge_codex_hooks(
     config: &mut toml_edit::DocumentMut,
     events: &[crate::agents::HookEvent],
+    target: HookInstallTarget,
 ) -> Result<()> {
     let hooks = ensure_codex_hooks_table(config)?;
 
@@ -926,13 +975,17 @@ fn merge_codex_hooks(
         };
 
         let event_array = ensure_codex_event_array(hooks, event.name)?;
-        event_array.push(codex_matcher_group(event, status));
+        event_array.push(codex_matcher_group(event, status, target));
     }
 
     Ok(())
 }
 
-fn codex_matcher_group(event: &crate::agents::HookEvent, status: &str) -> toml_edit::Table {
+fn codex_matcher_group(
+    event: &crate::agents::HookEvent,
+    status: &str,
+    target: HookInstallTarget,
+) -> toml_edit::Table {
     let mut group = toml_edit::Table::new();
     if let Some(matcher) = event.matcher {
         group.insert("matcher", toml_edit::value(matcher));
@@ -940,7 +993,7 @@ fn codex_matcher_group(event: &crate::agents::HookEvent, status: &str) -> toml_e
 
     let mut handler = toml_edit::Table::new();
     handler.insert("type", toml_edit::value("command"));
-    handler.insert("command", toml_edit::value(hook_command(status)));
+    handler.insert("command", toml_edit::value(hook_command(status, target)));
 
     let mut handlers = toml_edit::ArrayOfTables::new();
     handlers.push(handler);
@@ -1162,7 +1215,7 @@ const SETTL_HOOKS: &[(&str, &str)] = &[
 /// previous AoE-managed hooks (identified by the marker), and adds hooks
 /// for the three status transitions: TurnStarted->running,
 /// WaitingForHuman->waiting, GameWon->idle.
-pub fn install_settl_hooks(config_path: &Path) -> Result<()> {
+pub fn install_settl_hooks(config_path: &Path, target: HookInstallTarget) -> Result<()> {
     // Parse existing config or start fresh
     let mut config: toml::Value = if config_path.exists() {
         let content = std::fs::read_to_string(config_path)?;
@@ -1198,7 +1251,10 @@ pub fn install_settl_hooks(config_path: &Path) -> Result<()> {
     for (event, status) in SETTL_HOOKS {
         let mut entry = toml::map::Map::new();
         entry.insert("event".into(), toml::Value::String((*event).into()));
-        entry.insert("command".into(), toml::Value::String(hook_command(status)));
+        entry.insert(
+            "command".into(),
+            toml::Value::String(hook_command(status, target)),
+        );
         hooks_arr.push(toml::Value::Table(entry));
     }
 
@@ -1275,7 +1331,7 @@ const HERMES_HOOKS: &[(&str, &str)] = &[
 /// Hermes itself tolerates a missing/stale allowlist by re-prompting for
 /// consent, which is recoverable. Hardening to atomic-write across both
 /// files is tracked as a follow-up.
-pub fn install_hermes_hooks(config_path: &Path) -> Result<()> {
+pub fn install_hermes_hooks(config_path: &Path, target: HookInstallTarget) -> Result<()> {
     let mut config: serde_yaml::Value = if config_path.exists() {
         let content = std::fs::read_to_string(config_path)?;
         if content.trim().is_empty() {
@@ -1322,7 +1378,7 @@ pub fn install_hermes_hooks(config_path: &Path) -> Result<()> {
         let mut entry = serde_yaml::Mapping::new();
         entry.insert(
             serde_yaml::Value::String("command".into()),
-            serde_yaml::Value::String(hook_command(status)),
+            serde_yaml::Value::String(hook_command(status, target)),
         );
         arr.push(serde_yaml::Value::Mapping(entry));
     }
@@ -1331,7 +1387,7 @@ pub fn install_hermes_hooks(config_path: &Path) -> Result<()> {
     let config_dir = config_path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("config path has no parent"))?;
-    let (allowlist_path, allowlist_formatted) = render_hermes_allowlist(config_dir)?;
+    let (allowlist_path, allowlist_formatted) = render_hermes_allowlist(config_dir, target)?;
 
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -1424,7 +1480,10 @@ pub fn uninstall_hermes_hooks(config_path: &Path) -> Result<bool> {
 /// timestamp, only freshly-introduced entries get `Utc::now()`. This makes
 /// the install path (and the v015 hook-rewrite migration that reuses it)
 /// byte-idempotent for users whose canonical command is already current.
-fn render_hermes_allowlist(config_dir: &Path) -> Result<(std::path::PathBuf, String)> {
+fn render_hermes_allowlist(
+    config_dir: &Path,
+    target: HookInstallTarget,
+) -> Result<(std::path::PathBuf, String)> {
     let allowlist_path = config_dir.join("shell-hooks-allowlist.json");
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
@@ -1446,7 +1505,7 @@ fn render_hermes_allowlist(config_dir: &Path) -> Result<(std::path::PathBuf, Str
         .ok_or_else(|| anyhow::anyhow!("allowlist root is not a JSON object with approvals[]"))?;
 
     for (event, status) in HERMES_HOOKS {
-        let cmd = hook_command(status);
+        let cmd = hook_command(status, target);
         // Preserve the original `approved_at` when an entry with the same
         // (event, command) already exists; only fresh entries get `now`.
         // A `null` value is preserved verbatim: the field records
@@ -1496,7 +1555,7 @@ pub const KIRO_HOOKS_AGENT_FILE: &str = ".kiro/agents/aoe-hooks.json";
 /// from any context (host install, sandbox provisioning, tests). To make
 /// the agent the active default on the host, call
 /// [`set_kiro_default_agent_if_builtin`] after this returns.
-pub fn install_kiro_hooks(agent_config_path: &Path) -> Result<()> {
+pub fn install_kiro_hooks(agent_config_path: &Path, target: HookInstallTarget) -> Result<()> {
     let mut config: serde_json::Map<String, Value> = if agent_config_path.exists() {
         let content = std::fs::read_to_string(agent_config_path)?;
         serde_json::from_str(&content).unwrap_or_else(|_| serde_json::Map::new())
@@ -1530,7 +1589,7 @@ pub fn install_kiro_hooks(agent_config_path: &Path) -> Result<()> {
                     .and_then(|c| c.as_str())
                     .is_some_and(is_aoe_hook_command)
             });
-            arr.push(serde_json::json!({ "command": hook_command(status) }));
+            arr.push(serde_json::json!({ "command": hook_command(status, target) }));
         }
     }
 
@@ -1673,9 +1732,9 @@ pub fn uninstall_all_hooks() {
         }
     }
 
-    let base = std::path::Path::new(HOOK_STATUS_BASE);
+    let base = dir_guard::hook_base_path();
     if base.exists() {
-        if let Err(e) = std::fs::remove_dir_all(base) {
+        if let Err(e) = std::fs::remove_dir_all(&base) {
             tracing::warn!(target: "hooks.uninstall", "Failed to remove {}: {}", base.display(), e);
         }
     }
@@ -1937,7 +1996,7 @@ mod tests {
         let codex_dir = tmp.path().join(".codex");
         let config_path = codex_dir.join("config.toml");
 
-        install_codex_hooks(&config_path, codex_events()).unwrap();
+        install_codex_hooks(&config_path, codex_events(), HookInstallTarget::Host).unwrap();
 
         let config: toml::Value =
             toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
@@ -1966,7 +2025,7 @@ mod tests {
         let config_path = codex_dir.join("config.toml");
         symlink("../dotfiles/codex-config.toml", &config_path).unwrap();
 
-        install_codex_hooks(&config_path, codex_events()).unwrap();
+        install_codex_hooks(&config_path, codex_events(), HookInstallTarget::Host).unwrap();
 
         assert!(
             std::fs::symlink_metadata(&config_path)
@@ -2075,7 +2134,7 @@ mod tests {
         .unwrap();
 
         let config_path = codex_dir.join("config.toml");
-        install_codex_hooks(&config_path, codex_events()).unwrap();
+        install_codex_hooks(&config_path, codex_events(), HookInstallTarget::Host).unwrap();
 
         let config = std::fs::read_to_string(&config_path).unwrap();
         assert!(config.contains("# keep this comment"));
@@ -2100,8 +2159,8 @@ hooks = { PreToolUse = [{ matcher = "Bash", hooks = [{ type = "command", command
         )
         .unwrap();
 
-        install_codex_hooks(&config_path, codex_events()).unwrap();
-        install_codex_hooks(&config_path, codex_events()).unwrap();
+        install_codex_hooks(&config_path, codex_events(), HookInstallTarget::Host).unwrap();
+        install_codex_hooks(&config_path, codex_events(), HookInstallTarget::Host).unwrap();
 
         let config_text = std::fs::read_to_string(config_path).unwrap();
         let config: toml::Value = toml::from_str(&config_text).unwrap();
@@ -2136,13 +2195,13 @@ existing = {{ enabled = true, trusted_hash = "hook-trust" }}
 type = "command"
 command = {:?}
 "#,
-                hook_command("running")
+                hook_command("running", HookInstallTarget::Host)
             ),
         )
         .unwrap();
 
-        install_codex_hooks(&config_path, codex_events()).unwrap();
-        install_codex_hooks(&config_path, codex_events()).unwrap();
+        install_codex_hooks(&config_path, codex_events(), HookInstallTarget::Host).unwrap();
+        install_codex_hooks(&config_path, codex_events(), HookInstallTarget::Host).unwrap();
 
         let config_text = std::fs::read_to_string(config_path).unwrap();
         let config: toml::Value = toml::from_str(&config_text).unwrap();
@@ -2181,6 +2240,7 @@ trusted_hash = "new"
             &config_path,
             codex_events(),
             Some(preserved_state),
+            HookInstallTarget::Host,
         )
         .unwrap();
 
@@ -2245,16 +2305,16 @@ trusted_hash = "sha256:keep"
 [projects."/tmp/aoe-project"]
 trust_level = "trusted"
 "#,
-            hook_command("idle"),
-            hook_command("running"),
-            hook_command("idle"),
-            hook_command("idle"),
-            hook_command("running"),
-            hook_command("idle")
+            hook_command("idle", HookInstallTarget::Host),
+            hook_command("running", HookInstallTarget::Host),
+            hook_command("idle", HookInstallTarget::Host),
+            hook_command("idle", HookInstallTarget::Host),
+            hook_command("running", HookInstallTarget::Host),
+            hook_command("idle", HookInstallTarget::Host)
         );
         std::fs::write(&config_path, installed_once).unwrap();
 
-        install_codex_hooks(&config_path, codex_events()).unwrap();
+        install_codex_hooks(&config_path, codex_events(), HookInstallTarget::Host).unwrap();
 
         let config_text = std::fs::read_to_string(config_path).unwrap();
         let config: toml::Value = toml::from_str(&config_text).unwrap();
@@ -2297,7 +2357,8 @@ trust_level = "trusted"
             handles.push(std::thread::spawn(move || {
                 barrier.wait();
                 for _ in 0..8 {
-                    install_codex_hooks(&config_path, codex_events()).unwrap();
+                    install_codex_hooks(&config_path, codex_events(), HookInstallTarget::Host)
+                        .unwrap();
                     let config_text = std::fs::read_to_string(&config_path).unwrap();
                     config_text.parse::<toml_edit::DocumentMut>().unwrap();
                 }
@@ -2334,7 +2395,7 @@ features = { web_search = true, hooks = false }
         .unwrap();
 
         let config_path = codex_dir.join("config.toml");
-        install_codex_hooks(&config_path, codex_events()).unwrap();
+        install_codex_hooks(&config_path, codex_events(), HookInstallTarget::Host).unwrap();
 
         let config = std::fs::read_to_string(&config_path).unwrap();
         assert!(config.contains("model = \"gpt-5.3-codex\""));
@@ -2357,7 +2418,7 @@ features = { web_search = true, codex_hooks = false }
         .unwrap();
 
         let config_path = codex_dir.join("config.toml");
-        install_codex_hooks(&config_path, codex_events()).unwrap();
+        install_codex_hooks(&config_path, codex_events(), HookInstallTarget::Host).unwrap();
 
         let config = std::fs::read_to_string(config_path).unwrap();
         assert!(!config.contains("aoe-hooks"));
@@ -2383,7 +2444,7 @@ command = "echo user-hook"
         )
         .unwrap();
 
-        install_codex_hooks(&config_path, codex_events()).unwrap();
+        install_codex_hooks(&config_path, codex_events(), HookInstallTarget::Host).unwrap();
         let modified = uninstall_codex_hooks(&config_path).unwrap();
         assert!(modified);
 
@@ -2395,14 +2456,14 @@ command = "echo user-hook"
 
     #[test]
     fn test_hook_command_format() {
-        let cmd = hook_command("running");
+        let cmd = hook_command("running", HookInstallTarget::Host);
         assert!(cmd.contains(AOE_HOOK_MARKER));
         assert!(cmd.contains("printf running"));
     }
 
     #[test]
     fn test_hook_command_contains_instance_id_guard() {
-        let cmd = hook_command("idle");
+        let cmd = hook_command("idle", HookInstallTarget::Host);
         assert!(cmd.contains("AOE_INSTANCE_ID"));
         assert!(cmd.contains("printf idle"));
     }
@@ -2420,7 +2481,8 @@ command = "echo user-hook"
         // Pre-create base as a regular file so mkdir -p can never succeed.
         std::fs::write(&base, "i am a file, not a dir").unwrap();
 
-        let cmd = hook_command_with_base("running", base.to_str().unwrap());
+        let cmd =
+            hook_command_with_base("running", base.to_str().unwrap(), HookInstallTarget::Host);
 
         let output = Command::new("sh")
             .args(["-c", &cmd])
@@ -2437,12 +2499,16 @@ command = "echo user-hook"
 
     #[test]
     fn test_hook_command_writes_status_on_happy_path() {
+        use std::os::unix::fs::PermissionsExt;
         use std::process::Command;
 
         let tmp = TempDir::new().unwrap();
         let base = tmp.path().join("aoe-hooks");
+        std::fs::create_dir(&base).unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
 
-        let cmd = hook_command_with_base("waiting", base.to_str().unwrap());
+        let cmd =
+            hook_command_with_base("waiting", base.to_str().unwrap(), HookInstallTarget::Host);
 
         let output = Command::new("sh")
             .args(["-c", &cmd])
@@ -2660,7 +2726,7 @@ command = "echo user-hook"
         let tmp = TempDir::new().unwrap();
         let config_path = tmp.path().join(".settl").join("config.toml");
 
-        install_settl_hooks(&config_path).unwrap();
+        install_settl_hooks(&config_path, HookInstallTarget::Host).unwrap();
 
         let content = std::fs::read_to_string(&config_path).unwrap();
         let config: toml::Value = toml::from_str(&content).unwrap();
@@ -2680,8 +2746,8 @@ command = "echo user-hook"
         let tmp = TempDir::new().unwrap();
         let config_path = tmp.path().join(".settl").join("config.toml");
 
-        install_settl_hooks(&config_path).unwrap();
-        install_settl_hooks(&config_path).unwrap();
+        install_settl_hooks(&config_path, HookInstallTarget::Host).unwrap();
+        install_settl_hooks(&config_path, HookInstallTarget::Host).unwrap();
 
         let content = std::fs::read_to_string(&config_path).unwrap();
         let config: toml::Value = toml::from_str(&content).unwrap();
@@ -2709,7 +2775,7 @@ command = "echo user-hook"
         )
         .unwrap();
 
-        install_settl_hooks(&config_path).unwrap();
+        install_settl_hooks(&config_path, HookInstallTarget::Host).unwrap();
 
         let content = std::fs::read_to_string(&config_path).unwrap();
         let config: toml::Value = toml::from_str(&content).unwrap();
@@ -2724,7 +2790,7 @@ command = "echo user-hook"
         let tmp = TempDir::new().unwrap();
         let config_path = tmp.path().join(".settl").join("config.toml");
 
-        install_settl_hooks(&config_path).unwrap();
+        install_settl_hooks(&config_path, HookInstallTarget::Host).unwrap();
         let modified = uninstall_settl_hooks(&config_path).unwrap();
 
         assert!(modified);
@@ -2750,7 +2816,7 @@ command = "echo user-hook"
         )
         .unwrap();
 
-        install_settl_hooks(&config_path).unwrap();
+        install_settl_hooks(&config_path, HookInstallTarget::Host).unwrap();
         let modified = uninstall_settl_hooks(&config_path).unwrap();
 
         assert!(modified);
@@ -2764,7 +2830,7 @@ command = "echo user-hook"
     #[test]
     fn test_settl_hook_commands_write_correct_status() {
         for (event, expected_status) in SETTL_HOOKS {
-            let cmd = hook_command(expected_status);
+            let cmd = hook_command(expected_status, HookInstallTarget::Host);
             assert!(
                 cmd.contains(&format!("printf {}", expected_status)),
                 "Hook for {} should write '{}': {}",
@@ -2781,7 +2847,7 @@ command = "echo user-hook"
         let tmp = TempDir::new().unwrap();
         let config_path = tmp.path().join(".hermes").join("config.yaml");
 
-        install_hermes_hooks(&config_path).unwrap();
+        install_hermes_hooks(&config_path, HookInstallTarget::Host).unwrap();
 
         let content = std::fs::read_to_string(&config_path).unwrap();
         let config: serde_yaml::Value = serde_yaml::from_str(&content).unwrap();
@@ -2835,7 +2901,7 @@ hooks_auto_accept: false
         )
         .unwrap();
 
-        install_hermes_hooks(&config_path).unwrap();
+        install_hermes_hooks(&config_path, HookInstallTarget::Host).unwrap();
 
         let content = std::fs::read_to_string(&config_path).unwrap();
         let config: serde_yaml::Value = serde_yaml::from_str(&content).unwrap();
@@ -2863,7 +2929,7 @@ hooks_auto_accept: false
         let original = "hooks:\n  pre_tool_call: [\n";
         std::fs::write(&config_path, original).unwrap();
 
-        let result = install_hermes_hooks(&config_path);
+        let result = install_hermes_hooks(&config_path, HookInstallTarget::Host);
 
         assert!(result.is_err());
         assert_eq!(std::fs::read_to_string(&config_path).unwrap(), original);
@@ -2880,7 +2946,7 @@ hooks_auto_accept: false
         std::fs::write(&config_path, original_config).unwrap();
         std::fs::write(&allowlist_path, original_allowlist).unwrap();
 
-        let result = install_hermes_hooks(&config_path);
+        let result = install_hermes_hooks(&config_path, HookInstallTarget::Host);
 
         assert!(result.is_err());
         assert_eq!(
@@ -2898,8 +2964,8 @@ hooks_auto_accept: false
         let tmp = TempDir::new().unwrap();
         let config_path = tmp.path().join("config.yaml");
 
-        install_hermes_hooks(&config_path).unwrap();
-        install_hermes_hooks(&config_path).unwrap();
+        install_hermes_hooks(&config_path, HookInstallTarget::Host).unwrap();
+        install_hermes_hooks(&config_path, HookInstallTarget::Host).unwrap();
 
         let content = std::fs::read_to_string(&config_path).unwrap();
         let config: serde_yaml::Value = serde_yaml::from_str(&content).unwrap();
@@ -2924,7 +2990,7 @@ hooks_auto_accept: false
         )
         .unwrap();
 
-        install_hermes_hooks(&config_path).unwrap();
+        install_hermes_hooks(&config_path, HookInstallTarget::Host).unwrap();
         let modified = uninstall_hermes_hooks(&config_path).unwrap();
         assert!(modified);
 
@@ -2948,7 +3014,7 @@ hooks_auto_accept: false
     #[test]
     fn test_hermes_hook_commands_write_correct_status() {
         for (event, expected_status) in HERMES_HOOKS {
-            let cmd = hook_command(expected_status);
+            let cmd = hook_command(expected_status, HookInstallTarget::Host);
             assert!(
                 cmd.contains(&format!("printf {}", expected_status)),
                 "Hook for {} should write '{}': {}",
@@ -2983,7 +3049,7 @@ hooks_auto_accept: false
             .join("agents")
             .join("aoe-hooks.json");
 
-        install_kiro_hooks(&config_path).unwrap();
+        install_kiro_hooks(&config_path, HookInstallTarget::Host).unwrap();
 
         let content = std::fs::read_to_string(&config_path).unwrap();
         let config: Value = serde_json::from_str(&content).unwrap();
@@ -3011,7 +3077,7 @@ hooks_auto_accept: false
         )
         .unwrap();
 
-        install_kiro_hooks(&config_path).unwrap();
+        install_kiro_hooks(&config_path, HookInstallTarget::Host).unwrap();
 
         let content = std::fs::read_to_string(&config_path).unwrap();
         let config: Value = serde_json::from_str(&content).unwrap();
@@ -3029,8 +3095,8 @@ hooks_auto_accept: false
         let tmp = TempDir::new().unwrap();
         let config_path = tmp.path().join("aoe-hooks.json");
 
-        install_kiro_hooks(&config_path).unwrap();
-        install_kiro_hooks(&config_path).unwrap();
+        install_kiro_hooks(&config_path, HookInstallTarget::Host).unwrap();
+        install_kiro_hooks(&config_path, HookInstallTarget::Host).unwrap();
 
         let content = std::fs::read_to_string(&config_path).unwrap();
         let config: Value = serde_json::from_str(&content).unwrap();
@@ -3050,7 +3116,7 @@ hooks_auto_accept: false
         let tmp = TempDir::new().unwrap();
         let config_path = tmp.path().join("aoe-hooks.json");
 
-        install_kiro_hooks(&config_path).unwrap();
+        install_kiro_hooks(&config_path, HookInstallTarget::Host).unwrap();
         let modified = uninstall_kiro_hooks(&config_path).unwrap();
         assert!(modified);
         // File still exists (has name/tools fields) but hooks are gone
@@ -3069,7 +3135,7 @@ hooks_auto_accept: false
         )
         .unwrap();
 
-        install_kiro_hooks(&config_path).unwrap();
+        install_kiro_hooks(&config_path, HookInstallTarget::Host).unwrap();
         let modified = uninstall_kiro_hooks(&config_path).unwrap();
         assert!(modified);
 
@@ -3290,13 +3356,41 @@ hooks_auto_accept: false
 
     #[test]
     fn hook_command_with_base_quotes_and_guards() {
-        let cmd = hook_command_with_base("running", "/tmp/aoe-hooks");
+        let cmd = hook_command_with_base("running", "/tmp/aoe-hooks", HookInstallTarget::Host);
         assert!(
             cmd.contains("case \"$AOE_INSTANCE_ID\" in *[!0-9a-zA-Z_-]*) exit 0 ;; esac"),
-            "missing shell guard: {cmd}"
+            "missing instance-id allowlist: {cmd}"
         );
-        assert!(cmd.contains("\"/tmp/aoe-hooks/$AOE_INSTANCE_ID\""));
-        assert!(cmd.contains("\"/tmp/aoe-hooks/$AOE_INSTANCE_ID/status\""));
+        assert!(cmd.contains("unset IFS"), "missing IFS pin: {cmd}");
+        assert!(cmd.contains("umask 077"), "missing umask pin: {cmd}");
+        assert!(
+            cmd.contains("LC_ALL=C ls -ldn"),
+            "missing locale-pinned ls: {cmd}"
+        );
+        assert!(
+            cmd.contains("d*------|d*------.|d*------+|d*------@"),
+            "missing tolerant mode pattern (R11): {cmd}"
+        );
+        assert!(
+            cmd.contains("ME=$(id -u 2>/dev/null)"),
+            "host hook MUST include id-u uid check: {cmd}"
+        );
+        assert!(
+            cmd.contains("B=/tmp/aoe-hooks"),
+            "base must be baked: {cmd}"
+        );
+        assert!(
+            cmd.contains("D=\"$B/$AOE_INSTANCE_ID\""),
+            "instance dir must be baked under base: {cmd}"
+        );
+        assert!(
+            cmd.contains("printf running > \"$D/status\""),
+            "status writer must target the per-instance subdir: {cmd}"
+        );
+        assert!(
+            cmd.contains(&format!("# {AOE_HOOK_MARKER}")),
+            "marker substring must be present: {cmd}"
+        );
     }
 
     #[test]
@@ -3318,7 +3412,8 @@ hooks_auto_accept: false
         std::fs::create_dir(&base).unwrap();
         let canary_name = ".canary-deadbeef";
         std::fs::write(base.join(canary_name), b"do not delete").unwrap();
-        let cmd = hook_command_with_base("running", base.to_str().unwrap());
+        let cmd =
+            hook_command_with_base("running", base.to_str().unwrap(), HookInstallTarget::Host);
 
         for poisoned in ["..", "../../escape", "/etc", "foo/bar", "; rm -rf /;", ""] {
             let status = std::process::Command::new("sh")

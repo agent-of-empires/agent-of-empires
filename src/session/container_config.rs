@@ -886,6 +886,7 @@ fn refresh_codex_sandbox_hooks(sandbox_dir: &Path, preserved_state: Option<toml_
         &config_path,
         hook_cfg.events,
         preserved_state,
+        crate::hooks::HookInstallTarget::Sandbox,
     ) {
         tracing::warn!(
             "Failed to refresh Codex hooks in sandbox config {}: {}",
@@ -1306,16 +1307,22 @@ pub(crate) fn build_container_config(
                         e
                     );
                 }
+                let container_hook_path = format!(
+                    "{}/{instance_id}",
+                    crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER
+                );
                 volumes.push(VolumeMount {
                     host_path: hook_dir.to_string_lossy().to_string(),
-                    container_path: hook_dir.to_string_lossy().to_string(),
+                    container_path: container_hook_path,
                     read_only: false,
                 });
             }
 
             if let Some(sidecar) = &agent.sidecar_hooks {
                 let config_file = home.join(sidecar.sandbox_config_subpath);
-                if let Err(e) = (sidecar.install)(&config_file) {
+                if let Err(e) =
+                    (sidecar.install)(&config_file, crate::hooks::HookInstallTarget::Sandbox)
+                {
                     tracing::warn!(target: "session.profile", "Failed to install {} hooks in sandbox: {}", agent.name, e);
                 }
             } else if let Some(hook_cfg) = &agent.hook_config {
@@ -1333,7 +1340,11 @@ pub(crate) fn build_container_config(
                         let sandbox_dir = home.join(mount.host_rel).join(SANDBOX_SUBDIR);
                         let settings_file = sandbox_dir.join(config_file_name);
                         let result = if agent.name == "codex" {
-                            crate::hooks::install_codex_hooks(&settings_file, hook_cfg.events)
+                            crate::hooks::install_codex_hooks(
+                                &settings_file,
+                                hook_cfg.events,
+                                crate::hooks::HookInstallTarget::Sandbox,
+                            )
                         } else {
                             crate::hooks::install_hooks(
                                 &settings_file,
