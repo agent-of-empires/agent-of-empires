@@ -400,7 +400,7 @@ body {
   }
 }
 .animate-settings-highlight {
-  animation: settings-search-highlight 1.6s ease-out;
+  animation: settings-search-highlight 300ms cubic-bezier(0.16, 1, 0.3, 1);
   border-radius: 0.5rem;
 }
 @media (prefers-reduced-motion: reduce) {
