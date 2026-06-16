@@ -7,7 +7,7 @@
 // writes to disk but the server never reloads).
 
 import { spawnSync } from "node:child_process";
-import { mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { chmodSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { test as base, expect } from "@playwright/test";
 import { spawnAoeServe, listSessions, seedSessionViaAoeAdd } from "../helpers/aoeServe";
@@ -59,7 +59,7 @@ base.describe("ensure_session restart flow", () => {
       const hookBase = `/tmp/aoe-hooks-${euid}`;
       mkdirSync(hookBase, { recursive: true });
       try {
-        require("fs").chmodSync(hookBase, 0o700);
+        chmodSync(hookBase, 0o700);
       } catch {
         // best effort: if base is owned by us we can chmod, if not the
         // hook system would already be unusable for this user.
@@ -67,7 +67,7 @@ base.describe("ensure_session restart flow", () => {
       const hookDir = `${hookBase}/${sessionId}`;
       mkdirSync(hookDir, { recursive: true });
       try {
-        require("fs").chmodSync(hookDir, 0o700);
+        chmodSync(hookDir, 0o700);
       } catch {
         // ignore
       }

@@ -20,11 +20,10 @@ use fs2::FileExt as _;
 use serde_json::Value;
 
 #[cfg(test)]
+pub(crate) use dir_guard::{clear_base_override_for_test, override_base_for_test, reset_for_test};
 pub(crate) use dir_guard::{
-    clear_base_override_for_test, hook_base_path, override_base_for_test, reset_for_test,
-};
-pub(crate) use dir_guard::{
-    ensure_instance_dir_path, unlink_session_id_via_guard, write_session_id_via_guard,
+    ensure_instance_dir_path, hook_base_path, unlink_session_id_via_guard,
+    write_session_id_via_guard,
 };
 pub use status_file::{
     cleanup_hook_status_dir, hook_status_dir, read_hook_session_id, read_hook_status,

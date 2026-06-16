@@ -162,8 +162,8 @@ impl HooksInstallDialog {
         // alternative (a placeholder) would mislead users about what is
         // actually installed.
         lines.push(Line::from(format!(
-            "  printf {{status}} > /tmp/aoe-hooks-{}/$AOE_INSTANCE_ID/status",
-            nix::unistd::geteuid().as_raw()
+            "  printf {{status}} > {}/$AOE_INSTANCE_ID/status",
+            crate::hooks::hook_base_path().display()
         )));
 
         lines.push(Line::from(""));
@@ -441,8 +441,8 @@ mod tests {
             .join("\n");
         assert!(
             text.contains(&format!(
-                "/tmp/aoe-hooks-{}/$AOE_INSTANCE_ID/status",
-                nix::unistd::geteuid().as_raw()
+                "{}/$AOE_INSTANCE_ID/status",
+                crate::hooks::hook_base_path().display()
             )),
             "example command must reference the per-user (issue #1844) path: {text}"
         );
