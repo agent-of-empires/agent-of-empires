@@ -733,6 +733,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_oneshot_flags_are_single_tokens_without_placeholders() {
+        // The smart-rename safety contract: a non-None oneshot_flag is exactly
+        // one argv token placed before the prompt, and never interpolates the
+        // prompt. Keep future agent additions from weakening that.
+        for agent in AGENTS {
+            let Some(flag) = agent.oneshot_flag else {
+                continue;
+            };
+            assert_eq!(
+                flag,
+                flag.trim(),
+                "agent '{}' one-shot flag must not have surrounding whitespace",
+                agent.name
+            );
+            assert_eq!(
+                flag.split_whitespace().count(),
+                1,
+                "agent '{}' one-shot flag must be exactly one argv token",
+                agent.name
+            );
+            assert!(
+                !flag.contains("{}"),
+                "agent '{}' one-shot flag must not interpolate the prompt",
+                agent.name
+            );
+        }
+    }
+
+    #[test]
     fn test_get_agent_known() {
         assert_eq!(get_agent("claude").unwrap().binary, "claude");
         assert_eq!(get_agent("opencode").unwrap().binary, "opencode");
