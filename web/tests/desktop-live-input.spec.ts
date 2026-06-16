@@ -28,4 +28,19 @@ test.describe("Desktop live terminal input", () => {
       .poll(() => handle.liveMessages.filter((m) => m instanceof Buffer && m.length > 0).length)
       .toBeGreaterThan(before);
   });
+
+  test("renders at the desktop font size, not the small mobile default", async ({ page }) => {
+    // The live view used to always read `mobileFontSize` (default 8px), so on
+    // desktop it came up tiny and ignored the dashboard's terminal font-size
+    // control. A fine pointer must use `desktopFontSize` (default 14px).
+    await mockTerminalApis(page);
+    await page.goto("/");
+    await clickSidebarSession(page, "pinch-test");
+    const content = page.locator("[data-live-content]").first();
+    await content.waitFor({ state: "visible", timeout: 10_000 });
+    const px = await content.evaluate(
+      (el) => getComputedStyle(el.closest("[data-live-terminal] > div")!).fontSize,
+    );
+    expect(px).toBe("14px");
+  });
 });

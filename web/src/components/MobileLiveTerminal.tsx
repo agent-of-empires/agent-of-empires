@@ -4,6 +4,7 @@ import type { AnsiSegment, AnsiStyle } from "../lib/ansi";
 import { ansiToLines, wrapLine } from "../lib/liveTermLines";
 import type { LiveFrame } from "../hooks/useLiveTerminal";
 import { useWebSettings } from "../hooks/useWebSettings";
+import { useIsCoarsePointer } from "../hooks/useIsCoarsePointer";
 
 // Mobile rendering of a tmux agent pane, mirroring the TUI's live mode:
 // the server streams `capture-pane` snapshots (src/server/live_ws.rs)
@@ -192,7 +193,23 @@ export function MobileLiveTerminal({
   onInputFocusChange,
 }: MobileLiveTerminalProps) {
   const { settings, update } = useWebSettings();
-  const [fontSize, setFontSize] = useState(() => settings.mobileFontSize);
+  // The live view now renders on desktop too, so it honors the right font-size
+  // setting per device: the desktop terminal size on a fine pointer, the
+  // (smaller) mobile size on touch. Reading the wrong one is why the desktop
+  // pane came up tiny and ignored the dashboard's font-size control.
+  const coarse = useIsCoarsePointer();
+  const fontKey = coarse ? "mobileFontSize" : "desktopFontSize";
+  const configuredFontSize = settings[fontKey];
+  const [fontSize, setFontSize] = useState(() => configuredFontSize);
+  // Adopt the persisted setting when it changes (settings panel, or the
+  // pointer class flipping which font key applies) via the adjust-state-
+  // during-render pattern. Pinch-zoom on touch still drives fontSize live
+  // below; mid-gesture the setting is unchanged so this never clobbers it.
+  const [lastConfiguredFontSize, setLastConfiguredFontSize] = useState(configuredFontSize);
+  if (configuredFontSize !== lastConfiguredFontSize) {
+    setLastConfiguredFontSize(configuredFontSize);
+    setFontSize(configuredFontSize);
+  }
   const scrollerRef = useRef<HTMLDivElement>(null);
   const measureRef = useRef<HTMLSpanElement>(null);
 
@@ -479,11 +496,11 @@ export function MobileLiveTerminal({
         if (!changed) return;
         if (persistTimerRef.current) clearTimeout(persistTimerRef.current);
         persistTimerRef.current = setTimeout(() => {
-          update({ mobileFontSize: fontSize });
+          update({ [fontKey]: fontSize });
         }, 400);
       }
     },
-    [fontSize, update, returnToLive, atBottom],
+    [fontKey, fontSize, update, returnToLive, atBottom],
   );
   useEffect(
     () => () => {
