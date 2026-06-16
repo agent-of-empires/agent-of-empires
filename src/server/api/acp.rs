@@ -364,6 +364,31 @@ pub async fn spawn_acp(
     }
 }
 
+/// Process-wide guard so concurrent `npm install -g` runs (across any
+/// sessions) never race the daemon user's shared global npm prefix. See #2109.
+static INSTALL_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+/// Cap per stream on the npm output echoed back to the web. `npm install -g`
+/// runs arbitrary lifecycle scripts; a verbose or hostile package could emit
+/// huge output, so truncate what we serialize and mark it. See #2109.
+const MAX_INSTALL_LOG_BYTES: usize = 64 * 1024;
+
+fn truncate_install_log(raw: &[u8]) -> String {
+    let text = String::from_utf8_lossy(raw);
+    if text.len() <= MAX_INSTALL_LOG_BYTES {
+        return text.into_owned();
+    }
+    let mut cut = MAX_INSTALL_LOG_BYTES;
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!(
+        "{}\n... [truncated, output exceeded {MAX_INSTALL_LOG_BYTES} bytes]",
+        &text[..cut]
+    )
+}
+
 /// Result of a server-run agent install. The "& restart" half is the
 /// client's job: on `success` the web re-POSTs `/acp/spawn` (the same
 /// respawn path the Restart button uses), so this endpoint stays a pure
@@ -441,7 +466,10 @@ pub async fn install_agent(
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
-                format!("could not resolve agent `{agent}`: {e}"),
+                Json(serde_json::json!({
+                    "error": "agent_resolve_failed",
+                    "message": format!("could not resolve agent `{agent}`: {e}"),
+                })),
             )
                 .into_response();
         }
@@ -460,10 +488,12 @@ pub async fn install_agent(
             .into_response();
     };
 
-    // Serialize against concurrent installs / spawns for this session: a
-    // double-click must not run two installs against the global npm prefix.
-    // `instance_lock` returns the lock handle; hold the guard across the
-    // install.
+    // `npm install -g` mutates the daemon user's shared global prefix, so two
+    // *different* sessions installing at once would race. Serialize all
+    // installs process-wide, and also hold the per-session lock so a same-
+    // session spawn cannot run mid-install. `instance_lock` returns the lock
+    // handle; hold the guard across the install.
+    let _install_guard = INSTALL_LOCK.lock().await;
     let inst_lock = state.instance_lock(&id).await;
     let _guard = inst_lock.lock().await;
 
@@ -496,7 +526,10 @@ pub async fn install_agent(
         Ok(Err(e)) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("npm install failed to start: {e}"),
+                Json(serde_json::json!({
+                    "error": "npm_start_failed",
+                    "message": format!("npm install failed to start: {e}"),
+                })),
             )
                 .into_response();
         }
@@ -517,8 +550,8 @@ pub async fn install_agent(
         package: package.to_string(),
         success: output.status.success(),
         exit_code: output.status.code(),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        stdout: truncate_install_log(&output.stdout),
+        stderr: truncate_install_log(&output.stderr),
     })
     .into_response()
 }
