@@ -43,11 +43,11 @@ conflict message.
 
 ### Web dashboard
 
-In the new-session wizard, the **Project** step has a toggle labeled
+In the new-session wizard, the **Project** section has a toggle labeled
 **Skip project folder** above the Recent / Browse / Clone URL tabs.
-Turning it on hides the path picker and the worktree controls on the
-Session step. The Review step shows
-"Scratch directory (provisioned on create)" in place of the path.
+Turning it on hides the path picker and shows a "Scratch session"
+callout; the worktree controls under **More options** become
+unavailable.
 
 Selecting a real project (Recent / Browse / Clone) turns the toggle
 back off, so the wizard never submits a request with both a real path
@@ -55,9 +55,9 @@ and the scratch flag set.
 
 **Fast-create shortcut.** From anywhere in the dashboard, press
 `Cmd+Shift+N` (Mac) or `Ctrl+Shift+N` (Linux / Windows) to open the
-wizard with scratch already enabled and jumped to the Review step.
-A follow-up `Cmd+Enter` / `Ctrl+Enter` launches the session, so two
-keystrokes is enough to spin up a fresh scratch session.
+wizard with scratch already enabled. A follow-up `Cmd+Enter` /
+`Ctrl+Enter` launches the session, so two keystrokes is enough to spin
+up a fresh scratch session.
 
 **Command palette.** The same flow is reachable from the command
 palette (`Cmd+K` / `Ctrl+K`): search for "New scratch session" and

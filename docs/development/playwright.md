@@ -32,7 +32,7 @@ Heuristics:
 
 - "Every settings control emits the right JSON keys" → Vitest, not Playwright. Looping 30 controls through a live server is slow without adding signal.
 - "Theme persists across page reload" → live Playwright. The test point is the backend round-trip.
-- "The wizard's review step lets me edit the title inline and Escape cancels" → mocked Playwright. No backend needed; browser-specific Escape handling matters.
+- "The wizard remembers the More options fold open or closed across opens" → mocked Playwright. No backend needed; browser-specific localStorage persistence matters.
 - "POST /api/settings with body X returns 200, the value persists" → both: Vitest contract for the payload shape, live Playwright for one representative round-trip.
 
 ## Live harness (`web/tests/helpers/aoeServe.ts`)

@@ -125,7 +125,7 @@ From the home view, press `b` (or `B` with strict hotkeys) to open a filterable 
 
 The Projects page (folder icon in the sidebar footer) is full CRUD over the registry: add, remove, switch scope, opt into `allow_override`. Read-only servers (`aoe serve --read-only`) hide the destructive controls.
 
-The new-session wizard surfaces the registry as toggleable chips on the Project step. The free-text input still works for paths that aren't registered.
+The new-session wizard surfaces the registry as toggleable chips in the Project section. The free-text input still works for paths that aren't registered.
 
 Multi-repo sessions are bucketed into a single **Multi-repo** group at the bottom of the sidebar, regardless of which repo was chosen as the primary. Each session row shows a chip per repo under the title.
 
