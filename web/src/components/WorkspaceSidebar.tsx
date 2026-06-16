@@ -1883,7 +1883,7 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader({
             ({sessionCount})
           </span>
         </button>
-        <Tooltip text={offline ? OFFLINE_TITLE : `New session in ${group.displayName}`}>
+        <Tooltip text={offline ? OFFLINE_TITLE : "New session in this project"}>
           <button
             onClick={onNewSession}
             disabled={offline}

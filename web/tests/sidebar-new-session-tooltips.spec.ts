@@ -18,7 +18,9 @@ test("the two new-session buttons have distinct tooltips and labels", async ({ p
   await expect(page.getByRole("button", { name: "New session (choose project)" })).toBeVisible();
   await expect(page.getByText("New session (choose project)")).toBeAttached();
 
-  // Per-project header button: scoped to the repo's display name.
+  // Per-project header button: tooltip is static so the project name never
+  // leaks into the always-rendered tooltip text (which would collide with
+  // getByText(projectName) elsewhere); the accessible name stays scoped.
   await expect(page.getByRole("button", { name: "New session in repo-alpha" })).toBeVisible();
-  await expect(page.getByText("New session in repo-alpha")).toBeAttached();
+  await expect(page.getByText("New session in this project")).toBeAttached();
 });
