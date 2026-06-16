@@ -84,7 +84,7 @@ With a selection active, a bulk action bar shows the count and applicable action
 
 ## Profiles
 
-The Profiles entry in the sidebar footer opens `/profiles` for managing configuration profiles: a left rail lists every profile with a **default** badge; the detail panel lets you create, rename, delete, set the default, and edit a description. **Edit configuration** buttons deep-link into the matching Settings tab scoped to that profile (`/settings/<tab>?profile=<name>`).
+The **Profiles** tab in Settings (`/settings/profiles`, the first entry in the Settings sidebar) manages configuration profiles: a left rail lists every profile with a **default** badge; the detail panel lets you create, rename, delete, set the default, and edit a description. **Edit configuration** buttons deep-link into the matching Settings tab scoped to that profile (`/settings/<tab>?profile=<name>`). The old `/profiles` URL redirects here.
 
 Lifecycle hooks are shown **read-only** here, each labeled with its source (profile override, an override disabling inherited commands, inherited global commands, or none). Hooks run arbitrary shell commands, so they are never writable from the web; edit them in your config file or the TUI. The same applies to the agent-command and environment fields. In read-only mode the create / rename / delete / set-default / description controls are hidden.
 
