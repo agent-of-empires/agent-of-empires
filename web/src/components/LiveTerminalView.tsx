@@ -214,7 +214,21 @@ export function LiveTerminalView({ session, active = true, surface = "agent" }: 
         </div>
       )}
 
-      <div className="flex-1 overflow-hidden bg-[var(--term-bg)] relative">
+      <div
+        className="flex-1 overflow-hidden bg-[var(--term-bg)] relative"
+        // Click-to-type, like every terminal. The rendered pane is plain
+        // (non-focusable) DOM text, so clicking it blurs the hidden input to
+        // <body> and the session reads as view-only. On a fine pointer, a
+        // plain click refocuses the input; a click that ends a text selection
+        // is left alone so select-to-copy still works. Touch devices focus via
+        // the keyboard toggle, not taps (which scroll).
+        onClick={() => {
+          if (coarse) return;
+          const sel = window.getSelection();
+          if (sel && !sel.isCollapsed) return;
+          focusSelf();
+        }}
+      >
         <MobileLiveTerminal
           frame={live.state.frame}
           connected={live.state.connected}
