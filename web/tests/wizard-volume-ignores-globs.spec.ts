@@ -1,5 +1,6 @@
 import { test, expect } from "./helpers/mockedTest";
 import { Page } from "@playwright/test";
+import { openWizard, selectProject, expandMoreOptions, launch, wizard } from "./helpers/wizard";
 
 // Wizard glob volume_ignores confirmation modal (#2045). A sandbox session
 // whose resolved config has glob volume_ignores (e.g. `**/bin`) must surface a
@@ -23,6 +24,8 @@ async function mockApis(page: Page, calls: Calls) {
   }
   await page.route("**/api/settings**", (r) => r.fulfill({ json: {} }));
   await page.route("**/api/profiles", (r) => r.fulfill({ json: [] }));
+  await page.route("**/api/recent-projects", (r) => r.fulfill({ json: { projects: [] } }));
+  await page.route("**/api/projects", (r) => r.fulfill({ json: [] }));
   await page.route("**/api/docker/status", (r) => r.fulfill({ json: { available: true, runtime: "docker" } }));
   await page.route("**/api/agents", (r) =>
     r.fulfill({
@@ -78,25 +81,16 @@ async function mockApis(page: Page, calls: Calls) {
   });
 }
 
-// Walk project -> session -> agent, enable the sandbox toggle, then advance to
-// Review and click Launch. Lands with the create paused on the glob modal.
+// Pick the recent project, enable the sandbox toggle under More options, then
+// click Launch. Lands with the create paused on the glob modal.
 async function launchSandboxSession(page: Page) {
-  await page.locator("body").click();
-  await page.keyboard.press("n");
-  await expect(page.getByRole("heading", { name: "New session" })).toBeVisible();
-  const recent = page.getByRole("button").filter({ hasText: "/tmp/example" }).first();
-  await recent.waitFor({ state: "visible", timeout: 5000 });
-  await recent.click();
-  await page.getByRole("button", { name: "Next" }).click();
-  await expect(page.getByText("Name your session")).toBeVisible();
-  await page.getByRole("button", { name: "Next" }).click();
-  await expect(page.getByRole("heading", { name: "Which AI agent?" })).toBeVisible();
-  const sandboxToggle = page.locator("label", { hasText: "Run in a safe container" }).locator("role=switch");
+  await openWizard(page);
+  await selectProject(page, "/tmp/example");
+  await expandMoreOptions(page);
+  const sandboxToggle = wizard(page).locator("label", { hasText: "Run in a safe container" }).locator("role=switch");
   await sandboxToggle.click();
   await expect(sandboxToggle).toHaveAttribute("aria-checked", "true");
-  await page.getByRole("button", { name: "Next" }).click();
-  await expect(page.getByRole("heading", { name: "Review & Launch" })).toBeVisible();
-  await page.getByRole("button", { name: /Launch session/ }).click();
+  await launch(page);
 }
 
 test.describe("Wizard glob volume_ignores confirmation (#2045)", () => {
@@ -129,7 +123,7 @@ test.describe("Wizard glob volume_ignores confirmation (#2045)", () => {
     expect(calls.createSession).toBe(0);
     expect(calls.acknowledge).toBe(0);
     // Wizard is still open and the Launch button is interactive again.
-    await expect(page.getByRole("button", { name: /Launch session/ })).toBeEnabled();
+    await expect(wizard(page).getByRole("button", { name: /Launch session/ })).toBeEnabled();
   });
 
   test("Proceed without the checkbox creates the session and does not acknowledge", async ({ page }) => {

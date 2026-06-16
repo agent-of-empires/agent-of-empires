@@ -1,5 +1,6 @@
 import { test, expect } from "./helpers/mockedTest";
 import { Page } from "@playwright/test";
+import { openWizard, selectProject, launch, wizard } from "./helpers/wizard";
 
 // Wizard on_create hooks-trust confirmation modal (#2066). Creating a session
 // in a repo whose `.agent-of-empires/config.toml` defines on_create hooks that
@@ -22,6 +23,8 @@ async function mockApis(page: Page, calls: Calls) {
   }
   await page.route("**/api/settings**", (r) => r.fulfill({ json: {} }));
   await page.route("**/api/profiles", (r) => r.fulfill({ json: [] }));
+  await page.route("**/api/recent-projects", (r) => r.fulfill({ json: { projects: [] } }));
+  await page.route("**/api/projects", (r) => r.fulfill({ json: [] }));
   await page.route("**/api/docker/status", (r) => r.fulfill({ json: { available: false, runtime: null } }));
   await page.route("**/api/agents", (r) =>
     r.fulfill({
@@ -76,22 +79,13 @@ async function mockApis(page: Page, calls: Calls) {
   });
 }
 
-// Walk project -> session -> agent -> review and click Launch. Lands with the
-// create paused on the hooks-trust modal (server returned hooks_need_trust).
+// Pick the recent project on the single screen and click Launch. Lands with
+// the create paused on the hooks-trust modal (server returned
+// hooks_need_trust).
 async function launchSession(page: Page) {
-  await page.locator("body").click();
-  await page.keyboard.press("n");
-  await expect(page.getByRole("heading", { name: "New session" })).toBeVisible();
-  const recent = page.getByRole("button").filter({ hasText: "/tmp/example" }).first();
-  await recent.waitFor({ state: "visible", timeout: 5000 });
-  await recent.click();
-  await page.getByRole("button", { name: "Next" }).click();
-  await expect(page.getByText("Name your session")).toBeVisible();
-  await page.getByRole("button", { name: "Next" }).click();
-  await expect(page.getByRole("heading", { name: "Which AI agent?" })).toBeVisible();
-  await page.getByRole("button", { name: "Next" }).click();
-  await expect(page.getByRole("heading", { name: "Review & Launch" })).toBeVisible();
-  await page.getByRole("button", { name: /Launch session/ }).click();
+  await openWizard(page);
+  await selectProject(page, "/tmp/example");
+  await launch(page);
 }
 
 test.describe("Wizard on_create hooks-trust confirmation (#2066)", () => {
@@ -124,7 +118,7 @@ test.describe("Wizard on_create hooks-trust confirmation (#2066)", () => {
     await page.getByRole("button", { name: "Cancel" }).click();
     await expect(page.getByTestId("hooks-trust-dialog")).toHaveCount(0);
     expect(calls.createWithTrust).toBe(0);
-    await expect(page.getByRole("button", { name: /Launch session/ })).toBeEnabled();
+    await expect(wizard(page).getByRole("button", { name: /Launch session/ })).toBeEnabled();
   });
 
   test("Proceed resubmits with trust_hooks and creates the session", async ({ page }) => {

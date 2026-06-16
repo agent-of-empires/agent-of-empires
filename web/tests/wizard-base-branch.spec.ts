@@ -1,11 +1,16 @@
 import { test, expect } from "./helpers/mockedTest";
 import { Page } from "@playwright/test";
+import { openWizard, selectProject, expandMoreOptions, wizard } from "./helpers/wizard";
 
-// Wizard Advanced → Base branch (#948). Asserts:
-// - "Advanced" section is collapsed by default.
+// Wizard More options → Base branch (#948) on the single-screen wizard
+// (#2210). Asserts:
+// - The "Base branch" disclosure is collapsed by default.
 // - Expanding it fetches local + remote branches.
 // - Selecting one populates the base-branch input.
 // - Submitting the wizard sends `base_branch` in the POST body.
+//
+// The worktree controls (including the Base branch picker) now live under
+// the single "More options" fold; expand it first.
 
 async function mockApis(page: Page) {
   await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
@@ -16,10 +21,12 @@ async function mockApis(page: Page) {
       }),
     );
   }
+  await page.route("**/api/recent-projects", (r) => r.fulfill({ json: { projects: [] } }));
+  await page.route("**/api/projects", (r) => r.fulfill({ json: [] }));
   await page.route("**/api/docker/status", (r) => r.fulfill({ json: { available: false, runtime: null } }));
-  // The wizard's Project step shows a "Recent projects" list driven by
-  // /api/sessions. Seed one entry so the test can click it to advance
-  // to the Session step (where the Advanced base-branch UI lives).
+  // The wizard's project picker shows a "Recent projects" list driven by
+  // /api/sessions. Seed one entry so the test can click it to select a
+  // project.
   await page.route("**/api/sessions", (r) => {
     if (r.request().method() === "GET") {
       return r.fulfill({
@@ -65,49 +72,30 @@ async function mockApis(page: Page) {
   );
 }
 
-async function openWizardOnSessionStep(page: Page) {
-  await page.locator("body").click();
-  await page.keyboard.press("n");
-  await expect(page.getByRole("heading", { name: "New session" })).toBeVisible();
-  // Wait for the seeded recent project to populate (driven by
-  // /api/sessions which the test mocks).
-  const recentBtn = page.getByRole("button").filter({ hasText: "/tmp/example" }).first();
-  await recentBtn.waitFor({ state: "visible", timeout: 5000 });
-  await recentBtn.click();
-  // Next is gated on `data.path` being set; wait for it to enable
-  // before clicking through to the Session step.
-  const nextBtn = page.getByRole("button", { name: "Next" });
-  await expect(nextBtn).toBeEnabled();
-  await nextBtn.click();
-}
-
-// #1514 folds the worktree controls (including the Base branch picker)
-// behind a top-level "Advanced" disclosure that defaults closed. Expand
-// it before reaching the base-branch picker.
-async function expandAdvanced(page: Page) {
-  await page.getByRole("button", { name: "Advanced" }).click();
+async function openWizardWithProject(page: Page) {
+  await openWizard(page);
+  await selectProject(page, "/tmp/example");
 }
 
 test.describe("Wizard base branch (#948)", () => {
-  test("Base branch section is collapsed by default on the session step", async ({ page }) => {
+  test("Base branch section is collapsed by default under More options", async ({ page }) => {
     await mockApis(page);
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
     await expect(page.locator("header")).toBeVisible();
-    await openWizardOnSessionStep(page);
-    // Session step renders "Name your session" as the heading.
-    await expect(page.getByText("Name your session")).toBeVisible();
-    await expandAdvanced(page);
+    await openWizardWithProject(page);
+    await expandMoreOptions(page);
+    const w = wizard(page);
     // Worktree toggle is on by default; if a previous test left it
     // off, click to re-enable so the Base branch section renders.
     // `#969` added a second toggle ("Attach to existing branch") on this
     // step, so target the worktree toggle by its accessible name.
-    const toggle = page.getByRole("switch", { name: /Create a worktree/ });
+    const toggle = w.getByRole("switch", { name: /Create a worktree/ });
     if ((await toggle.getAttribute("aria-checked")) !== "true") {
       await toggle.click();
     }
-    await expect(page.getByRole("button", { name: "Base branch" })).toBeVisible();
-    await expect(page.getByLabel("Base branch")).toHaveCount(0);
+    await expect(w.getByRole("button", { name: "Base branch" })).toBeVisible();
+    await expect(w.getByLabel("Base branch")).toHaveCount(0);
   });
 
   test("expanding Base branch fetches branches with include_remote=true", async ({ page }) => {
@@ -127,10 +115,11 @@ test.describe("Wizard base branch (#948)", () => {
 
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
-    await openWizardOnSessionStep(page);
-    await expandAdvanced(page);
-    await page.getByRole("button", { name: "Base branch" }).click();
-    await expect(page.getByLabel("Base branch")).toBeVisible();
+    await openWizardWithProject(page);
+    await expandMoreOptions(page);
+    const w = wizard(page);
+    await w.getByRole("button", { name: "Base branch" }).click();
+    await expect(w.getByLabel("Base branch")).toBeVisible();
     await expect.poll(() => capturedUrl?.searchParams.get("include_remote")).toBe("true");
   });
 
@@ -146,12 +135,13 @@ test.describe("Wizard base branch (#948)", () => {
     );
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
-    await openWizardOnSessionStep(page);
-    await expandAdvanced(page);
-    await page.getByRole("button", { name: "Base branch" }).click();
-    const baseInput = page.getByLabel("Base branch");
+    await openWizardWithProject(page);
+    await expandMoreOptions(page);
+    const w = wizard(page);
+    await w.getByRole("button", { name: "Base branch" }).click();
+    const baseInput = w.getByLabel("Base branch");
     await baseInput.click();
-    const option = page.getByRole("option", { name: /release-1\.2/ });
+    const option = w.getByRole("option", { name: /release-1\.2/ });
     await expect(option).toBeVisible();
     await option.click();
     await expect(baseInput).toHaveValue("release-1.2");
