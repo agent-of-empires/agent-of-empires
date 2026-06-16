@@ -781,7 +781,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   // Profiles moved into Settings as a tab; redirect the retired standalone
   // route so old bookmarks and links still land somewhere valid.
   useEffect(() => {
-    if (profilesMatch) navigate("/settings/profiles", { replace: true });
+    if (profilesMatch) navigate(`/settings/profiles${window.location.search}`, { replace: true });
   }, [profilesMatch, navigate]);
 
   const handleCloseSettings = useCallback(() => {

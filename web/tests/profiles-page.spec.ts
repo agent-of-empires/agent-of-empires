@@ -181,6 +181,10 @@ test("the retired /profiles route redirects into the Settings Profiles tab", asy
   await page.goto("/profiles");
   await expect(page).toHaveURL(/\/settings\/profiles$/);
   await expect(page.getByRole("heading", { name: "Profiles" })).toBeVisible();
+
+  // The redirect preserves any query string (e.g. a ?profile= deep link).
+  await page.goto("/profiles?profile=work");
+  await expect(page).toHaveURL(/\/settings\/profiles\?profile=work$/);
 });
 
 test("the dashboard sidebar footer no longer has a Profiles button", async ({ page }) => {
