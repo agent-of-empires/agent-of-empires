@@ -673,6 +673,13 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/hooks/useRepoGroups.ts"]
     },
     {
+      "id": "sidebar.project-row",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/sidebar-project-row.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
       "id": "sidebar.empty-state",
       "kind": "mocked-playwright",
       "risk": "low",
