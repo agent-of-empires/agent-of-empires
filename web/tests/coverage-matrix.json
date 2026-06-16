@@ -33,7 +33,7 @@
       "kind": "live-playwright",
       "risk": "medium",
       "specs": ["tests/live/session-create-duplicate-worktree.spec.ts"],
-      "components": ["web/src/components/session-wizard/steps/ReviewStep.tsx"]
+      "components": ["web/src/components/session-wizard/LaunchFooter.tsx"]
     },
     {
       "id": "terminal.mobile-backspace-autorepeat",
@@ -455,18 +455,20 @@
         "tests/wizard-project-step.spec.ts",
         "tests/wizard-session-step.spec.ts",
         "tests/wizard-agent-step.spec.ts",
-        "tests/wizard-review-step.spec.ts",
+        "tests/wizard-single-screen.spec.ts",
         "tests/wizard-extra-repos.spec.ts",
         "tests/wizard-custom-agent.spec.ts"
       ],
       "components": [
         "web/src/components/DirectoryBrowser.tsx",
         "web/src/components/session-wizard/SessionWizard.tsx",
-        "web/src/components/session-wizard/StepIndicator.tsx",
+        "web/src/components/session-wizard/LaunchFooter.tsx",
         "web/src/components/session-wizard/steps/AgentStep.tsx",
+        "web/src/components/session-wizard/steps/AgentPickerEssentials.tsx",
+        "web/src/components/session-wizard/steps/AgentOptions.tsx",
+        "web/src/components/session-wizard/steps/Toggle.tsx",
         "web/src/components/session-wizard/steps/ExtraReposPicker.tsx",
         "web/src/components/session-wizard/steps/ProjectStep.tsx",
-        "web/src/components/session-wizard/steps/ReviewStep.tsx",
         "web/src/components/session-wizard/steps/SessionStep.tsx"
       ]
     },
@@ -533,7 +535,7 @@
       "components": [
         "web/src/components/session-wizard/SessionWizard.tsx",
         "web/src/components/session-wizard/steps/AgentStep.tsx",
-        "web/src/components/session-wizard/steps/ReviewStep.tsx",
+        "web/src/components/session-wizard/steps/AgentPickerEssentials.tsx",
         "web/src/components/session-wizard/wizardReducer.ts"
       ]
     },
@@ -548,10 +550,10 @@
       "id": "wizard.resolved-launch-command",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/components/session-wizard/__tests__/ReviewStep.launchCommand.test.tsx"],
+      "specs": ["src/components/session-wizard/__tests__/structuredViewToggle.test.tsx"],
       "components": [
         "web/src/components/session-wizard/steps/AgentStep.tsx",
-        "web/src/components/session-wizard/steps/ReviewStep.tsx"
+        "web/src/components/session-wizard/steps/AgentOptions.tsx"
       ]
     },
     {
@@ -605,7 +607,7 @@
       "components": [
         "web/src/components/session-wizard/SessionWizard.tsx",
         "web/src/components/session-wizard/steps/ProjectStep.tsx",
-        "web/src/components/session-wizard/steps/ReviewStep.tsx"
+        "web/src/components/session-wizard/LaunchFooter.tsx"
       ]
     },
     {
@@ -616,7 +618,7 @@
       "components": [
         "web/src/components/session-wizard/SessionWizard.tsx",
         "web/src/components/session-wizard/steps/AgentStep.tsx",
-        "web/src/components/session-wizard/steps/ReviewStep.tsx"
+        "web/src/components/session-wizard/steps/AgentPickerEssentials.tsx"
       ]
     },
     {
@@ -2239,7 +2241,7 @@
       "id": "story.wizard-session-title-edit",
       "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": ["tests/wizard-review-step.spec.ts"],
+      "specs": ["tests/wizard-session-step.spec.ts"],
       "components": ["web/src/components/session-wizard/steps/SessionStep.tsx"]
     },
     {
@@ -2267,8 +2269,8 @@
       "id": "story.wizard-creating-banner",
       "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": ["tests/wizard-review-step.spec.ts"],
-      "components": ["web/src/components/session-wizard/steps/ReviewStep.tsx"]
+      "specs": ["tests/wizard-single-screen.spec.ts"],
+      "components": ["web/src/components/session-wizard/LaunchFooter.tsx"]
     },
     {
       "id": "story.wizard-last-tool-persists",
@@ -2282,7 +2284,7 @@
       "kind": "live-playwright",
       "risk": "high",
       "specs": ["tests/live/acp-stories/wizard-launch-button.spec.ts"],
-      "components": ["web/src/components/session-wizard/steps/ReviewStep.tsx"]
+      "components": ["web/src/components/session-wizard/LaunchFooter.tsx"]
     },
     {
       "id": "story.wizard-branch-from-title",
@@ -2291,7 +2293,7 @@
       "specs": ["tests/wizard-form-ui.spec.ts"],
       "components": [
         "web/src/components/session-wizard/sessionNames.ts",
-        "web/src/components/session-wizard/steps/ReviewStep.tsx"
+        "web/src/components/session-wizard/steps/SessionStep.tsx"
       ]
     },
     {
