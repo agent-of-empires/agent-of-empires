@@ -1738,6 +1738,10 @@ pub fn uninstall_all_hooks() {
 
     let base = dir_guard::hook_base_path();
     if base.exists() {
+        // Modern std::fs::remove_dir_all uses openat + O_NOFOLLOW (CVE-2022-21658
+        // fixed in 1.70). The path itself is computed from `hook_base_path()`
+        // which is invariant for the running process, so the read-then-remove
+        // sequence cannot race a path swap.
         if let Err(e) = std::fs::remove_dir_all(&base) {
             tracing::warn!(target: "hooks.uninstall", "Failed to remove {}: {}", base.display(), e);
         }

@@ -157,6 +157,10 @@ impl HooksInstallDialog {
             "Each hook runs:",
             Style::default().bold(),
         )));
+        // The euid in the displayed path matches the runtime path baked into
+        // the hook command and is already exposed via `id -u` and `ps`. The
+        // alternative (a placeholder) would mislead users about what is
+        // actually installed.
         lines.push(Line::from(format!(
             "  printf {{status}} > /tmp/aoe-hooks-{}/$AOE_INSTANCE_ID/status",
             nix::unistd::geteuid().as_raw()

@@ -38,9 +38,19 @@
 //!
 //! An attacker who pre-creates `/tmp/aoe-hooks-<our-euid>` owned by themselves
 //! cannot be cleared by us (sticky bit on `/tmp` plus alien ownership). Effect:
-//! `init_hook_base` returns `Err`; AoE keeps running with hooks disabled and
+//! `with_hook_base` returns `Err`; AoE keeps running with hooks disabled and
 //! falls back to pane-detection. Recovery requires the squatter to log out,
 //! reboot, or root cooperation. Bounded DoS only; never a privilege escalation.
+//!
+//! ## `/tmp` reaper (documented limitation)
+//!
+//! systemd-tmpfiles or macOS `periodic.daily` may delete the base directory
+//! while we hold the cached fd. Subsequent `*at` calls keep working against
+//! the orphan inode (POSIX guarantee), but the hook shell snippets do path-
+//! based `mkdir -p` and create a fresh inode at the same path. Reads via
+//! the cached fd then see the orphan, writes via the shell hooks land on
+//! the new inode, and status detection silently breaks until the next AoE
+//! restart. Acceptable: pane-detection is the documented fallback.
 
 use std::fs::Metadata;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -59,7 +69,7 @@ use nix::libc;
 use nix::sys::stat::{fstat, mkdirat, Mode};
 use nix::unistd::{geteuid, mkdir, unlinkat, UnlinkatFlags};
 
-// --- Path resolution ---------------------------------------------------------
+// Path resolution.
 
 #[cfg(test)]
 thread_local! {
@@ -95,7 +105,7 @@ pub(crate) fn clear_base_override_for_test() {
     HOOK_BASE_OVERRIDE.with(|c| *c.borrow_mut() = None);
 }
 
-// --- Singleton cell ----------------------------------------------------------
+// Singleton cell.
 
 type CachedBase = std::result::Result<OwnedFd, Arc<anyhow::Error>>;
 
@@ -132,67 +142,58 @@ pub(crate) fn open_calls() -> usize {
 }
 
 #[cfg(test)]
-fn cached_get_or_init<F>(init: F) -> Result<BorrowedFd<'static>>
+fn cached_get_or_init_apply<I, A, T>(init: I, apply: A) -> Result<T>
 where
-    F: FnOnce() -> std::result::Result<OwnedFd, Arc<anyhow::Error>>,
+    I: FnOnce() -> std::result::Result<OwnedFd, Arc<anyhow::Error>>,
+    A: FnOnce(&std::result::Result<OwnedFd, Arc<anyhow::Error>>) -> Result<T>,
 {
     HOOK_BASE_TEST_CELL.with(|cell| {
         let mut slot = cell.borrow_mut();
         if slot.is_none() {
             *slot = Some(init());
         }
-        match slot.as_ref().unwrap() {
-            Ok(fd) => {
-                // SAFETY: the OwnedFd lives in the test thread-local for the
-                // lifetime of the test. Tests acknowledge `'static` is a lie
-                // and serialize via `serial_test::serial(hook_base)` plus
-                // `reset_for_test` in their teardown to keep the contract.
-                let raw = fd.as_raw_fd();
-                Ok(unsafe { BorrowedFd::borrow_raw(raw) })
-            }
-            Err(e) => Err(anyhow!("{e:#}")),
-        }
+        apply(slot.as_ref().unwrap())
     })
 }
 
 #[cfg(not(test))]
-fn cached_get_or_init<F>(init: F) -> Result<BorrowedFd<'static>>
+fn cached_get_or_init_apply<I, A, T>(init: I, apply: A) -> Result<T>
 where
-    F: FnOnce() -> std::result::Result<OwnedFd, Arc<anyhow::Error>>,
+    I: FnOnce() -> std::result::Result<OwnedFd, Arc<anyhow::Error>>,
+    A: FnOnce(&std::result::Result<OwnedFd, Arc<anyhow::Error>>) -> Result<T>,
 {
-    let entry = HOOK_BASE.get_or_init(init);
-    match entry {
-        Ok(fd) => Ok(fd.as_fd()),
-        Err(e) => Err(anyhow!("{e:#}")),
-    }
+    apply(HOOK_BASE.get_or_init(init))
 }
 
-// --- Public init -------------------------------------------------------------
-
-/// Lazily open and verify the per-user hook base directory. First caller does
-/// the real work; subsequent callers reuse the cached fd (or the cached
-/// `Arc<anyhow::Error>` on the failure path; one atomic incr per failed call).
+/// Lazily open-and-verify the per-user hook base directory and run `f` with
+/// a borrowed fd to it. First caller does the real work; subsequent callers
+/// reuse the cached fd (or, on the failure path, the cached `Arc<Error>`).
 ///
-/// Returns a `BorrowedFd<'static>` because the underlying `OwnedFd` lives in
-/// static storage for the lifetime of the program (see `HOOK_BASE`).
-///
-/// Surface: every public reader/writer in `super::status_file` and
-/// `crate::cli::extract_session_id` calls this at first touch. Failures are
-/// loud at the source (full anyhow chain via `tracing::error!`) and silent on
-/// the polling path (warn-once + `None`).
-pub(crate) fn init_hook_base() -> Result<BorrowedFd<'static>> {
-    cached_get_or_init(|| match open_and_verify_base() {
-        Ok(fd) => Ok(fd),
-        Err(e) => {
-            tracing::error!(
-                target: "hooks.guard",
-                "hook base init failed: {e:#}. AoE will fall back to pane-detection. \
-                 Recover: rm -rf {}",
-                hook_base_path().display()
-            );
-            Err(Arc::new(e))
-        }
-    })
+/// The borrow lifetime is bound to the closure call: the borrow checker
+/// rejects any attempt to escape the fd outside `f`. This is the soundness
+/// reason for the closure shape over a direct `BorrowedFd<'static>` return.
+pub(crate) fn with_hook_base<F, T>(f: F) -> Result<T>
+where
+    F: FnOnce(BorrowedFd<'_>) -> Result<T>,
+{
+    cached_get_or_init_apply(
+        || match open_and_verify_base() {
+            Ok(fd) => Ok(fd),
+            Err(e) => {
+                tracing::error!(
+                    target: "hooks.guard",
+                    "hook base init failed: {e:#}. AoE will fall back to pane-detection. \
+                     Recover: rm -rf {}",
+                    hook_base_path().display()
+                );
+                Err(Arc::new(e))
+            }
+        },
+        |entry| match entry {
+            Ok(fd) => f(fd.as_fd()),
+            Err(e) => Err(anyhow!("{e:#}")),
+        },
+    )
 }
 
 fn open_and_verify_base() -> Result<OwnedFd> {
@@ -261,30 +262,31 @@ fn verify_dir_metadata(fd: &OwnedFd, label: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-// --- Per-instance ---
+// Per-instance.
 
 /// `mkdirat(base, id, 0o700)` (EEXIST-tolerant) plus `openat(O_NOFOLLOW)` plus
 /// `fstat`-on-fd uid/mode check. Returns an owned fd to the per-instance
 /// directory.
 pub(crate) fn open_instance_dir(instance_id: &str) -> Result<OwnedFd> {
     crate::session::validate_instance_id(instance_id)?;
-    let base = init_hook_base()?;
-    match mkdirat(base, instance_id, Mode::S_IRWXU) {
-        Ok(()) | Err(Errno::EEXIST) => {}
-        Err(e) => {
-            return Err(e).with_context(|| format!("mkdirat {instance_id}"));
+    with_hook_base(|base| {
+        match mkdirat(base, instance_id, Mode::S_IRWXU) {
+            Ok(()) | Err(Errno::EEXIST) => {}
+            Err(e) => {
+                return Err(e).with_context(|| format!("mkdirat {instance_id}"));
+            }
         }
-    }
-    let fd: OwnedFd = openat(
-        base,
-        instance_id,
-        OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
-        Mode::empty(),
-    )
-    .with_context(|| format!("openat instance subdir {instance_id} (symlink or non-dir)"))?;
-    let label = hook_base_path().join(instance_id);
-    verify_dir_metadata(&fd, &label)?;
-    Ok(fd)
+        let fd: OwnedFd = openat(
+            base,
+            instance_id,
+            OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
+            Mode::empty(),
+        )
+        .with_context(|| format!("openat instance subdir {instance_id} (symlink or non-dir)"))?;
+        let label = hook_base_path().join(instance_id);
+        verify_dir_metadata(&fd, &label)?;
+        Ok(fd)
+    })
 }
 
 /// Read-only variant: never creates the dir. Returns `Ok(None)` on `ENOENT` /
@@ -292,24 +294,25 @@ pub(crate) fn open_instance_dir(instance_id: &str) -> Result<OwnedFd> {
 /// indistinguishable from "no hook fired yet" on the polling path).
 pub(crate) fn open_instance_dir_read_only(instance_id: &str) -> Result<Option<OwnedFd>> {
     crate::session::validate_instance_id(instance_id)?;
-    let base = init_hook_base()?;
-    match openat(
-        base,
-        instance_id,
-        OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
-        Mode::empty(),
-    ) {
-        Ok(fd) => {
-            let label = hook_base_path().join(instance_id);
-            verify_dir_metadata(&fd, &label)?;
-            Ok(Some(fd))
+    with_hook_base(|base| {
+        match openat(
+            base,
+            instance_id,
+            OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
+            Mode::empty(),
+        ) {
+            Ok(fd) => {
+                let label = hook_base_path().join(instance_id);
+                verify_dir_metadata(&fd, &label)?;
+                Ok(Some(fd))
+            }
+            Err(Errno::ENOENT) | Err(Errno::ELOOP) => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("openat instance subdir {instance_id}")),
         }
-        Err(Errno::ENOENT) | Err(Errno::ELOOP) => Ok(None),
-        Err(e) => Err(e).with_context(|| format!("openat instance subdir {instance_id}")),
-    }
+    })
 }
 
-// --- Per-file I/O ---
+// Per-file I/O.
 
 /// Open a file inside an already-verified per-instance dir for reading.
 /// `O_NOFOLLOW` forbids the leaf being a symlink. `ENOENT` / `ELOOP` map to
@@ -340,10 +343,6 @@ pub(crate) fn read_file_at(
 /// `fstatat(AT_SYMLINK_NOFOLLOW)` view for mtime gating. Returns `Ok(None)` on
 /// missing or symlinked entries.
 pub(crate) fn metadata_at(dir: BorrowedFd<'_>, name: &str) -> Result<Option<Metadata>> {
-    use std::os::unix::fs::MetadataExt;
-    // Open with O_NOFOLLOW and read metadata via std::fs::File::metadata().
-    // Avoids fstatat(AT_SYMLINK_NOFOLLOW) (which would also work but produce a
-    // nix FileStat that we would then have to convert to std::fs::Metadata).
     let fd = match openat(
         dir,
         name,
@@ -356,11 +355,9 @@ pub(crate) fn metadata_at(dir: BorrowedFd<'_>, name: &str) -> Result<Option<Meta
     };
     let file = std::fs::File::from(fd);
     let meta = file.metadata()?;
-    // Belt and suspenders: refuse to consider non-regular leaves.
     if !meta.is_file() {
         return Ok(None);
     }
-    let _ = meta.size(); // touch MetadataExt to keep the import live
     Ok(Some(meta))
 }
 
@@ -389,13 +386,18 @@ pub(crate) fn write_short(dir: BorrowedFd<'_>, name: &str, bytes: &[u8]) -> Resu
 /// Atomic write via `O_CREAT|O_EXCL` tmpfile + `renameat`. Used for files that
 /// must never be observed torn (`session_id`, `attention.json`).
 ///
-/// Tmp name carries the PID to avoid same-process collisions. Multi-thread
-/// writers of the SAME `name` may race; one wins, the other sees `EEXIST`.
-/// Hook fires originate from a single shell process per event so this is fine
-/// in practice.
+/// Tmp name carries the PID and a process-local counter so multi-thread
+/// writers of the same `name` get distinct tmpfiles and cannot collide via
+/// `O_EXCL`.
 pub(crate) fn write_atomic(dir: BorrowedFd<'_>, name: &str, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
-    let tmp = format!(".{name}.tmp.{}", std::process::id());
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let tmp = format!(
+        ".{name}.tmp.{}.{}",
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
     let fd = openat(
         dir,
         tmp.as_str(),
@@ -449,7 +451,7 @@ pub(crate) fn ensure_instance_dir_path(instance_id: &str) -> Result<PathBuf> {
     Ok(hook_base_path().join(instance_id))
 }
 
-// --- Cleanup ---
+// Cleanup.
 
 /// Remove the per-instance subdir and every file inside, never following
 /// symlinks. Re-fstats each entry's fd before unlink to close the
@@ -460,42 +462,43 @@ pub(crate) fn ensure_instance_dir_path(instance_id: &str) -> Result<PathBuf> {
 /// will return `ENOTEMPTY` and we surface that as a warn-skip.
 pub(crate) fn remove_instance_dir(instance_id: &str) -> Result<()> {
     crate::session::validate_instance_id(instance_id)?;
-    let base = init_hook_base()?;
-    let dir_fd = match openat(
-        base,
-        instance_id,
-        OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
-        Mode::empty(),
-    ) {
-        Ok(fd) => fd,
-        Err(Errno::ENOENT) | Err(Errno::ELOOP) => {
-            // Already gone, or hostile symlink: try to unlink whatever is at
-            // the path so a future open succeeds. unlinkat without RemoveDir
-            // removes the symlink itself, not its target (POSIX guarantee).
-            let _ = unlinkat(base, instance_id, UnlinkatFlags::NoRemoveDir);
+    with_hook_base(|base| {
+        let dir_fd = match openat(
+            base,
+            instance_id,
+            OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(Errno::ENOENT) | Err(Errno::ELOOP) => {
+                // Already gone, or hostile symlink: try to unlink whatever is at
+                // the path so a future open succeeds. unlinkat without RemoveDir
+                // removes the symlink itself, not its target (POSIX guarantee).
+                let _ = unlinkat(base, instance_id, UnlinkatFlags::NoRemoveDir);
+                return Ok(());
+            }
+            Err(e) => return Err(e).with_context(|| format!("openat cleanup {instance_id}")),
+        };
+        let label = hook_base_path().join(instance_id);
+        if let Err(e) = verify_dir_metadata(&dir_fd, &label) {
+            // Wrong owner / mode: refuse to walk; do not unlink either, the user
+            // needs to inspect manually.
+            tracing::warn!(target: "hooks.guard", "skip cleanup {}: {e:#}", label.display());
             return Ok(());
         }
-        Err(e) => return Err(e).with_context(|| format!("openat cleanup {instance_id}")),
-    };
-    let label = hook_base_path().join(instance_id);
-    if let Err(e) = verify_dir_metadata(&dir_fd, &label) {
-        // Wrong owner / mode: refuse to walk; do not unlink either, the user
-        // needs to inspect manually.
-        tracing::warn!(target: "hooks.guard", "skip cleanup {}: {e:#}", label.display());
-        return Ok(());
-    }
-    walk_and_unlink_entries(&dir_fd)?;
-    // Final unlink of the per-instance subdir itself.
-    if let Err(e) = unlinkat(base, instance_id, UnlinkatFlags::RemoveDir) {
-        if e == Errno::ENOTEMPTY {
-            tracing::warn!(target: "hooks.guard",
-                "skipped non-empty cleanup of {}: hostile or stale subdir present",
-                label.display());
-            return Ok(());
+        walk_and_unlink_entries(&dir_fd)?;
+        // Final unlink of the per-instance subdir itself.
+        if let Err(e) = unlinkat(base, instance_id, UnlinkatFlags::RemoveDir) {
+            if e == Errno::ENOTEMPTY {
+                tracing::warn!(target: "hooks.guard",
+                    "skipped non-empty cleanup of {}: hostile or stale subdir present",
+                    label.display());
+                return Ok(());
+            }
+            return Err(e).with_context(|| format!("unlinkat RemoveDir {instance_id}"));
         }
-        return Err(e).with_context(|| format!("unlinkat RemoveDir {instance_id}"));
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 fn walk_and_unlink_entries(dir_fd: &OwnedFd) -> Result<()> {
@@ -548,8 +551,11 @@ fn walk_and_unlink_entries(dir_fd: &OwnedFd) -> Result<()> {
                 };
                 if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
                     tracing::warn!(target: "hooks.guard",
-                        "non-regular entry {name_str} (mode {:o}); skipping",
-                        st.st_mode);
+                        "non-regular entry {name_str} (mode {:o}) inside {}; \
+                         skipping. The instance dir will be left non-empty; \
+                         remove manually if it matters.",
+                        st.st_mode,
+                        hook_base_path().display());
                     continue;
                 }
                 // Regular file we own (parent dir was uid-checked) → safe to
@@ -579,7 +585,7 @@ fn walk_and_unlink_entries(dir_fd: &OwnedFd) -> Result<()> {
     Ok(())
 }
 
-// --- Tests -------------------------------------------------------------------
+// Tests.
 
 #[cfg(test)]
 mod tests {
@@ -589,12 +595,10 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
 
-    /// RAII: install an override + reset cell + restore on drop. Every test
-    /// using `init_hook_base` should hold one; serial_test gates the tests so
-    /// the thread-local override is consistent for the whole run.
-    struct BaseGuard {
-        _tmp: TempDir,
-    }
+    /// RAII: install an override + reset cell + restore on drop. Tests using
+    /// `with_hook_base` MUST hold one; `serial_test::serial(hook_base)` gates
+    /// the tests so the thread-local override stays consistent.
+    struct BaseGuard;
 
     impl BaseGuard {
         fn fresh() -> (Self, PathBuf, TempDir) {
@@ -602,13 +606,7 @@ mod tests {
             let base = tmp.path().join("aoe-hooks");
             override_base_for_test(base.clone());
             reset_for_test();
-            (
-                Self {
-                    _tmp: TempDir::new().unwrap(),
-                },
-                base,
-                tmp,
-            )
+            (Self, base, tmp)
         }
     }
 
@@ -628,13 +626,15 @@ mod tests {
     #[serial(hook_base)]
     fn init_succeeds_on_fresh_dir() {
         let (_g, base, _tmp) = BaseGuard::fresh();
-        // Do NOT pre-create; init must mkdir.
-        let fd = init_hook_base().expect("init must succeed on fresh path");
-        assert!(base.is_dir());
-        let st = fstat(fd).unwrap();
-        let mode = st.st_mode & 0o7777;
-        assert_eq!(mode, 0o700, "got mode {mode:o}");
-        assert_eq!(st.st_uid, geteuid().as_raw());
+        with_hook_base(|fd| {
+            assert!(base.is_dir());
+            let st = fstat(fd)?;
+            let mode = st.st_mode & 0o7777;
+            assert_eq!(mode, 0o700, "got mode {mode:o}");
+            assert_eq!(st.st_uid, geteuid().as_raw());
+            Ok(())
+        })
+        .expect("init must succeed on fresh path");
     }
 
     #[test]
@@ -642,7 +642,7 @@ mod tests {
     fn init_succeeds_when_base_already_correct() {
         let (_g, base, _tmp) = BaseGuard::fresh();
         make_correct_base(&base);
-        init_hook_base().expect("init must succeed when base already 0700 and ours");
+        with_hook_base(|_| Ok(())).expect("init must succeed when base already 0700 and ours");
     }
 
     #[test]
@@ -652,7 +652,7 @@ mod tests {
         let target = tmp.path().join("decoy");
         std::fs::create_dir_all(&target).unwrap();
         std::os::unix::fs::symlink(&target, &base).unwrap();
-        let err = init_hook_base().unwrap_err();
+        let err = with_hook_base(|_| Ok(())).unwrap_err();
         let s = format!("{err:#}");
         assert!(
             s.contains("symlink") || s.contains("ELOOP") || s.contains("Too many levels"),
@@ -666,7 +666,7 @@ mod tests {
         let (_g, base, _tmp) = BaseGuard::fresh();
         std::fs::create_dir(&base).unwrap();
         std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let err = init_hook_base().unwrap_err();
+        let err = with_hook_base(|_| Ok(())).unwrap_err();
         let s = format!("{err:#}");
         assert!(s.contains("mode"), "expected mode rejection, got: {s}");
     }
@@ -677,7 +677,7 @@ mod tests {
         let (_g, base, _tmp) = BaseGuard::fresh();
         std::fs::create_dir(&base).unwrap();
         std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o770)).unwrap();
-        let err = init_hook_base().unwrap_err();
+        let err = with_hook_base(|_| Ok(())).unwrap_err();
         let s = format!("{err:#}");
         assert!(s.contains("mode"), "expected mode rejection, got: {s}");
     }
@@ -686,13 +686,12 @@ mod tests {
     #[serial(hook_base)]
     fn init_caches_error() {
         let (_g, base, tmp) = BaseGuard::fresh();
-        // Bad state: symlink. Expected Err.
         let target = tmp.path().join("decoy2");
         std::fs::create_dir_all(&target).unwrap();
         std::os::unix::fs::symlink(&target, &base).unwrap();
-        let _ = init_hook_base().unwrap_err();
+        let _ = with_hook_base(|_| Ok(())).unwrap_err();
         let after_first = open_calls();
-        let _ = init_hook_base().unwrap_err();
+        let _ = with_hook_base(|_| Ok(())).unwrap_err();
         assert_eq!(
             open_calls(),
             after_first,
@@ -705,14 +704,10 @@ mod tests {
     fn init_caches_success() {
         let (_g, base, _tmp) = BaseGuard::fresh();
         make_correct_base(&base);
-        let fd1 = init_hook_base().unwrap();
+        let raw1 = with_hook_base(|fd| Ok(fd.as_raw_fd())).unwrap();
         let after_first = open_calls();
-        let fd2 = init_hook_base().unwrap();
-        assert_eq!(
-            fd1.as_raw_fd(),
-            fd2.as_raw_fd(),
-            "cached fd must be byte-equal across calls"
-        );
+        let raw2 = with_hook_base(|fd| Ok(fd.as_raw_fd())).unwrap();
+        assert_eq!(raw1, raw2, "cached fd must be byte-equal across calls");
         assert_eq!(
             open_calls(),
             after_first,
@@ -871,10 +866,25 @@ mod tests {
 
     #[test]
     #[serial(hook_base)]
-    fn multi_user_paths_do_not_collide() {
-        let (_g1, base1, _tmp1) = BaseGuard::fresh();
-        // Force a different override path the way two euids would diverge.
-        let base2 = base1.with_file_name("aoe-hooks-other");
-        assert_ne!(base1, base2, "test fixture must produce two paths");
+    fn hook_base_path_bakes_euid_suffix() {
+        clear_base_override_for_test();
+        let path = hook_base_path();
+        let want_suffix = format!("aoe-hooks-{}", geteuid().as_raw());
+        let got = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .expect("hook base path must end with a UTF-8 file name");
+        assert_eq!(
+            got,
+            want_suffix,
+            "production hook base must end with /tmp/aoe-hooks-<euid>; got {}",
+            path.display()
+        );
+        assert_eq!(
+            path.parent().and_then(|p| p.to_str()),
+            Some("/tmp"),
+            "production hook base must live under /tmp; got {}",
+            path.display()
+        );
     }
 }
