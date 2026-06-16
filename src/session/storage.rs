@@ -565,7 +565,7 @@ struct RecentProjects {
 /// The path is the worktree's main repo when present, else the project path,
 /// with any trailing slash trimmed so it keys identically to the client.
 pub fn recent_project_entry_for(inst: &Instance) -> Option<RecentProjectEntry> {
-    if inst.scratch || inst.is_workspace() {
+    if inst.scratch || inst.workspace_info.is_some() {
         return None;
     }
     let raw = inst
