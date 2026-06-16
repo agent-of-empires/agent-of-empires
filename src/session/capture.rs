@@ -221,7 +221,7 @@ fn read_claude_json_session_id(project_path: &Path) -> Option<String> {
 /// Polling closure for Claude Code session tracking on the host filesystem.
 ///
 /// Per tick, in order:
-/// 1. Read `/tmp/aoe-hooks/<instance_id>/session_id` (written by Claude's
+/// 1. Read `/tmp/aoe-hooks-<euid>/<instance_id>/session_id` (written by Claude's
 ///    `SessionStart` / `UserPromptSubmit` hooks). When present and ≤ 5 min
 ///    old, return it and skip the disk scan.
 /// 2. Otherwise scan `~/.claude/projects/<encoded-path>/`. The scan uses
@@ -239,7 +239,7 @@ pub(crate) fn claude_poll_fn(
     let last_known = std::sync::Mutex::new(known_session_id);
     move || {
         // Sidecar reads are scoped per-instance: the file lives under
-        // `/tmp/aoe-hooks/<instance_id>/` so a sibling instance's hook
+        // `/tmp/aoe-hooks-<euid>/<instance_id>/` so a sibling instance's hook
         // writes cannot reach this path, which is why the read skips
         // `compose_exclusion`. `extra_excludes` is still honored so a
         // sidecar value matching one of this instance's cleared sids does

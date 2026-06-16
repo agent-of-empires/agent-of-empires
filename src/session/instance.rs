@@ -1182,7 +1182,7 @@ impl Instance {
     }
 
     /// Read the agent-raised urgent flag from `attention.json`. Sourced
-    /// on-demand from `/tmp/aoe-hooks/{id}/attention.json` so it picks up
+    /// on-demand from `/tmp/aoe-hooks-<euid>/{id}/attention.json` so it picks up
     /// changes the running agent makes (via the `attention-urgent` script)
     /// without an Instance state mutation. Suppressed for archived/snoozed
     /// rows so a sunk session can't claw its way back to the top.

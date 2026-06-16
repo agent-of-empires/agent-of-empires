@@ -51,6 +51,20 @@
 //! the cached fd then see the orphan, writes via the shell hooks land on
 //! the new inode, and status detection silently breaks until the next AoE
 //! restart. Acceptable: pane-detection is the documented fallback.
+//!
+//! ## POSIX ACL widening (documented limitation)
+//!
+//! `verify_dir_metadata` inspects classic POSIX mode bits only (`mode &
+//! 0o077`, plus `mode & 0o7000` for setuid/setgid/sticky). It does NOT
+//! inspect POSIX ACL entries: a `setfacl -m u:other:rwx <base>` can grant
+//! a co-tenant write access without flipping any bit in `st_mode`. The
+//! mismatch is not exploitable in this threat model. An alien uid cannot
+//! `setfacl` on a `0o700` directory we own (ACL writes require ownership
+//! or write permission), and we never widen our own ACL. The shell pattern
+//! `d*------|d*------.|d*------+|d*------@` tolerates the trailing `+`
+//! glyph emitted by `ls -l` when a legitimate operator-applied ACL is
+//! present; the mode positions still must read `------`, so an ACL that
+//! widens past `r--` triggers a different glyph and the snippet rejects.
 
 use std::fs::Metadata;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -109,9 +123,10 @@ pub(crate) fn clear_base_override_for_test() {
 
 type CachedBase = std::result::Result<OwnedFd, Arc<anyhow::Error>>;
 
-// MUST be `static` for the BorrowedFd<'static> contract that `init_hook_base`
-// hands out: the `OwnedFd` lives in static storage for the program lifetime,
-// so a `BorrowedFd` derived from it is sound for `'static`.
+// MUST be `static` so the cached `OwnedFd` outlives every call site:
+// `with_hook_base` re-borrows it as a `BorrowedFd<'_>` scoped to the
+// closure invocation, but the underlying owned fd lives in static
+// storage for the program lifetime so its `close` on drop never fires.
 #[cfg(not(test))]
 static HOOK_BASE: OnceLock<CachedBase> = OnceLock::new();
 
@@ -386,6 +401,16 @@ pub(crate) fn write_short(dir: BorrowedFd<'_>, name: &str, bytes: &[u8]) -> Resu
 /// Atomic write via `O_CREAT|O_EXCL` tmpfile + `renameat`. Used for files that
 /// must never be observed torn (`session_id`, `attention.json`).
 ///
+/// Atomicity, not durability: there is no `fsync`/`sync_data` before the
+/// rename. After a power loss the file may revert to the previous version
+/// or vanish. Acceptable because the hook status tree lives under `/tmp`
+/// (wiped on reboot) and every reader is stale-tolerant: the next hook
+/// fire rewrites `session_id`, the filesystem-scan fallback in
+/// `claude_poll_fn` recovers when the sidecar is missing, and
+/// `attention.json` is a best-effort UI flag rather than authoritative
+/// state. `crate::session::atomic_write` is the durable counterpart for
+/// files that must survive a crash (e.g. persistent session storage).
+///
 /// Tmp name carries the PID and a process-local counter so multi-thread
 /// writers of the same `name` get distinct tmpfiles and cannot collide via
 /// `O_EXCL`.
@@ -439,9 +464,9 @@ pub(crate) fn write_session_id_via_guard(instance_id: &str, session_id: &str) ->
 /// `*at`+`O_NOFOLLOW`+`fstat-on-fd`, then drops the fd and returns the
 /// resolved path. Closes both attack vectors that an unguarded
 /// `create_dir_all` would re-introduce: self-DoS at default umask 022
-/// (would create `0o755`, `init_hook_base` would reject) and the
-/// multi-tenant pre-squat + symlink-swap race against Docker's bind-mount
-/// resolution.
+/// (would create `0o755`, which `with_hook_base`'s `verify_dir_metadata`
+/// would reject) and the multi-tenant pre-squat + symlink-swap race
+/// against Docker's bind-mount resolution.
 ///
 /// Caller policy on `Err`: skip the bind-mount push, surface a
 /// `tracing::warn!` and let the agent boot without status hooks

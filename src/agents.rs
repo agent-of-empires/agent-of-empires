@@ -55,7 +55,7 @@ pub struct HookEvent {
     pub status: Option<&'static str>,
     /// When `true`, install an additional hook command that extracts
     /// `session_id` from the agent's stdin JSON payload and writes it to
-    /// `/tmp/aoe-hooks/<AOE_INSTANCE_ID>/session_id`.
+    /// `/tmp/aoe-hooks-<euid>/<AOE_INSTANCE_ID>/session_id`.
     pub session_id_capture: bool,
 }
 
@@ -150,7 +150,7 @@ pub struct AgentDef {
 
 /// Claude Code hook events. `SessionStart` and `UserPromptSubmit` carry
 /// `session_id_capture: true` so the per-instance sidecar
-/// (`/tmp/aoe-hooks/<id>/session_id`) is updated whenever Claude rotates
+/// (`/tmp/aoe-hooks-<euid>/<id>/session_id`) is updated whenever Claude rotates
 /// its session UUID (`/clear`, `/new`, `--fork-session`, resume, compact).
 /// `claude_poll_fn` reads this sidecar before falling back to its disk
 /// scan.
