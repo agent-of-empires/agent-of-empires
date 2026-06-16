@@ -1158,7 +1158,8 @@
       "specs": [
         "tests/acp-composer-recall.spec.ts",
         "src/components/acp/recallNav.test.ts",
-        "src/components/acp/Composer.recall.test.ts"
+        "src/components/acp/Composer.recall.test.ts",
+        "src/components/acp/Composer.recall.dom.test.tsx"
       ],
       "components": ["web/src/components/acp/Composer.tsx", "web/src/components/acp/recallNav.ts"]
     },
