@@ -23,6 +23,9 @@ pub struct ProjectResponse {
     pub scope: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_base_branch: Option<String>,
+    /// Whether the project shows as a sessionless sidebar header. The web
+    /// derives the pin marker and empty-header visibility from this. See #2208.
+    pub pinned: bool,
 }
 
 impl From<Project> for ProjectResponse {
@@ -32,6 +35,7 @@ impl From<Project> for ProjectResponse {
             path: p.path,
             scope: p.scope.as_str().to_string(),
             default_base_branch: p.default_base_branch,
+            pinned: p.pinned,
         }
     }
 }
@@ -104,6 +108,11 @@ pub struct CreateProjectBody {
     /// workspace. Empty/whitespace is treated as unset.
     #[serde(default)]
     pub default_base_branch: Option<String>,
+    /// Whether to pin the project (show it as a sessionless sidebar header).
+    /// Defaults to false: the Projects view just saves a project, while the
+    /// sidebar "Pin project" action sends `true`. See #2208.
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 #[tracing::instrument(
@@ -180,7 +189,8 @@ pub async fn create_project(
     }
 
     let project = Project::new(name, canonical.to_string_lossy(), scope)
-        .with_base_branch(body.default_base_branch);
+        .with_base_branch(body.default_base_branch)
+        .with_pinned(body.pinned);
     match projects::add(&state.profile, scope, project, body.allow_override) {
         Ok(saved) => {
             tracing::info!(target: "http.api.projects", name = %saved.name, path = %saved.path, scope = saved.scope.as_str(), "created project");
@@ -285,24 +295,45 @@ pub async fn delete_project(
     }
 }
 
-/// Extract the new `default_base_branch` from a PATCH body. The key is
-/// required: a plain `Option<String>` field can't enforce that because serde
-/// deserializes a missing field to `None`, indistinguishable from an explicit
-/// `null`, so a `{}` body would silently clear the stored value. Inspect the
-/// raw JSON instead. `Ok(None)` clears, `Ok(Some(_))` sets, `Err((code, msg))`
-/// is a malformed request. Empty/whitespace is normalized to unset downstream.
-fn parse_base_branch_update(
+/// Parsed PATCH body for a project. Each field is `None` when its key is
+/// absent (leave that attribute untouched), `Some(_)` when present. The raw
+/// JSON is inspected rather than deserialized into a struct because a missing
+/// `default_base_branch` key must be distinguishable from an explicit `null`
+/// (which clears the value); serde would fold both to `None`. At least one
+/// recognized key must be present, else the request is a no-op.
+#[derive(Debug, PartialEq)]
+struct ProjectPatch {
+    /// `None`: key absent. `Some(None)`: clear. `Some(Some(s))`: set to `s`
+    /// (empty/whitespace normalized to unset downstream).
+    base_branch: Option<Option<String>>,
+    /// `None`: key absent. `Some(b)`: set the pin flag to `b`.
+    pinned: Option<bool>,
+}
+
+fn parse_project_patch(
     body: &serde_json::Value,
-) -> Result<Option<String>, (&'static str, &'static str)> {
-    match body.get("default_base_branch") {
-        None => Err((
-            "missing_field",
-            "default_base_branch is required (use null to clear)",
-        )),
-        Some(serde_json::Value::Null) => Ok(None),
-        Some(serde_json::Value::String(s)) => Ok(Some(s.clone())),
-        Some(_) => Err(("bad_field", "default_base_branch must be a string or null")),
+) -> Result<ProjectPatch, (&'static str, &'static str)> {
+    let base_branch = match body.get("default_base_branch") {
+        None => None,
+        Some(serde_json::Value::Null) => Some(None),
+        Some(serde_json::Value::String(s)) => Some(Some(s.clone())),
+        Some(_) => return Err(("bad_field", "default_base_branch must be a string or null")),
+    };
+    let pinned = match body.get("pinned") {
+        None => None,
+        Some(serde_json::Value::Bool(b)) => Some(*b),
+        Some(_) => return Err(("bad_field", "pinned must be a boolean")),
+    };
+    if base_branch.is_none() && pinned.is_none() {
+        return Err((
+            "no_fields",
+            "provide at least one of: default_base_branch, pinned",
+        ));
     }
+    Ok(ProjectPatch {
+        base_branch,
+        pinned,
+    })
 }
 
 #[tracing::instrument(target = "http.api.projects", skip_all, fields(name = %name, scope = q.scope.as_deref().unwrap_or("global")))]
@@ -344,8 +375,8 @@ pub async fn update_project(
         }
     };
 
-    let base = match parse_base_branch_update(&body) {
-        Ok(base) => base,
+    let patch = match parse_project_patch(&body) {
+        Ok(patch) => patch,
         Err((err, msg)) => {
             tracing::warn!(target: "http.api.projects", reason = err, "rejected update");
             return (
@@ -356,7 +387,27 @@ pub async fn update_project(
         }
     };
 
-    match projects::update_base_branch(&state.profile, scope, &name, base) {
+    // Apply each present field in turn. Both are read-modify-write over the
+    // same registry file, so the last call's returned project reflects every
+    // applied change. `parse_project_patch` guarantees at least one field.
+    let mut result: Option<std::result::Result<Project, RegistryError>> = None;
+    if let Some(base) = patch.base_branch {
+        result = Some(projects::update_base_branch(
+            &state.profile,
+            scope,
+            &name,
+            base,
+        ));
+    }
+    if let Some(pinned) = patch.pinned {
+        // Don't run the pinned write if a prior base-branch write already
+        // failed (e.g. NotFound), so its error is surfaced rather than masked.
+        if !matches!(&result, Some(Err(_))) {
+            result = Some(projects::set_pinned(&state.profile, scope, &name, pinned));
+        }
+    }
+
+    match result.expect("parse_project_patch guarantees at least one field") {
         Ok(updated) => {
             tracing::info!(target: "http.api.projects", name = %updated.name, path = %updated.path, scope = updated.scope.as_str(), "updated project");
             (StatusCode::OK, Json(ProjectResponse::from(updated))).into_response()
@@ -390,33 +441,60 @@ pub async fn update_project(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_base_branch_update;
+    use super::{parse_project_patch, ProjectPatch};
     use serde_json::json;
 
     #[test]
-    fn base_branch_update_requires_the_key() {
-        // A missing key is a malformed request, not an intent to clear: this is
-        // the guard that stops a `{}` body from silently wiping the default.
+    fn project_patch_requires_at_least_one_field() {
+        // An empty body is a no-op, not an intent to clear: this guard stops a
+        // `{}` body from silently wiping the default base branch (#2208 made
+        // the base-branch key optional, so the old "missing_field" guard moved
+        // here as "no_fields").
         assert_eq!(
-            parse_base_branch_update(&json!({})),
+            parse_project_patch(&json!({})),
             Err((
-                "missing_field",
-                "default_base_branch is required (use null to clear)"
+                "no_fields",
+                "provide at least one of: default_base_branch, pinned"
             ))
         );
-        // null and string both parse; null/empty clears downstream, a value sets.
+    }
+
+    #[test]
+    fn project_patch_parses_base_branch() {
+        // null clears, a string sets; the key being present is what matters.
         assert_eq!(
-            parse_base_branch_update(&json!({"default_base_branch": null})),
-            Ok(None)
+            parse_project_patch(&json!({"default_base_branch": null})),
+            Ok(ProjectPatch {
+                base_branch: Some(None),
+                pinned: None
+            })
         );
         assert_eq!(
-            parse_base_branch_update(&json!({"default_base_branch": "develop"})),
-            Ok(Some("develop".to_string()))
+            parse_project_patch(&json!({"default_base_branch": "develop"})),
+            Ok(ProjectPatch {
+                base_branch: Some(Some("develop".to_string())),
+                pinned: None
+            })
         );
-        // Wrong type is rejected.
         assert_eq!(
-            parse_base_branch_update(&json!({"default_base_branch": 42})),
+            parse_project_patch(&json!({"default_base_branch": 42})),
             Err(("bad_field", "default_base_branch must be a string or null"))
+        );
+    }
+
+    #[test]
+    fn project_patch_parses_pinned_alone() {
+        // The unpin path sends only `pinned`, with no base-branch key.
+        assert_eq!(
+            parse_project_patch(&json!({"pinned": false})),
+            Ok(ProjectPatch {
+                base_branch: None,
+                pinned: Some(false)
+            })
+        );
+        assert_eq!(
+            parse_project_patch(&json!({"pinned": "yes"})),
+            Err(("bad_field", "pinned must be a boolean"))
         );
     }
 }
