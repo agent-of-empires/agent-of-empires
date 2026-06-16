@@ -3485,6 +3485,16 @@ hooks_auto_accept: false
     #[test]
     #[serial_test::serial(hook_base)]
     fn host_shell_bakes_per_user_base_byte_stable_across_mocks() {
+        // Drop guard so the thread-local override clears even if an
+        // assertion below panics, preventing leakage into other
+        // serial(hook_base) tests.
+        struct ClearOnDrop;
+        impl Drop for ClearOnDrop {
+            fn drop(&mut self) {
+                crate::hooks::dir_guard::clear_base_override_for_test();
+            }
+        }
+        let _g = ClearOnDrop;
         for euid in [1000u32, 65534u32, 0u32] {
             let mock_base = std::path::PathBuf::from(format!("/tmp/aoe-hooks-{euid}"));
             crate::hooks::dir_guard::override_base_for_test(mock_base.clone());
@@ -3499,7 +3509,6 @@ hooks_auto_accept: false
                 "host hook must include id-u uid check: {cmd}"
             );
         }
-        crate::hooks::dir_guard::clear_base_override_for_test();
     }
 
     #[test]

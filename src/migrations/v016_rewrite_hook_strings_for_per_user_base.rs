@@ -599,6 +599,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(shell_env)]
     fn rewrites_pre_v016_claude_settings_to_per_user_base() {
         let _env = EnvGuard::unset_all();
         let (_tmp, home, app_dir) = setup_dirs();
@@ -611,6 +612,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(shell_env)]
     fn skips_files_without_aoe_marker() {
         let _env = EnvGuard::unset_all();
         let (_tmp, home, app_dir) = setup_dirs();
@@ -637,6 +639,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(shell_env)]
     fn idempotent_byte_identical_on_second_run() {
         let _env = EnvGuard::unset_all();
         let (_tmp, home, app_dir) = setup_dirs();
@@ -652,6 +655,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(shell_env)]
     fn rewrite_failure_keeps_legacy_dir_intact_for_manual_recovery() {
         use std::os::unix::fs::PermissionsExt;
         let _env = EnvGuard::unset_all();
@@ -685,6 +689,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(shell_env)]
     fn legacy_sweep_full_success_removes_owned_dir() {
         use std::os::unix::fs::PermissionsExt;
         let _env = EnvGuard::unset_all();
@@ -713,6 +718,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(shell_env)]
     fn legacy_sweep_handles_symlink_at_legacy_path() {
         use std::os::unix::fs::PermissionsExt;
         let _env = EnvGuard::unset_all();
@@ -741,6 +747,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(shell_env)]
     fn sandbox_baked_hooks_under_aoe_sandbox_subpath_are_untouched() {
         let _env = EnvGuard::unset_all();
         let (_tmp, home, app_dir) = setup_dirs();

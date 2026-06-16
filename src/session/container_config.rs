@@ -2859,6 +2859,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_build_container_config_includes_repo_sandbox_settings() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
         // Isolate HOME so global/profile config doesn't interfere
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
@@ -3091,6 +3092,7 @@ volume_ignores = ["**/bin", "**/obj", "target"]
     #[test]
     #[serial_test::serial]
     fn test_build_container_config_sibling_worktree_loads_main_repo_extra_volumes() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -3548,6 +3550,7 @@ trusted_hash = "keep"
     #[test]
     #[serial_test::serial]
     fn test_build_container_config_mounts_codex_home_from_extra_env() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -3592,6 +3595,7 @@ trusted_hash = "keep"
     #[test]
     #[serial_test::serial]
     fn test_build_container_config_mounts_codex_home_from_sandbox_environment() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -3651,6 +3655,7 @@ environment = ["CODEX_HOME=/root/profile-codex"]
     #[test]
     #[serial_test::serial]
     fn test_build_container_config_uses_passed_profile_not_global_default() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
         #[cfg(any(target_os = "linux", target_os = "macos"))]

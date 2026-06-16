@@ -6311,13 +6311,15 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             let base = crate::hooks::hook_base_path();
             if !base.exists() {
-                std::fs::create_dir_all(&base).ok();
+                std::fs::create_dir_all(&base).expect("create hook base dir");
             }
-            std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).ok();
+            std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700))
+                .expect("set hook base mode 0700");
             let dir =
                 crate::hooks::hook_status_dir(instance_id).expect("test id must be allowlist-safe");
             std::fs::create_dir_all(&dir).unwrap();
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).ok();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                .expect("set hook instance mode 0700");
             std::fs::write(dir.join("session_id"), sid).unwrap();
             dir
         }
@@ -7746,12 +7748,14 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
         use std::os::unix::fs::PermissionsExt;
         let base = crate::hooks::hook_base_path();
         if !base.exists() {
-            std::fs::create_dir_all(&base).ok();
+            std::fs::create_dir_all(&base).expect("create hook base dir");
         }
-        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).ok();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700))
+            .expect("set hook base mode 0700");
         let dir = crate::hooks::hook_status_dir(&inst.id).expect("hook dir");
         std::fs::create_dir_all(&dir).expect("create hook dir");
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).ok();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("set hook instance mode 0700");
         std::fs::write(dir.join("status"), "running").expect("write status");
         assert_eq!(
             crate::hooks::read_hook_status(&inst.id),
