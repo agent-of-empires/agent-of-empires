@@ -2304,6 +2304,13 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
+      "id": "sidebar.smart-rename-chip-render",
+      "kind": "mocked-playwright",
+      "risk": "low",
+      "specs": ["tests/sidebar-smart-rename-chip.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
       "id": "sidebar.multi-select-logic",
       "kind": "vitest",
       "risk": "high",
