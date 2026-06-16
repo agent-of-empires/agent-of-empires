@@ -17,8 +17,8 @@
 //!
 //! ## Algorithm
 //!
-//! 1. Resolve the per-user base path: `/tmp/aoe-hooks-<euid>` (R1). The euid
-//!    suffix removes the multi-tenant collision: pure `/tmp/aoe-hooks` would
+//! 1. Resolve the per-user base path: `/tmp/aoe-hooks-<euid>`. The euid
+//!    suffix prevents a co-tenant collision: pure `/tmp/aoe-hooks` would
 //!    deny user B once user A has created it.
 //! 2. `mkdir(0o700)` tolerating `EEXIST`.
 //! 3. `open(O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC | O_RDONLY)`. `O_NOFOLLOW`
@@ -34,14 +34,13 @@
 //! Per-instance subdirs and per-file I/O ride the same `*at` discipline,
 //! always anchored on a fd we have already verified.
 //!
-//! ## Squatting DoS (R10, documented limitation)
+//! ## Squatting DoS (documented limitation)
 //!
 //! An attacker who pre-creates `/tmp/aoe-hooks-<our-euid>` owned by themselves
 //! cannot be cleared by us (sticky bit on `/tmp` plus alien ownership). Effect:
-//! `init_hook_base` returns `Err`; the TUI surfaces a banner; AoE keeps running
-//! with hooks disabled and falls back to pane-detection. Recovery requires the
-//! squatter to log out, reboot, or root cooperation. Bounded DoS only; never a
-//! privilege escalation.
+//! `init_hook_base` returns `Err`; AoE keeps running with hooks disabled and
+//! falls back to pane-detection. Recovery requires the squatter to log out,
+//! reboot, or root cooperation. Bounded DoS only; never a privilege escalation.
 
 use std::fs::Metadata;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -182,7 +181,18 @@ where
 /// loud at the source (full anyhow chain via `tracing::error!`) and silent on
 /// the polling path (warn-once + `None`).
 pub(crate) fn init_hook_base() -> Result<BorrowedFd<'static>> {
-    cached_get_or_init(|| open_and_verify_base().map_err(Arc::new))
+    cached_get_or_init(|| match open_and_verify_base() {
+        Ok(fd) => Ok(fd),
+        Err(e) => {
+            tracing::error!(
+                target: "hooks.guard",
+                "hook base init failed: {e:#}. AoE will fall back to pane-detection. \
+                 Recover: rm -rf {}",
+                hook_base_path().display()
+            );
+            Err(Arc::new(e))
+        }
+    })
 }
 
 fn open_and_verify_base() -> Result<OwnedFd> {
@@ -254,7 +264,7 @@ fn verify_dir_metadata(fd: &OwnedFd, label: &std::path::Path) -> Result<()> {
 // --- Per-instance ---
 
 /// `mkdirat(base, id, 0o700)` (EEXIST-tolerant) plus `openat(O_NOFOLLOW)` plus
-/// `fstat`-on-fd uid/mode check (R14). Returns an owned fd to the per-instance
+/// `fstat`-on-fd uid/mode check. Returns an owned fd to the per-instance
 /// directory.
 pub(crate) fn open_instance_dir(instance_id: &str) -> Result<OwnedFd> {
     crate::session::validate_instance_id(instance_id)?;
@@ -418,11 +428,32 @@ pub(crate) fn write_session_id_via_guard(instance_id: &str, session_id: &str) ->
     write_atomic(dir.as_fd(), "session_id", session_id.as_bytes())
 }
 
+/// Ensure the per-instance hook directory exists with `dir_guard` discipline
+/// and return its host path. Used by callers that hand the path to an
+/// external resolver (Docker bind-mount source, sidecar config writer)
+/// rather than performing in-process I/O directly.
+///
+/// The function calls `open_instance_dir` to verify-and-create with
+/// `*at`+`O_NOFOLLOW`+`fstat-on-fd`, then drops the fd and returns the
+/// resolved path. Closes both attack vectors that an unguarded
+/// `create_dir_all` would re-introduce: self-DoS at default umask 022
+/// (would create `0o755`, `init_hook_base` would reject) and the
+/// multi-tenant pre-squat + symlink-swap race against Docker's bind-mount
+/// resolution.
+///
+/// Caller policy on `Err`: skip the bind-mount push, surface a
+/// `tracing::warn!` and let the agent boot without status hooks
+/// (pane-detection fallback).
+pub(crate) fn ensure_instance_dir_path(instance_id: &str) -> Result<PathBuf> {
+    let _fd = open_instance_dir(instance_id)?;
+    Ok(hook_base_path().join(instance_id))
+}
+
 // --- Cleanup ---
 
 /// Remove the per-instance subdir and every file inside, never following
-/// symlinks. Replaces `std::fs::remove_dir_all` (R14, S4): we re-fstat each
-/// entry's fd before unlink to close the swap-between-stat-and-unlink window.
+/// symlinks. Re-fstats each entry's fd before unlink to close the
+/// swap-between-stat-and-unlink window.
 ///
 /// Subdirectories under the per-instance dir are NEVER created by AoE; if one
 /// shows up it is hostile or stale. We refuse to descend; final `RemoveDir`
@@ -496,7 +527,7 @@ fn walk_and_unlink_entries(dir_fd: &OwnedFd) -> Result<()> {
                 continue;
             }
         };
-        // R14: re-validate the entry before removal. Open with O_NOFOLLOW so a
+        // Re-validate the entry before removal. Open with O_NOFOLLOW so a
         // symlink at the leaf rejects with ELOOP rather than chasing the
         // target. Anything that is not a regular file (subdir, fifo, device)
         // is hostile or stale; we warn and skip.

@@ -6,23 +6,22 @@
 //! tolerant mode pattern (`d*------|d*------.|d*------+|d*------@`) and an
 //! environment-pinning preamble (`unset IFS; umask 077; LC_ALL=C ls -ldn`).
 //!
-//! ## Strategy: rewrite first, sweep last (cross-validation finding C3)
+//! ## Strategy: rewrite first, sweep last
 //!
 //! 1. **Rewrite** every reachable host hook target's bytes via the live
-//!    `install_*` functions; pattern is identical to v015. Per-target
-//!    rewrite failures `tracing::warn!` and continue.
-//! 2. **Sweep** the legacy `/tmp/aoe-hooks` directory ONLY if it exists and
-//!    is owned by us. `O_NOFOLLOW` open + per-entry `fstatat` uid check;
-//!    we never `remove_dir_all` and never touch entries owned by another
-//!    user (multi-tenant safe).
+//!    `install_*` functions. Per-target rewrite failures `tracing::warn!`
+//!    and continue.
+//! 2. **Sweep** the legacy `/tmp/aoe-hooks` directory ONLY if every
+//!    rewrite succeeded AND it exists owned by us. `O_NOFOLLOW` open +
+//!    per-entry `fstatat` uid check; we never `remove_dir_all` and never
+//!    touch entries owned by another user (multi-tenant safe).
 //!
-//! Reverse order (sweep first, rewrite last) was REJECTED during v2 plan
-//! review: a rewrite failure between sweep and the schema bump would leave
-//! the agent recreating `/tmp/aoe-hooks` on every fire, undoing the
-//! hardening for any rewrite-failed target until the user manually
-//! `aoe uninstall && aoe add`. Rewrite-first guarantees the legacy path is
-//! never the next write target on success, and on failure the legacy entries
-//! survive in their previous shape.
+//! Reverse order (sweep first, rewrite last) was rejected: a rewrite
+//! failure between sweep and the schema bump would leave the agent
+//! recreating `/tmp/aoe-hooks` on every fire, undoing the hardening for
+//! any rewrite-failed target until the user manually runs
+//! `aoe uninstall && aoe add`. With rewrite-first, a partial-failure
+//! state keeps legacy entries discoverable for manual cleanup.
 //!
 //! ## Failure policy
 //!
@@ -67,6 +66,7 @@ pub(crate) fn run_in(home: &Path, app_dir: &Path) -> Result<()> {
     );
 
     let mut rewritten = 0usize;
+    let mut any_failure = false;
     for target in iter_hook_targets_in(home, &env_lists) {
         if !has_aoe_marker(&target) {
             continue;
@@ -82,6 +82,7 @@ pub(crate) fn run_in(home: &Path, app_dir: &Path) -> Result<()> {
                 );
             }
             Err(e) => {
+                any_failure = true;
                 warn!(
                     target: "migrations.v016",
                     agent = target.agent_name,
@@ -93,7 +94,20 @@ pub(crate) fn run_in(home: &Path, app_dir: &Path) -> Result<()> {
         }
     }
 
-    sweep_legacy_base();
+    // Gate the legacy sweep on full rewrite success: if any target's hook
+    // bytes still point at `/tmp/aoe-hooks/<id>` (because its rewrite
+    // failed), the agent will recreate that path on its next hook fire.
+    // Sweeping it now strands the user with no recoverable diagnostic
+    // state for the failed targets.
+    if any_failure {
+        info!(
+            target: "migrations.v016",
+            "skipped legacy /tmp/aoe-hooks sweep: at least one rewrite failed; \
+             the legacy directory is left for manual recovery"
+        );
+    } else {
+        sweep_legacy_base();
+    }
 
     info!(target: "migrations.v016", count = rewritten, "v016: done");
     Ok(())
@@ -121,7 +135,7 @@ fn rewrite_one(target: &HookTarget) -> Result<()> {
 
 /// Best-effort removal of the legacy world-known `/tmp/aoe-hooks` directory.
 ///
-/// Multi-tenant safe (R7): walks the directory with `O_NOFOLLOW`, checks each
+/// Multi-tenant safe: walks the directory with `O_NOFOLLOW`, checks each
 /// entry's owner via `fstatat(AT_SYMLINK_NOFOLLOW)`, unlinks only entries we
 /// own. Entries owned by other users are left untouched. The legacy directory
 /// itself is `rmdir`'d only if it is empty after our sweep AND owned by us.
@@ -407,8 +421,8 @@ mod tests {
     }
 
     /// Locks the canonical-form contract: every AoE-marked command in a
-    /// post-v016 settings file must contain the new tolerant mode pattern
-    /// (R11), the env preamble (R12), and the per-user-base suffix (R1).
+    /// post-v016 settings file must contain the SELinux/ACL/xattr-tolerant
+    /// mode pattern, the env-pinning preamble, and the per-user-base suffix.
     fn assert_post_v016_canonical(claude: &Path) {
         let parsed: Value = serde_json::from_str(&fs::read_to_string(claude).unwrap()).unwrap();
         let hooks = parsed["hooks"].as_object().expect("hooks present");
@@ -432,19 +446,19 @@ mod tests {
                     status_writers += 1;
                     assert!(
                         cmd.contains("d*------|d*------.|d*------+|d*------@"),
-                        "v016 must bake the tolerant mode pattern (R11): {cmd}"
+                        "v016 must bake the tolerant mode pattern: {cmd}"
                     );
                     assert!(
                         cmd.contains("unset IFS")
                             && cmd.contains("umask 077")
                             && cmd.contains("LC_ALL=C ls -ldn"),
-                        "v016 must bake the env preamble (R12): {cmd}"
+                        "v016 must bake the env preamble: {cmd}"
                     );
                     let euid = nix::unistd::geteuid().as_raw();
                     let suffix = format!("/tmp/aoe-hooks-{euid}");
                     assert!(
                         cmd.contains(&format!("B={suffix}")),
-                        "v016 must bake the per-user base (R1): {cmd}"
+                        "v016 must bake the per-user base: {cmd}"
                     );
                 }
             }

@@ -16,11 +16,11 @@ use anyhow::{Context, Result};
 use fs2::FileExt as _;
 use serde_json::Value;
 
-pub(crate) use dir_guard::write_session_id_via_guard;
 #[cfg(test)]
 pub(crate) use dir_guard::{
     clear_base_override_for_test, hook_base_path, override_base_for_test, reset_for_test,
 };
+pub(crate) use dir_guard::{ensure_instance_dir_path, write_session_id_via_guard};
 pub use status_file::{
     cleanup_hook_status_dir, hook_status_dir, read_hook_session_id, read_hook_status,
     read_hook_urgent,
@@ -30,7 +30,7 @@ pub use status_file::{
 /// threat does not apply (per-container, single-tenant). The host bind-mounts
 /// `/tmp/aoe-hooks-<euid>/<id>` from `dir_guard::hook_base_path()` to this
 /// fixed path inside the container so the sandbox shell can bake a single
-/// canonical string regardless of the host's effective uid (R4, R5).
+/// canonical string regardless of the host's effective uid.
 pub(crate) const HOOK_STATUS_BASE_IN_CONTAINER: &str = "/tmp/aoe-hooks";
 
 /// Marker substring used to identify AoE-managed hooks in settings.json.
@@ -180,16 +180,17 @@ fn resolve_config_dir_override(var: &str, host_env: &[String]) -> Option<String>
 /// hook call recovers.
 ///
 /// Per `HookInstallTarget`:
-/// - `Host`: bakes `/tmp/aoe-hooks-<euid>` (per-user, R1) and adds an
+/// - `Host`: bakes `/tmp/aoe-hooks-<euid>` (per-user) and adds an
 ///   `id -u` ownership self-check (defence-in-depth, the Rust-side
 ///   `dir_guard` is the authoritative gate).
-/// - `Sandbox`: bakes `/tmp/aoe-hooks` (R5, fixed inside the container; the
+/// - `Sandbox`: bakes `/tmp/aoe-hooks` (fixed inside the container; the
 ///   host bind-mounts `/tmp/aoe-hooks-<euid>/<id>` -> `/tmp/aoe-hooks/<id>`)
 ///   and drops the uid check because the in-container UID is unpredictable
-///   and the bind-mount source has already been validated host-side (R6).
+///   and the bind-mount source has already been validated host-side.
 ///
-/// Both variants share the SELinux/ACL/xattr-tolerant mode pattern (R11)
-/// and an environment-pinning preamble (R12).
+/// Both variants share the SELinux/ACL/xattr-tolerant mode pattern
+/// (`d*------|d*------.|d*------+|d*------@`) and an environment-pinning
+/// preamble (`unset IFS; umask 077; LC_ALL=C ls -ldn`).
 fn hook_command(status: &str, target: HookInstallTarget) -> String {
     let base = match target {
         HookInstallTarget::Host => dir_guard::hook_base_path().display().to_string(),
@@ -204,23 +205,26 @@ pub(crate) fn canonical_status_command(status: &str, target: HookInstallTarget) 
 }
 
 fn hook_command_with_base(status: &str, base: &str, target: HookInstallTarget) -> String {
-    let owner_check = match target {
+    let parent_check = match target {
         HookInstallTarget::Host => {
-            "ME=$(id -u 2>/dev/null) || exit 0; \
+            "\
+             LS=$(LC_ALL=C ls -ldn \"$B\" 2>/dev/null) || exit 0; \
+             set -- $LS; M=\"$1\"; \
+             case \"$M\" in d*------|d*------.|d*------+|d*------@) ;; *) exit 0 ;; esac; \
+             ME=$(id -u 2>/dev/null) || exit 0; \
              [ \"$3\" = \"$ME\" ] || exit 0; "
         }
         HookInstallTarget::Sandbox => "",
     };
-    let owner_recheck = owner_check;
+    let owner_recheck = match target {
+        HookInstallTarget::Host => "[ \"$3\" = \"$ME\" ] || exit 0; ",
+        HookInstallTarget::Sandbox => "",
+    };
     format!(
         "sh -c 'unset IFS; umask 077; \
          [ -n \"$AOE_INSTANCE_ID\" ] || exit 0; \
          case \"$AOE_INSTANCE_ID\" in *[!0-9a-zA-Z_-]*) exit 0 ;; esac; \
-         B={base}; \
-         LS=$(LC_ALL=C ls -ldn \"$B\" 2>/dev/null) || exit 0; \
-         set -- $LS; M=\"$1\"; \
-         case \"$M\" in d*------|d*------.|d*------+|d*------@) ;; *) exit 0 ;; esac; \
-         {owner_check}\
+         B={base}; {parent_check}\
          D=\"$B/$AOE_INSTANCE_ID\"; \
          mkdir -p \"$D\" 2>/dev/null; \
          LS=$(LC_ALL=C ls -ldn \"$D\" 2>/dev/null) || exit 0; \
@@ -3369,7 +3373,7 @@ hooks_auto_accept: false
         );
         assert!(
             cmd.contains("d*------|d*------.|d*------+|d*------@"),
-            "missing tolerant mode pattern (R11): {cmd}"
+            "missing tolerant mode pattern: {cmd}"
         );
         assert!(
             cmd.contains("ME=$(id -u 2>/dev/null)"),

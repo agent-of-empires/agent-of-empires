@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 use crate::containers::{ContainerConfig, EnvEntry, NamedVolumeMount, VolumeMount};
 use crate::git::GitWorktree;
@@ -1297,25 +1297,29 @@ pub(crate) fn build_container_config(
             // generic hook_config path below cannot emit; they install through
             // their SidecarHooks installer at the sandbox config subpath.
             if agent.sidecar_hooks.is_some() || agent.hook_config.is_some() {
-                let hook_dir = crate::hooks::hook_status_dir(instance_id).context(
-                    "refusing to mount hook directory: AOE_INSTANCE_ID failed validation",
-                )?;
-                if let Err(e) = std::fs::create_dir_all(&hook_dir) {
-                    tracing::warn!(target: "session.profile",
-                        "Failed to create hook directory {}: {}",
-                        hook_dir.display(),
-                        e
-                    );
+                crate::session::validate_instance_id(instance_id).map_err(|e| {
+                    anyhow::anyhow!(
+                        "refusing to mount hook directory: AOE_INSTANCE_ID failed validation: {e}"
+                    )
+                })?;
+                match crate::hooks::ensure_instance_dir_path(instance_id) {
+                    Ok(hook_dir) => {
+                        let container_hook_path = format!(
+                            "{}/{instance_id}",
+                            crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER
+                        );
+                        volumes.push(VolumeMount {
+                            host_path: hook_dir.to_string_lossy().to_string(),
+                            container_path: container_hook_path,
+                            read_only: false,
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "session.profile",
+                            "Hook directory unavailable, skipping bind-mount; \
+                             agent boots without status hooks (pane detection takes over): {e:#}");
+                    }
                 }
-                let container_hook_path = format!(
-                    "{}/{instance_id}",
-                    crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER
-                );
-                volumes.push(VolumeMount {
-                    host_path: hook_dir.to_string_lossy().to_string(),
-                    container_path: container_hook_path,
-                    read_only: false,
-                });
             }
 
             if let Some(sidecar) = &agent.sidecar_hooks {
@@ -1500,7 +1504,32 @@ fn common_ancestor(a: &Path, b: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
+
+    /// Sets up a per-test hook base override at 0o700 ours-owned, so that
+    /// `ensure_instance_dir_path` succeeds and `build_container_config`
+    /// pushes the bind-mount volume. Restores the global state on Drop.
+    struct HookBaseGuard {
+        _tmp: TempDir,
+    }
+    impl HookBaseGuard {
+        fn new() -> Self {
+            let tmp = TempDir::new().unwrap();
+            let base = tmp.path().join("aoe-hooks");
+            fs::create_dir(&base).unwrap();
+            fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).unwrap();
+            crate::hooks::override_base_for_test(base);
+            crate::hooks::reset_for_test();
+            Self { _tmp: tmp }
+        }
+    }
+    impl Drop for HookBaseGuard {
+        fn drop(&mut self) {
+            crate::hooks::clear_base_override_for_test();
+            crate::hooks::reset_for_test();
+        }
+    }
 
     // --- compute_volume_paths tests ---
 
@@ -2967,6 +2996,7 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
     #[test]
     #[serial_test::serial]
     fn test_build_container_config_installs_codex_hooks_files() {
+        let _hg = HookBaseGuard::new();
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -3009,12 +3039,22 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
 
         let hook_dir =
             crate::hooks::hook_status_dir(instance_id).expect("test id must be allowlist-safe");
-        assert!(
-            config
-                .volumes
-                .iter()
-                .any(|v| v.host_path == hook_dir.to_string_lossy()),
-            "status hook directory should be mounted"
+        let expected_container_path = format!(
+            "{}/{instance_id}",
+            crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER
+        );
+        let mount = config
+            .volumes
+            .iter()
+            .find(|v| v.host_path == hook_dir.to_string_lossy())
+            .expect("status hook directory should be mounted");
+        assert_eq!(
+            mount.container_path, expected_container_path,
+            "container path must be the fixed in-container path, not the host euid path"
+        );
+        assert_ne!(
+            mount.host_path, mount.container_path,
+            "host (per-user) and container (fixed) paths MUST differ for the bind-mount remap"
         );
         crate::hooks::cleanup_hook_status_dir(instance_id);
     }
@@ -3029,6 +3069,7 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
     #[test]
     #[serial_test::serial]
     fn test_build_container_config_installs_sidecar_hooks_files() {
+        let _hg = HookBaseGuard::new();
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -3203,6 +3244,7 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
     #[test]
     #[serial_test::serial]
     fn test_build_container_config_uses_detected_codex_for_custom_wrapper_hooks() {
+        let _hg = HookBaseGuard::new();
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
         #[cfg(any(target_os = "linux", target_os = "macos"))]
