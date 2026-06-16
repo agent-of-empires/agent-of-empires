@@ -1144,6 +1144,11 @@ impl Instance {
         self.favorited_at = None;
         self.snoozed_until = None;
         self.pinned_at = None;
+        // Archiving tears down the session's tmux on purpose (#1868), so its
+        // resting state is Stopped, not whatever it was running as. Stopped is
+        // polling tier 0, so the status poller stops re-probing the row and
+        // can never flip it to Error for a tmux that is gone by design (#2206).
+        self.status = Status::Stopped;
     }
 
     pub fn unarchive(&mut self) {
@@ -3330,6 +3335,21 @@ impl Instance {
             return;
         }
 
+        // Archived sessions have their tmux torn down on purpose (#1868), so
+        // probing tmux here only ever produces a spurious "tmux session is
+        // gone" Error transition (#2206). Heal a session that was already
+        // persisted as Error before this guard existed, then short-circuit so
+        // the poller never re-probes a row whose tmux is gone by design.
+        if self.is_archived() {
+            if self.last_error.as_deref() == Some(TMUX_SESSION_GONE_ERROR) {
+                self.last_error = None;
+            }
+            if self.status == Status::Error {
+                self.status = Status::Stopped;
+            }
+            return;
+        }
+
         // Acp-mode sessions are not backed by a tmux pane; the structured view
         // worker supervisor owns their lifecycle and emits typed health
         // events over the broadcast. Probing tmux here only ever produces
@@ -3978,6 +3998,36 @@ mod tests {
         inst.touch_last_accessed();
         assert!(!inst.is_archived());
         assert!(inst.last_accessed_at.is_some());
+    }
+
+    #[test]
+    fn test_archived_session_not_marked_error_when_tmux_gone() {
+        // #2206: archiving kills the session's tmux on purpose. A subsequent
+        // status poll must not flip the archived row to Error for the missing
+        // tmux; it should rest at Stopped with no tmux-gone error recorded.
+        let mut inst = Instance::new("test", "/tmp/test");
+        inst.archive();
+        inst.update_status_with_metadata(None);
+        assert_ne!(inst.status, Status::Error);
+        assert_eq!(inst.status, Status::Stopped);
+        assert_eq!(inst.last_error, None);
+    }
+
+    #[test]
+    fn test_archived_session_heals_stale_tmux_gone_error() {
+        // #2206: a session archived before this guard existed may already be
+        // persisted as Error with a tmux-gone message. The next poll heals it
+        // to Stopped and clears the stale error.
+        let mut inst = Instance::new("test", "/tmp/test");
+        inst.status = Status::Error;
+        inst.last_error = Some(TMUX_SESSION_GONE_ERROR.to_string());
+        inst.archive();
+        // archive() resets status to Stopped, but force Error back to simulate
+        // a row loaded from disk that predates the archive() status reset.
+        inst.status = Status::Error;
+        inst.update_status_with_metadata(None);
+        assert_eq!(inst.status, Status::Stopped);
+        assert_eq!(inst.last_error, None);
     }
 
     #[test]
