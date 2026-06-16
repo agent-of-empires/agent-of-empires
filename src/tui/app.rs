@@ -2474,7 +2474,7 @@ impl App {
                 match stale_sid {
                     Some(sid) => {
                         self.update_status = Some(UpdateStatus::transient(format!(
-                            "Resume failed for sid {sid}; sent to fresh session (history not loaded)"
+                            "Resume target {sid} was reset; sent to fresh session (history not loaded)"
                         )));
                     }
                     None => {
@@ -2503,7 +2503,7 @@ impl App {
                 // shifted up.
                 self.update_status = match &outcome {
                     Ok(Some(sid)) => Some(UpdateStatus::transient(format!(
-                        "Resume failed for sid {sid}; live-send sent to a fresh pane (history not loaded)"
+                        "Resume target {sid} was reset; live-send used a fresh pane (history not loaded)"
                     ))),
                     // On clean ready, drop the toast entirely. On Err the
                     // info_dialog already carries the failure detail, so the
