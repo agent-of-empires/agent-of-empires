@@ -6227,7 +6227,7 @@ fn pinned_project_without_sessions_shows_empty_header() {
     projects::add(
         "test",
         ProjectScope::Global,
-        Project::new("gamma", "/repos/gamma", ProjectScope::Global),
+        Project::new("gamma", "/repos/gamma", ProjectScope::Global).with_pinned(true),
         false,
     )
     .unwrap();
@@ -6282,9 +6282,15 @@ fn p_key_pins_project_on_header() {
     // The pin path must not open the projects dialog (the chord is shared).
     assert!(env.view.projects_dialog.is_none());
 
-    // Unpinning (a second toggle) drops the registry entry.
+    // Unpinning (a second toggle) clears the pin but KEEPS the saved project,
+    // so the entry stays in the registry (only an explicit remove deletes it).
+    // See #2208.
     env.view.toggle_project_pin_at_cursor();
     assert!(!env.view.is_project_label_pinned("alpha"));
+    assert!(
+        !crate::session::projects::load_global().unwrap().is_empty(),
+        "unpin must keep the registry entry, not delete it"
+    );
 }
 
 /// Off a project header (here: in Manual grouping), `p` keeps its original
@@ -6421,10 +6427,11 @@ fn stale_registry_entry_with_mismatched_archived_path_stays_pinned_and_unpinnabl
         .unwrap();
 
     // Stale registry entry: same basename, different (nonexistent) path.
+    // Pinned, so it surfaces as an empty header (#2208).
     projects::add(
         "test",
         ProjectScope::Global,
-        Project::new("otari", "/repos/otari", ProjectScope::Global),
+        Project::new("otari", "/repos/otari", ProjectScope::Global).with_pinned(true),
         false,
     )
     .unwrap();
@@ -6474,10 +6481,11 @@ fn stale_registry_entry_with_mismatched_archived_path_stays_pinned_and_unpinnabl
         "unpin must drop the empty header from the main flow; got {:?}",
         view.flat_items
     );
-    assert!(
-        projects::load_global().unwrap().is_empty(),
-        "unpin must remove the stale registry entry"
-    );
+    // Unpin clears the flag but KEEPS the saved project (#2208): the entry
+    // survives, now unpinned, so it stays in the Projects view / wizard.
+    let after = projects::load_global().unwrap();
+    assert_eq!(after.len(), 1, "unpin must keep the registry entry");
+    assert!(!after[0].pinned, "unpin must clear the pin flag");
     // The archived session itself is untouched; it stays under Archived.
     assert!(
         view.flat_items
