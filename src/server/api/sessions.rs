@@ -2276,6 +2276,7 @@ pub async fn start_session(
         }
     }
 
+    let sync_base = instance.clone();
     let restart_result = tokio::task::spawn_blocking(
         move || -> Result<(Instance, crate::session::StartOutcome), Box<(Instance, anyhow::Error)>> {
             let mut inst = instance;
@@ -2299,7 +2300,7 @@ pub async fn start_session(
             let mut instances = state.instances.write().await;
             let response = match instances.iter_mut().find(|i| i.id == id) {
                 Some(inst) => {
-                    apply_post_restart_sync(inst, &started);
+                    apply_post_restart_sync(inst, &sync_base, &started);
                     SessionResponse::from_instance(
                         inst,
                         crate::claude_settings::read_tui_fullscreen(),
@@ -2332,7 +2333,7 @@ pub async fn start_session(
             tracing::warn!(target: "http.api.sessions", "start_session restart failed for {id}: {msg}");
             let mut instances = state.instances.write().await;
             if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                apply_post_restart_sync(inst, &started);
+                apply_post_restart_sync(inst, &sync_base, &started);
                 inst.status = Status::Error;
                 inst.last_error = Some(msg.clone());
             }
@@ -3720,7 +3721,22 @@ fn public_create_session_error(e: &anyhow::Error) -> String {
 /// a rapid second restart inside that window would see a stale
 /// `agent_session_id = None` and generate (and persist) a new UUID,
 /// silently orphaning the previous Claude conversation.
-fn apply_post_restart_sync(live: &mut Instance, started: &Instance) {
+fn apply_post_restart_identity_sync(live: &mut Instance, before: &Instance, started: &Instance) {
+    // Treat the pre-restart snapshot as a CAS baseline for peer-writable
+    // identity fields. If a poller/CLI/TUI peer changed the sid while the
+    // restart clone was blocking, that newer sid and its marker stay
+    // authoritative.
+    let sid_unchanged = live.agent_session_id == before.agent_session_id;
+    let marker_unchanged = live.resume_probe_failed_sid == before.resume_probe_failed_sid;
+    if sid_unchanged {
+        live.agent_session_id = started.agent_session_id.clone();
+    }
+    if marker_unchanged && live.agent_session_id == started.agent_session_id {
+        live.resume_probe_failed_sid = started.resume_probe_failed_sid.clone();
+    }
+}
+
+fn apply_post_restart_sync(live: &mut Instance, before: &Instance, started: &Instance) {
     live.status = started.status;
     live.last_error = if started.status == Status::Error {
         started.last_error.clone()
@@ -3728,8 +3744,7 @@ fn apply_post_restart_sync(live: &mut Instance, started: &Instance) {
         None
     };
     live.last_error_check = started.last_error_check;
-    live.agent_session_id = started.agent_session_id.clone();
-    live.resume_probe_failed_sid = started.resume_probe_failed_sid.clone();
+    apply_post_restart_identity_sync(live, before, started);
     live.last_start_time = started.last_start_time;
     live.retroactive_capture_excludes = started.retroactive_capture_excludes.clone();
 }
@@ -3745,9 +3760,8 @@ fn apply_post_restart_sync(live: &mut Instance, started: &Instance) {
 /// `live.status` with `started.status` (typically `Starting` from the
 /// post-cascade `finalize_launch`) would briefly mis-paint a broken pane
 /// as `Starting` until the 2s status poll loop reconciles.
-fn apply_cascade_state_sync(live: &mut Instance, started: &Instance) {
-    live.agent_session_id = started.agent_session_id.clone();
-    live.resume_probe_failed_sid = started.resume_probe_failed_sid.clone();
+fn apply_cascade_state_sync(live: &mut Instance, before: &Instance, started: &Instance) {
+    apply_post_restart_identity_sync(live, before, started);
     live.retroactive_capture_excludes = started.retroactive_capture_excludes.clone();
 }
 
@@ -3876,6 +3890,7 @@ pub async fn ensure_session(
         }
     }
 
+    let sync_base = instance.clone();
     let restart_result = tokio::task::spawn_blocking(
         move || -> Result<(Instance, crate::session::StartOutcome), Box<(Instance, anyhow::Error)>> {
             let mut inst = instance;
@@ -3904,7 +3919,7 @@ pub async fn ensure_session(
         Ok(Ok((started, outcome))) => {
             let mut instances = state.instances.write().await;
             if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                apply_post_restart_sync(inst, &started);
+                apply_post_restart_sync(inst, &sync_base, &started);
             }
             let resume_outcome = match &outcome {
                 crate::session::StartOutcome::Resumed => "resumed",
@@ -3932,7 +3947,7 @@ pub async fn ensure_session(
             tracing::warn!(target: "http.api.sessions", "ensure_session restart failed for {id}: {msg}");
             let mut instances = state.instances.write().await;
             if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                apply_post_restart_sync(inst, &started);
+                apply_post_restart_sync(inst, &sync_base, &started);
                 inst.status = crate::session::Status::Error;
                 inst.last_error = Some(msg.clone());
             }
@@ -5198,13 +5213,14 @@ mod tests {
         live.last_error = Some("prior failure".to_string());
         live.agent_session_id = None;
         live.last_start_time = None;
+        let before = live.clone();
 
         let mut started = make_test_instance();
         started.status = Status::Starting;
         started.agent_session_id = Some("claude-uuid-restart".to_string());
         started.last_start_time = Some(std::time::Instant::now());
 
-        apply_post_restart_sync(&mut live, &started);
+        apply_post_restart_sync(&mut live, &before, &started);
 
         assert_eq!(live.status, Status::Starting);
         assert!(live.last_error.is_none());
@@ -5223,11 +5239,12 @@ mod tests {
         // existing ID, but the contract here is "started wins."
         let mut live = make_test_instance();
         live.agent_session_id = Some("stale-id".to_string());
+        let before = live.clone();
 
         let mut started = make_test_instance();
         started.agent_session_id = Some("fresh-id".to_string());
 
-        apply_post_restart_sync(&mut live, &started);
+        apply_post_restart_sync(&mut live, &before, &started);
 
         assert_eq!(live.agent_session_id.as_deref(), Some("fresh-id"));
     }
@@ -5239,6 +5256,7 @@ mod tests {
         live.last_error = Some("prior failure".to_string());
         live.agent_session_id = Some("sid-before".to_string());
         live.resume_probe_failed_sid = None;
+        let before = live.clone();
 
         let mut started = make_test_instance();
         started.status = Status::Error;
@@ -5248,7 +5266,7 @@ mod tests {
             Some("resume failed for sid sid-after; preserved for explicit retry".to_string());
         started.last_error_check = Some(std::time::Instant::now());
 
-        apply_post_restart_sync(&mut live, &started);
+        apply_post_restart_sync(&mut live, &before, &started);
 
         assert_eq!(live.status, Status::Error);
         assert_eq!(
@@ -5267,6 +5285,7 @@ mod tests {
         live.last_error = Some("keep me".to_string());
         live.agent_session_id = Some("sid-before".to_string());
         live.resume_probe_failed_sid = None;
+        let before = live.clone();
 
         let mut started = make_test_instance();
         started.status = Status::Error;
@@ -5274,12 +5293,140 @@ mod tests {
         started.agent_session_id = Some("sid-after".to_string());
         started.resume_probe_failed_sid = Some("sid-after".to_string());
 
-        apply_cascade_state_sync(&mut live, &started);
+        apply_cascade_state_sync(&mut live, &before, &started);
 
         assert_eq!(live.status, Status::Running);
         assert_eq!(live.last_error.as_deref(), Some("keep me"));
         assert_eq!(live.agent_session_id.as_deref(), Some("sid-after"));
         assert_eq!(live.resume_probe_failed_sid.as_deref(), Some("sid-after"));
+    }
+
+    #[test]
+    fn apply_post_restart_sync_preserves_peer_sid_write() {
+        let mut before = make_test_instance();
+        before.agent_session_id = Some("stale-restart-sid".to_string());
+        before.resume_probe_failed_sid = None;
+
+        let mut live = make_test_instance();
+        live.agent_session_id = Some("peer-fresh-sid".to_string());
+        live.resume_probe_failed_sid = Some("peer-fresh-sid".to_string());
+
+        let mut started = make_test_instance();
+        started.status = Status::Error;
+        started.agent_session_id = Some("stale-restart-sid".to_string());
+        started.resume_probe_failed_sid = Some("stale-restart-sid".to_string());
+        started.last_error = Some("resume failed".to_string());
+
+        apply_post_restart_sync(&mut live, &before, &started);
+
+        assert_eq!(live.status, Status::Error);
+        assert_eq!(live.last_error.as_deref(), Some("resume failed"));
+        assert_eq!(live.agent_session_id.as_deref(), Some("peer-fresh-sid"));
+        assert_eq!(
+            live.resume_probe_failed_sid.as_deref(),
+            Some("peer-fresh-sid")
+        );
+    }
+
+    #[test]
+    fn apply_post_restart_sync_preserves_peer_marker_for_same_sid() {
+        let mut before = make_test_instance();
+        before.agent_session_id = Some("same-sid".to_string());
+        before.resume_probe_failed_sid = None;
+
+        let mut live = before.clone();
+        live.resume_probe_failed_sid = Some("same-sid".to_string());
+
+        let mut started = before.clone();
+        started.status = Status::Starting;
+        started.resume_probe_failed_sid = None;
+
+        apply_post_restart_sync(&mut live, &before, &started);
+
+        assert_eq!(live.status, Status::Starting);
+        assert_eq!(live.agent_session_id.as_deref(), Some("same-sid"));
+        assert_eq!(live.resume_probe_failed_sid.as_deref(), Some("same-sid"));
+    }
+
+    #[test]
+    fn apply_cascade_state_sync_preserves_peer_sid_write() {
+        let mut before = make_test_instance();
+        before.agent_session_id = Some("stale-restart-sid".to_string());
+        before.resume_probe_failed_sid = None;
+
+        let mut live = make_test_instance();
+        live.status = Status::Running;
+        live.last_error = Some("keep me".to_string());
+        live.agent_session_id = Some("peer-fresh-sid".to_string());
+        live.resume_probe_failed_sid = Some("peer-fresh-sid".to_string());
+
+        let mut started = make_test_instance();
+        started.status = Status::Error;
+        started.last_error = Some("resume failed".to_string());
+        started.agent_session_id = Some("stale-restart-sid".to_string());
+        started.resume_probe_failed_sid = Some("stale-restart-sid".to_string());
+
+        apply_cascade_state_sync(&mut live, &before, &started);
+
+        assert_eq!(live.status, Status::Running);
+        assert_eq!(live.last_error.as_deref(), Some("keep me"));
+        assert_eq!(live.agent_session_id.as_deref(), Some("peer-fresh-sid"));
+        assert_eq!(
+            live.resume_probe_failed_sid.as_deref(),
+            Some("peer-fresh-sid")
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn send_message_post_restart_save_preserves_peer_sid_write() {
+        let temp_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        let _ = isolated_app_dir(temp_home.path());
+
+        let profile = "send-post-restart-peer-sid";
+        let storage = Storage::new_unwatched(profile).unwrap();
+        let mut seed = make_test_instance();
+        let id = seed.id.clone();
+        seed.agent_session_id = Some("peer-fresh-sid".to_string());
+        seed.resume_probe_failed_sid = Some("peer-fresh-sid".to_string());
+        storage
+            .update(|instances, _groups| {
+                instances.push(seed.clone());
+                Ok(())
+            })
+            .unwrap();
+
+        let mut sync_base_for_save = make_test_instance();
+        sync_base_for_save.id = id.clone();
+        sync_base_for_save.agent_session_id = Some("stale-restart-sid".to_string());
+        sync_base_for_save.resume_probe_failed_sid = None;
+
+        let mut started_for_save = make_test_instance();
+        started_for_save.id = id.clone();
+        started_for_save.status = Status::Starting;
+        started_for_save.agent_session_id = Some("stale-restart-sid".to_string());
+        started_for_save.resume_probe_failed_sid = None;
+
+        storage
+            .update(|all, _groups| {
+                if let Some(disk_inst) = all.iter_mut().find(|i| i.id == id) {
+                    apply_post_restart_sync(disk_inst, &sync_base_for_save, &started_for_save);
+                    disk_inst.touch_last_accessed();
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        let reloaded = storage.load().unwrap();
+        let disk = reloaded.iter().find(|i| i.id == seed.id).unwrap();
+        assert_eq!(disk.status, Status::Starting);
+        assert_eq!(disk.agent_session_id.as_deref(), Some("peer-fresh-sid"));
+        assert_eq!(
+            disk.resume_probe_failed_sid.as_deref(),
+            Some("peer-fresh-sid")
+        );
+        assert!(disk.last_accessed_at.is_some());
     }
 
     fn isolated_app_dir(temp_home: &std::path::Path) -> std::path::PathBuf {
@@ -6131,6 +6278,7 @@ pub async fn send_message(
     let inst_lock = state.instance_lock(&id).await;
     let _guard = inst_lock.lock().await;
 
+    let sync_base = instance.clone();
     let tool = instance.tool.clone();
     let message = req.message;
     let revive = req.revive;
@@ -6214,7 +6362,7 @@ pub async fn send_message(
             let mut instances = state.instances.write().await;
             let profile = if let Some(i) = instances.iter_mut().find(|i| i.id == id) {
                 if !matches!(outcome, EnsureReadyOutcome::AlreadyAlive) {
-                    apply_post_restart_sync(i, &started);
+                    apply_post_restart_sync(i, &sync_base, &started);
                 }
                 i.touch_last_accessed();
                 i.source_profile.clone()
@@ -6225,6 +6373,7 @@ pub async fn send_message(
             };
             drop(instances);
             let id_for_save = id.clone();
+            let sync_base_for_save = sync_base.clone();
             let started_for_save = started.clone();
             let outcome_already_alive = matches!(outcome, EnsureReadyOutcome::AlreadyAlive);
             tokio::task::spawn_blocking(move || {
@@ -6232,7 +6381,11 @@ pub async fn send_message(
                     if let Err(e) = storage.update(|all, _groups| {
                         if let Some(disk_inst) = all.iter_mut().find(|i| i.id == id_for_save) {
                             if !outcome_already_alive {
-                                apply_post_restart_sync(disk_inst, &started_for_save);
+                                apply_post_restart_sync(
+                                    disk_inst,
+                                    &sync_base_for_save,
+                                    &started_for_save,
+                                );
                             }
                             disk_inst.touch_last_accessed();
                         }
@@ -6263,7 +6416,7 @@ pub async fn send_message(
                     if did_work {
                         let mut instances = state.instances.write().await;
                         if let Some(i) = instances.iter_mut().find(|i| i.id == id) {
-                            apply_cascade_state_sync(i, &started);
+                            apply_cascade_state_sync(i, &sync_base, &started);
                         }
                     }
                     (
@@ -6275,7 +6428,7 @@ pub async fn send_message(
                 SendKeysError::ResumeFailed(sid) => {
                     let mut instances = state.instances.write().await;
                     if let Some(i) = instances.iter_mut().find(|i| i.id == id) {
-                        apply_post_restart_sync(i, &started);
+                        apply_post_restart_sync(i, &sync_base, &started);
                     }
                     (
                         StatusCode::CONFLICT,
@@ -6314,7 +6467,7 @@ pub async fn send_message(
                     // must be copied back from the clone).
                     let mut instances = state.instances.write().await;
                     if let Some(i) = instances.iter_mut().find(|i| i.id == id) {
-                        apply_post_restart_sync(i, &started);
+                        apply_post_restart_sync(i, &sync_base, &started);
                         i.status = crate::session::Status::Error;
                         i.last_error = Some(msg);
                     }
