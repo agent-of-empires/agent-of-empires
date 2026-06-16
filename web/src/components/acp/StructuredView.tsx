@@ -98,15 +98,8 @@ const STARTER_PROMPTS = [
   "What does the build pipeline do?",
 ];
 
-export function StructuredView({
-  sessionId,
-  acpWorkerState,
-  tool,
-  archivedAt,
-  snoozedUntil,
-  onOpenFileRef,
-  fileRefSession,
-}: Props) {
+export function StructuredView(props: Props) {
+  const { sessionId, acpWorkerState, tool, archivedAt, snoozedUntil, onOpenFileRef, fileRefSession } = props;
   // Folds rows above the most recent `/clear` divider out of the
   // thread by default; the disclosure banner toggles this. Lives on
   // the view (not the reducer) because it's a UI preference, not
