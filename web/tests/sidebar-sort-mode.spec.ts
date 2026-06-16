@@ -381,11 +381,13 @@ test.describe("Sidebar sort picker (#1418, #1640)", () => {
     // No native browser tooltip on the trigger any more.
     await expect(toggle).not.toHaveAttribute("title", /.+/);
 
-    // The active-mode label now lives in the shared Tooltip span, carrying
-    // the same surface-950 styling the group/filter tooltips use.
-    const tip = page.getByText("Sort: manual, drag enabled", { exact: true });
+    // The active-mode label lives in the shared Tooltip, which now portals its
+    // popup to document.body on hover with `position: fixed`, carrying the same
+    // surface-950 styling the group/filter tooltips use (#2214).
+    await toggle.hover();
+    const tip = page.getByRole("tooltip").filter({ hasText: "Sort: manual, drag enabled" });
     await expect(tip).toHaveClass(/bg-surface-950/);
-    await expect(tip).toHaveClass(/group-hover\/tip:opacity-100/);
+    await expect(tip).toHaveClass(/fixed/);
 
     // The scrollable session list is separated from the control row by a top
     // border (the explicit ask in #1836).
