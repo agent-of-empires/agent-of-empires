@@ -31,10 +31,18 @@ function seedSessionAndEmptyProject(opts: {
       GIT_COMMITTER_NAME: "t",
       GIT_COMMITTER_EMAIL: "t@t",
     };
+    const runGit = (args: string[], dir: string) => {
+      const res = spawnSync("git", args, { cwd: dir, env: gitEnv });
+      if (res.error || res.status !== 0) {
+        throw new Error(
+          `git ${args.join(" ")} failed in ${dir}: status=${res.status} stderr=${res.stderr?.toString() ?? "<none>"} error=${res.error?.message ?? "<none>"}`,
+        );
+      }
+    };
     const initRepo = (dir: string) => {
       mkdirSync(dir, { recursive: true });
-      spawnSync("git", ["init", "-q"], { cwd: dir });
-      spawnSync("git", ["commit", "--allow-empty", "-q", "-m", "init"], { cwd: dir, env: gitEnv });
+      runGit(["init", "-q"], dir);
+      runGit(["commit", "--allow-empty", "-q", "-m", "init"], dir);
     };
 
     const projectA = join(home, "projectA");
