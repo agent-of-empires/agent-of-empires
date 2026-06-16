@@ -34,7 +34,7 @@ Individual settings also appear in the palette under `Settings`. A writable togg
 
 ## Settings search
 
-The search box in the Settings header filters every setting by name and description as you type, with the same fuzzy matching as the command palette (so `mcw` finds **Max Concurrent Workers**). Picking a result jumps to that setting's tab, scrolls the field into view, and briefly highlights it, opening the **Advanced** fold when the setting lives inside it. Search spans every tab, so you can find a setting without knowing which tab it is on. The TUI settings screen has the same fuzzy search behind the `/` key.
+The search box in the Settings header filters schema-backed settings by name and description as you type, with the same fuzzy matching as the command palette (so `mcw` finds **Max Concurrent Workers**). Picking a result jumps to that setting's tab, scrolls the field into view, and briefly highlights it, opening the **Advanced** fold when the setting lives inside it. Search spans schema-backed settings tabs, so you can find a setting without knowing its tab first. The TUI settings screen has the same fuzzy search behind the `/` key.
 
 ## First-run onboarding
 
