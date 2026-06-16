@@ -129,6 +129,7 @@ pub fn is_recovery_candidate(inst: &Instance) -> bool {
         && !inst.is_archived()
         && !inst.is_snoozed()
         && inst.status != super::Status::Stopped
+        && inst.agent_session_id != inst.resume_probe_failed_sid
         && should_attempt_resume(inst.agent_session_id.as_deref(), &inst.tool)
 }
 
@@ -323,8 +324,8 @@ pub fn drain_recovery_pending(
 /// hung `on_launch` hook cannot pin the recovery lock (#1265).
 ///
 /// `skip_on_launch=false` is mandatory: hooks must run on the first start
-/// after a reboot. The Tier-2 retry in `start_with_resume_fallback`
-/// hardcodes `true` internally to prevent double-firing.
+/// after a reboot. Ambiguous resume-probe failures return `ResumeFailed`
+/// instead of launching fresh, so hooks are not double-fired on that path.
 ///
 /// On failure, stamps `Status::Error`, `last_error`, and `last_error_check`
 /// on the instance before propagating the error so daemon and TUI workers
@@ -333,7 +334,7 @@ pub fn drain_recovery_pending(
 /// failures keep the historical `"recovery cascade: <e>"` shape.
 ///
 /// Blocks; callers must invoke it off the main event-loop thread. Worst
-/// case is `N_hooks * RECOVERY_HOOK_TIMEOUT + ~7 s` fallback latency.
+/// case is `N_hooks * RECOVERY_HOOK_TIMEOUT + ~4 s` resume-probe latency.
 pub fn run_recovery_for_instance(inst: &mut Instance) -> Result<StartOutcome> {
     let _scope = HookTimeoutScope::new(recovery_hook_timeout());
     let result = inst.restart_with_size_opts(None, false);
@@ -671,6 +672,25 @@ mod tests {
         assert!(
             is_recovery_candidate(&inst),
             "expired snooze must restore recovery eligibility"
+        );
+    }
+
+    #[test]
+    fn resume_probe_failed_sid_is_not_recovery_candidate_until_user_action_changes_state() {
+        let sid = "44444444-4444-4444-8444-444444444444".to_string();
+        let mut inst = Instance::new("resume-failed", "/tmp/test");
+        inst.agent_session_id = Some(sid.clone());
+        inst.resume_probe_failed_sid = Some(sid.clone());
+
+        assert!(
+            !is_recovery_candidate(&inst),
+            "startup recovery must not loop on an ambiguously failed resume sid"
+        );
+
+        inst.resume_probe_failed_sid = None;
+        assert!(
+            is_recovery_candidate(&inst),
+            "clearing the marker through an explicit path restores recovery eligibility"
         );
     }
 
