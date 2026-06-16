@@ -722,6 +722,15 @@ fn transcript_lines<'a>(
                 }
                 out.push(Line::default());
             }
+            ActivityRow::ElicitationAnswer(answers) => {
+                for answer in answers {
+                    out.push(Line::from(Span::styled(
+                        format!("you  ▸ {}: {}", answer.question, answer.answer),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )));
+                }
+                out.push(Line::default());
+            }
             ActivityRow::Note { kind, text } => {
                 let modifier = match kind {
                     NoteKind::Info => Modifier::DIM,
