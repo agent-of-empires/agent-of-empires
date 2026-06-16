@@ -136,6 +136,18 @@ describe("reducer elicitation_resolved_locally", () => {
     expect(row?.elicitationAnswers).toEqual([{ question: "Proceed?", answer: "Yes" }]);
   });
 
+  it("adds no answer row when the pending card is already gone", () => {
+    // The broadcast may have cleared the card first; with no pending card to
+    // read questions from, the optimistic path records nothing and leaves the
+    // server-event row (if any) to stand.
+    const next = reducer(emptyAcpState(), {
+      kind: "elicitation_resolved_locally",
+      nonce: "missing",
+      resolution: { action: "accept", answers: { question_0: "Yes" } },
+    });
+    expect(next.activity.some((r) => r.kind === "elicitation_answered")).toBe(false);
+  });
+
   it("adds no answer row when the question was declined", () => {
     const state = {
       ...emptyAcpState(),
