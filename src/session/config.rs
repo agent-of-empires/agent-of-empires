@@ -668,6 +668,12 @@ pub struct AppStateConfig {
     #[serde(default)]
     pub has_seen_custom_instruction_warning: bool,
 
+    /// Latches once the user has been warned (when adding a project in the TUI)
+    /// that the directory is not a git repository, so the one-time notice about
+    /// git features being unavailable does not repeat on every non-git add.
+    #[serde(default)]
+    pub has_seen_non_git_project_warning: bool,
+
     #[serde(default)]
     pub has_acknowledged_agent_hooks: bool,
 

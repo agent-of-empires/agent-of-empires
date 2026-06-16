@@ -6,7 +6,8 @@ use ratatui::widgets::*;
 use tui_input::backend::crossterm::EventHandler;
 use tui_input::Input;
 
-use super::DialogResult;
+use super::{DialogResult, InfoDialog};
+use crate::session::config::{save_config, Config};
 use crate::session::projects;
 use crate::session::{Project, ProjectScope};
 use crate::tui::components::set_prefixed_input_cursor_position;
@@ -35,6 +36,10 @@ pub struct ProjectsDialog {
     add_focused: usize,
     error: Option<String>,
     info: Option<String>,
+    /// One-time notice shown on top of the dialog after registering a non-git
+    /// directory, explaining that git features are unavailable. Gated by
+    /// `app_state.has_seen_non_git_project_warning` so it appears once.
+    non_git_notice: Option<InfoDialog>,
 }
 
 impl ProjectsDialog {
@@ -51,6 +56,7 @@ impl ProjectsDialog {
             add_focused: 0,
             error: None,
             info: None,
+            non_git_notice: None,
         };
         dialog.reload();
         dialog
@@ -72,6 +78,14 @@ impl ProjectsDialog {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<()> {
+        // The one-time non-git notice sits on top of the dialog; while it is up,
+        // keys dismiss it rather than driving the list or add form.
+        if let Some(notice) = &mut self.non_git_notice {
+            if matches!(notice.handle_key(key), DialogResult::Cancel) {
+                self.non_git_notice = None;
+            }
+            return DialogResult::Continue;
+        }
         self.info = None;
         match self.mode {
             Mode::Browse => self.handle_browse_key(key),
@@ -176,6 +190,7 @@ impl ProjectsDialog {
                 let project =
                     Project::new(name.clone(), canonical.to_string_lossy(), self.add_scope)
                         .with_base_branch(base_branch);
+                let is_git = project.is_git();
                 match projects::add(
                     &self.profile,
                     self.add_scope,
@@ -183,6 +198,7 @@ impl ProjectsDialog {
                     self.add_allow_override,
                 ) {
                     Ok(saved) => {
+                        let saved_name = saved.name.clone();
                         self.info = Some(format!(
                             "Added '{}' [{}]",
                             saved.name,
@@ -192,6 +208,9 @@ impl ProjectsDialog {
                         self.add_input = Input::default();
                         self.add_base_branch = Input::default();
                         self.reload();
+                        if !is_git {
+                            self.maybe_warn_non_git(&saved_name);
+                        }
                     }
                     Err(e) => self.error = Some(format!("Add failed: {}", e)),
                 }
@@ -214,7 +233,28 @@ impl ProjectsDialog {
         }
     }
 
-    pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+    /// Show the one-time "not a git repository" notice, unless the user has
+    /// already seen it. Latches `app_state.has_seen_non_git_project_warning` so
+    /// it never repeats. A config load/save failure is non-fatal: the worst
+    /// case is showing the notice again on a future add.
+    fn maybe_warn_non_git(&mut self, project_name: &str) {
+        let mut config = Config::load_or_warn();
+        if config.app_state.has_seen_non_git_project_warning {
+            return;
+        }
+        self.non_git_notice = Some(InfoDialog::sized_to_fit(
+            "Not a Git Repository",
+            &format!(
+                "'{project_name}' isn't a git repository. Agent sessions will open \
+                 directly in this folder. Git features (a separate worktree per \
+                 session, branches, and the diff view) won't be available here."
+            ),
+        ));
+        config.app_state.has_seen_non_git_project_warning = true;
+        let _ = save_config(&config);
+    }
+
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let dialog_width: u16 = 76;
         let list_height: u16 = (self.items.len() as u16).clamp(3, 12);
         let adding_extra: u16 = if matches!(self.mode, Mode::Adding) {
@@ -436,5 +476,88 @@ impl ProjectsDialog {
             ],
         };
         frame.render_widget(Paragraph::new(Line::from(hint_spans)), chunks[3]);
+
+        // The one-time non-git notice renders last so it sits on top of the
+        // projects dialog body.
+        if let Some(notice) = &mut self.non_git_notice {
+            notice.render(frame, area, theme);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyModifiers;
+    use serial_test::serial;
+    use tempfile::tempdir;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn isolate_home(temp: &std::path::Path) {
+        std::env::set_var("HOME", temp);
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp.join(".config"));
+    }
+
+    /// Drive the dialog through an add of `dir`: enter add mode, set the path
+    /// input directly (typing char-by-char is unnecessary for this logic), and
+    /// submit.
+    fn add_dir(dialog: &mut ProjectsDialog, dir: &std::path::Path) {
+        dialog.handle_key(key(KeyCode::Char('a')));
+        dialog.add_input = Input::new(dir.to_string_lossy().to_string());
+        dialog.handle_key(key(KeyCode::Enter));
+    }
+
+    #[test]
+    #[serial]
+    fn non_git_add_shows_notice_once_then_latches() {
+        let temp = tempdir().unwrap();
+        isolate_home(temp.path());
+
+        let mut dialog = ProjectsDialog::new("test");
+
+        // First non-git add pops the one-time notice.
+        let plain = temp.path().join("plain-one");
+        std::fs::create_dir_all(&plain).unwrap();
+        add_dir(&mut dialog, &plain);
+        let notice = dialog
+            .non_git_notice
+            .as_ref()
+            .expect("non-git add should show the notice");
+        assert_eq!(notice.title(), "Not a Git Repository");
+
+        // Enter dismisses it.
+        dialog.handle_key(key(KeyCode::Enter));
+        assert!(dialog.non_git_notice.is_none(), "Enter should dismiss");
+
+        // A second non-git add does not re-show it: the persisted flag latched.
+        let plain2 = temp.path().join("plain-two");
+        std::fs::create_dir_all(&plain2).unwrap();
+        add_dir(&mut dialog, &plain2);
+        assert!(
+            dialog.non_git_notice.is_none(),
+            "notice must not repeat once seen"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn git_add_shows_no_notice() {
+        let temp = tempdir().unwrap();
+        isolate_home(temp.path());
+
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git2::Repository::init(&repo).expect("git init");
+
+        let mut dialog = ProjectsDialog::new("test");
+        add_dir(&mut dialog, &repo);
+        assert!(
+            dialog.non_git_notice.is_none(),
+            "a git repo add should not warn"
+        );
     }
 }

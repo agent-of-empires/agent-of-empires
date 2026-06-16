@@ -205,7 +205,10 @@ async fn add(profile: &str, profile_explicit: bool, args: ProjectAddArgs) -> Res
         println!("  Default base branch: {base}");
     }
     if !is_git {
-        println!("  Note: not a git repository; sessions run in place (no worktrees or branches).");
+        println!(
+            "  Note: not a git repository; sessions open directly in this folder \
+             (no worktree per session, branches, or diff view)."
+        );
     }
     Ok(())
 }
