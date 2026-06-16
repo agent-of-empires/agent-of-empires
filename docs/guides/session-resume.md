@@ -12,7 +12,9 @@ Pin a session to a specific Claude conversation:
 aoe session set-session-id <session-name-or-id> <claude-session-uuid>
 ```
 
-The pin is sticky: every launch passes `--resume <uuid>` until you change it. If a pinned conversation becomes invalid, the next launch starts fresh automatically.
+The pin is sticky: every launch passes `--resume <uuid>` until you change it. If AoE cannot prove whether a pinned conversation is invalid and only sees the resumed pane exit, it preserves the pinned ID and reports a recoverable resume failure instead of starting fresh automatically.
+
+Retry after fixing the underlying issue, set a different conversation ID, or explicitly start fresh once with the command below.
 
 Start fresh once:
 
@@ -35,7 +37,9 @@ State lives in `sessions.json` in your AoE config directory:
 - **Linux**: `$XDG_CONFIG_HOME/agent-of-empires/profiles/<profile>/sessions.json`
 - **macOS/Windows**: `~/.agent-of-empires/profiles/<profile>/sessions.json`
 
-Two relevant fields:
+Three relevant fields:
 
 - `agent_session_id`: the observed conversation ID. Auto-managed; do not edit.
 - `resume_intent`: your intent (`Default`, `Use(uuid)`, `Cleared`). Set via the CLI above. Absent when `Default`.
+- `resume_probe_failed_sid`: the last pinned ID whose resume probe failed ambiguously.
+  This loop-breaker prevents startup recovery from retrying that same ID automatically until user action changes the resume state.
