@@ -40,7 +40,15 @@ const QUEUE: QueuedPrompt[] = [
   { id: "q-b", text: "second queued", queuedAt: "2026-01-01T00:00:01Z" },
 ];
 
-function Harness({ editQueuedPrompt }: { editQueuedPrompt: (id: string, text: string) => void }) {
+function Harness({
+  editQueuedPrompt = () => {},
+  enqueuePrompt = () => {},
+  queue = QUEUE,
+}: {
+  editQueuedPrompt?: (id: string, text: string) => void;
+  enqueuePrompt?: (text: string) => void;
+  queue?: QueuedPrompt[];
+}) {
   const runtime = useExternalStoreRuntime<ThreadMessageLike>({
     messages: [],
     isRunning: true,
@@ -62,13 +70,13 @@ function Harness({ editQueuedPrompt }: { editQueuedPrompt: (id: string, text: st
         availableCommands={[] as never}
         connected={true}
         turnActive={true}
-        queuedCount={QUEUE.length}
-        enqueuePrompt={() => {}}
+        queuedCount={queue.length}
+        enqueuePrompt={enqueuePrompt}
         promptCapabilities={null}
         pendingAttachments={[]}
         setPendingAttachments={() => {}}
         primerPrefill={null}
-        queuedPrompts={QUEUE}
+        queuedPrompts={queue}
         editQueuedPrompt={editQueuedPrompt}
       />
     </AssistantRuntimeProvider>
@@ -167,5 +175,30 @@ describe("<Composer> queue recall (#2147)", () => {
     fireEvent.keyDown(getComposer(), { key: "Enter" });
 
     await waitFor(() => expect(editQueuedPrompt).toHaveBeenCalledWith("q-b", "second queued edited"));
+  });
+
+  it("plain Enter when not browsing sends through enqueue", async () => {
+    const enqueuePrompt = vi.fn();
+    render(<Harness enqueuePrompt={enqueuePrompt} />);
+    const ta = getComposer();
+    fireEvent.change(ta, { target: { value: "brand new" } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+    await waitFor(() => expect(enqueuePrompt).toHaveBeenCalledWith("brand new", undefined));
+  });
+
+  it("draining the browsed entry mid-browse exits recall, keeping the text", async () => {
+    const { rerender } = render(<Harness />);
+    const ta = getComposer();
+    ta.focus();
+    ta.setSelectionRange(0, 0);
+    fireEvent.keyDown(ta, { key: "ArrowUp" });
+    await waitFor(() => expect(getComposer().value).toBe("second queued"));
+
+    // The browsed entry (q-b) drains away; only q-a remains. The next
+    // ArrowUp finds the cursor id gone and exits, leaving the text put.
+    rerender(<Harness queue={[QUEUE[0]!]} />);
+    fireEvent.keyDown(getComposer(), { key: "ArrowUp" });
+    await waitFor(() => expect(screen.queryByText(/Editing queued message/)).toBeNull());
+    expect(getComposer().value).toBe("second queued");
   });
 });
