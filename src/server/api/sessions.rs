@@ -540,10 +540,20 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
             .lock()
             .map(|g| g.clone())
             .unwrap_or_default();
+        let attempted: HashSet<String> = state
+            .smart_rename_attempted
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
         let mut cfg_cache: HashMap<String, (bool, HashMap<String, String>)> = HashMap::new();
         for (resp, inst) in sessions.iter_mut().zip(instances.iter()) {
             if inflight.contains(&inst.id) {
                 resp.smart_rename = SmartRenameState::Running;
+                continue;
+            }
+            // A session whose one-shot already ran (and failed, since the name
+            // is still default) will not retry, so it is not pending either.
+            if attempted.contains(&inst.id) {
                 continue;
             }
             let (setting_on, overrides) = cfg_cache

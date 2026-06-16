@@ -326,6 +326,19 @@ mod serve {
             return;
         };
 
+        // One attempt per session lifetime. A failed or unusable first try
+        // leaves the name default; without this guard every later prompt would
+        // respawn a one-shot agent (12s + tokens) until one happened to succeed.
+        {
+            let mut attempted = state
+                .smart_rename_attempted
+                .lock()
+                .expect("smart_rename_attempted poisoned");
+            if !attempted.insert(session_id.clone()) {
+                return;
+            }
+        }
+
         let prompt = build_prompt(&first_message);
         let Some(argv) = build_oneshot_argv(agent, &prompt) else {
             return;
