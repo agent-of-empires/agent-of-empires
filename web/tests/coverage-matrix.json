@@ -275,6 +275,31 @@
       "components": ["web/src/components/SettingsView.tsx"]
     },
     {
+      "id": "settings.search",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/settings-search.spec.ts"],
+      "components": [
+        "web/src/components/settings/SettingsSearch.tsx",
+        "web/src/components/SettingsView.tsx",
+        "web/src/components/settings/SchemaSection.tsx",
+        "web/src/index.css"
+      ]
+    },
+    {
+      "id": "settings.search.index",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/settings/__tests__/settingsSearchIndex.test.ts",
+        "src/components/settings/__tests__/SettingsSearch.test.tsx"
+      ],
+      "components": [
+        "web/src/components/settings/SettingsSearch.tsx",
+        "web/src/components/settings/settingsSearchIndex.ts"
+      ]
+    },
+    {
       "id": "settings.advanced-fold",
       "kind": "vitest",
       "risk": "medium",

@@ -12,6 +12,7 @@ mod home;
 #[cfg(feature = "serve")]
 pub(crate) mod remote_home;
 pub(crate) mod responsive;
+mod restart_poller;
 pub mod settings;
 mod status_poller;
 mod stop_poller;

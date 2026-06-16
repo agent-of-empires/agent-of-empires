@@ -1,4 +1,7 @@
 import { ProfileSelector } from "./ProfileSelector";
+import { SettingsSearch } from "./SettingsSearch";
+import type { SettingsFieldDescriptor } from "../../lib/types";
+import type { SettingsSearchHit } from "./settingsSearchIndex";
 
 interface Props {
   onClose: () => void;
@@ -6,13 +9,25 @@ interface Props {
   saveError: string | null;
   selectedProfile: string;
   onSelectProfile: (profile: string) => void;
+  schema: SettingsFieldDescriptor[];
+  schemaLoading: boolean;
+  onSearchJump: (hit: SettingsSearchHit) => void;
 }
 
-// Settings header. ProfileSelector wraps onto its own row on mobile via
-// `basis-full` so the Back affordance and title keep their space; on md+
-// the wrapper switches to `basis-auto ml-auto` for a single-row layout
-// with the picker aligned right.
-export function SettingsHeader({ onClose, saving, saveError, selectedProfile, onSelectProfile }: Props) {
+// Settings header. The search box takes the flexible middle (full-width row on
+// mobile); ProfileSelector wraps onto its own row on mobile via `basis-full`
+// so the Back affordance and title keep their space; on md+ both sit on a
+// single row with the picker aligned right.
+export function SettingsHeader({
+  onClose,
+  saving,
+  saveError,
+  selectedProfile,
+  onSelectProfile,
+  schema,
+  schemaLoading,
+  onSearchJump,
+}: Props) {
   return (
     <div
       data-testid="settings-header"
@@ -31,7 +46,10 @@ export function SettingsHeader({ onClose, saving, saveError, selectedProfile, on
           {saveError}
         </span>
       )}
-      <div className="basis-full flex justify-center overflow-x-auto md:basis-auto md:ml-auto md:overflow-visible md:justify-end shrink-0">
+      <div className="basis-full md:basis-auto md:flex-1 md:min-w-0 md:max-w-sm md:ml-auto">
+        <SettingsSearch schema={schema} loading={schemaLoading} onJump={onSearchJump} />
+      </div>
+      <div className="basis-full flex justify-center overflow-x-auto md:basis-auto md:overflow-visible md:justify-end shrink-0">
         <ProfileSelector selectedProfile={selectedProfile} onSelect={onSelectProfile} />
       </div>
     </div>

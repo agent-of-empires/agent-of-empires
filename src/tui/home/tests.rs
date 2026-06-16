@@ -6066,7 +6066,7 @@ fn restart_selected_session_debounces_via_cooldown_map() {
 
 #[test]
 #[serial]
-fn restart_selected_session_surfaces_resume_failed_without_touching_last_accessed() {
+fn restart_selected_session_surfaces_resume_failed_after_async_restart() {
     if std::process::Command::new("tmux")
         .arg("-V")
         .output()
@@ -6112,11 +6112,22 @@ fn restart_selected_session_surfaces_resume_failed_without_touching_last_accesse
     view.selected_session = Some(id.clone());
 
     let result = view.restart_selected_session(None, None, None, None);
+    assert!(result.is_ok());
+
+    let mut applied = false;
+    for _ in 0..120 {
+        if view.apply_restart_results() {
+            applied = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
     let _ = std::process::Command::new("tmux")
         .args(["kill-session", "-t", &tmux_name])
         .output();
 
-    assert!(result.is_ok());
+    assert!(applied, "timed out waiting for async restart result");
     let dialog = view.info_dialog.as_ref().expect("resume failure dialog");
     assert_eq!(dialog.title(), "Restart Failed");
     assert!(dialog.message().contains(stale_sid));
@@ -6124,7 +6135,59 @@ fn restart_selected_session_surfaces_resume_failed_without_touching_last_accesse
     assert_eq!(row.agent_session_id.as_deref(), Some(stale_sid));
     assert_eq!(row.resume_probe_failed_sid.as_deref(), Some(stale_sid));
     assert_eq!(row.status, crate::session::Status::Error);
-    assert!(row.last_accessed_at.is_none());
+    assert!(row.last_accessed_at.is_some());
+}
+
+/// A second restart press while the first cascade is still running on the
+/// poller worker must be dropped. The cascade is off the event loop, so the
+/// 1.5s keyboard-repeat debounce does not cover a deliberate press during a
+/// multi-second pull; without the in-flight guard the worker would enqueue a
+/// duplicate request and restart the row twice.
+#[test]
+#[serial]
+fn restart_selected_session_skips_when_already_in_flight() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances[0].id.clone();
+    env.view.selected_session = Some(id.clone());
+    env.view.restart_in_flight.insert(id.clone());
+
+    let result = env.view.restart_selected_session(None, None, None, None);
+    assert!(result.is_ok());
+    assert!(
+        env.view.restart_cooldown_at.is_empty(),
+        "an in-flight restart must drop the press before any bookkeeping"
+    );
+    assert_ne!(
+        env.view.instances[0].status,
+        crate::session::Status::Starting,
+        "the row must not be re-flipped to Starting by a dropped duplicate press"
+    );
+}
+
+/// Deleting a row whose restart cascade is still running would fire docker
+/// commands against the container the worker is mid-creating. The delete must
+/// be refused (and surfaced) rather than racing the restart worker.
+#[test]
+#[serial]
+fn delete_selected_refused_during_restart() {
+    use crate::tui::dialogs::DeleteOptions;
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances[0].id.clone();
+    env.view.selected_session = Some(id.clone());
+    env.view.restart_in_flight.insert(id.clone());
+
+    let result = env.view.delete_selected(&DeleteOptions::default());
+    assert!(result.is_ok());
+    assert_ne!(
+        env.view.instances[0].status,
+        crate::session::Status::Deleting,
+        "delete must be refused while a restart is in flight"
+    );
+    assert!(
+        env.view.info_dialog.is_some(),
+        "the refused delete must surface a dialog, not silently no-op"
+    );
 }
 
 /// Build a HomeView seeded with two distinct projects, each containing
