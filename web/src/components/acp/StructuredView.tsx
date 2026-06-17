@@ -295,10 +295,14 @@ function AcpChrome({
   // land (revealed synchronously or fetched async). See #2236.
   const autoLoadArmedRef = useRef(true);
   const pendingScrollAnchorRef = useRef<number | null>(null);
+  const lastAutoLoadAtRef = useRef(0);
 
   const requestEarlierHistory = useCallback(() => {
     const vp = viewportRef.current;
     if (!vp || !canLoadEarlierRef.current) return;
+    // Stamp every load (button or auto) so the cooldown below covers the
+    // scroll-into-view a click triggers, not just scroll-driven loads.
+    lastAutoLoadAtRef.current = performance.now();
     pendingScrollAnchorRef.current = vp.scrollHeight;
     loadEarlierRef.current();
   }, []);
@@ -328,14 +332,29 @@ function AcpChrome({
     // and momentary content reflows otherwise drop us out of the
     // pinned state for one frame.
     const PRELOAD_PX = 200;
+    // Minimum gap between auto-loads. The position-restore below nudges
+    // scrollTop after each load, and clicking the (top-anchored) "Load
+    // earlier" button scrolls it into view; both land the viewport back
+    // near the top. Without a cooldown that re-fires immediately and the
+    // button never settles enough to click (the CI failure). One page per
+    // window is plenty for a real scroll-up.
+    const AUTO_LOAD_COOLDOWN_MS = 500;
     const sample = () => {
       wasAtBottomRef.current = vp.scrollTop + vp.clientHeight >= vp.scrollHeight - 16;
+      // Only meaningful once the transcript overflows; otherwise there is
+      // nothing to scroll up through and a mount at scrollTop 0 would
+      // auto-load spuriously.
+      const overflowing = vp.scrollHeight > vp.clientHeight + PRELOAD_PX;
       // Auto-load older history as the top approaches. Arm only after the
       // user has scrolled away from the top so a single fetch doesn't
       // re-trigger every scroll frame while parked at the top.
-      if (vp.scrollTop > PRELOAD_PX) {
+      if (!overflowing || vp.scrollTop > PRELOAD_PX) {
         autoLoadArmedRef.current = true;
-      } else if (autoLoadArmedRef.current && canLoadEarlierRef.current) {
+      } else if (
+        autoLoadArmedRef.current &&
+        canLoadEarlierRef.current &&
+        performance.now() - lastAutoLoadAtRef.current > AUTO_LOAD_COOLDOWN_MS
+      ) {
         autoLoadArmedRef.current = false;
         requestEarlierHistory();
       }
