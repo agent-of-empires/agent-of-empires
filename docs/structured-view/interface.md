@@ -146,6 +146,11 @@ Bluetooth keyboard) keep the desktop Enter-to-send convention.
 On-screen keyboard dictation (the mic icon, e.g. iOS Safari) commits
 into the composer correctly.
 
+On touch devices, tapping anywhere in the transcript focuses the composer
+and brings up the soft keyboard, so you do not have to reach for the
+composer field to start typing. Tapping a control inside a message (a
+tool-call card, a link, a button) still does its own thing instead.
+
 ## Composer attachments (images, audio, files)
 
 The web composer can send attachments alongside the prompt text when the
