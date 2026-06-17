@@ -1137,7 +1137,14 @@ async fn build_spawn_request(
     // pre-move path is the crash-loop in #2260. Bail if the session vanished
     // mid-flight (e.g. deleted during the handshake); ensure_container below
     // re-acquires the same lock, so this read-and-release must not hold it.
-    let cwd = PathBuf::from(&target.project_path); // TEMP pre-fix
+    let cwd = {
+        let _guard = inst_lock.lock().await;
+        let instances = state.instances.read().await;
+        let Some(inst) = instances.iter().find(|i| i.id == target.id) else {
+            return Err(());
+        };
+        PathBuf::from(&inst.project_path)
+    };
     let agent = supervisor
         .pick_agent_for_tool(
             &target.tool,
