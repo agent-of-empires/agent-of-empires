@@ -198,6 +198,15 @@ pub struct App {
     /// differs. Single-process scope; on restart the new binary's
     /// `CARGO_PKG_VERSION` makes the underlying check return "no update".
     last_installed_version_in_session: Option<String>,
+    /// Whether a left-button press is currently outstanding: a `Down(Left)`
+    /// was seen without a matching `Up(Left)` yet. Used to recognize an
+    /// "orphan" left release. When you click an OS-unfocused terminal, the
+    /// window manager consumes the focusing mouse-down to raise the window
+    /// but the terminal still reports the mouse-up; motion is reported
+    /// regardless of focus (so hover already highlighted the target). With
+    /// no preceding Down the click would be lost, so we treat such an orphan
+    /// Up as a click at its own coordinates, which match the hovered element.
+    left_button_down: bool,
 }
 
 /// Check if the app version changed and return the previous version if changelog should be shown.
@@ -371,6 +380,7 @@ impl App {
             pending_structured_view_open: None,
             pending_install_version: None,
             last_installed_version_in_session: None,
+            left_button_down: false,
         })
     }
 
@@ -813,6 +823,10 @@ impl App {
                                                     // during dictation can click again after the burst
                                                     // ends.
                                                     MouseEventKind::Down(MouseButton::Left) => {
+                                                        // Keep press tracking in sync with the
+                                                        // non-burst arm so the paired release isn't
+                                                        // misread as a focus-click orphan.
+                                                        self.left_button_down = true;
                                                         if self.home.handle_context_menu_click(mouse.column, mouse.row) {
                                                             // Click consumed by the context menu
                                                             // (item dispatched, kept open, or
@@ -922,10 +936,28 @@ impl App {
                             // PreviewSelect; `handle_drag_end` collapses it
                             // back to no selection on release if the cursor
                             // never moved.
-                            let click_action = if matches!(
+                            //
+                            // `treat_as_click` fires for a real `Down(Left)`
+                            // and for an "orphan" `Up(Left)` (a release with
+                            // no outstanding press, see `left_button_down`):
+                            // the latter is the click on an OS-unfocused
+                            // terminal whose mouse-down the window manager ate
+                            // to raise the window. The orphan release skips
+                            // drag-start (there's nothing to drag on a release)
+                            // and lands the click on whatever the hover already
+                            // highlighted at the release coordinates.
+                            let is_left_down =
+                                matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left));
+                            let orphan_left_up = matches!(
                                 mouse.kind,
-                                MouseEventKind::Down(MouseButton::Left)
-                            ) {
+                                MouseEventKind::Up(MouseButton::Left)
+                            ) && !self.left_button_down;
+                            if is_left_down {
+                                self.left_button_down = true;
+                            } else if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
+                                self.left_button_down = false;
+                            }
+                            let click_action = if is_left_down || orphan_left_up {
                                 if self
                                     .home
                                     .handle_context_menu_click(mouse.column, mouse.row)
@@ -952,9 +984,8 @@ impl App {
                                     self.sync_mouse_capture(terminal)?;
                                     self.draw(terminal)?;
                                     None
-                                } else if self
-                                    .home
-                                    .handle_drag_start(mouse.column, mouse.row)
+                                } else if is_left_down
+                                    && self.home.handle_drag_start(mouse.column, mouse.row)
                                 {
                                     // handle_drag_start already overwrote the
                                     // selection if it started a PreviewSelect;

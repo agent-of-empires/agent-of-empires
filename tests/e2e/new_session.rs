@@ -182,6 +182,43 @@ fn test_right_click_on_session_row_opens_rename_delete_menu() {
     h.wait_for_absent("Rename", Duration::from_secs(5));
 }
 
+#[test]
+#[serial]
+fn test_orphan_left_release_clicks_hovered_row() {
+    // Clicking a session row in an OS-unfocused terminal: the window
+    // manager swallows the focusing mouse-down to raise the window, so
+    // the TUI only ever sees the mouse-up. With the default LiveSend
+    // click action, that orphan release must still land the click and
+    // enter live-send on the row, exactly as a real (paired down+up)
+    // click would. Motion is reported regardless of focus, so the row was
+    // already hover-highlighted; the release coordinates match it.
+    require_tmux!();
+
+    let mut h = TuiTestHarness::new("orphan_release_click");
+    let project = h.project_path();
+    let add = h.run_cli(&["add", project.to_str().unwrap(), "-t", "OrphanRow"]);
+    assert!(
+        add.status.success(),
+        "aoe add failed: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+
+    h.spawn_tui();
+    h.wait_for(" aoe ");
+    h.send_keys("Enter"); // dismiss welcome
+    h.wait_for("OrphanRow");
+
+    // Release-only (SGR `m`) over the first session row, no preceding
+    // press. Same coordinates the right-click row test uses: top border
+    // is row 1, the first item is row 2, column 5 is the label area.
+    h.send_mouse_release(0, 5, 2);
+
+    // The LIVE footer banner is the load-bearing tell that the orphan
+    // release entered live-send on the clicked row.
+    h.wait_for_timeout("LIVE", Duration::from_secs(10));
+    h.assert_screen_contains(" aoe ");
+}
+
 /// Submit the new session dialog, handling the "Path does not exist. Create?"
 /// prompt if it appears.
 ///

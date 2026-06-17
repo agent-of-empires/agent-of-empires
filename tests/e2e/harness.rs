@@ -506,6 +506,33 @@ last_seen_version = "{}"
         std::thread::sleep(Duration::from_millis(100));
     }
 
+    /// Send only the SGR release (`m`) for a left button, with no preceding
+    /// press. This reproduces the "focus-click orphan": clicking an
+    /// OS-unfocused terminal, where the window manager swallows the
+    /// focusing mouse-down to raise the window but the terminal still
+    /// reports the mouse-up. The TUI treats such an orphan release as a
+    /// click at its coordinates.
+    pub fn send_mouse_release(&self, button: u8, col: u16, row: u16) {
+        assert!(self.spawned, "must call spawn_tui() or spawn() first");
+        let seq = format!("\x1b[<{button};{col};{row}m");
+        let output = Command::new("tmux")
+            .arg("-S")
+            .arg(&self.socket_path)
+            .arg("send-keys")
+            .arg("-t")
+            .arg(&self.session_name)
+            .arg("-l")
+            .arg(&seq)
+            .output()
+            .expect("failed to send mouse release");
+        assert!(
+            output.status.success(),
+            "send_mouse_release failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
     /// Send literal text (prevents "Enter" in text from being interpreted as
     /// the Enter key).
     pub fn type_text(&self, text: &str) {
