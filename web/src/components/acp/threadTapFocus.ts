@@ -10,7 +10,7 @@
 // Kept pure so the guard is unit-testable without mounting the assistant-ui
 // runtime; the caller does the (synchronous, iOS-gesture-safe) focus dispatch.
 
-const INTERACTIVE_SELECTOR = 'button, a, input, textarea, select, [role="button"], [contenteditable="true"]';
+const INTERACTIVE_SELECTOR = 'button, a, input, textarea, select, [role="button"], [contenteditable]';
 
 export function shouldFocusComposerOnThreadTap(opts: {
   isCoarse: boolean;
