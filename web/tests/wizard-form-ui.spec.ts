@@ -1,6 +1,6 @@
 import { test, expect } from "./helpers/mockedTest";
 import { Page } from "@playwright/test";
-import { openWizard, selectProject, selectAgent, expandMoreOptions, setTitle, launch } from "./helpers/wizard";
+import { openWizard, selectProject, selectAgent, expandMoreOptions, setTitle, launch, wizard } from "./helpers/wizard";
 
 // Wizard form UI stories on the single-screen wizard (#2210). Covers:
 // - branch auto-derivation from the title (the reducer slugifies the title
@@ -110,10 +110,12 @@ test.describe("Wizard form UI stories", () => {
     await expect(groupHeader).toBeVisible();
     await groupHeader.getByRole("button", { name: /New session in /i }).click();
 
+    const w = wizard(page);
     await expect(page.getByRole("heading", { name: "New session" })).toBeVisible();
-    await expect(page.getByText("/tmp/example").first()).toBeVisible();
+    // Scope to the modal: the seeded sidebar row behind it also shows this path.
+    await expect(w.getByText("/tmp/example")).toBeVisible();
     // Path prefilled => the launch gate is satisfied immediately.
-    await expect(page.getByRole("button", { name: /Launch session/ })).toBeEnabled();
+    await expect(w.getByRole("button", { name: /Launch session/ })).toBeEnabled();
   });
 
   test("wizard remembers the last-picked agent across reloads", async ({ page }) => {
