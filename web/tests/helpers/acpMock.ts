@@ -128,11 +128,59 @@ export async function mockAcpSession(page: Page, opts: AcpSessionMockOptions = {
     });
   });
   await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));
-  // Structured view REST endpoints (replay/snapshot/...): empty is fine,
+  // Structured view REST endpoints (snapshot/...): empty is fine,
   // everything interesting arrives over the WebSocket. Registered before
   // the prompt/config-option captures so those (later, more specific)
   // routes win Playwright's reverse-registration-order matching.
   await page.route("**/api/sessions/*/acp/**", (r) => r.fulfill({ json: {} }));
+  // Replay endpoint: serve the frame log with the real recent-first
+  // paging contract so the client's cold-open (tail via `before`) and
+  // scroll-up (older pages via `before`) paths are exercised, not stubbed.
+  // Registered after the generic acp/** route so it wins for replay URLs.
+  // See #2236.
+  const isBoundary = (event: unknown): boolean =>
+    typeof event === "object" && event !== null && ("UserPromptSent" in event || "UserDiffCommentsPrompt" in event);
+  await page.route(/\/acp\/replay(\?|$)/, (r) => {
+    const url = new URL(r.request().url());
+    const limit = Number(url.searchParams.get("limit") ?? "1000");
+    const frames = frameLog.map((f) => JSON.parse(f) as { seq: number; event: unknown });
+    const highestSeq = frames.length > 0 ? frames[frames.length - 1]!.seq : 0;
+    const lowestSeq = frames.length > 0 ? frames[0]!.seq : null;
+    const beforeParam = url.searchParams.get("before");
+    if (beforeParam != null) {
+      const before = Number(beforeParam);
+      const below = frames.filter((f) => f.seq < before);
+      const hasMore = below.length > limit;
+      let page = below.slice(Math.max(0, below.length - limit));
+      if (hasMore) {
+        const i = page.findIndex((f) => isBoundary(f.event));
+        if (i > 0) page = page.slice(i);
+      }
+      return r.fulfill({
+        json: {
+          frames: page,
+          lost: false,
+          highest_seq: highestSeq,
+          lowest_seq: lowestSeq,
+          next_cursor: page.length > 0 ? page[0]!.seq : null,
+          has_more: hasMore,
+        },
+      });
+    }
+    const since = Number(url.searchParams.get("since") ?? "0");
+    const newer = frames.filter((f) => f.seq > since);
+    const page = newer.slice(0, limit);
+    return r.fulfill({
+      json: {
+        frames: page,
+        lost: false,
+        highest_seq: highestSeq,
+        lowest_seq: lowestSeq,
+        next_cursor: page.length > 0 ? page[page.length - 1]!.seq : null,
+        has_more: newer.length > limit,
+      },
+    });
+  });
   await page.route("**/api/sessions/*/acp/prompt", async (r) => {
     const body = JSON.parse(r.request().postData() ?? "{}") as { text: string };
     handle.promptBodies.push(body);
