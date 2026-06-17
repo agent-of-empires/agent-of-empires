@@ -3585,13 +3585,24 @@ pub(crate) async fn seed_acp_statuses(state: Arc<AppState>) {
         let Some(event) = state.acp_event_store.latest_status_event(&id) else {
             continue;
         };
-        let intent = derive_acp_status(&event);
-        if intent.is_none() {
+        let Some(intent) = derive_acp_status(&event) else {
             continue;
-        }
+        };
         let mut instances = state.instances.write().await;
         if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-            apply_status_intent(inst, intent, &state.status_tx);
+            // At startup the on-disk event log is the whole truth: nothing
+            // is racing the apply, unlike the live stream. If the latest
+            // lifecycle event shows a turn was in flight when the previous
+            // daemon died, a stale persisted Stopped must not trap the dot
+            // grey, so clear it before the Running/Waiting intent applies.
+            // A latest Idle/Error (clean or deliberate stop) is left as
+            // Stopped by apply_status_intent's guard. See #2248.
+            if inst.status == Status::Stopped
+                && matches!(intent, StatusIntent::Set(Status::Running | Status::Waiting))
+            {
+                inst.status = Status::Idle;
+            }
+            apply_status_intent(inst, Some(intent), &state.status_tx);
         }
     }
 }
@@ -3607,22 +3618,32 @@ pub(crate) fn apply_status_intent(
     status_tx: &broadcast::Sender<StatusChange>,
 ) {
     let Some(intent) = intent else { return };
-    // Don't fight terminal lifecycle states. Acp events keep
-    // arriving for a few ticks after a Stop/Delete, and we don't
-    // want the spinner to flicker back to Running.
-    if matches!(
-        inst.status,
-        Status::Stopped | Status::Deleting | Status::Creating
-    ) {
+    // Genuine in-flight terminal states: never fight them.
+    if matches!(inst.status, Status::Deleting | Status::Creating) {
         return;
     }
     let target = match intent {
-        StatusIntent::Set(s) => s,
-        // HealError: only move from Error → Idle. Skip when the
-        // session is in a normal state so a respawn during an active
-        // Running turn doesn't stop the spinner.
+        StatusIntent::Set(s) => {
+            // A Stopped session must not be woken by a trailing worker
+            // event: acp events keep arriving for a few ticks after a
+            // Stop, and a deliberate Stop must keep showing Stopped. Only
+            // a fresh worker-epoch signal (HealError below) lifts Stopped;
+            // the live UserPromptSent that follows the respawn then drives
+            // Running. Without this, the chain Stopped -> (trailing prompt)
+            // Running -> (trailing stop) Idle would strand a deliberate
+            // Stop on Idle.
+            if inst.status == Status::Stopped {
+                return;
+            }
+            s
+        }
+        // HealError comes only from AcpSessionAssigned / RateLimitAuto
+        // Resumed, both emitted when a fresh worker attaches and never as
+        // trailing post-stop events. So heal a sticky Error AND wake a
+        // session out of a stale Stopped (idle-reap or manual stop, then
+        // re-prompt): the live worker is provably back. See #2248.
         StatusIntent::HealError => {
-            if inst.status != Status::Error {
+            if !matches!(inst.status, Status::Error | Status::Stopped) {
                 return;
             }
             Status::Idle
@@ -4548,6 +4569,125 @@ mod tests {
         );
         assert_eq!(derive_acp_status(&Event::ThinkingStarted), None);
         assert_eq!(derive_acp_status(&Event::ThinkingEnded), None);
+    }
+
+    // --- #2248: a structured session must heal out of a stale Stopped ---
+
+    #[cfg(feature = "serve")]
+    fn stopped_structured_instance() -> Instance {
+        let mut inst = Instance::new("s", "/tmp/s");
+        inst.view = crate::session::View::Structured;
+        inst.status = Status::Stopped;
+        inst
+    }
+
+    #[cfg(feature = "serve")]
+    fn apply(inst: &mut Instance, intent: StatusIntent) {
+        let tx = broadcast::channel(8).0;
+        apply_status_intent(inst, Some(intent), &tx);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn heal_error_wakes_a_stopped_session() {
+        // AcpSessionAssigned / RateLimitAutoResumed -> HealError: a fresh
+        // worker attached, so a stale Stopped from idle-reap or a prior
+        // manual stop must heal. This is the #2248 trap: pre-fix the guard
+        // froze Stopped and the dot stayed grey through a live turn.
+        let mut inst = stopped_structured_instance();
+        apply(&mut inst, StatusIntent::HealError);
+        assert_eq!(inst.status, Status::Idle);
+        // The UserPromptSent that follows the respawn then drives Running.
+        apply(&mut inst, StatusIntent::Set(Status::Running));
+        assert_eq!(inst.status, Status::Running);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn heal_error_still_heals_a_sticky_error() {
+        let mut inst = stopped_structured_instance();
+        inst.status = Status::Error;
+        apply(&mut inst, StatusIntent::HealError);
+        assert_eq!(inst.status, Status::Idle);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn trailing_set_intents_do_not_wake_a_stopped_session() {
+        // A deliberate Stop, or a session mid-stop, keeps emitting acp
+        // events for a few ticks. None of those Set intents may revive it,
+        // or the chain Stopped -> Running -> Idle would strand a deliberate
+        // Stop on Idle.
+        for target in [Status::Running, Status::Waiting, Status::Idle] {
+            let mut inst = stopped_structured_instance();
+            apply(&mut inst, StatusIntent::Set(target));
+            assert_eq!(
+                inst.status,
+                Status::Stopped,
+                "target {target:?} woke Stopped"
+            );
+        }
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn deleting_and_creating_block_every_intent() {
+        for terminal in [Status::Deleting, Status::Creating] {
+            let mut inst = stopped_structured_instance();
+            inst.status = terminal;
+            apply(&mut inst, StatusIntent::Set(Status::Running));
+            assert_eq!(inst.status, terminal);
+            apply(&mut inst, StatusIntent::HealError);
+            assert_eq!(inst.status, terminal);
+        }
+    }
+
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn seed_unblocks_a_stopped_session_with_an_in_flight_turn() {
+        use crate::acp::Event;
+        // Daemon restart: session persisted Stopped, but the last lifecycle
+        // event was a UserPromptSent (a turn was in flight when the prior
+        // daemon died). Seed must reflect the live turn, not the stale dot.
+        let inst = stopped_structured_instance();
+        let id = inst.id.clone();
+        let state = test_support::build_test_app_state(vec![inst]);
+        state
+            .acp_event_store
+            .record(
+                &id,
+                1,
+                &Event::UserPromptSent {
+                    text: "go".into(),
+                    attachments: Vec::new(),
+                },
+            )
+            .expect("record");
+        seed_acp_statuses(state.clone()).await;
+        assert_eq!(state.instances.read().await[0].status, Status::Running);
+    }
+
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn seed_preserves_a_deliberate_stop_across_restart() {
+        use crate::acp::Event;
+        // Latest event is a Stopped (clean / deliberate stop), so the seed
+        // leaves the persisted Stopped intact rather than downgrading it.
+        let inst = stopped_structured_instance();
+        let id = inst.id.clone();
+        let state = test_support::build_test_app_state(vec![inst]);
+        state
+            .acp_event_store
+            .record(
+                &id,
+                1,
+                &Event::Stopped {
+                    reason: "prompt_complete".into(),
+                },
+            )
+            .expect("record");
+        seed_acp_statuses(state.clone()).await;
+        assert_eq!(state.instances.read().await[0].status, Status::Stopped);
     }
 
     #[test]
