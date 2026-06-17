@@ -1343,6 +1343,30 @@ mod tests {
     }
 
     #[test]
+    fn transcript_renders_elicitation_answers_as_user_rows() {
+        use crate::acp::elicitations::ElicitationAnswer;
+        let mut t = AcpTranscript::new("s-1");
+        t.rows.push(ActivityRow::ElicitationAnswer(vec![
+            ElicitationAnswer {
+                question: "Proceed?".into(),
+                answer: "Yes".into(),
+            },
+            ElicitationAnswer {
+                question: "Mode".into(),
+                answer: "Fast".into(),
+            },
+        ]));
+        let out = joined(&transcript_lines(
+            &t,
+            None,
+            Focus::Transcript,
+            &Theme::default(),
+        ));
+        assert!(out.contains("you  ▸ Proceed?: Yes"), "{out:?}");
+        assert!(out.contains("you  ▸ Mode: Fast"), "{out:?}");
+    }
+
+    #[test]
     fn edit_kind_renders_added_and_removed_diff_lines() {
         let row = tool_row(
             "edit",
