@@ -339,7 +339,7 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
       <div className="absolute inset-0 bg-black/60" onClick={onClose} />
       <div
         data-testid="session-wizard"
-        className="relative w-full max-w-lg bg-surface-800 border border-surface-700/30 rounded-xl flex flex-col max-h-[min(720px,90vh)]"
+        className="relative w-full max-w-lg bg-surface-800 border border-surface-700/30 rounded-lg flex flex-col max-h-[min(720px,90vh)]"
       >
         <div className="flex items-center justify-between px-5 py-4 border-b border-surface-700/20">
           <h1 className="text-sm font-medium text-text-secondary">New session</h1>
