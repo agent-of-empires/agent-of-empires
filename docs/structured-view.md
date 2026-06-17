@@ -16,7 +16,7 @@ Contributors: see [Structured View Internals](development/internals/structured-v
 
 ## Supported agents
 
-aoe ships an ACP registry entry for each tool whose ACP server we've verified. For those tools the web wizard shows a per-session **Use structured view** toggle (on by default). Tools not in the set, and custom agents without an ACP command, have no toggle and always run in the terminal view.
+aoe ships an ACP registry entry for each tool whose ACP server we've verified. For those tools the web wizard shows a per-session **Use structured view** toggle (on by default), under the wizard's **More options** disclosure. Tools not in the set, and custom agents without an ACP command, have no toggle and always run in the terminal view.
 
 | Agent | ACP adapter | Install | Auth |
 |-------|-------------|---------|------|
@@ -54,7 +54,7 @@ Codex/opencode/gemini support is built from adapter docs and code reading rather
 The web new-session wizard is the primary path; no CLI needed.
 
 1. Run `aoe serve` and open the dashboard.
-2. Click **New session**, pick your project and agent, and leave **Use structured view** on.
+2. Click **New session**, pick your project and agent, and launch. Structured view is on by default; to confirm or change it, expand **More options** and leave **Use structured view** on.
 3. Open the session: you see the structured plan and tool-call cards instead of a terminal.
 
 The CLI is the optional path for scripting or headless launches. Unlike the wizard, `aoe add` defaults to the terminal view (matching the TUI):

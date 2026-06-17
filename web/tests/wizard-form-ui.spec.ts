@@ -1,6 +1,6 @@
 import { test, expect } from "./helpers/mockedTest";
 import { Page } from "@playwright/test";
-import { openWizard, selectProject, selectAgent, setTitle, launch } from "./helpers/wizard";
+import { openWizard, selectProject, selectAgent, expandMoreOptions, setTitle, launch } from "./helpers/wizard";
 
 // Wizard form UI stories on the single-screen wizard (#2210). Covers:
 // - branch auto-derivation from the title (the reducer slugifies the title
@@ -91,6 +91,8 @@ test.describe("Wizard form UI stories", () => {
     await openWizard(page);
     await selectProject(page, "/tmp/example");
     await setTitle(page, "autogen branch here");
+    // The branch input lives in the worktree controls under More options.
+    await expandMoreOptions(page);
 
     await expect(page.getByPlaceholder("Uses session title if empty")).toHaveValue("autogen-branch-here");
   });

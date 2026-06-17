@@ -44,6 +44,10 @@ vi.mock("../../../lib/api", () => ({
 
 afterEach(() => {
   cleanup();
+  // The wizard persists the More options fold state (and last-used tool) to
+  // localStorage; clear it so one test's expanded fold doesn't carry into the
+  // next test's fresh mount.
+  localStorage.clear();
 });
 
 const claude: AgentInfo = {
@@ -177,8 +181,9 @@ describe("SessionWizard structured_view payload", () => {
 
   it("sends the terminal view when the user opts out via the toggle", async () => {
     const { getByText, getByRole } = renderWizard();
-    // The structured-view switch is an always-visible essential on the
-    // single screen (#2210): flip it off, then launch.
+    // The structured-view switch lives under More options (#2210): expand,
+    // flip it off, then launch.
+    fireEvent.click(getByText("More options"));
     fireEvent.click(getByRole("switch", { name: "Use structured view" }));
     fireEvent.click(getByText(/Launch session/));
     await waitFor(() => expect(createSession).toHaveBeenCalled());

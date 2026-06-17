@@ -163,12 +163,9 @@ export function SessionStep({ data, onChange, embedded = false }: Props) {
   );
 
   if (embedded) {
-    return (
-      <div>
-        {titleField}
-        {detailsBlock}
-      </div>
-    );
+    // The title lives in the always-visible essentials on the single screen
+    // (#2210); embedded mode renders only the worktree / group details.
+    return <div>{detailsBlock}</div>;
   }
 
   return (

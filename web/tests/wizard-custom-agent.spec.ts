@@ -1,5 +1,5 @@
 import { test, expect, Page } from "@playwright/test";
-import { openWizard, selectProject, selectAgent, launch, wizard } from "./helpers/wizard";
+import { openWizard, selectProject, selectAgent, expandMoreOptions, launch, wizard } from "./helpers/wizard";
 
 // Custom agent picker on the single-screen wizard (#2210). A configured
 // custom agent shows in the always-visible picker with a "Custom" badge,
@@ -105,10 +105,19 @@ test.describe("wizard custom agent picker", () => {
     await expect(w.getByRole("button", { name: /^claude/ })).toHaveCount(0);
 
     await selectAgent(page, /remote-helper/);
-    // Custom agents that do not define agent_acp_cmd are terminal-only, so
-    // the structured-view picker is replaced by the terminal fallback notice.
-    await expect(w.getByText(/Custom agents run in the terminal unless they define agent_acp_cmd/)).toBeVisible();
+    // Default (collapsed) view: the picker shows only the agent name, never
+    // its binary / command / detect-as.
     await expect(page.locator("body")).not.toContainText(hiddenBinary);
+    await expect(page.locator("body")).not.toContainText(hiddenCommand);
+    await expect(page.locator("body")).not.toContainText(hiddenDetectAs);
+    await expect(page.locator("body")).not.toContainText("shell string");
+
+    // Custom agents that do not define agent_acp_cmd are terminal-only, so
+    // the structured-view picker is replaced by the terminal fallback notice
+    // under More options (#2210). The command-override preview there does
+    // surface the resolved launch command (binary), which is by design.
+    await expandMoreOptions(page);
+    await expect(w.getByText(/Custom agents run in the terminal unless they define agent_acp_cmd/)).toBeVisible();
     await expect(page.locator("body")).not.toContainText(hiddenCommand);
     await expect(page.locator("body")).not.toContainText(hiddenDetectAs);
     await expect(page.locator("body")).not.toContainText("shell string");

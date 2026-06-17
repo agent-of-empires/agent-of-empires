@@ -48,10 +48,8 @@ export async function expandMoreOptions(page: Page) {
   }
 }
 
-/** Fill the session title. Expands More options first since the title input
- *  lives inside the fold on the single screen. */
+/** Fill the always-visible session title essential. */
 export async function setTitle(page: Page, title: string) {
-  await expandMoreOptions(page);
   await wizard(page).getByPlaceholder("Auto-generated if empty").fill(title);
 }
 

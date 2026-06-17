@@ -67,8 +67,9 @@ test.describe("Single-screen wizard (#2210)", () => {
   });
 
   test("only essentials show on open; advanced controls hide behind collapsed More options", async ({ page }) => {
-    // Story: project + agent picker + structured-view + Launch are visible;
-    // worktree / sandbox / preset sit inside a collapsed fold.
+    // Story: project + session title + agent picker + Launch are visible;
+    // structured-view / worktree / sandbox / preset sit inside a collapsed
+    // fold.
     await mockApis(page);
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
@@ -76,15 +77,17 @@ test.describe("Single-screen wizard (#2210)", () => {
     await openWizard(page);
     const w = wizard(page);
     await expect(w.getByRole("button", { name: /^claude/ })).toBeVisible();
-    await expect(w.getByRole("switch", { name: "Use structured view" })).toBeVisible();
+    await expect(w.getByPlaceholder("Auto-generated if empty")).toBeVisible();
     await expect(w.getByRole("button", { name: /Launch session/ })).toBeVisible();
 
     const more = w.getByRole("button", { name: "More options" });
     await expect(more).toHaveAttribute("aria-expanded", "false");
+    await expect(w.getByRole("switch", { name: "Use structured view" })).toHaveCount(0);
     await expect(w.getByText("Create a worktree")).toHaveCount(0);
     await expect(w.getByText("Run in a safe container")).toHaveCount(0);
 
     await expandMoreOptions(page);
+    await expect(w.getByRole("switch", { name: "Use structured view" })).toBeVisible();
     await expect(w.getByText("Create a worktree")).toBeVisible();
     await expect(w.getByText("Run in a safe container")).toBeVisible();
   });

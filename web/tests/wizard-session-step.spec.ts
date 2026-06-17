@@ -77,7 +77,7 @@ test.describe("Wizard session step (#1219)", () => {
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
     await openWithProject(page);
-    await expandMoreOptions(page);
+    // Title is an always-visible essential, not folded under More options.
     const titleInput = wizard(page).getByPlaceholder("Auto-generated if empty");
     await expect(titleInput).toHaveValue("");
     await titleInput.fill("my-feature");
@@ -164,13 +164,11 @@ test.describe("Wizard session step (#1219)", () => {
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
     await openWithProject(page);
-    // Fill the title via the fold, then collapse it again so the worktree
-    // toggle is hidden. It defaults on, so the default new-worktree
+    // Fill the always-visible title and launch with More options never
+    // opened. The worktree toggle defaults on, so the default new-worktree
     // behavior must still reach the request body.
-    await expandMoreOptions(page);
     const w = wizard(page);
     await w.getByPlaceholder("Auto-generated if empty").fill("Cool Feature");
-    await w.getByRole("button", { name: "More options" }).click();
     await w.getByRole("button", { name: /Launch session/ }).click();
     await expect.poll(() => captured?.worktree_branch).toBe("cool-feature");
     expect(captured?.create_new_branch).toBe(true);
@@ -226,25 +224,22 @@ test.describe("Wizard session step (#1219)", () => {
     await page.goto("/");
     await openWithProject(page);
     const w = wizard(page);
-    // More options is collapsed, so the title input and all worktree /
-    // group controls are folded away.
+    // More options is collapsed, so all worktree / group controls are folded
+    // away. The title is an essential and stays visible.
     await expect(w.getByRole("button", { name: "More options" })).toHaveAttribute("aria-expanded", "false");
-    await expect(w.getByPlaceholder("Auto-generated if empty")).toHaveCount(0);
+    await expect(w.getByPlaceholder("Auto-generated if empty")).toBeVisible();
     await expect(w.getByPlaceholder("Uses session title if empty")).toHaveCount(0);
     await expect(w.getByPlaceholder("Optional, for organizing related sessions")).toHaveCount(0);
     await expect(w.getByRole("button", { name: "Base branch" })).toHaveCount(0);
   });
 
-  test("expanding More options reveals the title, worktree toggle, branch, attach toggle, and group", async ({
-    page,
-  }) => {
+  test("expanding More options reveals the worktree toggle, branch, attach toggle, and group", async ({ page }) => {
     await mockApis(page);
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
     await openWithProject(page);
     await expandMoreOptions(page);
     const w = wizard(page);
-    await expect(w.getByPlaceholder("Auto-generated if empty")).toBeVisible();
     // Worktree toggle defaults on.
     await expect(w.getByRole("switch", { name: /Create a worktree/ })).toHaveAttribute("aria-checked", "true");
     await expect(w.getByPlaceholder("Uses session title if empty")).toBeVisible();

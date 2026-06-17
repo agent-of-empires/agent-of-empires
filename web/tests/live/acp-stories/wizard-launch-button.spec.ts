@@ -25,9 +25,8 @@ base("Launch button on Review step creates the session", async ({ page }, testIn
     const wizard = page.getByTestId("session-wizard");
     await expect(wizard).toBeVisible({ timeout: 10_000 });
 
-    // Set the title under More options so the new row is easy to find in
-    // the sidebar.
-    await wizard.getByRole("button", { name: "More options" }).click();
+    // Set the always-visible title so the new row is easy to find in the
+    // sidebar.
     await wizard.getByPlaceholder("Auto-generated if empty").fill("story-launched-button");
 
     const before = await listSessions(serve.baseUrl);

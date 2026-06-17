@@ -355,6 +355,20 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
           <ProjectStep data={state.data} onChange={handleChange} initialTab={prefill?.initialTab} />
 
           <div>
+            <label className="block text-sm text-text-dim mb-1.5">Session title</label>
+            <input
+              type="text"
+              value={state.data.title}
+              onChange={(e) => handleChange("title", e.target.value)}
+              placeholder="Auto-generated if empty"
+              className="w-full bg-surface-900 border border-surface-700 rounded-lg px-3 py-2.5 text-base font-mono text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"
+            />
+            <p className="text-xs text-text-dim mt-1">
+              Shown in the dashboard. Renaming it later does not rename the git branch.
+            </p>
+          </div>
+
+          <div>
             <h2 className="text-lg font-semibold text-text-primary mb-1">Which AI agent?</h2>
             <p className="text-sm text-text-muted mb-5">Pick the coding assistant for this session.</p>
             <AgentPickerEssentials data={state.data} onChange={handleChange} agents={state.agents} />
