@@ -493,6 +493,21 @@ export function MobileLiveTerminal({
     returnToLive(rowsRef.current);
   }, [returnToLive, liveScrollTarget]);
 
+  // Tap anywhere on the terminal brings up the soft keyboard, so the user does
+  // not have to find the keyboard FAB. The focus() must be synchronous inside
+  // the click handler for iOS to honor the user-gesture requirement for showing
+  // the keyboard, so nothing async runs before it. The active-element check
+  // skips a redundant re-focus when the keyboard is already up, and a click that
+  // ends a text selection is left alone so select-to-copy still works (this view
+  // renders on desktop too). The FAB and "Back to live" button are siblings of
+  // the scroller, not descendants, so tapping them never reaches this handler.
+  const focusInputOnTap = useCallback(() => {
+    if (document.activeElement === inputRef.current) return;
+    const sel = window.getSelection();
+    if (sel && !sel.isCollapsed) return;
+    inputRef.current?.focus();
+  }, [inputRef]);
+
   // Map a viewport point to the app's 1-based pane cell for the forwarded
   // wheel event (apps mostly ignore the exact cell, but send a sane one).
   const pointerCell = useCallback(
@@ -826,6 +841,7 @@ export function MobileLiveTerminal({
         ref={scrollerRef}
         onScroll={onScroll}
         onWheel={onWheel}
+        onClick={focusInputOnTap}
         onTouchStart={onTouchStart}
         onTouchMove={onTouchMove}
         onTouchEnd={onTouchEnd}
