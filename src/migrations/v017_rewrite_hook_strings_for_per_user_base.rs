@@ -1,6 +1,6 @@
-//! Migration v016: rewrite previously-installed AoE hook shell strings to the
+//! Migration v017: rewrite previously-installed AoE hook shell strings to the
 //! per-user-base shape (issue #1844). This is the second hook-string rewrite
-//! in the AoE history; v015 hardened the in-shell guards and v016 changes the
+//! in the AoE history; v015 hardened the in-shell guards and v017 changes the
 //! base path baked into them from `/tmp/aoe-hooks` (world-known, multi-tenant
 //! exposed) to `/tmp/aoe-hooks-<euid>` host-side, plus a SELinux/ACL/xattr-
 //! tolerant mode pattern (`d*------|d*------.|d*------+|d*------@`) and an
@@ -25,7 +25,7 @@
 //!
 //! ## Failure policy
 //!
-//! Per `AGENTS.md > Data Migrations`, a returned `Err` aborts boot. v016
+//! Per `AGENTS.md > Data Migrations`, a returned `Err` aborts boot. v017
 //! never bubbles per-target failures (matches v015): every per-target
 //! issue surfaces as `tracing::warn!`, the schema-version still bumps so
 //! the migration runs at most once, and recovery is `aoe uninstall && aoe
@@ -34,7 +34,7 @@
 //! ## Sandbox image hooks
 //!
 //! Hooks baked into a Docker / Podman / Apple-Containers sandbox image are
-//! NOT rewritten by v016 (inherits the v015 limitation). Next image rebuild
+//! NOT rewritten by v017 (inherits the v015 limitation). Next image rebuild
 //! picks up the current canonical bytes. Defense-in-depth bound: container
 //! isolation already gates the multi-tenant threat we are addressing.
 
@@ -99,11 +99,11 @@ pub fn run() -> Result<()> {
 pub(crate) fn run_in(home: &Path, app_dir: &Path) -> Result<()> {
     let env_lists = collect_env_lists(app_dir);
     debug!(
-        target: "migrations.v016",
+        target: "migrations.v017",
         home = %home.display(),
         app_dir = %app_dir.display(),
         env_lists = env_lists.len(),
-        "v016: scanning hook targets"
+        "v017: scanning hook targets"
     );
 
     let mut rewritten = 0usize;
@@ -116,20 +116,20 @@ pub(crate) fn run_in(home: &Path, app_dir: &Path) -> Result<()> {
             Ok(()) => {
                 rewritten += 1;
                 info!(
-                    target: "migrations.v016",
+                    target: "migrations.v017",
                     agent = target.agent_name,
                     path = %target.path.display(),
-                    "v016: rewrote AoE hook entries to per-user-base canonical form"
+                    "v017: rewrote AoE hook entries to per-user-base canonical form"
                 );
             }
             Err(e) => {
                 any_failure = true;
                 warn!(
-                    target: "migrations.v016",
+                    target: "migrations.v017",
                     agent = target.agent_name,
                     path = %target.path.display(),
                     error = %e,
-                    "v016: skipped (rewrite failed)"
+                    "v017: skipped (rewrite failed)"
                 );
             }
         }
@@ -142,7 +142,7 @@ pub(crate) fn run_in(home: &Path, app_dir: &Path) -> Result<()> {
     // state for the failed targets.
     if any_failure {
         info!(
-            target: "migrations.v016",
+            target: "migrations.v017",
             "skipped legacy /tmp/aoe-hooks sweep: at least one rewrite failed; \
              the legacy directory is left for manual recovery"
         );
@@ -150,7 +150,7 @@ pub(crate) fn run_in(home: &Path, app_dir: &Path) -> Result<()> {
         sweep_legacy_base_in(&legacy_path());
     }
 
-    info!(target: "migrations.v016", count = rewritten, "v016: done");
+    info!(target: "migrations.v017", count = rewritten, "v017: done");
     Ok(())
 }
 
@@ -208,8 +208,8 @@ fn sweep_legacy_base_in(legacy: &Path) {
         Ok(fd) => fd,
         Err(Errno::ENOENT) => return,
         Err(e) => {
-            debug!(target: "migrations.v016",
-                "v016: skipped legacy {} sweep (open: {})", legacy.display(), e);
+            debug!(target: "migrations.v017",
+                "v017: skipped legacy {} sweep (open: {})", legacy.display(), e);
             return;
         }
     };
@@ -217,8 +217,8 @@ fn sweep_legacy_base_in(legacy: &Path) {
     let parent_st = match fstat(&dir_fd) {
         Ok(st) => st,
         Err(e) => {
-            warn!(target: "migrations.v016",
-                "v016: fstat legacy {} failed: {}", legacy.display(), e);
+            warn!(target: "migrations.v017",
+                "v017: fstat legacy {} failed: {}", legacy.display(), e);
             return;
         }
     };
@@ -227,14 +227,14 @@ fn sweep_legacy_base_in(legacy: &Path) {
     let dup = match dir_fd.try_clone() {
         Ok(fd) => fd,
         Err(e) => {
-            warn!(target: "migrations.v016", "v016: dup legacy fd: {}", e);
+            warn!(target: "migrations.v017", "v017: dup legacy fd: {}", e);
             return;
         }
     };
     let mut readdir = match nix::dir::Dir::from_fd(dup) {
         Ok(d) => d,
         Err(e) => {
-            warn!(target: "migrations.v016", "v016: Dir::from_fd legacy: {}", e);
+            warn!(target: "migrations.v017", "v017: Dir::from_fd legacy: {}", e);
             return;
         }
     };
@@ -258,21 +258,21 @@ fn sweep_legacy_base_in(legacy: &Path) {
         let st = match fstatat(dir_fd.as_fd(), name_str, AtFlags::AT_SYMLINK_NOFOLLOW) {
             Ok(st) => st,
             Err(e) => {
-                debug!(target: "migrations.v016", "v016: fstatat {}: {}", name_str, e);
+                debug!(target: "migrations.v017", "v017: fstatat {}: {}", name_str, e);
                 continue;
             }
         };
         if st.st_uid != euid {
-            debug!(target: "migrations.v016",
-                "v016: legacy {}/{} owned by uid={}, skipping (multi-tenant)",
+            debug!(target: "migrations.v017",
+                "v017: legacy {}/{} owned by uid={}, skipping (multi-tenant)",
                 legacy.display(), name_str, st.st_uid);
             continue;
         }
         match unlink_subtree(&dir_fd, name_str, &st) {
-            Ok(()) => debug!(target: "migrations.v016",
-                "v016: removed {}/{}", legacy.display(), name_str),
-            Err(e) => warn!(target: "migrations.v016",
-                "v016: failed to remove {}/{}: {}", legacy.display(), name_str, e),
+            Ok(()) => debug!(target: "migrations.v017",
+                "v017: removed {}/{}", legacy.display(), name_str),
+            Err(e) => warn!(target: "migrations.v017",
+                "v017: failed to remove {}/{}: {}", legacy.display(), name_str, e),
         }
     }
 
@@ -284,21 +284,21 @@ fn sweep_legacy_base_in(legacy: &Path) {
         let legacy_c = CString::new(legacy_str).expect("legacy path must not contain NUL");
         let rc = unsafe { nix::libc::rmdir(legacy_c.as_ptr()) };
         if rc == 0 {
-            info!(target: "migrations.v016", "v016: removed legacy {}", legacy.display());
+            info!(target: "migrations.v017", "v017: removed legacy {}", legacy.display());
         } else {
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() == Some(nix::libc::ENOTEMPTY) {
-                debug!(target: "migrations.v016",
-                    "v016: legacy {} non-empty (other-user entries remain)",
+                debug!(target: "migrations.v017",
+                    "v017: legacy {} non-empty (other-user entries remain)",
                     legacy.display());
             } else {
-                debug!(target: "migrations.v016",
-                    "v016: rmdir legacy {}: {}", legacy.display(), err);
+                debug!(target: "migrations.v017",
+                    "v017: rmdir legacy {}: {}", legacy.display(), err);
             }
         }
     } else {
-        debug!(target: "migrations.v016",
-            "v016: legacy {} owner uid={} != euid={}, leaving parent",
+        debug!(target: "migrations.v017",
+            "v017: legacy {} owner uid={} != euid={}, leaving parent",
             legacy.display(), parent_st.st_uid, euid);
     }
 }
@@ -354,9 +354,9 @@ fn unlink_subtree(
             Phase::Enter => {
                 if frame.depth >= MAX_DEPTH {
                     warn!(
-                        target: "migrations.v016",
+                        target: "migrations.v017",
                         depth = frame.depth,
-                        "v016: depth cap reached, leaving subtree intact"
+                        "v017: depth cap reached, leaving subtree intact"
                     );
                     continue;
                 }
@@ -441,7 +441,7 @@ fn unlink_subtree(
 
 /// Read `environment` arrays from raw TOML (global config + each profile).
 /// Mirror of v015's helper of the same shape; kept duplicated rather than
-/// shared so v015 cannot pull a regression in v016 and vice versa.
+/// shared so v015 cannot pull a regression in v017 and vice versa.
 fn collect_env_lists(app_dir: &Path) -> Vec<Vec<String>> {
     let mut out = Vec::new();
     if let Some(env) = read_environment_from_toml(&app_dir.join("config.toml")) {
@@ -482,7 +482,7 @@ mod tests {
     /// Pre-#1844 hardened bytes (post-v015): the form we are migrating
     /// AWAY from. Contains the `aoe-hooks` substring so `is_aoe_hook_command`
     /// flags it for rewrite.
-    const PRE_V016_STATUS_CMD: &str = "sh -c '[ -n \"$AOE_INSTANCE_ID\" ] || exit 0; \
+    const PRE_V017_STATUS_CMD: &str = "sh -c '[ -n \"$AOE_INSTANCE_ID\" ] || exit 0; \
         case \"$AOE_INSTANCE_ID\" in *[!0-9a-zA-Z_-]*) exit 0 ;; esac; \
         mkdir -p \"/tmp/aoe-hooks/$AOE_INSTANCE_ID\" 2>/dev/null; \
         printf running > \"/tmp/aoe-hooks/$AOE_INSTANCE_ID/status\" 2>/dev/null; \
@@ -538,25 +538,25 @@ mod tests {
         fs::write(path, serde_json::to_string_pretty(value).unwrap()).unwrap();
     }
 
-    fn pre_v016_claude_settings() -> Value {
+    fn pre_v017_claude_settings() -> Value {
         serde_json::json!({
             "hooks": {
                 "PreToolUse": [{
-                    "hooks": [{ "type": "command", "command": PRE_V016_STATUS_CMD }]
+                    "hooks": [{ "type": "command", "command": PRE_V017_STATUS_CMD }]
                 }]
             }
         })
     }
 
     /// Locks the canonical-form contract: every AoE-marked command in a
-    /// post-v016 settings file must contain the SELinux/ACL/xattr-tolerant
+    /// post-v017 settings file must contain the SELinux/ACL/xattr-tolerant
     /// mode pattern, the env-pinning preamble, and the per-user-base suffix.
-    fn assert_post_v016_canonical(claude: &Path) {
+    fn assert_post_v017_canonical(claude: &Path) {
         let parsed: Value = serde_json::from_str(&fs::read_to_string(claude).unwrap()).unwrap();
         let hooks = parsed["hooks"].as_object().expect("hooks present");
         assert!(
             !hooks.is_empty(),
-            "v016 wrote empty hooks on {}",
+            "v017 wrote empty hooks on {}",
             claude.display()
         );
         let mut status_writers = 0;
@@ -574,19 +574,19 @@ mod tests {
                     status_writers += 1;
                     assert!(
                         cmd.contains("drwx------|drwx------.|drwx------+|drwx------@"),
-                        "v016 must bake the strict 0700 mode pattern: {cmd}"
+                        "v017 must bake the strict 0700 mode pattern: {cmd}"
                     );
                     assert!(
                         cmd.contains("unset IFS")
                             && cmd.contains("umask 077")
                             && cmd.contains("LC_ALL=C ls -ldn"),
-                        "v016 must bake the env preamble: {cmd}"
+                        "v017 must bake the env preamble: {cmd}"
                     );
                     let euid = nix::unistd::geteuid().as_raw();
                     let suffix = format!("/tmp/aoe-hooks-{euid}");
                     assert!(
                         cmd.contains(&format!("B={suffix}")),
-                        "v016 must bake the per-user base: {cmd}"
+                        "v017 must bake the per-user base: {cmd}"
                     );
                 }
             }
@@ -600,15 +600,15 @@ mod tests {
 
     #[test]
     #[serial_test::serial(shell_env)]
-    fn rewrites_pre_v016_claude_settings_to_per_user_base() {
+    fn rewrites_pre_v017_claude_settings_to_per_user_base() {
         let _env = EnvGuard::unset_all();
         let (_tmp, home, app_dir) = setup_dirs();
         let claude = home.join(".claude").join("settings.json");
-        write_json(&claude, &pre_v016_claude_settings());
+        write_json(&claude, &pre_v017_claude_settings());
 
         run_in(&home, &app_dir).unwrap();
 
-        assert_post_v016_canonical(&claude);
+        assert_post_v017_canonical(&claude);
     }
 
     #[test]
@@ -644,14 +644,14 @@ mod tests {
         let _env = EnvGuard::unset_all();
         let (_tmp, home, app_dir) = setup_dirs();
         let claude = home.join(".claude").join("settings.json");
-        write_json(&claude, &pre_v016_claude_settings());
+        write_json(&claude, &pre_v017_claude_settings());
 
         run_in(&home, &app_dir).unwrap();
         let after_first = fs::read_to_string(&claude).unwrap();
         run_in(&home, &app_dir).unwrap();
         let after_second = fs::read_to_string(&claude).unwrap();
 
-        assert_eq!(after_first, after_second, "v016 must be byte-idempotent");
+        assert_eq!(after_first, after_second, "v017 must be byte-idempotent");
     }
 
     #[test]
@@ -662,7 +662,7 @@ mod tests {
         let (_tmp, home, app_dir) = setup_dirs();
 
         let claude = home.join(".claude").join("settings.json");
-        write_json(&claude, &pre_v016_claude_settings());
+        write_json(&claude, &pre_v017_claude_settings());
 
         let legacy = _tmp.path().join("legacy-aoe-hooks");
         fs::create_dir(&legacy).unwrap();
@@ -696,7 +696,7 @@ mod tests {
         let (_tmp, home, app_dir) = setup_dirs();
 
         let claude = home.join(".claude").join("settings.json");
-        write_json(&claude, &pre_v016_claude_settings());
+        write_json(&claude, &pre_v017_claude_settings());
 
         let legacy = _tmp.path().join("legacy-aoe-hooks-clean");
         fs::create_dir(&legacy).unwrap();
@@ -732,7 +732,7 @@ mod tests {
         std::os::unix::fs::symlink(&canary, &legacy_link).unwrap();
 
         let claude = home.join(".claude").join("settings.json");
-        write_json(&claude, &pre_v016_claude_settings());
+        write_json(&claude, &pre_v017_claude_settings());
         fs::set_permissions(_tmp.path().join("home"), fs::Permissions::from_mode(0o755)).ok();
 
         super::override_legacy_for_test(legacy_link.clone());
@@ -753,7 +753,7 @@ mod tests {
         let (_tmp, home, app_dir) = setup_dirs();
 
         let claude = home.join(".claude").join("settings.json");
-        write_json(&claude, &pre_v016_claude_settings());
+        write_json(&claude, &pre_v017_claude_settings());
 
         let sandbox_settings = home.join(".claude").join("sandbox").join("settings.json");
         let sandbox_baked = serde_json::json!({
@@ -761,7 +761,7 @@ mod tests {
                 "PreToolUse": [{
                     "hooks": [{
                         "type": "command",
-                        "command": PRE_V016_STATUS_CMD
+                        "command": PRE_V017_STATUS_CMD
                     }]
                 }]
             }
@@ -774,7 +774,7 @@ mod tests {
         let sandbox_after = fs::read_to_string(&sandbox_settings).unwrap();
         assert_eq!(
             sandbox_before, sandbox_after,
-            "v016 must not touch settings under .claude/sandbox/ (baked into image)"
+            "v017 must not touch settings under .claude/sandbox/ (baked into image)"
         );
     }
 }
