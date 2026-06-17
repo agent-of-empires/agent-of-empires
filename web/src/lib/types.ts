@@ -122,6 +122,13 @@ export interface SessionResponse {
   /** Reason the agent provided when scheduling the wakeup. Only set
    *  when `next_wakeup_at` is also set. */
   next_wakeup_reason?: string;
+  /** True when the acp session has an armed `Monitor` (a background
+   *  watch). Drives a static "monitoring" sidebar badge. Cleared once a
+   *  fresh user prompt lands after the monitor was armed. */
+  monitor_active?: boolean;
+  /** The `description` the agent gave the `Monitor` tool, shown as the
+   *  badge tooltip. Only set when `monitor_active` is true. */
+  monitor_description?: string;
 }
 
 export interface PlanSummary {

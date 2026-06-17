@@ -295,6 +295,25 @@ function WakeupCountdown({ wakeAt, reason }: { wakeAt: string; reason: string | 
   );
 }
 
+/** Sidebar chip shown while the agent has an armed `Monitor` (a
+ *  background watch). Unlike the wakeup chip there is no fire time, so this
+ *  is a static "monitoring" badge with no countdown. It persists across the
+ *  monitor's re-fires (those resume the agent without a user prompt) and
+ *  the underlying `monitor_active` field clears on the next user prompt. */
+function MonitorBadge({ description }: { description: string | null | undefined }) {
+  const title = description ? `Monitoring: ${description}` : "Monitoring a background job";
+  return (
+    <span
+      title={title}
+      aria-label={`Monitoring${description ? ` ${description}` : ""}`}
+      className="inline-flex shrink-0 items-center gap-0.5 rounded border border-violet-700/40 bg-violet-950/30 px-1 py-0 text-[10px] font-medium text-violet-300"
+    >
+      <span aria-hidden="true">👁</span>
+      monitoring
+    </span>
+  );
+}
+
 /** Compact duration formatting used by the wakeup chip: `45s`, `3m`,
  *  `1h 7m`. Drops sub-minute resolution above one minute since the chip
  *  is read at a glance. */
@@ -1002,6 +1021,7 @@ export const SessionRow = memo(function SessionRow({
               {firstSession?.next_wakeup_at && (
                 <WakeupCountdown wakeAt={firstSession.next_wakeup_at} reason={firstSession.next_wakeup_reason} />
               )}
+              {firstSession?.monitor_active && <MonitorBadge description={firstSession.monitor_description} />}
             </span>
             {subtitle && (
               <span className="block text-[11px] font-mono text-text-dim truncate" title={subtitleTitle ?? subtitle}>

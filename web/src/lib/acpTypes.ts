@@ -493,6 +493,7 @@ export type AcpEvent =
   | { AcpSessionAssigned: { acp_session_id: string } }
   | { SessionContextReset: { reason: string } }
   | { WakeupScheduled: { at: string; reason: string | null } }
+  | { MonitorArmed: { description: string | null } }
   | { PromptRejected: { reason: string; text: string } }
   | { AgentSwitched: { from: string; to: string; reason: string } };
 
@@ -718,6 +719,16 @@ export interface AcpState {
   /** Reason the agent provided when scheduling the wakeup. Shown in
    *  the structured view banner next to the countdown. */
   nextWakeupReason: string | null;
+  /** True when the agent has an armed `Monitor` (a background watch).
+   *  Unlike a scheduled wakeup it has no fire time, so the UI shows a
+   *  static "monitoring" badge, not a countdown. A monitor firing
+   *  re-invokes the agent with activity but never a `UserPromptSent`, so
+   *  this persists across re-fires and clears only on the next
+   *  `UserPromptSent` (the user takes over). */
+  monitorArmed: boolean;
+  /** The `description` the agent gave the `Monitor` tool, shown as the
+   *  badge tooltip. Null when none was provided or no monitor is armed. */
+  monitorDescription: string | null;
   /** True between a `CancelRequested` event (aoe sent `session/cancel`
    *  and armed the escalation watchdog) and the next `Stopped`. Drives
    *  the "Stopping..." spinner label and reveals the Force-stop
@@ -923,6 +934,8 @@ export function emptyAcpState(): AcpState {
     queuedPrompts: [],
     nextWakeupAt: null,
     nextWakeupReason: null,
+    monitorArmed: false,
+    monitorDescription: null,
     cancelling: false,
     cancelEscalatesAt: null,
     contextPrimerAvailable: null,
@@ -981,6 +994,11 @@ function applyNewTurnResets(next: AcpState): void {
       next.nextWakeupReason = null;
     }
   }
+  // A monitor has no fire time to gate on. Unlike a wakeup it never
+  // self-fires a prompt, so any UserPromptSent reaching here is the user
+  // taking over: clear the "monitoring" badge unconditionally.
+  next.monitorArmed = false;
+  next.monitorDescription = null;
   // Any pending context-primer offer is consumed once the user submits
   // a new prompt; the recovery affordance is one-shot.
   next.contextPrimerAvailable = null;
@@ -1716,6 +1734,11 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   if ("WakeupScheduled" in event) {
     next.nextWakeupAt = event.WakeupScheduled.at;
     next.nextWakeupReason = event.WakeupScheduled.reason ?? null;
+    return next;
+  }
+  if ("MonitorArmed" in event) {
+    next.monitorArmed = true;
+    next.monitorDescription = event.MonitorArmed.description ?? null;
     return next;
   }
   if ("CancelRequested" in event) {

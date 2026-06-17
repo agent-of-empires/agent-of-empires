@@ -475,6 +475,12 @@ function AcpChrome({
         !state.workerRestarting && (
           <ScheduledWakeupBanner wakeAt={state.nextWakeupAt} reason={state.nextWakeupReason} />
         )}
+      {state.monitorArmed &&
+        !state.nextWakeupAt &&
+        !state.turnActive &&
+        !state.startupError &&
+        !state.workerStopped &&
+        !state.workerRestarting && <MonitoringBanner description={state.monitorDescription} />}
       {state.lastError && <InteractionErrorBanner message={state.lastError} onDismiss={dismissError} />}
 
       <ThreadPrimitive.Root className="flex flex-1 flex-col min-h-0">
@@ -1579,6 +1585,26 @@ function ScheduledWakeupBanner({ wakeAt, reason }: { wakeAt: string; reason: str
       <span className="truncate">
         {label}
         {reason ? <span className="text-sky-300/70">: {reason}</span> : null}
+      </span>
+    </div>
+  );
+}
+
+/** Top-of-structured view chip shown while the agent has an armed
+ *  `Monitor` (a background watch). Unlike the wakeup banner there is no
+ *  fire time, so this is a static "monitoring" notice with no countdown.
+ *  Visible only when no turn is in flight (a firing monitor produces its
+ *  own busy chrome) and no other recovery banner is up; clears on the next
+ *  user prompt via `state.monitorArmed`. */
+function MonitoringBanner({ description }: { description: string | null }) {
+  return (
+    <div className="flex items-center gap-2 border-b border-violet-900/60 bg-violet-950/40 px-4 py-2 text-xs text-violet-200">
+      <span aria-hidden className="text-base leading-none">
+        👁
+      </span>
+      <span className="truncate">
+        Monitoring a background job
+        {description ? <span className="text-violet-300/70">: {description}</span> : null}
       </span>
     </div>
   );

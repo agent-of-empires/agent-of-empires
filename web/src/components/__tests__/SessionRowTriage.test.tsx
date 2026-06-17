@@ -138,6 +138,29 @@ describe("SessionRow chips", () => {
     expect(screen.queryByLabelText("Snoozed")).toBeNull();
   });
 
+  it("renders the monitoring badge when the first session has an armed monitor", () => {
+    // A monitor-parked session would otherwise look like a plain idle dot;
+    // the badge signals it is waiting on a background watch, not dead.
+    const ws = workspace("w-monitor", [session({ monitor_active: true, monitor_description: "clippy passes" })]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    const badge = screen.getByLabelText("Monitoring clippy passes");
+    expect(badge.textContent).toContain("monitoring");
+  });
+
+  it("renders no monitoring badge when no monitor is armed", () => {
+    const ws = workspace("w-none", [session()]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    expect(screen.queryByLabelText(/^Monitoring/)).toBeNull();
+  });
+
   it("renders the Archived chip when any session is archived", () => {
     const ws = workspace("w-archived", [session({ archived_at: "2026-01-01T00:00:00Z" })]);
     render(

@@ -1067,6 +1067,50 @@ describe("applyEvent / WakeupScheduled lifecycle", () => {
   });
 });
 
+describe("applyEvent / MonitorArmed lifecycle", () => {
+  it("MonitorArmed sets the monitoring badge with its description", () => {
+    const state = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: { MonitorArmed: { description: "clippy passes" } },
+    });
+    expect(state.monitorArmed).toBe(true);
+    expect(state.monitorDescription).toBe("clippy passes");
+  });
+
+  it("persists across agent activity with no user prompt", () => {
+    // A monitor firing re-invokes the agent with activity but never a
+    // UserPromptSent, so the badge must survive the resumed turn.
+    let state = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: { MonitorArmed: { description: "build" } },
+    });
+    state = applyEvent(state, { session_id: "s-1", seq: 2, event: "ThinkingStarted" });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 3,
+      event: { AgentMessageChunk: { text: "resuming" } },
+    });
+    expect(state.monitorArmed).toBe(true);
+  });
+
+  it("clears on the next user prompt (the user takes over)", () => {
+    let state = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: { MonitorArmed: { description: "watch" } },
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: { UserPromptSent: { text: "stop watching" } },
+    });
+    expect(state.monitorArmed).toBe(false);
+    expect(state.monitorDescription).toBeNull();
+  });
+});
+
 describe("applyEvent / CancelRequested lifecycle (#1727)", () => {
   function startedTurn() {
     // A turn must be active for cancelling to be meaningful.
