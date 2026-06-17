@@ -134,7 +134,12 @@ export function SessionStep({ data, onChange, embedded = false }: Props) {
 
           <label
             className="mt-3 flex items-center justify-between gap-3 p-3 bg-surface-900 border border-surface-700 rounded-lg cursor-pointer"
-            onClick={() => onChange("attachExisting", !data.attachExisting)}
+            onClick={(e) => {
+              // Skip the label handler for clicks on the Toggle itself; the
+              // switch already drives onChange, so handling both double-toggles.
+              if ((e.target as HTMLElement).closest('button[role="switch"]')) return;
+              onChange("attachExisting", !data.attachExisting);
+            }}
           >
             <div className="flex-1">
               <div className="text-sm font-medium text-text-primary">Attach to existing branch</div>
