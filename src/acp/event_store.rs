@@ -571,7 +571,7 @@ impl EventStore {
         let mut stmt = match conn.prepare(sql) {
             Ok(s) => s,
             Err(e) => {
-                warn!(target: "acp.event_store", "prepare replay_before for {session_id}: {e}");
+                warn!(target: "acp.event_store", "prepare replay_page_before for {session_id}: {e}");
                 return ReplayPage {
                     events: Vec::new(),
                     last_scanned_seq: None,
@@ -593,7 +593,7 @@ impl EventStore {
         let rows = match rows {
             Ok(r) => r,
             Err(e) => {
-                warn!(target: "acp.event_store", "query replay_before for {session_id}: {e}");
+                warn!(target: "acp.event_store", "query replay_page_before for {session_id}: {e}");
                 return ReplayPage {
                     events: Vec::new(),
                     last_scanned_seq: None,
