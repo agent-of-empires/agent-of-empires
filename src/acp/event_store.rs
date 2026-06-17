@@ -108,6 +108,16 @@ pub struct ReplayPage {
     pub lowest_seq: Option<u64>,
 }
 
+/// A user turn begins at one of these events. Backward replay paging
+/// (`replay_page_before`) aligns each page to one so the client never
+/// seams a split turn when it prepends older history.
+fn is_user_turn_boundary(ev: &Event) -> bool {
+    matches!(
+        ev,
+        Event::UserPromptSent { .. } | Event::UserDiffCommentsPrompt { .. }
+    )
+}
+
 /// Highest seq stored for `session_id`, or 0 if none. Free fn so both
 /// the public [`EventStore::highest_seq`] and the single-snapshot
 /// [`EventStore::replay_page`] can share it under one held lock.
@@ -626,6 +636,28 @@ impl EventStore {
         }
         // Scanned newest-first; callers expect oldest-first.
         out.reverse();
+        // Align the page to a user-turn boundary so the client can reduce
+        // it in isolation and prepend it without seaming a split turn onto
+        // the already-loaded head. Only when `has_more`: a leading partial
+        // turn belongs to an older turn whose start is in the next page, so
+        // drop it here and let the next `before` re-fetch it. When the page
+        // reached session start (`!has_more`) keep everything, so the very
+        // first turn and the pinned handshake snapshot (#1049) survive on a
+        // short session that loads in one page. The giant-single-turn case
+        // (no boundary in the whole window) keeps the window as-is rather
+        // than returning an empty page and trapping the client's paging loop.
+        if has_more {
+            if let Some(i) = out
+                .iter()
+                .position(|(_, ev)| is_user_turn_boundary(ev))
+                .filter(|&i| i > 0)
+            {
+                out.drain(0..i);
+            }
+        }
+        // Cursor for the next-older page is the lowest seq we kept, so a
+        // trimmed leading turn re-loads contiguously on the next request.
+        last_scanned_seq = out.first().map(|(seq, _)| *seq).or(last_scanned_seq);
         trace!(
             target: "acp.event_store",
             session = %session_id,
@@ -2870,5 +2902,48 @@ mod tests {
         let none = store.replay_page_before("s-1", 1, Some(10));
         assert!(none.events.is_empty());
         assert!(!none.has_more);
+    }
+
+    #[test]
+    fn replay_page_before_trims_leading_partial_turn_to_boundary() {
+        let (_tmp, store) = open_store(1000);
+        // seq 1: handshake-ish, 2: prompt A, 3-4: A's turn, 5: prompt B,
+        // 6-7: B's turn.
+        store
+            .record(
+                "s-1",
+                1,
+                &Event::PromptCapabilities {
+                    image: true,
+                    audio: false,
+                    embedded_context: true,
+                },
+            )
+            .unwrap();
+        let prompt = |t: &str| Event::UserPromptSent {
+            text: t.into(),
+            attachments: vec![],
+        };
+        store.record("s-1", 2, &prompt("A")).unwrap();
+        store.record("s-1", 3, &Event::ThinkingStarted).unwrap();
+        store.record("s-1", 4, &Event::ThinkingStarted).unwrap();
+        store.record("s-1", 5, &prompt("B")).unwrap();
+        store.record("s-1", 6, &Event::ThinkingStarted).unwrap();
+        store.record("s-1", 7, &Event::ThinkingStarted).unwrap();
+
+        // Tail of 4 frames would be seq 4..7, but seq 4 is mid-turn A.
+        // With has_more, the page is trimmed to start at prompt B (seq 5).
+        let tail = store.replay_page_before("s-1", u64::MAX, Some(4));
+        let seqs: Vec<u64> = tail.events.iter().map(|(seq, _)| *seq).collect();
+        assert_eq!(seqs, vec![5, 6, 7], "leading partial turn A trimmed");
+        assert!(tail.has_more);
+        assert_eq!(tail.last_scanned_seq, Some(5), "cursor is boundary B");
+
+        // Next page (before=5) reaches session start: keep everything,
+        // including the seq-1 handshake, so a one-page load isn't stripped.
+        let older = store.replay_page_before("s-1", 5, Some(10));
+        let seqs: Vec<u64> = older.events.iter().map(|(seq, _)| *seq).collect();
+        assert_eq!(seqs, vec![1, 2, 3, 4]);
+        assert!(!older.has_more);
     }
 }
