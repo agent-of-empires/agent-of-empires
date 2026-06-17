@@ -15,7 +15,7 @@ function loadExpanded(): boolean {
 
 interface ProjectsSectionProps {
   // No-session registered projects, one entry per path (scopes collapsed),
-  // carrying alias/color. Sourced from useRepoGroups().emptyProjects.
+  // carrying alias/color. Sourced from useRepoGroups().savedProjects.
   projects: RepoGroup[];
   // The active sidebar filter query (already lowercased + trimmed). Empty
   // string means no filter.

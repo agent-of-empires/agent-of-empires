@@ -2231,7 +2231,13 @@ export function WorkspaceSidebar({
         .filter((ng) => ng.subgroups.length > 0)
     : nestedGroups;
 
-  const hasResults = isNested ? filteredNested.length > 0 : filteredGroups.length > 0;
+  // A filter query that matches only a saved project (no live session) still
+  // populates the Projects section, so it must not trigger the "No matches"
+  // empty state below it. The no-query empty state ("No sessions yet") is left
+  // alone: saved projects are not sessions.
+  const savedProjectsMatchQuery =
+    !!q && savedProjects.some((p) => p.displayName.toLowerCase().includes(q) || p.repoPath.toLowerCase().includes(q));
+  const hasResults = (isNested ? filteredNested.length > 0 : filteredGroups.length > 0) || savedProjectsMatchQuery;
 
   // Sidebar multi-select. Selection is ephemeral sidebar UI state (not routed
   // or persisted); the anchor pivots Shift+click ranges. See #1724.
