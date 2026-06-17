@@ -6255,11 +6255,19 @@ mod tests {
             wall,
             cfg,
         );
-        // WakeupPending clears cost_seen and sets off-protocol work, so
-        // the clean-completion guard (cost_seen && off_protocol none) is
-        // false: a scheduled-wake turn never takes the prompt_complete
-        // shortcut.
-        assert!(!w.cost_seen());
+        // Now apply the end-of-turn cost marker. TerminalUsage sets
+        // cost_seen, but (unlike a backgrounded command, #1858) a scheduled
+        // wakeup is NOT dropped, so off-protocol work stays set. This is the
+        // "with cost" case the test name promises: the clean-completion guard
+        // (cost_seen && off_protocol none) is still false, so a scheduled-wake
+        // turn keeps the orphan path even once its cost usage lands.
+        w.apply_signal(
+            LifecycleSignal::TerminalUsage,
+            t0 + std::time::Duration::from_secs(2),
+            wall,
+            cfg,
+        );
+        assert!(w.cost_seen());
         assert!(w.off_protocol_work_seen().is_some());
     }
 
