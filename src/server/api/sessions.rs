@@ -3795,6 +3795,12 @@ pub async fn ensure_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    // Serialize concurrent ensure calls for the same session. The decision
+    // phase reads tmux state and the restart phase mutates it; any other
+    // ensure for this id must wait so both see a consistent view.
+    let inst_lock = state.instance_lock(&id).await;
+    let _guard = inst_lock.lock().await;
+
     let instances = state.instances.read().await;
     let Some(instance) = instances.iter().find(|i| i.id == id).cloned() else {
         return (
@@ -3804,12 +3810,6 @@ pub async fn ensure_session(
             .into_response();
     };
     drop(instances);
-
-    // Serialize concurrent ensure calls for the same session. The decision
-    // phase reads tmux state and the restart phase mutates it; any other
-    // ensure for this id must wait so both see a consistent view.
-    let inst_lock = state.instance_lock(&id).await;
-    let _guard = inst_lock.lock().await;
 
     // Inspect tmux + make the restart decision on a blocking thread. Refresh
     // the cache first so rapid re-calls see the true current state (the
@@ -5621,6 +5621,51 @@ mod tests {
         assert!(create_source.contains("std::path::Path::new(&body.path)"));
         assert!(!create_source[validation..spawn_blocking].contains("command_override"));
     }
+
+    #[test]
+    fn ensure_session_refreshes_instance_after_instance_lock() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/server/api/sessions.rs"),
+        )
+        .unwrap();
+        let start = source.find("pub async fn ensure_session").unwrap();
+        let end = source.find("pub async fn ensure_terminal").unwrap();
+        let ensure_source = &source[start..end];
+        let lock = ensure_source
+            .find("let inst_lock = state.instance_lock(&id).await")
+            .unwrap();
+        let read = ensure_source
+            .find("let instances = state.instances.read().await")
+            .unwrap();
+        let sync_base = ensure_source
+            .find("let sync_base = instance.clone()")
+            .unwrap();
+
+        assert!(lock < read);
+        assert!(read < sync_base);
+    }
+
+    #[test]
+    fn send_message_refreshes_instance_after_instance_lock() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/server/api/sessions.rs"),
+        )
+        .unwrap();
+        let start = source.find("pub async fn send_message").unwrap();
+        let send_source = &source[start..];
+        let lock = send_source
+            .find("let inst_lock = state.instance_lock(&id).await")
+            .unwrap();
+        let read = send_source
+            .find("let instances = state.instances.read().await")
+            .unwrap();
+        let sync_base = send_source
+            .find("let sync_base = instance.clone()")
+            .unwrap();
+
+        assert!(lock < read);
+        assert!(read < sync_base);
+    }
     // ── validate_diff_path: security regression tests ──────────────────────────
     //
     // Regression for a path-traversal vulnerability in the first cut of the
@@ -6261,6 +6306,13 @@ pub async fn send_message(
             .into_response();
     }
 
+    // Serialize concurrent sends (and other tmux mutations) for this id.
+    // Without this, two POSTs racing against the same session would issue
+    // overlapping `tmux send-keys -l` invocations and the bytes can interleave
+    // inside the pane.
+    let inst_lock = state.instance_lock(&id).await;
+    let _guard = inst_lock.lock().await;
+
     let instances = state.instances.read().await;
     let Some(instance) = instances.iter().find(|i| i.id == id).cloned() else {
         return (
@@ -6270,13 +6322,6 @@ pub async fn send_message(
             .into_response();
     };
     drop(instances);
-
-    // Serialize concurrent sends (and other tmux mutations) for this id.
-    // Without this, two POSTs racing against the same session would issue
-    // overlapping `tmux send-keys -l` invocations and the bytes can interleave
-    // inside the pane.
-    let inst_lock = state.instance_lock(&id).await;
-    let _guard = inst_lock.lock().await;
 
     let sync_base = instance.clone();
     let tool = instance.tool.clone();
