@@ -52,6 +52,7 @@ import {
   createProject,
   deleteProject,
   updateProject,
+  setProjectPinned,
   fetchDockerStatus,
   createSession,
   cloneRepo,
@@ -900,6 +901,45 @@ describe("updateProject", () => {
   it("returns a network error on a thrown fetch", async () => {
     fetchSpy.mockRejectedValueOnce(new Error("offline"));
     const result = await updateProject("p", "global", "x");
+    expect(result).toEqual({ ok: false, error: "offline" });
+  });
+});
+
+describe("setProjectPinned", () => {
+  it("PATCHes the pinned flag and returns the project on 200", async () => {
+    fetchSpy.mockResolvedValueOnce(jsonResponse({ name: "p", pinned: false }));
+    const result = await setProjectPinned("p", "global", false);
+    expect(result.ok).toBe(true);
+    expect(result.project).toEqual({ name: "p", pinned: false });
+    const [url, init] = lastCall();
+    expect(url).toBe("/api/projects/p?scope=global");
+    expect(init?.method).toBe("PATCH");
+    expect(bodyOf(init)).toEqual({ pinned: false });
+  });
+
+  it("encodes the name and forwards the profile scope", async () => {
+    fetchSpy.mockResolvedValueOnce(jsonResponse({ name: "a b", pinned: true }));
+    await setProjectPinned("a b", "profile", true);
+    expect(lastCall()[0]).toBe("/api/projects/a%20b?scope=profile");
+    expect(bodyOf(lastCall()[1])).toEqual({ pinned: true });
+  });
+
+  it("returns a parsed error on a JSON error body", async () => {
+    fetchSpy.mockResolvedValueOnce(new Response(JSON.stringify({ message: "nope" }), { status: 404 }));
+    const result = await setProjectPinned("p", "global", true);
+    expect(result).toEqual({ ok: false, error: "nope" });
+  });
+
+  it("falls back to the raw text on a non-JSON error body", async () => {
+    fetchSpy.mockResolvedValueOnce(new Response("boom", { status: 500 }));
+    const result = await setProjectPinned("p", "global", true);
+    expect(result.ok).toBe(false);
+    expect(result.error).toBe("boom");
+  });
+
+  it("returns a network error on a thrown fetch", async () => {
+    fetchSpy.mockRejectedValueOnce(new Error("offline"));
+    const result = await setProjectPinned("p", "global", true);
     expect(result).toEqual({ ok: false, error: "offline" });
   });
 });

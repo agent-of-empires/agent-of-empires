@@ -16,7 +16,7 @@ import {
   Archive,
   ArrowLeftRight,
   CircleStop,
-  GripVertical,
+  Folder,
   Hourglass,
   Layers,
   Moon,
@@ -478,6 +478,7 @@ type DragHandleProps = {
   setActivatorNodeRef: (el: HTMLElement | null) => void;
   attributes: ReturnType<typeof useSortable>["attributes"];
   listeners: ReturnType<typeof useSortable>["listeners"];
+  isDragging: boolean;
 };
 
 // Sortable wrapper around an entire repo-group block (header + its rows),
@@ -509,7 +510,7 @@ function SortableRepoGroup({
       style={style}
       className={"transition-shadow duration-150 " + (isDragging ? "ring-2 ring-inset ring-brand-500 shadow-lg" : "")}
     >
-      {children({ setActivatorNodeRef, attributes, listeners })}
+      {children({ setActivatorNodeRef, attributes, listeners, isDragging })}
     </div>
   );
 }
@@ -1625,7 +1626,7 @@ export function SnoozeModal({
   );
 }
 
-const SidebarGroupHeader = memo(function SidebarGroupHeader({
+export const SidebarGroupHeader = memo(function SidebarGroupHeader({
   group,
   hasActiveChild,
   onClick,
@@ -1681,6 +1682,30 @@ const SidebarGroupHeader = memo(function SidebarGroupHeader({
   const dotClass = STATUS_DOT_CLASS[group.status === "active" ? "Running" : "Idle"] ?? "bg-status-idle";
   const headerStyle = repoColorStyle(group.color);
   const headerHoverClass = group.color ? "" : "hover:bg-surface-800/50";
+  const sessionCount = group.workspaces.reduce((n, v) => n + v.workspace.sessions.length, 0);
+
+  // The whole header row is the drag activator now (no grip handle), so a
+  // drag ends with the pointer over one of the row's controls. Suppress the
+  // trailing click for a beat after a drag so reordering a group doesn't also
+  // collapse it or fire the New Session button. The window stays open for the
+  // whole drag (Infinity), so even a multi-second drag can't leak the click,
+  // then closes 250ms after release. Enforced row-wide via onClickCapture so
+  // every control is covered, not just the toggle.
+  const dragSuppressRef = useRef(0);
+  const isDragging = dragHandle?.isDragging ?? false;
+  useEffect(() => {
+    if (isDragging) {
+      dragSuppressRef.current = Number.POSITIVE_INFINITY;
+    } else if (dragSuppressRef.current > Date.now()) {
+      dragSuppressRef.current = Date.now() + 250;
+    }
+  }, [isDragging]);
+  const suppressClickAfterDrag = (e: React.MouseEvent) => {
+    if (dragSuppressRef.current > Date.now()) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+  };
 
   const openMenuAt = useCallback((x: number, y: number) => {
     closeOtherContextMenus();
@@ -1758,6 +1783,7 @@ const SidebarGroupHeader = memo(function SidebarGroupHeader({
       <div
         data-testid="sidebar-group-header"
         data-group-id={group.id}
+        data-draggable={dragHandle ? "true" : undefined}
         tabIndex={hasMenu ? 0 : undefined}
         aria-haspopup={hasMenu ? "menu" : undefined}
         aria-label={
@@ -1772,53 +1798,58 @@ const SidebarGroupHeader = memo(function SidebarGroupHeader({
             : undefined
         }
         onKeyDown={hasMenu ? handleHeaderKeyDown : undefined}
-        className={`flex items-center gap-2 px-3 py-2 transition-colors duration-75 text-text-secondary focus:outline-none focus:ring-2 focus:ring-brand-600 ${headerHoverClass} ${
+        onClickCapture={suppressClickAfterDrag}
+        className={`group flex items-center gap-2 px-3 py-2 transition-colors duration-75 text-text-secondary focus:outline-none focus:ring-2 focus:ring-brand-600 ${headerHoverClass} ${
           hasActiveChild ? "border-l-2 border-brand-600" : ""
         }`}
         style={headerStyle}
+        // The whole row is the drag activator (no grip). Mirrors SessionRow:
+        // spread only `listeners` (pointer-down), not dnd-kit's `attributes`,
+        // which would inject a role/tabIndex that collide with the context
+        // menu wiring. Keyboard drag isn't supported, matching session rows.
+        ref={dragHandle?.setActivatorNodeRef}
+        {...dragHandle?.listeners}
       >
-        {/* eslint-disable react-hooks/refs -- dnd-kit's DragHandleProps bundles
-            setActivatorNodeRef (a ref-setter callback) alongside plain
-            attributes/listeners objects; the rule incorrectly taints every
-            property access on the whole object as a "ref value read during
-            render". None of these touch .current, so it's a false positive. */}
-        {dragHandle && (
-          <button
-            ref={dragHandle.setActivatorNodeRef}
-            type="button"
-            aria-label={`Reorder project ${group.displayName}`}
-            data-testid="sidebar-group-drag-handle"
-            className="shrink-0 -ml-1 flex h-5 w-4 items-center justify-center text-text-dim hover:text-text-secondary cursor-grab active:cursor-grabbing touch-none"
-            {...dragHandle.attributes}
-            {...dragHandle.listeners}
-          >
-            <GripVertical className="h-3.5 w-3.5" />
-          </button>
-        )}
-        {/* eslint-enable react-hooks/refs */}
         <span className={`w-2 h-2 rounded-full shrink-0 ${dotClass}`} />
         <button
           onClick={onClick}
           aria-expanded={!group.collapsed}
           className="flex items-center gap-2 flex-1 min-w-0 text-left cursor-pointer"
         >
-          <svg
-            width="10"
-            height="10"
-            viewBox="0 0 10 10"
-            fill="currentColor"
-            className={`shrink-0 text-text-dim transition-transform duration-75 ${group.collapsed ? "-rotate-90" : ""}`}
-          >
-            <path
-              d="M2 3 L5 6.5 L8 3"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="1.5"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            />
-          </svg>
-          <OwnerAvatar owner={group.remoteOwner} size={16} />
+          <span className="relative h-4 w-4 shrink-0">
+            <span
+              data-testid="sidebar-group-icon"
+              className="absolute inset-0 flex items-center justify-center transition-opacity duration-75 group-hover:opacity-0 group-focus-within:opacity-0"
+            >
+              {group.remoteOwner ? (
+                <OwnerAvatar owner={group.remoteOwner} size={16} />
+              ) : (
+                <Folder className="h-3.5 w-3.5 text-text-dim" />
+              )}
+            </span>
+            <span
+              data-testid="sidebar-group-fold-chevron"
+              className="absolute inset-0 flex items-center justify-center opacity-0 transition-opacity duration-75 group-hover:opacity-100 group-focus-within:opacity-100"
+            >
+              <svg
+                width="10"
+                height="10"
+                viewBox="0 0 10 10"
+                fill="currentColor"
+                aria-hidden="true"
+                className={`text-text-dim transition-transform duration-75 ${group.collapsed ? "-rotate-90" : ""}`}
+              >
+                <path
+                  d="M2 3 L5 6.5 L8 3"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.5"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              </svg>
+            </span>
+          </span>
           {group.pinned && (
             <span
               className="shrink-0 text-[10px] leading-none text-text-dim"
@@ -1831,6 +1862,9 @@ const SidebarGroupHeader = memo(function SidebarGroupHeader({
           )}
           <span className="text-[13px] md:text-[14px] font-medium truncate flex-1" title={headerTitle}>
             {group.displayName}
+          </span>
+          <span className="shrink-0 text-[12px] tabular-nums text-text-dim" data-testid="sidebar-group-session-count">
+            ({sessionCount})
           </span>
         </button>
         <Tooltip text={offline ? OFFLINE_TITLE : "New session"}>

@@ -58,14 +58,18 @@ fn worktree_rename_block(
 impl HomeView {
     /// Pin or unpin the project header under the cursor (project view only).
     ///
-    /// Pinning registers the repo in the global project registry (the same
-    /// store the WebUI writes), so the project keeps its header in project
-    /// view even after its last session is deleted. Unpinning removes the
-    /// registry entry; a project with no remaining sessions then disappears.
+    /// Pinning keeps the repo's header in project view even after its last
+    /// session is gone: it registers the repo if needed (the same global
+    /// registry the WebUI writes) and sets its `pinned` flag. Unpinning clears
+    /// the flag but KEEPS the registry entry, so the project stays a saved
+    /// project (still in the Projects view and the new-session wizard); its
+    /// header just drops once it has no sessions. Only an explicit remove (the
+    /// projects dialog) deletes the entry. See #2208.
     ///
-    /// The registry is the shared persistence layer: this goes through the
-    /// same `projects::add` / `projects::remove` the web API and the projects
-    /// dialog use, so canonicalization and conflict rules stay in one place.
+    /// The registry is the shared persistence layer, so this goes through the
+    /// same `projects::add` / `projects::set_pinned` the web API and the
+    /// projects dialog use; canonicalization and conflict rules stay in one
+    /// place.
     pub(super) fn toggle_project_pin_at_cursor(&mut self) {
         use crate::session::{projects, Project, ProjectScope};
         use crate::tui::dialogs::InfoDialog;
@@ -82,7 +86,7 @@ impl HomeView {
         if self.is_project_label_pinned(&label) {
             // Unpin. Prefer the registry entry whose canonical path matches the
             // header's own repo. An empty header has no session path, so fall
-            // back to the basename match (it exists only because a registered
+            // back to the basename match (it exists only because a pinned
             // project carries that basename; two such empties share one header
             // and clear one per press).
             let existing = match &header_path {
@@ -99,50 +103,13 @@ impl HomeView {
             let Some(existing) = existing else {
                 return;
             };
-            // Unpin means "this repo is no longer pinned anywhere", so clear
-            // every registry entry for its canonical path rather than just the
-            // one `load_merged` happened to surface. A path can sit in more than
-            // one scope at once (`--allow-override` lets a profile entry shadow
-            // a global one); removing only the visible entry would re-surface
-            // the shadowed one and leave the header pinned after a "success"
-            // dialog. `registered_projects` also drops which profile each entry
-            // came from in all-profiles mode, and `config_profile()` is only
-            // the default, so sweep the global file plus every loaded profile.
             let target = existing.path.clone();
-            let mut profiles: Vec<String> = self.storages.keys().cloned().collect();
-            if !profiles.contains(&profile) {
-                profiles.push(profile.clone());
-            }
-            // Global lives in one shared file, so the profile arg is irrelevant.
-            let mut removals = vec![projects::remove(&profile, ProjectScope::Global, &target)];
-            for p in &profiles {
-                removals.push(projects::remove(p, ProjectScope::Profile, &target));
-            }
-            let mut removed_any = false;
-            let mut hard_err: Option<projects::RegistryError> = None;
-            for res in removals {
-                match res {
-                    Ok(_) => removed_any = true,
-                    Err(projects::RegistryError::NotFound(_)) => {}
-                    Err(e) => hard_err = Some(e),
-                }
-            }
-            // Surface a real I/O/parse failure even if some entry was removed;
-            // a partial unpin the user can't see is worse than a visible error.
-            let result: Result<(), projects::RegistryError> = match (hard_err, removed_any) {
-                (Some(e), _) => Err(e),
-                (None, true) => Ok(()),
-                (None, false) => Err(projects::RegistryError::NotFound(format!(
-                    "No pinned project '{}' found in any loaded scope",
-                    label
-                ))),
-            };
-            match result {
+            match self.set_project_pinned_all_scopes(&target, &profile, false) {
                 Ok(_) => {
                     self.info_dialog = Some(InfoDialog::new(
                         "Project Unpinned",
                         &format!(
-                            "'{}' is no longer pinned. It will drop from project view once it has no sessions.",
+                            "'{}' is no longer pinned. It stays a saved project; its header drops from project view once it has no sessions.",
                             label
                         ),
                     ));
@@ -157,12 +124,28 @@ impl HomeView {
         } else {
             // Pin the repo backing this header. An unpinned header always has at
             // least one live session (an empty header is pinned by
-            // construction), so its repo path is known.
+            // construction), so its repo path is known. If the repo is already
+            // saved (registered but not pinned), flip its flag; otherwise
+            // register it pinned.
             let Some(repo_path) = header_path else {
                 return;
             };
-            let project = Project::new(label.clone(), repo_path, ProjectScope::Global);
-            match projects::add(&profile, ProjectScope::Global, project, false) {
+            let already_registered = self
+                .registered_projects
+                .iter()
+                .any(|p| projects::canonical_key(&p.path) == repo_path);
+            let result = if already_registered {
+                self.set_project_pinned_all_scopes(&repo_path, &profile, true)
+            } else {
+                projects::add(
+                    &profile,
+                    ProjectScope::Global,
+                    Project::new(label.clone(), repo_path, ProjectScope::Global).with_pinned(true),
+                    false,
+                )
+                .map(|_| ())
+            };
+            match result {
                 Ok(_) => {
                     self.info_dialog = Some(InfoDialog::new(
                         "Project Pinned",
@@ -184,6 +167,60 @@ impl HomeView {
         self.refresh_registered_projects();
         self.flat_items = self.build_flat_items();
         self.update_selected();
+    }
+
+    /// Set the `pinned` flag on every registry entry for `target_path`'s
+    /// canonical path, across the global file and every loaded profile (plus
+    /// the default profile). A path can be registered in more than one scope at
+    /// once (`--allow-override` lets a profile entry shadow a global one), and
+    /// `registered_projects` drops which profile each entry came from in
+    /// all-profiles mode, so a single visible entry is not enough. `NotFound`
+    /// per scope is ignored; a real I/O/parse failure is surfaced even if
+    /// another scope updated, since a partial toggle the user can't see is
+    /// worse than a visible error; no match anywhere is `NotFound`. See #2208.
+    fn set_project_pinned_all_scopes(
+        &self,
+        target_path: &str,
+        profile: &str,
+        pinned: bool,
+    ) -> Result<(), crate::session::projects::RegistryError> {
+        use crate::session::{projects, ProjectScope};
+        let mut profiles: Vec<String> = self.storages.keys().cloned().collect();
+        if !profiles.iter().any(|p| p == profile) {
+            profiles.push(profile.to_string());
+        }
+        // Global lives in one shared file, so the profile arg is irrelevant.
+        let mut updates = vec![projects::set_pinned(
+            profile,
+            ProjectScope::Global,
+            target_path,
+            pinned,
+        )];
+        for p in &profiles {
+            updates.push(projects::set_pinned(
+                p,
+                ProjectScope::Profile,
+                target_path,
+                pinned,
+            ));
+        }
+        let mut updated_any = false;
+        let mut hard_err: Option<projects::RegistryError> = None;
+        for res in updates {
+            match res {
+                Ok(_) => updated_any = true,
+                Err(projects::RegistryError::NotFound(_)) => {}
+                Err(e) => hard_err = Some(e),
+            }
+        }
+        match (hard_err, updated_any) {
+            (Some(e), _) => Err(e),
+            (None, true) => Ok(()),
+            (None, false) => Err(projects::RegistryError::NotFound(format!(
+                "No project for path '{}' found in any loaded scope",
+                target_path
+            ))),
+        }
     }
 
     pub(super) fn create_session(&mut self, data: NewSessionData) -> anyhow::Result<String> {

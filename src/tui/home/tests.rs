@@ -6279,7 +6279,7 @@ fn pinned_project_without_sessions_shows_empty_header() {
     projects::add(
         "test",
         ProjectScope::Global,
-        Project::new("gamma", "/repos/gamma", ProjectScope::Global),
+        Project::new("gamma", "/repos/gamma", ProjectScope::Global).with_pinned(true),
         false,
     )
     .unwrap();
@@ -6334,9 +6334,17 @@ fn p_key_pins_project_on_header() {
     // The pin path must not open the projects dialog (the chord is shared).
     assert!(env.view.projects_dialog.is_none());
 
-    // Unpinning (a second toggle) drops the registry entry.
+    // Unpinning (a second toggle) clears the pin but KEEPS the saved project,
+    // so the entry stays in the registry (only an explicit remove deletes it).
+    // See #2208.
     env.view.toggle_project_pin_at_cursor();
     assert!(!env.view.is_project_label_pinned("alpha"));
+    // The specific entry is kept (not just "registry non-empty") with its pin
+    // flag cleared: unpin keeps the saved project, only Remove deletes it.
+    let after = crate::session::projects::load_global().unwrap();
+    assert_eq!(after.len(), 1, "unpin must keep the registry entry");
+    assert_eq!(after[0].name, "alpha");
+    assert!(!after[0].pinned, "unpin must clear the pin flag");
 }
 
 /// Off a project header (here: in Manual grouping), `p` keeps its original
@@ -6473,10 +6481,11 @@ fn stale_registry_entry_with_mismatched_archived_path_stays_pinned_and_unpinnabl
         .unwrap();
 
     // Stale registry entry: same basename, different (nonexistent) path.
+    // Pinned, so it surfaces as an empty header (#2208).
     projects::add(
         "test",
         ProjectScope::Global,
-        Project::new("otari", "/repos/otari", ProjectScope::Global),
+        Project::new("otari", "/repos/otari", ProjectScope::Global).with_pinned(true),
         false,
     )
     .unwrap();
@@ -6526,10 +6535,11 @@ fn stale_registry_entry_with_mismatched_archived_path_stays_pinned_and_unpinnabl
         "unpin must drop the empty header from the main flow; got {:?}",
         view.flat_items
     );
-    assert!(
-        projects::load_global().unwrap().is_empty(),
-        "unpin must remove the stale registry entry"
-    );
+    // Unpin clears the flag but KEEPS the saved project (#2208): the entry
+    // survives, now unpinned, so it stays in the Projects view / wizard.
+    let after = projects::load_global().unwrap();
+    assert_eq!(after.len(), 1, "unpin must keep the registry entry");
+    assert!(!after[0].pinned, "unpin must clear the pin flag");
     // The archived session itself is untouched; it stays under Archived.
     assert!(
         view.flat_items
@@ -6700,7 +6710,7 @@ fn all_profiles_view_includes_profile_scoped_pins() {
     projects::add(
         "beta",
         ProjectScope::Profile,
-        Project::new("lonely", "/repos/lonely", ProjectScope::Profile),
+        Project::new("lonely", "/repos/lonely", ProjectScope::Profile).with_pinned(true),
         false,
     )
     .unwrap();
@@ -6759,7 +6769,7 @@ fn unpin_profile_scoped_pin_from_all_profiles_clears_header() {
     projects::add(
         "beta",
         ProjectScope::Profile,
-        Project::new("lonely", "/repos/lonely", ProjectScope::Profile),
+        Project::new("lonely", "/repos/lonely", ProjectScope::Profile).with_pinned(true),
         false,
     )
     .unwrap();
@@ -6782,10 +6792,13 @@ fn unpin_profile_scoped_pin_from_all_profiles_clears_header() {
         !view.is_project_label_pinned("lonely"),
         "lonely must read as unpinned after the toggle"
     );
-    // The entry is gone from beta's on-disk registry, not just the in-memory view.
+    // The unpin must clear the flag on beta's on-disk entry (not the default
+    // profile's), but KEEP the entry: it stays a saved project. See #2208.
+    let beta_after = projects::load_profile("beta").unwrap();
+    assert_eq!(beta_after.len(), 1, "the profile-scoped entry must be kept");
     assert!(
-        projects::load_profile("beta").unwrap().is_empty(),
-        "the profile-scoped registry entry must be removed from disk"
+        !beta_after[0].pinned,
+        "its pin flag must be cleared on disk"
     );
     let still: Vec<String> = view
         .flat_items
@@ -6803,9 +6816,10 @@ fn unpin_profile_scoped_pin_from_all_profiles_clears_header() {
 
 /// A repo pinned in BOTH scopes (a profile entry shadowing a global one via
 /// `--allow-override`) must fully unpin in a single press. `load_merged` only
-/// surfaces the shadowing profile entry, so removing just that one would
-/// re-surface the global entry and leave the header pinned after a "success"
-/// dialog. Unpin sweeps every scope for the path.
+/// surfaces the shadowing profile entry, so clearing just that one would
+/// re-surface the global pin and leave the header pinned after a "success"
+/// dialog. Unpin sweeps every scope for the path, clearing the flag while
+/// keeping each entry. See #2208.
 #[test]
 #[serial]
 fn unpin_clears_both_global_and_profile_entries_for_a_path() {
@@ -6817,14 +6831,14 @@ fn unpin_clears_both_global_and_profile_entries_for_a_path() {
     projects::add(
         "test",
         ProjectScope::Global,
-        Project::new("dual-global", "/repos/dual", ProjectScope::Global),
+        Project::new("dual-global", "/repos/dual", ProjectScope::Global).with_pinned(true),
         false,
     )
     .unwrap();
     projects::add(
         "test",
         ProjectScope::Profile,
-        Project::new("dual-profile", "/repos/dual", ProjectScope::Profile),
+        Project::new("dual-profile", "/repos/dual", ProjectScope::Profile).with_pinned(true),
         true,
     )
     .unwrap();
@@ -6849,14 +6863,14 @@ fn unpin_clears_both_global_and_profile_entries_for_a_path() {
         !env.view.is_project_label_pinned("dual"),
         "dual must read as unpinned after a single press"
     );
-    assert!(
-        projects::load_global().unwrap().is_empty(),
-        "global entry must be removed"
-    );
-    assert!(
-        projects::load_profile("test").unwrap().is_empty(),
-        "profile entry must be removed"
-    );
+    // Both entries are kept (saved projects), with the pin flag cleared in
+    // each scope so the merged view no longer shows a pinned header. See #2208.
+    let global_after = projects::load_global().unwrap();
+    assert_eq!(global_after.len(), 1, "global entry must be kept");
+    assert!(!global_after[0].pinned, "global pin flag must be cleared");
+    let profile_after = projects::load_profile("test").unwrap();
+    assert_eq!(profile_after.len(), 1, "profile entry must be kept");
+    assert!(!profile_after[0].pinned, "profile pin flag must be cleared");
     let names: Vec<String> = env
         .view
         .flat_items

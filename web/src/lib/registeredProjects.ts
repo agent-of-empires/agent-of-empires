@@ -21,12 +21,14 @@ function isSyntheticRepoGroup(id: string): boolean {
 }
 
 // Attach registry metadata to the session-derived repo groups and append a
-// zero-workspace group for every registered project that has no live group
-// (a pinned-but-empty project). Pure so it can be unit-tested directly and
-// memoized in `useRepoGroups`.
+// zero-workspace group for every PINNED registered project that has no live
+// group. Saved-but-unpinned projects attach to a populated group if one
+// exists, but never produce a standalone empty header (#2208). Pure so it can
+// be unit-tested directly and memoized in `useRepoGroups`.
 //
 // A registered path that matches a populated group attaches to it (so the
-// group renders a pin marker) instead of producing a second empty header.
+// group renders a pin marker when pinned) instead of producing a second empty
+// header.
 // Registrations are grouped by normalized path, so the same repo registered
 // under both global and profile scope collapses into one group carrying both
 // (unpin removes every registration for the path). Synthetic Multi-repo /
@@ -65,6 +67,11 @@ export function mergeRegisteredProjects(
 
   for (const [key, registrations] of byKey) {
     if (seen.has(key)) continue;
+    // Only a pinned registration earns a sessionless sidebar header. A
+    // saved-but-unpinned project (the default for a project added via the
+    // Projects view / CLI) stays in the Projects view and the wizard but is
+    // not forced into the sidebar. See #2208.
+    if (!registrations.some((p) => p.pinned)) continue;
     const primary = registrations[0];
     if (!primary) continue;
     const defaultDisplayName = primary.path.split("/").pop() || primary.path;

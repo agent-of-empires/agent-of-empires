@@ -50,13 +50,14 @@ export interface SidebarGroup {
   repoPath?: string;
   /** Set when `kind === "sessionGroup"`. Empty string for Ungrouped. */
   groupPath?: string;
-  /** Registry entries for this repo path (the "pin"); empty when unpinned.
-   *  Repo axis only. See #2047. */
+  /** Registry entries (saved projects) for this repo path; empty when the
+   *  repo is not saved. Present regardless of pin state, so the context menu
+   *  can offer Pin/Unpin. Repo axis only. See #2047, #2208. */
   registeredProjects: ProjectInfo[];
-  /** Derived: the repo is registered (pinned). */
+  /** Derived: a saved entry for this repo has `pinned === true`. */
   pinned: boolean;
-  /** Derived: registered with no live workspace, so it shows as an empty
-   *  header that only the pin keeps visible. */
+  /** Derived: pinned with no live workspace, so it shows as an empty header
+   *  that only the pin keeps visible. */
   pinnedEmpty: boolean;
 }
 
@@ -70,7 +71,10 @@ function isSyntheticRepoGroup(id: string): boolean {
 // repo path); real repos create directly in their repo.
 export function repoGroupToSidebarGroup(group: RepoGroup): SidebarGroup {
   const synthetic = isSyntheticRepoGroup(group.id);
-  const pinned = !synthetic && group.registeredProjects.length > 0;
+  // Pinned is the per-project flag, not mere registry membership: a
+  // saved-but-unpinned project attaches its entry for the context menu but
+  // shows no marker and no sessionless header. See #2208.
+  const pinned = !synthetic && group.registeredProjects.some((p) => p.pinned);
   return {
     id: group.id,
     kind: "repo",

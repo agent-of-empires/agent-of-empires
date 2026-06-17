@@ -42,8 +42,10 @@ function repoGroup(repoPath: string, over: Partial<RepoGroup> = {}): RepoGroup {
   };
 }
 
+// Defaults to pinned: most of these cases assert the empty-header behavior,
+// which only pinned projects get (#2208). Unpinned cases pass `{ pinned: false }`.
 function project(path: string, over: Partial<ProjectInfo> = {}): ProjectInfo {
-  return { name: path.split("/").pop() ?? path, path, scope: "global", ...over };
+  return { name: path.split("/").pop() ?? path, path, scope: "global", pinned: true, ...over };
 }
 
 describe("normalizeProjectPathKey", () => {
@@ -78,6 +80,32 @@ describe("mergeRegisteredProjects", () => {
     expect(merged[0]!.repoPath).toBe("/work/beta");
     expect(merged[0]!.displayName).toBe("beta");
     expect(merged[0]!.workspaces).toHaveLength(0);
+    expect(merged[0]!.registeredProjects).toHaveLength(1);
+  });
+
+  it("does NOT append a header for a saved-but-unpinned repo with no live group", () => {
+    // A project added via the Projects view defaults to unpinned: saved, but
+    // not forced into the sidebar. See #2208.
+    const merged = mergeRegisteredProjects([], [project("/work/saved", { pinned: false })]);
+    expect(merged).toHaveLength(0);
+  });
+
+  it("appends the header when at least one registration for the path is pinned", () => {
+    // Same path saved unpinned in one scope and pinned in another: the pin wins.
+    const merged = mergeRegisteredProjects(
+      [],
+      [
+        project("/work/beta", { scope: "global", pinned: false }),
+        project("/work/beta", { scope: "profile", pinned: true }),
+      ],
+    );
+    expect(merged).toHaveLength(1);
+    expect(merged[0]!.repoPath).toBe("/work/beta");
+  });
+
+  it("attaches a saved-but-unpinned entry to a populated group (for the context menu)", () => {
+    const merged = mergeRegisteredProjects([repoGroup("/work/alpha")], [project("/work/alpha", { pinned: false })]);
+    expect(merged).toHaveLength(1);
     expect(merged[0]!.registeredProjects).toHaveLength(1);
   });
 
@@ -135,6 +163,15 @@ describe("SidebarGroup pin derivation + render gating", () => {
 
   it("leaves an unregistered repo unpinned", () => {
     const sg = repoGroupToSidebarGroup(repoGroup("/work/gamma"));
+    expect(sg.pinned).toBe(false);
+    expect(sg.pinnedEmpty).toBe(false);
+  });
+
+  it("treats a populated saved-but-unpinned repo as not pinned (#2208)", () => {
+    const [g] = mergeRegisteredProjects([repoGroup("/work/alpha")], [project("/work/alpha", { pinned: false })]);
+    const sg = repoGroupToSidebarGroup(g!);
+    // The entry is attached (so the menu can offer Pin) but there is no marker.
+    expect(sg.registeredProjects).toHaveLength(1);
     expect(sg.pinned).toBe(false);
     expect(sg.pinnedEmpty).toBe(false);
   });

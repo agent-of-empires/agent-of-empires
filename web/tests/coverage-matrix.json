@@ -698,6 +698,20 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/hooks/useRepoGroups.ts"]
     },
     {
+      "id": "sidebar.project-row",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/sidebar-project-row.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
+      "id": "sidebar.project-row-header",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/__tests__/SidebarGroupHeader.test.tsx"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
       "id": "sidebar.empty-state",
       "kind": "mocked-playwright",
       "risk": "low",
@@ -2268,9 +2282,17 @@
       "components": [
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/lib/registeredProjects.ts",
+        "web/src/lib/sidebarGroups.ts",
         "web/src/hooks/useRepoGroups.ts",
         "web/src/hooks/useProjects.ts"
       ]
+    },
+    {
+      "id": "sidebar.project-pin-handlers",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/sidebar-project-pin.spec.ts"],
+      "components": ["web/src/App.tsx", "web/src/lib/api.ts"]
     },
     {
       "id": "triage.archive-toggle",

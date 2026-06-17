@@ -1,13 +1,14 @@
-// Live coverage for pinning a project from the web sidebar (#2047):
-//   - A registered project with no sessions shows as an empty header in the
-//     sidebar (the ◆ marker + a New session button), parity with the TUI.
-//   - "Pin project" on a populated repo header POSTs /api/projects and the
-//     ◆ marker appears and survives a reload (registry persistence).
-//   - "Unpin project" on the empty project DELETEs /api/projects and its
-//     header drops from the sidebar (it had no sessions keeping it alive).
+// Live coverage for pinning a project from the web sidebar (#2047, #2208):
+//   - A saved (registered) but UNPINNED project with no sessions does NOT show
+//     as a sidebar empty header, yet stays in the registry (Projects view /
+//     wizard). Saving a project no longer forces a sidebar header (#2208).
+//   - "Pin project" on a populated repo header POSTs /api/projects with
+//     pinned:true; the ◆ marker appears and survives a reload.
+//   - "Unpin project" PATCHes pinned:false (NOT DELETE): the empty header drops,
+//     but the project remains a saved registry entry (the #2208 regression).
 //
-// The render path is in web/src/components/WorkspaceSidebar.tsx + the merge
-// in web/src/lib/registeredProjects.ts; the registry CRUD is
+// The render path is in web/src/components/WorkspaceSidebar.tsx + the merge in
+// web/src/lib/registeredProjects.ts; the registry CRUD is
 // src/server/api/projects.rs. Live coverage catches wire-format drift the
 // mocked specs miss.
 
@@ -18,9 +19,9 @@ import { spawnSync } from "node:child_process";
 import { spawnAoeServe, listSessions, resolveAoeBinary } from "../helpers/aoeServe";
 
 // Seed a session in `projectA` and register `projectB` (a git repo with no
-// session) so the sidebar shows one populated header and one pinned-but-empty
-// header. Runs before serve spawns so the in-memory caches pick both up.
-function seedSessionAndEmptyProject(opts: {
+// session). projectB is registered UNPINNED (the `aoe project add` default
+// since #2208), so it is a saved project that does NOT show in the sidebar.
+function seedSessionAndSavedProject(opts: {
   title: string;
 }): (seedEnv: { home: string; shimBin: string; env: NodeJS.ProcessEnv }) => void {
   return ({ home, env }) => {
@@ -54,7 +55,7 @@ function seedSessionAndEmptyProject(opts: {
     if (add.status !== 0) {
       throw new Error(`aoe add failed: status=${add.status} stderr=${add.stderr?.toString() ?? "<none>"}`);
     }
-    // Register projectB with no session: the pinned-but-empty case.
+    // Register projectB with no session: saved but unpinned by default.
     const reg = spawnSync(resolveAoeBinary(), ["project", "add", projectB, "--scope", "global"], { env });
     if (reg.status !== 0) {
       throw new Error(`aoe project add failed: status=${reg.status} stderr=${reg.stderr?.toString() ?? "<none>"}`);
@@ -62,13 +63,13 @@ function seedSessionAndEmptyProject(opts: {
   };
 }
 
-base.describe("pin a project from the web sidebar (#2047)", () => {
-  base("empty project shows, pin persists, unpin removes", async ({ page }, testInfo) => {
+base.describe("pin a project from the web sidebar (#2047, #2208)", () => {
+  base("saved-unpinned hidden; pin POSTs; unpin keeps the saved project", async ({ page }, testInfo) => {
     const serve = await spawnAoeServe({
       authMode: "none",
       workerIndex: testInfo.workerIndex,
       parallelIndex: testInfo.parallelIndex,
-      seedFn: seedSessionAndEmptyProject({ title: "pin-session" }),
+      seedFn: seedSessionAndSavedProject({ title: "pin-session" }),
     });
 
     try {
@@ -82,14 +83,15 @@ base.describe("pin a project from the web sidebar (#2047)", () => {
       const headerA = page.locator(`[data-testid='sidebar-group-header'][data-group-id='${repoA}']`);
       await expect(headerA).toBeVisible({ timeout: 10_000 });
 
-      // The pinned-but-empty project (projectB) renders despite no sessions,
-      // with the ◆ marker and a New session button.
-      const headerB = page.locator("[data-testid='sidebar-group-header']").filter({ hasText: "projectB" });
-      await expect(headerB).toBeVisible({ timeout: 10_000 });
-      await expect(headerB.locator("[data-testid='sidebar-group-pinned-marker']")).toBeVisible();
-      await expect(headerB.locator("[aria-label='New session in projectB']")).toBeVisible();
+      // projectB is saved but unpinned: it must NOT show as a sidebar header,
+      // even though it has no sessions and is in the registry (#2208 story 2).
+      await expect(page.locator("[data-testid='sidebar-group-header']").filter({ hasText: "projectB" })).toHaveCount(0);
 
-      // ---- Pin projectA from its header menu ----
+      // ...but it IS a saved project: the registry still lists it.
+      const savedList = await (await page.request.get(`${serve.baseUrl}/api/projects`)).json();
+      expect(savedList.some((p: { name: string }) => p.name === "projectB")).toBe(true);
+
+      // ---- Pin projectA from its header menu (POST with pinned:true) ----
       await headerA.click({ button: "right" });
       const pinPost = page.waitForResponse(
         (res) => res.url().endsWith("/api/projects") && res.request().method() === "POST",
@@ -97,7 +99,7 @@ base.describe("pin a project from the web sidebar (#2047)", () => {
       await page.locator("[data-testid='sidebar-group-context-menu-pin']").click();
       const pinRes = await pinPost;
       expect(pinRes.ok()).toBe(true);
-      expect(pinRes.request().postDataJSON()).toMatchObject({ path: repoA, scope: "global" });
+      expect(pinRes.request().postDataJSON()).toMatchObject({ path: repoA, scope: "global", pinned: true });
 
       await expect(headerA.locator("[data-testid='sidebar-group-pinned-marker']")).toBeVisible({ timeout: 5_000 });
 
@@ -108,20 +110,25 @@ base.describe("pin a project from the web sidebar (#2047)", () => {
         timeout: 10_000,
       });
 
-      // ---- Unpin the empty projectB: its header drops (no sessions) ----
-      const headerBReloaded = page.locator("[data-testid='sidebar-group-header']").filter({ hasText: "projectB" });
-      await headerBReloaded.click({ button: "right" });
-      const unpinDelete = page.waitForResponse(
-        (res) => res.url().includes("/api/projects/") && res.request().method() === "DELETE",
+      // ---- Unpin projectA: PATCH pinned:false, NOT a DELETE ----
+      await headerAReloaded.click({ button: "right" });
+      const unpinPatch = page.waitForResponse(
+        (res) => res.url().includes("/api/projects/") && res.request().method() === "PATCH",
       );
       await page.locator("[data-testid='sidebar-group-context-menu-unpin']").click();
-      const unpinRes = await unpinDelete;
+      const unpinRes = await unpinPatch;
       expect(unpinRes.ok()).toBe(true);
+      expect(unpinRes.request().postDataJSON()).toMatchObject({ pinned: false });
 
-      await expect(page.locator("[data-testid='sidebar-group-header']").filter({ hasText: "projectB" })).toHaveCount(
-        0,
-        { timeout: 10_000 },
-      );
+      // Marker gone (projectA still has a session, so the header stays).
+      await expect(headerAReloaded.locator("[data-testid='sidebar-group-pinned-marker']")).toHaveCount(0, {
+        timeout: 5_000,
+      });
+
+      // The #2208 regression: unpin must NOT delete the saved project. The
+      // registry still lists projectA (it would be in the Projects view / wizard).
+      const afterUnpin = await (await page.request.get(`${serve.baseUrl}/api/projects`)).json();
+      expect(afterUnpin.some((p: { path: string }) => p.path === repoA)).toBe(true);
     } finally {
       await serve.stop();
     }
