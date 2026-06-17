@@ -369,6 +369,20 @@ pub struct Supervisor<S: BroadcastSink> {
     /// respawns these on the current binary once the turn finishes. See
     /// #1754.
     build_respawn_pending: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// Sessions currently parked on a per-adapter compatibility rejection,
+    /// mapped to the binary that failed the check. Populated at every
+    /// `IncompatibleAgent` publish site, cleared on a successful (re)spawn.
+    /// Lets the web "Update & restart" install endpoint find every other
+    /// session blocked on the same adapter and respawn them all at once, so
+    /// one global `npm install -g` clears every red X without a per-session
+    /// manual restart. See #2109.
+    incompatible_binaries: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    /// Sessions an out-of-band caller (the web install endpoint) wants the
+    /// reconciler to fresh-spawn on its next tick, regardless of the
+    /// `attempted` guard that otherwise pins a permanently-failing spawn.
+    /// Used to clear every red X after a global adapter install without a
+    /// per-session manual restart. See #2109.
+    force_respawn: Arc<std::sync::Mutex<HashSet<String>>>,
     /// Cap on concurrently-running workers, snapshotted from
     /// `[acp] max_concurrent_workers` at startup. Enforced in
     /// `spawn`; new workers past the cap return `CapacityFull`.
@@ -578,6 +592,8 @@ impl<S: BroadcastSink> Supervisor<S> {
             agent_warmup_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             worker_notify: Arc::new(tokio::sync::Notify::new()),
             build_respawn_pending: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            incompatible_binaries: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            force_respawn: Arc::new(std::sync::Mutex::new(HashSet::new())),
             max_concurrent_workers,
         }
     }
@@ -602,6 +618,58 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// is gone). Idempotent.
     pub fn clear_build_respawn_pending(&self, session_id: &str) {
         lock_recover(&self.build_respawn_pending).remove(session_id);
+    }
+
+    /// Record that a session is parked on a compatibility rejection for
+    /// `binary`. Overwrites any prior entry. Cleared by
+    /// `clear_incompatible_binary` on a successful (re)spawn. See #2109.
+    fn mark_incompatible_binary(&self, session_id: &str, binary: &str) {
+        lock_recover(&self.incompatible_binaries)
+            .insert(session_id.to_string(), binary.to_string());
+    }
+
+    /// Drop a session's compatibility-rejection record once it spawns
+    /// cleanly (or is gone). Idempotent. See #2109.
+    fn clear_incompatible_binary(&self, session_id: &str) {
+        lock_recover(&self.incompatible_binaries).remove(session_id);
+    }
+
+    /// Ask the reconciler to fresh-spawn these sessions on its next tick,
+    /// bypassing the `attempted` guard. Idempotent. See #2109.
+    pub fn request_respawn(&self, session_id: &str) {
+        lock_recover(&self.force_respawn).insert(session_id.to_string());
+    }
+
+    /// Drain the pending force-respawn requests. Called once per reconciler
+    /// tick; the ids are removed from `attempted` so the resume pass treats
+    /// them as fresh. See #2109.
+    pub fn take_respawn_requests(&self) -> Vec<String> {
+        let mut set = lock_recover(&self.force_respawn);
+        let ids = set.iter().cloned().collect();
+        set.clear();
+        ids
+    }
+
+    /// Session ids currently parked on a compatibility rejection for
+    /// `binary` that have no live worker. The `is_running` filter is the
+    /// safety net against a stale entry: a session that already recovered
+    /// (or was stopped by the user) is running or absent-but-not-parked, so
+    /// it is never resurrected by a bulk install-and-respawn. See #2109.
+    pub async fn incompatible_sessions_for_binary(&self, binary: &str) -> Vec<String> {
+        let candidates: Vec<String> = {
+            let map = lock_recover(&self.incompatible_binaries);
+            map.iter()
+                .filter(|(_, b)| b.as_str() == binary)
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        let mut out = Vec::new();
+        for id in candidates {
+            if !self.is_running(&id).await {
+                out.push(id);
+            }
+        }
+        out
     }
 
     /// Snapshot the lifecycle state of every structured view session known to
@@ -1337,6 +1405,9 @@ impl<S: BroadcastSink> Supervisor<S> {
         let mut client = match AcpClient::spawn(config.clone(), acp_session_id.clone()).await {
             Ok(c) => c,
             Err(err) => {
+                if matches!(err, AcpError::IncompatibleAgent(_)) {
+                    self.mark_incompatible_binary(&session_id, &config.spec.command);
+                }
                 self.publish_compat_rejection(&session_id, &err);
                 return Err(SupervisorError::Acp(err));
             }
@@ -1353,6 +1424,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         drop(warmup_guard);
 
         info!(target: "acp.supervisor", session = %session_id, "structured view worker spawned");
+        self.clear_incompatible_binary(&session_id);
 
         // Move the inbound receiver out so the drain task can poll events
         // without holding the client mutex (which would deadlock
@@ -1447,6 +1519,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         let sink = Arc::clone(&self.sink);
         let workers = Arc::clone(&self.workers);
         let next_seqs = Arc::clone(&self.next_seqs);
+        let incompatible_binaries = Arc::clone(&self.incompatible_binaries);
         crate::task_util::spawn_supervised(
             "supervisor.drain",
             crate::task_util::PanicPolicy::Log,
@@ -1798,6 +1871,10 @@ impl<S: BroadcastSink> Supervisor<S> {
                                 // stale runner before dropping the worker
                                 // entry.
                                 if let AcpError::IncompatibleAgent(payload) = &e {
+                                    lock_recover(&incompatible_binaries).insert(
+                                        session_id.clone(),
+                                        respawn_config.spec.command.clone(),
+                                    );
                                     let seq = next_seq(&next_seqs, &session_id);
                                     sink.publish(
                                         &session_id,
@@ -1877,6 +1954,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                         session = %session_id,
                         "structured view worker respawned"
                     );
+                    lock_recover(&incompatible_binaries).remove(&session_id);
                     inbound = new_inbound;
                 }
             },
@@ -3990,6 +4068,57 @@ mod tests {
         let frames = sink.frames.lock().unwrap().clone();
         assert_eq!(frames.len(), 1);
         assert!(matches!(&frames[0].2, Event::UserPromptSent { .. }));
+    }
+
+    /// Incompatible-session tracking (#2109): a session marked for one
+    /// binary is returned only for that binary's query and only while it
+    /// has no live worker; clearing drops it. None of the test sessions
+    /// have a worker, so the `is_running` filter passes them all through.
+    #[tokio::test]
+    async fn incompatible_sessions_tracked_and_filtered_by_binary() {
+        let sup = Supervisor::new(VecSink::new());
+        sup.mark_incompatible_binary("s-claude-1", "claude-agent-acp");
+        sup.mark_incompatible_binary("s-claude-2", "claude-agent-acp");
+        sup.mark_incompatible_binary("s-codex", "codex-acp");
+
+        let mut claude = sup
+            .incompatible_sessions_for_binary("claude-agent-acp")
+            .await;
+        claude.sort();
+        assert_eq!(claude, vec!["s-claude-1", "s-claude-2"]);
+        assert_eq!(
+            sup.incompatible_sessions_for_binary("codex-acp").await,
+            vec!["s-codex"]
+        );
+        // Unknown binary matches nothing.
+        assert!(sup
+            .incompatible_sessions_for_binary("gemini")
+            .await
+            .is_empty());
+
+        // A clean (re)spawn clears the entry.
+        sup.clear_incompatible_binary("s-claude-1");
+        assert_eq!(
+            sup.incompatible_sessions_for_binary("claude-agent-acp")
+                .await,
+            vec!["s-claude-2"]
+        );
+    }
+
+    /// Force-respawn requests round-trip through the supervisor and drain
+    /// to empty so a second tick does not re-respawn the same session. See
+    /// #2109.
+    #[test]
+    fn force_respawn_requests_drain_once() {
+        let sup = Supervisor::new(VecSink::new());
+        sup.request_respawn("s-1");
+        sup.request_respawn("s-2");
+        sup.request_respawn("s-1"); // idempotent
+        let mut ids = sup.take_respawn_requests();
+        ids.sort();
+        assert_eq!(ids, vec!["s-1", "s-2"]);
+        // Drained: nothing left for the next tick.
+        assert!(sup.take_respawn_requests().is_empty());
     }
 
     /// `next_seq` increments per-session and is independent of the

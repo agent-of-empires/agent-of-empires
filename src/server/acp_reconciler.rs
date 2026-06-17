@@ -160,6 +160,19 @@ pub async fn reconcile_acp_workers(
         respawn_history.remove(id);
     }
 
+    // Out-of-band respawn requests (web "Update & restart" after a global
+    // adapter install, #2109). These sessions failed their spawn on a
+    // compatibility rejection and have no live worker, so the
+    // `reap_user_stopped` path above never sees them; they sit pinned in
+    // `attempted`. Clear the guard (and the respawn budget, like an
+    // explicit restart) so the resume pass below fresh-spawns them on the
+    // freshly-installed adapter and the next handshake clears the red X.
+    for id in state.acp_supervisor.take_respawn_requests() {
+        attempted.remove(&id);
+        parked.remove(&id);
+        respawn_history.remove(&id);
+    }
+
     // Idle auto-stop (#1689). Cadence-gated to IDLE_REAP_INTERVAL so the
     // batched activity query does not run on every 2s tick. Runs BEFORE
     // the resume snapshot below: a worker marked dormant here is excluded

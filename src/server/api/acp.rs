@@ -401,6 +401,12 @@ pub struct InstallAgentResponse {
     pub exit_code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
+    /// How many *other* sessions parked on the same adapter's compatibility
+    /// rejection were queued for an automatic respawn on the freshly
+    /// installed version. The install is global, so one click clears every
+    /// red X. The current session is excluded (the client respawns it
+    /// directly). See #2109.
+    pub recovered_sessions: usize,
 }
 
 /// `POST /api/sessions/{id}/acp/install-agent`: run `npm install -g <pkg>`
@@ -545,6 +551,26 @@ pub async fn install_agent(
         }
     };
 
+    // On success the global npm prefix now carries the required version, so
+    // every other session parked on the same binary's compatibility check
+    // can recover too. Queue them for the reconciler to fresh-spawn; the
+    // current session is excluded because the client respawns it directly
+    // (and a double-spawn would race). See #2109.
+    let mut recovered_sessions = 0;
+    if output.status.success() {
+        for other in state
+            .acp_supervisor
+            .incompatible_sessions_for_binary(&binary)
+            .await
+        {
+            if other == id {
+                continue;
+            }
+            state.acp_supervisor.request_respawn(&other);
+            recovered_sessions += 1;
+        }
+    }
+
     Json(InstallAgentResponse {
         session_id: id,
         package: package.to_string(),
@@ -552,6 +578,7 @@ pub async fn install_agent(
         exit_code: output.status.code(),
         stdout: truncate_install_log(&output.stdout),
         stderr: truncate_install_log(&output.stderr),
+        recovered_sessions,
     })
     .into_response()
 }

@@ -687,6 +687,9 @@ export interface InstallAgentResponse {
   exit_code: number | null;
   stdout: string;
   stderr: string;
+  /** Other sessions blocked on the same adapter that were queued for an
+   *  automatic respawn (the install is global). See #2109. */
+  recovered_sessions: number;
 }
 
 /** Run `npm install -g` for the session's agent on the host. Opt-in and
