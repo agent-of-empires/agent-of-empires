@@ -5309,8 +5309,20 @@ async fn run_connection_task<W, R>(
                     }
                     Some(ClientCmd::Cancel) => {
                         info!(target: "acp.protocol", "sending session/cancel (no prompt in flight)");
-                        connection
-                            .send_notification(CancelNotification::new(acp_session_id.clone()))?;
+                        // Best-effort, NOT `?`: a failed notification means
+                        // the agent connection is likely already gone, which
+                        // is exactly when the UI most needs the synthetic
+                        // Stopped below to unstick. Propagating the error here
+                        // would skip that emit and defeat the desync recovery.
+                        if let Err(e) = connection
+                            .send_notification(CancelNotification::new(acp_session_id.clone()))
+                        {
+                            warn!(
+                                target: "acp.protocol",
+                                error = %e,
+                                "session/cancel (no prompt in flight) notification failed; still emitting Stopped"
+                            );
+                        }
                         // A cancel with no prompt in flight means the UI
                         // and the daemon have desynced: the client thinks
                         // a turn is running but this loop owns no
