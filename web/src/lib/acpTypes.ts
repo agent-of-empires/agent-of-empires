@@ -1990,6 +1990,7 @@ export function isTurnActive(state: Pick<AcpState, "pendingUserPromptSeq" | "las
  *  fully retired) and re-derive `turnActive` from the counters. */
 export function normaliseTurnCounters(
   state: AcpState & {
+    oldestSeq?: number;
     pendingUserPromptSeq?: number;
     lastStoppedSeq?: number;
     rejectedPrompts?: RejectedPrompt[];
@@ -2025,8 +2026,16 @@ export function normaliseTurnCounters(
   const configOptions = Array.isArray(state.configOptions) ? state.configOptions : [];
   const configOptionSwitchFailed = state.configOptionSwitchFailed === undefined ? null : state.configOptionSwitchFailed;
   const pendingConfigOption = state.pendingConfigOption === undefined ? null : state.pendingConfigOption;
+  // Pre-#2236 persisted entries lack oldestSeq; backfill to 0 (nothing
+  // older loaded) so the recent-first `before=<oldestSeq>` paging contract
+  // never sees undefined on a warm hydrate.
+  const oldestSeq =
+    typeof state.oldestSeq === "number" && Number.isFinite(state.oldestSeq)
+      ? Math.max(0, Math.floor(state.oldestSeq))
+      : 0;
   return {
     ...state,
+    oldestSeq,
     rejectedPrompts,
     agentUnresponsive,
     agentOrphaned,
