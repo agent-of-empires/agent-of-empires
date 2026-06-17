@@ -206,10 +206,15 @@ export function ProjectStep({ data, onChange, initialTab }: Props) {
   // A selected path that already shows up as a (border-highlighted) saved or
   // recent row needs no separate "Selected project" box; that would just
   // duplicate the row. Keep the box only for a path with no row to highlight
-  // (e.g. a freshly cloned repo not yet in the lists).
+  // (e.g. a freshly cloned repo not yet in the lists). Normalize trailing
+  // slashes (the recents/saved lists already are) so "/repo" and "/repo/"
+  // match, mirroring the dedup convention in splitSavedAndRecent.
+  const normalizePath = (p: string) => p.replace(/\/+$/, "") || "/";
+  const selectedPath = data.path ? normalizePath(data.path) : "";
   const selectedPathHasRow =
-    !!data.path &&
-    (filteredSaved.some((s) => s.path === data.path) || filteredRecent.some((r) => r.path === data.path));
+    !!selectedPath &&
+    (filteredSaved.some((s) => normalizePath(s.path) === selectedPath) ||
+      filteredRecent.some((r) => normalizePath(r.path) === selectedPath));
 
   const handleBrowseSelect = (path: string) => {
     onChange("path", path);
