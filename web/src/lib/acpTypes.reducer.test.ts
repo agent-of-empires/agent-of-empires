@@ -168,6 +168,21 @@ describe("summarizeAnswers (#2209)", () => {
     const out = summarizeAnswers(form([question("question_0", "free_text")]), { question_0: "hi" });
     expect(out).toEqual([{ question: "question_0", answer: "hi" }]);
   });
+
+  it("maps select values to option labels (MCP token, and AskUserQuestion desc)", () => {
+    const q = {
+      field_key: "color",
+      title: "Color",
+      required: true,
+      kind: "single_select" as const,
+      options: [
+        { value: "tok_blue", label: "Blue" }, // MCP: token -> human label
+        { value: "Green", label: "Green \u2014 the color green" }, // AskUserQuestion: keep bare value
+      ],
+    };
+    expect(summarizeAnswers(form([q]), { color: "tok_blue" })[0]!.answer).toBe("Blue");
+    expect(summarizeAnswers(form([q]), { color: "Green" })[0]!.answer).toBe("Green");
+  });
 });
 
 describe("appendElicitationAnswerRow (#2209)", () => {

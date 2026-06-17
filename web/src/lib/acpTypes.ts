@@ -279,11 +279,28 @@ export function isElicitationAnswersPayload(value: unknown): value is Elicitatio
   );
 }
 
-/** Render a submitted answer value for display. Selects carry the option
- *  value, which for AskUserQuestion is already the clean label. */
-function renderAnswerValue(value: AnswerValue): string {
+/** Separator the adapter wedges between an AskUserQuestion option's label and
+ *  its description (`"<label> <sep> <description>"`). Written as an escape so
+ *  the em dash never appears literally in source. Mirrors `OPTION_DESC_SEP` in
+ *  AskUserQuestionCard and `OPTION_DESC_SEP` in src/acp/elicitations.rs. */
+const OPTION_DESC_SEP = " \u2014 ";
+
+/** Map a selected option value to its human label. A generic MCP form sends a
+ *  machine token as the value and the display text as the label; AskUserQuestion
+ *  sends the label as the value (with `label` possibly carrying a trailing
+ *  `"value <sep> description"`), so the bare value is kept there. */
+function selectLabel(question: ElicitationQuestion, raw: string): string {
+  const opt = question.options.find((o) => o.value === raw);
+  if (!opt) return raw;
+  return opt.label.startsWith(`${raw}${OPTION_DESC_SEP}`) ? raw : opt.label;
+}
+
+/** Render a submitted answer value for display, mapping select values to their
+ *  option labels. */
+function renderAnswerValue(question: ElicitationQuestion, value: AnswerValue): string {
   if (typeof value === "boolean") return value ? "Yes" : "No";
-  if (Array.isArray(value)) return value.join(", ");
+  if (Array.isArray(value)) return value.map((v) => selectLabel(question, v)).join(", ");
+  if (typeof value === "string") return selectLabel(question, value);
   return String(value);
 }
 
@@ -298,7 +315,7 @@ export function summarizeAnswers(elicitation: Elicitation, answers: Record<strin
     if (value === undefined) continue;
     out.push({
       question: question.title || question.field_key,
-      answer: renderAnswerValue(value),
+      answer: renderAnswerValue(question, value),
     });
   }
   return out;

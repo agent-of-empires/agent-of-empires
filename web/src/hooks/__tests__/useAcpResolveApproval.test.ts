@@ -94,9 +94,11 @@ describe("reducer elicitation_resolved_locally", () => {
               title: "Proceed?",
               required: true,
               kind: "single_select",
+              // value != label so the test catches raw internal values
+              // leaking into the transcript instead of the display label.
               options: [
-                { value: "Yes", label: "Yes" },
-                { value: "No", label: "No" },
+                { value: "yes_internal", label: "Yes" },
+                { value: "no_internal", label: "No" },
               ],
             },
           ]
@@ -128,7 +130,7 @@ describe("reducer elicitation_resolved_locally", () => {
     const action: Action = {
       kind: "elicitation_resolved_locally",
       nonce: "e-1",
-      resolution: { action: "accept", answers: { question_0: "Yes" } },
+      resolution: { action: "accept", answers: { question_0: "yes_internal" } },
     };
     const next = reducer(state, action);
     const row = next.activity.find((r) => r.kind === "elicitation_answered");

@@ -141,6 +141,12 @@ pub struct ElicitationAnswer {
 /// optional question left blank is omitted). Single/multi selects carry
 /// the option value, which for AskUserQuestion is already the clean
 /// label (see `ElicitationOption::value`), so no option lookup is needed.
+/// Separator the claude-agent-acp adapter wedges between an AskUserQuestion
+/// option's label and its description when flattening into the enum title
+/// (`"<label> <sep> <description>"`). Written as an escape so the em dash
+/// never appears literally in source. Mirrors the web card's separator.
+const OPTION_DESC_SEP: &str = " \u{2014} ";
+
 pub fn summarize_answers(
     elicitation: &Elicitation,
     answers: &BTreeMap<String, AnswerValue>,
@@ -149,6 +155,19 @@ pub fn summarize_answers(
     for question in &elicitation.questions {
         let Some(value) = answers.get(&question.field_key) else {
             continue;
+        };
+        // Map a selected option value to its human label. For a generic MCP
+        // form the value is a machine token and the label the display text; for
+        // AskUserQuestion the value is already the label (and `label` may carry
+        // a `"value <sep> description"` form, so we keep the bare value there).
+        // Mirrors `optionParts` in the web AskUserQuestionCard. See #2209.
+        let label_for = |raw: &str| -> String {
+            match question.options.iter().find(|o| o.value == raw) {
+                Some(o) if !o.label.starts_with(&format!("{raw}{OPTION_DESC_SEP}")) => {
+                    o.label.clone()
+                }
+                _ => raw.to_string(),
+            }
         };
         let answer = match value {
             AnswerValue::Bool(b) => {
@@ -160,8 +179,12 @@ pub fn summarize_answers(
             }
             AnswerValue::Integer(i) => i.to_string(),
             AnswerValue::Number(n) => n.to_string(),
-            AnswerValue::Text(s) => s.clone(),
-            AnswerValue::List(values) => values.join(", "),
+            AnswerValue::Text(s) => label_for(s),
+            AnswerValue::List(values) => values
+                .iter()
+                .map(|v| label_for(v))
+                .collect::<Vec<_>>()
+                .join(", "),
         };
         let question = question
             .title
@@ -992,12 +1015,48 @@ mod tests {
         );
         answers.insert("question_0".to_string(), AnswerValue::Text("Yes".into()));
         let summary = summarize_answers(&e, &answers);
-        // Question order from the form, not BTreeMap key order.
+        // Question order from the form, not BTreeMap key order. Selected
+        // values render as their option labels ("a"/"b" -> "A"/"B").
         assert_eq!(summary.len(), 2);
         assert_eq!(summary[0].question, "question_0");
         assert_eq!(summary[0].answer, "Yes");
         assert_eq!(summary[1].question, "tags");
-        assert_eq!(summary[1].answer, "a, b");
+        assert_eq!(summary[1].answer, "A, B");
+    }
+
+    #[test]
+    fn summarize_maps_select_values_to_option_labels() {
+        // Generic MCP form: value is a machine token, label is human text.
+        let mcp = Elicitation {
+            nonce: Nonce::new(),
+            message: "q".into(),
+            title: None,
+            description: None,
+            tool_call_id: None,
+            questions: vec![ElicitationQuestion {
+                options: vec![
+                    ElicitationOption {
+                        value: "tok_blue".into(),
+                        label: "Blue".into(),
+                    },
+                    // AskUserQuestion-style "label <sep> description": the bare
+                    // value is kept, the description dropped from the summary.
+                    ElicitationOption {
+                        value: "Green".into(),
+                        label: "Green \u{2014} the color green".into(),
+                    },
+                ],
+                ..empty_question("color", ElicitationFieldKind::SingleSelect, true)
+            }],
+            requested_at: Utc::now(),
+            resolved: None,
+        };
+        let mut a = BTreeMap::new();
+        a.insert("color".to_string(), AnswerValue::Text("tok_blue".into()));
+        assert_eq!(summarize_answers(&mcp, &a)[0].answer, "Blue");
+        let mut b = BTreeMap::new();
+        b.insert("color".to_string(), AnswerValue::Text("Green".into()));
+        assert_eq!(summarize_answers(&mcp, &b)[0].answer, "Green");
     }
 
     #[test]
