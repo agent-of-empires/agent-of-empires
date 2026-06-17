@@ -46,7 +46,8 @@ use super::agent_profiles;
 use super::agent_registry::AgentSpec;
 use super::approvals::{is_destructive, ApprovalDecision, Nonce};
 use super::elicitations::{
-    build_response, parse_elicitation, Elicitation, ElicitationOutcome, ElicitationResolution,
+    build_response, parse_elicitation, summarize_answers, Elicitation, ElicitationAnswer,
+    ElicitationOutcome, ElicitationResolution,
 };
 use super::event_store::AttachmentBlob;
 use super::fs_handler::{self, FsPolicy, SandboxPathMap};
@@ -839,6 +840,51 @@ impl SilentOrphanWatchdog {
     fn off_protocol_work_seen(&self) -> Option<OffProtocolWorkKind> {
         self.off_protocol_work_seen
     }
+
+    /// True once a cost-populated `UsageUpdate` (the end-of-turn
+    /// accounting marker) has arrived and nothing has reset progress
+    /// since. At watchdog-fire time this means the turn demonstrably
+    /// wrapped up but the adapter never sent the JSON-RPC PromptResponse,
+    /// so the right recovery is a clean `prompt_complete`, not a
+    /// cancel-and-restart orphan. See #2237.
+    fn cost_seen(&self) -> bool {
+        self.cost_seen
+    }
+}
+
+/// Resolve the terminal `Stopped` reason for a prompt turn from the
+/// mutually-prioritised end-of-turn flags. Extracted as a pure function
+/// so the precedence is unit-testable without the connection loop.
+///
+/// Precedence (highest first) and why each wins where it does is
+/// documented inline at the single call site. The finished-but-unacked
+/// recovery (#2237) deliberately sets NONE of these flags and breaks the
+/// loop, so it falls through to `prompt_complete`: the turn finished, the
+/// adapter just never sent the PromptResponse, so it must NOT collapse
+/// into `prompt_orphaned` (which would trigger a worker restart).
+fn terminal_stop_reason(
+    rate_limited: bool,
+    force_stopped: bool,
+    prompt_orphaned: bool,
+    agent_unresponsive: bool,
+    shutdown: bool,
+    prompt_cancelled: bool,
+) -> &'static str {
+    if rate_limited {
+        "rate_limited"
+    } else if force_stopped {
+        "user_forced"
+    } else if prompt_orphaned {
+        "prompt_orphaned"
+    } else if agent_unresponsive {
+        "agent_unresponsive"
+    } else if shutdown {
+        "shutdown"
+    } else if prompt_cancelled {
+        "cancelled"
+    } else {
+        "prompt_complete"
+    }
 }
 
 /// Tagged lifecycle signal carried over the watchdog mpsc. The
@@ -1138,7 +1184,7 @@ enum PendingResolver {
     /// just forwards them. Boxed to keep the enum small.
     Elicitation {
         elicitation: Box<Elicitation>,
-        resolver: oneshot::Sender<(CreateElicitationResponse, ElicitationOutcome)>,
+        resolver: oneshot::Sender<ElicitationResolutionMessage>,
     },
 }
 
@@ -1147,6 +1193,16 @@ enum PendingResolver {
 enum ApprovalResolutionMessage {
     Decision { decision: ApprovalDecision },
     Cancelled,
+}
+
+/// Message sent over the elicitation resolver oneshot. Carries the
+/// validated wire response for the agent, the outcome for status
+/// derivation, and the display-ready answers for the transcript
+/// (`Event::ElicitationResolved.answers`). See #2209.
+struct ElicitationResolutionMessage {
+    response: CreateElicitationResponse,
+    outcome: ElicitationOutcome,
+    answers: Vec<ElicitationAnswer>,
 }
 
 type PendingResponders = Arc<Mutex<HashMap<Nonce, PendingResponder>>>;
@@ -1849,6 +1905,13 @@ impl AcpClient {
         // Validate against the parked form while it is still borrowed; on
         // failure the nonce stays in the map untouched.
         let outcome = resolution.outcome();
+        // Render the submitted answers for the transcript before
+        // `build_response` consumes `resolution`. The parked form supplies
+        // question titles; selects carry the clean label. See #2209.
+        let answers = match &resolution {
+            ElicitationResolution::Accept { answers } => summarize_answers(elicitation, answers),
+            ElicitationResolution::Decline | ElicitationResolution::Cancel => Vec::new(),
+        };
         let response = build_response(elicitation, resolution)
             .map_err(|e| AcpError::InvalidAnswer(e.to_string()))?;
         // Valid: now consume the responder and forward the built response.
@@ -1857,7 +1920,11 @@ impl AcpClient {
             unreachable!("checked above");
         };
         resolver
-            .send((response, outcome))
+            .send(ElicitationResolutionMessage {
+                response,
+                outcome,
+                answers,
+            })
             .map_err(|_| AcpError::AgentExited)
     }
 
@@ -4909,6 +4976,42 @@ async fn run_connection_task<W, R>(
                                 {
                                     let now = tokio::time::Instant::now();
                                     let should_fire = watchdog.should_fire(now, watchdog_cfg);
+                                    if should_fire
+                                        && watchdog.cost_seen()
+                                        && watchdog.off_protocol_work_seen().is_none()
+                                    {
+                                        // The turn emitted its cost-populated
+                                        // end-of-turn UsageUpdate and then went
+                                        // silent with no in-flight tools and no
+                                        // off-protocol work: claude-agent-acp
+                                        // finished but never returned the
+                                        // PromptResponse. Cancelling and
+                                        // restarting the worker here (the orphan
+                                        // path below) restarts a turn that
+                                        // actually succeeded and shows the
+                                        // "Agent finished but didn't notify the
+                                        // daemon" banner. Treat the cost marker
+                                        // as authoritative and end the turn
+                                        // cleanly as prompt_complete; the
+                                        // connection task stays alive for the
+                                        // next prompt. The genuinely-wedged
+                                        // case (no cost marker) still falls
+                                        // through to the orphan path. See #2237;
+                                        // the off-protocol guard preserves the
+                                        // monitor / async-agent grace behavior
+                                        // of #1360 / #1401 / #1858.
+                                        info!(
+                                            target: "acp.protocol",
+                                            session = %session_label,
+                                            grace_secs = watchdog.effective_grace(watchdog_cfg).as_secs(),
+                                            "silent-orphan watchdog: turn wrapped up (cost-populated usage) without PromptResponse; ending cleanly as prompt_complete"
+                                        );
+                                        // Break with NO orphan/shutdown flag set so the
+                                        // terminal reason falls through to prompt_complete:
+                                        // a clean end, no worker restart, connection task
+                                        // survives for the next prompt. See #2237.
+                                        break;
+                                    }
                                     if should_fire {
                                         warn!(
                                             target: "acp.protocol",
@@ -5194,37 +5297,29 @@ async fn run_connection_task<W, R>(
                         //     "agent_unresponsive" would lose the
                         //     failure signature in postmortems. See
                         //     #1240.
-                        let reason = if rate_limited {
-                            "rate_limited"
-                        } else if force_stopped {
-                            // Explicit user "Force stop" wins over the
-                            // orphan/unresponsive watchdog reasons: it's the
-                            // proximate cause of THIS turn ending (we broke
-                            // the loop the moment the user clicked), so it
-                            // must not be masked by a prompt_orphaned flag
-                            // that was set earlier. The drain task treats it
-                            // like `agent_unresponsive` (kill process group +
-                            // respawn) but the reason string keeps the
-                            // user-initiated signal distinct in postmortems.
-                            // See #1727.
-                            "user_forced"
-                        } else if prompt_orphaned {
-                            "prompt_orphaned"
-                        } else if agent_unresponsive {
-                            "agent_unresponsive"
-                        } else if shutdown {
-                            "shutdown"
-                        } else if prompt_cancelled {
-                            // The adapter resolved cancel cleanly with
-                            // StopReason::Cancelled (upstream #694). The
-                            // 10s cancel-escalation watchdog never
-                            // promoted this to `agent_unresponsive`, so
-                            // surface the cleanly-cancelled signal
-                            // distinctly from `prompt_complete`.
-                            "cancelled"
-                        } else {
-                            "prompt_complete"
-                        };
+                        // Reason precedence lives in `terminal_stop_reason`
+                        // (unit-tested). Notable orderings:
+                        //   - `force_stopped` (user "Force stop") wins over
+                        //     orphan/unresponsive: it's the proximate cause of
+                        //     THIS turn ending and must not be masked by a
+                        //     prompt_orphaned flag set earlier. The drain task
+                        //     still kills + respawns, but the reason keeps the
+                        //     user-initiated signal distinct in postmortems
+                        //     (#1727).
+                        //   - `prompt_cancelled` surfaces the adapter's clean
+                        //     StopReason::Cancelled (upstream #694) distinctly
+                        //     from prompt_complete.
+                        //   - the finished-but-unacked recovery breaks with
+                        //     no flag set, falling through to prompt_complete
+                        //     so the turn does NOT restart the worker (#2237).
+                        let reason = terminal_stop_reason(
+                            rate_limited,
+                            force_stopped,
+                            prompt_orphaned,
+                            agent_unresponsive,
+                            shutdown,
+                            prompt_cancelled,
+                        );
                         let _ = event_tx_for_block
                             .send(Event::Stopped {
                                 reason: reason.into(),
@@ -5236,8 +5331,36 @@ async fn run_connection_task<W, R>(
                     }
                     Some(ClientCmd::Cancel) => {
                         info!(target: "acp.protocol", "sending session/cancel (no prompt in flight)");
-                        connection
-                            .send_notification(CancelNotification::new(acp_session_id.clone()))?;
+                        // Best-effort, NOT `?`: a failed notification means
+                        // the agent connection is likely already gone, which
+                        // is exactly when the UI most needs the synthetic
+                        // Stopped below to unstick. Propagating the error here
+                        // would skip that emit and defeat the desync recovery.
+                        if let Err(e) = connection
+                            .send_notification(CancelNotification::new(acp_session_id.clone()))
+                        {
+                            warn!(
+                                target: "acp.protocol",
+                                error = %e,
+                                "session/cancel (no prompt in flight) notification failed; still emitting Stopped"
+                            );
+                        }
+                        // A cancel with no prompt in flight means the UI
+                        // and the daemon have desynced: the client thinks
+                        // a turn is running but this loop owns no
+                        // prompt_fut, so no terminal Stopped will ever be
+                        // emitted (the adopted/orphaned-turn residual of
+                        // #1216). Publish one now so the spinner clears on
+                        // the first Stop press instead of forcing the user
+                        // onto `aoe acp restart`. Harmless when the UI is
+                        // already idle: the reducer caps lastStoppedSeq at
+                        // pendingUserPromptSeq, so a spurious Stopped while
+                        // idle is a no-op. See #2237.
+                        let _ = event_tx_for_block
+                            .send(Event::Stopped {
+                                reason: "cancelled".into(),
+                            })
+                            .await;
                     }
                     Some(ClientCmd::ForceStop) => {
                         // No prompt in flight: nothing to kill here. The
@@ -5984,8 +6107,7 @@ async fn handle_elicitation_request(
         }
     };
 
-    let (resolve_tx, resolve_rx) =
-        oneshot::channel::<(CreateElicitationResponse, ElicitationOutcome)>();
+    let (resolve_tx, resolve_rx) = oneshot::channel::<ElicitationResolutionMessage>();
     pending.lock().await.insert(
         nonce.clone(),
         PendingResponder {
@@ -6011,17 +6133,23 @@ async fn handle_elicitation_request(
     // before sending, so whatever arrives here is already a built, valid
     // response. A dropped resolver (daemon teardown, agent cancel) cancels
     // the tool call.
-    let (response, outcome) = resolve_rx.await.unwrap_or_else(|_| {
-        (
-            CreateElicitationResponse::new(ElicitationAction::Cancel),
-            ElicitationOutcome::Cancelled,
-        )
-    });
+    let ElicitationResolutionMessage {
+        response,
+        outcome,
+        answers,
+    } = resolve_rx
+        .await
+        .unwrap_or_else(|_| ElicitationResolutionMessage {
+            response: CreateElicitationResponse::new(ElicitationAction::Cancel),
+            outcome: ElicitationOutcome::Cancelled,
+            answers: Vec::new(),
+        });
 
     let _ = event_tx
         .send(Event::ElicitationResolved {
             nonce: nonce.clone(),
             outcome,
+            answers,
         })
         .await;
 
@@ -6103,6 +6231,106 @@ mod tests {
         // Fast grace is 20s; 25s after the last progress with cost_seen
         // and no in-flight work must fire.
         assert!(w.should_fire(t0 + std::time::Duration::from_secs(25), cfg));
+    }
+
+    // #2237: when the watchdog fires on a turn that already emitted its
+    // cost-populated end-of-turn UsageUpdate (and no off-protocol work),
+    // the prompt loop ends the turn cleanly instead of cancel+restart.
+    // The decision keys on cost_seen() + off_protocol_work_seen(); guard
+    // both so the clean-completion branch is reachable only in that exact
+    // shape.
+    #[tokio::test]
+    async fn watchdog_cost_seen_marks_completed_unacked_path() {
+        let cfg = watchdog_test_cfg();
+        let t0 = tokio::time::Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::new();
+        w.apply_signal(LifecycleSignal::Progress, t0, wall, cfg);
+        w.apply_signal(
+            LifecycleSignal::TerminalUsage,
+            t0 + std::time::Duration::from_secs(1),
+            wall,
+            cfg,
+        );
+        let fire_at = t0 + std::time::Duration::from_secs(25);
+        assert!(w.should_fire(fire_at, cfg));
+        // The clean-completion branch is gated on both signals.
+        assert!(w.cost_seen(), "cost marker must be observable at fire");
+        assert!(
+            w.off_protocol_work_seen().is_none(),
+            "no off-protocol work, so clean completion (not the monitor floor) applies"
+        );
+    }
+
+    #[tokio::test]
+    async fn watchdog_off_protocol_keeps_orphan_path_even_with_cost() {
+        // A backgrounded command before the cost marker is dropped by
+        // TerminalUsage (#1858), so cost_seen + no off-protocol holds and
+        // the clean path applies. But an async-agent / scheduled wakeup is
+        // NOT dropped, so those keep off_protocol set and must stay on the
+        // orphan path. Lock that distinction down.
+        let cfg = watchdog_test_cfg();
+        let t0 = tokio::time::Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::new();
+        w.apply_signal(LifecycleSignal::Progress, t0, wall, cfg);
+        w.apply_signal(
+            LifecycleSignal::WakeupPending {
+                at: wall + chrono::Duration::seconds(1),
+            },
+            t0 + std::time::Duration::from_secs(1),
+            wall,
+            cfg,
+        );
+        // Now apply the end-of-turn cost marker. TerminalUsage sets
+        // cost_seen, but (unlike a backgrounded command, #1858) a scheduled
+        // wakeup is NOT dropped, so off-protocol work stays set. This is the
+        // "with cost" case the test name promises: the clean-completion guard
+        // (cost_seen && off_protocol none) is still false, so a scheduled-wake
+        // turn keeps the orphan path even once its cost usage lands.
+        w.apply_signal(
+            LifecycleSignal::TerminalUsage,
+            t0 + std::time::Duration::from_secs(2),
+            wall,
+            cfg,
+        );
+        assert!(w.cost_seen());
+        assert!(w.off_protocol_work_seen().is_some());
+    }
+
+    // #2237: the finished-but-unacked recovery breaks with no flag set, so
+    // it must fall through to prompt_complete (the non-restart reason), NOT
+    // prompt_orphaned. Guard the all-false fall-through here; the watchdog
+    // test above guards the branch condition (cost_seen + no off-protocol).
+    #[test]
+    fn terminal_stop_reason_all_false_is_prompt_complete() {
+        assert_eq!(
+            terminal_stop_reason(false, false, false, false, false, false),
+            "prompt_complete"
+        );
+    }
+
+    #[test]
+    fn terminal_stop_reason_precedence_is_preserved() {
+        // rate_limited wins over everything.
+        assert_eq!(
+            terminal_stop_reason(true, true, true, true, true, true),
+            "rate_limited"
+        );
+        // force_stopped beats a prompt_orphaned flag set earlier.
+        assert_eq!(
+            terminal_stop_reason(false, true, true, false, false, false),
+            "user_forced"
+        );
+        // prompt_orphaned (genuine wedge) wins over a later shutdown/cancel.
+        assert_eq!(
+            terminal_stop_reason(false, false, true, false, true, false),
+            "prompt_orphaned"
+        );
+        assert_eq!(
+            terminal_stop_reason(false, false, false, false, false, true),
+            "cancelled"
+        );
     }
 
     #[tokio::test]

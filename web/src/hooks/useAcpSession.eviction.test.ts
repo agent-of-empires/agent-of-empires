@@ -55,6 +55,26 @@ describe("loadPersistedState schema backfill", () => {
     expect(loaded?.pendingApprovals).toEqual([]);
   });
 
+  it("backfills oldestSeq to 0 for a pre-#2236 entry and preserves a stored value", () => {
+    // A warm session persisted before recent-first paging lacks oldestSeq;
+    // it must hydrate as 0 (not undefined) so the `before=<oldestSeq>`
+    // paging contract holds on the first load-earlier.
+    const legacy = { ...emptyAcpState() } as Record<string, unknown>;
+    delete legacy.oldestSeq;
+    window.localStorage.setItem(
+      `${STORAGE_KEY_PREFIX}sess-pre2236`,
+      JSON.stringify({ savedAt: Date.now(), state: legacy }),
+    );
+    expect(loadPersistedState("sess-pre2236")?.oldestSeq).toBe(0);
+
+    const withSeq = { ...emptyAcpState(), oldestSeq: 42 };
+    window.localStorage.setItem(
+      `${STORAGE_KEY_PREFIX}sess-seq`,
+      JSON.stringify({ savedAt: Date.now(), state: withSeq }),
+    );
+    expect(loadPersistedState("sess-seq")?.oldestSeq).toBe(42);
+  });
+
   it("preserves a persisted pendingElicitations list", () => {
     const state = {
       ...emptyAcpState(),

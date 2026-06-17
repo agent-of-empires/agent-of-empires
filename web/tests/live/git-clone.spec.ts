@@ -49,14 +49,14 @@ base("clone happy path: file:// URL clones into HOME and the wizard advances", a
     await cloneBtn.click();
 
     // The wizard switches back to the Recent tab and renders the selected
-    // path block; the cloned dir exists on disk; the wizard `Next`
-    // button becomes enabled now that `data.path` is set.
+    // path block; the cloned dir exists on disk; the Launch button becomes
+    // enabled now that `data.path` is set.
     await expect(page.getByText("Selected project")).toBeVisible({
       timeout: 30_000,
     });
     await expect(page.getByText(dest, { exact: false })).toBeVisible();
     expect(existsSync(join(dest, ".git"))).toBe(true);
-    await expect(page.getByRole("button", { name: "Next" })).toBeEnabled();
+    await expect(page.getByTestId("session-wizard").getByRole("button", { name: /Launch session/ })).toBeEnabled();
   } finally {
     await serve.stop();
   }
@@ -110,7 +110,7 @@ base("bare clone: creates worktree structure and returns main path", async ({ pa
     expect(existsSync(mainPath)).toBe(true);
     expect(existsSync(join(mainPath, ".git"))).toBe(true);
 
-    await expect(page.getByRole("button", { name: "Next" })).toBeEnabled();
+    await expect(page.getByTestId("session-wizard").getByRole("button", { name: /Launch session/ })).toBeEnabled();
   } finally {
     await serve.stop();
   }
@@ -140,7 +140,7 @@ base("clone failure path: unrecognised URL scheme surfaces a server error", asyn
 
     // No path got selected, so the wizard can't advance.
     await expect(page.getByText("Selected project")).toHaveCount(0);
-    await expect(page.getByRole("button", { name: "Next" })).toBeDisabled();
+    await expect(page.getByTestId("session-wizard").getByRole("button", { name: /Launch session/ })).toBeDisabled();
   } finally {
     await serve.stop();
   }

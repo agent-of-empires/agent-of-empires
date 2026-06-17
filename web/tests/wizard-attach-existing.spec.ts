@@ -1,10 +1,12 @@
 import { test, expect } from "./helpers/mockedTest";
 import { Page } from "@playwright/test";
+import { openWizard, selectProject, expandMoreOptions, wizard } from "./helpers/wizard";
 
-// Wizard "Attach to existing branch" toggle (#969). Mirrors the TUI's
-// `Attach to existing branch:` checkbox: when on, the request body
-// sends `create_new_branch: false` (and the Advanced base-branch
-// section hides since it's only honored for new-branch creates).
+// Wizard "Attach to existing branch" toggle (#969) on the single-screen
+// wizard (#2210). Mirrors the TUI's `Attach to existing branch:` checkbox:
+// when on, the request body sends `create_new_branch: false` (and the
+// Base branch section hides since it's only honored for new-branch
+// creates). The toggle lives under the single "More options" fold.
 
 async function mockApis(page: Page) {
   await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
@@ -15,6 +17,8 @@ async function mockApis(page: Page) {
       }),
     );
   }
+  await page.route("**/api/recent-projects", (r) => r.fulfill({ json: { projects: [] } }));
+  await page.route("**/api/projects", (r) => r.fulfill({ json: [] }));
   await page.route("**/api/docker/status", (r) => r.fulfill({ json: { available: false, runtime: null } }));
   await page.route("**/api/agents", (r) =>
     r.fulfill({
@@ -61,24 +65,13 @@ async function mockApis(page: Page) {
   });
 }
 
-async function openSessionStep(page: Page) {
-  await page.locator("body").click();
-  await page.keyboard.press("n");
-  await expect(page.getByRole("heading", { name: "New session" })).toBeVisible();
-  const recent = page.getByRole("button").filter({ hasText: "/tmp/example" }).first();
-  await recent.waitFor({ state: "visible", timeout: 5000 });
-  await recent.click();
-  const next = page.getByRole("button", { name: "Next" });
-  await expect(next).toBeEnabled();
-  await next.click();
-  await expect(page.getByText("Name your session")).toBeVisible();
+async function openWithProject(page: Page) {
+  await openWizard(page);
+  await selectProject(page, "/tmp/example");
 }
 
-// #1514 folds the worktree controls (including the attach-existing
-// toggle and the Base branch picker) behind a top-level "Advanced"
-// disclosure that defaults closed. Expand it before asserting on them.
-async function expandAdvanced(page: Page) {
-  await page.getByRole("button", { name: "Advanced" }).click();
+function attachToggle(page: Page) {
+  return wizard(page).getByRole("switch", { name: /Attach to existing branch/ });
 }
 
 test.describe("Wizard attach-existing toggle (#969)", () => {
@@ -86,26 +79,24 @@ test.describe("Wizard attach-existing toggle (#969)", () => {
     await mockApis(page);
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
-    await openSessionStep(page);
-    await expandAdvanced(page);
-    const attachToggle = page.locator("label", { hasText: "Attach to existing branch" }).locator("role=switch");
-    await expect(attachToggle).toBeVisible();
-    await expect(attachToggle).toHaveAttribute("aria-checked", "false");
+    await openWithProject(page);
+    await expandMoreOptions(page);
+    await expect(attachToggle(page)).toBeVisible();
+    await expect(attachToggle(page)).toHaveAttribute("aria-checked", "false");
     // The base-branch picker (only meaningful for new-branch creates) is
-    // its own "Base branch" disclosure inside Advanced.
-    await expect(page.getByRole("button", { name: "Base branch" })).toBeVisible();
+    // its own "Base branch" disclosure under More options.
+    await expect(wizard(page).getByRole("button", { name: "Base branch" })).toBeVisible();
   });
 
   test("turning attach on hides the Base branch section", async ({ page }) => {
     await mockApis(page);
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
-    await openSessionStep(page);
-    await expandAdvanced(page);
-    const attachToggle = page.locator("label", { hasText: "Attach to existing branch" }).locator("role=switch");
-    await attachToggle.click();
-    await expect(attachToggle).toHaveAttribute("aria-checked", "true");
-    await expect(page.getByRole("button", { name: "Base branch" })).toHaveCount(0);
+    await openWithProject(page);
+    await expandMoreOptions(page);
+    await attachToggle(page).click();
+    await expect(attachToggle(page)).toHaveAttribute("aria-checked", "true");
+    await expect(wizard(page).getByRole("button", { name: "Base branch" })).toHaveCount(0);
   });
 
   test("submit with attach off sends create_new_branch=true", async ({ page }) => {
@@ -144,14 +135,12 @@ test.describe("Wizard attach-existing toggle (#969)", () => {
     });
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
-    await openSessionStep(page);
-    await expandAdvanced(page);
-    await page.getByPlaceholder("Uses session title if empty").fill("feat/new");
-    await page.getByRole("button", { name: /Next/ }).click();
-    // Agent step → Next (defaults already set)
-    await page.getByRole("button", { name: /Next/ }).click();
-    // Review step → Create
-    await page.getByRole("button", { name: /Launch session/ }).click();
+    await openWithProject(page);
+    await expandMoreOptions(page);
+    await wizard(page).getByPlaceholder("Uses session title if empty").fill("feat/new");
+    await wizard(page)
+      .getByRole("button", { name: /Launch session/ })
+      .click();
     await expect.poll(() => captured?.create_new_branch).toBe(true);
   });
 
@@ -191,13 +180,13 @@ test.describe("Wizard attach-existing toggle (#969)", () => {
     });
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
-    await openSessionStep(page);
-    await expandAdvanced(page);
-    await page.getByPlaceholder("Uses session title if empty").fill("feat/existing");
-    await page.locator("label", { hasText: "Attach to existing branch" }).locator("role=switch").click();
-    await page.getByRole("button", { name: /Next/ }).click();
-    await page.getByRole("button", { name: /Next/ }).click();
-    await page.getByRole("button", { name: /Launch session/ }).click();
+    await openWithProject(page);
+    await expandMoreOptions(page);
+    await wizard(page).getByPlaceholder("Uses session title if empty").fill("feat/existing");
+    await attachToggle(page).click();
+    await wizard(page)
+      .getByRole("button", { name: /Launch session/ })
+      .click();
     await expect.poll(() => captured?.create_new_branch).toBe(false);
     expect(captured?.base_branch).toBeUndefined();
   });

@@ -232,6 +232,38 @@ container (rather than bind-mounting from the host).
   reconnect status if the WebSocket is degraded.
 - A repeatedly-failing worker is parked with a red "session parked" banner.
   Retry from the dashboard or run `aoe acp restart <session>`.
+- A session that was auto-stopped for inactivity and then respawned (for
+  example after a version upgrade) used to be able to keep a stale "dormant"
+  marker, which made the daemon refuse to bring the worker back after it next
+  exited; a follow-up message would then sit unsent. A worker coming online now
+  clears that marker, so this no longer strands a queued message.
+
+### "Restarting worker" banner after a turn looked done
+
+Some agents (notably `claude-agent-acp`) occasionally finish a turn, stream
+the final message and the end-of-turn usage, but never send the protocol's
+turn-complete acknowledgement. The daemon used to treat that as a wedge and
+restart the worker, showing **Agent finished but didn't notify the daemon.
+Restarting worker; your transcript will be preserved.** When the agent had
+already emitted its end-of-turn usage and was not running a background or
+scheduled task, the daemon now ends the turn cleanly instead, so a completed
+turn no longer triggers a restart. A genuine stall (no end-of-turn usage, or a
+monitor / scheduled-wake turn that overran) still restarts the worker and
+shows the banner; the transcript is preserved either way.
+
+### Diff viewer is blank (page-restyling browser extensions)
+
+If the Changes panel shows a file's header (path, `+`/`-` counts, the
+Unified/Split toggle) but the diff body below is empty, with no error and a
+clean console, a page-restyling browser extension is almost certainly
+overriding the diff styling. The diff renders into a shadow DOM, and "dark
+mode for every site" extensions (Midnight Lizard, DocsAfterDark, and similar)
+reach into it and make the rows invisible. This is most common on Firefox.
+
+To confirm it is an extension, open the dashboard in Firefox Troubleshoot Mode
+(Menu, Help, Troubleshoot Mode); if the diff renders there, an extension is
+the cause. Fix it by disabling the restyling extension for the dashboard, or
+allowlist the dashboard origin in the extension's settings.
 
 ### "Force end turn" button under the spinner
 

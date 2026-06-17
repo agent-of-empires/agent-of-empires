@@ -28,7 +28,7 @@
 // component-injection points.
 
 import { AssistantRuntimeProvider, useExternalStoreRuntime, type ThreadMessageLike } from "@assistant-ui/react";
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import { useAcpSession } from "../../hooks/useAcpSession";
 import type {
@@ -41,7 +41,13 @@ import type {
 } from "../../lib/acpTypes";
 import { hasTodoItemsArgsText, parseJsonObject } from "../../lib/acpArgs";
 import { useHistoryWindow } from "../../hooks/useHistoryWindow";
+import { canOfferEarlier, earlierAction } from "../../lib/historyScroll";
 import { useAgentProfile } from "../../lib/agentProfileContext";
+import { useCancelEscalation } from "./useCancelEscalation";
+
+// Re-exported for existing tests that import it from this module; the
+// implementation now lives alongside the escalation hook. See #2237.
+export { nextCancelAction } from "./useCancelEscalation";
 
 interface Props {
   sessionId: string;
@@ -99,11 +105,16 @@ export interface AcpContext {
   dismissModeSwitchFailed: () => void;
   setConfigOption: (configId: string, value: string) => Promise<void>;
   dismissConfigOptionSwitchFailed: () => void;
-  /** True when older activity rows exist above the rendered window, so
-   *  the view can offer a "Load earlier" control. See #2144. */
+  /** True when older rows exist above the rendered window, either already
+   *  in the reducer (client window) or still on the server (recent-first
+   *  paging), so the view can offer a "Load earlier" control. See #2236. */
   canLoadEarlierHistory: boolean;
-  /** Reveal an additional chunk of older history. */
+  /** Reveal more older history: first already-loaded rows, then fetch the
+   *  next-older page from the server once those run out. See #2236. */
   loadEarlierHistory: () => void;
+  /** True while an older-history page fetch is in flight, for a spinner
+   *  on the "Load earlier" affordance. See #2236. */
+  loadingEarlierHistory: boolean;
 }
 
 /**
@@ -130,6 +141,17 @@ export function AcpRuntime({
   useEffect(() => {
     pendingAttachmentsRef.current = pendingAttachments;
   }, [pendingAttachments]);
+  // Stop-button escalation: a second press always force-ends, even when the
+  // server never confirms the first cancel (no in-flight prompt on the
+  // daemon). Owns its own reset-on-turn-end and reset-on-session-switch
+  // lifecycle. See #2237.
+  const onCancel = useCancelEscalation(
+    sessionId,
+    acp.state.pendingUserPromptSeq,
+    acp.state.cancelling,
+    acp.cancelPrompt,
+    acp.forceEndTurn,
+  );
   // Render only the most recent slice of the transcript so a long
   // session does not block first paint on mobile; older rows stay in
   // reducer state and are revealed via "Load earlier". See #2144.
@@ -138,6 +160,17 @@ export function AcpRuntime({
     acp.state.activity,
     showClearedTurns,
   );
+  // "Load earlier" is two-stage: first reveal rows already loaded into
+  // the reducer (client window), then, once those are exhausted, fetch
+  // the next-older page from the server (recent-first paging). One
+  // affordance, no competing mechanisms. See #2236.
+  const { loadOlder, hasMoreOlder, loadingOlder } = acp;
+  const canLoadEarlierHistory = canOfferEarlier(canLoadEarlier, hasMoreOlder);
+  const loadEarlierHistory = useCallback(() => {
+    const action = earlierAction(canLoadEarlier, hasMoreOlder);
+    if (action === "reveal") loadEarlier();
+    else if (action === "fetch") void loadOlder();
+  }, [canLoadEarlier, hasMoreOlder, loadEarlier, loadOlder]);
 
   // Memoise the activity → ThreadMessageLike conversion. The function
   // walks the activity array, allocates a new AssistantBuilder
@@ -176,18 +209,7 @@ export function AcpRuntime({
       await acp.sendPrompt(text, attachments);
       setPendingAttachments([]);
     },
-    onCancel: async () => {
-      // First Stop sends a graceful cancel. If a cancel is already in
-      // flight (the agent is ignoring session/cancel on a stuck loop),
-      // a second Stop escalates to a force-stop instead of resending a
-      // no-op notification, so the user's instinct to click again
-      // actually ends the turn. See #1727.
-      if (acp.state.cancelling) {
-        await acp.forceEndTurn();
-      } else {
-        await acp.cancelPrompt();
-      }
-    },
+    onCancel,
   });
 
   return (
@@ -217,8 +239,9 @@ export function AcpRuntime({
         dismissModeSwitchFailed: acp.dismissModeSwitchFailed,
         setConfigOption: acp.setConfigOption,
         dismissConfigOptionSwitchFailed: acp.dismissConfigOptionSwitchFailed,
-        canLoadEarlierHistory: canLoadEarlier,
-        loadEarlierHistory: loadEarlier,
+        canLoadEarlierHistory,
+        loadEarlierHistory,
+        loadingEarlierHistory: loadingOlder,
       })}
     </AssistantRuntimeProvider>
   );
@@ -306,6 +329,23 @@ export function activityToThreadMessages(
         id: row.id,
         role: "user",
         content: parts.length > 0 ? parts : [{ type: "text", text: "" }],
+        createdAt: parseDate(row.at),
+      });
+      continue;
+    }
+
+    if (row.kind === "elicitation_answered") {
+      // The user's answer to an AskUserQuestion / elicitation form. Render
+      // as a user-authored message so the picked answer reads like the
+      // user's turn (mirrors how Claude Code shows it), but keep it a
+      // distinct row kind so it never folds into prompt grouping. The
+      // structured pairs ride on metadata for richer rendering. See #2209.
+      flushAssistant();
+      messages.push({
+        id: row.id,
+        role: "user",
+        content: [{ type: "text", text: row.text }],
+        metadata: row.elicitationAnswers ? { custom: { elicitationAnswers: row.elicitationAnswers } } : undefined,
         createdAt: parseDate(row.at),
       });
       continue;

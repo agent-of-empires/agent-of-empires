@@ -510,6 +510,37 @@ describe("activityToThreadMessages; diff-comments user card (#1123)", () => {
   });
 });
 
+describe("activityToThreadMessages; elicitation answer (#2209)", () => {
+  it("emits a user message with the answers on metadata.custom", () => {
+    const row: ActivityRow = {
+      id: "elicitation-el-1",
+      kind: "elicitation_answered",
+      text: "Proceed?: Yes",
+      elicitationAnswers: [{ question: "Proceed?", answer: "Yes" }],
+      at: "2026-05-12T00:00:00Z",
+    };
+    const messages = activityToThreadMessages([row], false);
+    const user = messages.find((m) => m.role === "user")!;
+    const parts = user.content as Array<{ type: string; text?: string }>;
+    expect(parts[0]!.type).toBe("text");
+    expect(parts[0]!.text).toBe("Proceed?: Yes");
+    const custom = (user.metadata as { custom?: { elicitationAnswers?: unknown[] } } | undefined)?.custom;
+    expect(custom?.elicitationAnswers).toHaveLength(1);
+  });
+
+  it("omits metadata when the structured answers are absent", () => {
+    const row: ActivityRow = {
+      id: "elicitation-el-2",
+      kind: "elicitation_answered",
+      text: "Q: A",
+      at: "2026-05-12T00:00:00Z",
+    };
+    const messages = activityToThreadMessages([row], false);
+    const user = messages.find((m) => m.role === "user")!;
+    expect(user.metadata).toBeUndefined();
+  });
+});
+
 function toolStopped(id: string, text = ""): ActivityRow {
   return {
     id: `stopped-${id}-9`,

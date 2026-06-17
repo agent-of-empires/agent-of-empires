@@ -42,6 +42,31 @@ describe("useHistoryWindow", () => {
     expect(result.current.canLoadEarlier).toBe(false);
   });
 
+  it("keeps earlier rows on screen when new turns append (no re-fold)", () => {
+    // Regression for #2236 symptom A: an end-anchored window slid its
+    // start forward on every appended row, folding visible older rows
+    // back behind "Load earlier".
+    const activity = transcript(100, 1); // 200 rows
+    const { result, rerender } = renderHook(({ a }) => useHistoryWindow("s1", a, false), {
+      initialProps: { a: activity },
+    });
+    const topBefore = result.current.windowedActivity[0]!.id;
+    expect(topBefore).toBeDefined();
+    // Stream 5 more turns (10 rows) onto the tail.
+    const appended = activity.concat(
+      Array.from({ length: 5 }, (_, t) => [
+        { id: `nu-${t}`, kind: "user_prompt" as const, text: `new ${t}` },
+        { id: `nm-${t}`, kind: "message" as const, text: `reply ${t}` },
+      ]).flat(),
+    );
+    rerender({ a: appended });
+    const ids = result.current.windowedActivity.map((r) => r.id);
+    // The row the user could see is still rendered, and the new turns
+    // landed too.
+    expect(ids).toContain(topBefore);
+    expect(ids).toContain("nu-4");
+  });
+
   it("resets the window to recent when the session changes", () => {
     const activity = transcript(100, 1);
     const { result, rerender } = renderHook(({ id }) => useHistoryWindow(id, activity, false), {

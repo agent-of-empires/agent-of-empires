@@ -90,11 +90,13 @@ test.describe("Create session from home screen", () => {
     await expect(page.getByRole("heading", { name: "New session" })).toBeVisible();
   });
 
-  test("wizard closes on cancel", async ({ page }) => {
+  test("wizard closes on the close button", async ({ page }) => {
     await page.goto("/");
     await page.getByRole("button", { name: NEW_SESSION_PANE_NAME }).click();
     await expect(page.getByRole("heading", { name: "New session" })).toBeVisible();
-    await page.getByRole("button", { name: "Cancel" }).click();
+    // The single-screen wizard (#2210) has no Back/Cancel footer; it closes
+    // via the header close button (or Escape, covered below).
+    await page.getByTestId("session-wizard").getByRole("button", { name: "Close" }).click();
     await expect(page.getByRole("heading", { name: "New session" })).not.toBeVisible();
   });
 

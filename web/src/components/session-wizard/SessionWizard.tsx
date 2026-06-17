@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useReducer, useState } from "react";
+import { useCallback, useEffect, useReducer, useState } from "react";
 import type { CreateSessionRequest, SessionResponse } from "../../lib/types";
 import {
   fetchAgents,
@@ -17,12 +17,11 @@ import { HooksTrustDialog } from "./HooksTrustDialog";
 import { ACP_CAPABLE_TOOLS, isAcpCapable } from "../../lib/acpCapableTools";
 import { safeGetItem, safeSetItem } from "../../lib/safeStorage";
 import { toastBus } from "../../lib/toastBus";
-import { StepIndicator } from "./StepIndicator";
-import type { StepDef, StepId } from "./StepIndicator";
 import { ProjectStep } from "./steps/ProjectStep";
 import { SessionStep } from "./steps/SessionStep";
-import { AgentStep } from "./steps/AgentStep";
-import { ReviewStep } from "./steps/ReviewStep";
+import { AgentPickerEssentials } from "./steps/AgentPickerEssentials";
+import { AgentOptions } from "./steps/AgentOptions";
+import { LaunchFooter } from "./LaunchFooter";
 import { getSubmittedBranch } from "./sessionNames";
 import { initialData, reducer, type WizardData } from "./wizardReducer";
 import { commandMapsFromSettings, EMPTY_COMMAND_MAPS, type CommandMaps } from "./commandMaps";
@@ -33,6 +32,12 @@ import { commandMapsFromSettings, EMPTY_COMMAND_MAPS, type CommandMaps } from ".
  *  different aoe install with extra agents registered) doesn't crash
  *  the wizard. See #1133 thread 7 / #1135. */
 const LAST_USED_TOOL_KEY = "aoe-acp-last-tool";
+
+/** localStorage key remembering whether the user expanded the single-screen
+ *  wizard's "More options" fold. Collapsed by default on a fresh browser;
+ *  once opened it stays open across opens so power users are not re-folded
+ *  every time. See #2210. */
+const MORE_OPTIONS_OPEN_KEY = "aoe-new-session-more-options-open";
 
 function loadLastUsedTool(): string {
   const stored = safeGetItem(LAST_USED_TOOL_KEY);
@@ -45,6 +50,14 @@ function loadLastUsedTool(): string {
 function saveLastUsedTool(tool: string): void {
   if (!ACP_CAPABLE_TOOLS.has(tool)) return;
   safeSetItem(LAST_USED_TOOL_KEY, tool);
+}
+
+function loadMoreOptionsOpen(): boolean {
+  return safeGetItem(MORE_OPTIONS_OPEN_KEY) === "true";
+}
+
+function saveMoreOptionsOpen(open: boolean): void {
+  safeSetItem(MORE_OPTIONS_OPEN_KEY, open ? "true" : "false");
 }
 
 /** Layer the last-used tool over the shared `initialData` template so
@@ -63,16 +76,6 @@ function acpDefaultsFor(session: Record<string, unknown> | undefined, tool: stri
   };
 }
 
-// Wizard: project path → session (title + worktree) → agent → review
-function computeSteps(_data: WizardData): StepDef[] {
-  return [
-    { id: "project", label: "Project" },
-    { id: "session", label: "Session" },
-    { id: "agent", label: "Agent" },
-    { id: "review", label: "Review" },
-  ];
-}
-
 export interface WizardPrefill {
   path?: string;
   tool?: string;
@@ -80,14 +83,11 @@ export interface WizardPrefill {
   sandboxEnabled?: boolean;
   profile?: string;
   group?: string;
-  /** If true, skip to the review step (all fields pre-filled) */
-  skipToReview?: boolean;
-  /** Which tab to show initially on the project step */
+  /** Which tab to show initially on the project section */
   initialTab?: "recent" | "browse" | "clone";
   /** Open the wizard pre-configured for a scratch session: the
    *  `scratch` flag is on, no path is required, worktree controls are
-   *  hidden. Pairs with `skipToReview` for the Cmd+Shift+N then
-   *  Cmd+Enter fast-create flow. */
+   *  hidden. The single screen is already one Cmd+Enter from launch. */
   scratch?: boolean;
 }
 
@@ -118,14 +118,6 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
     : baseInitial;
 
   const [state, dispatch] = useReducer(reducer, {
-    // Only `skipToReview` jumps directly to Review. The fast-create
-    // shortcut sets both `scratch: true` and `skipToReview: true`, so
-    // pairing them is still a single keystroke flow; gating on the
-    // scratch flag alone conflicted with WizardPrefill's documented
-    // contract (a wizard opened with `scratch: true` for "open at
-    // ProjectStep with scratch pre-enabled" would have skipped past
-    // the project step entirely).
-    currentStep: prefill?.skipToReview ? 3 : prefill?.path ? 1 : 0,
     data: prefillData,
     isSubmitting: false,
     error: null,
@@ -134,6 +126,17 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
     profiles: [],
     dockerAvailable: false,
   });
+
+  // "More options" fold. Local UI state (not reducer/domain data),
+  // persisted per browser so it stays open for users who expanded it.
+  const [moreOpen, setMoreOpen] = useState(loadMoreOptionsOpen);
+  const toggleMoreOpen = useCallback(() => {
+    setMoreOpen((open) => {
+      const next = !open;
+      saveMoreOptionsOpen(next);
+      return next;
+    });
+  }, []);
 
   // Profile-resolved override/custom-agent maps for the launch-command
   // preview. Sourced from the settings the wizard already fetches on open
@@ -155,12 +158,6 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
     tool: string;
   } | null>(null);
 
-  const steps = useMemo(() => computeSteps(state.data), [state.data]);
-
-  const currentStepDef = steps[state.currentStep];
-  const isFirst = state.currentStep === 0;
-  const isLast = currentStepDef?.id === "review";
-
   useEffect(() => {
     fetchAgents().then((a) => dispatch({ type: "SET_AGENTS", agents: a }));
     fetchGroups().then((g) => dispatch({ type: "SET_GROUPS", groups: g }));
@@ -169,7 +166,7 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
     // Seed the wizard with the resolved (global + active profile) defaults so
     // single-profile users get yolo_mode_default and friends without ever
     // touching the profile picker. The picker is hidden when
-    // profiles.length <= 1 (`AgentStep.tsx`), so its onChange-driven
+    // profiles.length <= 1 (`AgentOptions.tsx`), so its onChange-driven
     // `APPLY_PROFILE_DEFAULTS` path never fires and the wizard would
     // otherwise fall back to default permissions, ignoring the profile.
     // See #1142.
@@ -193,7 +190,7 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
         const acpDefaults = acpDefaultsFor(session, defaultTool || state.data.tool);
         // Honor explicit prefill values so a caller that sets yoloMode/
         // sandboxEnabled/tool isn't silently overridden by profile defaults.
-        // Mirrors the per-field guards `AgentStep.handleProfileChange` skips
+        // Mirrors the per-field guards `AgentOptions.handleProfileChange` skips
         // by going through the user-driven onChange path.
         dispatch({
           type: "APPLY_PROFILE_DEFAULTS",
@@ -233,17 +230,6 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
     },
     [],
   );
-
-  const goNext = () => {
-    if (state.currentStep < steps.length - 1) dispatch({ type: "SET_STEP", step: state.currentStep + 1 });
-  };
-  const goBack = () => {
-    if (state.currentStep > 0) dispatch({ type: "SET_STEP", step: state.currentStep - 1 });
-  };
-  const jumpTo = (stepId: StepId) => {
-    const idx = steps.findIndex((s) => s.id === stepId);
-    if (idx >= 0) dispatch({ type: "SET_STEP", step: idx });
-  };
 
   const handleSubmit = async () => {
     dispatch({ type: "SUBMIT_START" });
@@ -348,56 +334,13 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
     dispatch({ type: "SUBMIT_CANCEL" });
   };
 
-  useEffect(() => {
-    if (state.currentStep >= steps.length) dispatch({ type: "SET_STEP", step: steps.length - 1 });
-  }, [steps.length, state.currentStep]);
-
-  const renderStep = () => {
-    switch (currentStepDef?.id) {
-      case "project":
-        return <ProjectStep data={state.data} onChange={handleChange} initialTab={prefill?.initialTab} />;
-      case "session":
-        return <SessionStep data={state.data} onChange={handleChange} />;
-      case "agent":
-        return (
-          <AgentStep
-            data={state.data}
-            onChange={handleChange}
-            agents={state.agents}
-            profiles={state.profiles}
-            dockerAvailable={state.dockerAvailable}
-            onApplyProfileDefaults={handleApplyProfileDefaults}
-            commandMaps={commandMaps}
-          />
-        );
-      case "review":
-        return (
-          <ReviewStep
-            data={state.data}
-            onChange={handleChange}
-            agents={state.agents}
-            isSubmitting={state.isSubmitting}
-            error={state.error}
-            onSubmit={handleSubmit}
-            onJumpTo={jumpTo}
-            steps={steps}
-            commandMaps={commandMaps}
-          />
-        );
-      default:
-        return null;
-    }
-  };
-
-  // Scratch selection satisfies the project-step "need a project" gate
-  // without a path: the server provisions the working directory on
-  // submit. Otherwise require a path as before.
-  const nextDisabled = currentStepDef?.id === "project" && !state.data.scratch && !state.data.path;
-
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
       <div className="absolute inset-0 bg-black/60" onClick={onClose} />
-      <div className="relative w-full max-w-lg bg-surface-800 border border-surface-700/30 rounded-xl flex flex-col max-h-[min(720px,90vh)]">
+      <div
+        data-testid="session-wizard"
+        className="relative w-full max-w-lg bg-surface-800 border border-surface-700/30 rounded-lg flex flex-col max-h-[min(720px,90vh)]"
+      >
         <div className="flex items-center justify-between px-5 py-4 border-b border-surface-700/20">
           <h1 className="text-sm font-medium text-text-secondary">New session</h1>
           <button
@@ -408,31 +351,76 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
             &times;
           </button>
         </div>
-        <div className="flex-1 overflow-y-auto px-5 py-5">
-          <StepIndicator steps={steps} currentIndex={state.currentStep} />
-          {renderStep()}
-        </div>
-        {!isLast && (
-          <div className="flex justify-between px-5 py-4 border-t border-surface-700/20">
-            <button
-              onClick={isFirst ? onClose : goBack}
-              className="px-5 py-2.5 text-sm rounded-lg border border-surface-700 text-text-secondary hover:bg-surface-800 active:bg-surface-700 cursor-pointer transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-600"
-            >
-              {isFirst ? "Cancel" : "Back"}
-            </button>
-            <button
-              onClick={goNext}
-              disabled={nextDisabled}
-              className={`px-5 py-2.5 text-sm rounded-lg font-semibold transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-600 ${
-                nextDisabled
-                  ? "bg-brand-600/50 text-surface-900/50 cursor-not-allowed"
-                  : "bg-brand-600 hover:bg-brand-700 active:bg-brand-800 text-surface-900 cursor-pointer"
-              }`}
-            >
-              Next
-            </button>
+        <div className="flex-1 overflow-y-auto px-5 py-5 space-y-6">
+          <ProjectStep data={state.data} onChange={handleChange} initialTab={prefill?.initialTab} />
+
+          <div>
+            <label className="block text-sm text-text-dim mb-1.5">Session title</label>
+            <input
+              type="text"
+              value={state.data.title}
+              onChange={(e) => handleChange("title", e.target.value)}
+              placeholder="Auto-generated if empty"
+              className="w-full bg-surface-900 border border-surface-700 rounded-lg px-3 py-2.5 text-base font-mono text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"
+            />
+            <p className="text-xs text-text-dim mt-1">
+              Shown in the dashboard. Renaming it later does not rename the git branch.
+            </p>
           </div>
-        )}
+
+          <div>
+            <h2 className="text-lg font-semibold text-text-primary mb-1">Which AI agent?</h2>
+            <p className="text-sm text-text-muted mb-5">Pick the coding assistant for this session.</p>
+            <AgentPickerEssentials data={state.data} onChange={handleChange} agents={state.agents} />
+          </div>
+
+          <div className="border-t border-surface-700/20 pt-4">
+            <button
+              type="button"
+              onClick={toggleMoreOpen}
+              aria-expanded={moreOpen}
+              className="flex items-center gap-2 text-sm font-medium text-text-secondary hover:text-text-primary py-1 cursor-pointer w-full"
+            >
+              <svg
+                className={`w-3 h-3 transition-transform ${moreOpen ? "rotate-90" : ""}`}
+                viewBox="0 0 12 12"
+                fill="currentColor"
+              >
+                <path
+                  d="M4.5 2l4.5 4-4.5 4"
+                  stroke="currentColor"
+                  strokeWidth="1.5"
+                  fill="none"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              </svg>
+              More options
+            </button>
+            {moreOpen && (
+              <div className="mt-4 space-y-6">
+                <SessionStep data={state.data} onChange={handleChange} embedded />
+                <AgentOptions
+                  data={state.data}
+                  onChange={handleChange}
+                  agents={state.agents}
+                  profiles={state.profiles}
+                  dockerAvailable={state.dockerAvailable}
+                  onApplyProfileDefaults={handleApplyProfileDefaults}
+                  commandMaps={commandMaps}
+                />
+              </div>
+            )}
+          </div>
+        </div>
+        <div className="px-5 py-4 border-t border-surface-700/20">
+          <LaunchFooter
+            data={state.data}
+            isSubmitting={state.isSubmitting}
+            error={state.error}
+            onSubmit={handleSubmit}
+          />
+        </div>
       </div>
       {globConfirm && (
         <VolumeIgnoresGlobDialog globs={globConfirm.globs} onConfirm={handleGlobConfirm} onCancel={handleGlobCancel} />

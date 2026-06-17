@@ -51,6 +51,83 @@ test("long transcript renders recent first and reveals older on Load earlier", a
   await expect(page.getByText("prompt number 0")).toBeVisible({ timeout: 10_000 });
 });
 
+// User story (#2236): scrolling to the top auto-loads earlier messages,
+// no button click needed.
+test("scrolling to the top auto-loads earlier messages", async ({ page }) => {
+  const mock = await mockAcpSession(page, {
+    title: "story-history-autoload",
+    initialEvents: longTranscript(),
+  });
+  await openStructuredSession(page, mock);
+
+  await expect(page.getByText(`reply number ${TURNS - 1}`)).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByText("prompt number 0")).toHaveCount(0);
+
+  // Drive the viewport to the top; the scroll handler should reveal more
+  // history without a button click.
+  await page.getByTestId("acp-viewport").evaluate((el) => {
+    el.scrollTop = 0;
+  });
+  await expect(page.getByText("prompt number 0")).toBeVisible({ timeout: 10_000 });
+});
+
+// User story (#2236, feature C): a transcript larger than one replay page
+// loads recent-first and fetches still-older events from the server when
+// the already-loaded rows are exhausted (network paging, not just the
+// in-reducer window).
+test("loads older events from the server when the loaded window is exhausted", async ({ page }) => {
+  // 350 turns = 1050 events, past the client's 1000-event page, so the
+  // tail leaves older history on the server (has_more) reachable only via
+  // a `before` fetch.
+  const events: unknown[] = [];
+  for (let i = 0; i < 350; i += 1) {
+    events.push(userPrompt(`prompt number ${i}`));
+    events.push(agentMessageChunk(`reply number ${i}`));
+    events.push(stopped());
+  }
+  const mock = await mockAcpSession(page, { title: "story-history-network", initialEvents: events });
+  await openStructuredSession(page, mock);
+
+  await expect(page.getByText("reply number 349")).toBeVisible({ timeout: 10_000 });
+  // Turn 0 is not in the recent page at all; it must be fetched.
+  await expect(page.getByText("prompt number 0")).toHaveCount(0);
+
+  const loadEarlier = page.getByTestId("acp-load-earlier");
+  // Reveal loaded rows, then trip the server fetch, until the very first
+  // turn surfaces.
+  for (let i = 0; i < 12; i += 1) {
+    if ((await page.getByText("prompt number 0").count()) > 0) break;
+    await loadEarlier.click();
+    await page.waitForTimeout(150);
+  }
+  await expect(page.getByText("prompt number 0")).toBeVisible({ timeout: 10_000 });
+});
+
+// User story (#2236, symptom A): a new turn must not fold earlier rows
+// already in the window back behind "Load earlier".
+test("a new turn does not re-fold earlier messages", async ({ page }) => {
+  const mock = await mockAcpSession(page, {
+    title: "story-history-nofold",
+    initialEvents: longTranscript(),
+  });
+  await openStructuredSession(page, mock);
+
+  await expect(page.getByText(`reply number ${TURNS - 1}`)).toBeVisible({ timeout: 10_000 });
+  // 200 rows, 150-row window snapped to a user boundary: turn 25 is the
+  // oldest turn in the window and is rendered (off-screen but in the DOM).
+  await expect(page.getByText("prompt number 25")).toHaveCount(1);
+
+  // The agent streams several new turns.
+  for (let i = 0; i < 20; i += 1) {
+    mock.pushEvents([userPrompt(`fresh prompt ${i}`), agentMessageChunk(`fresh reply ${i}`), stopped()]);
+  }
+  await expect(page.getByText("fresh reply 19")).toBeVisible({ timeout: 10_000 });
+
+  // Pre-fix the window would have slid forward ~40 rows and dropped turn
+  // 25; with the anchor-on-append fix it stays rendered.
+  await expect(page.getByText("prompt number 25")).toHaveCount(1);
+});
+
 // User story (#2144): when /clear is active and the windowed-out rows are
 // all before the clear divider, "Load earlier" would be a no-op (those
 // turns are reached via the cleared-turns banner, not this control), so

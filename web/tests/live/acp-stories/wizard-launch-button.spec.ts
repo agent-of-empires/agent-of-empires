@@ -1,5 +1,5 @@
 // User story: launch a session by clicking the Launch button on the
-// wizard's Review step (mouse path).
+// single-screen wizard (mouse path).
 //
 // Mirrors wizard-launch-cmd-enter but exercises the click path that
 // many users prefer over the keyboard chord.
@@ -22,16 +22,15 @@ base("Launch button on Review step creates the session", async ({ page }, testIn
     const groupHeader = page.locator('[data-testid="sidebar-group-header"]').first();
     await groupHeader.getByRole("button", { name: /New session in /i }).click();
 
-    await expect(page.getByRole("heading", { name: /Review & Launch/i })).toBeVisible({ timeout: 10_000 });
+    const wizard = page.getByTestId("session-wizard");
+    await expect(wizard).toBeVisible({ timeout: 10_000 });
 
-    // Edit the title inline so the new row is easy to find in the sidebar.
-    await page.getByRole("button", { name: /^Title/i }).click();
-    const titleInput = page.locator('input[placeholder="Auto-generated"]').first();
-    await titleInput.fill("story-launched-button");
-    await titleInput.blur();
+    // Set the always-visible title so the new row is easy to find in the
+    // sidebar.
+    await wizard.getByPlaceholder("Auto-generated if empty").fill("story-launched-button");
 
     const before = await listSessions(serve.baseUrl);
-    await page.getByRole("button", { name: /Launch session/i }).click();
+    await wizard.getByRole("button", { name: /Launch session/i }).click();
 
     await expect
       .poll(async () => (await listSessions(serve.baseUrl)).length, {

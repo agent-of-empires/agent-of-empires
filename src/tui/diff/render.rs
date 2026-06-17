@@ -150,6 +150,10 @@ impl DiffView {
             return;
         }
 
+        self.ensure_selected_file_visible_in_list(inner.height as usize);
+        let start = self.file_list_scroll_offset;
+        let visible_rows = inner.height as usize;
+
         // Available width for the file path text (subtract borders, padding, prefix, status)
         let max_path_width = inner.width.saturating_sub(4) as usize; // "  M " = 4 chars
 
@@ -157,6 +161,8 @@ impl DiffView {
             .files
             .iter()
             .enumerate()
+            .skip(start)
+            .take(visible_rows)
             .map(|(i, file)| {
                 let is_selected = i == self.selected_file;
 
@@ -761,6 +767,58 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    fn diff_file(path: &str) -> crate::git::diff::DiffFile {
+        crate::git::diff::DiffFile {
+            path: std::path::PathBuf::from(path),
+            old_path: None,
+            status: FileStatus::Modified,
+            additions: 1,
+            deletions: 0,
+        }
+    }
+
+    #[test]
+    fn file_list_render_keeps_selected_file_visible_after_scroll() {
+        use crate::git::diff::{DiffHunk, DiffLine, FileDiff};
+
+        let mut view = DiffView::test_default();
+        view.files = (0..20)
+            .map(|i| diff_file(&format!("src/file_{i:02}.rs")))
+            .collect();
+        view.selected_file = 14;
+
+        let selected = view.files[14].clone();
+        view.diff_cache.insert(
+            selected.path.clone(),
+            FileDiff {
+                file: selected,
+                hunks: vec![DiffHunk {
+                    old_start: 1,
+                    old_lines: 1,
+                    new_start: 1,
+                    new_lines: 1,
+                    lines: vec![DiffLine {
+                        tag: ChangeTag::Equal,
+                        old_line_num: Some(1),
+                        new_line_num: Some(1),
+                        content: "selected file diff content\n".to_string(),
+                    }],
+                }],
+                is_binary: false,
+            },
+        );
+
+        let out = render_diff_to_string(&mut view, 100, 16);
+        assert!(
+            out.contains("> M src/file_14.rs"),
+            "selected file marker must remain visible in the file list, got:\n{out}"
+        );
+        assert!(
+            out.contains("selected file diff content"),
+            "selected file diff content should render in the diff pane, got:\n{out}"
+        );
     }
 
     #[test]

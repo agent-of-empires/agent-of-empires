@@ -154,12 +154,16 @@ export function triageStateOf(input: { isPinned: boolean; isArchived: boolean; i
 export function triageMenuShape(state: TriageState): TriageMenuShape {
   switch (state) {
     case "pinned":
+      // A pinned row offers Unpin plus Archive/Snooze: archiving or
+      // snoozing a pinned session is a valid transition (the backend
+      // clears pinned_at), and the TUI already allows it directly, so
+      // forcing unpin-first on the web was a parity gap.
       return {
         showPin: false,
         showUnpin: true,
-        showArchive: false,
+        showArchive: true,
         showUnarchive: false,
-        showSnooze: false,
+        showSnooze: true,
         showUnsnooze: false,
       };
     case "archived":

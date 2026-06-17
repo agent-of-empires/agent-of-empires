@@ -446,16 +446,16 @@ describe("triageMenuShape", () => {
     expect(shape.showUnsnooze).toBe(false);
   });
 
-  it("a pinned row only offers Unpin", () => {
-    // Regression: a pinned row used to show Archive and Snooze
-    // alongside Unpin, letting the user trigger contradictory
-    // transitions from the menu. See #1581.
+  it("a pinned row offers Unpin plus Archive / Snooze", () => {
+    // Archiving or snoozing a pinned session is a valid transition
+    // (the backend clears pinned_at) and the TUI already allows it,
+    // so the menu must not force unpin-first.
     const shape = triageMenuShape("pinned");
     expect(shape.showUnpin).toBe(true);
+    expect(shape.showArchive).toBe(true);
+    expect(shape.showSnooze).toBe(true);
     expect(shape.showPin).toBe(false);
-    expect(shape.showArchive).toBe(false);
     expect(shape.showUnarchive).toBe(false);
-    expect(shape.showSnooze).toBe(false);
     expect(shape.showUnsnooze).toBe(false);
   });
 

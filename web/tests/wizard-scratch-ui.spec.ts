@@ -1,15 +1,16 @@
 import { test, expect } from "./helpers/mockedTest";
 import { Page } from "@playwright/test";
+import { openWizard, expandMoreOptions, wizard } from "./helpers/wizard";
 
-// Wizard scratch-session stories (#1324), ported from the live suite.
+// Wizard scratch-session stories (#1324), on the single-screen wizard (#2210).
 // Covers:
-// - the "Skip project folder" toggle rendering above the project tabs;
-// - flipping it enabling Next without a path and hiding the path
+// - the "Skip project folder" toggle rendering at the top of ProjectStep;
+// - flipping it enabling Launch without a path and hiding the path
 //   sources (tab strip + directory browser);
-// - scratch hiding the worktree controls on the Session step (a
+// - scratch hiding the worktree controls under More options (a
 //   scratch directory is not a git repo);
-// - Cmd+Shift+N opening the wizard at Review pre-configured for
-//   scratch, with Cmd+Enter submitting the scratch-shaped POST;
+// - Cmd+Shift+N opening the wizard pre-configured for scratch, with
+//   Cmd+Enter submitting the scratch-shaped POST;
 // - the sidebar collapsing all scratch sessions into one synthetic
 //   "Scratch" group (useRepoGroups, #1324 follow-up).
 
@@ -48,6 +49,8 @@ async function mockApis(
       }),
     );
   }
+  await page.route("**/api/recent-projects", (r) => r.fulfill({ json: { projects: [] } }));
+  await page.route("**/api/projects", (r) => r.fulfill({ json: [] }));
   await page.route("**/api/docker/status", (r) => r.fulfill({ json: { available: false, runtime: null } }));
   await page.route("**/api/agents", (r) =>
     r.fulfill({
@@ -70,12 +73,6 @@ async function mockApis(
   });
 }
 
-async function openWizard(page: Page) {
-  await page.locator("body").click();
-  await page.keyboard.press("n");
-  await expect(page.getByRole("heading", { name: "New session" })).toBeVisible();
-}
-
 test.describe("Wizard scratch sessions (#1324)", () => {
   test("scratch toggle is visible above the project tabs and defaults off", async ({ page }) => {
     await mockApis(page);
@@ -83,56 +80,56 @@ test.describe("Wizard scratch sessions (#1324)", () => {
     await page.goto("/");
     await openWizard(page);
 
-    const toggle = page.getByRole("switch", { name: "Skip project folder" });
+    const toggle = wizard(page).getByRole("switch", { name: "Skip project folder" });
     await expect(toggle).toBeVisible();
     await expect(toggle).toHaveAttribute("aria-checked", "false");
   });
 
-  test("scratch toggle enables Next without a path and hides the path sources", async ({ page }) => {
+  test("scratch toggle enables Launch without a path and hides the path sources", async ({ page }) => {
     await mockApis(page);
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
     await openWizard(page);
 
-    // Baseline: Next is disabled because no path is selected.
-    const nextButton = page.getByRole("button", { name: "Next" });
-    await expect(nextButton).toBeDisabled();
+    const w = wizard(page);
+    // Baseline: Launch is disabled because no path is selected and scratch
+    // is off.
+    const launchButton = w.getByRole("button", { name: /Launch session/ });
+    await expect(launchButton).toBeDisabled();
 
     // Flip the toggle. The reducer also clears any prefilled path /
-    // useWorktree state, so Next must transition to enabled.
-    await page.getByRole("switch", { name: "Skip project folder" }).click();
-    await expect(nextButton).toBeEnabled();
+    // useWorktree state, so Launch must transition to enabled.
+    await w.getByRole("switch", { name: "Skip project folder" }).click();
+    await expect(launchButton).toBeEnabled();
 
     // The scratch confirmation card replaces the path picker, so the
     // Browse tab must no longer be reachable.
-    await expect(page.getByText(/Scratch session/).first()).toBeVisible();
-    await expect(page.getByRole("button", { name: "Browse" })).toBeHidden();
+    await expect(w.getByText(/Scratch session/).first()).toBeVisible();
+    await expect(w.getByRole("button", { name: "Browse" })).toBeHidden();
   });
 
-  test("scratch hides the worktree section on the Session step", async ({ page }) => {
+  test("scratch hides the worktree section under More options", async ({ page }) => {
     await mockApis(page);
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
     await openWizard(page);
 
-    await page.getByRole("switch", { name: "Skip project folder" }).click();
-    await page.getByRole("button", { name: "Next" }).click();
-    await expect(page.getByRole("heading", { name: "Name your session", exact: true })).toBeVisible();
+    const w = wizard(page);
+    await w.getByRole("switch", { name: "Skip project folder" }).click();
 
-    // #1514 folds the worktree section (and, for scratch, the
-    // explanatory note that replaces it) behind the top-level
-    // "Advanced" disclosure that defaults closed; expand it first.
-    await page.getByRole("button", { name: "Advanced" }).click();
+    // The worktree controls (and, for scratch, the explanatory note that
+    // replaces them) live behind the "More options" fold that defaults
+    // closed; expand it first.
+    await expandMoreOptions(page);
 
-    await expect(page.getByText(/Scratch sessions do not use git worktrees/)).toBeVisible();
+    await expect(w.getByText(/Scratch sessions do not use git worktrees/)).toBeVisible();
     // The "Create a worktree" switch must NOT be in the DOM at all.
-    await expect(page.getByRole("switch", { name: /Create a worktree/i })).toHaveCount(0);
+    await expect(w.getByRole("switch", { name: /Create a worktree/i })).toHaveCount(0);
   });
 
-  test("Cmd+Shift+N opens the wizard at Review with scratch on; Cmd+Enter launches", async ({ page }) => {
-    // The App.tsx callback sets both scratch: true and skipToReview, so
-    // a follow-up Cmd+Enter / Ctrl+Enter creates the session in two
-    // keystrokes total.
+  test("Cmd+Shift+N opens the wizard with scratch on; Cmd+Enter launches", async ({ page }) => {
+    // The App.tsx callback sets scratch: true, so a follow-up
+    // Cmd+Enter / Ctrl+Enter creates the session in two keystrokes total.
     const captured: { body: Record<string, unknown> | null } = { body: null };
     await mockApis(page, { captured });
     await page.setViewportSize({ width: 1280, height: 900 });
@@ -146,9 +143,12 @@ test.describe("Wizard scratch sessions (#1324)", () => {
     await expect(page.getByRole("button", { name: "New session", exact: true }).first()).toBeVisible();
     await page.keyboard.press("ControlOrMeta+Shift+KeyN");
 
-    await expect(page.getByRole("heading", { name: "Review & Launch" })).toBeVisible();
-    await expect(page.getByRole("button", { name: /Launch session/ })).toBeVisible();
-    await expect(page.getByText("Scratch directory (provisioned on create)")).toBeVisible();
+    await expect(wizard(page)).toBeVisible();
+    const w = wizard(page);
+    await expect(w.getByRole("button", { name: /Launch session/ })).toBeVisible();
+    // Scratch is pre-armed: the scratch callout shows and Launch is enabled.
+    await expect(w.getByText(/Scratch session/).first()).toBeVisible();
+    await expect(w.getByRole("switch", { name: "Skip project folder" })).toHaveAttribute("aria-checked", "true");
 
     await page.keyboard.press("ControlOrMeta+Enter");
 

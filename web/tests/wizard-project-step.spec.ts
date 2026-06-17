@@ -1,15 +1,18 @@
 import { test, expect } from "./helpers/mockedTest";
 import { Page } from "@playwright/test";
+import { openWizard } from "./helpers/wizard";
 
-// Wizard Project step (#1219). Covers the three-tab layout (recent /
-// browse / clone), DirectoryBrowser integration on the browse tab, and
-// the Clone-from-URL form's enable-by-URL gating. The attach-existing
-// and base-branch flows are covered separately in wizard-attach-existing
-// and wizard-base-branch specs.
+// Wizard Project section (#1219). The project picker is unchanged by the
+// single-screen migration (#2210): it keeps its three-tab layout (recent /
+// browse / clone), DirectoryBrowser integration on the browse tab, and the
+// Clone-from-URL form's enable-by-URL gating. The attach-existing and
+// base-branch flows are covered separately in wizard-attach-existing and
+// wizard-base-branch specs.
 
 async function mockBaseApis(page: Page) {
   await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
   await page.route("**/api/projects", (r) => r.fulfill({ json: [] }));
+  await page.route("**/api/recent-projects", (r) => r.fulfill({ json: { projects: [] } }));
   for (const path of ["settings", "themes", "profiles", "groups", "devices", "about", "system/update-status"]) {
     await page.route(`**/api/${path}`, (r) =>
       r.fulfill({
@@ -60,13 +63,7 @@ function seedRecentSession() {
   };
 }
 
-async function openWizard(page: Page) {
-  await page.locator("body").click();
-  await page.keyboard.press("n");
-  await expect(page.getByRole("heading", { name: "New session" })).toBeVisible();
-}
-
-test.describe("Wizard project step (#1219)", () => {
+test.describe("Wizard project section (#1219)", () => {
   test("Recent tab is the default when sessions exist", async ({ page }) => {
     await mockBaseApis(page);
     await page.route("**/api/sessions", (r) => r.fulfill({ json: seedRecentSession() }));
@@ -110,12 +107,12 @@ test.describe("Wizard project step (#1219)", () => {
     await expect(page.getByText("Saved projects")).toBeVisible();
     const savedRow = page.getByRole("button").filter({ hasText: "/srv/my-saved-repo" }).first();
     await expect(savedRow).toBeVisible();
-    // Selecting the saved project populates the wizard path.
+    // Selecting the saved project populates the wizard path and highlights
+    // the row with the selected border; no duplicate "Selected project" box.
     await savedRow.click();
-    await expect(page.getByText("Selected project")).toBeVisible();
-    // Scope to the selected-project panel's paragraph; the saved row also
-    // renders the same path (in a span), so an unscoped match is ambiguous.
-    await expect(page.getByRole("paragraph").filter({ hasText: "/srv/my-saved-repo" })).toBeVisible();
+    await expect(savedRow).toHaveClass(/border-brand-600/);
+    await expect(page.getByText("Selected project")).toHaveCount(0);
+    await expect(page.getByRole("button", { name: /Launch session/ })).toBeEnabled();
   });
 
   test("switching to Browse tab renders DirectoryBrowser and selecting a repo populates path", async ({ page }) => {

@@ -5,14 +5,14 @@
 // server PUT to assert; the round-trip we care about is "drag, then
 // reload, order survives", which works against a fully stubbed /api.
 //
-// The grip is a dedicated drag handle on each real group header
-// (`data-testid='sidebar-group-drag-handle'`); the rest of the header
-// keeps its expand/collapse + context-menu behavior. dnd-kit's
-// MouseSensor activates on an 8px distance, so the drag is
-// mouse.down on the grip -> mouse.move past 8px in steps over the target
-// header -> mouse.up. Synthetic groups have no grip and stay pinned, and
-// group drag is disabled in last-activity sort mode (the order is
-// computed there).
+// There is no dedicated grip anymore (#2207): the whole real group header
+// is the drag activator, while the header keeps its expand/collapse +
+// context-menu behavior. A draggable header carries `data-draggable='true'`.
+// dnd-kit's MouseSensor activates on an 8px distance, so the drag is
+// mouse.down on the header -> mouse.move past 8px in steps over the target
+// header -> mouse.up. Synthetic groups are not draggable and stay pinned,
+// and group drag is disabled in last-activity sort mode (the order is
+// computed there), where the header drops `data-draggable`.
 
 import { test, expect } from "./helpers/mockedTest";
 import type { Page } from "@playwright/test";
@@ -46,20 +46,21 @@ test.describe("sidebar group-header reorder (#1644)", () => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
 
-    const grips = page.locator("[data-testid='sidebar-group-drag-handle']");
-    await expect(grips).toHaveCount(2);
+    const draggable = page.locator("[data-testid='sidebar-group-header'][data-draggable='true']");
+    await expect(draggable).toHaveCount(2);
 
     const before = await readGroupNames(page);
     expect(before).toHaveLength(2);
 
-    // Drag the bottom group's grip up onto the top group's header.
-    const sourceGrip = await grips.nth(1).boundingBox();
+    // Drag the bottom group's header up onto the top group's header. Grab
+    // near the left (icon/name) to stay clear of the new-session button.
+    const source = await draggable.nth(1).boundingBox();
     const targetHeader = await page.locator("[data-testid='sidebar-group-header']").nth(0).boundingBox();
-    if (!sourceGrip || !targetHeader) throw new Error("drag boxes missing");
+    if (!source || !targetHeader) throw new Error("drag boxes missing");
 
-    await page.mouse.move(sourceGrip.x + sourceGrip.width / 2, sourceGrip.y + sourceGrip.height / 2);
+    await page.mouse.move(source.x + 40, source.y + source.height / 2);
     await page.mouse.down();
-    await page.mouse.move(targetHeader.x + targetHeader.width / 2, targetHeader.y + targetHeader.height / 3, {
+    await page.mouse.move(targetHeader.x + 40, targetHeader.y + targetHeader.height / 3, {
       steps: 12,
     });
     await page.mouse.up();
@@ -69,21 +70,22 @@ test.describe("sidebar group-header reorder (#1644)", () => {
 
     // The order is client-only; a reload re-reads it from localStorage.
     await page.reload();
-    await expect(grips).toHaveCount(2);
+    await expect(draggable).toHaveCount(2);
     await expect.poll(() => readGroupNames(page), { timeout: 4_000 }).toEqual(expected);
   });
 
-  test("group drag handles are absent in last-activity sort mode", async ({ page }) => {
+  test("group headers are not draggable in last-activity sort mode", async ({ page }) => {
     await installSidebarMocks(page, { sessions: twoRepoSessions() });
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
 
-    const grips = page.locator("[data-testid='sidebar-group-drag-handle']");
-    await expect(grips).toHaveCount(2);
+    const draggable = page.locator("[data-testid='sidebar-group-header'][data-draggable='true']");
+    await expect(draggable).toHaveCount(2);
 
     // Flip to last-activity sort; the order is computed there, so the
-    // grips disappear, matching how within-group row drag is gated.
+    // headers lose their drag wiring, matching how within-group row drag
+    // is gated.
     await selectSortMode(page, "lastActivity");
-    await expect(grips).toHaveCount(0);
+    await expect(draggable).toHaveCount(0);
   });
 });

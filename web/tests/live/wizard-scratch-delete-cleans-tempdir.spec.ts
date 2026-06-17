@@ -21,9 +21,6 @@ base("deleting a scratch session removes its scratch dir", async ({ page }, test
     await expect(wizard).toBeVisible({ timeout: 15_000 });
 
     await wizard.getByRole("switch", { name: "Skip project folder" }).click();
-    await wizard.getByRole("button", { name: "Next" }).click();
-    await wizard.getByRole("button", { name: "Next" }).click();
-    await wizard.getByRole("button", { name: "Next" }).click();
     await wizard.getByRole("button", { name: /Launch session/ }).click();
 
     await expect

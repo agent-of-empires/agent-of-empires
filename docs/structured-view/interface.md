@@ -146,6 +146,11 @@ Bluetooth keyboard) keep the desktop Enter-to-send convention.
 On-screen keyboard dictation (the mic icon, e.g. iOS Safari) commits
 into the composer correctly.
 
+On touch devices, tapping anywhere in the transcript focuses the composer
+and brings up the soft keyboard, so you do not have to reach for the
+composer field to start typing. Tapping a control inside a message (a
+tool-call card, a link, a button) still does its own thing instead.
+
 ## Composer attachments (images, audio, files)
 
 The web composer can send attachments alongside the prompt text when the
@@ -245,8 +250,14 @@ blocking command) do not honor a graceful cancel. When that happens a
 **Force stop** button appears next to the spinner, even while a tool is
 in flight. Force stop ends the turn immediately: it restarts the agent
 worker and kills the whole command tree, so a runaway loop actually
-stops instead of waiting out the grace window. Clicking **Stop** again
-while it already reads "Stopping..." does the same thing.
+stops instead of waiting out the grace window.
+
+Clicking **Stop** a second time always escalates to a force stop, even
+when the spinner is stuck "active" but the daemon no longer has a turn in
+flight (for example after the worker was restarted mid-turn). The second
+press no longer waits for the server to confirm the first cancel, so the
+button is always a working escape and you should not need
+`aoe acp restart` to clear a wedged spinner.
 
 Force stop is a hard interrupt. The agent resumes from its saved
 transcript on the next prompt, but any partial output from the tool that

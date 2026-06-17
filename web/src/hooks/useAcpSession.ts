@@ -9,11 +9,14 @@
 
 import { useCallback, useEffect, useReducer, useRef, useState, useSyncExternalStore } from "react";
 import {
+  appendElicitationAnswerRow,
   applyEvent,
   emptyAcpState,
   isTurnActive,
   normaliseTurnCounters,
+  reduceFrames,
   setActivityLimit,
+  summarizeAnswers,
   type ApprovalDecision,
   type AcpAttachment,
   type AcpFrame,
@@ -45,14 +48,16 @@ type PromptSendResult = "ok" | "retryable_failure" | "non_retryable_failure";
 
 export type Action =
   | { kind: "frame"; frame: AcpFrame }
-  | { kind: "frames"; frames: AcpFrame[] }
+  | { kind: "frames"; frames: AcpFrame[]; oldestSeq?: number }
+  | { kind: "prepend"; frames: AcpFrame[]; oldestSeq: number }
+  | { kind: "handshake"; frames: AcpFrame[] }
   | { kind: "lagged"; skipped: number }
   | { kind: "user_prompt"; text: string; attachments?: AcpAttachment[] }
   | { kind: "prompt_send_rejected" }
   | { kind: "error"; message: string }
   | { kind: "clear_error" }
   | { kind: "approval_resolved_locally"; nonce: string }
-  | { kind: "elicitation_resolved_locally"; nonce: string }
+  | { kind: "elicitation_resolved_locally"; nonce: string; resolution: ElicitationResolution }
   | { kind: "lagged_resolved" }
   | { kind: "reset" }
   | { kind: "hydrate"; state: AcpState }
@@ -330,6 +335,26 @@ const REPLAY_OVERLAP = 50;
  *  giant response. The loop follows `next_cursor` while `has_more`. */
 const REPLAY_PAGE_SIZE = 1000;
 
+/** `before` sentinel for the recent-first tail request: any value above
+ *  every real seq makes the backend return the most recent page. The
+ *  server clamps to i64, so MAX_SAFE_INTEGER is comfortably "newest".
+ *  See #2236. */
+const TAIL_BEFORE = Number.MAX_SAFE_INTEGER;
+
+/** Frames pulled from seq 0 on a long-session cold open purely to project
+ *  the handshake snapshot (capabilities, slash palette, agent/model);
+ *  small because the handshake fires in the first few events. See #2236. */
+const HANDSHAKE_PREFIX_SIZE = 50;
+
+/** Shape of the `acp/replay` JSON response (forward and backward modes). */
+type ReplayPageResponse = {
+  frames: AcpFrame[];
+  lost: boolean;
+  highest_seq: number;
+  next_cursor?: number | null;
+  has_more?: boolean;
+};
+
 export function clearAcpCache(sessionId?: string): void {
   if (sessionId === undefined) {
     stateCache.clear();
@@ -416,7 +441,48 @@ export function reducer(state: AcpState, action: Action): AcpState {
     return applyEvent(state, action.frame);
   }
   if (action.kind === "frames") {
-    return action.frames.reduce(applyEvent, state);
+    const next = action.frames.reduce(applyEvent, state);
+    // The recent-first tail load passes the page's lowest seq so the
+    // first forward fold seeds the older-history watermark. Live WS
+    // batches omit it (they append newer rows, never lower the floor).
+    if (action.oldestSeq != null && state.oldestSeq === 0) {
+      return { ...next, oldestSeq: action.oldestSeq };
+    }
+    return next;
+  }
+  if (action.kind === "prepend") {
+    // Older history page. Reduce it in ISOLATION and prepend only its
+    // activity rows; never re-fold the whole log, because live state
+    // (optimistic prompt rows, locally-resolved approvals #1821, the
+    // prompt queue, pendingConfigOption) is not a pure fold and would be
+    // clobbered. Backward paging guarantees the page starts at a turn
+    // boundary and ends just below the current oldest, so there is no
+    // split-turn seam and no overlap to dedupe. See #2236.
+    const next = { ...state, oldestSeq: action.oldestSeq };
+    if (action.frames.length === 0) return next;
+    next.activity = reduceFrames(action.frames).activity.concat(state.activity);
+    return next;
+  }
+  if (action.kind === "handshake") {
+    // Recent-first cold open skips the seq-0 handshake on a long session,
+    // so the composer would have null capabilities and an empty slash
+    // palette. Project the pinned handshake/snapshot frames (#1049) and
+    // backfill ONLY the fields still at their empty default, so the tail's
+    // authoritative recent values (e.g. a later model/mode switch) win and
+    // no transcript rows are added (avoiding a detached island above the
+    // gap). See #2236.
+    const hs = reduceFrames(action.frames);
+    return {
+      ...state,
+      agent: state.agent ?? hs.agent,
+      model: state.model ?? hs.model,
+      mode: state.mode !== "Default" ? state.mode : hs.mode,
+      promptCapabilities: state.promptCapabilities ?? hs.promptCapabilities,
+      availableModes: state.availableModes.length > 0 ? state.availableModes : hs.availableModes,
+      currentModeId: state.currentModeId ?? hs.currentModeId,
+      availableCommands: state.availableCommands.length > 0 ? state.availableCommands : hs.availableCommands,
+      configOptions: state.configOptions.length > 0 ? state.configOptions : hs.configOptions,
+    };
   }
   if (action.kind === "lagged") {
     return { ...state, lagged: true };
@@ -449,12 +515,18 @@ export function reducer(state: AcpState, action: Action): AcpState {
     // Optimistically drop the elicitation card once the server accepts the
     // resolution (204) or reports the nonce gone (404), instead of waiting
     // on the ElicitationResolved broadcast, which the seq dedupe can drop.
+    const card = state.pendingElicitations.find((e) => e.nonce === action.nonce);
     const pendingElicitations = state.pendingElicitations.filter((e) => e.nonce !== action.nonce);
     const removed = pendingElicitations.length !== state.pendingElicitations.length;
+    // Record the picked answer immediately (deduped by id), so it shows
+    // even when the broadcast is dropped by seq dedupe. See #2209.
+    const answers =
+      card && action.resolution.action === "accept" ? summarizeAnswers(card, action.resolution.answers) : [];
     return {
       ...state,
       lastError: removed ? null : state.lastError,
       pendingElicitations,
+      activity: appendElicitationAnswerRow(state.activity, action.nonce, answers),
     };
   }
   if (action.kind === "hydrate") {
@@ -714,6 +786,21 @@ export function useAcpSession(
   useEffect(() => {
     lastSeqRef.current = state.lastSeq;
   }, [state.lastSeq]);
+  // Older-history paging (#2236). `oldestSeqRef` mirrors the recent-first
+  // load watermark so `loadOlder` (a stable callback) reads it without
+  // re-creating. `hasMoreOlder` / `loadingOlder` drive the scroll-up
+  // affordance and guard against concurrent fetches.
+  const oldestSeqRef = useRef(0);
+  useEffect(() => {
+    oldestSeqRef.current = state.oldestSeq;
+  }, [state.oldestSeq]);
+  const [hasMoreOlder, setHasMoreOlder] = useState(false);
+  const hasMoreOlderRef = useRef(false);
+  useEffect(() => {
+    hasMoreOlderRef.current = hasMoreOlder;
+  }, [hasMoreOlder]);
+  const [loadingOlder, setLoadingOlder] = useState(false);
+  const loadingOlderRef = useRef(false);
   // Flips true the first time the WS opens for this session and
   // resets on session change. Lets the SystemNotices banner copy
   // distinguish "first connect, worker still spawning" from
@@ -844,6 +931,50 @@ export function useAcpSession(
 
   const fetchReplay = useCallback(async (sid: string) => {
     try {
+      // Cold open (cache miss, nothing loaded): recent-first. Render the
+      // most recent page immediately and page older history lazily on
+      // scroll-up, instead of forward-folding the whole transcript from
+      // seq 0 before first paint. The warm path below (hydrated from
+      // cache, lastSeq > 0) keeps the cheap forward seq-delta top-up.
+      // See #2236.
+      if (lastSeqRef.current === 0) {
+        const tailRes = await fetch(
+          `/api/sessions/${encodeURIComponent(sid)}/acp/replay?before=${TAIL_BEFORE}&limit=${REPLAY_PAGE_SIZE}`,
+          { credentials: "same-origin" },
+        );
+        if (!tailRes.ok) return;
+        const tail = (await tailRes.json()) as ReplayPageResponse;
+        if (tail.lost) {
+          dispatch({ kind: "lagged", skipped: tail.highest_seq });
+          return;
+        }
+        dispatch({ kind: "frames", frames: tail.frames ?? [], oldestSeq: tail.next_cursor ?? 0 });
+        setHasMoreOlder(tail.has_more ?? false);
+        // Advance the seq ref synchronously (the [state.lastSeq] effect
+        // mirror lags a render tick) so the WS dial that follows this
+        // awaited call subscribes with `since = highest_seq` and the
+        // server drains only live events, not the whole transcript we
+        // just rendered recent-first. See #2236.
+        if (tail.highest_seq > lastSeqRef.current) {
+          lastSeqRef.current = tail.highest_seq;
+        }
+        // Long session: the tail skipped the seq-0 handshake (prompt
+        // capabilities, slash palette, agent/model/mode), pinned near the
+        // start by #1049. Pull a small prefix and project just those
+        // fields so the composer isn't crippled until the user scrolls up.
+        if ((tail.has_more ?? false) && (tail.next_cursor ?? 0) > 1) {
+          const hsRes = await fetch(
+            `/api/sessions/${encodeURIComponent(sid)}/acp/replay?since=0&limit=${HANDSHAKE_PREFIX_SIZE}`,
+            { credentials: "same-origin" },
+          );
+          if (hsRes.ok) {
+            const hs = (await hsRes.json()) as ReplayPageResponse;
+            if ((hs.frames ?? []).length > 0) dispatch({ kind: "handshake", frames: hs.frames });
+          }
+        }
+        dispatch({ kind: "lagged_resolved" });
+        return;
+      }
       // Defensive overlap: re-fetch from `lastSeq - REPLAY_OVERLAP`
       // instead of `lastSeq` so events that landed in the broadcast
       // tail without being applied (WS-vs-replay race, broadcast lag
@@ -863,13 +994,7 @@ export function useAcpSession(
           { credentials: "same-origin" },
         );
         if (!res.ok) return;
-        const data = (await res.json()) as {
-          frames: AcpFrame[];
-          lost: boolean;
-          highest_seq: number;
-          next_cursor?: number | null;
-          has_more?: boolean;
-        };
+        const data = (await res.json()) as ReplayPageResponse;
         if (target === null) {
           target = data.highest_seq;
           // Detect a server-side seq reset: the supervisor's per-session
@@ -909,6 +1034,36 @@ export function useAcpSession(
     }
   }, []);
 
+  // Fetch the next-older page of history and prepend it. Stable callback;
+  // reads the watermark / guards from refs. The scroll-up handler and the
+  // "Load earlier" button both call this once the already-loaded rows are
+  // exhausted. See #2236.
+  const loadOlder = useCallback(async () => {
+    const sid = sessionIdRef.current;
+    const before = oldestSeqRef.current;
+    if (!sid || before <= 0 || loadingOlderRef.current || !hasMoreOlderRef.current) return;
+    loadingOlderRef.current = true;
+    setLoadingOlder(true);
+    try {
+      const res = await fetch(
+        `/api/sessions/${encodeURIComponent(sid)}/acp/replay?before=${before}&limit=${REPLAY_PAGE_SIZE}`,
+        { credentials: "same-origin" },
+      );
+      if (!res.ok) return;
+      const data = (await res.json()) as ReplayPageResponse;
+      if ((data.frames ?? []).length > 0) {
+        dispatch({ kind: "prepend", frames: data.frames, oldestSeq: data.next_cursor ?? before });
+      }
+      setHasMoreOlder(data.has_more ?? false);
+    } catch {
+      // Leave hasMoreOlder as-is; a transient failure shouldn't
+      // permanently hide the affordance. The next scroll-up retries.
+    } finally {
+      loadingOlderRef.current = false;
+      setLoadingOlder(false);
+    }
+  }, []);
+
   // Derive status and retry state from sessionId changes during render,
   // not in a useEffect, to satisfy
   // react-you-might-not-need-an-effect/no-adjust-state-on-prop-change
@@ -924,6 +1079,21 @@ export function useAcpSession(
     setReconnecting(false);
     setRetryCount(0);
     setRetryCountdown(0);
+    // The new session re-derives its window from its own recent-first
+    // load; clear the older-paging flags so a stale "more above" doesn't
+    // carry across the switch. See #2236.
+    setHasMoreOlder(false);
+    setLoadingOlder(false);
+    loadingOlderRef.current = false;
+    // Sync the seq refs to the switched-in session synchronously: the
+    // [state.lastSeq] / [state.oldestSeq] effect mirrors lag a render
+    // tick, so without this `fetchReplay` would read the PREVIOUS
+    // session's seq and take the warm forward path instead of a
+    // recent-first cold open (or fetch from the wrong cursor). Match what
+    // the effect's `hydrate` restores: the cache, else 0. See #2236.
+    const switched = sessionId ? cacheGet(sessionId) : undefined;
+    lastSeqRef.current = switched?.lastSeq ?? 0;
+    oldestSeqRef.current = switched?.oldestSeq ?? 0;
   }
 
   useEffect(() => {
@@ -1197,7 +1367,7 @@ export function useAcpSession(
       const detail = res.ok ? "" : await safeText(res);
       const outcome = classifyElicitationResolveResponse(res.ok, res.status, detail, nonce);
       if (outcome.kind === "resolved") {
-        dispatch({ kind: "elicitation_resolved_locally", nonce });
+        dispatch({ kind: "elicitation_resolved_locally", nonce, resolution });
         return;
       }
       // A validation rejection (422) leaves the elicitation pending
@@ -1703,6 +1873,16 @@ export function useAcpSession(
     sendPrompt,
     cancelPrompt,
     forceEndTurn,
+    /** Fetch and prepend the next-older page of history. No-op when a
+     *  fetch is already in flight or no older events remain. See #2236. */
+    loadOlder,
+    /** True when older events exist on the server beyond what's loaded,
+     *  so the scroll-up handler and "Load earlier" button should offer
+     *  to fetch more. See #2236. */
+    hasMoreOlder,
+    /** True while a `loadOlder` fetch is in flight; drives a spinner on
+     *  the load-earlier affordance. See #2236. */
+    loadingOlder,
     /** Timestamp (ms) of the most recent applied frame. The
      *  WorkingSpinner reads this on a 1s timer to decide whether to
      *  surface the "Force end turn" button. Exposed as a ref so the

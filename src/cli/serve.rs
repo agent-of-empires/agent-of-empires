@@ -974,7 +974,7 @@ pub async fn restart_daemon() -> Result<()> {
 }
 
 #[tracing::instrument(target = "serve.shutdown", skip_all)]
-async fn stop_daemon() -> Result<()> {
+pub(crate) async fn stop_daemon() -> Result<()> {
     let path = pid_file_path()?;
 
     if !path.exists() {

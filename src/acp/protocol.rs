@@ -168,6 +168,16 @@ pub struct ReplayQuery {
     /// `next_cursor` back as `since` while `has_more` is true.
     #[serde(default)]
     pub limit: Option<u64>,
+    /// Backward (older-first paging) cursor. When set, the endpoint
+    /// ignores `since` and returns the `limit` events with `seq < before`
+    /// that sit closest below `before`, in ascending order, so the client
+    /// can render recent-first and lazily page older history as the user
+    /// scrolls up. The tail (most recent page) is requested with
+    /// `before = u64::MAX`. `next_cursor` then carries the lowest seq of
+    /// the page, passed back as `before` for the next-older page while
+    /// `has_more` is true. Forward `since`/`limit` paging is unaffected.
+    #[serde(default)]
+    pub before: Option<u64>,
 }
 
 /// `GET /api/sessions/{id}/acp/replay` response.

@@ -62,7 +62,7 @@ pub struct Elicitation {
 /// One field of the elicitation form.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ElicitationQuestion {
-    /// Schema property key (`question_0`, `customAnswer`, ...). Echoed
+    /// Schema property key (`question_0`, `question_0_custom`, ...). Echoed
     /// back verbatim as the answer key in the response content.
     pub field_key: String,
     pub title: Option<String>,
@@ -122,6 +122,78 @@ pub struct ElicitationOption {
 pub struct ResolvedElicitation {
     pub outcome: ElicitationOutcome,
     pub resolved_at: DateTime<Utc>,
+}
+
+/// One answered question, rendered for the transcript. `question` is the
+/// human-readable prompt (the question title, or the field key as a
+/// fallback); `answer` is the display value the user submitted. Computed
+/// server-side at resolve time and carried on `Event::ElicitationResolved`
+/// so the structured view can show what the user picked after the card
+/// closes. See #2209.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ElicitationAnswer {
+    pub question: String,
+    pub answer: String,
+}
+
+/// Separator the claude-agent-acp adapter wedges between an AskUserQuestion
+/// option's label and its description when flattening into the enum title
+/// (`"<label> <sep> <description>"`). Written as an escape so the em dash
+/// never appears literally in source. Mirrors the web card's separator.
+const OPTION_DESC_SEP: &str = " \u{2014} ";
+
+/// Render the user's submitted answers into display-ready pairs, in the
+/// form's question order. Only answered questions are included (an optional
+/// question left blank is omitted). Select values are mapped to their option
+/// label; for AskUserQuestion the value is already the label (and `label` may
+/// carry a trailing description, which is dropped), while a generic MCP form
+/// maps its machine token to the human label.
+pub fn summarize_answers(
+    elicitation: &Elicitation,
+    answers: &BTreeMap<String, AnswerValue>,
+) -> Vec<ElicitationAnswer> {
+    let mut out = Vec::new();
+    for question in &elicitation.questions {
+        let Some(value) = answers.get(&question.field_key) else {
+            continue;
+        };
+        // Map a selected option value to its human label. For a generic MCP
+        // form the value is a machine token and the label the display text; for
+        // AskUserQuestion the value is already the label (and `label` may carry
+        // a `"value <sep> description"` form, so we keep the bare value there).
+        // Mirrors `optionParts` in the web AskUserQuestionCard. See #2209.
+        let label_for = |raw: &str| -> String {
+            match question.options.iter().find(|o| o.value == raw) {
+                Some(o) if !o.label.starts_with(&format!("{raw}{OPTION_DESC_SEP}")) => {
+                    o.label.clone()
+                }
+                _ => raw.to_string(),
+            }
+        };
+        let answer = match value {
+            AnswerValue::Bool(b) => {
+                if *b {
+                    "Yes".to_string()
+                } else {
+                    "No".to_string()
+                }
+            }
+            AnswerValue::Integer(i) => i.to_string(),
+            AnswerValue::Number(n) => n.to_string(),
+            AnswerValue::Text(s) => label_for(s),
+            AnswerValue::List(values) => values
+                .iter()
+                .map(|v| label_for(v))
+                .collect::<Vec<_>>()
+                .join(", "),
+        };
+        let question = question
+            .title
+            .clone()
+            .unwrap_or_else(|| question.field_key.clone());
+        out.push(ElicitationAnswer { question, answer });
+    }
+    out
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -218,18 +290,29 @@ impl ElicitationResolution {
 }
 
 /// Order a form's properties for display. The adapter keys questions
-/// `question_0..N` and serializes them through a `BTreeMap`, which sorts
-/// lexically (`question_10` before `question_2`), so recover the numeric
-/// order; non-`question_N` keys (e.g. `customAnswer`) sort after, by key.
+/// `question_0..N`, each optionally followed by its own free-text "Other"
+/// box `question_<n>_custom`, and serializes them through a `BTreeMap`,
+/// which sorts lexically (`question_10` before `question_2`, and every
+/// `question_<n>_custom` after every `question_<n>`). Recover the numeric
+/// order and keep each `_custom` box adjacent to its question, so the
+/// per-question "Other" field renders next to the question it belongs to
+/// rather than bunched at the end. Non-`question_N` keys (arbitrary MCP
+/// form fields) sort after, by key.
 fn ordered_fields(
     properties: &BTreeMap<String, ElicitationPropertySchema>,
 ) -> Vec<(&String, &ElicitationPropertySchema)> {
-    fn question_index(key: &str) -> Option<u64> {
-        key.strip_prefix("question_").and_then(|n| n.parse().ok())
+    // `(index, is_custom)`: the base question (0) sorts before its paired
+    // `_custom` box (1), and both before the next question's index.
+    fn question_order(key: &str) -> Option<(u64, u8)> {
+        let rest = key.strip_prefix("question_")?;
+        match rest.strip_suffix("_custom") {
+            Some(index) => Some((index.parse().ok()?, 1)),
+            None => Some((rest.parse().ok()?, 0)),
+        }
     }
     let mut fields: Vec<_> = properties.iter().collect();
     fields.sort_by(
-        |(a, _), (b, _)| match (question_index(a), question_index(b)) {
+        |(a, _), (b, _)| match (question_order(a), question_order(b)) {
             (Some(ai), Some(bi)) => ai.cmp(&bi),
             (Some(_), None) => std::cmp::Ordering::Less,
             (None, Some(_)) => std::cmp::Ordering::Greater,
@@ -783,6 +866,39 @@ mod tests {
     }
 
     #[test]
+    fn per_question_custom_box_stays_next_to_its_question() {
+        // claude-agent-acp >=0.46 emits a per-question "Other" box keyed
+        // `question_<n>_custom` right after each `question_<n>`. The BTreeMap
+        // would otherwise sort every `_custom` after every question; the
+        // ordering must instead keep each box adjacent to its question.
+        let schema = ElicitationSchema::new()
+            .string("question_0", false)
+            .property(
+                "question_0_custom",
+                StringPropertySchema::new().title("Other"),
+                false,
+            )
+            .string("question_1", false)
+            .property(
+                "question_1_custom",
+                StringPropertySchema::new().title("Other"),
+                false,
+            );
+        let req = form_request(schema, "many");
+        let e = parse_elicitation(Nonce::new(), &req, Utc::now()).unwrap();
+        let keys: Vec<&str> = e.questions.iter().map(|q| q.field_key.as_str()).collect();
+        assert_eq!(
+            keys,
+            [
+                "question_0",
+                "question_0_custom",
+                "question_1",
+                "question_1_custom"
+            ]
+        );
+    }
+
+    #[test]
     fn parses_number_integer_boolean_with_constraints_and_defaults() {
         let schema = ElicitationSchema::new()
             .property(
@@ -931,6 +1047,110 @@ mod tests {
         assert_eq!(
             content.get("tags"),
             Some(&ElicitationContentValue::StringArray(vec!["a".into()]))
+        );
+    }
+
+    #[test]
+    fn summarize_renders_answers_in_question_order() {
+        let e = sample_elicitation();
+        let mut answers = BTreeMap::new();
+        answers.insert(
+            "tags".to_string(),
+            AnswerValue::List(vec!["a".into(), "b".into()]),
+        );
+        answers.insert("question_0".to_string(), AnswerValue::Text("Yes".into()));
+        let summary = summarize_answers(&e, &answers);
+        // Question order from the form, not BTreeMap key order. Selected
+        // values render as their option labels ("a"/"b" -> "A"/"B").
+        assert_eq!(summary.len(), 2);
+        assert_eq!(summary[0].question, "question_0");
+        assert_eq!(summary[0].answer, "Yes");
+        assert_eq!(summary[1].question, "tags");
+        assert_eq!(summary[1].answer, "A, B");
+    }
+
+    #[test]
+    fn summarize_maps_select_values_to_option_labels() {
+        // Generic MCP form: value is a machine token, label is human text.
+        let mcp = Elicitation {
+            nonce: Nonce::new(),
+            message: "q".into(),
+            title: None,
+            description: None,
+            tool_call_id: None,
+            questions: vec![ElicitationQuestion {
+                options: vec![
+                    ElicitationOption {
+                        value: "tok_blue".into(),
+                        label: "Blue".into(),
+                    },
+                    // AskUserQuestion-style "label <sep> description": the bare
+                    // value is kept, the description dropped from the summary.
+                    ElicitationOption {
+                        value: "Green".into(),
+                        label: "Green \u{2014} the color green".into(),
+                    },
+                ],
+                ..empty_question("color", ElicitationFieldKind::SingleSelect, true)
+            }],
+            requested_at: Utc::now(),
+            resolved: None,
+        };
+        let mut a = BTreeMap::new();
+        a.insert("color".to_string(), AnswerValue::Text("tok_blue".into()));
+        assert_eq!(summarize_answers(&mcp, &a)[0].answer, "Blue");
+        let mut b = BTreeMap::new();
+        b.insert("color".to_string(), AnswerValue::Text("Green".into()));
+        assert_eq!(summarize_answers(&mcp, &b)[0].answer, "Green");
+    }
+
+    #[test]
+    fn summarize_omits_unanswered_and_renders_scalar_kinds() {
+        let e = Elicitation {
+            nonce: Nonce::new(),
+            message: "q".into(),
+            title: None,
+            description: None,
+            tool_call_id: None,
+            questions: vec![
+                ElicitationQuestion {
+                    title: Some("Your name".into()),
+                    ..empty_question("name", ElicitationFieldKind::FreeText, false)
+                },
+                ElicitationQuestion {
+                    title: Some("Enable it".into()),
+                    ..empty_question("flag", ElicitationFieldKind::Boolean, false)
+                },
+                ElicitationQuestion {
+                    title: Some("Count".into()),
+                    ..empty_question("count", ElicitationFieldKind::Integer, false)
+                },
+                empty_question("skipped", ElicitationFieldKind::FreeText, false),
+            ],
+            requested_at: Utc::now(),
+            resolved: None,
+        };
+        let mut answers = BTreeMap::new();
+        answers.insert("name".to_string(), AnswerValue::Text("Ada".into()));
+        answers.insert("flag".to_string(), AnswerValue::Bool(false));
+        answers.insert("count".to_string(), AnswerValue::Integer(3));
+        let summary = summarize_answers(&e, &answers);
+        assert_eq!(
+            summary,
+            vec![
+                ElicitationAnswer {
+                    question: "Your name".into(),
+                    answer: "Ada".into()
+                },
+                ElicitationAnswer {
+                    question: "Enable it".into(),
+                    answer: "No".into()
+                },
+                ElicitationAnswer {
+                    question: "Count".into(),
+                    answer: "3".into()
+                },
+            ]
         );
     }
 

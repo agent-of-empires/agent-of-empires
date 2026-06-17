@@ -14,7 +14,7 @@
 // AcpRuntime.tsx. We never let assistant-ui own the chat state; it
 // only renders what we feed it and surfaces user actions back.
 
-import { Fragment, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { MessagePrimitive, ThreadPrimitive, useMessage } from "@assistant-ui/react";
 import { AlertTriangle, Check, ChevronDown, Clock, Info, ListChecks, Paperclip, RotateCcw, X } from "lucide-react";
 
@@ -22,6 +22,7 @@ import { ApprovalCard } from "./ApprovalCard";
 import { AskUserQuestionCard } from "./AskUserQuestionCard";
 import { AcpFileRefContext } from "./AcpFileRefContext";
 import type { FileRef, FileRefSession } from "../../lib/fileRef";
+import { anchorIsStale, autoLoadDecision, scrollRestoreDelta } from "../../lib/historyScroll";
 import { ToolDensityToggle, ToolDisplayModeProvider, useToolDensityPref } from "./ToolDisplayMode";
 import { AcpRuntime, SUBAGENT_TASK_NAME, TODO_GROUP_NAME, TOOL_GROUP_NAME, type AcpContext } from "./AcpRuntime";
 import { Composer } from "./Composer";
@@ -35,6 +36,8 @@ import { pickWorkerStoppedVariant } from "./workerStoppedBanner";
 import { SubagentCard, ToolCard, ToolGroupCard, TodoGroupCard } from "./ToolCards";
 import { DiffCommentsUserCard } from "../diff/comments/DiffCommentsUserCard";
 import { isDiffCommentsCardPayload, parseDiffCommentsSentinel } from "../diff/comments/buildPrompt";
+import { ElicitationAnswerCard } from "./ElicitationAnswerCard";
+import { isElicitationAnswersPayload } from "../../lib/acpTypes";
 import {
   SPINNER_FRAMES,
   SPINNER_INTERVAL_MS,
@@ -49,6 +52,8 @@ import { AttentionChime } from "./AttentionChime";
 import { useRespawnSession } from "../../hooks/useRespawnSession";
 import { useIsCoarsePointer } from "../../hooks/useIsCoarsePointer";
 import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
+import { dispatchFocusTerminal } from "../../lib/terminalFocus";
+import { shouldFocusComposerOnThreadTap } from "./threadTapFocus";
 import type {
   Approval,
   ActivityRow,
@@ -212,6 +217,7 @@ function AcpChrome({
   dismissConfigOptionSwitchFailed,
   canLoadEarlierHistory,
   loadEarlierHistory,
+  loadingEarlierHistory,
 }: AcpContext & {
   sessionId: string;
   acpWorkerState: "absent" | "resuming" | "running";
@@ -273,21 +279,103 @@ function AcpChrome({
   // sample captures the pre-resize state; the RO callback consumes it.
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const belowViewportRef = useRef<HTMLDivElement | null>(null);
+  const messagesContentRef = useRef<HTMLDivElement | null>(null);
   const wasAtBottomRef = useRef<boolean>(true);
+  // Stable mirrors so the [] scroll effect always sees the latest
+  // load-earlier wiring without re-subscribing. Updated in an effect
+  // (not during render) per react-hooks/refs. See #2236.
+  const canLoadEarlierRef = useRef(canLoadEarlierHistory);
+  const loadEarlierRef = useRef(loadEarlierHistory);
+  const loadingEarlierRef = useRef(loadingEarlierHistory);
+  useEffect(() => {
+    canLoadEarlierRef.current = canLoadEarlierHistory;
+    loadEarlierRef.current = loadEarlierHistory;
+    loadingEarlierRef.current = loadingEarlierHistory;
+  }, [canLoadEarlierHistory, loadEarlierHistory, loadingEarlierHistory]);
+  // Fires loadEarlier once per arrival at the top (re-armed when the user
+  // scrolls back down), capturing the pre-growth scrollHeight so the
+  // content ResizeObserver can freeze the read position after older rows
+  // land (revealed synchronously or fetched async). See #2236.
+  const autoLoadArmedRef = useRef(true);
+  const pendingScrollAnchorRef = useRef<number | null>(null);
+  const lastAutoLoadAtRef = useRef(0);
+
+  const requestEarlierHistory = useCallback(() => {
+    const vp = viewportRef.current;
+    if (!vp || !canLoadEarlierRef.current) return;
+    // Stamp every load (button or auto) so the cooldown below covers the
+    // scroll-into-view a click triggers, not just scroll-driven loads.
+    lastAutoLoadAtRef.current = performance.now();
+    const stamped = vp.scrollHeight;
+    pendingScrollAnchorRef.current = stamped;
+    loadEarlierRef.current();
+    // Drop the anchor if the request adds nothing (a synchronous reveal
+    // that produced no rows, with no async fetch in flight). Otherwise a
+    // stale anchor would be applied to the next unrelated growth (e.g. a
+    // live append while scrolled up) and jump the viewport. The async
+    // fetch case is handled by the loadingEarlier effect below. See #2236.
+    requestAnimationFrame(() => {
+      if (
+        pendingScrollAnchorRef.current === stamped &&
+        anchorIsStale(loadingEarlierRef.current, pendingScrollAnchorRef.current, vp.scrollHeight)
+      ) {
+        pendingScrollAnchorRef.current = null;
+      }
+    });
+  }, []);
+
+  // Tap anywhere in the transcript focuses the composer and brings up the soft
+  // keyboard on touch, mirroring the live terminal's tap-to-focus (#2243). The
+  // bus dispatch runs the Composer's focus listener synchronously, so iOS still
+  // sees the focus inside the user-gesture call stack. Coarse-only: desktop
+  // already auto-focuses the composer, and a fine-pointer transcript click is
+  // usually a selection. Interactive targets and live selections are skipped by
+  // the guard.
+  const isCoarse = useIsCoarsePointer();
+  const onThreadTap = (e: React.MouseEvent) => {
+    const sel = window.getSelection();
+    if (shouldFocusComposerOnThreadTap({ isCoarse, target: e.target, hasSelection: !!sel && !sel.isCollapsed })) {
+      dispatchFocusTerminal("composer");
+    }
+  };
+
+  // When an async older-history fetch settles without growing the
+  // transcript (empty page, error), clear the anchor so it can't latch
+  // onto later unrelated growth. See #2236.
+  useEffect(() => {
+    const vp = viewportRef.current;
+    if (vp && anchorIsStale(loadingEarlierHistory, pendingScrollAnchorRef.current, vp.scrollHeight)) {
+      pendingScrollAnchorRef.current = null;
+    }
+  }, [loadingEarlierHistory]);
 
   useLayoutEffect(() => {
     const vp = viewportRef.current;
     const below = belowViewportRef.current;
+    const content = messagesContentRef.current;
     if (!vp || !below) return;
     // Treat "within 16px of the bottom" as pinned. assistant-ui's
     // own stick-to-bottom uses a similar slop; sub-pixel rounding
     // and momentary content reflows otherwise drop us out of the
     // pinned state for one frame.
-    const sampleAtBottom = () => {
+    const sample = () => {
       wasAtBottomRef.current = vp.scrollTop + vp.clientHeight >= vp.scrollHeight - 16;
+      // Decision (overflow gate, arm, cooldown) lives in a pure helper so
+      // it's unit-tested away from the DOM. See historyScroll.ts / #2236.
+      const decision = autoLoadDecision({
+        scrollTop: vp.scrollTop,
+        clientHeight: vp.clientHeight,
+        scrollHeight: vp.scrollHeight,
+        armed: autoLoadArmedRef.current,
+        canLoadEarlier: canLoadEarlierRef.current,
+        now: performance.now(),
+        lastLoadAt: lastAutoLoadAtRef.current,
+      });
+      autoLoadArmedRef.current = decision.armed;
+      if (decision.fire) requestEarlierHistory();
     };
-    sampleAtBottom();
-    vp.addEventListener("scroll", sampleAtBottom, { passive: true });
+    sample();
+    vp.addEventListener("scroll", sample, { passive: true });
     let prevHeight = below.offsetHeight;
     const ro = new ResizeObserver(() => {
       const nextHeight = below.offsetHeight;
@@ -298,11 +386,24 @@ function AcpChrome({
       }
     });
     ro.observe(below);
+    // Freeze the read position when older rows grow the transcript at the
+    // top: add the height delta to scrollTop so the row the user was
+    // reading stays under the cursor instead of jumping. Skipped while
+    // pinned to the bottom so live appends keep their stick-to-bottom.
+    const contentRo = new ResizeObserver(() => {
+      const anchor = pendingScrollAnchorRef.current;
+      if (anchor == null) return;
+      const delta = scrollRestoreDelta(anchor, vp.scrollHeight, wasAtBottomRef.current);
+      if (delta > 0) vp.scrollTop += delta;
+      pendingScrollAnchorRef.current = null;
+    });
+    if (content) contentRo.observe(content);
     return () => {
       ro.disconnect();
-      vp.removeEventListener("scroll", sampleAtBottom);
+      contentRo.disconnect();
+      vp.removeEventListener("scroll", sample);
     };
-  }, []);
+  }, [requestEarlierHistory]);
   // Short-circuit: when the per-adapter compatibility check rejected
   // the adapter, replace the chat layout with a dedicated screen that
   // renders the exact remediation command. We never reach Running, so
@@ -382,8 +483,9 @@ function AcpChrome({
           ref={viewportRef}
           data-testid="acp-viewport"
           className="flex-1 overflow-x-hidden overflow-y-auto"
+          onClick={onThreadTap}
         >
-          <div className="mx-auto max-w-3xl xl:max-w-4xl 2xl:max-w-5xl px-4 py-6">
+          <div ref={messagesContentRef} className="mx-auto max-w-3xl xl:max-w-4xl 2xl:max-w-5xl px-4 py-6">
             <ThreadPrimitive.Empty>
               <EmptyState onPick={sendPrompt} />
             </ThreadPrimitive.Empty>
@@ -406,11 +508,12 @@ function AcpChrome({
               <div className="mb-3 flex justify-center">
                 <button
                   type="button"
-                  onClick={loadEarlierHistory}
+                  onClick={requestEarlierHistory}
+                  disabled={loadingEarlierHistory}
                   data-testid="acp-load-earlier"
-                  className="h-8 rounded-md border border-surface-700 bg-surface-800 px-3 text-xs text-text-secondary hover:bg-surface-700 hover:text-text-primary transition-colors cursor-pointer"
+                  className="h-8 rounded-md border border-surface-700 bg-surface-800 px-3 text-xs text-text-secondary hover:bg-surface-700 hover:text-text-primary transition-colors cursor-pointer disabled:cursor-default disabled:opacity-60"
                 >
-                  Load earlier messages
+                  {loadingEarlierHistory ? "Loading…" : "Load earlier messages"}
                 </button>
               </div>
             )}
@@ -544,8 +647,16 @@ function UserMessage() {
  *  prompts. Falls back to the classic chat bubble otherwise. */
 function UserText({ text }: { text: string }) {
   const typedPayload = useMessage((m) => (m.metadata?.custom as { diffComments?: unknown } | undefined)?.diffComments);
+  // An answered AskUserQuestion / elicitation: render the picked answer as
+  // a tidy card from the typed payload on the message metadata. See #2209.
+  const answers = useMessage(
+    (m) => (m.metadata?.custom as { elicitationAnswers?: unknown } | undefined)?.elicitationAnswers,
+  );
   if (isDiffCommentsCardPayload(typedPayload)) {
     return <DiffCommentsUserCard payload={typedPayload} />;
+  }
+  if (isElicitationAnswersPayload(answers)) {
+    return <ElicitationAnswerCard answers={answers} />;
   }
   // Legacy fallback: older prompts carry the structured data in a
   // base64 sentinel at the top of the text body. Decode + render the

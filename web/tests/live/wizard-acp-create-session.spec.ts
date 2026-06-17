@@ -21,28 +21,20 @@ test("wizard with Use structured view on creates a structured_view session", asy
     const wizard = page.locator('div.fixed.inset-0.z-50:has(h1:has-text("New session"))');
     await expect(wizard).toBeVisible({ timeout: 15_000 });
 
-    // ProjectStep: a scratch dir keeps the test self-contained, advance.
+    // Single screen: a scratch dir keeps the test self-contained.
     await wizard.getByRole("switch", { name: "Skip project folder" }).click();
-    await wizard.getByRole("button", { name: "Next" }).click();
 
-    // SessionStep: title is auto-generated, advance.
-    await expect(wizard.getByRole("heading", { name: "Name your session", exact: true })).toBeVisible({
-      timeout: 10_000,
-    });
-    await wizard.getByRole("button", { name: "Next" }).click();
-
-    // AgentStep: claude is the default ACP-capable agent and the structured view
-    // master switch is on, so the "Use structured view" toggle is shown and
-    // defaults on. The docs tell the user to leave it on; assert that,
-    // then advance.
+    // claude is the default ACP-capable agent and the structured view master
+    // switch is on, so the "Use structured view" toggle (under More options)
+    // defaults on. The docs tell the user to leave it on; assert that, then
+    // launch.
+    await wizard.getByRole("button", { name: "More options" }).click();
     const acpToggle = wizard.getByRole("switch", {
       name: "Use structured view",
     });
     await expect(acpToggle).toBeVisible({ timeout: 10_000 });
     await expect(acpToggle).toBeChecked();
-    await wizard.getByRole("button", { name: "Next" }).click();
 
-    // ReviewStep: launch the session.
     await wizard.getByRole("button", { name: /Launch session/ }).click();
 
     // Server-side: one session exists and is persisted with structured_view

@@ -20,6 +20,12 @@ interface WizardData {
 interface Props {
   data: WizardData;
   onChange: (field: string, value: unknown) => void;
+  /** Single-screen wizard mode (#2210): render the title plus all worktree
+   *  / group controls flat, with no heading and no inner "Advanced" fold,
+   *  because the whole section already sits inside the one "More options"
+   *  disclosure. When false (default) the component keeps its standalone
+   *  shape: a heading, the title, and an inner Advanced disclosure. */
+  embedded?: boolean;
 }
 
 function Toggle({
@@ -51,14 +57,122 @@ function Toggle({
   );
 }
 
-export function SessionStep({ data, onChange }: Props) {
-  // Everything except the title input is folded behind this disclosure
+export function SessionStep({ data, onChange, embedded = false }: Props) {
+  // Standalone mode folds everything except the title behind a disclosure
   // so the common "name it, hit Next" path is a single visible control.
-  // Defaults to a new worktree branched off HEAD; the submit path in
-  // SessionWizard reads useWorktree/worktreeBranch/attachExisting/
-  // baseBranch/group from reducer state regardless of what is on screen,
-  // so a hidden toggle keeps its default value. See #1514.
+  // Embedded mode skips that fold (the parent already provides one). The
+  // submit path in SessionWizard reads useWorktree/worktreeBranch/
+  // attachExisting/baseBranch/group from reducer state regardless of what
+  // is on screen, so a hidden toggle keeps its default value. See #1514.
   const [advancedOpen, setAdvancedOpen] = useState(false);
+
+  const titleField = (
+    <div className="mb-5">
+      <label className="block text-sm text-text-dim mb-1.5">Session title</label>
+      <input
+        type="text"
+        value={data.title}
+        onChange={(e) => onChange("title", e.target.value)}
+        placeholder="Auto-generated if empty"
+        className="w-full bg-surface-900 border border-surface-700 rounded-lg px-3 py-2.5 text-base font-mono text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"
+      />
+      <p className="text-xs text-text-dim mt-1">
+        Shown in the dashboard. Renaming it later does not rename the git branch.
+      </p>
+    </div>
+  );
+
+  const detailsBlock = (
+    <>
+      {/* Worktree controls are meaningless for scratch sessions: the
+          working directory is a fresh scratch dir, not a git repo. The
+          reducer also forces useWorktree to false when scratch flips
+          on; this hide is purely a UX confirmation that the worktree
+          path is not available in scratch mode. */}
+      {data.scratch ? (
+        <p className="text-xs text-text-dim mb-3" aria-label="Worktree disabled: scratch session">
+          Scratch sessions do not use git worktrees.
+        </p>
+      ) : (
+        <label
+          className="flex items-center justify-between gap-3 p-3 bg-surface-900 border border-surface-700 rounded-lg cursor-pointer mb-3"
+          onClick={(e) => {
+            // Clicks that land on the Toggle button already drive
+            // `onChange("useWorktree", v)`. Letting the label's own
+            // handler also fire would flip the value a second time
+            // and land back on the original. Skip the label handler
+            // for clicks originating inside the Toggle.
+            if ((e.target as HTMLElement).closest('button[role="switch"]')) {
+              return;
+            }
+            onChange("useWorktree", !data.useWorktree);
+          }}
+        >
+          <div className="flex-1">
+            <div className="text-sm font-medium text-text-primary">Create a worktree</div>
+            <div className="text-xs text-text-dim mt-0.5 leading-snug">
+              Run the agent in a new git worktree branched off the current HEAD. Off = run directly in the repo folder.
+            </div>
+          </div>
+          <Toggle checked={data.useWorktree} onChange={(v) => onChange("useWorktree", v)} />
+        </label>
+      )}
+
+      {!data.scratch && data.useWorktree && (
+        <div className="mb-5">
+          <label className="block text-sm text-text-dim mb-1.5">Branch / worktree name</label>
+          <input
+            type="text"
+            value={data.worktreeBranch}
+            onChange={(e) => onChange("worktreeBranch", e.target.value)}
+            placeholder="Uses session title if empty"
+            className="w-full bg-surface-900 border border-surface-700 rounded-lg px-3 py-2.5 text-base font-mono text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"
+          />
+          <p className="text-xs text-text-dim mt-1">
+            The branch name is also the worktree directory name. Leave blank to use the session title.
+          </p>
+
+          <label
+            className="mt-3 flex items-center justify-between gap-3 p-3 bg-surface-900 border border-surface-700 rounded-lg cursor-pointer"
+            onClick={(e) => {
+              // Skip the label handler for clicks on the Toggle itself; the
+              // switch already drives onChange, so handling both double-toggles.
+              if ((e.target as HTMLElement).closest('button[role="switch"]')) return;
+              onChange("attachExisting", !data.attachExisting);
+            }}
+          >
+            <div className="flex-1">
+              <div className="text-sm font-medium text-text-primary">Attach to existing branch</div>
+              <div className="text-xs text-text-dim mt-0.5 leading-snug">
+                Re-use a branch + worktree that already exists. Off = create a new branch.
+              </div>
+            </div>
+            <Toggle checked={data.attachExisting} onChange={(v) => onChange("attachExisting", v)} />
+          </label>
+
+          {!data.attachExisting && <AdvancedWorktreeOptions data={data} onChange={onChange} />}
+        </div>
+      )}
+
+      <div>
+        <label className="block text-sm text-text-dim mb-1.5">Group</label>
+        <input
+          type="text"
+          value={data.group}
+          onChange={(e) => onChange("group", e.target.value)}
+          placeholder="Optional, for organizing related sessions"
+          className="w-full bg-surface-900 border border-surface-700 rounded-lg px-3 py-2.5 text-sm font-mono text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"
+        />
+      </div>
+    </>
+  );
+
+  if (embedded) {
+    // The title lives in the always-visible essentials on the single screen
+    // (#2210); embedded mode renders only the worktree / group details.
+    return <div>{detailsBlock}</div>;
+  }
+
   return (
     <div>
       <h2 className="text-lg font-semibold text-text-primary mb-1">Name your session</h2>
@@ -67,19 +181,7 @@ export function SessionStep({ data, onChange }: Props) {
         branch, attach to an existing one, or set a group.
       </p>
 
-      <div className="mb-5">
-        <label className="block text-sm text-text-dim mb-1.5">Session title</label>
-        <input
-          type="text"
-          value={data.title}
-          onChange={(e) => onChange("title", e.target.value)}
-          placeholder="Auto-generated if empty"
-          className="w-full bg-surface-900 border border-surface-700 rounded-lg px-3 py-2.5 text-base font-mono text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"
-        />
-        <p className="text-xs text-text-dim mt-1">
-          Shown in the dashboard. Renaming it later does not rename the git branch.
-        </p>
-      </div>
+      {titleField}
 
       <button
         type="button"
@@ -92,86 +194,7 @@ export function SessionStep({ data, onChange }: Props) {
         </span>
         Advanced
       </button>
-      {advancedOpen && (
-        <div className="mt-3 pl-4 border-l border-surface-700/40">
-          {/* Worktree controls are meaningless for scratch sessions: the
-              working directory is a fresh scratch dir, not a git repo. The
-              reducer also forces useWorktree to false when scratch flips
-              on; this hide is purely a UX confirmation that the worktree
-              path is not available in scratch mode. */}
-          {data.scratch ? (
-            <p className="text-xs text-text-dim mb-3" aria-label="Worktree disabled: scratch session">
-              Scratch sessions do not use git worktrees.
-            </p>
-          ) : (
-            <label
-              className="flex items-center justify-between gap-3 p-3 bg-surface-900 border border-surface-700 rounded-lg cursor-pointer mb-3"
-              onClick={(e) => {
-                // Clicks that land on the Toggle button already drive
-                // `onChange("useWorktree", v)`. Letting the label's own
-                // handler also fire would flip the value a second time
-                // and land back on the original. Skip the label handler
-                // for clicks originating inside the Toggle.
-                if ((e.target as HTMLElement).closest('button[role="switch"]')) {
-                  return;
-                }
-                onChange("useWorktree", !data.useWorktree);
-              }}
-            >
-              <div className="flex-1">
-                <div className="text-sm font-medium text-text-primary">Create a worktree</div>
-                <div className="text-xs text-text-dim mt-0.5 leading-snug">
-                  Run the agent in a new git worktree branched off the current HEAD. Off = run directly in the repo
-                  folder.
-                </div>
-              </div>
-              <Toggle checked={data.useWorktree} onChange={(v) => onChange("useWorktree", v)} />
-            </label>
-          )}
-
-          {!data.scratch && data.useWorktree && (
-            <div className="mb-5">
-              <label className="block text-sm text-text-dim mb-1.5">Branch / worktree name</label>
-              <input
-                type="text"
-                value={data.worktreeBranch}
-                onChange={(e) => onChange("worktreeBranch", e.target.value)}
-                placeholder="Uses session title if empty"
-                className="w-full bg-surface-900 border border-surface-700 rounded-lg px-3 py-2.5 text-base font-mono text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"
-              />
-              <p className="text-xs text-text-dim mt-1">
-                The branch name is also the worktree directory name. Leave blank to use the session title.
-              </p>
-
-              <label
-                className="mt-3 flex items-center justify-between gap-3 p-3 bg-surface-900 border border-surface-700 rounded-lg cursor-pointer"
-                onClick={() => onChange("attachExisting", !data.attachExisting)}
-              >
-                <div className="flex-1">
-                  <div className="text-sm font-medium text-text-primary">Attach to existing branch</div>
-                  <div className="text-xs text-text-dim mt-0.5 leading-snug">
-                    Re-use a branch + worktree that already exists. Off = create a new branch.
-                  </div>
-                </div>
-                <Toggle checked={data.attachExisting} onChange={(v) => onChange("attachExisting", v)} />
-              </label>
-
-              {!data.attachExisting && <AdvancedWorktreeOptions data={data} onChange={onChange} />}
-            </div>
-          )}
-
-          <div>
-            <label className="block text-sm text-text-dim mb-1.5">Group</label>
-            <input
-              type="text"
-              value={data.group}
-              onChange={(e) => onChange("group", e.target.value)}
-              placeholder="Optional, for organizing related sessions"
-              className="w-full bg-surface-900 border border-surface-700 rounded-lg px-3 py-2.5 text-sm font-mono text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"
-            />
-          </div>
-        </div>
-      )}
+      {advancedOpen && <div className="mt-3 pl-4 border-l border-surface-700/40">{detailsBlock}</div>}
     </div>
   );
 }

@@ -5259,22 +5259,25 @@ impl HomeView {
             .map(|i| crate::session::projects::canonical_key(i.repo_path()))
     }
 
-    /// Whether the project-view header `label` is backed by a registered
-    /// (pinned) project. A header with live sessions is pinned iff its own repo
-    /// path is in the registry, so two repos sharing a basename are judged
-    /// independently. An empty header exists only because a registered project
-    /// carries that basename, so it is pinned by construction (matched by
-    /// label). Used for the pin indicator and the pin toggle.
+    /// Whether the project-view header `label` is backed by a registered AND
+    /// pinned project. A registry entry is the "saved project"; the `pinned`
+    /// flag is the separate decision to keep its header visible (#2208), so a
+    /// saved-but-unpinned repo reads as not pinned (no glyph; the toggle pins
+    /// it). A header with live sessions is pinned iff its own repo path is a
+    /// pinned entry, so two repos sharing a basename are judged independently.
+    /// An empty header exists only because a pinned project carries that
+    /// basename, so the label match still requires the flag. Used for the pin
+    /// indicator and the pin toggle.
     pub(super) fn is_project_label_pinned(&self, label: &str) -> bool {
         match self.project_header_repo_path(label) {
             Some(path) => self
                 .registered_projects
                 .iter()
-                .any(|p| crate::session::projects::canonical_key(&p.path) == path),
+                .any(|p| p.pinned && crate::session::projects::canonical_key(&p.path) == path),
             None => self
                 .registered_projects
                 .iter()
-                .any(|p| crate::session::projects::repo_label(&p.path) == label),
+                .any(|p| p.pinned && crate::session::projects::repo_label(&p.path) == label),
         }
     }
 

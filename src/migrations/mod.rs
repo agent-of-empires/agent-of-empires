@@ -23,6 +23,7 @@ mod v012_acp_rename;
 mod v013_strip_profile_theme;
 mod v014_rename_default_theme;
 mod v015_rewrite_hook_strings;
+mod v016_clear_archived_tmux_gone_error;
 mod v017_rewrite_hook_strings_for_per_user_base;
 
 use anyhow::Result;
@@ -114,6 +115,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 15,
         name: "rewrite_hook_strings",
         run: v015_rewrite_hook_strings::run,
+    },
+    Migration {
+        version: 16,
+        name: "clear_archived_tmux_gone_error",
+        run: v016_clear_archived_tmux_gone_error::run,
     },
     Migration {
         version: 17,

@@ -8,6 +8,7 @@ pub mod definition;
 pub mod extract_session_id;
 pub mod group;
 pub mod init;
+pub mod killall;
 pub mod list;
 #[cfg(feature = "serve")]
 pub mod log_level;

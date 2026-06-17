@@ -1,12 +1,15 @@
 import { test, expect } from "./helpers/mockedTest";
 import { Page } from "@playwright/test";
+import { openWizard, selectProject, expandMoreOptions, launch, wizard } from "./helpers/wizard";
 
-// Wizard Agent step (#1219). Covers the agent picker grid, the profile
-// selector visibility rule (only when profiles.length > 1) plus its
-// APPLY_PROFILE_DEFAULTS path, the sandbox toggle (which is disabled
-// when Docker is unavailable), and the Advanced section's extra-env /
-// extra-args inputs. Profile-defaults seeding on mount is exercised by
-// the unit tests on the reducer; here we test the picker-driven UI path.
+// Wizard agent section (#1219, migrated to the single-screen wizard #2210).
+// Covers the always-visible agent picker grid, plus the agent OPTIONS that
+// now live behind "More options": the profile selector visibility rule
+// (only when profiles.length > 1) and its APPLY_PROFILE_DEFAULTS path, the
+// sandbox toggle (disabled when Docker is unavailable), and the extra-args
+// input flowing into the create-session POST body. Profile-defaults seeding
+// on mount is exercised by the reducer unit tests; here we test the
+// picker-driven UI path.
 
 interface MockOptions {
   agents?: Array<{
@@ -21,6 +24,32 @@ interface MockOptions {
   profileSettings?: Record<string, unknown>;
 }
 
+function seedSessionsPayload() {
+  return {
+    sessions: [
+      {
+        id: "seed-session",
+        title: "seed",
+        project_path: "/tmp/example",
+        group_path: "/tmp",
+        tool: "claude",
+        status: "Idle",
+        yolo_mode: false,
+        created_at: new Date().toISOString(),
+        last_accessed_at: null,
+        last_error: null,
+        branch: null,
+        main_repo_path: null,
+        is_sandboxed: false,
+        has_terminal: true,
+        profile: "default",
+        workspace_repos: [],
+      },
+    ],
+    workspace_ordering: [],
+  };
+}
+
 async function mockApis(page: Page, opts: MockOptions = {}) {
   await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
   for (const path of ["themes", "groups", "devices", "about", "system/update-status"]) {
@@ -30,6 +59,9 @@ async function mockApis(page: Page, opts: MockOptions = {}) {
       }),
     );
   }
+  // ProjectStep always mounts now and fetches these.
+  await page.route("**/api/recent-projects", (r) => r.fulfill({ json: { projects: [] } }));
+  await page.route("**/api/projects", (r) => r.fulfill({ json: [] }));
   await page.route("**/api/settings**", (r) => r.fulfill({ json: opts.profileSettings ?? {} }));
   await page.route("**/api/profiles", (r) => r.fulfill({ json: opts.profiles ?? [] }));
   await page.route("**/api/docker/status", (r) =>
@@ -55,50 +87,13 @@ async function mockApis(page: Page, opts: MockOptions = {}) {
   );
   await page.route("**/api/sessions", (r) => {
     if (r.request().method() === "GET") {
-      return r.fulfill({
-        json: {
-          sessions: [
-            {
-              id: "seed-session",
-              title: "seed",
-              project_path: "/tmp/example",
-              group_path: "/tmp",
-              tool: "claude",
-              status: "Idle",
-              yolo_mode: false,
-              created_at: new Date().toISOString(),
-              last_accessed_at: null,
-              last_error: null,
-              branch: null,
-              main_repo_path: null,
-              is_sandboxed: false,
-              has_terminal: true,
-              profile: "default",
-              workspace_repos: [],
-            },
-          ],
-          workspace_ordering: [],
-        },
-      });
+      return r.fulfill({ json: seedSessionsPayload() });
     }
     return r.fulfill({ json: { session: { id: "new-session" } } });
   });
 }
 
-async function openAgentStep(page: Page) {
-  await page.locator("body").click();
-  await page.keyboard.press("n");
-  await expect(page.getByRole("heading", { name: "New session" })).toBeVisible();
-  const recent = page.getByRole("button").filter({ hasText: "/tmp/example" }).first();
-  await recent.waitFor({ state: "visible", timeout: 5000 });
-  await recent.click();
-  await page.getByRole("button", { name: "Next" }).click();
-  await expect(page.getByText("Name your session")).toBeVisible();
-  await page.getByRole("button", { name: "Next" }).click();
-  await expect(page.getByRole("heading", { name: "Which AI agent?" })).toBeVisible();
-}
-
-test.describe("Wizard agent step (#1219)", () => {
+test.describe("Wizard agent section (#1219)", () => {
   test("agent picker renders installed agents, including terminal fallback tools", async ({ page }) => {
     await mockApis(page, {
       agents: [
@@ -115,26 +110,25 @@ test.describe("Wizard agent step (#1219)", () => {
     });
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
-    await openAgentStep(page);
-    const claudeBtn = page.getByRole("button", { name: "claude", exact: true });
-    const codexBtn = page.getByRole("button", { name: "codex", exact: true });
-    const antigravityBtn = page.getByRole("button", {
-      name: "antigravity",
-      exact: true,
-    });
-    await expect(claudeBtn).toBeVisible();
-    await expect(codexBtn).toBeVisible();
-    await expect(antigravityBtn).toBeVisible();
+    await openWizard(page);
+    await selectProject(page, "/tmp/example");
+    const w = wizard(page);
+    // Picker is always visible; no step navigation.
+    await expect(w.getByRole("button", { name: "claude", exact: true })).toBeVisible();
+    await expect(w.getByRole("button", { name: "codex", exact: true })).toBeVisible();
+    await expect(w.getByRole("button", { name: "antigravity", exact: true })).toBeVisible();
     // Uninstalled agents are hidden from the picker grid.
-    await expect(page.getByRole("button", { name: "uninstalled-tool", exact: true })).toHaveCount(0);
+    await expect(w.getByRole("button", { name: "uninstalled-tool", exact: true })).toHaveCount(0);
   });
 
   test("profile picker is hidden when there is only one profile", async ({ page }) => {
     await mockApis(page, { profiles: [{ name: "default", is_default: true }] });
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
-    await openAgentStep(page);
-    await expect(page.getByText("Workflow preset")).toHaveCount(0);
+    await openWizard(page);
+    await selectProject(page, "/tmp/example");
+    await expandMoreOptions(page);
+    await expect(wizard(page).getByText("Workflow preset")).toHaveCount(0);
   });
 
   test("profile picker visible with multiple profiles; selecting applies sandbox + yolo defaults", async ({ page }) => {
@@ -165,15 +159,18 @@ test.describe("Wizard agent step (#1219)", () => {
     });
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
-    await openAgentStep(page);
-    await expect(page.getByText("Workflow preset")).toBeVisible();
-    // Profile picker is now a radiogroup of cards (#949) so each profile
-    // can show a short description; clicking the row is equivalent to the
-    // old <select>.selectOption call.
-    await page.getByRole("radio", { name: /yolo-sandbox/ }).click();
+    await openWizard(page);
+    await selectProject(page, "/tmp/example");
+    await expandMoreOptions(page);
+    const w = wizard(page);
+    await expect(w.getByText("Workflow preset")).toBeVisible();
+    // Profile picker is a radiogroup of cards (#949) so each profile can
+    // show a short description; clicking the row is equivalent to the old
+    // <select>.selectOption call.
+    await w.getByRole("radio", { name: /yolo-sandbox/ }).click();
     // Both toggles flip on because APPLY_PROFILE_DEFAULTS dispatched.
-    const sandboxToggle = page.locator("label", { hasText: "Run in a safe container" }).locator("role=switch");
-    const yoloToggle = page.locator("label", { hasText: "Auto-approve actions" }).locator("role=switch");
+    const sandboxToggle = w.locator("label", { hasText: "Run in a safe container" }).locator("role=switch");
+    const yoloToggle = w.locator("label", { hasText: "Auto-approve actions" }).locator("role=switch");
     await expect(sandboxToggle).toHaveAttribute("aria-checked", "true");
     await expect(yoloToggle).toHaveAttribute("aria-checked", "true");
     expect(settingsCalls).toContain("yolo-sandbox");
@@ -199,26 +196,32 @@ test.describe("Wizard agent step (#1219)", () => {
     });
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
-    await openAgentStep(page);
-    await expect(page.getByText("Workflow preset")).toBeVisible();
+    await openWizard(page);
+    await selectProject(page, "/tmp/example");
+    await expandMoreOptions(page);
+    const w = wizard(page);
+    await expect(w.getByText("Workflow preset")).toBeVisible();
     // Descriptions render beneath the profile name.
-    await expect(page.getByText("Stock setup with no overrides")).toBeVisible();
-    await expect(page.getByText("Auto-approve in a container")).toBeVisible();
+    await expect(w.getByText("Stock setup with no overrides")).toBeVisible();
+    await expect(w.getByText("Auto-approve in a container")).toBeVisible();
     // Profiles without a description still appear in the picker.
-    await expect(page.getByRole("radio", { name: /no-desc/ })).toBeVisible();
+    await expect(w.getByRole("radio", { name: /no-desc/ })).toBeVisible();
   });
 
   test("sandbox toggle is disabled when Docker is not running", async ({ page }) => {
     await mockApis(page, { docker: false });
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
-    await openAgentStep(page);
-    const sandboxToggle = page.locator("label", { hasText: "Run in a safe container" }).locator("role=switch");
+    await openWizard(page);
+    await selectProject(page, "/tmp/example");
+    await expandMoreOptions(page);
+    const w = wizard(page);
+    const sandboxToggle = w.locator("label", { hasText: "Run in a safe container" }).locator("role=switch");
     await expect(sandboxToggle).toBeDisabled();
-    await expect(page.getByText("Docker is not running.")).toBeVisible();
+    await expect(w.getByText("Docker is not running.")).toBeVisible();
   });
 
-  test("Advanced settings: extra args propagate to the create-session POST body", async ({ page }) => {
+  test("extra args propagate to the create-session POST body", async ({ page }) => {
     await mockApis(page);
     let captured: { extra_args?: string } | null = null;
     await page.route("**/api/sessions", (r) => {
@@ -226,39 +229,18 @@ test.describe("Wizard agent step (#1219)", () => {
         captured = JSON.parse(r.request().postData() || "{}");
         return r.fulfill({ json: { session: { id: "new-session" } } });
       }
-      return r.fulfill({
-        json: {
-          sessions: [
-            {
-              id: "seed-session",
-              title: "seed",
-              project_path: "/tmp/example",
-              group_path: "/tmp",
-              tool: "claude",
-              status: "Idle",
-              yolo_mode: false,
-              created_at: new Date().toISOString(),
-              last_accessed_at: null,
-              last_error: null,
-              branch: null,
-              main_repo_path: null,
-              is_sandboxed: false,
-              has_terminal: true,
-              profile: "default",
-              workspace_repos: [],
-            },
-          ],
-          workspace_ordering: [],
-        },
-      });
+      return r.fulfill({ json: seedSessionsPayload() });
     });
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
-    await openAgentStep(page);
-    await page.getByRole("button", { name: "Advanced settings" }).click();
-    await page.getByPlaceholder("e.g. --port 8080").fill("--verbose");
-    await page.getByRole("button", { name: /Next/ }).click();
-    await page.getByRole("button", { name: /Launch session/ }).click();
+    await openWizard(page);
+    await selectProject(page, "/tmp/example");
+    await expandMoreOptions(page);
+    // The advanced launch knobs render flat under More options on the
+    // single screen, so the extra-args input is directly available (no
+    // nested "Advanced settings" disclosure).
+    await wizard(page).getByPlaceholder("e.g. --port 8080").fill("--verbose");
+    await launch(page);
     await expect.poll(() => captured?.extra_args).toBe("--verbose");
   });
 });

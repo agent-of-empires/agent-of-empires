@@ -72,6 +72,20 @@ pub struct Project {
     /// then the repo's detected default branch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_base_branch: Option<String>,
+    /// Whether this project shows as an empty (sessionless) header in the
+    /// sidebar / project view. A registry entry is the "saved project" (it
+    /// feeds the Projects view and the new-session wizard); the pin is the
+    /// separate decision to keep its header visible without sessions. Unpin
+    /// clears this flag but keeps the entry; only an explicit remove deletes
+    /// the entry. See #2208.
+    ///
+    /// Missing in JSON written before #2208 deserializes to `true`: every
+    /// registered project was implicitly pinned then, so an upgrade preserves
+    /// the existing headers rather than silently hiding them. New entries
+    /// (`Project::new`, the create API, `aoe project add`) default to `false`,
+    /// so saving a project no longer forces a sidebar header.
+    #[serde(default = "default_pinned")]
+    pub pinned: bool,
     /// Populated by the loader; not persisted.
     #[serde(skip, default = "default_scope")]
     pub scope: ProjectScope,
@@ -81,12 +95,17 @@ fn default_scope() -> ProjectScope {
     ProjectScope::Global
 }
 
+fn default_pinned() -> bool {
+    true
+}
+
 impl Project {
     pub fn new(name: impl Into<String>, path: impl Into<String>, scope: ProjectScope) -> Self {
         Self {
             name: name.into(),
             path: path.into(),
             default_base_branch: None,
+            pinned: false,
             scope,
         }
     }
@@ -95,6 +114,12 @@ impl Project {
     /// string as "unset".
     pub fn with_base_branch(mut self, base: Option<String>) -> Self {
         self.default_base_branch = base.map(|b| b.trim().to_string()).filter(|b| !b.is_empty());
+        self
+    }
+
+    /// Set the pin flag (whether the project shows as a sessionless header).
+    pub fn with_pinned(mut self, pinned: bool) -> Self {
+        self.pinned = pinned;
         self
     }
 
@@ -239,6 +264,13 @@ pub fn unpopulated_projects(
     let mut out = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     for p in registered {
+        // Only pinned projects surface as empty headers. An unpinned entry is
+        // saved (Projects view / wizard) but not forced into the sidebar; check
+        // it before `seen.insert` so an unpinned entry never consumes the slot
+        // a pinned entry for the same path would. See #2208.
+        if !p.pinned {
+            continue;
+        }
         let label = repo_label(&p.path);
         if populated_labels.contains(&label) || !seen.insert(canonical_key(&p.path)) {
             continue;
@@ -402,6 +434,42 @@ pub fn update_base_branch(
     Ok(updated)
 }
 
+/// Set the pin flag on the entry matching `name_or_path` in the given scope.
+/// Unpinning (`pinned = false`) keeps the registry entry, so the project stays
+/// in the Projects view and the new-session wizard; only [`remove`] deletes it.
+/// Returns the updated project, or `NotFound` if no entry matches. Same
+/// read-modify-write, last-writer-wins semantics as [`update_base_branch`].
+pub fn set_pinned(
+    profile: &str,
+    scope: ProjectScope,
+    name_or_path: &str,
+    pinned: bool,
+) -> std::result::Result<Project, RegistryError> {
+    let mut existing = match scope {
+        ProjectScope::Global => load_global().map_err(RegistryError::Other)?,
+        ProjectScope::Profile => load_profile(profile).map_err(RegistryError::Other)?,
+    };
+
+    let canonical_target = canonical_key(name_or_path);
+    let idx = existing
+        .iter()
+        .position(|p| {
+            p.name.eq_ignore_ascii_case(name_or_path) || canonical_key(&p.path) == canonical_target
+        })
+        .ok_or_else(|| {
+            RegistryError::NotFound(format!(
+                "No project '{}' in {} scope",
+                name_or_path,
+                scope.as_str()
+            ))
+        })?;
+
+    existing[idx].pinned = pinned;
+    let updated = existing[idx].clone();
+    save_scope(profile, scope, &existing).map_err(RegistryError::Other)?;
+    Ok(updated)
+}
+
 /// Resolve a list of project names against the merged registry. Errors on the
 /// first unknown name with the available names listed.
 pub fn resolve_names(profile: &str, names: &[String]) -> Result<Vec<Project>> {
@@ -454,12 +522,12 @@ mod tests {
     #[test]
     fn unpopulated_projects_skips_populated_and_keys_on_path() {
         let registered = vec![
-            Project::new("alpha", "/work/alpha", ProjectScope::Global),
-            Project::new("beta", "/work/beta", ProjectScope::Global),
+            Project::new("alpha", "/work/alpha", ProjectScope::Global).with_pinned(true),
+            Project::new("beta", "/work/beta", ProjectScope::Global).with_pinned(true),
             // Same basename as the first beta entry but a distinct repo: it
             // must NOT be folded away by the shared basename, the identity is
             // the path.
-            Project::new("beta-other", "/other/beta", ProjectScope::Profile),
+            Project::new("beta-other", "/other/beta", ProjectScope::Profile).with_pinned(true),
         ];
         // `alpha` has a live session keeping its header alive, so only the
         // two distinct beta repos surface as empty headers.
@@ -474,10 +542,10 @@ mod tests {
     #[test]
     fn unpopulated_projects_dedupes_same_path() {
         let registered = vec![
-            Project::new("beta", "/work/beta", ProjectScope::Global),
+            Project::new("beta", "/work/beta", ProjectScope::Global).with_pinned(true),
             // Same canonical path registered again (e.g. global + profile
             // shadow): collapse to a single header.
-            Project::new("beta", "/work/beta", ProjectScope::Profile),
+            Project::new("beta", "/work/beta", ProjectScope::Profile).with_pinned(true),
         ];
         let populated: HashSet<String> = HashSet::new();
         let empties = unpopulated_projects(&populated, &registered);
@@ -487,9 +555,35 @@ mod tests {
 
     #[test]
     fn unpopulated_projects_empty_when_all_populated() {
-        let registered = vec![Project::new("alpha", "/work/alpha", ProjectScope::Global)];
+        let registered =
+            vec![Project::new("alpha", "/work/alpha", ProjectScope::Global).with_pinned(true)];
         let populated: HashSet<String> = ["alpha".to_string()].into_iter().collect();
         assert!(unpopulated_projects(&populated, &registered).is_empty());
+    }
+
+    #[test]
+    fn unpopulated_projects_skips_unpinned() {
+        // A saved-but-unpinned project (the new default) is not forced into the
+        // sidebar; only pinned ones surface as empty headers. See #2208.
+        let registered = vec![
+            Project::new("pinned", "/work/pinned", ProjectScope::Global).with_pinned(true),
+            Project::new("saved", "/work/saved", ProjectScope::Global),
+        ];
+        let populated: HashSet<String> = HashSet::new();
+        let empties = unpopulated_projects(&populated, &registered);
+        let paths: Vec<&str> = empties.iter().map(|p| p.path.as_str()).collect();
+        assert_eq!(paths, vec!["/work/pinned"]);
+    }
+
+    #[test]
+    fn new_project_defaults_unpinned_legacy_json_defaults_pinned() {
+        // New entries are saved-but-not-pinned.
+        assert!(!Project::new("r", "/tmp/r", ProjectScope::Global).pinned);
+        // JSON written before #2208 has no `pinned` key: it must deserialize to
+        // pinned so an upgrade keeps existing empty headers visible.
+        let legacy = r#"[{"name":"r","path":"/tmp/r"}]"#;
+        let parsed: Vec<Project> = serde_json::from_str(legacy).unwrap();
+        assert!(parsed[0].pinned);
     }
 
     #[test]
@@ -589,6 +683,47 @@ mod tests {
         // Unknown project is a NotFound.
         assert!(matches!(
             update_base_branch("default", ProjectScope::Global, "nope", Some("x".into())),
+            Err(RegistryError::NotFound(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn set_pinned_toggles_without_removing_entry() -> Result<()> {
+        let temp = tempdir()?;
+        setup(temp.path());
+        let repo = temp.path().join("repoPin");
+        let _ = git2::Repository::init(&repo);
+
+        // Pin on create, then unpin: the row must survive (the #2208 fix).
+        add(
+            "default",
+            ProjectScope::Global,
+            Project::new("repoPin", repo.to_string_lossy(), ProjectScope::Global).with_pinned(true),
+            false,
+        )?;
+        assert!(load_global()?[0].pinned);
+
+        let unpinned = set_pinned("default", ProjectScope::Global, "repoPin", false)?;
+        assert!(!unpinned.pinned);
+        // Unpin keeps the saved project rather than deleting it.
+        let loaded = load_global()?;
+        assert_eq!(loaded.len(), 1);
+        assert!(!loaded[0].pinned);
+
+        // Re-pin by canonical path.
+        let repinned = set_pinned(
+            "default",
+            ProjectScope::Global,
+            &repo.to_string_lossy(),
+            true,
+        )?;
+        assert!(repinned.pinned);
+        assert!(load_global()?[0].pinned);
+
+        assert!(matches!(
+            set_pinned("default", ProjectScope::Global, "nope", true),
             Err(RegistryError::NotFound(_))
         ));
         Ok(())

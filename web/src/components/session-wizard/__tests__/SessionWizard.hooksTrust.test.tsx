@@ -21,6 +21,13 @@ vi.mock("../../../lib/api", () => ({
   fetchProfiles: vi.fn().mockResolvedValue([]),
   fetchVolumeIgnoresPreview: vi.fn().mockResolvedValue([]),
   markVolumeIgnoresGlobsAcknowledged: vi.fn().mockResolvedValue(undefined),
+  // The single-screen wizard mounts ProjectStep on open (#2210); stub its
+  // recent-project fetches. One seeded recent keeps the Recent tab active.
+  fetchSessions: vi.fn().mockResolvedValue({ sessions: [] }),
+  fetchRecentProjects: vi.fn().mockResolvedValue({
+    projects: [{ path: "/tmp/proj", display_name: "proj", tool: "claude", last_used_at: "2026-01-01T00:00:00Z" }],
+  }),
+  fetchProjects: vi.fn().mockResolvedValue([]),
   createSession: (...args: unknown[]) => createSession(...args),
 }));
 
@@ -41,11 +48,7 @@ const HOOKS_REFUSAL = {
 
 function renderWizard(onCreated: (session: unknown) => void = () => {}) {
   return render(
-    <SessionWizard
-      onClose={() => {}}
-      onCreated={onCreated}
-      prefill={{ skipToReview: true, path: "/tmp/proj", tool: "claude" }}
-    />,
+    <SessionWizard onClose={() => {}} onCreated={onCreated} prefill={{ path: "/tmp/proj", tool: "claude" }} />,
   );
 }
 

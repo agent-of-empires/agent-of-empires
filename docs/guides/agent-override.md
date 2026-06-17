@@ -50,14 +50,15 @@ wrapper (for example `opencode-plannotator`) is installed and the bare agent bin
 ### Via the web dashboard
 
 The new-session wizard previews the exact command a session will launch.
-The review step shows a "Launch command" row with the resolved command,
-post-override and post-arg-resolution; for a structured view session this is the
-ACP registry command plus its args (for example `opencode acp`, or
-`opencode-plannotator acp` once an override is set), not the bare binary.
-Click the row to edit the command inline: the edit sets the per-session
-command override, while the registry args stay read-only so they are
-never duplicated. Note that extra args are ignored for structured view sessions;
-use the command override to change a structured view launch command.
+Under "More options", the agent section shows the resolved command beneath
+the "Command override" field, post-override and post-arg-resolution; for a
+structured view session this is the ACP registry command plus its args (for
+example `opencode acp`, or `opencode-plannotator acp` once an override is
+set), not the bare binary. Type in the "Command override" field to set the
+per-session command override; the registry args are appended automatically
+and never duplicated. Note that extra args are ignored for structured view
+sessions; use the command override to change a structured view launch
+command.
 
 ## Priority order
 
