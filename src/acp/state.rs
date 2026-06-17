@@ -857,6 +857,21 @@ pub enum Event {
         at: DateTime<Utc>,
         reason: Option<String>,
     },
+    /// The agent armed the Claude SDK's `Monitor` tool: a background watch
+    /// that streams events and re-invokes the agent off-protocol. Unlike
+    /// `ScheduleWakeup` it has no fixed wake time, so there is no countdown,
+    /// just a "monitoring" badge. The tool call is fire-and-forget (it
+    /// completes immediately while the watch keeps running), so the turn
+    /// ends and the session sits Idle while the monitor is still armed.
+    /// Emitted from `acp_client::map_update_to_events` so the sidebar can
+    /// flag the session without subscribing to the structured view WS.
+    /// Considered active until the next `UserPromptSent`: a monitor firing
+    /// re-invokes the agent with activity but never a `UserPromptSent`, so
+    /// the badge persists across re-fires and clears only when the user
+    /// takes over.
+    MonitorArmed {
+        description: Option<String>,
+    },
     /// User invoked `/clear` (claude-agent-acp's reset-conversation
     /// slash command). The adapter rotates its internal session so the
     /// model truly forgets earlier turns; aoe's transcript is now a
@@ -1082,6 +1097,10 @@ impl AcpState {
             // in-memory mirror needed yet. Bumps seq so the WS replay
             // surfaces it to live clients.
             Event::WakeupScheduled { .. } => {}
+            // Like WakeupScheduled, the "monitor armed" state lives in the
+            // event log (queried by the REST endpoint); no in-memory mirror.
+            // Bumps seq so the WS replay surfaces it to live clients.
+            Event::MonitorArmed { .. } => {}
             // Rejected follow-up prompt while another prompt was in flight.
             // No durable in-memory mutation; the reducer surfaces a Retry
             // pill from the broadcast frame and the event_store entry

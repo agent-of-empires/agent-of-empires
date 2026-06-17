@@ -168,6 +168,17 @@ pub struct SessionResponse {
     /// `next_wakeup_at` is also set. See #1091.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_wakeup_reason: Option<String>,
+    /// True when the structured view session has an armed `Monitor` tool
+    /// (a background watch). Unlike a scheduled wakeup there is no fire
+    /// time, so the sidebar shows a static "monitoring" badge rather than a
+    /// countdown. Cleared once a `UserPromptSent` lands after the monitor
+    /// was armed (the user took over).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub monitor_active: bool,
+    /// The `description` the agent gave the `Monitor` tool, shown as the
+    /// badge tooltip. Only set when `monitor_active` is true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub monitor_description: Option<String>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -211,6 +222,7 @@ impl SessionResponse {
             crate::acp::supervisor::AcpWorkerState::Absent,
             None,
             None,
+            None,
         )
     }
 
@@ -224,7 +236,16 @@ impl SessionResponse {
         #[cfg(feature = "serve")] acp_worker_state: crate::acp::supervisor::AcpWorkerState,
         next_wakeup_at: Option<String>,
         next_wakeup_reason: Option<String>,
+        // `Some(description)` when the session has an armed `Monitor` (the
+        // inner description is itself optional); `None` when none is armed.
+        // Mirrors `EventStore::latest_active_monitor`'s return so the caller
+        // forwards it verbatim.
+        active_monitor: Option<Option<String>>,
     ) -> Self {
+        let (monitor_active, monitor_description) = match active_monitor {
+            Some(description) => (true, description),
+            None => (false, None),
+        };
         Self {
             id: inst.id.clone(),
             title: inst.title.clone(),
@@ -320,6 +341,8 @@ impl SessionResponse {
             plan_summary,
             next_wakeup_at,
             next_wakeup_reason,
+            monitor_active,
+            monitor_description,
         }
     }
 }
@@ -436,6 +459,11 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
             } else {
                 (None, None)
             };
+            let active_monitor = if inst.is_structured() {
+                state.acp_event_store.latest_active_monitor(&inst.id)
+            } else {
+                None
+            };
             #[cfg(feature = "serve")]
             let acp_worker_state = worker_states
                 .get(&inst.id)
@@ -449,6 +477,7 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
                 acp_worker_state,
                 next_wakeup_at,
                 next_wakeup_reason,
+                active_monitor,
             )
         })
         .collect();
@@ -6695,6 +6724,8 @@ mod workspace_ordering_tests {
             plan_summary: None,
             next_wakeup_at: None,
             next_wakeup_reason: None,
+            monitor_active: false,
+            monitor_description: None,
             favorited: false,
             urgent: false,
             pinned_at: None,

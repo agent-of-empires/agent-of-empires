@@ -567,6 +567,7 @@ impl AcpTranscript {
             | Event::UsageUpdated { .. }
             | Event::RawAgentUpdate { .. }
             | Event::WakeupScheduled { .. }
+            | Event::MonitorArmed { .. }
             | Event::CancelRequested { .. }
             | Event::PromptCapabilities { .. }
             | Event::AgentSwitched { .. }

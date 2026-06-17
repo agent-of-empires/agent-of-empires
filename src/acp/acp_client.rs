@@ -2856,6 +2856,28 @@ fn wakeup_event_from_raw(raw_input: &serde_json::Value) -> Option<Event> {
     Some(Event::WakeupScheduled { at, reason })
 }
 
+/// Build a `MonitorArmed` event from a `Monitor` tool's raw_input. Reads
+/// the optional `description` for the badge label. Returns `None` when the
+/// frame carries neither `description` nor `command`: claude-agent-acp emits
+/// the initial `tool_call` frame with empty args (the real args land on a
+/// later `ToolCallUpdate`), and an empty frame should not arm the badge.
+fn monitor_event_from_raw(raw_input: &serde_json::Value) -> Option<Event> {
+    let description = raw_input
+        .get("description")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let has_command = raw_input.get("command").and_then(|v| v.as_str()).is_some();
+    if description.is_none() && !has_command {
+        return None;
+    }
+    info!(
+        target: "acp.protocol.wakeup",
+        description = ?description,
+        "emitting MonitorArmed from Monitor tool args"
+    );
+    Some(Event::MonitorArmed { description })
+}
+
 /// Derive a `LifecycleSignal::WakeupPending` from a `SessionUpdate`.
 ///
 /// The watchdog must not suppress on every `Event::WakeupScheduled`:
@@ -3240,6 +3262,24 @@ fn map_update_to_events(
             {
                 if let Some(raw) = update.fields.raw_input.as_ref() {
                     if let Some(event) = wakeup_event_from_raw(raw) {
+                        events.push(event);
+                    }
+                }
+            }
+            // The Claude SDK's `Monitor` tool is fire-and-forget: the tool
+            // call completes immediately while the background watch keeps
+            // running off-protocol, so the turn ends and the session sits
+            // Idle while the monitor is still armed. Like ScheduleWakeup the
+            // initial `tool_call` frame carries empty args; the real
+            // `command` / `description` land on this update. Emit MonitorArmed
+            // so the sidebar can flag the session instead of showing a plain
+            // grey "idle" dot that looks dead. Gated on the same claude-only
+            // profile flag as the wakeup tools.
+            if profile.supports_wakeup_tools
+                && matches!(update.fields.title.as_deref(), Some("Monitor"))
+            {
+                if let Some(raw) = update.fields.raw_input.as_ref() {
+                    if let Some(event) = monitor_event_from_raw(raw) {
                         events.push(event);
                     }
                 }
@@ -8303,6 +8343,60 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Event::WakeupScheduled { .. })),
             "no WakeupScheduled should fire without delaySeconds",
+        );
+    }
+
+    #[test]
+    fn map_tool_call_update_emits_monitor_armed_when_title_and_args_land() {
+        // Mirrors the ScheduleWakeup path: the Monitor tool's initial
+        // `ToolCall` frame has empty args; the real `command` /
+        // `description` arrive on a follow-up `ToolCallUpdate`. That update
+        // must emit MonitorArmed so the sidebar shows a "monitoring" badge
+        // instead of a plain grey idle dot.
+        use agent_client_protocol::schema::{ToolCallUpdate, ToolCallUpdateFields};
+        let fields = ToolCallUpdateFields::new()
+            .title("Monitor".to_string())
+            .raw_input(serde_json::json!({
+                "command": "until cargo clippy; do sleep 5; done",
+                "description": "clippy passes",
+                "timeout_ms": 600000,
+                "persistent": false,
+            }));
+        let update = ToolCallUpdate::new("toolu_test", fields);
+        let events = map_update_to_events(
+            SessionUpdate::ToolCallUpdate(update),
+            &agent_profiles::CLAUDE,
+        );
+        let armed = events
+            .iter()
+            .find(|e| matches!(e, Event::MonitorArmed { .. }))
+            .expect("ToolCallUpdate with title=Monitor + args must emit MonitorArmed");
+        match armed {
+            Event::MonitorArmed { description } => {
+                assert_eq!(description.as_deref(), Some("clippy passes"));
+            }
+            other => panic!("expected MonitorArmed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_tool_call_update_skips_monitor_when_args_empty() {
+        // The initial title-only / empty-args frame must NOT arm the badge;
+        // only the populated follow-up update does.
+        use agent_client_protocol::schema::{ToolCallUpdate, ToolCallUpdateFields};
+        let fields = ToolCallUpdateFields::new()
+            .title("Monitor".to_string())
+            .raw_input(serde_json::json!({}));
+        let update = ToolCallUpdate::new("toolu_test", fields);
+        let events = map_update_to_events(
+            SessionUpdate::ToolCallUpdate(update),
+            &agent_profiles::CLAUDE,
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::MonitorArmed { .. })),
+            "no MonitorArmed should fire without command or description",
         );
     }
 

@@ -812,6 +812,73 @@ impl EventStore {
         }
     }
 
+    /// Whether the session has an armed `Monitor` (background watch). Returns
+    /// the latest `MonitorArmed` description when active, `None` otherwise.
+    ///
+    /// A `Monitor` is fire-and-forget with no fixed end time, so unlike
+    /// `latest_pending_wakeup` there is no timestamp to gate on. A monitor
+    /// firing re-invokes the agent with activity but never a
+    /// `UserPromptSent`, so the badge must persist across re-fires and clear
+    /// only when the user takes over: treat the monitor as active iff the
+    /// latest `MonitorArmed` has no `UserPromptSent` at a higher seq.
+    ///
+    /// Known ceiling: a monitor that exits / times out, or is torn down by a
+    /// `TaskStop`, with no following user prompt leaves the badge up until
+    /// the user's next prompt. aoe gets no clean disarm signal, and a stale
+    /// "monitoring" badge that clears on any user action is strictly better
+    /// than an idle dot that looks dead.
+    pub fn latest_active_monitor(&self, session_id: &str) -> Option<Option<String>> {
+        let conn = match self.conn.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        // Latest MonitorArmed and its seq.
+        let row: Option<(i64, String)> = conn
+            .query_row(
+                "SELECT seq, event_json FROM acp_events
+                 WHERE session_id = ?1
+                   AND event_json LIKE '{\"MonitorArmed\":%'
+                 ORDER BY seq DESC LIMIT 1",
+                params![session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        let (armed_seq, json) = row?;
+        // A user prompt after the arm means the user took over; the badge
+        // clears. No log on the common "no monitor" branch above (this query
+        // fans out per structured session on every ~2-3s sessions poll).
+        let user_took_over: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM acp_events
+                 WHERE session_id = ?1
+                   AND seq > ?2
+                   AND event_json LIKE '{\"UserPromptSent\":%'
+                 LIMIT 1",
+                params![session_id, armed_seq],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        if user_took_over.is_some() {
+            return None;
+        }
+        match serde_json::from_str::<Event>(&json) {
+            Ok(Event::MonitorArmed { description }) => Some(description),
+            Ok(_) => None,
+            Err(e) => {
+                warn!(
+                    target: "acp.event_store",
+                    session = %session_id,
+                    "latest_active_monitor: deserialise failed: {e}"
+                );
+                None
+            }
+        }
+    }
+
     /// Given the seq of a just-published `UserPromptSent`, return the
     /// `WakeupScheduled` whose timer just fired (so the structured view event
     /// listener can dispatch a push notification). A prompt counts as
@@ -1497,6 +1564,7 @@ fn event_kind(event: &Event) -> &'static str {
         Event::SessionCleared => "session_cleared",
         Event::ConversationCompacted => "conversation_compacted",
         Event::WakeupScheduled { .. } => "wakeup_scheduled",
+        Event::MonitorArmed { .. } => "monitor_armed",
         Event::PromptRejected { .. } => "prompt_rejected",
         Event::AgentSwitched { .. } => "agent_switched",
     }
@@ -2401,6 +2469,92 @@ mod tests {
             .unwrap();
         let pending = store.latest_pending_wakeup("s-1").expect("pending");
         assert_eq!(pending.1.as_deref(), Some("rescheduled"));
+    }
+
+    #[test]
+    fn latest_active_monitor_returns_description_when_armed() {
+        let (_tmp, store) = open_store(1000);
+        store
+            .record(
+                "s-1",
+                1,
+                &Event::MonitorArmed {
+                    description: Some("clippy passes".into()),
+                },
+            )
+            .unwrap();
+        let armed = store.latest_active_monitor("s-1").expect("armed");
+        assert_eq!(armed.as_deref(), Some("clippy passes"));
+    }
+
+    #[test]
+    fn latest_active_monitor_persists_without_a_user_prompt() {
+        // A monitor firing re-invokes the agent with activity but no
+        // UserPromptSent, so the badge must persist across those re-fires.
+        let (_tmp, store) = open_store(1000);
+        store
+            .record(
+                "s-1",
+                1,
+                &Event::MonitorArmed {
+                    description: Some("build".into()),
+                },
+            )
+            .unwrap();
+        // Trailing agent activity (no user prompt) does not clear it.
+        store.record("s-1", 2, &Event::ThinkingStarted).unwrap();
+        store
+            .record(
+                "s-1",
+                3,
+                &Event::AgentMessageChunk {
+                    text: "resuming".into(),
+                },
+            )
+            .unwrap();
+        assert!(store.latest_active_monitor("s-1").is_some());
+    }
+
+    #[test]
+    fn latest_active_monitor_clears_on_user_prompt() {
+        // The user typing a follow-up means they took over; the badge clears.
+        let (_tmp, store) = open_store(1000);
+        store
+            .record(
+                "s-1",
+                1,
+                &Event::MonitorArmed {
+                    description: Some("watch".into()),
+                },
+            )
+            .unwrap();
+        store
+            .record(
+                "s-1",
+                2,
+                &Event::UserPromptSent {
+                    text: "stop watching".into(),
+                    attachments: Vec::new(),
+                },
+            )
+            .unwrap();
+        assert!(store.latest_active_monitor("s-1").is_none());
+    }
+
+    #[test]
+    fn latest_active_monitor_none_without_monitor() {
+        let (_tmp, store) = open_store(1000);
+        store
+            .record(
+                "s-1",
+                1,
+                &Event::UserPromptSent {
+                    text: "hi".into(),
+                    attachments: Vec::new(),
+                },
+            )
+            .unwrap();
+        assert!(store.latest_active_monitor("s-1").is_none());
     }
 
     #[test]
