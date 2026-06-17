@@ -232,6 +232,11 @@ container (rather than bind-mounting from the host).
   reconnect status if the WebSocket is degraded.
 - A repeatedly-failing worker is parked with a red "session parked" banner.
   Retry from the dashboard or run `aoe acp restart <session>`.
+- A session that was auto-stopped for inactivity and then respawned (for
+  example after a version upgrade) used to be able to keep a stale "dormant"
+  marker, which made the daemon refuse to bring the worker back after it next
+  exited; a follow-up message would then sit unsent. A worker coming online now
+  clears that marker, so this no longer strands a queued message.
 
 ### "Restarting worker" banner after a turn looked done
 

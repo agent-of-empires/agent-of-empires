@@ -3661,8 +3661,28 @@ fn apply_acp_session_change(
 ) -> Option<String> {
     match change? {
         AcpSessionChange::Assigned(new_id) => {
+            // A worker just initialized (session/new or session/load), so the
+            // session is by definition no longer idle-dormant. Clear any
+            // marker now: a stale one left by a non-user respawn (e.g. the
+            // build-stale respawn #1754, which brings the worker back without
+            // a user wake) otherwise makes the reconciler's
+            // `!is_idle_dormant()` resume filter refuse to bring the session
+            // back after this worker later dies, deadlocking a queued prompt
+            // that the client parked waiting for a worker that never returns.
+            // See #2237.
+            let cleared_stale_dormant = inst.idle_dormant_since.take().is_some();
             if inst.acp_session_id.as_deref() == Some(new_id.as_str()) {
-                // Same id — already on disk, no need to rewrite.
+                // Same id (a reattach / session/load reuses it). Only persist
+                // if we actually cleared a stale dormant marker; otherwise the
+                // id is already on disk and there is nothing to rewrite.
+                if cleared_stale_dormant {
+                    tracing::info!(
+                        target: "acp.event_listener",
+                        session = %session_id,
+                        "cleared stale idle-dormant marker on worker (re)assign"
+                    );
+                    return Some(inst.source_profile.clone());
+                }
                 return None;
             }
             tracing::info!(
@@ -3934,6 +3954,53 @@ mod tests {
 
         let merged = merge_runtime_fields(prior, fresh);
         assert_eq!(merged.last_error.as_deref(), Some("recovery cascade: foo"));
+    }
+
+    // #2237: a worker coming live (AcpSessionAssigned) must clear a stale
+    // idle-dormant marker, even when the acp_session_id is unchanged (a
+    // session/load reattach reuses it). Without this, a stale marker left by a
+    // non-user respawn keeps the reconciler's resume filter skipping the
+    // session forever once the worker dies, deadlocking a queued prompt.
+    #[cfg(feature = "serve")]
+    #[test]
+    fn acp_session_assigned_clears_stale_dormant_marker_on_same_id() {
+        let mut inst = Instance::new("seed", "/tmp/seed");
+        inst.acp_session_id = Some("sid-1".to_string());
+        inst.idle_dormant_since = Some(chrono::Utc::now());
+
+        // Same id as already stored: the only reason to persist is the
+        // stale-dormant clear, so the function must return Some(profile).
+        let persist = apply_acp_session_change(
+            &mut inst,
+            "seed",
+            Some(&AcpSessionChange::Assigned("sid-1".to_string())),
+        );
+        assert!(
+            inst.idle_dormant_since.is_none(),
+            "dormant marker must be cleared when a worker (re)assigns"
+        );
+        assert!(
+            persist.is_some(),
+            "clearing a stale marker must trigger a persist even on an unchanged id"
+        );
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn acp_session_assigned_same_id_no_marker_is_noop() {
+        let mut inst = Instance::new("seed", "/tmp/seed");
+        inst.acp_session_id = Some("sid-1".to_string());
+        inst.idle_dormant_since = None;
+        // Same id, nothing stale to clear: must stay a no-op (no rewrite).
+        let persist = apply_acp_session_change(
+            &mut inst,
+            "seed",
+            Some(&AcpSessionChange::Assigned("sid-1".to_string())),
+        );
+        assert!(
+            persist.is_none(),
+            "unchanged id with no stale marker is a no-op"
+        );
     }
 
     #[test]
