@@ -233,6 +233,19 @@ container (rather than bind-mounting from the host).
 - A repeatedly-failing worker is parked with a red "session parked" banner.
   Retry from the dashboard or run `aoe acp restart <session>`.
 
+### "Restarting worker" banner after a turn looked done
+
+Some agents (notably `claude-agent-acp`) occasionally finish a turn, stream
+the final message and the end-of-turn usage, but never send the protocol's
+turn-complete acknowledgement. The daemon used to treat that as a wedge and
+restart the worker, showing **Agent finished but didn't notify the daemon.
+Restarting worker; your transcript will be preserved.** When the agent had
+already emitted its end-of-turn usage and was not running a background or
+scheduled task, the daemon now ends the turn cleanly instead, so a completed
+turn no longer triggers a restart. A genuine stall (no end-of-turn usage, or a
+monitor / scheduled-wake turn that overran) still restarts the worker and
+shows the banner; the transcript is preserved either way.
+
 ### "Force end turn" button under the spinner
 
 If the agent finished a turn but the working spinner is still rattling, a small
