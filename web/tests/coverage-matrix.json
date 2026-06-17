@@ -113,6 +113,13 @@
       "components": ["web/src/components/MobileLiveTerminal.tsx", "web/src/components/LiveTerminalView.tsx"]
     },
     {
+      "id": "terminal.mobile-tap-to-focus",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/__tests__/MobileLiveTerminal.tapFocus.test.tsx"],
+      "components": ["web/src/components/MobileLiveTerminal.tsx"]
+    },
+    {
       "id": "terminal.mobile-live-wheel-forward-e2e",
       "kind": "mocked-playwright",
       "risk": "high",
@@ -1266,6 +1273,13 @@
         "src/components/acp/__tests__/StructuredViewRoot.test.tsx"
       ],
       "components": ["web/src/components/acp/StructuredView.tsx"]
+    },
+    {
+      "id": "acp.thread-tap-focus",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/acp/threadTapFocus.test.ts"],
+      "components": ["web/src/components/acp/StructuredView.tsx", "web/src/components/acp/threadTapFocus.ts"]
     },
     {
       "id": "acp.composer-queue-recall",
