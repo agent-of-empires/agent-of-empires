@@ -38,7 +38,8 @@ import {
 } from "@dnd-kit/core";
 import { SortableContext, useSortable, verticalListSortingStrategy, arrayMove } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import type { SessionResponse, SessionStatus, Workspace } from "../lib/types";
+import type { ProjectInfo, RepoGroup, SessionResponse, SessionStatus, Workspace } from "../lib/types";
+import { ProjectsSection } from "./ProjectsSection";
 import type { SidebarAxis } from "../lib/sidebarAxis";
 import {
   archivableWorkspaces,
@@ -49,7 +50,8 @@ import {
   type SidebarGroup,
 } from "../lib/sidebarGroups";
 import { safeGetItem, safeSetItem } from "../lib/safeStorage";
-import { REPO_COLOR_OPTIONS, type RepoAppearanceUpdate, type RepoColor } from "../lib/repoAppearance";
+import { menuBus, closeOtherContextMenus } from "../lib/menuBus";
+import { REPO_COLOR_OPTIONS, repoColorStyle, repoSwatchStyle, type RepoAppearanceUpdate } from "../lib/repoAppearance";
 import { STATUS_DOT_CLASS, getStatusTextClass, isSessionActive } from "../lib/session";
 import { useIdleDecayWindowMs } from "../lib/idleDecay";
 import { exceedsTouchSlop } from "../lib/longPress";
@@ -112,17 +114,6 @@ export const SNOOZE_PRESETS: readonly { label: string; minutes: number }[] = [
   { label: "1 week", minutes: 10080 },
 ];
 
-// Module-level bus for closing any open SessionRow context menu when a
-// new one opens. Each SessionRow manages its own menu state; without
-// this bus, long-pressing a second session on mobile leaves the first
-// menu visible because document "click" listeners don't fire on
-// touchstart. Publishing on open + subscribing here keeps "one menu at
-// a time" without lifting state up to the parent.
-const menuBus = new EventTarget();
-function closeOtherContextMenus() {
-  menuBus.dispatchEvent(new Event("close"));
-}
-
 // Group headers and session rows are both sortable inside the one
 // sidebar DndContext, so a header drag must not collide with a session
 // droppable (or vice versa). dnd-kit registers every sortable in a
@@ -158,8 +149,16 @@ interface Props {
   onPinProject?: (repoPath: string) => void;
   /** Unpin a repo: remove every registry entry for its path. See #2047. */
   onUnpinProject?: (group: SidebarGroup) => void;
+  /** Saved projects with no live session, for the dedicated Projects section
+   *  (#2212). Pinned projects render above as headers, not here. */
+  savedProjects: RepoGroup[];
+  /** Open the add-project form (directory browser + scope + base branch). */
+  onAddProject: () => void;
+  /** Open the edit form for one registration (default base branch). */
+  onEditProject: (project: ProjectInfo) => void;
+  /** Remove a project: delete every registration for its path. */
+  onRemoveProject: (group: RepoGroup) => void;
   onSettings: () => void;
-  onProjects: () => void;
   onDeleteSession?: (workspaceId: string) => void;
   onStopSession?: (workspaceId: string) => void;
   onStartSession?: (workspaceId: string) => void;
@@ -350,27 +349,6 @@ function useDragSuppressRef(): MutableRefObject<number> {
     throw new Error("DragSuppressContext used outside provider");
   }
   return ref;
-}
-
-const REPO_COLOR_TOKENS: Record<RepoColor, string> = {
-  amber: "--color-status-waiting",
-  teal: "--color-terminal-active",
-  sky: "--color-sandbox",
-  violet: "--color-diff-header",
-  rose: "--color-status-error",
-  slate: "--color-surface-700",
-};
-
-function repoColorStyle(color: RepoColor | null): React.CSSProperties | undefined {
-  if (!color) return undefined;
-  const token = REPO_COLOR_TOKENS[color];
-  return {
-    backgroundColor: `color-mix(in srgb, var(${token}) 14%, transparent)`,
-  };
-}
-
-function repoSwatchStyle(color: RepoColor): React.CSSProperties {
-  return { backgroundColor: `var(${REPO_COLOR_TOKENS[color]})` };
 }
 
 function useSuppressClickAfterDrag(ref: MutableRefObject<number>) {
@@ -2077,8 +2055,11 @@ export function WorkspaceSidebar({
   onCreateSession,
   onPinProject,
   onUnpinProject,
+  savedProjects,
+  onAddProject,
+  onEditProject,
+  onRemoveProject,
   onSettings,
-  onProjects,
   onDeleteSession,
   onStopSession,
   onStartSession,
@@ -2765,6 +2746,16 @@ export function WorkspaceSidebar({
                 </div>
               );
             })}
+          <ProjectsSection
+            projects={savedProjects}
+            query={q}
+            readOnly={readOnly}
+            offline={offline}
+            onCreateSession={onCreateSession}
+            onAddProject={onAddProject}
+            onEditProject={onEditProject}
+            onRemoveProject={onRemoveProject}
+          />
           {(() => {
             // Single global "Snoozed & archived" section at the very
             // bottom of the sidebar. Aggregates sunk workspaces from
@@ -2866,25 +2857,6 @@ export function WorkspaceSidebar({
         </div>
 
         <div className="border-t border-surface-700/20 p-2 flex items-center gap-1">
-          <button
-            onClick={onProjects}
-            className="w-8 h-8 flex items-center justify-center text-text-secondary hover:text-text-primary hover:bg-surface-800/50 cursor-pointer rounded-md transition-colors"
-            title="Projects"
-            aria-label="Projects"
-          >
-            <svg
-              width="16"
-              height="16"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="1.5"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
-            </svg>
-          </button>
           <button
             onClick={onSettings}
             {...tourAnchor(TOUR_ANCHORS.sidebarSettings)}
