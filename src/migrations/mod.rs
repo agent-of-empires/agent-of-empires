@@ -185,7 +185,7 @@ fn get_current_version() -> u32 {
 fn set_version(version: u32) -> Result<()> {
     let dir = crate::session::get_app_dir()?;
     let version_file = dir.join(VERSION_FILE);
-    fs::write(&version_file, version.to_string())?;
+    crate::session::atomic_write(&version_file, version.to_string().as_bytes())?;
     debug!("Updated schema version to {}", version);
     Ok(())
 }

@@ -223,7 +223,7 @@ fn migrate_config_file(path: &Path) -> Result<()> {
     // stale `[cockpit]` rather than clobbering.
     doc.entry("acp".to_string()).or_insert(cockpit);
 
-    fs::write(path, toml::to_string_pretty(&doc)?)?;
+    crate::session::atomic_write(path, toml::to_string_pretty(&doc)?.as_bytes())?;
     info!("v012: renamed [cockpit] -> [acp] in {}", path.display());
     Ok(())
 }
@@ -268,7 +268,7 @@ fn migrate_sessions_file(path: &Path) -> Result<()> {
     }
 
     if changed {
-        fs::write(path, serde_json::to_string_pretty(&value)?)?;
+        crate::session::atomic_write(path, serde_json::to_string_pretty(&value)?.as_bytes())?;
         info!(
             "v012: migrated cockpit_* session keys in {}",
             path.display()

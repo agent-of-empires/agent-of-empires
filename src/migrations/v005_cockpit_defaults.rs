@@ -54,7 +54,7 @@ pub(crate) fn run_in(app_dir: &Path) -> Result<()> {
     doc.insert("cockpit".into(), toml::Value::Table(cockpit));
 
     let serialized = toml::to_string_pretty(&doc)?;
-    fs::write(&global_config, serialized)?;
+    crate::session::atomic_write(&global_config, serialized.as_bytes())?;
 
     info!(
         "v005: seeded [cockpit] section in {}",

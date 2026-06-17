@@ -36,7 +36,7 @@ fn rename_theme(path: &Path) -> Result<()> {
     theme.insert("name".into(), toml::Value::String("zinc".into()));
 
     info!("Renaming theme 'default' -> 'zinc' in {}", path.display());
-    fs::write(path, toml::to_string_pretty(&doc)?)?;
+    crate::session::atomic_write(path, toml::to_string_pretty(&doc)?.as_bytes())?;
     Ok(())
 }
 

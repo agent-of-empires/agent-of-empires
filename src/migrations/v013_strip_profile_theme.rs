@@ -74,7 +74,7 @@ fn strip_profile_theme(path: &Path) -> Result<()> {
         path.display()
     );
     let new_content = toml::to_string_pretty(&doc)?;
-    fs::write(path, new_content)?;
+    crate::session::atomic_write(path, new_content.as_bytes())?;
     Ok(())
 }
 

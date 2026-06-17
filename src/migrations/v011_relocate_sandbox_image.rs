@@ -76,7 +76,7 @@ fn migrate_config_file(path: &PathBuf) -> Result<()> {
     sandbox.insert("default_image".to_string(), toml::Value::String(new_value));
 
     let new_content = toml::to_string_pretty(&doc)?;
-    fs::write(path, new_content)?;
+    crate::session::atomic_write(path, new_content.as_bytes())?;
 
     Ok(())
 }
