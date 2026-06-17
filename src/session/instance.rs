@@ -82,11 +82,6 @@ impl Status {
     }
 }
 
-/// Outcome of `start_with_resume_fallback`.
-///
-/// Tmux/process failures propagate as `Err` so callers keep the existing
-/// `Status::Error` + `last_error` path. Resume-probe death is represented
-/// explicitly as `ResumeFailed` because it preserves durable state.
 /// `last_error` the status poller stamps when a session's tmux pane is simply
 /// absent (killed, exited, server reboot) and nothing more specific was
 /// captured from the pane. The preview treats this as the calm "Stopped" case
@@ -94,6 +89,11 @@ impl Status {
 pub const TMUX_SESSION_GONE_ERROR: &str =
     "tmux session is gone. The agent process may have exited or been killed.";
 
+/// Outcome of `start_with_resume_fallback`.
+///
+/// Tmux/process failures propagate as `Err` so callers keep the existing
+/// `Status::Error` + `last_error` path. Resume-probe death is represented
+/// explicitly as `ResumeFailed` because it preserves durable state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StartOutcome {
     /// Session ID was set and resume succeeded; pane is alive.
@@ -118,12 +118,12 @@ pub enum StartOutcome {
 /// `StartOutcome::Resumed` because `acquire_session_id` always assigns a
 /// UUID for Claude.
 #[must_use]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaunchSidOutcome {
     /// `acquire_session_id` reused a prior sid: `ResumeIntent::Use(sid)`,
     /// observed `agent_session_id`, or retroactive-capture hit. The launch
     /// command embedded the agent's resume flag.
-    Existing,
+    Existing { sid: String },
     /// `acquire_session_id` returned a fresh sid (Claude UUID generation)
     /// or `None`. No prior conversation continued.
     Fresh,
@@ -1786,6 +1786,15 @@ impl Instance {
 
         let profile = self.effective_profile();
         let (cmd, is_existing) = self.build_launch_command(skip_on_launch, &profile)?;
+        let launch_sid = if is_existing {
+            Some(
+                self.agent_session_id
+                    .clone()
+                    .expect("existing launch command carries agent_session_id"),
+            )
+        } else {
+            None
+        };
 
         tracing::debug!(target: "session.store",
             "container cmd: {}",
@@ -1809,10 +1818,9 @@ impl Instance {
             expected_prior_intent,
         );
 
-        Ok(if is_existing {
-            LaunchSidOutcome::Existing
-        } else {
-            LaunchSidOutcome::Fresh
+        Ok(match launch_sid {
+            Some(sid) => LaunchSidOutcome::Existing { sid },
+            None => LaunchSidOutcome::Fresh,
         })
     }
 
@@ -2936,8 +2944,13 @@ impl Instance {
         // honestly report `Fresh`. Without this gate, every Claude launch
         // would probe (~2s) and return `Resumed` because acquire always
         // assigns a UUID, even when no `--resume` was passed.
-        let attempting_resume = matches!(outcome, LaunchSidOutcome::Existing)
-            && should_attempt_resume(self.agent_session_id.as_deref(), &self.tool);
+        let attempted_sid = match &outcome {
+            LaunchSidOutcome::Existing { sid } if should_attempt_resume(Some(sid), &self.tool) => {
+                Some(sid.clone())
+            }
+            _ => None,
+        };
+        let attempting_resume = attempted_sid.is_some();
 
         if pane_was_preexisting {
             if attempting_resume {
@@ -2993,10 +3006,7 @@ impl Instance {
             ProbeResult::Dead => {}
         }
 
-        let stale_sid = self
-            .agent_session_id
-            .clone()
-            .expect("attempting_resume guarantees agent_session_id is Some");
+        let stale_sid = attempted_sid.expect("attempting_resume guarantees launch sid is Some");
         let profile = self.effective_profile();
         tracing::warn!(
             target: "session.store",
@@ -3008,9 +3018,6 @@ impl Instance {
 
         self.stop_poller();
         self.session_id_poller = None;
-        self.kill_clean()
-            .with_context(|| format!("kill_clean before resume fallback for {}", self.id))?;
-
         self.resume_probe_failed_sid = Some(stale_sid.clone());
         match self.mark_resume_probe_failed(&profile, &stale_sid) {
             SidWrite::Applied | SidWrite::Skipped => {}
@@ -3022,6 +3029,8 @@ impl Instance {
                 );
             }
         }
+        self.kill_clean()
+            .with_context(|| format!("kill_clean before resume fallback for {}", self.id))?;
         self.status = Status::Error;
         self.last_error = Some(format!(
             "resume failed for sid {}; preserved for explicit retry",
@@ -5767,7 +5776,9 @@ mod tests {
     }
 
     mod resume_fallback {
-        use super::super::{should_attempt_resume, Instance, ResumeIntent, StartOutcome, Status};
+        use super::super::{
+            should_attempt_resume, Instance, LaunchSidOutcome, ResumeIntent, StartOutcome, Status,
+        };
         use serial_test::serial;
         use tempfile::tempdir;
 
@@ -5811,6 +5822,65 @@ mod tests {
         #[test]
         fn unknown_tool_does_not_attempt_resume() {
             assert!(!should_attempt_resume(Some("uuid-abc-123"), "nonexistent"));
+        }
+
+        #[test]
+        fn launch_sid_outcome_carries_emitted_sid() {
+            let outcome = LaunchSidOutcome::Existing {
+                sid: "11111111-1111-1111-1111-111111111111".to_string(),
+            };
+
+            match outcome {
+                LaunchSidOutcome::Existing { sid } => {
+                    assert_eq!(sid, "11111111-1111-1111-1111-111111111111");
+                }
+                other => panic!("expected Existing, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn start_with_resume_fallback_uses_launch_sid_for_probe_decision() {
+            let source = std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/session/instance.rs"),
+            )
+            .unwrap();
+            let start = source
+                .find("pub(crate) fn start_with_resume_fallback")
+                .unwrap();
+            let end = source.find("pub fn ensure_pane_ready").unwrap();
+            let fallback_source = &source[start..end];
+
+            assert!(fallback_source.contains("let attempted_sid = match &outcome"));
+            assert!(fallback_source.contains("LaunchSidOutcome::Existing { sid }"));
+            assert!(
+                !fallback_source.contains("should_attempt_resume(self.agent_session_id.as_deref()")
+            );
+            assert!(
+                !fallback_source.contains("let stale_sid = self\n            .agent_session_id")
+            );
+        }
+
+        #[test]
+        fn resume_probe_failure_marks_before_cleanup() {
+            let source = std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/session/instance.rs"),
+            )
+            .unwrap();
+            let start = source
+                .find("pub(crate) fn start_with_resume_fallback")
+                .unwrap();
+            let end = source.find("pub fn ensure_pane_ready").unwrap();
+            let fallback_source = &source[start..end];
+            let local_marker = fallback_source
+                .find("self.resume_probe_failed_sid = Some(stale_sid.clone())")
+                .unwrap();
+            let persisted_marker = fallback_source
+                .find("self.mark_resume_probe_failed(&profile, &stale_sid)")
+                .unwrap();
+            let cleanup = fallback_source.find("self.kill_clean()").unwrap();
+
+            assert!(local_marker < cleanup);
+            assert!(persisted_marker < cleanup);
         }
 
         #[test]
