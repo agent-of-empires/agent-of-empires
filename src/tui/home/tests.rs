@@ -6224,6 +6224,24 @@ fn apply_restart_results_propagates_worker_sid_without_peer_write() {
     assert!(env.view.restart_in_flight.is_empty());
 }
 
+#[test]
+#[serial]
+fn execute_send_message_missing_session_shows_send_failed() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances[0].id.clone();
+    env.view.instances.retain(|inst| inst.id != id);
+    env.view.instance_map.remove(&id);
+
+    env.view.execute_send_message(&id, "hello");
+
+    let dialog = env.view.info_dialog.as_ref().expect("send failure dialog");
+    assert_eq!(dialog.title(), "Send Failed");
+    assert_eq!(
+        dialog.message(),
+        "Session disappeared before the message could be sent."
+    );
+}
+
 /// A second restart press while the first cascade is still running on the
 /// poller worker must be dropped. The cascade is off the event loop, so the
 /// 1.5s keyboard-repeat debounce does not cover a deliberate press during a

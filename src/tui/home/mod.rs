@@ -4246,6 +4246,10 @@ impl HomeView {
             }
         };
         let Some(inst) = self.get_instance(session_id) else {
+            self.info_dialog = Some(InfoDialog::new(
+                "Send Failed",
+                "Session disappeared before the message could be sent.",
+            ));
             return;
         };
         let tmux_session = match target {
