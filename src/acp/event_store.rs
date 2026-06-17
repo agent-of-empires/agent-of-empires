@@ -514,6 +514,136 @@ impl EventStore {
         }
     }
 
+    /// Return up to `limit` events for `session_id` with `seq < before`,
+    /// the ones sitting CLOSEST below `before`, in ascending (oldest
+    /// first) order. Backs the structured view's recent-first load: the
+    /// client renders the tail first (request `before = u64::MAX`) and
+    /// pages older history as the user scrolls up, passing the previous
+    /// page's lowest seq back as `before`.
+    ///
+    /// Mirrors [`replay_page`](Self::replay_page)'s single-snapshot lock
+    /// and `n + 1` probe, but scans `ORDER BY seq DESC` so the window is
+    /// the newest rows below `before` (a forward `ORDER BY seq ASC LIMIT`
+    /// would return the OLDEST rows and leave a gap). The DESC result is
+    /// reversed in memory before returning so callers always see ASC.
+    /// `last_scanned_seq` is the LOWEST seq consumed (the cursor for the
+    /// next-older page); it advances over rows that fail to deserialise so
+    /// a corrupt row can't stall the paging loop.
+    pub fn replay_page_before(
+        &self,
+        session_id: &str,
+        before: u64,
+        limit: Option<usize>,
+    ) -> ReplayPage {
+        let conn = match self.conn.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let highest_seq = query_highest_seq(&conn, session_id);
+        let lowest_seq = query_lowest_seq(&conn, session_id);
+        // `seq` is a signed SQLite column; clamp before the cast so the
+        // tail request's `before = u64::MAX` stays positive (`seq < MAX`
+        // matches everything) instead of wrapping to a negative bound.
+        let before_i64 = i64::try_from(before).unwrap_or(i64::MAX);
+        let probe = limit.map(|n| n.saturating_add(1));
+        let sql = match probe {
+            Some(_) => {
+                "SELECT seq, event_json FROM acp_events
+                 WHERE session_id = ?1 AND seq < ?2
+                 ORDER BY seq DESC LIMIT ?3"
+            }
+            None => {
+                "SELECT seq, event_json FROM acp_events
+                 WHERE session_id = ?1 AND seq < ?2
+                 ORDER BY seq DESC"
+            }
+        };
+        let mut stmt = match conn.prepare(sql) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(target: "acp.event_store", "prepare replay_before for {session_id}: {e}");
+                return ReplayPage {
+                    events: Vec::new(),
+                    last_scanned_seq: None,
+                    has_more: false,
+                    highest_seq,
+                    lowest_seq,
+                };
+            }
+        };
+        let map_row = |row: &rusqlite::Row| {
+            let seq: i64 = row.get(0)?;
+            let json: String = row.get(1)?;
+            Ok((seq as u64, json))
+        };
+        let rows = match probe {
+            Some(p) => stmt.query_map(params![session_id, before_i64, p as i64], map_row),
+            None => stmt.query_map(params![session_id, before_i64], map_row),
+        };
+        let rows = match rows {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(target: "acp.event_store", "query replay_before for {session_id}: {e}");
+                return ReplayPage {
+                    events: Vec::new(),
+                    last_scanned_seq: None,
+                    has_more: false,
+                    highest_seq,
+                    lowest_seq,
+                };
+            }
+        };
+        let mut out = Vec::new();
+        let mut last_scanned_seq = None;
+        let mut scanned = 0usize;
+        let mut has_more = false;
+        for row in rows {
+            match row {
+                Ok((seq, json)) => {
+                    // The probe row proves an older page exists; don't
+                    // consume it or move the cursor onto it.
+                    if let Some(n) = limit {
+                        if scanned == n {
+                            has_more = true;
+                            break;
+                        }
+                    }
+                    scanned += 1;
+                    // DESC scan, so each consumed row's seq is lower than
+                    // the last; the final one is the page's lowest, which
+                    // is the cursor for the next-older page.
+                    last_scanned_seq = Some(seq);
+                    match serde_json::from_str::<Event>(&json) {
+                        Ok(event) => out.push((seq, event)),
+                        Err(e) => warn!(
+                            target: "acp.event_store",
+                            "deserialise event {session_id}@{seq}: {e}"
+                        ),
+                    }
+                }
+                Err(e) => warn!(target: "acp.event_store", "row error: {e}"),
+            }
+        }
+        // Scanned newest-first; callers expect oldest-first.
+        out.reverse();
+        trace!(
+            target: "acp.event_store",
+            session = %session_id,
+            before,
+            limit = ?limit,
+            returned = out.len(),
+            has_more,
+            "replayed events before cursor"
+        );
+        ReplayPage {
+            events: out,
+            last_scanned_seq,
+            has_more,
+            highest_seq,
+            lowest_seq,
+        }
+    }
+
     /// Return the latest `Event::PlanUpdated` stored for `session_id`,
     /// if any. Used by the REST sessions endpoint to surface
     /// plan-progress chrome (current step / completed / total) on the
@@ -2695,5 +2825,50 @@ mod tests {
             ),
             "RateLimitAutoResumed must supersede Stopped{{rate_limited}}"
         );
+    }
+
+    #[test]
+    fn replay_page_before_returns_closest_below_in_asc_order() {
+        let (_tmp, store) = open_store(1000);
+        for seq in 1..=10 {
+            store.record("s-1", seq, &Event::ThinkingStarted).unwrap();
+        }
+        // Tail: newest page is requested with before = u64::MAX.
+        let tail = store.replay_page_before("s-1", u64::MAX, Some(3));
+        let seqs: Vec<u64> = tail.events.iter().map(|(seq, _)| *seq).collect();
+        // The CLOSEST 3 below the cursor, ascending (not the oldest 3).
+        assert_eq!(seqs, vec![8, 9, 10]);
+        assert!(tail.has_more, "older events remain below seq 8");
+        assert_eq!(
+            tail.last_scanned_seq,
+            Some(8),
+            "cursor is the page's lowest"
+        );
+        assert_eq!(tail.highest_seq, 10);
+
+        // Next-older page pages back via before = previous lowest.
+        let older = store.replay_page_before("s-1", 8, Some(3));
+        let seqs: Vec<u64> = older.events.iter().map(|(seq, _)| *seq).collect();
+        assert_eq!(seqs, vec![5, 6, 7]);
+        assert!(older.has_more);
+        assert_eq!(older.last_scanned_seq, Some(5));
+    }
+
+    #[test]
+    fn replay_page_before_stops_at_session_start() {
+        let (_tmp, store) = open_store(1000);
+        for seq in 1..=4 {
+            store.record("s-1", seq, &Event::ThinkingStarted).unwrap();
+        }
+        // A page that reaches the very first event clears has_more so the
+        // client knows not to keep paging older.
+        let page = store.replay_page_before("s-1", 3, Some(10));
+        let seqs: Vec<u64> = page.events.iter().map(|(seq, _)| *seq).collect();
+        assert_eq!(seqs, vec![1, 2]);
+        assert!(!page.has_more, "reached session start, nothing older");
+        // Empty when before predates everything stored.
+        let none = store.replay_page_before("s-1", 1, Some(10));
+        assert!(none.events.is_empty());
+        assert!(!none.has_more);
     }
 }

@@ -2023,7 +2023,16 @@ pub async fn acp_replay(
     // One store call returns the page and its `highest_seq`/`lowest_seq`
     // under a single lock, so the response is a consistent snapshot and a
     // concurrent `record()` can't desync the cap from the page rows.
-    let page = state.acp_event_store.replay_page(&id, q.since, Some(limit));
+    // `before` switches to backward (older-first) paging for recent-first
+    // load; absent it stays on the forward `since` contract WS catch-up
+    // and existing clients rely on.
+    let backward = q.before.is_some();
+    let page = match q.before {
+        Some(before) => state
+            .acp_event_store
+            .replay_page_before(&id, before, Some(limit)),
+        None => state.acp_event_store.replay_page(&id, q.since, Some(limit)),
+    };
     let highest_seq = page.highest_seq;
     let lowest_seq = page.lowest_seq;
     let next_cursor = page.last_scanned_seq;
@@ -2043,9 +2052,12 @@ pub async fn acp_replay(
     // full reload. With no events on disk yet, nothing is lost. Computed
     // per request so a mid-loop prune is caught on whatever page first
     // sees the gap, not only the first.
-    let lost = match lowest_seq {
-        Some(lo) => q.since < lo.saturating_sub(1),
-        None => false,
+    // Backward paging walks down only within what's stored, so the
+    // truncation signal doesn't apply; the client stops when `has_more`
+    // clears. `lost` stays a forward-replay concern.
+    let lost = match (backward, lowest_seq) {
+        (false, Some(lo)) => q.since < lo.saturating_sub(1),
+        _ => false,
     };
     Json(ReplayResponse {
         frames,
