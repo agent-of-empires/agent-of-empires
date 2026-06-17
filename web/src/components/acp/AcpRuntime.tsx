@@ -43,6 +43,18 @@ import { hasTodoItemsArgsText, parseJsonObject } from "../../lib/acpArgs";
 import { useHistoryWindow } from "../../hooks/useHistoryWindow";
 import { useAgentProfile } from "../../lib/agentProfileContext";
 
+/**
+ * Decides whether a Stop-button press should send a graceful cancel or
+ * escalate to a force-end. Pure so it can be unit-tested without the
+ * assistant-ui runtime. Escalation happens when the server has confirmed
+ * a cancel is in flight (`cancelling`) OR the user has already pressed
+ * Stop once this turn (`alreadyRequested`), so the escape hatch never
+ * depends on an acknowledgement from the wedged daemon. See #2237.
+ */
+export function nextCancelAction(cancelling: boolean, alreadyRequested: boolean): "cancel" | "force" {
+  return cancelling || alreadyRequested ? "force" : "cancel";
+}
+
 interface Props {
   sessionId: string;
   /** Live acp worker lifecycle pulled from `SessionResponse.acp_worker_state`.
@@ -130,6 +142,24 @@ export function AcpRuntime({
   useEffect(() => {
     pendingAttachmentsRef.current = pendingAttachments;
   }, [pendingAttachments]);
+  // Tracks whether the user has already clicked Stop for the current
+  // turn. The server confirms a cancel by flipping `acp.state.cancelling`
+  // via a CancelRequested event, but that event is only emitted while a
+  // prompt is in flight on the daemon. When the UI is stuck "active" but
+  // the daemon has no in-flight prompt (an adopted/orphaned turn whose
+  // terminal Stopped was lost, see #1216), CancelRequested never arrives,
+  // so `cancelling` never flips and the Stop button could never escalate.
+  // This local ref is the client-owned escape hatch: it does not require
+  // an acknowledgement from the system it is escaping. See #2237.
+  const cancelRequestedRef = useRef(false);
+  // Reset the local cancel intent the moment the turn is no longer
+  // active (a terminal Stopped landed, or a fresh prompt started), so the
+  // next turn starts from a graceful-cancel-first state.
+  useEffect(() => {
+    if (!acp.state.turnActive) {
+      cancelRequestedRef.current = false;
+    }
+  }, [acp.state.turnActive]);
   // Render only the most recent slice of the transcript so a long
   // session does not block first paint on mobile; older rows stay in
   // reducer state and are revealed via "Load earlier". See #2144.
@@ -177,14 +207,20 @@ export function AcpRuntime({
       setPendingAttachments([]);
     },
     onCancel: async () => {
-      // First Stop sends a graceful cancel. If a cancel is already in
-      // flight (the agent is ignoring session/cancel on a stuck loop),
-      // a second Stop escalates to a force-stop instead of resending a
-      // no-op notification, so the user's instinct to click again
-      // actually ends the turn. See #1727.
-      if (acp.state.cancelling) {
+      // First Stop sends a graceful cancel. A second Stop escalates to a
+      // force-stop instead of resending a no-op notification, so the
+      // user's instinct to click again actually ends the turn. See #1727.
+      //
+      // The escalation triggers on EITHER the server-confirmed
+      // `cancelling` flag OR our local `cancelRequestedRef`. Relying on
+      // the server flag alone bricks the button whenever no in-flight
+      // prompt exists on the daemon (an adopted/orphaned turn whose
+      // CancelRequested is never emitted), which is the exact state that
+      // forced users onto `aoe acp restart`. See #2237.
+      if (nextCancelAction(acp.state.cancelling, cancelRequestedRef.current) === "force") {
         await acp.forceEndTurn();
       } else {
+        cancelRequestedRef.current = true;
         await acp.cancelPrompt();
       }
     },
