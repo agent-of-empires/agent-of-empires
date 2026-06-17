@@ -419,7 +419,16 @@ impl AcpTranscript {
                 answers,
             } => {
                 self.flush_pending_chunk();
+                // Gate on the card actually being pending: a resolved
+                // elicitation can be re-broadcast (cancel-on-teardown racing a
+                // POST; the store is lenient on the nonce), and replaying it
+                // must not append a second row. The web reducer dedupes by row
+                // id; here the pending card is the dedupe key. See #2209.
+                let was_pending = self.pending_elicitations.iter().any(|p| p.nonce == nonce.0);
                 self.pending_elicitations.retain(|p| p.nonce != nonce.0);
+                if !was_pending {
+                    return;
+                }
                 // Record what the user picked so the transcript keeps a
                 // trace after the card closes. Skip (Decline) leaves a
                 // short note; Cancel / teardown adds nothing. See #2209.
