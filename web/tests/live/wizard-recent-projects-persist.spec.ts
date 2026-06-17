@@ -39,7 +39,7 @@ test("project stays in the wizard Recent tab after its last session is deleted (
     await page.goto(serve.baseUrl);
     await page.getByRole("button", { name: "New session", exact: true }).first().click();
 
-    const wizard = page.locator('div.fixed.inset-0.z-50:has(h1:has-text("New session"))');
+    const wizard = page.locator('[data-testid="session-wizard"]');
     await expect(wizard).toBeVisible({ timeout: 15_000 });
     await expect(wizard.getByText("frontend", { exact: true })).toBeVisible({ timeout: 10_000 });
     await expect(wizard.getByText("0 sessions")).toBeVisible();

@@ -17,7 +17,7 @@ base("scratch happy path: launch creates a scratch-dir session", async ({ page }
     await page.goto(serve.baseUrl);
     await page.getByRole("button", { name: "New session", exact: true }).first().click();
 
-    const wizard = page.locator('div.fixed.inset-0.z-50:has(h1:has-text("New session"))');
+    const wizard = page.locator('[data-testid="session-wizard"]');
     await expect(wizard).toBeVisible({ timeout: 15_000 });
 
     // Single screen: enable scratch. The scratch callout confirms the mode

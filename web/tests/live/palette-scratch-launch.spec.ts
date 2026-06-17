@@ -22,7 +22,7 @@ test("palette 'New scratch session' opens the wizard and launches a scratch sess
   await page.getByPlaceholder(PALETTE_PLACEHOLDER).fill("scratch");
   await page.getByRole("option", { name: /New scratch session/i }).click();
 
-  const wizard = page.locator('div.fixed.inset-0.z-50:has(h1:has-text("New session"))');
+  const wizard = page.locator('[data-testid="session-wizard"]');
   await expect(wizard).toBeVisible({ timeout: 10_000 });
 
   // The palette command opens the single-screen wizard with scratch enabled;
