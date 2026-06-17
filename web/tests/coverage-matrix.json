@@ -464,7 +464,8 @@
         "tests/wizard-agent-step.spec.ts",
         "tests/wizard-single-screen.spec.ts",
         "tests/wizard-extra-repos.spec.ts",
-        "tests/wizard-custom-agent.spec.ts"
+        "tests/wizard-custom-agent.spec.ts",
+        "tests/wizard-tooltip-z-index.spec.ts"
       ],
       "components": [
         "web/src/components/DirectoryBrowser.tsx",
