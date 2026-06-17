@@ -31,7 +31,7 @@ test.describe("Sidebar", () => {
   test("sidebar visible on desktop by default", async ({ page }) => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
-    await expect(page.getByLabel("New session")).toBeVisible();
+    await expect(page.getByLabel("New project session")).toBeVisible();
   });
 
   test("sidebar toggle button exists", async ({ page }) => {
@@ -56,7 +56,7 @@ test.describe("Sidebar", () => {
   test("sidebar can be toggled closed and open on desktop", async ({ page }) => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
-    const addBtn = page.getByLabel("New session");
+    const addBtn = page.getByLabel("New project session");
     await expect(addBtn).toBeVisible();
 
     await page.getByRole("button", { name: "Toggle sidebar" }).click();
@@ -116,7 +116,7 @@ test.describe("Create session from home screen", () => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
 
-    await page.getByLabel("New session").first().click();
+    await page.getByLabel("New project session").first().click();
     await expect(page.getByRole("heading", { name: "New session" })).toBeVisible();
 
     await page.getByRole("button", { name: "Close" }).click();
@@ -192,7 +192,7 @@ test.describe("Mobile responsive", () => {
     await page.goto("/");
     // Sidebar is translated off-screen on mobile (not display:none), so
     // use toBeInViewport rather than toBeVisible.
-    await expect(page.getByLabel("New session")).not.toBeInViewport();
+    await expect(page.getByLabel("New project session")).not.toBeInViewport();
     // Home screen content visible
     await expect(page.getByText("empires", { exact: false })).toBeVisible();
   });
@@ -208,17 +208,17 @@ test.describe("Mobile responsive", () => {
     await page.setViewportSize({ width: 375, height: 812 });
     await page.goto("/");
     await page.getByRole("button", { name: "Toggle sidebar" }).click();
-    await expect(page.getByLabel("New session")).toBeInViewport();
+    await expect(page.getByLabel("New project session")).toBeInViewport();
   });
 
   test("sidebar closes via toggle on mobile", async ({ page }) => {
     await page.setViewportSize({ width: 375, height: 812 });
     await page.goto("/");
     await page.getByRole("button", { name: "Toggle sidebar" }).click();
-    await expect(page.getByLabel("New session")).toBeInViewport();
+    await expect(page.getByLabel("New project session")).toBeInViewport();
     // Toggle the sidebar closed again
     await page.getByRole("button", { name: "Toggle sidebar" }).click();
-    await expect(page.getByLabel("New session")).not.toBeInViewport();
+    await expect(page.getByLabel("New project session")).not.toBeInViewport();
   });
 
   test("settings gear accessible on mobile", async ({ page }) => {
