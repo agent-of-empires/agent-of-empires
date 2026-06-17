@@ -948,7 +948,7 @@ export function useAcpSession(
           dispatch({ kind: "lagged", skipped: tail.highest_seq });
           return;
         }
-        dispatch({ kind: "frames", frames: tail.frames, oldestSeq: tail.next_cursor ?? 0 });
+        dispatch({ kind: "frames", frames: tail.frames ?? [], oldestSeq: tail.next_cursor ?? 0 });
         setHasMoreOlder(tail.has_more ?? false);
         // Advance the seq ref synchronously (the [state.lastSeq] effect
         // mirror lags a render tick) so the WS dial that follows this
@@ -969,7 +969,7 @@ export function useAcpSession(
           );
           if (hsRes.ok) {
             const hs = (await hsRes.json()) as ReplayPageResponse;
-            if (hs.frames.length > 0) dispatch({ kind: "handshake", frames: hs.frames });
+            if ((hs.frames ?? []).length > 0) dispatch({ kind: "handshake", frames: hs.frames });
           }
         }
         dispatch({ kind: "lagged_resolved" });
@@ -1051,7 +1051,7 @@ export function useAcpSession(
       );
       if (!res.ok) return;
       const data = (await res.json()) as ReplayPageResponse;
-      if (data.frames.length > 0) {
+      if ((data.frames ?? []).length > 0) {
         dispatch({ kind: "prepend", frames: data.frames, oldestSeq: data.next_cursor ?? before });
       }
       setHasMoreOlder(data.has_more ?? false);
