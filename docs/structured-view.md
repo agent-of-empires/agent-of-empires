@@ -99,6 +99,8 @@ When a structured view session keeps its generated civilization name (no `--titl
 
 The sidebar shows where each session stands: an `Auto-name` chip (sparkle) marks a session that is still default-named and will be renamed on its first message, and a `Naming…` chip (pulsing dot) shows while the one-shot title call is in flight. The chips disappear once the session is renamed or if it is not eligible.
 
+Two chips flag a session that has parked itself but is still alive, so an agent waiting on background work does not read as a dead idle session. A `⏰` countdown shows when the agent scheduled a wakeup (a `ScheduleWakeup` call or a `/loop` run) and ticks down to the fire time. A `👁 monitoring` badge shows when the agent armed a `Monitor` (a background watch, for example waiting for a build or `cargo clippy` to finish); it has no fixed end time, so it stays put while the monitor keeps re-invoking the agent and clears once you send the session a new prompt.
+
 ```toml
 [session.acp_defaults.opencode]
 model = "openai/gpt-5.5"
