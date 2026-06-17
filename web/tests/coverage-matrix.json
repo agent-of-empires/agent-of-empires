@@ -1194,8 +1194,11 @@
       "id": "acp.stop-button-escalation",
       "kind": "vitest",
       "risk": "high",
-      "specs": ["src/components/acp/__tests__/AcpRuntime.cancelEscalation.test.ts"],
-      "components": ["web/src/components/acp/AcpRuntime.tsx"]
+      "specs": [
+        "src/components/acp/__tests__/AcpRuntime.cancelEscalation.test.ts",
+        "src/components/acp/__tests__/useCancelEscalation.test.tsx"
+      ],
+      "components": ["web/src/components/acp/AcpRuntime.tsx", "web/src/components/acp/useCancelEscalation.ts"]
     },
     {
       "id": "acp.spinner-tool-precedence",
