@@ -14,7 +14,7 @@
 // AcpRuntime.tsx. We never let assistant-ui own the chat state; it
 // only renders what we feed it and surfaces user actions back.
 
-import { Fragment, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { MessagePrimitive, ThreadPrimitive, useMessage } from "@assistant-ui/react";
 import { AlertTriangle, Check, ChevronDown, Clock, Info, ListChecks, Paperclip, RotateCcw, X } from "lucide-react";
 
@@ -216,6 +216,7 @@ function AcpChrome({
   dismissConfigOptionSwitchFailed,
   canLoadEarlierHistory,
   loadEarlierHistory,
+  loadingEarlierHistory,
 }: AcpContext & {
   sessionId: string;
   acpWorkerState: "absent" | "resuming" | "running";
@@ -277,7 +278,30 @@ function AcpChrome({
   // sample captures the pre-resize state; the RO callback consumes it.
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const belowViewportRef = useRef<HTMLDivElement | null>(null);
+  const messagesContentRef = useRef<HTMLDivElement | null>(null);
   const wasAtBottomRef = useRef<boolean>(true);
+  // Stable mirrors so the [] scroll effect always sees the latest
+  // load-earlier wiring without re-subscribing. Updated in an effect
+  // (not during render) per react-hooks/refs. See #2236.
+  const canLoadEarlierRef = useRef(canLoadEarlierHistory);
+  const loadEarlierRef = useRef(loadEarlierHistory);
+  useEffect(() => {
+    canLoadEarlierRef.current = canLoadEarlierHistory;
+    loadEarlierRef.current = loadEarlierHistory;
+  }, [canLoadEarlierHistory, loadEarlierHistory]);
+  // Fires loadEarlier once per arrival at the top (re-armed when the user
+  // scrolls back down), capturing the pre-growth scrollHeight so the
+  // content ResizeObserver can freeze the read position after older rows
+  // land (revealed synchronously or fetched async). See #2236.
+  const autoLoadArmedRef = useRef(true);
+  const pendingScrollAnchorRef = useRef<number | null>(null);
+
+  const requestEarlierHistory = useCallback(() => {
+    const vp = viewportRef.current;
+    if (!vp || !canLoadEarlierRef.current) return;
+    pendingScrollAnchorRef.current = vp.scrollHeight;
+    loadEarlierRef.current();
+  }, []);
 
   // Tap anywhere in the transcript focuses the composer and brings up the soft
   // keyboard on touch, mirroring the live terminal's tap-to-focus (#2243). The
@@ -297,16 +321,27 @@ function AcpChrome({
   useLayoutEffect(() => {
     const vp = viewportRef.current;
     const below = belowViewportRef.current;
+    const content = messagesContentRef.current;
     if (!vp || !below) return;
     // Treat "within 16px of the bottom" as pinned. assistant-ui's
     // own stick-to-bottom uses a similar slop; sub-pixel rounding
     // and momentary content reflows otherwise drop us out of the
     // pinned state for one frame.
-    const sampleAtBottom = () => {
+    const PRELOAD_PX = 200;
+    const sample = () => {
       wasAtBottomRef.current = vp.scrollTop + vp.clientHeight >= vp.scrollHeight - 16;
+      // Auto-load older history as the top approaches. Arm only after the
+      // user has scrolled away from the top so a single fetch doesn't
+      // re-trigger every scroll frame while parked at the top.
+      if (vp.scrollTop > PRELOAD_PX) {
+        autoLoadArmedRef.current = true;
+      } else if (autoLoadArmedRef.current && canLoadEarlierRef.current) {
+        autoLoadArmedRef.current = false;
+        requestEarlierHistory();
+      }
     };
-    sampleAtBottom();
-    vp.addEventListener("scroll", sampleAtBottom, { passive: true });
+    sample();
+    vp.addEventListener("scroll", sample, { passive: true });
     let prevHeight = below.offsetHeight;
     const ro = new ResizeObserver(() => {
       const nextHeight = below.offsetHeight;
@@ -317,11 +352,26 @@ function AcpChrome({
       }
     });
     ro.observe(below);
+    // Freeze the read position when older rows grow the transcript at the
+    // top: add the height delta to scrollTop so the row the user was
+    // reading stays under the cursor instead of jumping. Skipped while
+    // pinned to the bottom so live appends keep their stick-to-bottom.
+    const contentRo = new ResizeObserver(() => {
+      const anchor = pendingScrollAnchorRef.current;
+      if (anchor == null) return;
+      const delta = vp.scrollHeight - anchor;
+      if (delta > 0 && !wasAtBottomRef.current) {
+        vp.scrollTop += delta;
+      }
+      pendingScrollAnchorRef.current = null;
+    });
+    if (content) contentRo.observe(content);
     return () => {
       ro.disconnect();
-      vp.removeEventListener("scroll", sampleAtBottom);
+      contentRo.disconnect();
+      vp.removeEventListener("scroll", sample);
     };
-  }, []);
+  }, [requestEarlierHistory]);
   // Short-circuit: when the per-adapter compatibility check rejected
   // the adapter, replace the chat layout with a dedicated screen that
   // renders the exact remediation command. We never reach Running, so
@@ -403,7 +453,7 @@ function AcpChrome({
           className="flex-1 overflow-x-hidden overflow-y-auto"
           onClick={onThreadTap}
         >
-          <div className="mx-auto max-w-3xl xl:max-w-4xl 2xl:max-w-5xl px-4 py-6">
+          <div ref={messagesContentRef} className="mx-auto max-w-3xl xl:max-w-4xl 2xl:max-w-5xl px-4 py-6">
             <ThreadPrimitive.Empty>
               <EmptyState onPick={sendPrompt} />
             </ThreadPrimitive.Empty>
@@ -426,11 +476,12 @@ function AcpChrome({
               <div className="mb-3 flex justify-center">
                 <button
                   type="button"
-                  onClick={loadEarlierHistory}
+                  onClick={requestEarlierHistory}
+                  disabled={loadingEarlierHistory}
                   data-testid="acp-load-earlier"
-                  className="h-8 rounded-md border border-surface-700 bg-surface-800 px-3 text-xs text-text-secondary hover:bg-surface-700 hover:text-text-primary transition-colors cursor-pointer"
+                  className="h-8 rounded-md border border-surface-700 bg-surface-800 px-3 text-xs text-text-secondary hover:bg-surface-700 hover:text-text-primary transition-colors cursor-pointer disabled:cursor-default disabled:opacity-60"
                 >
-                  Load earlier messages
+                  {loadingEarlierHistory ? "Loading…" : "Load earlier messages"}
                 </button>
               </div>
             )}

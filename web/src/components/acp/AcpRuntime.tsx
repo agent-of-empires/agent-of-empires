@@ -28,7 +28,7 @@
 // component-injection points.
 
 import { AssistantRuntimeProvider, useExternalStoreRuntime, type ThreadMessageLike } from "@assistant-ui/react";
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import { useAcpSession } from "../../hooks/useAcpSession";
 import type {
@@ -104,11 +104,16 @@ export interface AcpContext {
   dismissModeSwitchFailed: () => void;
   setConfigOption: (configId: string, value: string) => Promise<void>;
   dismissConfigOptionSwitchFailed: () => void;
-  /** True when older activity rows exist above the rendered window, so
-   *  the view can offer a "Load earlier" control. See #2144. */
+  /** True when older rows exist above the rendered window, either already
+   *  in the reducer (client window) or still on the server (recent-first
+   *  paging), so the view can offer a "Load earlier" control. See #2236. */
   canLoadEarlierHistory: boolean;
-  /** Reveal an additional chunk of older history. */
+  /** Reveal more older history: first already-loaded rows, then fetch the
+   *  next-older page from the server once those run out. See #2236. */
   loadEarlierHistory: () => void;
+  /** True while an older-history page fetch is in flight, for a spinner
+   *  on the "Load earlier" affordance. See #2236. */
+  loadingEarlierHistory: boolean;
 }
 
 /**
@@ -154,6 +159,16 @@ export function AcpRuntime({
     acp.state.activity,
     showClearedTurns,
   );
+  // "Load earlier" is two-stage: first reveal rows already loaded into
+  // the reducer (client window), then, once those are exhausted, fetch
+  // the next-older page from the server (recent-first paging). One
+  // affordance, no competing mechanisms. See #2236.
+  const { loadOlder, hasMoreOlder, loadingOlder } = acp;
+  const canLoadEarlierHistory = canLoadEarlier || hasMoreOlder;
+  const loadEarlierHistory = useCallback(() => {
+    if (canLoadEarlier) loadEarlier();
+    else if (hasMoreOlder) void loadOlder();
+  }, [canLoadEarlier, hasMoreOlder, loadEarlier, loadOlder]);
 
   // Memoise the activity → ThreadMessageLike conversion. The function
   // walks the activity array, allocates a new AssistantBuilder
@@ -222,8 +237,9 @@ export function AcpRuntime({
         dismissModeSwitchFailed: acp.dismissModeSwitchFailed,
         setConfigOption: acp.setConfigOption,
         dismissConfigOptionSwitchFailed: acp.dismissConfigOptionSwitchFailed,
-        canLoadEarlierHistory: canLoadEarlier,
-        loadEarlierHistory: loadEarlier,
+        canLoadEarlierHistory,
+        loadEarlierHistory,
+        loadingEarlierHistory: loadingOlder,
       })}
     </AssistantRuntimeProvider>
   );
