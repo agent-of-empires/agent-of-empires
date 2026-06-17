@@ -54,15 +54,15 @@ base.describe("sidebar pin via context menu (#1581)", () => {
         timeout: 5_000,
       });
 
-      // Regression: a pinned row's menu only offers Unpin, not the
-      // contradictory Archive or Snooze toggles. The Pin button still
-      // exists because its testid is shared with Unpin; the others
-      // must be hidden entirely. See #1581. The reload below resets
-      // the page so we don't need to dismiss the menu by hand.
+      // A pinned row's menu offers Unpin plus Archive and Snooze:
+      // archiving or snoozing a pinned session clears the pin on the
+      // backend (matching the TUI), so the menu must not force
+      // unpin-first. See #1581. The reload below resets the page so we
+      // don't need to dismiss the menu by hand.
       await row.click({ button: "right" });
       await expect(page.locator("[data-testid='sidebar-context-menu-pin']")).toContainText("Unpin");
-      await expect(page.locator("[data-testid='sidebar-context-menu-archive']")).toHaveCount(0);
-      await expect(page.locator("[data-testid='sidebar-context-menu-snooze']")).toHaveCount(0);
+      await expect(page.locator("[data-testid='sidebar-context-menu-archive']")).toHaveCount(1);
+      await expect(page.locator("[data-testid='sidebar-context-menu-snooze']")).toHaveCount(1);
 
       // Server reflects the pin in the next list response.
       await expect
