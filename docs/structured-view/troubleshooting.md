@@ -233,6 +233,20 @@ container (rather than bind-mounting from the host).
 - A repeatedly-failing worker is parked with a red "session parked" banner.
   Retry from the dashboard or run `aoe acp restart <session>`.
 
+### Diff viewer is blank (page-restyling browser extensions)
+
+If the Changes panel shows a file's header (path, `+`/`-` counts, the
+Unified/Split toggle) but the diff body below is empty, with no error and a
+clean console, a page-restyling browser extension is almost certainly
+overriding the diff styling. The diff renders into a shadow DOM, and "dark
+mode for every site" extensions (Midnight Lizard, DocsAfterDark, and similar)
+reach into it and make the rows invisible. This is most common on Firefox.
+
+To confirm it is an extension, open the dashboard in Firefox Troubleshoot Mode
+(Menu, Help, Troubleshoot Mode); if the diff renders there, an extension is
+the cause. Fix it by disabling the restyling extension for the dashboard, or
+allowlist the dashboard origin in the extension's settings.
+
 ### "Force end turn" button under the spinner
 
 If the agent finished a turn but the working spinner is still rattling, a small
