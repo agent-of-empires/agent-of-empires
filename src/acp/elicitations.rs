@@ -62,7 +62,7 @@ pub struct Elicitation {
 /// One field of the elicitation form.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ElicitationQuestion {
-    /// Schema property key (`question_0`, `customAnswer`, ...). Echoed
+    /// Schema property key (`question_0`, `question_0_custom`, ...). Echoed
     /// back verbatim as the answer key in the response content.
     pub field_key: String,
     pub title: Option<String>,
@@ -218,18 +218,29 @@ impl ElicitationResolution {
 }
 
 /// Order a form's properties for display. The adapter keys questions
-/// `question_0..N` and serializes them through a `BTreeMap`, which sorts
-/// lexically (`question_10` before `question_2`), so recover the numeric
-/// order; non-`question_N` keys (e.g. `customAnswer`) sort after, by key.
+/// `question_0..N`, each optionally followed by its own free-text "Other"
+/// box `question_<n>_custom`, and serializes them through a `BTreeMap`,
+/// which sorts lexically (`question_10` before `question_2`, and every
+/// `question_<n>_custom` after every `question_<n>`). Recover the numeric
+/// order and keep each `_custom` box adjacent to its question, so the
+/// per-question "Other" field renders next to the question it belongs to
+/// rather than bunched at the end. Non-`question_N` keys (arbitrary MCP
+/// form fields) sort after, by key.
 fn ordered_fields(
     properties: &BTreeMap<String, ElicitationPropertySchema>,
 ) -> Vec<(&String, &ElicitationPropertySchema)> {
-    fn question_index(key: &str) -> Option<u64> {
-        key.strip_prefix("question_").and_then(|n| n.parse().ok())
+    // `(index, is_custom)`: the base question (0) sorts before its paired
+    // `_custom` box (1), and both before the next question's index.
+    fn question_order(key: &str) -> Option<(u64, u8)> {
+        let rest = key.strip_prefix("question_")?;
+        match rest.strip_suffix("_custom") {
+            Some(index) => Some((index.parse().ok()?, 1)),
+            None => Some((rest.parse().ok()?, 0)),
+        }
     }
     let mut fields: Vec<_> = properties.iter().collect();
     fields.sort_by(
-        |(a, _), (b, _)| match (question_index(a), question_index(b)) {
+        |(a, _), (b, _)| match (question_order(a), question_order(b)) {
             (Some(ai), Some(bi)) => ai.cmp(&bi),
             (Some(_), None) => std::cmp::Ordering::Less,
             (None, Some(_)) => std::cmp::Ordering::Greater,
@@ -780,6 +791,39 @@ mod tests {
         assert_eq!(e.questions[1].field_key, "question_10");
         assert_eq!(e.questions[1].kind, ElicitationFieldKind::MultiSelect);
         assert_eq!(e.questions[2].field_key, "customAnswer");
+    }
+
+    #[test]
+    fn per_question_custom_box_stays_next_to_its_question() {
+        // claude-agent-acp >=0.46 emits a per-question "Other" box keyed
+        // `question_<n>_custom` right after each `question_<n>`. The BTreeMap
+        // would otherwise sort every `_custom` after every question; the
+        // ordering must instead keep each box adjacent to its question.
+        let schema = ElicitationSchema::new()
+            .string("question_0", false)
+            .property(
+                "question_0_custom",
+                StringPropertySchema::new().title("Other"),
+                false,
+            )
+            .string("question_1", false)
+            .property(
+                "question_1_custom",
+                StringPropertySchema::new().title("Other"),
+                false,
+            );
+        let req = form_request(schema, "many");
+        let e = parse_elicitation(Nonce::new(), &req, Utc::now()).unwrap();
+        let keys: Vec<&str> = e.questions.iter().map(|q| q.field_key.as_str()).collect();
+        assert_eq!(
+            keys,
+            [
+                "question_0",
+                "question_0_custom",
+                "question_1",
+                "question_1_custom"
+            ]
+        );
     }
 
     #[test]
