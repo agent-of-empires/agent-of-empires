@@ -40,17 +40,17 @@ export function LaunchFooter({ data, isSubmitting, error, onSubmit }: Props) {
 
   return (
     <div>
-      {error && <div className="text-sm text-red-400 bg-red-400/10 rounded-lg p-3 mb-4">{error}</div>}
+      {error && <div className="text-sm text-status-error bg-status-error/10 rounded-lg p-3 mb-4">{error}</div>}
       {offline && (
         <div className="text-sm text-status-error bg-status-error/10 rounded-lg p-3 mb-4">{OFFLINE_TITLE}</div>
       )}
       <button
         onClick={onSubmit}
         disabled={!canSubmit}
-        className={`w-full py-3 rounded-lg font-semibold text-sm transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-green-500 ${
+        className={`w-full py-3 rounded-lg font-semibold text-sm transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-600 ${
           !canSubmit
-            ? "bg-green-500/50 text-surface-900/50 cursor-not-allowed"
-            : "bg-green-500 hover:bg-green-600 active:bg-green-700 text-surface-900 cursor-pointer"
+            ? "bg-brand-600/50 text-surface-900/50 cursor-not-allowed"
+            : "bg-brand-600 hover:bg-brand-700 active:bg-brand-800 text-surface-900 cursor-pointer"
         }`}
       >
         {isSubmitting ? (
