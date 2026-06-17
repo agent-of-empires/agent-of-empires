@@ -136,17 +136,18 @@ pub struct ElicitationAnswer {
     pub answer: String,
 }
 
-/// Render the user's submitted answers into display-ready pairs, in the
-/// form's question order. Only answered questions are included (an
-/// optional question left blank is omitted). Single/multi selects carry
-/// the option value, which for AskUserQuestion is already the clean
-/// label (see `ElicitationOption::value`), so no option lookup is needed.
 /// Separator the claude-agent-acp adapter wedges between an AskUserQuestion
 /// option's label and its description when flattening into the enum title
 /// (`"<label> <sep> <description>"`). Written as an escape so the em dash
 /// never appears literally in source. Mirrors the web card's separator.
 const OPTION_DESC_SEP: &str = " \u{2014} ";
 
+/// Render the user's submitted answers into display-ready pairs, in the
+/// form's question order. Only answered questions are included (an optional
+/// question left blank is omitted). Select values are mapped to their option
+/// label; for AskUserQuestion the value is already the label (and `label` may
+/// carry a trailing description, which is dropped), while a generic MCP form
+/// maps its machine token to the human label.
 pub fn summarize_answers(
     elicitation: &Elicitation,
     answers: &BTreeMap<String, AnswerValue>,
