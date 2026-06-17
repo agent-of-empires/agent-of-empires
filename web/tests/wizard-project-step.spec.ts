@@ -107,12 +107,12 @@ test.describe("Wizard project section (#1219)", () => {
     await expect(page.getByText("Saved projects")).toBeVisible();
     const savedRow = page.getByRole("button").filter({ hasText: "/srv/my-saved-repo" }).first();
     await expect(savedRow).toBeVisible();
-    // Selecting the saved project populates the wizard path.
+    // Selecting the saved project populates the wizard path and highlights
+    // the row with the selected border; no duplicate "Selected project" box.
     await savedRow.click();
-    await expect(page.getByText("Selected project")).toBeVisible();
-    // Scope to the selected-project panel's paragraph; the saved row also
-    // renders the same path (in a span), so an unscoped match is ambiguous.
-    await expect(page.getByRole("paragraph").filter({ hasText: "/srv/my-saved-repo" })).toBeVisible();
+    await expect(savedRow).toHaveClass(/border-brand-600/);
+    await expect(page.getByText("Selected project")).toHaveCount(0);
+    await expect(page.getByRole("button", { name: /Launch session/ })).toBeEnabled();
   });
 
   test("switching to Browse tab renders DirectoryBrowser and selecting a repo populates path", async ({ page }) => {

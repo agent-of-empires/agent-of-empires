@@ -203,6 +203,14 @@ export function ProjectStep({ data, onChange, initialTab }: Props) {
 
   const hasPicks = recent.length > 0 || saved.length > 0;
 
+  // A selected path that already shows up as a (border-highlighted) saved or
+  // recent row needs no separate "Selected project" box; that would just
+  // duplicate the row. Keep the box only for a path with no row to highlight
+  // (e.g. a freshly cloned repo not yet in the lists).
+  const selectedPathHasRow =
+    !!data.path &&
+    (filteredSaved.some((s) => s.path === data.path) || filteredRecent.some((r) => r.path === data.path));
+
   const handleBrowseSelect = (path: string) => {
     onChange("path", path);
     setActiveTab("recent");
@@ -530,8 +538,9 @@ export function ProjectStep({ data, onChange, initialTab }: Props) {
             </div>
           )}
 
-          {/* Selected path display */}
-          {data.path && activeTab !== "browse" && (
+          {/* Selected path display, only when no saved/recent row already
+              highlights it (e.g. a freshly cloned repo). */}
+          {data.path && activeTab !== "browse" && !selectedPathHasRow && (
             <div className="mt-4 px-3 py-2 bg-surface-900 border border-brand-600/30 rounded-md">
               <p className="text-[10px] font-mono uppercase tracking-wider text-text-dim mb-1">Selected project</p>
               <p className="text-sm font-mono text-text-primary truncate">{data.path}</p>
