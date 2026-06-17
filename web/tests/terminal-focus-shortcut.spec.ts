@@ -147,7 +147,7 @@ test.describe("Cmd/Ctrl+` desktop", () => {
     // Wait for paired to be ready (its ensureTerminal isn't delayed); use
     // it as the focus source so target=agent.
     const paired = page.locator('[data-term="paired"]:visible').first();
-    await expect(paired.locator(".xterm")).toBeVisible();
+    await expect(paired.locator("[data-live-terminal]")).toBeVisible();
     await paired.locator("textarea").focus();
     await expect.poll(() => focusedKind(page)).toBe("paired");
 
@@ -216,18 +216,9 @@ test.describe("Cmd/Ctrl+` desktop", () => {
     await expect.poll(() => focusedKind(page)).toBe("paired");
   });
 
-  test("term-focused CSS class follows the focused panel", async ({ page }) => {
-    await mockTerminalApis(page);
-    await page.goto("/");
-    await openSession(page);
-
-    await focusKind(page, "agent");
-    await expect(page.locator('[data-term="agent"]').first()).toHaveClass(/term-focused/);
-
-    await page.keyboard.press("ControlOrMeta+`");
-    // The visible paired panel should pick up term-focused.
-    await expect(page.locator('[data-term="paired"]:visible').first()).toHaveClass(/term-focused/);
-  });
+  // (The xterm-only `term-focused` panel CSS ring was removed with the xterm
+  // renderer; focus correctness is covered by the focusedKind() assertions
+  // above.)
 });
 
 // ────────────────────────────────────────────────────────────────────

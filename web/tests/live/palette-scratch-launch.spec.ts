@@ -61,5 +61,11 @@ test("palette hides creation commands in read-only mode", async ({ serveReadOnly
   await expect(page.getByPlaceholder(PALETTE_PLACEHOLDER)).toBeVisible();
 
   await expect(page.getByRole("option", { name: /New scratch session/i })).toHaveCount(0);
-  await expect(page.getByRole("option", { name: /New session/i })).toHaveCount(0);
+  // Exclude per-setting palette entries (#2108): the "New Session Attach Mode"
+  // setting also matches /New session/i but is a settings jump, not a creation
+  // command. Its row carries the "Opens settings" subtitle; creation commands
+  // do not.
+  await expect(page.getByRole("option", { name: /New session/i }).filter({ hasNotText: "Opens settings" })).toHaveCount(
+    0,
+  );
 });

@@ -678,6 +678,40 @@ export async function switchAcpAgent(
   });
 }
 
+// --- Acp install agent (Tier 2 of #2109) ---
+
+export interface InstallAgentResponse {
+  session_id: string;
+  package: string;
+  success: boolean;
+  exit_code: number | null;
+  stdout: string;
+  stderr: string;
+}
+
+/** Run `npm install -g` for the session's agent on the host. Opt-in and
+ *  hardened server-side (see `install_agent` in src/server/api/acp.rs).
+ *  Resolves with the parsed body on 2xx; throws with the server's error
+ *  message on failure (disabled, sandboxed, not npm-installable, npm
+ *  missing) so the caller can surface why. The caller respawns the worker
+ *  separately via `useRespawnSession` on `success`. */
+export async function installAcpAgent(sessionId: string): Promise<InstallAgentResponse> {
+  const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/acp/install-agent`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+  });
+  const body = (await res.json().catch(() => null)) as
+    | (Partial<InstallAgentResponse> & { error?: string; message?: string })
+    | null;
+  if (!res.ok) {
+    throw new Error(body?.message || body?.error || `Server returned ${res.status}`);
+  }
+  if (!body) {
+    throw new Error("Server returned an invalid or empty response");
+  }
+  return body as InstallAgentResponse;
+}
+
 /** Fetch a markdown primer built from events `seq < beforeSeq`. Used
  *  after a `session/load` failure: the agent's model context is empty
  *  but the transcript is intact in SQLite, so the user can opt in to
@@ -1245,13 +1279,10 @@ export async function setSessionPin(id: string, pinned: boolean): Promise<Sessio
   }
 }
 
-/** Archive or unarchive a session. On archive, the server kills the tmux
- *  pane (when `killPane` is true or omitted, matching TUI/CLI semantics)
- *  and shuts down the acp worker for acp-mode sessions; the
- *  reconciler will not respawn it because archived sessions are excluded
- *  from the resume target list. Sending a message via the dashboard
- *  auto-unarchives via the existing `touch_last_accessed` invariant in
- *  the send handler. See #1581. */
+/** Archive or unarchive a session. On archive (with `killPane` true or
+ *  omitted), the server tears down all tmux sessions and shuts down the
+ *  ACP worker for acp-mode sessions. Sending a message auto-unarchives.
+ *  See #1581, #1868. */
 export async function setSessionArchive(
   id: string,
   archived: boolean,

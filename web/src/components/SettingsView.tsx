@@ -1,5 +1,5 @@
 /* eslint-disable react-refresh/only-export-components */
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { useServerDown, OFFLINE_TITLE } from "../lib/connectionState";
 import { ConnectedDevices } from "./ConnectedDevices";
 import { McpServers } from "./McpServers";
@@ -20,8 +20,11 @@ import { SelectField } from "./settings/FormFields";
 import { DiffSettings } from "./settings/DiffSettings";
 import { TelemetrySettings } from "./settings/TelemetrySettings";
 import { SettingsHeader } from "./settings/SettingsHeader";
+import { ProfilesSection } from "./profiles/ProfilesSection";
+import type { SettingsSearchHit } from "./settings/settingsSearchIndex";
 
-type TabId =
+export type TabId =
+  | "profiles"
   | "session"
   | "sandbox"
   | "worktree"
@@ -39,7 +42,31 @@ type TabId =
   | "mcp"
   | "logging";
 
-type SidebarItem = { kind: "tab"; id: TabId; label: string } | { kind: "divider"; label: string };
+type SidebarItem = { kind: "tab"; id: TabId; label: string; icon?: ReactNode } | { kind: "divider"; label: string };
+
+// ID-card / badge glyph for the Profiles tab. Profiles is the only Settings
+// tab that carries an icon; it sits at the top as a meta-section over the
+// config tabs below it.
+const PROFILES_ICON = (
+  <svg
+    width="14"
+    height="14"
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="1.5"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    aria-hidden="true"
+    className="shrink-0"
+  >
+    <rect x="3" y="4" width="18" height="16" rx="2" />
+    <circle cx="9" cy="10" r="2" />
+    <path d="M6 16a3 3 0 0 1 6 0" />
+    <path d="M15 9h3" />
+    <path d="M15 13h3" />
+  </svg>
+);
 
 // Sidebar groups mirror the TUI Settings layout (Appearance / Sessions /
 // Environment / Notifications / Web Dashboard / System) so muscle memory
@@ -52,6 +79,7 @@ type SidebarItem = { kind: "tab"; id: TabId; label: string } | { kind: "divider"
 // tab strips in the DOM.
 export function buildSidebar(): SidebarItem[] {
   return [
+    { kind: "tab", id: "profiles", label: "Profiles", icon: PROFILES_ICON },
     { kind: "divider", label: "Appearance" },
     { kind: "tab", id: "theme", label: "Theme" },
     { kind: "tab", id: "diff", label: "Diff" },
@@ -88,9 +116,12 @@ interface Props {
   /** Notifies the host when the profile changes via the header dropdown,
    *  so it can keep `?profile=` in sync for shareable/refreshable URLs. */
   onSelectProfile?: (profile: string) => void;
+  /** Read-only server: the Profiles tab hides its create/edit controls. */
+  readOnly?: boolean;
 }
 
 const ALL_TAB_IDS = new Set<TabId>([
+  "profiles",
   "session",
   "sandbox",
   "worktree",
@@ -143,7 +174,15 @@ export function resolveSelectedProfile(current: string, profiles: ProfileInfo[])
   return profiles.find((p) => p.is_default)?.name ?? "default";
 }
 
-export function SettingsView({ onClose, tab, onSelectTab, onServerAboutRefresh, profile, onSelectProfile }: Props) {
+export function SettingsView({
+  onClose,
+  tab,
+  onSelectTab,
+  onServerAboutRefresh,
+  profile,
+  onSelectProfile,
+  readOnly,
+}: Props) {
   const offline = useServerDown();
   const [settings, setSettings] = useState<Record<string, unknown> | null>(null);
   const [saving, setSaving] = useState(false);
@@ -188,6 +227,19 @@ export function SettingsView({ onClose, tab, onSelectTab, onServerAboutRefresh, 
   const [schema, setSchema] = useState<SettingsFieldDescriptor[]>([]);
   const [schemaLoading, setSchemaLoading] = useState(true);
   const [schemaError, setSchemaError] = useState<string | null>(null);
+  // Set when a settings-search hit is chosen: switch to the hit's tab and ask
+  // the matching SchemaSection to scroll the field into view and highlight it.
+  // The nonce bumps on every jump so re-selecting the same field (or jumping to
+  // an advanced field on the current tab) re-triggers the scroll and reopens
+  // the Advanced fold via the content-subtree remount key.
+  const [focusRequest, setFocusRequest] = useState<{ section: string; field: string; nonce: number } | null>(null);
+  const handleSearchJump = useCallback(
+    (hit: SettingsSearchHit) => {
+      setFocusRequest((prev) => ({ section: hit.section, field: hit.field, nonce: (prev?.nonce ?? 0) + 1 }));
+      onSelectTab(hit.tab);
+    },
+    [onSelectTab],
+  );
 
   useEffect(() => {
     fetchProfiles().then((p) => {
@@ -329,6 +381,7 @@ export function SettingsView({ onClose, tab, onSelectTab, onServerAboutRefresh, 
   const renderTabContent = () => {
     if (
       !settings &&
+      activeTab !== "profiles" &&
       activeTab !== "notifications" &&
       activeTab !== "terminal" &&
       activeTab !== "security" &&
@@ -373,6 +426,9 @@ export function SettingsView({ onClose, tab, onSelectTab, onServerAboutRefresh, 
     }
 
     switch (activeTab) {
+      case "profiles":
+        return <ProfilesSection readOnly={readOnly} />;
+
       case "session":
         return (
           <div className="space-y-4">
@@ -394,6 +450,7 @@ export function SettingsView({ onClose, tab, onSelectTab, onServerAboutRefresh, 
               <SchemaSection
                 section="session"
                 schema={schema}
+                focusRequest={focusRequest}
                 values={session}
                 onSaveField={saveSubField}
                 advancedSubtitle="Idle auto-stop, attach modes, live-send, and other session tuning."
@@ -407,6 +464,7 @@ export function SettingsView({ onClose, tab, onSelectTab, onServerAboutRefresh, 
           <SchemaSection
             section="sandbox"
             schema={schema}
+            focusRequest={focusRequest}
             values={sandbox}
             onSaveField={saveSubField}
             advancedSubtitle="Resource limits, custom instructions, environment, volumes, and ports."
@@ -418,6 +476,7 @@ export function SettingsView({ onClose, tab, onSelectTab, onServerAboutRefresh, 
           <SchemaSection
             section="worktree"
             schema={schema}
+            focusRequest={focusRequest}
             values={worktree}
             onSaveField={saveSubField}
             advancedSubtitle="Bare-repo and workspace path templates, branch cleanup, and submodules."
@@ -429,6 +488,7 @@ export function SettingsView({ onClose, tab, onSelectTab, onServerAboutRefresh, 
           <SchemaSection
             section="theme"
             schema={schema}
+            focusRequest={focusRequest}
             values={(settings?.theme ?? {}) as Record<string, unknown>}
             onSaveField={saveThemeField}
           />
@@ -440,6 +500,7 @@ export function SettingsView({ onClose, tab, onSelectTab, onServerAboutRefresh, 
           <SchemaSection
             section="sound"
             schema={schema}
+            focusRequest={focusRequest}
             values={(settings?.sound ?? {}) as Record<string, unknown>}
             onSaveField={saveSubField}
           />
@@ -449,6 +510,7 @@ export function SettingsView({ onClose, tab, onSelectTab, onServerAboutRefresh, 
           <SchemaSection
             section="tmux"
             schema={schema}
+            focusRequest={focusRequest}
             values={(settings?.tmux ?? {}) as Record<string, unknown>}
             onSaveField={saveSubField}
           />
@@ -458,6 +520,7 @@ export function SettingsView({ onClose, tab, onSelectTab, onServerAboutRefresh, 
           <SchemaSection
             section="updates"
             schema={schema}
+            focusRequest={focusRequest}
             values={(settings?.updates ?? {}) as Record<string, unknown>}
             onSaveField={saveSubField}
           />
@@ -469,6 +532,7 @@ export function SettingsView({ onClose, tab, onSelectTab, onServerAboutRefresh, 
           <SchemaSection
             section="logging"
             schema={schema}
+            focusRequest={focusRequest}
             values={(settings?.logging ?? {}) as Record<string, unknown>}
             onSaveField={saveSubField}
             advancedSubtitle="Sink and rotation; some fields require restarting aoe to take effect."
@@ -486,7 +550,15 @@ export function SettingsView({ onClose, tab, onSelectTab, onServerAboutRefresh, 
                 Controls which session events trigger push notifications on the server.
               </p>
               {schemaGuard() ??
-                (settings && <SchemaSection section="web" schema={schema} values={web} onSaveField={saveSubField} />)}
+                (settings && (
+                  <SchemaSection
+                    section="web"
+                    schema={schema}
+                    focusRequest={focusRequest}
+                    values={web}
+                    onSaveField={saveSubField}
+                  />
+                ))}
             </div>
           </div>
         );
@@ -505,17 +577,25 @@ export function SettingsView({ onClose, tab, onSelectTab, onServerAboutRefresh, 
         }
         const acp = (settings.acp ?? {}) as Record<string, unknown>;
         return (
-          <SchemaSection
-            section="acp"
-            schema={schema}
-            values={acp}
-            onSaveField={saveSubField}
-            // The acp section mirrors three fields into serverAbout, which
-            // ToolCards and the composer read live; refresh it after any acp
-            // save so those surfaces pick up the change without a reload.
-            onAfterSave={() => onServerAboutRefresh()}
-            advancedSubtitle="Replay retention caps and daemon watchdog tuning. Touch only when triaging a specific failure mode."
-          />
+          <div className="space-y-4">
+            <p className="text-xs text-text-dim">
+              Defaults for structured-view (ACP) sessions: which agent starts, how many workers run at once, and how
+              much history is replayed on reconnect. These apply when a session renders in the structured view instead
+              of a raw terminal.
+            </p>
+            <SchemaSection
+              section="acp"
+              schema={schema}
+              focusRequest={focusRequest}
+              values={acp}
+              onSaveField={saveSubField}
+              // The acp section mirrors three fields into serverAbout, which
+              // ToolCards and the composer read live; refresh it after any acp
+              // save so those surfaces pick up the change without a reload.
+              onAfterSave={() => onServerAboutRefresh()}
+              advancedSubtitle="Replay retention caps and daemon watchdog tuning. Touch only when triaging a specific failure mode."
+            />
+          </div>
         );
       }
     }
@@ -531,6 +611,9 @@ export function SettingsView({ onClose, tab, onSelectTab, onServerAboutRefresh, 
         saveError={saveError}
         selectedProfile={selectedProfile}
         onSelectProfile={handleSelectProfile}
+        schema={schema}
+        schemaLoading={schemaLoading}
+        onSearchJump={handleSearchJump}
       />
 
       {/* Mobile tabs (horizontal scroll) */}
@@ -543,12 +626,13 @@ export function SettingsView({ onClose, tab, onSelectTab, onServerAboutRefresh, 
               <button
                 key={item.id}
                 onClick={() => onSelectTab(item.id)}
-                className={`px-4 py-2.5 text-xs font-medium whitespace-nowrap cursor-pointer transition-colors ${
+                className={`flex items-center gap-1.5 px-4 py-2.5 text-xs font-medium whitespace-nowrap cursor-pointer transition-colors ${
                   activeTab === item.id
                     ? "text-brand-500 border-b-2 border-brand-500"
                     : "text-text-secondary hover:text-text-primary"
                 }`}
               >
+                {item.icon}
                 {item.label}
               </button>
             ),
@@ -572,12 +656,13 @@ export function SettingsView({ onClose, tab, onSelectTab, onServerAboutRefresh, 
               <button
                 key={item.id}
                 onClick={() => onSelectTab(item.id)}
-                className={`px-4 py-2 text-sm text-left cursor-pointer transition-colors ${
+                className={`flex items-center gap-2 px-4 py-2 text-sm text-left cursor-pointer transition-colors ${
                   activeTab === item.id
                     ? "text-brand-500 bg-surface-800 border-r-2 border-brand-500"
                     : "text-text-secondary hover:text-text-primary hover:bg-surface-800/50"
                 }`}
               >
+                {item.icon}
                 {item.label}
               </button>
             ),
@@ -606,7 +691,7 @@ export function SettingsView({ onClose, tab, onSelectTab, onServerAboutRefresh, 
                 selectedProfile from its "" seed to the default does not remount
                 mid-interaction and collapse a just-expanded fold. */}
             <fieldset
-              key={`${activeTab}-${profileEpoch}`}
+              key={`${activeTab}-${profileEpoch}-${focusRequest?.nonce ?? 0}`}
               disabled={offline}
               className="space-y-5 disabled:opacity-50 border-0 m-0 p-0 min-w-0"
             >

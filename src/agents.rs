@@ -136,6 +136,14 @@ pub struct AgentDef {
     /// CLI flag template for custom instruction injection.
     /// `{}` is replaced with the shell-escaped instruction text.
     pub instruction_flag: Option<&'static str>,
+    /// Single argv token that runs this agent non-interactively (one-shot),
+    /// printing the model's response to stdout and exiting (e.g. claude `-p`,
+    /// codex `exec`, opencode `run`, gemini `-p`). It is exactly one token,
+    /// placed immediately before the prompt argument, and must NOT contain a
+    /// `{}` placeholder (the prompt is passed as its own argv element, never
+    /// interpolated). `None` means the agent has no known one-shot mode, so
+    /// smart session rename is skipped for it. See `session::smart_rename`.
+    pub oneshot_flag: Option<&'static str>,
     /// If true, `builder.rs` sets `instance.command = binary` for this agent.
     pub set_default_command: bool,
     /// Status detection function pointer. Takes raw (non-lowercased) pane content.
@@ -328,6 +336,7 @@ const CODEX_HOOK_EVENTS: &[HookEvent] = &[
 pub const AGENTS: &[AgentDef] = &[
     AgentDef {
         name: "claude",
+        oneshot_flag: Some("-p"),
         binary: "claude",
         aliases: &[],
         detection: DetectionMethod::Which("claude"),
@@ -353,6 +362,7 @@ pub const AGENTS: &[AgentDef] = &[
     },
     AgentDef {
         name: "opencode",
+        oneshot_flag: Some("run"),
         binary: "opencode",
         aliases: &["open-code"],
         detection: DetectionMethod::Which("opencode"),
@@ -370,6 +380,7 @@ pub const AGENTS: &[AgentDef] = &[
     },
     AgentDef {
         name: "vibe",
+        oneshot_flag: None,
         binary: "vibe",
         aliases: &["mistral-vibe"],
         detection: DetectionMethod::RunWithArg("vibe", "--version"),
@@ -387,6 +398,7 @@ pub const AGENTS: &[AgentDef] = &[
     },
     AgentDef {
         name: "codex",
+        oneshot_flag: Some("exec"),
         binary: "codex",
         aliases: &[],
         detection: DetectionMethod::Which("codex"),
@@ -416,6 +428,7 @@ pub const AGENTS: &[AgentDef] = &[
     },
     AgentDef {
         name: "gemini",
+        oneshot_flag: Some("-p"),
         binary: "gemini",
         aliases: &[],
         detection: DetectionMethod::Which("gemini"),
@@ -463,6 +476,7 @@ pub const AGENTS: &[AgentDef] = &[
     },
     AgentDef {
         name: "cursor",
+        oneshot_flag: None,
         binary: "agent",
         aliases: &["agent"],
         detection: DetectionMethod::Which("agent"),
@@ -485,6 +499,7 @@ pub const AGENTS: &[AgentDef] = &[
     },
     AgentDef {
         name: "copilot",
+        oneshot_flag: None,
         binary: "copilot",
         aliases: &["github-copilot"],
         detection: DetectionMethod::Which("copilot"),
@@ -502,6 +517,7 @@ pub const AGENTS: &[AgentDef] = &[
     },
     AgentDef {
         name: "pi",
+        oneshot_flag: None,
         binary: "pi",
         aliases: &[],
         detection: DetectionMethod::Which("pi"),
@@ -520,6 +536,7 @@ pub const AGENTS: &[AgentDef] = &[
     },
     AgentDef {
         name: "droid",
+        oneshot_flag: None,
         binary: "droid",
         aliases: &["factory-droid"],
         detection: DetectionMethod::Which("droid"),
@@ -537,6 +554,7 @@ pub const AGENTS: &[AgentDef] = &[
     },
     AgentDef {
         name: "settl",
+        oneshot_flag: None,
         binary: "settl",
         aliases: &["settlers", "catan"],
         detection: DetectionMethod::Which("settl"),
@@ -563,6 +581,7 @@ pub const AGENTS: &[AgentDef] = &[
     },
     AgentDef {
         name: "hermes",
+        oneshot_flag: None,
         binary: "hermes",
         aliases: &[],
         detection: DetectionMethod::Which("hermes"),
@@ -596,6 +615,7 @@ pub const AGENTS: &[AgentDef] = &[
     },
     AgentDef {
         name: "kiro",
+        oneshot_flag: None,
         binary: "kiro-cli",
         aliases: &["kiro-cli"],
         detection: DetectionMethod::Which("kiro-cli"),
@@ -625,6 +645,7 @@ pub const AGENTS: &[AgentDef] = &[
     },
     AgentDef {
         name: "qwen",
+        oneshot_flag: None,
         binary: "qwen",
         aliases: &[],
         detection: DetectionMethod::Which("qwen"),
@@ -650,6 +671,7 @@ pub const AGENTS: &[AgentDef] = &[
     },
     AgentDef {
         name: "antigravity",
+        oneshot_flag: None,
         binary: "agy",
         aliases: &["agy"],
         detection: DetectionMethod::Which("agy"),
@@ -734,6 +756,35 @@ pub fn name_from_settings_index(index: usize) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_oneshot_flags_are_single_tokens_without_placeholders() {
+        // The smart-rename safety contract: a non-None oneshot_flag is exactly
+        // one argv token placed before the prompt, and never interpolates the
+        // prompt. Keep future agent additions from weakening that.
+        for agent in AGENTS {
+            let Some(flag) = agent.oneshot_flag else {
+                continue;
+            };
+            assert_eq!(
+                flag,
+                flag.trim(),
+                "agent '{}' one-shot flag must not have surrounding whitespace",
+                agent.name
+            );
+            assert_eq!(
+                flag.split_whitespace().count(),
+                1,
+                "agent '{}' one-shot flag must be exactly one argv token",
+                agent.name
+            );
+            assert!(
+                !flag.contains("{}"),
+                "agent '{}' one-shot flag must not interpolate the prompt",
+                agent.name
+            );
+        }
+    }
 
     #[test]
     fn test_get_agent_known() {

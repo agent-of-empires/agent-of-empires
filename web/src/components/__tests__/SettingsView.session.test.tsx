@@ -40,6 +40,18 @@ const SESSION_SCHEMA = [
     validation: { rule: "none" },
     advanced: false,
   },
+  {
+    section: "session",
+    field: "smart_rename",
+    category: "Agents",
+    label: "Smart Session Rename",
+    description: "",
+    widget: { kind: "toggle" },
+    web_write: { policy: "allow" },
+    profile_overridable: true,
+    validation: { rule: "none" },
+    advanced: false,
+  },
 ];
 
 vi.mock("../../lib/api", () => ({
@@ -121,6 +133,31 @@ describe("Session tab auto-stop idle field", () => {
     await waitFor(() =>
       expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
         session: { auto_stop_idle_secs: 7200 },
+      }),
+    );
+  });
+
+  it("persists session.smart_rename through the profile path", async () => {
+    vi.mocked(api.fetchSettings).mockResolvedValue({
+      session: { smart_rename: true },
+      acp: {},
+      sandbox: {},
+      worktree: {},
+    } as never);
+
+    const { container } = render(
+      <SettingsView onClose={() => {}} tab="session" onSelectTab={() => {}} onServerAboutRefresh={() => {}} />,
+    );
+    await screen.findByText("Smart Session Rename");
+
+    // Only one toggle field is in SESSION_SCHEMA, so the lone switch is it.
+    const toggle = container.querySelector("button[role=switch]") as HTMLButtonElement;
+    expect(toggle).toBeTruthy();
+    fireEvent.click(toggle);
+
+    await waitFor(() =>
+      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
+        session: { smart_rename: false },
       }),
     );
   });

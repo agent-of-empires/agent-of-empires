@@ -70,11 +70,9 @@ pub enum SessionCommands {
     /// Clear the favorite flag on a session.
     Unfavorite(SessionIdArgs),
 
-    /// Archive a session (sinks it to the bottom of the Attention sort).
-    /// Kills the tmux pane unless `--no-kill` is passed. The worktree,
-    /// branch, and container are preserved; use `aoe remove` (optionally
-    /// with `--delete-worktree` / `--delete-branch`) to fully destroy a
-    /// session.
+    /// Archive a session: sink it in the Attention sort and tear down its
+    /// tmux sessions. Worktree, branch, container preserved. `--no-kill`
+    /// skips tmux teardown. See #1868.
     Archive(ArchiveArgs),
 
     /// Unarchive a session (restores it to its tier in the Attention sort)
@@ -97,9 +95,7 @@ pub struct ArchiveArgs {
     /// Session ID or title
     pub identifier: String,
 
-    /// Skip killing the tmux pane. By default archiving stops the running
-    /// agent so the row renders as truly parked; pass this to keep the
-    /// pane alive while still marking the session archived.
+    /// Skip tmux teardown on archive.
     #[arg(long = "no-kill")]
     pub no_kill: bool,
 }
@@ -307,11 +303,13 @@ async fn archive_session(profile: &str, args: ArchiveArgs) -> Result<()> {
     let title = inst.title.clone();
     let inst = inst.clone();
 
-    // Phase 2 (unlocked): tmux work; Storage::update closures must stay CPU-only.
+    // Phase 2 (unlocked): tmux work. Agent kill split from ancillary so
+    // the CLI prints a warn on agent failure. #1868.
     if !args.no_kill {
         if let Err(e) = inst.kill() {
-            eprintln!("Warning: failed to kill tmux session: {}", e);
+            eprintln!("Warning: failed to kill agent tmux session: {}", e);
         }
+        inst.kill_ancillary_tmux_sessions();
     }
 
     // Phase 3 (locked, fast): set archived_at by id.

@@ -330,7 +330,13 @@ fn sync_agent_config(
         };
 
         if metadata.is_dir() {
-            if copy_dirs.iter().any(|&d| d == name_str.as_ref()) {
+            // copy_dirs (e.g. plugins, skills) are host -> sandbox pushes. Like
+            // the general file copy below, skip them once the sandbox has prior
+            // session data: re-copying a large tree (plugins can hold full git
+            // clones) on every restart stalled startup for tens of seconds and
+            // would clobber container-side changes. A fresh sandbox still gets
+            // them on its first launch.
+            if !has_prior_data && copy_dirs.iter().any(|&d| d == name_str.as_ref()) {
                 let dest = sandbox_dir.join(&name);
                 if let Err(e) = copy_dir_recursive(&entry.path(), &dest) {
                     tracing::warn!(target: "session.profile", "Failed to copy dir {}: {}", name_str, e);
@@ -448,16 +454,124 @@ fn rewrite_plugin_value_paths(
 
 /// Recursively copy a directory tree, following symlinks.
 fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
-    std::fs::create_dir_all(dest)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
+    let mut visited = std::collections::HashSet::new();
+    copy_dir_recursive_inner(src, dest, &mut visited)
+}
+
+/// Whether an I/O error during the copy means the destination filesystem can no
+/// longer accept writes, in which case continuing would silently produce a
+/// partial copy (a sandbox missing arbitrary files, reported as success). Those
+/// must abort the whole copy. Everything else (a single unreadable or dangling
+/// source entry) is skipped best-effort.
+fn is_fatal_copy_error(e: &std::io::Error) -> bool {
+    // ENOSPC (no space), EROFS (read-only fs), EDQUOT (quota). EDQUOT differs by
+    // platform (122 on Linux, 69 on macOS). raw_os_error covers all three more
+    // portably than the (partly unstable) ErrorKind variants.
+    matches!(e.raw_os_error(), Some(28) | Some(30) | Some(69) | Some(122))
+}
+
+fn copy_dir_recursive_inner(
+    src: &Path,
+    dest: &Path,
+    visited: &mut std::collections::HashSet<PathBuf>,
+) -> Result<()> {
+    // Break symlink cycles. We follow symlinks (a legitimately symlinked config
+    // dir should be copied), but a link that points back up its own tree would
+    // otherwise recurse forever; a real cycle under ~/.claude/plugins churned
+    // for 30s before aborting. Keying on the canonical (symlink-resolved) source
+    // path stops the second visit. A canonicalize failure (e.g. ELOOP) is
+    // exactly when we most need the guard, so skip the dir rather than descend
+    // blindly.
+    match std::fs::canonicalize(src) {
+        Ok(real) => {
+            if !visited.insert(real) {
+                tracing::warn!(
+                    target: "session.profile",
+                    "skipping already-visited dir (symlink cycle?): {}",
+                    src.display()
+                );
+                return Ok(());
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "session.profile",
+                "skipping dir (cannot resolve, possible symlink loop): {}: {}",
+                src.display(),
+                e
+            );
+            return Ok(());
+        }
+    }
+    // create_dir_all / read_dir failures: a filesystem that can't accept writes
+    // is fatal (silent partial copy); anything else means we just skip this
+    // subtree. This keeps the fail-soft behavior errno-aware and consistent.
+    if let Err(e) = std::fs::create_dir_all(dest) {
+        if is_fatal_copy_error(&e) {
+            return Err(e).with_context(|| format!("creating {}", dest.display()));
+        }
+        tracing::warn!(
+            target: "session.profile",
+            "skipping dir (cannot create destination): {}: {}",
+            dest.display(),
+            e
+        );
+        return Ok(());
+    }
+    let entries = match std::fs::read_dir(src) {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::warn!(
+                target: "session.profile",
+                "skipping dir (cannot read): {}: {}",
+                src.display(),
+                e
+            );
+            return Ok(());
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                tracing::warn!(target: "session.profile", "skipping entry in {}: {}", src.display(), e);
+                continue;
+            }
+        };
         let target = dest.join(entry.file_name());
-        // Follow symlinks so symlinked dirs/files are handled correctly.
-        let metadata = std::fs::metadata(entry.path())?;
+        // Follow symlinks so symlinked dirs/files are handled correctly; the
+        // visited-set guard above stops a cycle from looping forever. A single
+        // unreadable or dangling entry is skipped rather than aborting the whole
+        // copy: one Permission-denied file under ~/.claude/plugins used to fail
+        // the entire sync.
+        let metadata = match std::fs::metadata(entry.path()) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    target: "session.profile",
+                    "skipping {}: {}",
+                    entry.path().display(),
+                    e
+                );
+                continue;
+            }
+        };
         if metadata.is_dir() {
-            copy_dir_recursive(&entry.path(), &target)?;
-        } else {
-            std::fs::copy(entry.path(), &target)?;
+            // Propagate with `?`: the child only returns Err for a fatal
+            // (filesystem-full) error, so a cycle / unreadable subdir resolves to
+            // Ok inside the child and is skipped there, while a real out-of-space
+            // condition aborts the whole copy.
+            copy_dir_recursive_inner(&entry.path(), &target, visited)?;
+        } else if let Err(e) = std::fs::copy(entry.path(), &target) {
+            if is_fatal_copy_error(&e) {
+                return Err(e).with_context(|| format!("copying {}", entry.path().display()));
+            }
+            tracing::warn!(
+                target: "session.profile",
+                "skipping file {}: {}",
+                entry.path().display(),
+                e
+            );
         }
     }
     Ok(())
@@ -2556,6 +2670,87 @@ mod tests {
             fs::read_to_string(sandbox.join("settings.json")).unwrap(),
             r#"{"theme":"dark"}"#,
             "container-side settings must not be overwritten when projects/ sentinel exists"
+        );
+    }
+
+    #[test]
+    fn test_is_fatal_copy_error_discriminates_storage_exhaustion() {
+        use std::io::Error;
+        // ENOSPC / EROFS / EDQUOT mean the destination can't accept writes;
+        // continuing would silently produce a partial copy, so these abort.
+        assert!(is_fatal_copy_error(&Error::from_raw_os_error(28)), "ENOSPC");
+        assert!(is_fatal_copy_error(&Error::from_raw_os_error(30)), "EROFS");
+        assert!(
+            is_fatal_copy_error(&Error::from_raw_os_error(69)),
+            "EDQUOT (macOS)"
+        );
+        assert!(
+            is_fatal_copy_error(&Error::from_raw_os_error(122)),
+            "EDQUOT (Linux)"
+        );
+        // A single unreadable / missing source entry is best-effort skippable.
+        assert!(
+            !is_fatal_copy_error(&Error::from_raw_os_error(13)),
+            "EACCES"
+        );
+        assert!(!is_fatal_copy_error(&Error::from_raw_os_error(2)), "ENOENT");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_copy_dir_recursive_terminates_on_symlink_cycle() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("src");
+        fs::create_dir_all(src.join("sub")).unwrap();
+        fs::write(src.join("sub").join("file.txt"), "data").unwrap();
+        // Cycle: src/sub/loop -> src. The old code followed it and recursed
+        // forever; the visited-set guard must break it.
+        std::os::unix::fs::symlink(&src, src.join("sub").join("loop")).unwrap();
+
+        let dest = dir.path().join("dest");
+        // Must return rather than infinite-loop / stack-overflow.
+        copy_dir_recursive(&src, &dest).unwrap();
+        assert_eq!(
+            fs::read_to_string(dest.join("sub").join("file.txt")).unwrap(),
+            "data"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_copy_dir_recursive_skips_bad_entry_inside_subdir() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("good.txt"), "good").unwrap();
+        // Dangling symlink inside the copied tree. The old code propagated the
+        // stat error with `?` and aborted the whole copy (the log's "Failed to
+        // copy dir plugins: Permission denied"); now a single bad entry is
+        // skipped and the rest still copies.
+        std::os::unix::fs::symlink("/nonexistent/target", src.join("dangling")).unwrap();
+
+        let dest = dir.path().join("dest");
+        copy_dir_recursive(&src, &dest).unwrap();
+        assert_eq!(fs::read_to_string(dest.join("good.txt")).unwrap(), "good");
+        assert!(!dest.join("dangling").exists());
+    }
+
+    #[test]
+    fn test_copy_dirs_skipped_when_prior_data() {
+        let dir = TempDir::new().unwrap();
+        let host = dir.path().join("host");
+        fs::create_dir_all(host.join("plugins")).unwrap();
+        fs::write(host.join("plugins").join("p.txt"), "host-plugin").unwrap();
+        let sandbox = dir.path().join("sandbox");
+
+        // Prior container session sentinel.
+        fs::create_dir_all(sandbox.join("projects")).unwrap();
+
+        sync_agent_config(&host, &sandbox, &[], &[], &["plugins"], &[]).unwrap();
+        assert!(
+            !sandbox.join("plugins").exists(),
+            "copy_dirs must be skipped once the sandbox has prior session data, \
+             so a restart no longer re-copies the whole plugins tree"
         );
     }
 

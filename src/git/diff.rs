@@ -217,13 +217,31 @@ fn get_commit_from_ref<'a>(
     repo: &'a git2::Repository,
     reference: &str,
 ) -> Result<git2::Commit<'a>> {
+    let remote_ref = format!("origin/{}", reference);
+
     // Try as a local branch
     if let Ok(branch) = repo.find_branch(reference, git2::BranchType::Local) {
-        return Ok(branch.get().peel_to_commit()?);
+        let local_commit = branch.get().peel_to_commit()?;
+        // When the local branch is strictly behind its `origin/<ref>`
+        // tracking counterpart (local is a strict ancestor, no
+        // divergence), diff against the remote tip instead. This matches
+        // GitHub PR semantics and stops a stale local base from rendering
+        // upstream churn as session changes. See #1029, #1951, #2164.
+        if let Ok(remote) = repo.find_branch(&remote_ref, git2::BranchType::Remote) {
+            if let Ok(remote_commit) = remote.get().peel_to_commit() {
+                if local_commit.id() != remote_commit.id()
+                    && repo
+                        .graph_descendant_of(remote_commit.id(), local_commit.id())
+                        .unwrap_or(false)
+                {
+                    return Ok(remote_commit);
+                }
+            }
+        }
+        return Ok(local_commit);
     }
 
     // Try as a remote branch
-    let remote_ref = format!("origin/{}", reference);
     if let Ok(branch) = repo.find_branch(&remote_ref, git2::BranchType::Remote) {
         return Ok(branch.get().peel_to_commit()?);
     }
@@ -1341,5 +1359,153 @@ mod tests {
 
         let loaded = get_working_file_content(dir.path(), Path::new("test.txt")).unwrap();
         assert_eq!(loaded, content);
+    }
+
+    /// Build a repo where `origin/main` is ahead of a stale local `main`,
+    /// with HEAD detached at the `origin/main` tip and a clean working tree.
+    /// Mirrors the #2164 scenario: a worktree cut from `origin/main` whose
+    /// local `main` ref drifted behind. Returns (dir, repo, origin_tip).
+    fn setup_stale_local_main() -> (TempDir, git2::Repository, git2::Oid) {
+        let dir = TempDir::new().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+
+        // Base commit, then a local `main` pinned to it.
+        commit_file(&repo, "shared.txt", "base\n", "Initial commit");
+        let base = repo.head().unwrap().peel_to_commit().unwrap().id();
+        ensure_local_branch(&repo, "main", &repo.find_commit(base).unwrap());
+
+        // Advance `main` with two upstream commits (the dependabot-style churn).
+        repo.set_head("refs/heads/main").unwrap();
+        repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+            .unwrap();
+        commit_file(&repo, "upstream_a.txt", "a\n", "Upstream commit A");
+        commit_file(&repo, "upstream_b.txt", "b\n", "Upstream commit B");
+        let origin_tip = repo.head().unwrap().peel_to_commit().unwrap().id();
+
+        // Record that tip as origin/main, then rewind local `main` to base so
+        // it is strictly behind origin/main.
+        repo.reference(
+            "refs/remotes/origin/main",
+            origin_tip,
+            true,
+            "set origin/main",
+        )
+        .unwrap();
+        repo.reference("refs/heads/main", base, true, "rewind local main")
+            .unwrap();
+
+        // Detach HEAD at the origin tip with a matching (clean) working tree.
+        repo.set_head_detached(origin_tip).unwrap();
+        repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+            .unwrap();
+
+        (dir, repo, origin_tip)
+    }
+
+    #[test]
+    fn test_stale_local_main_resolves_to_remote() {
+        // Story: worktree HEAD == origin/main, local `main` strictly behind.
+        // The diff must show zero changed files, not the upstream commits.
+        let (dir, _repo, _tip) = setup_stale_local_main();
+        let files = compute_changed_files(dir.path(), "main").unwrap();
+        assert!(
+            files.is_empty(),
+            "stale local main behind origin/main should yield no phantom changes, got: {:?}",
+            files.iter().map(|f| &f.path).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_local_main_equals_origin_diff_unchanged() {
+        // Story: local `main` == origin/main, so resolution and the computed
+        // diff are identical to the no-remote case (regression guard).
+        let (dir, repo) = setup_branching_repo();
+        let main_tip = repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        repo.reference(
+            "refs/remotes/origin/main",
+            main_tip,
+            true,
+            "origin/main == main",
+        )
+        .unwrap();
+
+        let files = compute_changed_files(dir.path(), "main").unwrap();
+        let paths: Vec<&Path> = files.iter().map(|f| f.path.as_path()).collect();
+        assert!(
+            paths.contains(&Path::new("feature_only.txt")),
+            "feature_only.txt should appear, got: {:?}",
+            paths
+        );
+        assert!(
+            !paths.contains(&Path::new("main_only.txt")),
+            "main_only.txt should NOT appear, got: {:?}",
+            paths
+        );
+    }
+
+    #[test]
+    fn test_diverged_local_main_stays_local() {
+        // Story: local base branch genuinely diverged from its remote (not a
+        // strict ancestor), so the diff still resolves against the local branch.
+        let dir = TempDir::new().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+
+        commit_file(&repo, "shared.txt", "base\n", "Initial commit");
+        let base = repo.head().unwrap().peel_to_commit().unwrap().id();
+        ensure_local_branch(&repo, "main", &repo.find_commit(base).unwrap());
+
+        // Local `main`: base -> local_main.txt.
+        repo.set_head("refs/heads/main").unwrap();
+        repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+            .unwrap();
+        commit_file(&repo, "local_main.txt", "local\n", "Local main commit");
+
+        // origin/main diverges off the same base via a throwaway branch.
+        ensure_local_branch(&repo, "origintmp", &repo.find_commit(base).unwrap());
+        repo.set_head("refs/heads/origintmp").unwrap();
+        repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+            .unwrap();
+        commit_file(&repo, "origin_main.txt", "origin\n", "Origin main commit");
+        let origin_tip = repo.head().unwrap().peel_to_commit().unwrap().id();
+        repo.reference(
+            "refs/remotes/origin/main",
+            origin_tip,
+            true,
+            "diverged origin/main",
+        )
+        .unwrap();
+
+        // Feature branch off local `main`, then a feature change.
+        repo.set_head("refs/heads/main").unwrap();
+        repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+            .unwrap();
+        let local_main_tip = repo.head().unwrap().peel_to_commit().unwrap();
+        ensure_local_branch(&repo, "feature", &local_main_tip);
+        repo.set_head("refs/heads/feature").unwrap();
+        repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+            .unwrap();
+        commit_file(&repo, "feature.txt", "feature\n", "Feature commit");
+
+        let files = compute_changed_files(dir.path(), "main").unwrap();
+        let paths: Vec<&Path> = files.iter().map(|f| f.path.as_path()).collect();
+        assert!(
+            paths.contains(&Path::new("feature.txt")),
+            "feature.txt should appear, got: {:?}",
+            paths
+        );
+        // Resolving against the diverged origin tip would drop the merge-base
+        // back to the common ancestor and surface local_main.txt. Its absence
+        // proves the local branch was used.
+        assert!(
+            !paths.contains(&Path::new("local_main.txt")),
+            "local_main.txt should NOT appear (diverged local must not switch to origin), got: {:?}",
+            paths
+        );
     }
 }

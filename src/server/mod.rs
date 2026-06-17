@@ -11,11 +11,11 @@ pub mod api;
 pub mod auth;
 pub mod live_ws;
 pub mod login;
+mod pane;
 pub mod push;
 pub mod push_send;
 pub mod rate_limit;
 pub mod tunnel;
-pub mod ws;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -295,6 +295,17 @@ pub struct AppState {
     /// first use and live for the lifetime of the process — there are only
     /// as many as the user has sessions.
     pub instance_locks: RwLock<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Session ids with an in-flight smart-rename one-shot, so a burst of rapid
+    /// first prompts cannot spawn concurrent title generators for the same
+    /// session. Synchronous mutex: critical sections are tiny and never span an
+    /// `await`. See `session::smart_rename`.
+    pub smart_rename_inflight: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Session ids that have already had a smart-rename one-shot attempt this
+    /// process lifetime (success or failure). A failed or unusable first try
+    /// leaves the name default, so without this every later prompt would
+    /// respawn a one-shot agent; one attempt per session bounds that cost and
+    /// clears the `pending` sidebar chip once an attempt has run.
+    pub smart_rename_attempted: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Suppression set for the startup-recovery cascade. While an entry is
     /// present and younger than `recovery::RECENTLY_RESTARTED_TTL`, the
     /// `status_poll_loop` skips `update_status_with_metadata` for that
@@ -357,18 +368,6 @@ pub struct AppState {
     #[cfg(feature = "serve")]
     pub acp_supervisor:
         Arc<crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>>,
-    /// Per-tmux-session primary WebSocket client. Maps tmux session name
-    /// to the client ID that most recently sent keyboard input. Only the
-    /// primary client's resize messages are applied to its PTY, preventing
-    /// multiple browser viewports from fighting over the tmux window size.
-    pub session_primaries: Arc<RwLock<std::collections::HashMap<String, String>>>,
-    /// Per-tmux-session refcount of clients currently asking the pane's
-    /// process tree to be paused (SIGSTOP). Incremented by `pause_output`,
-    /// decremented by `resume_output` and on WebSocket disconnect. The
-    /// pane's process is SIGSTOP-ed on 0→N transitions and SIGCONT-ed on
-    /// N→0, so two mobile clients scrolling concurrently don't have one's
-    /// `resume_output` un-pause the other's scrollback read.
-    pub session_pause_counts: Arc<tokio::sync::Mutex<std::collections::HashMap<String, u32>>>,
     /// Epoch-millis timestamp of the most recent authenticated API request.
     /// Updated by auth middleware on every successful auth. The push consumer
     /// checks this to suppress notifications when someone is actively using
@@ -955,6 +954,8 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         auth_mode,
         serve_mode,
         instance_locks: RwLock::new(std::collections::HashMap::new()),
+        smart_rename_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
+        smart_rename_attempted: std::sync::Mutex::new(std::collections::HashSet::new()),
         recently_restarted: crate::session::recovery::new_recently_restarted(),
         recovery_pending: crate::session::recovery::new_recovery_pending(),
         cleanup_defaults_cache: RwLock::new(CleanupDefaultsCache {
@@ -965,8 +966,6 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         }),
         remote_owner_cache: RwLock::new(std::collections::HashMap::new()),
         changed_files_cache: std::sync::RwLock::new(std::collections::HashMap::new()),
-        session_primaries: Arc::new(RwLock::new(std::collections::HashMap::new())),
-        session_pause_counts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         status_tx: broadcast::channel(STATUS_CHANNEL_CAPACITY).0,
         #[cfg(feature = "serve")]
         acp_events_tx: acp_events_tx.clone(),
@@ -1502,8 +1501,8 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/api/telemetry/structured-interaction",
             post(api::post_telemetry_structured_interaction),
         )
-        // Terminal WebSockets
-        .route("/sessions/{id}/ws", get(ws::terminal_ws))
+        // Terminal WebSockets (capture-streaming live view; the agent pane and
+        // the paired host/container shells). The xterm PTY relay was removed.
         .route("/sessions/{id}/live-ws", get(live_ws::live_terminal_ws))
         .route(
             "/sessions/{id}/terminal/live-ws",
@@ -1512,17 +1511,16 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/sessions/{id}/container-terminal/live-ws",
             get(live_ws::live_container_terminal_ws),
-        )
-        .route("/sessions/{id}/terminal/ws", get(ws::paired_terminal_ws))
-        .route(
-            "/sessions/{id}/container-terminal/ws",
-            get(ws::container_terminal_ws),
         );
 
     #[cfg(feature = "serve")]
     let app = app
         .route("/sessions/{id}/acp/ws", get(acp_ws::acp_ws))
         .route("/api/sessions/{id}/acp/spawn", post(api::spawn_acp))
+        .route(
+            "/api/sessions/{id}/acp/install-agent",
+            post(api::install_agent),
+        )
         .route("/api/sessions/{id}/acp", delete(api::shutdown_acp))
         .route(
             "/api/sessions/{id}/acp/switch-agent",
@@ -3796,6 +3794,8 @@ pub mod test_support {
             auth_mode: "none",
             serve_mode: "local",
             instance_locks: RwLock::new(HashMap::new()),
+            smart_rename_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            smart_rename_attempted: std::sync::Mutex::new(std::collections::HashSet::new()),
             recently_restarted: crate::session::recovery::new_recently_restarted(),
             recovery_pending: crate::session::recovery::new_recovery_pending(),
             cleanup_defaults_cache: RwLock::new(CleanupDefaultsCache {
@@ -3804,8 +3804,6 @@ pub mod test_support {
             }),
             changed_files_cache: std::sync::RwLock::new(std::collections::HashMap::new()),
             remote_owner_cache: RwLock::new(HashMap::new()),
-            session_primaries: Arc::new(RwLock::new(HashMap::new())),
-            session_pause_counts: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             status_tx: broadcast::channel(STATUS_CHANNEL_CAPACITY).0,
             acp_events_tx,
             acp_event_store: event_store,

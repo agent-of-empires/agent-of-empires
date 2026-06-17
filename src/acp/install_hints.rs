@@ -22,9 +22,42 @@ pub fn install_hint_for(binary: &str) -> Option<&'static str> {
     })
 }
 
+/// The npm package spec for an agent the daemon can install itself via a
+/// plain `npm install -g <pkg>`, or `None` for agents that need a different
+/// installer (curl|bash, brew, manual). Distinct from `install_hint_for`,
+/// whose strings are human-facing and not shell-safe to execute. Only the
+/// npm subset is eligible for the web "Update & restart" action; everything
+/// else falls back to the displayed manual hint. See #2109.
+pub fn npm_package_for(binary: &str) -> Option<&'static str> {
+    Some(match binary {
+        "claude-agent-acp" => "@agentclientprotocol/claude-agent-acp@latest",
+        "codex-acp" => "@zed-industries/codex-acp",
+        "gemini" => "@google/gemini-cli",
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn npm_package_only_for_clean_npm_agents() {
+        assert_eq!(
+            npm_package_for("codex-acp"),
+            Some("@zed-industries/codex-acp")
+        );
+        assert_eq!(
+            npm_package_for("claude-agent-acp"),
+            Some("@agentclientprotocol/claude-agent-acp@latest")
+        );
+        assert_eq!(npm_package_for("gemini"), Some("@google/gemini-cli"));
+        // curl|bash and manual-install agents are intentionally excluded.
+        assert_eq!(npm_package_for("opencode"), None);
+        assert_eq!(npm_package_for("vibe-acp"), None);
+        assert_eq!(npm_package_for("pi-acp"), None);
+        assert_eq!(npm_package_for("nonexistent"), None);
+    }
 
     #[test]
     fn covers_every_default_registry_binary() {

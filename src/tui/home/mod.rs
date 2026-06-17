@@ -43,6 +43,7 @@ use super::dialogs::{
     WorktreeNameDialog,
 };
 use super::diff::DiffView;
+use super::restart_poller::RestartPoller;
 use super::settings::SettingsView;
 use super::status_poller::{StatusPoller, StatusUpdate};
 use super::stop_poller::StopPoller;
@@ -609,6 +610,14 @@ pub struct HomeView {
 
     // Performance: background stop (docker stop can block up to ~10s)
     pub(super) stop_poller: StopPoller,
+
+    // Performance: background restart (the start cascade shells out to docker
+    // and runs the before_start host hook, which can block for seconds)
+    pub(super) restart_poller: RestartPoller,
+    /// Sessions whose restart cascade is in flight on the restart poller.
+    /// Suppresses the StatusPoller's missing-tmux Error transition until the
+    /// worker reports back via `apply_restart_results`.
+    pub(super) restart_in_flight: std::collections::HashSet<String>,
 
     // Performance: background session creation (for sandbox)
     pub(super) creation_poller: CreationPoller,
@@ -1343,6 +1352,8 @@ impl HomeView {
             pending_status_refresh: false,
             deletion_poller: DeletionPoller::new(),
             stop_poller: StopPoller::new(),
+            restart_poller: RestartPoller::new(),
+            restart_in_flight: std::collections::HashSet::new(),
             creation_poller: CreationPoller::new(),
             creation_cancelled: false,
             on_launch_hooks_ran: HashSet::new(),
@@ -2332,14 +2343,16 @@ impl HomeView {
     }
 
     /// Snapshot of `self.instances` eligible for status polling.
-    /// In-flight recovery candidates are excluded; their post-cascade
-    /// `Instance` arrives via `apply_recovery_updates` and skipping the
-    /// parallel poll prevents racing transitions during the suppression
-    /// window.
+    /// In-flight recovery and restart candidates are excluded; their
+    /// post-cascade `Instance` arrives via `apply_recovery_updates` /
+    /// `apply_restart_results` and skipping the parallel poll prevents racing
+    /// transitions during the suppression window.
     pub(super) fn pollable_instances(&self) -> Vec<Instance> {
         self.instances
             .iter()
-            .filter(|i| !self.recovery_in_flight.contains(&i.id))
+            .filter(|i| {
+                !self.recovery_in_flight.contains(&i.id) && !self.restart_in_flight.contains(&i.id)
+            })
             .cloned()
             .collect()
     }
@@ -2800,56 +2813,139 @@ impl HomeView {
             self.recovery_in_flight.clear();
         }
         if touched {
-            self.instance_map = self
-                .instances
-                .iter()
-                .map(|i| (i.id.clone(), i.clone()))
-                .collect();
-            // Preserve the selection across the rebuild. Without this, a
-            // recovery completion that reorders rows under
-            // `SortOrder::LastActivity` (the recovered session's
-            // `last_start_time` shifted) would silently latch the
-            // selection onto a neighbour because `update_selected()`
-            // resolves through `flat_items[cursor]`. Mirrors the
-            // canonical sequence in `reload()`.
-            let prev_selected_session = self.selected_session.clone();
-            let prev_selected_group = self.selected_group.clone();
+            self.refresh_rows_preserving_selection();
+        }
+        touched
+    }
 
-            self.flat_items = self.build_flat_items();
+    /// Rebuild `instance_map` + `flat_items` after a background worker replaced
+    /// an `Instance` snapshot, preserving the current selection. Without the
+    /// selection restore, a completion that reorders rows (e.g. a shifted
+    /// `last_start_time` under `SortOrder::LastActivity`) would silently latch
+    /// the cursor onto a neighbour, since `update_selected()` resolves through
+    /// `flat_items[cursor]`. Mirrors the canonical sequence in `reload()`.
+    /// Shared by `apply_recovery_updates` and `apply_restart_results`.
+    fn refresh_rows_preserving_selection(&mut self) {
+        self.instance_map = self
+            .instances
+            .iter()
+            .map(|i| (i.id.clone(), i.clone()))
+            .collect();
+        let prev_selected_session = self.selected_session.clone();
+        let prev_selected_group = self.selected_group.clone();
 
-            let mut restored = false;
-            if let Some(ref sid) = prev_selected_session {
-                for (idx, item) in self.flat_items.iter().enumerate() {
-                    if let Item::Session { id, .. } = item {
-                        if id == sid {
-                            self.cursor = idx;
-                            restored = true;
-                            break;
-                        }
-                    }
-                }
-            } else if let Some(ref gpath) = prev_selected_group {
-                for (idx, item) in self.flat_items.iter().enumerate() {
-                    if let Item::Group { path, .. } = item {
-                        if path == gpath {
-                            self.cursor = idx;
-                            restored = true;
-                            break;
-                        }
+        self.flat_items = self.build_flat_items();
+
+        let mut restored = false;
+        if let Some(ref sid) = prev_selected_session {
+            for (idx, item) in self.flat_items.iter().enumerate() {
+                if let Item::Session { id, .. } = item {
+                    if id == sid {
+                        self.cursor = idx;
+                        restored = true;
+                        break;
                     }
                 }
             }
-            if !restored && self.cursor >= self.flat_items.len() && !self.flat_items.is_empty() {
-                self.cursor = self.flat_items.len() - 1;
+        } else if let Some(ref gpath) = prev_selected_group {
+            for (idx, item) in self.flat_items.iter().enumerate() {
+                if let Item::Group { path, .. } = item {
+                    if path == gpath {
+                        self.cursor = idx;
+                        restored = true;
+                        break;
+                    }
+                }
             }
+        }
+        if !restored && self.cursor >= self.flat_items.len() && !self.flat_items.is_empty() {
+            self.cursor = self.flat_items.len() - 1;
+        }
 
-            if self.search_active && !self.search_query.value().is_empty() {
-                self.update_search();
-            } else if !self.search_matches.is_empty() {
-                self.refresh_search_matches();
+        if self.search_active && !self.search_query.value().is_empty() {
+            self.update_search();
+        } else if !self.search_matches.is_empty() {
+            self.refresh_search_matches();
+        }
+
+        self.update_selected();
+    }
+
+    /// Apply results from the restart poller. Writes the post-cascade `Instance`
+    /// snapshot back into memory (so `restart_with_size`'s mutations and the
+    /// `#[serde(skip)]` `last_start_time` survive), clears the in-flight marker,
+    /// and persists. A failed cascade surfaces as `Status::Error` plus a
+    /// "Restart Failed" dialog (the user explicitly initiated the restart).
+    /// Returns true if any instance changed.
+    pub fn apply_restart_results(&mut self) -> bool {
+        use crate::session::Status;
+        use std::sync::mpsc::TryRecvError;
+
+        let mut touched = false;
+        loop {
+            match self.restart_poller.try_recv_result() {
+                Ok(result) => {
+                    let crate::session::restart::RestartResult {
+                        session_id,
+                        mut instance,
+                        outcome,
+                    } = result;
+
+                    self.restart_in_flight.remove(&session_id);
+
+                    match outcome {
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "session.restart",
+                                id = %session_id,
+                                error = %e,
+                                "restart cascade failed",
+                            );
+                            instance.status = Status::Error;
+                            instance.last_error = Some(e.clone());
+                            // Surface it: a cascade failure now arrives async, so
+                            // the input handler's "Restart Failed" dialog can no
+                            // longer catch it (restart_selected_session returned
+                            // Ok once the work was enqueued).
+                            self.info_dialog = Some(InfoDialog::new(
+                                "Restart Failed",
+                                &format!("Could not restart session: {e}"),
+                            ));
+                        }
+                    }
+
+                    if let Some(slot) = self.instances.iter_mut().find(|i| i.id == session_id) {
+                        *slot = *instance;
+                        touched = true;
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    // The single worker thread is gone (a panic in
+                    // perform_restart dropped result_tx). Clear the in-flight set
+                    // defensively so the stuck rows fall back to the StatusPoller
+                    // (which marks them Error) instead of being filtered out of
+                    // polling forever by `pollable_instances`. Mirrors the
+                    // Disconnected handling in `apply_recovery_updates`.
+                    if !self.restart_in_flight.is_empty() {
+                        tracing::error!(
+                            target: "session.restart",
+                            "restart poller worker gone; clearing in-flight set",
+                        );
+                        self.restart_in_flight.clear();
+                        touched = true;
+                    }
+                    break;
+                }
             }
+        }
 
-            self.update_selected();
+        if touched {
+            self.refresh_rows_preserving_selection();
+            if let Err(e) = self.save() {
+                tracing::error!(target: "tui.home", "Failed to save after restart: {}", e);
+            }
         }
         touched
     }

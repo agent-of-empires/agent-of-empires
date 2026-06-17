@@ -95,6 +95,13 @@ pub struct SessionResponse {
     /// responses leave it `false` and the sidebar reads the list value. #1927.
     #[serde(default)]
     pub tie_workdir_to_name: bool,
+    /// Smart-rename indicator state for structured view sessions: `pending`
+    /// (still default-named and eligible, will auto-name on the next prompt),
+    /// `running` (a one-shot title call is in flight), or `inactive`. Populated
+    /// by `list_sessions`; single-session responses leave it `inactive`. See
+    /// `session::smart_rename`.
+    #[serde(default)]
+    pub smart_rename: crate::session::smart_rename::SmartRenameState,
     pub has_terminal: bool,
     pub profile: String,
     pub cleanup_defaults: CleanupDefaults,
@@ -264,6 +271,8 @@ impl SessionResponse {
                 .is_some_and(|w| w.managed_by_aoe),
             // Overlaid per-profile in list_sessions; see the field doc.
             tie_workdir_to_name: false,
+            // Overlaid in list_sessions; single-session responses stay inactive.
+            smart_rename: crate::session::smart_rename::SmartRenameState::Inactive,
             has_terminal: inst.terminal_info.is_some(),
             profile: inst.source_profile.clone(),
             cleanup_defaults: CleanupDefaults {
@@ -517,6 +526,58 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
                     .tie_workdir_to_name
             });
             session.tie_workdir_to_name = tied;
+        }
+    }
+
+    // Overlay the smart-rename indicator. `running` comes from the live
+    // in-flight set; `pending` from the shared eligibility predicate, so the
+    // chip cannot drift from the runtime gate. Config resolved once per profile.
+    {
+        use crate::session::smart_rename::{check_eligible, SmartRenameState};
+        use std::collections::{HashMap, HashSet};
+        let inflight: HashSet<String> = state
+            .smart_rename_inflight
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        let attempted: HashSet<String> = state
+            .smart_rename_attempted
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        let mut cfg_cache: HashMap<String, (bool, HashMap<String, String>)> = HashMap::new();
+        for (resp, inst) in sessions.iter_mut().zip(instances.iter()) {
+            if inflight.contains(&inst.id) {
+                resp.smart_rename = SmartRenameState::Running;
+                continue;
+            }
+            // A session whose one-shot already ran (and failed, since the name
+            // is still default) will not retry, so it is not pending either.
+            if attempted.contains(&inst.id) {
+                continue;
+            }
+            let (setting_on, overrides) = cfg_cache
+                .entry(inst.source_profile.clone())
+                .or_insert_with(|| {
+                    let cfg = crate::session::profile_config::resolve_config_or_warn(
+                        &inst.source_profile,
+                    )
+                    .session;
+                    (cfg.smart_rename, cfg.agent_command_override)
+                });
+            let eligible = check_eligible(
+                inst.is_structured(),
+                *setting_on,
+                &inst.title,
+                crate::agents::get_agent(&inst.tool),
+                inst.is_sandboxed(),
+                &inst.command,
+                overrides.contains_key(&inst.tool),
+            )
+            .is_ok();
+            if eligible {
+                resp.smart_rename = SmartRenameState::Pending;
+            }
         }
     }
 
@@ -1673,10 +1734,9 @@ pub struct UpdatePinBody {
 #[derive(Deserialize)]
 pub struct UpdateArchiveBody {
     pub archived: bool,
-    /// When `archived = true`, kill the tmux pane (parity with the TUI's
-    /// `z` keybind and the CLI's `aoe session archive` default). Omitted
-    /// or `true` means kill; `false` keeps the pane alive while still
-    /// marking the session archived. Ignored when `archived = false`.
+    /// On archive, tear down every tmux session this instance owns. `false`
+    /// keeps tmux state alive; structured-view supervisor shutdown is
+    /// unconditional. Ignored when `archived = false`. See #1868.
     #[serde(default = "default_kill_pane")]
     pub kill_pane: bool,
 }
@@ -1867,48 +1927,20 @@ pub async fn update_session_archive(
         let inst_snap = inst.clone();
         drop(instances);
 
-        // Stash the structured-view flag + clone + response and break out to do
-        // the side effects below. Return early on the non-archive path
-        // because we have no work left to do; the kill_pane=false case
-        // is NOT a short-circuit because structured view shutdown still has to
-        // run for structured view-mode sessions (kill_pane is a tmux-only
-        // switch, per the request-body documentation).
+        // Snapshot and drop the lock; run side effects below. Unarchive
+        // returns here; archive does NOT short-circuit on kill_pane=false
+        // because structured-view shutdown is unconditional.
         if !archived {
             return (StatusCode::OK, Json(serde_json::json!(response))).into_response();
         }
         (structured_view, inst_snap, body.kill_pane)
     };
 
-    // Best-effort tmux pane teardown for tmux-backed sessions. Mirrors
-    // `toggle_archive_at_cursor` in src/tui/home/operations.rs: if the
-    // kill fails (pane already dead, tmux gone), log and continue
-    // because the on-disk archived flag is the source of truth. The
-    // kill_pane=false body opt-out applies only here, so a caller can
-    // archive a tmux session without killing its pane while still
-    // unconditionally stopping a structured view worker on the other branch.
-    if !was_structured_view {
-        if kill_pane {
-            let inst_for_kill = inst_clone.clone();
-            match tokio::task::spawn_blocking(move || inst_for_kill.kill()).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => tracing::warn!(
-                    target: "http.api.sessions",
-                    "Archive: tmux kill failed: {e}"
-                ),
-                Err(e) => tracing::warn!(
-                    target: "http.api.sessions",
-                    "Archive: tmux kill join failed: {e}"
-                ),
-            }
-        }
-    } else {
-        // Acp sessions: shut down the worker so the supervisor's
-        // reconciler does not race to respawn it. The reconciler also
-        // skips archived sessions (see acp_reconciler.rs), but
-        // shutting down here gives an immediate teardown rather than
-        // waiting for the next poll tick. `shutdown` preserves the
-        // agent transcript (no session/delete), so unarchiving resumes
-        // the conversation instead of resetting it (#1710).
+    // Best-effort tmux teardown (helper logs at debug). #1868.
+    if was_structured_view {
+        // Worker shutdown before ancillary kill so in-flight tool output
+        // settles (mirrors acp.rs:1304-1310). shutdown() preserves the
+        // transcript (#1710).
         #[cfg(feature = "serve")]
         match state.acp_supervisor.shutdown(&id).await {
             Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
@@ -1917,6 +1949,28 @@ pub async fn update_session_archive(
                 session = %id,
                 "shutdown during archive failed: {e}"
             ),
+        }
+        if kill_pane {
+            let inst_for_kill = inst_clone.clone();
+            if let Err(e) =
+                tokio::task::spawn_blocking(move || inst_for_kill.kill_ancillary_tmux_sessions())
+                    .await
+            {
+                tracing::warn!(
+                    target: "http.api.sessions",
+                    "Archive: ancillary tmux kill join failed: {e}"
+                );
+            }
+        }
+    } else if kill_pane {
+        let inst_for_kill = inst_clone.clone();
+        if let Err(e) =
+            tokio::task::spawn_blocking(move || inst_for_kill.kill_all_tmux_sessions()).await
+        {
+            tracing::warn!(
+                target: "http.api.sessions",
+                "Archive: tmux kill join failed: {e}"
+            );
         }
     }
 
@@ -6343,6 +6397,7 @@ mod workspace_ordering_tests {
             scratch: false,
             has_managed_worktree: false,
             tie_workdir_to_name: false,
+            smart_rename: crate::session::smart_rename::SmartRenameState::Inactive,
             has_terminal: false,
             profile: "default".to_string(),
             cleanup_defaults: CleanupDefaults {

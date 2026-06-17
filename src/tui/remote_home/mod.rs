@@ -166,7 +166,11 @@ async fn run(
                         &session.id,
                     )
                     .await?;
-                    terminal.clear()?;
+                    // Use the shared helper, not `terminal.clear()`: the latter
+                    // does an `ESC[6n` cursor read that races the live
+                    // `EventStream` and can abort with "cursor position could
+                    // not be read" (see `crate::tui::clear_terminal`).
+                    crate::tui::clear_terminal(terminal)?;
                 }
             }
             _ => {}

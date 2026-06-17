@@ -19,7 +19,7 @@ Each sidebar row carries an animated braille glyph encoding the session's state:
 
 The **New session** wizard walks four steps:
 
-- **Project**: pick the working directory from recent and registered projects, or start a scratch session with no path. The Recent list keeps a project around after its last session is deleted, so you can quickly start there again; entries whose directory no longer exists are dropped.
+- **Project**: pick the working directory from the Recent tab, browse for one, clone a URL, or start a scratch session with no path. The Recent tab lists your saved projects under a "Saved projects" section above the directories of your recent sessions. The recent list keeps a project around after its last session is deleted, so you can quickly start there again; entries whose directory no longer exists are dropped.
 - **Session**: set the title (auto-slugifies into a worktree branch name unless you edit the branch), or attach an existing branch instead.
 - **Agent**: select the tool and profile, plus per-session knobs (auto-approve / YOLO mode, "Run in a safe container" sandbox, command override, extra args / env).
 - **Review**: confirm before the session spawns.
@@ -29,6 +29,8 @@ Choosing a profile seeds the agent-step defaults. If you have already edited a f
 ## Command palette
 
 The command palette (top-bar button or keyboard shortcut) is a fuzzy launcher for global actions: jump to a session, open settings, start a new session, toggle the right panel.
+
+Individual settings also appear in the palette under `Settings`. A writable toggle flips inline from the palette (a toast confirms, and the subtitle shows its current state and scope); every other setting opens the settings view on its tab. Read-only servers and settings that need elevation jump to the settings view instead of writing. The Settings header also has its own search box (and the TUI settings screen the `/` key) that filters settings across every tab and jumps to the one you pick.
 
 ## First-run onboarding
 
@@ -67,7 +69,7 @@ The choice is per-browser (localStorage). Collapse state is tracked separately p
 The right-click (long-press on touch) context menu on any session row exposes three triage primitives:
 
 - **Pin**: floats the workspace to the top in every sort mode. Pin is web-only and distinct from the favorite mark (a within-tier Attention signal on both surfaces). Renders as a pushpin glyph.
-- **Archive**: kills the session's tmux pane (or shuts down the structured-view worker for ACP sessions) and sinks the row into the collapsible "Snoozed & archived" footer. Sending a message wakes it back into the live list. Daemon restarts skip archived sessions.
+- **Archive**: tears down every tmux session the workspace owns (agent, web terminal, container terminal, and tool sub-sessions; pass `kill_pane: false` in the API body, or `--no-kill` on the CLI, to skip the tmux teardown) and shuts down the structured-view worker for ACP sessions, then sinks the row into the collapsible "Snoozed & archived" footer. Sending a message wakes it back into the live list. Daemon restarts skip archived sessions. See #1868.
 - **Snooze**: sinks the row for a chosen duration (presets: 1h, 2h, 3h, 4h, 5h, 6h, 1d, 1w). Wakes when the timer expires; sending a message wakes it early.
 
 Snooze and archive are mutually exclusive with pin (pinning a sunk row surfaces it; archiving or snoozing a pinned row removes the pin). The "Snoozed & archived" section sits at the bottom and aggregates every sunk workspace; collapsed by default, its state persists in localStorage. The three menu entries are hidden in read-only mode.
@@ -84,7 +86,7 @@ With a selection active, a bulk action bar shows the count and applicable action
 
 ## Profiles
 
-The Profiles entry in the sidebar footer opens `/profiles` for managing configuration profiles: a left rail lists every profile with a **default** badge; the detail panel lets you create, rename, delete, set the default, and edit a description. **Edit configuration** buttons deep-link into the matching Settings tab scoped to that profile (`/settings/<tab>?profile=<name>`).
+The **Profiles** tab in Settings (`/settings/profiles`, the first entry in the Settings sidebar) manages configuration profiles: a left rail lists every profile with a **default** badge; the detail panel lets you create, rename, delete, set the default, and edit a description. **Edit configuration** buttons deep-link into the matching Settings tab scoped to that profile (`/settings/<tab>?profile=<name>`). The old `/profiles` URL redirects here.
 
 Lifecycle hooks are shown **read-only** here, each labeled with its source (profile override, an override disabling inherited commands, inherited global commands, or none). Hooks run arbitrary shell commands, so they are never writable from the web; edit them in your config file or the TUI. The same applies to the agent-command and environment fields. In read-only mode the create / rename / delete / set-default / description controls are hidden.
 

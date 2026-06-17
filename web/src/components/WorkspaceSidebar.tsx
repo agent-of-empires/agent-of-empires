@@ -24,6 +24,7 @@ import {
   Pin,
   Play,
   Plus,
+  Sparkles,
 } from "lucide-react";
 import {
   DndContext,
@@ -158,7 +159,6 @@ interface Props {
   onUnpinProject?: (group: SidebarGroup) => void;
   onSettings: () => void;
   onProjects: () => void;
-  onProfiles: () => void;
   onDeleteSession?: (workspaceId: string) => void;
   onStopSession?: (workspaceId: string) => void;
   onStartSession?: (workspaceId: string) => void;
@@ -984,6 +984,26 @@ export const SessionRow = memo(function SessionRow({
                 >
                   <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-amber-400/80" />
                   Resuming
+                </span>
+              )}
+              {firstSession?.smart_rename === "pending" && (
+                <span
+                  title="Will auto-name this session from your first message"
+                  aria-label="Will auto-name"
+                  className="inline-flex shrink-0 items-center gap-0.5 rounded border border-surface-700/40 bg-surface-800/40 px-1 py-0 text-[10px] font-mono font-medium text-text-dim"
+                >
+                  <Sparkles className="h-3 w-3" />
+                  <span className="hidden sm:inline">Auto-name</span>
+                </span>
+              )}
+              {firstSession?.smart_rename === "running" && (
+                <span
+                  title="Generating a name from your first message"
+                  aria-label="Naming"
+                  className="inline-flex shrink-0 items-center gap-0.5 rounded border border-amber-700/40 bg-amber-950/30 px-1 py-0 text-[10px] font-medium text-amber-300"
+                >
+                  <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-amber-400/80" />
+                  Naming…
                 </span>
               )}
               {firstSession?.next_wakeup_at && (
@@ -2011,7 +2031,6 @@ export function WorkspaceSidebar({
   onUnpinProject,
   onSettings,
   onProjects,
-  onProfiles,
   onDeleteSession,
   onStopSession,
   onStartSession,
@@ -2816,28 +2835,6 @@ export function WorkspaceSidebar({
               strokeLinejoin="round"
             >
               <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
-            </svg>
-          </button>
-          <button
-            onClick={onProfiles}
-            className="w-8 h-8 flex items-center justify-center text-text-secondary hover:text-text-primary hover:bg-surface-800/50 cursor-pointer rounded-md transition-colors"
-            title="Profiles"
-            aria-label="Profiles"
-          >
-            <svg
-              width="16"
-              height="16"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="1.5"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
-              <circle cx="9" cy="7" r="4" />
-              <path d="M22 21v-2a4 4 0 0 0-3-3.87" />
-              <path d="M16 3.13a4 4 0 0 1 0 7.75" />
             </svg>
           </button>
           <button

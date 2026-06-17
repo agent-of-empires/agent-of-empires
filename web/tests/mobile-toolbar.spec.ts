@@ -22,8 +22,10 @@ test.describe("Mobile terminal toolbar", () => {
     await clickSidebarSession(page, "pinch-test");
     await expect(page).toHaveURL(/\/session\/pinch-test/, { timeout: 10_000 });
     // Wait for the terminal pane so the negative assertions run against
-    // the fully mounted session view, not a still-loading shell.
-    await expect(page.locator(".xterm").first()).toBeVisible({ timeout: 15_000 });
+    // the fully mounted session view, not a still-loading shell. The live
+    // view now renders on desktop too; its touch toolbar is gated off
+    // fine-pointer devices.
+    await expect(page.locator("[data-live-terminal]").first()).toBeVisible({ timeout: 15_000 });
 
     await expect(page.getByRole("button", { name: "Arrow up" })).toHaveCount(0);
     await expect(page.getByRole("button", { name: "Ctrl+C interrupt" })).toHaveCount(0);

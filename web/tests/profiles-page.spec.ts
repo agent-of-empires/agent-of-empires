@@ -1,13 +1,14 @@
-// Dedicated Profiles page (/profiles): CRUD + set-default + description
-// round-trips, the deep-link into Settings (?profile=), the sidebar-footer
-// entry point, the read-only mode, and the hooks panel invariant. Ported from
-// live to the mocked suite: a stateful in-route profile store stands in for
-// the backend, so "persists" assertions check the store and the post-reload
-// UI rather than a real config file.
+// Profiles settings tab (/settings/profiles): CRUD + set-default + description
+// round-trips, the deep-link into other Settings tabs (?profile=), the retired
+// /profiles redirect, the absence of the old sidebar button, the read-only
+// mode, and the hooks panel invariant. Ported from live to the mocked suite: a
+// stateful in-route profile store stands in for the backend, so "persists"
+// assertions check the store and the post-reload UI rather than a real config
+// file.
 //
 // Component-level handler details (the hooks-never-PATCHed invariant across
 // every interaction, the in-flight description edit race) are pinned in
-// ProfilesPage.test.tsx; this spec covers the app-level wiring: routing,
+// ProfilesSection.test.tsx; this spec covers the app-level wiring: routing,
 // the /api/about read_only flag, and the dropdown/rail refresh loops.
 
 import { test, expect } from "./helpers/mockedTest";
@@ -112,7 +113,7 @@ async function installProfilesPageMocks(
 }
 
 async function openProfiles(page: Page) {
-  await page.goto("/profiles");
+  await page.goto("/settings/profiles");
   await expect(page.getByRole("heading", { name: "Profiles" })).toBeVisible();
 }
 
@@ -164,7 +165,8 @@ test("Edit configuration deep-links into Settings scoped to the profile", async 
   await openProfiles(page);
 
   await page.getByRole("button", { name: "work", exact: true }).click();
-  await page.getByRole("button", { name: /^Session/ }).click();
+  // The arrow disambiguates the "Session ->" deep-link from the "Session" nav tab.
+  await page.getByRole("button", { name: "Session →" }).click();
 
   await expect(page).toHaveURL(/\/settings\/session\?profile=work/);
   const profileSelect = page
@@ -174,15 +176,22 @@ test("Edit configuration deep-links into Settings scoped to the profile", async 
   await expect(profileSelect).toHaveValue("work");
 });
 
-test("opens from the sidebar footer and closes back to the dashboard", async ({ page }) => {
+test("the retired /profiles route redirects into the Settings Profiles tab", async ({ page }) => {
   await installProfilesPageMocks(page);
-  await page.goto("/");
-  await page.getByRole("button", { name: "Profiles", exact: true }).click();
-  await expect(page).toHaveURL(/\/profiles$/);
+  await page.goto("/profiles");
+  await expect(page).toHaveURL(/\/settings\/profiles$/);
   await expect(page.getByRole("heading", { name: "Profiles" })).toBeVisible();
 
-  await page.getByRole("button", { name: "Close" }).click();
-  await expect(page).not.toHaveURL(/\/profiles/);
+  // The redirect preserves any query string (e.g. a ?profile= deep link).
+  await page.goto("/profiles?profile=work");
+  await expect(page).toHaveURL(/\/settings\/profiles\?profile=work$/);
+});
+
+test("the dashboard sidebar footer no longer has a Profiles button", async ({ page }) => {
+  await installProfilesPageMocks(page);
+  await page.goto("/");
+  await expect(page.getByRole("button", { name: "Settings", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Profiles", exact: true })).toHaveCount(0);
 });
 
 test("read-only mode hides every mutation control", async ({ page }) => {
@@ -190,11 +199,14 @@ test("read-only mode hides every mutation control", async ({ page }) => {
   await openProfiles(page);
   await page.getByRole("button", { name: "work", exact: true }).click();
 
-  await expect(page.getByPlaceholder("What this profile is for")).toBeVisible();
-  await expect(page.getByRole("button", { name: "+ New profile" })).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "Set as default" })).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "Rename" })).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "Save" })).toHaveCount(0);
+  // Scope to the section: the Settings header's ProfileSelector has its own
+  // create/rename/delete controls (tracked separately) that we are not asserting here.
+  const section = page.getByTestId("profiles-section");
+  await expect(section.getByPlaceholder("What this profile is for")).toBeVisible();
+  await expect(section.getByRole("button", { name: "+ New profile" })).toHaveCount(0);
+  await expect(section.getByRole("button", { name: "Set as default" })).toHaveCount(0);
+  await expect(section.getByRole("button", { name: "Rename" })).toHaveCount(0);
+  await expect(section.getByRole("button", { name: "Save" })).toHaveCount(0);
 });
 
 test("lifecycle hooks render read-only with the explain-why note", async ({ page }) => {

@@ -137,3 +137,123 @@ test.describe("URL routing", () => {
     await expect(page).toHaveURL("/settings");
   });
 });
+
+const LAST_SESSION_KEY = "aoe-last-session-id";
+
+function makeSession(id: string) {
+  return {
+    id,
+    title: id,
+    project_path: `/tmp/${id}`,
+    group_path: "/tmp",
+    tool: "claude",
+    status: "Running",
+    yolo_mode: false,
+    created_at: new Date().toISOString(),
+    last_accessed_at: null,
+    idle_entered_at: null,
+    last_error: null,
+    branch: null,
+    main_repo_path: null,
+    is_sandboxed: false,
+    has_managed_worktree: false,
+    has_terminal: true,
+    profile: "default",
+    cleanup_defaults: {},
+    remote_owner: null,
+    notify_on_waiting: null,
+    notify_on_idle: null,
+    notify_on_error: null,
+    claude_fullscreen: false,
+    workspace_repos: [],
+  };
+}
+
+async function stubSessions(page: import("@playwright/test").Page, ids: string[]) {
+  await page.route("**/api/sessions", (r) => {
+    if (r.request().method() === "POST") return r.fulfill({ status: 400 });
+    return r.fulfill({ json: { sessions: ids.map(makeSession), workspace_ordering: [] } });
+  });
+  await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));
+  await page.route("**/api/sessions/*/terminal", (r) => r.fulfill({ status: 200, body: "" }));
+  await page.routeWebSocket(/\/sessions\/.*\/(ws|acp-ws)$/, () => {});
+}
+
+// Verifies the PWA reopens to the session the user last had open (#2103).
+test.describe("PWA last-session restore", () => {
+  test("cold launch to '/' restores the stored last session", async ({ page }) => {
+    await stubSessions(page, ["known-session"]);
+    await page.addInitScript(
+      ([key, id]) => {
+        try {
+          localStorage.setItem(key, id);
+        } catch {
+          // storage disabled; the app degrades to no-restore
+        }
+      },
+      [LAST_SESSION_KEY, "known-session"],
+    );
+
+    await page.goto("/");
+    await expect(page).toHaveURL("/session/known-session");
+    await expect(page.getByRole("button", { name: NEW_SESSION_PANE_NAME })).not.toBeVisible();
+  });
+
+  test("cold launch stays on the dashboard when the stored session no longer exists", async ({ page }) => {
+    await stubSessions(page, ["other-session"]);
+    await page.addInitScript(
+      ([key, id]) => {
+        try {
+          localStorage.setItem(key, id);
+        } catch {
+          // storage disabled; the app degrades to no-restore
+        }
+      },
+      [LAST_SESSION_KEY, "deleted-session"],
+    );
+
+    await page.goto("/");
+    await expect(page.getByRole("button", { name: NEW_SESSION_PANE_NAME })).toBeVisible();
+    await expect(page).toHaveURL("/");
+    // The stale id is dropped so it is not re-evaluated on the next launch.
+    await expect.poll(() => page.evaluate((k) => localStorage.getItem(k), LAST_SESSION_KEY)).toBe(null);
+  });
+
+  test("a deep link to a session is not overridden by the stored last session", async ({ page }) => {
+    await stubSessions(page, ["known-session", "deep-link-session"]);
+    await page.addInitScript(
+      ([key, id]) => {
+        try {
+          localStorage.setItem(key, id);
+        } catch {
+          // storage disabled; the app degrades to no-restore
+        }
+      },
+      [LAST_SESSION_KEY, "known-session"],
+    );
+
+    await page.goto("/session/deep-link-session");
+    await expect(page).toHaveURL("/session/deep-link-session");
+  });
+
+  test("visiting a session records it as the last session", async ({ page }) => {
+    await stubSessions(page, ["known-session"]);
+
+    await page.goto("/session/known-session");
+    await expect(page).toHaveURL("/session/known-session");
+    await expect.poll(() => page.evaluate((k) => localStorage.getItem(k), LAST_SESSION_KEY)).toBe("known-session");
+  });
+
+  test("returning to the dashboard in-app clears the stored last session", async ({ page }) => {
+    await stubSessions(page, ["known-session"]);
+
+    await page.goto("/session/known-session");
+    await expect.poll(() => page.evaluate((k) => localStorage.getItem(k), LAST_SESSION_KEY)).toBe("known-session");
+
+    await page.getByRole("button", { name: "Go to dashboard" }).click();
+    await expect(page).toHaveURL("/");
+    // Leaving for the dashboard makes the dashboard the remembered view, so a
+    // later cold launch should not bounce the user back into the session.
+    await expect.poll(() => page.evaluate((k) => localStorage.getItem(k), LAST_SESSION_KEY)).toBe(null);
+  });
+});

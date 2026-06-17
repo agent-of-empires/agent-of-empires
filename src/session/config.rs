@@ -444,6 +444,23 @@ pub struct AcpConfig {
     #[serde(default = "default_rate_limit_auto_resume_grace_secs")]
     #[setting(label = "Auto-resume grace (s)", widget = "number", min = 0, advanced)]
     pub rate_limit_auto_resume_grace_secs: u32,
+    /// Allow the web dashboard's "Update & restart" control to run the
+    /// agent's `npm install -g <pkg>` on the host and respawn the worker.
+    /// Off by default: the daemon executing a global package install is a
+    /// host-level capability (it runs arbitrary npm lifecycle scripts as the
+    /// daemon user), so it stays opt-in, is always blocked in read-only mode,
+    /// and is `local_only` so a remote dashboard client cannot flip it on.
+    /// Only npm-installable agents are eligible; others keep the manual
+    /// install hint. See #2109.
+    #[serde(default)]
+    #[setting(
+        label = "Allow agent install from web",
+        widget = "toggle",
+        web = "local_only:runs npm install on the host as the daemon user",
+        global_only,
+        advanced
+    )]
+    pub allow_agent_install: bool,
 }
 
 fn default_rate_limit_auto_resume_grace_secs() -> u32 {
@@ -520,6 +537,7 @@ impl Default for AcpConfig {
             auto_stop_idle_secs: default_auto_stop_idle_secs(),
             rate_limit_auto_resume: false,
             rate_limit_auto_resume_grace_secs: default_rate_limit_auto_resume_grace_secs(),
+            allow_agent_install: false,
         }
     }
 }
@@ -668,6 +686,12 @@ pub struct AppStateConfig {
     #[serde(default)]
     pub has_seen_custom_instruction_warning: bool,
 
+    /// Latches once the user has been warned (when adding a project in the TUI)
+    /// that the directory is not a git repository, so the one-time notice about
+    /// git features being unavailable does not repeat on every non-git add.
+    #[serde(default)]
+    pub has_seen_non_git_project_warning: bool,
+
     #[serde(default)]
     pub has_acknowledged_agent_hooks: bool,
 
@@ -759,6 +783,17 @@ pub struct SessionConfig {
     #[serde(default = "default_true")]
     #[setting(label = "Agent Status Hooks", widget = "toggle", category = "Agents")]
     pub agent_status_hooks: bool,
+
+    /// Auto-rename a new structured-view (ACP) session from its first message,
+    /// using the session's own agent in one-shot mode (e.g. `claude -p`). Only
+    /// applies while the session still carries its auto-generated name; a
+    /// manually named session is never touched. Title only: the worktree
+    /// directory is not moved (the running agent holds it). Agents without a
+    /// one-shot mode, sandboxed sessions, and command-overridden agents keep
+    /// the generated name.
+    #[serde(default = "default_true")]
+    #[setting(label = "Smart Session Rename", widget = "toggle", category = "Agents")]
+    pub smart_rename: bool,
 
     /// Request xterm mouse tracking so the TUI handles the scroll wheel
     /// (preview-pane scroll) and click-to-select rows. Disable to hand the
@@ -1088,6 +1123,7 @@ impl Default for SessionConfig {
             agent_extra_args: HashMap::new(),
             agent_command_override: HashMap::new(),
             agent_status_hooks: true,
+            smart_rename: true,
             mouse_capture: true,
             custom_agents: HashMap::new(),
             agent_detect_as: HashMap::new(),

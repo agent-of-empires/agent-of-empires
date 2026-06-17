@@ -9,6 +9,7 @@ import { Page } from "@playwright/test";
 
 async function mockBaseApis(page: Page) {
   await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
+  await page.route("**/api/projects", (r) => r.fulfill({ json: [] }));
   for (const path of ["settings", "themes", "profiles", "groups", "devices", "about", "system/update-status"]) {
     await page.route(`**/api/${path}`, (r) =>
       r.fulfill({
@@ -91,6 +92,30 @@ test.describe("Wizard project step (#1219)", () => {
     await expect(page.getByRole("button", { name: "Recent" })).toHaveCount(0);
     // Browse tab is active: directory-browser breadcrumb root (`~`) renders.
     await expect(page.getByTitle("Go to home")).toBeVisible();
+  });
+
+  test("saved projects show under the Recent tab even with no sessions (#2140)", async ({ page }) => {
+    await mockBaseApis(page);
+    await page.route("**/api/sessions", (r) => r.fulfill({ json: { sessions: [], workspace_ordering: [] } }));
+    // Saved registry has one project; no live sessions exist.
+    await page.route("**/api/projects", (r) =>
+      r.fulfill({ json: [{ name: "my-saved-repo", path: "/srv/my-saved-repo", scope: "global" }] }),
+    );
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await page.goto("/");
+    await openWizard(page);
+    // Recent tab is present and active despite zero sessions, because a
+    // saved project exists.
+    await expect(page.getByRole("button", { name: "Recent", exact: true })).toBeVisible();
+    await expect(page.getByText("Saved projects")).toBeVisible();
+    const savedRow = page.getByRole("button").filter({ hasText: "/srv/my-saved-repo" }).first();
+    await expect(savedRow).toBeVisible();
+    // Selecting the saved project populates the wizard path.
+    await savedRow.click();
+    await expect(page.getByText("Selected project")).toBeVisible();
+    // Scope to the selected-project panel's paragraph; the saved row also
+    // renders the same path (in a span), so an unscoped match is ambiguous.
+    await expect(page.getByRole("paragraph").filter({ hasText: "/srv/my-saved-repo" })).toBeVisible();
   });
 
   test("switching to Browse tab renders DirectoryBrowser and selecting a repo populates path", async ({ page }) => {
