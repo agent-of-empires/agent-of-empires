@@ -1,6 +1,16 @@
 import { afterEach, describe, expect, it } from "vitest";
 
-import { applyEvent, emptyAcpState, setActivityLimit, type AcpFrame, type AcpState, type ToolCall } from "./acpTypes";
+import {
+  appendElicitationAnswerRow,
+  applyEvent,
+  emptyAcpState,
+  setActivityLimit,
+  summarizeAnswers,
+  type AcpFrame,
+  type AcpState,
+  type Elicitation,
+  type ToolCall,
+} from "./acpTypes";
 
 // Targets the AcpEvent variants and helper branches the canonical
 // acpTypes.test.ts leaves cold: PlanUpdated, ThinkingEnded, the
@@ -115,6 +125,155 @@ describe("applyEvent / approval lifecycle", () => {
       event: { ApprovalResolved: { nonce: "other", decision: "Deny" } },
     });
     expect(state.pendingApprovals.map((a) => a.nonce)).toEqual(["keep"]);
+  });
+});
+
+describe("summarizeAnswers (#2209)", () => {
+  function question(field_key: string, kind: Elicitation["questions"][number]["kind"], title?: string) {
+    return { field_key, title: title ?? null, required: false, kind, options: [] };
+  }
+  function form(questions: Elicitation["questions"]): Elicitation {
+    return { nonce: "n", message: "m", questions, requested_at: "2026-01-01T00:00:00Z" };
+  }
+
+  it("renders every answer kind in question order, omitting unanswered fields", () => {
+    const elicitation = form([
+      question("sel", "single_select", "Color"),
+      question("multi", "multi_select", "Tags"),
+      question("txt", "free_text", "Name"),
+      question("flag_on", "boolean", "On"),
+      question("flag_off", "boolean", "Off"),
+      question("num", "number", "Score"),
+      question("blank", "free_text"), // unanswered -> omitted
+    ]);
+    const out = summarizeAnswers(elicitation, {
+      sel: "Blue",
+      multi: ["a", "b"],
+      txt: "Ada",
+      flag_on: true,
+      flag_off: false,
+      num: 4,
+    });
+    expect(out).toEqual([
+      { question: "Color", answer: "Blue" },
+      { question: "Tags", answer: "a, b" },
+      { question: "Name", answer: "Ada" },
+      { question: "On", answer: "Yes" },
+      { question: "Off", answer: "No" },
+      { question: "Score", answer: "4" },
+    ]);
+  });
+
+  it("falls back to the field key when a question has no title", () => {
+    const out = summarizeAnswers(form([question("question_0", "free_text")]), { question_0: "hi" });
+    expect(out).toEqual([{ question: "question_0", answer: "hi" }]);
+  });
+
+  it("maps select values to option labels (MCP token, and AskUserQuestion desc)", () => {
+    const q = {
+      field_key: "color",
+      title: "Color",
+      required: true,
+      kind: "single_select" as const,
+      options: [
+        { value: "tok_blue", label: "Blue" }, // MCP: token -> human label
+        { value: "Green", label: "Green \u2014 the color green" }, // AskUserQuestion: keep bare value
+      ],
+    };
+    expect(summarizeAnswers(form([q]), { color: "tok_blue" })[0]!.answer).toBe("Blue");
+    expect(summarizeAnswers(form([q]), { color: "Green" })[0]!.answer).toBe("Green");
+  });
+});
+
+describe("appendElicitationAnswerRow (#2209)", () => {
+  it("appends a keyed row and is idempotent by id", () => {
+    const a = appendElicitationAnswerRow([], "n-1", [{ question: "q", answer: "a" }]);
+    expect(a).toHaveLength(1);
+    expect(a[0]!.id).toBe("elicitation-n-1");
+    const b = appendElicitationAnswerRow(a, "n-1", [{ question: "q", answer: "a" }]);
+    expect(b).toBe(a); // same ref, no duplicate
+  });
+
+  it("is a no-op for empty answers", () => {
+    expect(appendElicitationAnswerRow([], "n-1", [])).toEqual([]);
+  });
+});
+
+describe("applyEvent / elicitation answer (#2209)", () => {
+  const elicitation = {
+    nonce: "el-1",
+    message: "Pick",
+    questions: [],
+    requested_at: "2026-01-01T00:00:00Z",
+  };
+
+  it("records an elicitation_answered row on ElicitationResolved and clears the card", () => {
+    let state = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: { ElicitationRequested: { elicitation } },
+    });
+    expect(state.pendingElicitations).toHaveLength(1);
+
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: {
+        ElicitationResolved: {
+          nonce: "el-1",
+          outcome: "Accepted",
+          answers: [{ question: "Proceed?", answer: "Yes" }],
+        },
+      },
+    });
+    expect(state.pendingElicitations).toHaveLength(0);
+    const row = state.activity.find((r) => r.kind === "elicitation_answered");
+    expect(row?.id).toBe("elicitation-el-1");
+    expect(row?.elicitationAnswers).toEqual([{ question: "Proceed?", answer: "Yes" }]);
+  });
+
+  it("dedupes by id so a re-broadcast does not add a second row", () => {
+    let state = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: {
+        ElicitationResolved: {
+          nonce: "el-1",
+          outcome: "Accepted",
+          answers: [{ question: "Q", answer: "A" }],
+        },
+      },
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: {
+        ElicitationResolved: {
+          nonce: "el-1",
+          outcome: "Accepted",
+          answers: [{ question: "Q", answer: "A" }],
+        },
+      },
+    });
+    expect(state.activity.filter((r) => r.kind === "elicitation_answered")).toHaveLength(1);
+  });
+
+  it("adds no row when the elicitation was skipped or cancelled (empty answers)", () => {
+    const state = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: { ElicitationResolved: { nonce: "el-1", outcome: "Declined", answers: [] } },
+    });
+    expect(state.activity.some((r) => r.kind === "elicitation_answered")).toBe(false);
+  });
+
+  it("tolerates an event with no answers field (pre-#2209 stored events)", () => {
+    const state = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: { ElicitationResolved: { nonce: "el-1", outcome: "Accepted" } },
+    });
+    expect(state.activity.some((r) => r.kind === "elicitation_answered")).toBe(false);
   });
 });
 

@@ -722,6 +722,15 @@ fn transcript_lines<'a>(
                 }
                 out.push(Line::default());
             }
+            ActivityRow::ElicitationAnswer(answers) => {
+                for answer in answers {
+                    out.push(Line::from(Span::styled(
+                        format!("you  ▸ {}: {}", answer.question, answer.answer),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )));
+                }
+                out.push(Line::default());
+            }
             ActivityRow::Note { kind, text } => {
                 let modifier = match kind {
                     NoteKind::Info => Modifier::DIM,
@@ -1331,6 +1340,30 @@ mod tests {
 
     fn joined(lines: &[Line]) -> String {
         lines.iter().map(line_text).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn transcript_renders_elicitation_answers_as_user_rows() {
+        use crate::acp::elicitations::ElicitationAnswer;
+        let mut t = AcpTranscript::new("s-1");
+        t.rows.push(ActivityRow::ElicitationAnswer(vec![
+            ElicitationAnswer {
+                question: "Proceed?".into(),
+                answer: "Yes".into(),
+            },
+            ElicitationAnswer {
+                question: "Mode".into(),
+                answer: "Fast".into(),
+            },
+        ]));
+        let out = joined(&transcript_lines(
+            &t,
+            None,
+            Focus::Transcript,
+            &Theme::default(),
+        ));
+        assert!(out.contains("you  ▸ Proceed?: Yes"), "{out:?}");
+        assert!(out.contains("you  ▸ Mode: Fast"), "{out:?}");
     }
 
     #[test]

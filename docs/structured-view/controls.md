@@ -38,14 +38,15 @@ The card clears as soon as your decision is accepted. If it already resolved on 
 
 Some agents ask a structured question mid-turn rather than guessing. With `claude-agent-acp` this is the built-in `AskUserQuestion` tool; the daemon advertises the ACP form-elicitation capability so the agent surfaces it as a question card in the web dashboard. The same capability also lets an MCP server attached to the agent collect arbitrary structured input, which renders through the same card:
 
-- **Single-choice** questions render as radio buttons, **multi-choice** as checkboxes, and a free-text "Other" field shows when the agent offers one. When an option carries an explanation, it renders as a second line under the option label.
+- **Single-choice** questions render as radio buttons, **multi-choice** as checkboxes, and each question carries its own free-text "Other" box so you can type an answer instead of picking an option, scoped to that question. When an option carries an explanation, it renders as a second line under the option label.
 - MCP forms can also include **text** fields (typed by their format, so email / URL / date inputs get the matching control), **number** and **integer** fields, and **yes/no** checkboxes. Any field default the agent supplies is pre-filled.
 - **Submit** sends your answers back and the turn continues. **Skip** answers nothing (the agent proceeds without your input). **Cancel** aborts the tool call.
+- After you answer, the card closes and your picked answer is recorded in the transcript as your turn, so the history shows what you chose instead of jumping straight to the next agent output. Skipping leaves a short "skipped" note; cancelling adds nothing.
 - Required fields and every constraint the schema declares (selection min/max, text length, regex pattern, numeric range) are enforced before Submit; the daemon re-validates, so a stale or malformed answer never reaches the agent.
 
-The rich question form is web-only. In the native TUI the card shows the question with a pointer to answer it in the web dashboard, plus keys to skip or cancel from the transcript pane so a TUI-only session never stalls on a question.
+The rich question form is web-only. In the native TUI the card shows the question with a pointer to answer it in the web dashboard, plus keys to skip or cancel from the transcript pane so a TUI-only session never stalls on a question. Once answered (from any surface) the TUI transcript records the chosen answer too.
 
-> AskUserQuestion options can carry a `preview` (a code snippet or mockup shown on focus in the Claude Code CLI/desktop). The `claude-agent-acp` adapter does not forward `preview` over ACP, so it cannot be shown here; this is an adapter limitation, not a dashboard one.
+> AskUserQuestion options can carry a `preview` (a code snippet or mockup shown on focus in the Claude Code CLI/desktop). As of `claude-agent-acp` 0.46 the adapter does forward `preview` (and the option's structured `description`) under an ACP `_meta` extension, but the ACP enum-option type the dashboard parses has no slot for it yet, so previews still cannot be shown here; the option `description` continues to render via the flattened option label.
 
 ### Notifications and sound
 

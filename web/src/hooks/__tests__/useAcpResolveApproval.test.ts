@@ -82,12 +82,27 @@ describe("classifyElicitationResolveResponse", () => {
 });
 
 describe("reducer elicitation_resolved_locally", () => {
-  function elicitation(nonce: string): Elicitation {
+  function elicitation(nonce: string, withQuestion = false): Elicitation {
     return {
       nonce,
       message: "Pick",
       tool_call_id: null,
-      questions: [],
+      questions: withQuestion
+        ? [
+            {
+              field_key: "question_0",
+              title: "Proceed?",
+              required: true,
+              kind: "single_select",
+              // value != label so the test catches raw internal values
+              // leaking into the transcript instead of the display label.
+              options: [
+                { value: "yes_internal", label: "Yes" },
+                { value: "no_internal", label: "No" },
+              ],
+            },
+          ]
+        : [],
       requested_at: new Date().toISOString(),
       resolved: null,
     };
@@ -98,9 +113,54 @@ describe("reducer elicitation_resolved_locally", () => {
       ...emptyAcpState(),
       pendingElicitations: [elicitation("e-1"), elicitation("e-2")],
     };
-    const action: Action = { kind: "elicitation_resolved_locally", nonce: "e-1" };
+    const action: Action = {
+      kind: "elicitation_resolved_locally",
+      nonce: "e-1",
+      resolution: { action: "decline" },
+    };
     const next = reducer(state, action);
     expect(next.pendingElicitations.map((e) => e.nonce)).toEqual(["e-2"]);
+  });
+
+  it("records the answer row from the pending card and the submitted resolution (#2209)", () => {
+    const state = {
+      ...emptyAcpState(),
+      pendingElicitations: [elicitation("e-1", true)],
+    };
+    const action: Action = {
+      kind: "elicitation_resolved_locally",
+      nonce: "e-1",
+      resolution: { action: "accept", answers: { question_0: "yes_internal" } },
+    };
+    const next = reducer(state, action);
+    const row = next.activity.find((r) => r.kind === "elicitation_answered");
+    expect(row?.id).toBe("elicitation-e-1");
+    expect(row?.elicitationAnswers).toEqual([{ question: "Proceed?", answer: "Yes" }]);
+  });
+
+  it("adds no answer row when the pending card is already gone", () => {
+    // The broadcast may have cleared the card first; with no pending card to
+    // read questions from, the optimistic path records nothing and leaves the
+    // server-event row (if any) to stand.
+    const next = reducer(emptyAcpState(), {
+      kind: "elicitation_resolved_locally",
+      nonce: "missing",
+      resolution: { action: "accept", answers: { question_0: "Yes" } },
+    });
+    expect(next.activity.some((r) => r.kind === "elicitation_answered")).toBe(false);
+  });
+
+  it("adds no answer row when the question was declined", () => {
+    const state = {
+      ...emptyAcpState(),
+      pendingElicitations: [elicitation("e-1", true)],
+    };
+    const next = reducer(state, {
+      kind: "elicitation_resolved_locally",
+      nonce: "e-1",
+      resolution: { action: "decline" },
+    });
+    expect(next.activity.some((r) => r.kind === "elicitation_answered")).toBe(false);
   });
 });
 

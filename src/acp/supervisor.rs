@@ -2484,6 +2484,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 &Event::ElicitationResolved {
                     nonce,
                     outcome: ElicitationOutcome::Cancelled,
+                    answers: Vec::new(),
                 },
             );
         }
@@ -4834,7 +4835,7 @@ mod tests {
         );
         for (frame, expected) in frames.iter().zip(["e-a", "e-b"]) {
             match &frame.2 {
-                Event::ElicitationResolved { nonce, outcome } => {
+                Event::ElicitationResolved { nonce, outcome, .. } => {
                     assert_eq!(nonce.0, expected);
                     assert!(matches!(outcome, ElicitationOutcome::Cancelled));
                 }

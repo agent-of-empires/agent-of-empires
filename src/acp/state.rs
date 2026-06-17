@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::approvals::{Approval, ApprovalDecision, Nonce};
-use super::elicitations::{Elicitation, ElicitationOutcome};
+use super::elicitations::{Elicitation, ElicitationAnswer, ElicitationOutcome};
 
 /// Identifier for a structured view session. Distinct from `SessionId` in
 /// `src/session/` because structured view sessions are a separate `SessionBackend`.
@@ -628,10 +628,15 @@ pub enum Event {
     },
     /// An elicitation was answered, skipped, cancelled, or torn down. The
     /// reducer drops the matching pending card. `outcome` records how it
-    /// ended for replay/debugging.
+    /// ended for replay/debugging. `answers` carries the user's submitted
+    /// answers (display-ready, in form order) so the transcript can show
+    /// what was picked after the card closes; empty for skip/cancel/teardown
+    /// and for events stored before #2209.
     ElicitationResolved {
         nonce: Nonce,
         outcome: ElicitationOutcome,
+        #[serde(default)]
+        answers: Vec<ElicitationAnswer>,
     },
     DiffEmitted {
         diff: DiffPreview,

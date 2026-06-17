@@ -35,6 +35,8 @@ import { pickWorkerStoppedVariant } from "./workerStoppedBanner";
 import { SubagentCard, ToolCard, ToolGroupCard, TodoGroupCard } from "./ToolCards";
 import { DiffCommentsUserCard } from "../diff/comments/DiffCommentsUserCard";
 import { isDiffCommentsCardPayload, parseDiffCommentsSentinel } from "../diff/comments/buildPrompt";
+import { ElicitationAnswerCard } from "./ElicitationAnswerCard";
+import { isElicitationAnswersPayload } from "../../lib/acpTypes";
 import {
   SPINNER_FRAMES,
   SPINNER_INTERVAL_MS,
@@ -544,8 +546,16 @@ function UserMessage() {
  *  prompts. Falls back to the classic chat bubble otherwise. */
 function UserText({ text }: { text: string }) {
   const typedPayload = useMessage((m) => (m.metadata?.custom as { diffComments?: unknown } | undefined)?.diffComments);
+  // An answered AskUserQuestion / elicitation: render the picked answer as
+  // a tidy card from the typed payload on the message metadata. See #2209.
+  const answers = useMessage(
+    (m) => (m.metadata?.custom as { elicitationAnswers?: unknown } | undefined)?.elicitationAnswers,
+  );
   if (isDiffCommentsCardPayload(typedPayload)) {
     return <DiffCommentsUserCard payload={typedPayload} />;
+  }
+  if (isElicitationAnswersPayload(answers)) {
+    return <ElicitationAnswerCard answers={answers} />;
   }
   // Legacy fallback: older prompts carry the structured data in a
   // base64 sentinel at the top of the text body. Decode + render the

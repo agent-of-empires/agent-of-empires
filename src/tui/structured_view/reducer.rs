@@ -20,6 +20,7 @@
 //!   layer can offer the "paste a context primer" affordance.
 
 use crate::acp::approvals::ApprovalDecision;
+use crate::acp::elicitations::{ElicitationAnswer, ElicitationOutcome};
 use crate::acp::protocol::AcpBroadcastFrame;
 use crate::acp::state::{AvailableCommand, Event, PlanStepStatus, ToolOutputBlock};
 
@@ -104,7 +105,14 @@ pub enum ActivityRow {
     ToolCall(ToolCallRow),
     Approval(ApprovalRow),
     Plan(Vec<PlanLine>),
-    Note { kind: NoteKind, text: String },
+    /// The user's answers to an AskUserQuestion / elicitation form, kept
+    /// in the transcript so the picked answer survives the card closing.
+    /// See #2209.
+    ElicitationAnswer(Vec<ElicitationAnswer>),
+    Note {
+        kind: NoteKind,
+        text: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -405,9 +413,34 @@ impl AcpTranscript {
                     nonce: elicitation.nonce.0.clone(),
                 });
             }
-            Event::ElicitationResolved { nonce, .. } => {
+            Event::ElicitationResolved {
+                nonce,
+                outcome,
+                answers,
+            } => {
                 self.flush_pending_chunk();
+                // Gate on the card actually being pending: a resolved
+                // elicitation can be re-broadcast (cancel-on-teardown racing a
+                // POST; the store is lenient on the nonce), and replaying it
+                // must not append a second row. The web reducer dedupes by row
+                // id; here the pending card is the dedupe key. See #2209.
+                let was_pending = self.pending_elicitations.iter().any(|p| p.nonce == nonce.0);
                 self.pending_elicitations.retain(|p| p.nonce != nonce.0);
+                if !was_pending {
+                    return;
+                }
+                // Record what the user picked so the transcript keeps a
+                // trace after the card closes. Skip (Decline) leaves a
+                // short note; Cancel / teardown adds nothing. See #2209.
+                if !answers.is_empty() {
+                    self.rows
+                        .push(ActivityRow::ElicitationAnswer(answers.clone()));
+                } else if matches!(outcome, ElicitationOutcome::Declined) {
+                    self.rows.push(ActivityRow::Note {
+                        kind: NoteKind::Info,
+                        text: "You skipped the question.".to_string(),
+                    });
+                }
             }
             Event::PlanUpdated { plan } => {
                 self.flush_pending_chunk();
@@ -786,9 +819,53 @@ mod tests {
             Event::ElicitationResolved {
                 nonce: Nonce("e-1".into()),
                 outcome: ElicitationOutcome::Declined,
+                answers: Vec::new(),
             },
         ));
         assert!(t.pending_elicitations.is_empty());
+        // A skip leaves a short note so the transcript records the choice.
+        assert!(matches!(
+            t.rows.last(),
+            Some(ActivityRow::Note { text, .. }) if text.contains("skipped")
+        ));
+    }
+
+    #[test]
+    fn elicitation_accepted_records_answer_row() {
+        use crate::acp::elicitations::{Elicitation, ElicitationAnswer, ElicitationOutcome};
+        let mut t = AcpTranscript::new("s-1");
+        let elicitation = Elicitation {
+            nonce: Nonce("e-1".into()),
+            message: "Pick one".into(),
+            title: None,
+            description: None,
+            tool_call_id: None,
+            questions: Vec::new(),
+            requested_at: Utc::now(),
+            resolved: None,
+        };
+        t.apply(&frame(1, Event::ElicitationRequested { elicitation }));
+        t.apply(&frame(
+            2,
+            Event::ElicitationResolved {
+                nonce: Nonce("e-1".into()),
+                outcome: ElicitationOutcome::Accepted,
+                answers: vec![ElicitationAnswer {
+                    question: "Proceed?".into(),
+                    answer: "Yes".into(),
+                }],
+            },
+        ));
+        assert!(t.pending_elicitations.is_empty());
+        // #2209: the picked answer must survive the card closing.
+        match t.rows.last() {
+            Some(ActivityRow::ElicitationAnswer(answers)) => {
+                assert_eq!(answers.len(), 1);
+                assert_eq!(answers[0].question, "Proceed?");
+                assert_eq!(answers[0].answer, "Yes");
+            }
+            other => panic!("expected ElicitationAnswer row, got {other:?}"),
+        }
     }
 
     #[test]

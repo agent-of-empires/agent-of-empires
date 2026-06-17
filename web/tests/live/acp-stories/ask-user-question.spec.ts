@@ -131,6 +131,14 @@ base("AskUserQuestion card submit resolves and the turn continues", async ({ pag
 
     await expect(postAnswerChunk).toBeVisible({ timeout: 10_000 });
     await expect(questionDialog).toBeHidden({ timeout: 10_000 });
+
+    // #2209: the picked answer is recorded in the transcript as the user's
+    // turn, so the history shows what was chosen rather than jumping to the
+    // next agent output.
+    const answerCard = page.getByTestId("elicitation-answer-card");
+    await expect(answerCard).toBeVisible({ timeout: 10_000 });
+    await expect(answerCard).toContainText("Which color?");
+    await expect(answerCard).toContainText("Blue");
   } finally {
     await serve.stop();
     rmSync(scriptDir, { recursive: true, force: true });

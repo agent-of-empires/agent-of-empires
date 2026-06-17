@@ -42,6 +42,11 @@ import type {
 import { hasTodoItemsArgsText, parseJsonObject } from "../../lib/acpArgs";
 import { useHistoryWindow } from "../../hooks/useHistoryWindow";
 import { useAgentProfile } from "../../lib/agentProfileContext";
+import { useCancelEscalation } from "./useCancelEscalation";
+
+// Re-exported for existing tests that import it from this module; the
+// implementation now lives alongside the escalation hook. See #2237.
+export { nextCancelAction } from "./useCancelEscalation";
 
 interface Props {
   sessionId: string;
@@ -130,6 +135,17 @@ export function AcpRuntime({
   useEffect(() => {
     pendingAttachmentsRef.current = pendingAttachments;
   }, [pendingAttachments]);
+  // Stop-button escalation: a second press always force-ends, even when the
+  // server never confirms the first cancel (no in-flight prompt on the
+  // daemon). Owns its own reset-on-turn-end and reset-on-session-switch
+  // lifecycle. See #2237.
+  const onCancel = useCancelEscalation(
+    sessionId,
+    acp.state.pendingUserPromptSeq,
+    acp.state.cancelling,
+    acp.cancelPrompt,
+    acp.forceEndTurn,
+  );
   // Render only the most recent slice of the transcript so a long
   // session does not block first paint on mobile; older rows stay in
   // reducer state and are revealed via "Load earlier". See #2144.
@@ -176,18 +192,7 @@ export function AcpRuntime({
       await acp.sendPrompt(text, attachments);
       setPendingAttachments([]);
     },
-    onCancel: async () => {
-      // First Stop sends a graceful cancel. If a cancel is already in
-      // flight (the agent is ignoring session/cancel on a stuck loop),
-      // a second Stop escalates to a force-stop instead of resending a
-      // no-op notification, so the user's instinct to click again
-      // actually ends the turn. See #1727.
-      if (acp.state.cancelling) {
-        await acp.forceEndTurn();
-      } else {
-        await acp.cancelPrompt();
-      }
-    },
+    onCancel,
   });
 
   return (
@@ -306,6 +311,23 @@ export function activityToThreadMessages(
         id: row.id,
         role: "user",
         content: parts.length > 0 ? parts : [{ type: "text", text: "" }],
+        createdAt: parseDate(row.at),
+      });
+      continue;
+    }
+
+    if (row.kind === "elicitation_answered") {
+      // The user's answer to an AskUserQuestion / elicitation form. Render
+      // as a user-authored message so the picked answer reads like the
+      // user's turn (mirrors how Claude Code shows it), but keep it a
+      // distinct row kind so it never folds into prompt grouping. The
+      // structured pairs ride on metadata for richer rendering. See #2209.
+      flushAssistant();
+      messages.push({
+        id: row.id,
+        role: "user",
+        content: [{ type: "text", text: row.text }],
+        metadata: row.elicitationAnswers ? { custom: { elicitationAnswers: row.elicitationAnswers } } : undefined,
         createdAt: parseDate(row.at),
       });
       continue;

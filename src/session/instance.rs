@@ -3330,6 +3330,16 @@ impl Instance {
             return;
         }
 
+        // Archived sessions have their tmux torn down on purpose (#1868), so
+        // probing tmux here only ever produces a spurious "tmux session is
+        // gone" Error transition (#2206). Short-circuit so the poller never
+        // re-probes a row whose tmux is gone by design; this keeps
+        // archive/unarchive status-preserving. Rows already persisted as Error
+        // by a pre-fix build are cleaned up once by the v016 migration.
+        if self.is_archived() {
+            return;
+        }
+
         // Acp-mode sessions are not backed by a tmux pane; the structured view
         // worker supervisor owns their lifecycle and emits typed health
         // events over the broadcast. Probing tmux here only ever produces
@@ -3978,6 +3988,52 @@ mod tests {
         inst.touch_last_accessed();
         assert!(!inst.is_archived());
         assert!(inst.last_accessed_at.is_some());
+    }
+
+    #[test]
+    fn test_archived_session_not_marked_error_when_tmux_gone() {
+        // #2206: archiving kills the session's tmux on purpose. A subsequent
+        // status poll must not flip the archived row to Error for the missing
+        // tmux; the archived guard short-circuits, so an idle row stays Idle.
+        // Red on the pre-fix tree, where the tmux probe stamps Error.
+        let mut inst = Instance::new("test", "/tmp/test");
+        inst.archive();
+        inst.update_status_with_metadata(None);
+        assert_ne!(inst.status, Status::Error);
+        assert_eq!(inst.status, Status::Idle);
+        assert_eq!(inst.last_error, None);
+    }
+
+    #[test]
+    fn test_archived_session_preserves_genuine_error() {
+        // #2206 regression guard (passes on both trees): the archived guard
+        // never mutates status, so a genuinely errored session keeps its Error
+        // state while archived. The legacy on-disk footprint is cleaned up by
+        // the v016 migration, not by the poller.
+        let mut inst = Instance::new("test", "/tmp/test");
+        inst.archive();
+        inst.status = Status::Error;
+        inst.last_error = Some("agent crashed".to_string());
+        inst.update_status_with_metadata(None);
+        assert_eq!(inst.status, Status::Error);
+        assert_eq!(inst.last_error.as_deref(), Some("agent crashed"));
+    }
+
+    #[test]
+    fn test_archived_unarchived_genuine_error_roundtrips() {
+        // #2206: archive then unarchive must stay status-preserving for a real
+        // failure. The archived guard leaves Error untouched; after unarchive
+        // the tmux probe re-stamps Error and its is_none() guard preserves the
+        // original message regardless of whether tmux is installed on the box.
+        let mut inst = Instance::new("test", "/tmp/test");
+        inst.archive();
+        inst.status = Status::Error;
+        inst.last_error = Some("agent crashed".to_string());
+        inst.update_status_with_metadata(None);
+        inst.unarchive();
+        inst.update_status_with_metadata(None);
+        assert_eq!(inst.status, Status::Error);
+        assert_eq!(inst.last_error.as_deref(), Some("agent crashed"));
     }
 
     #[test]

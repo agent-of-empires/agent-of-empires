@@ -9,11 +9,13 @@
 
 import { useCallback, useEffect, useReducer, useRef, useState, useSyncExternalStore } from "react";
 import {
+  appendElicitationAnswerRow,
   applyEvent,
   emptyAcpState,
   isTurnActive,
   normaliseTurnCounters,
   setActivityLimit,
+  summarizeAnswers,
   type ApprovalDecision,
   type AcpAttachment,
   type AcpFrame,
@@ -52,7 +54,7 @@ export type Action =
   | { kind: "error"; message: string }
   | { kind: "clear_error" }
   | { kind: "approval_resolved_locally"; nonce: string }
-  | { kind: "elicitation_resolved_locally"; nonce: string }
+  | { kind: "elicitation_resolved_locally"; nonce: string; resolution: ElicitationResolution }
   | { kind: "lagged_resolved" }
   | { kind: "reset" }
   | { kind: "hydrate"; state: AcpState }
@@ -449,12 +451,18 @@ export function reducer(state: AcpState, action: Action): AcpState {
     // Optimistically drop the elicitation card once the server accepts the
     // resolution (204) or reports the nonce gone (404), instead of waiting
     // on the ElicitationResolved broadcast, which the seq dedupe can drop.
+    const card = state.pendingElicitations.find((e) => e.nonce === action.nonce);
     const pendingElicitations = state.pendingElicitations.filter((e) => e.nonce !== action.nonce);
     const removed = pendingElicitations.length !== state.pendingElicitations.length;
+    // Record the picked answer immediately (deduped by id), so it shows
+    // even when the broadcast is dropped by seq dedupe. See #2209.
+    const answers =
+      card && action.resolution.action === "accept" ? summarizeAnswers(card, action.resolution.answers) : [];
     return {
       ...state,
       lastError: removed ? null : state.lastError,
       pendingElicitations,
+      activity: appendElicitationAnswerRow(state.activity, action.nonce, answers),
     };
   }
   if (action.kind === "hydrate") {
@@ -1197,7 +1205,7 @@ export function useAcpSession(
       const detail = res.ok ? "" : await safeText(res);
       const outcome = classifyElicitationResolveResponse(res.ok, res.status, detail, nonce);
       if (outcome.kind === "resolved") {
-        dispatch({ kind: "elicitation_resolved_locally", nonce });
+        dispatch({ kind: "elicitation_resolved_locally", nonce, resolution });
         return;
       }
       // A validation rejection (422) leaves the elicitation pending

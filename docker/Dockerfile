@@ -79,7 +79,7 @@ RUN npm install -g @qwen-code/qwen-code
 # `gemini --acp`, `vibe-acp`) are already provided by their respective
 # CLIs above.
 RUN npm install -g \
-    @agentclientprotocol/claude-agent-acp@^0.44.0 \
+    @agentclientprotocol/claude-agent-acp@^0.47.0 \
     @zed-industries/codex-acp \
     pi-acp
 
