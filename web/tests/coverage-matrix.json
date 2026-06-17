@@ -2481,7 +2481,10 @@
       "id": "triage.acp-banners",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/components/acp/__tests__/TriageBanners.test.tsx"],
+      "specs": [
+        "src/components/acp/__tests__/TriageBanners.test.tsx",
+        "src/components/acp/__tests__/ScheduledWakeupBanner.test.tsx"
+      ],
       "components": ["web/src/components/acp/StructuredView.tsx"]
     },
     {

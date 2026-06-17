@@ -1538,22 +1538,47 @@ function WorkerResumingBanner() {
   );
 }
 
+/** How long the post-fire "Waking…" state lingers before self-dismissing.
+ *  A genuine fire flips `turnActive` (which hides this banner) within a
+ *  second or two, so this only ever clears a stale banner. */
+const WAKING_GRACE_MS = 10_000;
+
 /** Top-of-structured view chip shown while the agent's `ScheduleWakeup` is
  *  pending. Visible only when no turn is in flight (turns produce their
  *  own busy chrome) and no other recovery banner is up. 1Hz local tick
  *  for the countdown; once the wake fires the next UserPromptSent
  *  clears `state.nextWakeupAt` on the reducer side and this unmounts.
- *  See #1091. */
-function ScheduledWakeupBanner({ wakeAt, reason }: { wakeAt: string; reason: string | null }) {
+ *  See #1091.
+ *
+ *  A fallback `ScheduleWakeup` superseded by its primary signal (a turn
+ *  that fired before `wakeAt`) leaves `nextWakeupAt` set with nothing
+ *  left to clear it: a prompt arriving before `wakeAt` is kept on
+ *  purpose, and once `wakeAt` passes no further prompt lands. That left
+ *  "Waking…" stuck indefinitely. Self-dismiss `WAKING_GRACE_MS` after
+ *  firing so the stale banner clears on its own. */
+export function ScheduledWakeupBanner({ wakeAt, reason }: { wakeAt: string; reason: string | null }) {
   const targetMs = Date.parse(wakeAt);
   const [now, setNow] = useState(() => Date.now());
+  const [dismissed, setDismissed] = useState(false);
   const elapsed = !Number.isFinite(targetMs) || targetMs <= now;
+  // A fresh wake reuses this instance (same render slot); un-dismiss
+  // during render so the new countdown shows.
+  const [prevWakeAt, setPrevWakeAt] = useState(wakeAt);
+  if (wakeAt !== prevWakeAt) {
+    setPrevWakeAt(wakeAt);
+    setDismissed(false);
+  }
   useEffect(() => {
     if (elapsed) return;
     const id = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(id);
   }, [elapsed]);
-  if (!Number.isFinite(targetMs)) return null;
+  useEffect(() => {
+    if (!elapsed) return;
+    const id = setTimeout(() => setDismissed(true), WAKING_GRACE_MS);
+    return () => clearTimeout(id);
+  }, [elapsed]);
+  if (!Number.isFinite(targetMs) || dismissed) return null;
   const remaining = Math.max(0, Math.floor((targetMs - now) / 1000));
   const wakeDate = new Date(targetMs);
   const clock = `${String(wakeDate.getHours()).padStart(2, "0")}:${String(wakeDate.getMinutes()).padStart(2, "0")}`;
