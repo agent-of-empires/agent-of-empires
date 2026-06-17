@@ -1619,11 +1619,18 @@
       ]
     },
     {
-      "id": "projects-view",
+      "id": "projects-form-modal",
       "kind": "vitest",
       "risk": "low",
-      "specs": ["src/components/__tests__/ProjectsView.test.tsx"],
-      "components": ["web/src/components/ProjectsView.tsx"]
+      "specs": ["src/components/__tests__/ProjectFormModal.test.tsx"],
+      "components": ["web/src/components/ProjectFormModal.tsx"]
+    },
+    {
+      "id": "projects-section-unit",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/__tests__/ProjectsSection.test.tsx"],
+      "components": ["web/src/components/ProjectsSection.tsx"]
     },
     {
       "id": "story.settings-tmux-select",
@@ -1832,32 +1839,32 @@
       "components": ["web/src/components/HelpOverlay.tsx"]
     },
     {
-      "id": "story.projects-open",
+      "id": "story.projects-section",
       "kind": "mocked-playwright",
       "risk": "low",
       "specs": ["tests/dashboard.spec.ts"],
-      "components": ["web/src/components/ProjectsView.tsx"]
+      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/ProjectsSection.tsx"]
     },
     {
       "id": "story.projects-add",
       "kind": "live-playwright",
       "risk": "medium",
       "specs": ["tests/live/acp-stories/projects-add.spec.ts"],
-      "components": ["web/src/components/ProjectsView.tsx"]
+      "components": ["web/src/components/ProjectsSection.tsx", "web/src/components/ProjectFormModal.tsx"]
     },
     {
       "id": "story.projects-edit",
       "kind": "live-playwright",
       "risk": "medium",
       "specs": ["tests/live/acp-stories/projects-edit.spec.ts"],
-      "components": ["web/src/components/ProjectsView.tsx"]
+      "components": ["web/src/components/ProjectsSection.tsx", "web/src/components/ProjectFormModal.tsx"]
     },
     {
       "id": "story.projects-remove",
       "kind": "live-playwright",
       "risk": "medium",
       "specs": ["tests/live/acp-stories/projects-remove.spec.ts"],
-      "components": ["web/src/components/ProjectsView.tsx"]
+      "components": ["web/src/components/ProjectsSection.tsx"]
     },
     {
       "id": "story.right-panel-resize-persist",

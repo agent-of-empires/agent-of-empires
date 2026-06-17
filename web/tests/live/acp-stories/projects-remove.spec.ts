@@ -1,8 +1,8 @@
-// User story: remove a project from the Projects view.
+// User story: remove a project from the sidebar Projects section (#2212).
 //
-// Each project row renders a Remove button that triggers a window
-// confirm() then calls DELETE on the project. The row disappears
-// after the confirmation passes.
+// Right-clicking a project row offers "Remove project", which triggers a
+// window confirm() then calls DELETE on every registration for the path. The
+// row disappears after the confirmation passes.
 
 import { mkdirSync } from "node:fs";
 import { spawnSync } from "node:child_process";
@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { test as base, expect } from "@playwright/test";
 import { spawnAoeServe, resolveAoeBinary } from "../../helpers/aoeServe";
 
-base("remove a project from the Projects view", async ({ page }, testInfo) => {
+base("remove a project from the sidebar Projects section", async ({ page }, testInfo) => {
   let projectPath = "";
   const serve = await spawnAoeServe({
     authMode: "none",
@@ -51,17 +51,15 @@ base("remove a project from the Projects view", async ({ page }, testInfo) => {
   try {
     page.on("dialog", (d) => void d.accept());
 
-    await page.goto(`${serve.baseUrl}/projects`);
-    // Scope to the row container so the Remove click targets the row
-    // we seeded, not the first Remove on the page (which could belong
-    // to another project if other tests / fixtures add rows later).
+    await page.goto(`${serve.baseUrl}/`);
     const row = page
-      .locator("li, tr, [data-testid='project-row']")
-      .filter({ hasText: "story-projects-remove" })
-      .first();
+      .getByTestId("sidebar-projects-section")
+      .locator("[data-testid='sidebar-project-row']")
+      .filter({ hasText: "story-projects-remove" });
     await expect(row).toBeVisible({ timeout: 10_000 });
 
-    await row.getByRole("button", { name: "Remove" }).click();
+    await row.click({ button: "right" });
+    await page.getByTestId("sidebar-project-context-menu-remove").click();
     await expect(row).toHaveCount(0, { timeout: 5_000 });
   } finally {
     await serve.stop();

@@ -39,18 +39,22 @@ test.describe("Sidebar", () => {
     await expect(page.getByRole("button", { name: "Toggle sidebar" })).toBeVisible();
   });
 
-  test("sidebar Projects button opens the Projects view", async ({ page }) => {
-    // Ported from the live projects-open story: the sidebar footer's
-    // Projects button navigates to /projects and ProjectsView mounts.
-    await page.route("**/api/projects*", (r) => r.fulfill({ json: [] }));
+  test("sidebar Projects section lists a no-session saved project with an add button", async ({ page }) => {
+    // The dedicated Projects section (#2212) replaced the /projects page: a
+    // saved (non-pinned) project with no live session renders as a row in the
+    // sidebar, alongside an add-project button. Stub /api/sessions so the app
+    // reports online, otherwise the add button stays hidden.
+    await page.route("**/api/sessions", (r) => r.fulfill({ json: { sessions: [], workspace_ordering: [] } }));
+    await page.route("**/api/projects*", (r) =>
+      r.fulfill({ json: [{ name: "saved-repo", path: "/work/saved-repo", scope: "global", pinned: false }] }),
+    );
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
 
-    await page.getByRole("button", { name: "Projects", exact: true }).click();
-
-    await expect(page).toHaveURL(/\/projects/);
-    await expect(page.getByRole("heading", { name: "Projects", exact: true })).toBeVisible();
-    await expect(page.getByText(/Saved repositories you can multi-select/i)).toBeVisible();
+    const section = page.getByTestId("sidebar-projects-section");
+    await expect(section).toBeVisible();
+    await expect(section.getByText("saved-repo", { exact: true })).toBeVisible();
+    await expect(page.getByTestId("sidebar-projects-add")).toBeVisible();
   });
 
   test("sidebar can be toggled closed and open on desktop", async ({ page }) => {
