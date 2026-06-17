@@ -284,10 +284,6 @@ jobs:
         if: env.CLAWHUB_TOKEN != ''
         run: |
           bun install -g clawhub
-          # Workaround: clawhub CLI v0.7.0 doesn't send acceptLicenseTerms
-          GLOBAL_DIR="$(bun pm ls -g 2>/dev/null | head -1 | sed 's/ .*//')"
-          PUBLISH_JS="${GLOBAL_DIR}/node_modules/clawhub/dist/cli/commands/publish.js"
-          sed -i 's/slug,/slug, acceptLicenseTerms: true,/' "$PUBLISH_JS"
 
       - name: Publish skill
         if: env.CLAWHUB_TOKEN != ''
