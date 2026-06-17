@@ -1019,7 +1019,8 @@
         "tests/acp-history-window.spec.ts",
         "src/lib/acpHistoryWindow.test.ts",
         "src/hooks/__tests__/useHistoryWindow.test.tsx",
-        "src/hooks/useAcpSession.history.test.ts"
+        "src/hooks/useAcpSession.history.test.ts",
+        "src/hooks/useAcpSession.recentFirst.test.ts"
       ],
       "components": [
         "web/src/lib/acpHistoryWindow.ts",
