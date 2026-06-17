@@ -6064,6 +6064,184 @@ fn restart_selected_session_debounces_via_cooldown_map() {
     );
 }
 
+#[test]
+#[serial]
+fn restart_selected_session_surfaces_resume_failed_after_async_restart() {
+    if std::process::Command::new("tmux")
+        .arg("-V")
+        .output()
+        .is_err()
+    {
+        eprintln!("Skipping: tmux not available");
+        return;
+    }
+
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let profile = "restart-resume-failed";
+    let storage = Storage::new_unwatched(profile).unwrap();
+    let stale_sid = "11111111-2222-3333-4444-555555555555";
+
+    let mut inst = Instance::new("restart-resume-failed", "/tmp/x");
+    inst.source_profile = profile.to_string();
+    inst.tool = "claude".to_string();
+    inst.command = "/bin/false".to_string();
+    inst.agent_session_id = Some(stale_sid.to_string());
+    let id = inst.id.clone();
+    let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+    let _ = std::process::Command::new("tmux")
+        .args(["kill-session", "-t", &tmux_name])
+        .output();
+
+    storage
+        .update(|instances, groups| {
+            *instances = vec![inst.clone()];
+            *groups = GroupTree::new_with_groups(std::slice::from_ref(&inst), &[]).get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(
+        Some(profile.to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    view.update_selected();
+    view.selected_session = Some(id.clone());
+
+    let result = view.restart_selected_session(None, None, None, None);
+    assert!(result.is_ok());
+
+    let mut applied = false;
+    for _ in 0..120 {
+        if view.apply_restart_results() {
+            applied = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    let _ = std::process::Command::new("tmux")
+        .args(["kill-session", "-t", &tmux_name])
+        .output();
+
+    assert!(applied, "timed out waiting for async restart result");
+    let dialog = view.info_dialog.as_ref().expect("resume failure dialog");
+    assert_eq!(dialog.title(), "Restart Failed");
+    assert!(dialog.message().contains(stale_sid));
+    let row = view.get_instance(&id).expect("instance remains visible");
+    assert_eq!(row.agent_session_id.as_deref(), Some(stale_sid));
+    assert_eq!(row.resume_probe_failed_sid.as_deref(), Some(stale_sid));
+    assert_eq!(row.status, crate::session::Status::Error);
+    assert!(row.last_accessed_at.is_some());
+}
+
+#[test]
+#[serial]
+fn apply_restart_results_preserves_peer_sid_and_marker() {
+    use crate::session::StartOutcome;
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances[0].id.clone();
+    env.view.restart_in_flight.insert(id.clone());
+    env.view.instances[0].agent_session_id = Some("peer-fresh-sid".to_string());
+    env.view.instances[0].resume_probe_failed_sid = Some("peer-fresh-sid".to_string());
+
+    let mut worker = env.view.instances[0].clone();
+    worker.status = crate::session::Status::Error;
+    worker.agent_session_id = Some("phase1-stale-sid".to_string());
+    worker.resume_probe_failed_sid = Some("phase1-stale-sid".to_string());
+    worker.last_error =
+        Some("resume failed for sid phase1-stale-sid; preserved for explicit retry".to_string());
+
+    env.view.restart_poller = crate::tui::restart_poller::RestartPoller::with_result_for_test(
+        crate::session::restart::RestartResult {
+            session_id: id.clone(),
+            before: Box::new(worker.clone()),
+            instance: Box::new(worker),
+            outcome: Ok(StartOutcome::ResumeFailed {
+                sid: "phase1-stale-sid".to_string(),
+            }),
+        },
+    );
+
+    assert!(env.view.apply_restart_results());
+
+    let row = env
+        .view
+        .get_instance(&id)
+        .expect("instance remains visible");
+    assert_eq!(row.status, crate::session::Status::Error);
+    assert_eq!(row.agent_session_id.as_deref(), Some("peer-fresh-sid"));
+    assert_eq!(
+        row.resume_probe_failed_sid.as_deref(),
+        Some("peer-fresh-sid")
+    );
+    assert!(env.view.restart_in_flight.is_empty());
+    let dialog = env
+        .view
+        .info_dialog
+        .as_ref()
+        .expect("resume failure dialog");
+    assert!(dialog.message().contains("phase1-stale-sid"));
+}
+
+#[test]
+#[serial]
+fn apply_restart_results_propagates_worker_sid_without_peer_write() {
+    use crate::session::StartOutcome;
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances[0].id.clone();
+    env.view.restart_in_flight.insert(id.clone());
+    env.view.instances[0].agent_session_id = Some("sid-before".to_string());
+
+    let before = env.view.instances[0].clone();
+    let mut worker = before.clone();
+    worker.agent_session_id = Some("sid-after".to_string());
+    worker.status = crate::session::Status::Running;
+
+    env.view.restart_poller = crate::tui::restart_poller::RestartPoller::with_result_for_test(
+        crate::session::restart::RestartResult {
+            session_id: id.clone(),
+            before: Box::new(before),
+            instance: Box::new(worker),
+            outcome: Ok(StartOutcome::Resumed),
+        },
+    );
+
+    assert!(env.view.apply_restart_results());
+
+    let row = env
+        .view
+        .get_instance(&id)
+        .expect("instance remains visible");
+    assert_eq!(row.status, crate::session::Status::Running);
+    assert_eq!(row.agent_session_id.as_deref(), Some("sid-after"));
+    assert_eq!(row.resume_probe_failed_sid, None);
+    assert!(env.view.restart_in_flight.is_empty());
+}
+
+#[test]
+#[serial]
+fn execute_send_message_missing_session_shows_send_failed() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances[0].id.clone();
+    env.view.instances.retain(|inst| inst.id != id);
+    env.view.instance_map.remove(&id);
+
+    env.view.execute_send_message(&id, "hello");
+
+    let dialog = env.view.info_dialog.as_ref().expect("send failure dialog");
+    assert_eq!(dialog.title(), "Send Failed");
+    assert_eq!(
+        dialog.message(),
+        "Session disappeared before the message could be sent."
+    );
+}
+
 /// A second restart press while the first cascade is still running on the
 /// poller worker must be dropped. The cascade is off the event loop, so the
 /// 1.5s keyboard-repeat debounce does not cover a deliberate press during a

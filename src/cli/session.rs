@@ -7,13 +7,6 @@ use std::collections::HashSet;
 
 use crate::session::{GroupTree, StartOutcome, Storage};
 
-/// Wording used by both single-session and `--all` restart paths when the
-/// resume-fallback cascade cleared a stale agent_session_id. Centralized so
-/// drift between the two surfaces cannot happen.
-pub(crate) fn stale_history_suffix(stale_sid: &str) -> String {
-    format!(" (resume failed for sid {stale_sid}; started fresh, prior history not loaded)")
-}
-
 #[derive(Subcommand)]
 pub enum SessionCommands {
     /// Start a session's tmux process
@@ -583,24 +576,21 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
         });
     }
 
-    let mut succeeded: Vec<(String, String, Option<String>)> = Vec::new();
+    let mut succeeded: Vec<(String, String)> = Vec::new();
     let mut failed: Vec<(String, String)> = Vec::new();
-    let mut restarted: Vec<(crate::session::Instance, Option<String>)> = Vec::new();
+    let mut restarted: Vec<crate::session::Instance> = Vec::new();
     while let Some(joined) = join_set.join_next().await {
         let (title, inst_opt, result) = joined.expect("JoinSet shouldn't panic on join itself");
-        let stale_sid = match &result {
-            Ok(StartOutcome::Restarted { stale_sid }) => Some(stale_sid.clone()),
-            _ => None,
-        };
         let id = inst_opt.as_ref().map(|i| i.id.clone()).unwrap_or_default();
         if let Some(inst) = inst_opt {
-            restarted.push((inst, stale_sid.clone()));
+            restarted.push(inst);
         }
         match result {
-            Ok(StartOutcome::Restarted { stale_sid }) => {
-                succeeded.push((id, title, Some(stale_sid)))
-            }
-            Ok(StartOutcome::Resumed | StartOutcome::Fresh) => succeeded.push((id, title, None)),
+            Ok(StartOutcome::ResumeFailed { sid }) => failed.push((
+                title,
+                format!("resume failed for sid {sid}; preserved for explicit retry"),
+            )),
+            Ok(StartOutcome::Resumed | StartOutcome::Fresh) => succeeded.push((id, title)),
             Err(e) => failed.push((title, e.to_string())),
         }
     }
@@ -612,9 +602,9 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
     // closure receives the latest disk state.
     let orphaned: Vec<(String, String)> = storage.update(|instances, _groups| {
         let mut orphaned = Vec::new();
-        for (restarted_inst, stale_sid) in restarted {
+        for restarted_inst in restarted {
             if let Some(stored) = instances.iter_mut().find(|i| i.id == restarted_inst.id) {
-                stored.merge_post_restart(&restarted_inst, stale_sid.as_deref());
+                stored.merge_post_restart(&restarted_inst);
             } else {
                 tracing::warn!(
                     target: "session.cli",
@@ -629,24 +619,11 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
 
     // Sessions can share a title across paths; orphan filter keys on id.
     let orphaned_ids: HashSet<&String> = orphaned.iter().map(|(id, _)| id).collect();
-    succeeded.retain(|(id, _, _)| !orphaned_ids.contains(id));
+    succeeded.retain(|(id, _)| !orphaned_ids.contains(id));
 
-    let stale_count = succeeded.iter().filter(|(_, _, s)| s.is_some()).count();
-    if stale_count == 0 {
-        println!("✓ Restarted {}/{} sessions:", succeeded.len(), total);
-    } else {
-        println!(
-            "✓ Restarted {}/{} sessions ({} without prior history):",
-            succeeded.len(),
-            total,
-            stale_count,
-        );
-    }
-    for (_id, title, stale) in &succeeded {
-        match stale {
-            Some(sid) => println!("  · {}{}", title, stale_history_suffix(sid)),
-            None => println!("  · {}", title),
-        }
+    println!("✓ Restarted {}/{} sessions:", succeeded.len(), total);
+    for (_id, title) in &succeeded {
+        println!("  · {}", title);
     }
     if !orphaned.is_empty() {
         println!(
@@ -721,7 +698,7 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         .unwrap_or_else(|_| "wake up: pick up what you were doing".to_string());
 
     let mut wake_succeeded = false;
-    if !wake_msg.is_empty() {
+    if !wake_msg.is_empty() && !matches!(outcome, StartOutcome::ResumeFailed { .. }) {
         // Restart re-execs the agent at a blank prompt; nudge it back into
         // its prior task. Poll capture-pane for steady-state output instead
         // of a blind sleep, so the keys land as soon as the agent is at a
@@ -744,13 +721,9 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
 
     // touch_last_accessed runs on `stored`, not `working`: its fields are
     // peer-mutable and do not belong in `merge_post_restart`.
-    let stale_sid = match &outcome {
-        StartOutcome::Restarted { stale_sid } => Some(stale_sid.as_str()),
-        StartOutcome::Resumed | StartOutcome::Fresh => None,
-    };
     let landed = storage.update(|instances, _groups| {
         if let Some(stored) = instances.iter_mut().find(|i| i.id == session_id) {
-            stored.merge_post_restart(&working, stale_sid);
+            stored.merge_post_restart(&working);
             if wake_succeeded {
                 stored.touch_last_accessed();
             }
@@ -772,12 +745,8 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     }
 
     match outcome {
-        StartOutcome::Restarted { stale_sid } => {
-            println!(
-                "✓ Restarted session: {}{}",
-                title,
-                stale_history_suffix(&stale_sid),
-            );
+        StartOutcome::ResumeFailed { sid } => {
+            bail!("Resume failed for sid {sid}; preserved for explicit retry");
         }
         StartOutcome::Resumed | StartOutcome::Fresh => {
             println!("✓ Restarted session: {}", title);
@@ -1324,6 +1293,7 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
                 );
             }
             inst.resume_intent = new_intent.clone();
+            inst.resume_probe_failed_sid = None;
             Ok((inst.title.clone(), inst.tool.clone()))
         })
     })?;
@@ -1548,31 +1518,53 @@ mod target_filter_tests {
 }
 
 #[cfg(test)]
-mod stale_history_suffix_tests {
-    use super::stale_history_suffix;
+mod set_session_id_tests {
+    use super::{set_session_id, SetSessionIdArgs};
+    use crate::session::{Instance, ResumeIntent, Storage};
+    use serial_test::serial;
+    use tempfile::tempdir;
 
-    #[test]
-    fn matches_single_session_wording() {
-        let suffix = stale_history_suffix("11111111-1111-1111-1111-111111111111");
-        assert_eq!(
-            suffix,
-            " (resume failed for sid 11111111-1111-1111-1111-111111111111; \
-             started fresh, prior history not loaded)"
-        );
-    }
+    #[tokio::test]
+    #[serial]
+    async fn set_session_id_clears_resume_probe_failed_marker() {
+        let temp = tempdir().unwrap();
+        std::env::set_var("HOME", temp.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
-    #[test]
-    fn renders_inline_with_title_correctly() {
-        let line = format!(
-            "  · {}{}",
-            "alpha",
-            stale_history_suffix("22222222-2222-2222-2222-222222222222"),
-        );
+        let storage = Storage::new_unwatched("set-sid-clear-marker").unwrap();
+        let mut inst = Instance::new("marked_session", "/tmp/x");
+        inst.agent_session_id = Some("11111111-1111-1111-1111-111111111111".to_string());
+        inst.resume_probe_failed_sid = Some("11111111-1111-1111-1111-111111111111".to_string());
+        let id = inst.id.clone();
+        let on_disk = inst.clone();
+        storage
+            .update(|i, g| {
+                *i = vec![on_disk.clone()];
+                *g =
+                    crate::session::GroupTree::new_with_groups(std::slice::from_ref(&on_disk), &[])
+                        .get_all_groups();
+                Ok(())
+            })
+            .unwrap();
+
+        set_session_id(
+            "set-sid-clear-marker",
+            SetSessionIdArgs {
+                identifier: id.clone(),
+                session_id: "22222222-2222-2222-2222-222222222222".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let loaded = storage.load().unwrap();
+        let inst_disk = loaded.iter().find(|i| i.id == id).unwrap();
         assert_eq!(
-            line,
-            "  · alpha (resume failed for sid 22222222-2222-2222-2222-222222222222; \
-             started fresh, prior history not loaded)"
+            inst_disk.resume_intent,
+            ResumeIntent::Use("22222222-2222-2222-2222-222222222222".to_string())
         );
+        assert_eq!(inst_disk.resume_probe_failed_sid, None);
     }
 }
 

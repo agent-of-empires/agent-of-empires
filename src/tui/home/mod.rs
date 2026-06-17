@@ -2590,13 +2590,12 @@ impl HomeView {
                     filtered_ids.insert(inst.id.clone());
                     continue;
                 };
-                // Defense-in-depth against the resume-fallback cascade: a sid
-                // the cascade just cleared can still live on disk for several
-                // minutes (opencode db, vibe meta.json, codex/gemini/pi/hermes
-                // state). The poller closures filter via `compose_exclusion`,
-                // but if a closure factory ever forgets to thread the per-
-                // instance excludes, this guard prevents the cleared sid from
-                // being re-imported into memory and disk.
+                // Defense-in-depth against explicit resume-target invalidation:
+                // an invalidated sid can still live on disk for several minutes
+                // (opencode db, vibe meta.json, codex/gemini/pi/hermes state).
+                // The poller closures filter via `compose_exclusion`, but if a
+                // closure factory ever forgets to thread the per-instance
+                // excludes, this guard prevents the sid from being re-imported.
                 if inst.retroactive_capture_excludes.contains(&session_id) {
                     tracing::debug!(
                         target: "tui.home",
@@ -2620,7 +2619,7 @@ impl HomeView {
         }
 
         let mut to_apply: Vec<(String, String)> = Vec::new();
-        let mut to_rollback: Vec<(String, Option<String>)> = Vec::new();
+        let mut to_rollback: Vec<(String, Option<String>, Option<String>)> = Vec::new();
 
         for (id, session_id, expected_prior) in &updates {
             let Some(profile) = self.instance_map.get(id).map(|i| i.source_profile.clone()) else {
@@ -2643,7 +2642,11 @@ impl HomeView {
                     {
                         if let Ok(disk_insts) = storage.load() {
                             if let Some(disk_inst) = disk_insts.iter().find(|i| i.id == *id) {
-                                to_rollback.push((id.clone(), disk_inst.agent_session_id.clone()));
+                                to_rollback.push((
+                                    id.clone(),
+                                    disk_inst.agent_session_id.clone(),
+                                    disk_inst.resume_probe_failed_sid.clone(),
+                                ));
                                 reloaded = true;
                             }
                         }
@@ -2668,19 +2671,22 @@ impl HomeView {
         for (id, session_id) in &to_apply {
             self.mutate_instance(id, |inst| {
                 inst.agent_session_id = Some(session_id.clone());
+                inst.resume_probe_failed_sid = None;
             });
         }
-        for (id, disk_sid) in &to_rollback {
+        for (id, disk_sid, disk_failed_sid) in &to_rollback {
             let disk_sid = disk_sid.clone();
+            let disk_failed_sid = disk_failed_sid.clone();
             self.mutate_instance(id, |inst| {
                 inst.agent_session_id = disk_sid.clone();
+                inst.resume_probe_failed_sid = disk_failed_sid.clone();
             });
         }
 
         let touched_ids: Vec<&str> = to_apply
             .iter()
             .map(|(id, _)| id.as_str())
-            .chain(to_rollback.iter().map(|(id, _)| id.as_str()))
+            .chain(to_rollback.iter().map(|(id, _, _)| id.as_str()))
             .chain(filtered_ids.iter().map(|s| s.as_str()))
             .collect();
         let mut set_batch: Vec<(String, String, String)> = Vec::new();
@@ -2766,13 +2772,13 @@ impl HomeView {
                                 "resumed",
                             );
                         }
-                        Ok(crate::session::StartOutcome::Restarted { stale_sid }) => {
+                        Ok(crate::session::StartOutcome::ResumeFailed { sid }) => {
                             tracing::warn!(
                                 target: "session.startup_recovery",
                                 id = %instance_id,
                                 %title,
-                                %stale_sid,
-                                "restarted fresh after resume failure",
+                                %sid,
+                                "resume failed; sid preserved for explicit retry",
                             );
                         }
                         Ok(crate::session::StartOutcome::Fresh) => {}
@@ -2874,8 +2880,8 @@ impl HomeView {
     /// Apply results from the restart poller. Writes the post-cascade `Instance`
     /// snapshot back into memory (so `restart_with_size`'s mutations and the
     /// `#[serde(skip)]` `last_start_time` survive), clears the in-flight marker,
-    /// and persists. A failed cascade surfaces as `Status::Error` plus a
-    /// "Restart Failed" dialog (the user explicitly initiated the restart).
+    /// and persists. A failed cascade or preserved resume-probe failure surfaces
+    /// as a "Restart Failed" dialog (the user explicitly initiated the restart).
     /// Returns true if any instance changed.
     pub fn apply_restart_results(&mut self) -> bool {
         use crate::session::Status;
@@ -2887,6 +2893,7 @@ impl HomeView {
                 Ok(result) => {
                     let crate::session::restart::RestartResult {
                         session_id,
+                        before,
                         mut instance,
                         outcome,
                     } = result;
@@ -2894,6 +2901,20 @@ impl HomeView {
                     self.restart_in_flight.remove(&session_id);
 
                     match outcome {
+                        Ok(crate::session::StartOutcome::ResumeFailed { sid }) => {
+                            tracing::warn!(
+                                target: "session.restart",
+                                id = %session_id,
+                                %sid,
+                                "resume failed; sid preserved for explicit retry",
+                            );
+                            self.info_dialog = Some(InfoDialog::new(
+                                "Restart Failed",
+                                &format!(
+                                    "Resume failed for sid {sid}; preserved for explicit retry"
+                                ),
+                            ));
+                        }
                         Ok(_) => {}
                         Err(e) => {
                             tracing::warn!(
@@ -2916,7 +2937,16 @@ impl HomeView {
                     }
 
                     if let Some(slot) = self.instances.iter_mut().find(|i| i.id == session_id) {
-                        *slot = *instance;
+                        slot.merge_post_restart_with_baseline(&before, &instance);
+                        slot.last_error = if instance.status == Status::Error {
+                            instance.last_error.clone()
+                        } else {
+                            None
+                        };
+                        slot.last_error_check = instance.last_error_check;
+                        slot.last_start_time = instance.last_start_time;
+                        slot.retroactive_capture_excludes =
+                            instance.retroactive_capture_excludes.clone();
                         touched = true;
                     }
                 }
@@ -4160,10 +4190,7 @@ impl HomeView {
     /// the keystrokes. Errors are surfaced via `info_dialog` so the caller
     /// (`execute_action`) only has to clear its transient status.
     ///
-    /// Returns `Some(stale_sid)` when the resume-fallback cascade fired
-    /// during the implicit respawn so the caller can toast the user about
-    /// the lost history; `None` otherwise.
-    pub fn execute_send_message(&mut self, session_id: &str, message: &str) -> Option<String> {
+    pub fn execute_send_message(&mut self, session_id: &str, message: &str) {
         let target = std::mem::replace(
             &mut self.pending_send_target,
             live_send::LiveSendTarget::Agent,
@@ -4176,25 +4203,26 @@ impl HomeView {
         // live-send does (see `ensure_pane_ready_with_size`): otherwise it
         // boots at tmux's 80x24 default and runs narrow until something
         // resizes it.
-        let stale_sid = match target {
+        match target {
             live_send::LiveSendTarget::Agent => {
                 let outcome = self.try_mutate_instance_writeback_on_err(session_id, |inst| {
                     inst.ensure_pane_ready_with_size(size).map_err(Into::into)
                 });
                 match outcome {
-                    Ok(Some(EnsureReadyOutcome::Respawned {
-                        stale_sid: Some(sid),
-                    }))
-                    | Ok(Some(EnsureReadyOutcome::Started {
-                        stale_sid: Some(sid),
-                    })) => Some(sid),
-                    Ok(_) => None,
+                    Ok(Some(EnsureReadyOutcome::ResumeFailed { sid })) => {
+                        self.info_dialog = Some(InfoDialog::new(
+                            "Send Failed",
+                            &format!("Resume failed for sid {sid}; preserved for explicit retry"),
+                        ));
+                        return;
+                    }
+                    Ok(_) => {}
                     Err(err) => {
                         self.info_dialog = Some(InfoDialog::new(
                             "Send Failed",
                             &format!("Cannot prepare session: {}", err),
                         ));
-                        return None;
+                        return;
                     }
                 }
             }
@@ -4204,9 +4232,8 @@ impl HomeView {
                         "Send Failed",
                         &format!("Cannot prepare terminal: {}", e),
                     ));
-                    return None;
+                    return;
                 }
-                None
             }
             live_send::LiveSendTarget::ContainerTerminal => {
                 if let Err(e) = self.ensure_container_terminal_pane_ready(session_id, size) {
@@ -4214,12 +4241,17 @@ impl HomeView {
                         "Send Failed",
                         &format!("Cannot prepare container terminal: {}", e),
                     ));
-                    return None;
+                    return;
                 }
-                None
             }
         };
-        let inst = self.get_instance(session_id)?;
+        let Some(inst) = self.get_instance(session_id) else {
+            self.info_dialog = Some(InfoDialog::new(
+                "Send Failed",
+                "Session disappeared before the message could be sent.",
+            ));
+            return;
+        };
         let tmux_session = match target {
             live_send::LiveSendTarget::Agent => {
                 match crate::tmux::Session::new(&inst.id, &inst.title) {
@@ -4229,7 +4261,7 @@ impl HomeView {
                             "Send Failed",
                             &format!("Failed to resolve session: {}", e),
                         ));
-                        return None;
+                        return;
                     }
                 }
             }
@@ -4252,7 +4284,7 @@ impl HomeView {
                 "Send Failed",
                 &format!("Failed to send message: {}", e),
             ));
-            return None;
+            return;
         }
         self.stamp_last_accessed(session_id);
         if let Err(e) = self.save() {
@@ -4262,7 +4294,6 @@ impl HomeView {
             self.select_top_attention(None);
             self.selected_session = None;
         }
-        stale_sid
     }
 
     /// Size to boot a cold/dead agent pane at on live-send entry: the visible
@@ -4301,11 +4332,9 @@ impl HomeView {
     /// the post-toast frame, and the agent's first capture rendered
     /// shifted up.
     ///
-    /// Returns `Ok(Some(stale_sid))` when the resume-fallback cascade
-    /// fired during respawn, `Ok(None)` on a clean ready, and `Err(())`
-    /// if the pane could not be readied (`info_dialog` is set with the
-    /// underlying error so the caller only has to clear its toast).
-    pub fn prepare_live_send(&mut self, session_id: &str) -> Result<Option<String>, ()> {
+    /// Returns `Err(())` if the pane could not be readied (`info_dialog` is
+    /// set with the underlying error so the caller only has to clear its toast).
+    pub fn prepare_live_send(&mut self, session_id: &str) -> Result<(), ()> {
         let target = self.pending_live_send_target;
         self.pending_live_send_target = live_send::LiveSendTarget::Agent;
         let size = crate::terminal::get_size();
@@ -4322,20 +4351,21 @@ impl HomeView {
         // lost, leaves the pane pinned at ~50% width until live mode is
         // re-entered. See `Instance::ensure_pane_ready_with_size`.
         let agent_boot_size = self.live_send_boot_size();
-        let stale_sid = match target {
+        match target {
             live_send::LiveSendTarget::Agent => {
                 let outcome = self.try_mutate_instance_writeback_on_err(session_id, |inst| {
                     inst.ensure_pane_ready_with_size(agent_boot_size)
                         .map_err(Into::into)
                 });
                 match outcome {
-                    Ok(Some(EnsureReadyOutcome::Respawned {
-                        stale_sid: Some(sid),
-                    }))
-                    | Ok(Some(EnsureReadyOutcome::Started {
-                        stale_sid: Some(sid),
-                    })) => Some(sid),
-                    Ok(_) => None,
+                    Ok(Some(EnsureReadyOutcome::ResumeFailed { sid })) => {
+                        self.info_dialog = Some(InfoDialog::new(
+                            "Live send failed",
+                            &format!("Resume failed for sid {sid}; preserved for explicit retry"),
+                        ));
+                        return Err(());
+                    }
+                    Ok(_) => {}
                     Err(err) => {
                         self.info_dialog = Some(InfoDialog::new(
                             "Live send failed",
@@ -4353,7 +4383,6 @@ impl HomeView {
                     ));
                     return Err(());
                 }
-                None
             }
             live_send::LiveSendTarget::ContainerTerminal => {
                 if let Err(e) = self.ensure_container_terminal_pane_ready(session_id, size) {
@@ -4363,7 +4392,6 @@ impl HomeView {
                     ));
                     return Err(());
                 }
-                None
             }
         };
         let inst = match self.get_instance(session_id) {
@@ -4510,7 +4538,7 @@ impl HomeView {
         // preview dedup so exiting re-asserts the preview geometry cleanly.
         self.preview_pane_synced = None;
         self.stamp_last_accessed(session_id);
-        Ok(stale_sid)
+        Ok(())
     }
 
     /// Synchronously resize the live-send pane to match `self.preview_pane_area`,
@@ -5053,15 +5081,12 @@ impl HomeView {
     /// when `f` returns `Err`.
     ///
     /// Required for callers of `Instance::restart_with_size_opts` /
-    /// `ensure_pane_ready`, because the resume-fallback cascade mutates
-    /// `agent_session_id` and `retroactive_capture_excludes` BEFORE
-    /// returning `Err` on Tier-2 failure. The default `try_mutate_instance`
-    /// drops the mutated clone on `Err`, leaving the live entry with the
-    /// stale sid in memory while disk has been cleared. Subsequent restarts
-    /// then loop indefinitely on the same bad sid (the TUI's `reload()`
-    /// merge prefers in-memory, so even the 5s disk refresh does not
-    /// recover). This helper preserves the cascade's partial mutations so
-    /// the live state stays consistent with disk.
+    /// `ensure_pane_ready`, because the resume path can mutate
+    /// `agent_session_id`, `resume_probe_failed_sid`, and
+    /// `retroactive_capture_excludes` before returning `Err`. The default
+    /// `try_mutate_instance` drops the mutated clone on `Err`, leaving live
+    /// state inconsistent with disk until a later reload. This helper keeps
+    /// the live state consistent with the attempted restart.
     pub(super) fn try_mutate_instance_writeback_on_err<T>(
         &mut self,
         id: &str,

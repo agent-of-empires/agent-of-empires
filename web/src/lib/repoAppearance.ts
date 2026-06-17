@@ -1,3 +1,4 @@
+import type { CSSProperties } from "react";
 import { safeGetItem, safeRemoveItem, safeSetItem } from "./safeStorage";
 
 const STORAGE_KEY = "aoe-repo-appearance-v1";
@@ -25,6 +26,28 @@ export const REPO_COLOR_OPTIONS: Array<{
   { id: "rose", label: "Rose" },
   { id: "slate", label: "Slate" },
 ];
+
+const REPO_COLOR_TOKENS: Record<RepoColor, string> = {
+  amber: "--color-status-waiting",
+  teal: "--color-terminal-active",
+  sky: "--color-sandbox",
+  violet: "--color-diff-header",
+  rose: "--color-status-error",
+  slate: "--color-surface-700",
+};
+
+// Faint tinted background for a repo header / project row carrying a color.
+export function repoColorStyle(color: RepoColor | null): CSSProperties | undefined {
+  if (!color) return undefined;
+  return {
+    backgroundColor: `color-mix(in srgb, var(${REPO_COLOR_TOKENS[color]}) 14%, transparent)`,
+  };
+}
+
+// Solid swatch for the color picker.
+export function repoSwatchStyle(color: RepoColor): CSSProperties {
+  return { backgroundColor: `var(${REPO_COLOR_TOKENS[color]})` };
+}
 
 const validColors = new Set(REPO_COLOR_OPTIONS.map((option) => option.id));
 

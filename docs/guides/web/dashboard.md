@@ -86,6 +86,16 @@ Select multiple rows to act on the whole selection:
 
 With a selection active, a bulk action bar shows the count and applicable actions, split by the rows they affect (e.g. **Pin 3** alongside **Unpin 2**). Bulk actions are best-effort: each session updates independently and the bar reports a summary, then clears the selection. The selection survives collapse and filter changes but is not saved across reloads. Hidden in read-only mode.
 
+## Projects
+
+A **Projects** section near the bottom of the sidebar (above "Snoozed & archived") lists your saved projects that are not pinned and have no live session. It is the same registry the new-session wizard's "Saved projects" tab reads, and it shows on every grouping axis. The section is expanded by default; its collapsed state persists per-browser.
+
+Pinned projects are not in this section: a pinned project always renders above as its own header, with or without sessions (pin from a project header's right-click menu). A project that has live sessions also renders above as its normal group. So the section is the home for the "saved but neither pinned nor currently in use" projects, which previously lived only on the standalone Projects page (now removed).
+
+- **Add** with the **+** on the section header: browse for a path or type one, optionally set a name and a default base branch, choose global or profile scope, then save. The project appears in the section, ready to start work in.
+- **Start a session** by clicking a project row (or its **+**), which opens the new-session flow in that repo. Once it has a session it moves up into the normal group list.
+- **Edit base branch** and **Remove** live in the row's right-click (long-press on touch) menu. Removing deletes every registration for that path. The add / edit / remove controls are hidden in read-only mode.
+
 ## Profiles
 
 The **Profiles** tab in Settings (`/settings/profiles`, the first entry in the Settings sidebar) manages configuration profiles: a left rail lists every profile with a **default** badge; the detail panel lets you create, rename, delete, set the default, and edit a description. **Edit configuration** buttons deep-link into the matching Settings tab scoped to that profile (`/settings/<tab>?profile=<name>`). The old `/profiles` URL redirects here.

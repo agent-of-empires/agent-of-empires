@@ -2479,17 +2479,8 @@ impl App {
                     .set_instance_status(&id, crate::session::Status::Starting);
                 self.update_status = Some(UpdateStatus::transient("Reviving session...".into()));
                 self.draw(terminal)?;
-                let stale_sid = self.home.execute_send_message(&id, &message);
-                match stale_sid {
-                    Some(sid) => {
-                        self.update_status = Some(UpdateStatus::transient(format!(
-                            "Resume failed for sid {sid}; sent to fresh session (history not loaded)"
-                        )));
-                    }
-                    None => {
-                        self.update_status = None;
-                    }
-                }
+                self.home.execute_send_message(&id, &message);
+                self.update_status = None;
             }
             Action::EnterLiveSend(id) => {
                 // Same revive flow as SendMessage so cold-start (Docker,
@@ -2511,13 +2502,10 @@ impl App {
                 // the smaller pane, and the first capture would render
                 // shifted up.
                 self.update_status = match &outcome {
-                    Ok(Some(sid)) => Some(UpdateStatus::transient(format!(
-                        "Resume failed for sid {sid}; live-send sent to a fresh pane (history not loaded)"
-                    ))),
                     // On clean ready, drop the toast entirely. On Err the
                     // info_dialog already carries the failure detail, so the
                     // transient toast just gets in the way.
-                    Ok(None) | Err(()) => None,
+                    Ok(()) | Err(()) => None,
                 };
                 if outcome.is_ok() {
                     self.draw(terminal)?;
@@ -2688,10 +2676,11 @@ impl App {
                     )));
                     return Ok(());
                 }
-                Ok(crate::session::StartOutcome::Restarted { stale_sid }) => {
+                Ok(crate::session::StartOutcome::ResumeFailed { sid }) => {
                     self.update_status = Some(UpdateStatus::transient(format!(
-                        "Resume failed for sid {stale_sid}; started fresh (history not loaded)"
+                        "Resume failed for sid {sid}; preserved for retry"
                     )));
+                    return Ok(());
                 }
                 Ok(_) => {}
             }

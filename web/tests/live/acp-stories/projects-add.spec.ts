@@ -1,8 +1,8 @@
-// User story: add a new project from the Projects view.
+// User story: add a project from the sidebar Projects section (#2212).
 //
-// Navigate to /projects, click "+ Add project", type a path, set a default
-// base branch, click Add. The project appears in the list below with its
-// configured base branch.
+// Click the section's add button, type a path, set a default base branch,
+// click Add. The project appears as a no-session row in the Projects section
+// with its configured base branch.
 
 import { mkdirSync } from "node:fs";
 import { spawnSync } from "node:child_process";
@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { test as base, expect } from "@playwright/test";
 import { spawnAoeServe } from "../../helpers/aoeServe";
 
-base("add a project from the Projects view", async ({ page }, testInfo) => {
+base("add a project from the sidebar Projects section", async ({ page }, testInfo) => {
   let projectPath = "";
   const serve = await spawnAoeServe({
     authMode: "none",
@@ -40,20 +40,18 @@ base("add a project from the Projects view", async ({ page }, testInfo) => {
   });
 
   try {
-    await page.goto(`${serve.baseUrl}/projects`);
-    await expect(page.getByRole("heading", { name: "Projects", exact: true })).toBeVisible({ timeout: 10_000 });
+    await page.goto(`${serve.baseUrl}/`);
 
-    await page.getByRole("button", { name: "+ Add project" }).click();
+    await page.getByTestId("sidebar-projects-add").click();
     await page.getByPlaceholder("/path/to/repo").fill(projectPath);
     await page.getByPlaceholder("blank = inherit global default, then auto-detect").fill("develop");
     await page.getByRole("button", { name: "Add", exact: true }).click();
 
-    await expect(page.getByText(projectPath).first()).toBeVisible({
-      timeout: 5_000,
-    });
-    await expect(page.getByText("story-projects-add", { exact: true }).first()).toBeVisible();
+    const section = page.getByTestId("sidebar-projects-section");
+    const row = section.locator("[data-testid='sidebar-project-row']").filter({ hasText: "story-projects-add" });
+    await expect(row).toBeVisible({ timeout: 10_000 });
     // The configured base branch persists and renders on the project row.
-    await expect(page.getByText("develop", { exact: true }).first()).toBeVisible();
+    await expect(row.getByText("develop", { exact: false })).toBeVisible();
   } finally {
     await serve.stop();
   }

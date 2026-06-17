@@ -64,6 +64,27 @@ impl RestartPoller {
     pub fn try_recv_result(&self) -> Result<RestartResult, mpsc::TryRecvError> {
         self.result_rx.try_recv()
     }
+
+    #[cfg(test)]
+    pub(crate) fn with_result_for_test(result: RestartResult) -> Self {
+        let (request_tx, request_rx) = mpsc::channel::<RestartRequest>();
+        let (result_tx, result_rx) = mpsc::channel::<RestartResult>();
+        result_tx.send(result).expect("seed restart result");
+
+        let handle = thread::Builder::new()
+            .name("aoe-restart-poller-test".to_string())
+            .spawn(move || {
+                while request_rx.recv().is_ok() {}
+                drop(result_tx);
+            })
+            .expect("failed to spawn test restart poller thread");
+
+        Self {
+            request_tx,
+            result_rx,
+            _handle: handle,
+        }
+    }
 }
 
 impl Default for RestartPoller {

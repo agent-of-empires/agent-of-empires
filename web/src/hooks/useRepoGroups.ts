@@ -1,6 +1,6 @@
 import { useCallback, useMemo, useState } from "react";
 import type { ProjectInfo, Workspace, RepoGroup } from "../lib/types";
-import { mergeRegisteredProjects } from "../lib/registeredProjects";
+import { mergeRegisteredProjects, unpinnedSavedProjects } from "../lib/registeredProjects";
 import { safeGetItem, safeRemoveItem, safeSetItem } from "../lib/safeStorage";
 import {
   applyRepoAppearanceUpdate,
@@ -63,6 +63,9 @@ export function useRepoGroups(
   projects: readonly ProjectInfo[] = [],
 ): {
   groups: RepoGroup[];
+  /** Saved (registered) projects that are not pinned and have no live
+   *  session, for the dedicated sidebar "Projects" section. See #2212. */
+  savedProjects: RepoGroup[];
   toggleRepoCollapsed: (repoId: string) => void;
   updateRepoAppearance: (repoId: string, update: RepoAppearanceUpdate) => void;
   reorderRepoGroups: (orderedGroupIds: string[]) => void;
@@ -71,7 +74,7 @@ export function useRepoGroups(
   const [appearanceMap, setAppearanceMap] = useState(loadRepoAppearances);
   const [groupOrder, setGroupOrder] = useState<string[]>(loadRepoGroupOrder);
 
-  const groups = useMemo(() => {
+  const { groups, savedProjects } = useMemo(() => {
     const rank = new Map(workspaceOrdering.map((id, i) => [id, i] as const));
     const rankOf = (id: string) => rank.get(id) ?? Infinity;
     // Manual per-browser group order (#1644). A group's position in this
@@ -308,7 +311,15 @@ export function useRepoGroups(
       return a.repoPath.localeCompare(b.repoPath);
     });
 
-    return merged;
+    // Non-pinned saved projects with no live session, for the dedicated
+    // Projects section. Derived from the raw session-built repoGroups (not
+    // `merged`, which already appended pinned-empty headers). See #2212.
+    const savedProjects = unpinnedSavedProjects(repoGroups, [...projects], {
+      alias: (repoPath) => appearanceMap[repoPath]?.alias ?? null,
+      color: (repoPath) => appearanceMap[repoPath]?.color ?? null,
+    });
+
+    return { groups: merged, savedProjects };
   }, [workspaces, workspaceOrdering, sortMode, projects, collapsedMap, appearanceMap, groupOrder]);
 
   const toggleRepoCollapsed = useCallback((repoId: string) => {
@@ -342,6 +353,7 @@ export function useRepoGroups(
 
   return {
     groups,
+    savedProjects,
     toggleRepoCollapsed,
     updateRepoAppearance,
     reorderRepoGroups,

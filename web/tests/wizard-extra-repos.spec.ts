@@ -89,12 +89,16 @@ test.describe("Wizard extra repos picker (#1219)", () => {
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
     await openProjectStepWithPath(page);
-    await expect(page.getByText("Registered projects")).toBeVisible();
+    // Scope to the wizard: the same registered projects also render in the
+    // sidebar Projects section now (#2212), so page-wide button locators are
+    // ambiguous.
+    const wizard = page.getByTestId("session-wizard");
+    await expect(wizard.getByText("Registered projects")).toBeVisible();
     // The primary entry (matching /tmp/example) is hidden from the picker
     // so users can't accidentally duplicate it.
-    await expect(page.getByRole("button").filter({ hasText: /^primary$/ })).toHaveCount(0);
-    await expect(page.getByRole("button").filter({ hasText: /^shared-lib/ })).toBeVisible();
-    await expect(page.getByRole("button").filter({ hasText: /^docs/ })).toBeVisible();
+    await expect(wizard.getByRole("button").filter({ hasText: /^primary$/ })).toHaveCount(0);
+    await expect(wizard.getByRole("button").filter({ hasText: /^shared-lib/ })).toBeVisible();
+    await expect(wizard.getByRole("button").filter({ hasText: /^docs/ })).toBeVisible();
   });
 
   test("clicking a registered project chip toggles selection", async ({ page }) => {
@@ -102,7 +106,9 @@ test.describe("Wizard extra repos picker (#1219)", () => {
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
     await openProjectStepWithPath(page);
+    // Scope to the wizard; the sidebar Projects section also lists shared-lib.
     const sharedLib = page
+      .getByTestId("session-wizard")
       .getByRole("button")
       .filter({ hasText: /^shared-lib/ })
       .first();

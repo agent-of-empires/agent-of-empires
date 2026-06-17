@@ -330,9 +330,9 @@ impl HomeView {
     /// The start cascade itself runs on the `RestartPoller` worker thread (it
     /// shells out to docker and runs the before_start host hook, which can
     /// block for seconds), so the TUI event loop never blocks. The post-cascade
-    /// `Instance` (with `restart_with_size`'s mutations: cleared stale
-    /// `agent_session_id` on Tier-2 resume fallback, container id, etc.) is
-    /// written back via `apply_restart_results`.
+    /// `Instance` (with `restart_with_size`'s mutations: `resume_probe_failed_sid`,
+    /// `last_error`, container id, etc.) is written back via
+    /// `apply_restart_results`.
     ///
     /// The wake-up message is read from the resolved config
     /// (`session.restart_wake_message`); an empty value disables the

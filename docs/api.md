@@ -43,9 +43,12 @@ submits the whole message.
 | --- | --- | --- |
 | `200` | `{"sent": true}` | Keys delivered to the tmux pane |
 | `400` | `{"error": "message_empty"}` | `message` is empty or whitespace-only |
+| `400` | `{"error": "acp_mode_unsupported"}` | Session is structured-view/ACP mode and has no tmux pane |
 | `403` | `{"error": "read_only"}` | Server is in read-only mode |
 | `404` | `{"error": "not_found"}` | No session with that id |
 | `409` | `{"error": "session_not_running"}` | Session exists but the tmux pane is gone |
+| `409` | `{"error": "resume_failed", "message": "...", "resume_session_id": "..."}` | Auto-revive tried to resume a stored conversation, but the pane exited before AoE could prove the ID invalid. The ID is preserved for explicit retry or replacement. |
+| `409` | `{"error": "session_transient", "status": "..."}` | Session is mid-lifecycle and cannot accept input yet |
 | `500` | `{"error": "tmux_error"}` or `{"error": "internal"}` | Unexpected failure (logged server-side) |
 
 Concurrent POSTs to the same `id` are serialized server-side, so two
