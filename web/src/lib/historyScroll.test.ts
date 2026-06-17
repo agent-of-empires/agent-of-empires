@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  anchorIsStale,
   autoLoadDecision,
   canOfferEarlier,
   earlierAction,
@@ -83,5 +84,21 @@ describe("earlierAction / canOfferEarlier", () => {
     expect(canOfferEarlier(true, false)).toBe(true);
     expect(canOfferEarlier(false, true)).toBe(true);
     expect(canOfferEarlier(false, false)).toBe(false);
+  });
+});
+
+describe("anchorIsStale", () => {
+  it("is stale when settled with no growth", () => {
+    // load done, anchor still equals current scrollHeight => nothing grew.
+    expect(anchorIsStale(false, 1000, 1000)).toBe(true);
+  });
+  it("is not stale while a fetch is in flight", () => {
+    expect(anchorIsStale(true, 1000, 1000)).toBe(false);
+  });
+  it("is not stale once the transcript grew", () => {
+    expect(anchorIsStale(false, 1000, 1300)).toBe(false);
+  });
+  it("is not stale with no anchor set", () => {
+    expect(anchorIsStale(false, null, 1000)).toBe(false);
   });
 });

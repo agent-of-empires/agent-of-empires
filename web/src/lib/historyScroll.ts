@@ -72,3 +72,12 @@ export function earlierAction(canRevealLoaded: boolean, hasMoreOlder: boolean): 
 export function canOfferEarlier(canRevealLoaded: boolean, hasMoreOlder: boolean): boolean {
   return canRevealLoaded || hasMoreOlder;
 }
+
+/** A pending scroll anchor is stale when a load has settled (nothing in
+ *  flight) but the transcript never grew (anchor still equals the current
+ *  scrollHeight): an empty/failed page or a no-op reveal. Left set, it
+ *  would latch onto the next unrelated growth (a live append while
+ *  scrolled up) and jump the viewport, so the caller drops it. See #2236. */
+export function anchorIsStale(loading: boolean, anchor: number | null, scrollHeight: number): boolean {
+  return !loading && anchor != null && anchor === scrollHeight;
+}

@@ -22,7 +22,7 @@ import { ApprovalCard } from "./ApprovalCard";
 import { AskUserQuestionCard } from "./AskUserQuestionCard";
 import { AcpFileRefContext } from "./AcpFileRefContext";
 import type { FileRef, FileRefSession } from "../../lib/fileRef";
-import { autoLoadDecision, scrollRestoreDelta } from "../../lib/historyScroll";
+import { anchorIsStale, autoLoadDecision, scrollRestoreDelta } from "../../lib/historyScroll";
 import { ToolDensityToggle, ToolDisplayModeProvider, useToolDensityPref } from "./ToolDisplayMode";
 import { AcpRuntime, SUBAGENT_TASK_NAME, TODO_GROUP_NAME, TOOL_GROUP_NAME, type AcpContext } from "./AcpRuntime";
 import { Composer } from "./Composer";
@@ -286,10 +286,12 @@ function AcpChrome({
   // (not during render) per react-hooks/refs. See #2236.
   const canLoadEarlierRef = useRef(canLoadEarlierHistory);
   const loadEarlierRef = useRef(loadEarlierHistory);
+  const loadingEarlierRef = useRef(loadingEarlierHistory);
   useEffect(() => {
     canLoadEarlierRef.current = canLoadEarlierHistory;
     loadEarlierRef.current = loadEarlierHistory;
-  }, [canLoadEarlierHistory, loadEarlierHistory]);
+    loadingEarlierRef.current = loadingEarlierHistory;
+  }, [canLoadEarlierHistory, loadEarlierHistory, loadingEarlierHistory]);
   // Fires loadEarlier once per arrival at the top (re-armed when the user
   // scrolls back down), capturing the pre-growth scrollHeight so the
   // content ResizeObserver can freeze the read position after older rows
@@ -304,8 +306,22 @@ function AcpChrome({
     // Stamp every load (button or auto) so the cooldown below covers the
     // scroll-into-view a click triggers, not just scroll-driven loads.
     lastAutoLoadAtRef.current = performance.now();
-    pendingScrollAnchorRef.current = vp.scrollHeight;
+    const stamped = vp.scrollHeight;
+    pendingScrollAnchorRef.current = stamped;
     loadEarlierRef.current();
+    // Drop the anchor if the request adds nothing (a synchronous reveal
+    // that produced no rows, with no async fetch in flight). Otherwise a
+    // stale anchor would be applied to the next unrelated growth (e.g. a
+    // live append while scrolled up) and jump the viewport. The async
+    // fetch case is handled by the loadingEarlier effect below. See #2236.
+    requestAnimationFrame(() => {
+      if (
+        pendingScrollAnchorRef.current === stamped &&
+        anchorIsStale(loadingEarlierRef.current, pendingScrollAnchorRef.current, vp.scrollHeight)
+      ) {
+        pendingScrollAnchorRef.current = null;
+      }
+    });
   }, []);
 
   // Tap anywhere in the transcript focuses the composer and brings up the soft
@@ -322,6 +338,16 @@ function AcpChrome({
       dispatchFocusTerminal("composer");
     }
   };
+
+  // When an async older-history fetch settles without growing the
+  // transcript (empty page, error), clear the anchor so it can't latch
+  // onto later unrelated growth. See #2236.
+  useEffect(() => {
+    const vp = viewportRef.current;
+    if (vp && anchorIsStale(loadingEarlierHistory, pendingScrollAnchorRef.current, vp.scrollHeight)) {
+      pendingScrollAnchorRef.current = null;
+    }
+  }, [loadingEarlierHistory]);
 
   useLayoutEffect(() => {
     const vp = viewportRef.current;
