@@ -61,8 +61,9 @@ impl DiffView {
         let pos = ratatui::layout::Position::from((col, row));
         if self.file_list_inner.contains(pos) {
             let row_in_list = (row - self.file_list_inner.y) as usize;
-            if row_in_list < self.files.len() && self.selected_file != row_in_list {
-                self.selected_file = row_in_list;
+            let file_index = self.file_list_scroll_offset + row_in_list;
+            if file_index < self.files.len() && self.selected_file != file_index {
+                self.selected_file = file_index;
                 self.scroll_offset = 0;
             }
         }
@@ -312,6 +313,45 @@ mod tests {
             view.success_message.as_deref(),
             Some("Copied src/app/foo.rs")
         );
+    }
+
+    #[test]
+    fn file_list_scroll_tracks_the_selected_file() {
+        let mut view = make_diff_view_no_warning();
+        view.files = (0..20)
+            .map(|i| diff_file(&format!("src/file_{i}.rs")))
+            .collect();
+
+        view.selected_file = 0;
+        view.ensure_selected_file_visible_in_list(5);
+        assert_eq!(view.file_list_scroll_offset, 0);
+
+        view.selected_file = 5;
+        view.ensure_selected_file_visible_in_list(5);
+        assert_eq!(view.file_list_scroll_offset, 1);
+
+        view.selected_file = 19;
+        view.ensure_selected_file_visible_in_list(5);
+        assert_eq!(view.file_list_scroll_offset, 15);
+
+        view.selected_file = 14;
+        view.ensure_selected_file_visible_in_list(5);
+        assert_eq!(view.file_list_scroll_offset, 14);
+    }
+
+    #[test]
+    fn file_list_click_uses_the_visible_scroll_offset() {
+        let mut view = make_diff_view_no_warning();
+        view.files = (0..20)
+            .map(|i| diff_file(&format!("src/file_{i}.rs")))
+            .collect();
+        view.file_list_scroll_offset = 10;
+        view.file_list_inner = ratatui::layout::Rect::new(0, 5, 20, 5);
+
+        view.handle_click(1, 7);
+
+        assert_eq!(view.selected_file, 12);
+        assert_eq!(view.scroll_offset, 0);
     }
 
     #[test]

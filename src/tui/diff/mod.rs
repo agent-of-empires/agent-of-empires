@@ -98,6 +98,11 @@ pub struct DiffView {
     /// the same way `j`/`k` would.
     pub(crate) file_list_inner: ratatui::layout::Rect,
 
+    /// First file index currently rendered in the file-list panel.
+    /// Keeps keyboard selection and mouse clicks aligned when the file list is
+    /// taller than the visible panel.
+    pub(crate) file_list_scroll_offset: usize,
+
     /// Process-wide file-watch primitive, threaded through to per-session
     /// `Storage` writes so the local in-process Local fast path fires when
     /// the diff view persists a `base_branch_override`.
@@ -179,6 +184,7 @@ impl DiffView {
             warning_dialog,
             pending_override: None,
             file_list_inner: ratatui::layout::Rect::default(),
+            file_list_scroll_offset: 0,
             file_watch,
         };
 
@@ -192,6 +198,13 @@ impl DiffView {
         self.diff_cache.clear();
         if self.selected_file >= self.files.len() {
             self.selected_file = self.files.len().saturating_sub(1);
+        }
+        if self.files.is_empty() {
+            self.file_list_scroll_offset = 0;
+        } else {
+            self.file_list_scroll_offset = self
+                .file_list_scroll_offset
+                .min(self.files.len().saturating_sub(1));
         }
         self.scroll_offset = 0;
         Ok(())
@@ -318,6 +331,26 @@ impl DiffView {
         }
     }
 
+    /// Keep the selected file within the visible file-list rows.
+    pub(crate) fn ensure_selected_file_visible_in_list(&mut self, visible_rows: usize) {
+        if self.files.is_empty() || visible_rows == 0 {
+            self.file_list_scroll_offset = 0;
+            return;
+        }
+
+        let selected = self.selected_file.min(self.files.len().saturating_sub(1));
+        let max_offset = self.files.len().saturating_sub(visible_rows);
+        self.file_list_scroll_offset = self.file_list_scroll_offset.min(max_offset);
+
+        if selected < self.file_list_scroll_offset {
+            self.file_list_scroll_offset = selected;
+        } else if selected >= self.file_list_scroll_offset + visible_rows {
+            self.file_list_scroll_offset = selected + 1 - visible_rows;
+        }
+
+        self.file_list_scroll_offset = self.file_list_scroll_offset.min(max_offset);
+    }
+
     /// Scroll diff content down
     pub fn scroll_down(&mut self, amount: u16) {
         let max_scroll = self.total_lines.saturating_sub(self.visible_lines);
@@ -431,6 +464,7 @@ impl DiffView {
             warning_dialog: None,
             pending_override: None,
             file_list_inner: ratatui::layout::Rect::default(),
+            file_list_scroll_offset: 0,
             file_watch: FileWatchService::noop(),
         }
     }
