@@ -1276,9 +1276,9 @@
     },
     {
       "id": "acp.thread-tap-focus",
-      "kind": "vitest",
+      "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": ["src/components/acp/threadTapFocus.test.ts"],
+      "specs": ["tests/acp-thread-tap-focus.spec.ts", "src/components/acp/threadTapFocus.test.ts"],
       "components": ["web/src/components/acp/StructuredView.tsx", "web/src/components/acp/threadTapFocus.ts"]
     },
     {
