@@ -41,6 +41,7 @@ import type {
 } from "../../lib/acpTypes";
 import { hasTodoItemsArgsText, parseJsonObject } from "../../lib/acpArgs";
 import { useHistoryWindow } from "../../hooks/useHistoryWindow";
+import { canOfferEarlier, earlierAction } from "../../lib/historyScroll";
 import { useAgentProfile } from "../../lib/agentProfileContext";
 import { useCancelEscalation } from "./useCancelEscalation";
 
@@ -164,10 +165,11 @@ export function AcpRuntime({
   // the next-older page from the server (recent-first paging). One
   // affordance, no competing mechanisms. See #2236.
   const { loadOlder, hasMoreOlder, loadingOlder } = acp;
-  const canLoadEarlierHistory = canLoadEarlier || hasMoreOlder;
+  const canLoadEarlierHistory = canOfferEarlier(canLoadEarlier, hasMoreOlder);
   const loadEarlierHistory = useCallback(() => {
-    if (canLoadEarlier) loadEarlier();
-    else if (hasMoreOlder) void loadOlder();
+    const action = earlierAction(canLoadEarlier, hasMoreOlder);
+    if (action === "reveal") loadEarlier();
+    else if (action === "fetch") void loadOlder();
   }, [canLoadEarlier, hasMoreOlder, loadEarlier, loadOlder]);
 
   // Memoise the activity → ThreadMessageLike conversion. The function

@@ -22,6 +22,7 @@ import { ApprovalCard } from "./ApprovalCard";
 import { AskUserQuestionCard } from "./AskUserQuestionCard";
 import { AcpFileRefContext } from "./AcpFileRefContext";
 import type { FileRef, FileRefSession } from "../../lib/fileRef";
+import { autoLoadDecision, scrollRestoreDelta } from "../../lib/historyScroll";
 import { ToolDensityToggle, ToolDisplayModeProvider, useToolDensityPref } from "./ToolDisplayMode";
 import { AcpRuntime, SUBAGENT_TASK_NAME, TODO_GROUP_NAME, TOOL_GROUP_NAME, type AcpContext } from "./AcpRuntime";
 import { Composer } from "./Composer";
@@ -331,33 +332,21 @@ function AcpChrome({
     // own stick-to-bottom uses a similar slop; sub-pixel rounding
     // and momentary content reflows otherwise drop us out of the
     // pinned state for one frame.
-    const PRELOAD_PX = 200;
-    // Minimum gap between auto-loads. The position-restore below nudges
-    // scrollTop after each load, and clicking the (top-anchored) "Load
-    // earlier" button scrolls it into view; both land the viewport back
-    // near the top. Without a cooldown that re-fires immediately and the
-    // button never settles enough to click (the CI failure). One page per
-    // window is plenty for a real scroll-up.
-    const AUTO_LOAD_COOLDOWN_MS = 500;
     const sample = () => {
       wasAtBottomRef.current = vp.scrollTop + vp.clientHeight >= vp.scrollHeight - 16;
-      // Only meaningful once the transcript overflows; otherwise there is
-      // nothing to scroll up through and a mount at scrollTop 0 would
-      // auto-load spuriously.
-      const overflowing = vp.scrollHeight > vp.clientHeight + PRELOAD_PX;
-      // Auto-load older history as the top approaches. Arm only after the
-      // user has scrolled away from the top so a single fetch doesn't
-      // re-trigger every scroll frame while parked at the top.
-      if (!overflowing || vp.scrollTop > PRELOAD_PX) {
-        autoLoadArmedRef.current = true;
-      } else if (
-        autoLoadArmedRef.current &&
-        canLoadEarlierRef.current &&
-        performance.now() - lastAutoLoadAtRef.current > AUTO_LOAD_COOLDOWN_MS
-      ) {
-        autoLoadArmedRef.current = false;
-        requestEarlierHistory();
-      }
+      // Decision (overflow gate, arm, cooldown) lives in a pure helper so
+      // it's unit-tested away from the DOM. See historyScroll.ts / #2236.
+      const decision = autoLoadDecision({
+        scrollTop: vp.scrollTop,
+        clientHeight: vp.clientHeight,
+        scrollHeight: vp.scrollHeight,
+        armed: autoLoadArmedRef.current,
+        canLoadEarlier: canLoadEarlierRef.current,
+        now: performance.now(),
+        lastLoadAt: lastAutoLoadAtRef.current,
+      });
+      autoLoadArmedRef.current = decision.armed;
+      if (decision.fire) requestEarlierHistory();
     };
     sample();
     vp.addEventListener("scroll", sample, { passive: true });
@@ -378,10 +367,8 @@ function AcpChrome({
     const contentRo = new ResizeObserver(() => {
       const anchor = pendingScrollAnchorRef.current;
       if (anchor == null) return;
-      const delta = vp.scrollHeight - anchor;
-      if (delta > 0 && !wasAtBottomRef.current) {
-        vp.scrollTop += delta;
-      }
+      const delta = scrollRestoreDelta(anchor, vp.scrollHeight, wasAtBottomRef.current);
+      if (delta > 0) vp.scrollTop += delta;
       pendingScrollAnchorRef.current = null;
     });
     if (content) contentRo.observe(content);

@@ -1085,6 +1085,15 @@ export function useAcpSession(
     setHasMoreOlder(false);
     setLoadingOlder(false);
     loadingOlderRef.current = false;
+    // Sync the seq refs to the switched-in session synchronously: the
+    // [state.lastSeq] / [state.oldestSeq] effect mirrors lag a render
+    // tick, so without this `fetchReplay` would read the PREVIOUS
+    // session's seq and take the warm forward path instead of a
+    // recent-first cold open (or fetch from the wrong cursor). Match what
+    // the effect's `hydrate` restores: the cache, else 0. See #2236.
+    const switched = sessionId ? cacheGet(sessionId) : undefined;
+    lastSeqRef.current = switched?.lastSeq ?? 0;
+    oldestSeqRef.current = switched?.oldestSeq ?? 0;
   }
 
   useEffect(() => {

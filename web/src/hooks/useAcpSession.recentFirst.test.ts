@@ -10,7 +10,7 @@
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { useAcpSession } from "./useAcpSession";
+import { clearAcpCache, useAcpSession } from "./useAcpSession";
 
 interface FakeSocket {
   url: string;
@@ -69,6 +69,9 @@ function replayBody(frames: unknown[], next: number | null, hasMore: boolean) {
 
 beforeEach(() => {
   sockets.length = 0;
+  // The reduced-state cache is module-level; clear it so one test's
+  // session can't hydrate another's and skip the cold-open path.
+  clearAcpCache();
   vi.stubGlobal(
     "fetch",
     vi.fn(async (input: RequestInfo | URL) => {
@@ -163,5 +166,47 @@ describe("useAcpSession recent-first cold open + loadOlder (#2236)", () => {
     ]);
     expect(result.current.state.oldestSeq).toBe(2);
     expect(result.current.hasMoreOlder).toBe(false);
+  });
+
+  it("flags a lagged transcript when the tail reports lost", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url.includes("/api/login/status")) {
+          return new Response(JSON.stringify({ required: false, authenticated: true, elevated: true }), {
+            status: 200,
+          });
+        }
+        if (url.includes("/acp/replay")) {
+          return new Response(
+            JSON.stringify({ frames: [], lost: true, highest_seq: 9999, lowest_seq: 5000, has_more: false }),
+            { status: 200 },
+          );
+        }
+        return new Response(JSON.stringify({ frames: [], lost: false, highest_seq: 0 }), { status: 200 });
+      }),
+    );
+    const { result } = renderHook(() => useAcpSession("sess-lost"));
+    await flush();
+    expect(result.current.state.lagged).toBe(true);
+    expect(result.current.hasMoreOlder).toBe(false);
+  });
+
+  it("resets older-paging state when the session changes", async () => {
+    const { result, rerender } = renderHook(({ id }: { id: string }) => useAcpSession(id), {
+      initialProps: { id: "sess-rf" },
+    });
+    await flush();
+    expect(result.current.hasMoreOlder).toBe(true);
+
+    rerender({ id: "sess-rf-2" });
+    // The switch clears the flags synchronously before the new session's
+    // own recent-first load runs.
+    expect(result.current.loadingOlder).toBe(false);
+    await flush();
+    await flush();
+    // The fresh session re-derives its own watermark from its tail.
+    expect(result.current.hasMoreOlder).toBe(true);
   });
 });
