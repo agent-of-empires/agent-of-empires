@@ -5238,6 +5238,22 @@ async fn run_connection_task<W, R>(
                         info!(target: "acp.protocol", "sending session/cancel (no prompt in flight)");
                         connection
                             .send_notification(CancelNotification::new(acp_session_id.clone()))?;
+                        // A cancel with no prompt in flight means the UI
+                        // and the daemon have desynced: the client thinks
+                        // a turn is running but this loop owns no
+                        // prompt_fut, so no terminal Stopped will ever be
+                        // emitted (the adopted/orphaned-turn residual of
+                        // #1216). Publish one now so the spinner clears on
+                        // the first Stop press instead of forcing the user
+                        // onto `aoe acp restart`. Harmless when the UI is
+                        // already idle: the reducer caps lastStoppedSeq at
+                        // pendingUserPromptSeq, so a spurious Stopped while
+                        // idle is a no-op. See #2237.
+                        let _ = event_tx_for_block
+                            .send(Event::Stopped {
+                                reason: "cancelled".into(),
+                            })
+                            .await;
                     }
                     Some(ClientCmd::ForceStop) => {
                         // No prompt in flight: nothing to kill here. The
