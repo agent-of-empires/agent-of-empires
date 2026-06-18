@@ -7,6 +7,8 @@
 // rows, past the 150-row default window) and asserts the oldest turn is
 // not painted until the user loads earlier history.
 
+import type { Page } from "@playwright/test";
+
 import { test, expect } from "./helpers/mockedTest";
 import { mockAcpSession, openStructuredSession, agentMessageChunk, stopped } from "./helpers/acpMock";
 
@@ -24,6 +26,27 @@ function longTranscript(): unknown[] {
     events.push(stopped());
   }
   return events;
+}
+
+// Click "Load earlier" until the oldest turn (`prompt number 0`) surfaces.
+// The button is conditionally mounted and disables itself while a server
+// `before` fetch is in flight (StructuredView `canLoadEarlierHistory` /
+// `loadingEarlierHistory`), so it unmounts and remounts mid-interaction. A
+// fixed-interval click loop races that re-render and the click lands on a
+// detaching node ("element was detached from the DOM"), which flaked #2236's
+// network-paging test. Re-resolve the button on every poll and bound each
+// click, so a click waits out an in-flight load instead of racing it.
+async function revealOldestTurn(page: Page): Promise<void> {
+  const oldest = page.getByText("prompt number 0");
+  await expect(async () => {
+    if ((await oldest.count()) === 0) {
+      await page
+        .getByTestId("acp-load-earlier")
+        .click({ timeout: 2_000 })
+        .catch(() => {});
+    }
+    expect(await oldest.count()).toBeGreaterThan(0);
+  }).toPass({ timeout: 30_000 });
 }
 
 test("long transcript renders recent first and reveals older on Load earlier", async ({ page }) => {
@@ -44,10 +67,7 @@ test("long transcript renders recent first and reveals older on Load earlier", a
   await expect(loadEarlier).toBeVisible();
 
   // Growing the window enough times reveals the oldest turn.
-  for (let i = 0; i < 3; i += 1) {
-    if ((await page.getByText("prompt number 0").count()) > 0) break;
-    await loadEarlier.click();
-  }
+  await revealOldestTurn(page);
   await expect(page.getByText("prompt number 0")).toBeVisible({ timeout: 10_000 });
 });
 
@@ -92,14 +112,9 @@ test("loads older events from the server when the loaded window is exhausted", a
   // Turn 0 is not in the recent page at all; it must be fetched.
   await expect(page.getByText("prompt number 0")).toHaveCount(0);
 
-  const loadEarlier = page.getByTestId("acp-load-earlier");
-  // Reveal loaded rows, then trip the server fetch, until the very first
-  // turn surfaces.
-  for (let i = 0; i < 12; i += 1) {
-    if ((await page.getByText("prompt number 0").count()) > 0) break;
-    await loadEarlier.click();
-    await page.waitForTimeout(150);
-  }
+  // Reveal loaded rows, then trip the server `before` fetch, until the very
+  // first turn surfaces.
+  await revealOldestTurn(page);
   await expect(page.getByText("prompt number 0")).toBeVisible({ timeout: 10_000 });
 });
 
