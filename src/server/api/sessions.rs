@@ -807,6 +807,50 @@ fn apply_session_title_rename(inst: &mut Instance, title: String) {
     inst.title = title;
 }
 
+/// Quiesce a structured-view worker before its worktree directory is moved.
+/// A live ACP worker is pinned to the current cwd; `git worktree move` pulls
+/// that directory out, the worker crashes, and the supervisor respawns it at
+/// the stale baked-in cwd, crash-looping until the reconciler parks the
+/// session with a misleading install-the-adapter banner (#2260). The
+/// blocks_worktree_edit gate does not catch this because a structured session
+/// the user "stopped" sits at Idle yet still owns a live worker.
+///
+/// `shutdown` is the reversible teardown: it keeps the agent transcript and the
+/// instance's acp_session_id, so once the move lands the reconciler fresh-spawns
+/// at the new path and resumes context via session/load. Callers hold the
+/// session's instance_lock across shutdown plus move plus persist, and the
+/// reconciler re-reads project_path under that same lock, so the post-move
+/// respawn never targets the old path. No-op for a session with no live worker;
+/// refuses the move (409) if a live worker cannot be stopped, so the directory
+/// is never moved out from under one.
+async fn quiesce_structured_worker_for_worktree_move(
+    state: &Arc<AppState>,
+    id: &str,
+    is_structured: bool,
+) -> Result<(), axum::response::Response> {
+    if !is_structured {
+        return Ok(());
+    }
+    match state.acp_supervisor.shutdown(id).await {
+        Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => Ok(()),
+        Err(e) => {
+            tracing::warn!(
+                target: "http.api.sessions",
+                session = %id,
+                "could not stop structured-view worker before worktree move: {e}"
+            );
+            Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "worker_shutdown_failed",
+                    "message": "Could not stop the structured view worker before renaming; retry in a moment"
+                })),
+            )
+                .into_response())
+        }
+    }
+}
+
 pub async fn rename_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -846,7 +890,7 @@ pub async fn rename_session(
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
 
-    let (worktree_info, current_path, status, profile, is_sandboxed) = {
+    let (worktree_info, current_path, status, profile, is_sandboxed, is_structured) = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
             return (
@@ -861,6 +905,7 @@ pub async fn rename_session(
             inst.status,
             inst.source_profile.clone(),
             inst.is_sandboxed(),
+            inst.is_structured(),
         )
     };
 
@@ -901,6 +946,17 @@ pub async fn rename_session(
                 })),
             )
                 .into_response();
+        }
+
+        // Stop any live structured-view worker before the move so it can't
+        // crash on the pulled-out cwd and respawn-loop at the stale path
+        // (#2260). Done under the instance_lock held since the top of this
+        // function. Preserves the agent transcript so the reconciler resumes
+        // context at the new path.
+        if let Err(resp) =
+            quiesce_structured_worker_for_worktree_move(&state, &id, is_structured).await
+        {
+            return resp;
         }
 
         let wt = worktree_info.expect("tied implies worktree_info is Some");
@@ -1126,7 +1182,7 @@ pub async fn set_worktree_name(
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
 
-    let (worktree_info, current_path, status, profile, is_sandboxed) = {
+    let (worktree_info, current_path, status, profile, is_sandboxed, is_structured) = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
             return (
@@ -1141,6 +1197,7 @@ pub async fn set_worktree_name(
             inst.status,
             inst.source_profile.clone(),
             inst.is_sandboxed(),
+            inst.is_structured(),
         )
     };
 
@@ -1189,6 +1246,14 @@ pub async fn set_worktree_name(
             })),
         )
             .into_response();
+    }
+
+    // Stop any live structured-view worker before the move so it can't crash on
+    // the pulled-out cwd and respawn-loop at the stale path (#2260). Held under
+    // the instance_lock acquired at the top of this function.
+    if let Err(resp) = quiesce_structured_worker_for_worktree_move(&state, &id, is_structured).await
+    {
+        return resp;
     }
 
     let wt = worktree_info.clone();

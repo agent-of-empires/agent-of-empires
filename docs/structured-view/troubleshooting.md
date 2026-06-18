@@ -84,17 +84,22 @@ Two recovery controls sit on the compatibility screen:
 - **Update & restart** runs the agent's `npm install -g` on the host (as the
   user running the daemon) and then respawns. It appears only for
   npm-installable agents (`claude-agent-acp`, `codex-acp`, `gemini`) and only
-  when `acp.allow_agent_install` is enabled.
+  when `acp.allow_agent_install` is enabled. Because the install is global, the
+  same click also queues **every other session blocked on that same adapter** for
+  an automatic respawn, so one update clears every red X at once (the screen
+  reports how many other sessions it recovered). When the setting is off the
+  button is shown disabled with a hint to enable it.
 
 `acp.allow_agent_install` is **off by default**: running a global package install
 from the daemon is a host-level capability that executes the package's npm
 lifecycle scripts as the daemon user. It is always blocked in `--read-only` mode,
-and the setting is `local_only` (you can only turn it on from a dashboard
-connection to localhost, not a remote one). For agents that install some other
-way (`opencode`, `vibe-acp`, `pi-acp`), the screen shows the manual command
-instead of an Update button. Inside a sandbox session, a host install would not
-reach the containerized agent, so the action is refused; install the agent in the
-container image instead.
+and the setting is `local_only`, so the web dashboard cannot turn it on (the leaf
+is stripped from every web settings write, remote or local). Enable it from the
+`aoe` TUI settings (Advanced) or in the config file; the button activates on the
+next reload. For agents that install some other way (`opencode`, `vibe-acp`,
+`pi-acp`), the screen shows the manual command instead of an Update button.
+Inside a sandbox session, a host install would not reach the containerized agent,
+so the action is refused; install the agent in the container image instead.
 
 ### "Failed to start structured view agent" while the adapter is installed
 

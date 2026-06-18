@@ -52,6 +52,29 @@ describe("StartupErrorBanner native-binary branch", () => {
   });
 });
 
+describe("StartupErrorBanner respawn-budget park with a moved project_path (#2260)", () => {
+  beforeEach(() => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ exists: false, tail: "" }) }),
+    );
+  });
+
+  // The reconciler park banner embeds the ProjectPathMissing Display text when
+  // the cwd is gone (see acp_reconciler::park_message). The banner must route to
+  // the moved-cwd remediation, not tell the user to reinstall a healthy adapter.
+  const PARK_MOVED_CWD =
+    "Structured view worker failed to stay up after 5 restart attempts in 60s; auto-respawn paused. " +
+    "project path no longer exists: /Users/me/aoe/worktrees/Burmese";
+
+  it("renders the moved-cwd remediation and echoes the path, not the doctor --fix copy", () => {
+    const { container } = render(<StartupErrorBanner sessionId="s-1" message={PARK_MOVED_CWD} />);
+    expect(container.textContent).toContain("working directory no longer exists");
+    expect(container.textContent).toContain("/Users/me/aoe/worktrees/Burmese");
+    expect(container.textContent).not.toContain("aoe acp doctor --fix");
+  });
+});
+
 describe("StartupErrorBanner fallback branch (unchanged)", () => {
   it("still renders the doctor --fix copy on a generic failure", () => {
     vi.stubGlobal(

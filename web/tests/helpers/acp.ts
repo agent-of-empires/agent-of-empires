@@ -392,7 +392,7 @@ export async function attachServeDiagnostics(testInfo: TestInfo, serve: { home: 
  * sidebar / topbar elements behind the overlay.
  */
 export function wizardScope(page: Page): Locator {
-  return page.locator('div.fixed.inset-0.z-50:has(h1:has-text("New session"))');
+  return page.locator('[data-testid="session-wizard"]');
 }
 
 /**

@@ -122,19 +122,25 @@ describe("StartupErrorScreen", () => {
     );
   });
 
-  it("hides Update & restart when the install setting is off", async () => {
+  it("shows a disabled Update & restart plus an enable hint when the install setting is off", async () => {
     fetchSettings.mockResolvedValue({ acp: { allow_agent_install: false } });
-    const { queryByTestId } = render(<StartupErrorScreen detail={incompatible(true)} sessionId="s1" />);
-    // Give the settings effect a tick to resolve.
+    const { queryByTestId, findByTestId } = render(<StartupErrorScreen detail={incompatible(true)} sessionId="s1" />);
+    // The active button stays hidden; the disabled placeholder + hint appear.
     await waitFor(() => expect(fetchSettings).toHaveBeenCalled());
     expect(queryByTestId("startup-error-update-restart")).toBeNull();
+    const disabled = await findByTestId("startup-error-update-restart-disabled");
+    expect((disabled as HTMLButtonElement).disabled).toBe(true);
+    const hint = await findByTestId("startup-error-enable-hint");
+    expect(hint.textContent).toContain("acp.allow_agent_install");
   });
 
-  it("hides Update & restart for non-npm agents even when the setting is on", async () => {
+  it("hides Update & restart entirely for non-npm agents even when the setting is on", async () => {
     fetchSettings.mockResolvedValue({ acp: { allow_agent_install: true } });
     const { queryByTestId } = render(<StartupErrorScreen detail={incompatible(false)} sessionId="s1" />);
     await waitFor(() => expect(fetchSettings).toHaveBeenCalled());
     expect(queryByTestId("startup-error-update-restart")).toBeNull();
+    expect(queryByTestId("startup-error-update-restart-disabled")).toBeNull();
+    expect(queryByTestId("startup-error-enable-hint")).toBeNull();
   });
 
   it("Update & restart installs then respawns on success", async () => {
@@ -146,6 +152,7 @@ describe("StartupErrorScreen", () => {
       exit_code: 0,
       stdout: "added 1 package",
       stderr: "",
+      recovered_sessions: 0,
     });
     const { findByTestId } = render(<StartupErrorScreen detail={incompatible(true)} sessionId="s1" />);
     const btn = await findByTestId("startup-error-update-restart");
@@ -154,6 +161,22 @@ describe("StartupErrorScreen", () => {
     await waitFor(() =>
       expect(fetch).toHaveBeenCalledWith("/api/sessions/s1/acp/spawn", expect.objectContaining({ method: "POST" })),
     );
+  });
+
+  it("reports how many other sessions were queued for recovery after a global install", async () => {
+    fetchSettings.mockResolvedValue({ acp: { allow_agent_install: true } });
+    installAcpAgent.mockResolvedValue({
+      session_id: "s1",
+      package: "@agentclientprotocol/claude-agent-acp@latest",
+      success: true,
+      exit_code: 0,
+      stdout: "added 1 package",
+      stderr: "",
+      recovered_sessions: 3,
+    });
+    const { findByTestId, container } = render(<StartupErrorScreen detail={incompatible(true)} sessionId="s1" />);
+    fireEvent.click(await findByTestId("startup-error-update-restart"));
+    await waitFor(() => expect(container.textContent).toContain("3 other sessions"));
   });
 
   it("Update & restart surfaces the error and does not respawn on failure", async () => {

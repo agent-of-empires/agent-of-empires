@@ -3768,6 +3768,15 @@ pub(crate) fn derive_acp_status(event: &crate::acp::Event) -> Option<StatusInten
         Event::UserPromptSent { .. }
         | Event::ApprovalResolved { .. }
         | Event::ElicitationResolved { .. } => Some(StatusIntent::Set(Status::Running)),
+        // Agent transcript output means a turn is live even when no
+        // UserPromptSent preceded it. A fired ScheduleWakeup or a background
+        // TaskOutput notification resumes the turn agent-side, streaming only
+        // these events; aoe never publishes a prompt for them, so without this
+        // the sidebar dot stayed grey through real work. apply_status_intent's
+        // guards keep a deliberate Stopped grey and no-op once already Running.
+        Event::ThinkingStarted
+        | Event::AgentMessageChunk { .. }
+        | Event::ToolCallStarted { .. } => Some(StatusIntent::Set(Status::Running)),
         // A pending approval or elicitation both block the turn on the
         // user, so the sidebar dot goes yellow either way.
         Event::ApprovalRequested { .. } | Event::ElicitationRequested { .. } => {
@@ -4628,14 +4637,37 @@ mod tests {
 
     #[cfg(feature = "serve")]
     #[test]
-    fn derive_acp_status_ignores_streaming_and_string_events() {
+    fn derive_acp_status_running_on_agent_activity() {
+        use crate::acp::state::ToolCall;
         use crate::acp::Event;
-        // Mid-turn events that shouldn't move the session out of Running.
+        // A turn that resumes agent-side (fired ScheduleWakeup, background
+        // TaskOutput notification) streams only these events, never a
+        // UserPromptSent. They must drive Running so the sidebar dot recovers.
         assert_eq!(
             derive_acp_status(&Event::AgentMessageChunk { text: "x".into() }),
-            None
+            Some(StatusIntent::Set(Status::Running))
         );
-        assert_eq!(derive_acp_status(&Event::ThinkingStarted), None);
+        assert_eq!(
+            derive_acp_status(&Event::ThinkingStarted),
+            Some(StatusIntent::Set(Status::Running))
+        );
+        assert_eq!(
+            derive_acp_status(&Event::ToolCallStarted {
+                tool_call: ToolCall {
+                    id: "t".into(),
+                    name: "shell".into(),
+                    kind: "execute".into(),
+                    args_preview: "{}".into(),
+                    started_at: chrono::Utc::now(),
+                    parent_tool_call_id: None,
+                    memory_recall: None,
+                    diffs: Vec::new(),
+                },
+            }),
+            Some(StatusIntent::Set(Status::Running))
+        );
+        // ThinkingEnded is a sub-phase terminator, not a work signal; leaving
+        // it None avoids needless intents (ThinkingStarted already set Running).
         assert_eq!(derive_acp_status(&Event::ThinkingEnded), None);
     }
 
@@ -4668,6 +4700,20 @@ mod tests {
         // The UserPromptSent that follows the respawn then drives Running.
         apply(&mut inst, StatusIntent::Set(Status::Running));
         assert_eq!(inst.status, Status::Running);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn agent_activity_wakes_an_idle_session_after_a_fired_wakeup() {
+        // A session that paused on ScheduleWakeup sits Idle. When the wake
+        // fires the turn resumes agent-side with activity events (no
+        // UserPromptSent), so the activity-derived Set(Running) must flip the
+        // dot green instead of leaving it grey.
+        let mut inst = stopped_structured_instance();
+        inst.status = Status::Idle;
+        apply(&mut inst, StatusIntent::Set(Status::Running));
+        assert_eq!(inst.status, Status::Running);
+        assert_eq!(inst.idle_entered_at, None);
     }
 
     #[cfg(feature = "serve")]

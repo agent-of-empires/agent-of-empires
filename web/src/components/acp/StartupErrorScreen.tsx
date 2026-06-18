@@ -19,7 +19,12 @@ interface Props {
  *  "Restart agent" respawns the worker (re-running the handshake after a
  *  manual reinstall), and, when the agent is npm-installable and the
  *  `acp.allow_agent_install` setting is on, "Update & restart" runs the
- *  install on the host then respawns. See #2109. */
+ *  install on the host then respawns. The install is global, so it also
+ *  queues every other session blocked on the same adapter for an automatic
+ *  respawn (reported as `recovered_sessions`), clearing every red X from
+ *  one click. When the setting is off the button is shown disabled with a
+ *  hint to enable it in the TUI (it is `local_only`, so the web cannot flip
+ *  it). See #2109. */
 export function StartupErrorScreen({ detail, sessionId }: Props) {
   const heading = headingFor(detail);
   const summary = summaryFor(detail);
@@ -31,6 +36,7 @@ export function StartupErrorScreen({ detail, sessionId }: Props) {
   const [installState, setInstallState] = useState<"idle" | "installing" | "failed">("idle");
   const [installError, setInstallError] = useState<string | null>(null);
   const [installOutput, setInstallOutput] = useState<string | null>(null);
+  const [recoveredCount, setRecoveredCount] = useState(0);
 
   useEffect(() => {
     let alive = true;
@@ -59,6 +65,7 @@ export function StartupErrorScreen({ detail, sessionId }: Props) {
         setInstallError(`Install exited with code ${res.exit_code ?? "unknown"}.`);
         return;
       }
+      setRecoveredCount(res.recovered_sessions);
       setInstallState("idle");
       // Re-run the handshake against the freshly installed version.
       await respawn();
@@ -119,11 +126,34 @@ export function StartupErrorScreen({ detail, sessionId }: Props) {
               {installState === "installing" ? "Updating…" : "Update & restart"}
             </button>
           )}
+          {autoInstallable && !allowInstall && (
+            <button
+              type="button"
+              data-testid="startup-error-update-restart-disabled"
+              disabled
+              title="Enable acp.allow_agent_install in the aoe TUI settings (Advanced) to install from the dashboard"
+              className="cursor-not-allowed rounded-md border border-surface-700 bg-surface-800 px-3 py-1.5 text-xs font-medium text-text-dim opacity-60"
+            >
+              Update & restart
+            </button>
+          )}
         </div>
+
+        {autoInstallable && !allowInstall && (
+          <div className="mt-2 text-xs text-text-dim" data-testid="startup-error-enable-hint">
+            One-click install is off. Enable{" "}
+            <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">acp.allow_agent_install</code> in the{" "}
+            <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">aoe</code> TUI settings (Advanced) to
+            run the update from here. It is blocked from the web on purpose: it runs{" "}
+            <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">npm install</code> on the host.
+          </div>
+        )}
 
         {respawnState === "ok" && (
           <div className="mt-2 text-xs text-emerald-200/90">
             Restart requested. The agent re-runs the compatibility check on the next handshake.
+            {recoveredCount > 0 &&
+              ` Also restarting ${recoveredCount} other session${recoveredCount === 1 ? "" : "s"} blocked on the same adapter.`}
           </div>
         )}
         {respawnState === "failed" && respawnError && (
