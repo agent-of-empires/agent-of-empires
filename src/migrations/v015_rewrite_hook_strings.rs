@@ -66,15 +66,17 @@
 //! gap requires in-place string rewrite inside non-AoE matcher groups;
 //! tracked as a follow-up.
 //!
-//! ### Power-loss durability asymmetry across formats
+//! ### Power-loss durability across formats
 //!
-//! Only Codex routes its rewrite through `crate::session::atomic_write`
-//! (`hooks/mod.rs::write_codex_config`). JSON settings, settl, Hermes,
-//! and Kiro use `std::fs::write` (truncate+write). Power loss in that
-//! window leaves a 0-byte file; the v015 gate then fails closed on the
-//! corrupted parse and never auto-recovers. Recovery:
-//! `aoe uninstall && aoe add --cmd <agent>`. Routing every install path
-//! through `atomic_write` is tracked as a follow-up.
+//! Every install/uninstall path in `hooks/mod.rs` routes through
+//! `crate::session::atomic_write_following_symlinks` (resolve symlink
+//! chain, then temp file + fsync + rename + dir fsync on the resolved
+//! target). A power loss mid-rewrite either keeps the prior bytes intact
+//! or surfaces the freshly written bytes; partial writes are not
+//! observable. Symlinks at the destination (a common dotfile-manager
+//! pattern: `~/.claude/settings.json -> ~/dotfiles/...`) are followed
+//! rather than replaced, so the underlying dotfile target receives the
+//! rewrite and the symlink survives.
 //!
 //! ### Sandbox-image hooks are not rewritten
 //!

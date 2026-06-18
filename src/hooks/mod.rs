@@ -762,7 +762,7 @@ pub fn install_hooks(
             std::fs::create_dir_all(parent)?;
         }
         let formatted = serde_json::to_string_pretty(&settings)?;
-        std::fs::write(settings_path, formatted)?;
+        crate::session::atomic_write_following_symlinks(settings_path, formatted.as_bytes())?;
 
         tracing::info!(target: "hooks.install", "Installed AoE hooks in {}", settings_path.display());
         Ok(())
@@ -837,7 +837,7 @@ pub(crate) fn install_codex_hooks_with_preserved_state(
 }
 
 fn with_codex_config_lock<T>(config_path: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
-    let lock_base_path = codex_config_write_path(config_path)?;
+    let lock_base_path = crate::session::resolve_symlink_chain(config_path)?;
     with_config_lock(&lock_base_path, "toml.lock", f)
 }
 
@@ -881,48 +881,7 @@ fn with_config_lock<T>(
 }
 
 fn write_codex_config(config_path: &Path, config: &toml_edit::DocumentMut) -> Result<()> {
-    let write_path = codex_config_write_path(config_path)?;
-    crate::session::atomic_write(&write_path, config.to_string().as_bytes())
-}
-
-fn codex_config_write_path(config_path: &Path) -> Result<PathBuf> {
-    let mut write_path = config_path.to_path_buf();
-
-    for _ in 0..32 {
-        let metadata = match std::fs::symlink_metadata(&write_path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(write_path),
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("Failed to inspect Codex config {}", write_path.display())
-                });
-            }
-        };
-
-        if !metadata.file_type().is_symlink() {
-            return Ok(write_path);
-        }
-
-        let target = std::fs::read_link(&write_path).with_context(|| {
-            format!(
-                "Failed to read Codex config symlink {}",
-                write_path.display()
-            )
-        })?;
-        write_path = if target.is_absolute() {
-            target
-        } else {
-            write_path
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .join(target)
-        };
-    }
-
-    Err(anyhow::anyhow!(
-        "Codex config symlink chain is too deep: {}",
-        config_path.display()
-    ))
+    crate::session::atomic_write_following_symlinks(config_path, config.to_string().as_bytes())
 }
 
 fn read_codex_config(config_path: &Path) -> Result<toml_edit::DocumentMut> {
@@ -1234,7 +1193,7 @@ pub fn uninstall_hooks(settings_path: &Path) -> Result<bool> {
         }
 
         let formatted = serde_json::to_string_pretty(&settings)?;
-        std::fs::write(settings_path, formatted)?;
+        crate::session::atomic_write_following_symlinks(settings_path, formatted.as_bytes())?;
 
         tracing::info!(target: "hooks.uninstall", "Removed AoE hooks from {}", settings_path.display());
         Ok(true)
@@ -1300,7 +1259,7 @@ pub fn install_settl_hooks(config_path: &Path, target: HookInstallTarget) -> Res
             std::fs::create_dir_all(parent)?;
         }
         let formatted = toml::to_string_pretty(&config)?;
-        std::fs::write(config_path, formatted)?;
+        crate::session::atomic_write_following_symlinks(config_path, formatted.as_bytes())?;
 
         tracing::info!(target: "hooks.install", "Installed AoE hooks in {}", config_path.display());
         Ok(())
@@ -1338,7 +1297,7 @@ pub fn uninstall_settl_hooks(config_path: &Path) -> Result<bool> {
         }
 
         let formatted = toml::to_string_pretty(&config)?;
-        std::fs::write(config_path, formatted)?;
+        crate::session::atomic_write_following_symlinks(config_path, formatted.as_bytes())?;
         tracing::info!(target: "hooks.uninstall", "Removed AoE hooks from {}", config_path.display());
         Ok(true)
     })
@@ -1435,12 +1394,15 @@ pub fn install_hermes_hooks(config_path: &Path, target: HookInstallTarget) -> Re
         if let Some(parent) = config_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(config_path, formatted)?;
+        crate::session::atomic_write_following_symlinks(config_path, formatted.as_bytes())?;
 
         if let Some(parent) = allowlist_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&allowlist_path, allowlist_formatted)?;
+        crate::session::atomic_write_following_symlinks(
+            &allowlist_path,
+            allowlist_formatted.as_bytes(),
+        )?;
 
         tracing::info!(target: "hooks.install", "Installed AoE hooks in {}", config_path.display());
         Ok(())
@@ -1511,7 +1473,7 @@ pub fn uninstall_hermes_hooks(config_path: &Path) -> Result<bool> {
         }
 
         let formatted = serde_yaml::to_string(&config)?;
-        std::fs::write(config_path, formatted)?;
+        crate::session::atomic_write_following_symlinks(config_path, formatted.as_bytes())?;
         tracing::info!(target: "hooks.uninstall", "Removed AoE hooks from {}", config_path.display());
         Ok(true)
     })
@@ -1644,7 +1606,7 @@ pub fn install_kiro_hooks(agent_config_path: &Path, target: HookInstallTarget) -
             std::fs::create_dir_all(parent)?;
         }
         let formatted = serde_json::to_string_pretty(&Value::Object(config))?;
-        std::fs::write(agent_config_path, formatted)?;
+        crate::session::atomic_write_following_symlinks(agent_config_path, formatted.as_bytes())?;
 
         tracing::info!(target: "hooks.install", "Installed AoE hooks in {}", agent_config_path.display());
         Ok(())
@@ -1749,7 +1711,10 @@ pub fn uninstall_kiro_hooks(agent_config_path: &Path) -> Result<bool> {
             std::fs::remove_file(agent_config_path)?;
         } else {
             let formatted = serde_json::to_string_pretty(&Value::Object(config))?;
-            std::fs::write(agent_config_path, formatted)?;
+            crate::session::atomic_write_following_symlinks(
+                agent_config_path,
+                formatted.as_bytes(),
+            )?;
         }
 
         tracing::info!(target: "hooks.uninstall", "Removed AoE hooks from {}", agent_config_path.display());
@@ -2091,6 +2056,167 @@ mod tests {
         assert!(config["hooks"]["UserPromptSubmit"].is_array());
         assert!(target_path.with_extension("toml.lock").exists());
         assert!(!config_path.with_extension("toml.lock").exists());
+
+        uninstall_codex_hooks(&config_path).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&config_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "Codex config path must remain a symlink after uninstall"
+        );
+        let after = std::fs::read_to_string(&target_path).unwrap();
+        assert!(
+            after.contains("model = \"gpt-5.3-codex\""),
+            "user content must survive uninstall"
+        );
+        let after_doc: toml::Value = toml::from_str(&after).unwrap();
+        assert!(
+            after_doc.get("hooks").is_none(),
+            "AoE hooks must be removed from target"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_install_hooks_preserves_symlinked_settings() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let claude_dir = tmp.path().join(".claude");
+        let dotfiles_dir = tmp.path().join("dotfiles");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::fs::create_dir_all(&dotfiles_dir).unwrap();
+
+        let target_path = dotfiles_dir.join("claude-settings.json");
+        std::fs::write(&target_path, "{\"apiKey\":\"keep-me\"}\n").unwrap();
+        let settings_path = claude_dir.join("settings.json");
+        symlink("../dotfiles/claude-settings.json", &settings_path).unwrap();
+
+        install_hooks(&settings_path, claude_events(), HookInstallTarget::Host).unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&settings_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "settings path must remain a symlink"
+        );
+        let settings: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&target_path).unwrap()).unwrap();
+        assert_eq!(settings["apiKey"], "keep-me");
+        assert!(settings["hooks"]["SessionStart"].is_array());
+
+        uninstall_hooks(&settings_path).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&settings_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "settings path must remain a symlink after uninstall"
+        );
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&target_path).unwrap()).unwrap();
+        assert_eq!(after["apiKey"], "keep-me");
+        assert!(after.get("hooks").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_install_hermes_hooks_preserves_symlinked_config() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let hermes_dir = tmp.path().join(".hermes");
+        let dotfiles_dir = tmp.path().join("dotfiles");
+        std::fs::create_dir_all(&hermes_dir).unwrap();
+        std::fs::create_dir_all(&dotfiles_dir).unwrap();
+
+        let config_target = dotfiles_dir.join("hermes-config.yaml");
+        let allowlist_target = dotfiles_dir.join("hermes-allowlist.json");
+        std::fs::write(&config_target, "user_field: keep-me\n").unwrap();
+        std::fs::write(&allowlist_target, "{\"approvals\":[]}\n").unwrap();
+
+        let config_path = hermes_dir.join("config.yaml");
+        let allowlist_path = hermes_dir.join("shell-hooks-allowlist.json");
+        symlink("../dotfiles/hermes-config.yaml", &config_path).unwrap();
+        symlink("../dotfiles/hermes-allowlist.json", &allowlist_path).unwrap();
+
+        install_hermes_hooks(&config_path, HookInstallTarget::Host).unwrap();
+
+        for path in [&config_path, &allowlist_path] {
+            assert!(
+                std::fs::symlink_metadata(path)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "{} must remain a symlink",
+                path.display()
+            );
+        }
+        let config: serde_yaml::Value =
+            serde_yaml::from_str(&std::fs::read_to_string(&config_target).unwrap()).unwrap();
+        assert_eq!(
+            config
+                .as_mapping()
+                .unwrap()
+                .get(serde_yaml::Value::String("user_field".into()))
+                .and_then(|v| v.as_str()),
+            Some("keep-me")
+        );
+        let hooks = config
+            .as_mapping()
+            .unwrap()
+            .get(serde_yaml::Value::String("hooks".into()))
+            .unwrap()
+            .as_mapping()
+            .unwrap();
+        for (event, _) in HERMES_HOOKS {
+            assert!(
+                hooks
+                    .get(serde_yaml::Value::String((*event).into()))
+                    .is_some(),
+                "event {} missing on dotfile target",
+                event
+            );
+        }
+        let allowlist: Value =
+            serde_json::from_str(&std::fs::read_to_string(&allowlist_target).unwrap()).unwrap();
+        assert_eq!(
+            allowlist["approvals"].as_array().unwrap().len(),
+            HERMES_HOOKS.len()
+        );
+
+        uninstall_hermes_hooks(&config_path).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&config_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "config symlink must remain after uninstall"
+        );
+        let after: serde_yaml::Value =
+            serde_yaml::from_str(&std::fs::read_to_string(&config_target).unwrap()).unwrap();
+        assert_eq!(
+            after
+                .as_mapping()
+                .unwrap()
+                .get(serde_yaml::Value::String("user_field".into()))
+                .and_then(|v| v.as_str()),
+            Some("keep-me")
+        );
+        assert!(after
+            .as_mapping()
+            .unwrap()
+            .get(serde_yaml::Value::String("hooks".into()))
+            .is_none());
+        assert!(
+            std::fs::symlink_metadata(&allowlist_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "allowlist symlink must remain untouched after uninstall"
+        );
     }
 
     #[test]

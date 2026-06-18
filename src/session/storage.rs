@@ -64,7 +64,7 @@
 //! both in different orders across processes would deadlock cross-process.
 //! Today no caller does this; this comment is the invariant.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use fs2::FileExt;
 use std::collections::HashMap;
 use std::fs;
@@ -115,6 +115,57 @@ pub(crate) fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
         let _ = dir_file.sync_all();
     }
     Ok(())
+}
+
+/// Resolve `path` through a symlink chain to the underlying target file. Used
+/// for user-facing config files where users symlink to a dotfiles repo:
+/// `rename(2)` would otherwise replace the symlink instead of updating the
+/// target, silently desyncing the dotfile tree.
+///
+/// Returns `path` unchanged when it is not a symlink. When the chain ends in
+/// a missing target (fresh install or dangling link), returns that target
+/// path so the caller materialises a regular file there. Caps recursion at
+/// 32 hops, well below typical kernel MAXSYMLINKS limits (40 on Linux, 32 on
+/// Darwin); deeper chains are almost certainly loops.
+pub(crate) fn resolve_symlink_chain(path: &Path) -> Result<PathBuf> {
+    let mut current = path.to_path_buf();
+    let mut hops: usize = 0;
+    loop {
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if !metadata.file_type().is_symlink() => return Ok(current),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(current),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("Failed to inspect {}", current.display()));
+            }
+            Ok(_) => {}
+        }
+
+        if hops >= 32 {
+            return Err(anyhow!("Symlink chain too deep: {}", path.display()));
+        }
+
+        let target = fs::read_link(&current)
+            .with_context(|| format!("Failed to read symlink {}", current.display()))?;
+        current = if target.is_absolute() {
+            target
+        } else {
+            current
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(target)
+        };
+        hops += 1;
+    }
+}
+
+/// Like [`atomic_write`], but resolves any symlink at `path` first and writes
+/// through to the underlying file. Use for user-facing agent config files
+/// where users may symlink the path into a dotfiles repo (chezmoi, stow,
+/// dotbot). Plain [`atomic_write`] would replace the symlink with a regular
+/// file via `rename(2)`, silently desyncing the dotfile tree.
+pub(crate) fn atomic_write_following_symlinks(path: &Path, content: &[u8]) -> Result<()> {
+    atomic_write(&resolve_symlink_chain(path)?, content)
 }
 
 /// Process-wide registry of per-profile save mutexes. Every `Storage::new` for
@@ -655,6 +706,94 @@ mod tests {
         std::env::set_var("HOME", temp);
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp.join(".config"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_symlink_chain_returns_path_when_missing() {
+        let tmp = tempdir().unwrap();
+        let missing = tmp.path().join("does-not-exist.json");
+        assert_eq!(resolve_symlink_chain(&missing).unwrap(), missing);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_symlink_chain_returns_path_when_regular_file() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("regular.json");
+        std::fs::write(&path, b"x").unwrap();
+        assert_eq!(resolve_symlink_chain(&path).unwrap(), path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_symlink_chain_follows_multi_hop_chain() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempdir().unwrap();
+        let target = tmp.path().join("target.json");
+        std::fs::write(&target, b"x").unwrap();
+        let mid = tmp.path().join("mid.json");
+        symlink(&target, &mid).unwrap();
+        let top = tmp.path().join("top.json");
+        symlink("mid.json", &top).unwrap();
+        assert_eq!(resolve_symlink_chain(&top).unwrap(), target);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_symlink_chain_detects_loop() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempdir().unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        symlink(&b, &a).unwrap();
+        symlink(&a, &b).unwrap();
+        let err = resolve_symlink_chain(&a).unwrap_err().to_string();
+        assert!(err.contains("too deep"), "got: {err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_symlink_chain_dangling_returns_target_path() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempdir().unwrap();
+        let missing = tmp.path().join("missing.json");
+        let link = tmp.path().join("link.json");
+        symlink(&missing, &link).unwrap();
+        assert_eq!(resolve_symlink_chain(&link).unwrap(), missing);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_symlink_chain_resolves_at_max_depth() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempdir().unwrap();
+        let target = tmp.path().join("target.json");
+        std::fs::write(&target, b"x").unwrap();
+        let mut prev = target.clone();
+        for i in (0..32).rev() {
+            let link = tmp.path().join(format!("link_{}.json", i));
+            symlink(&prev, &link).unwrap();
+            prev = link;
+        }
+        assert_eq!(resolve_symlink_chain(&prev).unwrap(), target);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_symlink_chain_rejects_over_max_depth() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempdir().unwrap();
+        let target = tmp.path().join("target.json");
+        std::fs::write(&target, b"x").unwrap();
+        let mut prev = target.clone();
+        for i in (0..33).rev() {
+            let link = tmp.path().join(format!("link_{}.json", i));
+            symlink(&prev, &link).unwrap();
+            prev = link;
+        }
+        let err = resolve_symlink_chain(&prev).unwrap_err().to_string();
+        assert!(err.contains("too deep"), "got: {err}");
     }
 
     #[test]
