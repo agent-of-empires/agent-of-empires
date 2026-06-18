@@ -1200,7 +1200,7 @@ impl Instance {
     }
 
     /// Read the agent-raised urgent flag from `attention.json`. Sourced
-    /// on-demand from `/tmp/aoe-hooks/{id}/attention.json` so it picks up
+    /// on-demand from `/tmp/aoe-hooks-<euid>/{id}/attention.json` so it picks up
     /// changes the running agent makes (via the `attention-urgent` script)
     /// without an Instance state mutation. Suppressed for archived/snoozed
     /// rows so a sunk session can't claw its way back to the top.
@@ -1804,9 +1804,12 @@ impl Instance {
         );
 
         if self.tool == "claude" {
-            if let Ok(dir) = crate::hooks::hook_status_dir(&self.id) {
-                let _ = std::fs::remove_file(dir.join("session_id"));
-            }
+            // Route through dir_guard so the session_id removal participates
+            // in the same `*at`-anchored, mode-checked, owner-checked
+            // discipline as every other hook I/O. Path-join + remove_file
+            // would have bypassed base verification on the first launch
+            // before any other hook code ran (#1844 follow-up).
+            let _ = crate::hooks::unlink_session_id_via_guard(&self.id);
         }
 
         session.create_with_size(&self.project_path, cmd.as_deref(), size)?;
@@ -1980,7 +1983,7 @@ impl Instance {
             if !self.is_sandboxed() {
                 if let Some(home) = dirs::home_dir() {
                     let config_path = home.join(sidecar.host_config_subpath);
-                    match (sidecar.install)(&config_path) {
+                    match (sidecar.install)(&config_path, crate::hooks::HookInstallTarget::Host) {
                         Ok(()) => {
                             if let Some(post_install) = sidecar.post_install_host {
                                 post_install();
@@ -1995,9 +1998,11 @@ impl Instance {
             if let Some(hook_cfg) = agent.and_then(|a| a.hook_config.as_ref()) {
                 match self.codex_config_path_for_launch_env() {
                     Ok(config_path) => {
-                        if let Err(e) =
-                            crate::hooks::install_codex_hooks(&config_path, hook_cfg.events)
-                        {
+                        if let Err(e) = crate::hooks::install_codex_hooks(
+                            &config_path,
+                            hook_cfg.events,
+                            crate::hooks::HookInstallTarget::Host,
+                        ) {
                             tracing::warn!("Failed to install codex hooks: {}", e);
                         }
                     }
@@ -6366,9 +6371,18 @@ mod tests {
         }
 
         fn write_sidecar(instance_id: &str, sid: &str) -> std::path::PathBuf {
+            use std::os::unix::fs::PermissionsExt;
+            let base = crate::hooks::hook_base_path();
+            if !base.exists() {
+                std::fs::create_dir_all(&base).expect("create hook base dir");
+            }
+            std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700))
+                .expect("set hook base mode 0700");
             let dir =
                 crate::hooks::hook_status_dir(instance_id).expect("test id must be allowlist-safe");
             std::fs::create_dir_all(&dir).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                .expect("set hook instance mode 0700");
             std::fs::write(dir.join("session_id"), sid).unwrap();
             dir
         }
@@ -7516,8 +7530,17 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
         );
 
         // The clobbered hook state that produced the green row.
+        use std::os::unix::fs::PermissionsExt;
+        let base = crate::hooks::hook_base_path();
+        if !base.exists() {
+            std::fs::create_dir_all(&base).expect("create hook base dir");
+        }
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700))
+            .expect("set hook base mode 0700");
         let dir = crate::hooks::hook_status_dir(&inst.id).expect("hook dir");
         std::fs::create_dir_all(&dir).expect("create hook dir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("set hook instance mode 0700");
         std::fs::write(dir.join("status"), "running").expect("write status");
         assert_eq!(
             crate::hooks::read_hook_status(&inst.id),

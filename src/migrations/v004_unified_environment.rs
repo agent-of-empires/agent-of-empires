@@ -71,7 +71,7 @@ fn migrate_config_file(path: &PathBuf) -> Result<()> {
             sandbox.remove("environment_values");
         }
         let new_content = toml::to_string_pretty(&doc)?;
-        fs::write(path, new_content)?;
+        crate::session::atomic_write(path, new_content.as_bytes())?;
         return Ok(());
     }
 
@@ -104,7 +104,7 @@ fn migrate_config_file(path: &PathBuf) -> Result<()> {
     sandbox.remove("environment_values");
 
     let new_content = toml::to_string_pretty(&doc)?;
-    fs::write(path, new_content)?;
+    crate::session::atomic_write(path, new_content.as_bytes())?;
 
     Ok(())
 }

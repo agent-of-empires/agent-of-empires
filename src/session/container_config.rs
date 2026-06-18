@@ -1000,6 +1000,7 @@ fn refresh_codex_sandbox_hooks(sandbox_dir: &Path, preserved_state: Option<toml_
         &config_path,
         hook_cfg.events,
         preserved_state,
+        crate::hooks::HookInstallTarget::Sandbox,
     ) {
         tracing::warn!(
             "Failed to refresh Codex hooks in sandbox config {}: {}",
@@ -1410,26 +1411,36 @@ pub(crate) fn build_container_config(
             // generic hook_config path below cannot emit; they install through
             // their SidecarHooks installer at the sandbox config subpath.
             if agent.sidecar_hooks.is_some() || agent.hook_config.is_some() {
-                let hook_dir = crate::hooks::hook_status_dir(instance_id).context(
-                    "refusing to mount hook directory: AOE_INSTANCE_ID failed validation",
-                )?;
-                if let Err(e) = std::fs::create_dir_all(&hook_dir) {
-                    tracing::warn!(target: "session.profile",
-                        "Failed to create hook directory {}: {}",
-                        hook_dir.display(),
-                        e
-                    );
+                crate::session::validate_instance_id(instance_id).map_err(|e| {
+                    anyhow::anyhow!(
+                        "refusing to mount hook directory: AOE_INSTANCE_ID failed validation: {e}"
+                    )
+                })?;
+                match crate::hooks::ensure_instance_dir_path(instance_id) {
+                    Ok(hook_dir) => {
+                        let container_hook_path = format!(
+                            "{}/{instance_id}",
+                            crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER
+                        );
+                        volumes.push(VolumeMount {
+                            host_path: hook_dir.to_string_lossy().to_string(),
+                            container_path: container_hook_path,
+                            read_only: false,
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "session.profile",
+                            "Hook directory unavailable, skipping bind-mount; \
+                             agent boots without status hooks (pane detection takes over): {e:#}");
+                    }
                 }
-                volumes.push(VolumeMount {
-                    host_path: hook_dir.to_string_lossy().to_string(),
-                    container_path: hook_dir.to_string_lossy().to_string(),
-                    read_only: false,
-                });
             }
 
             if let Some(sidecar) = &agent.sidecar_hooks {
                 let config_file = home.join(sidecar.sandbox_config_subpath);
-                if let Err(e) = (sidecar.install)(&config_file) {
+                if let Err(e) =
+                    (sidecar.install)(&config_file, crate::hooks::HookInstallTarget::Sandbox)
+                {
                     tracing::warn!(target: "session.profile", "Failed to install {} hooks in sandbox: {}", agent.name, e);
                 }
             } else if let Some(hook_cfg) = &agent.hook_config {
@@ -1447,7 +1458,11 @@ pub(crate) fn build_container_config(
                         let sandbox_dir = home.join(mount.host_rel).join(SANDBOX_SUBDIR);
                         let settings_file = sandbox_dir.join(config_file_name);
                         let result = if agent.name == "codex" {
-                            crate::hooks::install_codex_hooks(&settings_file, hook_cfg.events)
+                            crate::hooks::install_codex_hooks(
+                                &settings_file,
+                                hook_cfg.events,
+                                crate::hooks::HookInstallTarget::Sandbox,
+                            )
                         } else {
                             crate::hooks::install_hooks(
                                 &settings_file,
@@ -1602,6 +1617,7 @@ fn common_ancestor(a: &Path, b: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hooks::test_support::BaseGuard;
     use std::fs;
     use tempfile::TempDir;
 
@@ -2843,6 +2859,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_build_container_config_includes_repo_sandbox_settings() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
         // Isolate HOME so global/profile config doesn't interfere
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
@@ -3075,6 +3092,7 @@ volume_ignores = ["**/bin", "**/obj", "target"]
     #[test]
     #[serial_test::serial]
     fn test_build_container_config_sibling_worktree_loads_main_repo_extra_volumes() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -3151,6 +3169,7 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
     #[test]
     #[serial_test::serial]
     fn test_build_container_config_installs_codex_hooks_files() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -3193,12 +3212,22 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
 
         let hook_dir =
             crate::hooks::hook_status_dir(instance_id).expect("test id must be allowlist-safe");
-        assert!(
-            config
-                .volumes
-                .iter()
-                .any(|v| v.host_path == hook_dir.to_string_lossy()),
-            "status hook directory should be mounted"
+        let expected_container_path = format!(
+            "{}/{instance_id}",
+            crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER
+        );
+        let mount = config
+            .volumes
+            .iter()
+            .find(|v| v.host_path == hook_dir.to_string_lossy())
+            .expect("status hook directory should be mounted");
+        assert_eq!(
+            mount.container_path, expected_container_path,
+            "container path must be the fixed in-container path, not the host euid path"
+        );
+        assert_ne!(
+            mount.host_path, mount.container_path,
+            "host (per-user) and container (fixed) paths MUST differ for the bind-mount remap"
         );
         crate::hooks::cleanup_hook_status_dir(instance_id);
     }
@@ -3213,6 +3242,7 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
     #[test]
     #[serial_test::serial]
     fn test_build_container_config_installs_sidecar_hooks_files() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -3387,6 +3417,7 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
     #[test]
     #[serial_test::serial]
     fn test_build_container_config_uses_detected_codex_for_custom_wrapper_hooks() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -3519,6 +3550,7 @@ trusted_hash = "keep"
     #[test]
     #[serial_test::serial]
     fn test_build_container_config_mounts_codex_home_from_extra_env() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -3563,6 +3595,7 @@ trusted_hash = "keep"
     #[test]
     #[serial_test::serial]
     fn test_build_container_config_mounts_codex_home_from_sandbox_environment() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -3622,6 +3655,7 @@ environment = ["CODEX_HOME=/root/profile-codex"]
     #[test]
     #[serial_test::serial]
     fn test_build_container_config_uses_passed_profile_not_global_default() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
         #[cfg(any(target_os = "linux", target_os = "macos"))]

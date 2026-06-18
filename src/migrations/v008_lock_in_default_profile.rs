@@ -74,7 +74,7 @@ pub(crate) fn run_in(app_dir: &Path) -> Result<()> {
     );
 
     let serialized = toml::to_string_pretty(&doc)?;
-    fs::write(&global_config, serialized)?;
+    crate::session::atomic_write(&global_config, serialized.as_bytes())?;
 
     info!(
         "v008: locked in default_profile = \"default\" in {}",

@@ -7,7 +7,7 @@
 // writes to disk but the server never reloads).
 
 import { spawnSync } from "node:child_process";
-import { mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { chmodSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { test as base, expect } from "@playwright/test";
 import { spawnAoeServe, listSessions, seedSessionViaAoeAdd } from "../helpers/aoeServe";
@@ -55,8 +55,22 @@ base.describe("ensure_session restart flow", () => {
       expect((await r1.json()).status).toBe("restarted");
       expect(tmuxHasSession(serve.home, tmuxName)).toBe(true);
 
-      const hookDir = `/tmp/aoe-hooks/${sessionId}`;
+      const euid = process.getuid?.() ?? 0;
+      const hookBase = `/tmp/aoe-hooks-${euid}`;
+      mkdirSync(hookBase, { recursive: true });
+      try {
+        chmodSync(hookBase, 0o700);
+      } catch {
+        // best effort: if base is owned by us we can chmod, if not the
+        // hook system would already be unusable for this user.
+      }
+      const hookDir = `${hookBase}/${sessionId}`;
       mkdirSync(hookDir, { recursive: true });
+      try {
+        chmodSync(hookDir, 0o700);
+      } catch {
+        // ignore
+      }
       writeFileSync(join(hookDir, "status"), "idle");
 
       const r2 = await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/ensure`, { method: "POST" });

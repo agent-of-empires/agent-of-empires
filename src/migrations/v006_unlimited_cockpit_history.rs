@@ -56,7 +56,7 @@ pub(crate) fn run_in(app_dir: &Path) -> Result<()> {
     cockpit.insert("replay_events".into(), (0_i64).into());
 
     let serialized = toml::to_string_pretty(&doc)?;
-    fs::write(&global_config, serialized)?;
+    crate::session::atomic_write(&global_config, serialized.as_bytes())?;
 
     info!(
         "v006: flipped cockpit.replay_events from 500 to 0 (unlimited) in {}",

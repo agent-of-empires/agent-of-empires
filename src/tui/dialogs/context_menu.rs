@@ -37,7 +37,12 @@ pub enum ContextMenuAction {
 
 pub struct ContextMenuDialog {
     items: Vec<(ContextMenuAction, &'static str)>,
-    selected: usize,
+    /// Which item is highlighted, or `None` when the pointer is not over
+    /// any item. Opens at `Some(0)` so the keyboard default and the
+    /// "Enter submits the first item" behavior hold, but mouse hover can
+    /// clear it to `None` so no row stays lit once the cursor leaves every
+    /// item (a near-miss onto the border or off the menu entirely).
+    highlight: Option<usize>,
     /// Anchor where the popup's top-left corner wants to sit. The renderer
     /// clamps this into the visible area so a click near the bottom-right
     /// edge of the screen doesn't push the menu off-frame.
@@ -144,14 +149,24 @@ impl ContextMenuDialog {
     fn new(anchor: (u16, u16), items: Vec<(ContextMenuAction, &'static str)>) -> Self {
         Self {
             items,
-            selected: 0,
+            highlight: Some(0),
             anchor,
             last_area: Rect::default(),
         }
     }
 
+    /// The action `Enter` would submit. Falls back to the first item when
+    /// nothing is highlighted (e.g. mouse hover cleared it), mirroring the
+    /// `Some(0)` open state, so the accessor is always total.
     pub fn selected_action(&self) -> ContextMenuAction {
-        self.items[self.selected].0
+        self.items[self.highlight.unwrap_or(0)].0
+    }
+
+    /// Test-only accessor: the currently highlighted item index, or
+    /// `None` when the pointer left every item and nothing is lit.
+    #[cfg(test)]
+    pub fn highlight_for_test(&self) -> Option<usize> {
+        self.highlight
     }
 
     /// Test-only accessor: returns the (action, label) pairs in order
@@ -198,42 +213,60 @@ impl ContextMenuDialog {
                 Some(DialogResult::Continue)
             }
             Some(idx) => {
-                self.selected = idx;
+                self.highlight = Some(idx);
                 Some(DialogResult::Submit(self.items[idx].0))
             }
         }
     }
 
-    /// Move the selection (and thus the highlighted row) to whichever
-    /// item the mouse is hovering, so the visual cue tracks the cursor
-    /// the same way a desktop menu does. Returns true when the
-    /// highlight actually changed, so the caller can skip a redraw on
+    /// Move the highlight to whichever item the mouse is hovering, so the
+    /// visual cue tracks the cursor the same way a desktop menu does. When
+    /// the cursor is not over any item (a border row/column, or off the
+    /// menu entirely) the highlight clears to `None` so the last-hovered
+    /// item doesn't stay lit once the pointer leaves it. Returns true when
+    /// the highlight actually changed, so the caller can skip a redraw on
     /// every pixel-level mouse twitch.
+    ///
+    /// This intentionally diverges from the focus-style dialogs
+    /// (`ConfirmDialog` and friends), which keep their selection when the
+    /// mouse drifts off so a click still lands on a sensible default. A
+    /// multi-row popup menu follows desktop semantics instead: drift off
+    /// and nothing is armed, so an accidental near-miss can't leave a
+    /// misleading row lit for `Enter`.
     pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
-        let Some(idx) = row_to_item_idx(self.last_area, self.items.len(), col, row) else {
-            return false;
-        };
-        if self.selected == idx {
+        let next = row_to_item_idx(self.last_area, self.items.len(), col, row);
+        if self.highlight == next {
             return false;
         }
-        self.selected = idx;
+        self.highlight = next;
         true
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<ContextMenuAction> {
         match key.code {
             KeyCode::Esc => DialogResult::Cancel,
-            KeyCode::Enter => DialogResult::Submit(self.items[self.selected].0),
+            // Enter submits the highlighted item. If mouse hover cleared the
+            // highlight (cursor left every item) there's nothing to submit,
+            // so keep the menu open rather than firing a stale action.
+            KeyCode::Enter => match self.highlight {
+                Some(idx) => DialogResult::Submit(self.items[idx].0),
+                None => DialogResult::Continue,
+            },
+            // Arrow keys always re-establish a concrete highlight, so the
+            // keyboard works even after hover cleared it to `None`.
             KeyCode::Up | KeyCode::Char('k') => {
-                if self.selected == 0 {
-                    self.selected = self.items.len() - 1;
-                } else {
-                    self.selected -= 1;
-                }
+                let last = self.items.len() - 1;
+                self.highlight = Some(match self.highlight {
+                    None | Some(0) => last,
+                    Some(idx) => idx - 1,
+                });
                 DialogResult::Continue
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.selected = (self.selected + 1) % self.items.len();
+                self.highlight = Some(match self.highlight {
+                    None => 0,
+                    Some(idx) => (idx + 1) % self.items.len(),
+                });
                 DialogResult::Continue
             }
             // Quick-pick hotkeys mirror the underlying actions' home-view
@@ -325,7 +358,7 @@ impl ContextMenuDialog {
             .iter()
             .enumerate()
             .map(|(idx, (_, label))| {
-                let style = if idx == self.selected {
+                let style = if Some(idx) == self.highlight {
                     Style::default()
                         .fg(theme.background)
                         .bg(theme.accent)
@@ -753,16 +786,65 @@ mod tests {
     }
 
     #[test]
-    fn hover_off_menu_leaves_selection_alone() {
+    fn hover_off_menu_clears_the_highlight() {
         let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false));
         stub_render(&mut menu, 10, 10, 14, 7);
         menu.handle_hover(12, 15); // Delete (fifth/last row)
-        assert_eq!(menu.selected_action(), ContextMenuAction::Delete);
-        assert!(!menu.handle_hover(40, 40));
+        assert_eq!(menu.highlight_for_test(), Some(4));
+        // Moving the cursor off every item must drop the highlight so no
+        // row stays lit once the pointer is no longer over any of them.
+        assert!(menu.handle_hover(40, 40));
         assert_eq!(
-            menu.selected_action(),
-            ContextMenuAction::Delete,
-            "hover outside menu must not snap the highlight back"
+            menu.highlight_for_test(),
+            None,
+            "hover off every item must clear the highlight, not keep the last one"
         );
+        // A second move that is still off every item is a no-op redraw-wise.
+        assert!(!menu.handle_hover(41, 41));
+    }
+
+    #[test]
+    fn hover_onto_border_clears_the_highlight() {
+        // Regression for the reported bug: hovering an item then sliding
+        // onto the menu's own border (still inside `last_area`, but not an
+        // item row) must unhighlight rather than leave the item lit.
+        let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false));
+        stub_render(&mut menu, 10, 10, 14, 7);
+        menu.handle_hover(12, 12); // Rename (second row)
+        assert_eq!(menu.highlight_for_test(), Some(1));
+        // Top border row (y itself) is inside the menu but not an item.
+        assert!(menu.handle_hover(12, 10));
+        assert_eq!(menu.highlight_for_test(), None);
+    }
+
+    #[test]
+    fn enter_after_hover_cleared_keeps_menu_open() {
+        // With nothing highlighted, Enter has no item to submit, so the
+        // menu stays open instead of firing a stale action.
+        let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false));
+        stub_render(&mut menu, 10, 10, 14, 7);
+        menu.handle_hover(40, 40); // off every item -> None
+        assert!(matches!(
+            menu.handle_key(key(KeyCode::Enter)),
+            DialogResult::Continue
+        ));
+    }
+
+    #[test]
+    fn arrow_down_after_hover_cleared_starts_at_first_item() {
+        let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false));
+        stub_render(&mut menu, 10, 10, 14, 7);
+        menu.handle_hover(40, 40); // off every item -> None
+        menu.handle_key(key(KeyCode::Down));
+        assert_eq!(menu.selected_action(), ContextMenuAction::NewFromSelection);
+    }
+
+    #[test]
+    fn arrow_up_after_hover_cleared_starts_at_last_item() {
+        let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false));
+        stub_render(&mut menu, 10, 10, 14, 7);
+        menu.handle_hover(40, 40); // off every item -> None
+        menu.handle_key(key(KeyCode::Up));
+        assert_eq!(menu.selected_action(), ContextMenuAction::Delete);
     }
 }

@@ -77,7 +77,7 @@ fn clear_archived_error(path: &Path) -> Result<()> {
     }
 
     if healed > 0 {
-        fs::write(path, serde_json::to_string_pretty(&value)?)?;
+        crate::session::atomic_write(path, serde_json::to_string_pretty(&value)?.as_bytes())?;
         info!(
             "v016: cleared spurious archived Error on {healed} session(s) in {} (#2206)",
             path.display()

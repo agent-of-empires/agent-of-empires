@@ -58,7 +58,7 @@ pub struct SessionResponse {
     /// the predicate. Cross-feature parity with the TUI's `f`/`F` keybind.
     pub favorited: bool,
     /// True when the agent has flagged this session as urgent via the
-    /// `attention-urgent` hook (read from `/tmp/aoe-hooks/{id}/attention.json`
+    /// `attention-urgent` hook (read from `/tmp/aoe-hooks-<euid>/{id}/attention.json`
     /// by `Instance::is_urgent()`). The web sidebar's Attention sort floats
     /// urgent rows above all non-urgent ones within their triage tier,
     /// matching the TUI's `attention_session_key` urgent-bias. `is_urgent()`
@@ -836,6 +836,50 @@ fn apply_session_title_rename(inst: &mut Instance, title: String) {
     inst.title = title;
 }
 
+/// Quiesce a structured-view worker before its worktree directory is moved.
+/// A live ACP worker is pinned to the current cwd; `git worktree move` pulls
+/// that directory out, the worker crashes, and the supervisor respawns it at
+/// the stale baked-in cwd, crash-looping until the reconciler parks the
+/// session with a misleading install-the-adapter banner (#2260). The
+/// blocks_worktree_edit gate does not catch this because a structured session
+/// the user "stopped" sits at Idle yet still owns a live worker.
+///
+/// `shutdown` is the reversible teardown: it keeps the agent transcript and the
+/// instance's acp_session_id, so once the move lands the reconciler fresh-spawns
+/// at the new path and resumes context via session/load. Callers hold the
+/// session's instance_lock across shutdown plus move plus persist, and the
+/// reconciler re-reads project_path under that same lock, so the post-move
+/// respawn never targets the old path. No-op for a session with no live worker;
+/// refuses the move (409) if a live worker cannot be stopped, so the directory
+/// is never moved out from under one.
+async fn quiesce_structured_worker_for_worktree_move(
+    state: &Arc<AppState>,
+    id: &str,
+    is_structured: bool,
+) -> Result<(), axum::response::Response> {
+    if !is_structured {
+        return Ok(());
+    }
+    match state.acp_supervisor.shutdown(id).await {
+        Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => Ok(()),
+        Err(e) => {
+            tracing::warn!(
+                target: "http.api.sessions",
+                session = %id,
+                "could not stop structured-view worker before worktree move: {e}"
+            );
+            Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "worker_shutdown_failed",
+                    "message": "Could not stop the structured view worker before renaming; retry in a moment"
+                })),
+            )
+                .into_response())
+        }
+    }
+}
+
 pub async fn rename_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -875,7 +919,7 @@ pub async fn rename_session(
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
 
-    let (worktree_info, current_path, status, profile, is_sandboxed) = {
+    let (worktree_info, current_path, status, profile, is_sandboxed, is_structured) = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
             return (
@@ -890,6 +934,7 @@ pub async fn rename_session(
             inst.status,
             inst.source_profile.clone(),
             inst.is_sandboxed(),
+            inst.is_structured(),
         )
     };
 
@@ -930,6 +975,17 @@ pub async fn rename_session(
                 })),
             )
                 .into_response();
+        }
+
+        // Stop any live structured-view worker before the move so it can't
+        // crash on the pulled-out cwd and respawn-loop at the stale path
+        // (#2260). Done under the instance_lock held since the top of this
+        // function. Preserves the agent transcript so the reconciler resumes
+        // context at the new path.
+        if let Err(resp) =
+            quiesce_structured_worker_for_worktree_move(&state, &id, is_structured).await
+        {
+            return resp;
         }
 
         let wt = worktree_info.expect("tied implies worktree_info is Some");
@@ -1155,7 +1211,7 @@ pub async fn set_worktree_name(
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
 
-    let (worktree_info, current_path, status, profile, is_sandboxed) = {
+    let (worktree_info, current_path, status, profile, is_sandboxed, is_structured) = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
             return (
@@ -1170,6 +1226,7 @@ pub async fn set_worktree_name(
             inst.status,
             inst.source_profile.clone(),
             inst.is_sandboxed(),
+            inst.is_structured(),
         )
     };
 
@@ -1218,6 +1275,14 @@ pub async fn set_worktree_name(
             })),
         )
             .into_response();
+    }
+
+    // Stop any live structured-view worker before the move so it can't crash on
+    // the pulled-out cwd and respawn-loop at the stale path (#2260). Held under
+    // the instance_lock acquired at the top of this function.
+    if let Err(resp) = quiesce_structured_worker_for_worktree_move(&state, &id, is_structured).await
+    {
+        return resp;
     }
 
     let wt = worktree_info.clone();
@@ -4803,14 +4868,16 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(hook_base)]
     fn from_instance_surfaces_hook_urgent_flag() {
         // #1640: the web Attention sort needs `Instance::is_urgent()` on the
         // wire. Write the hook-side attention.json the agent would emit and
         // confirm it round-trips onto the response, then confirm a session
         // with no hook file reports urgent: false.
+        let (_g, _, _tmp_base) = crate::hooks::test_support::BaseGuard::ready();
         let inst = make_test_instance();
-        let dir = crate::hooks::hook_status_dir(&inst.id).expect("test id must be allowlist-safe");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::hooks::ensure_instance_dir_path(&inst.id)
+            .expect("guard must create instance subdir");
         std::fs::write(
             dir.join("attention.json"),
             r#"{"urgent":true,"urgent_reason":"needs input"}"#,
