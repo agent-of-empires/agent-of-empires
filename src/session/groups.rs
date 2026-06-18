@@ -503,31 +503,18 @@ fn attention_tier(inst: &Instance) -> u8 {
     }
 }
 
-/// Key used to sort sessions by Attention. Primary = urgent-bias (the agent
-/// has flagged the session via `attention-urgent`); secondary = priority tier
-/// ascending; tertiary = favorite within tier; rest = "longest aging first":
-/// within a tier, the session that has been ignored the longest bubbles to
-/// the top. A Waiting session that has been sitting untouched for 2 days
-/// should rank above one that was just bumped a minute ago, because the
-/// stale one is the one most likely to have been forgotten.
-///
-/// Sessions with no `last_accessed_at` (never polled / just created) bucket
-/// into the "no activity" slot AFTER the dated ones, so fresh-but-untouched
-/// rows don't falsely claim the top.
-///
-/// Within tier 99 (archived), preserve the reverse convention; most-recently
-/// archived first, since the archive block is a recency view, not an
-/// attention view. Urgent is suppressed for tier 99 so a sunk row can't
-/// claw back to the top.
 /// Attention bucket rank with the unread promoter folded in. Pure (no global
 /// flag read) so it can be unit-tested directly. Waiting (tier 0) stays top;
-/// when `unread` and the feature is on, a non-waiting row is promoted to rank
-/// 1, just below Waiting and above every other tier, with the remaining tiers
-/// shifted up by one (2..=7). When the feature is off it returns `tier`
-/// unchanged; the shift is monotonic so a feature-on run with no unread rows
-/// orders identically to before. Tier 99 (archived/snoozed) never reaches
-/// here, so sunk rows stay sunk regardless of an unread marker.
+/// tier 99 stays sunk regardless of unread state. When `unread` and the
+/// feature is on, any other non-waiting row is promoted to rank 1, just below
+/// Waiting and above every other tier, with the remaining tiers shifted up by
+/// one (2..=7). When the feature is off it returns `tier` unchanged; the shift
+/// is monotonic so a feature-on run with no unread rows orders identically to
+/// before.
 fn attention_rank(tier: u8, unread: bool, unread_enabled: bool) -> u8 {
+    if tier == 99 {
+        return 99;
+    }
     if unread_enabled {
         if tier == 0 {
             0
@@ -541,6 +528,21 @@ fn attention_rank(tier: u8, unread: bool, unread_enabled: bool) -> u8 {
     }
 }
 
+/// Key used to sort sessions by Attention. Primary = urgent-bias (the agent
+/// has flagged the session via `attention-urgent`); secondary = priority tier
+/// ascending; tertiary = favorite within tier; rest = "longest aging first":
+/// within a tier, the session that has been ignored the longest bubbles to
+/// the top. A Waiting session that has been sitting untouched for 2 days
+/// should rank above one that was just bumped a minute ago, because the
+/// stale one is the one most likely to have been forgotten.
+///
+/// Sessions with no `last_accessed_at` (never polled / just created) bucket
+/// into the "no activity" slot AFTER the dated ones, so fresh-but-untouched
+/// rows don't falsely claim the top.
+///
+/// Within tier 99, preserve the reverse convention: most-recently sunk first,
+/// since the archive block is a recency view, not an attention view. Urgent is
+/// suppressed for tier 99 so a sunk row can't claw back to the top.
 #[allow(clippy::type_complexity)]
 fn attention_session_key(
     inst: &Instance,
@@ -567,10 +569,10 @@ fn attention_session_key(
     // design; within the sunk block, recency ordering is the intent.
     let favorite_bias = tier != 99 && inst.is_favorited();
     if tier == 99 {
-        // Tier 99 unifies archived, snoozed, pane_dead, and Error rows.
+        // Tier 99 unifies archived, snoozed, and pane-dead rows.
         // Secondary sort timestamp falls through: archived_at first, then
-        // snoozed_until, then last_accessed_at (the only signal Error /
-        // pane_dead rows have, since they were never explicitly archived).
+        // snoozed_until, then last_accessed_at (the only signal pane-dead
+        // rows have, since they were never explicitly archived).
         // Reverse() makes most-recent sink-time bubble to the top of the
         // sunk block, matching "recency view" intent across all four
         // sub-categories.
@@ -2098,6 +2100,17 @@ mod tests {
         assert_eq!(attention_rank(0, false, false), 0);
         assert_eq!(attention_rank(2, true, false), 2);
         assert_eq!(attention_rank(4, false, false), 4);
+
+        assert_eq!(
+            attention_rank(99, true, true),
+            99,
+            "unread must not promote sunk rows"
+        );
+        assert_eq!(
+            attention_rank(99, false, true),
+            99,
+            "read sunk rows must keep rank 99"
+        );
 
         // OFF ordering matches the pre-feature tier order for read rows.
         assert!(attention_rank(0, false, false) < attention_rank(1, false, false));
