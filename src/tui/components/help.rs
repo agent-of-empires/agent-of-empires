@@ -50,6 +50,13 @@ fn shortcuts(strict: bool, live_on_enter: bool) -> Vec<(&'static str, Vec<(Strin
     let mut other: Vec<(String, String)> = Vec::new();
     for b in bindings::BINDINGS {
         let Some(help) = &b.help else { continue };
+        // The unread toggle is fully removed when the feature is off, so the
+        // help overlay shouldn't advertise a dead key (unlike the sort-gated
+        // Attention rows, which stay listed because that's a transient view
+        // state, not a disabled feature).
+        if b.id == bindings::ActionId::ToggleUnread && !crate::session::unread_enabled() {
+            continue;
+        }
         let mut label = bindings::label(b.id, strict);
         if label.is_empty() {
             label = bindings::label(b.id, false);

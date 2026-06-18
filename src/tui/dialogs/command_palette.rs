@@ -94,6 +94,11 @@ pub fn builtin_commands(serve_enabled: bool, strict_hotkeys: bool) -> Vec<Palett
             if meta.serve_only && !serve_enabled {
                 return None;
             }
+            // Drop the unread toggle entirely when the feature is off, so the
+            // palette can't invoke a removed binding.
+            if b.id == bindings::ActionId::ToggleUnread && !crate::session::unread_enabled() {
+                return None;
+            }
             Some(PaletteCommand {
                 id: bindings::palette_id(b.id),
                 title: meta.title.to_string(),

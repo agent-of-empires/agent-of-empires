@@ -98,6 +98,10 @@
      dimmer than waiting so the hierarchy reads bright > amber > slate. */
   --color-status-fresh-idle: #f59e0b;
   --color-status-idle: #71717a;
+  /* Unread accent: a finished turn the user hasn't viewed, or a manual flag.
+     Sits between waiting and idle on the attention scale. Theme-projected
+     from `theme.unread` (see resolved.rs); this default matches `zinc`. */
+  --color-status-unread: #38bdf8;
   --color-status-error: #ef4444;
   --color-status-starting: #f59e0b;
   --color-status-stopped: #52525b;

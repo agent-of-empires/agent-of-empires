@@ -23,6 +23,7 @@ import {
   setSessionArchive,
   setSessionPin,
   setSessionSnooze,
+  setSessionUnread,
   getSettingsSchema,
   updateProfileSettings,
   updateTheme,
@@ -189,6 +190,28 @@ describe("setSessionSnooze", () => {
   it("returns null on 400 (server rejected an out-of-range duration)", async () => {
     fetchSpy.mockResolvedValueOnce(new Response("", { status: 400 }));
     expect(await setSessionSnooze("sess-1", 0)).toBeNull();
+  });
+});
+
+describe("setSessionUnread", () => {
+  it("PATCHes /api/sessions/{id}/unread with unread=true to flag unread", async () => {
+    fetchSpy.mockResolvedValueOnce(jsonResponse({ id: "sess-1", unread: true }));
+    await setSessionUnread("sess-1", true);
+    const [url, init] = fetchSpy.mock.calls[0]!;
+    expect(url).toBe("/api/sessions/sess-1/unread");
+    expect(init?.method).toBe("PATCH");
+    expect(JSON.parse(init!.body as string)).toEqual({ unread: true });
+  });
+
+  it("PATCHes unread=false to mark read", async () => {
+    fetchSpy.mockResolvedValueOnce(jsonResponse({ id: "sess-1" }));
+    await setSessionUnread("sess-1", false);
+    expect(JSON.parse(fetchSpy.mock.calls[0]![1]!.body as string)).toEqual({ unread: false });
+  });
+
+  it("returns null on a non-ok response", async () => {
+    fetchSpy.mockResolvedValueOnce(new Response("", { status: 500 }));
+    expect(await setSessionUnread("sess-1", true)).toBeNull();
   });
 });
 

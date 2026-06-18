@@ -64,6 +64,13 @@ export interface SessionResponse {
    *  comes back as null on the wire; the web therefore only needs to
    *  treat any non-null value as an active snooze. See #1581. */
   snoozed_until?: string | null;
+  /** Unread marker mirroring `Instance::unread`: `true` when the session
+   *  needs attention (a finished turn the user hasn't engaged with, or a
+   *  manual flag), false / undefined when read. The sidebar paints an unread
+   *  accent and offers a right-click "Mark as read/unread" toggle, both gated
+   *  on the `session.unread_indicator` setting. The chip is suppressed for the
+   *  session currently open, which also clears the marker. */
+  unread?: boolean;
   has_managed_worktree: boolean;
   /** True when renaming this session also moves its worktree directory (the
    *  resolved `session.tie_workdir_to_name` for an aoe-managed worktree). The

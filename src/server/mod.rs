@@ -649,6 +649,10 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         token_grace,
     ));
     let config = crate::session::profile_config::resolve_config_or_warn(profile);
+    // Feed the unread-feature gate from this daemon's resolved config. Like
+    // `push_enabled`, this is read once at startup; a config change needs a
+    // restart to take effect. The TUI process maintains its own copy.
+    crate::session::set_unread_enabled(config.session.unread_indicator);
 
     // Login sessions persist across daemon restarts by default (#1235) so
     // signed-in devices are not re-prompted for the passphrase on every
@@ -1392,6 +1396,10 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/sessions/{id}/snooze",
             patch(api::update_session_snooze),
+        )
+        .route(
+            "/api/sessions/{id}/unread",
+            patch(api::update_session_unread),
         )
         .route("/api/sessions/{id}/stop", post(api::stop_session))
         .route("/api/sessions/{id}/start", post(api::start_session))
@@ -2867,7 +2875,7 @@ async fn status_poll_loop(state: Arc<AppState>) {
         })
         .await;
 
-        if let Ok(instances) = updated {
+        if let Ok(mut instances) = updated {
             // Diff BEFORE the helper: status_tx must observe the raw
             // post-suppression, post-tmux-scrape values, never the acp
             // overlay applied by the helper.
@@ -2885,6 +2893,46 @@ async fn status_poll_loop(state: Arc<AppState>) {
                     }
                 }
             }
+
+            // Auto-mark unread on a finished turn (Running -> Idle), the same
+            // transition the TUI marks on. This is what lets a web-only user
+            // (no TUI process polling) accrue the indicator. There's no
+            // server-side "is being viewed" exemption: the client suppresses
+            // the chip on the session it is actively viewing and clears the
+            // auto marker on open. Mutate the in-memory rows we're about to
+            // install AND persist per profile so the next disk reload keeps it.
+            if crate::session::unread_enabled() {
+                let mut newly_idle: std::collections::HashMap<String, Vec<String>> =
+                    std::collections::HashMap::new();
+                for inst in &mut instances {
+                    let finished_turn = prev.get(&inst.id) == Some(&Status::Running)
+                        && inst.status == Status::Idle
+                        && !inst.unread;
+                    if finished_turn {
+                        inst.mark_unread();
+                        newly_idle
+                            .entry(inst.source_profile.clone())
+                            .or_default()
+                            .push(inst.id.clone());
+                    }
+                }
+                for (profile, ids) in newly_idle {
+                    let _ = api::persist_session_update(
+                        profile,
+                        "auto-unread",
+                        state.file_watch.clone(),
+                        move |insts| {
+                            for inst in insts.iter_mut() {
+                                if ids.contains(&inst.id) {
+                                    inst.mark_unread();
+                                }
+                            }
+                        },
+                    )
+                    .await;
+                }
+            }
+
             reload_state_instances_from_disk(&state, instances, StatusSource::TmuxApplied).await;
 
             #[cfg(feature = "serve")]

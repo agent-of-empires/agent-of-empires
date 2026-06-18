@@ -56,6 +56,10 @@ pub enum ActionId {
     ToggleArchive,
     ToggleFavorite,
     ToggleSnooze,
+    /// Toggle the selected session's unread marker (read -> manual-unread;
+    /// unread -> read). Gated behind the `session.unread_indicator` config
+    /// toggle (on by default); a no-op when disabled.
+    ToggleUnread,
     ToggleContainer,
     TogglePreviewInfo,
     SortPicker,
@@ -107,6 +111,10 @@ pub enum Context {
     SearchActive,
     /// The cursor is on a real (non-synthetic) project header in project view.
     ProjectGroupSelected,
+    /// The unread-session feature is enabled (`session.unread_indicator`). When
+    /// off, the binding is removed from dispatch so the key isn't swallowed by
+    /// a dead action; help and the command palette skip it separately.
+    UnreadEnabled,
 }
 
 /// Help-overlay section. Ordering mirrors `components/help.rs`.
@@ -165,6 +173,7 @@ fn context_holds(context: Context, ctx: &Ctx) -> bool {
         Context::AttentionSort => ctx.sort_order == SortOrder::Attention,
         Context::SearchActive => ctx.has_search,
         Context::ProjectGroupSelected => ctx.project_group_selected,
+        Context::UnreadEnabled => crate::session::unread_enabled(),
     }
 }
 
@@ -591,10 +600,32 @@ pub static BINDINGS: &[Binding] = &[
             serve_only: false,
         }),
     },
+    // `U` toggles read/unread, pinned to Shift+u in BOTH modes (matches the
+    // macOS Mail "mark unread" muscle memory and keeps the key stable). It does
+    // NOT participate in the strict relocation: `U` is already a modified key,
+    // so it satisfies strict mode's "no bare action letters" rule as-is.
+    // `u` updates (when available) and relocates the usual way: bare `u` in
+    // non-strict, `Ctrl+u` in strict.
+    Binding {
+        id: ActionId::ToggleUnread,
+        non_strict: &[k('U')],
+        strict: &[k('U')],
+        context: Context::UnreadEnabled,
+        help: Some(HelpMeta {
+            section: HelpSection::Actions,
+            desc: "Mark read/unread (toggle)",
+        }),
+        palette: Some(PaletteMeta {
+            title: "Toggle read/unread",
+            keywords: &["read", "unread", "seen", "flag", "viewed"],
+            group: PaletteGroup::Actions,
+            serve_only: false,
+        }),
+    },
     Binding {
         id: ActionId::Update,
         non_strict: &[k('u')],
-        strict: &[k('u')],
+        strict: &[ctrl('u')],
         context: Context::Always,
         help: Some(HelpMeta {
             section: HelpSection::Other,
@@ -708,6 +739,7 @@ pub fn palette_id(id: ActionId) -> &'static str {
         ActionId::ToggleArchive => "archive",
         ActionId::ToggleFavorite => "favorite",
         ActionId::ToggleSnooze => "snooze",
+        ActionId::ToggleUnread => "toggle-unread",
         ActionId::TogglePreviewInfo => "toggle-preview-info",
         ActionId::SortPicker => "pick-sort",
         ActionId::GroupBy => "pick-group-by",
@@ -762,6 +794,9 @@ mod tests {
             ('o', ActionId::SortPicker),
             ('g', ActionId::GroupBy),
             ('q', ActionId::Quit),
+            // `u` is Update (unread lives on Shift+U); resolves regardless of
+            // whether an update is actually available.
+            ('u', ActionId::Update),
         ];
         for (ch, want) in cases {
             assert_eq!(
@@ -770,6 +805,34 @@ mod tests {
                 "non-strict '{ch}'"
             );
         }
+    }
+
+    #[test]
+    fn shift_u_toggles_unread_in_both_modes_and_u_updates() {
+        let c = ctx();
+        // Unread is pinned to Shift+U regardless of strict mode.
+        assert_eq!(
+            resolve(&key('U'), false, &c),
+            Some(ActionId::ToggleUnread),
+            "non-strict U = unread"
+        );
+        assert_eq!(
+            resolve(&key('U'), true, &c),
+            Some(ActionId::ToggleUnread),
+            "strict U = unread"
+        );
+        // Update relocates the usual way: bare `u` in non-strict, `Ctrl+u`
+        // in strict (and never collides with unread on `U`).
+        assert_eq!(
+            resolve(&key('u'), false, &c),
+            Some(ActionId::Update),
+            "non-strict u = update"
+        );
+        assert_eq!(
+            resolve(&ctrl_key('u'), true, &c),
+            Some(ActionId::Update),
+            "strict Ctrl+u = update"
+        );
     }
 
     #[test]
@@ -784,6 +847,7 @@ mod tests {
             ('N', ActionId::NewSession),
             ('P', ActionId::Projects),
             ('O', ActionId::SortPicker),
+            ('U', ActionId::ToggleUnread),
         ];
         for (ch, want) in shifted {
             assert_eq!(resolve(&key(ch), true, &c), Some(want), "strict '{ch}'");
@@ -795,6 +859,7 @@ mod tests {
             ('n', ActionId::NewFromSelection),
             ('p', ActionId::Profiles),
             ('g', ActionId::GroupBy),
+            ('u', ActionId::Update),
         ];
         for (ch, want) in ctrled {
             assert_eq!(
@@ -810,7 +875,7 @@ mod tests {
         // They fall through to the dispatcher's typing-guard, not an action.
         let c = ctx();
         for ch in [
-            'd', 'r', 't', 'n', 'p', 's', 'x', 'm', 'e', 'i', 'z', 'g', 'o',
+            'd', 'r', 't', 'n', 'p', 's', 'x', 'm', 'e', 'i', 'z', 'g', 'o', 'u',
         ] {
             assert_eq!(resolve(&key(ch), true, &c), None, "strict bare '{ch}'");
         }

@@ -5,6 +5,7 @@ import {
   effectiveArchivedOf,
   effectivePinnedOf,
   effectiveSnoozedUntilOf,
+  effectiveUnreadOf,
   reconcileOptimistic,
   serverTriageOf,
   withOverride,
@@ -47,6 +48,12 @@ describe("effective resolvers", () => {
       "2099-01-01T00:00:00Z",
     );
   });
+
+  it("unread override: null falls through, true/false win", () => {
+    expect(effectiveUnreadOf(EMPTY_OPTIMISTIC, true)).toBe(true);
+    expect(effectiveUnreadOf(override({ unread: false }), true)).toBe(false);
+    expect(effectiveUnreadOf(override({ unread: true }), false)).toBe(true);
+  });
 });
 
 describe("serverTriageOf", () => {
@@ -63,7 +70,16 @@ describe("serverTriageOf", () => {
       isPinned: true,
       isArchived: false,
       snoozedUntil: "2099-01-01T00:00:00Z",
+      unread: false,
     });
+  });
+
+  it("aggregates unread with `.some` across sessions", () => {
+    const w = ws("w", [
+      { pinned_at: null, archived_at: null, snoozed_until: null, unread: true },
+      { pinned_at: null, archived_at: null, snoozed_until: null },
+    ]);
+    expect(serverTriageOf(w).unread).toBe(true);
   });
 });
 
@@ -74,6 +90,7 @@ describe("withOverride", () => {
       pinned: true,
       archived: true,
       snoozedUntil: undefined,
+      unread: null,
     });
   });
 
@@ -136,6 +153,26 @@ describe("reconcileOptimistic", () => {
       pinned: true,
       archived: null,
       snoozedUntil: undefined,
+      unread: null,
     });
+  });
+
+  it("drops a mark-read override once the server reports read", () => {
+    const map = new Map([["w", override({ unread: false })]]);
+    const next = reconcileOptimistic(map, [ws("w", [{ unread: false }])]);
+    expect(next.has("w")).toBe(false);
+  });
+
+  it("keeps a mark-unread override while the server still reports read", () => {
+    // The optimistic flag must survive until the server confirms it.
+    const map = new Map([["w", override({ unread: true })]]);
+    const next = reconcileOptimistic(map, [ws("w", [{ unread: false }])]);
+    expect(next.get("w")?.unread).toBe(true);
+  });
+
+  it("drops a mark-unread override once the server reports unread", () => {
+    const map = new Map([["w", override({ unread: true })]]);
+    const next = reconcileOptimistic(map, [ws("w", [{ unread: true }])]);
+    expect(next.has("w")).toBe(false);
   });
 });

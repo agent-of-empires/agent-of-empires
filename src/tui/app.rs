@@ -1194,6 +1194,12 @@ impl App {
                 needs_full_refresh = true;
             }
 
+            // Dwell-to-read: a session kept selected (list in the foreground)
+            // for a few seconds counts as read and clears its unread marker.
+            if self.home.tick_unread_dwell(std::time::Instant::now()) {
+                refresh_needed = true;
+            }
+
             // Update-check / install-status polls can flip the
             // bottom-of-screen update bar (banner or transient toast)
             // on or off, which shifts the home view's layout. If a
@@ -2707,6 +2713,11 @@ impl App {
         self.home.reload()?;
         self.home
             .apply_status_updates_without_hooks(attached_status_updates);
+        // The user just viewed this session (and any turn that finished
+        // during the attach was applied above without the live-send
+        // exemption). Clear its unread marker on return so the round-trip
+        // nets to read.
+        self.home.clear_unread_on_view(session_id);
         self.home.stamp_last_accessed(session_id);
         // Persist so the attach-return bump survives aoe restart. Same
         // reasoning as the send-message path in home/input.rs: without a

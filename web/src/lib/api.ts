@@ -1393,6 +1393,24 @@ export async function setSessionSnooze(id: string, minutes: number | null): Prom
   }
 }
 
+/** Flag a session manually unread (`true`) or mark it read (`false`, clearing
+ *  both auto and manual markers). Mirrors the TUI `u` toggle; the caller
+ *  computes the target from the current state so an optimistic update stays in
+ *  sync with the server. */
+export async function setSessionUnread(id: string, unread: boolean): Promise<SessionResponse | null> {
+  try {
+    const res = await fetch(`/api/sessions/${id}/unread`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ unread }),
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as SessionResponse;
+  } catch {
+    return null;
+  }
+}
+
 export interface DeleteSessionOptions {
   delete_worktree?: boolean;
   delete_branch?: boolean;

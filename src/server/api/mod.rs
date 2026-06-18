@@ -41,9 +41,11 @@ pub use sessions::{
     get_recent_projects, list_sessions, preview_volume_ignores_globs, read_output, rename_session,
     send_message, session_diff_file, session_diff_files, set_worktree_name, start_session,
     stop_session, update_session_archive, update_session_diff_base, update_session_group,
-    update_session_notifications, update_session_pin, update_session_snooze,
+    update_session_notifications, update_session_pin, update_session_snooze, update_session_unread,
     update_workspace_ordering, CleanupDefaults, OutputQuery, SendMessageRequest, SessionResponse,
 };
+// Shared by the status poll loop's auto-unread persistence; not a route handler.
+pub(crate) use sessions::persist_session_update;
 pub use system::{
     browse_filesystem, create_profile, default_profile, delete_profile, dismiss_update,
     docker_status, filesystem_home, get_about, get_current_theme, get_profile_settings,
@@ -160,6 +162,7 @@ mod tests {
                     "update_session_pin",
                     "update_session_archive",
                     "update_session_snooze",
+                    "update_session_unread",
                     "stop_session",
                     "start_session",
                     "update_workspace_ordering",
@@ -313,6 +316,7 @@ mod tests {
                     "update_session_pin",
                     "update_session_archive",
                     "update_session_snooze",
+                    "update_session_unread",
                     "stop_session",
                     "start_session",
                     "update_workspace_ordering",

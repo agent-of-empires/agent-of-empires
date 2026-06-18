@@ -9,7 +9,7 @@ use rattles::presets::prelude as spinners;
 
 use super::{
     get_indent, live_send, HomeView, TerminalMode, ViewMode, ICON_COLLAPSED, ICON_DELETING,
-    ICON_ERROR, ICON_EXPANDED, ICON_IDLE, ICON_PINNED, ICON_STOPPED, ICON_UNKNOWN,
+    ICON_ERROR, ICON_EXPANDED, ICON_IDLE, ICON_PINNED, ICON_STOPPED, ICON_UNKNOWN, ICON_UNREAD,
 };
 use crate::containers::image_update::ImageUpdate;
 use crate::session::config::{GroupByMode, SortOrder};
@@ -1013,12 +1013,24 @@ impl HomeView {
                                 Status::Deleting => ICON_DELETING,
                                 Status::Creating => spinner_starting(&inst.created_at),
                             };
+                            // Unread paints only on resting rows
+                            // (Idle/Unknown): a live status (Running/Waiting/
+                            // Starting/...) supersedes it and keeps its own
+                            // color AND spinner. Auto-unread only ever lands
+                            // on Idle; a manual flag on a live row defers to
+                            // the live state. Archived/snoozed/urgent below
+                            // still override on top.
+                            let unread_resting = crate::session::unread_enabled()
+                                && inst.is_unread()
+                                && matches!(inst.status, Status::Idle | Status::Unknown);
                             let color = match inst.status {
                                 Status::Running => theme.running,
                                 Status::Waiting => theme.waiting,
+                                Status::Idle if unread_resting => theme.unread,
                                 Status::Idle => {
                                     theme.idle_color_at_age(idle_age, self.idle_decay_window)
                                 }
+                                Status::Unknown if unread_resting => theme.unread,
                                 Status::Unknown => theme.waiting,
                                 Status::Stopped => theme.dimmed,
                                 Status::Error => theme.error,
@@ -1027,6 +1039,15 @@ impl HomeView {
                                 Status::Creating => theme.accent,
                             };
                             let mut style = Style::default().fg(color);
+                            if unread_resting {
+                                // Make unread unmistakable: a solid dot glyph
+                                // plus bold, on top of the `theme.unread`
+                                // color set above. A plain color swap read as
+                                // too subtle (#2088 review). Sink/urgent
+                                // states below still override icon + style.
+                                icon = ICON_UNREAD;
+                                style = style.add_modifier(ratatui::style::Modifier::BOLD);
+                            }
                             if inst.is_archived() {
                                 // Archived rows render with one uniform
                                 // muted glyph regardless of underlying
@@ -1102,12 +1123,19 @@ impl HomeView {
                                     .map(|s| s.exists())
                                     .unwrap_or(false),
                             };
+                            let unread_overlay =
+                                crate::session::unread_enabled() && inst.is_unread();
                             let (mut icon, color) = if terminal_running {
                                 (spinner_running(&inst.created_at), theme.terminal_active)
+                            } else if unread_overlay {
+                                (ICON_UNREAD, theme.unread)
                             } else {
                                 (ICON_IDLE, theme.dimmed)
                             };
                             let mut style = Style::default().fg(color);
+                            if unread_overlay && !terminal_running {
+                                style = style.add_modifier(ratatui::style::Modifier::BOLD);
+                            }
                             if inst.is_archived() {
                                 // Archive lifecycle override mirrors the
                                 // Agent-view path: dim color, stopped
@@ -2848,6 +2876,10 @@ impl HomeView {
         image_update: Option<&ImageUpdate>,
     ) {
         let update_style = Style::default().fg(theme.waiting).bold();
+        // The Update key is `u` (`Ctrl+u` in strict mode); pull the label from
+        // the binding registry so this hint can't drift from the dispatcher.
+        let update_key =
+            super::bindings::label(super::bindings::ActionId::Update, self.strict_hotkeys);
         // Precedence (highest first): transient status, app update, then the
         // sandbox-image update. Only one banner shows at a time, so its keys
         // ([u]/[Ctrl+x]) are unambiguous; a lower-priority banner surfaces once
@@ -2856,11 +2888,11 @@ impl HomeView {
             format!(" {s}  [Ctrl+x] dismiss")
         } else if let Some(info) = info {
             format!(
-                " update available {} → {}  [u] update  [Ctrl+x] dismiss",
+                " update available {} → {}  [{update_key}] update  [Ctrl+x] dismiss",
                 info.current_version, info.latest_version
             )
         } else if image_update.is_some() {
-            " sandbox image update available  [u] pull  [Ctrl+x] dismiss".to_string()
+            format!(" sandbox image update available  [{update_key}] pull  [Ctrl+x] dismiss")
         } else {
             return;
         };

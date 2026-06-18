@@ -249,6 +249,7 @@ fn web_projection(theme: &Theme, appearance: ThemeAppearance) -> CssVarProjectio
     css.insert("--color-status-warning".into(), hex(theme.waiting));
     css.insert("--color-status-fresh-idle".into(), hex(theme.fresh_idle));
     css.insert("--color-status-idle".into(), hex(theme.idle));
+    css.insert("--color-status-unread".into(), hex(theme.unread));
     css.insert("--color-status-error".into(), hex(theme.error));
     css.insert(
         "--color-status-starting".into(),

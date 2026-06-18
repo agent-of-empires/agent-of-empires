@@ -52,6 +52,27 @@ pub use instance::{
     Status, TerminalInfo, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
     TMUX_SESSION_GONE_ERROR,
 };
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Process-wide cache of the `session.unread_indicator` toggle (default on).
+/// The TUI refreshes it via [`set_unread_enabled`] on startup and whenever
+/// config is re-applied, so a runtime settings change takes effect without a
+/// restart. Defaults to `true` so the feature is on out of the box before the
+/// first config apply. Read on the hot Attention-sort path, hence a plain
+/// atomic load rather than threading the flag through every sort helper.
+static UNREAD_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Whether the unread-session indicator feature is enabled.
+pub fn unread_enabled() -> bool {
+    UNREAD_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Update the cached unread-indicator flag from resolved config.
+pub fn set_unread_enabled(on: bool) {
+    UNREAD_ENABLED.store(on, Ordering::Relaxed);
+}
+
 pub use profile_config::{
     load_profile_config, merge_configs, resolve_config, resolve_config_or_warn,
     save_profile_config, validate_check_interval, validate_env_format, validate_memory_limit,

@@ -1,6 +1,6 @@
 import { useCallback, useState } from "react";
 
-import { setSessionArchive, setSessionPin, setSessionSnooze } from "../lib/api";
+import { setSessionArchive, setSessionPin, setSessionSnooze, setSessionUnread } from "../lib/api";
 import { reportError } from "../lib/toastBus";
 import {
   EMPTY_OPTIMISTIC,
@@ -92,6 +92,22 @@ export function useSidebarTriage(workspaces: readonly Workspace[]) {
     [setOverride],
   );
 
+  const unread = useCallback(
+    async (ws: Workspace, markUnread: boolean): Promise<TriageResult> => {
+      const sessionId = ws.sessions[0]?.id;
+      if (!sessionId) return { workspaceId: ws.id, ok: false, skipped: true };
+      // "Mark as unread" flags it; "Mark as read" clears it.
+      setOverride(ws.id, { unread: markUnread });
+      const result = await setSessionUnread(sessionId, markUnread);
+      if (!result) {
+        setOverride(ws.id, { unread: null });
+        return { workspaceId: ws.id, ok: false };
+      }
+      return { workspaceId: ws.id, ok: true };
+    },
+    [setOverride],
+  );
+
   // Single-row handlers surface a toast on failure (the bulk path reports a
   // single summary toast instead, so these don't).
   const pinToggle = useCallback(
@@ -125,6 +141,17 @@ export function useSidebarTriage(workspaces: readonly Workspace[]) {
       });
     },
     [snooze],
+  );
+
+  const unreadToggle = useCallback(
+    (ws: Workspace, markUnread: boolean) => {
+      void unread(ws, markUnread).then((r) => {
+        if (!r.ok && !r.skipped) {
+          reportError(markUnread ? "Failed to mark unread" : "Failed to mark read");
+        }
+      });
+    },
+    [unread],
   );
 
   // Bulk fan-out. Serial on purpose: each single-id PATCH re-persists the
@@ -167,6 +194,7 @@ export function useSidebarTriage(workspaces: readonly Workspace[]) {
     pinToggle,
     archiveToggle,
     snooze: snoozeOne,
+    unreadToggle,
     bulkPin,
     bulkArchive,
     bulkSnooze,

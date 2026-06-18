@@ -416,6 +416,17 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snoozed_until: Option<DateTime<Utc>>,
 
+    /// Unread marker: a session that needs attention. Set automatically when a
+    /// turn finishes (`Running -> Idle`) and also by the manual `u` toggle;
+    /// cleared by engaging with the session (open/attach, enter live-send,
+    /// click, or dwell on it in the list) or the manual toggle. Surfaced as a
+    /// non-intrusive `theme.unread` row color and an Attention-sort promoter
+    /// ranked just below Waiting. The whole feature is gated behind
+    /// `unread_enabled()` (the `session.unread_indicator` config toggle, on by
+    /// default); when off, the field is never written and changes nothing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unread: bool,
+
     /// Internal structured view idle-dormancy marker. Set by the reconciler's
     /// idle-reap pass when a structured view worker is shut down for inactivity
     /// (`acp.auto_stop_idle_secs`); while set, the reconciler skips
@@ -796,6 +807,7 @@ impl Instance {
             archived_at: None,
             favorited_at: None,
             snoozed_until: None,
+            unread: false,
             idle_dormant_since: None,
             pinned_at: None,
             scratch: false,
@@ -1080,6 +1092,9 @@ impl Instance {
         if pre.pinned_at != post.pinned_at {
             self.pinned_at = post.pinned_at;
         }
+        if pre.unread != post.unread {
+            self.unread = post.unread;
+        }
         if pre.base_branch_override != post.base_branch_override {
             self.base_branch_override = post.base_branch_override.clone();
         }
@@ -1232,6 +1247,30 @@ impl Instance {
 
     pub fn unsnooze(&mut self) {
         self.snoozed_until = None;
+    }
+
+    /// True if the session carries the unread marker.
+    pub fn is_unread(&self) -> bool {
+        self.unread
+    }
+
+    /// Mark the session unread. Used both by the auto-mark on a finished turn
+    /// (`Running -> Idle`) and the manual "Mark as unread" action; the single
+    /// state means there is no kind to preserve. Idempotent.
+    pub fn mark_unread(&mut self) {
+        self.unread = true;
+    }
+
+    /// Clear the unread marker. Used whenever the user engages with the
+    /// session (open/attach, live-send, click, dwell) and by the explicit
+    /// "Mark as read" action. Idempotent.
+    pub fn mark_read(&mut self) {
+        self.unread = false;
+    }
+
+    /// Manual toggle (`U`): read -> unread; unread -> read.
+    pub fn toggle_unread(&mut self) {
+        self.unread = !self.unread;
     }
 
     /// True if `snoozed_until` is set AND in the future. Expired snoozes
@@ -3994,6 +4033,83 @@ mod tests {
         assert!(inst.is_idle_dormant());
         inst.touch_last_accessed();
         assert!(!inst.is_idle_dormant());
+    }
+
+    #[test]
+    fn test_mark_unread_and_mark_read_are_idempotent() {
+        let mut inst = Instance::new("test", "/tmp/test");
+        assert!(!inst.is_unread());
+        // read -> unread
+        inst.mark_unread();
+        assert!(inst.is_unread());
+        // unread -> unread (idempotent)
+        inst.mark_unread();
+        assert!(inst.is_unread());
+        // unread -> read
+        inst.mark_read();
+        assert!(!inst.is_unread());
+        // read -> read (idempotent)
+        inst.mark_read();
+        assert!(!inst.is_unread());
+    }
+
+    #[test]
+    fn test_toggle_unread_round_trips() {
+        let mut inst = Instance::new("test", "/tmp/test");
+        // read -> unread
+        inst.toggle_unread();
+        assert!(inst.is_unread());
+        // unread -> read
+        inst.toggle_unread();
+        assert!(!inst.is_unread());
+    }
+
+    #[test]
+    fn test_unread_serde_round_trip() {
+        // Absent field deserializes to false (older sessions.json).
+        let inst: Instance = serde_json::from_value(serde_json::json!({
+            "id": "abc",
+            "title": "t",
+            "project_path": "/tmp",
+            "tool": "claude",
+            "status": "idle",
+            "created_at": "2026-01-01T00:00:00Z",
+        }))
+        .expect("deserialize without unread");
+        assert!(!inst.unread);
+
+        // Round-trips when set, and is omitted when false.
+        let mut set = Instance::new("t", "/tmp");
+        set.unread = true;
+        let json = serde_json::to_value(&set).unwrap();
+        assert_eq!(json["unread"], serde_json::json!(true));
+        let back: Instance = serde_json::from_value(json).unwrap();
+        assert!(back.unread);
+
+        let read = Instance::new("t", "/tmp");
+        let json = serde_json::to_value(&read).unwrap();
+        assert!(
+            json.get("unread").is_none(),
+            "false must skip serialization"
+        );
+    }
+
+    #[test]
+    fn test_merge_user_action_diff_propagates_unread() {
+        let pre = Instance::new("t", "/tmp");
+        let mut post = pre.clone();
+        post.unread = true;
+        let mut disk = pre.clone();
+        disk.merge_user_action_diff(&pre, &post);
+        assert!(disk.unread);
+
+        // Clearing also propagates.
+        let pre2 = post.clone();
+        let mut post2 = pre2.clone();
+        post2.unread = false;
+        let mut disk2 = pre2.clone();
+        disk2.merge_user_action_diff(&pre2, &post2);
+        assert!(!disk2.unread);
     }
 
     #[test]

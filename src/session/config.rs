@@ -1018,6 +1018,27 @@ pub struct SessionConfig {
     #[setting(label = "Confirm Before Quit", widget = "toggle", global_only)]
     pub confirm_before_quit: bool,
 
+    /// Show an unread indicator on sessions. When on (default), a session
+    /// whose turn just finished is painted in the theme's unread color until
+    /// you view it (Tab into live-send or Enter to attach), and you can flag
+    /// a session unread for later with `U`; unread rows also sort just below
+    /// Waiting in the Attention sort. Turn this off to disable the indicator,
+    /// the auto-marking, and the `U` toggle entirely.
+    ///
+    /// `global_only`: the gate is a single process-wide flag
+    /// (`crate::session::unread_enabled`), refreshed from the active profile's
+    /// resolved config, so it can't honor a per-profile override. Exposing it
+    /// as profile-overridable would silently ignore the override; keep the
+    /// schema honest by scoping it global.
+    #[serde(default = "default_true")]
+    #[setting(
+        label = "Unread Session Indicator",
+        widget = "toggle",
+        category = "Interaction",
+        global_only
+    )]
+    pub unread_indicator: bool,
+
     /// Keep an aoe-managed worktree session's directory leaf in sync with its
     /// title. When enabled (default), renaming the session also moves its
     /// worktree directory, and new sessions derive the directory leaf from the
@@ -1141,6 +1162,7 @@ impl Default for SessionConfig {
             default_attach_mode: NewSessionAttachMode::default(),
             click_action: ClickAction::default(),
             confirm_before_quit: true,
+            unread_indicator: true,
             tie_workdir_to_name: true,
         }
     }

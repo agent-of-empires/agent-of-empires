@@ -88,6 +88,14 @@ pub struct SessionResponse {
     /// and the response simply omits the field. See #1581.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snoozed_until: Option<String>,
+    /// Unread marker, mirroring `Instance::unread`: `true` when the session
+    /// needs attention (a finished turn the user hasn't engaged with, or a
+    /// manual flag), omitted when read. The web sidebar paints an unread
+    /// accent and offers a right-click "Mark as read/unread" toggle; gated
+    /// client-side on the `session.unread_indicator` setting. See the TUI's
+    /// `theme.unread`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub unread: bool,
     pub has_managed_worktree: bool,
     /// Whether renaming this session also moves its worktree directory (the
     /// resolved `session.tie_workdir_to_name` for an aoe-managed worktree).
@@ -286,6 +294,9 @@ impl SessionResponse {
             } else {
                 None
             },
+            // Surface the marker (omitted when read); the web gates the
+            // visual on the `session.unread_indicator` setting.
+            unread: inst.unread,
             has_managed_worktree: inst
                 .worktree_info
                 .as_ref()
@@ -1567,7 +1578,7 @@ where
 /// instance untouched: persisting first is what keeps disk and memory from
 /// diverging when a write fails, and stops the archive/snooze side effects
 /// from firing on a write that never landed. See #1589.
-async fn persist_session_update<F>(
+pub(crate) async fn persist_session_update<F>(
     profile: String,
     label: &'static str,
     file_watch: std::sync::Arc<crate::file_watch::FileWatchService>,
@@ -1847,6 +1858,17 @@ pub struct UpdateSnoozeBody {
     /// TUI dialog and CLI use also apply here.
     #[serde(default)]
     pub minutes: Option<u32>,
+}
+
+#[derive(Deserialize)]
+pub struct UpdateUnreadBody {
+    /// `true` flags the session manually unread (a deliberate "flag for
+    /// later"); `false` marks it read, clearing both auto and manual markers.
+    /// The clear is the explicit one (web "Mark as read"); the auto-clear on
+    /// view is driven separately by the client, which only fires it for an
+    /// `auto` marker, so a `false` here never silently drops a manual flag the
+    /// user meant to keep.
+    pub unread: bool,
 }
 
 pub async fn update_session_pin(
@@ -2572,6 +2594,104 @@ pub async fn update_session_snooze(
     }
     #[cfg(not(feature = "serve"))]
     let _ = was_structured_view;
+
+    let instances = state.instances.read().await;
+    let response = match instances.iter().find(|i| i.id == id) {
+        Some(inst) => {
+            SessionResponse::from_instance(inst, crate::claude_settings::read_tui_fullscreen())
+        }
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "message": "Session not found" })),
+            )
+                .into_response();
+        }
+    };
+    (StatusCode::OK, Json(serde_json::json!(response))).into_response()
+}
+
+/// `PATCH /api/sessions/{id}/unread` — flag a session unread (`{"unread":true}`)
+/// or mark it read (`{"unread":false}`). Mirrors the TUI's `u` toggle, but the
+/// client computes the target from the current state rather than toggling
+/// server-side, so an optimistic UI update can't desync. No-op when the
+/// `session.unread_indicator` feature is off (the client hides the control
+/// then, but guard here too). Persist-then-mutate, like snooze.
+pub async fn update_session_unread(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Result<Json<UpdateUnreadBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "read_only",
+                "message": "Server is in read-only mode"
+            })),
+        )
+            .into_response();
+    }
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(rej) => return rej.into_response(),
+    };
+    let mark_unread = body.unread;
+
+    let lock = state.instance_lock(&id).await;
+    let _guard = lock.lock().await;
+
+    let profile = {
+        let instances = state.instances.read().await;
+        let Some(inst) = instances.iter().find(|i| i.id == id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "message": "Session not found" })),
+            )
+                .into_response();
+        };
+        inst.source_profile.clone()
+    };
+
+    // Feature off: report the current state without mutating, matching the
+    // TUI's no-op when `session.unread_indicator` is disabled.
+    if crate::session::unread_enabled() {
+        let persist_id = id.clone();
+        if persist_session_update(
+            profile,
+            "unread update",
+            state.file_watch.clone(),
+            move |instances| {
+                if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+                    if mark_unread {
+                        inst.mark_unread();
+                    } else {
+                        inst.mark_read();
+                    }
+                }
+            },
+        )
+        .await
+        .is_err()
+        {
+            return persist_failed_response();
+        }
+
+        let mut instances = state.instances.write().await;
+        let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
+            tracing::error!(
+                target: "http.api.sessions",
+                session = %id,
+                "unread update: instance vanished after persist"
+            );
+            return persist_failed_response();
+        };
+        if mark_unread {
+            inst.mark_unread();
+        } else {
+            inst.mark_read();
+        }
+    }
 
     let instances = state.instances.read().await;
     let response = match instances.iter().find(|i| i.id == id) {
@@ -5898,6 +6018,19 @@ mod tests {
         assert_eq!(out.chars().count(), 3);
     }
 
+    #[test]
+    fn session_response_serializes_unread_marker() {
+        use crate::session::Instance;
+        let mut inst = Instance::new("t", "/tmp");
+        // Read: the field is omitted from the wire (skip_serializing_if false).
+        let json = serde_json::to_value(SessionResponse::from_instance(&inst, false)).unwrap();
+        assert!(json.get("unread").is_none());
+        // Unread serializes as a bare boolean the web reads directly.
+        inst.unread = true;
+        let json = serde_json::to_value(SessionResponse::from_instance(&inst, false)).unwrap();
+        assert_eq!(json["unread"], serde_json::json!(true));
+    }
+
     fn step(
         id: &str,
         title: &str,
@@ -6798,6 +6931,7 @@ mod workspace_ordering_tests {
             pinned_at: None,
             archived_at: None,
             snoozed_until: None,
+            unread: false,
         }
     }
 

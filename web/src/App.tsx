@@ -45,10 +45,12 @@ import {
   createProject,
   setProjectPinned,
   deleteProject,
+  setSessionUnread,
 } from "./lib/api";
 import type { DeleteSessionOptions, ServerAbout } from "./lib/api";
 import { normalizeProjectPathKey } from "./lib/registeredProjects";
 import { IdleDecayWindowContext, parseIdleDecayWindowMs, useIdleDecayWindowMs } from "./lib/idleDecay";
+import { parseUnreadIndicatorEnabled, UnreadIndicatorContext, useUnreadIndicatorEnabled } from "./lib/unreadIndicator";
 import { toastBus } from "./lib/toastBus";
 import { resolveToRepoRelative, type FileRef } from "./lib/fileRef";
 import { OPEN_SESSION_EVENT } from "./lib/sessionRoute";
@@ -112,6 +114,7 @@ export default function App() {
   const [loginAuthenticated, setLoginAuthenticated] = useState(true);
   const [tokenExpired, setTokenExpired] = useState(false);
   const [idleDecayWindowMs, setIdleDecayWindowMs] = useState(IDLE_DECAY_WINDOW_MS);
+  const [unreadIndicatorEnabled, setUnreadIndicatorEnabled] = useState(true);
 
   useEffect(() => {
     const onTokenExpired = () => setTokenExpired(true);
@@ -142,6 +145,7 @@ export default function App() {
   useEffect(() => {
     fetchSettings().then((settings) => {
       setIdleDecayWindowMs(parseIdleDecayWindowMs(settings));
+      setUnreadIndicatorEnabled(parseUnreadIndicatorEnabled(settings));
     });
   }, []);
 
@@ -182,8 +186,10 @@ export default function App() {
 
   return (
     <IdleDecayWindowContext.Provider value={idleDecayWindowMs}>
-      <AppContent loginRequired={loginRequired} onLogout={handleLogout} />
-      <ElevationPrompt />
+      <UnreadIndicatorContext.Provider value={unreadIndicatorEnabled}>
+        <AppContent loginRequired={loginRequired} onLogout={handleLogout} />
+        <ElevationPrompt />
+      </UnreadIndicatorContext.Provider>
     </IdleDecayWindowContext.Provider>
   );
 }
@@ -400,6 +406,18 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [commentSendEnabled, diffComments.count]);
+
+  // Clear-on-view: opening a session (or having it open when its turn
+  // finishes) reads it, clearing the unread marker. Mirrors the TUI, where
+  // engaging with a session (open / live-send / dwell) clears it. The sidebar
+  // separately hides the chip for the active row, so there's no flash in the
+  // ~poll window before this lands.
+  const unreadIndicatorEnabled = useUnreadIndicatorEnabled();
+  useEffect(() => {
+    if (unreadIndicatorEnabled && activeSessionId && activeSession?.unread) {
+      void setSessionUnread(activeSessionId, false);
+    }
+  }, [unreadIndicatorEnabled, activeSessionId, activeSession?.unread]);
 
   // Derive selectedFile/rightPanelView/pickerOpen/pairedMounted resets
   // during render to satisfy

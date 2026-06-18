@@ -25,6 +25,10 @@ export interface OptimisticTriage {
   pinned: boolean | null;
   archived: boolean | null;
   snoozedUntil: string | null | undefined;
+  /** Optimistic unread override: `null` means "no override, use the server
+   *  value", `true`/`false` mean "pretend the server already flagged/cleared
+   *  it". Mirrors `pinned`/`archived`'s two-state-plus-null shape. */
+  unread: boolean | null;
 }
 
 /** A row with no optimistic override. Shared frozen singleton so rows that
@@ -34,6 +38,7 @@ export const EMPTY_OPTIMISTIC: OptimisticTriage = Object.freeze({
   pinned: null,
   archived: null,
   snoozedUntil: undefined,
+  unread: null,
 });
 
 /** Server-truth triage aggregates for a workspace, matching the exact
@@ -45,11 +50,13 @@ export function serverTriageOf(ws: Workspace): {
   isPinned: boolean;
   isArchived: boolean;
   snoozedUntil: string | null;
+  unread: boolean;
 } {
   return {
     isPinned: ws.sessions.some((s) => s.pinned_at != null),
     isArchived: ws.sessions.some((s) => s.archived_at != null),
     snoozedUntil: ws.sessions.find((s) => s.snoozed_until)?.snoozed_until ?? null,
+    unread: ws.sessions.some((s) => s.unread === true),
   };
 }
 
@@ -66,6 +73,10 @@ export function effectiveSnoozedUntilOf(
   serverSnoozedUntil: string | null | undefined,
 ): string | null | undefined {
   return resolveEffectiveSnoozedUntil(optimistic.snoozedUntil, serverSnoozedUntil);
+}
+
+export function effectiveUnreadOf(optimistic: OptimisticTriage, serverUnread: boolean): boolean {
+  return optimistic.unread ?? serverUnread;
 }
 
 /** True when an override has been caught up to by the server and can be
@@ -111,14 +122,20 @@ export function reconcileOptimistic(
     const pinned = fieldCaughtUp(override.pinned, server.isPinned) ? null : override.pinned;
     const archived = fieldCaughtUp(override.archived, server.isArchived) ? null : override.archived;
     const snoozedUntil = snoozeCaughtUp(override.snoozedUntil, server.snoozedUntil) ? undefined : override.snoozedUntil;
-    if (pinned !== override.pinned || archived !== override.archived || snoozedUntil !== override.snoozedUntil) {
+    const unread = fieldCaughtUp(override.unread, server.unread) ? null : override.unread;
+    if (
+      pinned !== override.pinned ||
+      archived !== override.archived ||
+      snoozedUntil !== override.snoozedUntil ||
+      unread !== override.unread
+    ) {
       changed = true;
     }
-    if (pinned === null && archived === null && snoozedUntil === undefined) {
+    if (pinned === null && archived === null && snoozedUntil === undefined && unread === null) {
       changed = true;
       continue;
     }
-    next.set(id, { pinned, archived, snoozedUntil });
+    next.set(id, { pinned, archived, snoozedUntil, unread });
   }
   return changed ? next : (map as Map<string, OptimisticTriage>);
 }
@@ -131,5 +148,6 @@ export function withOverride(prev: OptimisticTriage | undefined, patch: Partial<
     pinned: patch.pinned !== undefined ? patch.pinned : (prev?.pinned ?? null),
     archived: patch.archived !== undefined ? patch.archived : (prev?.archived ?? null),
     snoozedUntil: "snoozedUntil" in patch ? patch.snoozedUntil : (prev?.snoozedUntil ?? undefined),
+    unread: patch.unread !== undefined ? patch.unread : (prev?.unread ?? null),
   };
 }

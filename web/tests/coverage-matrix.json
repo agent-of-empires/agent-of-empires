@@ -827,6 +827,17 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
+      "id": "sidebar.unread-indicator",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/__tests__/SessionRowTriage.test.tsx",
+        "src/lib/api.test.ts",
+        "src/lib/__tests__/sidebarOptimistic.test.ts"
+      ],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
       "id": "sidebar.sort-pure",
       "kind": "vitest",
       "risk": "medium",

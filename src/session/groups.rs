@@ -519,6 +519,28 @@ fn attention_tier(inst: &Instance) -> u8 {
 /// archived first, since the archive block is a recency view, not an
 /// attention view. Urgent is suppressed for tier 99 so a sunk row can't
 /// claw back to the top.
+/// Attention bucket rank with the unread promoter folded in. Pure (no global
+/// flag read) so it can be unit-tested directly. Waiting (tier 0) stays top;
+/// when `unread` and the feature is on, a non-waiting row is promoted to rank
+/// 1, just below Waiting and above every other tier, with the remaining tiers
+/// shifted up by one (2..=7). When the feature is off it returns `tier`
+/// unchanged; the shift is monotonic so a feature-on run with no unread rows
+/// orders identically to before. Tier 99 (archived/snoozed) never reaches
+/// here, so sunk rows stay sunk regardless of an unread marker.
+fn attention_rank(tier: u8, unread: bool, unread_enabled: bool) -> u8 {
+    if unread_enabled {
+        if tier == 0 {
+            0
+        } else if unread {
+            1
+        } else {
+            tier.saturating_add(1)
+        }
+    } else {
+        tier
+    }
+}
+
 #[allow(clippy::type_complexity)]
 fn attention_session_key(
     inst: &Instance,
@@ -565,13 +587,14 @@ fn attention_session_key(
             None,
         );
     }
+    let rank = attention_rank(tier, inst.is_unread(), crate::session::unread_enabled());
     // Non-archived: "longest aging" = oldest last_accessed_at first (ASC).
     // The `Reverse` slot is forced to `Reverse(None)` (= sorts after all
     // Some() in the Reverse ordering) so it doesn't contribute; the real
     // tiebreak is the trailing ASC field.
     (
         !urgent_bias,
-        tier,
+        rank,
         !favorite_bias,
         inst.last_accessed_at.is_none(),
         Reverse(None),
@@ -665,9 +688,23 @@ fn attention_group_key(
     // contribute; the real tiebreak is the trailing ASC field. Shape
     // mirrors `attention_session_key` so the intent is uniform.
     let max_last = members.iter().filter_map(|i| i.last_accessed_at).max();
+    // Fold the unread promoter in at the group level too, so a project
+    // containing an unread session floats up just like the flat Attention
+    // view does (a group with an unread Idle outranks a group whose best
+    // member is a read Error). Mirrors `attention_session_key`'s rank.
+    //
+    // Only non-sunk members count: archive/snooze don't clear `unread`, so an
+    // archived or snoozed (tier-99) member must not promote the group, or a
+    // dismissed session would drag its group back to the top. This matches the
+    // session key, which short-circuits tier-99 rows before the unread rank.
+    let unread = members
+        .iter()
+        .filter(|i| attention_tier(i) != 99)
+        .any(|i| i.is_unread());
+    let rank = attention_rank(min_tier, unread, crate::session::unread_enabled());
     (
         !urgent_bias,
-        min_tier,
+        rank,
         !favorite_bias,
         max_last.is_none(),
         Reverse(None),
@@ -1903,9 +1940,11 @@ mod tests {
 
     #[test]
     fn test_attention_group_key_one_active_pulls_group_up() {
-        // Mixed group: 1 archived Waiting, 1 active Idle. Group should sort
-        // at tier 2 (Idle); the active member pulls it out of the archive
-        // tier. This is the auto-unarchive contract for cascade.
+        // Mixed group: 1 archived Waiting, 1 active Idle. The active member
+        // pulls the group out of the archive tier (99) into the Idle bucket.
+        // With the unread promoter enabled (default), a non-unread Idle group
+        // encodes to rank 3 (Waiting=0, unread=1, other tiers shifted +1, so
+        // Idle tier 2 -> 3); the point is it's well above the archive tier.
         let mut archived_waiting = Instance::new("aw", "/tmp/aw");
         archived_waiting.group_path = "work".to_string();
         archived_waiting.status = crate::session::Status::Waiting;
@@ -1917,8 +1956,68 @@ mod tests {
         let instances = vec![archived_waiting, active_idle];
         let key = attention_group_key("work", None, &instances);
         assert_eq!(
-            key.1, 2,
-            "group with one active Idle session should sort at tier 2"
+            key.1, 3,
+            "active Idle group should sort in the Idle bucket, far above archive tier 99"
+        );
+    }
+
+    #[test]
+    fn test_attention_group_key_promotes_unread_below_waiting() {
+        // Group A holds a read Error (tier 1); Group B holds an unread Idle
+        // (tier 2). With the unread promoter on (default), B's unread member
+        // floats it to rank 1, above A's Error (rank 2), matching how the flat
+        // Attention view promotes unread just below Waiting.
+        let mut err = Instance::new("err", "/tmp/err");
+        err.group_path = "a".to_string();
+        err.status = crate::session::Status::Error;
+
+        let mut unread_idle = Instance::new("ui", "/tmp/ui");
+        unread_idle.group_path = "b".to_string();
+        unread_idle.status = crate::session::Status::Idle;
+        unread_idle.mark_unread();
+
+        let key_a = attention_group_key("a", None, std::slice::from_ref(&err));
+        let key_b = attention_group_key("b", None, std::slice::from_ref(&unread_idle));
+        assert!(
+            key_b < key_a,
+            "group with an unread Idle must outrank a group whose best member is a read Error: b={key_b:?} a={key_a:?}"
+        );
+    }
+
+    #[test]
+    fn test_attention_group_key_sunk_unread_member_does_not_promote() {
+        // A group with one active *read* Idle member and one *archived* member
+        // that still carries an unread marker (archive doesn't clear `unread`)
+        // must NOT be promoted: the dismissed member can't drag the group up.
+        // Rank should be the plain Idle bucket, identical to the same group
+        // without any unread anywhere.
+        let mut active_read = Instance::new("ar", "/tmp/ar");
+        active_read.group_path = "g".to_string();
+        active_read.status = crate::session::Status::Idle;
+
+        let mut archived_unread = Instance::new("au", "/tmp/au");
+        archived_unread.group_path = "g".to_string();
+        archived_unread.status = crate::session::Status::Idle;
+        archived_unread.mark_unread();
+        archived_unread.archive(); // archived_at set; unread intentionally kept
+
+        let members = vec![active_read.clone(), archived_unread];
+        let key = attention_group_key("g", None, &members);
+
+        // Same group but with the second member simply read: ranks identical,
+        // proving the sunk unread member contributed nothing.
+        let read_baseline = vec![active_read.clone(), {
+            let mut other = Instance::new("o", "/tmp/o");
+            other.group_path = "g".to_string();
+            other.status = crate::session::Status::Idle;
+            other.archive();
+            other
+        }];
+        let baseline = attention_group_key("g", None, &read_baseline);
+        assert_eq!(
+            key.1, baseline.1,
+            "an archived unread member must not promote the group: rank={} baseline={}",
+            key.1, baseline.1
         );
     }
 
@@ -1973,6 +2072,36 @@ mod tests {
             plain_key < fav_key,
             "plain+Waiting (tier 0) must sort above fav+Idle (tier 2): plain={plain_key:?} fav={fav_key:?}"
         );
+    }
+
+    #[test]
+    fn test_attention_rank_unread_promoter() {
+        // Tiers: Waiting=0, Error=1, Idle=2, Unknown=3, Running=4.
+        // Feature ON: an unread row ranks just below Waiting (0) and above
+        // every other tier, so an unread Idle beats a read Error/Running.
+        let waiting = attention_rank(0, false, true);
+        let unread_idle = attention_rank(2, true, true);
+        let read_error = attention_rank(1, false, true);
+        let read_running = attention_rank(4, false, true);
+        assert!(waiting < unread_idle, "Waiting must stay above unread");
+        assert!(
+            unread_idle < read_error,
+            "unread Idle must rank above a read Error"
+        );
+        assert!(
+            unread_idle < read_running,
+            "unread Idle must rank above a read Running"
+        );
+
+        // Feature OFF: rank is the raw tier, so ordering is unchanged and an
+        // (impossible-when-off, but defensive) unread flag does not promote.
+        assert_eq!(attention_rank(0, false, false), 0);
+        assert_eq!(attention_rank(2, true, false), 2);
+        assert_eq!(attention_rank(4, false, false), 4);
+
+        // OFF ordering matches the pre-feature tier order for read rows.
+        assert!(attention_rank(0, false, false) < attention_rank(1, false, false));
+        assert!(attention_rank(1, false, false) < attention_rank(2, false, false));
     }
 
     #[test]

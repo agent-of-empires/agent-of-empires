@@ -575,6 +575,130 @@ fn preview_visible_rows_equal_output_area_with_info_shown() {
     );
 }
 
+/// Precedence: unread paints only on resting (Idle/Unknown) rows. A live
+/// status supersedes it, keeping its own spinner — so a Running session that
+/// also carries an unread marker must NOT show the solid unread dot. See the
+/// #2088 review note about jumbled precedence.
+#[test]
+#[serial]
+fn unread_dot_yields_to_a_running_status() {
+    use crate::tui::styles::load_theme;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances()[0].id.clone();
+    let theme = load_theme("empire");
+
+    let render = |env: &mut TestEnv| -> String {
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| env.view.render(f, f.area(), &theme, None, None, None))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+        }
+        out
+    };
+
+    // Idle + unread: the row shows the solid unread dot.
+    env.view.mutate_instance(&id, |inst| {
+        inst.status = crate::session::Status::Idle;
+        inst.mark_unread();
+    });
+    env.view.flat_items = env.view.build_flat_items();
+    assert!(
+        render(&mut env).contains('●'),
+        "an idle unread row should paint the unread dot"
+    );
+
+    // Running + still unread: the live status wins; no unread dot.
+    env.view
+        .mutate_instance(&id, |inst| inst.status = crate::session::Status::Running);
+    env.view.flat_items = env.view.build_flat_items();
+    assert!(
+        !render(&mut env).contains('●'),
+        "a running row must keep its spinner, not the unread dot"
+    );
+}
+
+/// Dwell-to-read: an unread row that stays selected past `UNREAD_DWELL`
+/// (with the list in the foreground) is cleared, distinguishing "stopped to
+/// read it" from "scrolled past."
+#[test]
+#[serial]
+fn unread_dwell_clears_after_threshold() {
+    use std::time::{Duration, Instant};
+    crate::session::set_unread_enabled(true);
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances()[0].id.clone();
+    env.view.mutate_instance(&id, |inst| {
+        inst.status = crate::session::Status::Idle;
+        inst.mark_unread();
+    });
+    env.view.flat_items = env.view.build_flat_items();
+    env.view.select_session_by_id(&id);
+    assert!(env.view.get_instance(&id).unwrap().is_unread());
+
+    let t0 = Instant::now();
+    // First tick arms the dwell clock; nothing cleared yet.
+    assert!(!env.view.tick_unread_dwell(t0));
+    assert!(env.view.get_instance(&id).unwrap().is_unread());
+    // Below the threshold: still unread (this is the "scrolled past" guard).
+    assert!(!env.view.tick_unread_dwell(t0 + Duration::from_millis(500)));
+    assert!(env.view.get_instance(&id).unwrap().is_unread());
+    // Past the threshold: cleared.
+    assert!(env
+        .view
+        .tick_unread_dwell(t0 + super::UNREAD_DWELL + Duration::from_millis(1)));
+    assert!(!env.view.get_instance(&id).unwrap().is_unread());
+}
+
+/// Moving the selection to a different row before the dwell completes spares
+/// the first row: arrowing through a list doesn't read everything you pass.
+#[test]
+#[serial]
+fn unread_dwell_resets_on_selection_change() {
+    use std::time::{Duration, Instant};
+    crate::session::set_unread_enabled(true);
+    let mut env = create_test_env_with_sessions(2);
+    let a = env.view.instances()[0].id.clone();
+    let b = env.view.instances()[1].id.clone();
+    for id in [&a, &b] {
+        env.view.mutate_instance(id, |inst| {
+            inst.status = crate::session::Status::Idle;
+            inst.mark_unread();
+        });
+    }
+    env.view.flat_items = env.view.build_flat_items();
+
+    let t0 = Instant::now();
+    // Arm the dwell clock on A.
+    env.view.select_session_by_id(&a);
+    assert!(!env.view.tick_unread_dwell(t0));
+    // Move to B well before A's threshold; A's clock is dropped, B's arms.
+    env.view.select_session_by_id(&b);
+    assert!(!env.view.tick_unread_dwell(t0 + Duration::from_millis(500)));
+    // Long after, B has now dwelled past the threshold and clears; A, which we
+    // left early, is untouched.
+    assert!(env
+        .view
+        .tick_unread_dwell(t0 + super::UNREAD_DWELL + Duration::from_secs(2)));
+    assert!(
+        env.view.get_instance(&a).unwrap().is_unread(),
+        "row left before the threshold must stay unread"
+    );
+    assert!(
+        !env.view.get_instance(&b).unwrap().is_unread(),
+        "row dwelled past the threshold must be cleared"
+    );
+}
+
 #[test]
 #[serial]
 fn test_q_returns_quit_action() {
@@ -11847,11 +11971,13 @@ mod right_click_context_menu {
     fn down_then_enter_in_menu_opens_delete_dialog() {
         let mut env = create_test_env_with_sessions(2);
         setup_inner(&mut env);
-        // Attention sort surfaces the full session menu (New Session / Rename /
-        // Archive / Snooze / Delete), so Delete is four Downs away.
+        // Attention sort surfaces the full session menu (New Session / Rename
+        // / Archive / Snooze / Mark unread / Delete), so Delete is five Downs
+        // away. (Unread defaults on, so the "Mark unread" row is present.)
         env.view.sort_order = SortOrder::Attention;
         env.view.flat_items = env.view.build_flat_items();
         env.view.handle_right_click(5, 1);
+        env.view.handle_key(key(KeyCode::Down), None);
         env.view.handle_key(key(KeyCode::Down), None);
         env.view.handle_key(key(KeyCode::Down), None);
         env.view.handle_key(key(KeyCode::Down), None);
@@ -11935,9 +12061,19 @@ mod right_click_context_menu {
             .iter()
             .map(|(_, l)| *l)
             .collect();
-        // Default sort here is Newest, where Snooze is gated out, so the
-        // archived-row menu is just New Session / Rename / Unarchive / Delete.
-        assert_eq!(labels, vec!["New Session", "Rename", "Unarchive", "Delete"]);
+        // Default sort here is Newest, where Snooze is gated out. The unread
+        // toggle is always-on (any sort) and defaults on, so the archived-row
+        // menu is New Session / Rename / Unarchive / Mark unread / Delete.
+        assert_eq!(
+            labels,
+            vec![
+                "New Session",
+                "Rename",
+                "Unarchive",
+                "Mark unread",
+                "Delete"
+            ]
+        );
 
         env.view.handle_key(key(KeyCode::Down), None); // New Session -> Rename
         env.view.handle_key(key(KeyCode::Down), None); // Rename -> Unarchive

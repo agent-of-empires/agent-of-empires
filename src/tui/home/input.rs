@@ -2320,6 +2320,11 @@ impl HomeView {
                     tracing::error!("toggle_snooze_at_cursor failed: {}", e);
                 }
             }
+            ActionId::ToggleUnread => {
+                if let Err(e) = self.toggle_unread_at_cursor() {
+                    tracing::error!("toggle_unread_at_cursor failed: {}", e);
+                }
+            }
             ActionId::ToggleContainer => self.toggle_container_for_selected(),
             ActionId::TogglePreviewInfo => self.toggle_preview_info(),
             ActionId::SortPicker => self.show_sort_picker(),
@@ -2801,7 +2806,8 @@ impl HomeView {
             };
             if let Some(inst) = self.get_instance(&id) {
                 let is_actionable = inst.status == Status::Waiting
-                    || matches!(inst.idle_age(), Some(age) if age < window);
+                    || matches!(inst.idle_age(), Some(age) if age < window)
+                    || (crate::session::unread_enabled() && inst.is_unread());
                 if is_actionable {
                     self.cursor = idx;
                     self.update_selected();
@@ -3344,12 +3350,12 @@ impl HomeView {
             } else if is_group {
                 ContextMenuDialog::for_group(anchor)
             } else {
-                let (is_archived, is_snoozed) = match &self.flat_items[idx] {
+                let (is_archived, is_snoozed, is_unread) = match &self.flat_items[idx] {
                     super::Item::Session { id, .. } => self
                         .get_instance(id)
-                        .map(|inst| (inst.is_archived(), inst.is_snoozed()))
-                        .unwrap_or((false, false)),
-                    super::Item::Group { .. } => (false, false),
+                        .map(|inst| (inst.is_archived(), inst.is_snoozed(), inst.is_unread()))
+                        .unwrap_or((false, false, false)),
+                    super::Item::Group { .. } => (false, false, false),
                 };
                 // Snooze is an Attention-sort triage primitive: the `'h'`
                 // keybinding only fires in Attention sort, so the menu omits
@@ -3357,7 +3363,10 @@ impl HomeView {
                 // paths in step.
                 let snooze = (self.sort_order == crate::session::config::SortOrder::Attention)
                     .then_some(is_snoozed);
-                ContextMenuDialog::for_session(anchor, is_archived, snooze)
+                // The unread toggle is always-on (any sort), so it shows
+                // whenever the feature is enabled.
+                let unread = crate::session::unread_enabled().then_some(is_unread);
+                ContextMenuDialog::for_session(anchor, is_archived, snooze, unread)
             });
             return true;
         }
@@ -3432,6 +3441,12 @@ impl HomeView {
                 // wakes it immediately.
                 if let Err(e) = self.toggle_snooze_at_cursor() {
                     tracing::error!("toggle_snooze_at_cursor (context menu) failed: {}", e);
+                }
+            }
+            ContextMenuAction::ToggleUnread => {
+                // Same cursor-on-the-clicked-row guarantee as ToggleArchive.
+                if let Err(e) = self.toggle_unread_at_cursor() {
+                    tracing::error!("toggle_unread_at_cursor (context menu) failed: {}", e);
                 }
             }
             ContextMenuAction::NewSession => self.open_new_session_dialog(),

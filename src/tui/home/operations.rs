@@ -1290,6 +1290,34 @@ impl HomeView {
         None
     }
 
+    /// Manual unread toggle (`U`). Symmetric: a read row becomes unread (put
+    /// it back in the attention queue), an unread row becomes read. The row's
+    /// `theme.unread` color is the feedback, so there is no toast. No-op when
+    /// the feature is disabled.
+    pub(super) fn toggle_unread_at_cursor(&mut self) -> anyhow::Result<()> {
+        if !crate::session::unread_enabled() {
+            return Ok(());
+        }
+        let Some(id) = self.selected_session.clone() else {
+            return Ok(());
+        };
+        if !self.instances.iter().any(|i| i.id == id) {
+            return Ok(());
+        }
+        self.apply_user_action(&id, |inst| inst.toggle_unread())?;
+        // Restart the dwell clock for this row: without this, re-flagging the
+        // currently-selected session unread would be undone on the next tick
+        // (it has already been dwelled on past the threshold). The window
+        // restarts so the flag sticks until the user dwells again or moves on.
+        self.unread_dwell = Some((id.clone(), std::time::Instant::now()));
+        self.flat_items = self.build_flat_items();
+        // In Attention sort, toggling unread changes the row's rank, so the
+        // rebuild can move it; reseat the cursor by id so the next action
+        // still targets this session.
+        self.select_session_by_id(&id);
+        Ok(())
+    }
+
     /// Toggle the cursor's session: archive or unarchive. Archive tears down
     /// all tmux sessions (agent + ancillary); worktree, branch, container
     /// preserved. Unarchive does NOT respawn; press `e` to restart, or send

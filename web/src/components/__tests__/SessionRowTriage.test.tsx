@@ -12,6 +12,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { useMemo, useRef, type ReactNode } from "react";
 
 import { DragSuppressContext, SessionRow } from "../WorkspaceSidebar";
+import { UnreadIndicatorContext } from "../../lib/unreadIndicator";
 import { useSidebarTriage } from "../../hooks/useSidebarTriage";
 import type { SessionResponse, Workspace } from "../../lib/types";
 import { OPEN_SESSION_EVENT } from "../../lib/sessionRoute";
@@ -80,17 +81,19 @@ function Row({
   ws,
   readOnly,
   onCreateSession,
+  isActive = false,
 }: {
   ws: Workspace;
   readOnly?: boolean;
   onCreateSession?: (repoPath: string) => void;
+  isActive?: boolean;
 }) {
   const workspaces = useMemo(() => [ws], [ws]);
   const triage = useSidebarTriage(workspaces);
   return (
     <SessionRow
       workspace={ws}
-      isActive={false}
+      isActive={isActive}
       isSelected={false}
       onActivate={() => {}}
       onCreateSession={onCreateSession}
@@ -99,6 +102,7 @@ function Row({
       onPinToggle={triage.pinToggle}
       onArchiveToggle={triage.archiveToggle}
       onSnooze={triage.snooze}
+      onUnreadToggle={triage.unreadToggle}
     />
   );
 }
@@ -549,5 +553,95 @@ describe("SessionRow triage actions", () => {
     );
     fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
     expect(screen.queryByTestId("sidebar-context-menu-new-session")).toBeNull();
+  });
+});
+
+describe("SessionRow unread", () => {
+  it("renders the unread dot for an unread row", () => {
+    const ws = workspace("w-unread", [session({ id: "s-u", unread: true })]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    expect(screen.queryByTestId("sidebar-unread-dot")).not.toBeNull();
+  });
+
+  it("suppresses the unread dot on the active row (opening reads it)", () => {
+    const ws = workspace("w-unread", [session({ id: "s-u", unread: true })]);
+    render(
+      <Wrap>
+        <Row ws={ws} isActive />
+      </Wrap>,
+    );
+    expect(screen.queryByTestId("sidebar-unread-dot")).toBeNull();
+  });
+
+  it("menu offers 'Mark as unread' for a read row and 'Mark as read' for an unread row", () => {
+    const read = workspace("w-read", [session({ id: "s-read" })]);
+    const { unmount } = render(
+      <Wrap>
+        <Row ws={read} />
+      </Wrap>,
+    );
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    expect(screen.getByTestId("sidebar-context-menu-unread").textContent).toContain("Mark as unread");
+    unmount();
+
+    const unread = workspace("w-unread", [session({ id: "s-unread", unread: true })]);
+    render(
+      <Wrap>
+        <Row ws={unread} />
+      </Wrap>,
+    );
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    expect(screen.getByTestId("sidebar-context-menu-unread").textContent).toContain("Mark as read");
+  });
+
+  it("'Mark as unread' fires PATCH /api/sessions/:id/unread with { unread: true } and shows the dot", async () => {
+    const ws = workspace("w-live", [session({ id: "sess-unread-it" })]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    fireEvent.click(screen.getByTestId("sidebar-context-menu-unread"));
+    // Optimistic dot appears immediately, before the PATCH round-trips.
+    await vi.waitFor(() => expect(screen.queryByTestId("sidebar-unread-dot")).not.toBeNull());
+    await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalled());
+    const [url, init] = fetchSpy.mock.calls[0]!;
+    expect(url).toBe("/api/sessions/sess-unread-it/unread");
+    expect(init?.method).toBe("PATCH");
+    expect(JSON.parse(init!.body as string)).toEqual({ unread: true });
+  });
+
+  it("'Mark as read' on an unread row fires { unread: false }", async () => {
+    const ws = workspace("w-unread", [session({ id: "sess-read-it", unread: true })]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    fireEvent.click(screen.getByTestId("sidebar-context-menu-unread"));
+    await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalled());
+    const [url, init] = fetchSpy.mock.calls[0]!;
+    expect(url).toBe("/api/sessions/sess-read-it/unread");
+    expect(JSON.parse(init!.body as string)).toEqual({ unread: false });
+  });
+
+  it("hides the unread dot and menu item when the feature is disabled", () => {
+    const ws = workspace("w-unread", [session({ id: "s-off", unread: true })]);
+    render(
+      <Wrap>
+        <UnreadIndicatorContext.Provider value={false}>
+          <Row ws={ws} />
+        </UnreadIndicatorContext.Provider>
+      </Wrap>,
+    );
+    expect(screen.queryByTestId("sidebar-unread-dot")).toBeNull();
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    expect(screen.queryByTestId("sidebar-context-menu-unread")).toBeNull();
   });
 });
