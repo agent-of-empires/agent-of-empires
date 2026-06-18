@@ -1305,11 +1305,14 @@ impl HomeView {
             return Ok(());
         }
         self.apply_user_action(&id, |inst| inst.toggle_unread())?;
-        // Restart the dwell clock for this row: without this, re-flagging the
-        // currently-selected session unread would be undone on the next tick
-        // (it has already been dwelled on past the threshold). The window
-        // restarts so the flag sticks until the user dwells again or moves on.
-        self.unread_dwell = Some((id.clone(), std::time::Instant::now()));
+        // Hold this row for the current visit so the dwell doesn't undo a fresh
+        // `u` while the cursor stays on it; the hold is released once the cursor
+        // leaves (see `tick_unread_dwell`). Toggling back to read drops it.
+        if self.get_instance(&id).is_some_and(|i| i.is_unread()) {
+            self.manual_unread_hold = Some(id.clone());
+        } else if self.manual_unread_hold.as_deref() == Some(id.as_str()) {
+            self.manual_unread_hold = None;
+        }
         self.flat_items = self.build_flat_items();
         // In Attention sort, toggling unread changes the row's rank, so the
         // rebuild can move it; reseat the cursor by id so the next action

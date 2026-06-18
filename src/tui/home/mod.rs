@@ -717,9 +717,17 @@ pub struct HomeView {
     /// id and the instant the selection landed on it (while the list is the
     /// foreground, no dialog/live-send). When the same row stays selected for
     /// `UNREAD_DWELL`, the marker is cleared, distinguishing "scrolled past"
-    /// from "actually read." Reset on selection change, on leaving the list,
-    /// and on a manual unread toggle so re-flagging isn't instantly undone.
+    /// from "actually read." Reset on selection change and on leaving the list.
     pub(super) unread_dwell: Option<(String, std::time::Instant)>,
+
+    /// Session id the user just flagged unread by hand (`u`) and has not yet
+    /// navigated away from. While this row stays selected, dwell-to-read won't
+    /// undo the mark, so flagging a session and keeping the cursor on it
+    /// sticks. It is released the moment the cursor leaves the row (see
+    /// `tick_unread_dwell`), so returning to it later lets the dwell clear it
+    /// like any other unread row. In-memory only: a manual flag is a
+    /// this-visit hint, not a durable badge.
+    pub(super) manual_unread_hold: Option<String>,
 
     // Terminal mode for sandboxed sessions (per-session, ephemeral)
     pub(super) terminal_modes: HashMap<String, TerminalMode>,
@@ -1394,6 +1402,7 @@ impl HomeView {
             mouse_pos: None,
             last_click: None,
             unread_dwell: None,
+            manual_unread_hold: None,
             terminal_modes: HashMap::new(),
             default_terminal_mode,
             sound_config,
@@ -5046,6 +5055,11 @@ impl HomeView {
     /// actually unread, so an already-read session doesn't churn the storage
     /// flock.
     pub(crate) fn clear_unread_on_view(&mut self, id: &str) {
+        // Engaging with the row ends its manual-flag visit, so drop any hold;
+        // otherwise a stale hold could later suppress an auto mark on this row.
+        if self.manual_unread_hold.as_deref() == Some(id) {
+            self.manual_unread_hold = None;
+        }
         let is_unread = self.get_instance(id).is_some_and(|i| i.is_unread());
         if is_unread {
             let _ = self.apply_user_action(id, |i| i.mark_read());
@@ -5061,9 +5075,10 @@ impl HomeView {
     /// The clock is suspended (and reset) whenever the feature is off, a
     /// dialog or live-send is up (the list isn't being read then), or nothing
     /// is selected, and it restarts whenever the selection moves to a
-    /// different row. `toggle_unread_at_cursor` also restarts it, so manually
-    /// re-flagging the current row isn't undone by the dwell on the very next
-    /// tick.
+    /// different row. A row the user just flagged unread by hand is held until
+    /// the cursor leaves it (`manual_unread_hold`), so flagging it and sitting
+    /// there doesn't instantly undo the mark; once you leave and come back, it
+    /// clears on dwell like any other unread row.
     pub fn tick_unread_dwell(&mut self, now: std::time::Instant) -> bool {
         if !crate::session::unread_enabled() || self.has_dialog() {
             self.unread_dwell = None;
@@ -5073,6 +5088,16 @@ impl HomeView {
             self.unread_dwell = None;
             return false;
         };
+        // The manual hold only protects the row while it stays selected; the
+        // moment the cursor moves elsewhere, release it so a later return reads
+        // normally.
+        if self
+            .manual_unread_hold
+            .as_deref()
+            .is_some_and(|held| held != id)
+        {
+            self.manual_unread_hold = None;
+        }
         let started = match &self.unread_dwell {
             Some((prev, started)) if *prev == id => *started,
             // First tick on this row (or selection moved): start the clock.
@@ -5084,9 +5109,12 @@ impl HomeView {
         if now.duration_since(started) < UNREAD_DWELL {
             return false;
         }
-        // Dwell satisfied. Clear if the row is unread; leave the clock parked
-        // on this row either way so we don't re-evaluate every tick (a manual
-        // re-flag resets it via `toggle_unread_at_cursor`).
+        // A row the user just flagged by hand is held for this visit, so the
+        // dwell doesn't undo the mark while they sit on it. The clock stays
+        // parked on this row either way so we don't re-evaluate every tick.
+        if self.manual_unread_hold.as_deref() == Some(id.as_str()) {
+            return false;
+        }
         if self.get_instance(&id).is_some_and(|i| i.is_unread()) {
             self.clear_unread_on_view(&id);
             return true;

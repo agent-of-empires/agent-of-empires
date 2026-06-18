@@ -659,6 +659,127 @@ fn unread_dwell_clears_after_threshold() {
     assert!(!env.view.get_instance(&id).unwrap().is_unread());
 }
 
+/// A fresh manual flag (`u`) is held for the current visit: marking a session
+/// unread and keeping the cursor on it must not let dwell-to-read undo the
+/// mark. Regression for the bug where staying on the row past `UNREAD_DWELL`
+/// silently re-cleared it.
+#[test]
+#[serial]
+fn manual_unread_survives_same_visit_dwell() {
+    use std::time::{Duration, Instant};
+    crate::session::set_unread_enabled(true);
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances()[0].id.clone();
+    env.view.mutate_instance(&id, |inst| {
+        inst.status = crate::session::Status::Idle;
+    });
+    env.view.flat_items = env.view.build_flat_items();
+    env.view.select_session_by_id(&id);
+    env.view
+        .toggle_unread_at_cursor()
+        .expect("manual toggle should succeed");
+    assert!(env.view.get_instance(&id).unwrap().is_unread());
+
+    let t0 = Instant::now();
+    // Arm the clock, then sit well past the threshold without moving: the hold
+    // keeps the mark.
+    assert!(!env.view.tick_unread_dwell(t0));
+    assert!(!env
+        .view
+        .tick_unread_dwell(t0 + super::UNREAD_DWELL + Duration::from_secs(5)));
+    assert!(
+        env.view.get_instance(&id).unwrap().is_unread(),
+        "a freshly hand-flagged row must survive dwell while it stays selected"
+    );
+}
+
+/// The manual hold is per-visit: after leaving a hand-flagged row and coming
+/// back, dwelling on it clears the mark like any other unread row. This is the
+/// behavior verified by hand (select A, mark unread, move to B, move back, sit
+/// past the threshold -> it clears).
+#[test]
+#[serial]
+fn manual_unread_clears_after_leave_and_return() {
+    use std::time::{Duration, Instant};
+    crate::session::set_unread_enabled(true);
+    let mut env = create_test_env_with_sessions(2);
+    let a = env.view.instances()[0].id.clone();
+    let b = env.view.instances()[1].id.clone();
+    for id in [&a, &b] {
+        env.view.mutate_instance(id, |inst| {
+            inst.status = crate::session::Status::Idle;
+        });
+    }
+    env.view.flat_items = env.view.build_flat_items();
+
+    // Select A and flag it unread by hand.
+    env.view.select_session_by_id(&a);
+    env.view.toggle_unread_at_cursor().expect("manual mark A");
+    assert!(env.view.get_instance(&a).unwrap().is_unread());
+
+    // Move to B with NO dwell tick in between (a quick hop, like real
+    // navigation). The hold must release purely from the selection change;
+    // otherwise returning to A would stay suppressed forever (the reported
+    // bug, which an in-between tick would have masked).
+    env.view.select_session_by_id(&b);
+    assert!(
+        env.view.manual_unread_hold.is_none(),
+        "moving off the row must release the hold without needing a dwell tick"
+    );
+
+    // Come back to A: arm the clock, then sit past the threshold. Now it clears.
+    let t0 = Instant::now();
+    env.view.select_session_by_id(&a);
+    assert!(!env.view.tick_unread_dwell(t0));
+    let cleared = env
+        .view
+        .tick_unread_dwell(t0 + super::UNREAD_DWELL + Duration::from_secs(1));
+    assert!(cleared, "revisiting and dwelling should clear the mark");
+    assert!(
+        !env.view.get_instance(&a).unwrap().is_unread(),
+        "a hand-flagged row clears on revisit + dwell (per-visit hold)"
+    );
+}
+
+/// Engaging with a hand-flagged row (open/attach, which clears it) also drops
+/// the per-visit hold, so a *later* auto mark on that same still-selected row
+/// is not wrongly suppressed and clears on dwell.
+#[test]
+#[serial]
+fn manual_hold_released_on_engagement_lets_auto_clear() {
+    use std::time::{Duration, Instant};
+    crate::session::set_unread_enabled(true);
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances()[0].id.clone();
+    env.view.mutate_instance(&id, |inst| {
+        inst.status = crate::session::Status::Idle;
+    });
+    env.view.flat_items = env.view.build_flat_items();
+    env.view.select_session_by_id(&id);
+
+    // Hand-flag, then engage (the open/attach path), which clears it and ends
+    // the hold even though the cursor never left the row.
+    env.view.toggle_unread_at_cursor().expect("manual mark");
+    env.view.clear_unread_on_view(&id);
+    assert!(
+        env.view.manual_unread_hold.is_none(),
+        "engaging with the row must release the manual hold"
+    );
+    assert!(!env.view.get_instance(&id).unwrap().is_unread());
+
+    // A later auto mark on the same (still-selected) row must clear on dwell.
+    env.view.mutate_instance(&id, |inst| inst.mark_unread());
+    let t0 = Instant::now();
+    assert!(!env.view.tick_unread_dwell(t0));
+    let cleared = env
+        .view
+        .tick_unread_dwell(t0 + super::UNREAD_DWELL + Duration::from_secs(1));
+    assert!(
+        cleared && !env.view.get_instance(&id).unwrap().is_unread(),
+        "a later auto mark must not be suppressed by a stale hold"
+    );
+}
+
 /// Moving the selection to a different row before the dwell completes spares
 /// the first row: arrowing through a list doesn't read everything you pass.
 #[test]

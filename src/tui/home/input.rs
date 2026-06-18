@@ -3037,6 +3037,12 @@ impl HomeView {
             }
             if self.selected_session != prev_session {
                 self.preview_scroll_offset = 0;
+                // Moving off a hand-flagged row ends its manual-unread hold, so
+                // returning to it later dwell-clears like any other unread. Done
+                // here at the cursor->selection sync (every navigation path runs
+                // through it) so the release doesn't hinge on a dwell tick
+                // happening to fire during a quick hop to another row.
+                self.manual_unread_hold = None;
             }
         }
     }
