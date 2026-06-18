@@ -329,15 +329,28 @@ pub struct Supervisor<S: BroadcastSink> {
     /// removes the entry on success, error, or panic.
     pending_resumes: Arc<std::sync::Mutex<HashMap<String, ResumeKind>>>,
     /// Session ids whose in-flight resume (spawn or attach) should
-    /// bail out instead of inserting the freshly-built WorkerHandle.
+    /// bail out instead of inserting the freshly-built `WorkerHandle`.
     /// Set by `shutdown` when it observes a session that's in
     /// `pending_resumes`, either with no live runner record (the
     /// `pending_has_it` path) or against an existing runner about to
-    /// be SIGTERMed (the registry-terminate path). Without this, a
+    /// be SIGTERMed (the registry-terminate path). Without this, an
     /// `acp_disable` arriving during the 2-3s ACP handshake
     /// would no-op while the in-flight resume still completed a few
     /// seconds later, producing an orphaned worker the user can no
     /// longer manage.
+    ///
+    /// Lock-order invariant (see #1848): this mutex is taken
+    /// while `workers` is held. Writers in `shutdown_with_reason`
+    /// insert before `drop(workers)`; readers in `spawn` and
+    /// `attach` consume the breadcrumb (via `HashSet::remove`) after
+    /// `workers.lock().await` and before their own `drop(workers)`.
+    /// The lock pair (tokio `workers` outside, std `cancelled_resumes`
+    /// inside) sequences the writer's seed inside its `workers`
+    /// critical section: any resumer whose `workers.lock().await`
+    /// completes after the writer's `drop(workers)` is then guaranteed
+    /// to observe the seed when it next locks `cancelled_resumes`,
+    /// so its pre-insert check consumes the breadcrumb instead of
+    /// finding an empty set.
     cancelled_resumes: Arc<std::sync::Mutex<HashSet<String>>>,
     /// Per-agent install gate. claude-agent-acp lazy-installs its
     /// native binary on first ever run; two concurrent `session/new`
@@ -2239,6 +2252,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             // the breadcrumb under the workers lock so the racing
             // resume that re-acquires workers cannot observe an empty
             // cancelled_resumes between our drop and its read.
+            // Sibling test: `shutdown_holds_workers_lock_across_cancelled_resumes_seed`.
             if pending_has_it {
                 lock_recover(&self.cancelled_resumes).insert(session_id.to_string());
             }
@@ -2255,6 +2269,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             // between our drop and its read. The reservation cleanup
             // (ResumeReservation::Drop) clears `pending_resumes` on
             // exit, so we don't have to.
+            // Sibling test: `shutdown_holds_workers_lock_across_cancelled_resumes_seed`.
             lock_recover(&self.cancelled_resumes).insert(session_id.to_string());
             drop(workers);
             debug!(
@@ -4447,6 +4462,78 @@ mod tests {
                 .unwrap()
                 .contains("s-attach-cancel"),
             "shutdown must mark the pending attach for cancellation regardless of ResumeKind"
+        );
+    }
+
+    /// Regression for #1848: `shutdown_with_reason` must hold the
+    /// `workers` lock across its `cancelled_resumes.insert(...)`,
+    /// otherwise a concurrent `spawn` or `attach` that reacquires
+    /// `workers` between the drop and the insert observes an empty
+    /// breadcrumb set and installs an orphan worker the user cannot
+    /// disable. Locks down the lock-pair invariant under typical
+    /// scheduling: the test holds `cancelled_resumes` before
+    /// spawning a shutter, so `shutdown_with_reason` parks at its
+    /// own breadcrumb insert; a 50ms sleep gives the shutter time
+    /// to reach that park on a multi-core runtime;
+    /// `workers.try_lock()` from the test then samples the invariant
+    /// directly. `Err(_)` means the seed runs while `workers` is
+    /// held (the bug shape #1848 closed); `Ok(_)` means a future
+    /// reorder put the seed after the drop and the assert fails
+    /// with the embedded message.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    // The `await_holding_lock` lint analyses the std `MutexGuard`'s
+    // drop scope relative to every await in the function, so it
+    // cannot be narrowed to a single statement: the guard
+    // `cancelled_guard` lives at fn scope until `drop(cancelled_guard)`,
+    // and the lint scope follows the guard, not the await. Holding
+    // `cancelled_guard` across the sleep is the test mechanism.
+    #[allow(clippy::await_holding_lock)]
+    async fn shutdown_holds_workers_lock_across_cancelled_resumes_seed() {
+        let sup = Arc::new(Supervisor::new(VecSink::new()));
+        sup.pending_resumes
+            .lock()
+            .unwrap()
+            .insert("s-race".into(), ResumeKind::Spawn);
+
+        let cancelled_guard = sup.cancelled_resumes.lock().unwrap();
+
+        let shutter = {
+            let sup = Arc::clone(&sup);
+            tokio::spawn(async move { sup.shutdown("s-race").await })
+        };
+
+        // Wait for shutter to reach steady state (parked on the std
+        // mutex the test is holding). On a multi-core runtime this
+        // happens within microseconds; the wait is generous so the
+        // test stays deterministic on slow CI hardware.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Sanity probe: distinguishes a real #1848 regression from a
+        // test-environment timing failure. If shutter completed, the
+        // breadcrumb seed cannot have parked on the held std mutex,
+        // and the assertion below would mis-attribute that failure
+        // mode to the regression. Fail with a clearer message.
+        assert!(
+            !shutter.is_finished(),
+            "shutter completed unexpectedly; cancelled_resumes parking \
+             did not engage (test environment timing issue, not a \
+             #1848 regression)"
+        );
+
+        assert!(
+            sup.workers.try_lock().is_err(),
+            "regression #1848: shutdown released `workers` before \
+             writing the `cancelled_resumes` breadcrumb"
+        );
+
+        drop(cancelled_guard);
+        shutter
+            .await
+            .expect("shutter task panicked")
+            .expect("shutdown should succeed");
+        assert!(
+            sup.cancelled_resumes.lock().unwrap().contains("s-race"),
+            "shutdown must seed cancelled_resumes for the in-flight resume"
         );
     }
 
