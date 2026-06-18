@@ -155,6 +155,9 @@ impl ContextMenuDialog {
         }
     }
 
+    /// The action `Enter` would submit. Falls back to the first item when
+    /// nothing is highlighted (e.g. mouse hover cleared it), mirroring the
+    /// `Some(0)` open state, so the accessor is always total.
     pub fn selected_action(&self) -> ContextMenuAction {
         self.items[self.highlight.unwrap_or(0)].0
     }
@@ -223,6 +226,13 @@ impl ContextMenuDialog {
     /// item doesn't stay lit once the pointer leaves it. Returns true when
     /// the highlight actually changed, so the caller can skip a redraw on
     /// every pixel-level mouse twitch.
+    ///
+    /// This intentionally diverges from the focus-style dialogs
+    /// (`ConfirmDialog` and friends), which keep their selection when the
+    /// mouse drifts off so a click still lands on a sensible default. A
+    /// multi-row popup menu follows desktop semantics instead: drift off
+    /// and nothing is armed, so an accidental near-miss can't leave a
+    /// misleading row lit for `Enter`.
     pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
         let next = row_to_item_idx(self.last_area, self.items.len(), col, row);
         if self.highlight == next {
