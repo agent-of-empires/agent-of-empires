@@ -221,7 +221,7 @@ fn read_claude_json_session_id(project_path: &Path) -> Option<String> {
 /// Polling closure for Claude Code session tracking on the host filesystem.
 ///
 /// Per tick, in order:
-/// 1. Read `/tmp/aoe-hooks/<instance_id>/session_id` (written by Claude's
+/// 1. Read `/tmp/aoe-hooks-<euid>/<instance_id>/session_id` (written by Claude's
 ///    `SessionStart` / `UserPromptSubmit` hooks). When present and ≤ 5 min
 ///    old, return it and skip the disk scan.
 /// 2. Otherwise scan `~/.claude/projects/<encoded-path>/`. The scan uses
@@ -239,7 +239,7 @@ pub(crate) fn claude_poll_fn(
     let last_known = std::sync::Mutex::new(known_session_id);
     move || {
         // Sidecar reads are scoped per-instance: the file lives under
-        // `/tmp/aoe-hooks/<instance_id>/` so a sibling instance's hook
+        // `/tmp/aoe-hooks-<euid>/<instance_id>/` so a sibling instance's hook
         // writes cannot reach this path, which is why the read skips
         // `compose_exclusion`. `extra_excludes` is still honored so a
         // sidecar value matching one of this instance's cleared sids does
@@ -4180,9 +4180,26 @@ mod tests {
     #[test]
     #[serial]
     fn test_claude_poll_fn_reads_hook_sidecar_first() {
+        use std::os::unix::fs::PermissionsExt;
+        let hook_tmp = tempfile::tempdir().unwrap();
+        let hook_base = hook_tmp.path().join("aoe-hooks");
+        std::fs::create_dir(&hook_base).unwrap();
+        std::fs::set_permissions(&hook_base, std::fs::Permissions::from_mode(0o700)).unwrap();
+        crate::hooks::override_base_for_test(hook_base.clone());
+        crate::hooks::reset_for_test();
+        struct Cleanup;
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                crate::hooks::clear_base_override_for_test();
+                crate::hooks::reset_for_test();
+            }
+        }
+        let _cleanup = Cleanup;
+
         let instance_id = "test_sidecar_first_path";
-        let hook_dir = std::path::PathBuf::from("/tmp/aoe-hooks").join(instance_id);
-        std::fs::create_dir_all(&hook_dir).unwrap();
+        let hook_dir = hook_base.join(instance_id);
+        std::fs::create_dir(&hook_dir).unwrap();
+        std::fs::set_permissions(&hook_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         let sidecar_uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         std::fs::write(hook_dir.join("session_id"), sidecar_uuid).unwrap();
 
@@ -4207,15 +4224,31 @@ mod tests {
             Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
             None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
         }
-        std::fs::remove_dir_all(&hook_dir).ok();
     }
 
     #[test]
     #[serial]
     fn test_claude_poll_fn_skips_stale_sidecar_falls_through_to_disk() {
+        use std::os::unix::fs::PermissionsExt;
+        let hook_tmp = tempfile::tempdir().unwrap();
+        let hook_base = hook_tmp.path().join("aoe-hooks");
+        std::fs::create_dir(&hook_base).unwrap();
+        std::fs::set_permissions(&hook_base, std::fs::Permissions::from_mode(0o700)).unwrap();
+        crate::hooks::override_base_for_test(hook_base.clone());
+        crate::hooks::reset_for_test();
+        struct Cleanup;
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                crate::hooks::clear_base_override_for_test();
+                crate::hooks::reset_for_test();
+            }
+        }
+        let _cleanup = Cleanup;
+
         let instance_id = "test_sidecar_stale_falls_through";
-        let hook_dir = std::path::PathBuf::from("/tmp/aoe-hooks").join(instance_id);
-        std::fs::create_dir_all(&hook_dir).unwrap();
+        let hook_dir = hook_base.join(instance_id);
+        std::fs::create_dir(&hook_dir).unwrap();
+        std::fs::set_permissions(&hook_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         let stale_uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         let sidecar_path = hook_dir.join("session_id");
         std::fs::write(&sidecar_path, stale_uuid).unwrap();
@@ -4248,7 +4281,6 @@ mod tests {
             Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
             None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
         }
-        std::fs::remove_dir_all(&hook_dir).ok();
     }
 
     #[test]

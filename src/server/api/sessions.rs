@@ -58,7 +58,7 @@ pub struct SessionResponse {
     /// the predicate. Cross-feature parity with the TUI's `f`/`F` keybind.
     pub favorited: bool,
     /// True when the agent has flagged this session as urgent via the
-    /// `attention-urgent` hook (read from `/tmp/aoe-hooks/{id}/attention.json`
+    /// `attention-urgent` hook (read from `/tmp/aoe-hooks-<euid>/{id}/attention.json`
     /// by `Instance::is_urgent()`). The web sidebar's Attention sort floats
     /// urgent rows above all non-urgent ones within their triage tier,
     /// matching the TUI's `attention_session_key` urgent-bias. `is_urgent()`
@@ -4774,14 +4774,16 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(hook_base)]
     fn from_instance_surfaces_hook_urgent_flag() {
         // #1640: the web Attention sort needs `Instance::is_urgent()` on the
         // wire. Write the hook-side attention.json the agent would emit and
         // confirm it round-trips onto the response, then confirm a session
         // with no hook file reports urgent: false.
+        let (_g, _, _tmp_base) = crate::hooks::test_support::BaseGuard::ready();
         let inst = make_test_instance();
-        let dir = crate::hooks::hook_status_dir(&inst.id).expect("test id must be allowlist-safe");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::hooks::ensure_instance_dir_path(&inst.id)
+            .expect("guard must create instance subdir");
         std::fs::write(
             dir.join("attention.json"),
             r#"{"urgent":true,"urgent_reason":"needs input"}"#,

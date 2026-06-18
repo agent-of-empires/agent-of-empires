@@ -24,13 +24,14 @@ mod v013_strip_profile_theme;
 mod v014_rename_default_theme;
 mod v015_rewrite_hook_strings;
 mod v016_clear_archived_tmux_gone_error;
+mod v017_rewrite_hook_strings_for_per_user_base;
 
 use anyhow::Result;
 use std::fs;
 use std::path::PathBuf;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 16;
+const CURRENT_VERSION: u32 = 17;
 const VERSION_FILE: &str = ".schema_version";
 
 struct Migration {
@@ -119,6 +120,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 16,
         name: "clear_archived_tmux_gone_error",
         run: v016_clear_archived_tmux_gone_error::run,
+    },
+    Migration {
+        version: 17,
+        name: "rewrite_hook_strings_for_per_user_base",
+        run: v017_rewrite_hook_strings_for_per_user_base::run,
     },
 ];
 

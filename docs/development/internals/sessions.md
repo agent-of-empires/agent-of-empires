@@ -8,7 +8,7 @@ aoe persists each Claude Code session's conversation id so a session resumes the
 
 Two mechanisms keep the recorded id current as Claude rotates it (on `/clear`, `--fork-session`, `--continue`):
 
-- **Hook sidecar (primary).** aoe installs `SessionStart` and `UserPromptSubmit` hooks in `~/.claude/settings.json`. They extract `session_id` from Claude's stdin and write it atomically to `/tmp/aoe-hooks/<instance-id>/session_id`. The poller reads this before scanning, so rotations are caught within ~1 poll tick (~2s). The sidecar is host-only.
+- **Hook sidecar (primary).** aoe installs `SessionStart` and `UserPromptSubmit` hooks in `~/.claude/settings.json`. They extract `session_id` from Claude's stdin and write it atomically to `/tmp/aoe-hooks-<euid>/<instance-id>/session_id` (per-user host base, issue #1844). The poller reads this before scanning, so rotations are caught within ~1 poll tick (~2s). The sidecar is host-only.
 - **Filesystem-scan fallback.** If the sidecar is absent, stale (>5 min), or invalid, the poller scans `~/.claude/projects/<project>/` for the most recent `.jsonl`. Siblings sharing a project path are disambiguated via the tmux env `AOE_CAPTURED_SESSION_ID`. For Docker sessions the scan runs in-container via `docker exec` (5s cap).
 
 `resume_intent` is decoupled from the poller's observed id so a peer CLI write isn't undone and a daemon restart can't resurrect a cleared value. The post-launch persist of the new id plus the one-shot `Cleared` auto-promote land in a single atomic flock, preserving a concurrent peer write during the launch window.

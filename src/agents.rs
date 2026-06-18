@@ -55,7 +55,7 @@ pub struct HookEvent {
     pub status: Option<&'static str>,
     /// When `true`, install an additional hook command that extracts
     /// `session_id` from the agent's stdin JSON payload and writes it to
-    /// `/tmp/aoe-hooks/<AOE_INSTANCE_ID>/session_id`.
+    /// `/tmp/aoe-hooks-<euid>/<AOE_INSTANCE_ID>/session_id`.
     pub session_id_capture: bool,
 }
 
@@ -91,8 +91,11 @@ pub struct SidecarHooks {
     /// (e.g. `.hermes/sandbox/config.yaml`). The `sandbox` segment mirrors the
     /// container staging dir. Empty (and unused) for `host_only` agents.
     pub sandbox_config_subpath: &'static str,
-    /// Write AoE status hooks into the config file at the given path.
-    pub install: fn(&std::path::Path) -> anyhow::Result<()>,
+    /// Write AoE status hooks into the config file at the given path. The
+    /// `target` parameter selects which `{base}` is baked into the hook
+    /// command string (`/tmp/aoe-hooks-<euid>` for host, `/tmp/aoe-hooks` for
+    /// sandbox; see `crate::hooks::HookInstallTarget`).
+    pub install: fn(&std::path::Path, crate::hooks::HookInstallTarget) -> anyhow::Result<()>,
     /// Remove AoE status hooks from the config file at the given path.
     /// Returns whether anything was changed.
     pub uninstall: fn(&std::path::Path) -> anyhow::Result<bool>,
@@ -155,7 +158,7 @@ pub struct AgentDef {
 
 /// Claude Code hook events. `SessionStart` and `UserPromptSubmit` carry
 /// `session_id_capture: true` so the per-instance sidecar
-/// (`/tmp/aoe-hooks/<id>/session_id`) is updated whenever Claude rotates
+/// (`/tmp/aoe-hooks-<euid>/<id>/session_id`) is updated whenever Claude rotates
 /// its session UUID (`/clear`, `/new`, `--fork-session`, resume, compact).
 /// `claude_poll_fn` reads this sidecar before falling back to its disk
 /// scan.
