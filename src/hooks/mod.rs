@@ -30,16 +30,42 @@ pub use status_file::{
     read_hook_urgent,
 };
 
+/// Single source of truth for the `aoe-hooks` identity token. Defined as a
+/// `macro_rules!` rather than a `const &str` because `concat!` only accepts
+/// string literals, not const refs; folding this through `concat!` gives the
+/// derived constants below a compile-time link to one literal occurrence.
+macro_rules! aoe_hook_marker {
+    () => {
+        "aoe-hooks"
+    };
+}
+
 /// Fixed base path used inside the sandbox image, where the multi-tenant
 /// threat does not apply (per-container, single-tenant). The host bind-mounts
 /// `/tmp/aoe-hooks-<euid>/<id>` from `dir_guard::hook_base_path()` to this
 /// fixed path inside the container so the sandbox shell can bake a single
 /// canonical string regardless of the host's effective uid.
-pub(crate) const HOOK_STATUS_BASE_IN_CONTAINER: &str = "/tmp/aoe-hooks";
+pub(crate) const HOOK_STATUS_BASE_IN_CONTAINER: &str = concat!("/tmp/", aoe_hook_marker!());
 
-/// Marker substring used to identify AoE-managed hooks in settings.json.
-/// Any hook command containing this string is considered ours.
-const AOE_HOOK_MARKER: &str = "aoe-hooks";
+/// Marker token embedded by every AoE-emitted hook command in two structurally
+/// distinct positions: as a `# AOE_HOOK_MARKER` trailing shell comment, and as
+/// a path component in `HOOK_STATUS_BASE_IN_CONTAINER`. [`is_aoe_hook_command`]
+/// anchors on those positions via [`AOE_HOOK_TRAILING_SENTINEL`] and
+/// [`AOE_HOOK_PATH_SENTINEL`], not on bare substring presence, so user
+/// commands that mention the literal `aoe-hooks` are not misclassified.
+const AOE_HOOK_MARKER: &str = aoe_hook_marker!();
+
+/// Trailing sentinel: `0 # {AOE_HOOK_MARKER}`. Every shipping status and
+/// session-id emitter ends with `exit 0 # AOE_HOOK_MARKER`, so the leading
+/// `0 ` digit binds the sentinel to the canonical `exit 0` trailer and rules
+/// out incidental `# aoe-hooks` matches inside echo arguments or quoted
+/// strings.
+const AOE_HOOK_TRAILING_SENTINEL: &str = concat!("0 # ", aoe_hook_marker!());
+
+/// Path-template sentinel: `{AOE_HOOK_MARKER}/$AOE_INSTANCE_ID`. Baked into
+/// the sandbox session-id command body via [`HOOK_STATUS_BASE_IN_CONTAINER`].
+/// The un-expanded `$AOE_INSTANCE_ID` makes this user-collision-proof.
+const AOE_HOOK_PATH_SENTINEL: &str = concat!(aoe_hook_marker!(), "/$AOE_INSTANCE_ID");
 
 /// Where an agent's settings file lives. Determines which shell command
 /// `hook_command_session_id` emits.
@@ -260,10 +286,12 @@ fn hook_command_with_base(status: &str, base: &str, target: HookInstallTarget) -
 /// agent's stdin JSON payload and writes it to a sidecar file.
 ///
 /// Both variants must exit 0 even on failure: a non-zero hook blocks the
-/// agent's tool calls. The trailing `# AOE_HOOK_MARKER` on the host
-/// variant is load-bearing: `is_aoe_hook_command` recognises AoE hooks by
-/// substring; the sandbox variant gets the marker via its baked-in
-/// `HOOK_STATUS_BASE` path.
+/// agent's tool calls. Both variants end with the trailing
+/// `# AOE_HOOK_MARKER` shell comment so [`is_aoe_hook_command`] recognises
+/// them via the anchored `# aoe-hooks` sentinel; the sandbox variant
+/// additionally carries the legacy `aoe-hooks/$AOE_INSTANCE_ID` path
+/// substring so hooks installed before the trailing marker was added stay
+/// detectable on uninstall.
 ///
 /// Host-variant silent-failure modes (acceptable, equivalent to a regex
 /// miss in the sandbox variant): `aoe` not on PATH at hook-exec time, or
@@ -307,12 +335,36 @@ fn hook_command_session_id_sandbox(base: &str) -> String {
          case \"$M\" in drwx------|drwx------.|drwx------+|drwx------@) ;; *) exit 0 ;; esac; \
          SID=$(tr -d \"\\n\" | grep -oE \"[{{,][[:space:]]*\\\"session_id\\\"[[:space:]]*:[[:space:]]*\\\"[0-9a-fA-F]{{8}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{12}}\\\"\" | head -1 | grep -oE \"[0-9a-fA-F]{{8}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{12}}\"); \
          [ -n \"$SID\" ] && printf \"%s\" \"$SID\" > \"$D/.session_id.$$.tmp\" 2>/dev/null && mv \"$D/.session_id.$$.tmp\" \"$D/session_id\" 2>/dev/null; \
-         exit 0'"
+         exit 0 # {AOE_HOOK_MARKER}'"
     )
 }
 
+/// Recognises an AoE-managed hook command. Accepts iff one of two structural
+/// sentinels is present:
+///
+/// - [`AOE_HOOK_TRAILING_SENTINEL`] (`0 # aoe-hooks`) appears in trailing
+///   position. Anchored: the predicate strips trailing whitespace and the
+///   shell-string terminators `'` / `"` produced by the `sh -c '…'` wrapper,
+///   then requires the sentinel at the end. The leading `0 ` digit binds the
+///   match to the canonical `exit 0 # AOE_HOOK_MARKER` trailer baked by every
+///   shipping emitter, ruling out incidental `# aoe-hooks` matches inside
+///   echo arguments, quoted strings, or user-written trailing comments.
+/// - [`AOE_HOOK_PATH_SENTINEL`] (`aoe-hooks/$AOE_INSTANCE_ID`) appears
+///   anywhere. Substring match: the un-expanded `$AOE_INSTANCE_ID` is
+///   user-collision-proof (a real script would have already expanded the
+///   variable). This sentinel is load-bearing for backwards-compat with
+///   legacy emitter forms that have no trailing-comment marker: the
+///   pre-#2168 `hook_command_with_base` (host status) bakes
+///   `mkdir -p "/tmp/aoe-hooks/$AOE_INSTANCE_ID"` in the body, and the
+///   sandbox session-id command bakes `D="/tmp/aoe-hooks/$AOE_INSTANCE_ID"`.
+///
+/// Residual false-positive surface (accepted): a user hook whose stored
+/// command literally contains the un-expanded `$AOE_INSTANCE_ID` reference
+/// adjacent to `aoe-hooks/`. The out-of-band marker scheme proposed in
+/// issue #2191 (Option B) is the future-proof fix.
 fn is_aoe_hook_command(cmd: &str) -> bool {
-    cmd.contains(AOE_HOOK_MARKER)
+    let trimmed_tail = cmd.trim_end_matches(|c: char| c == '\'' || c == '"' || c.is_whitespace());
+    trimmed_tail.ends_with(AOE_HOOK_TRAILING_SENTINEL) || cmd.contains(AOE_HOOK_PATH_SENTINEL)
 }
 
 /// Per-agent dispatch shape for the hook target enumerator. Each kind picks a
@@ -413,14 +465,16 @@ fn push_unique_target_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
 }
 
 /// Best-effort env-list collector for the running AoE process: global config
-/// `environment` plus each profile's `environment`. Profile-listing failures
-/// degrade to an empty per-profile set, matching the warn-and-continue
-/// convention used elsewhere in this module.
+/// `environment` plus each profile's `environment`. Both the global load and
+/// the profile listing degrade to defaults on failure with a `tracing::warn!`,
+/// matching the warn-and-continue convention used elsewhere in this module.
+///
+/// Missing `config.toml` is silent: `Config::load` maps `!path.exists()` to
+/// `Ok(Config::default())`, so any `Err` reaching `load_or_warn` is a real
+/// TOML parse or I/O failure that the operator should see surfaced.
 fn collect_env_lists_from_session() -> Vec<Vec<String>> {
     let mut out = Vec::new();
-    if let Ok(c) = crate::session::config::Config::load() {
-        out.push(c.environment);
-    }
+    out.push(crate::session::config::Config::load_or_warn().environment);
     match crate::session::list_profiles() {
         Ok(profiles) => {
             for p in profiles {
@@ -1551,10 +1605,24 @@ const KIRO_HOOKS: &[(&str, &str)] = &[
     ("stop", "idle"),
 ];
 
+/// Single source of truth for the `aoe-hooks` Kiro agent identifier. Used
+/// both as the agent name (passed to `kiro-cli agent set-default`) and as the
+/// stem of [`KIRO_HOOKS_AGENT_FILE`]. Defined as a `macro_rules!` so the file
+/// path can fold it through `concat!`. Distinct from [`AOE_HOOK_MARKER`]:
+/// renaming the agent is a user-visible breaking change and must not couple
+/// to the internal hook-detection token.
+macro_rules! kiro_hooks_agent_name {
+    () => {
+        "aoe-hooks"
+    };
+}
+
+const KIRO_HOOKS_AGENT_NAME: &str = kiro_hooks_agent_name!();
+
 /// Default agent config path for Kiro CLI: `~/.kiro/agents/aoe-hooks.json`.
 /// We use a dedicated agent config file rather than modifying the user's
 /// default agent, so AoE hooks are isolated and easy to remove.
-pub const KIRO_HOOKS_AGENT_FILE: &str = ".kiro/agents/aoe-hooks.json";
+pub const KIRO_HOOKS_AGENT_FILE: &str = concat!(".kiro/agents/", kiro_hooks_agent_name!(), ".json");
 
 /// Install AoE status hooks into a Kiro CLI agent config file.
 ///
@@ -1574,7 +1642,7 @@ pub fn install_kiro_hooks(agent_config_path: &Path, target: HookInstallTarget) -
 
         config
             .entry("name".to_string())
-            .or_insert_with(|| Value::String("aoe-hooks".to_string()));
+            .or_insert_with(|| Value::String(KIRO_HOOKS_AGENT_NAME.to_string()));
         config
             .entry("tools".to_string())
             .or_insert_with(|| serde_json::json!(["*"]));
@@ -1638,11 +1706,11 @@ pub fn set_kiro_default_agent_if_builtin() {
 
     if is_builtin_default {
         let set_result = std::process::Command::new("kiro-cli")
-            .args(["agent", "set-default", "aoe-hooks"])
+            .args(["agent", "set-default", KIRO_HOOKS_AGENT_NAME])
             .output();
         match set_result {
             Ok(o) if o.status.success() => {
-                tracing::info!(target: "hooks.install", "Set aoe-hooks as default Kiro agent for status detection");
+                tracing::info!(target: "hooks.install", "Set {KIRO_HOOKS_AGENT_NAME} as default Kiro agent for status detection");
             }
             Ok(o) => {
                 tracing::debug!(target: "hooks.install",
@@ -1657,7 +1725,7 @@ pub fn set_kiro_default_agent_if_builtin() {
     } else {
         tracing::info!(target: "hooks.install",
             "Kiro has a custom default agent; skipping set-default. \
-             Run `kiro-cli agent set-default aoe-hooks` to enable status detection."
+             Run `kiro-cli agent set-default {KIRO_HOOKS_AGENT_NAME}` to enable status detection."
         );
     }
 }
@@ -2849,7 +2917,8 @@ command = "echo user-hook"
                 "hooks": [{"type": "command", "command": "echo user"}]
             }),
             serde_json::json!({
-                "hooks": [{"type": "command", "command": "sh -c 'aoe-hooks stuff'"}]
+                "hooks": [{"type": "command",
+                           "command": "sh -c 'printf running > /dev/null; exit 0 # aoe-hooks'"}]
             }),
         ];
 
@@ -3895,6 +3964,195 @@ hooks_auto_accept: false
         assert!(
             elapsed < std::time::Duration::from_millis(500),
             "lock should release immediately on panic, took {elapsed:?}"
+        );
+    }
+
+    #[derive(Clone)]
+    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn capture_warns<F: FnOnce()>(f: F) -> String {
+        use tracing_subscriber::layer::SubscriberExt;
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let writer = CaptureWriter(buf.clone());
+        let subscriber = tracing_subscriber::Registry::default().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(writer)
+                .with_ansi(false)
+                .with_target(true),
+        );
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = buf.lock().unwrap().clone();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    #[test]
+    #[serial_test::serial(shell_env)]
+    fn collect_env_lists_warns_on_corrupt_global_config_but_not_on_missing() {
+        let tmp = TempDir::new().unwrap();
+        let _codex = CodexHomeGuard::unset();
+        let _home = EnvGuard::set("HOME", tmp.path().to_str().unwrap());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let _xdg = EnvGuard::set(
+            "XDG_CONFIG_HOME",
+            tmp.path().join(".config").to_str().unwrap(),
+        );
+
+        let app_dir = crate::session::get_app_dir().unwrap();
+        let config_path = app_dir.join("config.toml");
+
+        let logs_missing = capture_warns(|| {
+            assert!(!config_path.exists(), "test precondition: no config.toml");
+            let _ = collect_env_lists_from_session();
+        });
+        assert!(
+            !logs_missing.contains("Failed to load global config"),
+            "missing config.toml must not warn; captured: {logs_missing}"
+        );
+
+        std::fs::write(&config_path, "this = is = not = toml\n").unwrap();
+        let logs_parse = capture_warns(|| {
+            let _ = collect_env_lists_from_session();
+        });
+        let warn_count = logs_parse.matches("Failed to load global config").count();
+        assert_eq!(
+            warn_count, 1,
+            "malformed config.toml must surface exactly one warn; captured: {logs_parse}"
+        );
+        assert!(
+            logs_parse.contains("session.store"),
+            "warn must carry the load_or_warn target; captured: {logs_parse}"
+        );
+    }
+
+    #[test]
+    fn is_aoe_hook_command_distinguishes_ours_from_user_commands() {
+        let aoe_emitted = [
+            canonical_status_command("running", HookInstallTarget::Host),
+            canonical_status_command("waiting", HookInstallTarget::Sandbox),
+            canonical_session_id_command(HookInstallTarget::Host),
+            canonical_session_id_command(HookInstallTarget::Sandbox),
+        ];
+        for cmd in &aoe_emitted {
+            assert!(
+                is_aoe_hook_command(cmd),
+                "every shipping AoE emitter must match: {cmd}"
+            );
+        }
+
+        let user_commands = [
+            "ls /tmp/aoe-hooks",
+            "echo 'cleaning aoe-hooks dir'",
+            "rm -rf /tmp/aoe-hooks-1000",
+            "cat /var/log/aoe-hooks.log",
+            "sh -c 'aoe-hooks stuff'",
+            "aoe-hooks --foo",
+            "echo aoe-hooks",
+            "echo \" # aoe-hooks comment\"",
+            "bash -c \"cd ~ && # aoe-hooks placeholder\nls\"",
+            "# aoe-hooks: clean up tmp dir",
+            "echo '# aoe-hooks'",
+            "echo \"# aoe-hooks\"",
+            "X='hidden # aoe-hooks'",
+            "say 'task done: # aoe-hooks'",
+        ];
+        for cmd in &user_commands {
+            assert!(
+                !is_aoe_hook_command(cmd),
+                "user command containing the marker substring must not match: {cmd}"
+            );
+        }
+
+        let legacy_sandbox_session_id = "sh -c 'unset IFS; set -f; umask 077; \
+             [ -n \"$AOE_INSTANCE_ID\" ] || exit 0; \
+             D=\"/tmp/aoe-hooks/$AOE_INSTANCE_ID\"; mkdir -p \"$D\" 2>/dev/null; \
+             exit 0'";
+        assert!(
+            is_aoe_hook_command(legacy_sandbox_session_id),
+            "legacy sandbox session-id (no trailing comment) must match via path sentinel"
+        );
+        let pre_2168_host_status = "sh -c '[ -n \"$AOE_INSTANCE_ID\" ] || exit 0; \
+             case \"$AOE_INSTANCE_ID\" in *[!0-9a-zA-Z_-]*) exit 0 ;; esac; \
+             mkdir -p \"/tmp/aoe-hooks/$AOE_INSTANCE_ID\" 2>/dev/null; \
+             printf running > \"/tmp/aoe-hooks/$AOE_INSTANCE_ID/status\" 2>/dev/null; \
+             exit 0'";
+        assert!(
+            is_aoe_hook_command(pre_2168_host_status),
+            "pre-#2168 host status (no trailing comment) must match via path sentinel"
+        );
+
+        let sandbox_sid = canonical_session_id_command(HookInstallTarget::Sandbox);
+        assert!(
+            sandbox_sid.contains(AOE_HOOK_PATH_SENTINEL),
+            "sandbox session-id keeps the path-template sentinel"
+        );
+        assert!(
+            sandbox_sid.contains(AOE_HOOK_TRAILING_SENTINEL),
+            "sandbox session-id gains the trailing comment sentinel"
+        );
+    }
+
+    #[test]
+    fn every_emitter_is_recognised_by_is_aoe_hook_command() {
+        let emitters = [
+            (
+                "host status (running)",
+                canonical_status_command("running", HookInstallTarget::Host),
+            ),
+            (
+                "host status (idle)",
+                canonical_status_command("idle", HookInstallTarget::Host),
+            ),
+            (
+                "sandbox status (waiting)",
+                canonical_status_command("waiting", HookInstallTarget::Sandbox),
+            ),
+            (
+                "host session-id",
+                canonical_session_id_command(HookInstallTarget::Host),
+            ),
+            (
+                "sandbox session-id",
+                canonical_session_id_command(HookInstallTarget::Sandbox),
+            ),
+        ];
+        for (label, cmd) in &emitters {
+            assert!(
+                is_aoe_hook_command(cmd),
+                "{label} must be recognised by is_aoe_hook_command: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn aoe_hook_sentinels_embed_marker() {
+        assert!(
+            AOE_HOOK_TRAILING_SENTINEL.contains(AOE_HOOK_MARKER),
+            "trailing sentinel must embed AOE_HOOK_MARKER verbatim"
+        );
+        assert!(
+            AOE_HOOK_PATH_SENTINEL.contains(AOE_HOOK_MARKER),
+            "path sentinel must embed AOE_HOOK_MARKER verbatim"
+        );
+        assert!(
+            HOOK_STATUS_BASE_IN_CONTAINER.contains(AOE_HOOK_MARKER),
+            "container base path must embed AOE_HOOK_MARKER verbatim"
         );
     }
 }
