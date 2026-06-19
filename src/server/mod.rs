@@ -2935,6 +2935,20 @@ async fn status_poll_loop(state: Arc<AppState>) {
 
             reload_state_instances_from_disk(&state, instances, StatusSource::TmuxApplied).await;
 
+            // Drain poller observations into sessions.json so daemon-only
+            // sessions (no attached TUI) persist post-`/clear` sids (#2291).
+            {
+                let state_for_drain = state.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let mut guard = state_for_drain.instances.blocking_write();
+                    crate::session::sync::drain_and_persist_session_ids(
+                        &mut guard,
+                        &state_for_drain.file_watch,
+                    )
+                })
+                .await;
+            }
+
             #[cfg(feature = "serve")]
             acp_reconciler::reconcile_acp_workers(
                 &state,

@@ -2626,172 +2626,24 @@ impl HomeView {
     /// Tmux env may also be republished when this returns `false`
     /// (filtered or Failed paths republish the memory mirror).
     pub fn apply_session_id_updates(&mut self) -> bool {
-        let mut updates: Vec<(String, String, Option<String>)> = Vec::new();
-        let mut filtered_ids: HashSet<String> = HashSet::new();
-
-        for inst in &self.instances {
-            if let Some((_id, session_id)) = inst
-                .session_id_poller
-                .as_ref()
-                .and_then(|p| p.lock().ok())
-                .and_then(|p| p.try_recv_session_update())
-            {
-                let Some(session_id) = crate::session::capture::validated_session_id(session_id)
-                else {
-                    // `on_change` already published this raw sid to env;
-                    // republish the memory mirror to overwrite it.
-                    filtered_ids.insert(inst.id.clone());
-                    continue;
-                };
-                // Defense-in-depth against explicit resume-target invalidation:
-                // an invalidated sid can still live on disk for several minutes
-                // (opencode db, vibe meta.json, codex/gemini/pi/hermes state).
-                // The poller closures filter via `compose_exclusion`, but if a
-                // closure factory ever forgets to thread the per-instance
-                // excludes, this guard prevents the sid from being re-imported.
-                if inst.retroactive_capture_excludes.contains(&session_id) {
-                    tracing::debug!(
-                        target: "tui.home",
-                        "Ignoring poller-reported sid {} for {}: in retroactive_capture_excludes",
-                        session_id,
-                        inst.id,
-                    );
-                    filtered_ids.insert(inst.id.clone());
-                    continue;
-                }
-                if inst.agent_session_id.as_deref() != Some(session_id.as_str()) {
-                    let expected_prior = inst.agent_session_id.clone();
-                    updates.push((inst.id.clone(), session_id, expected_prior));
-                }
-                continue;
-            }
-        }
-
-        if updates.is_empty() && filtered_ids.is_empty() {
+        let outcome = crate::session::sync::drain_and_persist_session_ids(
+            &mut self.instances,
+            &self.file_watch,
+        );
+        if !outcome.touched() {
             return false;
         }
-
-        let mut to_apply: Vec<(String, String)> = Vec::new();
-        let mut to_rollback: Vec<(String, Option<String>, Option<String>)> = Vec::new();
-
-        for (id, session_id, expected_prior) in &updates {
-            let Some(profile) = self.instance_map.get(id).map(|i| i.source_profile.clone()) else {
-                continue;
-            };
-            match crate::session::persist_session_to_storage(
-                &profile,
-                id,
-                session_id,
-                expected_prior.as_deref(),
-                &self.file_watch,
-            ) {
-                crate::session::SidWrite::Applied => {
-                    to_apply.push((id.clone(), session_id.clone()));
-                }
-                crate::session::SidWrite::Skipped => {
-                    let mut reloaded = false;
-                    if let Ok(storage) =
-                        crate::session::Storage::new(&profile, self.file_watch.clone())
-                    {
-                        if let Ok(disk_insts) = storage.load() {
-                            if let Some(disk_inst) = disk_insts.iter().find(|i| i.id == *id) {
-                                to_rollback.push((
-                                    id.clone(),
-                                    disk_inst.agent_session_id.clone(),
-                                    disk_inst.resume_probe_failed_sid.clone(),
-                                ));
-                                reloaded = true;
-                            }
-                        }
-                    }
-                    if !reloaded {
-                        // Memory is known stale (Skipped CAS proved
-                        // memory != disk) and we cannot read disk.
-                        // Leave env at the poller's last write; the next
-                        // poller event reconciles.
-                        tracing::warn!(target: "tui.home",
-                            instance = %id,
-                            "Skipped reload failed; deferring env reconcile");
-                    }
-                }
-                crate::session::SidWrite::Failed => {
-                    // `on_change` published an unvalidated sid; republish memory.
-                    filtered_ids.insert(id.clone());
-                }
-            }
-        }
-
-        for (id, session_id) in &to_apply {
-            self.mutate_instance(id, |inst| {
-                inst.agent_session_id = Some(session_id.clone());
-                inst.resume_probe_failed_sid = None;
-            });
-        }
-        for (id, disk_sid, disk_failed_sid) in &to_rollback {
-            let disk_sid = disk_sid.clone();
-            let disk_failed_sid = disk_failed_sid.clone();
-            self.mutate_instance(id, |inst| {
-                inst.agent_session_id = disk_sid.clone();
-                inst.resume_probe_failed_sid = disk_failed_sid.clone();
-            });
-        }
-
-        let touched_ids: Vec<&str> = to_apply
+        for id in outcome
+            .applied
             .iter()
-            .map(|(id, _)| id.as_str())
-            .chain(to_rollback.iter().map(|(id, _, _)| id.as_str()))
-            .chain(filtered_ids.iter().map(|s| s.as_str()))
-            .collect();
-        let mut set_batch: Vec<(String, String, String)> = Vec::new();
-        let mut unset_batch: Vec<(String, String)> = Vec::new();
-        for id in &touched_ids {
-            let Some(inst) = self.instance_map.get(*id) else {
-                continue;
-            };
-            // `s.exists()` reads a 2s-TTL cache; tests bypassing
-            // `Session::create` must call `refresh_session_cache()`.
-            let tmux_name = match inst.tmux_session() {
-                Ok(s) if s.exists() && !s.is_pane_dead() => s.name().to_string(),
-                Ok(_) => continue,
-                Err(e) => {
-                    tracing::warn!(target: "tui.home",
-                        instance = %id,
-                        "Skipping tmux env publish; tmux_session() error: {}", e);
-                    continue;
-                }
-            };
-            match &inst.agent_session_id {
-                Some(sid) => set_batch.push((
-                    tmux_name,
-                    crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY.to_string(),
-                    sid.clone(),
-                )),
-                None => unset_batch.push((
-                    tmux_name,
-                    crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY.to_string(),
-                )),
+            .chain(outcome.rolled_back.iter())
+            .chain(outcome.filtered.iter())
+        {
+            if let Some(inst) = self.instances.iter().find(|i| i.id == *id).cloned() {
+                self.instance_map.insert(id.clone(), inst);
             }
         }
-        if !set_batch.is_empty() {
-            let refs: Vec<(&str, &str, &str)> = set_batch
-                .iter()
-                .map(|(s, k, v)| (s.as_str(), k.as_str(), v.as_str()))
-                .collect();
-            if let Err(e) = crate::tmux::env::set_hidden_env_batch(&refs) {
-                tracing::warn!(target: "tui.home", "Post-CAS env publish failed: {}", e);
-            }
-        }
-        if !unset_batch.is_empty() {
-            let refs: Vec<(&str, &str)> = unset_batch
-                .iter()
-                .map(|(s, k)| (s.as_str(), k.as_str()))
-                .collect();
-            if let Err(e) = crate::tmux::env::remove_hidden_env_batch(&refs) {
-                tracing::warn!(target: "tui.home", "Post-CAS env unset failed: {}", e);
-            }
-        }
-
-        !to_apply.is_empty() || !to_rollback.is_empty()
+        !outcome.applied.is_empty() || !outcome.rolled_back.is_empty()
     }
 
     /// Drain the startup-recovery channel and apply each `RecoveryUpdate`
