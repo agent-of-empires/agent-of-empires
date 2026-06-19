@@ -537,10 +537,16 @@ mod tests {
             let w = luminance(theme.waiting);
             let f = luminance(theme.fresh_idle);
             let i = luminance(theme.idle);
+            let u = luminance(theme.unread);
             // Waiting beats fresh-idle.
             cmp("waiting", w, "fresh_idle", f);
             // Fresh-idle beats fully-decayed idle.
             cmp("fresh_idle", f, "idle", i);
+            // Unread sits between waiting and idle (Attention sort
+            // promoter from #2088). Its relationship to fresh_idle is
+            // intentionally unconstrained: themes may tie them.
+            cmp("waiting", w, "unread", u);
+            cmp("unread", u, "idle", i);
         }
     }
 }
