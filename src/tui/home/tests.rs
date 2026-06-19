@@ -8698,6 +8698,34 @@ mod footer_toolbar {
         );
     }
 
+    /// While a non-live overlay (here the help screen) is open, the footer
+    /// is drawn underneath but the overlay owns clicks: `footer_button_at`
+    /// and `handle_sidebar_collapse_click` must report no hit so a click
+    /// can't fire a shortcut or toggle the sidebar behind the modal.
+    #[test]
+    #[serial]
+    fn overlay_blocks_footer_and_sidebar_clicks() {
+        let mut env = create_test_env_with_sessions(3);
+        render_at(&mut env, 120, 12);
+        let (rect, _) = env.view.footer_buttons[0];
+        // No overlay: the button resolves.
+        assert!(env.view.footer_button_at(rect.x, rect.y).is_some());
+
+        env.view.show_help = true;
+        assert!(
+            env.view.has_non_live_send_overlay(),
+            "help screen is a non-live overlay"
+        );
+        assert!(
+            env.view.footer_button_at(rect.x, rect.y).is_none(),
+            "footer click is blocked while an overlay owns the screen"
+        );
+        assert!(
+            !env.view.handle_sidebar_collapse_click(0, 0),
+            "sidebar toggle is blocked while an overlay owns the screen"
+        );
+    }
+
     /// Strict-hotkey mode shifts the chords: Diff becomes Ctrl+D and Delete
     /// becomes an uppercase 'D', and the buttons synthesize those exactly.
     #[test]

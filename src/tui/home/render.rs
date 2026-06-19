@@ -737,8 +737,11 @@ impl HomeView {
             ViewMode::Structured => theme.border,
             ViewMode::Terminal | ViewMode::Tool(_) => theme.terminal_border,
         };
+        // Drop the right border so the preview's left border is the single
+        // shared seam, matching the expanded list and DESIGN.md's
+        // "eliminate the double-border between list and preview" rule.
         let block = Block::default()
-            .borders(Borders::ALL)
+            .borders(Borders::TOP | Borders::LEFT | Borders::BOTTOM)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(border_color));
         let inner = block.inner(area);
@@ -2936,9 +2939,11 @@ impl HomeView {
         // Greedy pack by priority. Width of a group = sum of span char counts;
         // separator between kept groups adds 3 cols each (" · "). Reserve 1
         // col for the leading space margin.
+        // Display-cell width (not `chars().count()`) so the greedy pack and
+        // the click rects line up with the cells ratatui actually paints.
         let widths: Vec<usize> = groups
             .iter()
-            .map(|(_, _, g)| g.iter().map(|s| s.content.chars().count()).sum::<usize>())
+            .map(|(_, _, g)| g.iter().map(|s| s.width()).sum::<usize>())
             .collect();
         let avail = (area.width as usize).saturating_sub(1);
 

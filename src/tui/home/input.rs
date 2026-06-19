@@ -373,8 +373,14 @@ impl HomeView {
     /// The `KeyEvent` a footer-toolbar button at `(col, row)` synthesizes,
     /// or `None` when the click misses every button. The caller routes the
     /// returned key through the normal key handler so a click behaves
-    /// exactly like pressing the shortcut.
+    /// exactly like pressing the shortcut. Returns `None` while a non-live
+    /// overlay (dialog, context menu, help, search) is open: the footer is
+    /// drawn underneath it, but the overlay owns clicks, so a footer button
+    /// must not fire a shortcut behind it.
     pub fn footer_button_at(&self, col: u16, row: u16) -> Option<KeyEvent> {
+        if self.has_non_live_send_overlay() {
+            return None;
+        }
         let pos = Position::from((col, row));
         self.footer_buttons
             .iter()
@@ -389,7 +395,13 @@ impl HomeView {
     /// path. The collapse button sits on the list's top border, which is
     /// inside `list_area`, so this MUST run before `hit_list` or the click
     /// falls through to `handle_empty_list_click` and opens a new session.
+    /// No-op while a non-live overlay is open so a click can't toggle the
+    /// sidebar behind a modal (the rects are cleared for the full-screen
+    /// takeover views, so a dialog overlay is the case left to guard).
     pub fn handle_sidebar_collapse_click(&mut self, col: u16, row: u16) -> bool {
+        if self.has_non_live_send_overlay() {
+            return false;
+        }
         let pos = Position::from((col, row));
         if self.collapse_button_area.contains(pos) || self.expand_strip_area.contains(pos) {
             self.toggle_sidebar_collapsed();
