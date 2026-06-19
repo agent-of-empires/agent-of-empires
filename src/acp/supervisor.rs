@@ -1415,21 +1415,29 @@ impl<S: BroadcastSink> Supervisor<S> {
         self.worker_notify.notify_waiters();
 
         // Honor the wizard's "Auto-approve" / profile `yolo_mode_default`
-        // by switching the ACP session to bypassPermissions mode. The
+        // by switching the ACP session to the adapter's bypass mode. The
         // tmux path achieves the same with `--dangerously-skip-permissions`
         // (see `apply_yolo_mode()` in `src/session/instance.rs`); structured view
         // can't pass CLI flags through the ACP adapter, so we set the
-        // mode via `session/set_mode` instead. Best-effort: the call is
+        // mode via `session/set_mode` instead. The mode id is adapter-specific
+        // (claude: `bypassPermissions`, codex: `full-access`, gemini: `yolo`),
+        // so resolve it from the agent profile rather than hard-coding Claude's
+        // id — codex advertises `full-access`, not `bypassPermissions`, so a
+        // hard-coded `bypassPermissions` was silently dropped by the
+        // not-advertised guard and left codex sessions in their default
+        // (approval-prompting) preset. Best-effort: the call is
         // fire-and-forget through cmd_tx, the connection loop warns on
-        // failure, and adapters that don't advertise bypass mode stay in
-        // default. See #1142.
+        // failure, and adapters with no known bypass mode (`yolo_mode_id:
+        // None`) stay in default. See #1142.
         if let Some(client) = client_for_yolo {
-            if let Err(e) = client.set_mode("bypassPermissions").await {
-                warn!(
-                    target: "acp.supervisor",
-                    session = %session_id,
-                    "set_mode(bypassPermissions) after spawn failed: {e}"
-                );
+            if let Some(mode_id) = super::agent_profiles::resolve(&agent).yolo_mode_id {
+                if let Err(e) = client.set_mode(mode_id).await {
+                    warn!(
+                        target: "acp.supervisor",
+                        session = %session_id,
+                        "set_mode({mode_id}) after spawn failed: {e}"
+                    );
+                }
             }
         }
         Ok(())

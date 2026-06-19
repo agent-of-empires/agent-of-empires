@@ -7917,6 +7917,40 @@ mod tests {
     }
 
     #[test]
+    fn profile_yolo_mode_ids_pass_the_advertised_guard() {
+        use super::super::agent_profiles;
+        // The supervisor's post-spawn `set_mode(profile.yolo_mode_id)` is
+        // gated by this same `is_mode_advertised` guard. Pin each adapter's
+        // YOLO id against the modes that adapter actually advertises, so a
+        // mismatch (the #1142 codex bug: `bypassPermissions` vs `full-access`)
+        // can't silently get dropped again.
+        let claude_modes = Some(vec![
+            "auto".to_string(),
+            "default".to_string(),
+            "acceptEdits".to_string(),
+            "plan".to_string(),
+            "bypassPermissions".to_string(),
+        ]);
+        let codex_modes = Some(vec![
+            "read-only".to_string(),
+            "auto".to_string(),
+            "full-access".to_string(),
+        ]);
+
+        let claude_yolo = agent_profiles::resolve("claude").yolo_mode_id.unwrap();
+        assert!(is_mode_advertised(claude_yolo, &claude_modes, false));
+
+        let codex_yolo = agent_profiles::resolve("codex").yolo_mode_id.unwrap();
+        assert!(is_mode_advertised(codex_yolo, &codex_modes, false));
+        // The old hard-coded id would NOT survive the guard for codex.
+        assert!(!is_mode_advertised(
+            "bypassPermissions",
+            &codex_modes,
+            false
+        ));
+    }
+
+    #[test]
     fn is_mode_advertised_without_mode_list_defers_to_config_option() {
         // No SessionMode list: the agent steers mode through a config option,
         // so set_mode must NOT be sent (returns false). Without a config-option

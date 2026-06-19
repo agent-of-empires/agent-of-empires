@@ -37,6 +37,17 @@ pub struct AgentProfile {
     /// a tool call titled `"ScheduleWakeup"`. Specific to Claude's
     /// `/loop` dynamic-pacing flow.
     pub supports_wakeup_tools: bool,
+    /// ACP session-mode id that means "bypass all permission prompts"
+    /// (the wizard's "Auto-approve" / profile `yolo_mode_default`). Each
+    /// adapter names this differently: claude-agent-acp advertises
+    /// `bypassPermissions`, codex-acp advertises `full-access`, gemini-cli
+    /// advertises `yolo`. The supervisor sends this id via
+    /// `session/set_mode` immediately after spawn (see
+    /// `supervisor::spawn_inner`). `None` for adapters with no known
+    /// bypass mode: YOLO then stays a best-effort no-op and the session
+    /// keeps the adapter's default mode rather than guessing an id the
+    /// adapter would reject. See #1142.
+    pub yolo_mode_id: Option<&'static str>,
 }
 
 impl AgentProfile {
@@ -97,6 +108,7 @@ pub const CLAUDE: AgentProfile = AgentProfile {
     clear_aliases: &["/clear"],
     supports_exit_plan_mode: true,
     supports_wakeup_tools: true,
+    yolo_mode_id: Some("bypassPermissions"),
 };
 
 /// Legacy alias key carried by older session records (`agent_name="claude-code"`).
@@ -115,6 +127,9 @@ pub const CODEX: AgentProfile = AgentProfile {
     clear_aliases: &["/new"],
     supports_exit_plan_mode: false,
     supports_wakeup_tools: false,
+    // codex-acp advertises its bypass preset as the `full-access` session
+    // mode (read-only / auto / full-access), not Claude's `bypassPermissions`.
+    yolo_mode_id: Some("full-access"),
 };
 
 /// SST OpenCode via native `opencode acp`. OpenCode's `task` tool can
@@ -127,6 +142,9 @@ pub const OPENCODE: AgentProfile = AgentProfile {
     clear_aliases: &["/new"],
     supports_exit_plan_mode: false,
     supports_wakeup_tools: false,
+    // OpenCode's bypass-mode id over ACP is unverified; leave YOLO a no-op
+    // until observed rather than guessing an id the adapter would reject.
+    yolo_mode_id: None,
 };
 
 /// Google Gemini CLI via native `gemini --acp`. Gemini's `/restore` is
@@ -138,6 +156,9 @@ pub const GEMINI: AgentProfile = AgentProfile {
     clear_aliases: &[],
     supports_exit_plan_mode: false,
     supports_wakeup_tools: false,
+    // gemini-cli surfaces its YOLO approval mode over `gemini --acp` with
+    // the `yolo` id (see the CurrentModeUpdate mapping in acp_client.rs).
+    yolo_mode_id: Some("yolo"),
 };
 
 /// Mistral Vibe via bundled `vibe-acp`. Defaults until verified.
@@ -147,6 +168,7 @@ pub const VIBE: AgentProfile = AgentProfile {
     clear_aliases: &[],
     supports_exit_plan_mode: false,
     supports_wakeup_tools: false,
+    yolo_mode_id: None,
 };
 
 /// Pi coding agent via `pi-acp`. Defaults until verified.
@@ -156,6 +178,7 @@ pub const PI: AgentProfile = AgentProfile {
     clear_aliases: &[],
     supports_exit_plan_mode: false,
     supports_wakeup_tools: false,
+    yolo_mode_id: None,
 };
 
 /// aoe's bundled multi-provider agent. Treated as Claude-equivalent
@@ -177,6 +200,7 @@ pub const DEFAULT: AgentProfile = AgentProfile {
     clear_aliases: &[],
     supports_exit_plan_mode: false,
     supports_wakeup_tools: false,
+    yolo_mode_id: None,
 };
 
 /// Resolve a static profile by registry key. Returns `DEFAULT` for
@@ -215,6 +239,30 @@ mod tests {
     fn resolve_falls_back_to_default() {
         assert_eq!(resolve("").key, "default");
         assert_eq!(resolve("unknown-agent").key, "default");
+    }
+
+    #[test]
+    fn yolo_mode_id_is_adapter_specific() {
+        // Each adapter names its bypass-all-permissions mode differently;
+        // the supervisor sends exactly this id via session/set_mode.
+        assert_eq!(resolve("claude").yolo_mode_id, Some("bypassPermissions"));
+        // Inherited from CLAUDE via `..CLAUDE`.
+        assert_eq!(
+            resolve("claude-code").yolo_mode_id,
+            Some("bypassPermissions")
+        );
+        assert_eq!(resolve("aoe-agent").yolo_mode_id, Some("bypassPermissions"));
+        // Regression for #1142: codex's bypass preset is `full-access`, not
+        // Claude's `bypassPermissions`. A hard-coded `bypassPermissions` was
+        // dropped by the not-advertised guard, leaving codex prompting for
+        // approvals despite yolo_mode_default.
+        assert_eq!(resolve("codex").yolo_mode_id, Some("full-access"));
+        assert_eq!(resolve("gemini").yolo_mode_id, Some("yolo"));
+        // Adapters with no verified bypass mode keep YOLO a no-op.
+        assert_eq!(resolve("opencode").yolo_mode_id, None);
+        assert_eq!(resolve("vibe").yolo_mode_id, None);
+        assert_eq!(resolve("pi").yolo_mode_id, None);
+        assert_eq!(resolve("unknown-agent").yolo_mode_id, None);
     }
 
     #[test]
