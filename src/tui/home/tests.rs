@@ -9000,6 +9000,60 @@ mod click_to_select {
 
     #[test]
     #[serial]
+    fn double_click_tears_down_live_send_before_tmux_attach() {
+        // Regression for #2290: with `click_action = LiveSend` the first
+        // click of a double-click enters live-send for the row, then the
+        // second click resolves to a tmux attach via
+        // `default_attach_mode = Tmux`. The attach must exit live mode
+        // first, otherwise the worker is stranded against a pane we're
+        // leaving and detaching drops the user back into live mode.
+        use crate::session::config::{save_config, ClickAction, Config};
+        let mut env = create_test_env_with_sessions(3);
+        setup_inner(&mut env);
+        env.view.cursor = 0;
+        env.view.update_selected();
+
+        let mut config = Config::default();
+        config.session.click_action = ClickAction::LiveSend;
+        save_config(&config).unwrap();
+
+        // Simulate the first click of the double having already entered
+        // live-send (the real install runs in App::execute_action, which a
+        // HomeView unit test can't drive): pin live_send to the row we are
+        // about to double-click.
+        let expected_id = match &env.view.flat_items[2] {
+            crate::session::Item::Session { id, .. } => id.clone(),
+            _ => panic!("flat_items[2] should be a session"),
+        };
+        env.view.live_send = Some(crate::tui::home::live_send::LiveSendState {
+            session_id: expected_id.clone(),
+            title: "row-2".to_string(),
+            tmux_name: "aoe_test_2290".to_string(),
+            target: crate::tui::home::live_send::LiveSendTarget::Agent,
+            exit_chords: Vec::new(),
+            leader: None,
+        });
+
+        let t0 = std::time::Instant::now();
+        // Seed last_click so the next click within the threshold is treated
+        // as the second click of a double-click on the same row.
+        env.view.last_click = Some((t0, 5, 3));
+        let t1 = t0 + std::time::Duration::from_millis(100);
+        let action = env.view.handle_click_at(t1, 5, 3);
+
+        assert_eq!(
+            action,
+            Some(crate::tui::app::Action::AttachSession(expected_id)),
+            "double-click must still resolve to a tmux attach under default_attach_mode (Tmux)"
+        );
+        assert!(
+            env.view.live_send.is_none(),
+            "the tmux attach path must exit live mode first, not strand the worker"
+        );
+    }
+
+    #[test]
+    #[serial]
     fn click_on_already_selected_row_does_not_move_cursor() {
         let mut env = create_test_env_with_sessions(3);
         setup_inner(&mut env);

@@ -2933,6 +2933,7 @@ impl HomeView {
                 ) {
                     self.start_live_send()
                 } else {
+                    self.exit_live_send_before_attach();
                     Some(Action::AttachSession(id))
                 }
             }
@@ -2957,9 +2958,14 @@ impl HomeView {
                 } else {
                     TerminalMode::Host
                 };
+                self.exit_live_send_before_attach();
                 Some(Action::AttachTerminal(id, terminal_mode))
             }
-            ViewMode::Tool(ref tool_name) => Some(Action::AttachToolSession(id, tool_name.clone())),
+            ViewMode::Tool(ref tool_name) => {
+                let tool_name = tool_name.clone();
+                self.exit_live_send_before_attach();
+                Some(Action::AttachToolSession(id, tool_name))
+            }
         }
     }
 
@@ -4317,6 +4323,23 @@ impl HomeView {
                 }
                 self.stamp_last_accessed(&state.session_id);
             }
+        }
+    }
+
+    /// Exit live-send before an activation hands the terminal to a tmux
+    /// attach. The double-click (and Enter) activation path resolves
+    /// through `default_attach_mode`, so when `click_action = LiveSend`
+    /// the *first* click of a double-click already entered live-send for
+    /// the row; the second click then resolves to a tmux attach
+    /// (`default_attach_mode = Tmux`). Without this teardown the
+    /// just-spawned worker keeps dispatching against a pane we're
+    /// leaving, the attach inherits the preview-pinned window size
+    /// instead of growing to the client, and detaching drops the user
+    /// back into live mode rather than the home list (#2290). No-op when
+    /// not live-sending.
+    fn exit_live_send_before_attach(&mut self) {
+        if let Some(state) = self.live_send.clone() {
+            self.exit_live_send_and_restore_sizing(&state);
         }
     }
 
