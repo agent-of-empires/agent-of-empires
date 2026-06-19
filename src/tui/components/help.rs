@@ -97,6 +97,12 @@ fn shortcuts(strict: bool, live_on_enter: bool) -> Vec<(&'static str, Vec<(Strin
         "Select + copy preview (live mode)".to_string(),
     ));
     other.push(("Ctrl+K".to_string(), "Command palette".to_string()));
+    // Tips has no global hotkey (it's palette / badge driven), so it isn't in
+    // the registry-derived rows above; surface it here so `?` still documents it.
+    other.push((
+        "\u{1f4a1}".to_string(),
+        "Tips (badge, or Ctrl+K \u{2192} \"tips\")".to_string(),
+    ));
 
     // Navigation is mode-invariant except the collapse row: in non-strict mode
     // bare `h` is the contextual snooze key, so only `<-` is advertised for

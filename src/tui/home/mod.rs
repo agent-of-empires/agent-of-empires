@@ -511,6 +511,25 @@ pub struct HomeView {
     /// telemetry existed. Startup gating keeps it from rendering over the
     /// changelog or the version update modal.
     pub(super) telemetry_consent_dialog: Option<super::dialogs::TelemetryConsentDialog>,
+    /// Tips overlay (the browsable list from `crate::tips`), when open. Reached
+    /// from the command palette, the `?` help screen, or the tips badge.
+    pub(super) tips_dialog: Option<super::dialogs::TipsDialog>,
+    /// Cached count of eligible, unseen tips for the home-view badge. Recomputed
+    /// from `app_state` on config refresh and after tips state changes, so the
+    /// badge doesn't read config on every frame. Zero when tips are disabled.
+    pub(super) tips_unseen: usize,
+    /// An earned tip queued to pop gently once the user is back on the idle home
+    /// view (set after the new-session dialog closes; see #2262). Drained on the
+    /// next keystroke into a small one-tip overlay so it never interrupts an
+    /// in-flight action.
+    pub(super) pending_tip_pop: Option<&'static crate::tips::Tip>,
+    /// Screen rect of the tips badge in the footer, captured each frame so a
+    /// click can target it. `None` when the badge isn't drawn (nothing unseen,
+    /// tips disabled, live-send banner up, or no room for it).
+    pub(super) tips_badge_rect: Option<ratatui::layout::Rect>,
+    /// Whether the mouse is currently over the tips badge, so it can paint a
+    /// hover highlight like a session row does. Updated by `handle_hover`.
+    pub(super) tips_badge_hovered: bool,
     pub(super) send_message_dialog: Option<super::dialogs::SendMessageDialog>,
     /// Session to receive the message from the send dialog
     pub(super) pending_send_session: Option<String>,
@@ -985,6 +1004,22 @@ pub(super) enum ConfigRefreshOrigin {
     Watcher,
 }
 
+/// Eligible, unseen tip count for the home-view badge, honoring the
+/// `session.show_tips` setting. Shared by the constructor, config refresh, and
+/// the tips-state writers so the cached badge count can't drift.
+pub(super) fn tips_unseen_count(config: &crate::session::Config) -> usize {
+    if !config.session.show_tips {
+        return 0;
+    }
+    crate::tips::unseen_count(
+        &config.app_state.tips_seen,
+        &crate::tips::TipSignals {
+            new_session_with_selection_count: config.app_state.new_session_with_selection_count,
+            used_new_from_selection: config.app_state.used_new_from_selection,
+        },
+    )
+}
+
 /// Per-profile subscription pair, held in `HomeView::disk_watch_handles`
 /// and `HomeView::config_watch_handles`.
 ///
@@ -1308,6 +1343,10 @@ impl HomeView {
             .as_ref()
             .and_then(|c| c.app_state.group_by)
             .unwrap_or(default_group_by);
+        let tips_unseen = user_config.as_ref().map_or_else(
+            || tips_unseen_count(&crate::session::Config::default()),
+            tips_unseen_count,
+        );
         let view_mode = ViewMode::default();
 
         let disk_dirty = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1369,6 +1408,11 @@ impl HomeView {
             serve_view: None,
             update_confirm_dialog: None,
             telemetry_consent_dialog: None,
+            tips_dialog: None,
+            tips_unseen,
+            pending_tip_pop: None,
+            tips_badge_rect: None,
+            tips_badge_hovered: false,
             send_message_dialog: None,
             pending_send_session: None,
             pending_send_target: live_send::LiveSendTarget::Agent,
@@ -3746,6 +3790,7 @@ impl HomeView {
             || self.send_message_dialog.is_some()
             || self.update_confirm_dialog.is_some()
             || self.telemetry_consent_dialog.is_some()
+            || self.tips_dialog.is_some()
             || serve_open
             || self.settings_view.is_some()
             || self.diff_view.is_some()
@@ -3784,6 +3829,7 @@ impl HomeView {
             || self.send_message_dialog.is_some()
             || self.update_confirm_dialog.is_some()
             || self.telemetry_consent_dialog.is_some()
+            || self.tips_dialog.is_some()
             || serve_open
             || self.settings_view.is_some()
             || self.diff_view.is_some()
@@ -5703,6 +5749,7 @@ impl HomeView {
         self.idle_decay_window =
             crate::tui::styles::idle_decay_window(config.theme.idle_decay_minutes);
         crate::session::set_unread_enabled(config.session.unread_indicator);
+        self.tips_unseen = tips_unseen_count(&config);
         self.tool_configs = config.tools;
         self.tool_hotkey_cache = input::build_tool_hotkey_cache(&self.tool_configs);
         let hotkey_warnings = input::validate_tool_hotkeys(&self.tool_configs);

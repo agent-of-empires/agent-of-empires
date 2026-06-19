@@ -17,7 +17,8 @@ use crate::tui::dialogs::{
     DeleteDialogConfig, DialogResult, GroupDeleteOptionsDialog, HooksInstallDialog, InfoDialog,
     IntroOutcome, NewSessionData, NewSessionDialog, NoAgentsAction, PaletteAction, PaletteCommand,
     PaletteGroup, ProfilePickerAction, ProjectsDialog, RenameDialog, RenameMode, RepoTrustAction,
-    RestartDialog, SendMessageDialog, UnifiedDeleteDialog, WorktreeNameDialog,
+    RestartDialog, SendMessageDialog, TipsDialog, TipsOutcome, UnifiedDeleteDialog,
+    WorktreeNameDialog,
 };
 use crate::tui::diff::{DiffAction, DiffView};
 use crate::tui::responsive;
@@ -409,6 +410,23 @@ impl HomeView {
         } else {
             false
         }
+    }
+
+    /// Click on the footer tips badge: open the tips overlay. Returns true when
+    /// the click was on the badge (so the caller stops routing it). Gated on no
+    /// overlay being open, the badge rect is captured behind any modal, so this
+    /// keeps a click in the bottom-right corner from punching through.
+    pub fn handle_tips_badge_click(&mut self, col: u16, row: u16) -> bool {
+        if self.has_non_live_send_overlay() || self.diff_view.is_some() {
+            return false;
+        }
+        let hit = self
+            .tips_badge_rect
+            .is_some_and(|r| r.contains(Position::from((col, row))));
+        if hit {
+            self.open_tips_dialog();
+        }
+        hit
     }
 
     /// True when `(col, row)` lands on the side-by-side list/preview
@@ -963,6 +981,23 @@ impl HomeView {
             // hit rect (e.g. on the title or border): swallow it so
             // the underlying list doesn't shift selection out from
             // under the modal.
+            return true;
+        }
+        if let Some(dialog) = &mut self.tips_dialog {
+            if let Some(result) = dialog.handle_click(col, row) {
+                match result {
+                    DialogResult::Continue => {}
+                    DialogResult::Cancel => {
+                        self.tips_dialog = None;
+                    }
+                    DialogResult::Submit(outcome) => {
+                        self.tips_dialog = None;
+                        self.persist_tips_outcome(outcome);
+                    }
+                }
+            }
+            // Swallow every click while the overlay is open so it can't fall
+            // through to the list underneath.
             return true;
         }
         if let Some(dialog) = &mut self.new_dialog {
@@ -1547,6 +1582,20 @@ impl HomeView {
             return None;
         }
 
+        if let Some(dialog) = &mut self.tips_dialog {
+            match dialog.handle_key(key) {
+                DialogResult::Continue => {}
+                DialogResult::Cancel => {
+                    self.tips_dialog = None;
+                }
+                DialogResult::Submit(outcome) => {
+                    self.tips_dialog = None;
+                    self.persist_tips_outcome(outcome);
+                }
+            }
+            return None;
+        }
+
         if let Some(dialog) = &mut self.info_dialog {
             match dialog.handle_key(key) {
                 DialogResult::Continue => {}
@@ -1748,6 +1797,12 @@ impl HomeView {
                         self.cancel_creation();
                     } else {
                         self.new_dialog = None;
+                        // Backing out of `n` with a selection is the most
+                        // contextual moment to surface the new-from-selection
+                        // tip; queue it (no-op until it's earned). On submit we
+                        // skip the pop so it doesn't interrupt session creation;
+                        // the badge still carries it. See #2262.
+                        self.queue_earned_tip_pop();
                     }
                 }
                 DialogResult::Submit(data) => {
@@ -2088,6 +2143,14 @@ impl HomeView {
             return None;
         }
 
+        // Drain a queued earned-tip pop now that the home view is idle: every
+        // overlay-routing block above has returned, so nothing is open here.
+        // Skip while searching so it can't interrupt a query. Opening the pop
+        // consumes this keystroke (it's a one-time, dismissable nudge). #2262
+        if !self.search_active && self.pending_tip_pop.is_some() && self.drain_pending_tip_pop() {
+            return None;
+        }
+
         // Search mode. Intentionally takes priority over the Ctrl+K palette
         // binding below: while the search input is focused, every key (including
         // Ctrl+K) feeds the search box. Users can press Esc to exit search and
@@ -2372,6 +2435,7 @@ impl HomeView {
             ActionId::GroupBy => self.show_group_picker(),
             ActionId::ToggleProjectPin => self.toggle_project_pin_at_cursor(),
             ActionId::NextWaiting => self.jump_to_next_waiting(),
+            ActionId::Tips => self.open_tips_dialog(),
         }
         None
     }
@@ -2448,6 +2512,9 @@ impl HomeView {
                 dialog.focus_title();
             }
             self.new_dialog = Some(dialog);
+            // The user just used N, so they've discovered it; suppress the tip
+            // that teaches it.
+            self.record_used_new_from_selection();
         }
     }
 
@@ -3536,6 +3603,13 @@ impl HomeView {
             self.show_no_agents();
             return;
         }
+        // Earned-tip signal: opening `n` with a row/group selected is exactly
+        // the situation where `N` (new-from-selection) would have helped, so
+        // count it. Once it crosses the threshold the "new from selection" tip
+        // earns its way into the badge/list and a one-time pop (#2262).
+        if self.selected_session.is_some() || self.selected_group.is_some() {
+            self.record_new_session_with_selection();
+        }
         let existing_groups: Vec<String> =
             self.all_groups().iter().map(|g| g.path.clone()).collect();
         let current_profile = self.config_profile();
@@ -3546,6 +3620,126 @@ impl HomeView {
             &current_profile,
             profiles,
         ));
+    }
+
+    /// Open the tips overlay (the browsable list from `crate::tips`). Shared by
+    /// the command palette, the `?` help screen, and the tips badge so they
+    /// can't drift. Always opens, even with no eligible tips, so an explicit
+    /// "Show tips" gives feedback (an empty state) rather than silently doing
+    /// nothing.
+    pub(super) fn open_tips_dialog(&mut self) {
+        let config = load_config().ok().flatten().unwrap_or_default();
+        let signals = crate::tips::TipSignals {
+            new_session_with_selection_count: config.app_state.new_session_with_selection_count,
+            used_new_from_selection: config.app_state.used_new_from_selection,
+        };
+        let eligible = crate::tips::eligible(&signals);
+        self.tips_dialog = Some(TipsDialog::new(
+            eligible,
+            config.app_state.tips_seen.clone(),
+            !config.session.show_tips,
+            self.strict_hotkeys,
+        ));
+    }
+
+    /// Persist what the tips overlay reported on close: merge newly-seen ids
+    /// into `tips_seen` and apply a "don't show tips" toggle if the user
+    /// flipped it. Merging (rather than overwriting) preserves seen ids for
+    /// tips that aren't currently eligible.
+    pub(super) fn persist_tips_outcome(&mut self, outcome: TipsOutcome) {
+        if outcome.newly_seen.is_empty() && outcome.disabled.is_none() {
+            return;
+        }
+        if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
+            for id in outcome.newly_seen {
+                if !config.app_state.tips_seen.iter().any(|s| s == &id) {
+                    config.app_state.tips_seen.push(id);
+                }
+            }
+            if let Some(disabled) = outcome.disabled {
+                config.session.show_tips = !disabled;
+            }
+            self.tips_unseen = super::tips_unseen_count(&config);
+            if let Err(e) = save_config(&config) {
+                tracing::warn!(target: "tui.input", "Failed to persist tips state: {}", e);
+            }
+        }
+    }
+
+    /// Bump the "opened new-session with a selection" counter that earns the
+    /// new-from-selection tip (#2262), persist it, and refresh the badge.
+    fn record_new_session_with_selection(&mut self) {
+        if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
+            config.app_state.new_session_with_selection_count = config
+                .app_state
+                .new_session_with_selection_count
+                .saturating_add(1);
+            self.tips_unseen = super::tips_unseen_count(&config);
+            if let Err(e) = save_config(&config) {
+                tracing::warn!(target: "tui.input", "Failed to persist tip signal: {}", e);
+            }
+        }
+    }
+
+    /// Record that the user has used `N` (new-from-selection). They've found the
+    /// feature, so the tip teaching it is suppressed from now on; also cancel a
+    /// queued pop and refresh the badge. Writes once (idempotent).
+    fn record_used_new_from_selection(&mut self) {
+        // They know about N now; don't pop the tip that teaches it.
+        if self.pending_tip_pop.map(|t| t.id) == Some("new-from-selection") {
+            self.pending_tip_pop = None;
+        }
+        if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
+            if config.app_state.used_new_from_selection {
+                return;
+            }
+            config.app_state.used_new_from_selection = true;
+            self.tips_unseen = super::tips_unseen_count(&config);
+            if let Err(e) = save_config(&config) {
+                tracing::warn!(target: "tui.input", "Failed to persist tip signal: {}", e);
+            }
+        }
+    }
+
+    /// After the new-session dialog closes, queue an earned tip to pop gently
+    /// if one just became eligible and tips aren't disabled. Drained on the
+    /// next keystroke by `drain_pending_tip_pop`, so it never interrupts an
+    /// in-flight action.
+    pub(super) fn queue_earned_tip_pop(&mut self) {
+        if self.pending_tip_pop.is_some() {
+            return;
+        }
+        let config = load_config().ok().flatten().unwrap_or_default();
+        if !config.session.show_tips {
+            return;
+        }
+        let signals = crate::tips::TipSignals {
+            new_session_with_selection_count: config.app_state.new_session_with_selection_count,
+            used_new_from_selection: config.app_state.used_new_from_selection,
+        };
+        self.pending_tip_pop = crate::tips::next_earned_pop(&config.app_state.tips_seen, &signals);
+    }
+
+    /// Open the queued earned tip as a small one-tip overlay, if any. Called
+    /// when the home view is idle (no other overlay) so the pop never
+    /// interrupts an action. Returns true if a pop was opened, so the caller
+    /// can treat the triggering keystroke as consumed.
+    pub(super) fn drain_pending_tip_pop(&mut self) -> bool {
+        let Some(tip) = self.pending_tip_pop.take() else {
+            return false;
+        };
+        let config = load_config().ok().flatten().unwrap_or_default();
+        // Re-check: the user may have disabled tips between queueing and now.
+        if !config.session.show_tips {
+            return false;
+        }
+        self.tips_dialog = Some(TipsDialog::new(
+            vec![tip],
+            config.app_state.tips_seen.clone(),
+            !config.session.show_tips,
+            self.strict_hotkeys,
+        ));
+        true
     }
 
     /// Left-click on the empty area of the sidebar (below the last
@@ -4041,7 +4235,18 @@ impl HomeView {
         let prev_idx = self.hovered_index();
         self.mouse_pos = new_pos;
         let new_idx = self.hovered_index();
-        overlay_changed || footer_changed || prev_idx != new_idx
+
+        // Footer tips badge: highlight on hover like a session row. Gated to no
+        // overlay being open (the badge isn't clickable then), matching
+        // `handle_tips_badge_click`.
+        let badge_hover = !self.has_non_live_send_overlay()
+            && self
+                .tips_badge_rect
+                .is_some_and(|r| r.contains(Position::from((col, row))));
+        let badge_changed = badge_hover != self.tips_badge_hovered;
+        self.tips_badge_hovered = badge_hover;
+
+        overlay_changed || footer_changed || badge_changed || prev_idx != new_idx
     }
 
     /// Route a mouse-wheel-down at (col, row); see handle_scroll_up.

@@ -69,6 +69,10 @@ pub enum ActionId {
     /// registers the repo so the project persists in the view without any
     /// sessions; unpinning removes the registry entry.
     ToggleProjectPin,
+    /// Open the tips overlay (the browsable list from `crate::tips`). Has no
+    /// global hotkey on purpose; reached from the command palette, the tips
+    /// badge, and the `?` help screen, so it doesn't consume a scarce key.
+    Tips,
 }
 
 /// A single chord. `ctrl` requires the Control modifier; Shift is implicit in
@@ -714,6 +718,23 @@ pub static BINDINGS: &[Binding] = &[
             serve_only: false,
         }),
     },
+    // Tips overlay. No key chords: it's reached from the palette, the badge,
+    // and the `?` help screen, so it never shadows a typing-guard key. `help`
+    // is None because the help overlay skips keyless rows; it gets a bespoke
+    // row in `components/help.rs` instead.
+    Binding {
+        id: ActionId::Tips,
+        non_strict: &[],
+        strict: &[],
+        context: Context::Always,
+        help: None,
+        palette: Some(PaletteMeta {
+            title: "Show tips",
+            keywords: &["tips", "hints", "learn", "discover", "did you know"],
+            group: PaletteGroup::Settings,
+            serve_only: false,
+        }),
+    },
 ];
 
 /// Stable palette/test id for an action (matches the legacy `builtin_commands`
@@ -753,6 +774,7 @@ pub fn palette_id(id: ActionId) -> &'static str {
         ActionId::Update => "update",
         ActionId::ToggleContainer => "toggle-container",
         ActionId::ToggleProjectPin => "toggle-project-pin",
+        ActionId::Tips => "tips",
     }
 }
 

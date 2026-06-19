@@ -22,6 +22,7 @@ mod status_hooks;
 pub mod task_util;
 pub mod telemetry;
 pub mod terminal;
+pub mod tips;
 pub mod tmux;
 pub mod tui;
 pub mod update;
