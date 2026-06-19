@@ -469,12 +469,17 @@ impl HomeView {
         update_status: Option<&str>,
         image_update: Option<&ImageUpdate>,
     ) {
-        // Start each frame with no footer buttons; `render_status_bar`
-        // repopulates them for the normal home view. The takeover views
-        // (settings/diff/serve) return before that runs, and the live-send
-        // banner replaces the footer, so in those cases the list stays
-        // empty and stale rects can't swallow clicks.
+        // Start each frame with no footer buttons and no sidebar
+        // collapse/expand hit rects; the home-view render paths
+        // (`render_status_bar`, `render_list` / `render_collapsed_strip`)
+        // repopulate them. The takeover views (settings/diff/serve) return
+        // before those run, so clearing here keeps a stale rect from a prior
+        // home frame from swallowing a click on the diff/serve surface (the
+        // collapse handler runs ahead of `hit_diff`). The live-send banner
+        // likewise replaces the footer, leaving the list empty.
         self.footer_buttons.clear();
+        self.collapse_button_area = Rect::default();
+        self.expand_strip_area = Rect::default();
 
         // Settings view takes over the whole screen
         if let Some(ref mut settings) = self.settings_view {
@@ -563,10 +568,10 @@ impl HomeView {
             // otherwise keep last frame's values and a click in the now-
             // preview area could resolve to an invisible list row (and
             // switch the live target). Zero them so mouse hit-testing can't
-            // target the hidden sidebar; the strip carries its own rect.
+            // target the hidden sidebar; `render` already cleared the
+            // collapse button rect, and the strip sets its own.
             self.list_area = Rect::default();
             self.list_inner_area = Rect::default();
-            self.collapse_button_area = Rect::default();
             self.render_collapsed_strip(frame, chunks[0], theme);
             self.render_preview(frame, chunks[1], theme);
         } else if available_width < responsive::STACKED_BREAKPOINT {
@@ -809,9 +814,8 @@ impl HomeView {
         // the list to the click-to-expand strip. Drawn as an overlay on the
         // border (after the block) so its clickable rect is known exactly,
         // and skipped on a list too narrow to spare the columns without
-        // colliding with the title. The strip carries the inverse rect, so
-        // zero it here while the full list is on screen.
-        self.expand_strip_area = Rect::default();
+        // colliding with the title (`render` already zeroed the rect, so the
+        // narrow case needs no else).
         const COLLAPSE_LABEL: &str = " \u{00AB} ";
         const COLLAPSE_LABEL_WIDTH: u16 = 3;
         if area.width > COLLAPSE_LABEL_WIDTH + 6 {
@@ -829,8 +833,6 @@ impl HomeView {
                 )),
                 btn_rect,
             );
-        } else {
-            self.collapse_button_area = Rect::default();
         }
 
         if self.instances().is_empty() && !self.has_any_groups() {

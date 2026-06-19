@@ -8565,6 +8565,49 @@ mod scroll_pane_isolation {
             "strip click re-expands the sidebar"
         );
     }
+
+    /// A takeover view (settings/diff/serve) returns early in `render`
+    /// before the home-view paths run, so the collapse/expand and footer
+    /// hit rects must be cleared up front. Otherwise a stale rect from the
+    /// prior home frame could swallow a click on the takeover surface (the
+    /// collapse handler runs ahead of `hit_diff`).
+    #[test]
+    #[serial]
+    fn takeover_view_clears_sidebar_hit_rects() {
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Rect;
+        use ratatui::Terminal;
+
+        let mut env = create_test_env_with_sessions(3);
+        let theme = crate::tui::styles::load_theme("empire");
+        let render = |env: &mut TestEnv| {
+            let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+            terminal
+                .draw(|f| {
+                    let area = f.area();
+                    env.view.render(f, area, &theme, None, None, None);
+                })
+                .unwrap();
+        };
+
+        // Home view populates the collapse button + footer rects.
+        render(&mut env);
+        assert!(env.view.collapse_button_area.width > 0);
+        assert!(!env.view.footer_buttons.is_empty());
+
+        // Opening settings is a full-screen takeover; the next render must
+        // clear the stale rects so a click can't toggle the hidden sidebar.
+        env.view.settings_view =
+            Some(crate::tui::settings::SettingsView::new("test", None).unwrap());
+        render(&mut env);
+        assert_eq!(env.view.collapse_button_area, Rect::default());
+        assert_eq!(env.view.expand_strip_area, Rect::default());
+        assert!(env.view.footer_buttons.is_empty());
+        assert!(
+            !env.view.handle_sidebar_collapse_click(0, 0),
+            "no sidebar rect can be hit while a takeover view owns the screen"
+        );
+    }
 }
 
 mod footer_toolbar {
