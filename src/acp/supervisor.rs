@@ -1422,7 +1422,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         // mode via `session/set_mode` instead. The mode id is adapter-specific
         // (claude: `bypassPermissions`, codex: `full-access`, gemini: `yolo`),
         // so resolve it from the agent profile rather than hard-coding Claude's
-        // id — codex advertises `full-access`, not `bypassPermissions`, so a
+        // id; codex advertises `full-access`, not `bypassPermissions`, so a
         // hard-coded `bypassPermissions` was silently dropped by the
         // not-advertised guard and left codex sessions in their default
         // (approval-prompting) preset. Best-effort: the call is
