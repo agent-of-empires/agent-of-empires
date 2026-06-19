@@ -17,11 +17,12 @@ use super::environment::{build_docker_env_args, shell_escape};
 use super::poller::SessionPoller;
 
 use crate::session::capture::{
-    capture_codex_session_id, capture_gemini_session_id, capture_hermes_session_id,
-    capture_pi_session_id, capture_vibe_session_id, claude_poll_fn, claude_poll_fn_sandboxed,
-    codex_poll_fn, codex_poll_fn_sandboxed, gemini_poll_fn, gemini_poll_fn_sandboxed,
-    generate_claude_session_id, hermes_poll_fn, hermes_poll_fn_sandboxed, is_valid_session_id,
-    opencode_poll_fn, opencode_poll_fn_sandboxed, pi_poll_fn, pi_poll_fn_sandboxed,
+    capture_claude_session_id, capture_claude_session_id_in_container, capture_codex_session_id,
+    capture_gemini_session_id, capture_hermes_session_id, capture_pi_session_id,
+    capture_vibe_session_id, claude_poll_fn, claude_poll_fn_sandboxed, codex_poll_fn,
+    codex_poll_fn_sandboxed, gemini_poll_fn, gemini_poll_fn_sandboxed, generate_claude_session_id,
+    hermes_poll_fn, hermes_poll_fn_sandboxed, is_valid_session_id, opencode_poll_fn,
+    opencode_poll_fn_sandboxed, pi_poll_fn, pi_poll_fn_sandboxed,
     try_capture_codex_session_id_in_container, try_capture_gemini_session_id_in_container,
     try_capture_hermes_session_id_in_container, try_capture_opencode_session_id,
     try_capture_opencode_session_id_in_container, try_capture_pi_session_id_in_container,
@@ -1399,9 +1400,11 @@ impl Instance {
     /// Returns `(session_id, is_existing)`. Consults `resume_intent` first:
     /// `Use(sid)` returns the user-pinned target; `Cleared` skips both the
     /// observed sid and retroactive capture (forces a fresh start, generating
-    /// a Claude UUID if applicable); `Default` falls back to the observed sid
-    /// (`agent_session_id`), then retroactive capture, then fresh UUID for
-    /// Claude.
+    /// a Claude UUID if applicable); `Default` verifies the observed sid
+    /// against live tool state via `capture_freshest_session_id` (so a
+    /// post-`/clear` session id supersedes a stale stored one), falls back
+    /// to retroactive capture when no sid is observed, then to a fresh
+    /// Claude UUID.
     pub fn acquire_session_id(&mut self) -> (Option<String>, bool) {
         match &self.resume_intent {
             ResumeIntent::Use(sid) => {
@@ -1424,8 +1427,19 @@ impl Instance {
             ResumeIntent::Default => {}
         }
 
-        if self.agent_session_id.is_some() {
-            return (self.agent_session_id.clone(), true);
+        if let Some(stored) = self.agent_session_id.clone() {
+            if let Some(fresh) = self.capture_freshest_session_id() {
+                tracing::info!(
+                    target: "session.store",
+                    stale = %stored,
+                    fresh = %fresh,
+                    tool = %self.tool,
+                    "Replacing stored session id with fresher live observation"
+                );
+                self.agent_session_id = Some(fresh.clone());
+                return (Some(fresh), true);
+            }
+            return (Some(stored), true);
         }
 
         let tmux_exists = self.tmux_session().is_ok_and(|s| s.exists());
@@ -1468,6 +1482,20 @@ impl Instance {
     pub(crate) fn try_retroactive_capture(&self) -> Option<String> {
         let exclusion = self.retroactive_capture_exclusion_set();
         let result: Option<String> = match self.tool.as_str() {
+            "claude" => {
+                if self.is_sandboxed() {
+                    let container_name = self.sandbox_info.as_ref()?.container_name.clone();
+                    capture_claude_session_id_in_container(
+                        &container_name,
+                        &self.container_workdir(),
+                        &exclusion,
+                        None,
+                    )
+                    .ok()
+                } else {
+                    capture_claude_session_id(&self.project_path, None, &exclusion).ok()
+                }
+            }
             "opencode" => {
                 if self.is_sandboxed() {
                     let container_name = self.sandbox_info.as_ref()?.container_name.clone();
@@ -1550,6 +1578,19 @@ impl Instance {
             _ => None,
         };
         result.and_then(validated_session_id)
+    }
+
+    /// Returns `Some(fresh)` when the live tool state shows a session id
+    /// distinct from `self.agent_session_id`, otherwise `None`. Reuses
+    /// the per-tool dispatch in `try_retroactive_capture` so the freshness
+    /// contract (mtime, SQLite ordering, exclusion set, host/container)
+    /// stays encapsulated in each tool's existing capture function.
+    pub(crate) fn capture_freshest_session_id(&self) -> Option<String> {
+        let live = self.try_retroactive_capture()?;
+        match self.agent_session_id.as_deref() {
+            Some(known) if known == live => None,
+            _ => Some(live),
+        }
     }
 
     fn apply_session_flags(&mut self, cmd: &mut String, context: &str) -> bool {
@@ -6768,6 +6809,126 @@ mod tests {
             assert!(sid.is_some());
             assert!(!is_existing);
             assert_eq!(inst.agent_session_id, sid);
+        }
+
+        mod verify_on_resume {
+            use super::*;
+            use std::fs;
+            use std::time::{Duration, SystemTime};
+            use tempfile::{tempdir, TempDir};
+
+            fn isolate_home(temp: &TempDir) {
+                std::env::set_var("HOME", temp.path());
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+                std::env::set_var("CLAUDE_CONFIG_DIR", temp.path().join(".claude"));
+            }
+
+            fn encode_claude_path(project_path: &str) -> String {
+                project_path
+                    .chars()
+                    .map(|c| {
+                        if c.is_alphanumeric() || c == '_' || c == '-' {
+                            c
+                        } else {
+                            '-'
+                        }
+                    })
+                    .collect()
+            }
+
+            fn write_jsonl_with_mtime(path: &std::path::Path, mtime: SystemTime) {
+                fs::write(path, "").unwrap();
+                let f = fs::File::options().write(true).open(path).unwrap();
+                f.set_times(fs::FileTimes::new().set_modified(mtime))
+                    .unwrap();
+            }
+
+            #[test]
+            #[serial]
+            fn supersedes_stale_claude_sid_after_clear() {
+                let temp = tempdir().unwrap();
+                isolate_home(&temp);
+
+                let project_path = "/tmp/aoe-test-2291-claude-bascule";
+                let claude_dir = temp
+                    .path()
+                    .join(".claude")
+                    .join("projects")
+                    .join(encode_claude_path(project_path));
+                fs::create_dir_all(&claude_dir).unwrap();
+
+                let stale = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+                let fresh = "11111111-2222-3333-4444-555555555555";
+                let now = SystemTime::now();
+                write_jsonl_with_mtime(
+                    &claude_dir.join(format!("{stale}.jsonl")),
+                    now - Duration::from_secs(120),
+                );
+                write_jsonl_with_mtime(
+                    &claude_dir.join(format!("{fresh}.jsonl")),
+                    now - Duration::from_secs(10),
+                );
+
+                let mut inst = Instance::new("verify-claude-bascule", project_path);
+                inst.tool = "claude".to_string();
+                inst.agent_session_id = Some(stale.to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                let (sid, is_existing) = inst.acquire_session_id();
+                assert_eq!(sid.as_deref(), Some(fresh));
+                assert!(is_existing);
+                assert_eq!(inst.agent_session_id.as_deref(), Some(fresh));
+            }
+
+            #[test]
+            #[serial]
+            fn no_bascule_when_claude_stored_matches_freshest() {
+                let temp = tempdir().unwrap();
+                isolate_home(&temp);
+
+                let project_path = "/tmp/aoe-test-2291-claude-steady";
+                let claude_dir = temp
+                    .path()
+                    .join(".claude")
+                    .join("projects")
+                    .join(encode_claude_path(project_path));
+                fs::create_dir_all(&claude_dir).unwrap();
+
+                let live = "ffffffff-eeee-dddd-cccc-bbbbbbbbbbbb";
+                let now = SystemTime::now();
+                write_jsonl_with_mtime(
+                    &claude_dir.join(format!("{live}.jsonl")),
+                    now - Duration::from_secs(10),
+                );
+
+                let mut inst = Instance::new("verify-claude-steady", project_path);
+                inst.tool = "claude".to_string();
+                inst.agent_session_id = Some(live.to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                let (sid, is_existing) = inst.acquire_session_id();
+                assert_eq!(sid.as_deref(), Some(live));
+                assert!(is_existing);
+                assert_eq!(inst.agent_session_id.as_deref(), Some(live));
+            }
+
+            #[test]
+            #[serial]
+            fn unaffected_for_unsupported_tool() {
+                let temp = tempdir().unwrap();
+                isolate_home(&temp);
+
+                let mut inst = Instance::new("verify-cursor", "/tmp/aoe-test-2291-cursor");
+                inst.tool = "cursor".to_string();
+                inst.agent_session_id = Some("stored-cursor-sid".to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                let (sid, is_existing) = inst.acquire_session_id();
+                assert_eq!(sid.as_deref(), Some("stored-cursor-sid"));
+                assert!(is_existing);
+                assert_eq!(inst.agent_session_id.as_deref(), Some("stored-cursor-sid"));
+            }
         }
 
         #[test]
