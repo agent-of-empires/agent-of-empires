@@ -4473,6 +4473,28 @@ mod tests {
         );
     }
 
+    /// Park until `shutter` is alive and holding `workers` (the
+    /// steady state both lock-pair regression tests probe), or
+    /// finish, or hit a 5s deadline. Polling avoids a fixed sleep
+    /// that flakes on contended CI runners; the caller's asserts
+    /// distinguish the three exit shapes.
+    ///
+    /// `clippy::await_holding_lock` is suppressed at each call site
+    /// because the test holds `cancelled_guard` (a std `MutexGuard`)
+    /// at fn scope across the inner sleep; the guard's lint scope
+    /// follows the guard, not the `await`.
+    async fn wait_for_shutter_park<T>(
+        shutter: &tokio::task::JoinHandle<T>,
+        sup: &Supervisor<VecSink>,
+    ) {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !shutter.is_finished() && sup.workers.try_lock().is_ok() {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+    }
+
     /// Regression for #1848: `shutdown_with_reason` must hold the
     /// `workers` lock across its `cancelled_resumes.insert(...)`,
     /// otherwise a concurrent `spawn` or `attach` that reacquires
@@ -4481,20 +4503,14 @@ mod tests {
     /// disable. Locks down the lock-pair invariant under typical
     /// scheduling: the test holds `cancelled_resumes` before
     /// spawning a shutter, so `shutdown_with_reason` parks at its
-    /// own breadcrumb insert; a 50ms sleep gives the shutter time
-    /// to reach that park on a multi-core runtime;
+    /// own breadcrumb insert; `wait_for_shutter_park` polls until
+    /// the shutter is parked inside `workers`;
     /// `workers.try_lock()` from the test then samples the invariant
     /// directly. `Err(_)` means the seed runs while `workers` is
     /// held (the bug shape #1848 closed); `Ok(_)` means a future
     /// reorder put the seed after the drop and the assert fails
     /// with the embedded message.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    // The `await_holding_lock` lint analyses the std `MutexGuard`'s
-    // drop scope relative to every await in the function, so it
-    // cannot be narrowed to a single statement: the guard
-    // `cancelled_guard` lives at fn scope until `drop(cancelled_guard)`,
-    // and the lint scope follows the guard, not the await. Holding
-    // `cancelled_guard` across the sleep is the test mechanism.
     #[allow(clippy::await_holding_lock)]
     async fn shutdown_holds_workers_lock_across_cancelled_resumes_seed() {
         let sup = Arc::new(Supervisor::new(VecSink::new()));
@@ -4510,11 +4526,7 @@ mod tests {
             tokio::spawn(async move { sup.shutdown("s-race").await })
         };
 
-        // Wait for shutter to reach steady state (parked on the std
-        // mutex the test is holding). On a multi-core runtime this
-        // happens within microseconds; the wait is generous so the
-        // test stays deterministic on slow CI hardware.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        wait_for_shutter_park(&shutter, &sup).await;
 
         // Sanity probe: distinguishes a real #1848 regression from a
         // test-environment timing failure. If shutter completed, the
@@ -4542,6 +4554,103 @@ mod tests {
         assert!(
             sup.cancelled_resumes.lock().unwrap().contains("s-race"),
             "shutdown must seed cancelled_resumes for the in-flight resume"
+        );
+    }
+
+    /// Regression for #1848 (registry-terminate sibling of
+    /// `shutdown_holds_workers_lock_across_cancelled_resumes_seed`):
+    /// the registry-terminate writer branch in `shutdown_with_reason`
+    /// must also seed `cancelled_resumes` while still holding `workers`,
+    /// otherwise a concurrent `spawn` or `attach` reacquiring `workers`
+    /// between the drop and the insert observes an empty breadcrumb set
+    /// and installs an orphan worker against the SIGTERMed runner. Same
+    /// lock-hold mechanism as the pending-only sibling. HOME is
+    /// isolated so `worker_registry::save` writes under the tempdir;
+    /// the saved record carries a sentinel PID well above `PID_MAX` on
+    /// macOS and Linux so `killpg`/`kill` in
+    /// `terminate_runner_for_session` return `ESRCH`, which
+    /// `signal_runner_group` discards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    #[allow(clippy::await_holding_lock)]
+    async fn shutdown_holds_workers_lock_across_cancelled_resumes_seed_registry_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // SAFETY: `std::env::set_var` is unsound (Rust 1.80+) under
+        // concurrent env reads. `#[serial]` excludes other
+        // HOME-mutating tests in this crate (notably
+        // `restart_budget_burns_after_threshold`); non-`#[serial]`
+        // parallel readers of HOME via `get_app_dir()` are not
+        // excluded.
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+        }
+
+        let sup = Arc::new(Supervisor::new(VecSink::new()));
+
+        // Save a registry record so `shutdown_with_reason` enters the
+        // registry-terminate branch (`worker_registry::load` returns Some).
+        // Sentinel PID is above macOS PID_MAX (99998) and Linux default
+        // pid_max (4_194_304), so signal_runner_group's killpg+kill both
+        // ESRCH and the test never signals an unrelated process.
+        let socket_path = tmp.path().join("registry-race.sock");
+        let record = crate::acp::worker_registry::WorkerRecord::new(
+            "s-registry-race".into(),
+            999_999_999,
+            socket_path,
+            "claude-agent-acp".into(),
+            "claude-code".into(),
+            std::env::temp_dir(),
+            None,
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+        crate::acp::worker_registry::save(&record).unwrap();
+
+        // The registry-terminate branch only seeds the breadcrumb when
+        // `pending_has_it` is true, mirroring the writer at line 2264.
+        sup.pending_resumes
+            .lock()
+            .unwrap()
+            .insert("s-registry-race".into(), ResumeKind::Spawn);
+
+        let cancelled_guard = sup.cancelled_resumes.lock().unwrap();
+
+        let shutter = {
+            let sup = Arc::clone(&sup);
+            tokio::spawn(async move { sup.shutdown("s-registry-race").await })
+        };
+
+        wait_for_shutter_park(&shutter, &sup).await;
+
+        assert!(
+            !shutter.is_finished(),
+            "shutter completed unexpectedly; cancelled_resumes parking \
+             did not engage on the registry-terminate path (test \
+             environment timing issue, not a #1848 regression)"
+        );
+
+        assert!(
+            sup.workers.try_lock().is_err(),
+            "regression #1848 (registry-terminate path): shutdown \
+             released `workers` before writing the `cancelled_resumes` \
+             breadcrumb"
+        );
+
+        drop(cancelled_guard);
+        shutter
+            .await
+            .expect("shutter task panicked")
+            .expect("shutdown should succeed");
+        assert!(
+            sup.cancelled_resumes
+                .lock()
+                .unwrap()
+                .contains("s-registry-race"),
+            "shutdown must seed cancelled_resumes for the in-flight \
+             resume on the registry-terminate path"
         );
     }
 
