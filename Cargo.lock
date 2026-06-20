@@ -94,6 +94,7 @@ dependencies = [
  "agent-of-empires",
  "ansi-to-tui",
  "anyhow",
+ "aoe-plugin-api",
  "aoe-settings-derive",
  "argon2",
  "axum",
@@ -111,6 +112,7 @@ dependencies = [
  "glob",
  "hkdf 0.13.0",
  "jsonwebtoken",
+ "libc",
  "mime_guess",
  "nix 0.31.3",
  "notify",
@@ -248,6 +250,16 @@ name = "anyhow"
 version = "1.0.102"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
+
+[[package]]
+name = "aoe-plugin-api"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "toml",
+]
 
 [[package]]
 name = "aoe-settings-derive"
@@ -5457,12 +5469,16 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "agent-of-empires",
+ "aoe-plugin-api",
  "clap",
  "clap-markdown",
  "ctrlc",
  "nix 0.31.3",
  "notify",
  "regex",
+ "serde",
+ "tempfile",
+ "toml",
 ]
 
 [[package]]

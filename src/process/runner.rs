@@ -58,7 +58,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-use super::worker_registry::{self, RunnerRecordState, WorkerRecord};
+use crate::process::worker_registry::{self, RunnerRecordState, WorkerRecord};
 
 /// How often the abandonment watchdog inspects its own registry record.
 const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_secs(10);

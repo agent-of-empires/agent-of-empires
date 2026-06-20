@@ -21,7 +21,7 @@
 use serde_json::{json, Value};
 
 use crate::session::settings_schema::{
-    clear_path, merge_json, schema, FieldDescriptor, ValidationKind, WidgetKind,
+    clear_path, merge_json, FieldDescriptor, ValidationKind, WidgetKind,
 };
 use crate::session::{validate_snooze_duration, Config, ProfileConfig};
 use crate::sound::{
@@ -52,6 +52,7 @@ pub enum SettingsCategory {
     Acp,
     Diff,
     Logging,
+    Plugins,
 }
 
 impl SettingsCategory {
@@ -73,6 +74,7 @@ impl SettingsCategory {
             Self::Acp => "Acp",
             Self::Diff => "Diff",
             Self::Logging => "Logging",
+            Self::Plugins => "Plugins",
         }
     }
 
@@ -97,6 +99,7 @@ impl SettingsCategory {
             Self::Diff => "Diff",
             Self::Telemetry => "Telemetry",
             Self::Logging => "Logging",
+            Self::Plugins => "Plugins",
         }
     }
 }
@@ -383,6 +386,11 @@ fn is_map_list(section: &str, field: &str) -> bool {
 /// Look up a `section.field` leaf in a serialized config / override object.
 fn json_at<'a>(root: &'a Value, section: &str, field: &str) -> Option<&'a Value> {
     root.get(section)?.get(field)
+}
+
+/// Build the `{section: {field: leaf}}` JSON object that writes `section.field`.
+fn nested_leaf(section: &str, field: &str, leaf: Value) -> Value {
+    json!({ section: { field: leaf } })
 }
 
 // ---------------------------------------------------------------------------
@@ -687,7 +695,7 @@ pub fn build_fields_for_category(
         });
     }
 
-    for desc in schema()
+    for desc in crate::session::settings_schema::schema()
         .into_iter()
         .filter(|d| d.category == category.schema_name())
         // Global-only fields (e.g. the theme) are not profile-overridable, so
@@ -758,10 +766,8 @@ fn build_schema_row(
     desc: &FieldDescriptor,
     ctx: &BuildCtx,
 ) -> SettingField {
-    let value = value_from_json(
-        &desc.widget,
-        json_at(ctx.effective_json, &desc.section, &desc.field),
-    );
+    let current = json_at(ctx.effective_json, &desc.section, &desc.field);
+    let value = value_from_json(&desc.widget, current);
     let has_override = desc.profile_overridable && ctx.has_override(&desc.section, &desc.field);
     let inherited_display = if has_override {
         let base_value = value_from_json(
@@ -1007,7 +1013,7 @@ fn apply_logging_target(global: &mut Config, idx: usize, value: &FieldValue) {
 /// Write `section.field = leaf` into a typed `Config` via its JSON form.
 fn set_config_path(config: &mut Config, section: &str, field: &str, leaf: Value) {
     let mut j = serde_json::to_value(&*config).unwrap_or_else(|_| json!({}));
-    merge_json(&mut j, &json!({ section: { field: leaf } }));
+    merge_json(&mut j, &nested_leaf(section, field, leaf));
     if let Ok(updated) = serde_json::from_value(j) {
         *config = updated;
     }
@@ -1017,7 +1023,7 @@ fn set_config_path(config: &mut Config, section: &str, field: &str, leaf: Value)
 /// Always stores the value as an override; the `r` key clears it.
 fn set_override_path(profile: &mut ProfileConfig, section: &str, field: &str, leaf: Value) {
     let mut j = serde_json::to_value(&*profile).unwrap_or_else(|_| json!({}));
-    merge_json(&mut j, &json!({ section: { field: leaf } }));
+    merge_json(&mut j, &nested_leaf(section, field, leaf));
     if let Ok(updated) = serde_json::from_value(j) {
         *profile = updated;
     }

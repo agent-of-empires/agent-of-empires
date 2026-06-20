@@ -111,7 +111,8 @@ pub fn discover_custom_themes() -> Vec<(String, PathBuf)> {
     themes
 }
 
-/// Return the full list of available theme names: built-in themes first, then custom.
+/// Return the full list of available theme names: built-in themes first,
+/// then custom.
 pub fn available_themes() -> Vec<String> {
     let mut names: Vec<String> = builtin_theme_names().map(|s| s.to_string()).collect();
     for (name, _) in discover_custom_themes() {

@@ -8,7 +8,7 @@
 // `tokenLifetimeSecs` / `tokenGraceSecs` options on spawnAoeServe. In
 // release builds the override is ignored (token lifetime stays at 24h);
 // this spec relies on debug-build behavior so the CI matrix that runs
-// live specs must build aoe in debug or pass --features serve with
+// live specs must build aoe in debug with
 // `cfg!(debug_assertions)` on (current `playwright-live` job does both).
 
 import { readFile } from "node:fs/promises";

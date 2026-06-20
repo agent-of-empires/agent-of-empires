@@ -8,10 +8,10 @@
 //! diagnostic. This proves a daemon-emitted, session-scoped `acp.protocol`
 //! breadcrumb now lands in the per-session log surfaced by `aoe acp logs`.
 //!
-//! Compiled only with `--features serve`. Run via:
+//! Compiled only with the default `serve` feature (excluded by `--no-default-features`). Run via:
 //!
 //! ```sh
-//! cargo test --test e2e --features serve -- acp_session_log_tee
+//! cargo test --test e2e -- acp_session_log_tee
 //! ```
 #![cfg(feature = "serve")]
 

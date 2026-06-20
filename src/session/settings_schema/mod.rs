@@ -24,7 +24,7 @@ mod registry;
 mod validate;
 
 pub use merge::{clear_path, merge_json};
-pub use policy::{strip_local_only, validate_patch, PatchRejection, Scope};
+pub use policy::{strip_local_only, validate_patch, validate_patch_with, PatchRejection, Scope};
 pub use registry::{descriptor, schema};
 pub use validate::{validate_value, ValidationError};
 

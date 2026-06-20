@@ -4,7 +4,7 @@ pub(crate) mod bindings;
 mod input;
 mod live_send;
 mod operations;
-mod render;
+pub(crate) mod render;
 
 #[cfg(test)]
 mod tests;
@@ -503,6 +503,7 @@ pub struct HomeView {
     pub(super) sort_picker_dialog: Option<SortPickerDialog>,
     pub(super) project_session_picker_dialog: Option<ProjectSessionPickerDialog>,
     pub(super) projects_dialog: Option<ProjectsDialog>,
+    pub(super) plugin_manager_dialog: Option<crate::tui::dialogs::PluginManagerDialog>,
     pub(super) command_palette: Option<CommandPaletteDialog>,
     #[cfg(feature = "serve")]
     pub(super) serve_view: Option<ServeView>,
@@ -1417,6 +1418,7 @@ impl HomeView {
             sort_picker_dialog: None,
             project_session_picker_dialog: None,
             projects_dialog: None,
+            plugin_manager_dialog: None,
             command_palette: None,
             #[cfg(feature = "serve")]
             serve_view: None,
@@ -3646,6 +3648,7 @@ impl HomeView {
             || self.profile_picker_dialog.is_some()
             || self.project_session_picker_dialog.is_some()
             || self.projects_dialog.is_some()
+            || self.plugin_manager_dialog.is_some()
             || self.command_palette.is_some()
             || self.tool_picker_dialog.is_some()
             || self.send_message_dialog.is_some()
@@ -3685,6 +3688,7 @@ impl HomeView {
             || self.profile_picker_dialog.is_some()
             || self.project_session_picker_dialog.is_some()
             || self.projects_dialog.is_some()
+            || self.plugin_manager_dialog.is_some()
             || self.command_palette.is_some()
             || self.tool_picker_dialog.is_some()
             || self.send_message_dialog.is_some()
@@ -5606,7 +5610,7 @@ impl HomeView {
     /// path uses `try_refresh_from_config_watcher` instead, which
     /// preserves previous in-memory state on parse failure rather than
     /// silently applying defaults.
-    pub fn refresh_from_config(&mut self, origin: ConfigRefreshOrigin) {
+    pub(super) fn refresh_from_config(&mut self, origin: ConfigRefreshOrigin) {
         let profile = self.config_profile();
         let config = resolve_config_or_warn(&profile);
         self.apply_config_to_state(config, origin);

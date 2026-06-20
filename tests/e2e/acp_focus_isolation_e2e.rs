@@ -13,11 +13,11 @@
 //! the client's decision, so the approval stays pending until the TUI
 //! resolves it.
 //!
-//! Compiled only with `--features serve` (structured view + `aoe add --structured-view`
+//! Compiled only with the default `serve` feature (excluded by `--no-default-features`) (structured view + `aoe add --structured-view`
 //! don't exist otherwise). Run via:
 //!
 //! ```sh
-//! cargo test --test e2e --features serve -- acp_focus_isolation
+//! cargo test --test e2e -- acp_focus_isolation
 //! ```
 #![cfg(feature = "serve")]
 

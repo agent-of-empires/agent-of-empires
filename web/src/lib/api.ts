@@ -179,6 +179,67 @@ export function resetSettingsSchemaCache(): void {
   schemaPromise = null;
 }
 
+// --- Plugins ---
+
+export interface PluginView {
+  id: string;
+  name: string;
+  version: string;
+  description: string;
+  enabled: boolean;
+  builtin: boolean;
+}
+
+export interface PluginListResponse {
+  plugins: PluginView[];
+  load_errors: string[];
+}
+
+/** Outcome of a plugin enable/disable toggle. On success the server returns
+ *  the refreshed list; on failure it returns the error JSON (403 read_only /
+ *  elevation_required, or 400 plugin_error). A 403 `elevation_required` is
+ *  handled globally by the fetch interceptor, which pops the passphrase
+ *  prompt, the same as any other elevated request. */
+export type PluginToggleResult = { kind: "ok"; data: PluginListResponse } | { kind: "error"; message: string };
+
+export function fetchPlugins(): Promise<PluginListResponse | null> {
+  return fetchJson<PluginListResponse>("/api/plugins");
+}
+
+export async function setPluginEnabled(id: string, enabled: boolean): Promise<PluginToggleResult> {
+  try {
+    const res = await fetch(`/api/plugins/${encodeURIComponent(id)}/enabled`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled }),
+    });
+    const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+    if (res.ok && payload) {
+      return { kind: "ok", data: payload as unknown as PluginListResponse };
+    }
+    const message =
+      typeof payload?.message === "string"
+        ? (payload.message as string)
+        : `Failed to ${enabled ? "enable" : "disable"} plugin (${res.status}).`;
+    return { kind: "error", message };
+  } catch {
+    return { kind: "error", message: "Network error." };
+  }
+}
+
+export async function updateSettings(updates: Record<string, unknown>): Promise<boolean> {
+  try {
+    const res = await fetch("/api/settings", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(updates),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Sets the global theme (name and/or color mode). Dedicated endpoint, not
  * `PATCH /api/settings`: the theme is a global preference but cosmetic, so it

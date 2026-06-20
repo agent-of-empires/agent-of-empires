@@ -2,11 +2,11 @@
 //!
 //! Targeted regression tests for the `R`-key ModePicker + Confirm flow
 //! introduced with the Tailscale Funnel transport picker. Compiled only
-//! with `--features serve` since the serve dialog doesn't exist
-//! otherwise; run via:
+//! with the default `serve` feature since the serve dialog doesn't exist
+//! under `--no-default-features`; run via:
 //!
 //! ```sh
-//! cargo test --test e2e --features serve -- tui_serve_dialog
+//! cargo test --test e2e -- tui_serve_dialog
 //! ```
 #![cfg(feature = "serve")]
 

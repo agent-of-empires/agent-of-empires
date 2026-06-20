@@ -1,6 +1,6 @@
 name: Push to Cachix
 
-# Builds aoe-with-web (--features serve, web UI embedded) for Linux and macOS
+# Builds aoe-with-web (default features, web UI embedded) for Linux and macOS
 # and pushes the results to the Cachix binary cache so users can install
 # without compiling. Runs a matrix so both systems build in parallel.
 #

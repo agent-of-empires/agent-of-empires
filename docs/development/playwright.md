@@ -168,7 +168,7 @@ Collecting V8 (not istanbul-on-bundle) is deliberate: both Vitest and Playwright
 
 The CI `coverage` job:
 
-1. Builds aoe with `AOE_COVERAGE=1 cargo build --features serve --release`.
+1. Builds aoe with `AOE_COVERAGE=1 cargo build --release`.
 2. Runs Vitest with `--coverage`.
 3. Runs mocked + live Playwright with `AOE_COVERAGE=1`.
 4. Merges via the merge script.
@@ -191,7 +191,7 @@ Report-only in this PR. Phase-2 threshold floor and phase-3 ratchet upward are t
 3. Pick a fixture (`serve`, `servePassphrase`, `serveToken`, `serveReadOnly`, `serveAcp`) or call `spawnAoeServe()` directly if you need custom options.
 4. Add (or update) the matching surface entry in `web/tests/coverage-matrix.json`. Make sure every component the spec touches is in its `components[]` (or already in another surface or the exempt list).
 5. Run `node web/tests/validate-coverage-matrix.mjs` locally. CI runs the same script.
-6. Run `npx playwright test --config=playwright.live.config.ts <your spec>` to confirm it passes. Live specs require tmux installed and `cargo build --features serve --release` to have run at least once.
+6. Run `npx playwright test --config=playwright.live.config.ts <your spec>` to confirm it passes. Live specs require tmux installed and `cargo build --release` to have run at least once.
 
 ## Adding a Vitest contract test
 

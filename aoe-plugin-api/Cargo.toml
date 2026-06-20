@@ -1,0 +1,18 @@
+[package]
+name = "aoe-plugin-api"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+publish = false
+description = "Plugin manifest and capability types for the Agent of Empires plugin system (#268)"
+license = "MIT"
+repository = "https://github.com/agent-of-empires/agent-of-empires"
+readme = "README.md"
+keywords = ["aoe", "agent-of-empires", "plugin"]
+categories = ["development-tools"]
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "1.1"
+thiserror = "2.0"

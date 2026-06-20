@@ -84,7 +84,7 @@ curl -fsSL \
 # Homebrew
 brew install aoe
 
-# Nix
+# Nix (web dashboard included; append #aoe-tui for a TUI-only binary)
 nix run github:agent-of-empires/agent-of-empires
 
 # Build from source
@@ -174,14 +174,16 @@ cargo check                       # Type-check
 cargo test                        # Run tests
 cargo fmt                         # Format
 cargo clippy                      # Lint
-cargo build --release             # Release build (TUI only)
 
-# Web dashboard build (pulls in axum + the React frontend via build.rs)
-cargo build --release --features serve
+# Release build (includes the web dashboard: axum + the React frontend via build.rs)
+cargo build --release
+
+# TUI-only release build (no Node toolchain needed)
+cargo build --release --no-default-features
 
 # Run from source
 cargo run                         # TUI
-cargo run --features serve -- serve  # Web dashboard on :8081 (debug namespace)
+cargo run -- serve                # Web dashboard on :8081 (debug namespace)
 
 # Logging at startup. AOE_LOG_LEVEL is the canonical knob.
 AOE_LOG_LEVEL=debug cargo run

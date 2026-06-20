@@ -7,7 +7,7 @@
 // Behavior:
 // - If `AOE_E2E_BINARY` is set and the file exists, do nothing.
 // - Else if `<repo>/target/release/aoe` exists, do nothing.
-// - Else run `cargo build --features serve --release` from the repo root.
+// - Else run `cargo build --release` from the repo root (default features include serve).
 //
 // CI sets `AOE_E2E_BINARY` (see `.github/workflows/ci.yml`) so the build
 // happens in a dedicated job step where the output is visible. Local dev
@@ -39,13 +39,13 @@ export default async function globalSetup(): Promise<void> {
     return;
   }
 
-  process.stdout.write(`[liveGlobalSetup] building aoe via 'cargo build --features serve --release'...\n`);
-  const result = spawnSync("cargo", ["build", "--features", "serve", "--release"], {
+  process.stdout.write(`[liveGlobalSetup] building aoe via 'cargo build --release'...\n`);
+  const result = spawnSync("cargo", ["build", "--release"], {
     cwd: repoRoot,
     stdio: "inherit",
   });
   if (result.status !== 0) {
-    throw new Error(`cargo build --features serve --release failed with status ${result.status}`);
+    throw new Error(`cargo build --release failed with status ${result.status}`);
   }
   if (!existsSync(fallback)) {
     throw new Error(`cargo build succeeded but ${fallback} is missing`);

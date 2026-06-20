@@ -11,10 +11,10 @@
 //! fake-ACP `tool_call` shape (toolCallId / kind / status / rawInput) is
 //! identical, so the TUI and the dashboard exercise the same wire data.
 //!
-//! Compiled only with `--features serve`. Run via:
+//! Compiled only with the default `serve` feature (excluded by `--no-default-features`). Run via:
 //!
 //! ```sh
-//! cargo test --test e2e --features serve -- acp_tool_cards
+//! cargo test --test e2e -- acp_tool_cards
 //! ```
 #![cfg(feature = "serve")]
 

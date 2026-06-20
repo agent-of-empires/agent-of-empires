@@ -12,40 +12,35 @@ export function PairedShellPane({ session, sessionId }: { session: SessionRespon
   const [shellMode, setShellMode] = useState<ShellMode>("host");
   const isSandboxed = session?.is_sandboxed ?? false;
 
+  const shellTabClass = (active: boolean) =>
+    `text-[12px] px-2 py-0.5 rounded cursor-pointer transition-colors ${
+      active ? "text-brand-500 bg-brand-600/10" : "text-text-dim hover:text-text-muted"
+    }`;
+
   return (
     <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
       <div className="flex items-center gap-1 px-2 py-1 bg-surface-900 border-b border-surface-700/20 shrink-0">
         <span className="text-xs text-text-dim mr-1">Shell</span>
-        <button
-          onClick={() => setShellMode("host")}
-          className={`text-[12px] px-2 py-0.5 rounded cursor-pointer transition-colors ${
-            shellMode === "host" ? "text-brand-500 bg-brand-600/10" : "text-text-dim hover:text-text-muted"
-          }`}
-        >
+        <button onClick={() => setShellMode("host")} className={shellTabClass(shellMode === "host")}>
           Host
         </button>
         {isSandboxed && (
-          <button
-            onClick={() => setShellMode("container")}
-            className={`text-[12px] px-2 py-0.5 rounded cursor-pointer transition-colors ${
-              shellMode === "container" ? "text-brand-500 bg-brand-600/10" : "text-text-dim hover:text-text-muted"
-            }`}
-          >
+          <button onClick={() => setShellMode("container")} className={shellTabClass(shellMode === "container")}>
             Container
           </button>
         )}
       </div>
 
-      {sessionId && session ? (
+      {!sessionId || !session ? (
+        <div className="flex-1 flex items-center justify-center bg-surface-950 text-text-dim">
+          <p className="text-xs">Select a session</p>
+        </div>
+      ) : (
         <LiveTerminalView
           key={`${sessionId}-${shellMode}`}
           session={session}
           surface={shellMode === "container" ? "paired-container" : "paired-host"}
         />
-      ) : (
-        <div className="flex-1 flex items-center justify-center bg-surface-950 text-text-dim">
-          <p className="text-xs">Select a session</p>
-        </div>
       )}
     </div>
   );

@@ -1207,9 +1207,7 @@ impl HomeView {
                 }
                 DialogResult::Submit(order) => {
                     self.sort_picker_dialog = None;
-                    if order != self.sort_order {
-                        self.apply_sort_order(order);
-                    }
+                    self.apply_sort_order(order);
                 }
             }
             return true;
@@ -1996,6 +1994,16 @@ impl HomeView {
             return None;
         }
 
+        if let Some(dialog) = &mut self.plugin_manager_dialog {
+            match dialog.handle_key(key) {
+                DialogResult::Continue => {}
+                DialogResult::Cancel | DialogResult::Submit(()) => {
+                    self.plugin_manager_dialog = None;
+                }
+            }
+            return None;
+        }
+
         if let Some(dialog) = &mut self.group_picker_dialog {
             match dialog.handle_key(key) {
                 DialogResult::Continue => {}
@@ -2037,9 +2045,7 @@ impl HomeView {
                 }
                 DialogResult::Submit(order) => {
                     self.sort_picker_dialog = None;
-                    if order != self.sort_order {
-                        self.apply_sort_order(order);
-                    }
+                    self.apply_sort_order(order);
                 }
             }
             return None;
@@ -2405,6 +2411,9 @@ impl HomeView {
                 let profile = self.config_profile();
                 self.projects_dialog = Some(ProjectsDialog::new(&profile));
             }
+            ActionId::Plugins => {
+                self.plugin_manager_dialog = Some(crate::tui::dialogs::PluginManagerDialog::new());
+            }
             ActionId::Restart => self.open_restart_dialog(),
             ActionId::Update => return self.run_update(update_info),
             ActionId::ToggleArchive => {
@@ -2653,13 +2662,13 @@ impl HomeView {
         {
             self.info_dialog = Some(InfoDialog::new(
                 "Serve unavailable",
-                "This `aoe` binary was built without the `serve` feature, \
-                 so the web dashboard, local network serving, and \
-                 Cloudflare Tunnel integration are not included.\n\n\
+                "This `aoe` binary was built without the web dashboard \
+                 (a `--no-default-features` source build), so local network \
+                 serving and Cloudflare Tunnel integration are not included.\n\n\
                  To serve to your phone (LAN / Tailscale / tunnel):\n\
                    \u{2022} Install a release build from GitHub Releases, or\n\
-                   \u{2022} Build from source with:\n\
-                     cargo build --release --features serve\n\n\
+                   \u{2022} Build from source with default features:\n\
+                     cargo build --release\n\n\
                  Once you have a `serve`-enabled binary, press R again to \
                  open the serve dialog.",
             ));
@@ -3011,7 +3020,7 @@ impl HomeView {
                 #[cfg(not(feature = "serve"))]
                 {
                     return Some(Action::SetTransientStatus(
-                        "Acp session: rebuild with --features serve to attach".to_string(),
+                        "Acp session: rebuild with default features to attach".to_string(),
                     ));
                 }
             }
@@ -3097,7 +3106,7 @@ impl HomeView {
                 #[cfg(not(feature = "serve"))]
                 {
                     return Some(Action::SetTransientStatus(
-                        "Acp session: rebuild with --features serve to attach".to_string(),
+                        "Acp session: rebuild with default features to attach".to_string(),
                     ));
                 }
             }
@@ -4818,6 +4827,10 @@ impl HomeView {
     }
 
     /// Re-score matches after a reload without moving the cursor.
+    fn search_haystack_for(inst: &crate::session::Instance) -> String {
+        format!("{} {}", inst.title, inst.project_path)
+    }
+
     pub(super) fn refresh_search_matches(&mut self) {
         let query = self.search_query.value();
         if query.is_empty() {
@@ -4845,7 +4858,7 @@ impl HomeView {
             let haystack = match item {
                 Item::Session { id, .. } => {
                     if let Some(inst) = self.get_instance(id) {
-                        format!("{} {}", inst.title, inst.project_path)
+                        Self::search_haystack_for(inst)
                     } else {
                         continue;
                     }
@@ -4899,7 +4912,7 @@ impl HomeView {
             let haystack = match item {
                 Item::Session { id, .. } => {
                     if let Some(inst) = self.get_instance(id) {
-                        format!("{} {}", inst.title, inst.project_path)
+                        Self::search_haystack_for(inst)
                     } else {
                         continue;
                     }

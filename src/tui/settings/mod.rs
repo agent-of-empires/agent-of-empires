@@ -253,6 +253,12 @@ pub struct SettingsView {
     /// disturbs the keyboard cursor. Cleared on every keypress so
     /// hover doesn't linger after the user switches modalities.
     pub(super) mouse_pos: Option<(u16, u16)>,
+
+    /// Embedded plugin manager for the Plugins category: the same dialog the
+    /// command palette opens (`crate::tui::dialogs::PluginManagerDialog`),
+    /// hosted inline so the builtin plugin list lives on the settings screen.
+    /// One implementation, reused; it reloads its own list on mutation.
+    pub(super) plugin_manager: crate::tui::dialogs::PluginManagerDialog,
 }
 
 impl SettingsView {
@@ -326,6 +332,7 @@ impl SettingsView {
             category_rects: Vec::new(),
             field_rects: Vec::new(),
             mouse_pos: None,
+            plugin_manager: crate::tui::dialogs::PluginManagerDialog::embedded(),
         };
 
         // The constructor parks `selected_category` at 0, which is the
@@ -383,6 +390,11 @@ impl SettingsView {
             push_tab(&mut rows, SettingsCategory::Telemetry);
         }
         push_tab(&mut rows, SettingsCategory::Logging);
+        // Plugin enable/disable is stored in the global config, so the manager
+        // tab (which stages toggles into it) only appears under Global scope.
+        if scope == SettingsScope::Global {
+            push_tab(&mut rows, SettingsCategory::Plugins);
+        }
 
         rows
     }
@@ -489,6 +501,26 @@ impl SettingsView {
         // section divider, advance to the next real field so the user
         // never sees the cursor parked on a heading.
         self.snap_to_interactive_field_forward();
+    }
+
+    /// Re-sync the in-memory `plugins` config after the embedded manager
+    /// mutated it on disk (enable/disable/install/update/uninstall write
+    /// immediately and reload the registry). Without this, a later settings
+    /// save would write the stale `plugins` table and clobber the change.
+    /// Only the `plugins` subtree is touched, so unrelated unsaved edits stay
+    /// flagged.
+    pub(super) fn resync_after_plugin_mutation(&mut self) {
+        let Ok(disk) = Config::load() else {
+            return;
+        };
+        self.global_config.plugins = disk.plugins;
+        if let (Some(obj), Ok(plugins_val)) = (
+            self.baseline_global.as_object_mut(),
+            serde_json::to_value(&self.global_config.plugins),
+        ) {
+            obj.insert("plugins".to_string(), plugins_val);
+        }
+        self.recompute_dirty();
     }
 
     /// Advance `selected_field` to the first interactive field
@@ -658,6 +690,18 @@ impl SettingsView {
                 {
                     save_repo_config(std::path::Path::new(project_path), repo_config)?;
                 }
+            }
+        }
+
+        // Plugin enable/disable lives in `config.plugins`. When that subtree
+        // changed, reload the registry so the save takes effect live (a
+        // disabled plugin drops from the active set). Compared against the
+        // still-old baseline before snapshotting. Mirrors what the immediate
+        // `aoe plugin enable/disable` CLI path does.
+        if self.scope == SettingsScope::Global {
+            let now_plugins = serde_json::to_value(&self.global_config.plugins).ok();
+            if now_plugins.as_ref() != self.baseline_global.get("plugins") {
+                crate::plugin::reload_registry();
             }
         }
 

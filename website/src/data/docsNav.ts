@@ -70,6 +70,7 @@ export const docsNav: NavSection[] = [
       { title: "Telemetry", href: "/docs/telemetry/" },
       { title: "GitHub Integration", href: "/docs/github-integration/" },
       { title: "Configuration", href: "/docs/guides/configuration/" },
+      { title: "Plugins", href: "/docs/plugins/" },
     ],
   },
   {
@@ -93,6 +94,7 @@ export const docsNav: NavSection[] = [
       { title: "Structured View Internals", href: "/docs/development/internals/structured-view/" },
       { title: "Sandbox Internals", href: "/docs/development/internals/sandbox/" },
       { title: "Session & Worktree Internals", href: "/docs/development/internals/sessions/" },
+      { title: "Plugin System Internals", href: "/docs/development/internals/plugin-system/" },
     ],
   },
 ];

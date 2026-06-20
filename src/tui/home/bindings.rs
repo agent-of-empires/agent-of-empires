@@ -65,6 +65,8 @@ pub enum ActionId {
     SortPicker,
     GroupBy,
     NextWaiting,
+    /// Open the plugin manager (palette only; no default chord).
+    Plugins,
     /// Pin or unpin the selected project header (project view only). Pinning
     /// registers the repo so the project persists in the view without any
     /// sessions; unpinning removes the registry entry.
@@ -735,6 +737,21 @@ pub static BINDINGS: &[Binding] = &[
             serve_only: false,
         }),
     },
+    // Palette-only: no default chord in either mode; the manager opens from
+    // the command palette (or the web Settings Plugins tab).
+    Binding {
+        id: ActionId::Plugins,
+        non_strict: &[],
+        strict: &[],
+        context: Context::Always,
+        help: None,
+        palette: Some(PaletteMeta {
+            title: "Manage plugins",
+            keywords: &["plugin", "extension", "enable", "disable"],
+            group: PaletteGroup::Settings,
+            serve_only: false,
+        }),
+    },
 ];
 
 /// Stable palette/test id for an action (matches the legacy `builtin_commands`
@@ -775,6 +792,7 @@ pub fn palette_id(id: ActionId) -> &'static str {
         ActionId::ToggleContainer => "toggle-container",
         ActionId::ToggleProjectPin => "toggle-project-pin",
         ActionId::Tips => "tips",
+        ActionId::Plugins => "plugins",
     }
 }
 

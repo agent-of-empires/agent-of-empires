@@ -37,6 +37,26 @@ pub struct GitHubRelease {
     pub published_at: Option<String>,
 }
 
+/// One repository from `GET /search/repositories`, trimmed to the fields the
+/// plugin discovery surface shows.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GitHubSearchRepo {
+    /// `owner/repo`, the exact string `aoe plugin install` accepts.
+    pub full_name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub stargazers_count: u64,
+    #[serde(default)]
+    pub archived: bool,
+}
+
+#[derive(Deserialize)]
+struct SearchRepositoriesResponse {
+    #[serde(default)]
+    items: Vec<GitHubSearchRepo>,
+}
+
 #[derive(Deserialize)]
 struct ApiErrorBody {
     message: Option<String>,
@@ -86,6 +106,22 @@ impl GitHubClient {
     pub async fn latest_release(&self, owner: &str, repo: &str) -> Result<GitHubRelease> {
         let url = format!("{}/repos/{}/{}/releases/latest", self.api_base, owner, repo);
         self.send_json(self.http.get(url)).await
+    }
+
+    /// `GET /search/repositories?q=topic:{topic}` sorted by stars. Used by
+    /// plugin discovery; unauthenticated search is rate-limited to ~10
+    /// requests/min, fine for an explicit user action.
+    pub async fn search_repositories_by_topic(
+        &self,
+        topic: &str,
+        per_page: u8,
+    ) -> Result<Vec<GitHubSearchRepo>> {
+        let url = format!(
+            "{}/search/repositories?q=topic%3A{}&sort=stars&order=desc&per_page={}",
+            self.api_base, topic, per_page
+        );
+        let response: SearchRepositoriesResponse = self.send_json(self.http.get(url)).await?;
+        Ok(response.items)
     }
 
     async fn send_json<T: DeserializeOwned>(&self, request: reqwest::RequestBuilder) -> Result<T> {

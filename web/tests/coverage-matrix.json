@@ -3,6 +3,13 @@
   "description": "Surface/flow coverage matrix for the agent-of-empires web dashboard. Every component file under web/src/components/** must appear in at least one entry's `components` list (covered, deferred, or out-of-scope), or in coverage-matrix.exempt.json. CI validates this on every PR via tests/validate-coverage-matrix.mjs.",
   "surfaces": [
     {
+      "id": "terminal.paired-shell",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/__tests__/RightPanel.test.tsx"],
+      "components": ["web/src/components/PairedTerminal.tsx"]
+    },
+    {
       "id": "settings.mcp-servers",
       "kind": "live-playwright",
       "risk": "high",
@@ -2644,6 +2651,20 @@
       "risk": "high",
       "specs": ["tests/live/file-watch-peer-propagation.spec.ts"],
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
+      "id": "settings.plugins",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/components/settings/__tests__/PluginsSettings.test.tsx"],
+      "components": ["web/src/components/settings/PluginsSettings.tsx"]
+    },
+    {
+      "id": "settings.plugins-live-toggle",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/plugins-enable-toggle.spec.ts"],
+      "components": ["web/src/components/settings/PluginsSettings.tsx"]
     },
     {
       "id": "terminal.desktop-live-input",

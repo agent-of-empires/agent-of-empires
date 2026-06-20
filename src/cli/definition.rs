@@ -18,6 +18,7 @@ use super::list::ListArgs;
 use super::log_level::LogLevelArgs;
 use super::logs::LogsArgs;
 use super::mcp::McpCommands;
+use super::plugin::PluginCommands;
 use super::profile::ProfileCommands;
 use super::project::ProjectCommands;
 use super::remove::RemoveArgs;
@@ -126,6 +127,12 @@ pub enum Commands {
         command: GroupCommands,
     },
 
+    /// Manage plugins (list, info, enable, disable)
+    Plugin {
+        #[command(subcommand)]
+        command: PluginCommands,
+    },
+
     /// Manage profiles (separate workspaces)
     Profile {
         #[command(subcommand)]
@@ -194,7 +201,7 @@ pub enum Commands {
     /// `aoe serve --stop`. Hidden from help.
     #[cfg(feature = "serve")]
     #[command(name = "__acp-runner", hide = true)]
-    AcpRunner(Box<crate::acp::runner::AcpRunnerArgs>),
+    AcpRunner(Box<crate::process::runner::AcpRunnerArgs>),
 
     /// Internal: extract Claude's `session_id` from a hook stdin payload
     /// and write it to the sidecar file. Spawned by the host-side
@@ -238,6 +245,7 @@ pub const CLI_COMMAND_NAMES: &[&str] = &[
     "killall",
     "session",
     "group",
+    "plugin",
     "profile",
     "project",
     "worktree",
@@ -281,6 +289,7 @@ pub fn command_name(command: &Commands) -> Option<&'static str> {
         Commands::Stop { .. } => return None,
         Commands::Session { .. } => "session",
         Commands::Group { .. } => "group",
+        Commands::Plugin { .. } => "plugin",
         Commands::Profile { .. } => "profile",
         Commands::Project { .. } => "project",
         Commands::Worktree { .. } => "worktree",

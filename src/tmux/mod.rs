@@ -45,6 +45,14 @@ pub const TERMINAL_PREFIX: &str = if cfg!(debug_assertions) {
 } else {
     "aoe_term_"
 };
+/// Prefix for plugin-owned pane sessions (#268 extension points). Distinct so
+/// the startup orphan sweep can find them and they never collide with agent or
+/// paired-terminal sessions.
+pub const PLUGIN_PANE_PREFIX: &str = if cfg!(debug_assertions) {
+    "aoe_dev_pane_"
+} else {
+    "aoe_pane_"
+};
 pub const CONTAINER_TERMINAL_PREFIX: &str = if cfg!(debug_assertions) {
     "aoe_dev_cterm_"
 } else {

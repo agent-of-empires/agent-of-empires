@@ -313,6 +313,7 @@ async fn main() -> Result<()> {
         Some(Commands::Killall(args)) => cli::killall::run(args).await,
         Some(Commands::Session { command }) => cli::session::run(&profile, command).await,
         Some(Commands::Group { command }) => cli::group::run(&profile, command).await,
+        Some(Commands::Plugin { command }) => cli::plugin::run(command),
         Some(Commands::Profile { command }) => cli::profile::run(command).await,
         Some(Commands::Project { command }) => {
             cli::project::run(&profile, profile_explicit, command).await
@@ -325,7 +326,7 @@ async fn main() -> Result<()> {
         #[cfg(feature = "serve")]
         Some(Commands::Acp { command }) => cli::acp::run(command).await,
         #[cfg(feature = "serve")]
-        Some(Commands::AcpRunner(args)) => agent_of_empires::acp::runner::run(*args).await,
+        Some(Commands::AcpRunner(args)) => agent_of_empires::process::runner::run(*args).await,
         None => {
             // Fold the drift notice into the existing startup-warning channel
             // so the TUI surfaces both (debug-log + drift, if both fire) in a

@@ -10,7 +10,7 @@
 #   scripts/dev/capture-web-screenshots.sh
 #
 # Honors AOE_E2E_BINARY if set; otherwise prefers an existing
-# target/release/aoe, then builds one with `--features serve`.
+# target/release/aoe, then builds one with default features (includes serve).
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -24,8 +24,8 @@ elif [[ -x "target/release/aoe" ]]; then
 elif [[ -x "target/debug/aoe" ]]; then
   BIN="target/debug/aoe"
 else
-  echo "No aoe binary found; building with --features serve (this is slow on a cold cache)."
-  cargo build --release --features serve
+  echo "No aoe binary found; building release with default features (this is slow on a cold cache)."
+  cargo build --release
   BIN="target/release/aoe"
 fi
 export AOE_E2E_BINARY="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")"

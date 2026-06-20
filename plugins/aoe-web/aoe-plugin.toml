@@ -1,0 +1,13 @@
+# First-party web dashboard plugin marker (P8 of #268).
+#
+# The dashboard itself is Tier 2 trusted-native code compiled behind the
+# `serve` cargo feature; this manifest puts it under plugin management so it
+# can be disabled at runtime (`aoe plugin disable aoe.web`) independently of
+# the compile-time feature. `aoe serve` refuses to start while disabled.
+# Full extraction of the web crate is the last phase of the proving sequence.
+
+id = "aoe.web"
+name = "Web Dashboard"
+version = "1.0.0"
+api_version = 1
+description = "The aoe serve web dashboard and REST/WebSocket API. Disable to keep aoe TUI-only at runtime; the serve command refuses to start while disabled."

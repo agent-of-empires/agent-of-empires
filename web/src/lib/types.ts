@@ -531,7 +531,11 @@ export type SettingsWebWritePolicy =
  *  widget's min/max is advisory; this is the gate the server enforces. */
 export type SettingsValidation =
   | { rule: "none" }
+  | { rule: "bool" }
+  | { rule: "str" }
   | { rule: "range_u64"; min: number; max?: number }
+  | { rule: "range_i64"; min: number; max?: number }
+  | { rule: "one_of"; options: string[] }
   | { rule: "non_empty_string" }
   | { rule: "memory_limit" }
   | { rule: "volume_list" }

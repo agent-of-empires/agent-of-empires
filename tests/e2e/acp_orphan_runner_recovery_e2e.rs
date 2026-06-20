@@ -17,10 +17,10 @@
 //! Without the fix this test hangs until the 45s prompt deadline and panics;
 //! with it, the prompt is accepted once the worker is recovered.
 //!
-//! Compiled only with `--features serve`. Run via:
+//! Compiled only with the default `serve` feature (excluded by `--no-default-features`). Run via:
 //!
 //! ```sh
-//! cargo test --test e2e --features serve -- acp_orphan_runner_recovery
+//! cargo test --test e2e -- acp_orphan_runner_recovery
 //! ```
 #![cfg(feature = "serve")]
 

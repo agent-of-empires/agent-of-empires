@@ -634,6 +634,34 @@ last_seen_version = "{}"
             .expect("failed to run aoe CLI")
     }
 
+    /// Like [`Self::run_cli`], but writes `stdin` to the child before
+    /// collecting output. Used by the plugin-worker tests, which speak
+    /// ndjson JSON-RPC on stdio and exit on EOF.
+    pub fn run_cli_with_stdin(&self, args: &[&str], stdin: &str) -> Output {
+        use std::io::Write;
+        let mut child = Command::new(&self.binary_path)
+            .args(args)
+            .env("HOME", self.home_dir.path())
+            .env("XDG_CONFIG_HOME", self.home_dir.path().join(".config"))
+            .env("PATH", self.env_path())
+            .env_remove("AGENT_OF_EMPIRES_DEBUG")
+            .env_remove("AOE_LOG_LEVEL")
+            .envs(self.extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("failed to spawn aoe CLI");
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(stdin.as_bytes())
+            .expect("write stdin");
+        // Dropping stdin closes the pipe; the worker exits on EOF.
+        child.wait_with_output().expect("collect aoe CLI output")
+    }
+
     /// Path to the isolated home directory for custom test setup.
     pub fn home_path(&self) -> &Path {
         self.home_dir.path()

@@ -251,7 +251,15 @@ impl SettingsView {
             .split(area);
 
         self.render_categories(frame, layout[0], theme);
-        self.render_fields(frame, layout[1], theme);
+        // The Plugins category hosts the embedded plugin manager in the right
+        // pane; every other category renders the normal field list.
+        if self.current_category() == SettingsCategory::Plugins {
+            let focused = self.focus == SettingsFocus::Fields;
+            self.plugin_manager
+                .render_inline(frame, layout[1], theme, focused);
+        } else {
+            self.render_fields(frame, layout[1], theme);
+        }
     }
 
     fn render_categories(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {

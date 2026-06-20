@@ -68,7 +68,7 @@ aoe add . --agent aoe-agent --model gpt-5   # pick an ACP agent + model (implies
 `--agent` for an uninstalled adapter errors with an install hint; `--structured-view` (no `--agent`) falls back to the terminal view with a warning so the command still succeeds.
 ## Requirements
 
-- aoe built with `--features serve`.
+- aoe built with default features (release binaries and plain `cargo build` both qualify; only `--no-default-features` builds exclude it).
 - Node.js 20+ on `PATH` (the structured view spawns an ACP agent subprocess; `aoe-agent` needs Node 20+ for Vercel AI SDK 6).
 - For Claude Code, a `claude login` session.
 

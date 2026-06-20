@@ -24,14 +24,15 @@
 - `docs/development/adding-settings.md`: guide for adding a setting via the single-source schema.
 - `scripts/`: installation and utility scripts.
 - `xtask/`: build automation workspace.
+- `aoe-plugin-api/`: plugin manifest and capability types (see `docs/development/internals/plugin-system.md`).
 
 - `contrib/`: community-maintained integration files (e.g., OpenClaw skill). Checked by `cargo xtask check-skill` in CI.
 
 ## Build, Test, and Development Commands
 
-- `cargo build` / `cargo build --release`: TUI-only (release binary at `target/release/aoe`).
+- `cargo build` / `cargo build --release`: full build including the web dashboard by default (release binary at `target/release/aoe`); `--no-default-features` is the TUI-only build (see below).
 - `cargo build --profile dev-release`: optimized local builds without LTO; faster compile. Lands on the release namespace (app dir, tmux prefix, serve port), so it shares state with an installed release `aoe`. Use `--release` only when producing a shipping binary.
-- `cargo build --features serve`: includes the web dashboard (needs Node.js + npm).
+- `cargo build` includes the web dashboard by default (needs Node.js + npm); `cargo build --no-default-features` is the TUI-only build with no JS tooling.
 - `cargo test`: unit + integration tests (some skip if `tmux` unavailable).
 - `cargo fmt` + `cargo clippy`: run before pushing; fix clippy warnings unless there's a strong reason not to.
 - Debug logging: `AGENT_OF_EMPIRES_DEBUG=1 cargo run` (writes `debug.log` in app data dir).
@@ -41,11 +42,11 @@
 ### Web Dashboard
 
 - Stack: React 19, TypeScript, Vite, Tailwind v4, xterm.js v6. Installable as a PWA ("Install Agent of Empires" in Chrome; "Add to Home Screen" on iOS).
-- Build: `cargo build --features serve` (build.rs runs `npm install && npm run build` in `web/` when inputs change).
+- Build: `cargo build` (default features; build.rs runs `npm install && npm run build` in `web/` when inputs change).
 - Run: `aoe serve --host 0.0.0.0` (token-based auth by default).
-- Frontend dev: `cargo xtask dev` (Unix) builds the serve binary, then runs `aoe serve` (8081) and the Vite dev server (5173, HMR) together, pointing Vite at the backend via `VITE_PROXY` so `/api` and the `/sessions/*/ws` relays resolve; open `:5173`, Ctrl-C stops both. Or run them by hand: `cd web && npm run dev` plus a separate `cargo run --features serve -- serve`.
+- Frontend dev: `cargo xtask dev` (Unix) builds the serve binary, then runs `aoe serve` (8081) and the Vite dev server (5173, HMR) together, pointing Vite at the backend via `VITE_PROXY` so `/api` and the `/sessions/*/ws` relays resolve; open `:5173`, Ctrl-C stops both. Or run them by hand: `cd web && npm run dev` plus a separate `cargo run -- serve`.
 - Web checks (CI gates all three on any `web/` change): `cd web && npm run format:check` (oxfmt, NOT prettier; `npm run format` to fix), `npm run lint` (ESLint), and `npx tsc -b` (typecheck, also part of `npm run build`). ESLint and tsc do not catch formatting; run oxfmt explicitly.
-- TUI-only `cargo build` (without `--features serve`) needs no JS tooling.
+- TUI-only `cargo build --no-default-features` needs no JS tooling.
 
 ## Settings & Configuration
 
@@ -122,7 +123,7 @@ Full-binary e2e tests live in `tests/e2e/`, exercising `aoe` through tmux (TUI) 
 
 The harness (`tests/e2e/harness.rs`) exposes `TuiTestHarness` with `spawn_tui()`/`spawn(args)`, `send_keys(keys)`/`type_text(text)`, `wait_for(text)` (10s timeout), `capture_screen()`/`assert_screen_contains(text)`, and `run_cli(args)`. TUI tests auto-skip without tmux; Docker tests use `#[ignore]`; all use `#[serial]` for tmux isolation.
 
-Agent-view live-daemon e2e (`tests/e2e/acp_focus_isolation_e2e.rs`) stands up a real `aoe serve --daemon` and attaches the native TUI structured view against it. It reuses the shared Node fake-ACP agent (`web/tests/helpers/fakeAcpAgent.mjs`) to drive a deterministic pending approval, so it needs `--features serve` and Node on `PATH` (it auto-skips via `require_node!` otherwise). The harness installs the fake as the `claude` / `claude-agent-acp` / `aoe-agent` shims (`install_acp_shim`), roots `$HOME` under `/tmp` (`new_in_tmp`, keeping the worker unix socket under the macOS `sun_path` limit), and stops the worker plus daemon on `Drop` (`stop_daemon_on_drop`).
+Agent-view live-daemon e2e (`tests/e2e/acp_focus_isolation_e2e.rs`) stands up a real `aoe serve --daemon` and attaches the native TUI structured view against it. It reuses the shared Node fake-ACP agent (`web/tests/helpers/fakeAcpAgent.mjs`) to drive a deterministic pending approval, so it needs the default `serve` feature and Node on `PATH` (it auto-skips via `require_node!` otherwise). The harness installs the fake as the `claude` / `claude-agent-acp` / `aoe-agent` shims (`install_acp_shim`), roots `$HOME` under `/tmp` (`new_in_tmp`, keeping the worker unix socket under the macOS `sun_path` limit), and stops the worker plus daemon on `Drop` (`stop_daemon_on_drop`).
 
 Recording (for PR reviews): `RECORD_E2E=1 cargo test --test e2e -- --nocapture` locally (needs `asciinema` + `agg`, outputs to `target/e2e-recordings/`), or add the `needs-recording` label in CI.
 
@@ -168,7 +169,7 @@ Full recipe, harness API, and fake-ACP-agent details live in `docs/development/p
 
 Before requesting review, every PR must clear:
 
-1. **`cargo fmt`, `cargo clippy`, `cargo test`** all clean (`--features serve` if the change touches the web dashboard or structured view). For any `web/` change, also **`cd web && npm run format:check && npm run lint`** (oxfmt + ESLint; both are CI gates, and neither ESLint nor tsc catches formatting).
+1. **`cargo fmt`, `cargo clippy`, `cargo test`** all clean (default features include the web dashboard and structured view). For any `web/` change, also **`cd web && npm run format:check && npm run lint`** (oxfmt + ESLint; both are CI gates, and neither ESLint nor tsc catches formatting).
 2. **Web tests when applicable.** If the change touches a user-facing dashboard flow listed in the coverage matrix mandate (auth, wizard, settings, profiles, sessions / sidebar, right panel / diff / notifications, directory browser, devices, git clone, connectivity, read-only), update `web/tests/coverage-matrix.json` and add or modify the appropriate Vitest / Playwright test. CI fails on a missing matrix entry.
 3. **Codecov checks.** See below.
 

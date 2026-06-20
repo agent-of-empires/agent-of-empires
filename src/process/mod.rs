@@ -1,4 +1,14 @@
-//! Process utilities for tmux session management
+//! Process utilities: tmux pane PID resolution plus the protocol-agnostic
+//! subprocess worker substrate (runner shim, on-disk worker registry).
+//!
+//! The worker substrate is consumed by both the ACP layer and the plugin
+//! host; it knows nothing about either protocol. The dependency arrow points
+//! from those consumers down to this module, never between them.
+
+#[cfg(feature = "serve")]
+pub mod runner;
+#[cfg(feature = "serve")]
+pub mod worker_registry;
 
 use std::process::Command;
 use std::time::Duration;

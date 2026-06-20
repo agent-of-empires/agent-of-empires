@@ -1307,7 +1307,7 @@ pub async fn acp_worker_log(
         return (StatusCode::NOT_FOUND, "session not found").into_response();
     }
 
-    let log_path = match crate::acp::worker_registry::log_path_for(&id) {
+    let log_path = match crate::process::worker_registry::log_path_for(&id) {
         Ok(p) => p,
         Err(e) => {
             return (StatusCode::BAD_REQUEST, format!("invalid session id: {e}")).into_response();

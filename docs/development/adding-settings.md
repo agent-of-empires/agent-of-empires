@@ -33,7 +33,7 @@ crate) turns the annotated field into a `FieldDescriptor` in
   extend.
 - **`config.toml`** round-trips via `serde`.
 
-Run `cargo test` and `cargo build --features serve`; the field is live on all
+Run `cargo test` and `cargo build`; the field is live on all
 surfaces.
 
 ## Choosing the section and widget

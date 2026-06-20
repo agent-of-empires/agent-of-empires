@@ -8,7 +8,7 @@ mod creation_poller;
 mod deletion_poller;
 pub mod dialogs;
 pub mod diff;
-mod home;
+pub(crate) mod home;
 #[cfg(feature = "serve")]
 pub(crate) mod remote_home;
 pub(crate) mod responsive;

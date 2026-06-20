@@ -6,9 +6,13 @@ publish = false
 
 [dependencies]
 agent-of-empires = { path = "..", features = ["serve"] }
+aoe-plugin-api = { path = "../aoe-plugin-api" }
 clap = { version = "4.6", features = ["derive"] }
 clap-markdown = "0.1"
 regex = "1"
+serde = { version = "1.0", features = ["derive"] }
+tempfile = "3.14"
+toml = "1.1"
 
 [target.'cfg(unix)'.dependencies]
 ctrlc = "3"

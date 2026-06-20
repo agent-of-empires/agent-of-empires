@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "xtask", "aoe-settings-derive"]
+members = [".", "xtask", "aoe-settings-derive", "aoe-plugin-api"]
 
 [package]
 name = "agent-of-empires"
@@ -15,7 +15,7 @@ categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 # CLI
-clap = { version = "4.6", features = ["derive", "env"] }
+clap = { version = "4.6", features = ["derive", "env", "string"] }
 clap_complete = "4.6"
 
 # TUI
@@ -35,6 +35,9 @@ tokio = { version = "1.52", features = ["full"] }
 
 # Settings single-source-of-truth derive (#1692)
 aoe-settings-derive = { path = "aoe-settings-derive" }
+
+# Plugin manifest and capability types (#268)
+aoe-plugin-api = { path = "aoe-plugin-api" }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -167,12 +170,24 @@ xz2 = { version = "0.1", optional = true }
 # the daemon itself uses axum's built-in WS support and never pulls this in.
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["rustls-tls-webpki-roots", "connect"], optional = true }
 
+# Unix-only: O_NOFOLLOW for race-free plugin-tree reads/copies (no std constant).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
-default = []
+# The web dashboard ships by default so plain `cargo build` produces the
+# full binary (#268 task: aoe.web is a default-enabled builtin plugin).
+# TUI-only builds without Node/npm: `cargo build --no-default-features`.
+default = ["serve", "default-plugins"]
 # Re-exports private tmux env helpers via `crate::tmux::test_support` so that
 # integration tests in `tests/` can poke them. Not enabled by default — only
 # used by `cargo test`.
 test-support = []
+# Compile in the bundled first-party plugins (status detection, attention
+# sort, the aoe.web marker). Additive and on by default so `--all-features`
+# and `cargo test --all-features` keep them. Build the bare core (acceptance
+# criterion 1 of #268) by opting out with `--no-default-features`.
+default-plugins = []
 serve = [
     "axum",
     "tower-http",
@@ -216,8 +231,10 @@ axum = { version = "0.8", features = ["ws"] }
 # Self-dev-dependency: enables the `test-support` feature when building
 # integration tests so they can reach `crate::tmux::test_support`. This is
 # the standard Cargo pattern for opt-in test-only re-exports; the lib build
-# (and release binaries) never see the feature.
-agent-of-empires = { path = ".", features = ["test-support"] }
+# (and release binaries) never see the feature. `default-features = false`
+# matters: without it this entry re-enables the default `serve` feature
+# under `cargo test --no-default-features`, making that CI job meaningless.
+agent-of-empires = { path = ".", default-features = false, features = ["test-support"] }
 
 [profile.release]
 lto = true

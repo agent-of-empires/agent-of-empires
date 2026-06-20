@@ -15,6 +15,7 @@ pub mod log_level;
 pub mod logs;
 pub mod mcp;
 pub mod output;
+pub mod plugin;
 pub mod profile;
 pub mod project;
 pub mod remove;

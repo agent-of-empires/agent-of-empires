@@ -148,6 +148,13 @@ const PAGES = [
 
   // --- Docs pages (docs/ → pages/docs/) ---
   {
+    source: "docs/plugins.md",
+    dest: "docs/plugins.md",
+    title: "Plugins",
+    description:
+      "Enable, disable, install, and update plugins from the CLI, TUI, or web dashboard; capability approvals, bundled plugins, and writing your own.",
+  },
+  {
     source: "docs/index.md",
     dest: "docs/index.md",
     title: "Agent of Empires",
@@ -229,6 +236,13 @@ const PAGES = [
     title: "Sandbox Internals",
     description:
       "Contributor reference for Docker sandbox internals: shared agent credential sync, the container lifecycle, Vertex AI wiring, and GH_TOKEN forwarding.",
+  },
+  {
+    source: "docs/development/internals/plugin-system.md",
+    dest: "docs/development/internals/plugin-system.md",
+    title: "Plugin System Internals",
+    description:
+      "Code-level design for the plugin system: subprocess JSON-RPC runtime, core event bus, contribution registries, capability model, and the phased rollout.",
   },
   {
     source: "docs/development/internals/sessions.md",
@@ -347,6 +361,7 @@ const PAGES = [
 // Every known docs path → website URL, used for link rewriting.
 const URL_MAP = {
   // Docs pages
+  "docs/plugins.md": "/docs/plugins/",
   "docs/index.md": "/docs/",
   "docs/installation.md": "/docs/installation/",
   "docs/quick-start.md": "/docs/quick-start/",
@@ -363,6 +378,7 @@ const URL_MAP = {
   "docs/development/web-dashboard.md": "/docs/development/web-dashboard/",
   "docs/development/internals/structured-view.md": "/docs/development/internals/structured-view/",
   "docs/development/internals/sandbox.md": "/docs/development/internals/sandbox/",
+  "docs/development/internals/plugin-system.md": "/docs/development/internals/plugin-system/",
   "docs/development/internals/sessions.md": "/docs/development/internals/sessions/",
   "docs/guides/configuration.md": "/docs/guides/configuration/",
   "docs/cli/reference.md": "/docs/cli/reference/",

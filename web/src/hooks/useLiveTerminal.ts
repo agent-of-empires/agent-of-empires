@@ -144,7 +144,11 @@ export function useLiveTerminal(sessionId: string | null, wsPath: string = "live
     function connect() {
       if (disposed) return;
       const proto = location.protocol === "https:" ? "wss:" : "ws:";
-      const url = `${proto}//${location.host}/sessions/${sessionId}/${wsPath}`;
+      // A leading-slash `wsPath` is an absolute relay path; otherwise it is a
+      // per-session suffix under `/sessions/<id>/`.
+      const url = wsPath.startsWith("/")
+        ? `${proto}//${location.host}${wsPath}`
+        : `${proto}//${location.host}/sessions/${sessionId}/${wsPath}`;
       const token = getToken();
       let bindingSecret: string | null = null;
       try {

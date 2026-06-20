@@ -38,6 +38,11 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe group create`↴](#aoe-group-create)
 * [`aoe group delete`↴](#aoe-group-delete)
 * [`aoe group move`↴](#aoe-group-move)
+* [`aoe plugin`↴](#aoe-plugin)
+* [`aoe plugin list`↴](#aoe-plugin-list)
+* [`aoe plugin info`↴](#aoe-plugin-info)
+* [`aoe plugin enable`↴](#aoe-plugin-enable)
+* [`aoe plugin disable`↴](#aoe-plugin-disable)
 * [`aoe profile`↴](#aoe-profile)
 * [`aoe profile list`↴](#aoe-profile-list)
 * [`aoe profile create`↴](#aoe-profile-create)
@@ -113,6 +118,7 @@ Run without arguments to launch the TUI dashboard.
 * `killall` — Force-stop everything aoe is running: the serve daemon, all agent workers, and all aoe tmux sessions. Destructive and unprompted
 * `session` — Manage session lifecycle (start, stop, attach, etc.)
 * `group` — Manage groups for organizing sessions
+* `plugin` — Manage plugins (list, info, enable, disable)
 * `profile` — Manage profiles (separate workspaces)
 * `project` — Manage the project registry used by multi-repo session pickers
 * `worktree` — Manage git worktrees for parallel development
@@ -652,6 +658,65 @@ Move session to group
 
 * `<IDENTIFIER>` — Session ID or title
 * `<GROUP>` — Target group
+
+
+
+## `aoe plugin`
+
+Manage plugins (list, info, enable, disable)
+
+**Usage:** `aoe plugin <COMMAND>`
+
+###### **Subcommands:**
+
+* `list` — List every known plugin with version and state
+* `info` — Show one plugin's manifest details
+* `enable` — Enable a plugin's contributions
+* `disable` — Disable a plugin; its settings stay on disk for re-enabling
+
+
+
+## `aoe plugin list`
+
+List every known plugin with version and state
+
+**Usage:** `aoe plugin list`
+
+
+
+## `aoe plugin info`
+
+Show one plugin's manifest details
+
+**Usage:** `aoe plugin info <ID>`
+
+###### **Arguments:**
+
+* `<ID>` — Plugin id, e.g. `aoe.web`
+
+
+
+## `aoe plugin enable`
+
+Enable a plugin's contributions
+
+**Usage:** `aoe plugin enable <ID>`
+
+###### **Arguments:**
+
+* `<ID>` — Plugin id
+
+
+
+## `aoe plugin disable`
+
+Disable a plugin; its settings stay on disk for re-enabling
+
+**Usage:** `aoe plugin disable <ID>`
+
+###### **Arguments:**
+
+* `<ID>` — Plugin id
 
 
 

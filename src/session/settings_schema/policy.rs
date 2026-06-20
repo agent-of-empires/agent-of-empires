@@ -97,9 +97,14 @@ fn lookup(section: &str, field: &str) -> Option<FieldDescriptor> {
         .find(|d| d.section == section && d.field == field)
 }
 
-/// True if `section` is a known schema section (has at least one field).
-fn section_exists(section: &str) -> bool {
-    schema().iter().any(|d| d.section == section)
+fn lookup_in<'a>(
+    descriptors: &'a [FieldDescriptor],
+    section: &str,
+    field: &str,
+) -> Option<&'a FieldDescriptor> {
+    descriptors
+        .iter()
+        .find(|d| d.section == section && d.field == field)
 }
 
 /// Remove every `local_only` leaf from a PATCH body in place, before validation
@@ -135,6 +140,18 @@ pub fn strip_local_only(patch: &mut Value) {
 /// `local_only` policy (host-execution surfaces are removed before they get
 /// here), it only gates unknown fields, elevation, and value validity.
 pub fn validate_patch(patch: &Value, scope: Scope, elevated: bool) -> Result<(), PatchRejection> {
+    validate_patch_with(&schema(), patch, scope, elevated)
+}
+
+/// [`validate_patch`] against an explicit descriptor list. The server passes
+/// the runtime schema (core plus active-plugin sections) so plugin settings
+/// validate through the same gate as core fields.
+pub fn validate_patch_with(
+    descriptors: &[FieldDescriptor],
+    patch: &Value,
+    scope: Scope,
+    elevated: bool,
+) -> Result<(), PatchRejection> {
     let Some(obj) = patch.as_object() else {
         return Err(PatchRejection::Malformed("<root>".into()));
     };
@@ -146,7 +163,7 @@ pub fn validate_patch(patch: &Value, scope: Scope, elevated: bool) -> Result<(),
             }
             return Err(PatchRejection::UnknownSection(section.clone()));
         }
-        if !section_exists(section) {
+        if !descriptors.iter().any(|d| d.section == *section) {
             return Err(PatchRejection::UnknownSection(section.clone()));
         }
         let Some(fields) = value.as_object() else {
@@ -154,7 +171,7 @@ pub fn validate_patch(patch: &Value, scope: Scope, elevated: bool) -> Result<(),
         };
         for (field, val) in fields {
             let path = format!("{section}.{field}");
-            let Some(d) = lookup(section, field) else {
+            let Some(d) = lookup_in(descriptors, section, field) else {
                 return Err(PatchRejection::UnknownField(path));
             };
             if let WebWritePolicy::RequiresElevation { reason } = &d.web_write {

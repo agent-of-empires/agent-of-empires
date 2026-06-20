@@ -36,6 +36,7 @@ mod filewatch_tui_reload;
 mod intro;
 mod logs;
 mod new_session;
+mod plugins;
 mod profile_picker;
 mod project_registry;
 mod sandbox;

@@ -88,6 +88,22 @@ pub struct Config {
     /// palette (Ctrl+K).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub tools: HashMap<String, ToolSessionConfig>,
+
+    /// Per-plugin configuration keyed by plugin id (`[plugins."aoe.web"]`).
+    /// An explicit typed map rather than a root-level flatten so unknown core
+    /// keys still fail loudly while plugin enable-state survives every save.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub plugins: std::collections::BTreeMap<String, PluginConfig>,
+}
+
+/// Configuration for one bundled plugin: just whether it is enabled. Richer
+/// per-plugin settings return in a follow-up PR.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PluginConfig {
+    /// Whether the plugin is active. A disabled plugin contributes nothing to
+    /// any surface.
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 /// Configuration for a user-defined tool session (lazygit, yazi, tig, etc.)
@@ -2162,12 +2178,12 @@ pub(crate) fn config_path() -> Result<PathBuf> {
 impl Config {
     pub fn load() -> Result<Self> {
         let path = config_path()?;
-        if !path.exists() {
-            return Ok(Config::default());
-        }
-
-        let content = fs::read_to_string(&path)?;
-        let mut config: Config = toml::from_str(&content)?;
+        let table: toml::Table = if path.exists() {
+            toml::from_str(&fs::read_to_string(&path)?)?
+        } else {
+            toml::Table::new()
+        };
+        let mut config: Config = table.try_into()?;
         config.normalize();
         Ok(config)
     }
@@ -2221,7 +2237,8 @@ pub fn load_config() -> Result<Option<Config>> {
 
 pub fn save_config(config: &Config) -> Result<()> {
     let path = config_path()?;
-    let content = toml::to_string_pretty(config)?;
+    let table = toml::Table::try_from(config)?;
+    let content = toml::to_string_pretty(&table)?;
     super::atomic_write(&path, content.as_bytes())?;
     Ok(())
 }
@@ -2401,6 +2418,32 @@ mod tests {
         assert_eq!(config.default_profile, "custom");
         // Other fields should have defaults
         assert!(!config.worktree.enabled);
+    }
+
+    #[test]
+    fn test_plugins_table_round_trips_through_save() {
+        // A plugin's enable-state must survive serialize/deserialize.
+        let toml_in = r#"
+            [plugins."aoe.web"]
+            enabled = false
+        "#;
+        let config: Config = toml::from_str(toml_in).unwrap();
+        assert!(!config.plugins["aoe.web"].enabled);
+
+        let serialized = toml::to_string(&config).unwrap();
+        let reloaded: Config = toml::from_str(&serialized).unwrap();
+        assert!(!reloaded.plugins["aoe.web"].enabled);
+    }
+
+    #[test]
+    fn test_plugins_default_empty_and_omitted_from_toml() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(config.plugins.is_empty());
+        let serialized = toml::to_string(&config).unwrap();
+        assert!(
+            !serialized.contains("[plugins"),
+            "empty plugins map must not serialize a stray section"
+        );
     }
 
     // Tests for ThemeConfig
