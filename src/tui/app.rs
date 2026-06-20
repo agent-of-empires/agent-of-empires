@@ -132,6 +132,16 @@ pub struct App {
     home: HomeView,
     should_quit: bool,
     theme: Theme,
+    /// Identity of the currently applied `theme` (global theme name +
+    /// palette-downsample mode). `set_theme` compares against this so a
+    /// re-apply with the same identity is a no-op. The config-file watcher
+    /// re-dispatches the theme on EVERY `config.toml` save (it can't tell
+    /// what changed), and a needless `set_theme` there sets `needs_redraw`,
+    /// forcing a full-screen `clear_terminal` that flickers. Guarding here
+    /// keeps any config save (collapse persistence, list resize, `i`,
+    /// settings) from clearing the screen when the theme is unchanged.
+    theme_name: String,
+    theme_palette_mode: bool,
     needs_redraw: bool,
     update_info: Option<UpdateInfo>,
     update_rx: Option<tokio::sync::oneshot::Receiver<anyhow::Result<UpdateInfo>>>,
@@ -213,6 +223,15 @@ pub fn check_version_change() -> Result<Option<String>> {
     } else {
         Ok(None)
     }
+}
+
+/// Whether applying `next` `(theme name, palette-downsample mode)` would change
+/// the active theme `current`. Pulled out of `App::set_theme` so the
+/// idempotency guard (which keeps a config-file-watcher theme re-dispatch from
+/// forcing a flickering full-screen clear on every `config.toml` save) is
+/// unit-testable without constructing a full `App`.
+fn theme_apply_needed(current: (&str, bool), next: (&str, bool)) -> bool {
+    current != next
 }
 
 impl App {
@@ -349,6 +368,8 @@ impl App {
             home,
             should_quit: false,
             theme,
+            theme_name,
+            theme_palette_mode: palette_mode,
             needs_redraw: true,
             update_info: None,
             update_rx: None,
@@ -531,7 +552,20 @@ impl App {
         // global config: theme (and its color_mode) is a global preference,
         // not profile-merged.
         let palette_mode = crate::session::config::resolve_theme_palette_mode();
+        // No-op when the theme is already applied. The config watcher
+        // re-dispatches the theme on every `config.toml` save, so without
+        // this a list-resize / `i` / collapse-persistence / settings save
+        // would force a full-screen `clear_terminal` and flicker even though
+        // nothing visual changed.
+        if !theme_apply_needed(
+            (&self.theme_name, self.theme_palette_mode),
+            (name, palette_mode),
+        ) {
+            return;
+        }
         self.theme = crate::tui::styles::load_theme_with_mode(name, palette_mode);
+        self.theme_name = name.to_string();
+        self.theme_palette_mode = palette_mode;
         self.needs_redraw = true;
     }
 
@@ -823,6 +857,10 @@ impl App {
                                                             // non-burst path so dialog buttons are
                                                             // clickable even when a mouse event lands
                                                             // right after a paste/dictation burst.
+                                                        } else if self.home.handle_sidebar_collapse_click(mouse.column, mouse.row) {
+                                                            // Sidebar collapse/expand toggle; must
+                                                            // precede hit_list (button is on the
+                                                            // list's top border).
                                                         } else if hit_list {
                                                             let action = self.home.handle_click(mouse.column, mouse.row);
                                                             if action.is_none() {
@@ -899,6 +937,29 @@ impl App {
                             continue;
                         }
                         Some(Ok(Event::Mouse(mouse))) => {
+                            // Footer toolbar: a left-click on a button
+                            // synthesizes its shortcut and routes it through
+                            // the full key handler, so clicking behaves
+                            // exactly like pressing the key (global handling,
+                            // action dispatch, structured-view drain). The
+                            // footer is a disjoint area from the list/preview/
+                            // diff, so nothing else in this arm needs to run.
+                            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                                if let Some(key) =
+                                    self.home.footer_button_at(mouse.column, mouse.row)
+                                {
+                                    let _ = self.home.clear_preview_selection();
+                                    self.handle_key(key, terminal).await?;
+                                    self.sync_mouse_capture(terminal)?;
+                                    if !self.needs_redraw {
+                                        self.draw(terminal)?;
+                                    }
+                                    if self.should_quit {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                            }
                             let hit_list = self.home.hit_list(mouse.column, mouse.row);
                             let hit_preview = self.home.hit_preview(mouse.column, mouse.row);
                             let hit_diff = self.home.is_diff_open()
@@ -950,6 +1011,17 @@ impl App {
                                         self.set_theme(&name);
                                     }
                                     self.sync_mouse_capture(terminal)?;
+                                    self.draw(terminal)?;
+                                    None
+                                } else if self
+                                    .home
+                                    .handle_sidebar_collapse_click(mouse.column, mouse.row)
+                                {
+                                    // Collapse button (expanded list border) or
+                                    // the collapsed strip toggled the sidebar.
+                                    // Runs before hit_list because the button
+                                    // lives on the list's top border.
+                                    let _ = self.home.clear_preview_selection();
                                     self.draw(terminal)?;
                                     None
                                 } else if self
@@ -2996,6 +3068,27 @@ mod tests {
     use super::*;
     use crate::telemetry::SendOutcome;
     use std::sync::atomic::Ordering;
+
+    /// The theme idempotency guard must treat both the name AND the palette
+    /// mode as part of the theme identity, and report "no change" only when
+    /// both match. This is what keeps a config-file-watcher theme re-dispatch
+    /// (fired on every `config.toml` save: sidebar-collapse persistence, list
+    /// resize, `i`, settings) from forcing a flickering full-screen clear.
+    #[test]
+    fn theme_apply_needed_compares_name_and_palette_mode() {
+        assert!(
+            !theme_apply_needed(("empire", false), ("empire", false)),
+            "identical name + mode is a no-op (no redraw, no clear)"
+        );
+        assert!(
+            theme_apply_needed(("empire", false), ("zinc", false)),
+            "a different name must re-apply"
+        );
+        assert!(
+            theme_apply_needed(("empire", false), ("empire", true)),
+            "a different palette mode must re-apply even with the same name"
+        );
+    }
 
     // The TUI create counter is a process-global static, so these tests mutate
     // shared state. `#[serial]` (with the `telemetry_creates` group key) keeps

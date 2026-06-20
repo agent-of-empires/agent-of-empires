@@ -567,10 +567,12 @@ pub struct HomeView {
     /// shows the which-key menu. Always false outside live mode; cleared on
     /// live-send exit. See `handle_live_send_key`.
     pub(super) live_send_pending_leader: bool,
-    /// When true, the session list (sidebar) is hidden so the preview pane
-    /// gets the full terminal width. Toggled from live mode via the leader
-    /// (`leader b`) for a distraction-free structured view; reset on live-send
-    /// exit so the list always reappears in the normal home view.
+    /// When true, the session list (sidebar) collapses to a narrow,
+    /// click-to-expand strip so the preview pane gets nearly the full
+    /// terminal width. Toggled by the collapse button on the list border,
+    /// by clicking the collapsed strip, or from live mode via the leader
+    /// (`leader b`). Persisted to `app_state.home_sidebar_collapsed` so the
+    /// choice survives restarts.
     pub(super) sidebar_collapsed: bool,
     /// `(session_id, cols, rows)` of the last NON-live preview resize we sent
     /// to the selected agent's pane, so the 250ms preview poll doesn't
@@ -702,6 +704,23 @@ pub struct HomeView {
     /// keep working; clicks use the inner rect so we don't try to select
     /// the border row.
     pub(super) list_inner_area: Rect,
+    /// Clickable rect of the collapse button drawn on the list block's
+    /// top-right border (expanded side-by-side/stacked view). Zeroed on
+    /// frames where the button isn't drawn (e.g. while collapsed) so a
+    /// stale rect can't swallow clicks.
+    pub(super) collapse_button_area: Rect,
+    /// Clickable rect of the narrow strip shown in place of the list when
+    /// collapsed. Clicking anywhere in it re-expands the sidebar. Zeroed
+    /// while the full list is drawn.
+    pub(super) expand_strip_area: Rect,
+    /// Clickable footer-toolbar buttons captured during `render_status_bar`,
+    /// each paired with the `KeyEvent` a click synthesizes (so a click is
+    /// dispatched through the exact same path as pressing the shortcut).
+    /// Rebuilt every frame; empty in live mode and the takeover views.
+    pub(super) footer_buttons: Vec<(Rect, crossterm::event::KeyEvent)>,
+    /// Index into `footer_buttons` the pointer is currently over, used to
+    /// draw a hover highlight. Recomputed on every `Moved` event.
+    pub(super) footer_hover: Option<usize>,
     /// Last reported mouse position when it was over `list_inner_area`,
     /// `None` when the cursor is outside the list. Stored as a position
     /// rather than a resolved item index so wheel scrolls implicitly
@@ -1361,7 +1380,14 @@ impl HomeView {
             preview_wake: std::sync::Arc::new(tokio::sync::Notify::new()),
             live_send_last_resize: None,
             live_send_pending_leader: false,
-            sidebar_collapsed: false,
+            sidebar_collapsed: user_config
+                .as_ref()
+                .and_then(|c| c.app_state.home_sidebar_collapsed)
+                .unwrap_or(false),
+            collapse_button_area: Rect::default(),
+            expand_strip_area: Rect::default(),
+            footer_buttons: Vec::new(),
+            footer_hover: None,
             preview_pane_synced: None,
             pending_paste: None,
             pending_attach_after_warning: None,
@@ -3805,14 +3831,22 @@ impl HomeView {
         self.save_list_width();
     }
 
-    /// Hide or reveal the session list so the preview pane can use the
-    /// full terminal width. Only meaningful while live mode is active
-    /// (the render path ignores the flag otherwise and `exit_live_send_*`
-    /// resets it), so this is deliberately ephemeral rather than persisted
-    /// to config. The next render reflows the preview, and the live-send
-    /// resize loop pushes the new geometry to the agent's pane.
+    /// Collapse the session list to a narrow click-to-expand strip, or
+    /// re-expand it. The next render reflows the preview into the freed
+    /// width; in live mode the resize loop pushes the new geometry to the
+    /// agent's pane. Persisted so the choice survives restarts.
     pub fn toggle_sidebar_collapsed(&mut self) {
         self.sidebar_collapsed = !self.sidebar_collapsed;
+        self.save_sidebar_collapsed();
+    }
+
+    fn save_sidebar_collapsed(&self) {
+        if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
+            config.app_state.home_sidebar_collapsed = Some(self.sidebar_collapsed);
+            if let Err(e) = save_config(&config) {
+                tracing::warn!(target: "tui.home", "Failed to save config: {e}");
+            }
+        }
     }
 
     fn save_list_width(&self) {

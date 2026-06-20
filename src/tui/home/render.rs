@@ -1,6 +1,7 @@
 //! Rendering for HomeView
 
 use chrono::{DateTime, Utc};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 use std::time::{Duration, Instant};
@@ -468,6 +469,18 @@ impl HomeView {
         update_status: Option<&str>,
         image_update: Option<&ImageUpdate>,
     ) {
+        // Start each frame with no footer buttons and no sidebar
+        // collapse/expand hit rects; the home-view render paths
+        // (`render_status_bar`, `render_list` / `render_collapsed_strip`)
+        // repopulate them. The takeover views (settings/diff/serve) return
+        // before those run, so clearing here keeps a stale rect from a prior
+        // home frame from swallowing a click on the diff/serve surface (the
+        // collapse handler runs ahead of `hit_diff`). The live-send banner
+        // likewise replaces the footer, leaving the list empty.
+        self.footer_buttons.clear();
+        self.collapse_button_area = Rect::default();
+        self.expand_strip_area = Rect::default();
+
         // Settings view takes over the whole screen
         if let Some(ref mut settings) = self.settings_view {
             self.divider_col = None;
@@ -539,20 +552,28 @@ impl HomeView {
         // stacking gives the preview the full width.
         let available_width = main_chunks[0].width;
         self.main_area_width = available_width;
-        // Collapsed sidebar (live mode only): hand the whole main area to
-        // the preview so the agent pane fills the terminal. The live-send
-        // resize loop then reflows the agent to the wider geometry. Reset
-        // on live-send exit, so the list always returns in the home view.
-        if self.live_send.is_some() && self.sidebar_collapsed {
+        // Collapsed sidebar: the list shrinks to a narrow click-to-expand
+        // strip on the left and the preview takes the rest of the width
+        // (in live mode the resize loop then reflows the agent pane). This
+        // path is width-independent: a collapsed list is narrow enough that
+        // re-imposing the stacked breakpoint would only waste space.
+        if self.sidebar_collapsed {
             self.divider_col = None;
-            // render_list is skipped, so its hit-test rects would otherwise
-            // keep last frame's values and a click in the now-preview area
-            // could resolve to an invisible list row (and switch the live
-            // target). Zero them so mouse hit-testing can't target the
-            // hidden sidebar.
+            let strip_width = responsive::COLLAPSED_STRIP_WIDTH.min(available_width);
+            let chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Length(strip_width), Constraint::Min(0)])
+                .split(main_chunks[0]);
+            // The full list isn't drawn, so its hit-test rects would
+            // otherwise keep last frame's values and a click in the now-
+            // preview area could resolve to an invisible list row (and
+            // switch the live target). Zero them so mouse hit-testing can't
+            // target the hidden sidebar; `render` already cleared the
+            // collapse button rect, and the strip sets its own.
             self.list_area = Rect::default();
             self.list_inner_area = Rect::default();
-            self.render_preview(frame, main_chunks[0], theme);
+            self.render_collapsed_strip(frame, chunks[0], theme);
+            self.render_preview(frame, chunks[1], theme);
         } else if available_width < responsive::STACKED_BREAKPOINT {
             let main_height = main_chunks[0].height;
             let list_height = responsive::stacked_list_height(main_height);
@@ -705,6 +726,47 @@ impl HomeView {
         Block::default().borders(Borders::ALL).inner(panes[1])
     }
 
+    /// Render the collapsed sidebar: a narrow bordered strip standing in
+    /// for the full list. The whole strip is the click target (stored in
+    /// `expand_strip_area`) and re-expands the sidebar. A `»` glyph hints
+    /// the expand direction; the session count sits below it so the strip
+    /// still conveys "there are N sessions here".
+    fn render_collapsed_strip(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        self.expand_strip_area = area;
+        let border_color = match self.view_mode {
+            ViewMode::Structured => theme.border,
+            ViewMode::Terminal | ViewMode::Tool(_) => theme.terminal_border,
+        };
+        // Drop the right border so the preview's left border is the single
+        // shared seam, matching the expanded list and DESIGN.md's
+        // "eliminate the double-border between list and preview" rule.
+        let block = Block::default()
+            .borders(Borders::TOP | Borders::LEFT | Borders::BOTTOM)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(border_color));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+        let mut lines = vec![
+            Line::from(Span::styled(
+                "\u{00BB}",
+                Style::default().fg(theme.hint).bold(),
+            )),
+            Line::from(""),
+        ];
+        // Session count stacked one digit per row, since the strip is a
+        // single cell wide.
+        for ch in self.instances().len().to_string().chars() {
+            lines.push(Line::from(Span::styled(
+                ch.to_string(),
+                Style::default().fg(theme.dimmed),
+            )));
+        }
+        frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), inner);
+    }
+
     fn render_list(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         self.list_area = area;
         let profile = self.active_profile_display();
@@ -750,6 +812,31 @@ impl HomeView {
         let inner = block.inner(area);
         self.list_inner_area = inner;
         frame.render_widget(block, area);
+
+        // Collapse affordance on the top-right border. Clicking it shrinks
+        // the list to the click-to-expand strip. Drawn as an overlay on the
+        // border (after the block) so its clickable rect is known exactly,
+        // and skipped on a list too narrow to spare the columns without
+        // colliding with the title (`render` already zeroed the rect, so the
+        // narrow case needs no else).
+        const COLLAPSE_LABEL: &str = " \u{00AB} ";
+        const COLLAPSE_LABEL_WIDTH: u16 = 3;
+        if area.width > COLLAPSE_LABEL_WIDTH + 6 {
+            let btn_rect = Rect {
+                x: area.right() - COLLAPSE_LABEL_WIDTH,
+                y: area.y,
+                width: COLLAPSE_LABEL_WIDTH,
+                height: 1,
+            };
+            self.collapse_button_area = btn_rect;
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    COLLAPSE_LABEL,
+                    Style::default().fg(theme.hint).bold(),
+                )),
+                btn_rect,
+            );
+        }
 
         if self.instances().is_empty() && !self.has_any_groups() {
             let empty_text = vec![
@@ -2551,7 +2638,7 @@ impl HomeView {
         frame.render_widget(para, area);
     }
 
-    fn render_status_bar(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+    fn render_status_bar(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         // Live-send banner takes over the status bar so the user has an
         // always-visible reminder that keystrokes are being relayed to
         // the pane (and how to get out). Distinct color + bold so it
@@ -2701,7 +2788,17 @@ impl HomeView {
         let mk_key =
             |key: &str| -> Vec<Span<'static>> { vec![Span::styled(key.to_string(), key_style)] };
 
-        let mut groups: Vec<(u8, Vec<Span<'static>>)> = Vec::new();
+        // Key a footer button synthesizes on click. The registry matches on
+        // the bare keycode (Shift implied by an uppercase char, Ctrl by the
+        // flag), so a plain char and a Ctrl char cover every footer chord.
+        let kc = |c: char| Some(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        let kctrl = |c: char| Some(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+        let kenter = Some(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        // (priority, click-key, spans). `click-key` is `None` for the
+        // non-actionable status indicators (Serve / watching), which render
+        // but aren't clickable.
+        let mut groups: Vec<(u8, Option<KeyEvent>, Vec<Span<'static>>)> = Vec::new();
 
         // Serve indicator: shown only when the `aoe serve` daemon is live.
         // The TUI does not own the daemon, so we probe the PID file each
@@ -2717,6 +2814,7 @@ impl HomeView {
                 };
                 groups.push((
                     0,
+                    None,
                     vec![Span::styled(
                         label,
                         Style::default().fg(theme.running).bold(),
@@ -2733,6 +2831,7 @@ impl HomeView {
         if self.active_tui_count > 1 {
             groups.push((
                 0,
+                None,
                 vec![Span::styled(
                     format!(" \u{25C9} {} watching ", self.active_tui_count),
                     Style::default().fg(theme.accent).bold(),
@@ -2751,7 +2850,7 @@ impl HomeView {
                 let desc = format!("send {} buffered", buf.chars().count());
                 let mut spans = mk(key, &desc);
                 spans[1] = Span::styled(desc, Style::default().fg(theme.running).bold());
-                groups.push((0, spans));
+                groups.push((0, kc(if strict { 'M' } else { 'm' }), spans));
             }
         }
 
@@ -2771,29 +2870,45 @@ impl HomeView {
             // visual gap before the description — at most fonts the arrow
             // glyph fills its cell tightly and a single mk-internal space
             // looks too close to the desc.
-            groups.push((0, mk("↵ ", enter_action_text)));
+            groups.push((0, kenter, mk("↵ ", enter_action_text)));
         }
 
-        groups.push((2, mk(if strict { "T" } else { "t" }, "View")));
+        groups.push((
+            2,
+            kc(if strict { 'T' } else { 't' }),
+            mk(if strict { "T" } else { "t" }, "View"),
+        ));
         if matches!(self.view_mode, ViewMode::Tool(_)) {
-            groups.push((1, mk(";", "Back")));
+            groups.push((1, kc(';'), mk(";", "Back")));
         } else if !self.tool_configs.is_empty() {
-            groups.push((2, mk(";", "Tools")));
+            groups.push((2, kc(';'), mk(";", "Tools")));
         }
-        groups.push((3, mk(if strict { "^G" } else { "g" }, "Group")));
+        groups.push((
+            3,
+            if strict { kctrl('g') } else { kc('g') },
+            mk(if strict { "^G" } else { "g" }, "Group"),
+        ));
 
         // c: container/host toggle hint for sandboxed sessions in Terminal view
         if self.view_mode == ViewMode::Terminal {
             if let Some(id) = &self.selected_session {
                 if let Some(inst) = self.get_instance(id) {
                     if inst.is_sandboxed() {
-                        groups.push((4, mk(if strict { "C" } else { "c" }, "Mode")));
+                        groups.push((
+                            4,
+                            kc(if strict { 'C' } else { 'c' }),
+                            mk(if strict { "C" } else { "c" }, "Mode"),
+                        ));
                     }
                 }
             }
         }
 
-        groups.push((2, mk(if strict { "N" } else { "n" }, "New")));
+        groups.push((
+            2,
+            kc(if strict { 'N' } else { 'n' }),
+            mk(if strict { "N" } else { "n" }, "New"),
+        ));
 
         // Priority 1: user's core daily workflow (message / del).
         // These survive the greedy pack under narrow-pane widths (iPad
@@ -2801,10 +2916,18 @@ impl HomeView {
         // reaches for most often. Del stays at p3, less frequent,
         // OK to drop first.
         if self.selected_session.is_some() {
-            groups.push((1, mk(if strict { "M" } else { "m" }, "Msg")));
+            groups.push((
+                1,
+                kc(if strict { 'M' } else { 'm' }),
+                mk(if strict { "M" } else { "m" }, "Msg"),
+            ));
         }
         if !self.flat_items.is_empty() {
-            groups.push((3, mk(if strict { "D" } else { "d" }, "Del")));
+            groups.push((
+                3,
+                kc(if strict { 'D' } else { 'd' }),
+                mk(if strict { "D" } else { "d" }, "Del"),
+            ));
         }
         // Attention-workflow shortcuts (Archive / Fav / Snooze) only render
         // when the user is in Attention sort. They are only useful for
@@ -2812,25 +2935,43 @@ impl HomeView {
         // they just take footer space without changing what the user sees.
         if self.sort_order == SortOrder::Attention {
             if !self.flat_items.is_empty() {
-                groups.push((1, mk(if strict { "Z" } else { "z" }, "Archive")));
+                groups.push((
+                    1,
+                    kc(if strict { 'Z' } else { 'z' }),
+                    mk(if strict { "Z" } else { "z" }, "Archive"),
+                ));
             }
             if self.selected_session.is_some() {
-                groups.push((1, mk(if strict { "F" } else { "f" }, "Fav")));
-                groups.push((1, mk(if strict { "H" } else { "h" }, "Snooze")));
+                groups.push((
+                    1,
+                    kc(if strict { 'F' } else { 'f' }),
+                    mk(if strict { "F" } else { "f" }, "Fav"),
+                ));
+                groups.push((
+                    1,
+                    kc(if strict { 'H' } else { 'h' }),
+                    mk(if strict { "H" } else { "h" }, "Snooze"),
+                ));
             }
         }
 
-        groups.push((4, mk_key("/")));
-        groups.push((4, mk(if strict { "^D" } else { "D" }, "Diff")));
-        groups.push((1, mk("^K", "Cmds")));
-        groups.push((0, mk_key("?")));
+        groups.push((4, kc('/'), mk_key("/")));
+        groups.push((
+            4,
+            if strict { kctrl('d') } else { kc('D') },
+            mk(if strict { "^D" } else { "D" }, "Diff"),
+        ));
+        groups.push((1, kctrl('k'), mk("^K", "Cmds")));
+        groups.push((0, kc('?'), mk_key("?")));
 
         // Greedy pack by priority. Width of a group = sum of span char counts;
         // separator between kept groups adds 3 cols each (" · "). Reserve 1
         // col for the leading space margin.
+        // Display-cell width (not `chars().count()`) so the greedy pack and
+        // the click rects line up with the cells ratatui actually paints.
         let widths: Vec<usize> = groups
             .iter()
-            .map(|(_, g)| g.iter().map(|s| s.content.chars().count()).sum::<usize>())
+            .map(|(_, _, g)| g.iter().map(|s| s.width()).sum::<usize>())
             .collect();
         let avail = (area.width as usize).saturating_sub(1);
 
@@ -2849,16 +2990,51 @@ impl HomeView {
             }
         }
 
+        // Inverted-chip highlight for the button under the pointer, matching
+        // the LIVE chip's fg/bg swap so hover reads as "this is clickable".
+        let hover_style = Style::default()
+            .fg(theme.background)
+            .bg(theme.accent)
+            .bold();
+
         let mut spans: Vec<Span> = vec![Span::raw(" ")];
         let mut first = true;
-        for (i, (_, group)) in groups.into_iter().enumerate() {
+        // Column of the next span; starts past the leading space margin. Used
+        // to record each clickable button's hit rect as it's laid out.
+        let mut col = area.x.saturating_add(1);
+        let mut clickable_idx = 0usize;
+        for (i, (_, key, group)) in groups.into_iter().enumerate() {
             if !keep[i] {
                 continue;
             }
             if !first {
                 spans.push(Span::styled(" · ", sep_style));
+                col = col.saturating_add(3);
             }
-            spans.extend(group);
+            let width = widths[i] as u16;
+            match key {
+                Some(key) => {
+                    self.footer_buttons.push((
+                        Rect {
+                            x: col,
+                            y: area.y,
+                            width,
+                            height: area.height,
+                        },
+                        key,
+                    ));
+                    if self.footer_hover == Some(clickable_idx) {
+                        for s in group {
+                            spans.push(Span::styled(s.content, hover_style));
+                        }
+                    } else {
+                        spans.extend(group);
+                    }
+                    clickable_idx += 1;
+                }
+                None => spans.extend(group),
+            }
+            col = col.saturating_add(width);
             first = false;
         }
 
