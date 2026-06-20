@@ -6818,7 +6818,6 @@ mod tests {
             use std::time::{Duration, SystemTime};
             use tempfile::{tempdir, TempDir};
 
-            /// RAII env-restore guard, matches `VibeHomeGuard` shape in capture.rs.
             struct ClaudeHomeGuard {
                 prev_home: Option<String>,
                 prev_xdg: Option<String>,

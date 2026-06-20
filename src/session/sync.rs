@@ -1,11 +1,10 @@
 //! Drain pollers' session-id mpsc channels and persist observations.
 //!
-//! Lifted out of `tui/home/mod.rs::apply_session_id_updates` so the daemon's
-//! `status_poll_loop` can run the same path. Without it, sessions running
+//! Shared by the TUI tick (`apply_session_id_updates`) and the daemon's
+//! `status_poll_loop`. Without the daemon-side caller, sessions running
 //! under `aoe serve` without an attached TUI never persist post-`/clear`
-//! sids through the channel: the TUI is the only consumer of the mpsc that
-//! `SessionPoller::on_change` pushes to, leaving `sessions.json` stale until
-//! the next launch's resume-time verify (#2291).
+//! sids through the channel and `sessions.json` stays stale until the
+//! next launch's resume-time verify (#2291).
 //!
 //! The helper takes `&mut [Instance]` and mutates the slice's per-instance
 //! `agent_session_id` and `resume_probe_failed_sid` directly. It does NOT
@@ -28,22 +27,22 @@ use crate::session::{persist_session_to_storage, Instance, SidWrite};
 /// auxiliary in-memory mirror (e.g. the TUI's `instance_map`) can re-sync
 /// each affected entry from the slice.
 #[derive(Debug, Default, Clone)]
-pub struct SessionIdSyncOutcome {
+pub(crate) struct SessionIdSyncOutcome {
     /// Instances whose `agent_session_id` was updated to a poller-observed
     /// value (CAS-Applied; `resume_probe_failed_sid` is also reset).
-    pub applied: Vec<String>,
+    pub(crate) applied: Vec<String>,
     /// Instances whose in-memory state was reloaded from disk after a
     /// CAS-Skipped persist (peer wrote a different sid first).
-    pub rolled_back: Vec<String>,
+    pub(crate) rolled_back: Vec<String>,
     /// Instances whose poller-observed sid was rejected (validation failed,
     /// matched a cleared sid in the per-instance exclusion set, or the
     /// persist returned Failed). The tmux env mirror is republished from
     /// the in-memory value for these so the on_change publish is overwritten.
-    pub filtered: Vec<String>,
+    pub(crate) filtered: Vec<String>,
 }
 
 impl SessionIdSyncOutcome {
-    pub fn touched(&self) -> bool {
+    pub(crate) fn touched(&self) -> bool {
         !self.applied.is_empty() || !self.rolled_back.is_empty() || !self.filtered.is_empty()
     }
 }
@@ -55,8 +54,6 @@ struct Update {
     profile: String,
 }
 
-/// CAS-Skipped reload: peer wrote a different sid first, so memory must
-/// adopt the on-disk values rather than the poller's observation.
 struct Rollback {
     id: String,
     disk_sid: Option<String>,
@@ -64,10 +61,9 @@ struct Rollback {
 }
 
 /// Drain each instance's poller channel, persist new sids via CAS, reconcile
-/// in-memory state on the slice, and republish tmux env. Mutates `instances`
-/// in place; callers with auxiliary mirrors must re-sync touched ids from
-/// the slice.
-pub fn drain_and_persist_session_ids(
+/// in-memory state, and republish tmux env. Callers with auxiliary mirrors
+/// must re-sync touched ids from the slice.
+pub(crate) fn drain_and_persist_session_ids(
     instances: &mut [Instance],
     file_watch: &Arc<FileWatchService>,
 ) -> SessionIdSyncOutcome {
@@ -271,12 +267,12 @@ mod tests {
     use std::sync::Mutex;
     use tempfile::{tempdir, TempDir};
 
-    struct HomeGuard {
+    struct StorageHomeGuard {
         prev_home: Option<String>,
         prev_xdg: Option<String>,
     }
 
-    impl HomeGuard {
+    impl StorageHomeGuard {
         fn set(temp: &TempDir) -> Self {
             let prev_home = std::env::var("HOME").ok();
             let prev_xdg = std::env::var("XDG_CONFIG_HOME").ok();
@@ -290,16 +286,17 @@ mod tests {
         }
     }
 
-    impl Drop for HomeGuard {
+    impl Drop for StorageHomeGuard {
         fn drop(&mut self) {
-            match self.prev_home.take() {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-            match self.prev_xdg.take() {
-                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
+            restore_or_remove("HOME", self.prev_home.take());
+            restore_or_remove("XDG_CONFIG_HOME", self.prev_xdg.take());
+        }
+    }
+
+    fn restore_or_remove(key: &str, prev: Option<String>) {
+        match prev {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
         }
     }
 
@@ -326,7 +323,7 @@ mod tests {
     #[serial]
     fn drain_applied_updates_memory_and_clears_failed_sid() {
         let temp = tempdir().unwrap();
-        let _guard = HomeGuard::set(&temp);
+        let _guard = StorageHomeGuard::set(&temp);
 
         let profile = "sync-applied";
         let mut inst = Instance::new("sync-applied-title", "/tmp/x");
@@ -358,7 +355,7 @@ mod tests {
     #[serial]
     fn drain_filters_invalid_sid_and_leaves_state_unchanged() {
         let temp = tempdir().unwrap();
-        let _guard = HomeGuard::set(&temp);
+        let _guard = StorageHomeGuard::set(&temp);
 
         let profile = "sync-filtered-validation";
         let mut inst = Instance::new("sync-validation-title", "/tmp/x");
@@ -385,7 +382,7 @@ mod tests {
     #[serial]
     fn drain_filters_sid_present_in_retroactive_capture_excludes() {
         let temp = tempdir().unwrap();
-        let _guard = HomeGuard::set(&temp);
+        let _guard = StorageHomeGuard::set(&temp);
 
         let profile = "sync-filtered-excludes";
         let excluded = "019342ab-1234-7def-8901-abcdef012345";

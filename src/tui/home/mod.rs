@@ -2633,12 +2633,7 @@ impl HomeView {
         if !outcome.touched() {
             return false;
         }
-        for id in outcome
-            .applied
-            .iter()
-            .chain(outcome.rolled_back.iter())
-            .chain(outcome.filtered.iter())
-        {
+        for id in outcome.applied.iter().chain(outcome.rolled_back.iter()) {
             if let Some(inst) = self.instances.iter().find(|i| i.id == *id).cloned() {
                 self.instance_map.insert(id.clone(), inst);
             }
