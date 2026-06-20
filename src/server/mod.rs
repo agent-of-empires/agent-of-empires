@@ -2824,7 +2824,11 @@ fn decrement_reported_count(counter: &std::sync::atomic::AtomicU32, reported: u3
 /// leaves the session module free of any broadcast-channel dependency
 /// and keeps TUI/CLI callers unchanged.
 async fn status_poll_loop(state: Arc<AppState>) {
+    // `Delay` re-arms the next tick `period` after the current one returns,
+    // so a stall (suspend, scheduler stall, flock contention) does not drain
+    // queued ticks and collapse the 2s cooldown the per-tick work expects.
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     #[cfg(feature = "serve")]
     let mut attempted_acp_spawns: std::collections::HashSet<String> =
         std::collections::HashSet::new();
@@ -5031,5 +5035,27 @@ mod tests {
     async fn token_manager_no_auth_mode() {
         let mgr = TokenManager::new(None, Duration::from_secs(3600));
         assert!(mgr.is_no_auth().await);
+    }
+
+    // Pins the `MissedTickBehavior::Delay` contract on `tokio::time::interval`;
+    // the prod callsite (`status_poll_loop`) is not exercised by this test.
+    #[tokio::test]
+    async fn status_poll_loop_interval_delays_after_stall() {
+        let period = Duration::from_millis(100);
+        let mut interval = tokio::time::interval(period);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        interval.tick().await;
+        tokio::time::sleep(period * 4).await;
+        interval.tick().await;
+
+        let before = std::time::Instant::now();
+        interval.tick().await;
+        let gap = before.elapsed();
+
+        assert!(
+            gap >= Duration::from_millis(80),
+            "second post-stall tick must wait ~period (Delay), got {gap:?}"
+        );
     }
 }
