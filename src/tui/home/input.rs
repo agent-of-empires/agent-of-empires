@@ -370,6 +370,47 @@ impl HomeView {
         self.list_area.contains(Position::from((col, row)))
     }
 
+    /// The `KeyEvent` a footer-toolbar button at `(col, row)` synthesizes,
+    /// or `None` when the click misses every button. The caller routes the
+    /// returned key through the normal key handler so a click behaves
+    /// exactly like pressing the shortcut. Returns `None` while a non-live
+    /// overlay (dialog, context menu, help, search) is open: the footer is
+    /// drawn underneath it, but the overlay owns clicks, so a footer button
+    /// must not fire a shortcut behind it.
+    pub fn footer_button_at(&self, col: u16, row: u16) -> Option<KeyEvent> {
+        if self.has_non_live_send_overlay() {
+            return None;
+        }
+        let pos = Position::from((col, row));
+        self.footer_buttons
+            .iter()
+            .find(|(rect, _)| rect.contains(pos))
+            .map(|(_, key)| *key)
+    }
+
+    /// Handle a left-click on the sidebar collapse/expand affordances:
+    /// the collapse button on the expanded list's top-right border, or
+    /// anywhere in the collapsed strip. Returns true when the click landed
+    /// on one (and toggled), so the caller can stop before the row-click
+    /// path. The collapse button sits on the list's top border, which is
+    /// inside `list_area`, so this MUST run before `hit_list` or the click
+    /// falls through to `handle_empty_list_click` and opens a new session.
+    /// No-op while a non-live overlay is open so a click can't toggle the
+    /// sidebar behind a modal (the rects are cleared for the full-screen
+    /// takeover views, so a dialog overlay is the case left to guard).
+    pub fn handle_sidebar_collapse_click(&mut self, col: u16, row: u16) -> bool {
+        if self.has_non_live_send_overlay() {
+            return false;
+        }
+        let pos = Position::from((col, row));
+        if self.collapse_button_area.contains(pos) || self.expand_strip_area.contains(pos) {
+            self.toggle_sidebar_collapsed();
+            true
+        } else {
+            false
+        }
+    }
+
     /// True when `(col, row)` lands on the side-by-side list/preview
     /// divider. The divider is the preview's left border column (one
     /// past `list_area.right()` is exclusive, so this *is* a valid hit
@@ -3982,6 +4023,16 @@ impl HomeView {
             overlay_changed |= dialog.handle_hover(col, row);
         }
 
+        // Footer-toolbar hover: the index drives the inverted-chip highlight
+        // on the next render. Recomputed against the current button rects so
+        // it clears the moment the pointer leaves a button.
+        let prev_footer_hover = self.footer_hover;
+        self.footer_hover = self
+            .footer_buttons
+            .iter()
+            .position(|(rect, _)| rect.contains(Position::from((col, row))));
+        let footer_changed = prev_footer_hover != self.footer_hover;
+
         let new_pos = if self.list_inner_area.contains(Position::from((col, row))) {
             Some((col, row))
         } else {
@@ -3990,7 +4041,7 @@ impl HomeView {
         let prev_idx = self.hovered_index();
         self.mouse_pos = new_pos;
         let new_idx = self.hovered_index();
-        overlay_changed || prev_idx != new_idx
+        overlay_changed || footer_changed || prev_idx != new_idx
     }
 
     /// Route a mouse-wheel-down at (col, row); see handle_scroll_up.
@@ -4359,11 +4410,12 @@ impl HomeView {
         // previewed after exit, just at the idle cadence. The render
         // reconcile retunes it (and retargets if the view later changes).
         self.live_send_last_resize = None;
-        // The leader menu and sidebar collapse are live-mode-only: drop
-        // any half-entered leader chord and re-reveal the session list so
-        // the normal home view is never left in a collapsed or armed state.
+        // The leader menu is live-mode-only: drop any half-entered chord so
+        // the home view is never left armed. The sidebar collapse is now a
+        // general, persisted home-view state (the collapsed strip stays
+        // clickable here), so exiting live mode deliberately leaves it as
+        // the user set it rather than force-revealing the list.
         self.live_send_pending_leader = false;
-        self.sidebar_collapsed = false;
         // Live mode just owned the pane's size; the non-live preview must
         // re-assert its geometry on the next render now that the header is
         // visible again (and so the agent reflows back to the previewed size).

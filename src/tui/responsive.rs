@@ -32,6 +32,11 @@ pub const STACKED_BREAKPOINT: u16 = 80;
 /// without hash-soup wrapping. Used as the side-by-side preview floor.
 pub const PREVIEW_MIN_WIDTH: u16 = 40;
 
+/// Width of the collapsed-sidebar strip: a bordered column wide enough
+/// for the `»` expand glyph plus its two border columns. Everything else
+/// goes to the preview, so the strip is intentionally minimal.
+pub const COLLAPSED_STRIP_WIDTH: u16 = 3;
+
 /// In stacked mode the list takes 1/N of vertical space.
 pub const STACKED_LIST_HEIGHT_FRACTION: u16 = 3;
 
