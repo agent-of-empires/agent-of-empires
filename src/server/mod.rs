@@ -2937,16 +2937,36 @@ async fn status_poll_loop(state: Arc<AppState>) {
 
             // Drain poller observations into sessions.json so daemon-only
             // sessions (no attached TUI) persist post-`/clear` sids (#2291).
+            // Snapshot + spawn_blocking + reapply, never holding AppState
+            // across the flock or tmux exec, per storage.rs:46.
+            let snapshot = state.instances.read().await.clone();
+            let drain_state = state.clone();
+            match tokio::task::spawn_blocking(move || {
+                let mut snapshot = snapshot;
+                let outcome = crate::session::sync::drain_and_persist_session_ids(
+                    &mut snapshot,
+                    &drain_state.file_watch,
+                );
+                (outcome, snapshot)
+            })
+            .await
             {
-                let state_for_drain = state.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    let mut guard = state_for_drain.instances.blocking_write();
-                    crate::session::sync::drain_and_persist_session_ids(
-                        &mut guard,
-                        &state_for_drain.file_watch,
-                    )
-                })
-                .await;
+                Ok((outcome, mutated)) if outcome.touched() => {
+                    let mut guard = state.instances.write().await;
+                    for src in &mutated {
+                        if let Some(dst) = guard.iter_mut().find(|i| i.id == src.id) {
+                            dst.agent_session_id = src.agent_session_id.clone();
+                            dst.resume_probe_failed_sid = src.resume_probe_failed_sid.clone();
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::error!(
+                        target: "session.sync",
+                        "drain_and_persist task failed: {e}",
+                    );
+                }
             }
 
             #[cfg(feature = "serve")]

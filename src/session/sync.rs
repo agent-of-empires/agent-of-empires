@@ -6,6 +6,14 @@
 //! sids through the channel: the TUI is the only consumer of the mpsc that
 //! `SessionPoller::on_change` pushes to, leaving `sessions.json` stale until
 //! the next launch's resume-time verify (#2291).
+//!
+//! The helper takes `&mut [Instance]` and mutates the slice's per-instance
+//! `agent_session_id` and `resume_probe_failed_sid` directly. It does NOT
+//! take any tokio lock and is safe to call from within `spawn_blocking`.
+//! Daemon callers MUST satisfy the lock-ordering invariant in
+//! `storage.rs:46`: snapshot the instances under a brief read lock, run the
+//! helper on the snapshot inside `spawn_blocking`, then reapply the
+//! mutations to live state under a brief write lock.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -35,9 +43,26 @@ pub struct SessionIdSyncOutcome {
 }
 
 impl SessionIdSyncOutcome {
+    /// True iff at least one instance was applied, rolled back, or filtered.
     pub fn touched(&self) -> bool {
         !self.applied.is_empty() || !self.rolled_back.is_empty() || !self.filtered.is_empty()
     }
+}
+
+/// Pending CAS update derived from a poller observation.
+struct Update {
+    id: String,
+    sid: String,
+    expected_prior: Option<String>,
+    profile: String,
+}
+
+/// CAS-Skipped reload: peer wrote a different sid first, so memory must
+/// adopt the on-disk values rather than the poller's observation.
+struct Rollback {
+    id: String,
+    disk_sid: Option<String>,
+    disk_failed_sid: Option<String>,
 }
 
 /// Drain each instance's poller channel, persist new sids via CAS, reconcile
@@ -48,35 +73,34 @@ pub fn drain_and_persist_session_ids(
     instances: &mut [Instance],
     file_watch: &Arc<FileWatchService>,
 ) -> SessionIdSyncOutcome {
-    let mut updates: Vec<(String, String, Option<String>)> = Vec::new();
-    let mut filtered_ids: HashSet<String> = HashSet::new();
+    let mut updates: Vec<Update> = Vec::with_capacity(instances.len());
+    let mut filtered_ids: HashSet<String> = HashSet::with_capacity(instances.len());
 
     for inst in instances.iter() {
-        let Some((_id, session_id)) = inst
-            .session_id_poller
-            .as_ref()
-            .and_then(|p| p.lock().ok())
-            .and_then(|p| p.try_recv_session_update())
-        else {
+        let Some(sid) = try_drain_poller(inst) else {
             continue;
         };
-        let Some(session_id) = validated_session_id(session_id) else {
+        let Some(sid) = validated_session_id(sid) else {
             filtered_ids.insert(inst.id.clone());
             continue;
         };
-        if inst.retroactive_capture_excludes.contains(&session_id) {
+        if inst.retroactive_capture_excludes.contains(&sid) {
             tracing::debug!(
                 target: "session.sync",
-                "Ignoring poller-reported sid {} for {}: in retroactive_capture_excludes",
-                session_id,
-                inst.id,
+                instance = %inst.id,
+                sid = %sid,
+                "Ignoring poller-reported sid: in retroactive_capture_excludes",
             );
             filtered_ids.insert(inst.id.clone());
             continue;
         }
-        if inst.agent_session_id.as_deref() != Some(session_id.as_str()) {
-            let expected_prior = inst.agent_session_id.clone();
-            updates.push((inst.id.clone(), session_id, expected_prior));
+        if inst.agent_session_id.as_deref() != Some(sid.as_str()) {
+            updates.push(Update {
+                id: inst.id.clone(),
+                sid,
+                expected_prior: inst.agent_session_id.clone(),
+                profile: inst.source_profile.clone(),
+            });
         }
     }
 
@@ -84,65 +108,47 @@ pub fn drain_and_persist_session_ids(
         return SessionIdSyncOutcome::default();
     }
 
-    let mut to_apply: Vec<(String, String)> = Vec::new();
-    let mut to_rollback: Vec<(String, Option<String>, Option<String>)> = Vec::new();
+    let mut to_apply: Vec<(String, String)> = Vec::with_capacity(updates.len());
+    let mut to_rollback: Vec<Rollback> = Vec::with_capacity(updates.len());
 
-    for (id, session_id, expected_prior) in &updates {
-        let Some(profile) = instances
-            .iter()
-            .find(|i| i.id == *id)
-            .map(|i| i.source_profile.clone())
-        else {
-            continue;
-        };
+    for upd in &updates {
         match persist_session_to_storage(
-            &profile,
-            id,
-            session_id,
-            expected_prior.as_deref(),
+            &upd.profile,
+            &upd.id,
+            &upd.sid,
+            upd.expected_prior.as_deref(),
             file_watch,
         ) {
             SidWrite::Applied => {
-                to_apply.push((id.clone(), session_id.clone()));
+                to_apply.push((upd.id.clone(), upd.sid.clone()));
             }
             SidWrite::Skipped => {
-                let mut reloaded = false;
-                if let Ok(storage) = Storage::new(&profile, file_watch.clone()) {
-                    if let Ok(disk_insts) = storage.load() {
-                        if let Some(disk_inst) = disk_insts.iter().find(|i| i.id == *id) {
-                            to_rollback.push((
-                                id.clone(),
-                                disk_inst.agent_session_id.clone(),
-                                disk_inst.resume_probe_failed_sid.clone(),
-                            ));
-                            reloaded = true;
-                        }
-                    }
-                }
-                if !reloaded {
+                if let Some(rb) = reload_skipped_from_disk(&upd.profile, &upd.id, file_watch) {
+                    to_rollback.push(rb);
+                } else {
                     tracing::warn!(
                         target: "session.sync",
-                        instance = %id,
-                        "Skipped reload failed; deferring env reconcile"
+                        instance = %upd.id,
+                        "Skipped reload failed; deferring env reconcile",
                     );
                 }
             }
             SidWrite::Failed => {
-                filtered_ids.insert(id.clone());
+                filtered_ids.insert(upd.id.clone());
             }
         }
     }
 
-    for (id, session_id) in &to_apply {
+    for (id, sid) in &to_apply {
         if let Some(inst) = instances.iter_mut().find(|i| i.id == *id) {
-            inst.agent_session_id = Some(session_id.clone());
+            inst.agent_session_id = Some(sid.clone());
             inst.resume_probe_failed_sid = None;
         }
     }
-    for (id, disk_sid, disk_failed_sid) in &to_rollback {
-        if let Some(inst) = instances.iter_mut().find(|i| i.id == *id) {
-            inst.agent_session_id = disk_sid.clone();
-            inst.resume_probe_failed_sid = disk_failed_sid.clone();
+    for rb in &to_rollback {
+        if let Some(inst) = instances.iter_mut().find(|i| i.id == rb.id) {
+            inst.agent_session_id = rb.disk_sid.clone();
+            inst.resume_probe_failed_sid = rb.disk_failed_sid.clone();
         }
     }
 
@@ -150,27 +156,65 @@ pub fn drain_and_persist_session_ids(
 
     SessionIdSyncOutcome {
         applied: to_apply.into_iter().map(|(id, _)| id).collect(),
-        rolled_back: to_rollback.into_iter().map(|(id, _, _)| id).collect(),
+        rolled_back: to_rollback.into_iter().map(|r| r.id).collect(),
         filtered: filtered_ids.into_iter().collect(),
     }
+}
+
+/// Try to drain one poller observation off the per-instance mpsc. Recovers
+/// the inner guard from a poisoned mutex with a logged warning so a poison
+/// (typically from a panic in another thread) does not silently freeze the
+/// drain forever.
+fn try_drain_poller(inst: &Instance) -> Option<String> {
+    let arc = inst.session_id_poller.as_ref()?;
+    let guard = match arc.lock() {
+        Ok(g) => g,
+        Err(poisoned) => {
+            tracing::warn!(
+                target: "session.sync",
+                instance = %inst.id,
+                "session_id_poller mutex poisoned; recovering inner guard",
+            );
+            poisoned.into_inner()
+        }
+    };
+    let (_id, sid) = guard.try_recv_session_update()?;
+    Some(sid)
+}
+
+fn reload_skipped_from_disk(
+    profile: &str,
+    id: &str,
+    file_watch: &Arc<FileWatchService>,
+) -> Option<Rollback> {
+    let storage = Storage::new(profile, file_watch.clone()).ok()?;
+    let disk_insts = storage.load().ok()?;
+    let disk_inst = disk_insts.iter().find(|i| i.id == id)?;
+    Some(Rollback {
+        id: id.to_string(),
+        disk_sid: disk_inst.agent_session_id.clone(),
+        disk_failed_sid: disk_inst.resume_probe_failed_sid.clone(),
+    })
 }
 
 fn publish_tmux_env(
     instances: &[Instance],
     to_apply: &[(String, String)],
-    to_rollback: &[(String, Option<String>, Option<String>)],
+    to_rollback: &[Rollback],
     filtered_ids: &HashSet<String>,
 ) {
-    let touched_ids: Vec<&str> = to_apply
+    let touched_count = to_apply.len() + to_rollback.len() + filtered_ids.len();
+    let mut set_batch: Vec<(String, String, String)> = Vec::with_capacity(touched_count);
+    let mut unset_batch: Vec<(String, String)> = Vec::with_capacity(touched_count);
+
+    let touched_ids = to_apply
         .iter()
         .map(|(id, _)| id.as_str())
-        .chain(to_rollback.iter().map(|(id, _, _)| id.as_str()))
-        .chain(filtered_ids.iter().map(|s| s.as_str()))
-        .collect();
-    let mut set_batch: Vec<(String, String, String)> = Vec::new();
-    let mut unset_batch: Vec<(String, String)> = Vec::new();
-    for id in &touched_ids {
-        let Some(inst) = instances.iter().find(|i| i.id == **id) else {
+        .chain(to_rollback.iter().map(|r| r.id.as_str()))
+        .chain(filtered_ids.iter().map(|s| s.as_str()));
+
+    for id in touched_ids {
+        let Some(inst) = instances.iter().find(|i| i.id == id) else {
             continue;
         };
         let tmux_name = match inst.tmux_session() {
@@ -180,8 +224,7 @@ fn publish_tmux_env(
                 tracing::warn!(
                     target: "session.sync",
                     instance = %id,
-                    "Skipping tmux env publish; tmux_session() error: {}",
-                    e
+                    "Skipping tmux env publish; tmux_session() error: {e}",
                 );
                 continue;
             }
@@ -198,13 +241,14 @@ fn publish_tmux_env(
             )),
         }
     }
+
     if !set_batch.is_empty() {
         let refs: Vec<(&str, &str, &str)> = set_batch
             .iter()
             .map(|(s, k, v)| (s.as_str(), k.as_str(), v.as_str()))
             .collect();
         if let Err(e) = crate::tmux::env::set_hidden_env_batch(&refs) {
-            tracing::warn!(target: "session.sync", "Post-CAS env publish failed: {}", e);
+            tracing::warn!(target: "session.sync", "Post-CAS env publish failed: {e}");
         }
     }
     if !unset_batch.is_empty() {
@@ -213,7 +257,7 @@ fn publish_tmux_env(
             .map(|(s, k)| (s.as_str(), k.as_str()))
             .collect();
         if let Err(e) = crate::tmux::env::remove_hidden_env_batch(&refs) {
-            tracing::warn!(target: "session.sync", "Post-CAS env unset failed: {}", e);
+            tracing::warn!(target: "session.sync", "Post-CAS env unset failed: {e}");
         }
     }
 }
