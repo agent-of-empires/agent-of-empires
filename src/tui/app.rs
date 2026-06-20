@@ -861,6 +861,11 @@ impl App {
                                                             // Sidebar collapse/expand toggle; must
                                                             // precede hit_list (button is on the
                                                             // list's top border).
+                                                        } else if self.home.handle_tips_badge_click(mouse.column, mouse.row) {
+                                                            // Footer tips badge opened the overlay;
+                                                            // drop any stale preview highlight, like
+                                                            // the non-burst click path does.
+                                                            let _ = self.home.clear_preview_selection();
                                                         } else if hit_list {
                                                             let action = self.home.handle_click(mouse.column, mouse.row);
                                                             if action.is_none() {
@@ -1021,6 +1026,14 @@ impl App {
                                     // the collapsed strip toggled the sidebar.
                                     // Runs before hit_list because the button
                                     // lives on the list's top border.
+                                    let _ = self.home.clear_preview_selection();
+                                    self.draw(terminal)?;
+                                    None
+                                } else if self
+                                    .home
+                                    .handle_tips_badge_click(mouse.column, mouse.row)
+                                {
+                                    // Footer tips badge opened the overlay.
                                     let _ = self.home.clear_preview_selection();
                                     self.draw(terminal)?;
                                     None

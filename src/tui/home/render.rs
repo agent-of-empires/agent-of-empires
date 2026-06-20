@@ -680,6 +680,7 @@ impl HomeView {
             no_agents_dialog,
             changelog_dialog,
             telemetry_consent_dialog,
+            tips_dialog,
             info_dialog,
             snooze_duration_dialog,
             profile_picker_dialog,
@@ -983,6 +984,7 @@ impl HomeView {
             || self.no_agents_dialog.is_some()
             || self.changelog_dialog.is_some()
             || self.telemetry_consent_dialog.is_some()
+            || self.tips_dialog.is_some()
             || self.info_dialog.is_some()
             || self.profile_picker_dialog.is_some()
             || self.group_picker_dialog.is_some()
@@ -2639,6 +2641,10 @@ impl HomeView {
     }
 
     fn render_status_bar(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        // Cleared each frame and only set when the badge is actually drawn, so
+        // a stale rect can't make a footer click open tips when the badge is
+        // hidden (live-send, nothing unseen, or no room).
+        self.tips_badge_rect = None;
         // Live-send banner takes over the status bar so the user has an
         // always-visible reminder that keystrokes are being relayed to
         // the pane (and how to get out). Distinct color + bold so it
@@ -2973,7 +2979,33 @@ impl HomeView {
             .iter()
             .map(|(_, _, g)| g.iter().map(|s| s.width()).sum::<usize>())
             .collect();
-        let avail = (area.width as usize).saturating_sub(1);
+
+        // Tips badge: pinned to the bottom-right of the footer and clickable. It
+        // takes priority over the keybind hints, the greedy pack below reserves
+        // its width first, so on a thin terminal the hints drop rather than
+        // collide with it. Hidden when nothing is unseen / tips disabled
+        // (`tips_unseen` is zero then) or when even the badge can't fit.
+        // Hover highlight mirrors a session row, but the footer's own bg is
+        // already `theme.selection`, so hover uses the brighter
+        // `session_selection` to actually stand out.
+        let badge_bg = if self.tips_badge_hovered {
+            theme.session_selection
+        } else {
+            theme.selection
+        };
+        let badge_line = (self.tips_unseen > 0).then(|| {
+            Line::from(Span::styled(
+                format!(" \u{1f4a1} {} tips ", self.tips_unseen),
+                Style::default().fg(theme.accent).bold().bg(badge_bg),
+            ))
+        });
+        let badge_width = badge_line.as_ref().map(|l| l.width()).unwrap_or(0);
+        let badge_fits = badge_width > 0 && badge_width <= area.width as usize;
+        let badge_reserve = if badge_fits { badge_width + 1 } else { 0 };
+
+        let avail = (area.width as usize)
+            .saturating_sub(1)
+            .saturating_sub(badge_reserve);
 
         let mut order: Vec<usize> = (0..groups.len()).collect();
         order.sort_by_key(|&i| groups[i].0);
@@ -3040,6 +3072,25 @@ impl HomeView {
 
         let status = Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.selection));
         frame.render_widget(status, area);
+
+        // Draw the badge over the reserved right edge and remember its rect so
+        // a click there opens the tips overlay.
+        if badge_fits {
+            if let Some(line) = badge_line {
+                let bw = badge_width as u16;
+                let rect = Rect {
+                    x: area.x + area.width.saturating_sub(bw),
+                    y: area.y,
+                    width: bw,
+                    height: 1,
+                };
+                frame.render_widget(
+                    Paragraph::new(line).style(Style::default().bg(badge_bg)),
+                    rect,
+                );
+                self.tips_badge_rect = Some(rect);
+            }
+        }
     }
 
     fn render_update_bar(
