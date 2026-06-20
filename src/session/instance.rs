@@ -6813,28 +6813,48 @@ mod tests {
 
         mod verify_on_resume {
             use super::*;
+            use crate::session::capture::encode_claude_project_path;
             use std::fs;
             use std::time::{Duration, SystemTime};
             use tempfile::{tempdir, TempDir};
 
-            fn isolate_home(temp: &TempDir) {
-                std::env::set_var("HOME", temp.path());
-                #[cfg(any(target_os = "linux", target_os = "macos"))]
-                std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
-                std::env::set_var("CLAUDE_CONFIG_DIR", temp.path().join(".claude"));
+            /// RAII env-restore guard, matches `VibeHomeGuard` shape in capture.rs.
+            struct ClaudeHomeGuard {
+                prev_home: Option<String>,
+                prev_xdg: Option<String>,
+                prev_claude: Option<String>,
             }
 
-            fn encode_claude_path(project_path: &str) -> String {
-                project_path
-                    .chars()
-                    .map(|c| {
-                        if c.is_alphanumeric() || c == '_' || c == '-' {
-                            c
-                        } else {
-                            '-'
-                        }
-                    })
-                    .collect()
+            impl ClaudeHomeGuard {
+                fn set(temp: &TempDir) -> Self {
+                    let prev_home = std::env::var("HOME").ok();
+                    let prev_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+                    let prev_claude = std::env::var("CLAUDE_CONFIG_DIR").ok();
+                    std::env::set_var("HOME", temp.path());
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+                    std::env::set_var("CLAUDE_CONFIG_DIR", temp.path().join(".claude"));
+                    Self {
+                        prev_home,
+                        prev_xdg,
+                        prev_claude,
+                    }
+                }
+            }
+
+            impl Drop for ClaudeHomeGuard {
+                fn drop(&mut self) {
+                    restore_or_remove("HOME", self.prev_home.take());
+                    restore_or_remove("XDG_CONFIG_HOME", self.prev_xdg.take());
+                    restore_or_remove("CLAUDE_CONFIG_DIR", self.prev_claude.take());
+                }
+            }
+
+            fn restore_or_remove(key: &str, prev: Option<String>) {
+                match prev {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
             }
 
             fn write_jsonl_with_mtime(path: &std::path::Path, mtime: SystemTime) {
@@ -6848,14 +6868,14 @@ mod tests {
             #[serial]
             fn supersedes_stale_claude_sid_after_clear() {
                 let temp = tempdir().unwrap();
-                isolate_home(&temp);
+                let _guard = ClaudeHomeGuard::set(&temp);
 
                 let project_path = "/tmp/aoe-test-2291-claude-bascule";
                 let claude_dir = temp
                     .path()
                     .join(".claude")
                     .join("projects")
-                    .join(encode_claude_path(project_path));
+                    .join(encode_claude_project_path(project_path));
                 fs::create_dir_all(&claude_dir).unwrap();
 
                 let stale = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
@@ -6885,14 +6905,14 @@ mod tests {
             #[serial]
             fn no_bascule_when_claude_stored_matches_freshest() {
                 let temp = tempdir().unwrap();
-                isolate_home(&temp);
+                let _guard = ClaudeHomeGuard::set(&temp);
 
                 let project_path = "/tmp/aoe-test-2291-claude-steady";
                 let claude_dir = temp
                     .path()
                     .join(".claude")
                     .join("projects")
-                    .join(encode_claude_path(project_path));
+                    .join(encode_claude_project_path(project_path));
                 fs::create_dir_all(&claude_dir).unwrap();
 
                 let live = "ffffffff-eeee-dddd-cccc-bbbbbbbbbbbb";
@@ -6915,9 +6935,29 @@ mod tests {
 
             #[test]
             #[serial]
+            fn stored_sid_returned_when_no_jsonl_on_disk() {
+                let temp = tempdir().unwrap();
+                let _guard = ClaudeHomeGuard::set(&temp);
+
+                let project_path = "/tmp/aoe-test-2291-no-jsonl";
+                let stored = "12121212-3434-5656-7878-9a9a9a9a9a9a";
+
+                let mut inst = Instance::new("verify-claude-no-jsonl", project_path);
+                inst.tool = "claude".to_string();
+                inst.agent_session_id = Some(stored.to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                let (sid, is_existing) = inst.acquire_session_id();
+                assert_eq!(sid.as_deref(), Some(stored));
+                assert!(is_existing);
+                assert_eq!(inst.agent_session_id.as_deref(), Some(stored));
+            }
+
+            #[test]
+            #[serial]
             fn unaffected_for_unsupported_tool() {
                 let temp = tempdir().unwrap();
-                isolate_home(&temp);
+                let _guard = ClaudeHomeGuard::set(&temp);
 
                 let mut inst = Instance::new("verify-cursor", "/tmp/aoe-test-2291-cursor");
                 inst.tool = "cursor".to_string();

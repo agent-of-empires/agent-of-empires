@@ -62,7 +62,7 @@ pub(crate) fn generate_claude_session_id() -> String {
 /// Claude stores per-project data under `~/.claude/projects/{encoded}/` where
 /// non-alphanumeric characters (except `-`) are replaced with `-`.
 /// For example: `/Users/foo/bar` becomes `-Users-foo-bar`.
-fn encode_claude_project_path(project_path: &str) -> String {
+pub(crate) fn encode_claude_project_path(project_path: &str) -> String {
     project_path
         .chars()
         .map(|c| {
