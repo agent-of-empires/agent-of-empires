@@ -1585,6 +1585,12 @@ impl Instance {
     /// the per-tool dispatch in `try_retroactive_capture` so the freshness
     /// contract (mtime, SQLite ordering, exclusion set, host/container)
     /// stays encapsulated in each tool's existing capture function.
+    ///
+    /// Known limitation: when a non-AoE Claude session writes to the same
+    /// `project_path` (manual `claude` invocation outside the pane), its sid
+    /// is not in the tmux-env exclusion set and a fresher mtime there can
+    /// supersede the stored sid on resume. Co-located non-AoE peers are an
+    /// uncommon layout; the steady-state case (no peer) is unaffected.
     pub(crate) fn capture_freshest_session_id(&self) -> Option<String> {
         let live = self.try_retroactive_capture()?;
         match self.agent_session_id.as_deref() {
