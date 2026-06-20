@@ -2952,11 +2952,23 @@ async fn status_poll_loop(state: Arc<AppState>) {
             .await
             {
                 Ok((outcome, mutated)) if outcome.touched() => {
-                    let mut guard = state.instances.write().await;
-                    for src in &mutated {
-                        if let Some(dst) = guard.iter_mut().find(|i| i.id == src.id) {
-                            dst.agent_session_id = src.agent_session_id.clone();
-                            dst.resume_probe_failed_sid = src.resume_probe_failed_sid.clone();
+                    // Reapply only for ids the helper actually touched, so a
+                    // peer that wrote `agent_session_id` (e.g. the restart-
+                    // completion path) on the live state during the
+                    // spawn_blocking window is not silently reverted.
+                    let touched: std::collections::HashSet<&str> = outcome
+                        .applied
+                        .iter()
+                        .chain(outcome.rolled_back.iter())
+                        .map(String::as_str)
+                        .collect();
+                    if !touched.is_empty() {
+                        let mut guard = state.instances.write().await;
+                        for src in mutated.iter().filter(|i| touched.contains(i.id.as_str())) {
+                            if let Some(dst) = guard.iter_mut().find(|i| i.id == src.id) {
+                                dst.agent_session_id = src.agent_session_id.clone();
+                                dst.resume_probe_failed_sid = src.resume_probe_failed_sid.clone();
+                            }
                         }
                     }
                 }

@@ -43,13 +43,11 @@ pub struct SessionIdSyncOutcome {
 }
 
 impl SessionIdSyncOutcome {
-    /// True iff at least one instance was applied, rolled back, or filtered.
     pub fn touched(&self) -> bool {
         !self.applied.is_empty() || !self.rolled_back.is_empty() || !self.filtered.is_empty()
     }
 }
 
-/// Pending CAS update derived from a poller observation.
 struct Update {
     id: String,
     sid: String,
@@ -259,5 +257,158 @@ fn publish_tmux_env(
         if let Err(e) = crate::tmux::env::remove_hidden_env_batch(&refs) {
             tracing::warn!(target: "session.sync", "Post-CAS env unset failed: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::file_watch::FileWatchService;
+    use crate::session::poller::SessionPoller;
+    use crate::session::storage::Storage;
+    use crate::session::{GroupTree, Instance};
+    use serial_test::serial;
+    use std::sync::Mutex;
+    use tempfile::{tempdir, TempDir};
+
+    struct HomeGuard {
+        prev_home: Option<String>,
+        prev_xdg: Option<String>,
+    }
+
+    impl HomeGuard {
+        fn set(temp: &TempDir) -> Self {
+            let prev_home = std::env::var("HOME").ok();
+            let prev_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+            std::env::set_var("HOME", temp.path());
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+            Self {
+                prev_home,
+                prev_xdg,
+            }
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match self.prev_home.take() {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match self.prev_xdg.take() {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+    }
+
+    fn seed_instance_on_disk(profile: &str, inst: &Instance) {
+        let storage = Storage::new_unwatched(profile).unwrap();
+        let on_disk = inst.clone();
+        storage
+            .update(|i, g| {
+                *i = vec![on_disk.clone()];
+                *g = GroupTree::new_with_groups(std::slice::from_ref(&on_disk), &[])
+                    .get_all_groups();
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn attach_poller_with_update(inst: &mut Instance, sid: &str) {
+        let poller = SessionPoller::new(format!("test-tmux-{}", inst.id));
+        poller.inject_test_update(&inst.id, sid);
+        inst.session_id_poller = Some(Arc::new(Mutex::new(poller)));
+    }
+
+    #[test]
+    #[serial]
+    fn drain_applied_updates_memory_and_clears_failed_sid() {
+        let temp = tempdir().unwrap();
+        let _guard = HomeGuard::set(&temp);
+
+        let profile = "sync-applied";
+        let mut inst = Instance::new("sync-applied-title", "/tmp/x");
+        inst.source_profile = profile.to_string();
+        inst.agent_session_id = None;
+        inst.resume_probe_failed_sid = Some("old-failed".to_string());
+        seed_instance_on_disk(profile, &inst);
+
+        let fresh = "019342ab-1234-7def-8901-abcdef012345";
+        attach_poller_with_update(&mut inst, fresh);
+
+        let file_watch = FileWatchService::noop();
+        let mut instances = vec![inst];
+        let outcome = drain_and_persist_session_ids(&mut instances, &file_watch);
+
+        assert_eq!(outcome.applied, vec![instances[0].id.clone()]);
+        assert!(outcome.rolled_back.is_empty());
+        assert!(outcome.filtered.is_empty());
+        assert_eq!(instances[0].agent_session_id.as_deref(), Some(fresh));
+        assert_eq!(instances[0].resume_probe_failed_sid, None);
+
+        let storage = Storage::new_unwatched(profile).unwrap();
+        let loaded = storage.load().unwrap();
+        assert_eq!(loaded[0].agent_session_id.as_deref(), Some(fresh));
+        assert_eq!(loaded[0].resume_probe_failed_sid, None);
+    }
+
+    #[test]
+    #[serial]
+    fn drain_filters_invalid_sid_and_leaves_state_unchanged() {
+        let temp = tempdir().unwrap();
+        let _guard = HomeGuard::set(&temp);
+
+        let profile = "sync-filtered-validation";
+        let mut inst = Instance::new("sync-validation-title", "/tmp/x");
+        inst.source_profile = profile.to_string();
+        inst.agent_session_id = Some("original-sid".to_string());
+        seed_instance_on_disk(profile, &inst);
+
+        attach_poller_with_update(&mut inst, "bad sid!");
+
+        let file_watch = FileWatchService::noop();
+        let mut instances = vec![inst];
+        let outcome = drain_and_persist_session_ids(&mut instances, &file_watch);
+
+        assert_eq!(outcome.filtered, vec![instances[0].id.clone()]);
+        assert!(outcome.applied.is_empty());
+        assert!(outcome.rolled_back.is_empty());
+        assert_eq!(
+            instances[0].agent_session_id.as_deref(),
+            Some("original-sid")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn drain_filters_sid_present_in_retroactive_capture_excludes() {
+        let temp = tempdir().unwrap();
+        let _guard = HomeGuard::set(&temp);
+
+        let profile = "sync-filtered-excludes";
+        let excluded = "019342ab-1234-7def-8901-abcdef012345";
+
+        let mut inst = Instance::new("sync-excludes-title", "/tmp/x");
+        inst.source_profile = profile.to_string();
+        inst.agent_session_id = Some("original-sid".to_string());
+        inst.retroactive_capture_excludes
+            .insert(excluded.to_string());
+        seed_instance_on_disk(profile, &inst);
+
+        attach_poller_with_update(&mut inst, excluded);
+
+        let file_watch = FileWatchService::noop();
+        let mut instances = vec![inst];
+        let outcome = drain_and_persist_session_ids(&mut instances, &file_watch);
+
+        assert_eq!(outcome.filtered, vec![instances[0].id.clone()]);
+        assert!(outcome.applied.is_empty());
+        assert!(outcome.rolled_back.is_empty());
+        assert_eq!(
+            instances[0].agent_session_id.as_deref(),
+            Some("original-sid")
+        );
     }
 }
