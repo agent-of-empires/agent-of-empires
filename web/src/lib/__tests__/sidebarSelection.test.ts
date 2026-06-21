@@ -138,6 +138,12 @@ describe("selectionReducer", () => {
     expect([...ranged.selectedIds].sort()).toEqual(["a", "b", "c"]);
   });
 
+  it("select-only replaces the selection with the target and anchors it", () => {
+    const selected = selectionReducer(state(["a", "b"], "a"), { type: "select-only", id: "d" });
+    expect([...selected.selectedIds]).toEqual(["d"]);
+    expect(selected.anchorId).toBe("d");
+  });
+
   it("clear empties the selection and anchor", () => {
     expect(selectionReducer(state(["a", "b"], "b"), { type: "clear" })).toEqual(EMPTY_SELECTION);
   });
