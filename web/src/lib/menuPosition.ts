@@ -1,4 +1,4 @@
-import { useLayoutEffect, type RefObject } from "react";
+import { useLayoutEffect, type Dispatch, type RefObject, type SetStateAction } from "react";
 
 export interface ClampMenuArgs {
   x: number;
@@ -44,10 +44,10 @@ export function clampMenuPosition({
  *  items off the bottom edge. Guarded with a `typeof` check so the
  *  jsdom-based Vitest suites that lack `ResizeObserver` still execute
  *  the layout effect cleanly. See #1601. */
-export function useClampedMenuPosition(
-  contextMenu: { x: number; y: number } | null,
+export function useClampedMenuPosition<T extends { x: number; y: number }>(
+  contextMenu: T | null,
   menuRef: RefObject<HTMLElement | null>,
-  setContextMenu: (next: { x: number; y: number }) => void,
+  setContextMenu: Dispatch<SetStateAction<T | null>>,
 ): void {
   useLayoutEffect(() => {
     if (!contextMenu || !menuRef.current) return;
@@ -63,7 +63,9 @@ export function useClampedMenuPosition(
         viewportHeight: window.innerHeight,
       });
       if (next.x !== contextMenu.x || next.y !== contextMenu.y) {
-        setContextMenu(next);
+        // Merge so callers carrying extra menu state (e.g. a single/bulk
+        // scope) keep it through a reposition. See #2312.
+        setContextMenu((prev) => (prev ? { ...prev, x: next.x, y: next.y } : prev));
       }
     };
     clamp();

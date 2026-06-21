@@ -2,7 +2,7 @@
 
 import { describe, expect, it, vi } from "vitest";
 import { renderHook } from "@testing-library/react";
-import { useRef } from "react";
+import { useRef, type Dispatch, type SetStateAction } from "react";
 import { clampMenuPosition, useClampedMenuPosition } from "../menuPosition";
 
 describe("clampMenuPosition", () => {
@@ -103,7 +103,9 @@ describe("useClampedMenuPosition", () => {
     menuRect: { width: number; height: number };
     viewport: { width: number; height: number };
   }) {
-    const setContextMenu = vi.fn<(next: { x: number; y: number }) => void>();
+    // The hook forwards a functional updater so callers carrying extra menu
+    // state keep it through a reposition. See #2312.
+    const setContextMenu = vi.fn<Dispatch<SetStateAction<{ x: number; y: number } | null>>>();
     const menu = document.createElement("div");
     menu.getBoundingClientRect = () =>
       ({
@@ -150,7 +152,12 @@ describe("useClampedMenuPosition", () => {
       menuRect: { width: 180, height: 240 },
       viewport: { width: 1280, height: 720 },
     });
-    expect(setContextMenu).toHaveBeenCalledWith({ x: 100, y: 472 });
+    const updater = setContextMenu.mock.calls[0][0] as (
+      prev: { x: number; y: number } | null,
+    ) => { x: number; y: number } | null;
+    expect(updater({ x: 100, y: 700 })).toEqual({ x: 100, y: 472 });
+    // Extra menu state on the previous value survives the reposition.
+    expect(updater({ x: 100, y: 700, scope: "bulk" } as never)).toEqual({ x: 100, y: 472, scope: "bulk" });
   });
 
   it("clamps the menu left when the anchor overflows the right edge", () => {
@@ -159,7 +166,10 @@ describe("useClampedMenuPosition", () => {
       menuRect: { width: 180, height: 240 },
       viewport: { width: 1280, height: 720 },
     });
-    expect(setContextMenu).toHaveBeenCalledWith({ x: 1092, y: 100 });
+    const updater = setContextMenu.mock.calls[0][0] as (
+      prev: { x: number; y: number } | null,
+    ) => { x: number; y: number } | null;
+    expect(updater({ x: 1270, y: 100 })).toEqual({ x: 1092, y: 100 });
   });
 
   it("does not call setContextMenu when contextMenu is null", () => {
