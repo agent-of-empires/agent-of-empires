@@ -117,4 +117,21 @@ test.describe("Sidebar multi-select (#1724)", () => {
     // Selection clears once the bulk action completes.
     await expect(bar).toHaveCount(0);
   });
+
+  test("plain click then Shift+click selects the range from the navigated row (#2312)", async ({ page }) => {
+    await mockApis(page, THREE);
+    await page.goto("/");
+    const rows = page.locator("[data-testid='sidebar-session-row']");
+    await expect(rows).toHaveCount(3);
+
+    // Plain click navigates to the first session and leaves it as the anchor;
+    // no intervening Cmd+click is needed before the range works.
+    await rows.nth(0).click();
+    await expect.poll(() => page.url()).toContain("/session/s-1");
+
+    await rows.nth(2).click({ modifiers: ["Shift"] });
+
+    const bar = page.locator("[data-testid='sidebar-bulk-bar']");
+    await expect(bar).toContainText("3 selected");
+  });
 });
