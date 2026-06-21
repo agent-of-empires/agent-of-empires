@@ -18,6 +18,40 @@ function transcript(turns: number, perTurn: number): ActivityRow[] {
   return rows;
 }
 
+/** A `tool_start` row carrying the ToolCall fields the sub-agent
+ *  grouping reads: `tool.id` (the call id) and, on a sub-agent child,
+ *  `tool.parent_tool_call_id` pointing at the parent Task's id. */
+function toolRow(id: string, parentId?: string): ActivityRow {
+  return {
+    id,
+    kind: "tool_start",
+    text: id,
+    tool: {
+      id,
+      name: id,
+      kind: "other",
+      args_preview: "{}",
+      started_at: "",
+      parent_tool_call_id: parentId,
+    },
+  };
+}
+
+/** One prompt, `lead` filler tool rows, then a Task parent `task` with
+ *  `children` child tool calls, with no later user boundary so the cap
+ *  cut falls inside the sub-agent block. */
+function subagentTranscript(lead: number, children: number, parentChain: string[] = ["task1"]): ActivityRow[] {
+  const rows: ActivityRow[] = [row("user_prompt", 0)];
+  for (let i = 0; i < lead; i += 1) rows.push(row("tool_complete", i));
+  // Parent chain top-first: task1 (top-level), then nested sub-agents.
+  for (let p = 0; p < parentChain.length; p += 1) {
+    rows.push(toolRow(parentChain[p]!, p === 0 ? undefined : parentChain[p - 1]!));
+  }
+  const leafParent = parentChain[parentChain.length - 1]!;
+  for (let c = 0; c < children; c += 1) rows.push(toolRow(`child-${c}`, leafParent));
+  return rows;
+}
+
 describe("historyWindowStart", () => {
   it("returns 0 when everything fits", () => {
     const rows = transcript(2, 3); // 8 rows
@@ -63,6 +97,41 @@ describe("historyWindowStart", () => {
     const rows = transcript(10, 10);
     expect(historyWindowStart(rows, 0)).toBe(0);
     expect(historyWindowStart(rows, -5)).toBe(0);
+  });
+
+  it("pulls the cut back to the Task parent when it lands among sub-agent children (#2313)", () => {
+    // prompt(0) + 100 filler(1..100) + parent task1(101) + 50 children(102..151).
+    const rows = subagentTranscript(100, 50);
+    const parentIdx = rows.findIndex((r) => r.kind === "tool_start" && r.tool?.id === "task1");
+    expect(parentIdx).toBe(101);
+    // visibleRows 40 -> cap = 112, a child row, no user boundary after it.
+    // Without the snap the window would open mid-block at 112, orphaning
+    // the children from their Task. The snap pulls start back to 101.
+    const start = historyWindowStart(rows, 40);
+    expect(start).toBe(parentIdx);
+    expect(rows[start]!.tool?.parent_tool_call_id).toBeUndefined();
+  });
+
+  it("leaves the cut alone when it lands exactly on the Task parent", () => {
+    const rows = subagentTranscript(100, 50); // 152 rows, parent at 101.
+    // visibleRows 51 -> cap = 101, the parent itself: nothing to pull back.
+    expect(historyWindowStart(rows, 51)).toBe(101);
+  });
+
+  it("walks the whole parent chain back for nested sub-agents", () => {
+    // task1(101) -> task2(102, child of task1) -> 49 grandchildren(103..151).
+    const rows = subagentTranscript(100, 49, ["task1", "task2"]);
+    // visibleRows 40 -> cap = 112, a grandchild; snap climbs task2 then task1.
+    expect(historyWindowStart(rows, 40)).toBe(101);
+  });
+
+  it("does not pull back a clean user-boundary start", () => {
+    // The forward-snap landed on a user_prompt (no tool), so the sub-agent
+    // snap is a no-op and the boundary stands.
+    const rows = transcript(10, 10);
+    const start = historyWindowStart(rows, 30);
+    expect(rows[start]!.kind).toBe("user_prompt");
+    expect(start).toBe(88);
   });
 });
 
