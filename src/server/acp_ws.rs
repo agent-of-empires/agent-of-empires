@@ -51,6 +51,14 @@ const PING_INTERVAL: Duration = Duration::from_secs(30);
 /// recovery, not a session loss.
 const PONG_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// The app-level keepalive frame emitted on every ping tick. A plain
+/// Text frame the browser delivers to `onmessage`, unlike the WS Ping
+/// the browser handles invisibly. The client keys its staleness
+/// watchdog on this exact shape, so keep it stable. See #2287.
+fn heartbeat_frame() -> String {
+    r#"{"kind":"heartbeat"}"#.to_string()
+}
+
 /// Query parameters for the structured view WS upgrade. Clients pass
 /// `?since=<lastSeq>` so the on-connect drain only resends events
 /// newer than what they already have. Without this, a long-running
@@ -168,6 +176,22 @@ async fn handle(mut socket: WebSocket, session_id: String, state: Arc<AppState>,
                         idle_secs = last_pong_at.elapsed().as_secs(),
                         "agent ws idle reaper fired (no Pong from peer)"
                     );
+                    break;
+                }
+                // App-level heartbeat the browser can actually see. The WS
+                // Ping below keeps the server-side pong reaper honest, but
+                // browser JavaScript cannot observe Ping/Pong frames, so a
+                // quiet-but-live session gives the client no liveness signal
+                // and it cannot tell a healthy idle socket from a half-open
+                // (zombie) one a proxy reset without the browser noticing.
+                // This Text frame is that signal; the client's staleness
+                // watchdog reconnects when it stops arriving. See #2287.
+                if socket
+                    .send(Message::Text(heartbeat_frame().into()))
+                    .await
+                    .is_err()
+                {
+                    debug!(target: "acp.ws", session = %session_id, "ws heartbeat send failed, peer gone");
                     break;
                 }
                 if socket
@@ -489,5 +513,14 @@ mod tests {
             "PING_INTERVAL ({:?}) must be shorter than Cloudflare's 100s tunnel idle cap",
             PING_INTERVAL,
         );
+    }
+
+    /// The client staleness watchdog matches this exact byte string to
+    /// distinguish a keepalive tick from a real event frame. If the shape
+    /// drifts, the client treats heartbeats as malformed and a quiet but
+    /// live session looks stale. See #2287.
+    #[test]
+    fn heartbeat_frame_shape_is_stable() {
+        assert_eq!(heartbeat_frame(), r#"{"kind":"heartbeat"}"#);
     }
 }
