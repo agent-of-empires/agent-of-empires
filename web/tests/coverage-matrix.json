@@ -1467,6 +1467,13 @@
       ]
     },
     {
+      "id": "acp.ws-reconnect-liveness",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/hooks/useAcpSession.reconnect.test.ts"],
+      "components": ["web/src/hooks/useAcpSession.ts"]
+    },
+    {
       "id": "acp.args",
       "kind": "vitest",
       "risk": "medium",

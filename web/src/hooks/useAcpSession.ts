@@ -663,6 +663,19 @@ export function acpRetryDelayMs(attempt: number): number {
 }
 export const ACP_MAX_RETRIES_EXPORT = ACP_MAX_RETRIES;
 
+/** Liveness watchdog (#2287). The server emits a `{"kind":"heartbeat"}`
+ *  Text frame every 30s. A proxy can RST the idle connection so the
+ *  daemon's Close never reaches the browser, leaving the socket in
+ *  `readyState === OPEN` (a zombie) while no frames arrive. Browser JS
+ *  cannot see WS Ping/Pong, so the heartbeat is the only liveness
+ *  signal: if none arrives within `ACP_WS_STALE_MS`, the socket is
+ *  treated as dead and re-dialed. 75s tolerates two missed heartbeats
+ *  plus a watchdog interval and stays under the daemon's 90s pong
+ *  reaper, so the client heals first. A false positive is cheap: the
+ *  redial resumes from `?since=<lastSeq>` and dedupes. */
+const ACP_WS_WATCHDOG_INTERVAL_MS = 15000;
+export const ACP_WS_STALE_MS = 75000;
+
 export function useAcpSession(
   sessionId: string | null,
   /** Live structured view worker lifecycle from `SessionResponse.acp_worker_state`.
@@ -845,6 +858,12 @@ export function useAcpSession(
     }
   }, []);
 
+  // Timestamp (ms) of the most recent message received on the current
+  // socket (any frame, including the server heartbeat). The liveness
+  // watchdog and the visibility/online triggers compare it against
+  // ACP_WS_STALE_MS to spot a zombie socket. See #2287.
+  const lastServerMsgRef = useRef<number>(0);
+
   // Stable callback ref for visibility/online/pageshow triggers so the
   // reactive effects below can reconnect without depending on sessionId
   // (satisfies react-you-might-not-need-an-effect/no-event-handler).
@@ -852,13 +871,36 @@ export function useAcpSession(
   tryAutoReconnectRef.current = () => {
     const ws = wsRef.current;
     const ready = ws?.readyState;
-    if (ready === WebSocket.OPEN || ready === WebSocket.CONNECTING) return;
+    if (ready === WebSocket.CONNECTING) return;
+    // A socket that reports OPEN but has gone quiet past the stale
+    // window is a half-open zombie (proxy RST the browser never saw).
+    // Fall through and re-dial; connect() closes it and bumps the dial
+    // generation, so we don't rely on the dead socket ever firing
+    // onclose. A genuinely fresh OPEN socket bails here. See #2287.
+    if (ready === WebSocket.OPEN && Date.now() - lastServerMsgRef.current < ACP_WS_STALE_MS) {
+      return;
+    }
     retryCountRef.current = 0;
     setRetryCount(0);
     setRetryCountdown(0);
     clearRetryTimers();
     connectRef.current?.();
   };
+
+  // Liveness watchdog: a foreground-visible idle tab fires neither
+  // visibilitychange nor online, so a zombie socket would otherwise sit
+  // forever. Poll while the socket reports OPEN and let
+  // tryAutoReconnect re-dial only when it's also stale. Gated on OPEN so
+  // it never resurrects an intentionally-closed or retry-exhausted
+  // socket; backoff owns those. See #2287.
+  useEffect(() => {
+    const id = setInterval(() => {
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        tryAutoReconnectRef.current();
+      }
+    }, ACP_WS_WATCHDOG_INTERVAL_MS);
+    return () => clearInterval(id);
+  }, []);
 
   // Subscribe to visibility+pageshow and online via useSyncExternalStore
   // so no effect directly subscribes to an external store, satisfying
@@ -1151,11 +1193,15 @@ export function useAcpSession(
       if (cancelled) return;
       // Cancel any pending scheduled retry; a fresh dial supersedes it.
       clearRetryTimers();
-      // Close any prior socket synchronously so its handlers fire (and
-      // get filtered out by the generation check below) before the new
-      // dial starts. Without this, the orphan's `onclose` can land
-      // after the new WS opens and re-arm scheduleReconnect on top of
-      // a healthy connection.
+      // Bump the dial generation BEFORE closing any prior socket, so a
+      // synchronously-firing `onclose` sees itself as orphaned
+      // (`isCurrentDial()` false) and bails instead of re-arming
+      // scheduleReconnect on top of this fresh dial. This matters when
+      // connect() is invoked on a still-OPEN zombie socket (the
+      // staleness watchdog path, #2287); the previous order only worked
+      // because every other caller reached connect() with an
+      // already-closed or null socket.
+      dialGenRef.current += 1;
       if (wsRef.current) {
         try {
           wsRef.current.close();
@@ -1164,7 +1210,6 @@ export function useAcpSession(
         }
         wsRef.current = null;
       }
-      dialGenRef.current += 1;
       const myGen = dialGenRef.current;
       const isCurrentDial = () => !cancelled && dialGenRef.current === myGen;
       statusRef.current = "connecting";
@@ -1235,6 +1280,9 @@ export function useAcpSession(
           statusRef.current = "open";
           setStatusRef.current("open");
           setHasEverOpenedRef.current(true);
+          // Seed the liveness clock so a slow first heartbeat doesn't
+          // trip the staleness watchdog right after connect. See #2287.
+          lastServerMsgRef.current = Date.now();
           // A live socket is the right moment to reset the retry
           // envelope: a future close from here is a genuinely new
           // failure, not a continuation of the prior backoff chain.
@@ -1257,8 +1305,17 @@ export function useAcpSession(
         };
         ws.onmessage = (ev) => {
           if (!isCurrentDial()) return;
+          // Any message on the current socket proves the browser-visible
+          // path is alive, so refresh the liveness clock before parsing.
+          // The server heartbeat keeps this fresh on quiet sessions; a
+          // busy stream keeps it fresh too. See #2287.
+          lastServerMsgRef.current = Date.now();
           try {
-            const data = JSON.parse(ev.data) as AcpFrame | { kind: "lagged"; skipped?: number };
+            const data = JSON.parse(ev.data) as AcpFrame | { kind: "lagged"; skipped?: number } | { kind: "heartbeat" };
+            if (typeof data === "object" && data !== null && (data as { kind?: unknown }).kind === "heartbeat") {
+              // Keepalive tick; liveness clock already bumped above.
+              return;
+            }
             if (
               typeof data === "object" &&
               data !== null &&
