@@ -45,6 +45,7 @@ export function rangeBetween(orderedIds: readonly string[], anchorId: string, ta
 
 export type SidebarSelectionAction =
   | { type: "toggle"; id: string }
+  | { type: "navigate"; id: string }
   | {
       type: "range";
       targetId: string;
@@ -79,6 +80,11 @@ export function selectionReducer(state: SidebarSelectionState, action: SidebarSe
       // origin, matching Finder / file-manager behavior.
       return { selectedIds: next, anchorId: anchor };
     }
+    case "navigate":
+      // A plain click clears any multi-selection but keeps the navigated row
+      // as the anchor, so the next Shift+click ranges from here instead of
+      // collapsing to the single clicked row (Finder / file-manager behavior).
+      return { selectedIds: new Set<string>(), anchorId: action.id };
     case "clear":
       return EMPTY_SELECTION;
     case "prune": {

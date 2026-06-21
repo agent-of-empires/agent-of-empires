@@ -2446,7 +2446,7 @@ export function WorkspaceSidebar({
       const intent = classifyClick(e);
       switch (intent) {
         case "navigate":
-          dispatchSelection({ type: "clear" });
+          dispatchSelection({ type: "navigate", id: workspaceId });
           setOptimisticActive({ id: workspaceId, fromActiveId: activeId });
           onSelect(workspaceId);
           break;
