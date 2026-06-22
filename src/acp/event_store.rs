@@ -770,10 +770,12 @@ impl EventStore {
             .flatten();
         // No log for the "no row" branch. The web UI polls /api/sessions
         // every ~2-3s and fans this query out per structured view session; every
-        // idle session would land here on every poll. The "still pending"
-        // and "treated as fired" branches below stay at trace because
-        // those carry the wake `at` timestamp, which is the only
-        // diagnostic value of this function.
+        // idle session would land here on every poll. The past-due branch
+        // below is silent for the same reason: once a wakeup's `at` is in
+        // the past it stays past forever, so logging there would spam one
+        // line per poll for the session's whole life. Only the bounded
+        // "still pending" branch logs; it carries the wake `at` and clears
+        // the moment the wakeup fires.
         let json = json?;
         let event: Event = match serde_json::from_str(&json) {
             Ok(e) => e,
@@ -798,13 +800,6 @@ impl EventStore {
                 );
                 Some((at, reason))
             } else {
-                trace!(
-                    target: "acp.event_store",
-                    session = %session_id,
-                    wake_at = %at,
-                    elapsed_secs = (now - at).num_seconds(),
-                    "latest_pending_wakeup: wake `at` in past; treating as fired"
-                );
                 None
             }
         } else {
