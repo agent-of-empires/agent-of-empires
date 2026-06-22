@@ -7,12 +7,16 @@
 //! single hook to call after `initialize` succeeds, instead of scattering
 //! ad-hoc semver checks at every spawn site.
 //!
-//! Today only `ClaudeAgentAcp` carries a minimum version (see
+//! `ClaudeAgentAcp` carries a minimum version (see
 //! `CLAUDE_AGENT_ACP_MIN_VERSION`,
 //! required for `memory_recall` tool-call emission, native `cancelled`
 //! stop reason, force-cancel of a wedged `TaskOutput` block (upstream
 //! #680), the upstream #641 fix, the `fable` model, and several other
-//! behaviors aoe builds on). Other agents
+//! behaviors aoe builds on). `OpenCode` carries one too (see
+//! `OPENCODE_MIN_VERSION`, the release that stopped sending empty
+//! `rawInput` on `external_directory` permission requests so the approval
+//! card shows the path and command; AoE issue #1907, upstream #30567). The
+//! remaining agents
 //! get a permissive policy (protocol check only). Long-term aoe should
 //! prefer ACP capability flags over package-version gating; until upstream
 //! exposes those, package versions are the only precise contract.
@@ -43,6 +47,22 @@ pub const CLAUDE_AGENT_ACP_MIN_VERSION: &str = "0.49.0";
 fn claude_agent_acp_min_version() -> semver::Version {
     semver::Version::parse(CLAUDE_AGENT_ACP_MIN_VERSION)
         .expect("CLAUDE_AGENT_ACP_MIN_VERSION must be valid semver")
+}
+
+/// Single source of truth for the `opencode` minimum-version floor.
+///
+/// 1.16.0 is the first release that ships upstream #30567: pre-1.16
+/// opencode sent an empty `rawInput` on `external_directory` permission
+/// requests, so the structured-view approval card had no path or command
+/// to show and the user could not tell what was being approved (#1907).
+/// opencode installs via `curl | bash`, not npm, so there is no Dockerfile
+/// pin to keep in sync; the sandbox image's `curl` install always pulls a
+/// release at or above this floor.
+pub const OPENCODE_MIN_VERSION: &str = "1.16.0";
+
+/// Parsed form of [`OPENCODE_MIN_VERSION`].
+fn opencode_min_version() -> semver::Version {
+    semver::Version::parse(OPENCODE_MIN_VERSION).expect("OPENCODE_MIN_VERSION must be valid semver")
 }
 
 /// The adapter aoe is trying to launch. Drives which `CompatibilityPolicy`
@@ -124,19 +144,27 @@ impl ExpectedAgent {
                 required_protocol: ProtocolVersion::V1,
                 fail_on_missing_agent_info: true,
             },
+            Self::OpenCode => CompatibilityPolicy {
+                // opencode's ACP handshake reports `agentInfo.name`
+                // "OpenCode" (a display string, not an npm id), verified
+                // against opencode v1.16.0 `acp/service.ts`. Gating the
+                // name mirrors the claude policy and yields a precise
+                // mismatch diagnostic if a different binary is shimmed in.
+                expected_name: Some("OpenCode"),
+                min_version: Some(opencode_min_version()),
+                required_protocol: ProtocolVersion::V1,
+                fail_on_missing_agent_info: true,
+            },
             // Other adapters: protocol check only. aoe doesn't yet
             // depend on a version-gated behavior in any of them.
-            Self::CodexAcp
-            | Self::OpenCode
-            | Self::AoeAgent
-            | Self::Gemini
-            | Self::PiAcp
-            | Self::Other => CompatibilityPolicy {
-                expected_name: None,
-                min_version: None,
-                required_protocol: ProtocolVersion::V1,
-                fail_on_missing_agent_info: false,
-            },
+            Self::CodexAcp | Self::AoeAgent | Self::Gemini | Self::PiAcp | Self::Other => {
+                CompatibilityPolicy {
+                    expected_name: None,
+                    min_version: None,
+                    required_protocol: ProtocolVersion::V1,
+                    fail_on_missing_agent_info: false,
+                }
+            }
         }
     }
 }
@@ -541,12 +569,44 @@ mod tests {
     }
 
     #[test]
-    fn non_claude_permissive_on_missing_info() {
+    fn non_gated_permissive_on_missing_info() {
         let init = make_init_no_info();
         validate(ExpectedAgent::CodexAcp, &init).unwrap();
-        validate(ExpectedAgent::OpenCode, &init).unwrap();
         validate(ExpectedAgent::AoeAgent, &init).unwrap();
         validate(ExpectedAgent::Other, &init).unwrap();
+    }
+
+    #[test]
+    fn opencode_below_floor_rejected() {
+        let init = make_init("OpenCode", "1.15.13");
+        let err = validate(ExpectedAgent::OpenCode, &init).unwrap_err();
+        assert_eq!(err.kind(), "incompatible_agent_version");
+    }
+
+    #[test]
+    fn opencode_at_floor_accepted() {
+        let init = make_init("OpenCode", OPENCODE_MIN_VERSION);
+        validate(ExpectedAgent::OpenCode, &init).unwrap();
+    }
+
+    #[test]
+    fn opencode_above_floor_accepted() {
+        let init = make_init("OpenCode", "1.17.9");
+        validate(ExpectedAgent::OpenCode, &init).unwrap();
+    }
+
+    #[test]
+    fn opencode_missing_agent_info_rejected() {
+        let init = make_init_no_info();
+        let err = validate(ExpectedAgent::OpenCode, &init).unwrap_err();
+        assert_eq!(err.kind(), "missing_agent_info");
+    }
+
+    #[test]
+    fn opencode_mismatched_name_rejected() {
+        let init = make_init("opencode", OPENCODE_MIN_VERSION);
+        let err = validate(ExpectedAgent::OpenCode, &init).unwrap_err();
+        assert_eq!(err.kind(), "mismatched_agent_name");
     }
 
     #[test]
