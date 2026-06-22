@@ -1405,7 +1405,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
 
         {showHelp && <HelpOverlay onClose={() => setShowHelp(false)} />}
 
-        {showAbout && <AboutModal onClose={() => setShowAbout(false)} />}
+        {showAbout && <AboutModal onClose={() => setShowAbout(false)} sessionId={activeSessionId} />}
         {telemetryConsentNeeded && <TelemetryConsentModal onChoose={handleTelemetryConsent} />}
 
         {deletingSession && (

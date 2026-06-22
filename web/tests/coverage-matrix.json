@@ -1959,6 +1959,13 @@
       "components": ["web/src/components/settings/SchemaSection.tsx"]
     },
     {
+      "id": "story.modal-about-copy-session-id",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/__tests__/AboutModal.test.tsx"],
+      "components": ["web/src/components/AboutModal.tsx"]
+    },
+    {
       "id": "story.modal-about-escape",
       "kind": "mocked-playwright",
       "risk": "low",
