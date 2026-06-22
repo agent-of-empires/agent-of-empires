@@ -2135,13 +2135,17 @@ pub async fn list_claude_sessions(State(state): State<Arc<AppState>>) -> impl In
     let mut sessions = tokio::task::spawn_blocking(crate::acp::claude_import::scan_sessions)
         .await
         .unwrap_or_default();
-    // Drop sessions AoE already manages: importing one would be a no-op, and
-    // they are noise in the picker. A managed session's on-disk id equals the
-    // instance's acp_session_id (structured view) or agent_session_id
-    // (terminal resume). See #2276.
-    let managed: std::collections::HashSet<String> = {
+    // Drop sessions AoE owns: importing one is a no-op and they are noise in
+    // the picker. Two signals (instances span all profiles, #2276):
+    //   - id match: a managed session's on-disk id equals the instance's
+    //     acp_session_id (structured) or agent_session_id (terminal resume).
+    //   - cwd match: any session whose cwd is inside a known session's
+    //     project_path. This catches worktree sessions (whose cwd is the
+    //     worktree dir AoE created) and the smart-rename one-shot AoE runs
+    //     in that same dir, which has its own id not stored anywhere.
+    let (managed_ids, managed_dirs): (std::collections::HashSet<String>, Vec<PathBuf>) = {
         let instances = state.instances.read().await;
-        instances
+        let ids = instances
             .iter()
             .flat_map(|i| {
                 i.acp_session_id
@@ -2149,9 +2153,21 @@ pub async fn list_claude_sessions(State(state): State<Arc<AppState>>) -> impl In
                     .chain(i.agent_session_id.iter())
                     .cloned()
             })
-            .collect()
+            .collect();
+        let dirs = instances
+            .iter()
+            .map(|i| PathBuf::from(&i.project_path))
+            .filter(|p| !p.as_os_str().is_empty())
+            .collect();
+        (ids, dirs)
     };
-    sessions.retain(|s| !managed.contains(&s.session_id));
+    sessions.retain(|s| {
+        if managed_ids.contains(&s.session_id) {
+            return false;
+        }
+        let cwd = std::path::Path::new(&s.cwd);
+        !managed_dirs.iter().any(|d| cwd.starts_with(d))
+    });
     Json(sessions).into_response()
 }
 
