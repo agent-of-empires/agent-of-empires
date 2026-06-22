@@ -585,14 +585,22 @@ pub async fn mark_tip_seen(
     }
 }
 
-/// Turns tips off by setting `session.show_tips = false`, the dashboard's
-/// "don't show again". A dedicated single-purpose write rather than `PATCH
-/// /api/settings`, which the auth middleware elevation-gates: disabling tips is
-/// a cosmetic preference and must not trip the passphrase wall on a remote
-/// server. Mirrors [`mark_web_tour_seen`]: exempt from elevation, still blocked
-/// by `read_only`, and uses `Config::load()` so a corrupt config is not
-/// silently replaced. Re-enabling stays in the settings Interaction tab.
-pub async fn disable_tips(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+#[derive(Deserialize)]
+pub struct SetShowTipsBody {
+    pub enabled: bool,
+}
+
+/// Sets `session.show_tips`, the "Show tips on startup" checkbox in the tip-of-
+/// the-day modal. A dedicated single-purpose write rather than `PATCH
+/// /api/settings`, which the auth middleware elevation-gates: this is a cosmetic
+/// preference and must not trip the passphrase wall on a remote server. Mirrors
+/// [`mark_web_tour_seen`]: exempt from elevation, still blocked by `read_only`,
+/// and uses `Config::load()` so a corrupt config is not silently replaced. The
+/// same preference is also editable from the settings Interaction tab.
+pub async fn set_show_tips(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<SetShowTipsBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
     if state.read_only {
         return (
             StatusCode::FORBIDDEN,
@@ -602,10 +610,14 @@ pub async fn disable_tips(State(state): State<Arc<AppState>>) -> impl IntoRespon
         )
             .into_response();
     }
+    let Json(SetShowTipsBody { enabled }) = match body {
+        Ok(b) => b,
+        Err(rej) => return rej.into_response(),
+    };
 
-    let result = tokio::task::spawn_blocking(|| {
+    let result = tokio::task::spawn_blocking(move || {
         let mut config = crate::session::Config::load()?;
-        config.session.show_tips = false;
+        config.session.show_tips = enabled;
         crate::session::save_config(&config)?;
         Ok::<_, anyhow::Error>(())
     })
@@ -614,11 +626,11 @@ pub async fn disable_tips(State(state): State<Arc<AppState>>) -> impl IntoRespon
     match result {
         Ok(Ok(())) => (
             StatusCode::OK,
-            Json(serde_json::json!({"show_tips": false})),
+            Json(serde_json::json!({"show_tips": enabled})),
         )
             .into_response(),
         Ok(Err(e)) => {
-            tracing::warn!(target: "http.api.system", "Disabling tips failed: {}", e);
+            tracing::warn!(target: "http.api.system", "Setting show_tips failed: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "save_failed", "message": "Failed to persist tips state"})),
@@ -626,7 +638,7 @@ pub async fn disable_tips(State(state): State<Arc<AppState>>) -> impl IntoRespon
                 .into_response()
         }
         Err(e) => {
-            tracing::error!(target: "http.api.system", "Disabling tips panicked: {}", e);
+            tracing::error!(target: "http.api.system", "Setting show_tips panicked: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),

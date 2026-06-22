@@ -47,12 +47,12 @@ pub use sessions::{
 // Shared by the status poll loop's auto-unread persistence; not a route handler.
 pub(crate) use sessions::persist_session_update;
 pub use system::{
-    browse_filesystem, create_profile, default_profile, delete_profile, disable_tips,
-    dismiss_update, docker_status, filesystem_home, get_about, get_current_theme,
-    get_profile_settings, get_resolved_theme, get_settings, get_settings_schema, get_tips,
-    get_update_status, get_web_ui_state, list_agents, list_groups, list_profiles, list_sounds,
-    list_themes, mark_tip_seen, mark_volume_ignores_globs_acknowledged, mark_web_tour_seen,
-    patch_web_ui_state, rename_profile, serve_sound_file, update_profile_settings, update_settings,
+    browse_filesystem, create_profile, default_profile, delete_profile, dismiss_update,
+    docker_status, filesystem_home, get_about, get_current_theme, get_profile_settings,
+    get_resolved_theme, get_settings, get_settings_schema, get_tips, get_update_status,
+    get_web_ui_state, list_agents, list_groups, list_profiles, list_sounds, list_themes,
+    mark_tip_seen, mark_volume_ignores_globs_acknowledged, mark_web_tour_seen, patch_web_ui_state,
+    rename_profile, serve_sound_file, set_show_tips, update_profile_settings, update_settings,
     update_theme,
 };
 pub use telemetry::{
@@ -194,7 +194,7 @@ mod tests {
                     "patch_web_ui_state",
                     "mark_web_tour_seen",
                     "mark_tip_seen",
-                    "disable_tips",
+                    "set_show_tips",
                     "mark_volume_ignores_globs_acknowledged",
                     "create_profile",
                     "delete_profile",
@@ -349,6 +349,7 @@ mod tests {
                     "dismiss_update",
                     "patch_web_ui_state",
                     "mark_tip_seen",
+                    "set_show_tips",
                     "create_profile",
                     "delete_profile",
                     "rename_profile",
