@@ -22,6 +22,7 @@ const WORKTREE_SID = "22222222-3333-4444-5555-666666666666";
 const WORKSPACE_SID = "33333333-4444-5555-6666-777777777777";
 const SCRATCH_SID = "44444444-5555-6666-7777-888888888888";
 const REPLAY_TEXT = "imported transcript line abc123";
+const REPLAY_USER_TEXT = "the original user question xyz789";
 const PROJECT_SUBDIR = "imported-project";
 
 test("imports an existing Claude session and replays its transcript", async ({}, testInfo) => {
@@ -30,7 +31,7 @@ test("imports an existing Claude session and replays its transcript", async ({},
     acp: true,
     workerIndex: testInfo.workerIndex,
     parallelIndex: testInfo.parallelIndex,
-    extraEnv: { FAKE_ACP_LOAD_REPLAY: REPLAY_TEXT },
+    extraEnv: { FAKE_ACP_LOAD_REPLAY: REPLAY_TEXT, FAKE_ACP_LOAD_REPLAY_USER: REPLAY_USER_TEXT },
     seedFn: ({ home }) => {
       const projectDir = join(home, PROJECT_SUBDIR);
       mkdirSync(projectDir, { recursive: true });
@@ -121,18 +122,25 @@ test("imports an existing Claude session and replays its transcript", async ({},
     // The session adopts the imported id and renders in the structured view.
     expect(created.view).toBe("structured");
 
-    // 3. The resumed transcript is seeded into the store (not suppressed).
+    // 3. The resumed transcript is seeded into the store (not suppressed),
+    // including the replayed USER turn (user_message_chunk -> UserPromptSent,
+    // #2276) so the imported conversation isn't missing the user's messages.
+    let frames = "";
     await expect
       .poll(
         async () => {
           const res = await fetch(`${serve.baseUrl}/api/sessions/${newId}/acp/replay?since=0`);
           if (!res.ok) return "";
           const body = await res.json();
-          return JSON.stringify(body.frames ?? []);
+          frames = JSON.stringify(body.frames ?? []);
+          return frames;
         },
         { timeout: 20_000, intervals: [200, 500, 1000] },
       )
       .toContain(REPLAY_TEXT);
+    // The user turn rendered as a UserPromptSent event carrying its text.
+    expect(frames).toContain(REPLAY_USER_TEXT);
+    expect(frames).toContain("UserPromptSent");
 
     // 4. Now that AoE manages this session by id (acp_session_id), it drops
     // out of the import list so it is not offered for re-import. (Filtering a

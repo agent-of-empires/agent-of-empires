@@ -3281,6 +3281,19 @@ fn map_update_to_events(
             }
             other => vec![raw_event(&other)],
         },
+        // Replayed user turns (#2276): claude-agent-acp re-emits each prior
+        // user message as a user_message_chunk during session/load. Live user
+        // prompts are recorded by the send_prompt path as UserPromptSent, so
+        // this only fires on replay; mapping it to UserPromptSent makes the
+        // imported transcript show the user's bubbles. On a normal reattach
+        // these are suppressed (already in the store) by is_transcript_event.
+        SessionUpdate::UserMessageChunk(chunk) => match chunk.content {
+            ContentBlock::Text(text) => vec![Event::UserPromptSent {
+                text: text.text,
+                attachments: Vec::new(),
+            }],
+            other => vec![raw_event(&other)],
+        },
         SessionUpdate::AgentThoughtChunk(_) => vec![Event::ThinkingStarted],
         SessionUpdate::ToolCall(tc) => {
             let raw_args = tc.raw_input.clone().unwrap_or(serde_json::Value::Null);
@@ -8548,6 +8561,27 @@ mod tests {
                 assert_eq!(content, "abc1234 first commit");
             }
             other => panic!("expected ToolCallCompleted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_user_message_chunk_becomes_user_prompt_sent() {
+        // Imported sessions replay prior user turns as user_message_chunk
+        // (#2276); they must map to UserPromptSent so the user's bubbles
+        // render, not get dropped to a raw event.
+        use agent_client_protocol::schema::{ContentBlock, ContentChunk, TextContent};
+        let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new("hello from the past")));
+        let events = map_update_to_events(
+            SessionUpdate::UserMessageChunk(chunk),
+            &agent_profiles::CLAUDE,
+        );
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            Event::UserPromptSent { text, attachments } => {
+                assert_eq!(text, "hello from the past");
+                assert!(attachments.is_empty());
+            }
+            other => panic!("expected UserPromptSent, got {other:?}"),
         }
     }
 

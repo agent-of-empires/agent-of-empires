@@ -505,6 +505,19 @@ async function handleRequest(msg) {
       const loadReplay = process.env.FAKE_ACP_LOAD_REPLAY;
       if (method === "session/load" && loadReplay) {
         setImmediate(() => {
+          // Replay a prior USER turn first (claude-agent-acp emits
+          // user_message_chunk for historical user messages), then the
+          // assistant reply, so the import spec can assert both render.
+          const userReplay = process.env.FAKE_ACP_LOAD_REPLAY_USER;
+          if (userReplay) {
+            sendNotification("session/update", {
+              sessionId,
+              update: {
+                sessionUpdate: "user_message_chunk",
+                content: { type: "text", text: userReplay },
+              },
+            });
+          }
           sendNotification("session/update", {
             sessionId,
             update: {
