@@ -85,6 +85,31 @@ describe("TipsModal (tip of the day)", () => {
     expect(queryByText(/Tip \d+ of/)).toBeNull();
   });
 
+  it("navigates backward with Previous", () => {
+    const { getByRole, getByText } = renderModal({ startIndex: 1 });
+    fireEvent.click(getByRole("button", { name: "Previous" }));
+    expect(getByText("First tip")).toBeTruthy();
+    expect(getByText("Tip 1 of 2")).toBeTruthy();
+  });
+
+  it("closes from the Close button", () => {
+    const { getByRole, onClose } = renderModal();
+    fireEvent.click(getByRole("button", { name: "Close" }));
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("closes when the overlay is clicked", () => {
+    const { getByRole, onClose } = renderModal();
+    fireEvent.click(getByRole("dialog"));
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("closes on Escape", () => {
+    const { onClose } = renderModal();
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
   it("renders an empty state with no tips", () => {
     const { getByText } = renderModal({ tips: [] });
     expect(getByText(/No tips right now/)).toBeTruthy();
