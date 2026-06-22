@@ -130,6 +130,98 @@ static CATALOG: &[Tip] = &[
         // About the web dashboard's PWA install, irrelevant to the TUI.
         surfaces: &[TipSurface::Web],
     },
+    // Web feature-discovery tips. These describe web gestures (right-click,
+    // pickers, the wizard), so they are web-only; the TUI teaches the same
+    // features through its help screen and the keyboard tips below.
+    Tip {
+        id: "pin-sessions",
+        title: "Keep important sessions on top",
+        body: "Right-click a session in the sidebar (long-press on touch) and choose Pin to \
+               float it to the top of every sort. Unpin it the same way.",
+        trigger: TipTrigger::Rotation,
+        surfaces: &[TipSurface::Web],
+    },
+    Tip {
+        id: "archive-sessions",
+        title: "Tuck finished sessions away",
+        body: "Right-click a session and choose Archive to stop it and tuck it into the \
+               \"Snoozed & archived\" footer at the bottom of the sidebar. Sending it a \
+               message brings it right back.",
+        trigger: TipTrigger::Rotation,
+        surfaces: &[TipSurface::Web],
+    },
+    Tip {
+        id: "snooze-sessions",
+        title: "Snooze a session for later",
+        body: "Right-click a session, choose Snooze, and pick a duration from 1 hour up to \
+               1 week. It stays hidden until the timer runs out or you send it a message.",
+        trigger: TipTrigger::Rotation,
+        surfaces: &[TipSurface::Web],
+    },
+    Tip {
+        id: "group-sessions",
+        title: "Organize sessions into groups",
+        body: "Use the grouping toggle in the sidebar to switch between By repo, By group, \
+               and By repo and group. Right-click a session and choose Edit group to file it \
+               under any name you like.",
+        trigger: TipTrigger::Rotation,
+        surfaces: &[TipSurface::Web],
+    },
+    Tip {
+        id: "sort-sidebar",
+        title: "Sort the sidebar your way",
+        body: "The sort picker offers Manual, where you drag the rows into any order \
+               yourself, Recent activity, and Attention, which floats the sessions that need \
+               you to the top.",
+        trigger: TipTrigger::Rotation,
+        surfaces: &[TipSurface::Web],
+    },
+    Tip {
+        id: "scratch-sessions",
+        title: "Spin up a scratch session",
+        body: "Need a throwaway? Toggle \"Skip project folder\" in the new-session wizard \
+               (or press Ctrl+Shift+N) to start a session with no repo. AoE makes a temp \
+               directory and cleans it up when you delete the session.",
+        trigger: TipTrigger::Rotation,
+        surfaces: &[TipSurface::Web],
+    },
+    Tip {
+        id: "multi-repo-sessions",
+        title: "Drive several repos at once",
+        body: "Save your repos as projects, then multi-select them in the new-session wizard \
+               to give one agent a worktree in every repo on a shared branch.",
+        trigger: TipTrigger::Rotation,
+        surfaces: &[TipSurface::Web],
+    },
+    // TUI keyboard-shortcut tips. Keys are written as `{placeholder}` and the
+    // tips overlay substitutes the live chord (correct in strict-hotkey mode);
+    // see `resolve_body` in `src/tui/dialogs/tips.rs`.
+    Tip {
+        id: "tui-core-views",
+        title: "Switch views fast",
+        body: "Toggle the agent and terminal panes with {toggle_view}, open the diff with \
+               {diff}, jump to settings with {settings}, and open this help any time with \
+               {help}.",
+        trigger: TipTrigger::Rotation,
+        surfaces: &[TipSurface::Tui],
+    },
+    Tip {
+        id: "tui-triage",
+        title: "Triage from the keyboard",
+        body: "Cycle the sort with {sort} and grouping with {group}, and archive a session \
+               with {archive}. In Attention sort, snooze with {snooze} or favorite with \
+               {favorite}.",
+        trigger: TipTrigger::Rotation,
+        surfaces: &[TipSurface::Tui],
+    },
+    Tip {
+        id: "tui-power",
+        title: "Power moves",
+        body: "Ctrl+K opens the command palette, {serve} exposes the dashboard for remote \
+               access, and {tool_session} opens a tool session like lazygit or yazi.",
+        trigger: TipTrigger::Rotation,
+        surfaces: &[TipSurface::Tui],
+    },
 ];
 
 /// Whether `id` is the id of a tip in the catalog. Used to reject unknown ids
@@ -214,6 +306,13 @@ mod tests {
         assert_eq!(sorted.len(), ids.len(), "tip ids must be unique");
     }
 
+    fn web_unseen_ids(seen: &[String], signals: &TipSignals) -> Vec<&'static str> {
+        eligible_unseen(TipSurface::Web, seen, signals)
+            .iter()
+            .map(|t| t.id)
+            .collect()
+    }
+
     #[test]
     fn earned_tip_suppressed_once_n_used() {
         let tip = by_id("new-from-selection").unwrap();
@@ -223,7 +322,12 @@ mod tests {
             used_new_from_selection: true,
         };
         assert!(!tip.is_eligible(TipSurface::Tui, &used));
-        assert_eq!(unseen_count(TipSurface::Tui, &[], &used), 0);
+        // The earned tip drops out, but rotation TUI tips remain.
+        let unseen: Vec<&str> = eligible_unseen(TipSurface::Tui, &[], &used)
+            .iter()
+            .map(|t| t.id)
+            .collect();
+        assert!(!unseen.contains(&"new-from-selection"));
         assert!(next_earned_pop(TipSurface::Tui, &[], &used).is_none());
     }
 
@@ -245,20 +349,19 @@ mod tests {
 
     #[test]
     fn unseen_count_tracks_eligibility_and_seen() {
-        // The only TUI tip is earned, so below threshold nothing is eligible.
-        assert_eq!(unseen_count(TipSurface::Tui, &[], &signals(0)), 0);
-
-        // At threshold it becomes eligible and unseen.
+        // Earning the N tip adds exactly one to the TUI count, regardless of how
+        // many rotation tips ship alongside it.
+        let base = unseen_count(TipSurface::Tui, &[], &signals(0));
         assert_eq!(
             unseen_count(
                 TipSurface::Tui,
                 &[],
                 &signals(NEW_FROM_SELECTION_TIP_THRESHOLD)
             ),
-            1
+            base + 1
         );
 
-        // Once seen, it drops back out of the count.
+        // Once seen, it drops back to the baseline.
         let seen = vec!["new-from-selection".to_string()];
         assert_eq!(
             unseen_count(
@@ -266,7 +369,7 @@ mod tests {
                 &seen,
                 &signals(NEW_FROM_SELECTION_TIP_THRESHOLD)
             ),
-            0
+            base
         );
     }
 
@@ -316,12 +419,27 @@ mod tests {
     }
 
     #[test]
-    fn web_rotation_tip_is_eligible_by_default() {
-        // The PWA tip is rotation, so a brand-new web user with no signals sees
-        // it (the badge has real content on the web surface).
-        assert_eq!(unseen_count(TipSurface::Web, &[], &signals(0)), 1);
-        // It is not earned, so it never pops on its own.
+    fn web_rotation_tips_are_eligible_by_default() {
+        // Web tips are all rotation, so a brand-new web user sees every one of
+        // them with no signals, and seeing one drops it from the count.
+        let all = web_unseen_ids(&[], &signals(0));
+        assert!(all.contains(&"install-dashboard-pwa"));
+        assert!(all.len() > 1, "more than just the PWA tip ships on the web");
+        let seen = vec!["install-dashboard-pwa".to_string()];
+        assert_eq!(web_unseen_ids(&seen, &signals(0)).len(), all.len() - 1);
+        // No web tip is earned, so nothing pops on its own.
         assert!(next_earned_pop(TipSurface::Web, &[], &signals(0)).is_none());
+    }
+
+    #[test]
+    fn web_tips_carry_no_keybinding_placeholders() {
+        // Web bodies are rendered as-is by the server (no placeholder resolver),
+        // so a `{...}` would leak raw into the dashboard.
+        for tip in catalog() {
+            if tip.surfaces.contains(&TipSurface::Web) {
+                assert!(!tip.body.contains('{'), "{} has a placeholder", tip.id);
+            }
+        }
     }
 
     #[test]

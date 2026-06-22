@@ -187,10 +187,29 @@ impl TipsDialog {
         if !body.contains('{') {
             return body.to_string();
         }
-        body.replace(
-            "{new_from_selection}",
-            &bindings::label(ActionId::NewFromSelection, self.strict),
-        )
+        // (placeholder, action) pairs; each is replaced with the action's live
+        // chord so the text is correct in strict-hotkey mode too.
+        const PLACEHOLDERS: &[(&str, ActionId)] = &[
+            ("{new_from_selection}", ActionId::NewFromSelection),
+            ("{toggle_view}", ActionId::ToggleView),
+            ("{diff}", ActionId::Diff),
+            ("{settings}", ActionId::Settings),
+            ("{help}", ActionId::Help),
+            ("{sort}", ActionId::SortPicker),
+            ("{group}", ActionId::GroupBy),
+            ("{archive}", ActionId::ToggleArchive),
+            ("{snooze}", ActionId::ToggleSnooze),
+            ("{favorite}", ActionId::ToggleFavorite),
+            ("{serve}", ActionId::Serve),
+            ("{tool_session}", ActionId::ToolPicker),
+        ];
+        let mut out = body.to_string();
+        for (placeholder, action) in PLACEHOLDERS {
+            if out.contains(placeholder) {
+                out = out.replace(placeholder, &bindings::label(*action, self.strict));
+            }
+        }
+        out
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<TipsOutcome> {
@@ -573,6 +592,20 @@ mod tests {
         assert!(strict_resolved.contains(&bindings::label(ActionId::NewFromSelection, true)));
         // The two modes render different chords (Shift+N vs Ctrl+N).
         assert_ne!(resolved, strict_resolved);
+    }
+
+    #[test]
+    fn body_substitutes_all_shortcut_placeholders() {
+        let dialog = TipsDialog::new(all_tips(), vec![], false, false);
+        let body = "{toggle_view} {diff} {settings} {help} {sort} {group} {archive} \
+                    {snooze} {favorite} {serve} {tool_session}";
+        let resolved = dialog.resolve_body(body);
+        assert!(
+            !resolved.contains('{'),
+            "every placeholder filled: {resolved}"
+        );
+        assert!(resolved.contains(&bindings::label(ActionId::Diff, false)));
+        assert!(resolved.contains(&bindings::label(ActionId::ToggleArchive, false)));
     }
 
     fn rendered_dialog(seen: Vec<String>) -> TipsDialog {

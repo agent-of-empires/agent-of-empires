@@ -1795,7 +1795,8 @@ fn using_n_suppresses_the_earned_tip() {
     env.view.selected_session = Some(id);
     // Earn the tip (badge showing) without queueing a pop.
     earn_tip(&mut env);
-    assert!(env.view.tips_unseen > 0, "tip is earned and badged");
+    let earned = env.view.tips_unseen;
+    assert!(earned > 0, "tip is earned and badged");
 
     // The user discovers N for themselves: open new-from-selection.
     env.view.handle_key(key(KeyCode::Char('N')), None);
@@ -1803,8 +1804,10 @@ fn using_n_suppresses_the_earned_tip() {
         env.view.new_dialog.is_some(),
         "N opens the new-from-selection dialog"
     );
+    // The earned tip drops from the badge (rotation tips, if any, remain).
     assert_eq!(
-        env.view.tips_unseen, 0,
+        env.view.tips_unseen,
+        earned - 1,
         "using N suppresses the tip that teaches it"
     );
 
