@@ -80,6 +80,20 @@
       "components": ["web/src/hooks/useLiveTerminal.ts", "web/src/components/MobileLiveTerminal.tsx"]
     },
     {
+      "id": "terminal.live-edge-pin",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/components/__tests__/MobileLiveTerminal.scrollPin.test.tsx"],
+      "components": ["web/src/components/MobileLiveTerminal.tsx"]
+    },
+    {
+      "id": "terminal.live-scrollback-buffer",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/mobile-live-scrollback-buffer.spec.ts"],
+      "components": ["web/src/components/MobileLiveTerminal.tsx", "web/src/hooks/useLiveTerminal.ts"]
+    },
+    {
       "id": "terminal.live-size-owner",
       "kind": "live-playwright",
       "risk": "high",

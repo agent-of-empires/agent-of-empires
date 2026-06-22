@@ -40,7 +40,7 @@ export function makeLiveFrame(opts: { rows?: number; history?: number; window?: 
   };
 }
 
-export async function mockTerminalApis(page: Page): Promise<MockHandle> {
+export async function mockTerminalApis(page: Page, opts: { liveHistory?: number } = {}): Promise<MockHandle> {
   const liveSockets: Array<{ send: (data: string) => void }> = [];
   const handle: MockHandle = {
     wsMessages: [],
@@ -113,7 +113,7 @@ export async function mockTerminalApis(page: Page): Promise<MockHandle> {
     liveSockets.push(ws);
     let rows = 24;
     let window = 24;
-    const history = 120;
+    const history = opts.liveHistory ?? 120;
     const reply = () => {
       try {
         ws.send(JSON.stringify({ type: "frame", ...makeLiveFrame({ rows, history, window }) }));
