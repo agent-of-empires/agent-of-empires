@@ -437,18 +437,21 @@ mod tests {
             title: "Alpha tip",
             body: "Body of the alpha tip.",
             trigger: crate::tips::TipTrigger::Rotation,
+            surfaces: &[crate::tips::TipSurface::Tui],
         },
         Tip {
             id: "beta",
             title: "Beta tip",
             body: "Body of the beta tip.",
             trigger: crate::tips::TipTrigger::Rotation,
+            surfaces: &[crate::tips::TipSurface::Tui],
         },
         Tip {
             id: "gamma",
             title: "Gamma tip",
             body: "Body of the gamma tip.",
             trigger: crate::tips::TipTrigger::Rotation,
+            surfaces: &[crate::tips::TipSurface::Tui],
         },
     ];
 

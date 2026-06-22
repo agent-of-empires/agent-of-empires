@@ -35,6 +35,19 @@ pub struct TipSignals {
 /// eventually learns about `N`.
 pub const NEW_FROM_SELECTION_TIP_THRESHOLD: u32 = 3;
 
+/// Which surface a tip is meant for. A tip lists every surface it applies to in
+/// [`Tip::surfaces`], so keyboard-only hints (the `N` shortcut) stay out of the
+/// web dashboard and web-only hints (installing the PWA) stay out of the TUI.
+/// All eligibility queries take a surface so each surface only ever sees its
+/// own tips.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TipSurface {
+    /// The terminal UI.
+    Tui,
+    /// The web dashboard (`aoe serve`).
+    Web,
+}
+
 /// When a tip becomes eligible to surface.
 pub enum TipTrigger {
     /// Always eligible. Surfaced passively via the badge + tips list; never
@@ -57,15 +70,20 @@ pub struct Tip {
     pub body: &'static str,
     /// What makes this tip eligible to surface.
     pub trigger: TipTrigger,
+    /// Surfaces this tip applies to. A tip never shows on a surface it doesn't
+    /// list, so a query for one surface can't leak another surface's tips.
+    pub surfaces: &'static [TipSurface],
 }
 
 impl Tip {
-    /// Whether this tip is eligible to surface given the current signals.
-    fn is_eligible(&self, signals: &TipSignals) -> bool {
-        match self.trigger {
-            TipTrigger::Rotation => true,
-            TipTrigger::Earned(predicate) => predicate(signals),
-        }
+    /// Whether this tip is eligible to surface on `surface` given the current
+    /// signals: it must apply to the surface and its trigger must fire.
+    fn is_eligible(&self, surface: TipSurface, signals: &TipSignals) -> bool {
+        self.surfaces.contains(&surface)
+            && match self.trigger {
+                TipTrigger::Rotation => true,
+                TipTrigger::Earned(predicate) => predicate(signals),
+            }
     }
 
     /// Whether this tip is allowed to pop on its own (earned tips only).
@@ -86,54 +104,84 @@ pub fn catalog() -> &'static [Tip] {
     CATALOG
 }
 
-static CATALOG: &[Tip] = &[Tip {
-    id: "new-from-selection",
-    title: "Reuse the selected session's settings",
-    // `{new_from_selection}` is substituted with the live keybinding label by
-    // the tips overlay, so it stays correct in strict-hotkey mode (where the
-    // chord is Ctrl+N rather than Shift+N).
-    body: "Tired of choosing the directory, profile, and group every time? Press \
-           {new_from_selection} on the home view to start a new session that inherits \
-           all of them from the session you have selected.",
-    trigger: TipTrigger::Earned(earned_new_from_selection),
-}];
+static CATALOG: &[Tip] = &[
+    Tip {
+        id: "new-from-selection",
+        title: "Reuse the selected session's settings",
+        // `{new_from_selection}` is substituted with the live keybinding label
+        // by the tips overlay, so it stays correct in strict-hotkey mode (where
+        // the chord is Ctrl+N rather than Shift+N).
+        body: "Tired of choosing the directory, profile, and group every time? Press \
+               {new_from_selection} on the home view to start a new session that inherits \
+               all of them from the session you have selected.",
+        trigger: TipTrigger::Earned(earned_new_from_selection),
+        // Teaches a keyboard shortcut, so it only makes sense in the TUI.
+        surfaces: &[TipSurface::Tui],
+    },
+    Tip {
+        id: "install-dashboard-pwa",
+        title: "Install the dashboard as an app",
+        // Browser-neutral wording: the engine can't know the user's browser or
+        // whether the dashboard is already installed.
+        body: "You can install the dashboard as an app for quick access. In your browser, \
+               use the install option (Install Agent of Empires in Chrome, or Add to Home \
+               Screen on iOS) to keep it one tap away and keep notifications working.",
+        trigger: TipTrigger::Rotation,
+        // About the web dashboard's PWA install, irrelevant to the TUI.
+        surfaces: &[TipSurface::Web],
+    },
+];
+
+/// Whether `id` is the id of a tip in the catalog. Used to reject unknown ids
+/// before persisting them to the shared seen list.
+pub fn id_in_catalog(id: &str) -> bool {
+    catalog().iter().any(|tip| tip.id == id)
+}
 
 /// Whether `id` is present in the seen list.
 fn is_seen(seen: &[String], id: &str) -> bool {
     seen.iter().any(|s| s == id)
 }
 
-/// Tips eligible to surface given the current signals, ignoring seen-state, in
-/// catalog order. The tips list shows these (seen ones marked); the badge and
-/// pops use the `*_unseen` variants below.
-pub fn eligible(signals: &TipSignals) -> Vec<&'static Tip> {
+/// Tips eligible to surface on `surface` given the current signals, ignoring
+/// seen-state, in catalog order. The tips list shows these (seen ones marked);
+/// the badge and pops use the `*_unseen` variants below.
+pub fn eligible(surface: TipSurface, signals: &TipSignals) -> Vec<&'static Tip> {
     catalog()
         .iter()
-        .filter(|tip| tip.is_eligible(signals))
+        .filter(|tip| tip.is_eligible(surface, signals))
         .collect()
 }
 
-/// Tips eligible to surface for a user who has already seen `seen`, given the
-/// current signals, in catalog order. Callers should additionally honor the
-/// `session.show_tips` setting before showing anything.
-pub fn eligible_unseen(seen: &[String], signals: &TipSignals) -> Vec<&'static Tip> {
-    eligible(signals)
+/// Tips eligible to surface on `surface` for a user who has already seen
+/// `seen`, given the current signals, in catalog order. Callers should
+/// additionally honor the `session.show_tips` setting before showing anything.
+pub fn eligible_unseen(
+    surface: TipSurface,
+    seen: &[String],
+    signals: &TipSignals,
+) -> Vec<&'static Tip> {
+    eligible(surface, signals)
         .into_iter()
         .filter(|tip| !is_seen(seen, tip.id))
         .collect()
 }
 
-/// Count of eligible, unseen tips. Drives the badge.
-pub fn unseen_count(seen: &[String], signals: &TipSignals) -> usize {
-    eligible_unseen(seen, signals).len()
+/// Count of eligible, unseen tips on `surface`. Drives the badge.
+pub fn unseen_count(surface: TipSurface, seen: &[String], signals: &TipSignals) -> usize {
+    eligible_unseen(surface, seen, signals).len()
 }
 
-/// The first earned tip that is eligible and unseen, i.e. one that may pop on
-/// its own right now. Rotation tips never pop, so they are excluded here.
-pub fn next_earned_pop(seen: &[String], signals: &TipSignals) -> Option<&'static Tip> {
+/// The first earned tip eligible and unseen on `surface`, i.e. one that may pop
+/// on its own right now. Rotation tips never pop, so they are excluded here.
+pub fn next_earned_pop(
+    surface: TipSurface,
+    seen: &[String],
+    signals: &TipSignals,
+) -> Option<&'static Tip> {
     catalog()
         .iter()
-        .find(|tip| tip.is_earned() && tip.is_eligible(signals) && !is_seen(seen, tip.id))
+        .find(|tip| tip.is_earned() && tip.is_eligible(surface, signals) && !is_seen(seen, tip.id))
 }
 
 #[cfg(test)]
@@ -174,36 +222,50 @@ mod tests {
             new_session_with_selection_count: NEW_FROM_SELECTION_TIP_THRESHOLD + 5,
             used_new_from_selection: true,
         };
-        assert!(!tip.is_eligible(&used));
-        assert_eq!(unseen_count(&[], &used), 0);
-        assert!(next_earned_pop(&[], &used).is_none());
+        assert!(!tip.is_eligible(TipSurface::Tui, &used));
+        assert_eq!(unseen_count(TipSurface::Tui, &[], &used), 0);
+        assert!(next_earned_pop(TipSurface::Tui, &[], &used).is_none());
     }
 
     #[test]
     fn earned_tip_gates_on_threshold() {
         let tip = by_id("new-from-selection").unwrap();
         assert!(tip.is_earned());
-        assert!(!tip.is_eligible(&signals(0)));
-        assert!(!tip.is_eligible(&signals(NEW_FROM_SELECTION_TIP_THRESHOLD - 1)));
-        assert!(tip.is_eligible(&signals(NEW_FROM_SELECTION_TIP_THRESHOLD)));
-        assert!(tip.is_eligible(&signals(NEW_FROM_SELECTION_TIP_THRESHOLD + 5)));
+        assert!(!tip.is_eligible(TipSurface::Tui, &signals(0)));
+        assert!(!tip.is_eligible(
+            TipSurface::Tui,
+            &signals(NEW_FROM_SELECTION_TIP_THRESHOLD - 1)
+        ));
+        assert!(tip.is_eligible(TipSurface::Tui, &signals(NEW_FROM_SELECTION_TIP_THRESHOLD)));
+        assert!(tip.is_eligible(
+            TipSurface::Tui,
+            &signals(NEW_FROM_SELECTION_TIP_THRESHOLD + 5)
+        ));
     }
 
     #[test]
     fn unseen_count_tracks_eligibility_and_seen() {
-        // The only tip is earned, so below threshold nothing is eligible.
-        assert_eq!(unseen_count(&[], &signals(0)), 0);
+        // The only TUI tip is earned, so below threshold nothing is eligible.
+        assert_eq!(unseen_count(TipSurface::Tui, &[], &signals(0)), 0);
 
         // At threshold it becomes eligible and unseen.
         assert_eq!(
-            unseen_count(&[], &signals(NEW_FROM_SELECTION_TIP_THRESHOLD)),
+            unseen_count(
+                TipSurface::Tui,
+                &[],
+                &signals(NEW_FROM_SELECTION_TIP_THRESHOLD)
+            ),
             1
         );
 
         // Once seen, it drops back out of the count.
         let seen = vec!["new-from-selection".to_string()];
         assert_eq!(
-            unseen_count(&seen, &signals(NEW_FROM_SELECTION_TIP_THRESHOLD)),
+            unseen_count(
+                TipSurface::Tui,
+                &seen,
+                &signals(NEW_FROM_SELECTION_TIP_THRESHOLD)
+            ),
             0
         );
     }
@@ -211,14 +273,62 @@ mod tests {
     #[test]
     fn next_earned_pop_only_when_eligible_and_unseen() {
         // Below threshold: nothing to pop.
-        assert!(next_earned_pop(&[], &signals(0)).is_none());
+        assert!(next_earned_pop(TipSurface::Tui, &[], &signals(0)).is_none());
 
         // At threshold: the new-from-selection tip pops.
-        let pop = next_earned_pop(&[], &signals(NEW_FROM_SELECTION_TIP_THRESHOLD));
+        let pop = next_earned_pop(
+            TipSurface::Tui,
+            &[],
+            &signals(NEW_FROM_SELECTION_TIP_THRESHOLD),
+        );
         assert_eq!(pop.map(|t| t.id), Some("new-from-selection"));
 
         // Once seen, it no longer pops even when eligible.
         let seen = vec!["new-from-selection".to_string()];
-        assert!(next_earned_pop(&seen, &signals(NEW_FROM_SELECTION_TIP_THRESHOLD)).is_none());
+        assert!(next_earned_pop(
+            TipSurface::Tui,
+            &seen,
+            &signals(NEW_FROM_SELECTION_TIP_THRESHOLD)
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn every_tip_lists_at_least_one_surface() {
+        for tip in catalog() {
+            assert!(!tip.surfaces.is_empty(), "{} lists no surface", tip.id);
+        }
+    }
+
+    #[test]
+    fn surfaces_do_not_leak_across() {
+        // The keyboard-shortcut tip is TUI-only; the PWA tip is web-only. Each
+        // surface sees its own and never the other's, even when eligible.
+        let earned = signals(NEW_FROM_SELECTION_TIP_THRESHOLD);
+
+        let web = eligible(TipSurface::Web, &earned);
+        assert!(web.iter().any(|t| t.id == "install-dashboard-pwa"));
+        assert!(!web.iter().any(|t| t.id == "new-from-selection"));
+
+        let tui = eligible(TipSurface::Tui, &earned);
+        assert!(tui.iter().any(|t| t.id == "new-from-selection"));
+        assert!(!tui.iter().any(|t| t.id == "install-dashboard-pwa"));
+    }
+
+    #[test]
+    fn web_rotation_tip_is_eligible_by_default() {
+        // The PWA tip is rotation, so a brand-new web user with no signals sees
+        // it (the badge has real content on the web surface).
+        assert_eq!(unseen_count(TipSurface::Web, &[], &signals(0)), 1);
+        // It is not earned, so it never pops on its own.
+        assert!(next_earned_pop(TipSurface::Web, &[], &signals(0)).is_none());
+    }
+
+    #[test]
+    fn id_in_catalog_matches_known_ids_only() {
+        assert!(id_in_catalog("new-from-selection"));
+        assert!(id_in_catalog("install-dashboard-pwa"));
+        assert!(!id_in_catalog("nope"));
+        assert!(!id_in_catalog(""));
     }
 }

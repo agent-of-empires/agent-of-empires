@@ -1016,6 +1016,7 @@ pub(super) fn tips_unseen_count(config: &crate::session::Config) -> usize {
         return 0;
     }
     crate::tips::unseen_count(
+        crate::tips::TipSurface::Tui,
         &config.app_state.tips_seen,
         &crate::tips::TipSignals {
             new_session_with_selection_count: config.app_state.new_session_with_selection_count,
