@@ -1616,6 +1616,14 @@ impl<S: BroadcastSink> Supervisor<S> {
                                         );
                                         spawn_config.stored_acp_session_id =
                                             Some(acp_session_id.clone());
+                                        // Import replay is one-shot: only the
+                                        // first successful session/load needs
+                                        // it. Clear it so an automatic respawn
+                                        // (crash/drain) suppresses replay against
+                                        // the now-populated event store instead
+                                        // of duplicating the transcript. See
+                                        // #2276.
+                                        spawn_config.seed_history_replay = false;
                                     }
                                 }
                                 // Mirror into the on-disk registry so a fresh
