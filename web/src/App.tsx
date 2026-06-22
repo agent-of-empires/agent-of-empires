@@ -92,6 +92,8 @@ import { TokenEntryPage } from "./components/TokenEntryPage";
 import { LOGIN_REQUIRED_EVENT, TOKEN_EXPIRED_EVENT, resetTokenExpired } from "./lib/fetchInterceptor";
 import { AboutModal } from "./components/AboutModal";
 import { TelemetryConsentModal } from "./components/TelemetryConsentModal";
+import { TipsModal } from "./components/TipsModal";
+import { useTips } from "./hooks/useTips";
 import { CommandPalette } from "./components/command-palette/CommandPalette";
 import { DisconnectBanner } from "./components/DisconnectBanner";
 import { ElevationPrompt } from "./components/ElevationPrompt";
@@ -356,6 +358,8 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   const [pairedMounted, setPairedMounted] = useState(false);
   const [showSessionWizard, setShowSessionWizard] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
+  const [showTips, setShowTips] = useState(false);
+  const tips = useTips();
   const [showPalette, setShowPalette] = useState(false);
   const [showAbout, setShowAbout] = useState(false);
   const [telemetryConsentNeeded, setTelemetryConsentNeeded] = useState(false);
@@ -1323,6 +1327,8 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
           loginRequired={loginRequired}
           isOffline={!!error}
           isDevBuild={isDebugBuild(serverAbout)}
+          tipsUnseen={tips.unseenCount}
+          onOpenTips={() => setShowTips(true)}
           onGoDashboard={handleGoDashboard}
           sidebarColumnVisible={!showSettings && sidebarOpen}
           rightColumnVisible={isMdUp && !showSettings && !!activeWorkspace && !!activeSession && !diffCollapsed}
@@ -1404,6 +1410,15 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
         {tour.tourElement}
 
         {showHelp && <HelpOverlay onClose={() => setShowHelp(false)} />}
+
+        {showTips && (
+          <TipsModal
+            tips={tips.tips}
+            onMarkSeen={tips.markSeen}
+            onDisable={tips.disable}
+            onClose={() => setShowTips(false)}
+          />
+        )}
 
         {showAbout && <AboutModal onClose={() => setShowAbout(false)} sessionId={activeSessionId} />}
         {telemetryConsentNeeded && <TelemetryConsentModal onChoose={handleTelemetryConsent} />}

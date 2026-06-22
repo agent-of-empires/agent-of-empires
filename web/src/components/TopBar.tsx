@@ -24,6 +24,10 @@ interface Props {
    *  the port is not visible in the window chrome. Driven by
    *  `ServerAbout.build_flavor === "debug"`. See #1055. */
   isDevBuild: boolean;
+  /** Count of unseen tips. When > 0 a clickable 💡 badge shows in the right
+   *  zone; 0 hides it (tips off or nothing unseen). */
+  tipsUnseen: number;
+  onOpenTips: () => void;
   onGoDashboard: () => void;
   /** When true (desktop, sidebar open, not in a full-width settings/projects
    *  view), the header's left zone widens to match the sidebar column and the
@@ -50,6 +54,8 @@ export function TopBar({
   loginRequired,
   isOffline,
   isDevBuild,
+  tipsUnseen,
+  onOpenTips,
   onGoDashboard,
   sidebarColumnVisible,
   rightColumnVisible,
@@ -138,6 +144,18 @@ export function TopBar({
             <span className="w-1.5 h-1.5 rounded-full bg-status-error animate-pulse" />
             offline
           </span>
+        )}
+
+        {tipsUnseen > 0 && (
+          <button
+            onClick={onOpenTips}
+            className="font-mono text-[11px] px-1.5 py-0.5 rounded-full bg-brand-600/15 text-brand-400 ring-1 ring-brand-500/30 flex items-center gap-1 hover:bg-brand-600/25 transition-colors cursor-pointer"
+            title={`${tipsUnseen} ${tipsUnseen === 1 ? "tip" : "tips"}`}
+            aria-label={`${tipsUnseen} ${tipsUnseen === 1 ? "tip" : "tips"}`}
+          >
+            <span aria-hidden="true">💡</span>
+            {tipsUnseen}
+          </button>
         )}
 
         {activeWorkspace && activeSession && (
