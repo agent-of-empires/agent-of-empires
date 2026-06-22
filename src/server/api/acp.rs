@@ -814,6 +814,10 @@ pub async fn switch_acp_agent(
         if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
             inst.agent_name = Some(target_for_save.clone());
             inst.acp_session_id = None;
+            // Switching backend abandons any pending import (#2276), else a
+            // later spawn/reconciler pass treats this as an import and clears
+            // the store before spawning.
+            inst.import_pending = None;
             if let Some(m) = &model {
                 inst.agent_model = Some(m.clone());
             }
@@ -824,6 +828,7 @@ pub async fn switch_acp_agent(
             if let Some(inst) = instances.iter_mut().find(|i| i.id == id_for_save) {
                 inst.agent_name = Some(target_for_save.clone());
                 inst.acp_session_id = None;
+                inst.import_pending = None;
             }
             Ok(())
         }) {
@@ -1739,6 +1744,8 @@ pub async fn acp_disable(
             "clearing acp_session_id on disable"
         );
         instance.acp_session_id = None;
+        // Disabling structured view abandons any pending import (#2276).
+        instance.import_pending = None;
     }
 
     // Persist + start tmux. start() now no longer short-circuits for
@@ -1755,6 +1762,7 @@ pub async fn acp_disable(
         if let Some(slot) = instances.iter_mut().find(|i| i.id == id) {
             slot.view = crate::session::View::Terminal;
             slot.acp_session_id = None;
+            slot.import_pending = None;
         }
     }
     let id_for_save = id.clone();
@@ -1766,6 +1774,7 @@ pub async fn acp_disable(
             if let Some(slot) = all.iter_mut().find(|i| i.id == id_for_save) {
                 slot.view = crate::session::View::Terminal;
                 slot.acp_session_id = None;
+                slot.import_pending = None;
             }
             Ok(())
         })?;
