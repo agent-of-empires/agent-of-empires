@@ -385,6 +385,27 @@
       "components": ["web/src/components/TopBar.tsx"]
     },
     {
+      "id": "app-shell.tips-badge",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/__tests__/TopBar.test.tsx"],
+      "components": ["web/src/components/TopBar.tsx"]
+    },
+    {
+      "id": "tips.panel",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/__tests__/TipsModal.test.tsx"],
+      "components": ["web/src/components/TipsModal.tsx"]
+    },
+    {
+      "id": "tips.persistence",
+      "kind": "live-playwright",
+      "risk": "medium",
+      "specs": ["tests/live/tips.spec.ts"],
+      "components": ["web/src/components/TipsModal.tsx", "web/src/hooks/useTips.ts", "web/src/lib/api.ts"]
+    },
+    {
       "id": "app-shell.routing",
       "kind": "mocked-playwright",
       "risk": "high",

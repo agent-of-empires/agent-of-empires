@@ -32,6 +32,14 @@ base("first-run tutorial: auto-launch, skip, persist, re-trigger", async ({ page
       Object.defineProperty(navigator, "webdriver", { get: () => false });
     });
 
+    // Tips also auto-pop for returning users (tour seen) in a non-automated
+    // session. This spec reloads into exactly that state, so turn tips off here
+    // to keep the tour the only modal under test; tips have their own spec.
+    const disableTipsRes = await page.request.post(`${serve.baseUrl}/api/tips/show`, {
+      data: { enabled: false },
+    });
+    expect(disableTipsRes.ok(), "failed to disable tips before tutorial isolation").toBeTruthy();
+
     await page.goto(serve.baseUrl);
 
     // Phase 1 of onboarding (#1834): the theme welcome modal shows first on a

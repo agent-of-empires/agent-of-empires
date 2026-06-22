@@ -23,6 +23,7 @@ interface Props {
   webSettings: { persistentTerminals: boolean; maxPersistentTerminals: number };
   selectedFilePath: string | null;
   selectedRepoName: string | undefined;
+  selectedFileLine: number | undefined;
   revision: number;
   diffFiles: RichDiffFile[];
   perRepoBases: RepoBase[];
@@ -63,6 +64,7 @@ export function MobileMainPane({
   webSettings,
   selectedFilePath,
   selectedRepoName,
+  selectedFileLine,
   revision,
   diffFiles,
   perRepoBases,
@@ -136,6 +138,7 @@ export function MobileMainPane({
                 sessionId={activeSessionId}
                 filePath={selectedFilePath}
                 repoName={selectedRepoName}
+                targetLine={selectedFileLine}
                 revision={revision}
                 onClose={onCloseFile}
                 commentsEnabled={commentsEnabled}

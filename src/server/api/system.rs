@@ -455,6 +455,200 @@ pub async fn mark_web_tour_seen(State(state): State<Arc<AppState>>) -> impl Into
     }
 }
 
+#[derive(Serialize)]
+pub struct TipDto {
+    pub id: String,
+    pub title: String,
+    pub body: String,
+    pub seen: bool,
+}
+
+#[derive(Serialize)]
+pub struct TipsResponse {
+    /// Mirror of `session.show_tips`. The dashboard hides the badge and panel
+    /// when this is false. This payload is a read projection; the toggle is
+    /// written through the dedicated `POST /api/tips/show` ([`set_show_tips`]),
+    /// and the same preference is also editable from the settings schema.
+    pub enabled: bool,
+    /// Web-eligible tips in catalog order, each flagged with whether it has been
+    /// seen. The frontend derives the badge count from the unseen ones and can
+    /// still show seen tips in a collapsed section.
+    pub tips: Vec<TipDto>,
+}
+
+/// Returns the web-surface tips and whether tips are enabled, composed from the
+/// shared `crate::tips` catalog plus `app_state.tips_seen` and
+/// `session.show_tips`. A read projection, so it stays a plain GET behind the
+/// token wall like [`get_web_ui_state`]; the TUI-only tips never appear here.
+pub async fn get_tips(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
+    let result = tokio::task::spawn_blocking(|| {
+        let config = crate::session::Config::load()?;
+        let signals = crate::tips::TipSignals {
+            new_session_with_selection_count: config.app_state.new_session_with_selection_count,
+            used_new_from_selection: config.app_state.used_new_from_selection,
+        };
+        let seen = &config.app_state.tips_seen;
+        let tips = crate::tips::eligible(crate::tips::TipSurface::Web, &signals)
+            .into_iter()
+            .map(|tip| TipDto {
+                id: tip.id.to_string(),
+                title: tip.title.to_string(),
+                body: tip.body.to_string(),
+                seen: seen.iter().any(|s| s == tip.id),
+            })
+            .collect();
+        Ok::<_, anyhow::Error>(TipsResponse {
+            enabled: config.session.show_tips,
+            tips,
+        })
+    })
+    .await;
+
+    match result {
+        Ok(Ok(resp)) => (StatusCode::OK, Json(resp)).into_response(),
+        // Best-effort: an unreadable config yields an empty, disabled payload so
+        // the dashboard simply shows no badge rather than erroring.
+        _ => (
+            StatusCode::OK,
+            Json(TipsResponse {
+                enabled: false,
+                tips: Vec::new(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct MarkTipSeenBody {
+    pub id: String,
+}
+
+/// Marks one tip seen by appending its id to the shared `app_state.tips_seen`,
+/// so the dashboard's mark-seen-on-view sticks across devices and matches the
+/// TUI. Single-purpose write mirroring [`mark_web_tour_seen`]: exempt from the
+/// elevation wall, still blocked by `read_only`, and uses `Config::load()` so a
+/// corrupt config is not silently replaced. Rejects an id that is not in the
+/// catalog so junk can't accumulate in the persisted seen list.
+pub async fn mark_tip_seen(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<MarkTipSeenBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(
+                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
+            ),
+        )
+            .into_response();
+    }
+    let Json(MarkTipSeenBody { id }) = match body {
+        Ok(b) => b,
+        Err(rej) => return rej.into_response(),
+    };
+    if !crate::tips::id_in_catalog(&id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "unknown_tip", "message": format!("Unknown tip id '{id}'")})),
+        )
+            .into_response();
+    }
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut config = crate::session::Config::load()?;
+        if !config.app_state.tips_seen.iter().any(|s| s == &id) {
+            config.app_state.tips_seen.push(id);
+        }
+        crate::session::save_config(&config)?;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
+        Ok(Err(e)) => {
+            tracing::warn!(target: "http.api.system", "Marking tip seen failed: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "save_failed", "message": "Failed to persist tip state"})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!(target: "http.api.system", "Marking tip seen panicked: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct SetShowTipsBody {
+    pub enabled: bool,
+}
+
+/// Sets `session.show_tips`, the "Show tips on startup" checkbox in the tip-of-
+/// the-day modal. A dedicated single-purpose write rather than `PATCH
+/// /api/settings`, which the auth middleware elevation-gates: this is a cosmetic
+/// preference and must not trip the passphrase wall on a remote server. Mirrors
+/// [`mark_web_tour_seen`]: exempt from elevation, still blocked by `read_only`,
+/// and uses `Config::load()` so a corrupt config is not silently replaced. The
+/// same preference is also editable from the settings Interaction tab.
+pub async fn set_show_tips(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<SetShowTipsBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(
+                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
+            ),
+        )
+            .into_response();
+    }
+    let Json(SetShowTipsBody { enabled }) = match body {
+        Ok(b) => b,
+        Err(rej) => return rej.into_response(),
+    };
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut config = crate::session::Config::load()?;
+        config.session.show_tips = enabled;
+        crate::session::save_config(&config)?;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"show_tips": enabled})),
+        )
+            .into_response(),
+        Ok(Err(e)) => {
+            tracing::warn!(target: "http.api.system", "Setting show_tips failed: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "save_failed", "message": "Failed to persist tips state"})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!(target: "http.api.system", "Setting show_tips panicked: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
 #[derive(serde::Deserialize)]
 pub struct DismissUpdateBody {
     pub version: String,

@@ -3633,7 +3633,7 @@ impl HomeView {
             new_session_with_selection_count: config.app_state.new_session_with_selection_count,
             used_new_from_selection: config.app_state.used_new_from_selection,
         };
-        let eligible = crate::tips::eligible(&signals);
+        let eligible = crate::tips::eligible(crate::tips::TipSurface::Tui, &signals);
         self.tips_dialog = Some(TipsDialog::new(
             eligible,
             config.app_state.tips_seen.clone(),
@@ -3717,7 +3717,11 @@ impl HomeView {
             new_session_with_selection_count: config.app_state.new_session_with_selection_count,
             used_new_from_selection: config.app_state.used_new_from_selection,
         };
-        self.pending_tip_pop = crate::tips::next_earned_pop(&config.app_state.tips_seen, &signals);
+        self.pending_tip_pop = crate::tips::next_earned_pop(
+            crate::tips::TipSurface::Tui,
+            &config.app_state.tips_seen,
+            &signals,
+        );
     }
 
     /// Open the queued earned tip as a small one-tip overlay, if any. Called
