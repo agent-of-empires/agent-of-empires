@@ -111,9 +111,12 @@ function normalizeGroupPath(path: string | null | undefined): string {
 
 function groupDisplayName(path: string): string {
   if (path === "") return "Ungrouped";
-  // v1 renders groups flat; the leaf segment is the friendly label while
-  // the full path stays available as the header title for nested groups.
-  return path.split("/").pop() || path;
+  // v1 renders groups flat, so show the full nested path (segments joined
+  // by " / ") rather than the leaf alone, which collides when sibling
+  // groups share a leaf name (e.g. "pushforward/PRs" and
+  // "chargeunpacker/PRs" both showing "PRs"). The raw path stays the header
+  // title. See #2277.
+  return path.split("/").join(" / ");
 }
 
 // Build the user-group axis from workspaces. `group_path` is per-session,

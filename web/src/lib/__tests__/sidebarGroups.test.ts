@@ -157,10 +157,18 @@ describe("buildSessionGroups", () => {
     expect(groups[0]!.workspaces.map((v) => v.workspace.id)).toEqual(["w1", "w2", "w3"]);
   });
 
-  it("uses the leaf segment of a nested path as the display name", () => {
+  it("flattens a nested path into the display name instead of truncating to the leaf", () => {
     const groups = build([workspace("w1", [session({ id: "s1", group_path: "feature/auth" })])]);
     expect(groups[0]!.id).toBe("feature/auth");
-    expect(groups[0]!.displayName).toBe("auth");
+    expect(groups[0]!.displayName).toBe("feature / auth");
+  });
+
+  it("keeps sibling nested groups distinct instead of colliding on a shared leaf", () => {
+    const groups = build([
+      workspace("w1", [session({ id: "a", group_path: "pushforward/PRs" })]),
+      workspace("w2", [session({ id: "b", group_path: "chargeunpacker/PRs" })]),
+    ]);
+    expect(groups.map((g) => g.displayName)).toEqual(["chargeunpacker / PRs", "pushforward / PRs"]);
   });
 
   it("reflects collapse state from the isCollapsed lookup", () => {
