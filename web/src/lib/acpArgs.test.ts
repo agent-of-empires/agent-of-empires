@@ -8,12 +8,24 @@ import { describe, expect, it } from "vitest";
 import {
   hasArgsBody,
   hasTodoItemsArgsText,
+  humanizePermissionTitle,
   parseJsonObject,
   pickFirst,
   pickStr,
   previewFromArgs,
   todoItemsFromArgs,
 } from "./acpArgs";
+
+describe("humanizePermissionTitle", () => {
+  it("maps a known permission identifier to a readable label", () => {
+    expect(humanizePermissionTitle("external_directory")).toBe("External directory access");
+  });
+
+  it("passes an unknown identifier through verbatim", () => {
+    expect(humanizePermissionTitle("Bash")).toBe("Bash");
+    expect(humanizePermissionTitle("some_future_kind")).toBe("some_future_kind");
+  });
+});
 
 describe("parseJsonObject", () => {
   it("returns the object for valid JSON object input", () => {
