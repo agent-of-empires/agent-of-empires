@@ -462,7 +462,12 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
             } else {
                 None
             };
-            let (next_wakeup_at, next_wakeup_reason) = if inst.is_structured() {
+            // Archived sessions are sunk and not live; their wakeup/monitor
+            // badge is meaningless, so skip the per-poll SQLite lookups for
+            // them. Unarchiving restores the queries. latest_plan stays
+            // ungated: a collapsed archived row may still show a plan summary.
+            let structured_live = inst.is_structured() && !inst.is_archived();
+            let (next_wakeup_at, next_wakeup_reason) = if structured_live {
                 match state.acp_event_store.latest_pending_wakeup(&inst.id) {
                     Some((at, reason)) => (Some(at.to_rfc3339()), reason),
                     None => (None, None),
@@ -470,7 +475,7 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
             } else {
                 (None, None)
             };
-            let active_monitor = if inst.is_structured() {
+            let active_monitor = if structured_live {
                 state.acp_event_store.latest_active_monitor(&inst.id)
             } else {
                 None
