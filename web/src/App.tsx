@@ -94,7 +94,7 @@ import { LOGIN_REQUIRED_EVENT, TOKEN_EXPIRED_EVENT, resetTokenExpired } from "./
 import { AboutModal } from "./components/AboutModal";
 import { TelemetryConsentModal } from "./components/TelemetryConsentModal";
 import { TipsModal } from "./components/TipsModal";
-import { useTips } from "./hooks/useTips";
+import { useTips, shouldAutoPopTips } from "./hooks/useTips";
 import { CommandPalette } from "./components/command-palette/CommandPalette";
 import { DisconnectBanner } from "./components/DisconnectBanner";
 import { ElevationPrompt } from "./components/ElevationPrompt";
@@ -359,29 +359,15 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   const [pairedMounted, setPairedMounted] = useState(false);
   const [showSessionWizard, setShowSessionWizard] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
-  const [tipsOpen, setTipsOpen] = useState(false);
-  const [tipsStartIndex, setTipsStartIndex] = useState(0);
   const tipsAutoPoppedRef = useRef(false);
   // Whether the tour was already seen when this page loaded (set in the settings
   // fetch below). Auto-pop keys off this, not the live tourSeen, so finishing
   // the tour this session does not then pop tips on top of the first-run flow.
   const tourSeenAtLoadRef = useRef<boolean | null>(null);
+  // All tips orchestration (open state, mark-seen, the show toggle, the auto-pop
+  // decision) lives in the hook / lib so it stays out of this component and is
+  // unit-tested directly.
   const tips = useTips();
-  // Open the tip-of-the-day modal on the first unseen tip and mark that tip seen
-  // here (an event, not an effect); the modal marks the rest as you navigate.
-  // Capture the index before marking: marking shifts firstUnseenIndex, so the
-  // modal must open on the captured index, not the recomputed one, or it would
-  // skip the tip we just marked.
-  const openTips = useCallback(() => {
-    const idx = tips.firstUnseenIndex;
-    setTipsStartIndex(idx);
-    setTipsOpen(true);
-    const tip = tips.tips[idx];
-    if (tip && !tip.seen) tips.markSeen(tip.id);
-  }, [tips]);
-  // Auto-pop scheduler: defer one frame so the open happens off the effect body
-  // (mirrors the tour's begin()), keeping the state change out of the effect.
-  const beginTipsAutoPop = useCallback(() => requestAnimationFrame(() => openTips()), [openTips]);
   const [showPalette, setShowPalette] = useState(false);
   const [showAbout, setShowAbout] = useState(false);
   const [telemetryConsentNeeded, setTelemetryConsentNeeded] = useState(false);
@@ -1345,23 +1331,22 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   // tour, not a tips modal piled on top. Reopen any time from the menu.
   useEffect(() => {
     if (tipsAutoPoppedRef.current) return;
-    if (!tips.loaded || !tips.hasUnseen) return;
-    if (tourSeenAtLoadRef.current !== true) return;
-    if (!tourAutoLaunchReady || !welcome.resolved || telemetryConsentNeeded || tour.isTourActive) return;
-    if (isAutomatedSession()) return;
+    const gate = shouldAutoPopTips({
+      loaded: tips.loaded,
+      hasUnseen: tips.hasUnseen,
+      tourSeenAtLoad: tourSeenAtLoadRef.current,
+      onboardingReady: tourAutoLaunchReady && welcome.resolved,
+      telemetryPending: telemetryConsentNeeded,
+      tourActive: tour.isTourActive,
+      automated: isAutomatedSession(),
+    });
+    if (!gate) return;
     tipsAutoPoppedRef.current = true;
-    const id = beginTipsAutoPop();
+    // Defer one frame so the open happens off the effect body (mirrors the
+    // tour's begin()), keeping the state change out of the effect.
+    const id = requestAnimationFrame(() => tips.open());
     return () => cancelAnimationFrame(id);
-  }, [
-    tips.loaded,
-    tips.hasUnseen,
-    tourSeenKnown,
-    tourAutoLaunchReady,
-    welcome.resolved,
-    telemetryConsentNeeded,
-    tour.isTourActive,
-    beginTipsAutoPop,
-  ]);
+  }, [tips, tourSeenKnown, tourAutoLaunchReady, welcome.resolved, telemetryConsentNeeded, tour.isTourActive]);
 
   return (
     <AcpPrefsProvider value={acpPrefs}>
@@ -1380,7 +1365,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
           loginRequired={loginRequired}
           isOffline={!!error}
           isDevBuild={isDebugBuild(serverAbout)}
-          onOpenTips={openTips}
+          onOpenTips={tips.open}
           onGoDashboard={handleGoDashboard}
           sidebarColumnVisible={!showSettings && sidebarOpen}
           rightColumnVisible={isMdUp && !showSettings && !!activeWorkspace && !!activeSession && !diffCollapsed}
@@ -1463,14 +1448,14 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
 
         {showHelp && <HelpOverlay onClose={() => setShowHelp(false)} />}
 
-        {tipsOpen && (
+        {tips.isOpen && (
           <TipsModal
             tips={tips.tips}
-            startIndex={tipsStartIndex}
+            startIndex={tips.startIndex}
             enabled={tips.enabled}
             onMarkSeen={tips.markSeen}
             onSetEnabled={tips.setEnabled}
-            onClose={() => setTipsOpen(false)}
+            onClose={tips.close}
           />
         )}
 

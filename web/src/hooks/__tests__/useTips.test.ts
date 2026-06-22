@@ -1,14 +1,14 @@
 // @vitest-environment jsdom
 //
-// Hook tests for useTips (#2292): fetches the web-surface tips on mount,
-// derives the unseen/firstUnseen state the tip-of-the-day modal needs, and
-// persists mark-seen and the show-on-startup toggle through the api module
-// (mocked here so no network is touched).
+// Tests for useTips and shouldAutoPopTips (#2292): the hook fetches the
+// web-surface tips, derives unseen state, owns the modal open/close + the tip
+// it opens on, and persists mark-seen and the show-on-startup toggle through
+// the api module (mocked). shouldAutoPopTips is the pure startup-auto-pop gate.
 
 import { renderHook, act, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { useTips } from "../useTips";
+import { useTips, shouldAutoPopTips, type TipsAutoPopGate } from "../useTips";
 import type { TipsResponse } from "../../lib/api";
 
 vi.mock("../../lib/api", () => ({
@@ -47,16 +47,7 @@ describe("useTips", () => {
     expect(result.current.enabled).toBe(true);
     expect(result.current.tips).toHaveLength(2);
     expect(result.current.hasUnseen).toBe(true);
-    expect(result.current.firstUnseenIndex).toBe(1);
-  });
-
-  it("reports no unseen and index 0 when all tips are seen", async () => {
-    mockFetch.mockResolvedValue(resp({ tips: [{ id: "a", title: "A", body: "b", seen: true }] }));
-    const { result } = renderHook(() => useTips());
-
-    await waitFor(() => expect(result.current.loaded).toBe(true));
-    expect(result.current.hasUnseen).toBe(false);
-    expect(result.current.firstUnseenIndex).toBe(0);
+    expect(result.current.isOpen).toBe(false);
   });
 
   it("treats a failed fetch as loaded with no tips", async () => {
@@ -77,6 +68,32 @@ describe("useTips", () => {
     expect(result.current.hasUnseen).toBe(false);
   });
 
+  it("opens on the first unseen tip, marks it seen, and closes", async () => {
+    mockFetch.mockResolvedValue(resp());
+    mockMarkSeen.mockResolvedValue(true);
+    const { result } = renderHook(() => useTips());
+    await waitFor(() => expect(result.current.loaded).toBe(true));
+
+    act(() => result.current.open());
+    expect(result.current.isOpen).toBe(true);
+    expect(result.current.startIndex).toBe(1); // first unseen
+    expect(result.current.tips.find((t) => t.id === "b")?.seen).toBe(true);
+    expect(mockMarkSeen).toHaveBeenCalledWith("b");
+
+    act(() => result.current.close());
+    expect(result.current.isOpen).toBe(false);
+  });
+
+  it("opens at index 0 when every tip is already seen", async () => {
+    mockFetch.mockResolvedValue(resp({ tips: [{ id: "a", title: "A", body: "b", seen: true }] }));
+    const { result } = renderHook(() => useTips());
+    await waitFor(() => expect(result.current.loaded).toBe(true));
+
+    act(() => result.current.open());
+    expect(result.current.startIndex).toBe(0);
+    expect(mockMarkSeen).not.toHaveBeenCalled();
+  });
+
   it("markSeen flips the tip locally and persists it", async () => {
     mockFetch.mockResolvedValue(resp());
     mockMarkSeen.mockResolvedValue(true);
@@ -84,7 +101,6 @@ describe("useTips", () => {
     await waitFor(() => expect(result.current.loaded).toBe(true));
 
     act(() => result.current.markSeen("b"));
-
     expect(result.current.tips.find((t) => t.id === "b")?.seen).toBe(true);
     expect(result.current.hasUnseen).toBe(false);
     expect(mockMarkSeen).toHaveBeenCalledWith("b");
@@ -97,9 +113,35 @@ describe("useTips", () => {
     await waitFor(() => expect(result.current.loaded).toBe(true));
 
     act(() => result.current.setEnabled(false));
-
     expect(result.current.enabled).toBe(false);
     expect(result.current.hasUnseen).toBe(false);
     expect(mockSetShow).toHaveBeenCalledWith(false);
+  });
+});
+
+describe("shouldAutoPopTips", () => {
+  const ready: TipsAutoPopGate = {
+    loaded: true,
+    hasUnseen: true,
+    tourSeenAtLoad: true,
+    onboardingReady: true,
+    telemetryPending: false,
+    tourActive: false,
+    automated: false,
+  };
+
+  it("returns true when every gate is satisfied", () => {
+    expect(shouldAutoPopTips(ready)).toBe(true);
+  });
+
+  it("blocks each individual gate", () => {
+    expect(shouldAutoPopTips({ ...ready, loaded: false })).toBe(false);
+    expect(shouldAutoPopTips({ ...ready, hasUnseen: false })).toBe(false);
+    expect(shouldAutoPopTips({ ...ready, tourSeenAtLoad: false })).toBe(false);
+    expect(shouldAutoPopTips({ ...ready, tourSeenAtLoad: null })).toBe(false);
+    expect(shouldAutoPopTips({ ...ready, onboardingReady: false })).toBe(false);
+    expect(shouldAutoPopTips({ ...ready, telemetryPending: true })).toBe(false);
+    expect(shouldAutoPopTips({ ...ready, tourActive: true })).toBe(false);
+    expect(shouldAutoPopTips({ ...ready, automated: true })).toBe(false);
   });
 });
