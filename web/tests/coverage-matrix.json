@@ -630,6 +630,27 @@
       ]
     },
     {
+      "id": "wizard.import-claude-session",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/acp-import-claude-session.spec.ts"],
+      "components": [
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/components/session-wizard/steps/ProjectStep.tsx",
+        "web/src/components/session-wizard/steps/ClaudeSessionPicker.tsx"
+      ]
+    },
+    {
+      "id": "wizard.import-claude-session.unit",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/components/session-wizard/__tests__/ProjectStep.import.test.tsx"],
+      "components": [
+        "web/src/components/session-wizard/steps/ProjectStep.tsx",
+        "web/src/components/session-wizard/steps/ClaudeSessionPicker.tsx"
+      ]
+    },
+    {
       "id": "wizard.scratch-delete-cleans-tempdir",
       "kind": "live-playwright",
       "risk": "high",

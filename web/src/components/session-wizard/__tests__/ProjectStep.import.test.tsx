@@ -1,0 +1,97 @@
+// @vitest-environment jsdom
+//
+// Vitest coverage for the ProjectStep "Import Claude" tab (#2276): the
+// picker lists on-disk Claude Code sessions, disables ones whose cwd is
+// gone, and selecting one prefills a structured-view claude session that
+// resumes the chosen id (path = original cwd, worktree off,
+// importAcpSessionId set). Live Playwright exercises the end-to-end
+// resume + transcript render; this isolates the field-wiring so it does
+// not depend on a real `aoe serve`.
+
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { cleanup, render, fireEvent, waitFor } from "@testing-library/react";
+
+import { ProjectStep } from "../steps/ProjectStep";
+import { initialData } from "../wizardReducer";
+import type { ClaudeSessionSummary } from "../../../lib/types";
+
+vi.mock("../../../lib/api", () => ({
+  fetchSessions: vi.fn().mockResolvedValue({ sessions: [], workspace_ordering: [] }),
+  fetchRecentProjects: vi.fn(),
+  fetchProjects: vi.fn().mockResolvedValue([]),
+  cloneRepo: vi.fn(),
+  getHomePath: vi.fn().mockResolvedValue(null),
+  browseFilesystem: vi.fn().mockResolvedValue({ ok: false, entries: [] }),
+  listClaudeSessions: vi.fn(),
+}));
+
+import { listClaudeSessions } from "../../../lib/api";
+
+const SESSIONS: ClaudeSessionSummary[] = [
+  {
+    session_id: "713b7f46-d0f2-454e-91be-a3305d35660c",
+    cwd: "/Users/me/projects/alpha",
+    title: "Fix the spinner bug",
+    last_modified_ms: 1_700_000_000_000,
+    cwd_exists: true,
+  },
+  {
+    session_id: "dead-beef",
+    cwd: "/Users/me/gone",
+    title: "Old work",
+    last_modified_ms: 1_600_000_000_000,
+    cwd_exists: false,
+  },
+];
+
+afterEach(() => {
+  cleanup();
+  vi.clearAllMocks();
+});
+
+function renderStep() {
+  const onChange = vi.fn();
+  const utils = render(
+    <ProjectStep
+      data={{ ...initialData, path: "", extraRepoPaths: [], scratch: false }}
+      onChange={onChange}
+      initialTab="import"
+    />,
+  );
+  return { onChange, ...utils };
+}
+
+describe("ProjectStep Import Claude tab (#2276)", () => {
+  beforeEach(() => {
+    vi.mocked(listClaudeSessions).mockResolvedValue(SESSIONS);
+  });
+
+  it("lists discovered sessions and disables one whose cwd is gone", async () => {
+    const { findByText, getByText } = renderStep();
+    await findByText("Fix the spinner bug");
+    expect(getByText("/Users/me/projects/alpha")).toBeTruthy();
+    const missingRow = getByText("Old work").closest("button") as HTMLButtonElement;
+    expect(missingRow.disabled).toBe(true);
+  });
+
+  it("selecting a session prefills a structured claude import", async () => {
+    const { onChange, findByText } = renderStep();
+    const row = (await findByText("Fix the spinner bug")).closest("button") as HTMLButtonElement;
+    fireEvent.click(row);
+
+    const calls = Object.fromEntries(onChange.mock.calls);
+    expect(calls.importAcpSessionId).toBe("713b7f46-d0f2-454e-91be-a3305d35660c");
+    expect(calls.path).toBe("/Users/me/projects/alpha");
+    expect(calls.tool).toBe("claude");
+    expect(calls.useStructuredView).toBe(true);
+    expect(calls.useWorktree).toBe(false);
+  });
+
+  it("filters by title", async () => {
+    const { findByText, getByLabelText, queryByText } = renderStep();
+    await findByText("Fix the spinner bug");
+    fireEvent.change(getByLabelText("Filter Claude sessions"), { target: { value: "old" } });
+    await waitFor(() => expect(queryByText("Fix the spinner bug")).toBeNull());
+    expect(queryByText("Old work")).toBeTruthy();
+  });
+});

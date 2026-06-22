@@ -497,6 +497,23 @@ async function handleRequest(msg) {
         result.configOptions = [...(result.configOptions ?? []), makeOpencodeModeOption(current)];
       }
       sendResult(id, result);
+      // Test hook for the import flow (#2276): on session/load, replay a
+      // deterministic transcript chunk the way claude-agent-acp re-emits
+      // prior history during a load. Lets the import spec assert the
+      // imported transcript renders (seed-not-suppressed), while a normal
+      // reattach would drop it. Only on load, deferred after the response.
+      const loadReplay = process.env.FAKE_ACP_LOAD_REPLAY;
+      if (method === "session/load" && loadReplay) {
+        setImmediate(() => {
+          sendNotification("session/update", {
+            sessionId,
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: loadReplay },
+            },
+          });
+        });
+      }
       return;
     }
 
