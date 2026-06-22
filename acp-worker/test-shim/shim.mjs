@@ -104,7 +104,7 @@ class ShimAgent {
     };
   }
 
-  // Experimental session/delete handler installed only when
+  // session/delete handler installed only when
   // SHIM_DELETE_CAPABILITY=1. Without the install, the SDK's request
   // dispatcher returns -32601 method_not_found, which is the
   // negative-path expectation aoe needs to test against (matches
@@ -116,7 +116,7 @@ class ShimAgent {
     // distinct shim binaries. SHIM_DELETE_RECORD_FILE, when set,
     // appends one line per call with the requested sessionId so tests
     // assert the RPC actually fired.
-    this.unstable_deleteSession = async (params) => {
+    this.deleteSession = async (params) => {
       const mode = process.env.SHIM_DELETE_MODE ?? "success";
       const recordFile = process.env.SHIM_DELETE_RECORD_FILE;
       if (recordFile) {
