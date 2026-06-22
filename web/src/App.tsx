@@ -360,14 +360,24 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   const [showSessionWizard, setShowSessionWizard] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
   const [tipsOpen, setTipsOpen] = useState(false);
+  const [tipsStartIndex, setTipsStartIndex] = useState(0);
   const tipsAutoPoppedRef = useRef(false);
+  // Whether the tour was already seen when this page loaded (set in the settings
+  // fetch below). Auto-pop keys off this, not the live tourSeen, so finishing
+  // the tour this session does not then pop tips on top of the first-run flow.
+  const tourSeenAtLoadRef = useRef<boolean | null>(null);
   const tips = useTips();
-  // Open the tip-of-the-day modal and mark the tip it opens on seen here (an
-  // event, not an effect); the modal marks the rest as you navigate.
+  // Open the tip-of-the-day modal on the first unseen tip and mark that tip seen
+  // here (an event, not an effect); the modal marks the rest as you navigate.
+  // Capture the index before marking: marking shifts firstUnseenIndex, so the
+  // modal must open on the captured index, not the recomputed one, or it would
+  // skip the tip we just marked.
   const openTips = useCallback(() => {
-    const tip = tips.tips[tips.firstUnseenIndex];
-    if (tip && !tip.seen) tips.markSeen(tip.id);
+    const idx = tips.firstUnseenIndex;
+    setTipsStartIndex(idx);
     setTipsOpen(true);
+    const tip = tips.tips[idx];
+    if (tip && !tip.seen) tips.markSeen(tip.id);
   }, [tips]);
   // Auto-pop scheduler: defer one frame so the open happens off the effect body
   // (mirrors the tour's begin()), keeping the state change out of the effect.
@@ -1272,8 +1282,12 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       const legacySeen = safeGetItem(LEGACY_TOUR_SEEN_KEY) === "1";
       // Treat the legacy local flag as a suppression hint while the migration
       // POST is in flight, so the tour cannot flash before the backend agrees.
-      setTourSeen(backendSeen || legacySeen);
+      const seenAtLoad = backendSeen || legacySeen;
+      setTourSeen(seenAtLoad);
       setTourSeenKnown(true);
+      // Capture whether onboarding was already done at load so completing the
+      // tour this session does not then pop the tip-of-the-day on top of it.
+      tourSeenAtLoadRef.current = seenAtLoad;
       if (legacySeen && !backendSeen) {
         void markWebTourSeen().then((ok) => {
           if (ok) safeRemoveItem(LEGACY_TOUR_SEEN_KEY);
@@ -1326,10 +1340,13 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   // GIMP/DBeaver. Gated like the tour: only on a settled dashboard, only when a
   // tip is unseen and tips are enabled, never while the welcome/telemetry/tour
   // flows are up, and never in an automated browser session (so the modal can't
-  // intercept the rest of the Playwright suite). Reopen any time from the menu.
+  // intercept the rest of the Playwright suite). Only for users who already
+  // finished onboarding before this load: first-run users get the welcome and
+  // tour, not a tips modal piled on top. Reopen any time from the menu.
   useEffect(() => {
     if (tipsAutoPoppedRef.current) return;
     if (!tips.loaded || !tips.hasUnseen) return;
+    if (tourSeenAtLoadRef.current !== true) return;
     if (!tourAutoLaunchReady || !welcome.resolved || telemetryConsentNeeded || tour.isTourActive) return;
     if (isAutomatedSession()) return;
     tipsAutoPoppedRef.current = true;
@@ -1338,6 +1355,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   }, [
     tips.loaded,
     tips.hasUnseen,
+    tourSeenKnown,
     tourAutoLaunchReady,
     welcome.resolved,
     telemetryConsentNeeded,
@@ -1448,7 +1466,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
         {tipsOpen && (
           <TipsModal
             tips={tips.tips}
-            startIndex={tips.firstUnseenIndex}
+            startIndex={tipsStartIndex}
             enabled={tips.enabled}
             onMarkSeen={tips.markSeen}
             onSetEnabled={tips.setEnabled}

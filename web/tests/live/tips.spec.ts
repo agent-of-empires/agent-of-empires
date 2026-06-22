@@ -35,20 +35,29 @@ base("tips: auto-pops on startup and marks the shown tip seen", async ({ page },
     );
     await page.goto(serve.baseUrl);
 
-    // Story 1: the tip-of-the-day modal auto-pops, showing the web tip and never
-    // the TUI-only one.
+    // Story 1: the tip-of-the-day modal auto-pops on the first unseen tip and
+    // never shows the TUI-only one. The PWA tip is the first web tip in the
+    // catalog, so it leads.
     await expect(page.getByRole("heading", { name: "Tip of the day" })).toBeVisible({ timeout: 15_000 });
     await expect(page.getByRole("heading", { name: PWA_TIP })).toBeVisible();
     await expect(page.getByText(TUI_TIP)).toBeHidden();
+    // Several web tips ship, so the carousel counter and navigation are present.
+    await expect(page.getByText(/Tip 1 of \d+/)).toBeVisible();
 
-    // Story 2: showing a tip marks it seen on the server.
+    // Story 2: showing a tip marks it seen on the server, and a reload reads
+    // that back (the PWA tip no longer leads).
     expect((await postSeen).status()).toBe(200);
     await page.getByRole("button", { name: "Close" }).click();
-
-    // Once the only tip is seen, a reload does not re-pop it (no nagging).
     await page.reload();
     await expect(page.getByRole("button", { name: "Go to dashboard" })).toBeVisible({ timeout: 10_000 });
-    await expect(page.getByRole("heading", { name: "Tip of the day" })).toBeHidden();
+    expect(
+      await page.evaluate(async () => {
+        const res = await fetch("/api/tips", { cache: "no-store" });
+        if (!res.ok) return false;
+        const data = await res.json();
+        return data.tips.find((t: { id: string }) => t.id === "install-dashboard-pwa")?.seen === true;
+      }),
+    ).toBe(true);
   } finally {
     await serve.stop();
   }
