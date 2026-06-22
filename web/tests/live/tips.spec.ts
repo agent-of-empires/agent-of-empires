@@ -50,14 +50,20 @@ base("tips: auto-pops on startup and marks the shown tip seen", async ({ page },
     await page.getByRole("button", { name: "Close" }).click();
     await page.reload();
     await expect(page.getByRole("button", { name: "Go to dashboard" })).toBeVisible({ timeout: 10_000 });
-    expect(
-      await page.evaluate(async () => {
-        const res = await fetch("/api/tips", { cache: "no-store" });
-        if (!res.ok) return false;
-        const data = await res.json();
-        return data.tips.find((t: { id: string }) => t.id === "install-dashboard-pwa")?.seen === true;
-      }),
-    ).toBe(true);
+    // The mark-seen POST returns 200 before the flag is flushed to config.toml
+    // (same as the tour-seen write), so poll rather than assert once.
+    await expect
+      .poll(
+        () =>
+          page.evaluate(async () => {
+            const res = await fetch("/api/tips", { cache: "no-store" });
+            if (!res.ok) return false;
+            const data = await res.json();
+            return data.tips.find((t: { id: string }) => t.id === "install-dashboard-pwa")?.seen === true;
+          }),
+        { timeout: 10_000 },
+      )
+      .toBe(true);
   } finally {
     await serve.stop();
   }
