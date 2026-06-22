@@ -20,6 +20,7 @@ import { spawnAoeServe } from "../helpers/aoeServe";
 const IMPORT_SID = "11111111-2222-3333-4444-555555555555";
 const WORKTREE_SID = "22222222-3333-4444-5555-666666666666";
 const WORKSPACE_SID = "33333333-4444-5555-6666-777777777777";
+const SCRATCH_SID = "44444444-5555-6666-7777-888888888888";
 const REPLAY_TEXT = "imported transcript line abc123";
 const PROJECT_SUBDIR = "imported-project";
 
@@ -65,6 +66,18 @@ test("imports an existing Claude session and replays its transcript", async ({},
         message: { role: "user", content: [{ type: "text", text: "plan then implement" }] },
       });
       writeFileSync(join(claudeProjects, `${WORKSPACE_SID}.jsonl`), `${wsLine}\n`);
+
+      // A scratch session in the *other* (release) namespace must be excluded
+      // too: the feature does not discriminate dev vs release. The serving
+      // daemon's app dir differs from this hardcoded `.agent-of-empires` path.
+      const scratchCwd = join(home, ".agent-of-empires", "scratch", "5c8d250f60ec4328");
+      mkdirSync(scratchCwd, { recursive: true });
+      const scLine = JSON.stringify({
+        type: "user",
+        cwd: scratchCwd,
+        message: { role: "user", content: [{ type: "text", text: "Generate a concise title" }] },
+      });
+      writeFileSync(join(claudeProjects, `${SCRATCH_SID}.jsonl`), `${scLine}\n`);
     },
   });
 
@@ -85,9 +98,10 @@ test("imports an existing Claude session and replays its transcript", async ({},
     expect(found!.cwd).toBe(projectDir);
     expect(found!.cwd_exists).toBe(true);
     expect(found!.title).toBe("Imported session prompt");
-    // Sessions living in AoE worktree / workspace directories are excluded.
+    // AoE worktree / workspace / scratch (any namespace) sessions are excluded.
     expect(sessions.some((s) => s.session_id === WORKTREE_SID)).toBe(false);
     expect(sessions.some((s) => s.session_id === WORKSPACE_SID)).toBe(false);
+    expect(sessions.some((s) => s.session_id === SCRATCH_SID)).toBe(false);
 
     // 2. Create a structured session importing it.
     const createRes = await fetch(`${serve.baseUrl}/api/sessions`, {

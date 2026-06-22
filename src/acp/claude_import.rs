@@ -96,6 +96,21 @@ fn strip_placeholders(seg: &str) -> String {
     out
 }
 
+/// True when `cwd` is an AoE scratch directory (`<app_dir>/scratch/<id>`),
+/// regardless of namespace. The serving daemon's `get_app_dir()` only resolves
+/// one namespace (release vs `-dev`), so a scratch session from the other
+/// namespace slips past a plain `starts_with` check; match the app-dir name +
+/// `scratch` component pair instead. See #2276.
+fn cwd_is_aoe_scratch(cwd: &str) -> bool {
+    let comps: Vec<&str> = Path::new(cwd)
+        .components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .collect();
+    comps
+        .windows(2)
+        .any(|w| w[0].contains("agent-of-empires") && w[1] == "scratch")
+}
+
 /// True when any directory component of `cwd` contains a worktree marker. Uses
 /// `contains` (not a suffix match) because workspace dirs carry the marker
 /// mid-name, e.g. `<branch>-workspace-<id>`.
@@ -114,11 +129,12 @@ fn cwd_under_worktree(cwd: &str, markers: &[String]) -> bool {
 /// `MAX_SESSIONS`. Returns an empty vec when the projects directory is absent
 /// (e.g. Claude Code was never run). Unreadable files are skipped, not fatal.
 ///
-/// Sessions whose `cwd` lives inside the AoE app data dir are excluded: those
-/// are AoE's own internal Claude runs (scratch sessions root their cwd under
-/// `<app_dir>/scratch/`), not conversations a user would import. Sessions AoE
-/// already manages by id are filtered separately by the endpoint, which has
-/// the instance list. See #2276.
+/// AoE's own internal Claude runs are excluded: scratch sessions (cwd under
+/// `<app_dir>/scratch/`, matched by layout so both release and -dev namespaces
+/// are covered) and worktree / workspace sessions (cwd under a dir named by the
+/// worktree path template). Sessions AoE already manages by id or project_path
+/// are filtered separately by the endpoint, which has the instance list.
+/// See #2276.
 pub fn scan_sessions() -> Vec<ClaudeSessionSummary> {
     let Some(projects) = claude_config_dir().map(|d| d.join("projects")) else {
         return Vec::new();
@@ -126,7 +142,6 @@ pub fn scan_sessions() -> Vec<ClaudeSessionSummary> {
     let Ok(project_dirs) = fs::read_dir(&projects) else {
         return Vec::new();
     };
-    let app_dir = crate::session::get_app_dir().ok();
     let worktree_markers = worktree_dir_markers();
 
     let mut out = Vec::new();
@@ -144,10 +159,11 @@ pub fn scan_sessions() -> Vec<ClaudeSessionSummary> {
                 continue;
             }
             if let Some(summary) = summarize_file(&fpath) {
-                if let Some(app_dir) = &app_dir {
-                    if Path::new(&summary.cwd).starts_with(app_dir) {
-                        continue;
-                    }
+                // Scratch sessions live under `<app_dir>/scratch/<id>`. Match by
+                // layout so both release and -dev namespaces are excluded the
+                // same way (the feature does not discriminate between them).
+                if cwd_is_aoe_scratch(&summary.cwd) {
+                    continue;
                 }
                 // AoE creates session worktrees under a directory named by the
                 // worktree path template (e.g. "<repo>-worktrees"). Any cwd
@@ -336,6 +352,21 @@ mod tests {
         ));
         assert!(!cwd_under_worktree("/Users/me/projects/alpha", &markers));
         assert!(!cwd_under_worktree("/Users/me/projects/alpha", &[]));
+    }
+
+    #[test]
+    fn aoe_scratch_detected_in_both_namespaces() {
+        assert!(cwd_is_aoe_scratch(
+            "/Users/me/.agent-of-empires/scratch/5c8d250f60ec4328"
+        ));
+        assert!(cwd_is_aoe_scratch(
+            "/Users/me/.agent-of-empires-dev/scratch/abcd"
+        ));
+        assert!(cwd_is_aoe_scratch(
+            "/home/me/.config/agent-of-empires/scratch/abcd"
+        ));
+        assert!(!cwd_is_aoe_scratch("/Users/me/projects/scratch"));
+        assert!(!cwd_is_aoe_scratch("/Users/me/projects/alpha"));
     }
 
     #[test]

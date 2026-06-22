@@ -248,7 +248,7 @@ export function ProjectStep({ data, onChange, initialTab }: Props) {
     ...(hasPicks ? [{ id: "recent" as Tab, label: "Recent" }] : []),
     { id: "browse", label: "Browse" },
     { id: "clone", label: "Clone URL" },
-    { id: "import", label: "Import Claude" },
+    { id: "import", label: "Import from Claude" },
   ];
 
   // #2276: importing an existing Claude Code session prefills the original

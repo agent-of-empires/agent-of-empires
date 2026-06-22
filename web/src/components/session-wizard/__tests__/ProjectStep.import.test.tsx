@@ -61,7 +61,7 @@ function renderStep() {
   return { onChange, ...utils };
 }
 
-describe("ProjectStep Import Claude tab (#2276)", () => {
+describe("ProjectStep Import from Claude tab (#2276)", () => {
   beforeEach(() => {
     vi.mocked(listClaudeSessions).mockResolvedValue(SESSIONS);
   });
