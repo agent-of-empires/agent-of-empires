@@ -88,7 +88,7 @@ pub fn scan_sessions() -> Vec<ClaudeSessionSummary> {
         }
     }
 
-    out.sort_by(|a, b| b.last_modified_ms.cmp(&a.last_modified_ms));
+    out.sort_by_key(|s| std::cmp::Reverse(s.last_modified_ms));
     out.truncate(MAX_SESSIONS);
     out
 }
