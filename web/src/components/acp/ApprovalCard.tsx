@@ -14,7 +14,7 @@ import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "rea
 import { AlertTriangle, Check, ChevronDown, Shield, X } from "lucide-react";
 import type { Approval, ApprovalDecision } from "../../lib/acpTypes";
 import { useServerDown, OFFLINE_TITLE } from "../../lib/connectionState";
-import { hasArgsBody, parseJsonObject, previewFromArgs } from "../../lib/acpArgs";
+import { hasArgsBody, humanizePermissionTitle, parseJsonObject, previewFromArgs } from "../../lib/acpArgs";
 
 interface Props {
   approval: Approval;
@@ -101,7 +101,7 @@ export function ApprovalCard({ approval, onResolve }: Props) {
         approval.destructive ? "border-rose-900/60 bg-rose-950/20" : "border-brand-700/40 bg-brand-700/5",
       ].join(" ")}
       role="alertdialog"
-      aria-label={`Approval needed: ${approval.tool_call.name}`}
+      aria-label={`Approval needed: ${humanizePermissionTitle(approval.tool_call.name)}`}
     >
       <Header
         type={canExpand ? "button" : undefined}
@@ -125,7 +125,9 @@ export function ApprovalCard({ approval, onResolve }: Props) {
         >
           {approval.destructive ? "Destructive action" : "Approval needed"}
         </span>
-        <span className="shrink-0 font-mono text-xs text-text-secondary">{approval.tool_call.name}</span>
+        <span className="shrink-0 font-mono text-xs text-text-secondary">
+          {humanizePermissionTitle(approval.tool_call.name)}
+        </span>
         {preview && <span className="min-w-0 flex-1 truncate font-mono text-xs text-text-dim">{preview}</span>}
         {canExpand && (
           <ChevronDown

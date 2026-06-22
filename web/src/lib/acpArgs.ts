@@ -63,6 +63,22 @@ export function hasArgsBody(argsPreview: string): boolean {
   return Object.keys(parsed).some((k) => !k.startsWith("_aoe_"));
 }
 
+/** Readable labels for known ACP permission identifiers that some agents
+ *  send verbatim as the permission-request title (e.g. opencode's
+ *  `external_directory`). These are internal protocol kinds, not real tool
+ *  names, so the raw identifier reads as jargon on the approval card.
+ *  Unknown titles pass through unchanged, so a new upstream identifier
+ *  shows as-is (a debuggable signal) rather than a mangled auto-title; we
+ *  deliberately avoid blanket snake_case-to-title casing, which mauls
+ *  acronyms and legitimate tool names. */
+const PERMISSION_TITLE_LABELS: Record<string, string> = {
+  external_directory: "External directory access",
+};
+
+export function humanizePermissionTitle(title: string): string {
+  return PERMISSION_TITLE_LABELS[title] ?? title;
+}
+
 export interface TodoPayloadItem {
   content: string;
   status: unknown;
