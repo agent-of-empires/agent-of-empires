@@ -888,6 +888,41 @@ fn terminal_stop_reason(
     }
 }
 
+/// Decide whether the between-prompt idle watchdog should synthesize a
+/// terminal `Stopped` for an agent-initiated turn that ran with no
+/// aoe-issued `session/prompt`. A claude-code Monitor (or any backgrounded
+/// task) can fire AFTER the prompt that armed it already completed,
+/// resuming the agent into a fresh turn the per-prompt watchdog never
+/// saw; without this the turn never ends and the UI stays "running"
+/// forever. See #2325.
+///
+/// Pure so the precedence is unit-testable without the connection loop.
+/// Times are wall-clock millis (`chrono::Utc::now().timestamp_millis()`),
+/// matching the resume-idle watchdog. Mirrors the per-prompt watchdog's
+/// grace policy: the cost-bearing `UsageUpdate` is claude-agent-acp's
+/// end-of-turn marker, so once it has arrived the fast grace applies;
+/// otherwise the vendor-agnostic off-protocol floor governs. A pending
+/// scheduled wake (`wake_until` in the future) suppresses firing so a
+/// legitimately-sleeping monitor is never killed early.
+fn between_prompt_should_fire(
+    active: bool,
+    now_ms: i64,
+    last_lifecycle_ms: i64,
+    wake_until_ms: i64,
+    cost_seen: bool,
+    fast_grace: std::time::Duration,
+    floor: std::time::Duration,
+) -> bool {
+    if !active {
+        return false;
+    }
+    if now_ms < wake_until_ms {
+        return false;
+    }
+    let grace = if cost_seen { fast_grace } else { floor };
+    now_ms - last_lifecycle_ms >= grace.as_millis() as i64
+}
+
 /// Tagged lifecycle signal carried over the watchdog mpsc. The
 /// `epoch` field is captured at signal-construction time from the
 /// shared `current_prompt_epoch` atomic; the prompt loop discards
@@ -4199,8 +4234,24 @@ async fn run_connection_task<W, R>(
     let first_event_after_attach = Arc::new(AtomicBool::new(false));
     let prompt_sent_since_attach = Arc::new(AtomicBool::new(false));
     let watchdog_fired = Arc::new(AtomicBool::new(false));
+    // Between-prompt idle watchdog state (#2325). Tracks an agent-initiated
+    // turn (Monitor / scheduled-wake resume) that runs with no aoe-issued
+    // `session/prompt`, so the outer command loop's idle tick can synthesize
+    // its terminal Stopped. `last_lifecycle_at` is updated only on transcript
+    // progress (NOT ambient AvailableCommandsUpdate), so periodic
+    // command-list refreshes can't keep resetting the idle timer.
+    let last_lifecycle_at = Arc::new(AtomicI64::new(now_ms));
+    let between_prompt_active = Arc::new(AtomicBool::new(false));
+    let between_prompt_cost_seen = Arc::new(AtomicBool::new(false));
+    let between_prompt_wake_until = Arc::new(AtomicI64::new(0));
+    let prompt_in_flight = Arc::new(AtomicBool::new(false));
     let last_event_at_for_notif = last_event_at.clone();
     let first_event_after_attach_for_notif = first_event_after_attach.clone();
+    let last_lifecycle_at_for_notif = last_lifecycle_at.clone();
+    let between_prompt_active_for_notif = between_prompt_active.clone();
+    let between_prompt_cost_seen_for_notif = between_prompt_cost_seen.clone();
+    let between_prompt_wake_until_for_notif = between_prompt_wake_until.clone();
+    let prompt_in_flight_for_notif = prompt_in_flight.clone();
 
     // Per-session tracker that drops claude-agent-acp's leaked consolidated
     // agent_message_chunk restatement before it doubles the rendered message.
@@ -4229,6 +4280,13 @@ async fn run_connection_task<W, R>(
                 let lifecycle_signal_tx = lifecycle_signal_tx_for_notif.clone();
                 let current_prompt_epoch = current_prompt_epoch_for_notif.clone();
                 let agent_msg_dedup = agent_msg_dedup_for_notif.clone();
+                let last_lifecycle_at = last_lifecycle_at_for_notif.clone();
+                let between_prompt_active = between_prompt_active_for_notif.clone();
+                let between_prompt_cost_seen =
+                    between_prompt_cost_seen_for_notif.clone();
+                let between_prompt_wake_until =
+                    between_prompt_wake_until_for_notif.clone();
+                let prompt_in_flight = prompt_in_flight_for_notif.clone();
                 async move {
                     last_event_at
                         .store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
@@ -4280,6 +4338,44 @@ async fn run_connection_task<W, R>(
                     // not proof of in-flight turn progress.
                     if lifecycle_signal.is_some() || wakeup_signal.is_some() {
                         first_event_after_attach.store(true, Ordering::Relaxed);
+                    }
+                    // Between-prompt idle tracking (#2325). Only while no
+                    // aoe-issued prompt is in flight: a lifecycle signal here
+                    // means the agent resumed itself (Monitor / scheduled
+                    // wake), a turn the per-prompt watchdog never sees. Mirror
+                    // its cost/progress/wake semantics so the outer loop's
+                    // idle tick applies the same grace. During a real prompt
+                    // the per-prompt watchdog owns this, so skip.
+                    if !prompt_in_flight.load(Ordering::Relaxed) {
+                        match &lifecycle_signal {
+                            Some(LifecycleSignal::TerminalUsage) => {
+                                between_prompt_active.store(true, Ordering::Relaxed);
+                                between_prompt_cost_seen.store(true, Ordering::Relaxed);
+                            }
+                            Some(_) => {
+                                between_prompt_active.store(true, Ordering::Relaxed);
+                                between_prompt_cost_seen.store(false, Ordering::Relaxed);
+                                last_lifecycle_at.store(
+                                    chrono::Utc::now().timestamp_millis(),
+                                    Ordering::Relaxed,
+                                );
+                            }
+                            None => {}
+                        }
+                        if let Some(LifecycleSignal::WakeupPending { at }) = &wakeup_signal {
+                            between_prompt_active.store(true, Ordering::Relaxed);
+                            between_prompt_cost_seen.store(false, Ordering::Relaxed);
+                            last_lifecycle_at.store(
+                                chrono::Utc::now().timestamp_millis(),
+                                Ordering::Relaxed,
+                            );
+                            let deadline = at.timestamp_millis()
+                                + OFF_PROTOCOL_WORK_GRACE_FLOOR.as_millis() as i64;
+                            // Multiple wakes extend, never shorten, suppression.
+                            let prev = between_prompt_wake_until.load(Ordering::Relaxed);
+                            between_prompt_wake_until
+                                .store(deadline.max(prev), Ordering::Relaxed);
+                        }
                     }
                     let mapped_events =
                         map_update_to_events(notification.update, profile);
@@ -4900,8 +4996,46 @@ async fn run_connection_task<W, R>(
                 });
             }
 
+            // The idle tick fires the between-prompt watchdog (#2325). It is
+            // only polled while this loop is parked at `cmd_rx.recv()`, i.e.
+            // between prompts; during a prompt the inner drain owns the
+            // connection and this arm never runs, so the per-prompt watchdog
+            // stays the sole idle authority there. Emitting Stopped from the
+            // command loop (never a detached task) keeps it serialized with
+            // every other command, so it can't race a new prompt's events.
+            let mut between_prompt_idle_tick =
+                tokio::time::interval(SILENT_ORPHAN_CHECK_INTERVAL);
+            between_prompt_idle_tick
+                .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                let cmd = cmd_rx.recv().await;
+                let cmd = tokio::select! {
+                    cmd = cmd_rx.recv() => cmd,
+                    _ = between_prompt_idle_tick.tick() => {
+                        let now = chrono::Utc::now().timestamp_millis();
+                        if between_prompt_should_fire(
+                            between_prompt_active.load(Ordering::Relaxed),
+                            now,
+                            last_lifecycle_at.load(Ordering::Relaxed),
+                            between_prompt_wake_until.load(Ordering::Relaxed),
+                            between_prompt_cost_seen.load(Ordering::Relaxed),
+                            SILENT_ORPHAN_FAST_GRACE_DEFAULT,
+                            OFF_PROTOCOL_WORK_GRACE_FLOOR,
+                        ) {
+                            between_prompt_active.store(false, Ordering::Relaxed);
+                            info!(
+                                target: "acp.protocol",
+                                session = %session_label,
+                                "between-prompt idle watchdog: synthesizing Stopped for completed agent-initiated turn"
+                            );
+                            let _ = event_tx_for_block
+                                .send(Event::Stopped {
+                                    reason: "agent_idle".into(),
+                                })
+                                .await;
+                        }
+                        continue;
+                    }
+                };
                 match cmd {
                     Some(ClientCmd::Prompt(blocks)) => {
                         // Scope the agent-message deduper to one turn: a new
@@ -4927,6 +5061,13 @@ async fn run_connection_task<W, R>(
                         // transition, so we no longer need to synthesize
                         // one for the orphaned prior turn.
                         prompt_sent_since_attach.store(true, Ordering::Relaxed);
+                        // A real prompt supersedes any agent-initiated turn the
+                        // between-prompt idle watchdog was tracking; this
+                        // prompt's own Stopped will own the next transition.
+                        // The per-prompt watchdog owns idle detection until the
+                        // Stopped emit below clears `prompt_in_flight`. See #2325.
+                        prompt_in_flight.store(true, Ordering::Relaxed);
+                        between_prompt_active.store(false, Ordering::Relaxed);
                         info!(target: "acp.protocol", "sending prompt ({} content blocks)", blocks.len());
                         // Drive the prompt request concurrently with the
                         // command channel so out-of-band notifications
@@ -5503,6 +5644,10 @@ async fn run_connection_task<W, R>(
                             .lock()
                             .expect("agent message dedup mutex poisoned")
                             .reset();
+                        // The prompt drain is done; hand idle ownership back to
+                        // the between-prompt watchdog for any agent-initiated
+                        // turn that fires after this point. See #2325.
+                        prompt_in_flight.store(false, Ordering::Relaxed);
                         if shutdown {
                             break;
                         }
@@ -6509,6 +6654,89 @@ mod tests {
             terminal_stop_reason(false, false, false, false, false, true),
             "cancelled"
         );
+    }
+
+    // Between-prompt idle watchdog fire decision (#2325). Wall-clock millis.
+    const FAST: std::time::Duration = std::time::Duration::from_secs(20);
+    const FLOOR: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+    #[test]
+    fn between_prompt_inactive_never_fires() {
+        // No agent-initiated turn tracked, even long past any grace.
+        assert!(!between_prompt_should_fire(
+            false, 10_000_000, 0, 0, true, FAST, FLOOR
+        ));
+    }
+
+    #[test]
+    fn between_prompt_fires_after_fast_grace_when_cost_seen() {
+        let last = 1_000_000;
+        // 19s idle: still within the 20s fast grace.
+        assert!(!between_prompt_should_fire(
+            true,
+            last + 19_000,
+            last,
+            0,
+            true,
+            FAST,
+            FLOOR
+        ));
+        // 21s idle: past the fast grace, the completed turn ends.
+        assert!(between_prompt_should_fire(
+            true,
+            last + 21_000,
+            last,
+            0,
+            true,
+            FAST,
+            FLOOR
+        ));
+    }
+
+    #[test]
+    fn between_prompt_uses_floor_without_cost() {
+        let last = 1_000_000;
+        // 21s idle but no cost marker: the generous floor governs, no fire.
+        assert!(!between_prompt_should_fire(
+            true,
+            last + 21_000,
+            last,
+            0,
+            false,
+            FAST,
+            FLOOR
+        ));
+        // Past the 30-minute floor: fire even without a cost marker.
+        assert!(between_prompt_should_fire(
+            true,
+            last + 30 * 60 * 1000 + 1,
+            last,
+            0,
+            false,
+            FAST,
+            FLOOR
+        ));
+    }
+
+    #[test]
+    fn between_prompt_suppressed_while_wake_pending() {
+        let last = 1_000_000;
+        let now = last + 60_000; // idle well past fast grace
+        let wake_until = now + 5_000; // a re-armed monitor still sleeping
+                                      // Suppressed: the agent is deliberately asleep on a scheduled wake.
+        assert!(!between_prompt_should_fire(
+            true, now, last, wake_until, true, FAST, FLOOR
+        ));
+        // Once the wake deadline passes, the idle grace governs again.
+        assert!(between_prompt_should_fire(
+            true,
+            wake_until + 21_000,
+            last,
+            wake_until,
+            true,
+            FAST,
+            FLOOR
+        ));
     }
 
     #[tokio::test]
