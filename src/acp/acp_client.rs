@@ -922,6 +922,55 @@ fn terminal_stop_reason(
 /// otherwise the vendor-agnostic off-protocol floor governs. A pending
 /// scheduled wake (`wake_until` in the future) suppresses firing so a
 /// legitimately-sleeping monitor is never killed early.
+/// State update the between-prompt watchdog should apply for one inbound
+/// notification's classified signals. `None` when neither a lifecycle nor a
+/// wakeup signal is present (ambient updates do not touch the watchdog).
+///
+/// Extracted as a pure function so the cost / progress / wake bookkeeping is
+/// unit-testable without the notification closure. Every tracked signal
+/// refreshes `last_lifecycle_at` to `now_ms`, including `TerminalUsage`: the
+/// cost-bearing `UsageUpdate` is the end-of-turn marker, and the fast grace
+/// must measure from it (when the turn wrapped up) rather than from a
+/// possibly-stale earlier progress event. See #2325.
+#[derive(Debug, PartialEq)]
+struct BetweenPromptUpdate {
+    cost_seen: bool,
+    last_lifecycle_at: i64,
+    wake_until: i64,
+}
+
+fn between_prompt_signal_update(
+    lifecycle: Option<&LifecycleSignal>,
+    wakeup: Option<&LifecycleSignal>,
+    now_ms: i64,
+    prev_wake_until: i64,
+) -> Option<BetweenPromptUpdate> {
+    let mut update = match lifecycle {
+        Some(LifecycleSignal::TerminalUsage) => Some(BetweenPromptUpdate {
+            cost_seen: true,
+            last_lifecycle_at: now_ms,
+            wake_until: prev_wake_until,
+        }),
+        Some(_) => Some(BetweenPromptUpdate {
+            cost_seen: false,
+            last_lifecycle_at: now_ms,
+            wake_until: prev_wake_until,
+        }),
+        None => None,
+    };
+    // A scheduled wake (a re-armed monitor) suppresses firing until its
+    // deadline. Multiple wakes extend, never shorten, suppression.
+    if let Some(LifecycleSignal::WakeupPending { at }) = wakeup {
+        let deadline = at.timestamp_millis() + OFF_PROTOCOL_WORK_GRACE_FLOOR.as_millis() as i64;
+        update = Some(BetweenPromptUpdate {
+            cost_seen: false,
+            last_lifecycle_at: now_ms,
+            wake_until: deadline.max(prev_wake_until),
+        });
+    }
+    update
+}
+
 fn between_prompt_should_fire(
     active: bool,
     now_ms: i64,
@@ -4365,34 +4414,22 @@ async fn run_connection_task<W, R>(
                     // idle tick applies the same grace. During a real prompt
                     // the per-prompt watchdog owns this, so skip.
                     if !prompt_in_flight.load(Ordering::Relaxed) {
-                        match &lifecycle_signal {
-                            Some(LifecycleSignal::TerminalUsage) => {
-                                between_prompt_active.store(true, Ordering::Relaxed);
-                                between_prompt_cost_seen.store(true, Ordering::Relaxed);
-                            }
-                            Some(_) => {
-                                between_prompt_active.store(true, Ordering::Relaxed);
-                                between_prompt_cost_seen.store(false, Ordering::Relaxed);
-                                last_lifecycle_at.store(
-                                    chrono::Utc::now().timestamp_millis(),
-                                    Ordering::Relaxed,
-                                );
-                            }
-                            None => {}
-                        }
-                        if let Some(LifecycleSignal::WakeupPending { at }) = &wakeup_signal {
+                        let now = chrono::Utc::now().timestamp_millis();
+                        if let Some(u) = between_prompt_signal_update(
+                            lifecycle_signal.as_ref(),
+                            wakeup_signal.as_ref(),
+                            now,
+                            between_prompt_wake_until.load(Ordering::Relaxed),
+                        ) {
                             between_prompt_active.store(true, Ordering::Relaxed);
-                            between_prompt_cost_seen.store(false, Ordering::Relaxed);
-                            last_lifecycle_at.store(
-                                chrono::Utc::now().timestamp_millis(),
-                                Ordering::Relaxed,
-                            );
-                            let deadline = at.timestamp_millis()
-                                + OFF_PROTOCOL_WORK_GRACE_FLOOR.as_millis() as i64;
-                            // Multiple wakes extend, never shorten, suppression.
-                            let prev = between_prompt_wake_until.load(Ordering::Relaxed);
-                            between_prompt_wake_until
-                                .store(deadline.max(prev), Ordering::Relaxed);
+                            between_prompt_cost_seen.store(u.cost_seen, Ordering::Relaxed);
+                            // Refresh from `now` on every tracked signal,
+                            // including TerminalUsage, so the fast grace
+                            // measures from when the turn wrapped up rather
+                            // than from a possibly-stale earlier progress
+                            // event. See #2325 review.
+                            last_lifecycle_at.store(u.last_lifecycle_at, Ordering::Relaxed);
+                            between_prompt_wake_until.store(u.wake_until, Ordering::Relaxed);
                         }
                     }
                     let mapped_events =
@@ -6756,6 +6793,111 @@ mod tests {
             true,
             FAST,
             FLOOR
+        ));
+    }
+
+    #[test]
+    fn between_prompt_signal_update_terminal_usage_refreshes_timestamp() {
+        // TerminalUsage marks cost_seen AND refreshes last_lifecycle_at to
+        // `now`, so the fast grace measures from the cost marker, not a
+        // stale earlier progress event. See #2325 review.
+        let u =
+            between_prompt_signal_update(Some(&LifecycleSignal::TerminalUsage), None, 500_000, 0)
+                .expect("TerminalUsage is a tracked signal");
+        assert_eq!(
+            u,
+            BetweenPromptUpdate {
+                cost_seen: true,
+                last_lifecycle_at: 500_000,
+                wake_until: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn between_prompt_signal_update_progress_clears_cost_and_refreshes() {
+        let u = between_prompt_signal_update(Some(&LifecycleSignal::Progress), None, 500_000, 0)
+            .expect("Progress is a tracked signal");
+        assert_eq!(
+            u,
+            BetweenPromptUpdate {
+                cost_seen: false,
+                last_lifecycle_at: 500_000,
+                wake_until: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn between_prompt_signal_update_ambient_is_none() {
+        // No lifecycle and no wakeup signal: ambient update, no state change.
+        assert!(between_prompt_signal_update(None, None, 500_000, 42).is_none());
+    }
+
+    #[test]
+    fn between_prompt_signal_update_wakeup_extends_suppression() {
+        let at = chrono::DateTime::from_timestamp_millis(600_000).unwrap();
+        let expected_deadline = 600_000 + OFF_PROTOCOL_WORK_GRACE_FLOOR.as_millis() as i64;
+        // A later wake deadline wins; an earlier prev does not shorten it.
+        let u = between_prompt_signal_update(
+            None,
+            Some(&LifecycleSignal::WakeupPending { at }),
+            500_000,
+            1_000,
+        )
+        .expect("WakeupPending is a tracked signal");
+        assert_eq!(
+            u,
+            BetweenPromptUpdate {
+                cost_seen: false,
+                last_lifecycle_at: 500_000,
+                wake_until: expected_deadline,
+            }
+        );
+        // A larger prev_wake_until is preserved (suppression only extends).
+        let u2 = between_prompt_signal_update(
+            None,
+            Some(&LifecycleSignal::WakeupPending { at }),
+            500_000,
+            expected_deadline + 10_000,
+        )
+        .unwrap();
+        assert_eq!(u2.wake_until, expected_deadline + 10_000);
+    }
+
+    #[test]
+    fn between_prompt_stale_progress_plus_cost_marker_does_not_fire_early() {
+        // Regression for the state-update path (#2325 review): a progress
+        // event 10s ago, then a cost-bearing UsageUpdate now. The cost marker
+        // refreshes last_lifecycle_at, so 2s later (under the 3s grace) the
+        // watchdog must NOT fire even though cost_seen is true and the prior
+        // progress is older than the grace.
+        let cost_now = 1_000_000;
+        let stale_progress = cost_now - 10_000;
+        let u =
+            between_prompt_signal_update(Some(&LifecycleSignal::TerminalUsage), None, cost_now, 0)
+                .unwrap();
+        // The refresh, not the stale progress, governs the grace window.
+        assert_eq!(u.last_lifecycle_at, cost_now);
+        assert_ne!(u.last_lifecycle_at, stale_progress);
+        assert!(!between_prompt_should_fire(
+            true,
+            cost_now + 2_000,
+            u.last_lifecycle_at,
+            u.wake_until,
+            u.cost_seen,
+            FAST,
+            FLOOR,
+        ));
+        // After the full grace it does fire.
+        assert!(between_prompt_should_fire(
+            true,
+            cost_now + FAST.as_millis() as i64 + 1,
+            u.last_lifecycle_at,
+            u.wake_until,
+            u.cost_seen,
+            FAST,
+            FLOOR,
         ));
     }
 
