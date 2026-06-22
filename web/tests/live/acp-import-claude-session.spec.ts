@@ -157,6 +157,19 @@ test("imports an existing Claude session and replays its transcript", async ({},
         { timeout: 10_000, intervals: [200, 500, 1000] },
       )
       .toBe(false);
+
+    // 5. An import that pairs a real id with the wrong cwd is rejected, so a
+    // stale/hand-written request can't seed the transcript in the wrong place.
+    const badRes = await fetch(`${serve.baseUrl}/api/sessions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        path: join(serve.home, "some-other-dir"),
+        tool: "claude",
+        import_acp_session_id: WORKTREE_SID,
+      }),
+    });
+    expect(badRes.status).toBe(400);
   } finally {
     await serve.stop();
   }
