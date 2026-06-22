@@ -75,9 +75,7 @@ const PERMISSION_TITLE_LABELS: Record<string, string> = {
   external_directory: "External directory access",
 };
 
-export function humanizePermissionTitle(title: string): string {
-  return PERMISSION_TITLE_LABELS[title] ?? title;
-}
+export const humanizePermissionTitle = (title: string): string => PERMISSION_TITLE_LABELS[title] ?? title;
 
 export interface TodoPayloadItem {
   content: string;
