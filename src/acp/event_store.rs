@@ -811,17 +811,18 @@ impl EventStore {
     /// the latest `MonitorArmed` description when active, `None` otherwise.
     ///
     /// A `Monitor` is fire-and-forget with no fixed end time, so unlike
-    /// `latest_pending_wakeup` there is no timestamp to gate on. A monitor
-    /// firing re-invokes the agent with activity but never a
-    /// `UserPromptSent`, so the badge must persist across re-fires and clear
-    /// only when the user takes over: treat the monitor as active iff the
-    /// latest `MonitorArmed` has no `UserPromptSent` at a higher seq.
-    ///
-    /// Known ceiling: a monitor that exits / times out, or is torn down by a
-    /// `TaskStop`, with no following user prompt leaves the badge up until
-    /// the user's next prompt. aoe gets no clean disarm signal, and a stale
-    /// "monitoring" badge that clears on any user action is strictly better
-    /// than an idle dot that looks dead.
+    /// `latest_pending_wakeup` there is no timestamp to gate on, and the
+    /// `Monitor` tool call itself completes at arm time (it returns "monitor
+    /// started"), so its completion is not the disarm signal either. The
+    /// badge stays up from the arm until either the user takes over
+    /// (`UserPromptSent` at a higher seq) or the monitor fires and that turn
+    /// ends. The fire is observed as a tool call started after the arm (the
+    /// agent acting on the wake); the badge then retires on the next
+    /// `Stopped`. This covers both shapes: the agent ending the arming turn
+    /// and resuming later between prompts (closed by `agent_idle`), and the
+    /// monitor blocking the arming turn in-band (closed by `prompt_complete`).
+    /// A `Stopped` with no post-arm tool work is the arming turn ending while
+    /// the monitor is still pending, so it leaves the badge up. See #2325.
     pub fn latest_active_monitor(&self, session_id: &str) -> Option<Option<String>> {
         let conn = match self.conn.lock() {
             Ok(g) => g,
@@ -841,9 +842,9 @@ impl EventStore {
             .ok()
             .flatten();
         let (armed_seq, json) = row?;
-        // A user prompt after the arm means the user took over; the badge
-        // clears. No log on the common "no monitor" branch above (this query
-        // fans out per structured session on every ~2-3s sessions poll).
+        // The user taking over clears the badge immediately. No log on the
+        // common "no monitor" branch above (this query fans out per
+        // structured session on every ~2-3s sessions poll).
         let user_took_over: Option<i64> = conn
             .query_row(
                 "SELECT 1 FROM acp_events
@@ -859,6 +860,41 @@ impl EventStore {
             .flatten();
         if user_took_over.is_some() {
             return None;
+        }
+        // Otherwise the badge clears once the monitor fired (a tool call
+        // started after the arm) AND that turn has since ended (a Stopped
+        // past that tool start). Without the post-work gate, the arming
+        // turn's own Stopped while the monitor is still pending would clear
+        // it prematurely.
+        let first_work_seq: Option<i64> = conn
+            .query_row(
+                "SELECT MIN(seq) FROM acp_events
+                 WHERE session_id = ?1
+                   AND seq > ?2
+                   AND event_json LIKE '{\"ToolCallStarted\":%'",
+                params![session_id, armed_seq],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        if let Some(work_seq) = first_work_seq {
+            let turn_ended: Option<i64> = conn
+                .query_row(
+                    "SELECT 1 FROM acp_events
+                     WHERE session_id = ?1
+                       AND seq > ?2
+                       AND event_json LIKE '{\"Stopped\":%'
+                     LIMIT 1",
+                    params![session_id, work_seq],
+                    |row| row.get(0),
+                )
+                .optional()
+                .ok()
+                .flatten();
+            if turn_ended.is_some() {
+                return None;
+            }
         }
         match serde_json::from_str::<Event>(&json) {
             Ok(Event::MonitorArmed { description }) => Some(description),
@@ -2534,6 +2570,85 @@ mod tests {
             )
             .unwrap();
         assert!(store.latest_active_monitor("s-1").is_none());
+    }
+
+    #[test]
+    fn latest_active_monitor_persists_on_arming_turn_stop() {
+        // The arming turn ending while the monitor is still pending (no
+        // post-arm tool work yet) must NOT clear the badge (#2325).
+        let (_tmp, store) = open_store(1000);
+        store
+            .record(
+                "s-1",
+                1,
+                &Event::MonitorArmed {
+                    description: Some("watch".into()),
+                },
+            )
+            .unwrap();
+        store
+            .record(
+                "s-1",
+                2,
+                &Event::Stopped {
+                    reason: "prompt_complete".into(),
+                },
+            )
+            .unwrap();
+        assert!(store.latest_active_monitor("s-1").is_some());
+    }
+
+    #[test]
+    fn latest_active_monitor_clears_after_fired_work_and_stop() {
+        // The monitor fired (a tool call started after the arm) and that turn
+        // then ended: the badge clears regardless of the Stopped reason, so
+        // both the in-band (`prompt_complete`) and between-prompt
+        // (`agent_idle`) monitor shapes are covered (#2325).
+        for reason in ["prompt_complete", "agent_idle"] {
+            let (_tmp, store) = open_store(1000);
+            store
+                .record(
+                    "s-1",
+                    1,
+                    &Event::MonitorArmed {
+                        description: Some("watch".into()),
+                    },
+                )
+                .unwrap();
+            store
+                .record(
+                    "s-1",
+                    2,
+                    &Event::ToolCallStarted {
+                        tool_call: crate::acp::state::ToolCall {
+                            id: "tc-1".into(),
+                            name: "Read".into(),
+                            kind: "read".into(),
+                            args_preview: String::new(),
+                            started_at: Utc::now(),
+                            parent_tool_call_id: None,
+                            memory_recall: None,
+                            diffs: Vec::new(),
+                        },
+                    },
+                )
+                .unwrap();
+            // Tool started but turn not yet ended: badge still up.
+            assert!(store.latest_active_monitor("s-1").is_some());
+            store
+                .record(
+                    "s-1",
+                    3,
+                    &Event::Stopped {
+                        reason: reason.into(),
+                    },
+                )
+                .unwrap();
+            assert!(
+                store.latest_active_monitor("s-1").is_none(),
+                "badge should clear after fired work + Stopped({reason})"
+            );
+        }
     }
 
     #[test]
