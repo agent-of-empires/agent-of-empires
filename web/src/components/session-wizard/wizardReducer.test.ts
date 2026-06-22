@@ -278,3 +278,49 @@ describe("SessionWizard reducer / SUBMIT_CANCEL (#2045)", () => {
     expect(cancelled.error).toBeNull();
   });
 });
+
+describe("SessionWizard reducer / import id clearing (#2276)", () => {
+  it("clears importAcpSessionId when a non-import path is chosen", () => {
+    const imported = reducer(makeState(), {
+      type: "SET_FIELD",
+      field: "importAcpSessionId",
+      value: "abc-123",
+    });
+    expect(imported.data.importAcpSessionId).toBe("abc-123");
+
+    // User switches to Browse and picks a different path.
+    const browsed = reducer(imported, {
+      type: "SET_FIELD",
+      field: "path",
+      value: "/Users/me/other-repo",
+    });
+    expect(browsed.data.importAcpSessionId).toBe("");
+    expect(browsed.data.path).toBe("/Users/me/other-repo");
+  });
+
+  it("clears importAcpSessionId when scratch is enabled", () => {
+    const imported = reducer(makeState(), {
+      type: "SET_FIELD",
+      field: "importAcpSessionId",
+      value: "abc-123",
+    });
+    const scratch = reducer(imported, { type: "SET_FIELD", field: "scratch", value: true });
+    expect(scratch.data.importAcpSessionId).toBe("");
+  });
+
+  it("preserves importAcpSessionId across the import picker's path-then-id dispatch order", () => {
+    // ProjectStep.handleImportSelect dispatches path first, then the id.
+    const withPath = reducer(makeState(), {
+      type: "SET_FIELD",
+      field: "path",
+      value: "/Users/me/imported-cwd",
+    });
+    const withId = reducer(withPath, {
+      type: "SET_FIELD",
+      field: "importAcpSessionId",
+      value: "imp-789",
+    });
+    expect(withId.data.importAcpSessionId).toBe("imp-789");
+    expect(withId.data.path).toBe("/Users/me/imported-cwd");
+  });
+});
