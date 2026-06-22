@@ -24,9 +24,8 @@ interface Props {
    *  the port is not visible in the window chrome. Driven by
    *  `ServerAbout.build_flavor === "debug"`. See #1055. */
   isDevBuild: boolean;
-  /** Count of unseen tips. When > 0 a clickable 💡 badge shows in the right
-   *  zone; 0 hides it (tips off or nothing unseen). */
-  tipsUnseen: number;
+  /** Opens the tip-of-the-day modal; wired into the overflow menu so tips are
+   *  re-readable any time, like GIMP/DBeaver's Help menu entry. */
   onOpenTips: () => void;
   onGoDashboard: () => void;
   /** When true (desktop, sidebar open, not in a full-width settings/projects
@@ -54,7 +53,6 @@ export function TopBar({
   loginRequired,
   isOffline,
   isDevBuild,
-  tipsUnseen,
   onOpenTips,
   onGoDashboard,
   sidebarColumnVisible,
@@ -64,11 +62,12 @@ export function TopBar({
     const items: OverflowItem[] = [
       { label: "Help", onClick: onOpenHelp },
       { label: "Show tutorial", onClick: onStartTutorial },
+      { label: "Tips", onClick: onOpenTips },
       { label: "About", onClick: onOpenAbout },
     ];
     if (loginRequired) items.push({ label: "Sign out", onClick: onLogout });
     return items;
-  }, [onOpenHelp, onStartTutorial, onOpenAbout, onLogout, loginRequired]);
+  }, [onOpenHelp, onStartTutorial, onOpenTips, onOpenAbout, onLogout, loginRequired]);
 
   return (
     <header {...tourAnchor(TOUR_ANCHORS.topbar)} className="h-12 bg-surface-850 flex items-stretch shrink-0">
@@ -144,18 +143,6 @@ export function TopBar({
             <span className="w-1.5 h-1.5 rounded-full bg-status-error animate-pulse" />
             offline
           </span>
-        )}
-
-        {tipsUnseen > 0 && (
-          <button
-            onClick={onOpenTips}
-            className="font-mono text-[11px] px-1.5 py-0.5 rounded-full bg-brand-600/15 text-brand-400 ring-1 ring-brand-500/30 flex items-center gap-1 hover:bg-brand-600/25 transition-colors cursor-pointer"
-            title={`${tipsUnseen} ${tipsUnseen === 1 ? "tip" : "tips"}`}
-            aria-label={`${tipsUnseen} ${tipsUnseen === 1 ? "tip" : "tips"}`}
-          >
-            <span aria-hidden="true">💡</span>
-            {tipsUnseen}
-          </button>
         )}
 
         {activeWorkspace && activeSession && (

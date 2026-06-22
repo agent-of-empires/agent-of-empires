@@ -6,6 +6,7 @@ import { clearAcpCache } from "./hooks/useAcpSession";
 import { clearDraft, sweepOrphanDrafts } from "./lib/acpDrafts";
 import { AcpPrefsProvider } from "./lib/acpPrefs";
 import { safeGetItem, safeRemoveItem, safeSetItem } from "./lib/safeStorage";
+import { isAutomatedSession } from "./lib/onboarding";
 import { useWorkspaces } from "./hooks/useWorkspaces";
 import { useLastSessionRestore } from "./hooks/useLastSessionRestore";
 import { useRepoGroups } from "./hooks/useRepoGroups";
@@ -358,8 +359,19 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   const [pairedMounted, setPairedMounted] = useState(false);
   const [showSessionWizard, setShowSessionWizard] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
-  const [showTips, setShowTips] = useState(false);
+  const [tipsOpen, setTipsOpen] = useState(false);
+  const tipsAutoPoppedRef = useRef(false);
   const tips = useTips();
+  // Open the tip-of-the-day modal and mark the tip it opens on seen here (an
+  // event, not an effect); the modal marks the rest as you navigate.
+  const openTips = useCallback(() => {
+    const tip = tips.tips[tips.firstUnseenIndex];
+    if (tip && !tip.seen) tips.markSeen(tip.id);
+    setTipsOpen(true);
+  }, [tips]);
+  // Auto-pop scheduler: defer one frame so the open happens off the effect body
+  // (mirrors the tour's begin()), keeping the state change out of the effect.
+  const beginTipsAutoPop = useCallback(() => requestAnimationFrame(() => openTips()), [openTips]);
   const [showPalette, setShowPalette] = useState(false);
   const [showAbout, setShowAbout] = useState(false);
   const [telemetryConsentNeeded, setTelemetryConsentNeeded] = useState(false);
@@ -1310,6 +1322,29 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     onSeen: handleTourSeen,
   });
 
+  // Auto-pop the tip-of-the-day once per load, after onboarding settles, like
+  // GIMP/DBeaver. Gated like the tour: only on a settled dashboard, only when a
+  // tip is unseen and tips are enabled, never while the welcome/telemetry/tour
+  // flows are up, and never in an automated browser session (so the modal can't
+  // intercept the rest of the Playwright suite). Reopen any time from the menu.
+  useEffect(() => {
+    if (tipsAutoPoppedRef.current) return;
+    if (!tips.loaded || !tips.hasUnseen) return;
+    if (!tourAutoLaunchReady || !welcome.resolved || telemetryConsentNeeded || tour.isTourActive) return;
+    if (isAutomatedSession()) return;
+    tipsAutoPoppedRef.current = true;
+    const id = beginTipsAutoPop();
+    return () => cancelAnimationFrame(id);
+  }, [
+    tips.loaded,
+    tips.hasUnseen,
+    tourAutoLaunchReady,
+    welcome.resolved,
+    telemetryConsentNeeded,
+    tour.isTourActive,
+    beginTipsAutoPop,
+  ]);
+
   return (
     <AcpPrefsProvider value={acpPrefs}>
       <div className="h-dvh flex flex-col bg-surface-900 text-text-primary overflow-hidden safe-area-inset">
@@ -1327,8 +1362,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
           loginRequired={loginRequired}
           isOffline={!!error}
           isDevBuild={isDebugBuild(serverAbout)}
-          tipsUnseen={tips.unseenCount}
-          onOpenTips={() => setShowTips(true)}
+          onOpenTips={openTips}
           onGoDashboard={handleGoDashboard}
           sidebarColumnVisible={!showSettings && sidebarOpen}
           rightColumnVisible={isMdUp && !showSettings && !!activeWorkspace && !!activeSession && !diffCollapsed}
@@ -1411,12 +1445,14 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
 
         {showHelp && <HelpOverlay onClose={() => setShowHelp(false)} />}
 
-        {showTips && (
+        {tipsOpen && (
           <TipsModal
             tips={tips.tips}
+            startIndex={tips.firstUnseenIndex}
+            enabled={tips.enabled}
             onMarkSeen={tips.markSeen}
-            onDisable={tips.disable}
-            onClose={() => setShowTips(false)}
+            onSetEnabled={tips.setEnabled}
+            onClose={() => setTipsOpen(false)}
           />
         )}
 

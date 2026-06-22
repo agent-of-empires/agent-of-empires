@@ -3,25 +3,27 @@ import type { TipDto } from "../lib/api";
 
 interface Props {
   tips: TipDto[];
-  /** Mark one tip seen (called when an unseen tip is expanded into view). */
+  /** Tip to open on (the first unseen one, so new content leads). */
+  startIndex: number;
+  /** "Show tips on startup" checkbox state (session.show_tips). */
+  enabled: boolean;
+  /** Mark one tip seen (called as each tip is shown). */
   onMarkSeen: (id: string) => void;
-  /** "Don't show again": turns tips off. */
-  onDisable: () => void;
+  /** Toggle "Show tips on startup". */
+  onSetEnabled: (enabled: boolean) => void;
   onClose: () => void;
 }
 
-/// Browsable tips panel for the web dashboard, mirroring the TUI overlay:
-/// unseen tips lead, already-seen tips collapse into an expandable section so
-/// what's new is foregrounded. Expanding an unseen tip marks it seen (mark-seen-
-/// on-view), and "Don't show again" turns tips off. Modeled on
-/// TelemetryConsentModal's fixed-overlay styling.
-export function TipsModal({ tips, onMarkSeen, onDisable, onClose }: Props) {
+/// Tip-of-the-day modal for the web dashboard, in the style of GIMP / DBeaver:
+/// one tip at a time with Previous / Next, a "Show tips on startup" checkbox,
+/// and Close. Auto-pops on startup (from App) and is reopenable from the top-bar
+/// menu. Each tip is marked seen as it is shown, so the seen state stays in sync
+/// with the TUI. Modeled on TelemetryConsentModal's fixed-overlay styling.
+export function TipsModal({ tips, startIndex, enabled, onMarkSeen, onSetEnabled, onClose }: Props) {
+  const count = tips.length;
+  const clampedStart = count === 0 ? 0 : Math.min(Math.max(startIndex, 0), count - 1);
+  const [index, setIndex] = useState(clampedStart);
   const closeRef = useRef<HTMLButtonElement>(null);
-  const [expandedId, setExpandedId] = useState<string | null>(null);
-  const [seenOpen, setSeenOpen] = useState(false);
-
-  const unseen = tips.filter((t) => !t.seen);
-  const seen = tips.filter((t) => t.seen);
 
   useEffect(() => {
     closeRef.current?.focus();
@@ -36,31 +38,17 @@ export function TipsModal({ tips, onMarkSeen, onDisable, onClose }: Props) {
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
 
-  const toggle = (tip: TipDto) => {
-    const opening = expandedId !== tip.id;
-    setExpandedId(opening ? tip.id : null);
-    // Mark seen when an unseen tip is opened into view.
-    if (opening && !tip.seen) onMarkSeen(tip.id);
+  // The initially shown tip is marked seen by the opener (App); navigation
+  // marks the rest, so mark-on-view never runs from an effect.
+  const go = (next: number) => {
+    if (count === 0) return;
+    const wrapped = (next + count) % count;
+    setIndex(wrapped);
+    const t = tips[wrapped];
+    if (t && !t.seen) onMarkSeen(t.id);
   };
 
-  const row = (tip: TipDto) => (
-    <li key={tip.id} className="border border-surface-700/50 rounded-md overflow-hidden">
-      <button
-        onClick={() => toggle(tip)}
-        aria-expanded={expandedId === tip.id}
-        className="w-full px-3 py-2 flex items-center justify-between text-left text-sm text-text-primary hover:bg-surface-850 transition-colors cursor-pointer"
-      >
-        <span className="flex items-center gap-2">
-          {!tip.seen && <span className="w-1.5 h-1.5 rounded-full bg-brand-500 shrink-0" aria-hidden="true" />}
-          {tip.title}
-        </span>
-        <span className="text-text-dim text-xs">{expandedId === tip.id ? "Hide" : "Read"}</span>
-      </button>
-      {expandedId === tip.id && (
-        <p className="px-3 pb-3 pt-1 text-sm text-text-secondary border-t border-surface-700/50">{tip.body}</p>
-      )}
-    </li>
-  );
+  const current = tips[index];
 
   return (
     <div
@@ -71,48 +59,57 @@ export function TipsModal({ tips, onMarkSeen, onDisable, onClose }: Props) {
       onClick={onClose}
     >
       <div
-        className="bg-surface-800 border border-surface-700/50 rounded-lg w-[460px] max-w-[90vw] max-h-[80vh] flex flex-col shadow-2xl animate-slide-up"
+        className="bg-surface-800 border border-surface-700/50 rounded-lg w-[480px] max-w-[90vw] max-h-[80vh] flex flex-col shadow-2xl animate-slide-up"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="px-5 py-4 border-b border-surface-700 flex items-center gap-2">
           <span aria-hidden="true">💡</span>
           <h2 id="tips-modal-title" className="text-sm font-semibold text-text-bright">
-            Tips
+            Tip of the day
           </h2>
         </div>
 
-        <div className="p-5 space-y-2 overflow-y-auto">
-          {tips.length === 0 ? (
-            <p className="text-sm text-text-dim">No tips right now. Check back after a new release.</p>
-          ) : (
+        <div className="p-5 overflow-y-auto min-h-[7rem]">
+          {current ? (
             <>
-              {unseen.length > 0 && <ul className="space-y-2">{unseen.map(row)}</ul>}
-              {seen.length > 0 && (
-                <div className={unseen.length > 0 ? "pt-1" : ""}>
-                  <button
-                    onClick={() => setSeenOpen((o) => !o)}
-                    aria-expanded={seenOpen}
-                    className="text-xs text-text-dim hover:text-text-secondary transition-colors cursor-pointer"
-                  >
-                    {seenOpen ? "Hide" : "Show"} seen ({seen.length})
-                  </button>
-                  {seenOpen && <ul className="space-y-2 mt-2">{seen.map(row)}</ul>}
-                </div>
-              )}
+              <h3 className="text-sm font-semibold text-text-primary mb-2">{current.title}</h3>
+              <p className="text-sm text-text-secondary">{current.body}</p>
             </>
+          ) : (
+            <p className="text-sm text-text-dim">No tips right now. Check back after a new release.</p>
           )}
         </div>
 
-        <div className="px-5 py-4 border-t border-surface-700 flex justify-between gap-2">
-          <button
-            onClick={() => {
-              onDisable();
-              onClose();
-            }}
-            className="h-8 px-3 rounded-md border border-surface-700/50 text-sm text-text-secondary hover:bg-surface-850 hover:text-text-primary transition-colors duration-150 cursor-pointer"
-          >
-            Don't show again
-          </button>
+        <div className="px-5 py-3 border-t border-surface-700 flex items-center justify-between gap-2">
+          <label className="flex items-center gap-2 text-xs text-text-secondary cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={enabled}
+              onChange={(e) => onSetEnabled(e.target.checked)}
+              className="accent-brand-500 cursor-pointer"
+            />
+            Show tips on startup
+          </label>
+          {count > 1 && <span className="text-xs text-text-dim">{`Tip ${index + 1} of ${count}`}</span>}
+        </div>
+
+        <div className="px-5 py-3 border-t border-surface-700 flex items-center justify-between gap-2">
+          <div className="flex gap-2">
+            <button
+              onClick={() => go(index - 1)}
+              disabled={count <= 1}
+              className="h-8 px-3 rounded-md border border-surface-700/50 text-sm text-text-secondary hover:bg-surface-850 hover:text-text-primary transition-colors duration-150 cursor-pointer disabled:opacity-40 disabled:cursor-default"
+            >
+              Previous
+            </button>
+            <button
+              onClick={() => go(index + 1)}
+              disabled={count <= 1}
+              className="h-8 px-3 rounded-md border border-surface-700/50 text-sm text-text-secondary hover:bg-surface-850 hover:text-text-primary transition-colors duration-150 cursor-pointer disabled:opacity-40 disabled:cursor-default"
+            >
+              Next
+            </button>
+          </div>
           <button
             ref={closeRef}
             onClick={onClose}

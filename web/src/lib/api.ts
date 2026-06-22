@@ -253,13 +253,16 @@ export async function markTipSeen(id: string): Promise<boolean> {
   }
 }
 
-/** Turn tips off ("don't show again"), setting `session.show_tips=false`.
- *  Dedicated endpoint, not `PATCH /api/settings`, so this cosmetic toggle stays
- *  off the passphrase/elevation wall. Returns false on read-only (403) or
- *  network failure. */
-export async function disableTips(): Promise<boolean> {
+/** Set "Show tips on startup" (`session.show_tips`). Dedicated endpoint, not
+ *  `PATCH /api/settings`, so this cosmetic toggle stays off the passphrase/
+ *  elevation wall. Returns false on read-only (403) or network failure. */
+export async function setShowTips(enabled: boolean): Promise<boolean> {
   try {
-    const res = await fetch("/api/tips/disable", { method: "POST" });
+    const res = await fetch("/api/tips/show", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled }),
+    });
     return res.ok;
   } catch {
     return false;
