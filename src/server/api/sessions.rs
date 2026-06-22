@@ -4526,15 +4526,23 @@ const MAX_CONTENTS_LINES: usize = 200_000;
 
 /// Validate a user-supplied relative file path against a workdir.
 ///
-/// Returns the canonicalized absolute path if the requested path is safe to
-/// read (no absolute, no `..`, no symlink-escape out of the workdir) and
-/// appears in `changed_files` (so only actually-diffed files are exposed).
-/// Returns `Err(status, message)` otherwise.
+/// Returns `(canonical_path, is_changed)` if the requested path is safe to read
+/// (no absolute, no `..`, no symlink-escape out of the workdir). `is_changed`
+/// is true when the path appears in `changed_files` (diffable); false marks an
+/// in-repo file with no diff against the base, served via the full-file
+/// fallback (gated further on being a tracked blob; see
+/// [`crate::git::diff::compute_unchanged_file_contents`]). See #1810.
+///
+/// A path that is neither in the changed set nor present on disk yields
+/// `NOT_FOUND`. The non-canonical fallback is reserved for the changed-set case
+/// (a file deleted in the working tree but still diffable); the unchanged
+/// branch requires canonicalization to succeed. Returns `Err(status, message)`
+/// otherwise.
 fn validate_diff_path(
     workdir: &std::path::Path,
     requested: &std::path::Path,
     changed_files: &[crate::git::diff::DiffFile],
-) -> Result<std::path::PathBuf, (StatusCode, &'static str)> {
+) -> Result<(std::path::PathBuf, bool), (StatusCode, &'static str)> {
     use std::path::Component;
 
     if requested.as_os_str().is_empty() {
@@ -4552,13 +4560,7 @@ fn validate_diff_path(
         }
     }
 
-    // Cross-check: path must be one of the currently-changed files.
-    // This is the narrowest trust boundary: only files the user actually
-    // modified on this branch are diffable, not arbitrary files in the worktree.
-    let matches_changed = changed_files.iter().any(|f| f.path == requested);
-    if !matches_changed {
-        return Err((StatusCode::NOT_FOUND, "file not in changed set"));
-    }
+    let is_changed = changed_files.iter().any(|f| f.path == requested);
 
     // Canonicalize both sides and verify containment as defense in depth
     // against symlinks that might point outside the workdir.
@@ -4569,19 +4571,20 @@ fn validate_diff_path(
         )
     })?;
     let full = canonical_workdir.join(requested);
-    // The file may not exist on disk (e.g., deleted in the working tree), in
-    // which case canonicalize fails; fall back to the non-canonical path and
-    // just verify textual containment.
-    let final_path = match full.canonicalize() {
+    match full.canonicalize() {
         Ok(c) => {
             if !c.starts_with(&canonical_workdir) {
                 return Err((StatusCode::BAD_REQUEST, "path escapes workdir"));
             }
-            c
+            Ok((c, is_changed))
         }
-        Err(_) => full,
-    };
-    Ok(final_path)
+        // The file isn't on disk. A changed file may have been deleted in the
+        // working tree but is still diffable, so fall back to the non-canonical
+        // (component-vetted) path. An unchanged path that isn't on disk has
+        // nothing to show.
+        Err(_) if is_changed => Ok((full, true)),
+        Err(_) => Err((StatusCode::NOT_FOUND, "file not found")),
+    }
 }
 
 /// One repo's worth of diff context: a name (for workspace members)
@@ -4831,21 +4834,64 @@ pub async fn session_diff_file(
                 repo_path,
             );
 
-            // Validate the requested path against the set of actually-changed files.
-            // This is the primary security boundary: only files modified on this
-            // branch are diffable, preventing arbitrary file reads via ?path=...
+            // Validate the requested path. Files in the changed set are diffed;
+            // an in-repo file with no diff against the base is served through
+            // the full-file fallback below. The path-traversal and containment
+            // checks are the security boundary preventing arbitrary reads.
             let changed_files = scan_state
                 .changed_files_cached(repo_path, &base_branch)
                 .map_err(|e| DiffFileError::Internal(e.into()))?;
-            match validate_diff_path(repo_path, file_path, &changed_files) {
-                Ok(_) => {}
-                Err((status, msg)) => {
-                    return Err(if status == StatusCode::NOT_FOUND {
-                        DiffFileError::NotFound(msg)
-                    } else {
-                        DiffFileError::BadRequest(msg)
-                    });
-                }
+            let (canonical_path, is_changed) =
+                match validate_diff_path(repo_path, file_path, &changed_files) {
+                    Ok(v) => v,
+                    Err((status, msg)) => {
+                        return Err(if status == StatusCode::NOT_FOUND {
+                            DiffFileError::NotFound(msg)
+                        } else {
+                            DiffFileError::BadRequest(msg)
+                        });
+                    }
+                };
+
+            // Full-file fallback: an agent-cited file with no diff against the
+            // base. Render its current contents instead of a dead end. See #1810.
+            if !is_changed {
+                let full =
+                    diff::compute_unchanged_file_contents(repo_path, file_path, &canonical_path)
+                        .map_err(|e| DiffFileError::Internal(e.into()))?
+                        .ok_or(DiffFileError::NotFound("file not found"))?;
+                let file = RichDiffFileInfo {
+                    path: query.path.clone(),
+                    old_path: None,
+                    status: "unchanged".to_string(),
+                    additions: 0,
+                    deletions: 0,
+                    repo_name: selected_repo_name.clone(),
+                };
+                let total_lines = full.content.lines().count();
+                let resp = if full.content.len() > MAX_CONTENTS_BYTES
+                    || total_lines > MAX_CONTENTS_LINES
+                {
+                    RichFileContentsResponse {
+                        file,
+                        old_content: String::new(),
+                        new_content: String::new(),
+                        patch: String::new(),
+                        is_binary: full.is_binary,
+                        truncated: true,
+                    }
+                } else {
+                    RichFileContentsResponse {
+                        file,
+                        old_content: String::new(),
+                        new_content: full.content,
+                        patch: String::new(),
+                        is_binary: full.is_binary,
+                        truncated: false,
+                    }
+                };
+                return Ok(serde_json::to_value(resp)
+                    .expect("RichFileContentsResponse is always serializable"));
             }
 
             // Hand the client raw old/new text plus a server-computed unified
@@ -6030,13 +6076,29 @@ mod tests {
     }
 
     #[test]
-    fn validate_diff_path_rejects_unchanged_file() {
+    fn validate_diff_path_accepts_unchanged_existing_file() {
+        // An in-repo file that exists on disk but is not in the changed set is
+        // now accepted for the full-file fallback (#1810), flagged
+        // `is_changed = false`. The tracked-blob gate that blocks `.git/` and
+        // gitignored secrets lives in compute_unchanged_file_contents, not here.
         let dir = TempDir::new().unwrap();
         std::fs::write(dir.path().join("existing.txt"), "hello").unwrap();
-        // File exists inside workdir but is not in the changed set.
-        let err = validate_diff_path(
+        let (_, is_changed) = validate_diff_path(
             dir.path(),
             std::path::Path::new("existing.txt"),
+            &changed(&["src/main.rs"]),
+        )
+        .unwrap();
+        assert!(!is_changed);
+    }
+
+    #[test]
+    fn validate_diff_path_rejects_nonexistent_unchanged_file() {
+        // Not in the changed set and not on disk: nothing to show.
+        let dir = TempDir::new().unwrap();
+        let err = validate_diff_path(
+            dir.path(),
+            std::path::Path::new("ghost.txt"),
             &changed(&["src/main.rs"]),
         )
         .unwrap_err();
@@ -6047,12 +6109,13 @@ mod tests {
     fn validate_diff_path_accepts_changed_file() {
         let dir = TempDir::new().unwrap();
         std::fs::write(dir.path().join("changed.txt"), "hello").unwrap();
-        let ok = validate_diff_path(
+        let (_, is_changed) = validate_diff_path(
             dir.path(),
             std::path::Path::new("changed.txt"),
             &changed(&["changed.txt"]),
-        );
-        assert!(ok.is_ok(), "expected Ok, got {:?}", ok);
+        )
+        .unwrap();
+        assert!(is_changed);
     }
 
     #[test]
@@ -6062,12 +6125,13 @@ mod tests {
         // what was removed. canonicalize() on the joined path will fail,
         // so the validator must fall back to the non-canonical path.
         let dir = TempDir::new().unwrap();
-        let ok = validate_diff_path(
+        let (_, is_changed) = validate_diff_path(
             dir.path(),
             std::path::Path::new("deleted.txt"),
             &changed(&["deleted.txt"]),
-        );
-        assert!(ok.is_ok(), "expected Ok, got {:?}", ok);
+        )
+        .unwrap();
+        assert!(is_changed);
     }
 
     #[test]
