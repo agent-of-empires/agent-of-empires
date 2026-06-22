@@ -585,6 +585,57 @@ pub async fn mark_tip_seen(
     }
 }
 
+/// Turns tips off by setting `session.show_tips = false`, the dashboard's
+/// "don't show again". A dedicated single-purpose write rather than `PATCH
+/// /api/settings`, which the auth middleware elevation-gates: disabling tips is
+/// a cosmetic preference and must not trip the passphrase wall on a remote
+/// server. Mirrors [`mark_web_tour_seen`]: exempt from elevation, still blocked
+/// by `read_only`, and uses `Config::load()` so a corrupt config is not
+/// silently replaced. Re-enabling stays in the settings Interaction tab.
+pub async fn disable_tips(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if state.read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(
+                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
+            ),
+        )
+            .into_response();
+    }
+
+    let result = tokio::task::spawn_blocking(|| {
+        let mut config = crate::session::Config::load()?;
+        config.session.show_tips = false;
+        crate::session::save_config(&config)?;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"show_tips": false})),
+        )
+            .into_response(),
+        Ok(Err(e)) => {
+            tracing::warn!(target: "http.api.system", "Disabling tips failed: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "save_failed", "message": "Failed to persist tips state"})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!(target: "http.api.system", "Disabling tips panicked: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
 #[derive(serde::Deserialize)]
 pub struct DismissUpdateBody {
     pub version: String,

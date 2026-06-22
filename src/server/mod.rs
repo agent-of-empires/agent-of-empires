@@ -1443,6 +1443,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/settings/schema", get(api::get_settings_schema))
         .route("/api/tips", get(api::get_tips))
+        .route("/api/tips/disable", post(api::disable_tips))
         .route("/api/app-state/tip-seen", post(api::mark_tip_seen))
         .route(
             "/api/app-state/web-tour-seen",
