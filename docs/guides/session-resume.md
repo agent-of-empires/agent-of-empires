@@ -34,7 +34,7 @@ In the new-session wizard, open the **Import Claude** tab. It lists the Claude C
 
 Pick a session and launch. AoE creates a structured-view session in that conversation's original working directory and resumes it, so the prior transcript shows up in the structured view and you can keep going. The import always uses the recorded working directory and does not create a worktree, because the conversation only resolves in the directory it was started in.
 
-The list only shows conversations worth importing: AoE's own Claude sessions (scratch sessions and sessions AoE already manages) are filtered out. Sessions whose working directory no longer exists are hidden by default, since they cannot be resumed; tick "show missing directories" to see them (they appear disabled).
+The list only shows conversations worth importing: AoE's own Claude sessions are filtered out, including scratch sessions, sessions AoE already manages, and any conversation living inside an AoE worktree directory (the `*-worktrees` folders AoE creates for sessions). Sessions whose working directory no longer exists are hidden by default, since they cannot be resumed; tick "show missing directories" to see them (they appear disabled).
 
 This reads the existing conversation in place; the original session keeps existing and is not copied.
 

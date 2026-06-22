@@ -18,6 +18,7 @@ import { test, expect } from "@playwright/test";
 import { spawnAoeServe } from "../helpers/aoeServe";
 
 const IMPORT_SID = "11111111-2222-3333-4444-555555555555";
+const WORKTREE_SID = "22222222-3333-4444-5555-666666666666";
 const REPLAY_TEXT = "imported transcript line abc123";
 const PROJECT_SUBDIR = "imported-project";
 
@@ -41,6 +42,17 @@ test("imports an existing Claude session and replays its transcript", async ({},
         message: { role: "user", content: [{ type: "text", text: "Imported session prompt" }] },
       });
       writeFileSync(join(claudeProjects, `${IMPORT_SID}.jsonl`), `${line}\n`);
+
+      // A Claude session living inside an AoE worktree dir (matching the
+      // "*-worktrees" path template) must never be offered for import.
+      const worktreeCwd = join(home, "agent-of-empires-worktrees", "Saracens");
+      mkdirSync(worktreeCwd, { recursive: true });
+      const wtLine = JSON.stringify({
+        type: "user",
+        cwd: worktreeCwd,
+        message: { role: "user", content: [{ type: "text", text: "Base directory for this skill" }] },
+      });
+      writeFileSync(join(claudeProjects, `${WORKTREE_SID}.jsonl`), `${wtLine}\n`);
     },
   });
 
@@ -61,6 +73,8 @@ test("imports an existing Claude session and replays its transcript", async ({},
     expect(found!.cwd).toBe(projectDir);
     expect(found!.cwd_exists).toBe(true);
     expect(found!.title).toBe("Imported session prompt");
+    // The session living in an AoE "*-worktrees" directory is excluded.
+    expect(sessions.some((s) => s.session_id === WORKTREE_SID)).toBe(false);
 
     // 2. Create a structured session importing it.
     const createRes = await fetch(`${serve.baseUrl}/api/sessions`, {

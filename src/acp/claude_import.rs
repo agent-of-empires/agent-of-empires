@@ -57,6 +57,56 @@ fn claude_config_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".claude"))
 }
 
+/// Literal directory tokens derived from the worktree path templates, e.g.
+/// `"-worktrees"` from the default `"../{repo-name}-worktrees/{branch}"`. A cwd
+/// living under a directory whose name ends with one of these is an AoE
+/// worktree, so it is excluded from the import picker. Derived from config so a
+/// custom template is honored. See #2276.
+fn worktree_dir_markers() -> Vec<String> {
+    let cfg = crate::session::Config::load_or_warn();
+    let mut markers = Vec::new();
+    for tmpl in [
+        cfg.worktree.path_template.as_str(),
+        cfg.worktree.workspace_path_template.as_str(),
+    ] {
+        for seg in tmpl.split('/') {
+            let lit = strip_placeholders(seg);
+            if lit.len() >= 3 && lit != ".." && !markers.contains(&lit) {
+                markers.push(lit);
+            }
+        }
+    }
+    markers
+}
+
+/// Remove `{placeholder}` spans from a template path segment, leaving the
+/// literal text (e.g. `"{repo-name}-worktrees"` -> `"-worktrees"`).
+fn strip_placeholders(seg: &str) -> String {
+    let mut out = String::new();
+    let mut depth = 0u32;
+    for c in seg.chars() {
+        match c {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// True when any directory component of `cwd` ends with a worktree marker.
+fn cwd_under_worktree(cwd: &str, markers: &[String]) -> bool {
+    if markers.is_empty() {
+        return false;
+    }
+    Path::new(cwd).components().any(|c| {
+        c.as_os_str()
+            .to_str()
+            .is_some_and(|name| markers.iter().any(|m| name.ends_with(m.as_str())))
+    })
+}
+
 /// Scan all discoverable Claude Code sessions, newest first, capped at
 /// `MAX_SESSIONS`. Returns an empty vec when the projects directory is absent
 /// (e.g. Claude Code was never run). Unreadable files are skipped, not fatal.
@@ -74,6 +124,7 @@ pub fn scan_sessions() -> Vec<ClaudeSessionSummary> {
         return Vec::new();
     };
     let app_dir = crate::session::get_app_dir().ok();
+    let worktree_markers = worktree_dir_markers();
 
     let mut out = Vec::new();
     for project in project_dirs.flatten() {
@@ -94,6 +145,13 @@ pub fn scan_sessions() -> Vec<ClaudeSessionSummary> {
                     if Path::new(&summary.cwd).starts_with(app_dir) {
                         continue;
                     }
+                }
+                // AoE creates session worktrees under a directory named by the
+                // worktree path template (e.g. "<repo>-worktrees"). Any cwd
+                // inside one is an AoE-managed worktree (or a one-shot AoE ran
+                // there, like smart-rename), not a conversation to import.
+                if cwd_under_worktree(&summary.cwd, &worktree_markers) {
+                    continue;
                 }
                 out.push(summary);
             }
@@ -248,6 +306,28 @@ mod tests {
         assert_eq!(s.cwd, "/nonexistent/path/xyz");
         assert!(!s.cwd_exists);
         assert_eq!(s.title.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn strip_placeholders_leaves_literal() {
+        assert_eq!(strip_placeholders("{repo-name}-worktrees"), "-worktrees");
+        assert_eq!(strip_placeholders("{branch}"), "");
+        assert_eq!(strip_placeholders(".."), "..");
+    }
+
+    #[test]
+    fn cwd_under_worktree_matches_worktree_dirs() {
+        let markers = vec!["-worktrees".to_string()];
+        assert!(cwd_under_worktree(
+            "/Users/me/aoe/agent-of-empires-worktrees/Saracens",
+            &markers
+        ));
+        assert!(cwd_under_worktree(
+            "/Users/me/aoe/agent-of-empires-worktrees/Saracens/sub",
+            &markers
+        ));
+        assert!(!cwd_under_worktree("/Users/me/projects/alpha", &markers));
+        assert!(!cwd_under_worktree("/Users/me/projects/alpha", &[]));
     }
 
     #[test]
