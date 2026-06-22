@@ -16,6 +16,7 @@ import { DiffWorkerPoolProvider } from "./pierre/DiffWorkerPoolProvider";
 import { FindBar } from "./find/FindBar";
 import { changedLines } from "./find/changedLines";
 import type { FindMatch } from "./find/findMatches";
+import { targetScrollFraction } from "./scrollFraction";
 
 interface Props {
   sessionId: string;
@@ -72,37 +73,6 @@ type AnnotationMeta = { kind: "card"; anchored: AnchoredComment } | { kind: "for
 const sideToAnnotation = (side: DiffSide) => (side === "old" ? ("deletions" as const) : ("additions" as const));
 const annotationToSide = (side: "deletions" | "additions"): DiffSide => (side === "deletions" ? "old" : "new");
 
-const clamp01 = (n: number) => Math.min(1, Math.max(0, n));
-
-/** Approximate scroll fraction (0..1) for a new-side source line. The
- *  Virtualizer has no scroll-to-line API, so we map the cited line to the
- *  rendered diff rows: find the nearest changed new-side line and return its
- *  rank among all rendered changed rows (deletions and additions, in render
- *  order). This tracks where the diff content actually sits, unlike a raw
- *  line/total-lines fraction which is wrong when unchanged regions are
- *  collapsed. Falls back to a file-line fraction when the diff has no changed
- *  new-side rows (e.g. a deletion-only patch). See #1809. */
-function targetScrollFraction(
-  meta: Parameters<typeof changedLines>[0],
-  targetLine: number,
-  newLineCount: number,
-): number {
-  const lines = changedLines(meta);
-  let bestIdx = -1;
-  let bestDist = Infinity;
-  for (let i = 0; i < lines.length; i++) {
-    if (lines[i]!.side !== "new") continue;
-    const dist = Math.abs(lines[i]!.lineNumber - targetLine);
-    if (dist < bestDist) {
-      bestDist = dist;
-      bestIdx = i;
-    }
-  }
-  if (bestIdx < 0) return clamp01((targetLine - 1) / Math.max(1, newLineCount));
-  if (lines.length <= 1) return 0;
-  return bestIdx / (lines.length - 1);
-}
-
 export function DiffFileViewer({
   sessionId,
   filePath,
@@ -142,14 +112,19 @@ export function DiffFileViewer({
   // async reflows by the ResizeObserver below, until the user scrolls. #1809.
   const targetFracRef = useRef<number | null>(null);
 
-  // Reset transient state when the viewer switches files / repos / sessions.
-  // Synced at render time (not in an effect) to avoid set-state-in-effect.
-  const syncKey = JSON.stringify([sessionId, repoName ?? null, filePath, revision]);
+  // Reset transient state when the viewer switches files / repos / sessions,
+  // or when a new cited line is targeted. Synced at render time (not in an
+  // effect) to avoid set-state-in-effect. When a `path:line` link opened this
+  // file, seed the selection with the cited line so it renders highlighted
+  // (the scroll-to it lives in the effect below). #1809.
+  const syncKey = JSON.stringify([sessionId, repoName ?? null, filePath, revision, targetLine ?? null]);
   const [handledSyncKey, setHandledSyncKey] = useState(syncKey);
   if (syncKey !== handledSyncKey) {
     setHandledSyncKey(syncKey);
     setDraft(null);
-    setSelected(null);
+    setSelected(
+      targetLine != null ? { start: targetLine, end: targetLine, side: "additions", endSide: "additions" } : null,
+    );
     setFindOpen(false);
   }
 
@@ -366,15 +341,6 @@ export function DiffFileViewer({
       if (scrollerRef.current === scroller) scrollerRef.current = null;
     };
   }, [resolvedPath, repoName, splitActive, oldContent, newContent, fileDiff, targetLine]);
-
-  // Highlight the cited line via the selection overlay once a target is set
-  // (selection rendering is enabled for it in `options`). Synced at render
-  // time would fight the comment-draft selection, so do it in an effect keyed
-  // to the file + target line. #1809.
-  useEffect(() => {
-    if (targetLine == null) return;
-    setSelected({ start: targetLine, end: targetLine, side: "additions", endSide: "additions" });
-  }, [targetLine, viewKey]);
 
   if (loading && !contents) {
     return (
