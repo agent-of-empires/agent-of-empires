@@ -4863,6 +4863,25 @@ async fn run_connection_task<W, R>(
                                     }
                                     acp_session_id = Some(SessionId::from(stored));
                                 }
+                                Err(e) if seed_history_replay => {
+                                    // Import seed (#2276): the replay may have
+                                    // partially populated the (otherwise empty)
+                                    // event store before load failed. Falling
+                                    // back to session/new would leave a fresh
+                                    // session inheriting that partial external
+                                    // transcript, so fail the import instead.
+                                    // import_pending stays set (no
+                                    // AcpSessionAssigned), and the next spawn
+                                    // clears the store and re-seeds before
+                                    // retrying.
+                                    warn!(
+                                        target: "acp.protocol",
+                                        session = %session_label,
+                                        stored_id = %stored,
+                                        "session/load failed for imported session; failing import (no session/new fallback): {e}"
+                                    );
+                                    return Err(e);
+                                }
                                 Err(e) => {
                                     warn!(
                                         target: "acp.protocol",
