@@ -242,12 +242,6 @@ container (rather than bind-mounting from the host).
   marker, which made the daemon refuse to bring the worker back after it next
   exited; a follow-up message would then sit unsent. A worker coming online now
   clears that marker, so this no longer strands a queued message.
-- An agent that armed a monitor or a scheduled wake, finished the turn, then was
-  woken later by that background task used to keep the session marked "running"
-  forever: the resumed turn ran with no driving prompt, so nothing ended it. The
-  daemon now ends such a turn cleanly once it goes idle (a few seconds after
-  the agent's last output, longer while a fresh wake is still pending), so the
-  session returns to idle on its own without `aoe acp restart`.
 
 ### "Restarting worker" banner after a turn looked done
 
