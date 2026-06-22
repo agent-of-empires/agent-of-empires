@@ -9314,12 +9314,12 @@ mod footer_toolbar {
     fn hover_tracks_button_under_pointer() {
         let mut env = create_test_env_with_sessions(3);
         render_at(&mut env, 120, 12);
-        let (rect, _) = env.view.footer_buttons[1];
+        let (rect, key) = env.view.footer_buttons[1];
 
         assert!(env.view.footer_hover.is_none());
         let changed = env.view.handle_hover(rect.x + 1, rect.y);
         assert!(changed, "moving onto a button is a hover change");
-        assert_eq!(env.view.footer_hover, Some(1));
+        assert_eq!(env.view.footer_hover, Some(key));
 
         // Same button, no change reported.
         assert!(!env.view.handle_hover(rect.x, rect.y));

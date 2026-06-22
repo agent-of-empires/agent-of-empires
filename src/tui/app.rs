@@ -949,6 +949,11 @@ impl App {
                             // action dispatch, structured-view drain). The
                             // footer is a disjoint area from the list/preview/
                             // diff, so nothing else in this arm needs to run.
+                            // This runs ahead of the dialog/context-menu click
+                            // handlers, but that is not a hazard: when an
+                            // overlay is open `footer_button_at` returns `None`
+                            // (its `has_non_live_send_overlay()` guard), so a
+                            // click can never fire a shortcut behind a modal.
                             if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                                 if let Some(key) =
                                     self.home.footer_button_at(mouse.column, mouse.row)

@@ -23,14 +23,15 @@ use agent_client_protocol::schema::{
     CreateTerminalResponse, ElicitationAction, ElicitationCapabilities,
     ElicitationFormCapabilities, EmbeddedResource, EmbeddedResourceResource,
     FileSystemCapabilities, ImageContent, InitializeRequest, KillTerminalRequest,
-    KillTerminalResponse, LoadSessionRequest, McpServer, NewSessionRequest, PermissionOptionKind,
-    PromptRequest, ProtocolVersion, ReadTextFileRequest, ReadTextFileResponse,
-    ReleaseTerminalRequest, ReleaseTerminalResponse, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
-    SessionConfigId, SessionConfigValueId, SessionId, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionModeRequest, StopReason, TerminalId,
-    TerminalOutputRequest, TerminalOutputResponse, TextContent, WaitForTerminalExitRequest,
-    WaitForTerminalExitResponse, WriteTextFileRequest, WriteTextFileResponse,
+    KillTerminalResponse, LoadSessionRequest, McpServer, MessageId, NewSessionRequest,
+    PermissionOptionKind, PromptRequest, ProtocolVersion, ReadTextFileRequest,
+    ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    SelectedPermissionOutcome, SessionConfigId, SessionConfigValueId, SessionId,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest,
+    StopReason, TerminalId, TerminalOutputRequest, TerminalOutputResponse, TextContent,
+    WaitForTerminalExitRequest, WaitForTerminalExitResponse, WriteTextFileRequest,
+    WriteTextFileResponse,
 };
 use agent_client_protocol::{
     Agent, ByteStreams, Client, ConnectionTo, JsonRpcRequest, JsonRpcResponse, Responder,
@@ -3032,6 +3033,94 @@ fn is_compact_completion(text: &str) -> bool {
     text.contains("Compacting completed.")
 }
 
+/// Tracks the in-flight assistant text block so claude-agent-acp's leaked
+/// consolidated `agent_message_chunk` restatement can be dropped before it
+/// reaches the watchdog, the event store, or any client. The adapter streams a
+/// text block as incremental chunks, then re-sends the whole block as one
+/// chunk; its own dedup (`streamedTextIds`) is meant to suppress that copy but
+/// misses on a message-id mismatch (deterministic right after an Opus to Sonnet
+/// switch, intermittent otherwise), so both reach us and every reducer appends
+/// both, doubling the message. See #2281.
+///
+/// The schema guarantees that a change in `message_id` marks a new message, and
+/// the streamed deltas plus the empty block-start marker all share the streamed
+/// id while the leaked restatement carries a different one. So a non-empty chunk
+/// whose id differs from the open block and whose text restates the block's
+/// accumulated text is the leak; a same-id chunk is always a genuine delta and
+/// is never dropped (a legitimately repeated delta keeps the same id). Absent
+/// ids on either side degrade to never-drop, which leaves that rarer leak shape
+/// in place rather than risk corrupting real output.
+#[derive(Default)]
+struct AgentMessageDedup {
+    block: Option<AgentTextBlock>,
+}
+
+struct AgentTextBlock {
+    id: Option<MessageId>,
+    text: String,
+}
+
+impl AgentMessageDedup {
+    /// Forget any in-flight block. Called while post-load history replay is
+    /// suppressed so replayed chunks cannot poison live block tracking once
+    /// suppression lifts.
+    fn reset(&mut self) {
+        self.block = None;
+    }
+
+    /// Returns true when `update` is the leaked consolidated restatement and the
+    /// whole notification should be skipped (not mapped, not emitted).
+    fn observe(&mut self, update: &SessionUpdate) -> bool {
+        let SessionUpdate::AgentMessageChunk(chunk) = update else {
+            // Any non-message-chunk update ends the current text block. The
+            // event stream never interleaves ambient updates inside a streamed
+            // block, so this is a safe block terminator.
+            self.block = None;
+            return false;
+        };
+        let ContentBlock::Text(t) = &chunk.content else {
+            // Non-text content (image, audio) ends the text block.
+            self.block = None;
+            return false;
+        };
+        if t.text.is_empty() {
+            // The adapter emits an empty chunk at each block start; treat it as
+            // the boundary so adjacent blocks never merge in the accumulator.
+            // Empty text renders nothing, so keep forwarding it.
+            self.block = Some(AgentTextBlock {
+                id: chunk.message_id.clone(),
+                text: String::new(),
+            });
+            return false;
+        }
+        match &mut self.block {
+            Some(block) if block.id == chunk.message_id => {
+                // Same message: a genuine streamed delta (or both ids absent).
+                // Never dropped.
+                block.text.push_str(&t.text);
+                false
+            }
+            Some(block)
+                if block.id.is_some() && chunk.message_id.is_some() && block.text == t.text =>
+            {
+                // Different message id restating the whole block verbatim: the
+                // leaked consolidated copy. Drop it and close the block.
+                self.block = None;
+                true
+            }
+            _ => {
+                // A genuinely new block (id changed, text differs) or no open
+                // block: start tracking fresh.
+                self.block = Some(AgentTextBlock {
+                    id: chunk.message_id.clone(),
+                    text: t.text.clone(),
+                });
+                false
+            }
+        }
+    }
+}
+
 /// Map an ACP `SessionUpdate` to the structured view's typed `Event`. Variants we
 /// don't yet handle pass through as `RawAgentUpdate` so UI clients can at
 /// least see them; we'll narrow these as the schema stabilises.
@@ -4113,6 +4202,19 @@ async fn run_connection_task<W, R>(
     let last_event_at_for_notif = last_event_at.clone();
     let first_event_after_attach_for_notif = first_event_after_attach.clone();
 
+    // Per-session tracker that drops claude-agent-acp's leaked consolidated
+    // agent_message_chunk restatement before it doubles the rendered message.
+    // See AgentMessageDedup and #2281. std Mutex (not tokio) so the critical
+    // section stays synchronous and the guard never crosses an await.
+    let agent_msg_dedup = Arc::new(std::sync::Mutex::new(AgentMessageDedup::default()));
+    let agent_msg_dedup_for_notif = agent_msg_dedup.clone();
+    // The prompt loop resets the deduper at turn boundaries (a new prompt, and
+    // the turn's terminal Stopped). Turn completion is not a SessionUpdate, so
+    // without this an open text block could survive into the next turn and a
+    // new turn that legitimately reuses the prior turn's trailing text under a
+    // fresh message_id would be misclassified as a restatement. See #2281.
+    let agent_msg_dedup_for_block = agent_msg_dedup.clone();
+
     let result = Client
         .builder()
         .name("aoe-acp")
@@ -4126,10 +4228,31 @@ async fn run_connection_task<W, R>(
                     first_event_after_attach_for_notif.clone();
                 let lifecycle_signal_tx = lifecycle_signal_tx_for_notif.clone();
                 let current_prompt_epoch = current_prompt_epoch_for_notif.clone();
+                let agent_msg_dedup = agent_msg_dedup_for_notif.clone();
                 async move {
                     last_event_at
                         .store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
                     let suppressing = suppress.load(Ordering::Relaxed);
+                    // Drop claude-agent-acp's leaked consolidated
+                    // agent_message_chunk restatement before it reaches the
+                    // watchdog, the event store, or any client (#2281). During
+                    // post-load history replay the deduper is reset rather than
+                    // fed, so replayed chunks can't poison live block tracking.
+                    {
+                        let mut dedup = agent_msg_dedup
+                            .lock()
+                            .expect("agent message dedup mutex poisoned");
+                        if suppressing {
+                            dedup.reset();
+                        } else if dedup.observe(&notification.update) {
+                            debug!(
+                                target: "acp.protocol",
+                                session = %session_label,
+                                "dropping leaked consolidated agent_message_chunk restatement (#2281)"
+                            );
+                            return Ok(());
+                        }
+                    }
                     // Snapshot the prompt epoch ONCE per notification so
                     // every signal derived from this update shares the
                     // same epoch. If the prompt loop bumps the atomic
@@ -4781,6 +4904,13 @@ async fn run_connection_task<W, R>(
                 let cmd = cmd_rx.recv().await;
                 match cmd {
                     Some(ClientCmd::Prompt(blocks)) => {
+                        // Scope the agent-message deduper to one turn: a new
+                        // prompt starts a fresh assistant block, so forget any
+                        // block left open by the prior turn. See #2281.
+                        agent_msg_dedup_for_block
+                            .lock()
+                            .expect("agent message dedup mutex poisoned")
+                            .reset();
                         // First user prompt after session/load: stop
                         // dropping notifications. The agent's history-
                         // replay window is over; everything from now on
@@ -5365,6 +5495,14 @@ async fn run_connection_task<W, R>(
                                 reason: reason.into(),
                             })
                             .await;
+                        // Turn ended: close any open assistant text block so a
+                        // restatement can never be matched across the turn
+                        // boundary. The next prompt also resets, this is the
+                        // belt to that suspenders. See #2281.
+                        agent_msg_dedup_for_block
+                            .lock()
+                            .expect("agent message dedup mutex poisoned")
+                            .reset();
                         if shutdown {
                             break;
                         }
@@ -7194,6 +7332,92 @@ mod tests {
             _ => None,
         });
         assert!(started.unwrap().parent_tool_call_id.is_none());
+    }
+
+    fn text_chunk(text: &str, id: Option<&str>) -> SessionUpdate {
+        use agent_client_protocol::schema::{ContentBlock, ContentChunk, TextContent};
+        let mut chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text)));
+        if let Some(id) = id {
+            chunk = chunk.message_id(id);
+        }
+        SessionUpdate::AgentMessageChunk(chunk)
+    }
+
+    fn tool_update() -> SessionUpdate {
+        use agent_client_protocol::schema::ToolCall as AcpToolCall;
+        SessionUpdate::ToolCall(AcpToolCall::new("t-dedup", "Read"))
+    }
+
+    #[test]
+    fn dedup_drops_consolidated_restatement_after_deltas() {
+        // The reported leak: empty marker + two streamed deltas sharing the
+        // streamed id, then the whole block re-sent under a different id.
+        let mut d = AgentMessageDedup::default();
+        assert!(!d.observe(&text_chunk("", Some("m1"))));
+        assert!(!d.observe(&text_chunk(
+            "Concrete repro. Let me inspect the events around lgtm and",
+            Some("m1")
+        )));
+        assert!(!d.observe(&text_chunk(
+            " the \"Plan approved\" message in that session.",
+            Some("m1")
+        )));
+        // Consolidated copy carries the mismatched id and restates the block.
+        assert!(d.observe(&text_chunk(
+            "Concrete repro. Let me inspect the events around lgtm and the \"Plan approved\" message in that session.",
+            Some("m2")
+        )));
+    }
+
+    #[test]
+    fn dedup_drops_single_delta_restatement() {
+        let mut d = AgentMessageDedup::default();
+        assert!(!d.observe(&text_chunk("hello world", Some("m1"))));
+        assert!(d.observe(&text_chunk("hello world", Some("m2"))));
+    }
+
+    #[test]
+    fn dedup_keeps_legitimate_repeated_same_id_delta() {
+        // Two identical deltas that share a message id are genuine streamed
+        // output ("haha"), not a restatement. Never dropped.
+        let mut d = AgentMessageDedup::default();
+        assert!(!d.observe(&text_chunk("", Some("m1"))));
+        assert!(!d.observe(&text_chunk("ha", Some("m1"))));
+        assert!(!d.observe(&text_chunk("ha", Some("m1"))));
+    }
+
+    #[test]
+    fn dedup_resets_on_boundary_and_handles_adjacent_blocks() {
+        let mut d = AgentMessageDedup::default();
+        // Block 1: delta then restatement, dropped.
+        assert!(!d.observe(&text_chunk("ab", Some("m1"))));
+        assert!(d.observe(&text_chunk("ab", Some("m2"))));
+        // A tool call ends the block.
+        assert!(!d.observe(&tool_update()));
+        // Block 2 reuses text "ab": the first chunk after the boundary must
+        // not be mistaken for a restatement of the closed block.
+        assert!(!d.observe(&text_chunk("ab", Some("m3"))));
+        assert!(d.observe(&text_chunk("ab", Some("m4"))));
+    }
+
+    #[test]
+    fn dedup_never_drops_when_ids_absent() {
+        // Without message ids the delta-vs-restatement distinction is
+        // ambiguous; degrade to never-drop so real output is never corrupted.
+        let mut d = AgentMessageDedup::default();
+        assert!(!d.observe(&text_chunk("", None)));
+        assert!(!d.observe(&text_chunk("done", None)));
+        assert!(!d.observe(&text_chunk("done", None)));
+    }
+
+    #[test]
+    fn dedup_reset_forgets_in_flight_block() {
+        // Mirrors the suppression path: reset() between a block's deltas and
+        // its restatement means the restatement is treated as a fresh block.
+        let mut d = AgentMessageDedup::default();
+        assert!(!d.observe(&text_chunk("ab", Some("m1"))));
+        d.reset();
+        assert!(!d.observe(&text_chunk("ab", Some("m2"))));
     }
 
     #[test]

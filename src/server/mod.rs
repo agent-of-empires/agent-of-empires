@@ -2665,7 +2665,6 @@ pub struct StructuredTelemetryCounters {
     pub approvals_allow_always: std::sync::atomic::AtomicU32,
     pub approvals_deny: std::sync::atomic::AtomicU32,
     pub agent_switches: std::sync::atomic::AtomicU32,
-    pub view_toggles: std::sync::atomic::AtomicU32,
     pub plan_mode_seen: std::sync::atomic::AtomicU32,
     pub prompts_queued: std::sync::atomic::AtomicU32,
 }
@@ -2691,7 +2690,6 @@ struct ReportedAcpCounts {
     approvals_allow_always: u32,
     approvals_deny: u32,
     agent_switches: u32,
-    view_toggles: u32,
     plan_mode: u32,
     prompts_queued: u32,
 }
@@ -2722,7 +2720,6 @@ async fn build_serve_snapshot(
         approvals_allow_always: c.approvals_allow_always.load(Ordering::Relaxed),
         approvals_deny: c.approvals_deny.load(Ordering::Relaxed),
         agent_switches: c.agent_switches.load(Ordering::Relaxed),
-        view_toggles: c.view_toggles.load(Ordering::Relaxed),
         plan_mode: c.plan_mode_seen.load(Ordering::Relaxed),
         prompts_queued: c.prompts_queued.load(Ordering::Relaxed),
     };
@@ -2731,7 +2728,6 @@ async fn build_serve_snapshot(
         approvals_allow_always: reported_acp.approvals_allow_always,
         approvals_deny: reported_acp.approvals_deny,
         agent_switches: reported_acp.agent_switches,
-        view_toggles: reported_acp.view_toggles,
         plan_mode_seen: reported_acp.plan_mode > 0,
         prompts_queued: reported_acp.prompts_queued,
     };
@@ -2790,7 +2786,6 @@ fn clear_reported_serve_signals(state: &AppState, outcome: crate::telemetry::Sen
     decrement_reported_count(&c.approvals_allow_always, rc.approvals_allow_always);
     decrement_reported_count(&c.approvals_deny, rc.approvals_deny);
     decrement_reported_count(&c.agent_switches, rc.agent_switches);
-    decrement_reported_count(&c.view_toggles, rc.view_toggles);
     decrement_reported_count(&c.plan_mode_seen, rc.plan_mode);
     decrement_reported_count(&c.prompts_queued, rc.prompts_queued);
 }

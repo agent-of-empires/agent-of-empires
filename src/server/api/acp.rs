@@ -1521,12 +1521,7 @@ pub async fn acp_enable(
     }
 
     // A real terminal -> acp transition is now committed (the idempotent
-    // already-acp and unresolvable-agent cases returned above). Tally the
-    // substrate toggle for the opt-in telemetry snapshot.
-    state
-        .telemetry_structured
-        .view_toggles
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // already-acp and unresolvable-agent cases returned above).
 
     // Tear down the tmux side. Best-effort: a stale tmux name should
     // not block the swap. Run on a blocking pool worker because each
@@ -1696,12 +1691,7 @@ pub async fn acp_disable(
     }
 
     // A real acp -> terminal transition is now committed (the idempotent
-    // already-terminal case returned above). Tally the substrate toggle for the
-    // opt-in telemetry snapshot.
-    state
-        .telemetry_structured
-        .view_toggles
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // already-terminal case returned above).
 
     // Tear down the acp worker. Disabling acp mode discards the
     // conversation (we delete on-disk history and clear the stored ACP
@@ -1803,6 +1793,16 @@ pub struct SetModeRequest {
     pub mode_id: String,
 }
 
+/// Whether a mode value selects plan mode. `"plan"` is the canonical plan value
+/// on both mode channels: the legacy `session/set_mode` `mode_id` and the
+/// config-option `value` (claude-agent-acp v0.37.0+, OpenCode). Routing both
+/// `acp_set_mode` and `acp_set_config_option` through this one check keeps the
+/// plan-mode telemetry tally from drifting between the two paths. See the web
+/// `modeChannel.ts`, where the plan choice id is `"plan"` regardless of channel.
+fn is_plan_mode_value(value: &str) -> bool {
+    value == "plan"
+}
+
 /// Set the active session mode (Default / Plan / AcceptEdits /
 /// BypassPermissions). Sends an ACP `session/set_mode` request.
 pub async fn acp_set_mode(
@@ -1819,10 +1819,9 @@ pub async fn acp_set_mode(
     };
     match state.acp_supervisor.set_mode(&id, &req.mode_id).await {
         Ok(()) => {
-            // The agent accepted the mode switch. "plan" is the canonical ACP
-            // mode id; tally plan-mode adoption for the opt-in telemetry
-            // snapshot. Other modes are out of scope for now.
-            if req.mode_id == "plan" {
+            // The agent accepted the mode switch; tally plan-mode adoption for
+            // the opt-in telemetry snapshot. Other modes are out of scope for now.
+            if is_plan_mode_value(&req.mode_id) {
                 state
                     .telemetry_structured
                     .plan_mode_seen
@@ -1869,7 +1868,22 @@ pub async fn acp_set_config_option(
         .set_config_option(&id, &req.config_id, &req.value)
         .await
     {
-        Ok(()) => StatusCode::ACCEPTED.into_response(),
+        Ok(()) => {
+            // Tally plan-mode adoption. claude-agent-acp v0.37.0+ (and OpenCode)
+            // advertise the mode picker as a config option of category "mode" and
+            // switch through this path rather than the legacy `session/set_mode`
+            // handled by `acp_set_mode`, so the plan tally has to live here too or
+            // the modern fleet reports zero. No other config category (model,
+            // thought level) carries a "plan" value, so keying on the value alone
+            // is safe and stays in sync with the legacy path via the shared check.
+            if is_plan_mode_value(&req.value) {
+                state
+                    .telemetry_structured
+                    .plan_mode_seen
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            StatusCode::ACCEPTED.into_response()
+        }
         Err(SupervisorError::UnknownSession(_)) => (
             StatusCode::NOT_FOUND,
             "session has no running structured view",
@@ -2116,6 +2130,21 @@ mod tests {
             "application/pdf"
         ));
         assert!(!mime_allowed(PromptAttachmentKind::Resource, "text/html"));
+    }
+
+    #[test]
+    fn plan_mode_value_matches_only_plan() {
+        // Both `acp_set_mode` (legacy `mode_id`) and `acp_set_config_option`
+        // (config-option `value`) tally plan-mode adoption through this check, so
+        // it must accept the canonical "plan" value and reject every other mode or
+        // selector value (Default / AcceptEdits / model ids / thought levels).
+        assert!(is_plan_mode_value("plan"));
+        assert!(!is_plan_mode_value("default"));
+        assert!(!is_plan_mode_value("accept_edits"));
+        assert!(!is_plan_mode_value("bypassPermissions"));
+        assert!(!is_plan_mode_value("yolo"));
+        assert!(!is_plan_mode_value("Plan"));
+        assert!(!is_plan_mode_value(""));
     }
 
     #[test]

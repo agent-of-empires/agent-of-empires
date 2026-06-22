@@ -737,9 +737,13 @@ pub struct HomeView {
     /// dispatched through the exact same path as pressing the shortcut).
     /// Rebuilt every frame; empty in live mode and the takeover views.
     pub(super) footer_buttons: Vec<(Rect, crossterm::event::KeyEvent)>,
-    /// Index into `footer_buttons` the pointer is currently over, used to
-    /// draw a hover highlight. Recomputed on every `Moved` event.
-    pub(super) footer_hover: Option<usize>,
+    /// The `KeyEvent` of the footer button the pointer is currently over, used
+    /// to draw a hover highlight. Recomputed on every `Moved` event. Keyed by
+    /// the button's shortcut rather than its index into `footer_buttons` so the
+    /// highlight follows the right button when a sort/group/view-mode change
+    /// reorders the toolbar between the move and the next render, and can never
+    /// index a button that no longer exists.
+    pub(super) footer_hover: Option<crossterm::event::KeyEvent>,
     /// Last reported mouse position when it was over `list_inner_area`,
     /// `None` when the cursor is outside the list. Stored as a position
     /// rather than a resolved item index so wheel scrolls implicitly
@@ -3886,32 +3890,45 @@ impl HomeView {
         self.save_sidebar_collapsed();
     }
 
-    fn save_sidebar_collapsed(&self) {
-        if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
-            config.app_state.home_sidebar_collapsed = Some(self.sidebar_collapsed);
-            if let Err(e) = save_config(&config) {
-                tracing::warn!(target: "tui.home", "Failed to save config: {e}");
+    /// Load the persisted config, apply `mutate` to its `app_state`, and write
+    /// it back. Both the load and save failure paths are logged, so a
+    /// UI-preference write never fails silently in one persister while being
+    /// reported in another. Centralizes the load/mutate/save boilerplate the
+    /// home view's preference persisters would otherwise each repeat.
+    fn persist_app_state(
+        what: &str,
+        mutate: impl FnOnce(&mut crate::session::config::AppStateConfig),
+    ) {
+        match load_config() {
+            Ok(config) => {
+                let mut config = config.unwrap_or_default();
+                mutate(&mut config.app_state);
+                if let Err(e) = save_config(&config) {
+                    tracing::warn!(target: "tui.home", "Failed to save config ({what}): {e}");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(target: "tui.home", "Failed to load config for {what} save: {e}");
             }
         }
     }
 
+    fn save_sidebar_collapsed(&self) {
+        let collapsed = self.sidebar_collapsed;
+        Self::persist_app_state("sidebar collapsed", |s| {
+            s.home_sidebar_collapsed = Some(collapsed)
+        });
+    }
+
     fn save_list_width(&self) {
-        if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
-            config.app_state.home_list_width = Some(self.list_width);
-            if let Err(e) = save_config(&config) {
-                tracing::warn!(target: "tui.home", "Failed to save config: {e}");
-            }
-        }
+        let width = self.list_width;
+        Self::persist_app_state("list width", |s| s.home_list_width = Some(width));
     }
 
     pub fn toggle_preview_info(&mut self) {
         self.show_preview_info = !self.show_preview_info;
-        if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
-            config.app_state.show_preview_info = Some(self.show_preview_info);
-            if let Err(e) = save_config(&config) {
-                tracing::warn!(target: "tui.home", "Failed to save config: {e}");
-            }
-        }
+        let show = self.show_preview_info;
+        Self::persist_app_state("preview info", |s| s.show_preview_info = Some(show));
     }
 
     /// Forget the last non-live preview resize so the next render re-asserts the
@@ -3933,22 +3950,17 @@ impl HomeView {
             return;
         }
         self.archived_section_collapsed = false;
-        if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
-            config.app_state.archived_section_collapsed = Some(false);
-            if let Err(e) = save_config(&config) {
-                tracing::warn!(target: "tui.home", "Failed to save config: {e}");
-            }
-        }
+        Self::persist_app_state("archived section", |s| {
+            s.archived_section_collapsed = Some(false)
+        });
     }
 
     pub fn toggle_archived_section(&mut self) {
         self.archived_section_collapsed = !self.archived_section_collapsed;
-        if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
-            config.app_state.archived_section_collapsed = Some(self.archived_section_collapsed);
-            if let Err(e) = save_config(&config) {
-                tracing::warn!(target: "tui.home", "Failed to save config: {e}");
-            }
-        }
+        let collapsed = self.archived_section_collapsed;
+        Self::persist_app_state("archived section", |s| {
+            s.archived_section_collapsed = Some(collapsed)
+        });
         self.flat_items = self.build_flat_items();
         // Defensive cursor clamp + selection refresh. Today the only
         // call site routes through `toggle_group_collapsed` after the

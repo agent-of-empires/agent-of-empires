@@ -4217,14 +4217,16 @@ impl HomeView {
             overlay_changed |= dialog.handle_hover(col, row);
         }
 
-        // Footer-toolbar hover: the index drives the inverted-chip highlight
-        // on the next render. Recomputed against the current button rects so
-        // it clears the moment the pointer leaves a button.
+        // Footer-toolbar hover: the hovered button's shortcut drives the
+        // inverted-chip highlight on the next render. Recomputed against the
+        // current button rects so it clears the moment the pointer leaves a
+        // button.
         let prev_footer_hover = self.footer_hover;
         self.footer_hover = self
             .footer_buttons
             .iter()
-            .position(|(rect, _)| rect.contains(Position::from((col, row))));
+            .find(|(rect, _)| rect.contains(Position::from((col, row))))
+            .map(|(_, key)| *key);
         let footer_changed = prev_footer_hover != self.footer_hover;
 
         let new_pos = if self.list_inner_area.contains(Position::from((col, row))) {

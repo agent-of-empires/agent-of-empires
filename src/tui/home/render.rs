@@ -822,7 +822,10 @@ impl HomeView {
         // narrow case needs no else).
         const COLLAPSE_LABEL: &str = " \u{00AB} ";
         const COLLAPSE_LABEL_WIDTH: u16 = 3;
-        if area.width > COLLAPSE_LABEL_WIDTH + 6 {
+        // Columns kept clear for the title that shares this top border row, so
+        // the collapse affordance only draws when it won't collide with it.
+        const COLLAPSE_LABEL_TITLE_RESERVE: u16 = 6;
+        if area.width > COLLAPSE_LABEL_WIDTH + COLLAPSE_LABEL_TITLE_RESERVE {
             let btn_rect = Rect {
                 x: area.right() - COLLAPSE_LABEL_WIDTH,
                 y: area.y,
@@ -3034,7 +3037,6 @@ impl HomeView {
         // Column of the next span; starts past the leading space margin. Used
         // to record each clickable button's hit rect as it's laid out.
         let mut col = area.x.saturating_add(1);
-        let mut clickable_idx = 0usize;
         for (i, (_, key, group)) in groups.into_iter().enumerate() {
             if !keep[i] {
                 continue;
@@ -3055,14 +3057,13 @@ impl HomeView {
                         },
                         key,
                     ));
-                    if self.footer_hover == Some(clickable_idx) {
+                    if self.footer_hover == Some(key) {
                         for s in group {
                             spans.push(Span::styled(s.content, hover_style));
                         }
                     } else {
                         spans.extend(group);
                     }
-                    clickable_idx += 1;
                 }
                 None => spans.extend(group),
             }
