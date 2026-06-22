@@ -359,6 +359,22 @@ const INITIALIZE_RESULT = {
   // Omitting the key signals "no auth required" cleanly.
 };
 
+// The same fake is shimmed under several binary names (claude /
+// claude-agent-acp / aoe-agent / opencode). The agent_compat gate keys
+// its policy off the binary the supervisor spawned, so when this process
+// stands in for opencode it must report opencode's own name and a version
+// at or above the opencode floor (OPENCODE_MIN_VERSION in
+// src/acp/agent_compat.rs); otherwise the gate rejects the handshake and
+// the opencode live specs (acp-mode-picker) fail. The shim sets
+// FAKE_ACP_IMPERSONATE; default stays claude.
+function resolveAgentInfo() {
+  if (process.env.FAKE_ACP_IMPERSONATE === "opencode") {
+    // Keep at (or above) the agent_compat opencode floor (>=1.16.0).
+    return { name: "OpenCode", version: "1.16.0" };
+  }
+  return INITIALIZE_RESULT.agentInfo;
+}
+
 async function handleRequest(msg) {
   const { id, method, params } = msg;
   fakeDebug(`handleRequest method=${method} id=${id}`);
@@ -401,6 +417,7 @@ async function handleRequest(msg) {
       const result = script.promptCapabilities
         ? {
             ...INITIALIZE_RESULT,
+            agentInfo: resolveAgentInfo(),
             agentCapabilities: {
               ...INITIALIZE_RESULT.agentCapabilities,
               promptCapabilities: {
@@ -409,7 +426,7 @@ async function handleRequest(msg) {
               },
             },
           }
-        : INITIALIZE_RESULT;
+        : { ...INITIALIZE_RESULT, agentInfo: resolveAgentInfo() };
       sendResult(id, result);
       return;
     }
