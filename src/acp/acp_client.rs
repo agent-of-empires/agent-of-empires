@@ -464,6 +464,24 @@ const SILENT_ORPHAN_FAST_GRACE_DEFAULT: std::time::Duration = std::time::Duratio
 /// notification handler to reach back into a pinned `tokio::time::sleep`.
 const SILENT_ORPHAN_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Idle grace for the between-prompt watchdog once the cost-bearing
+/// end-of-turn `UsageUpdate` has arrived. Much shorter than the per-prompt
+/// `SILENT_ORPHAN_FAST_GRACE_DEFAULT`: that one also waits out a
+/// possibly-late `PromptResponse` over the wire, but a between-prompt
+/// agent-initiated turn has no RPC to wait for, so once it emits its
+/// end-of-turn marker and goes quiet a few seconds is enough. Kept low so
+/// the "monitoring" badge and running status clear promptly after a monitor
+/// turn finishes. A turn that actually continues emits fresh progress,
+/// which resets the idle timer and clears `cost_seen`, so this cannot cut a
+/// live turn short. See #2325.
+const BETWEEN_PROMPT_IDLE_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Tick cadence for the between-prompt idle check. Faster than
+/// `SILENT_ORPHAN_CHECK_INTERVAL` so the badge and status clear within a few
+/// seconds of the turn ending. Only polled while the command loop is parked
+/// between prompts, so the extra wakeups are cheap. See #2325.
+const BETWEEN_PROMPT_IDLE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Classification of an inbound ACP `SessionUpdate` for the silent-
 /// orphan watchdog state machine. Sent from the notification handler
 /// to the prompt loop via a dedicated mpsc; the prompt loop owns the
@@ -5004,7 +5022,7 @@ async fn run_connection_task<W, R>(
             // command loop (never a detached task) keeps it serialized with
             // every other command, so it can't race a new prompt's events.
             let mut between_prompt_idle_tick =
-                tokio::time::interval(SILENT_ORPHAN_CHECK_INTERVAL);
+                tokio::time::interval(BETWEEN_PROMPT_IDLE_CHECK_INTERVAL);
             between_prompt_idle_tick
                 .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -5018,7 +5036,7 @@ async fn run_connection_task<W, R>(
                             last_lifecycle_at.load(Ordering::Relaxed),
                             between_prompt_wake_until.load(Ordering::Relaxed),
                             between_prompt_cost_seen.load(Ordering::Relaxed),
-                            SILENT_ORPHAN_FAST_GRACE_DEFAULT,
+                            BETWEEN_PROMPT_IDLE_GRACE,
                             OFF_PROTOCOL_WORK_GRACE_FLOOR,
                         ) {
                             between_prompt_active.store(false, Ordering::Relaxed);
@@ -6657,8 +6675,9 @@ mod tests {
     }
 
     // Between-prompt idle watchdog fire decision (#2325). Wall-clock millis.
-    const FAST: std::time::Duration = std::time::Duration::from_secs(20);
-    const FLOOR: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+    // Bind to the production constants so the test tracks the real grace.
+    const FAST: std::time::Duration = BETWEEN_PROMPT_IDLE_GRACE;
+    const FLOOR: std::time::Duration = OFF_PROTOCOL_WORK_GRACE_FLOOR;
 
     #[test]
     fn between_prompt_inactive_never_fires() {
@@ -6671,20 +6690,21 @@ mod tests {
     #[test]
     fn between_prompt_fires_after_fast_grace_when_cost_seen() {
         let last = 1_000_000;
-        // 19s idle: still within the 20s fast grace.
+        let grace_ms = FAST.as_millis() as i64;
+        // Just under the fast grace: still waiting.
         assert!(!between_prompt_should_fire(
             true,
-            last + 19_000,
+            last + grace_ms - 500,
             last,
             0,
             true,
             FAST,
             FLOOR
         ));
-        // 21s idle: past the fast grace, the completed turn ends.
+        // Past the fast grace: the completed turn ends.
         assert!(between_prompt_should_fire(
             true,
-            last + 21_000,
+            last + grace_ms + 500,
             last,
             0,
             true,
