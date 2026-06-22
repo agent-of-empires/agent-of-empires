@@ -3782,13 +3782,18 @@ fn apply_acp_session_change(
             // that the client parked waiting for a worker that never returns.
             // See #2237.
             let cleared_stale_dormant = inst.idle_dormant_since.take().is_some();
-            // #2276: an imported session's session/load has now landed and its
-            // history replay is in the event store, so clear import_pending.
-            // The id it reports is the same one we adopted at import, so this
-            // lands in the same-id branch below; a later reattach must then
-            // suppress the replay normally.
-            let cleared_import_pending = inst.import_pending.take().unwrap_or(false);
-            if inst.acp_session_id.as_deref() == Some(new_id.as_str()) {
+            let same_acp_session = inst.acp_session_id.as_deref() == Some(new_id.as_str());
+            // #2276: clear import_pending only when the assigned id matches the
+            // imported one, i.e. the import's session/load actually landed and
+            // its replay is now in the event store. A fallback session/new (or
+            // a stale worker) reports a different id; consuming the marker then
+            // would block a later retry from re-seeding the transcript.
+            let cleared_import_pending = if same_acp_session {
+                inst.import_pending.take().unwrap_or(false)
+            } else {
+                false
+            };
+            if same_acp_session {
                 // Same id (a reattach / session/load reuses it). Only persist
                 // if we actually cleared a stale dormant marker or the import
                 // flag; otherwise the id is already on disk and there is
