@@ -134,26 +134,17 @@ test("imports an existing Claude session and replays its transcript", async ({},
       )
       .toContain(REPLAY_TEXT);
 
-    // A smart-rename-style one-shot AoE runs in the same cwd writes its own
-    // jsonl with a different id that is stored nowhere. It must still be
-    // excluded by the cwd match against the managed session's project_path.
-    const oneShotId = "99999999-aaaa-bbbb-cccc-dddddddddddd";
-    const oneShotLine = JSON.stringify({
-      type: "user",
-      cwd: projectDir,
-      message: { role: "user", content: [{ type: "text", text: "Generate a concise title" }] },
-    });
-    writeFileSync(join(serve.home, ".claude", "projects", "imported-proj", `${oneShotId}.jsonl`), `${oneShotLine}\n`);
-
-    // 4. Now that AoE manages this session, neither its id (acp_session_id)
-    // nor the one-shot sharing its project_path is offered for import.
+    // 4. Now that AoE manages this session by id (acp_session_id), it drops
+    // out of the import list so it is not offered for re-import. (Filtering a
+    // plain project_path is deliberately NOT done, so an external claude
+    // session in the same repo would still show; only the managed id is hidden.)
     await expect
       .poll(
         async () => {
           const res = await fetch(`${serve.baseUrl}/api/claude-sessions`);
           if (!res.ok) return true;
           const list: { session_id: string }[] = await res.json();
-          return list.some((s) => s.session_id === IMPORT_SID || s.session_id === oneShotId);
+          return list.some((s) => s.session_id === IMPORT_SID);
         },
         { timeout: 10_000, intervals: [200, 500, 1000] },
       )
