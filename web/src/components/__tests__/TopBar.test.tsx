@@ -12,7 +12,7 @@
 // instances on ports 8081 / 8080 are visually distinguishable).
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render } from "@testing-library/react";
+import { cleanup, fireEvent, render } from "@testing-library/react";
 
 import { TopBar } from "../TopBar";
 import type { SessionResponse, Workspace } from "../../lib/types";
@@ -27,6 +27,8 @@ function renderTopBar(
     isOffline?: boolean;
     activeWorkspace?: Workspace;
     activeSession?: SessionResponse | null;
+    tipsUnseen?: number;
+    onOpenTips?: () => void;
   } = {},
 ) {
   return render(
@@ -44,6 +46,8 @@ function renderTopBar(
       loginRequired={false}
       isOffline={overrides.isOffline ?? false}
       isDevBuild={overrides.isDevBuild ?? false}
+      tipsUnseen={overrides.tipsUnseen ?? 0}
+      onOpenTips={overrides.onOpenTips ?? vi.fn()}
       onGoDashboard={vi.fn()}
       sidebarColumnVisible={false}
       rightColumnVisible={false}
@@ -95,5 +99,25 @@ describe("TopBar", () => {
     });
     expect(getByText("offline")).toBeTruthy();
     expect(getByLabelText("Debug build")).toBeTruthy();
+  });
+
+  it("hides the tips badge when no tips are unseen", () => {
+    const { queryByLabelText } = renderTopBar({ tipsUnseen: 0 });
+    expect(queryByLabelText("1 tip")).toBeNull();
+    expect(queryByLabelText(/tips?$/)).toBeNull();
+  });
+
+  it("renders the tips badge with the count and fires onOpenTips on click", () => {
+    const onOpenTips = vi.fn();
+    const { getByLabelText, getByText } = renderTopBar({ tipsUnseen: 3, onOpenTips });
+    const badge = getByLabelText("3 tips");
+    expect(getByText("3")).toBeTruthy();
+    fireEvent.click(badge);
+    expect(onOpenTips).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses the singular label for a single tip", () => {
+    const { getByLabelText } = renderTopBar({ tipsUnseen: 1 });
+    expect(getByLabelText("1 tip")).toBeTruthy();
   });
 });
