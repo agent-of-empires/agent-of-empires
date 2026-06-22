@@ -4643,6 +4643,113 @@ fn test_shift_n_opens_prefilled_dialog_from_group() {
 
 #[test]
 #[serial]
+fn test_n_prefills_group_from_selected_group() {
+    let mut env = create_test_env_with_groups();
+
+    let group_idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|item| matches!(item, Item::Group { path, .. } if path == "work"))
+        .expect("work group should exist in flat_items");
+    env.view.cursor = group_idx;
+    env.view.update_selected();
+
+    env.view.handle_key(key(KeyCode::Char('n')), None);
+    let dialog = env.view.new_dialog.as_ref().expect("n should open dialog");
+    assert_eq!(dialog.group_value(), "work");
+}
+
+#[test]
+#[serial]
+fn test_n_prefilled_group_uses_group_profile() {
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+
+    let default_storage = Storage::new_unwatched("default").unwrap();
+    default_storage
+        .update(|i, g| {
+            let inst = Instance::new("Default", "/tmp/default");
+            *i = vec![inst.clone()];
+            *g = GroupTree::new_with_groups(&[inst], &[]).get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    let alpha_storage = Storage::new_unwatched("alpha").unwrap();
+    alpha_storage
+        .update(|i, g| {
+            let mut inst = Instance::new("Security", "/tmp/security");
+            inst.group_path = "security".to_string();
+            *i = vec![inst.clone()];
+            *g = GroupTree::new_with_groups(&[inst], &[]).get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
+    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.flat_items = view.build_flat_items();
+    let group_idx = view
+        .flat_items
+        .iter()
+        .position(|item| {
+            matches!(
+                item,
+                Item::Group { path, profile, .. }
+                    if path == "security" && profile.as_deref() == Some("alpha")
+            )
+        })
+        .expect("alpha security group should exist");
+    view.cursor = group_idx;
+    view.update_selected();
+
+    view.handle_key(key(KeyCode::Char('n')), None);
+    let dialog = view.new_dialog.as_ref().expect("n should open dialog");
+    assert_eq!(dialog.group_value(), "security");
+    assert_eq!(dialog.profile_value(), "alpha");
+}
+
+#[test]
+#[serial]
+fn test_n_prefills_group_from_archived_project_subgroup() {
+    use crate::session::config::GroupByMode;
+
+    let mut env = create_test_env_with_groups();
+    env.view
+        .instances
+        .iter_mut()
+        .find(|inst| inst.title == "work-project")
+        .expect("work-project session should exist")
+        .archive();
+    env.view.group_by = GroupByMode::Project;
+    env.view.archived_section_collapsed = false;
+    env.view.flat_items = env.view.build_flat_items();
+
+    let group_idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|item| {
+            matches!(
+                item,
+                Item::Group { name, path, .. }
+                    if name == "work" && crate::session::is_within_archived_section(path)
+            )
+        })
+        .expect("archived work project subgroup should exist");
+    env.view.cursor = group_idx;
+    env.view.update_selected();
+    assert!(env.view.selected_group.is_none());
+
+    env.view.handle_key(key(KeyCode::Char('n')), None);
+    let dialog = env.view.new_dialog.as_ref().expect("n should open dialog");
+    assert_eq!(dialog.group_value(), "work");
+}
+
+#[test]
+#[serial]
 fn test_group_context_menu_new_session_prefills_path() {
     use crate::tui::dialogs::ContextMenuAction;
 

@@ -527,6 +527,11 @@ impl NewSessionDialog {
         self.group.value()
     }
 
+    #[cfg(test)]
+    pub fn profile_value(&self) -> &str {
+        self.selected_profile()
+    }
+
     /// Push a hook progress message into the dialog state
     pub fn push_hook_progress(&mut self, progress: HookProgress) {
         match progress {

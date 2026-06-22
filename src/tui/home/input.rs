@@ -2456,6 +2456,7 @@ impl HomeView {
             self.show_no_agents();
             return;
         }
+        let selected_group = self.new_session_group_prefill_from_cursor();
         let prefill_path = self
             .selected_session
             .as_ref()
@@ -2466,9 +2467,9 @@ impl HomeView {
                 // `'N'` on a group header): borrow a member's repo path so the
                 // new session lands in the same project, matching the web
                 // sidebar's per-project "+".
-                self.selected_group
+                selected_group
                     .as_ref()
-                    .and_then(|g| self.group_repo_path(g))
+                    .and_then(|(group, _)| self.group_repo_path(group))
             });
         let prefill_group = self
             .selected_session
@@ -2481,7 +2482,7 @@ impl HomeView {
                     Some(inst.group_path.clone())
                 }
             })
-            .or_else(|| self.selected_group.clone());
+            .or_else(|| selected_group.map(|(group, _)| group));
 
         if prefill_path.is_some() || prefill_group.is_some() {
             let existing_groups: Vec<String> =
@@ -2549,6 +2550,32 @@ impl HomeView {
                     None
                 }
             })
+    }
+
+    fn new_session_group_prefill_from_cursor(&self) -> Option<(String, Option<String>)> {
+        match self.flat_items.get(self.cursor) {
+            Some(Item::Group { path, .. }) if crate::session::is_archived_section_path(path) => {
+                None
+            }
+            Some(Item::Group {
+                path,
+                name,
+                profile,
+                ..
+            }) if crate::session::is_within_archived_section(path) => Some((
+                name.clone(),
+                profile
+                    .clone()
+                    .or_else(|| self.profile_for_cursor(self.cursor)),
+            )),
+            Some(Item::Group { path, profile, .. }) => Some((
+                path.clone(),
+                profile
+                    .clone()
+                    .or_else(|| self.profile_for_cursor(self.cursor)),
+            )),
+            _ => None,
+        }
     }
 
     fn attach_terminal_for_selected(&mut self) -> Option<Action> {
@@ -3612,14 +3639,22 @@ impl HomeView {
         }
         let existing_groups: Vec<String> =
             self.all_groups().iter().map(|g| g.path.clone()).collect();
-        let current_profile = self.config_profile();
+        let selected_group = self.new_session_group_prefill_from_cursor();
+        let current_profile = selected_group
+            .as_ref()
+            .and_then(|(_, profile)| profile.clone())
+            .unwrap_or_else(|| self.config_profile());
         let profiles = list_profiles().unwrap_or_else(|_| vec![current_profile.clone()]);
-        self.new_dialog = Some(NewSessionDialog::new(
+        let mut dialog = NewSessionDialog::new(
             self.available_tools.clone(),
             existing_groups,
             &current_profile,
             profiles,
-        ));
+        );
+        if let Some((group, _)) = selected_group {
+            dialog.set_group(group);
+        }
+        self.new_dialog = Some(dialog);
     }
 
     /// Open the tips overlay (the browsable list from `crate::tips`). Shared by
