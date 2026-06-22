@@ -49,11 +49,11 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-function renderStep() {
+function renderStep(importAcpSessionId = "") {
   const onChange = vi.fn();
   const utils = render(
     <ProjectStep
-      data={{ ...initialData, path: "", extraRepoPaths: [], scratch: false }}
+      data={{ ...initialData, path: "", extraRepoPaths: [], scratch: false, importAcpSessionId }}
       onChange={onChange}
       initialTab="import"
     />,
@@ -89,6 +89,12 @@ describe("ProjectStep Import from Claude tab (#2276)", () => {
     expect(calls.tool).toBe("claude");
     expect(calls.useStructuredView).toBe(true);
     expect(calls.useWorktree).toBe(false);
+  });
+
+  it("highlights the currently selected session", async () => {
+    const { findByText } = renderStep("713b7f46-d0f2-454e-91be-a3305d35660c");
+    const row = (await findByText("Fix the spinner bug")).closest("button") as HTMLButtonElement;
+    expect(row.getAttribute("aria-pressed")).toBe("true");
   });
 
   it("filters by title", async () => {

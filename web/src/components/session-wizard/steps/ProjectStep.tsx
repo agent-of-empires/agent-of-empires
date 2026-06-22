@@ -11,6 +11,7 @@ interface WizardData {
   path: string;
   extraRepoPaths: string[];
   scratch: boolean;
+  importAcpSessionId?: string;
   [key: string]: unknown;
 }
 
@@ -409,7 +410,9 @@ export function ProjectStep({ data, onChange, initialTab }: Props) {
           {!loading && activeTab === "browse" && <DirectoryBrowser onSelect={handleBrowseSelect} />}
 
           {/* Import an existing Claude Code session (#2276) */}
-          {!loading && activeTab === "import" && <ClaudeSessionPicker onSelect={handleImportSelect} />}
+          {!loading && activeTab === "import" && (
+            <ClaudeSessionPicker onSelect={handleImportSelect} selectedSessionId={data.importAcpSessionId} />
+          )}
 
           {/* Clone from URL tab */}
           {!loading && activeTab === "clone" && (

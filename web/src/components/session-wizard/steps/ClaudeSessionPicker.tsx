@@ -7,7 +7,14 @@ import type { ClaudeSessionSummary } from "../../../lib/types";
  *  selecting one hands the caller the id + cwd to prefill the wizard. Sessions
  *  whose recorded cwd no longer exists are shown disabled, since `claude
  *  --resume` has no valid working directory for them. */
-export function ClaudeSessionPicker({ onSelect }: { onSelect: (session: ClaudeSessionSummary) => void }) {
+export function ClaudeSessionPicker({
+  onSelect,
+  selectedSessionId,
+}: {
+  onSelect: (session: ClaudeSessionSummary) => void;
+  /** Currently-picked session id, so the chosen row stays highlighted. */
+  selectedSessionId?: string;
+}) {
   const [sessions, setSessions] = useState<ClaudeSessionSummary[] | null>(null);
   const [filter, setFilter] = useState("");
   // Sessions whose recorded cwd is gone cannot be resumed, so hide them by
@@ -70,30 +77,36 @@ export function ClaudeSessionPicker({ onSelect }: { onSelect: (session: ClaudeSe
         </label>
       )}
       <ul className="flex max-h-80 flex-col gap-1 overflow-y-auto" aria-label="Claude sessions">
-        {filtered.map((s) => (
-          <li key={s.session_id}>
-            <button
-              type="button"
-              disabled={!s.cwd_exists}
-              onClick={() => onSelect(s)}
-              title={s.cwd_exists ? s.cwd : `${s.cwd} (directory no longer exists)`}
-              className={`flex w-full flex-col items-start gap-0.5 rounded-md border border-surface-700 px-3 py-2 text-left transition-colors ${
-                s.cwd_exists
-                  ? "cursor-pointer hover:border-brand-600 hover:bg-surface-800"
-                  : "cursor-not-allowed opacity-50"
-              }`}
-            >
-              <span className="line-clamp-1 text-sm font-medium">
-                {s.title || <span className="italic text-content-subtle">(no prompt yet)</span>}
-              </span>
-              <span className="line-clamp-1 text-xs text-content-subtle">{s.cwd}</span>
-              <span className="text-xs text-content-subtle">
-                {formatRelative(s.last_modified_ms)}
-                {!s.cwd_exists && " · directory missing"}
-              </span>
-            </button>
-          </li>
-        ))}
+        {filtered.map((s) => {
+          const selected = s.session_id === selectedSessionId;
+          return (
+            <li key={s.session_id}>
+              <button
+                type="button"
+                disabled={!s.cwd_exists}
+                aria-pressed={selected}
+                onClick={() => onSelect(s)}
+                title={s.cwd_exists ? s.cwd : `${s.cwd} (directory no longer exists)`}
+                className={`flex w-full flex-col items-start gap-0.5 rounded-md border px-3 py-2 text-left transition-colors ${
+                  selected ? "border-brand-500 bg-surface-800 ring-1 ring-brand-500" : "border-surface-700"
+                } ${
+                  s.cwd_exists
+                    ? "cursor-pointer hover:border-brand-600 hover:bg-surface-800"
+                    : "cursor-not-allowed opacity-50"
+                }`}
+              >
+                <span className="line-clamp-1 text-sm font-medium">
+                  {s.title || <span className="italic text-content-subtle">(no prompt yet)</span>}
+                </span>
+                <span className="line-clamp-1 text-xs text-content-subtle">{s.cwd}</span>
+                <span className="text-xs text-content-subtle">
+                  {formatRelative(s.last_modified_ms)}
+                  {!s.cwd_exists && " · directory missing"}
+                </span>
+              </button>
+            </li>
+          );
+        })}
         {filtered.length === 0 && (
           <li className="px-3 py-2 text-sm text-content-subtle">No sessions match "{filter}".</li>
         )}
