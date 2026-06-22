@@ -29,6 +29,12 @@ pub struct AgentInfo {
     /// valid `agent_acp_cmd`. The web wizard reads this to decide
     /// whether a session created for the agent runs in acp or tmux.
     pub acp_capable: bool,
+    /// True when the agent's ACP adapter binary (`acp_command`) is actually
+    /// resolvable on this host, not just registered. Distinct from
+    /// `installed` (the agent's own CLI binary) and `acp_capable` (registry
+    /// knows an adapter exists). The wizard's "Import from Claude" tab gates
+    /// on this so it never shows when claude-agent-acp is missing. See #2276.
+    pub acp_installed: bool,
     /// The ACP command a built-in agent launches in acp, e.g.
     /// `claude-agent-acp` for claude or `opencode` for opencode. This is
     /// the registry command (post `${aoe_data_dir}` substitution), which
@@ -90,6 +96,10 @@ fn build_custom_agent_infos(
             acp_capable: agent_acp_cmd
                 .get(name)
                 .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(name, cmd).is_ok()),
+            // Custom agents' acp_command is never serialized here (it can hold
+            // hostnames or secrets), so we don't probe its install state; the
+            // import tab is claude-only regardless.
+            acp_installed: false,
             // Custom agents' command values are deliberately never
             // serialized here; they can hold hostnames or secrets.
             acp_command: None,
@@ -123,6 +133,9 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentIn
                     installed: available.iter().any(|s| s == a.name),
                     install_hint: a.install_hint.to_string(),
                     acp_capable: acp_registry.get(a.name).is_some(),
+                    acp_installed: acp_command
+                        .as_deref()
+                        .is_some_and(crate::cli::acp::command_present),
                     acp_command,
                     acp_args,
                 }

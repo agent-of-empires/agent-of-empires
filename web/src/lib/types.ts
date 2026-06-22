@@ -338,6 +338,9 @@ export interface AgentInfo {
    *  The wizard reads this to decide whether a new session runs in
    *  acp or tmux, replacing the hardcoded client-side tool list. */
   acp_capable: boolean;
+  /** True when the agent's ACP adapter binary is actually resolvable on the
+   *  host (not just registered). The import tab gates on this for claude. */
+  acp_installed: boolean;
   /** The ACP command a built-in agent launches in acp (e.g.
    *  `claude-agent-acp`, `opencode`), post `${aoe_data_dir}`
    *  substitution. Can differ from `binary`. Absent for custom agents,

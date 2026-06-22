@@ -355,7 +355,12 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
           </button>
         </div>
         <div className="flex-1 overflow-y-auto px-5 py-5 space-y-6">
-          <ProjectStep data={state.data} onChange={handleChange} initialTab={prefill?.initialTab} />
+          <ProjectStep
+            data={state.data}
+            onChange={handleChange}
+            initialTab={prefill?.initialTab}
+            agents={state.agents}
+          />
 
           <div>
             <label className="block text-sm text-text-dim mb-1.5">Session title</label>

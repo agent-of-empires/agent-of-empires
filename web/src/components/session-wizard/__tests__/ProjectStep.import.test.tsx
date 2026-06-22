@@ -13,7 +13,7 @@ import { cleanup, render, fireEvent, waitFor } from "@testing-library/react";
 
 import { ProjectStep } from "../steps/ProjectStep";
 import { initialData } from "../wizardReducer";
-import type { ClaudeSessionSummary } from "../../../lib/types";
+import type { AgentInfo, ClaudeSessionSummary } from "../../../lib/types";
 
 vi.mock("../../../lib/api", () => ({
   fetchSessions: vi.fn().mockResolvedValue({ sessions: [], workspace_ordering: [] }),
@@ -49,13 +49,26 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-function renderStep(importAcpSessionId = "") {
+const CLAUDE_INSTALLED: AgentInfo = {
+  name: "claude",
+  kind: "builtin",
+  binary: "claude",
+  host_only: false,
+  installed: true,
+  install_hint: "",
+  acp_capable: true,
+  acp_installed: true,
+  acp_command: "claude-agent-acp",
+};
+
+function renderStep(importAcpSessionId = "", agents: AgentInfo[] = [CLAUDE_INSTALLED]) {
   const onChange = vi.fn();
   const utils = render(
     <ProjectStep
       data={{ ...initialData, path: "", extraRepoPaths: [], scratch: false, importAcpSessionId }}
       onChange={onChange}
       initialTab="import"
+      agents={agents}
     />,
   );
   return { onChange, ...utils };
@@ -89,6 +102,14 @@ describe("ProjectStep Import from Claude tab (#2276)", () => {
     expect(calls.tool).toBe("claude");
     expect(calls.useStructuredView).toBe(true);
     expect(calls.useWorktree).toBe(false);
+  });
+
+  it("does not render the import picker when claude-agent-acp is not installed", async () => {
+    const notInstalled: AgentInfo = { ...CLAUDE_INSTALLED, acp_installed: false };
+    const { queryByLabelText } = renderStep("", [notInstalled]);
+    // Let any pending effects settle, then confirm the picker never mounted.
+    await Promise.resolve();
+    expect(queryByLabelText("Filter Claude sessions")).toBeNull();
   });
 
   it("highlights the currently selected session", async () => {
