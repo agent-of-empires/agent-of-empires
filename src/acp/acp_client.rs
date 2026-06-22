@@ -4688,6 +4688,21 @@ async fn run_connection_task<W, R>(
                 "initialize handshake complete"
             );
 
+            // Signal handshake-ready now: the ACP `initialize` handshake (what
+            // the spawn timeout actually bounds) is done. session/new and
+            // session/load run below and stream their results as events; for a
+            // resumed/imported session the adapter replays the whole transcript
+            // before answering session/load, which can take far longer than the
+            // handshake timeout. Firing ready here keeps that replay out of the
+            // timeout window (the events still reach the UI as they arrive), so
+            // importing or resuming a large conversation no longer times out
+            // and gets the worker killed. A later session/new failure surfaces
+            // as an AgentStartupError event instead of a spawn() error. See
+            // #2276.
+            if let Some(tx) = ready_for_block.lock().await.take() {
+                let _ = tx.send(Ok(()));
+            }
+
             // Track the mode channels the agent advertised so we can skip
             // session/set_mode requests for modes the agent doesn't support.
             // When new_session.modes is present, only those IDs are valid.
@@ -5002,10 +5017,6 @@ async fn run_connection_task<W, R>(
                     }
                 }
             };
-
-            if let Some(tx) = ready_for_block.lock().await.take() {
-                let _ = tx.send(Ok(()));
-            }
 
             // Arm the resume-idle watchdog. The agent's response to the
             // orphaned in-flight `session/prompt` (from the previous
