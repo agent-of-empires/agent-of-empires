@@ -68,6 +68,21 @@ describe("AboutModal session id", () => {
     expect(info).toHaveBeenCalledWith("Copied session id");
   });
 
+  it("reports an error when the copy fails", async () => {
+    setSecureContext(false);
+    Object.defineProperty(navigator, "clipboard", { value: undefined, configurable: true });
+    const exec = vi.fn().mockReturnValue(false);
+    Object.defineProperty(document, "execCommand", { value: exec, configurable: true });
+    const { info, error } = stubToasts();
+    render(<AboutModal onClose={() => {}} sessionId="sess-fail" />);
+
+    fireEvent.click(screen.getByRole("button", { name: /copy session id/i }));
+    await flushMicrotasks();
+
+    expect(error).toHaveBeenCalledWith("Copy failed");
+    expect(info).not.toHaveBeenCalled();
+  });
+
   it("renders no session-id row when there is no open session", () => {
     render(<AboutModal onClose={() => {}} sessionId={null} />);
     expect(screen.queryByRole("button", { name: /copy session id/i })).toBeNull();

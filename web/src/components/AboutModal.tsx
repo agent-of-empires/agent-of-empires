@@ -122,7 +122,9 @@ export function AboutModal({ onClose, sessionId }: Props) {
               <span className="font-mono text-[11px] uppercase tracking-wider text-text-muted shrink-0">
                 Session id
               </span>
-              <span className="text-sm text-brand-500 group-hover:text-brand-400 font-mono truncate">{sessionId}</span>
+              <span className="text-sm text-text-secondary group-hover:text-text-primary font-mono truncate">
+                {sessionId}
+              </span>
             </button>
           )}
 
