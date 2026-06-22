@@ -11,7 +11,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { useMemo, useRef, type ReactNode } from "react";
 
-import { DragSuppressContext, SessionRow } from "../WorkspaceSidebar";
+import { DragSuppressContext, SessionRow, type RowBulkApi } from "../WorkspaceSidebar";
+
+// Single-row stub for the bulk-triage bridge: these tests mount one
+// unselected row, so the context menu is always single-scope. See #2312.
+const SINGLE_BULK_API: RowBulkApi = {
+  prepareScope: () => ({ kind: "single" }),
+  pin: () => {},
+  archive: () => {},
+  snooze: () => {},
+};
 import { UnreadIndicatorContext } from "../../lib/unreadIndicator";
 import { useSidebarTriage } from "../../hooks/useSidebarTriage";
 import type { SessionResponse, Workspace } from "../../lib/types";
@@ -103,6 +112,7 @@ function Row({
       onArchiveToggle={triage.archiveToggle}
       onSnooze={triage.snooze}
       onUnreadToggle={triage.unreadToggle}
+      bulkApi={SINGLE_BULK_API}
     />
   );
 }
