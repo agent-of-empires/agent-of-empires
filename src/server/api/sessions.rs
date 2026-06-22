@@ -3370,53 +3370,6 @@ pub async fn create_session(
             .into_response();
     }
 
-    // Importing an existing Claude session (#2276) is tightly scoped: it
-    // resumes a specific on-disk session id in its original cwd via the claude
-    // structured agent. Reject any request that pairs the id with a different
-    // workspace shape, a non-claude agent, or a cwd the id doesn't belong to,
-    // so a stale or hand-written request can't seed the transcript in the
-    // wrong place.
-    #[cfg(feature = "serve")]
-    if let Some(import_id) = body
-        .import_acp_session_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        let bad = |msg: &str| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "validation_failed", "message": msg})),
-            )
-                .into_response()
-        };
-        if body.tool != "claude"
-            || body
-                .agent_name
-                .as_deref()
-                .is_some_and(|n| !n.trim().is_empty())
-        {
-            return bad("Importing a Claude session requires the built-in claude agent");
-        }
-        if body.scratch || body.worktree_branch.is_some() || !body.extra_repo_paths.is_empty() {
-            return bad(
-                "Importing a Claude session cannot use scratch, a worktree, or extra repos",
-            );
-        }
-        let import_cwd = body.path.trim().to_string();
-        let import_id_owned = import_id.to_string();
-        let belongs = tokio::task::spawn_blocking(move || {
-            crate::acp::claude_import::scan_sessions()
-                .into_iter()
-                .any(|s| s.session_id == import_id_owned && s.cwd == import_cwd)
-        })
-        .await
-        .unwrap_or(false);
-        if !belongs {
-            return bad("Unknown Claude session for this directory");
-        }
-    }
-
     // Validate user inputs for shell injection. For scratch sessions the
     // `path` field is server-provisioned (and clients typically send an
     // empty string), so skip the path entry in that case.
@@ -3510,6 +3463,54 @@ pub async fn create_session(
             })),
         )
             .into_response();
+    }
+
+    // Importing an existing Claude session (#2276) is tightly scoped: it
+    // resumes a specific on-disk session id in its original cwd via the claude
+    // structured agent. Reject any request that pairs the id with a different
+    // workspace shape, a non-claude agent, or a cwd the id doesn't belong to,
+    // so a stale or hand-written request can't seed the transcript in the
+    // wrong place. Runs after tool-identity validation so it sits ahead of
+    // the build's spawn_blocking but behind the agent check.
+    #[cfg(feature = "serve")]
+    if let Some(import_id) = body
+        .import_acp_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let bad = |msg: &str| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "validation_failed", "message": msg})),
+            )
+                .into_response()
+        };
+        if body.tool != "claude"
+            || body
+                .agent_name
+                .as_deref()
+                .is_some_and(|n| !n.trim().is_empty())
+        {
+            return bad("Importing a Claude session requires the built-in claude agent");
+        }
+        if body.scratch || body.worktree_branch.is_some() || !body.extra_repo_paths.is_empty() {
+            return bad(
+                "Importing a Claude session cannot use scratch, a worktree, or extra repos",
+            );
+        }
+        let import_cwd = body.path.trim().to_string();
+        let import_id_owned = import_id.to_string();
+        let belongs = tokio::task::spawn_blocking(move || {
+            crate::acp::claude_import::scan_sessions()
+                .into_iter()
+                .any(|s| s.session_id == import_id_owned && s.cwd == import_cwd)
+        })
+        .await
+        .unwrap_or(false);
+        if !belongs {
+            return bad("Unknown Claude session for this directory");
+        }
     }
 
     let profile = body.profile.unwrap_or_else(|| state.profile.clone());
