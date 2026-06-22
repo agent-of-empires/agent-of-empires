@@ -2144,10 +2144,13 @@ pub async fn list_claude_sessions(State(state): State<Arc<AppState>>) -> impl In
     // the picker. Two signals (instances span all profiles, #2276):
     //   - id match: a managed session's on-disk id equals the instance's
     //     acp_session_id (structured) or agent_session_id (terminal resume).
-    //   - cwd match: any session whose cwd is inside a known session's
-    //     project_path. This catches worktree sessions (whose cwd is the
-    //     worktree dir AoE created) and the smart-rename one-shot AoE runs
-    //     in that same dir, which has its own id not stored anywhere.
+    //   - cwd match: any session whose cwd is inside an AoE-PROVISIONED dir
+    //     (scratch, a managed worktree, or a workspace). This catches the
+    //     smart-rename one-shot AoE runs in that dir, which has its own id not
+    //     stored anywhere. It deliberately does NOT cover a plain project_path:
+    //     a user running `claude` directly in the same repo as an AoE session
+    //     is a real importable conversation, not AoE's, so it stays in the list
+    //     and is only filtered by id match.
     let (managed_ids, managed_dirs): (std::collections::HashSet<String>, Vec<PathBuf>) = {
         let instances = state.instances.read().await;
         let ids = instances
@@ -2161,6 +2164,11 @@ pub async fn list_claude_sessions(State(state): State<Arc<AppState>>) -> impl In
             .collect();
         let dirs = instances
             .iter()
+            .filter(|i| {
+                i.scratch
+                    || i.worktree_info.as_ref().is_some_and(|w| w.managed_by_aoe)
+                    || i.workspace_info.is_some()
+            })
             .map(|i| PathBuf::from(&i.project_path))
             .filter(|p| !p.as_os_str().is_empty())
             .collect();
