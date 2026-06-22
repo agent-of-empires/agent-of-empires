@@ -2129,9 +2129,14 @@ pub async fn acp_replay(
 }
 
 /// List existing Claude Code sessions on disk, newest first, for the import
-/// picker. Read-only filesystem scan; mutates nothing, so it runs in
-/// read-only mode too.
+/// picker. Gated behind `read_only_block`: this exposes external Claude session
+/// titles and working directories from outside AoE-managed state, and import
+/// can't run in read-only mode anyway, so read-only dashboard users get no
+/// historical prompt metadata. See #2276.
 pub async fn list_claude_sessions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if let Some(resp) = read_only_block(&state) {
+        return resp;
+    }
     let mut sessions = tokio::task::spawn_blocking(crate::acp::claude_import::scan_sessions)
         .await
         .unwrap_or_default();
