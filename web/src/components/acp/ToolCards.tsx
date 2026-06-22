@@ -1082,8 +1082,11 @@ function classifyTodoWrite(
 ): { isTodoWrite: true; todos: TodoItem[] } | { isTodoWrite: false } {
   if (!profile.capabilities.todos) return { isTodoWrite: false };
   const args = parseJsonObject(tool.args_preview);
+  // Array-presence, not item count: an empty `todos: []` is a real
+  // clear-list snapshot, while a non-todo think tool carries no `todos`
+  // key at all. Gating on length rejected legitimate clears. See #2003.
+  if (!Array.isArray(args?.todos)) return { isTodoWrite: false };
   const payload = todoItemsFromArgs(args);
-  if (payload.length === 0) return { isTodoWrite: false };
   const todos = payload.map((entry) => ({
     content: entry.content,
     status: normaliseTodoStatus(entry.status),
@@ -1144,6 +1147,13 @@ function todoBreakdown(counts: Record<TodoStatus, number>): string[] {
 /** The todo checklist itself, shared by the per-call `TodoUpdateCard`
  *  body and the folded `TodoGroupCard`'s always-visible latest list. */
 function TodoList({ todos }: { todos: TodoItem[] }) {
+  if (todos.length === 0) {
+    return (
+      <div className="border-t border-surface-800 bg-surface-950 px-3 py-2 font-mono text-xs text-text-dim">
+        todos cleared
+      </div>
+    );
+  }
   return (
     <div className="border-t border-surface-800 bg-surface-950 px-3 py-2">
       <ul className="flex flex-col gap-1 font-mono text-xs">
@@ -1171,7 +1181,7 @@ function TodoUpdateCard({ tool, result, todos }: TodoCardProps) {
       label="todos"
       primary={
         <>
-          <span>{todos.length} items</span>
+          <span>{todos.length === 0 ? "todos cleared" : `${todos.length} items`}</span>
           {breakdown.length > 0 && <span className="ml-2 text-text-dim">· {breakdown.join(" · ")}</span>}
         </>
       }

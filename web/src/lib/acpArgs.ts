@@ -85,3 +85,11 @@ export function todoItemsFromArgs(args: Record<string, unknown> | null): TodoPay
 export function hasTodoItemsArgsText(argsText: string): boolean {
   return todoItemsFromArgs(parseJsonObject(argsText)).length > 0;
 }
+
+/** Whether `args.todos` is present as an array, even an empty one. An
+ *  empty `todos: []` is a real clear-list snapshot, not a non-todo tool;
+ *  array-presence (not item count) is the discriminator both grouping and
+ *  rendering key on so a clear still groups and renders. See #2003. */
+export function hasTodoArrayArgsText(argsText: string): boolean {
+  return Array.isArray(parseJsonObject(argsText)?.todos);
+}

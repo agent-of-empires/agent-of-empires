@@ -7,6 +7,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   hasArgsBody,
+  hasTodoArrayArgsText,
   hasTodoItemsArgsText,
   parseJsonObject,
   pickFirst,
@@ -177,5 +178,27 @@ describe("todoItemsFromArgs", () => {
   it("detects todo args only when at least one item has content", () => {
     expect(hasTodoItemsArgsText(JSON.stringify({ todos: [{ content: "   ", status: "pending" }] }))).toBe(false);
     expect(hasTodoItemsArgsText(JSON.stringify({ todos: [{ content: "Real", status: "pending" }] }))).toBe(true);
+  });
+});
+
+describe("hasTodoArrayArgsText", () => {
+  it("recognizes an empty todos array as a clear-list snapshot", () => {
+    // The #2003 case: a TodoWrite that clears the list still carries the
+    // `todos` key, so it must read as a todo snapshot even with zero items.
+    expect(hasTodoArrayArgsText(JSON.stringify({ todos: [] }))).toBe(true);
+  });
+
+  it("recognizes a populated todos array", () => {
+    expect(hasTodoArrayArgsText(JSON.stringify({ todos: [{ content: "Real", status: "pending" }] }))).toBe(true);
+  });
+
+  it("rejects payloads with no todos key (a genuine non-todo tool)", () => {
+    expect(hasTodoArrayArgsText(JSON.stringify({ thought: "thinking" }))).toBe(false);
+    expect(hasTodoArrayArgsText("{}")).toBe(false);
+  });
+
+  it("rejects a todos key that is not an array", () => {
+    expect(hasTodoArrayArgsText(JSON.stringify({ todos: "nope" }))).toBe(false);
+    expect(hasTodoArrayArgsText("not json")).toBe(false);
   });
 });

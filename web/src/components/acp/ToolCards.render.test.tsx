@@ -225,6 +225,26 @@ describe("ToolCards profile-gated dispatch (claude)", () => {
     expect(container.textContent).toContain("Step three");
   });
 
+  it("renders an empty TodoWrite clear as a todos card, not a bare think card (#2003)", () => {
+    const { container } = render(
+      <Wrap toolKey="claude">
+        <ToolCard
+          tool={makeToolCall({
+            id: "todo-clear",
+            name: "TodoWrite",
+            kind: "think",
+            args_preview: JSON.stringify({ todos: [] }),
+          })}
+          result={makeCompletion({ id: "done-clear", toolCallId: "todo-clear" })}
+        />
+      </Wrap>,
+    );
+    // Routes to the todos card (label "todos") and reads "todos cleared",
+    // rather than falling through to ThinkToolCard's bare italic name.
+    expect(container.textContent).toContain("todos");
+    expect(container.textContent).toContain("todos cleared");
+  });
+
   it("routes a Skill tool to the skill card under the claude profile", () => {
     const { container } = render(
       <Wrap toolKey="claude">
@@ -448,6 +468,28 @@ describe("TodoGroupCard fold (#1468)", () => {
     expect(text).toContain("Step Charlie");
     // History renders each call in original order.
     expect(text.indexOf("Step Alpha")).toBeLessThan(text.indexOf("Step Bravo"));
+  });
+
+  it("folds a run ending in an empty clear into one group reading cleared (#2003)", () => {
+    const clearTail = {
+      tool: makeToolCall({
+        id: "td-clear",
+        name: "TodoWrite",
+        kind: "think",
+        args_preview: JSON.stringify({ todos: [] }),
+      }),
+      result: makeCompletion({ id: "done-td-clear", toolCallId: "td-clear" }),
+    };
+    const { container } = render(
+      <Wrap toolKey="claude">
+        <TodoGroupCard items={[...items, clearTail]} />
+      </Wrap>,
+    );
+    // The empty clear survives classification, so it counts toward the
+    // fold (4 snapshots) and the collapsed preview reads "todos cleared".
+    expect(container.textContent).toContain("updated 4 times");
+    expect(container.textContent).toContain("todos cleared");
+    expect(container.textContent).not.toContain("Step Charlie");
   });
 
   it("falls back to the last successful snapshot when the latest failed", () => {
