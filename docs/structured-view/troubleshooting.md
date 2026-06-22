@@ -302,14 +302,6 @@ shows `Reconnecting (N/7) in Xs...` while the auto-retry is armed, and a manual
 **Reconnect** button after the attempts exhaust. Returning the tab to the
 foreground triggers an immediate reconnect.
 
-Behind a reverse proxy (Tailscale Serve, Cloudflare, nginx) an idle connection
-can be reset without the browser ever seeing a close, leaving the socket in a
-half-open state the browser still reports as connected. To catch this, the
-daemon emits a small heartbeat frame every 30s and the view runs a staleness
-watchdog: if no frame (event or heartbeat) arrives for 75s, it treats the
-socket as dead and re-dials, even while the tab is foregrounded and idle. So a
-session left open behind a proxy resyncs on its own instead of silently
-stalling until you send a message.
 
 ### Approval card vanished without resolving
 
