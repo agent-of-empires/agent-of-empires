@@ -962,7 +962,7 @@ pub(crate) fn refresh_agent_configs() {
         match prepare_sandbox_dir(mount, &home) {
             Ok(sandbox_dir) => {
                 if refresh_codex_hooks {
-                    refresh_codex_sandbox_hooks(&sandbox_dir, preserved_codex_state);
+                    refresh_codex_sandbox_hooks(mount, &sandbox_dir, preserved_codex_state);
                 }
             }
             Err(e) => {
@@ -977,7 +977,10 @@ pub(crate) fn refresh_agent_configs() {
 }
 
 fn should_refresh_codex_hooks(mount: &AgentConfigMount, home: &Path) -> bool {
-    if mount.tool_name != "codex" || mount.host_rel != ".codex" {
+    let is_codex_toml = crate::agents::get_agent(mount.tool_name)
+        .and_then(|a| a.hook_config.as_ref())
+        .is_some_and(|c| c.format == crate::agents::HookFormat::CodexToml);
+    if !is_codex_toml {
         return false;
     }
 
@@ -989,8 +992,13 @@ fn should_refresh_codex_hooks(mount: &AgentConfigMount, home: &Path) -> bool {
     host_config.exists() || sandbox_config.exists()
 }
 
-fn refresh_codex_sandbox_hooks(sandbox_dir: &Path, preserved_state: Option<toml_edit::Item>) {
-    let Some(hook_cfg) = crate::agents::get_agent("codex").and_then(|a| a.hook_config.as_ref())
+fn refresh_codex_sandbox_hooks(
+    mount: &AgentConfigMount,
+    sandbox_dir: &Path,
+    preserved_state: Option<toml_edit::Item>,
+) {
+    let Some(hook_cfg) =
+        crate::agents::get_agent(mount.tool_name).and_then(|a| a.hook_config.as_ref())
     else {
         return;
     };
@@ -1457,18 +1465,19 @@ pub(crate) fn build_container_config(
                     if std::path::Path::new(mount.host_rel) == config_dir_name {
                         let sandbox_dir = home.join(mount.host_rel).join(SANDBOX_SUBDIR);
                         let settings_file = sandbox_dir.join(config_file_name);
-                        let result = if agent.name == "codex" {
-                            crate::hooks::install_codex_hooks(
+                        let result = match hook_cfg.format {
+                            crate::agents::HookFormat::CodexToml => {
+                                crate::hooks::install_codex_hooks(
+                                    &settings_file,
+                                    hook_cfg.events,
+                                    crate::hooks::HookInstallTarget::Sandbox,
+                                )
+                            }
+                            crate::agents::HookFormat::JsonSettings => crate::hooks::install_hooks(
                                 &settings_file,
                                 hook_cfg.events,
                                 crate::hooks::HookInstallTarget::Sandbox,
-                            )
-                        } else {
-                            crate::hooks::install_hooks(
-                                &settings_file,
-                                hook_cfg.events,
-                                crate::hooks::HookInstallTarget::Sandbox,
-                            )
+                            ),
                         };
                         if let Err(e) = result {
                             tracing::warn!(target: "session.profile", "Failed to install hooks in sandbox config: {}", e);

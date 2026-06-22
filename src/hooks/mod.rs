@@ -420,23 +420,23 @@ pub(crate) fn iter_hook_targets_in(home: &Path, env_lists: &[Vec<String>]) -> Ve
     let mut out: Vec<HookTarget> = Vec::new();
     for agent in crate::agents::AGENTS {
         if let Some(hook_cfg) = agent.hook_config.as_ref() {
-            let kind = if agent.name == "codex" {
-                HookTargetKind::CodexToml
-            } else {
-                HookTargetKind::JsonSettings
-            };
             let mut paths: Vec<PathBuf> = Vec::new();
             let resolve = |env: &[String]| -> PathBuf {
-                if matches!(kind, HookTargetKind::CodexToml) {
-                    codex_config_path_in(home, env)
-                } else {
-                    agent_settings_path_in(home, hook_cfg, env)
+                match hook_cfg.format {
+                    crate::agents::HookFormat::JsonSettings => {
+                        agent_settings_path_in(home, hook_cfg, env)
+                    }
+                    crate::agents::HookFormat::CodexToml => codex_config_path_in(home, env),
                 }
             };
             push_unique_target_path(&mut paths, resolve(&[]));
             for env in env_lists {
                 push_unique_target_path(&mut paths, resolve(env));
             }
+            let kind = match hook_cfg.format {
+                crate::agents::HookFormat::JsonSettings => HookTargetKind::JsonSettings,
+                crate::agents::HookFormat::CodexToml => HookTargetKind::CodexToml,
+            };
             for path in paths {
                 out.push(HookTarget {
                     agent_name: agent.name,
@@ -507,16 +507,11 @@ pub(crate) fn has_aoe_marker(target: &HookTarget) -> bool {
     match target.kind {
         HookTargetKind::JsonSettings => json_settings_has_aoe_marker(&target.path),
         HookTargetKind::CodexToml => codex_config_has_aoe_marker(&target.path),
-        HookTargetKind::Sidecar(sidecar) => {
-            let sub = sidecar.host_config_subpath;
-            if sub.ends_with(".toml") {
-                settl_config_has_aoe_marker(&target.path)
-            } else if sub.ends_with(".yaml") || sub.ends_with(".yml") {
-                hermes_config_has_aoe_marker(&target.path)
-            } else {
-                kiro_config_has_aoe_marker(&target.path)
-            }
-        }
+        HookTargetKind::Sidecar(sidecar) => match sidecar.format {
+            crate::agents::SidecarFormat::SettlToml => settl_config_has_aoe_marker(&target.path),
+            crate::agents::SidecarFormat::HermesYaml => hermes_config_has_aoe_marker(&target.path),
+            crate::agents::SidecarFormat::KiroJson => kiro_config_has_aoe_marker(&target.path),
+        },
     }
 }
 
@@ -2433,7 +2428,7 @@ mod tests {
 
         let codex_paths: Vec<_> = iter_hook_targets()
             .into_iter()
-            .filter(|t| t.agent_name == "codex")
+            .filter(|t| matches!(t.kind, HookTargetKind::CodexToml))
             .map(|t| t.path)
             .collect();
 

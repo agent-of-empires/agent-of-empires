@@ -37,17 +37,20 @@ impl HooksInstallDialog {
                     .map(crate::session::profile_config::resolve_config_or_warn)
                     .map(|config| config.environment)
                     .unwrap_or_default();
-                if agent.name == "codex" {
-                    needs_codex_trust_note = true;
-                    settings_paths.push(
-                        crate::hooks::codex_config_path_display_for_host_environment(&host_env),
-                    );
-                } else {
-                    settings_paths.push(
-                        crate::hooks::agent_settings_path_display_for_host_environment(
-                            hook_cfg, &host_env,
-                        ),
-                    );
+                match hook_cfg.format {
+                    crate::agents::HookFormat::CodexToml => {
+                        needs_codex_trust_note = true;
+                        settings_paths.push(
+                            crate::hooks::codex_config_path_display_for_host_environment(&host_env),
+                        );
+                    }
+                    crate::agents::HookFormat::JsonSettings => {
+                        settings_paths.push(
+                            crate::hooks::agent_settings_path_display_for_host_environment(
+                                hook_cfg, &host_env,
+                            ),
+                        );
+                    }
                 }
                 for event in hook_cfg.events {
                     let label = match event.status {

@@ -2092,45 +2092,53 @@ impl Instance {
                     }
                 }
             }
-        } else if agent.is_some_and(|a| a.name == "codex") && !self.is_sandboxed() {
-            if let Some(hook_cfg) = agent.and_then(|a| a.hook_config.as_ref()) {
-                match self.codex_config_path_for_launch_env() {
-                    Ok(config_path) => {
-                        if let Err(e) = crate::hooks::install_codex_hooks(
-                            &config_path,
-                            hook_cfg.events,
-                            crate::hooks::HookInstallTarget::Host,
-                        ) {
-                            tracing::warn!("Failed to install codex hooks: {}", e);
-                        }
+        } else if let Some(hook_cfg) = agent.and_then(|a| a.hook_config.as_ref()) {
+            if !self.is_sandboxed() {
+                match hook_cfg.format {
+                    crate::agents::HookFormat::CodexToml => self.install_codex_host_hooks(hook_cfg),
+                    crate::agents::HookFormat::JsonSettings => {
+                        self.install_json_host_hooks(hook_cfg)
                     }
-                    Err(e) => tracing::warn!("Failed to resolve codex config path: {}", e),
                 }
             }
-        } else if let Some(hook_cfg) = agent.and_then(|a| a.hook_config.as_ref()) {
-            if self.is_sandboxed() {
-                // For sandboxed sessions, hooks are installed via build_container_config
-            } else {
-                // Install hooks in the agent's host settings file, honoring a
-                // config-dir override env var (e.g. CLAUDE_CONFIG_DIR) so hooks
-                // land where the agent actually reads them.
-                match crate::hooks::agent_settings_path_for_host_environment(
-                    hook_cfg,
-                    &self.profile_host_environment(),
+            // Sandboxed sessions install via build_container_config.
+        }
+    }
+
+    fn install_codex_host_hooks(&self, hook_cfg: &crate::agents::AgentHookConfig) {
+        match self.codex_config_path_for_launch_env() {
+            Ok(config_path) => {
+                if let Err(e) = crate::hooks::install_codex_hooks(
+                    &config_path,
+                    hook_cfg.events,
+                    crate::hooks::HookInstallTarget::Host,
                 ) {
-                    Ok(settings_path) => {
-                        if let Err(e) = crate::hooks::install_hooks(
-                            &settings_path,
-                            hook_cfg.events,
-                            crate::hooks::HookInstallTarget::Host,
-                        ) {
-                            tracing::warn!(target: "session.store", "Failed to install agent hooks: {}", e);
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(target: "session.store", "Failed to resolve agent hooks path: {}", e)
-                    }
+                    tracing::warn!("Failed to install codex hooks: {}", e);
                 }
+            }
+            Err(e) => tracing::warn!("Failed to resolve codex config path: {}", e),
+        }
+    }
+
+    fn install_json_host_hooks(&self, hook_cfg: &crate::agents::AgentHookConfig) {
+        // Install hooks in the agent's host settings file, honoring a
+        // config-dir override env var (e.g. CLAUDE_CONFIG_DIR) so hooks
+        // land where the agent actually reads them.
+        match crate::hooks::agent_settings_path_for_host_environment(
+            hook_cfg,
+            &self.profile_host_environment(),
+        ) {
+            Ok(settings_path) => {
+                if let Err(e) = crate::hooks::install_hooks(
+                    &settings_path,
+                    hook_cfg.events,
+                    crate::hooks::HookInstallTarget::Host,
+                ) {
+                    tracing::warn!(target: "session.store", "Failed to install agent hooks: {}", e);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(target: "session.store", "Failed to resolve agent hooks path: {}", e)
             }
         }
     }
