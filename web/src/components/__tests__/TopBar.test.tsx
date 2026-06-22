@@ -27,7 +27,6 @@ function renderTopBar(
     isOffline?: boolean;
     activeWorkspace?: Workspace;
     activeSession?: SessionResponse | null;
-    tipsUnseen?: number;
     onOpenTips?: () => void;
   } = {},
 ) {
@@ -46,7 +45,6 @@ function renderTopBar(
       loginRequired={false}
       isOffline={overrides.isOffline ?? false}
       isDevBuild={overrides.isDevBuild ?? false}
-      tipsUnseen={overrides.tipsUnseen ?? 0}
       onOpenTips={overrides.onOpenTips ?? vi.fn()}
       onGoDashboard={vi.fn()}
       sidebarColumnVisible={false}
@@ -101,23 +99,11 @@ describe("TopBar", () => {
     expect(getByLabelText("Debug build")).toBeTruthy();
   });
 
-  it("hides the tips badge when no tips are unseen", () => {
-    const { queryByLabelText } = renderTopBar({ tipsUnseen: 0 });
-    expect(queryByLabelText("1 tip")).toBeNull();
-    expect(queryByLabelText(/tips?$/)).toBeNull();
-  });
-
-  it("renders the tips badge with the count and fires onOpenTips on click", () => {
+  it("exposes a Tips entry in the overflow menu that fires onOpenTips", () => {
     const onOpenTips = vi.fn();
-    const { getByLabelText, getByText } = renderTopBar({ tipsUnseen: 3, onOpenTips });
-    const badge = getByLabelText("3 tips");
-    expect(getByText("3")).toBeTruthy();
-    fireEvent.click(badge);
+    const { getByRole } = renderTopBar({ onOpenTips });
+    fireEvent.click(getByRole("button", { name: "More options" }));
+    fireEvent.click(getByRole("menuitem", { name: "Tips" }));
     expect(onOpenTips).toHaveBeenCalledTimes(1);
-  });
-
-  it("uses the singular label for a single tip", () => {
-    const { getByLabelText } = renderTopBar({ tipsUnseen: 1 });
-    expect(getByLabelText("1 tip")).toBeTruthy();
   });
 });

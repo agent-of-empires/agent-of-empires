@@ -182,8 +182,8 @@ When you leave the PWA and come back, it reopens to the session you last had ope
 
 ## Tips
 
-The dashboard surfaces the same "did you know" tips as the TUI. When a tip you have not seen is available, a clickable lightbulb badge (💡 with a count) appears in the top bar. Click it to open the tips panel: unseen tips lead, and ones you have already read collapse into an expandable section. Opening a tip marks it read, so the badge clears once you have seen everything. Read state is stored on the server, so it follows you across browsers and devices.
+The dashboard surfaces the same "did you know" tips as the TUI, as a tip-of-the-day modal. When you have an unseen tip, it pops once on startup (after the first-run onboarding settles); step through tips with Previous and Next. Reopen it any time from the top-bar menu (More options > Tips). Each tip is marked read as you view it, and read state is stored on the server, so it follows you across browsers and devices and a tip never re-pops once seen.
 
-"Don't show again" in the panel turns tips off everywhere (it sets the same `Show tips` preference as the TUI). Turn them back on under Settings > Interaction > Show tips. Tips are surface-aware: keyboard-shortcut tips stay in the TUI and never show on the dashboard.
+The "Show tips on startup" checkbox in the modal controls whether it auto-pops; it sets the same `Show tips` preference as the TUI, also editable under Settings > Interaction > Show tips. Tips are surface-aware: keyboard-shortcut tips stay in the TUI and never show on the dashboard.
 
 For build, architecture, and frontend-development details, see [Web Dashboard Development](../development/web-dashboard.md).

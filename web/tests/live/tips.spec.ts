@@ -1,25 +1,17 @@
-// User stories (issue #2292): the web dashboard mirrors the TUI tips system.
-// A fresh server has one web-eligible rotation tip ("Install the dashboard as
-// an app"), so the 💡 badge shows in the TopBar. Opening the panel and reading
-// a tip marks it seen (persisted via POST /api/app-state/tip-seen, shared with
-// the TUI), and "Don't show again" turns tips off (POST /api/tips/disable). Both
-// survive a reload via GET /api/tips. The TUI-only shortcut tip never appears.
-import { test as base, expect, type Page } from "@playwright/test";
+// User stories (issue #2292): the web dashboard mirrors the TUI tips system as a
+// GIMP/DBeaver-style tip-of-the-day. A fresh server has one web-eligible tip
+// ("Install the dashboard as an app"). The modal auto-pops on startup (once
+// onboarding settles), is reopenable from the top-bar menu, marks tips seen as
+// they are shown (persisted, shared with the TUI), and the "Show tips on
+// startup" checkbox persists via the dedicated endpoint. The TUI-only shortcut
+// tip never appears.
+import { test as base, expect } from "@playwright/test";
 import { spawnAoeServe } from "../helpers/aoeServe";
 
 const PWA_TIP = "Install the dashboard as an app";
+const TUI_TIP = "Reuse the selected session's settings";
 
-// A fresh $HOME shows the theme welcome modal first; dismiss it so the TopBar
-// badge is clickable. The tour does not auto-launch here (Playwright presents
-// navigator.webdriver = true, which suppresses it).
-async function dismissWelcome(page: Page) {
-  const welcome = page.getByText("Choose your theme");
-  if (await welcome.isVisible().catch(() => false)) {
-    await page.getByRole("button", { name: "Continue" }).click();
-  }
-}
-
-base("tips: badge surfaces a tip, reading it marks it seen across reloads", async ({ page }, testInfo) => {
+base("tips: auto-pops on startup and marks the shown tip seen", async ({ page }, testInfo) => {
   const serve = await spawnAoeServe({
     authMode: "none",
     workerIndex: testInfo.workerIndex,
@@ -27,41 +19,42 @@ base("tips: badge surfaces a tip, reading it marks it seen across reloads", asyn
   });
 
   try {
-    await page.goto(serve.baseUrl);
-    await expect(page.getByRole("button", { name: "Go to dashboard" })).toBeVisible({ timeout: 10_000 });
-    await dismissWelcome(page);
+    // Auto-pop is suppressed in automated sessions (navigator.webdriver) so the
+    // modal never intercepts the rest of the suite; present as a real browser to
+    // exercise it, and clear the other onboarding phases so tips pops cleanly:
+    // mark the theme welcome seen (localStorage) and the tour seen (server).
+    await page.addInitScript(() => {
+      Object.defineProperty(navigator, "webdriver", { get: () => false });
+      window.localStorage.setItem("aoe-welcome-seen", "1");
+    });
+    await page.request.post(`${serve.baseUrl}/api/app-state/web-tour-seen`);
 
-    // Story 1: the badge shows for the single unseen web tip.
-    const badge = page.getByRole("button", { name: "1 tip" });
-    await expect(badge).toBeVisible({ timeout: 10_000 });
-
-    // Story 2: opening the panel lists the web tip (and never the TUI-only one).
-    await badge.click();
-    await expect(page.getByRole("heading", { name: "Tips" })).toBeVisible();
-    await expect(page.getByText(PWA_TIP)).toBeVisible();
-    await expect(page.getByText("Reuse the selected session's settings")).toBeHidden();
-
-    // Story 3: reading (expanding) an unseen tip marks it seen on the server.
     const postSeen = page.waitForResponse(
       (r) => r.url().includes("/api/app-state/tip-seen") && r.request().method() === "POST",
-      { timeout: 10_000 },
+      { timeout: 15_000 },
     );
-    await page.getByRole("button", { name: new RegExp(PWA_TIP) }).click();
+    await page.goto(serve.baseUrl);
+
+    // Story 1: the tip-of-the-day modal auto-pops, showing the web tip and never
+    // the TUI-only one.
+    await expect(page.getByRole("heading", { name: "Tip of the day" })).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByRole("heading", { name: PWA_TIP })).toBeVisible();
+    await expect(page.getByText(TUI_TIP)).toBeHidden();
+
+    // Story 2: showing a tip marks it seen on the server.
     expect((await postSeen).status()).toBe(200);
     await page.getByRole("button", { name: "Close" }).click();
 
-    // Badge clears once the only tip is seen, and stays gone after a reload
-    // (seen state is server-side, so a new page load reads it back).
-    await expect(page.getByRole("button", { name: /tips?$/ })).toHaveCount(0);
+    // Once the only tip is seen, a reload does not re-pop it (no nagging).
     await page.reload();
     await expect(page.getByRole("button", { name: "Go to dashboard" })).toBeVisible({ timeout: 10_000 });
-    await expect(page.getByRole("button", { name: /tips?$/ })).toHaveCount(0);
+    await expect(page.getByRole("heading", { name: "Tip of the day" })).toBeHidden();
   } finally {
     await serve.stop();
   }
 });
 
-base("tips: Don't show again turns tips off across reloads", async ({ page }, testInfo) => {
+base("tips: reopen from the menu and persist the startup toggle", async ({ page }, testInfo) => {
   const serve = await spawnAoeServe({
     authMode: "none",
     workerIndex: testInfo.workerIndex,
@@ -69,26 +62,29 @@ base("tips: Don't show again turns tips off across reloads", async ({ page }, te
   });
 
   try {
+    // Default automated session: no auto-pop, so this drives the menu path.
     await page.goto(serve.baseUrl);
     await expect(page.getByRole("button", { name: "Go to dashboard" })).toBeVisible({ timeout: 10_000 });
-    await dismissWelcome(page);
 
-    const badge = page.getByRole("button", { name: "1 tip" });
-    await expect(badge).toBeVisible({ timeout: 10_000 });
-    await badge.click();
+    // Story 3: reopen tips from the top-bar overflow menu.
+    await page.getByRole("button", { name: "More options" }).click();
+    await page.getByRole("menuitem", { name: "Tips" }).click();
+    await expect(page.getByRole("heading", { name: "Tip of the day" })).toBeVisible();
+    const checkbox = page.getByRole("checkbox", { name: "Show tips on startup" });
+    await expect(checkbox).toBeChecked();
 
-    const postDisable = page.waitForResponse(
-      (r) => r.url().includes("/api/tips/disable") && r.request().method() === "POST",
+    // Story 4: unchecking "Show tips on startup" persists through the dedicated
+    // endpoint and survives a reload.
+    const postShow = page.waitForResponse(
+      (r) => r.url().includes("/api/tips/show") && r.request().method() === "POST",
       { timeout: 10_000 },
     );
-    await page.getByRole("button", { name: "Don't show again" }).click();
-    expect((await postDisable).status()).toBe(200);
+    await checkbox.uncheck();
+    expect((await postShow).status()).toBe(200);
+    await page.getByRole("button", { name: "Close" }).click();
 
-    // Badge gone immediately and after a reload; GET /api/tips reports disabled.
-    await expect(page.getByRole("button", { name: /tips?$/ })).toHaveCount(0);
     await page.reload();
     await expect(page.getByRole("button", { name: "Go to dashboard" })).toBeVisible({ timeout: 10_000 });
-    await expect(page.getByRole("button", { name: /tips?$/ })).toHaveCount(0);
     expect(
       await page.evaluate(async () => {
         const res = await fetch("/api/tips", { cache: "no-store" });
@@ -96,6 +92,11 @@ base("tips: Don't show again turns tips off across reloads", async ({ page }, te
         return (await res.json())?.enabled;
       }),
     ).toBe(false);
+
+    // Reopening from the menu shows the checkbox unchecked.
+    await page.getByRole("button", { name: "More options" }).click();
+    await page.getByRole("menuitem", { name: "Tips" }).click();
+    await expect(page.getByRole("checkbox", { name: "Show tips on startup" })).not.toBeChecked();
   } finally {
     await serve.stop();
   }
