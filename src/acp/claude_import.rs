@@ -243,22 +243,30 @@ fn extract_user_title(record: &serde_json::Value) -> Option<String> {
     }
     let content = record.get("message")?.get("content")?;
     let text = match content {
-        serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Array(parts) => parts
-            .iter()
-            .find_map(|p| {
-                (p.get("type").and_then(|v| v.as_str()) == Some("text"))
-                    .then(|| p.get("text").and_then(|v| v.as_str()))
-                    .flatten()
-            })?
-            .to_string(),
-        _ => return None,
-    };
+        serde_json::Value::String(s) => displayable_user_text(s).map(str::to_owned),
+        serde_json::Value::Array(parts) => parts.iter().find_map(|p| {
+            if p.get("type").and_then(|v| v.as_str()) != Some("text") {
+                return None;
+            }
+            let text = p.get("text").and_then(|v| v.as_str())?;
+            displayable_user_text(text).map(str::to_owned)
+        }),
+        _ => None,
+    }?;
+    Some(truncate(&text, 120))
+}
+
+/// A user message's displayable text, or `None` for the command wrappers and
+/// caveat blocks Claude Code injects (`<local-command-...>`, `<command-...>`).
+/// Only those specific wrappers are dropped; a real prompt like `<div> is
+/// rendering wrong` is kept.
+fn displayable_user_text(text: &str) -> Option<&str> {
     let text = text.trim();
-    if text.is_empty() || text.starts_with('<') {
-        return None;
+    if text.is_empty() || text.starts_with("<local-command-") || text.starts_with("<command-") {
+        None
+    } else {
+        Some(text)
     }
-    Some(truncate(text, 120))
 }
 
 fn truncate(s: &str, max_chars: usize) -> String {
@@ -309,6 +317,40 @@ mod tests {
         assert_eq!(s.cwd, cwd_str);
         assert_eq!(s.title.as_deref(), Some("Fix the spinner bug please"));
         assert!(s.cwd_exists);
+    }
+
+    #[test]
+    fn title_keeps_angle_bracket_prompts_and_skips_only_wrappers() {
+        // A real prompt that starts with '<' is kept.
+        assert_eq!(
+            displayable_user_text("<div> is rendering wrong"),
+            Some("<div> is rendering wrong")
+        );
+        // Injected command wrappers are dropped.
+        assert_eq!(
+            displayable_user_text("<local-command-caveat>x</local-command-caveat>"),
+            None
+        );
+        assert_eq!(
+            displayable_user_text("<command-name>/foo</command-name>"),
+            None
+        );
+        assert_eq!(displayable_user_text("   "), None);
+    }
+
+    #[test]
+    fn title_picks_first_real_text_part_after_wrapper() {
+        let record = serde_json::json!({
+            "type": "user",
+            "message": { "role": "user", "content": [
+                { "type": "text", "text": "<command-name>/plan</command-name>" },
+                { "type": "text", "text": "Actually fix the bug" }
+            ]}
+        });
+        assert_eq!(
+            extract_user_title(&record).as_deref(),
+            Some("Actually fix the bug")
+        );
     }
 
     #[test]
