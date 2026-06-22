@@ -321,6 +321,12 @@ pub struct SpawnConfig {
     /// advertise) happens later, against the `initialize` response. Empty when
     /// no config file exists, which preserves pre-feature behavior.
     pub mcp_servers: Vec<McpServer>,
+    /// When true and this spawn resumes via `session/load`, seed the event
+    /// store from the agent's history replay instead of suppressing it.
+    /// Set for the first spawn of an imported Claude session whose store is
+    /// empty; false for normal reattach (the transcript is already stored,
+    /// so re-ingesting would duplicate-key panic). See #2276.
+    pub seed_history_replay: bool,
 }
 
 /// Commands sent from `AcpClient` methods to the background connection task.
@@ -377,6 +383,10 @@ enum ClientCmd {
 enum ConnectMode {
     Fresh {
         stored_acp_session_id: Option<String>,
+        /// Seed the event store from the `session/load` history replay
+        /// instead of suppressing it (imported session, empty store). See
+        /// #2276.
+        seed_history_replay: bool,
     },
     Resume {
         acp_session_id: String,
@@ -1497,6 +1507,7 @@ impl AcpClient {
         //    a real `aoe` binary, and as a safety valve.
         let mode = ConnectMode::Fresh {
             stored_acp_session_id: config.stored_acp_session_id.clone(),
+            seed_history_replay: config.seed_history_replay,
         };
         let sandbox_pair = if let Some(info) = &config.sandbox_info {
             Some(SessionSandbox::from_info(
@@ -4741,6 +4752,7 @@ async fn run_connection_task<W, R>(
                 }
                 ConnectMode::Fresh {
                     stored_acp_session_id,
+                    seed_history_replay,
                 } => {
                     // Decide whether to resume the prior agent session or create
                     // a fresh one. session/load is only attempted when the agent
@@ -4766,7 +4778,16 @@ async fn run_connection_task<W, R>(
                             // next reload (assistant-ui then panics with "Duplicate
                             // key toolCallId-..."). Cleared on Err below if we fall
                             // back to session/new, which has no replay payload.
-                            suppress_for_block.store(true, Ordering::Relaxed);
+                            //
+                            // Exception: an imported session (#2276) has an empty
+                            // event store, so we WANT the replay to populate it and
+                            // render the transcript. No existing rows means no
+                            // duplicate-key risk. The server clears import_pending
+                            // once this load lands, so a later reattach suppresses
+                            // normally.
+                            if !seed_history_replay {
+                                suppress_for_block.store(true, Ordering::Relaxed);
+                            }
                             let req = LoadSessionRequest::new(stored.clone(), cwd.clone())
                                 .mcp_servers(mcp_servers.clone());
                             match connection.send_request(req).block_task().await {
@@ -7392,6 +7413,7 @@ mod tests {
             default_effort: None,
             socket_path: None,
             stored_acp_session_id: None,
+            seed_history_replay: false,
             sandbox_info: Some(sandbox.clone()),
             source_profile: None,
             mcp_servers: Vec::new(),
@@ -7460,6 +7482,7 @@ mod tests {
             default_effort: None,
             socket_path: None,
             stored_acp_session_id: None,
+            seed_history_replay: false,
             sandbox_info: Some(sandbox.clone()),
             source_profile: None,
             mcp_servers: Vec::new(),
@@ -7530,6 +7553,7 @@ mod tests {
             default_effort: None,
             socket_path: None,
             stored_acp_session_id: None,
+            seed_history_replay: false,
             sandbox_info: Some(sandbox.clone()),
             source_profile: None,
             mcp_servers: Vec::new(),
@@ -7576,6 +7600,7 @@ mod tests {
             default_effort: None,
             socket_path: None,
             stored_acp_session_id: None,
+            seed_history_replay: false,
             sandbox_info: None,
             source_profile: None,
             mcp_servers: Vec::new(),
@@ -7608,6 +7633,7 @@ mod tests {
             default_effort: None,
             socket_path: None,
             stored_acp_session_id: None,
+            seed_history_replay: false,
             sandbox_info: None,
             source_profile: None,
             mcp_servers: Vec::new(),

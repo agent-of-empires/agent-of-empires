@@ -496,6 +496,13 @@ pub struct SpawnRequest {
     /// tool's built-in binary (see `apply_agent_command_override`).
     /// See #1766.
     pub agent_command_override: Option<AgentCommandOverride>,
+    /// When true and this is a `session/load` spawn, do NOT suppress the
+    /// agent's history replay; let it populate the (empty) event store so
+    /// an imported transcript renders. Normal reattach leaves this false so
+    /// the replay is suppressed against the already-stored transcript,
+    /// avoiding a duplicate-key panic. The caller computes it from the
+    /// session's `import_pending` flag. See #2276.
+    pub seed_history_replay: bool,
 }
 
 /// True when `command` names the same executable as `binary`, comparing
@@ -1287,6 +1294,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             source_profile,
             yolo_mode,
             agent_command_override,
+            seed_history_replay,
         } = req;
 
         // Per-agent install gate. claude-agent-acp lazy-installs its
@@ -1405,6 +1413,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             sandbox_info,
             source_profile,
             mcp_servers,
+            seed_history_replay,
         };
 
         debug!(
@@ -3090,6 +3099,7 @@ mod tests {
                 model: None,
                 effort: None,
                 stored_acp_session_id: None,
+                seed_history_replay: false,
                 sandbox_info: None,
                 source_profile: None,
                 yolo_mode: false,
@@ -3130,6 +3140,7 @@ mod tests {
                 model: None,
                 effort: None,
                 stored_acp_session_id: None,
+                seed_history_replay: false,
                 sandbox_info: None,
                 source_profile: None,
                 yolo_mode: false,
@@ -3345,6 +3356,7 @@ mod tests {
             default_effort: None,
             socket_path: Some(socket_path.clone()),
             stored_acp_session_id: None,
+            seed_history_replay: false,
             sandbox_info: None,
             source_profile: None,
             mcp_servers: Vec::new(),
@@ -3436,6 +3448,7 @@ mod tests {
             default_effort: None,
             socket_path: Some(tmp.path().join("dummy.sock")),
             stored_acp_session_id: None,
+            seed_history_replay: false,
             sandbox_info: None,
             source_profile: None,
             mcp_servers: Vec::new(),
@@ -3510,6 +3523,7 @@ mod tests {
             default_effort: None,
             socket_path: Some(tmp.path().join("dummy.sock")),
             stored_acp_session_id: None,
+            seed_history_replay: false,
             sandbox_info: None,
             source_profile: None,
             mcp_servers: Vec::new(),
@@ -3584,6 +3598,7 @@ mod tests {
             default_effort: None,
             socket_path: Some(tmp.path().join("dummy.sock")),
             stored_acp_session_id: None,
+            seed_history_replay: false,
             sandbox_info: None,
             source_profile: None,
             mcp_servers: Vec::new(),
@@ -3711,6 +3726,7 @@ mod tests {
             default_effort: None,
             socket_path: Some(tmp.path().join("dummy.sock")),
             stored_acp_session_id: None,
+            seed_history_replay: false,
             sandbox_info: None,
             source_profile: None,
             mcp_servers: Vec::new(),
@@ -4742,6 +4758,7 @@ mod tests {
                 model: None,
                 effort: None,
                 stored_acp_session_id: None,
+                seed_history_replay: false,
                 sandbox_info: None,
                 source_profile: None,
                 yolo_mode: false,
@@ -4816,6 +4833,7 @@ mod tests {
                 model: None,
                 effort: None,
                 stored_acp_session_id: None,
+                seed_history_replay: false,
                 sandbox_info: None,
                 source_profile: None,
                 yolo_mode: false,
@@ -5028,6 +5046,7 @@ mod tests {
                 model: None,
                 effort: None,
                 stored_acp_session_id: None,
+                seed_history_replay: false,
                 sandbox_info: None,
                 source_profile: None,
                 yolo_mode: false,
@@ -5081,6 +5100,7 @@ mod tests {
                 model: None,
                 effort: None,
                 stored_acp_session_id: None,
+                seed_history_replay: false,
                 sandbox_info: None,
                 source_profile: None,
                 yolo_mode: false,

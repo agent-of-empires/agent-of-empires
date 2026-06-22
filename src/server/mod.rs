@@ -1582,7 +1582,8 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/api/sessions/{id}/acp/elicitations/{nonce}",
             post(api::resolve_elicitation),
         )
-        .route("/api/acp/agents", get(api::list_acp_agents));
+        .route("/api/acp/agents", get(api::list_acp_agents))
+        .route("/api/claude-sessions", get(api::list_claude_sessions));
 
     app
         // Static assets (Vite build output: assets/, manifest.json, sw.js, icons)
@@ -3781,15 +3782,23 @@ fn apply_acp_session_change(
             // that the client parked waiting for a worker that never returns.
             // See #2237.
             let cleared_stale_dormant = inst.idle_dormant_since.take().is_some();
+            // #2276: an imported session's session/load has now landed and its
+            // history replay is in the event store, so clear import_pending.
+            // The id it reports is the same one we adopted at import, so this
+            // lands in the same-id branch below; a later reattach must then
+            // suppress the replay normally.
+            let cleared_import_pending = inst.import_pending.take().unwrap_or(false);
             if inst.acp_session_id.as_deref() == Some(new_id.as_str()) {
                 // Same id (a reattach / session/load reuses it). Only persist
-                // if we actually cleared a stale dormant marker; otherwise the
-                // id is already on disk and there is nothing to rewrite.
-                if cleared_stale_dormant {
+                // if we actually cleared a stale dormant marker or the import
+                // flag; otherwise the id is already on disk and there is
+                // nothing to rewrite.
+                if cleared_stale_dormant || cleared_import_pending {
                     tracing::info!(
                         target: "acp.event_listener",
                         session = %session_id,
-                        "cleared stale idle-dormant marker on worker (re)assign"
+                        cleared_import_pending,
+                        "cleared stale idle-dormant / import marker on worker (re)assign"
                     );
                     return Some(inst.source_profile.clone());
                 }

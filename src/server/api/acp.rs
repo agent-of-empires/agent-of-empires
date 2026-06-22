@@ -292,6 +292,13 @@ pub async fn spawn_acp(
     let model = req.model.or_else(|| instance.agent_model.clone());
     let stored_acp_session_id = instance.acp_session_id.clone();
     let yolo_mode = instance.yolo_mode;
+    // #2276: seed the transcript from the session/load replay when importing
+    // an existing Claude session (import_pending set, empty store). Clear any
+    // partial events from a prior failed load first so the seed is clean.
+    let seed_history_replay = instance.import_pending == Some(true);
+    if seed_history_replay {
+        state.acp_event_store.delete_session(&id);
+    }
 
     let inst_lock = state.instance_lock(&id).await;
     let sandbox_info = match crate::acp::sandbox::ensure_container_for_session(
@@ -334,6 +341,7 @@ pub async fn spawn_acp(
                 &instance.tool,
                 &instance.command,
             ),
+            seed_history_replay,
         })
         .await
     {
@@ -763,6 +771,8 @@ pub async fn switch_acp_agent(
                 &instance.tool,
                 &instance.command,
             ),
+            // Switching ACP backend starts a fresh session, never an import.
+            seed_history_replay: false,
         })
         .await;
     if let Err(e) = spawn_result {
@@ -1602,6 +1612,9 @@ pub async fn acp_enable(
     let model = instance.agent_model.clone();
     let stored_acp_session_id = instance.acp_session_id.clone();
     let yolo_mode = instance.yolo_mode;
+    // #2276: seed the transcript from the session/load replay when enabling
+    // the structured view on an imported session (import_pending, empty store).
+    let seed_history_replay = instance.import_pending == Some(true);
     let profile_for_spawn = profile.clone();
     let command_override = crate::server::acp_reconciler::command_override_for_spawn(
         &instance.tool,
@@ -1630,6 +1643,9 @@ pub async fn acp_enable(
         // spawn path resolves agent_acp_cmd and worker env from the right
         // profile for non-sandbox sessions too.
         let source_profile = Some(profile_for_spawn);
+        if seed_history_replay {
+            state_for_spawn.acp_event_store.delete_session(&session_id);
+        }
         if let Err(e) = supervisor
             .spawn(crate::acp::supervisor::SpawnRequest {
                 session_id: session_id.clone(),
@@ -1644,6 +1660,7 @@ pub async fn acp_enable(
                 source_profile,
                 yolo_mode,
                 agent_command_override: command_override,
+                seed_history_replay,
             })
             .await
         {
@@ -2109,6 +2126,16 @@ pub async fn acp_replay(
         has_more,
     })
     .into_response()
+}
+
+/// List existing Claude Code sessions on disk, newest first, for the import
+/// picker. Read-only filesystem scan; mutates nothing, so it runs in
+/// read-only mode too.
+pub async fn list_claude_sessions(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
+    let sessions = tokio::task::spawn_blocking(crate::acp::claude_import::scan_sessions)
+        .await
+        .unwrap_or_default();
+    Json(sessions).into_response()
 }
 
 #[cfg(test)]

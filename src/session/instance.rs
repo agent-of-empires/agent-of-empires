@@ -559,6 +559,16 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acp_session_id: Option<String>,
 
+    /// Set when this session was imported from an existing Claude Code
+    /// session on disk. While true, the next structured spawn seeds the
+    /// event store from the agent's `session/load` history replay (instead
+    /// of suppressing it like a normal reattach does) so the imported
+    /// transcript renders. Cleared once the load completes and the history
+    /// is durably stored. See #2276.
+    #[cfg(feature = "serve")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import_pending: Option<bool>,
+
     // Runtime state (not serialized)
     #[serde(skip)]
     pub last_error_check: Option<std::time::Instant>,
@@ -832,6 +842,8 @@ impl Instance {
             agent_model: None,
             #[cfg(feature = "serve")]
             acp_session_id: None,
+            #[cfg(feature = "serve")]
+            import_pending: None,
             last_error_check: None,
             last_start_time: None,
             last_error: None,

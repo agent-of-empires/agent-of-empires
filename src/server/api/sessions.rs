@@ -3060,6 +3060,14 @@ pub struct CreateSessionBody {
     /// `trust_hooks: true`. Already-trusted hooks run regardless.
     #[serde(default)]
     pub trust_hooks: Option<bool>,
+    /// Import an existing Claude Code session: the on-disk session id (the
+    /// `<sessionId>.jsonl` stem) to resume via `session/load`. When set, the
+    /// new session adopts this id as its `acp_session_id`, is forced to the
+    /// structured view, and seeds its transcript from the agent's history
+    /// replay. `path` must be the session's original cwd. See #2276.
+    #[cfg(feature = "serve")]
+    #[serde(default)]
+    pub import_acp_session_id: Option<String>,
 }
 
 fn validate_session_tool_identity(
@@ -3567,6 +3575,20 @@ pub async fn create_session(
         #[cfg(feature = "serve")]
         let agent_effort = {
             instance.view = body.view;
+            // #2276: importing an existing Claude session forces the
+            // structured view and adopts the on-disk session id, so the
+            // structured spawn resumes it via session/load and seeds the
+            // transcript from the agent's history replay. `path` is the
+            // session's original cwd (the wizard prefills it).
+            if let Some(import_id) = body
+                .import_acp_session_id
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+            {
+                instance.view = crate::session::View::Structured;
+                instance.acp_session_id = Some(import_id);
+                instance.import_pending = Some(true);
+            }
             instance.agent_name = body.agent_name;
             let agent_key = instance
                 .agent_name
@@ -3742,6 +3764,7 @@ pub async fn create_session(
                     instance.source_profile.clone(),
                     instance.yolo_mode,
                     instance.command.clone(),
+                    instance.import_pending == Some(true),
                 ))
             } else {
                 None
@@ -3768,6 +3791,7 @@ pub async fn create_session(
                 source_profile,
                 yolo_mode,
                 command,
+                seed_history_replay,
             )) = acp_spawn_target
             {
                 let agent = state
@@ -3807,6 +3831,13 @@ pub async fn create_session(
                         }
                     };
                     let source_profile_for_spawn = Some(source_profile.clone());
+                    // #2276: clear any partial events from a prior failed import
+                    // load so the seeded replay repopulates cleanly. import_pending
+                    // stays set until the load lands, so a crash mid-load just
+                    // re-seeds on the next spawn.
+                    if seed_history_replay {
+                        state_for_check.acp_event_store.delete_session(&id);
+                    }
                     if let Err(e) = supervisor
                         .spawn(crate::acp::supervisor::SpawnRequest {
                             session_id: id.clone(),
@@ -3821,6 +3852,7 @@ pub async fn create_session(
                             source_profile: source_profile_for_spawn,
                             yolo_mode,
                             agent_command_override: command_override,
+                            seed_history_replay,
                         })
                         .await
                     {
