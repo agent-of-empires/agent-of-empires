@@ -23,9 +23,11 @@ use serde::Serialize;
 /// lines is plenty without reading a multi-MB file fully.
 const MAX_SCAN_LINES: usize = 400;
 
-/// Cap how many sessions we return. Newest first, so older sessions past the
-/// cap are the least likely to be resumed.
-const MAX_SESSIONS: usize = 200;
+/// Cap how many sessions the picker shows. Newest first, so older sessions
+/// past the cap are the least likely to be resumed. Applied by the endpoint
+/// AFTER it filters out AoE-managed sessions, so a burst of managed sessions
+/// can't squeeze real imports off the list.
+pub const MAX_SESSIONS: usize = 200;
 
 /// A discovered Claude Code session, summarized for the import picker.
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -125,9 +127,10 @@ fn cwd_under_worktree(cwd: &str, markers: &[String]) -> bool {
     })
 }
 
-/// Scan all discoverable Claude Code sessions, newest first, capped at
-/// `MAX_SESSIONS`. Returns an empty vec when the projects directory is absent
-/// (e.g. Claude Code was never run). Unreadable files are skipped, not fatal.
+/// Scan all discoverable Claude Code sessions, newest first (uncapped; the
+/// endpoint applies `MAX_SESSIONS` after ownership filtering). Returns an empty
+/// vec when the projects directory is absent (e.g. Claude Code was never run).
+/// Unreadable files are skipped, not fatal.
 ///
 /// AoE's own internal Claude runs are excluded: scratch sessions (cwd under
 /// `<app_dir>/scratch/`, matched by layout so both release and -dev namespaces
@@ -178,7 +181,6 @@ pub fn scan_sessions() -> Vec<ClaudeSessionSummary> {
     }
 
     out.sort_by_key(|s| std::cmp::Reverse(s.last_modified_ms));
-    out.truncate(MAX_SESSIONS);
     out
 }
 

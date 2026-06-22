@@ -2168,6 +2168,9 @@ pub async fn list_claude_sessions(State(state): State<Arc<AppState>>) -> impl In
         let cwd = std::path::Path::new(&s.cwd);
         !managed_dirs.iter().any(|d| cwd.starts_with(d))
     });
+    // Cap AFTER ownership filtering so a burst of AoE-managed sessions can't
+    // push real imports off the (newest-first) list. See #2276.
+    sessions.truncate(crate::acp::claude_import::MAX_SESSIONS);
     Json(sessions).into_response()
 }
 
