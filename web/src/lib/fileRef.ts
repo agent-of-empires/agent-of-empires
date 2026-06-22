@@ -8,8 +8,8 @@
 // mailto, ...) are left untouched. See #1718.
 
 /** A parsed local file reference. `line`/`column` are 1-based when the
- *  href carried a suffix; they are parsed but not yet wired to viewer
- *  scroll-to-line (follow-up). */
+ *  href carried a suffix. `line` is threaded through to the diff viewer to
+ *  scroll the cited line into view (#1809); `column` is parsed but unused. */
 export interface FileRef {
   path: string;
   line?: number;

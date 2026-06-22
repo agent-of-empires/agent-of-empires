@@ -23,6 +23,9 @@ interface Props {
   /** Workspace repo name; passed through to the diff endpoint so the file is
    *  resolved against the correct repo for multi-repo workspaces. See #1047. */
   repoName?: string;
+  /** 1-based new-side source line to scroll into view (and highlight) when the
+   *  file is opened from a transcript `path:line` link. See #1809. */
+  targetLine?: number;
   /** Triggers a re-fetch when the file list changes. */
   revision?: number;
   /** Called when the user wants to return to the terminal view. */
@@ -69,10 +72,42 @@ type AnnotationMeta = { kind: "card"; anchored: AnchoredComment } | { kind: "for
 const sideToAnnotation = (side: DiffSide) => (side === "old" ? ("deletions" as const) : ("additions" as const));
 const annotationToSide = (side: "deletions" | "additions"): DiffSide => (side === "deletions" ? "old" : "new");
 
+const clamp01 = (n: number) => Math.min(1, Math.max(0, n));
+
+/** Approximate scroll fraction (0..1) for a new-side source line. The
+ *  Virtualizer has no scroll-to-line API, so we map the cited line to the
+ *  rendered diff rows: find the nearest changed new-side line and return its
+ *  rank among all rendered changed rows (deletions and additions, in render
+ *  order). This tracks where the diff content actually sits, unlike a raw
+ *  line/total-lines fraction which is wrong when unchanged regions are
+ *  collapsed. Falls back to a file-line fraction when the diff has no changed
+ *  new-side rows (e.g. a deletion-only patch). See #1809. */
+function targetScrollFraction(
+  meta: Parameters<typeof changedLines>[0],
+  targetLine: number,
+  newLineCount: number,
+): number {
+  const lines = changedLines(meta);
+  let bestIdx = -1;
+  let bestDist = Infinity;
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i]!.side !== "new") continue;
+    const dist = Math.abs(lines[i]!.lineNumber - targetLine);
+    if (dist < bestDist) {
+      bestDist = dist;
+      bestIdx = i;
+    }
+  }
+  if (bestIdx < 0) return clamp01((targetLine - 1) / Math.max(1, newLineCount));
+  if (lines.length <= 1) return 0;
+  return bestIdx / (lines.length - 1);
+}
+
 export function DiffFileViewer({
   sessionId,
   filePath,
   repoName,
+  targetLine,
   revision,
   onClose,
   commentsEnabled = false,
@@ -102,6 +137,10 @@ export function DiffFileViewer({
   const scrollResetRef = useRef<HTMLDivElement | null>(null);
   const scrollerRef = useRef<HTMLElement | null>(null);
   const userScrolledRef = useRef(false);
+  // Scroll fraction to hold the diff at while a cited line is targeted; null
+  // means "hold at the top" (the default). Maintained across the virtualizer's
+  // async reflows by the ResizeObserver below, until the user scrolls. #1809.
+  const targetFracRef = useRef<number | null>(null);
 
   // Reset transient state when the viewer switches files / repos / sessions.
   // Synced at render time (not in an effect) to avoid set-state-in-effect.
@@ -238,14 +277,15 @@ export function DiffFileViewer({
       diffStyle: splitActive ? "split" : "unified",
       theme,
       disableFileHeader: true,
-      // Enable selection for commenting, and also while find is open so the
-      // jumped-to match line renders its selection highlight.
-      enableLineSelection: commentsActive || findOpen,
+      // Enable selection for commenting, while find is open so the jumped-to
+      // match renders its highlight, and when a cited line was targeted so its
+      // scroll-to highlight renders even in a non-comment session (#1809).
+      enableLineSelection: commentsActive || findOpen || targetLine != null,
       controlledSelection: true,
       onLineSelectionChange: setSelected,
       onLineSelected: handleLineSelected,
     }),
-    [splitActive, theme, commentsActive, findOpen, handleLineSelected],
+    [splitActive, theme, commentsActive, findOpen, targetLine, handleLineSelected],
   );
 
   // Searchable line set for find: the diff's changed lines, read straight off
@@ -286,11 +326,14 @@ export function DiffFileViewer({
     }
   }, []);
 
-  // Keep the diff scrolled to the top when a file first opens. The
-  // virtualized renderer reconciles row heights asynchronously (and again
-  // when off-thread highlighting lands), which otherwise settles the scroll
-  // position at the bottom of large diffs. We force the top across those
-  // reflows until the user scrolls, then get out of the way.
+  // Position the diff scroll when a file first opens: held at the top by
+  // default, or at the cited line's approximate fraction when opened from a
+  // transcript `path:line` link (#1809). The virtualized renderer reconciles
+  // row heights asynchronously (and again when off-thread highlighting lands),
+  // which otherwise settles the scroll elsewhere, so we re-apply the desired
+  // position across those reflows until the user scrolls, then get out of the
+  // way. Co-opting one observer (rather than racing a second effect against
+  // this one) keeps the target stable without polling.
   useEffect(() => {
     const wrap = scrollResetRef.current;
     if (!wrap) return;
@@ -299,16 +342,21 @@ export function DiffFileViewer({
     if (!scroller || !content) return;
     scrollerRef.current = scroller;
     userScrolledRef.current = false;
+    targetFracRef.current =
+      targetLine != null && fileDiff ? targetScrollFraction(fileDiff, targetLine, newContent.split("\n").length) : null;
+    const apply = () => {
+      if (userScrolledRef.current) return;
+      const frac = targetFracRef.current;
+      scroller.scrollTop = frac == null ? 0 : frac * (scroller.scrollHeight - scroller.clientHeight);
+    };
     const markUser = () => {
       userScrolledRef.current = true;
     };
     scroller.addEventListener("wheel", markUser, { passive: true });
     scroller.addEventListener("pointerdown", markUser, { passive: true });
     scroller.addEventListener("keydown", markUser);
-    scroller.scrollTop = 0;
-    const ro = new ResizeObserver(() => {
-      if (!userScrolledRef.current) scroller.scrollTop = 0;
-    });
+    apply();
+    const ro = new ResizeObserver(apply);
     ro.observe(content);
     return () => {
       ro.disconnect();
@@ -317,7 +365,16 @@ export function DiffFileViewer({
       scroller.removeEventListener("keydown", markUser);
       if (scrollerRef.current === scroller) scrollerRef.current = null;
     };
-  }, [resolvedPath, repoName, splitActive, oldContent, newContent]);
+  }, [resolvedPath, repoName, splitActive, oldContent, newContent, fileDiff, targetLine]);
+
+  // Highlight the cited line via the selection overlay once a target is set
+  // (selection rendering is enabled for it in `options`). Synced at render
+  // time would fight the comment-draft selection, so do it in an effect keyed
+  // to the file + target line. #1809.
+  useEffect(() => {
+    if (targetLine == null) return;
+    setSelected({ start: targetLine, end: targetLine, side: "additions", endSide: "additions" });
+  }, [targetLine, viewKey]);
 
   if (loading && !contents) {
     return (

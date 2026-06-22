@@ -332,9 +332,13 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   const [selectedFile, setSelectedFile] = useState<{
     path: string;
     repoName?: string;
+    /** 1-based source line to scroll into view, when the file was opened from a
+     *  transcript `path:line` link. Undefined for plain file-list clicks. */
+    line?: number;
   } | null>(null);
   const selectedFilePath = selectedFile?.path ?? null;
   const selectedRepoName = selectedFile?.repoName;
+  const selectedFileLine = selectedFile?.line;
   const [diffCollapsed, setDiffCollapsed] = useState(() => {
     const stored = safeGetItem(RIGHT_PANEL_COLLAPSED_KEY);
     if (stored === "1") return true;
@@ -806,8 +810,8 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     setPickerOpen(false);
   }, []);
 
-  const handleSelectFile = useCallback((path: string, repoName?: string) => {
-    setSelectedFile({ path, repoName });
+  const handleSelectFile = useCallback((path: string, repoName?: string, line?: number) => {
+    setSelectedFile({ path, repoName, line });
   }, []);
 
   // Open a local file reference cited in an acp transcript (Codex
@@ -815,8 +819,8 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   // repo-relative path for the active session and open it in the in-app
   // diff/file viewer, keeping the current session route. A path outside
   // the session's known repo roots surfaces a non-destructive toast
-  // rather than navigating away. Line/column are parsed but not yet
-  // wired to viewer scroll-to-line. See #1718.
+  // rather than navigating away. The parsed line is threaded through so the
+  // viewer scrolls it into view. See #1718, #1809.
   const handleOpenFileRef = useCallback(
     (ref: FileRef) => {
       if (!activeSession) return;
@@ -825,7 +829,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
         toastBus.handler?.error(`Could not open ${ref.path}: not inside this session's repo`);
         return;
       }
-      handleSelectFile(resolved.relativePath, resolved.repoName);
+      handleSelectFile(resolved.relativePath, resolved.repoName, ref.line);
     },
     [activeSession, handleSelectFile],
   );
@@ -1110,6 +1114,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
           webSettings={webSettings}
           selectedFilePath={selectedFilePath}
           selectedRepoName={selectedRepoName}
+          selectedFileLine={selectedFileLine}
           revision={revision}
           diffFiles={diffFiles}
           perRepoBases={perRepoBases}
@@ -1168,6 +1173,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
                   sessionId={activeSessionId}
                   filePath={selectedFilePath}
                   repoName={selectedRepoName}
+                  targetLine={selectedFileLine}
                   revision={revision}
                   onClose={handleCloseFile}
                   commentsEnabled={commentsEnabled}
