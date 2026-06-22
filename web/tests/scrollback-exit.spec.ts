@@ -158,8 +158,12 @@ test.describe("Mobile live-view scrollback", () => {
 
     await btn.tap();
     await expect(btn).toHaveCount(0);
-    const distance = await scroller(page).evaluate((el) => el.scrollHeight - el.scrollTop - el.clientHeight);
-    expect(distance).toBeLessThan(30);
+    // Returning to the live edge involves a window-shrink round-trip, so the
+    // distance to the bottom converges asynchronously over a few frames; poll
+    // it rather than reading once (a single read can land mid-settle).
+    await expect
+      .poll(() => scroller(page).evaluate((el) => el.scrollHeight - el.scrollTop - el.clientHeight), { timeout: 5_000 })
+      .toBeLessThan(30);
   });
 
   test("scrolling requests a bigger capture window instead of wheel escapes", async ({ page }) => {
