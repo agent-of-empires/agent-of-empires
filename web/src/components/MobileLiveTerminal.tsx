@@ -840,7 +840,12 @@ export function MobileLiveTerminal({
     // invariant (spacer rows convert to content rows 1:1; appends only
     // extend the bottom), so the browser-preserved offset keeps the
     // same lines in view.
-  }, [lines, spacerLines, lineH, live, pinIfWasAtBottom, syncView]);
+    //
+    // `renderRowCount` is a dep because it sets the rendered content height
+    // when not reading (trailing blanks trimmed); without it a settle that
+    // grows/shrinks the document by a few rows would change scrollHeight while
+    // following WITHOUT re-pinning, leaving scrollTop short of the new bottom.
+  }, [lines, spacerLines, lineH, live, renderRowCount, pinIfWasAtBottom, syncView]);
 
   // --- keyboard input -----------------------------------------------------------
   const composingRef = useRef(false);
