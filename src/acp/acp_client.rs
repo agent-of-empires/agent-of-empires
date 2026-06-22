@@ -3155,14 +3155,21 @@ fn is_compact_completion(text: &str) -> bool {
 /// switch, intermittent otherwise), so both reach us and every reducer appends
 /// both, doubling the message. See #2281.
 ///
-/// The schema guarantees that a change in `message_id` marks a new message, and
-/// the streamed deltas plus the empty block-start marker all share the streamed
-/// id while the leaked restatement carries a different one. So a non-empty chunk
-/// whose id differs from the open block and whose text restates the block's
-/// accumulated text is the leak; a same-id chunk is always a genuine delta and
-/// is never dropped (a legitimately repeated delta keeps the same id). Absent
-/// ids on either side degrade to never-drop, which leaves that rarer leak shape
-/// in place rather than risk corrupting real output.
+/// The adapter's `message_id` only ever marks a new message, never reuses one
+/// across messages, so a same-id chunk is always a genuine delta and is never
+/// dropped (a legitimately repeated delta keeps the same id, for example
+/// streamed "ha" then "ha"). Any other chunk whose text restates the open
+/// block's accumulated text verbatim is the leaked consolidated copy, regardless
+/// of whether its id is present, absent, or merely different from the block's.
+/// Matching on content rather than on both ids being present closes the
+/// id-presence-asymmetry hole the adapter hits when `message_start` carries no
+/// id: the streamed deltas then arrive id-less while the restatement still
+/// carries a fallback uuid, so the two ids differ and the restatement is caught.
+/// claude-agent-acp >=0.49.0 dedups by content upstream (#800), so this is a
+/// backstop for that and for any other adapter that leaks the copy. The only
+/// shape left unfiltered is both sides genuinely id-less, where a verbatim
+/// repeat is indistinguishable from a leak; that degrades to the same-id append
+/// path rather than risk corrupting real output.
 #[derive(Default)]
 struct AgentMessageDedup {
     block: Option<AgentTextBlock>,
@@ -3213,11 +3220,11 @@ impl AgentMessageDedup {
                 block.text.push_str(&t.text);
                 false
             }
-            Some(block)
-                if block.id.is_some() && chunk.message_id.is_some() && block.text == t.text =>
-            {
-                // Different message id restating the whole block verbatim: the
-                // leaked consolidated copy. Drop it and close the block.
+            Some(block) if block.text == t.text => {
+                // Arm 1 already consumed the equal-id case, so the ids differ
+                // here (present-and-different, or one side absent). A non-empty
+                // chunk restating the whole block verbatim under a different id
+                // is the leaked consolidated copy. Drop it and close the block.
                 self.block = None;
                 true
             }
@@ -7825,6 +7832,22 @@ mod tests {
         assert!(d.observe(&text_chunk(
             "Concrete repro. Let me inspect the events around lgtm and the \"Plan approved\" message in that session.",
             Some("m2")
+        )));
+    }
+
+    #[test]
+    fn dedup_drops_restatement_when_delta_ids_absent() {
+        // The recurrence (sessions 0c425453, 614231): when `message_start`
+        // carries no id, the streamed deltas arrive id-less, but the leaked
+        // consolidated copy still carries a fallback uuid. The ids differ by
+        // presence, so the verbatim restatement must still be dropped.
+        let mut d = AgentMessageDedup::default();
+        assert!(!d.observe(&text_chunk("", None)));
+        assert!(!d.observe(&text_chunk("Getting the real failure log,", None)));
+        assert!(!d.observe(&text_chunk(" not guessing this time.", None)));
+        assert!(d.observe(&text_chunk(
+            "Getting the real failure log, not guessing this time.",
+            Some("uuid-1")
         )));
     }
 
