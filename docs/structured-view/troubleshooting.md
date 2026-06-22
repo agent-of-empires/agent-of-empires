@@ -65,21 +65,6 @@ Then run `claude login` if you haven't already. If an older version is pinned by
 an internal mirror, ship the required floor from the mirror or run the `@latest`
 install above before starting `aoe serve`.
 
-### opencode adapter is too old
-
-aoe requires opencode 1.16.0 or newer. Older releases sent empty permission
-details, so the approval card could not show the path or command being
-requested. As with claude, aoe refuses to start the session and reports the
-required version. Update opencode:
-
-```bash
-curl -fsSL https://opencode.ai/install | bash
-```
-
-opencode is not npm-installable, so the dashboard cannot update it for you; run
-the command above in a shell, then use **Restart agent** on the compatibility
-screen.
-
 ### Recovering a missing or out-of-date agent from the web dashboard
 
 When the structured view refuses a session because the agent is missing or too
