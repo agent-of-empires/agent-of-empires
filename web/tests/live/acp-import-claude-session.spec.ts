@@ -19,6 +19,7 @@ import { spawnAoeServe } from "../helpers/aoeServe";
 
 const IMPORT_SID = "11111111-2222-3333-4444-555555555555";
 const WORKTREE_SID = "22222222-3333-4444-5555-666666666666";
+const WORKSPACE_SID = "33333333-4444-5555-6666-777777777777";
 const REPLAY_TEXT = "imported transcript line abc123";
 const PROJECT_SUBDIR = "imported-project";
 
@@ -53,6 +54,17 @@ test("imports an existing Claude session and replays its transcript", async ({},
         message: { role: "user", content: [{ type: "text", text: "Base directory for this skill" }] },
       });
       writeFileSync(join(claudeProjects, `${WORKTREE_SID}.jsonl`), `${wtLine}\n`);
+
+      // A multi-repo workspace session carries the marker mid-name
+      // (<branch>-workspace-<id>); it must also be excluded.
+      const workspaceCwd = join(home, "feat-mm-template-sending-workspace-b13b3665");
+      mkdirSync(workspaceCwd, { recursive: true });
+      const wsLine = JSON.stringify({
+        type: "user",
+        cwd: workspaceCwd,
+        message: { role: "user", content: [{ type: "text", text: "plan then implement" }] },
+      });
+      writeFileSync(join(claudeProjects, `${WORKSPACE_SID}.jsonl`), `${wsLine}\n`);
     },
   });
 
@@ -73,8 +85,9 @@ test("imports an existing Claude session and replays its transcript", async ({},
     expect(found!.cwd).toBe(projectDir);
     expect(found!.cwd_exists).toBe(true);
     expect(found!.title).toBe("Imported session prompt");
-    // The session living in an AoE "*-worktrees" directory is excluded.
+    // Sessions living in AoE worktree / workspace directories are excluded.
     expect(sessions.some((s) => s.session_id === WORKTREE_SID)).toBe(false);
+    expect(sessions.some((s) => s.session_id === WORKSPACE_SID)).toBe(false);
 
     // 2. Create a structured session importing it.
     const createRes = await fetch(`${serve.baseUrl}/api/sessions`, {

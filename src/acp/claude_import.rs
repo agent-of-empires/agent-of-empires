@@ -58,10 +58,11 @@ fn claude_config_dir() -> Option<PathBuf> {
 }
 
 /// Literal directory tokens derived from the worktree path templates, e.g.
-/// `"-worktrees"` from the default `"../{repo-name}-worktrees/{branch}"`. A cwd
-/// living under a directory whose name ends with one of these is an AoE
-/// worktree, so it is excluded from the import picker. Derived from config so a
-/// custom template is honored. See #2276.
+/// `"-worktrees"` from `"../{repo-name}-worktrees/{branch}"` and `"-workspace-"`
+/// from `"../{branch}-workspace-{session-id}"`. A cwd living under a directory
+/// whose name contains one of these is an AoE worktree or workspace, so it is
+/// excluded from the import picker. Derived from config so a custom template is
+/// honored. See #2276.
 fn worktree_dir_markers() -> Vec<String> {
     let cfg = crate::session::Config::load_or_warn();
     let mut markers = Vec::new();
@@ -95,7 +96,9 @@ fn strip_placeholders(seg: &str) -> String {
     out
 }
 
-/// True when any directory component of `cwd` ends with a worktree marker.
+/// True when any directory component of `cwd` contains a worktree marker. Uses
+/// `contains` (not a suffix match) because workspace dirs carry the marker
+/// mid-name, e.g. `<branch>-workspace-<id>`.
 fn cwd_under_worktree(cwd: &str, markers: &[String]) -> bool {
     if markers.is_empty() {
         return false;
@@ -103,7 +106,7 @@ fn cwd_under_worktree(cwd: &str, markers: &[String]) -> bool {
     Path::new(cwd).components().any(|c| {
         c.as_os_str()
             .to_str()
-            .is_some_and(|name| markers.iter().any(|m| name.ends_with(m.as_str())))
+            .is_some_and(|name| markers.iter().any(|m| name.contains(m.as_str())))
     })
 }
 
@@ -316,14 +319,19 @@ mod tests {
     }
 
     #[test]
-    fn cwd_under_worktree_matches_worktree_dirs() {
-        let markers = vec!["-worktrees".to_string()];
+    fn cwd_under_worktree_matches_worktree_and_workspace_dirs() {
+        let markers = vec!["-worktrees".to_string(), "-workspace-".to_string()];
         assert!(cwd_under_worktree(
             "/Users/me/aoe/agent-of-empires-worktrees/Saracens",
             &markers
         ));
         assert!(cwd_under_worktree(
             "/Users/me/aoe/agent-of-empires-worktrees/Saracens/sub",
+            &markers
+        ));
+        // Workspace dirs carry the marker mid-name (contains, not suffix).
+        assert!(cwd_under_worktree(
+            "/Users/me/aoe/soft-close-grace-window-workspace-55406399",
             &markers
         ));
         assert!(!cwd_under_worktree("/Users/me/projects/alpha", &markers));
