@@ -293,12 +293,10 @@ pub async fn spawn_acp(
     let stored_acp_session_id = instance.acp_session_id.clone();
     let yolo_mode = instance.yolo_mode;
     // #2276: seed the transcript from the session/load replay when importing
-    // an existing Claude session (import_pending set, empty store). Clear any
-    // partial events from a prior failed load first so the seed is clean.
+    // an existing Claude session (import_pending set, empty store). The
+    // supervisor clears any partial replay from a prior attempt after it
+    // reserves the worker slot, so we only pass the flag here.
     let seed_history_replay = instance.import_pending == Some(true);
-    if seed_history_replay {
-        state.acp_event_store.delete_session(&id);
-    }
 
     let inst_lock = state.instance_lock(&id).await;
     let sandbox_info = match crate::acp::sandbox::ensure_container_for_session(
@@ -1643,9 +1641,6 @@ pub async fn acp_enable(
         // spawn path resolves agent_acp_cmd and worker env from the right
         // profile for non-sandbox sessions too.
         let source_profile = Some(profile_for_spawn);
-        if seed_history_replay {
-            state_for_spawn.acp_event_store.delete_session(&session_id);
-        }
         if let Err(e) = supervisor
             .spawn(crate::acp::supervisor::SpawnRequest {
                 session_id: session_id.clone(),

@@ -3831,13 +3831,6 @@ pub async fn create_session(
                         }
                     };
                     let source_profile_for_spawn = Some(source_profile.clone());
-                    // #2276: clear any partial events from a prior failed import
-                    // load so the seeded replay repopulates cleanly. import_pending
-                    // stays set until the load lands, so a crash mid-load just
-                    // re-seeds on the next spawn.
-                    if seed_history_replay {
-                        state_for_check.acp_event_store.delete_session(&id);
-                    }
                     if let Err(e) = supervisor
                         .spawn(crate::acp::supervisor::SpawnRequest {
                             session_id: id.clone(),

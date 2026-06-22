@@ -181,6 +181,12 @@ pub trait BroadcastSink: Send + Sync + 'static {
         self.publish(session_id, seq, event);
         true
     }
+    /// Drop all stored events for a session. Used by the import path to clear
+    /// any partial replay from a prior failed attempt before re-seeding, run
+    /// only after the worker slot is reserved so a duplicate spawn that hits
+    /// `AlreadyRunning` can't wipe a live worker's transcript. Default no-op
+    /// for test sinks without an event store. See #2276.
+    fn clear_session_events(&self, _session_id: &str) {}
     /// Approval nonces from `ApprovalRequested` events on disk with no
     /// matching `ApprovalResolved`. Used by `Supervisor::attach` to
     /// cancel approvals whose responder died with the previous daemon.
@@ -1422,6 +1428,15 @@ impl<S: BroadcastSink> Supervisor<S> {
             stored_id = ?stored_acp_session_id,
             "spawning structured view worker"
         );
+
+        // Import seeding: clear any partial replay from a prior failed attempt
+        // before session/load re-emits the transcript. Done here, after the
+        // spawn reservation is held, rather than in the REST handler, so a
+        // duplicate import spawn that bails with AlreadyRunning can't wipe a
+        // live worker's stored transcript. See #2276.
+        if seed_history_replay {
+            self.sink.clear_session_events(&session_id);
+        }
 
         let acp_session_id = AcpSessionId(session_id.clone());
         let mut client = match AcpClient::spawn(config.clone(), acp_session_id.clone()).await {
@@ -2872,6 +2887,10 @@ pub struct ChannelSink {
 impl BroadcastSink for ChannelSink {
     fn publish(&self, session_id: &str, seq: u64, event: &Event) {
         let _ = self.publish_persisted(session_id, seq, event);
+    }
+
+    fn clear_session_events(&self, session_id: &str) {
+        self.event_store.delete_session(session_id);
     }
 
     fn publish_persisted(&self, session_id: &str, seq: u64, event: &Event) -> bool {
