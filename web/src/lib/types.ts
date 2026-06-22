@@ -228,7 +228,7 @@ export interface TimingPongMessage {
 export interface RichDiffFile {
   path: string;
   old_path: string | null;
-  status: "added" | "modified" | "deleted" | "renamed" | "copied" | "untracked" | "conflicted";
+  status: "added" | "modified" | "deleted" | "renamed" | "copied" | "untracked" | "conflicted" | "unchanged";
   additions: number;
   deletions: number;
   /** Workspace repo this file belongs to. Omitted for single-repo

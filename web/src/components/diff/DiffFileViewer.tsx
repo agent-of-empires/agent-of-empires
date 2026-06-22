@@ -13,6 +13,7 @@ import { CommentCard } from "./comments/CommentCard";
 import { CommentForm } from "./comments/CommentForm";
 import type { AnchoredComment, DiffSide } from "./comments/types";
 import { DiffWorkerPoolProvider } from "./pierre/DiffWorkerPoolProvider";
+import { FullFileViewer } from "./FullFileViewer";
 import { FindBar } from "./find/FindBar";
 import { changedLines } from "./find/changedLines";
 import type { FindMatch } from "./find/findMatches";
@@ -46,6 +47,7 @@ const STATUS_LABELS: Record<string, string> = {
   copied: "Copied",
   untracked: "Untracked",
   conflicted: "Conflicted",
+  unchanged: "Unchanged",
 };
 
 const STATUS_COLORS: Record<string, string> = {
@@ -56,6 +58,7 @@ const STATUS_COLORS: Record<string, string> = {
   copied: "text-accent-600",
   untracked: "text-text-muted",
   conflicted: "text-status-waiting",
+  unchanged: "text-text-muted",
 };
 
 /** Transient draft for an in-progress comment range. */
@@ -367,6 +370,9 @@ export function DiffFileViewer({
   const statusColor = STATUS_COLORS[contents.file.status] ?? "text-text-muted";
   const statusLabel = STATUS_LABELS[contents.file.status] ?? contents.file.status;
   const noChanges = oldContent === newContent;
+  // Full-file fallback: an agent-cited file with no diff against the base. The
+  // server sends its whole body in new_content with an empty patch. See #1810.
+  const isFullFile = contents.file.status === "unchanged";
 
   return (
     <div className="flex-1 flex flex-col bg-surface-900 overflow-hidden" onKeyDown={onKeyDown}>
@@ -468,15 +474,17 @@ export function DiffFileViewer({
         )}
         {contents.is_binary ? (
           <div className="flex-1 flex items-center justify-center text-text-dim">
-            <span className="text-sm">Binary file changed</span>
+            <span className="text-sm">{isFullFile ? "Binary file" : "Binary file changed"}</span>
           </div>
         ) : contents.truncated ? (
           <div className="flex-1 flex items-center justify-center text-text-dim">
             <div className="text-center px-4">
-              <p className="text-sm mb-1">File too large to diff inline</p>
-              <p className="text-xs">Open it in your editor to review the changes.</p>
+              <p className="text-sm mb-1">File too large to display inline</p>
+              <p className="text-xs">Open it in your editor to view it.</p>
             </div>
           </div>
+        ) : isFullFile ? (
+          <FullFileViewer content={newContent} filePath={resolvedPath} />
         ) : noChanges && staleComments.length === 0 ? (
           <div className="flex-1 flex items-center justify-center text-text-dim">
             <span className="text-sm">No changes in this file</span>

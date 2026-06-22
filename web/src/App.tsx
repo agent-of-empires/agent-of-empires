@@ -335,6 +335,10 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     /** 1-based source line to scroll into view, when the file was opened from a
      *  transcript `path:line` link. Undefined for plain file-list clicks. */
     line?: number;
+    /** Opened from a transcript file-ref rather than the diff list. Such a
+     *  file may have no diff against the base (full-file fallback, #1810), so
+     *  it must not be auto-cleared for being absent from the diff list. */
+    cited?: boolean;
   } | null>(null);
   const selectedFilePath = selectedFile?.path ?? null;
   const selectedRepoName = selectedFile?.repoName;
@@ -453,9 +457,17 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     setSelectedFile(null);
   }
 
-  // Inline derivation for diffFiles validation: if the selected file is no
-  // longer in the diff, clear the selection.
-  if (activeSessionId && selectedFilePath && !diffFilesLoading && !diffFiles.some((f) => f.path === selectedFilePath)) {
+  // Inline derivation for diffFiles validation: if a diff-list selection is no
+  // longer in the diff, clear it. Cited files (opened from a transcript link)
+  // are exempt: they may have no diff against the base and still be viewable
+  // via the full-file fallback (#1810).
+  if (
+    activeSessionId &&
+    selectedFilePath &&
+    !selectedFile?.cited &&
+    !diffFilesLoading &&
+    !diffFiles.some((f) => f.path === selectedFilePath)
+  ) {
     setSelectedFile(null);
   }
 
@@ -829,9 +841,14 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
         toastBus.handler?.error(`Could not open ${ref.path}: not inside this session's repo`);
         return;
       }
-      handleSelectFile(resolved.relativePath, resolved.repoName, ref.line);
+      setSelectedFile({
+        path: resolved.relativePath,
+        repoName: resolved.repoName,
+        line: ref.line,
+        cited: true,
+      });
     },
-    [activeSession, handleSelectFile],
+    [activeSession],
   );
 
   const handleCloseFile = useCallback(() => {

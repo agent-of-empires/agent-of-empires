@@ -1560,7 +1560,8 @@
         "web/src/components/acp/Markdown.tsx",
         "web/src/components/acp/StructuredView.tsx",
         "web/src/components/MobileMainPane.tsx",
-        "web/src/components/diff/DiffFileViewer.tsx"
+        "web/src/components/diff/DiffFileViewer.tsx",
+        "web/src/components/diff/FullFileViewer.tsx"
       ]
     },
     {

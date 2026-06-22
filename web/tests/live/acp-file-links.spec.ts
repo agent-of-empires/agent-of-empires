@@ -1,13 +1,15 @@
-// Live-backend spec: structured view transcript local file links (#1718, #1809).
+// Live-backend spec: structured view transcript local file links (#1718, #1809, #1810).
 //
 // Seeds a git repo with committed-then-modified files so the diff
 // endpoint returns real content, registers it as a structured view session, and
-// scripts the fake ACP agent to emit an assistant message containing three
-// markdown links: an in-worktree file reference, a `path:line` reference deep
-// into a fully-rewritten (tall) file, and an absolute path outside any repo
-// root. Drives the real UI:
+// scripts the fake ACP agent to emit an assistant message containing four
+// markdown links: an in-worktree (changed) file reference, an unchanged
+// committed file, a `path:line` reference deep into a fully-rewritten (tall)
+// file, and an absolute path outside any repo root. Drives the real UI:
 //   - clicking the in-repo link opens the file in the in-app diff viewer
 //     and keeps the /session/<id> route (no navigation away),
+//   - clicking the unchanged file shows its full contents via the full-file
+//     fallback rather than a dead end (#1810),
 //   - clicking the `path:line` link scrolls the cited line into view (#1809):
 //     the row is virtualized and only mounts once scrolled near, so asserting
 //     its content is visible proves the scroll happened (it stays off-screen
@@ -57,7 +59,13 @@ base(
         const projectDir = join(home, "project");
         const tall = tallFile();
         initWorkingRepo(projectDir);
-        writeFiles(projectDir, { "src/a.ts": "export const a = 1;\n", "src/long.ts": tall.baseline });
+        // src/b.ts is committed and left untouched, so it has no diff against
+        // the base and exercises the full-file fallback. See #1810.
+        writeFiles(projectDir, {
+          "src/a.ts": "export const a = 1;\n",
+          "src/b.ts": "export const unchangedConst = 42;\n",
+          "src/long.ts": tall.baseline,
+        });
         commitAll(projectDir, "baseline");
         writeFiles(projectDir, { "src/a.ts": "export const a = 11;\n", "src/long.ts": tall.modified });
 
@@ -65,6 +73,7 @@ base(
         // so an absolute path under projectDir resolves to a repo file.
         // Bake that path into the agent message now that home is known.
         const inRepoLink = `${projectDir}/src/a.ts:1`;
+        const unchangedLink = `${projectDir}/src/b.ts:1`;
         const deepLink = `${projectDir}/src/long.ts:80`;
         writeFileSync(
           scriptPath,
@@ -76,7 +85,7 @@ base(
                     sessionUpdate: "agent_message_chunk",
                     content: {
                       type: "text",
-                      text: `See [a.ts](${inRepoLink}), [deep](${deepLink}) and [missing](${outsidePath}).`,
+                      text: `See [a.ts](${inRepoLink}), [b.ts](${unchangedLink}), [deep](${deepLink}) and [missing](${outsidePath}).`,
                     },
                   },
                 ],
@@ -103,7 +112,7 @@ base(
       await page.goto(`${serve.baseUrl}/session/${sessionId}`);
       await waitForStructuredView(page);
 
-      // Trigger the scripted agent turn that emits the two links.
+      // Trigger the scripted agent turn that emits the links.
       const promptRes = await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/acp/prompt`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -141,6 +150,17 @@ base(
       await expect(deepFileLink).toBeVisible();
       await deepFileLink.click();
       await expect(page.getByText(new RegExp(SCROLL_SENTINEL)).first()).toBeVisible({
+        timeout: 10_000,
+      });
+      await expect(page).toHaveURL(sessionUrl);
+
+      // Unchanged in-repo link: b.ts has no diff against the base, so the viewer
+      // falls back to showing its full contents instead of a dead end. See #1810.
+      await page.getByRole("button", { name: "Back to terminal" }).click();
+      const unchangedFileLink = page.getByRole("link", { name: "b.ts" });
+      await expect(unchangedFileLink).toBeVisible();
+      await unchangedFileLink.click();
+      await expect(page.getByText(/export const unchangedConst = 42/).first()).toBeVisible({
         timeout: 10_000,
       });
       await expect(page).toHaveURL(sessionUrl);
