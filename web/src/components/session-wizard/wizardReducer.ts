@@ -59,6 +59,11 @@ export interface WizardData {
   useStructuredView: boolean;
   agentModel: string;
   agentEffort: string;
+  /** When non-empty, this create is importing an existing Claude Code
+   *  session: the on-disk session id to resume via `session/load`. Set by
+   *  the ProjectStep import tab, which also forces `tool: "claude"`,
+   *  structured view on, and worktree off. See #2276. */
+  importAcpSessionId: string;
   [key: string]: unknown;
 }
 
@@ -123,6 +128,7 @@ export const initialData: WizardData = {
   useStructuredView: true,
   agentModel: "",
   agentEffort: "",
+  importAcpSessionId: "",
 };
 
 export function reducer(state: WizardState, action: Action): WizardState {

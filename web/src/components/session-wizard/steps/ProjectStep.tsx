@@ -2,9 +2,10 @@
 import { useEffect, useMemo, useState } from "react";
 import { fetchSessions, fetchRecentProjects, fetchProjects, cloneRepo } from "../../../lib/api";
 import type { RecentProjectEntry } from "../../../lib/api";
-import type { ProjectInfo, SessionResponse } from "../../../lib/types";
+import type { ClaudeSessionSummary, ProjectInfo, SessionResponse } from "../../../lib/types";
 import { DirectoryBrowser } from "../../DirectoryBrowser";
 import { ExtraReposPicker } from "./ExtraReposPicker";
+import { ClaudeSessionPicker } from "./ClaudeSessionPicker";
 
 interface WizardData {
   path: string;
@@ -46,7 +47,7 @@ function Toggle({
   );
 }
 
-type Tab = "recent" | "browse" | "clone";
+type Tab = "recent" | "browse" | "clone" | "import";
 
 interface Props {
   data: WizardData;
@@ -247,7 +248,23 @@ export function ProjectStep({ data, onChange, initialTab }: Props) {
     ...(hasPicks ? [{ id: "recent" as Tab, label: "Recent" }] : []),
     { id: "browse", label: "Browse" },
     { id: "clone", label: "Clone URL" },
+    { id: "import", label: "Import Claude" },
   ];
+
+  // #2276: importing an existing Claude Code session prefills the original
+  // cwd and forces a structured-view claude session that resumes it. Worktree
+  // and scratch are cleared: the on-disk session id only resolves in its
+  // recorded cwd.
+  const handleImportSelect = (s: ClaudeSessionSummary) => {
+    onChange("scratch", false);
+    onChange("path", s.cwd);
+    onChange("tool", "claude");
+    onChange("useStructuredView", true);
+    onChange("useWorktree", false);
+    onChange("attachExisting", false);
+    onChange("importAcpSessionId", s.session_id);
+    if (s.title) onChange("title", s.title.slice(0, 60));
+  };
 
   return (
     <div>
@@ -390,6 +407,9 @@ export function ProjectStep({ data, onChange, initialTab }: Props) {
 
           {/* Browse tab */}
           {!loading && activeTab === "browse" && <DirectoryBrowser onSelect={handleBrowseSelect} />}
+
+          {/* Import an existing Claude Code session (#2276) */}
+          {!loading && activeTab === "import" && <ClaudeSessionPicker onSelect={handleImportSelect} />}
 
           {/* Clone from URL tab */}
           {!loading && activeTab === "clone" && (

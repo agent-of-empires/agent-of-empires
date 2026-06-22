@@ -11,6 +11,7 @@ import type {
   ProjectInfo,
   DockerStatusResponse,
   CreateSessionRequest,
+  ClaudeSessionSummary,
   SettingsFieldDescriptor,
 } from "./types";
 import { clearDeviceBindingSecret, getOrCreateDeviceBindingSecret } from "./deviceBinding";
@@ -808,6 +809,12 @@ export async function fetchGroups(): Promise<GroupInfo[]> {
 export async function fetchProjects(scope?: "global" | "profile"): Promise<ProjectInfo[]> {
   const url = scope ? `/api/projects?scope=${scope}` : "/api/projects";
   return (await fetchJson<ProjectInfo[]>(url)) ?? [];
+}
+
+/** Existing Claude Code sessions on disk, newest first, for the import
+ *  picker (#2276). Empty when Claude Code was never run. */
+export async function listClaudeSessions(): Promise<ClaudeSessionSummary[]> {
+  return (await fetchJson<ClaudeSessionSummary[]>("/api/claude-sessions")) ?? [];
 }
 
 export async function createProject(body: {

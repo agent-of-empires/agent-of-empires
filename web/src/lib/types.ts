@@ -458,6 +458,20 @@ export interface CreateSessionRequest {
    *  unset, the server returns a `hooks_need_trust` 403; the wizard then
    *  prompts and resubmits with this set to true. */
   trust_hooks?: boolean;
+  /** Import an existing Claude Code session: the on-disk session id to
+   *  resume via `session/load`. Forces the structured view; `path` must be
+   *  the session's original cwd. See #2276. */
+  import_acp_session_id?: string;
+}
+
+/** A discoverable existing Claude Code session on disk, returned by
+ *  `GET /api/claude-sessions` for the import picker. See #2276. */
+export interface ClaudeSessionSummary {
+  session_id: string;
+  cwd: string;
+  title: string | null;
+  last_modified_ms: number;
+  cwd_exists: boolean;
 }
 
 /** Live acp worker lifecycle, mirrored from

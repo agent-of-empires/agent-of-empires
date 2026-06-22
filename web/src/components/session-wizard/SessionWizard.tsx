@@ -269,6 +269,9 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
       agent_model: selectedAgentAcpCapable && d.useStructuredView && d.agentModel ? d.agentModel : undefined,
       agent_effort: selectedAgentAcpCapable && d.useStructuredView && d.agentEffort ? d.agentEffort : undefined,
       scratch: d.scratch || undefined,
+      // #2276: importing an existing Claude session. The server adopts this
+      // id as the session's acp_session_id and resumes it via session/load.
+      import_acp_session_id: d.importAcpSessionId || undefined,
     };
 
     // Sandbox sessions whose resolved config has glob volume_ignores get a
