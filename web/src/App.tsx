@@ -371,6 +371,11 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   const [showPalette, setShowPalette] = useState(false);
   const [showAbout, setShowAbout] = useState(false);
   const [telemetryConsentNeeded, setTelemetryConsentNeeded] = useState(false);
+  // Whether the telemetry status fetch has settled. `telemetryConsentNeeded`
+  // starts false, so before this is true "no consent needed" and "not resolved
+  // yet" look the same; the tips auto-pop waits on this so it can't slip in
+  // before a pending consent modal.
+  const [telemetryConsentKnown, setTelemetryConsentKnown] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth >= 768);
   const keyboardProxyRef = useRef<HTMLTextAreaElement>(null);
 
@@ -574,12 +579,16 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       // Read-only servers can't persist an opt-in choice, so skip the ping.
       if (about && !about.read_only) reportTelemetrySeen("web");
     });
-    void fetchTelemetryStatus().then((status) => {
-      if (!active || !status) return;
-      if (!status.responded && !status.do_not_track) {
-        setTelemetryConsentNeeded(true);
-      }
-    });
+    void fetchTelemetryStatus()
+      .then((status) => {
+        if (!active || !status) return;
+        if (!status.responded && !status.do_not_track) {
+          setTelemetryConsentNeeded(true);
+        }
+      })
+      .finally(() => {
+        if (active) setTelemetryConsentKnown(true);
+      });
     return () => {
       active = false;
     };
@@ -1336,7 +1345,9 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       hasUnseen: tips.hasUnseen,
       tourSeenAtLoad: tourSeenAtLoadRef.current,
       onboardingReady: tourAutoLaunchReady && welcome.resolved,
-      telemetryPending: telemetryConsentNeeded,
+      // Treat "not resolved yet" as pending so tips can't pop ahead of a consent
+      // modal that the in-flight status fetch is about to raise.
+      telemetryPending: !telemetryConsentKnown || telemetryConsentNeeded,
       tourActive: tour.isTourActive,
       automated: isAutomatedSession(),
     });
@@ -1346,7 +1357,15 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     // tour's begin()), keeping the state change out of the effect.
     const id = requestAnimationFrame(() => tips.open());
     return () => cancelAnimationFrame(id);
-  }, [tips, tourSeenKnown, tourAutoLaunchReady, welcome.resolved, telemetryConsentNeeded, tour.isTourActive]);
+  }, [
+    tips,
+    tourSeenKnown,
+    tourAutoLaunchReady,
+    welcome.resolved,
+    telemetryConsentKnown,
+    telemetryConsentNeeded,
+    tour.isTourActive,
+  ]);
 
   return (
     <AcpPrefsProvider value={acpPrefs}>

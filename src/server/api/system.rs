@@ -466,8 +466,9 @@ pub struct TipDto {
 #[derive(Serialize)]
 pub struct TipsResponse {
     /// Mirror of `session.show_tips`. The dashboard hides the badge and panel
-    /// when this is false; the toggle itself is written through the settings
-    /// schema, so this is a read-only projection here.
+    /// when this is false. This payload is a read projection; the toggle is
+    /// written through the dedicated `POST /api/tips/show` ([`set_show_tips`]),
+    /// and the same preference is also editable from the settings schema.
     pub enabled: bool,
     /// Web-eligible tips in catalog order, each flagged with whether it has been
     /// seen. The frontend derives the badge count from the unseen ones and can
