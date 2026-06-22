@@ -60,6 +60,12 @@ fn claude_config_dir() -> Option<PathBuf> {
 /// Scan all discoverable Claude Code sessions, newest first, capped at
 /// `MAX_SESSIONS`. Returns an empty vec when the projects directory is absent
 /// (e.g. Claude Code was never run). Unreadable files are skipped, not fatal.
+///
+/// Sessions whose `cwd` lives inside the AoE app data dir are excluded: those
+/// are AoE's own internal Claude runs (scratch sessions root their cwd under
+/// `<app_dir>/scratch/`), not conversations a user would import. Sessions AoE
+/// already manages by id are filtered separately by the endpoint, which has
+/// the instance list. See #2276.
 pub fn scan_sessions() -> Vec<ClaudeSessionSummary> {
     let Some(projects) = claude_config_dir().map(|d| d.join("projects")) else {
         return Vec::new();
@@ -67,6 +73,7 @@ pub fn scan_sessions() -> Vec<ClaudeSessionSummary> {
     let Ok(project_dirs) = fs::read_dir(&projects) else {
         return Vec::new();
     };
+    let app_dir = crate::session::get_app_dir().ok();
 
     let mut out = Vec::new();
     for project in project_dirs.flatten() {
@@ -83,6 +90,11 @@ pub fn scan_sessions() -> Vec<ClaudeSessionSummary> {
                 continue;
             }
             if let Some(summary) = summarize_file(&fpath) {
+                if let Some(app_dir) = &app_dir {
+                    if Path::new(&summary.cwd).starts_with(app_dir) {
+                        continue;
+                    }
+                }
                 out.push(summary);
             }
         }

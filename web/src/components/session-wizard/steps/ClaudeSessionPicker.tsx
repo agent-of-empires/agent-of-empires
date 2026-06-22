@@ -10,6 +10,9 @@ import type { ClaudeSessionSummary } from "../../../lib/types";
 export function ClaudeSessionPicker({ onSelect }: { onSelect: (session: ClaudeSessionSummary) => void }) {
   const [sessions, setSessions] = useState<ClaudeSessionSummary[] | null>(null);
   const [filter, setFilter] = useState("");
+  // Sessions whose recorded cwd is gone cannot be resumed, so hide them by
+  // default; the toggle reveals them (shown disabled). See #2276.
+  const [showMissing, setShowMissing] = useState(false);
 
   useEffect(() => {
     let active = true;
@@ -21,12 +24,17 @@ export function ClaudeSessionPicker({ onSelect }: { onSelect: (session: ClaudeSe
     };
   }, []);
 
+  const hasMissing = useMemo(() => (sessions ?? []).some((s) => !s.cwd_exists), [sessions]);
+
   const filtered = useMemo(() => {
     if (!sessions) return [];
     const q = filter.trim().toLowerCase();
-    if (!q) return sessions;
-    return sessions.filter((s) => (s.title ?? "").toLowerCase().includes(q) || s.cwd.toLowerCase().includes(q));
-  }, [sessions, filter]);
+    return sessions.filter((s) => {
+      if (!showMissing && !s.cwd_exists) return false;
+      if (!q) return true;
+      return (s.title ?? "").toLowerCase().includes(q) || s.cwd.toLowerCase().includes(q);
+    });
+  }, [sessions, filter, showMissing]);
 
   if (sessions === null) {
     return <div className="p-4 text-sm text-content-subtle">Scanning for Claude Code sessions…</div>;
@@ -50,6 +58,17 @@ export function ClaudeSessionPicker({ onSelect }: { onSelect: (session: ClaudeSe
         aria-label="Filter Claude sessions"
         className="w-full rounded-md border border-surface-700 bg-surface-900 px-3 py-2 text-sm focus-visible:outline-2 focus-visible:outline-brand-600"
       />
+      {hasMissing && (
+        <label className="flex items-center gap-2 text-xs text-content-subtle">
+          <input
+            type="checkbox"
+            checked={showMissing}
+            onChange={(e) => setShowMissing(e.target.checked)}
+            aria-label="Show sessions with missing directories"
+          />
+          Show sessions whose directory is missing
+        </label>
+      )}
       <ul className="flex max-h-80 flex-col gap-1 overflow-y-auto" aria-label="Claude sessions">
         {filtered.map((s) => (
           <li key={s.session_id}>

@@ -2131,10 +2131,27 @@ pub async fn acp_replay(
 /// List existing Claude Code sessions on disk, newest first, for the import
 /// picker. Read-only filesystem scan; mutates nothing, so it runs in
 /// read-only mode too.
-pub async fn list_claude_sessions(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
-    let sessions = tokio::task::spawn_blocking(crate::acp::claude_import::scan_sessions)
+pub async fn list_claude_sessions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let mut sessions = tokio::task::spawn_blocking(crate::acp::claude_import::scan_sessions)
         .await
         .unwrap_or_default();
+    // Drop sessions AoE already manages: importing one would be a no-op, and
+    // they are noise in the picker. A managed session's on-disk id equals the
+    // instance's acp_session_id (structured view) or agent_session_id
+    // (terminal resume). See #2276.
+    let managed: std::collections::HashSet<String> = {
+        let instances = state.instances.read().await;
+        instances
+            .iter()
+            .flat_map(|i| {
+                i.acp_session_id
+                    .iter()
+                    .chain(i.agent_session_id.iter())
+                    .cloned()
+            })
+            .collect()
+    };
+    sessions.retain(|s| !managed.contains(&s.session_id));
     Json(sessions).into_response()
 }
 

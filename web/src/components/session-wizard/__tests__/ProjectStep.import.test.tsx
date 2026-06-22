@@ -66,11 +66,15 @@ describe("ProjectStep Import Claude tab (#2276)", () => {
     vi.mocked(listClaudeSessions).mockResolvedValue(SESSIONS);
   });
 
-  it("lists discovered sessions and disables one whose cwd is gone", async () => {
-    const { findByText, getByText } = renderStep();
+  it("lists discovered sessions and hides missing-cwd ones until toggled", async () => {
+    const { findByText, getByText, queryByText, getByLabelText } = renderStep();
     await findByText("Fix the spinner bug");
     expect(getByText("/Users/me/projects/alpha")).toBeTruthy();
-    const missingRow = getByText("Old work").closest("button") as HTMLButtonElement;
+    // Missing-cwd session hidden by default.
+    expect(queryByText("Old work")).toBeNull();
+    // Toggle reveals it, disabled.
+    fireEvent.click(getByLabelText("Show sessions with missing directories"));
+    const missingRow = (await findByText("Old work")).closest("button") as HTMLButtonElement;
     expect(missingRow.disabled).toBe(true);
   });
 
@@ -90,8 +94,9 @@ describe("ProjectStep Import Claude tab (#2276)", () => {
   it("filters by title", async () => {
     const { findByText, getByLabelText, queryByText } = renderStep();
     await findByText("Fix the spinner bug");
-    fireEvent.change(getByLabelText("Filter Claude sessions"), { target: { value: "old" } });
+    fireEvent.change(getByLabelText("Filter Claude sessions"), { target: { value: "spinner" } });
+    expect(queryByText("Fix the spinner bug")).toBeTruthy();
+    fireEvent.change(getByLabelText("Filter Claude sessions"), { target: { value: "zzznomatch" } });
     await waitFor(() => expect(queryByText("Fix the spinner bug")).toBeNull());
-    expect(queryByText("Old work")).toBeTruthy();
   });
 });

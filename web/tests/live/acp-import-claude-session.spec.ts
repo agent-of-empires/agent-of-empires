@@ -92,6 +92,20 @@ test("imports an existing Claude session and replays its transcript", async ({},
         { timeout: 20_000, intervals: [200, 500, 1000] },
       )
       .toContain(REPLAY_TEXT);
+
+    // 4. Now that AoE manages this id (acp_session_id), it drops out of the
+    // import list so it is not offered for re-import.
+    await expect
+      .poll(
+        async () => {
+          const res = await fetch(`${serve.baseUrl}/api/claude-sessions`);
+          if (!res.ok) return true;
+          const list: { session_id: string }[] = await res.json();
+          return list.some((s) => s.session_id === IMPORT_SID);
+        },
+        { timeout: 10_000, intervals: [200, 500, 1000] },
+      )
+      .toBe(false);
   } finally {
     await serve.stop();
   }
