@@ -14,9 +14,9 @@
 //!   the web-exposed schema), and
 //! - the host `environment` list (a root-level `Config` field).
 //!
-//! The five `custom:*` widgets (theme picker, default-tool picker, sound mode
-//! and volume, per-target logging matrix) keep bespoke value mapping here,
-//! keyed by the widget id from the schema.
+//! The `custom:*` widgets (theme picker, default-tool picker, smart-rename
+//! agent picker, sound mode and volume, per-target logging matrix) keep
+//! bespoke value mapping here, keyed by the widget id from the schema.
 
 use serde_json::{json, Value};
 

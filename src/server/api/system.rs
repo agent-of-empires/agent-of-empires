@@ -24,6 +24,11 @@ pub struct AgentInfo {
     pub host_only: bool,
     pub installed: bool,
     pub install_hint: String,
+    /// True when this agent has a one-shot mode (a `oneshot_flag`), so it can
+    /// be used for the smart-rename title call. The settings smart-rename agent
+    /// picker filters on this together with `installed`. Always false for
+    /// custom agents (no built-in one-shot contract).
+    pub oneshot_capable: bool,
     /// True when this agent can run in the structured acp UI: a
     /// built-in with an ACP adapter, or a custom agent that declares a
     /// valid `agent_acp_cmd`. The web wizard reads this to decide
@@ -93,6 +98,7 @@ fn build_custom_agent_infos(
             host_only: false,
             installed: true,
             install_hint: "Configured custom agent".to_string(),
+            oneshot_capable: false,
             acp_capable: agent_acp_cmd
                 .get(name)
                 .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(name, cmd).is_ok()),
@@ -132,6 +138,7 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentIn
                     host_only: a.host_only,
                     installed: available.iter().any(|s| s == a.name),
                     install_hint: a.install_hint.to_string(),
+                    oneshot_capable: a.oneshot_flag.is_some(),
                     acp_capable: acp_registry.get(a.name).is_some(),
                     acp_installed: acp_command
                         .as_deref()
