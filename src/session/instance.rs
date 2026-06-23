@@ -1598,12 +1598,30 @@ impl Instance {
     /// contract (mtime, SQLite ordering, exclusion set, host/container)
     /// stays encapsulated in each tool's existing capture function.
     ///
-    /// Known limitation: when a non-AoE Claude session writes to the same
-    /// `project_path` (manual `claude` invocation outside the pane), its sid
-    /// is not in the tmux-env exclusion set and a fresher mtime there can
-    /// supersede the stored sid on resume. Co-located non-AoE peers are an
-    /// uncommon layout; the steady-state case (no peer) is unaffected.
+    /// For Claude the authoritative per-instance sidecar
+    /// (`/tmp/aoe-hooks-<euid>/<instance_id>/session_id`, written by the
+    /// SessionStart / UserPromptSubmit hooks) is consulted first. It is keyed
+    /// by instance id, so it can never name a peer instance's conversation —
+    /// unlike the mtime disk scan, which picks the most-recent jsonl in the
+    /// shared `~/.claude/projects/<encoded-cwd>/` dir and so can select a
+    /// co-located peer's session when several AoE sessions share one cwd
+    /// (#2344). The mtime scan is only used as a fallback when no fresh
+    /// sidecar exists (e.g. an old session resumed after the 5-minute
+    /// sidecar window), matching the ordering already used by
+    /// `claude_poll_fn`.
     pub(crate) fn capture_freshest_session_id(&self) -> Option<String> {
+        if self.tool == "claude" && !self.is_sandboxed() {
+            if let Some(authoritative) = crate::hooks::read_hook_session_id(&self.id) {
+                if self.retroactive_capture_excludes.contains(&authoritative) {
+                    return None;
+                }
+                return match self.agent_session_id.as_deref() {
+                    Some(known) if known == authoritative => None,
+                    _ => Some(authoritative),
+                };
+            }
+        }
+
         let live = self.try_retroactive_capture()?;
         match self.agent_session_id.as_deref() {
             Some(known) if known == live => None,
@@ -6985,6 +7003,96 @@ mod tests {
                 assert_eq!(sid.as_deref(), Some("stored-cursor-sid"));
                 assert!(is_existing);
                 assert_eq!(inst.agent_session_id.as_deref(), Some("stored-cursor-sid"));
+            }
+
+            // #2344: when several AoE Claude sessions share one cwd, the
+            // most-recent jsonl in the shared `~/.claude/projects/<encoded-cwd>/`
+            // dir is often a *peer* session's conversation. The mtime scan would
+            // pick it and clobber this instance's stored sid on resume. The
+            // per-instance hook sidecar is authoritative and must win over the
+            // mtime guess: here the sidecar names the instance's own conversation
+            // while a peer's jsonl is strictly fresher on disk.
+            #[test]
+            #[serial]
+            fn sidecar_wins_over_fresher_peer_jsonl() {
+                let temp = tempdir().unwrap();
+                let _guard = ClaudeHomeGuard::set(&temp);
+
+                let project_path = "/tmp/aoe-test-2344-shared-cwd";
+                let claude_dir = temp
+                    .path()
+                    .join(".claude")
+                    .join("projects")
+                    .join(encode_claude_project_path(project_path));
+                fs::create_dir_all(&claude_dir).unwrap();
+
+                // This instance's real conversation (named by its sidecar) and a
+                // peer's conversation that happens to be the freshest on disk.
+                let mine = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+                let peer = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
+                let now = SystemTime::now();
+                write_jsonl_with_mtime(
+                    &claude_dir.join(format!("{mine}.jsonl")),
+                    now - Duration::from_secs(120),
+                );
+                write_jsonl_with_mtime(
+                    &claude_dir.join(format!("{peer}.jsonl")),
+                    now - Duration::from_secs(5),
+                );
+
+                let mut inst = Instance::new("verify-2344-shared-cwd", project_path);
+                inst.tool = "claude".to_string();
+                inst.agent_session_id = Some(mine.to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                let dir = super::write_sidecar(&inst.id, mine);
+                let (sid, is_existing) = inst.acquire_session_id();
+                std::fs::remove_dir_all(&dir).ok();
+
+                // The authoritative sidecar matches the stored sid, so no
+                // override happens despite the peer's fresher jsonl.
+                assert_eq!(sid.as_deref(), Some(mine));
+                assert!(is_existing);
+                assert_eq!(inst.agent_session_id.as_deref(), Some(mine));
+            }
+
+            // Companion to the above: without a sidecar (e.g. a session resumed
+            // after the 5-minute sidecar window) the mtime fallback still
+            // applies, preserving the #2291 daemon-mode fix.
+            #[test]
+            #[serial]
+            fn mtime_fallback_applies_without_sidecar() {
+                let temp = tempdir().unwrap();
+                let _guard = ClaudeHomeGuard::set(&temp);
+
+                let project_path = "/tmp/aoe-test-2344-no-sidecar";
+                let claude_dir = temp
+                    .path()
+                    .join(".claude")
+                    .join("projects")
+                    .join(encode_claude_project_path(project_path));
+                fs::create_dir_all(&claude_dir).unwrap();
+
+                let stale = "cccccccc-3333-4333-8333-cccccccccccc";
+                let fresh = "dddddddd-4444-4444-8444-dddddddddddd";
+                let now = SystemTime::now();
+                write_jsonl_with_mtime(
+                    &claude_dir.join(format!("{stale}.jsonl")),
+                    now - Duration::from_secs(120),
+                );
+                write_jsonl_with_mtime(
+                    &claude_dir.join(format!("{fresh}.jsonl")),
+                    now - Duration::from_secs(5),
+                );
+
+                let mut inst = Instance::new("verify-2344-no-sidecar", project_path);
+                inst.tool = "claude".to_string();
+                inst.agent_session_id = Some(stale.to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                let (sid, _is_existing) = inst.acquire_session_id();
+                assert_eq!(sid.as_deref(), Some(fresh));
+                assert_eq!(inst.agent_session_id.as_deref(), Some(fresh));
             }
         }
 
