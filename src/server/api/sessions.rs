@@ -2151,32 +2151,68 @@ pub async fn force_smart_rename(
         return resp;
     }
 
-    let (title, structured) = {
+    let Some((profile, tool, command, sandboxed, title, structured)) = ({
         let instances = state.instances.read().await;
-        let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "message": "Session not found" })),
+        instances.iter().find(|i| i.id == id).map(|i| {
+            (
+                i.source_profile.clone(),
+                i.tool.clone(),
+                i.command.clone(),
+                i.is_sandboxed(),
+                i.title.clone(),
+                i.is_structured(),
             )
-                .into_response();
-        };
-        (inst.title.clone(), inst.is_structured())
+        })
+    }) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "message": "Session not found" })),
+        )
+            .into_response();
     };
 
-    if !structured {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "message": "Session is not a structured-view session" })),
-        )
-            .into_response();
+    // Preflight the SAME gate the spawned try_smart_rename re-applies, so the
+    // action never reports success (202) for a session the gate would silently
+    // drop (disabled, sandboxed, or a resolved rename agent with no one-shot /
+    // an overridden command). Without this, the sidebar would show success
+    // while no title job runs.
+    let config = crate::session::profile_config::resolve_config_or_warn(&profile);
+    if let Err(reason) = crate::session::smart_rename::check_eligible_resolved(
+        structured,
+        config.session.smart_rename,
+        &title,
+        &tool,
+        &config.session.smart_rename_agent,
+        sandboxed,
+        &command,
+        &config.session.agent_command_override,
+    ) {
+        use crate::session::smart_rename::SkipReason;
+        let (status, message) = match reason {
+            SkipReason::NotStructured => (
+                StatusCode::BAD_REQUEST,
+                "Session is not a structured-view session",
+            ),
+            SkipReason::NameNotDefault => {
+                (StatusCode::CONFLICT, "Session already has a custom name")
+            }
+            SkipReason::Disabled => (StatusCode::CONFLICT, "Smart rename is disabled in settings"),
+            SkipReason::Sandboxed => (
+                StatusCode::CONFLICT,
+                "Smart rename is not available for sandboxed sessions",
+            ),
+            SkipReason::NoOneshot => (
+                StatusCode::CONFLICT,
+                "The smart-rename agent has no one-shot mode",
+            ),
+            SkipReason::CommandOverridden => (
+                StatusCode::CONFLICT,
+                "The smart-rename agent's command is overridden",
+            ),
+        };
+        return (status, Json(serde_json::json!({ "message": message }))).into_response();
     }
-    if !crate::session::civilizations::is_default_civ_name(&title) {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({ "message": "Session already has a custom name" })),
-        )
-            .into_response();
-    }
+
     let Some(first_message) = state.acp_event_store.first_user_prompt(&id) else {
         return (
             StatusCode::CONFLICT,
