@@ -4,7 +4,7 @@
 //!
 //! PR #2187 replaced the agent string-based hook dispatch with the
 //! `HookFormat` / `SidecarFormat` enums. The follow-up
-//! `feat/codex-hooks-json-migration` PR (issue #2188) flips Codex from
+//! `feat/codex-hooks-json-migration` PR flips Codex from
 //! `config.toml` to `hooks.json` as the on-disk hook location: the codex
 //! `AgentHookConfig` declares `HookFormat::CodexJson` with
 //! `settings_rel_path = ".codex/hooks.json"`.
@@ -516,7 +516,7 @@ mod tests {
 
     #[test]
     fn static_no_agent_uses_codex_toml_format_post_flip() {
-        // Regression lock for issue #2188: the codex agent must declare
+        // Regression lock for the Codex hooks.json pivot: the codex agent must declare
         // `HookFormat::CodexJson`. The `CodexToml` variant of `HookFormat`
         // is absent from the codebase, so this test pins the chosen value
         // by exact match; if a future refactor reintroduces a TOML-based

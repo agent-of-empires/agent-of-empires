@@ -431,7 +431,7 @@ pub(crate) enum HookTargetKind {
     JsonSettings,
     /// Codex `config.toml`: file-locked, symlink-resolved, with a user-trust
     /// `[hooks.state]` block to preserve. Only the v018 legacy-cleanup
-    /// migration (#2188) constructs this variant; no agent declares
+    /// migration constructs this variant; no agent declares
     /// `HookFormat::CodexToml`.
     CodexToml,
     /// Codex `hooks.json`: same JSON payload shape as `JsonSettings`, but
