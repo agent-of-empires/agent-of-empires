@@ -479,8 +479,8 @@ export function DiffFileViewer({
         ) : contents.truncated ? (
           <div className="flex-1 flex items-center justify-center text-text-dim">
             <div className="text-center px-4">
-              <p className="text-sm mb-1">File too large to display inline</p>
-              <p className="text-xs">Open it in your editor to view it.</p>
+              <p className="text-sm mb-1">File too large to diff inline</p>
+              <p className="text-xs">Open it in your editor to review the changes.</p>
             </div>
           </div>
         ) : isFullFile ? (
