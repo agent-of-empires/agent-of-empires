@@ -701,14 +701,15 @@ fn prepare_sandbox_dir(mount: &AgentConfigMount, home: &Path) -> Result<std::pat
     }
 
     if host_dir.exists() {
-        // Codex's `[hooks.state]` trust block lives only in the sandbox
-        // copy of `config.toml` (Codex writes `trusted_hash` there when
-        // the user accepts a hook hash inside the container). The next
-        // `sync_agent_config` overwrites that file from the host;
-        // snapshot here and restore after the sync so accepted hashes
-        // survive the host-to-sandbox refresh. The codex config lock is
-        // released between snapshot and restore; the sandbox path is
-        // process-private, so no concurrent writer is expected.
+        // Codex writes `trusted_hash` into `[hooks.state]` of the sandbox
+        // copy of `config.toml` when the user accepts a hook hash inside
+        // the container; that copy is overwritten on each
+        // `sync_agent_config` from the host. Snapshot here and restore
+        // after the sync so accepted hashes survive the host-to-sandbox
+        // refresh (the sandbox value wins by design, since trust is local
+        // to the container). The codex config lock is released between
+        // snapshot and restore; the sandbox path is process-private, so
+        // no concurrent writer is expected.
         let preserved_codex_state = if agent_format_is_codex_json(mount.tool_name) {
             let sandbox_config = sandbox_dir.join("config.toml");
             crate::hooks::snapshot_codex_hooks_state(&sandbox_config)
@@ -736,14 +737,17 @@ fn prepare_sandbox_dir(mount: &AgentConfigMount, home: &Path) -> Result<std::pat
 
         if let Some(state) = preserved_codex_state {
             let sandbox_config = sandbox_dir.join("config.toml");
-            if sandbox_config.exists() {
-                if let Err(e) = crate::hooks::restore_codex_hooks_state(&sandbox_config, state) {
-                    tracing::warn!(target: "session.profile",
-                        "Failed to restore Codex [hooks.state] in {}: {}",
-                        sandbox_config.display(),
-                        e
-                    );
-                }
+            if !sandbox_config.exists() {
+                tracing::warn!(target: "session.profile",
+                    "Codex [hooks.state] snapshotted but sandbox config.toml absent after sync at {}; trust block dropped",
+                    sandbox_config.display()
+                );
+            } else if let Err(e) = crate::hooks::restore_codex_hooks_state(&sandbox_config, state) {
+                tracing::warn!(target: "session.profile",
+                    "Failed to restore Codex [hooks.state] in {}: {}",
+                    sandbox_config.display(),
+                    e
+                );
             }
         }
 

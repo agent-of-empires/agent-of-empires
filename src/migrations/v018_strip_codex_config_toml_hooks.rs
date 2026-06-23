@@ -515,7 +515,7 @@ mod tests {
     }
 
     #[test]
-    fn static_no_agent_uses_codex_toml_format_post_flip() {
+    fn codex_agent_declares_codex_json_hook_format() {
         // Regression lock for the Codex hooks.json pivot: the codex agent must declare
         // `HookFormat::CodexJson`. The `CodexToml` variant of `HookFormat`
         // is absent from the codebase, so this test pins the chosen value

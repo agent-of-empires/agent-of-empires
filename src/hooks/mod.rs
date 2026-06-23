@@ -119,9 +119,9 @@ pub fn codex_config_path_display() -> String {
         .unwrap_or_else(|| "~/.codex/config.toml".to_string())
 }
 
-// Production paths resolve `hooks.json` (via `codex_hooks_json_path_*`)
-// after the `HookFormat::CodexJson` adoption; these `config.toml` helpers
-// stay for the v015/v017/v018 fixtures that synthesise `CodexToml` targets.
+// `hooks.json` is the production target for codex hooks; these
+// `config.toml` path helpers stay as test scaffolding for the
+// empty-`CODEX_HOME` fallback assertions in this module's unit tests.
 #[cfg(test)]
 pub(crate) fn codex_config_path_for_host_environment(entries: &[String]) -> Result<PathBuf> {
     let home =
@@ -921,6 +921,10 @@ pub(crate) fn install_codex_hooks(
     install_codex_hooks_with_preserved_state(config_path, events, None, target)
 }
 
+/// Read `[hooks.state]` from `config_path` under the codex config lock and
+/// return it for later restoration. Inverse of [`restore_codex_hooks_state`];
+/// returns `Ok(None)` when the file is absent so callers can no-op the
+/// snapshot/restore bracket.
 pub(crate) fn snapshot_codex_hooks_state(config_path: &Path) -> Result<Option<toml_edit::Item>> {
     if !config_path.exists() {
         return Ok(None);
@@ -940,7 +944,9 @@ pub(crate) fn snapshot_codex_hooks_state(config_path: &Path) -> Result<Option<to
 /// taking the codex config lock. Inverse of [`snapshot_codex_hooks_state`];
 /// together they bracket destructive rewrites of `config.toml` (e.g. the
 /// host-to-sandbox refresh in [`crate::session::container_config`]) so
-/// Codex's user-trust block survives.
+/// Codex's user-trust block survives. Unconditionally overwrites any
+/// `state` already present at `config_path`; pair only with a fresh
+/// snapshot from the authoritative source.
 pub(crate) fn restore_codex_hooks_state(config_path: &Path, state: toml_edit::Item) -> Result<()> {
     with_codex_config_lock(config_path, || {
         let mut config = read_codex_config(config_path)?;
