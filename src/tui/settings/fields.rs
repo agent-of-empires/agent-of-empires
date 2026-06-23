@@ -438,6 +438,19 @@ fn json_to_list(current: &Value) -> Vec<String> {
     }
 }
 
+/// Built-in agents that can run a one-shot rename (a `oneshot_flag`) AND are
+/// installed on this host. The smart-rename agent picker offers only these, so
+/// a user cannot pick an agent the one-shot would just fail on. Detection uses
+/// the per-agent availability check directly to avoid the `Config::load` side
+/// effects of `AvailableTools::detect()`.
+fn installed_oneshot_agents() -> Vec<String> {
+    crate::agents::oneshot_capable_names()
+        .into_iter()
+        .filter(|name| crate::agents::get_agent(name).is_some_and(crate::tmux::is_agent_available))
+        .map(|name| name.to_string())
+        .collect()
+}
+
 /// Build a `FieldValue` for a `custom:*` widget from its current JSON.
 fn custom_value_from_json(id: &str, current: &Value) -> FieldValue {
     match id {
@@ -451,6 +464,18 @@ fn custom_value_from_json(id: &str, current: &Value) -> FieldValue {
             let mut options = vec!["Auto (first available)".to_string()];
             options.extend(crate::agents::agent_names().iter().map(|n| n.to_string()));
             let selected = crate::agents::settings_index_from_name(current.as_str());
+            FieldValue::Select { selected, options }
+        }
+        "smart-rename-agent" => {
+            let names = installed_oneshot_agents();
+            let mut options = vec!["Same as session".to_string()];
+            options.extend(names.iter().cloned());
+            let current = current.as_str().unwrap_or("").trim();
+            let selected = if current.is_empty() {
+                0
+            } else {
+                names.iter().position(|n| n == current).map_or(0, |i| i + 1)
+            };
             FieldValue::Select { selected, options }
         }
         "sound-mode" => {
@@ -562,6 +587,19 @@ fn custom_value_to_json(id: &str, value: &FieldValue) -> Value {
             match crate::agents::name_from_settings_index(*selected) {
                 Some(name) => json!(name),
                 None => Value::Null,
+            }
+        }
+        ("smart-rename-agent", FieldValue::Select { selected, .. }) => {
+            // Index 0 is "Same as session" (empty string); the rest index into
+            // the installed one-shot-capable agents, rebuilt identically to the
+            // read path so the index maps back to the same name.
+            if *selected == 0 {
+                json!("")
+            } else {
+                installed_oneshot_agents()
+                    .get(*selected - 1)
+                    .map(|name| json!(name))
+                    .unwrap_or_else(|| json!(""))
             }
         }
         ("sound-mode", FieldValue::Select { selected, .. }) => {
@@ -1114,6 +1152,30 @@ mod tests {
         assert_eq!(
             custom_value_to_json("acp-defaults", &FieldValue::Text("[1,2]".to_string())),
             json!({}),
+        );
+    }
+
+    #[test]
+    fn smart_rename_agent_widget_same_as_session_round_trips() {
+        // "Same as session" is index 0 and persists as the empty string,
+        // independent of which agents are installed on the test host.
+        assert!(matches!(
+            custom_value_from_json("smart-rename-agent", &json!("")),
+            FieldValue::Select { selected: 0, ref options } if options[0] == "Same as session"
+        ));
+        assert!(matches!(
+            custom_value_from_json("smart-rename-agent", &Value::Null),
+            FieldValue::Select { selected: 0, .. }
+        ));
+        assert_eq!(
+            custom_value_to_json(
+                "smart-rename-agent",
+                &FieldValue::Select {
+                    selected: 0,
+                    options: vec!["Same as session".to_string()],
+                },
+            ),
+            json!(""),
         );
     }
 
