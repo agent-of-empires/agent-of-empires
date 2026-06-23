@@ -842,8 +842,8 @@ export const SessionRow = memo(function SessionRow({
     setContextMenu(null);
     if (!acpSession) return;
     const result = await smartRenameSession(acpSession.id);
-    if (!result.ok && result.message) {
-      reportError(result.message);
+    if (!result.ok) {
+      reportError(result.message ?? "Could not start auto-name. Please try again.");
     }
   };
 
