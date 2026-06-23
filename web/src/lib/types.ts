@@ -100,6 +100,13 @@ export interface SessionResponse {
    *  a one-shot title call is in flight; `inactive`/absent otherwise. Drives
    *  the sidebar auto-name chip. See session::smart_rename. */
   smart_rename?: "inactive" | "pending" | "running";
+  /** True when the session still carries its auto-generated civilization name.
+   *  Gates the sidebar "Auto-name now" action, which only re-runs smart rename
+   *  on a still-default session. More reliable than `smart_rename` for this: a
+   *  timed-out one-shot stays `pending` while an unusable-output one goes
+   *  `inactive`, but both leave the name default and recoverable. Populated by
+   *  the session list; absent on single-session responses. */
+  default_name?: boolean;
   /** True when this session's agent can run in acp: a built-in with
    *  an ACP adapter, or a custom agent whose profile config declares a
    *  valid `agent_acp_cmd`. The terminal view's "switch to acp"

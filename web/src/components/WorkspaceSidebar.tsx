@@ -59,7 +59,13 @@ import { useIdleDecayWindowMs } from "../lib/idleDecay";
 import { exceedsTouchSlop } from "../lib/longPress";
 import { useUnreadIndicatorEnabled } from "../lib/unreadIndicator";
 import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
-import { renameSession, setSessionNotifications, setWorktreeName, updateSessionGroup } from "../lib/api";
+import {
+  renameSession,
+  setSessionNotifications,
+  setWorktreeName,
+  smartRenameSession,
+  updateSessionGroup,
+} from "../lib/api";
 import { useServerDown, OFFLINE_TITLE } from "../lib/connectionState";
 import { requestOpenSession } from "../lib/sessionRoute";
 import { requestSwitchAgent } from "../lib/switchAgentTrigger";
@@ -827,6 +833,20 @@ export const SessionRow = memo(function SessionRow({
     requestSwitchAgent(acpSession.id);
   };
 
+  // Re-run smart rename ("Auto-name now") for a structured session whose
+  // automatic rename never landed. Best-effort and async: a success just means
+  // the one-shot was re-triggered; the title updates over the live session
+  // stream when it completes. Only offered while the session is still
+  // default-named (see the menu gate), so it never overwrites a chosen title.
+  const handleAutoNameNow = async () => {
+    setContextMenu(null);
+    if (!acpSession) return;
+    const result = await smartRenameSession(acpSession.id);
+    if (!result.ok && result.message) {
+      reportError(result.message);
+    }
+  };
+
   // Effective state for rendering: optimistic overrides win until the
   // sidebar's overlay reconciler drops them once the prop catches up.
   const effectivePinned = effectivePinnedOf(optimistic, isPinned);
@@ -1279,6 +1299,16 @@ export const SessionRow = memo(function SessionRow({
                   >
                     <ArrowLeftRight className="h-3.5 w-3.5 shrink-0" />
                     Switch agent
+                  </button>
+                )}
+                {!readOnly && acpSession?.default_name && (
+                  <button
+                    onClick={() => void handleAutoNameNow()}
+                    data-testid="sidebar-context-menu-auto-name"
+                    className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+                  >
+                    <Sparkles className="h-3.5 w-3.5 shrink-0" />
+                    Auto-name now
                   </button>
                 )}
                 {!readOnly && canStop && (

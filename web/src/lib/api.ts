@@ -1275,6 +1275,32 @@ export async function renameSession(id: string, title: string): Promise<{ ok: bo
 }
 
 /**
+ * Manually re-run smart rename ("Auto-name now") for a still-default-named
+ * structured-view session whose automatic rename never landed. Best-effort and
+ * async: a 202 means the one-shot was re-triggered, not that the title changed.
+ * Returns the server message on failure (409 when the session already has a
+ * custom name or has no prompt yet) so the caller can surface it.
+ */
+export async function smartRenameSession(id: string): Promise<{ ok: boolean; message?: string }> {
+  try {
+    const res = await fetch(`/api/sessions/${encodeURIComponent(id)}/smart-rename`, {
+      method: "POST",
+    });
+    if (res.ok) return { ok: true };
+    let message: string | undefined;
+    try {
+      const body = await res.json();
+      message = typeof body?.message === "string" ? body.message : undefined;
+    } catch {
+      // non-JSON error body; fall through with no message
+    }
+    return { ok: false, message };
+  } catch {
+    return { ok: false };
+  }
+}
+
+/**
  * Edit a managed worktree session's workdir name: move the worktree
  * directory and, optionally, rename its git branch. The session must not be
  * running. Returns the server's validation message on failure so the caller
