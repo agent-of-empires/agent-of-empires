@@ -668,6 +668,24 @@ pub const AGENTS: &[AgentDef] = &[
 ];
 
 /// Look up an agent by canonical name.
+impl AgentDef {
+    /// Extra argv tokens inserted between the one-shot flag and the prompt for a
+    /// one-shot (smart-rename) title call. These are static, never user input,
+    /// so the no-injection contract (prompt stays the final argv element) holds.
+    ///
+    /// Codex's `exec` refuses to run outside a trusted git repo
+    /// ("Not inside a trusted directory and --skip-git-repo-check was not
+    /// specified", exit 1), so a one-shot in a scratch or other non-repo session
+    /// cwd fails. `--skip-git-repo-check` lets the title call run anywhere; the
+    /// title task does not touch the repo, so skipping the check is safe.
+    pub fn oneshot_extra_args(&self) -> &'static [&'static str] {
+        match self.name {
+            "codex" => &["--skip-git-repo-check"],
+            _ => &[],
+        }
+    }
+}
+
 pub fn get_agent(name: &str) -> Option<&'static AgentDef> {
     AGENTS.iter().find(|a| a.name == name)
 }

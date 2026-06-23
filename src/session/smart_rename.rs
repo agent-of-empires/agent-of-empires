@@ -184,11 +184,13 @@ pub fn build_prompt(user_message: &str) -> String {
 /// into a shell string, so untrusted user text cannot inject arguments.
 pub fn build_oneshot_argv(agent: &agents::AgentDef, prompt: &str) -> Option<Vec<String>> {
     let token = agent.oneshot_flag?;
-    Some(vec![
-        agent.binary.to_string(),
-        token.to_string(),
-        prompt.to_string(),
-    ])
+    let mut argv = vec![agent.binary.to_string(), token.to_string()];
+    // Static per-agent flags (e.g. codex `--skip-git-repo-check`) go between the
+    // one-shot token and the prompt; the prompt stays the final argv element so
+    // untrusted user text can never be read as an argument.
+    argv.extend(agent.oneshot_extra_args().iter().map(|s| s.to_string()));
+    argv.push(prompt.to_string());
+    Some(argv)
 }
 
 /// Turn raw agent stdout into a clean title, or `None` to keep the generated
@@ -437,7 +439,10 @@ mod serve {
         cmd.args(&argv[1..])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
+            // Capture stderr so a non-zero exit logs WHY (e.g. codex's
+            // "Not inside a trusted directory"); without it the failure is an
+            // opaque exit code.
+            .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
         if !cwd.is_empty() {
             cmd.current_dir(cwd);
@@ -454,7 +459,17 @@ mod serve {
                 Some(String::from_utf8_lossy(&out.stdout).into_owned())
             }
             Ok(Ok(out)) => {
-                tracing::debug!(target: "smart_rename", "one-shot exited {:?}", out.status.code());
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let tail: String = stderr
+                    .trim()
+                    .chars()
+                    .rev()
+                    .take(300)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                tracing::debug!(target: "smart_rename", code = ?out.status.code(), stderr = %tail, "one-shot exited non-zero");
                 None
             }
             Ok(Err(e)) => {
@@ -601,6 +616,24 @@ mod tests {
         );
         // Command equal to the agent binary is not an override.
         assert!(check_eligible(true, true, "Vikings", c, false, "claude", false).is_ok());
+    }
+
+    #[test]
+    fn argv_codex_skips_git_repo_check_with_prompt_last() {
+        // codex `exec` refuses to run outside a git repo without this flag, so a
+        // scratch-session one-shot would exit non-zero. The flag goes between
+        // the token and the prompt; the prompt stays the final element.
+        let argv = build_oneshot_argv(agents::get_agent("codex").unwrap(), "name this")
+            .expect("codex one-shot");
+        assert_eq!(
+            argv,
+            vec!["codex", "exec", "--skip-git-repo-check", "name this"]
+        );
+        // claude takes no extra args: still [binary, flag, prompt].
+        assert_eq!(
+            build_oneshot_argv(claude(), "name this").unwrap(),
+            vec!["claude", "-p", "name this"]
+        );
     }
 
     #[test]
