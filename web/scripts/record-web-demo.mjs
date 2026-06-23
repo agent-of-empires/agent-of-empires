@@ -54,13 +54,19 @@ rmSync(recDir, { recursive: true, force: true });
 mkdirSync(recDir, { recursive: true });
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const sessionStatus = async () => {
+const listSessions = async () => {
   try {
     const a = await (await fetch(`${baseUrl}/api/sessions`)).json();
-    return a.sessions?.[0]?.status ?? "(none)";
+    return a.sessions ?? [];
   } catch {
-    return "(err)";
+    return [];
   }
+};
+const statusOf = async (id) => (await listSessions()).find((s) => s.id === id)?.status ?? "(none)";
+const runOrThrow = (cmd, cmdArgs) => {
+  const r = spawnSync(cmd, cmdArgs, { stdio: "inherit" });
+  if (r.error) throw r.error;
+  if (r.status !== 0) throw new Error(`${cmd} exited with code ${r.status}`);
 };
 
 const sizeOpts = isMobile ? devices["iPhone 13"] : { viewport: { width: 1280, height: 800 }, deviceScaleFactor: 2 };
@@ -97,16 +103,27 @@ if (await title.count()) await title.first().fill("Claude Code");
 await sleep(500);
 await page.getByRole("button", { name: "claude", exact: true }).first().click();
 await sleep(700);
+const idsBefore = new Set((await listSessions()).map((s) => s.id));
 await page
   .getByRole("button", { name: /Launch session/i })
   .first()
   .click();
 
-// Wait for the structured view to be ready (agent Idle + composer visible).
+// Wait for the new session to appear and its structured view to be ready
+// (agent Idle + composer visible). Track it by id so a stray pre-existing
+// session never confuses the status waits.
 const composer = page.getByPlaceholder(/Send a message/i).first();
+let sessionId = null;
 for (let i = 0; i < 40; i++) {
   await sleep(1000);
-  if ((await sessionStatus()) === "Idle" && (await composer.count()) && (await composer.isVisible().catch(() => false)))
+  const fresh = (await listSessions()).find((s) => !idsBefore.has(s.id));
+  if (fresh) sessionId = fresh.id;
+  if (
+    sessionId &&
+    (await statusOf(sessionId)) === "Idle" &&
+    (await composer.count()) &&
+    (await composer.isVisible().catch(() => false))
+  )
     break;
 }
 await sleep(1500);
@@ -130,14 +147,14 @@ if (isMobile) {
   }
   for (let i = 0; i < 24; i++) {
     await sleep(800);
-    if ((await sessionStatus()) === "Idle" && i > 2) break;
+    if ((await statusOf(sessionId)) === "Idle" && i > 2) break;
   }
   await sleep(2500);
 } else {
   // Desktop keeps the sidebar visible; just let the answer stream in.
   for (let i = 0; i < 24; i++) {
     await sleep(800);
-    if ((await sessionStatus()) === "Idle" && i > 4) break;
+    if ((await statusOf(sessionId)) === "Idle" && i > 4) break;
   }
   await sleep(2500);
 }
@@ -158,24 +175,18 @@ const palette = join(recDir, "palette.png");
 const fps = 12;
 const ss = "0.7"; // trim the initial page-load lead-in (keep a little dashboard dwell)
 const filters = `fps=${fps},scale=${isMobile ? 360 : 960}:-1:flags=lanczos`;
-spawnSync("ffmpeg", ["-y", "-ss", ss, "-i", webmPath, "-vf", `${filters},palettegen=max_colors=128`, palette], {
-  stdio: "inherit",
-});
-spawnSync(
-  "ffmpeg",
-  [
-    "-y",
-    "-ss",
-    ss,
-    "-i",
-    webmPath,
-    "-i",
-    palette,
-    "-lavfi",
-    `${filters} [x]; [x][1:v] paletteuse=dither=bayer:bayer_scale=5`,
-    outGif,
-  ],
-  { stdio: "inherit" },
-);
+runOrThrow("ffmpeg", ["-y", "-ss", ss, "-i", webmPath, "-vf", `${filters},palettegen=max_colors=128`, palette]);
+runOrThrow("ffmpeg", [
+  "-y",
+  "-ss",
+  ss,
+  "-i",
+  webmPath,
+  "-i",
+  palette,
+  "-lavfi",
+  `${filters} [x]; [x][1:v] paletteuse=dither=bayer:bayer_scale=5`,
+  outGif,
+]);
 console.log("gif:", outGif);
 process.exit(0);

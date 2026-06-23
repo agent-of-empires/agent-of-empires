@@ -51,6 +51,11 @@ const recDir = join(repoRoot, "target", "tui-demo-recording");
 rmSync(recDir, { recursive: true, force: true });
 mkdirSync(recDir, { recursive: true });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const runOrThrow = (cmd, cmdArgs) => {
+  const r = spawnSync(cmd, cmdArgs, { stdio: "inherit" });
+  if (r.error) throw r.error;
+  if (r.status !== 0) throw new Error(`${cmd} exited with code ${r.status}`);
+};
 
 const browser = await chromium.launch({ args: ["--no-sandbox"] });
 const context = await browser.newContext({
@@ -121,24 +126,18 @@ const palette = join(recDir, "palette.png");
 const fps = 12;
 const ss = "3.6"; // trim the ttyd connect + boot lead-in
 const filters = `fps=${fps},scale=960:-1:flags=lanczos`;
-spawnSync("ffmpeg", ["-y", "-ss", ss, "-i", webmPath, "-vf", `${filters},palettegen=max_colors=96`, palette], {
-  stdio: "inherit",
-});
-spawnSync(
-  "ffmpeg",
-  [
-    "-y",
-    "-ss",
-    ss,
-    "-i",
-    webmPath,
-    "-i",
-    palette,
-    "-lavfi",
-    `${filters} [x]; [x][1:v] paletteuse=dither=bayer:bayer_scale=5`,
-    outGif,
-  ],
-  { stdio: "inherit" },
-);
+runOrThrow("ffmpeg", ["-y", "-ss", ss, "-i", webmPath, "-vf", `${filters},palettegen=max_colors=96`, palette]);
+runOrThrow("ffmpeg", [
+  "-y",
+  "-ss",
+  ss,
+  "-i",
+  webmPath,
+  "-i",
+  palette,
+  "-lavfi",
+  `${filters} [x]; [x][1:v] paletteuse=dither=bayer:bayer_scale=5`,
+  outGif,
+]);
 console.log("gif:", outGif);
 process.exit(0);
