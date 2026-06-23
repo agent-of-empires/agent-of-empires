@@ -783,6 +783,16 @@ pub(crate) fn persist_session_to_storage(
     }
 }
 
+/// Emit `fresh` only when it differs from the stored session id, the
+/// "override only when distinct" contract shared by both branches of
+/// `capture_freshest_session_id` (sidecar and mtime fallback).
+fn override_if_distinct(stored: Option<&str>, fresh: String) -> Option<String> {
+    match stored {
+        Some(known) if known == fresh => None,
+        _ => Some(fresh),
+    }
+}
+
 /// Publish a captured session ID to the tmux environment only.
 ///
 /// Background threads (poller on_change) call this so that
@@ -1601,32 +1611,38 @@ impl Instance {
     /// For Claude the authoritative per-instance sidecar
     /// (`/tmp/aoe-hooks-<euid>/<instance_id>/session_id`, written by the
     /// SessionStart / UserPromptSubmit hooks) is consulted first. It is keyed
-    /// by instance id, so it can never name a peer instance's conversation —
+    /// by instance id, so it can never name a peer instance's conversation,
     /// unlike the mtime disk scan, which picks the most-recent jsonl in the
     /// shared `~/.claude/projects/<encoded-cwd>/` dir and so can select a
     /// co-located peer's session when several AoE sessions share one cwd
     /// (#2344). The mtime scan is only used as a fallback when no fresh
     /// sidecar exists (e.g. an old session resumed after the 5-minute
     /// sidecar window), matching the ordering already used by
-    /// `claude_poll_fn`.
+    /// `claude_poll_fn`. Sandboxed Claude is included: its `SessionStart`
+    /// hook writes through the `/tmp/aoe-hooks/<id>` bind-mount onto the
+    /// host path, so `read_hook_session_id` reads it the same way, and the
+    /// mtime fallback below still routes through the container-aware branch
+    /// of `try_retroactive_capture`.
+    ///
+    /// Two deliberate divergences from `claude_poll_fn`, both correct for the
+    /// resume context: (1) an excluded sidecar id returns `None` here rather
+    /// than falling through to the mtime scan, since falling through is what
+    /// re-opens #2344; (2) this reader and `claude_poll_fn` read the same
+    /// sidecar without a shared snapshot, so a hook rotation between the two
+    /// reads can briefly surface different UUIDs, benign under the existing
+    /// eventual-consistency capture model.
     pub(crate) fn capture_freshest_session_id(&self) -> Option<String> {
-        if self.tool == "claude" && !self.is_sandboxed() {
+        if self.tool == "claude" {
             if let Some(authoritative) = crate::hooks::read_hook_session_id(&self.id) {
                 if self.retroactive_capture_excludes.contains(&authoritative) {
                     return None;
                 }
-                return match self.agent_session_id.as_deref() {
-                    Some(known) if known == authoritative => None,
-                    _ => Some(authoritative),
-                };
+                return override_if_distinct(self.agent_session_id.as_deref(), authoritative);
             }
         }
 
         let live = self.try_retroactive_capture()?;
-        match self.agent_session_id.as_deref() {
-            Some(known) if known == live => None,
-            _ => Some(live),
-        }
+        override_if_distinct(self.agent_session_id.as_deref(), live)
     }
 
     fn apply_session_flags(&mut self, cmd: &mut String, context: &str) -> bool {
@@ -7051,6 +7067,65 @@ mod tests {
 
                 // The authoritative sidecar matches the stored sid, so no
                 // override happens despite the peer's fresher jsonl.
+                assert_eq!(sid.as_deref(), Some(mine));
+                assert!(is_existing);
+                assert_eq!(inst.agent_session_id.as_deref(), Some(mine));
+            }
+
+            // #2344 follow-up: a sandboxed Claude session must also consult the
+            // sidecar. Its SessionStart hook writes through the
+            // `/tmp/aoe-hooks/<id>` bind-mount onto the host path, so
+            // `read_hook_session_id` reads it the same way a host session's is
+            // read. Without the sidecar short-circuit the sandbox-aware mtime
+            // branch would pick a peer's fresher jsonl in the shared cwd.
+            #[test]
+            #[serial]
+            fn sidecar_consulted_for_sandboxed_claude() {
+                let temp = tempdir().unwrap();
+                let _guard = ClaudeHomeGuard::set(&temp);
+
+                let project_path = "/tmp/aoe-test-2344-sandbox";
+                let claude_dir = temp
+                    .path()
+                    .join(".claude")
+                    .join("projects")
+                    .join(encode_claude_project_path(project_path));
+                fs::create_dir_all(&claude_dir).unwrap();
+
+                let mine = "eeeeeeee-5555-4555-8555-eeeeeeeeeeee";
+                let peer = "ffffffff-6666-4666-8666-ffffffffffff";
+                let now = SystemTime::now();
+                write_jsonl_with_mtime(
+                    &claude_dir.join(format!("{mine}.jsonl")),
+                    now - Duration::from_secs(120),
+                );
+                write_jsonl_with_mtime(
+                    &claude_dir.join(format!("{peer}.jsonl")),
+                    now - Duration::from_secs(5),
+                );
+
+                let mut inst = Instance::new("verify-2344-sandbox", project_path);
+                inst.tool = "claude".to_string();
+                inst.agent_session_id = Some(mine.to_string());
+                inst.resume_intent = ResumeIntent::Default;
+                inst.sandbox_info = Some(crate::session::SandboxInfo {
+                    enabled: true,
+                    container_id: None,
+                    image: "test-image".to_string(),
+                    container_name: "verify-2344-sandbox".to_string(),
+                    extra_env: None,
+                    custom_instruction: None,
+                    before_start_env: Vec::new(),
+                });
+                assert!(inst.is_sandboxed());
+
+                let dir = super::write_sidecar(&inst.id, mine);
+                let (sid, is_existing) = inst.acquire_session_id();
+                std::fs::remove_dir_all(&dir).ok();
+
+                // Sidecar (host-readable) names this instance's conversation, so
+                // the peer's fresher jsonl does not win even though sandbox would
+                // otherwise route through the container-aware mtime branch.
                 assert_eq!(sid.as_deref(), Some(mine));
                 assert!(is_existing);
                 assert_eq!(inst.agent_session_id.as_deref(), Some(mine));
