@@ -25,13 +25,14 @@ mod v014_rename_default_theme;
 mod v015_rewrite_hook_strings;
 mod v016_clear_archived_tmux_gone_error;
 mod v017_rewrite_hook_strings_for_per_user_base;
+mod v018_strip_codex_config_toml_hooks;
 
 use anyhow::Result;
 use std::fs;
 use std::path::PathBuf;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 17;
+const CURRENT_VERSION: u32 = 18;
 const VERSION_FILE: &str = ".schema_version";
 
 struct Migration {
@@ -125,6 +126,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 17,
         name: "rewrite_hook_strings_for_per_user_base",
         run: v017_rewrite_hook_strings_for_per_user_base::run,
+    },
+    Migration {
+        version: 18,
+        name: "strip_codex_config_toml_hooks",
+        run: v018_strip_codex_config_toml_hooks::run,
     },
 ];
 

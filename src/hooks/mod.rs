@@ -119,12 +119,17 @@ pub fn codex_config_path_display() -> String {
         .unwrap_or_else(|| "~/.codex/config.toml".to_string())
 }
 
+// Production paths resolve `hooks.json` (via `codex_hooks_json_path_*`)
+// after the `HookFormat::CodexJson` adoption; these `config.toml` helpers
+// stay for the v015/v017/v018 fixtures that synthesise `CodexToml` targets.
+#[cfg(test)]
 pub(crate) fn codex_config_path_for_host_environment(entries: &[String]) -> Result<PathBuf> {
     let home =
         dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
     Ok(codex_config_path_in(&home, entries))
 }
 
+#[cfg(test)]
 pub(crate) fn codex_config_path_display_for_host_environment(entries: &[String]) -> String {
     crate::session::environment::resolve_host_environment_value(entries, "CODEX_HOME")
         .filter(|v| !v.is_empty())
@@ -135,6 +140,56 @@ pub(crate) fn codex_config_path_display_for_host_environment(entries: &[String])
                 .to_string()
         })
         .unwrap_or_else(codex_config_path_display)
+}
+
+/// Home-injectable variant of [`codex_hooks_json_path_for_host_environment`]:
+/// resolves Codex's `hooks.json` under the given `home` directory, honoring
+/// an explicit `CODEX_HOME` in `host_env` (or the AoE process env), then
+/// falling back to `<home>/.codex/hooks.json`.
+pub(crate) fn codex_hooks_json_path_in(home: &Path, host_env: &[String]) -> PathBuf {
+    if let Some(codex_home) =
+        crate::session::environment::resolve_host_environment_value(host_env, "CODEX_HOME")
+            .or_else(|| std::env::var("CODEX_HOME").ok())
+            .filter(|v| !v.is_empty())
+    {
+        return PathBuf::from(codex_home).join("hooks.json");
+    }
+    home.join(".codex").join("hooks.json")
+}
+
+/// Process-env variant of [`codex_hooks_json_path_in`]: resolves Codex's
+/// `hooks.json` against the live `dirs::home_dir()` so install paths
+/// outside the migration boot loop share a single call shape.
+pub(crate) fn codex_hooks_json_path_for_host_environment(entries: &[String]) -> Result<PathBuf> {
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+    Ok(codex_hooks_json_path_in(&home, entries))
+}
+
+/// Display-string variant of [`codex_hooks_json_path_for_host_environment`]
+/// used by the TUI consent dialog; falls back to the literal
+/// `~/.codex/hooks.json` string when the home directory cannot be resolved.
+pub(crate) fn codex_hooks_json_path_display_for_host_environment(entries: &[String]) -> String {
+    crate::session::environment::resolve_host_environment_value(entries, "CODEX_HOME")
+        .filter(|v| !v.is_empty())
+        .map(|codex_home| {
+            PathBuf::from(codex_home)
+                .join("hooks.json")
+                .display()
+                .to_string()
+        })
+        .unwrap_or_else(|| {
+            std::env::var("CODEX_HOME")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .map(|codex_home| {
+                    PathBuf::from(codex_home)
+                        .join("hooks.json")
+                        .display()
+                        .to_string()
+                })
+                .unwrap_or_else(|| "~/.codex/hooks.json".to_string())
+        })
 }
 
 /// Resolve the host settings-file path for an agent whose config directory may
@@ -375,8 +430,14 @@ pub(crate) enum HookTargetKind {
     /// `hooks.<event>[].hooks[].command`.
     JsonSettings,
     /// Codex `config.toml`: file-locked, symlink-resolved, with a user-trust
-    /// `[hooks].state` block to preserve.
+    /// `[hooks.state]` block to preserve. Only the v018 legacy-cleanup
+    /// migration (#2188) constructs this variant; no agent declares
+    /// `HookFormat::CodexToml`.
     CodexToml,
+    /// Codex `hooks.json`: same JSON payload shape as `JsonSettings`, but
+    /// the path is resolved through `codex_hooks_json_path_in`
+    /// (`CODEX_HOME` aware).
+    CodexJson,
     /// settl/hermes/kiro: a config format the JSON path cannot emit; install
     /// goes through the agent's bundled `SidecarHooks` function pointers.
     Sidecar(&'static crate::agents::SidecarHooks),
@@ -426,7 +487,7 @@ pub(crate) fn iter_hook_targets_in(home: &Path, env_lists: &[Vec<String>]) -> Ve
                     crate::agents::HookFormat::JsonSettings => {
                         agent_settings_path_in(home, hook_cfg, env)
                     }
-                    crate::agents::HookFormat::CodexToml => codex_config_path_in(home, env),
+                    crate::agents::HookFormat::CodexJson => codex_hooks_json_path_in(home, env),
                 }
             };
             push_unique_target_path(&mut paths, resolve(&[]));
@@ -435,7 +496,7 @@ pub(crate) fn iter_hook_targets_in(home: &Path, env_lists: &[Vec<String>]) -> Ve
             }
             let kind = match hook_cfg.format {
                 crate::agents::HookFormat::JsonSettings => HookTargetKind::JsonSettings,
-                crate::agents::HookFormat::CodexToml => HookTargetKind::CodexToml,
+                crate::agents::HookFormat::CodexJson => HookTargetKind::CodexJson,
             };
             for path in paths {
                 out.push(HookTarget {
@@ -505,7 +566,9 @@ pub(crate) fn has_aoe_marker(target: &HookTarget) -> bool {
         return false;
     }
     match target.kind {
-        HookTargetKind::JsonSettings => json_settings_has_aoe_marker(&target.path),
+        HookTargetKind::JsonSettings | HookTargetKind::CodexJson => {
+            json_settings_has_aoe_marker(&target.path)
+        }
         HookTargetKind::CodexToml => codex_config_has_aoe_marker(&target.path),
         HookTargetKind::Sidecar(sidecar) => match sidecar.format {
             crate::agents::SidecarFormat::SettlToml => settl_config_has_aoe_marker(&target.path),
@@ -849,7 +912,8 @@ const CODEX_HOOK_EVENT_NAMES: &[&str] = &[
 ///
 /// Idempotent on disk: when the on-disk file already encodes the same
 /// AoE-managed hook subtree, it is not rewritten (same inode, same bytes).
-pub fn install_codex_hooks(
+#[cfg(test)]
+pub(crate) fn install_codex_hooks(
     config_path: &Path,
     events: &[crate::agents::HookEvent],
     target: HookInstallTarget,
@@ -869,6 +933,21 @@ pub(crate) fn snapshot_codex_hooks_state(config_path: &Path) -> Result<Option<to
             .and_then(|hooks| hooks.as_table_like())
             .and_then(|hooks| hooks.get("state"))
             .cloned())
+    })
+}
+
+/// Write `state` back into the `[hooks.state]` table of `config_path`,
+/// taking the codex config lock. Inverse of [`snapshot_codex_hooks_state`];
+/// together they bracket destructive rewrites of `config.toml` (e.g. the
+/// host-to-sandbox refresh in [`crate::session::container_config`]) so
+/// Codex's user-trust block survives.
+pub(crate) fn restore_codex_hooks_state(config_path: &Path, state: toml_edit::Item) -> Result<()> {
+    with_codex_config_lock(config_path, || {
+        let mut config = read_codex_config(config_path)?;
+        let hooks = ensure_codex_hooks_table(&mut config)?;
+        hooks.insert("state", state);
+        write_codex_config(config_path, &config)?;
+        Ok(())
     })
 }
 
@@ -1865,7 +1944,9 @@ pub fn uninstall_kiro_hooks(agent_config_path: &Path) -> Result<bool> {
 pub fn uninstall_all_hooks() {
     for target in iter_hook_targets() {
         let result = match target.kind {
-            HookTargetKind::JsonSettings => uninstall_hooks(&target.path),
+            HookTargetKind::JsonSettings | HookTargetKind::CodexJson => {
+                uninstall_hooks(&target.path)
+            }
             HookTargetKind::CodexToml => uninstall_codex_hooks(&target.path),
             HookTargetKind::Sidecar(sidecar) => (sidecar.uninstall)(&target.path),
         };
@@ -2428,12 +2509,12 @@ mod tests {
 
         let codex_paths: Vec<_> = iter_hook_targets()
             .into_iter()
-            .filter(|t| matches!(t.kind, HookTargetKind::CodexToml))
+            .filter(|t| matches!(t.kind, HookTargetKind::CodexJson))
             .map(|t| t.path)
             .collect();
 
-        assert!(codex_paths.contains(&tmp.path().join(".codex").join("config.toml")));
-        assert!(codex_paths.contains(&codex_home.join("config.toml")));
+        assert!(codex_paths.contains(&tmp.path().join(".codex").join("hooks.json")));
+        assert!(codex_paths.contains(&codex_home.join("hooks.json")));
     }
 
     #[test]

@@ -38,10 +38,12 @@ impl HooksInstallDialog {
                     .map(|config| config.environment)
                     .unwrap_or_default();
                 match hook_cfg.format {
-                    crate::agents::HookFormat::CodexToml => {
+                    crate::agents::HookFormat::CodexJson => {
                         needs_codex_trust_note = true;
                         settings_paths.push(
-                            crate::hooks::codex_config_path_display_for_host_environment(&host_env),
+                            crate::hooks::codex_hooks_json_path_display_for_host_environment(
+                                &host_env,
+                            ),
                         );
                     }
                     crate::agents::HookFormat::JsonSettings => {
@@ -482,8 +484,8 @@ mod tests {
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(text.contains(".codex/config.toml"));
-        assert!(!text.contains(".codex/hooks.json"));
+        assert!(text.contains(".codex/hooks.json"));
+        assert!(!text.contains(".codex/config.toml"));
         assert!(text.contains("trust these hooks in /hooks"));
         assert!(text.contains("pane-based status detection"));
     }
@@ -497,8 +499,8 @@ mod tests {
         let dialog = HooksInstallDialog::new("codex");
         let text = content_text(&dialog);
 
-        assert!(text.contains(&tmp.path().join("config.toml").display().to_string()));
-        assert!(!text.contains(".codex/hooks.json"));
+        assert!(text.contains(&tmp.path().join("hooks.json").display().to_string()));
+        assert!(!text.contains(&tmp.path().join("config.toml").display().to_string()));
     }
 
     #[test]
@@ -521,8 +523,8 @@ mod tests {
         let dialog = HooksInstallDialog::new_for_profile("codex", Some("codex-profile"));
         let text = content_text(&dialog);
 
-        assert!(text.contains(&codex_home.join("config.toml").display().to_string()));
-        assert!(!text.contains(".codex/hooks.json"));
+        assert!(text.contains(&codex_home.join("hooks.json").display().to_string()));
+        assert!(!text.contains(&codex_home.join("config.toml").display().to_string()));
     }
 
     #[test]

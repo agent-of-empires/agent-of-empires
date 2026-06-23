@@ -61,18 +61,20 @@ pub struct HookEvent {
 
 /// On-disk format an agent uses for its status-detection hooks. Each variant
 /// drives one install path: `JsonSettings` goes through the generic
-/// `hooks.<event>[].hooks[].command` JSON writer, `CodexToml` goes through
-/// the bespoke TOML writer with file-locked atomic replacement and
-/// `[hooks.state]` preservation.
+/// `hooks.<event>[].hooks[].command` JSON writer used by Claude-shape agents;
+/// `CodexJson` shares the same JSON payload but resolves its path through
+/// Codex's `CODEX_HOME` convention.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookFormat {
     /// JSON `settings.json` with `hooks.<event>[].hooks[].command`. Used by
     /// Claude, Cursor, Gemini, Qwen, and any future agent that adopts this
     /// shape.
     JsonSettings,
-    /// Codex `config.toml`. Symlink-resolved, file-locked, with the
-    /// `[hooks.state]` trust block preserved across rewrites.
-    CodexToml,
+    /// Codex `hooks.json`. Identical JSON payload shape to `JsonSettings`,
+    /// but the path is resolved via `CODEX_HOME` → `~/.codex/hooks.json`.
+    /// Codex's `[hooks.state]` trust block lives in `config.toml` and is
+    /// untouched by this writer.
+    CodexJson,
 }
 
 /// Configuration for installing status-detection hooks into an agent's settings file.
@@ -312,8 +314,7 @@ const QWEN_HOOK_EVENTS: &[HookEvent] = &[
     },
 ];
 
-/// Codex hook events. Codex loads these from the `[hooks]` table in
-/// `~/.codex/config.toml`.
+/// Codex hook events. AoE installs these into `~/.codex/hooks.json`.
 const CODEX_HOOK_EVENTS: &[HookEvent] = &[
     HookEvent {
         name: "SessionStart",
@@ -430,12 +431,12 @@ pub const AGENTS: &[AgentDef] = &[
         detect_status: status_detection::detect_codex_status,
         container_env: &[],
         hook_config: Some(AgentHookConfig {
-            settings_rel_path: ".codex/config.toml",
-            // Codex resolves its config dir via `CODEX_HOME` through a bespoke
-            // path pair; install/uninstall live behind the `CodexToml` variant.
+            settings_rel_path: ".codex/hooks.json",
+            // Codex's config dir resolves via `CODEX_HOME`, not a generic
+            // `config_dir_env_var`; the `CodexJson` writer handles that itself.
             config_dir_env_var: None,
             events: CODEX_HOOK_EVENTS,
-            format: HookFormat::CodexToml,
+            format: HookFormat::CodexJson,
         }),
         sidecar_hooks: None,
         resume_strategy: ResumeStrategy::Subcommand("resume"),
@@ -1039,7 +1040,7 @@ mod tests {
         // drift here is a behavior change.
         let expected: &[(&str, HookFormat)] = &[
             ("claude", HookFormat::JsonSettings),
-            ("codex", HookFormat::CodexToml),
+            ("codex", HookFormat::CodexJson),
             ("gemini", HookFormat::JsonSettings),
             ("cursor", HookFormat::JsonSettings),
             ("qwen", HookFormat::JsonSettings),

@@ -154,9 +154,13 @@ pub(crate) fn run_in(home: &Path, app_dir: &Path) -> Result<()> {
 /// from "AoE never installed event X."
 fn rewrite_one(target: &HookTarget) -> Result<()> {
     match target.kind {
-        HookTargetKind::JsonSettings => {
+        HookTargetKind::JsonSettings | HookTargetKind::CodexJson => {
             install_hooks(&target.path, target.events, HookInstallTarget::Host)
         }
+        // Defensive: `iter_hook_targets_in` does not emit `CodexToml` for
+        // any registered agent (codex declares `CodexJson`). The arm stays
+        // for `HookTargetKind` exhaustiveness and as a guard rail should a
+        // future agent reintroduce a TOML-format codex.
         HookTargetKind::CodexToml => {
             let preserved = snapshot_codex_hooks_state(&target.path)?;
             install_codex_hooks_with_preserved_state(
@@ -510,129 +514,6 @@ mod tests {
 
     #[test]
     #[serial_test::serial(shell_env)]
-    fn codex_state_preserved_across_rewrite() {
-        let _g = EnvGuard::unset_all();
-        let (_tmp, home, app_dir) = setup_dirs();
-        let codex = home.join(".codex/config.toml");
-        fs::create_dir_all(codex.parent().unwrap()).unwrap();
-        fs::write(
-            &codex,
-            format!(
-                "[hooks.state]\n\
-                 existing = {{ enabled = true, trusted_hash = \"keep-me\" }}\n\
-                 \n\
-                 [[hooks.SessionStart]]\n\
-                 [[hooks.SessionStart.hooks]]\n\
-                 type = \"command\"\n\
-                 command = {LEGACY_STATUS_CMD:?}\n"
-            ),
-        )
-        .unwrap();
-
-        run_in(&home, &app_dir).unwrap();
-
-        let text = fs::read_to_string(&codex).unwrap();
-        let parsed: toml::Value = toml::from_str(&text).unwrap();
-        assert_eq!(
-            parsed["hooks"]["state"]["existing"]["trusted_hash"].as_str(),
-            Some("keep-me"),
-            "[hooks.state] must survive the rewrite"
-        );
-        assert!(
-            text.contains("case \"$AOE_INSTANCE_ID\""),
-            "Codex hook command must be rewritten to the hardened form"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial(shell_env)]
-    fn codex_features_hooks_false_skipped() {
-        let _g = EnvGuard::unset_all();
-        let (_tmp, home, app_dir) = setup_dirs();
-        let codex = home.join(".codex/config.toml");
-        fs::create_dir_all(codex.parent().unwrap()).unwrap();
-        fs::write(
-            &codex,
-            format!(
-                "[features]\n\
-                 hooks = false\n\
-                 \n\
-                 [[hooks.SessionStart]]\n\
-                 [[hooks.SessionStart.hooks]]\n\
-                 type = \"command\"\n\
-                 command = {LEGACY_STATUS_CMD:?}\n"
-            ),
-        )
-        .unwrap();
-        let before = fs::read(&codex).unwrap();
-
-        run_in(&home, &app_dir).unwrap();
-
-        assert_eq!(
-            fs::read(&codex).unwrap(),
-            before,
-            "features.hooks=false must short-circuit; file must be byte-untouched"
-        );
-        let text = String::from_utf8(before).unwrap();
-        assert!(
-            !text.contains("case \"$AOE_INSTANCE_ID\""),
-            "no hardening must be applied when feature is disabled"
-        );
-        // Lock IS acquired even when features.hooks=false:
-        // `with_codex_config_lock` opens the sidecar with `O_CREAT` BEFORE
-        // running its closure, and the feature gate runs INSIDE. Positive
-        // assertion locks the existing behaviour against a refactor that
-        // would leak the lock check ahead of acquisition.
-        let lock_path = codex.with_extension("toml.lock");
-        assert!(
-            lock_path.exists(),
-            "Codex lock sidecar must be acquired unconditionally (see TOCTOU \
-             note in module doc)",
-        );
-    }
-
-    #[test]
-    #[serial_test::serial(shell_env)]
-    fn codex_features_codex_hooks_alias_false_skipped() {
-        // `features.codex_hooks = false` is the deprecated alias for
-        // `features.hooks = false`. Locks the alias support in
-        // `codex_hooks_feature_is_disabled` (`hooks/mod.rs::or_else` fallback)
-        // so a refactor cannot drop it without flipping a test red.
-        let _g = EnvGuard::unset_all();
-        let (_tmp, home, app_dir) = setup_dirs();
-        let codex = home.join(".codex/config.toml");
-        fs::create_dir_all(codex.parent().unwrap()).unwrap();
-        fs::write(
-            &codex,
-            format!(
-                "[features]\n\
-                 codex_hooks = false\n\
-                 \n\
-                 [[hooks.SessionStart]]\n\
-                 [[hooks.SessionStart.hooks]]\n\
-                 type = \"command\"\n\
-                 command = {LEGACY_STATUS_CMD:?}\n"
-            ),
-        )
-        .unwrap();
-        let before = fs::read(&codex).unwrap();
-
-        run_in(&home, &app_dir).unwrap();
-
-        assert_eq!(
-            fs::read(&codex).unwrap(),
-            before,
-            "features.codex_hooks=false (deprecated alias) must short-circuit",
-        );
-        let text = String::from_utf8(before).unwrap();
-        assert!(
-            !text.contains("case \"$AOE_INSTANCE_ID\""),
-            "no hardening must be applied when the legacy alias is disabled"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial(shell_env)]
     fn settl_marker_only_rewrites_aoe_lines() {
         let _g = EnvGuard::unset_all();
         let (_tmp, home, app_dir) = setup_dirs();
@@ -873,19 +754,17 @@ mod tests {
         let (_tmp, home, app_dir) = setup_dirs();
         let codex_override = home.join("work-codex");
         fs::create_dir_all(&codex_override).unwrap();
-        fs::write(
-            codex_override.join("config.toml"),
-            format!(
-                "[[hooks.SessionStart]]\n\
-                 [[hooks.SessionStart.hooks]]\n\
-                 type = \"command\"\n\
-                 command = {LEGACY_STATUS_CMD:?}\n"
-            ),
-        )
-        .unwrap();
+        write_json(
+            &codex_override.join("hooks.json"),
+            &serde_json::json!({
+                "hooks": {
+                    "SessionStart": [
+                        {"hooks": [{"type": "command", "command": LEGACY_STATUS_CMD}]}
+                    ]
+                }
+            }),
+        );
 
-        // Profile config in app_dir/profiles/work/config.toml that pins
-        // CODEX_HOME at the override location.
         let profile_dir = app_dir.join("profiles/work");
         fs::create_dir_all(&profile_dir).unwrap();
         fs::write(
@@ -899,14 +778,19 @@ mod tests {
 
         run_in(&home, &app_dir).unwrap();
 
-        let text = fs::read_to_string(codex_override.join("config.toml")).unwrap();
+        let parsed: Value =
+            serde_json::from_str(&fs::read_to_string(codex_override.join("hooks.json")).unwrap())
+                .unwrap();
+        let cmd = parsed["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+            .as_str()
+            .expect("AoE command must be present at the override path");
         assert!(
-            text.contains("case \"$AOE_INSTANCE_ID\""),
-            "profile-overridden Codex path must be reached and rewritten"
+            cmd.contains("case \"$AOE_INSTANCE_ID\""),
+            "profile-overridden Codex path must be reached and rewritten; got: {cmd}"
         );
         assert!(
-            !home.join(".codex/config.toml").exists(),
-            "default ~/.codex/config.toml must not be magicked into existence"
+            !home.join(".codex/hooks.json").exists(),
+            "default ~/.codex/hooks.json must not be magicked into existence"
         );
     }
 
