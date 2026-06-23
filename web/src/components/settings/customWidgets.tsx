@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
-import { fetchThemes } from "../../lib/api";
+import { fetchAgents, fetchThemes } from "../../lib/api";
 import { dispatchThemePickerChanged } from "../../hooks/useResolvedTheme";
-import type { SettingsFieldDescriptor } from "../../lib/types";
+import type { AgentInfo, SettingsFieldDescriptor } from "../../lib/types";
 import { SelectField, SliderField, TextField } from "./FormFields";
 
 /** Props every custom settings widget receives. A custom widget renders one
@@ -70,6 +70,33 @@ export function DefaultToolWidget({ descriptor, value, save }: CustomWidgetProps
       onChange={(v) => save(v || null)}
       placeholder="Auto-detect"
       mono
+    />
+  );
+}
+
+/** Smart-rename agent picker. Lists installed one-shot-capable agents plus a
+ *  "Same as session" default (empty string), so the one-shot title call can be
+ *  pointed at a cheaper or more obedient model than the session's own agent.
+ *  Mirrors the TUI `smart-rename-agent` widget; the install + one-shot filter
+ *  keeps the dropdown to agents the rename would actually work on. */
+export function SmartRenameAgentWidget({ descriptor, value, save }: CustomWidgetProps) {
+  const [agents, setAgents] = useState<AgentInfo[]>([]);
+  useEffect(() => {
+    fetchAgents()
+      .then(setAgents)
+      .catch(() => setAgents([]));
+  }, []);
+  const options = [
+    { value: "", label: "Same as session" },
+    ...agents.filter((a) => a.installed && a.oneshot_capable).map((a) => ({ value: a.name, label: a.name })),
+  ];
+  return (
+    <SelectField
+      label={descriptor.label}
+      description={descriptor.description}
+      value={typeof value === "string" ? value : ""}
+      onChange={(v) => save(v)}
+      options={options}
     />
   );
 }

@@ -333,6 +333,11 @@ export interface AgentInfo {
   host_only: boolean;
   installed: boolean;
   install_hint: string;
+  /** True when the agent has a one-shot mode (so it can run the smart-rename
+   *  title call). The settings smart-rename agent picker filters on this
+   *  together with `installed`. Always false for custom agents. Optional so
+   *  existing test fixtures need not set it; the backend always sends it. */
+  oneshot_capable?: boolean;
   /** True when the agent can run in acp: a built-in with an ACP
    *  adapter, or a custom agent that declares a valid `agent_acp_cmd`.
    *  The wizard reads this to decide whether a new session runs in
