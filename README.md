@@ -38,7 +38,7 @@ Running one AI agent is easy. Running five of them across different branches, ke
 
 - **Multi-agent support**: Claude Code, OpenCode, Mistral Vibe, Codex CLI, Gemini CLI, Antigravity CLI, Cursor CLI, Copilot CLI, Pi.dev, Factory Droid, Hermes, Kiro CLI, and Qwen Code
 - **TUI dashboard**: visual interface to create, monitor, and manage sessions
-- **Web dashboard** (Beta, stabilization in progress): create, monitor, and control your agents from any browser, installable as a PWA
+- **Web dashboard**: create, monitor, and control your agents from any browser, installable as a PWA
 - **Structured view** (web dashboard default): mobile-first native rendering of agent state via the Agent Client Protocol, with plan panels, tool-call cards, and swipe-to-approve. Flip a session to the terminal view for raw tmux rendering
 - **CLI and HTTP API**: drive sessions from the command line or external orchestrators (integrates with tools like OpenClaw)
 - **Remote phone access**: press `R` in the TUI to expose the web dashboard over HTTPS with QR + passphrase auth, via Tailscale Funnel or Cloudflare Tunnel
@@ -52,7 +52,7 @@ Running one AI agent is easy. Running five of them across different branches, ke
 
 See the [full features inventory](https://www.agent-of-empires.com/docs/features/) for every shipping capability with links to each guide.
 
-## Web Dashboard (Beta, stabilization in progress)
+## Web Dashboard
 
 Access your agents from any browser. The real agent terminal renders in the page; switch sessions, type into the terminal, and review diffs without leaving the tab. Press `R` in the TUI to start the server, or see the [web dashboard guide](https://www.agent-of-empires.com/guides/web-dashboard/) for details.
 

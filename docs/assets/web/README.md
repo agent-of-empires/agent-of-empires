@@ -24,7 +24,7 @@ structured-view shots) through the live Playwright harness
 - **Refresh when the surface changes.** A screenshot that no longer
   matches the UI is a docs bug. Re-run the script in the same PR that
   changes the surface, or open a follow-up.
-- **Not wired into CI.** Pixel-diffing a fast-moving beta UI in CI is
+- **Not wired into CI.** Pixel-diffing a fast-moving UI in CI is
   noisy (font and anti-aliasing drift across runners), so capture is a
   manual developer step, not a gate.
 

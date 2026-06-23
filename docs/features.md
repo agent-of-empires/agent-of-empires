@@ -10,7 +10,7 @@ A keyboard-driven terminal interface to create, monitor, and manage sessions. St
 
 See the [Quick Start](quick-start.md) for the keyboard tour.
 
-### Web dashboard (Beta)
+### Web dashboard
 
 Browser access to the same sessions: real terminal in the page, switch sessions, type into the terminal, review diffs. Installable as a PWA on desktop ("Install Agent of Empires" in Chrome) and on iOS ("Add to Home Screen"). Token-based auth by default; QR + passphrase pairing when you expose it remotely.
 
