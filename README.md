@@ -34,6 +34,21 @@ Running one AI agent is easy. Running five of them across different branches, ke
   <a href="https://www.youtube.com/watch?v=Kk8dX_F-P4E">Watch the getting started video</a>
 </p>
 
+<p align="center"><sub>The same agents, from any browser:</sub></p>
+
+<table align="center">
+  <tr>
+    <td align="center" valign="middle">
+      <img src="docs/assets/web-desktop.gif" alt="Web dashboard on a laptop" width="560">
+      <br><sub><b>Desktop</b>: full dashboard, terminal, and diffs</sub>
+    </td>
+    <td align="center" valign="middle">
+      <img src="docs/assets/web-mobile.gif" alt="Web dashboard on a phone" width="200">
+      <br><sub><b>Phone</b>: structured view</sub>
+    </td>
+  </tr>
+</table>
+
 ## Features
 
 - **Multi-agent support**: Claude Code, OpenCode, Mistral Vibe, Codex CLI, Gemini CLI, Antigravity CLI, Cursor CLI, Copilot CLI, Pi.dev, Factory Droid, Hermes, Kiro CLI, and Qwen Code
@@ -55,19 +70,6 @@ See the [full features inventory](https://www.agent-of-empires.com/docs/features
 ## Web Dashboard
 
 Access your agents from any browser. The real agent terminal renders in the page; switch sessions, type into the terminal, and review diffs without leaving the tab. Press `R` in the TUI to start the server, or see the [web dashboard guide](https://www.agent-of-empires.com/guides/web-dashboard/) for details.
-
-<table align="center">
-  <tr>
-    <td align="center" valign="middle">
-      <img src="docs/assets/web-desktop.gif" alt="Web dashboard on a laptop" width="560">
-      <br><sub><b>Desktop</b> — full dashboard, terminal, and diffs</sub>
-    </td>
-    <td align="center" valign="middle">
-      <img src="docs/assets/web-mobile.gif" alt="Web dashboard on a phone" width="200">
-      <br><sub><b>Phone</b> — structured view</sub>
-    </td>
-  </tr>
-</table>
 
 ## How It Works
 
