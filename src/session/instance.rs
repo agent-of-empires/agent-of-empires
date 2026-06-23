@@ -7042,10 +7042,15 @@ mod tests {
                     .join(encode_claude_project_path(project_path));
                 fs::create_dir_all(&claude_dir).unwrap();
 
-                // This instance's real conversation (named by its sidecar) and a
-                // peer's conversation that happens to be the freshest on disk.
+                // `mine` is this instance's real conversation (named by its
+                // sidecar). `peer` is a co-located peer's conversation that is
+                // strictly freshest on disk. `stored` is a stale id distinct
+                // from `mine`, so asserting `sid == mine` proves the sidecar
+                // actively overrode the stored value rather than the stored
+                // value passing through unchanged.
                 let mine = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
                 let peer = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
+                let stored = "cccccccc-3333-4333-8333-cccccccccccc";
                 let now = SystemTime::now();
                 write_jsonl_with_mtime(
                     &claude_dir.join(format!("{mine}.jsonl")),
@@ -7058,15 +7063,15 @@ mod tests {
 
                 let mut inst = Instance::new("verify-2344-shared-cwd", project_path);
                 inst.tool = "claude".to_string();
-                inst.agent_session_id = Some(mine.to_string());
+                inst.agent_session_id = Some(stored.to_string());
                 inst.resume_intent = ResumeIntent::Default;
 
                 let dir = super::write_sidecar(&inst.id, mine);
                 let (sid, is_existing) = inst.acquire_session_id();
                 std::fs::remove_dir_all(&dir).ok();
 
-                // The authoritative sidecar matches the stored sid, so no
-                // override happens despite the peer's fresher jsonl.
+                // The authoritative sidecar overrides the stale stored sid;
+                // the peer's fresher jsonl never wins.
                 assert_eq!(sid.as_deref(), Some(mine));
                 assert!(is_existing);
                 assert_eq!(inst.agent_session_id.as_deref(), Some(mine));
@@ -7092,8 +7097,11 @@ mod tests {
                     .join(encode_claude_project_path(project_path));
                 fs::create_dir_all(&claude_dir).unwrap();
 
+                // `stored` is distinct from the sidecar `mine`, so the assertion
+                // proves the sidecar actively overrode the stale stored value.
                 let mine = "eeeeeeee-5555-4555-8555-eeeeeeeeeeee";
                 let peer = "ffffffff-6666-4666-8666-ffffffffffff";
+                let stored = "dddddddd-7777-4777-8777-dddddddddddd";
                 let now = SystemTime::now();
                 write_jsonl_with_mtime(
                     &claude_dir.join(format!("{mine}.jsonl")),
@@ -7106,7 +7114,7 @@ mod tests {
 
                 let mut inst = Instance::new("verify-2344-sandbox", project_path);
                 inst.tool = "claude".to_string();
-                inst.agent_session_id = Some(mine.to_string());
+                inst.agent_session_id = Some(stored.to_string());
                 inst.resume_intent = ResumeIntent::Default;
                 inst.sandbox_info = Some(crate::session::SandboxInfo {
                     enabled: true,
