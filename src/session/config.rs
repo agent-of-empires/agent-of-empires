@@ -821,6 +821,20 @@ pub struct SessionConfig {
     #[setting(label = "Smart Session Rename", widget = "toggle", category = "Agents")]
     pub smart_rename: bool,
 
+    /// Agent used for the one-shot smart-rename title call. Empty means use the
+    /// session's own agent. Set this to point smart rename at a cheaper or more
+    /// obedient title model (e.g. codex or opencode) without changing the
+    /// session's working agent. Only agents with a one-shot mode qualify; an
+    /// unknown or one-shot-incapable value falls back to leaving the generated
+    /// name. The picker lists installed one-shot-capable agents.
+    #[serde(default)]
+    #[setting(
+        label = "Smart-rename agent",
+        widget = "custom:smart-rename-agent",
+        category = "Agents"
+    )]
+    pub smart_rename_agent: String,
+
     /// Request xterm mouse tracking so the TUI handles the scroll wheel
     /// (preview-pane scroll) and click-to-select rows. Disable to hand the
     /// wheel and text selection back to the terminal, e.g. iOS Mosh +
@@ -1185,6 +1199,7 @@ impl Default for SessionConfig {
             agent_command_override: HashMap::new(),
             agent_status_hooks: true,
             smart_rename: true,
+            smart_rename_agent: String::new(),
             mouse_capture: true,
             custom_agents: HashMap::new(),
             agent_detect_as: HashMap::new(),

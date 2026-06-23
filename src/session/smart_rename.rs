@@ -16,6 +16,7 @@
 use crate::agents;
 use crate::session::civilizations::is_default_civ_name;
 use serde::Serialize;
+use std::collections::HashMap;
 
 /// Per-session smart-rename state surfaced to the dashboard so the sidebar can
 /// show that a session will be (or is being) auto-named. `Inactive` for
@@ -95,6 +96,57 @@ pub fn check_eligible(
     Ok(())
 }
 
+/// Resolve the tool name used for the one-shot rename: the configured
+/// `smart_rename_agent` when non-empty, otherwise the session's own tool. A
+/// blank or whitespace-only setting means "same as session".
+pub fn resolve_rename_tool<'a>(session_tool: &'a str, rename_setting: &'a str) -> &'a str {
+    let setting = rename_setting.trim();
+    if setting.is_empty() {
+        session_tool
+    } else {
+        setting
+    }
+}
+
+/// Resolve the rename agent from the `smart_rename_agent` setting and gate it,
+/// returning the resolved built-in agent on success. This is the single place
+/// the command-override semantics differ by rename target: when the rename
+/// agent is the session's own agent, the session's launch command and an
+/// override of that agent count (exactly as before). When the rename agent is
+/// a DIFFERENT agent, the session's launch command is irrelevant (the one-shot
+/// spawns the built-in binary fresh), so only a config override of the rename
+/// agent's own binary disqualifies it. Both the runtime gate
+/// (`try_smart_rename`) and the sidebar `Pending` indicator call this so they
+/// cannot drift.
+pub fn check_eligible_resolved(
+    structured: bool,
+    setting_on: bool,
+    title: &str,
+    session_tool: &str,
+    rename_setting: &str,
+    sandboxed: bool,
+    session_command: &str,
+    overrides: &HashMap<String, String>,
+) -> Result<&'static agents::AgentDef, SkipReason> {
+    let rename_tool = resolve_rename_tool(session_tool, rename_setting);
+    let agent = agents::get_agent(rename_tool);
+    let (command, command_override_in_cfg) = if rename_tool == session_tool {
+        (session_command, overrides.contains_key(session_tool))
+    } else {
+        ("", overrides.contains_key(rename_tool))
+    };
+    check_eligible(
+        structured,
+        setting_on,
+        title,
+        agent,
+        sandboxed,
+        command,
+        command_override_in_cfg,
+    )?;
+    Ok(agent.expect("check_eligible Ok implies a built-in agent"))
+}
+
 /// Hard cap on how much of the user's first message is handed to the one-shot
 /// call. A title needs only the opening intent, and very large argv values can
 /// trip some shells/agents.
@@ -108,8 +160,11 @@ const MAX_TITLE_WORDS: usize = 8;
 /// has the least possible work to do; anything off-format is rejected, never
 /// salvaged.
 const INSTRUCTION: &str = "Generate a concise 3 to 5 word title summarizing the following task. \
-Respond with ONLY the title: no quotes, no markdown, no surrounding punctuation, no explanation. \
-If you cannot, respond with exactly NONE.";
+Output the title and nothing else: no quotes, no markdown, no code fences, no labels, \
+no preamble, no explanation, no trailing punctuation. The entire response must be just \
+the title on a single line. Do not refuse: if the task is unclear, still produce your \
+best-guess title rather than commentary. Only if you truly cannot produce any title, \
+respond with exactly NONE.";
 
 /// Build the prompt string for the one-shot title call: the fixed instruction
 /// plus the (NUL-stripped, trimmed, byte-capped) first user message.
@@ -247,7 +302,14 @@ mod serve {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    const ONESHOT_TIMEOUT: Duration = Duration::from_secs(45);
+    // The one-shot is spawned from the prompt handler at the same instant the
+    // session's own worker starts its first heavy turn, so the two contend for
+    // CPU and the same provider API. Standalone the call finishes well under
+    // 12s; under that contention it can run far longer. 120s absorbs the
+    // contention without a deeper scheduling change (deferring the one-shot
+    // until the live turn settles is tracked as a follow-up). The child is
+    // killed on drop, so a timed-out call leaves no orphan.
+    const ONESHOT_TIMEOUT: Duration = Duration::from_secs(120);
 
     /// Marks a session as having an in-flight one-shot rename so a burst of
     /// rapid first prompts cannot spawn concurrent title generators. Removed on
@@ -306,21 +368,22 @@ mod serve {
         };
 
         let config = crate::session::profile_config::resolve_config_or_warn(&profile);
-        let agent = agents::get_agent(&tool);
-        let command_override_in_cfg = config.session.agent_command_override.contains_key(&tool);
-        if let Err(reason) = check_eligible(
+        let agent = match check_eligible_resolved(
             structured,
             config.session.smart_rename,
             &title,
-            agent,
+            &tool,
+            &config.session.smart_rename_agent,
             sandboxed,
             &command,
-            command_override_in_cfg,
+            &config.session.agent_command_override,
         ) {
-            tracing::debug!(target: "smart_rename", session = %session_id, tool = %tool, reason = reason.as_str(), "skip");
-            return;
-        }
-        let agent = agent.expect("check_eligible Ok implies a built-in agent");
+            Ok(agent) => agent,
+            Err(reason) => {
+                tracing::debug!(target: "smart_rename", session = %session_id, tool = %tool, reason = reason.as_str(), "skip");
+                return;
+            }
+        };
 
         let Some(_guard) = InflightGuard::acquire(&state.smart_rename_inflight, &session_id) else {
             return;
@@ -535,6 +598,111 @@ mod tests {
         );
         // Command equal to the agent binary is not an override.
         assert!(check_eligible(true, true, "Vikings", c, false, "claude", false).is_ok());
+    }
+
+    #[test]
+    fn resolve_rename_tool_falls_back_to_session() {
+        // Empty / whitespace setting => use the session's own tool.
+        assert_eq!(resolve_rename_tool("claude", ""), "claude");
+        assert_eq!(resolve_rename_tool("claude", "   "), "claude");
+        // Non-empty setting => use it verbatim (trimmed).
+        assert_eq!(resolve_rename_tool("claude", "codex"), "codex");
+        assert_eq!(resolve_rename_tool("claude", "  codex "), "codex");
+    }
+
+    #[test]
+    fn resolved_unset_uses_session_agent() {
+        let overrides = HashMap::new();
+        // Unset rename agent => resolves to the session's claude agent.
+        let agent =
+            check_eligible_resolved(true, true, "Vikings", "claude", "", false, "", &overrides)
+                .expect("eligible");
+        assert_eq!(agent.binary, "claude");
+    }
+
+    #[test]
+    fn resolved_picks_distinct_rename_agent() {
+        let overrides = HashMap::new();
+        let agent = check_eligible_resolved(
+            true, true, "Vikings", "claude", "codex", false, "", &overrides,
+        )
+        .expect("eligible");
+        assert_eq!(agent.binary, "codex");
+    }
+
+    #[test]
+    fn resolved_override_gate_targets_the_right_agent() {
+        // A session-agent command override only blocks when the rename agent IS
+        // the session agent.
+        let mut overrides = HashMap::new();
+        overrides.insert("claude".to_string(), "my-wrapper".to_string());
+        assert!(matches!(
+            check_eligible_resolved(true, true, "Vikings", "claude", "", false, "", &overrides),
+            Err(SkipReason::CommandOverridden)
+        ));
+        // ...but when the rename agent is a DIFFERENT agent (codex), the
+        // session's claude override is irrelevant: the one-shot launches codex
+        // fresh, so it stays eligible.
+        assert!(check_eligible_resolved(
+            true, true, "Vikings", "claude", "codex", false, "", &overrides
+        )
+        .is_ok());
+        // An override of the RENAME agent's own binary does block it.
+        let mut codex_override = HashMap::new();
+        codex_override.insert("codex".to_string(), "my-codex".to_string());
+        assert!(matches!(
+            check_eligible_resolved(
+                true,
+                true,
+                "Vikings",
+                "claude",
+                "codex",
+                false,
+                "",
+                &codex_override
+            ),
+            Err(SkipReason::CommandOverridden)
+        ));
+    }
+
+    #[test]
+    fn resolved_session_command_ignored_for_distinct_rename_agent() {
+        // The instance's launch command (for the session agent) must not be
+        // matched against a different rename agent's binary.
+        let overrides = HashMap::new();
+        assert!(check_eligible_resolved(
+            true, true, "Vikings", "opencode", "claude", false, "opencode", &overrides
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn resolved_unknown_rename_agent_is_no_oneshot() {
+        let overrides = HashMap::new();
+        assert!(matches!(
+            check_eligible_resolved(
+                true,
+                true,
+                "Vikings",
+                "claude",
+                "not-a-real-agent",
+                false,
+                "",
+                &overrides
+            ),
+            Err(SkipReason::NoOneshot)
+        ));
+    }
+
+    #[test]
+    fn sanitize_picks_title_from_chatty_output() {
+        // The tightened instruction asks for the bare title, but a chatty agent
+        // may still wrap it; the last qualifying line is the title.
+        let raw = "Sure, here is a concise title:\n\nFix login redirect bug\n";
+        assert_eq!(
+            sanitize_title(raw, "fix the login redirect").as_deref(),
+            Some("Fix login redirect bug")
+        );
     }
 
     #[test]

@@ -731,6 +731,17 @@ pub fn name_from_settings_index(index: usize) -> Option<&'static str> {
     }
 }
 
+/// Names of built-in agents that can run a one-shot title call (a non-`None`
+/// `oneshot_flag`). The smart-rename agent picker lists these, since only
+/// these agents can be used for the one-shot rename.
+pub fn oneshot_capable_names() -> Vec<&'static str> {
+    AGENTS
+        .iter()
+        .filter(|a| a.oneshot_flag.is_some())
+        .map(|a| a.name)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

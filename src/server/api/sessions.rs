@@ -578,7 +578,7 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
     // in-flight set; `pending` from the shared eligibility predicate, so the
     // chip cannot drift from the runtime gate. Config resolved once per profile.
     {
-        use crate::session::smart_rename::{check_eligible, SmartRenameState};
+        use crate::session::smart_rename::{check_eligible_resolved, SmartRenameState};
         use std::collections::{HashMap, HashSet};
         let inflight: HashSet<String> = state
             .smart_rename_inflight
@@ -590,7 +590,8 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
             .lock()
             .map(|g| g.clone())
             .unwrap_or_default();
-        let mut cfg_cache: HashMap<String, (bool, HashMap<String, String>)> = HashMap::new();
+        let mut cfg_cache: HashMap<String, (bool, String, HashMap<String, String>)> =
+            HashMap::new();
         for (resp, inst) in sessions.iter_mut().zip(instances.iter()) {
             if inflight.contains(&inst.id) {
                 resp.smart_rename = SmartRenameState::Running;
@@ -601,23 +602,28 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
             if attempted.contains(&inst.id) {
                 continue;
             }
-            let (setting_on, overrides) = cfg_cache
+            let (setting_on, rename_agent, overrides) = cfg_cache
                 .entry(inst.source_profile.clone())
                 .or_insert_with(|| {
                     let cfg = crate::session::profile_config::resolve_config_or_warn(
                         &inst.source_profile,
                     )
                     .session;
-                    (cfg.smart_rename, cfg.agent_command_override)
+                    (
+                        cfg.smart_rename,
+                        cfg.smart_rename_agent,
+                        cfg.agent_command_override,
+                    )
                 });
-            let eligible = check_eligible(
+            let eligible = check_eligible_resolved(
                 inst.is_structured(),
                 *setting_on,
                 &inst.title,
-                crate::agents::get_agent(&inst.tool),
+                &inst.tool,
+                rename_agent,
                 inst.is_sandboxed(),
                 &inst.command,
-                overrides.contains_key(&inst.tool),
+                overrides,
             )
             .is_ok();
             if eligible {
