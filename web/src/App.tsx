@@ -1,6 +1,7 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useMatch, useNavigate, useSearchParams } from "react-router-dom";
 import { IDLE_DECAY_WINDOW_MS, isSessionActive } from "./lib/session";
+import { diffSelectionStale } from "./lib/diffSelection";
 import { useSessions } from "./hooks/useSessions";
 import { clearAcpCache } from "./hooks/useAcpSession";
 import { clearDraft, sweepOrphanDrafts } from "./lib/acpDrafts";
@@ -457,19 +458,10 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     setSelectedFile(null);
   }
 
-  // Inline derivation for diffFiles validation: if a diff-list selection is no
-  // longer in the diff, clear it. Cited files (opened from a transcript link)
-  // are exempt: they may have no diff against the base and still be viewable
-  // via the full-file fallback (#1810).
-  if (
-    activeSessionId &&
-    selectedFilePath &&
-    !selectedFile?.cited &&
-    !diffFilesLoading &&
-    !diffFiles.some(
-      (f) => f.path === selectedFilePath && (f.repo_name ?? undefined) === (selectedRepoName ?? undefined),
-    )
-  ) {
+  // Inline derivation for diffFiles validation: clear a stale diff-list
+  // selection. The staleness rule (cited exemption, path+repo match) lives in
+  // diffSelectionStale so it can be unit-tested. See #1810.
+  if (activeSessionId && diffSelectionStale(selectedFile, diffFilesLoading, diffFiles)) {
     setSelectedFile(null);
   }
 
