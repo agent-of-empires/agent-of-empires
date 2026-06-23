@@ -466,7 +466,9 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     selectedFilePath &&
     !selectedFile?.cited &&
     !diffFilesLoading &&
-    !diffFiles.some((f) => f.path === selectedFilePath)
+    !diffFiles.some(
+      (f) => f.path === selectedFilePath && (f.repo_name ?? undefined) === (selectedRepoName ?? undefined),
+    )
   ) {
     setSelectedFile(null);
   }
