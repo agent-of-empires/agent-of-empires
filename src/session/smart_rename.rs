@@ -118,6 +118,9 @@ pub fn resolve_rename_tool<'a>(session_tool: &'a str, rename_setting: &'a str) -
 /// agent's own binary disqualifies it. Both the runtime gate
 /// (`try_smart_rename`) and the sidebar `Pending` indicator call this so they
 /// cannot drift.
+// One more input than `check_eligible` (the rename-agent setting); a params
+// struct would only add boilerplate to the two call sites and the unit tests.
+#[allow(clippy::too_many_arguments)]
 pub fn check_eligible_resolved(
     structured: bool,
     setting_on: bool,
