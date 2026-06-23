@@ -3782,14 +3782,45 @@ impl HomeView {
         Self::persist_app_state("list width", |s| s.home_list_width = Some(width));
     }
 
+    /// Folder paths that currently map to a real project-mode folder: the
+    /// project group of every live session (across all profiles, so switching
+    /// the active profile never prunes another profile's collapse state),
+    /// registered empty projects, and the per-project archived sub-folders.
+    /// Used to drop collapse entries for projects that no longer exist.
+    fn known_project_group_paths(&self) -> std::collections::HashSet<String> {
+        let mut paths = std::collections::HashSet::new();
+        for inst in &self.instances {
+            let group = project_group_name(inst);
+            if group.is_empty() {
+                continue;
+            }
+            if inst.is_archived() {
+                paths.insert(crate::session::archived_project_sub_path(&group));
+            } else {
+                paths.insert(group);
+            }
+        }
+        for project in &self.registered_projects {
+            // Only pinned registered projects surface as empty folder headers,
+            // keyed by repo label (mirroring `unpopulated_projects`).
+            if project.pinned {
+                paths.insert(crate::session::projects::repo_label(&project.path));
+            }
+        }
+        paths
+    }
+
     /// Persist the set of collapsed project-mode folders. Stored sorted for a
     /// stable on-disk order; only collapsed paths are written, so re-expanding a
-    /// folder drops it from the list.
+    /// folder drops it from the list. Paths for projects that no longer exist
+    /// are pruned here so the persisted set can't grow without bound as projects
+    /// come and go.
     fn save_project_group_collapsed(&self) {
+        let known = self.known_project_group_paths();
         let mut collapsed: Vec<String> = self
             .project_group_collapsed
             .iter()
-            .filter(|(_, &c)| c)
+            .filter(|(path, &c)| c && known.contains(path.as_str()))
             .map(|(path, _)| path.clone())
             .collect();
         collapsed.sort();

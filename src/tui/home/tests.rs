@@ -3063,6 +3063,53 @@ fn test_project_group_collapsed_state_persists_to_config() {
     );
 }
 
+/// A collapse entry for a project that no longer exists must be pruned on save
+/// so the persisted set can't grow without bound as projects come and go. A
+/// still-live folder collapsed in the same session must survive.
+#[test]
+#[serial]
+fn test_project_group_collapsed_prunes_stale_paths() {
+    use crate::session::config::GroupByMode;
+
+    let mut env = create_test_env_two_projects_mixed_attention();
+    env.view.group_by = GroupByMode::Project;
+    env.view.flat_items = env.view.build_flat_items();
+
+    // A real folder the user collapsed this session.
+    let live_path = env
+        .view
+        .flat_items
+        .iter()
+        .find_map(|item| match item {
+            Item::Group { path, .. } => Some(path.clone()),
+            _ => None,
+        })
+        .expect("project mode should have a folder header");
+
+    env.view
+        .project_group_collapsed
+        .insert(live_path.clone(), true);
+    // A stale entry for a project that isn't part of this session at all.
+    env.view
+        .project_group_collapsed
+        .insert("/repos/deleted-ghost".to_string(), true);
+
+    env.view.save_project_group_collapsed();
+
+    let config = crate::session::config::load_config()
+        .unwrap()
+        .expect("config should exist after save");
+    let saved = &config.app_state.project_group_collapsed;
+    assert!(
+        saved.contains(&live_path),
+        "a live collapsed folder must be persisted"
+    );
+    assert!(
+        !saved.iter().any(|p| p == "/repos/deleted-ghost"),
+        "a collapse entry for a nonexistent project must be pruned"
+    );
+}
+
 #[test]
 #[serial]
 fn test_list_width_default() {
