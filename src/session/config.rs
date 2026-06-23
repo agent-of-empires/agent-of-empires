@@ -729,6 +729,14 @@ pub struct AppStateConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_section_collapsed: Option<bool>,
 
+    /// Paths of project-mode sidebar folders the user has collapsed. Stored as
+    /// the set of collapsed paths (absent/expanded folders are not listed), so
+    /// the choice survives restarts. Group-mode collapse lives on the per-profile
+    /// GroupTrees in session storage; project-mode folders are auto-derived and
+    /// have no group record, so their collapse state is persisted here instead.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub project_group_collapsed: Vec<String>,
+
     /// Ids of tips the user has already seen/acknowledged. Drives the unseen
     /// badge count and stops earned tips from re-popping. Ids come from
     /// [`crate::tips`] and are stable, so this list stays meaningful across

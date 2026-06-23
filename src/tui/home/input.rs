@@ -3236,6 +3236,7 @@ impl HomeView {
             self.project_group_collapsed
                 .insert(path.to_string(), !collapsed);
             self.flat_items = self.build_flat_items();
+            self.save_project_group_collapsed();
             return;
         }
         // Route to the correct profile's GroupTree

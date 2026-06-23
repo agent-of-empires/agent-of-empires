@@ -1377,7 +1377,16 @@ impl HomeView {
             group_by,
             row_tag_mode: resolved.session.row_tag,
             profile_default_attach_mode: resolved.session.default_attach_mode,
-            project_group_collapsed: HashMap::new(),
+            project_group_collapsed: user_config
+                .as_ref()
+                .map(|c| {
+                    c.app_state
+                        .project_group_collapsed
+                        .iter()
+                        .map(|path| (path.clone(), true))
+                        .collect()
+                })
+                .unwrap_or_default(),
             registered_projects: Vec::new(),
             show_help: false,
             help_scroll: 0,
@@ -3771,6 +3780,22 @@ impl HomeView {
     fn save_list_width(&self) {
         let width = self.list_width;
         Self::persist_app_state("list width", |s| s.home_list_width = Some(width));
+    }
+
+    /// Persist the set of collapsed project-mode folders. Stored sorted for a
+    /// stable on-disk order; only collapsed paths are written, so re-expanding a
+    /// folder drops it from the list.
+    fn save_project_group_collapsed(&self) {
+        let mut collapsed: Vec<String> = self
+            .project_group_collapsed
+            .iter()
+            .filter(|(_, &c)| c)
+            .map(|(path, _)| path.clone())
+            .collect();
+        collapsed.sort();
+        Self::persist_app_state("project group collapsed", |s| {
+            s.project_group_collapsed = collapsed
+        });
     }
 
     pub fn toggle_preview_info(&mut self) {
