@@ -589,15 +589,16 @@ fn custom_value_to_json(id: &str, value: &FieldValue) -> Value {
                 None => Value::Null,
             }
         }
-        ("smart-rename-agent", FieldValue::Select { selected, .. }) => {
-            // Index 0 is "Same as session" (empty string); the rest index into
-            // the installed one-shot-capable agents, rebuilt identically to the
-            // read path so the index maps back to the same name.
+        ("smart-rename-agent", FieldValue::Select { selected, options }) => {
+            // Index 0 is "Same as session" (empty string); the rest are agent
+            // names (label == value). Persist from the rendered `options` so the
+            // saved value is exactly what the user picked, even if the installed
+            // set changed between render and save.
             if *selected == 0 {
                 json!("")
             } else {
-                installed_oneshot_agents()
-                    .get(*selected - 1)
+                options
+                    .get(*selected)
                     .map(|name| json!(name))
                     .unwrap_or_else(|| json!(""))
             }
@@ -1176,6 +1177,23 @@ mod tests {
                 },
             ),
             json!(""),
+        );
+        // A non-zero index persists the rendered option's name verbatim (not a
+        // re-detected list), so the saved value cannot drift if availability
+        // changes between render and save.
+        assert_eq!(
+            custom_value_to_json(
+                "smart-rename-agent",
+                &FieldValue::Select {
+                    selected: 2,
+                    options: vec![
+                        "Same as session".to_string(),
+                        "claude".to_string(),
+                        "codex".to_string(),
+                    ],
+                },
+            ),
+            json!("codex"),
         );
     }
 
