@@ -63,6 +63,20 @@ export function hasArgsBody(argsPreview: string): boolean {
   return Object.keys(parsed).some((k) => !k.startsWith("_aoe_"));
 }
 
+/** Readable labels for known ACP permission identifiers that some agents
+ *  send verbatim as the permission-request title (e.g. opencode's
+ *  `external_directory`). These are internal protocol kinds, not real tool
+ *  names, so the raw identifier reads as jargon on the approval card.
+ *  Unknown titles pass through unchanged, so a new upstream identifier
+ *  shows as-is (a debuggable signal) rather than a mangled auto-title; we
+ *  deliberately avoid blanket snake_case-to-title casing, which mauls
+ *  acronyms and legitimate tool names. */
+const PERMISSION_TITLE_LABELS: Record<string, string> = {
+  external_directory: "External directory access",
+};
+
+export const humanizePermissionTitle = (title: string): string => PERMISSION_TITLE_LABELS[title] ?? title;
+
 export interface TodoPayloadItem {
   content: string;
   status: unknown;
@@ -84,4 +98,12 @@ export function todoItemsFromArgs(args: Record<string, unknown> | null): TodoPay
 
 export function hasTodoItemsArgsText(argsText: string): boolean {
   return todoItemsFromArgs(parseJsonObject(argsText)).length > 0;
+}
+
+/** Whether `args.todos` is present as an array, even an empty one. An
+ *  empty `todos: []` is a real clear-list snapshot, not a non-todo tool;
+ *  array-presence (not item count) is the discriminator both grouping and
+ *  rendering key on so a clear still groups and renders. See #2003. */
+export function hasTodoArrayArgsText(argsText: string): boolean {
+  return Array.isArray(parseJsonObject(argsText)?.todos);
 }

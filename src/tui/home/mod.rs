@@ -511,6 +511,25 @@ pub struct HomeView {
     /// telemetry existed. Startup gating keeps it from rendering over the
     /// changelog or the version update modal.
     pub(super) telemetry_consent_dialog: Option<super::dialogs::TelemetryConsentDialog>,
+    /// Tips overlay (the browsable list from `crate::tips`), when open. Reached
+    /// from the command palette, the `?` help screen, or the tips badge.
+    pub(super) tips_dialog: Option<super::dialogs::TipsDialog>,
+    /// Cached count of eligible, unseen tips for the home-view badge. Recomputed
+    /// from `app_state` on config refresh and after tips state changes, so the
+    /// badge doesn't read config on every frame. Zero when tips are disabled.
+    pub(super) tips_unseen: usize,
+    /// An earned tip queued to pop gently once the user is back on the idle home
+    /// view (set after the new-session dialog closes; see #2262). Drained on the
+    /// next keystroke into a small one-tip overlay so it never interrupts an
+    /// in-flight action.
+    pub(super) pending_tip_pop: Option<&'static crate::tips::Tip>,
+    /// Screen rect of the tips badge in the footer, captured each frame so a
+    /// click can target it. `None` when the badge isn't drawn (nothing unseen,
+    /// tips disabled, live-send banner up, or no room for it).
+    pub(super) tips_badge_rect: Option<ratatui::layout::Rect>,
+    /// Whether the mouse is currently over the tips badge, so it can paint a
+    /// hover highlight like a session row does. Updated by `handle_hover`.
+    pub(super) tips_badge_hovered: bool,
     pub(super) send_message_dialog: Option<super::dialogs::SendMessageDialog>,
     /// Session to receive the message from the send dialog
     pub(super) pending_send_session: Option<String>,
@@ -718,9 +737,13 @@ pub struct HomeView {
     /// dispatched through the exact same path as pressing the shortcut).
     /// Rebuilt every frame; empty in live mode and the takeover views.
     pub(super) footer_buttons: Vec<(Rect, crossterm::event::KeyEvent)>,
-    /// Index into `footer_buttons` the pointer is currently over, used to
-    /// draw a hover highlight. Recomputed on every `Moved` event.
-    pub(super) footer_hover: Option<usize>,
+    /// The `KeyEvent` of the footer button the pointer is currently over, used
+    /// to draw a hover highlight. Recomputed on every `Moved` event. Keyed by
+    /// the button's shortcut rather than its index into `footer_buttons` so the
+    /// highlight follows the right button when a sort/group/view-mode change
+    /// reorders the toolbar between the move and the next render, and can never
+    /// index a button that no longer exists.
+    pub(super) footer_hover: Option<crossterm::event::KeyEvent>,
     /// Last reported mouse position when it was over `list_inner_area`,
     /// `None` when the cursor is outside the list. Stored as a position
     /// rather than a resolved item index so wheel scrolls implicitly
@@ -983,6 +1006,23 @@ pub(super) enum ConfigRefreshOrigin {
     Interactive,
     /// A watcher kick triggered the reload and should stay silent.
     Watcher,
+}
+
+/// Eligible, unseen tip count for the home-view badge, honoring the
+/// `session.show_tips` setting. Shared by the constructor, config refresh, and
+/// the tips-state writers so the cached badge count can't drift.
+pub(super) fn tips_unseen_count(config: &crate::session::Config) -> usize {
+    if !config.session.show_tips {
+        return 0;
+    }
+    crate::tips::unseen_count(
+        crate::tips::TipSurface::Tui,
+        &config.app_state.tips_seen,
+        &crate::tips::TipSignals {
+            new_session_with_selection_count: config.app_state.new_session_with_selection_count,
+            used_new_from_selection: config.app_state.used_new_from_selection,
+        },
+    )
 }
 
 /// Per-profile subscription pair, held in `HomeView::disk_watch_handles`
@@ -1308,6 +1348,10 @@ impl HomeView {
             .as_ref()
             .and_then(|c| c.app_state.group_by)
             .unwrap_or(default_group_by);
+        let tips_unseen = user_config.as_ref().map_or_else(
+            || tips_unseen_count(&crate::session::Config::default()),
+            tips_unseen_count,
+        );
         let view_mode = ViewMode::default();
 
         let disk_dirty = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1369,6 +1413,11 @@ impl HomeView {
             serve_view: None,
             update_confirm_dialog: None,
             telemetry_consent_dialog: None,
+            tips_dialog: None,
+            tips_unseen,
+            pending_tip_pop: None,
+            tips_badge_rect: None,
+            tips_badge_hovered: false,
             send_message_dialog: None,
             pending_send_session: None,
             pending_send_target: live_send::LiveSendTarget::Agent,
@@ -2652,172 +2701,19 @@ impl HomeView {
     /// Tmux env may also be republished when this returns `false`
     /// (filtered or Failed paths republish the memory mirror).
     pub fn apply_session_id_updates(&mut self) -> bool {
-        let mut updates: Vec<(String, String, Option<String>)> = Vec::new();
-        let mut filtered_ids: HashSet<String> = HashSet::new();
-
-        for inst in &self.instances {
-            if let Some((_id, session_id)) = inst
-                .session_id_poller
-                .as_ref()
-                .and_then(|p| p.lock().ok())
-                .and_then(|p| p.try_recv_session_update())
-            {
-                let Some(session_id) = crate::session::capture::validated_session_id(session_id)
-                else {
-                    // `on_change` already published this raw sid to env;
-                    // republish the memory mirror to overwrite it.
-                    filtered_ids.insert(inst.id.clone());
-                    continue;
-                };
-                // Defense-in-depth against explicit resume-target invalidation:
-                // an invalidated sid can still live on disk for several minutes
-                // (opencode db, vibe meta.json, codex/gemini/pi/hermes state).
-                // The poller closures filter via `compose_exclusion`, but if a
-                // closure factory ever forgets to thread the per-instance
-                // excludes, this guard prevents the sid from being re-imported.
-                if inst.retroactive_capture_excludes.contains(&session_id) {
-                    tracing::debug!(
-                        target: "tui.home",
-                        "Ignoring poller-reported sid {} for {}: in retroactive_capture_excludes",
-                        session_id,
-                        inst.id,
-                    );
-                    filtered_ids.insert(inst.id.clone());
-                    continue;
-                }
-                if inst.agent_session_id.as_deref() != Some(session_id.as_str()) {
-                    let expected_prior = inst.agent_session_id.clone();
-                    updates.push((inst.id.clone(), session_id, expected_prior));
-                }
-                continue;
-            }
-        }
-
-        if updates.is_empty() && filtered_ids.is_empty() {
+        let outcome = crate::session::sync::drain_and_persist_session_ids(
+            &mut self.instances,
+            &self.file_watch,
+        );
+        if !outcome.touched() {
             return false;
         }
-
-        let mut to_apply: Vec<(String, String)> = Vec::new();
-        let mut to_rollback: Vec<(String, Option<String>, Option<String>)> = Vec::new();
-
-        for (id, session_id, expected_prior) in &updates {
-            let Some(profile) = self.instance_map.get(id).map(|i| i.source_profile.clone()) else {
-                continue;
-            };
-            match crate::session::persist_session_to_storage(
-                &profile,
-                id,
-                session_id,
-                expected_prior.as_deref(),
-                &self.file_watch,
-            ) {
-                crate::session::SidWrite::Applied => {
-                    to_apply.push((id.clone(), session_id.clone()));
-                }
-                crate::session::SidWrite::Skipped => {
-                    let mut reloaded = false;
-                    if let Ok(storage) =
-                        crate::session::Storage::new(&profile, self.file_watch.clone())
-                    {
-                        if let Ok(disk_insts) = storage.load() {
-                            if let Some(disk_inst) = disk_insts.iter().find(|i| i.id == *id) {
-                                to_rollback.push((
-                                    id.clone(),
-                                    disk_inst.agent_session_id.clone(),
-                                    disk_inst.resume_probe_failed_sid.clone(),
-                                ));
-                                reloaded = true;
-                            }
-                        }
-                    }
-                    if !reloaded {
-                        // Memory is known stale (Skipped CAS proved
-                        // memory != disk) and we cannot read disk.
-                        // Leave env at the poller's last write; the next
-                        // poller event reconciles.
-                        tracing::warn!(target: "tui.home",
-                            instance = %id,
-                            "Skipped reload failed; deferring env reconcile");
-                    }
-                }
-                crate::session::SidWrite::Failed => {
-                    // `on_change` published an unvalidated sid; republish memory.
-                    filtered_ids.insert(id.clone());
-                }
+        for id in outcome.applied.iter().chain(outcome.rolled_back.iter()) {
+            if let Some(inst) = self.instances.iter().find(|i| i.id == *id).cloned() {
+                self.instance_map.insert(id.clone(), inst);
             }
         }
-
-        for (id, session_id) in &to_apply {
-            self.mutate_instance(id, |inst| {
-                inst.agent_session_id = Some(session_id.clone());
-                inst.resume_probe_failed_sid = None;
-            });
-        }
-        for (id, disk_sid, disk_failed_sid) in &to_rollback {
-            let disk_sid = disk_sid.clone();
-            let disk_failed_sid = disk_failed_sid.clone();
-            self.mutate_instance(id, |inst| {
-                inst.agent_session_id = disk_sid.clone();
-                inst.resume_probe_failed_sid = disk_failed_sid.clone();
-            });
-        }
-
-        let touched_ids: Vec<&str> = to_apply
-            .iter()
-            .map(|(id, _)| id.as_str())
-            .chain(to_rollback.iter().map(|(id, _, _)| id.as_str()))
-            .chain(filtered_ids.iter().map(|s| s.as_str()))
-            .collect();
-        let mut set_batch: Vec<(String, String, String)> = Vec::new();
-        let mut unset_batch: Vec<(String, String)> = Vec::new();
-        for id in &touched_ids {
-            let Some(inst) = self.instance_map.get(*id) else {
-                continue;
-            };
-            // `s.exists()` reads a 2s-TTL cache; tests bypassing
-            // `Session::create` must call `refresh_session_cache()`.
-            let tmux_name = match inst.tmux_session() {
-                Ok(s) if s.exists() && !s.is_pane_dead() => s.name().to_string(),
-                Ok(_) => continue,
-                Err(e) => {
-                    tracing::warn!(target: "tui.home",
-                        instance = %id,
-                        "Skipping tmux env publish; tmux_session() error: {}", e);
-                    continue;
-                }
-            };
-            match &inst.agent_session_id {
-                Some(sid) => set_batch.push((
-                    tmux_name,
-                    crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY.to_string(),
-                    sid.clone(),
-                )),
-                None => unset_batch.push((
-                    tmux_name,
-                    crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY.to_string(),
-                )),
-            }
-        }
-        if !set_batch.is_empty() {
-            let refs: Vec<(&str, &str, &str)> = set_batch
-                .iter()
-                .map(|(s, k, v)| (s.as_str(), k.as_str(), v.as_str()))
-                .collect();
-            if let Err(e) = crate::tmux::env::set_hidden_env_batch(&refs) {
-                tracing::warn!(target: "tui.home", "Post-CAS env publish failed: {}", e);
-            }
-        }
-        if !unset_batch.is_empty() {
-            let refs: Vec<(&str, &str)> = unset_batch
-                .iter()
-                .map(|(s, k)| (s.as_str(), k.as_str()))
-                .collect();
-            if let Err(e) = crate::tmux::env::remove_hidden_env_batch(&refs) {
-                tracing::warn!(target: "tui.home", "Post-CAS env unset failed: {}", e);
-            }
-        }
-
-        !to_apply.is_empty() || !to_rollback.is_empty()
+        !outcome.applied.is_empty() || !outcome.rolled_back.is_empty()
     }
 
     /// Drain the startup-recovery channel and apply each `RecoveryUpdate`
@@ -3746,6 +3642,7 @@ impl HomeView {
             || self.send_message_dialog.is_some()
             || self.update_confirm_dialog.is_some()
             || self.telemetry_consent_dialog.is_some()
+            || self.tips_dialog.is_some()
             || serve_open
             || self.settings_view.is_some()
             || self.diff_view.is_some()
@@ -3784,6 +3681,7 @@ impl HomeView {
             || self.send_message_dialog.is_some()
             || self.update_confirm_dialog.is_some()
             || self.telemetry_consent_dialog.is_some()
+            || self.tips_dialog.is_some()
             || serve_open
             || self.settings_view.is_some()
             || self.diff_view.is_some()
@@ -3840,32 +3738,45 @@ impl HomeView {
         self.save_sidebar_collapsed();
     }
 
-    fn save_sidebar_collapsed(&self) {
-        if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
-            config.app_state.home_sidebar_collapsed = Some(self.sidebar_collapsed);
-            if let Err(e) = save_config(&config) {
-                tracing::warn!(target: "tui.home", "Failed to save config: {e}");
+    /// Load the persisted config, apply `mutate` to its `app_state`, and write
+    /// it back. Both the load and save failure paths are logged, so a
+    /// UI-preference write never fails silently in one persister while being
+    /// reported in another. Centralizes the load/mutate/save boilerplate the
+    /// home view's preference persisters would otherwise each repeat.
+    fn persist_app_state(
+        what: &str,
+        mutate: impl FnOnce(&mut crate::session::config::AppStateConfig),
+    ) {
+        match load_config() {
+            Ok(config) => {
+                let mut config = config.unwrap_or_default();
+                mutate(&mut config.app_state);
+                if let Err(e) = save_config(&config) {
+                    tracing::warn!(target: "tui.home", "Failed to save config ({what}): {e}");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(target: "tui.home", "Failed to load config for {what} save: {e}");
             }
         }
     }
 
+    fn save_sidebar_collapsed(&self) {
+        let collapsed = self.sidebar_collapsed;
+        Self::persist_app_state("sidebar collapsed", |s| {
+            s.home_sidebar_collapsed = Some(collapsed)
+        });
+    }
+
     fn save_list_width(&self) {
-        if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
-            config.app_state.home_list_width = Some(self.list_width);
-            if let Err(e) = save_config(&config) {
-                tracing::warn!(target: "tui.home", "Failed to save config: {e}");
-            }
-        }
+        let width = self.list_width;
+        Self::persist_app_state("list width", |s| s.home_list_width = Some(width));
     }
 
     pub fn toggle_preview_info(&mut self) {
         self.show_preview_info = !self.show_preview_info;
-        if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
-            config.app_state.show_preview_info = Some(self.show_preview_info);
-            if let Err(e) = save_config(&config) {
-                tracing::warn!(target: "tui.home", "Failed to save config: {e}");
-            }
-        }
+        let show = self.show_preview_info;
+        Self::persist_app_state("preview info", |s| s.show_preview_info = Some(show));
     }
 
     /// Forget the last non-live preview resize so the next render re-asserts the
@@ -3887,22 +3798,17 @@ impl HomeView {
             return;
         }
         self.archived_section_collapsed = false;
-        if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
-            config.app_state.archived_section_collapsed = Some(false);
-            if let Err(e) = save_config(&config) {
-                tracing::warn!(target: "tui.home", "Failed to save config: {e}");
-            }
-        }
+        Self::persist_app_state("archived section", |s| {
+            s.archived_section_collapsed = Some(false)
+        });
     }
 
     pub fn toggle_archived_section(&mut self) {
         self.archived_section_collapsed = !self.archived_section_collapsed;
-        if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
-            config.app_state.archived_section_collapsed = Some(self.archived_section_collapsed);
-            if let Err(e) = save_config(&config) {
-                tracing::warn!(target: "tui.home", "Failed to save config: {e}");
-            }
-        }
+        let collapsed = self.archived_section_collapsed;
+        Self::persist_app_state("archived section", |s| {
+            s.archived_section_collapsed = Some(collapsed)
+        });
         self.flat_items = self.build_flat_items();
         // Defensive cursor clamp + selection refresh. Today the only
         // call site routes through `toggle_group_collapsed` after the
@@ -5703,6 +5609,7 @@ impl HomeView {
         self.idle_decay_window =
             crate::tui::styles::idle_decay_window(config.theme.idle_decay_minutes);
         crate::session::set_unread_enabled(config.session.unread_indicator);
+        self.tips_unseen = tips_unseen_count(&config);
         self.tool_configs = config.tools;
         self.tool_hotkey_cache = input::build_tool_hotkey_cache(&self.tool_configs);
         let hotkey_warnings = input::validate_tool_hotkeys(&self.tool_configs);

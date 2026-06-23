@@ -160,7 +160,7 @@ fn rewrite_one(target: &HookTarget) -> Result<()> {
         anyhow::bail!("test-injected rewrite failure for {}", target.agent_name);
     }
     match target.kind {
-        HookTargetKind::JsonSettings => {
+        HookTargetKind::JsonSettings | HookTargetKind::CodexJson => {
             install_hooks(&target.path, target.events, HookInstallTarget::Host)
         }
         HookTargetKind::CodexToml => {

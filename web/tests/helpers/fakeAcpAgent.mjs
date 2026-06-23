@@ -346,18 +346,34 @@ const INITIALIZE_RESULT = {
   agentInfo: {
     name: "@agentclientprotocol/claude-agent-acp",
     // Keep at (or above) the agent_compat floor in src/acp/agent_compat.rs
-    // (>=0.47.0, which adds the duplicate-message fix on top of 0.46's
-    // per-question "Other" boxes and PromptResponse-hang fix); the gate
+    // (>=0.49.0, which dedups streamed assistant blocks by content so the
+    // leaked consolidated restatement no longer doubles a message); the gate
     // rejects the fake's handshake otherwise, which fails every live
     // Playwright acp spec and the acp live-daemon e2e suite (#2077 bumped
     // the floor without this fixture and broke both).
-    version: "0.47.0",
+    version: "0.49.0",
   },
   // No authMethods key at all. An empty array is interpreted by some
   // ACP client implementations as "auth methods listed but none
   // available", which surfaces as AuthRequired on the next call.
   // Omitting the key signals "no auth required" cleanly.
 };
+
+// The same fake is shimmed under several binary names (claude /
+// claude-agent-acp / aoe-agent / opencode). The agent_compat gate keys
+// its policy off the binary the supervisor spawned, so when this process
+// stands in for opencode it must report opencode's own name and a version
+// at or above the opencode floor (OPENCODE_MIN_VERSION in
+// src/acp/agent_compat.rs); otherwise the gate rejects the handshake and
+// the opencode live specs (acp-mode-picker) fail. The shim sets
+// FAKE_ACP_IMPERSONATE; default stays claude.
+function resolveAgentInfo() {
+  if (process.env.FAKE_ACP_IMPERSONATE === "opencode") {
+    // Keep at (or above) the agent_compat opencode floor (>=1.16.0).
+    return { name: "OpenCode", version: "1.16.0" };
+  }
+  return INITIALIZE_RESULT.agentInfo;
+}
 
 async function handleRequest(msg) {
   const { id, method, params } = msg;
@@ -401,6 +417,7 @@ async function handleRequest(msg) {
       const result = script.promptCapabilities
         ? {
             ...INITIALIZE_RESULT,
+            agentInfo: resolveAgentInfo(),
             agentCapabilities: {
               ...INITIALIZE_RESULT.agentCapabilities,
               promptCapabilities: {
@@ -409,7 +426,7 @@ async function handleRequest(msg) {
               },
             },
           }
-        : INITIALIZE_RESULT;
+        : { ...INITIALIZE_RESULT, agentInfo: resolveAgentInfo() };
       sendResult(id, result);
       return;
     }
@@ -497,6 +514,36 @@ async function handleRequest(msg) {
         result.configOptions = [...(result.configOptions ?? []), makeOpencodeModeOption(current)];
       }
       sendResult(id, result);
+      // Test hook for the import flow (#2276): on session/load, replay a
+      // deterministic transcript chunk the way claude-agent-acp re-emits
+      // prior history during a load. Lets the import spec assert the
+      // imported transcript renders (seed-not-suppressed), while a normal
+      // reattach would drop it. Only on load, deferred after the response.
+      const loadReplay = process.env.FAKE_ACP_LOAD_REPLAY;
+      if (method === "session/load" && loadReplay) {
+        setImmediate(() => {
+          // Replay a prior USER turn first (claude-agent-acp emits
+          // user_message_chunk for historical user messages), then the
+          // assistant reply, so the import spec can assert both render.
+          const userReplay = process.env.FAKE_ACP_LOAD_REPLAY_USER;
+          if (userReplay) {
+            sendNotification("session/update", {
+              sessionId,
+              update: {
+                sessionUpdate: "user_message_chunk",
+                content: { type: "text", text: userReplay },
+              },
+            });
+          }
+          sendNotification("session/update", {
+            sessionId,
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: loadReplay },
+            },
+          });
+        });
+      }
       return;
     }
 

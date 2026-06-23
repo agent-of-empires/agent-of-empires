@@ -1150,13 +1150,21 @@ async fn build_spawn_request(
     // pre-move path is the crash-loop in #2260. Bail if the session vanished
     // mid-flight (e.g. deleted during the handshake); ensure_container below
     // re-acquires the same lock, so this read-and-release must not hold it.
-    let cwd = {
+    // Also read import_pending under the lock: if the daemon restarted before
+    // an imported session's first session/load completed, the reconciler must
+    // still seed the transcript from the replay. The supervisor clears any
+    // partial events from the interrupted attempt after it reserves the slot.
+    // See #2276.
+    let (cwd, seed_history_replay) = {
         let _guard = inst_lock.lock().await;
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == target.id) else {
             return Err(());
         };
-        PathBuf::from(&inst.project_path)
+        (
+            PathBuf::from(&inst.project_path),
+            inst.import_pending == Some(true),
+        )
     };
     let agent = supervisor
         .pick_agent_for_tool(
@@ -1204,6 +1212,7 @@ async fn build_spawn_request(
         source_profile: Some(target.source_profile.clone()),
         yolo_mode: target.yolo_mode,
         agent_command_override: command_override_for_spawn(&target.tool, &target.command),
+        seed_history_replay,
     })
 }
 

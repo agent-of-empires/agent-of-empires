@@ -32,7 +32,7 @@ Each level is additive; do only what the agent supports.
 
 **1. Research:** binary name, detection (`which`), YOLO/auto-approve flag, resume flag, hook support + format (JSON/YAML/TOML), config dir, install command.
 
-**2. `AgentDef` (`src/agents.rs`):** add to the `AGENTS` array. Key fields: `detection: DetectionMethod::Which(...)`, `yolo: Some(YoloMode::CliFlag(...))`, `hook_config` (`Some(...)` for Claude-format hooks), `resume_strategy`, `host_only`, `install_hint`. `set_default_command: true` only when the binary name alone isn't enough to relaunch (e.g. opencode).
+**2. `AgentDef` (`src/agents.rs`):** add to the `AGENTS` array. Key fields: `detection: DetectionMethod::Which(...)`, `yolo: Some(YoloMode::CliFlag(...))`, either `hook_config` (with `format: HookFormat::JsonSettings` or `HookFormat::CodexToml`) or `sidecar_hooks` (with `format: SidecarFormat::SettlToml`, `HermesYaml`, or `KiroJson`), `resume_strategy`, `host_only`, `install_hint`. The format enums drive installer and marker-walker dispatch; adding a hook-based agent without picking a variant is a compile error. `set_default_command: true` only when the binary name alone isn't enough to relaunch (e.g. opencode).
 
 **3. Status detection (`src/tmux/status_detection.rs`):** hook-based agents get a stub returning `Status::Idle`. Pane-parse agents get a function matching on lowercased pane content. Prefer `--format json` over substring matching when the CLI offers it; human-readable output changes between versions.
 

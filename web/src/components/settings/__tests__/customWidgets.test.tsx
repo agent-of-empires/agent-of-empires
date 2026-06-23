@@ -12,6 +12,7 @@ import {
   AcpDefaultsWidget,
   DefaultToolWidget,
   LoggingTargetsWidget,
+  SmartRenameAgentWidget,
   SoundModeWidget,
   SoundVolumeWidget,
   ThemeNameWidget,
@@ -19,9 +20,30 @@ import {
 
 const fetchThemes = vi.fn(() => Promise.resolve(["dark", "light"]));
 const dispatchThemePickerChanged = vi.fn();
+const agent = (name: string, installed: boolean, oneshot_capable: boolean) => ({
+  name,
+  kind: "builtin" as const,
+  binary: name,
+  host_only: false,
+  installed,
+  install_hint: "",
+  oneshot_capable,
+  acp_capable: true,
+  acp_installed: true,
+  acp_args: [],
+});
+const fetchAgents = vi.fn(() =>
+  Promise.resolve([
+    agent("claude", true, true),
+    agent("codex", true, true),
+    agent("gemini", false, true), // not installed -> filtered out
+    agent("cursor", true, false), // no one-shot -> filtered out
+  ]),
+);
 
 vi.mock("../../../lib/api", () => ({
   fetchThemes: () => fetchThemes(),
+  fetchAgents: () => fetchAgents(),
 }));
 vi.mock("../../../hooks/useResolvedTheme", () => ({
   dispatchThemePickerChanged: (t?: string) => dispatchThemePickerChanged(t),
@@ -178,6 +200,31 @@ describe("AcpDefaultsWidget", () => {
     });
     fireEvent.blur(ta);
     expect(save).toHaveBeenCalledWith({ claude: { effort: "high" } });
+  });
+});
+
+describe("SmartRenameAgentWidget", () => {
+  it("lists only installed one-shot-capable agents plus Same as session, and saves the name", async () => {
+    const save = vi.fn(() => Promise.resolve(true));
+    render(
+      <SmartRenameAgentWidget
+        descriptor={descriptor({ field: "smart_rename_agent", label: "Smart-rename agent" })}
+        value=""
+        save={save}
+      />,
+    );
+    await waitFor(() => expect(screen.getByText("codex")).toBeTruthy());
+    const select = selectByLabel("Smart-rename agent");
+    const optionValues = Array.from(select.options).map((o) => o.value);
+    // "Same as session" (empty) + installed one-shot agents only.
+    expect(optionValues).toEqual(["", "claude", "codex"]);
+
+    fireEvent.change(select, { target: { value: "codex" } });
+    expect(save).toHaveBeenCalledWith("codex");
+
+    // Empty selection persists as "" (use session agent), not null.
+    fireEvent.change(selectByLabel("Smart-rename agent"), { target: { value: "" } });
+    expect(save).toHaveBeenCalledWith("");
   });
 });
 

@@ -110,6 +110,15 @@ pub struct SessionResponse {
     /// `session::smart_rename`.
     #[serde(default)]
     pub smart_rename: crate::session::smart_rename::SmartRenameState,
+    /// Whether the session still carries its auto-generated civilization name.
+    /// The sidebar gates the manual "Auto-name now" action on this (it only
+    /// targets a still-default session, never overwriting a chosen title), and
+    /// it is a more reliable signal than `smart_rename`: a timed-out one-shot
+    /// stays `pending` while an unusable-output one goes `inactive`, but both
+    /// leave the name default and recoverable. Populated by `list_sessions`;
+    /// single-session responses leave it `false`.
+    #[serde(default)]
+    pub default_name: bool,
     pub has_terminal: bool,
     pub profile: String,
     pub cleanup_defaults: CleanupDefaults,
@@ -305,6 +314,8 @@ impl SessionResponse {
             tie_workdir_to_name: false,
             // Overlaid in list_sessions; single-session responses stay inactive.
             smart_rename: crate::session::smart_rename::SmartRenameState::Inactive,
+            // Overlaid in list_sessions; single-session responses stay false.
+            default_name: false,
             has_terminal: inst.terminal_info.is_some(),
             profile: inst.source_profile.clone(),
             cleanup_defaults: CleanupDefaults {
@@ -462,7 +473,12 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
             } else {
                 None
             };
-            let (next_wakeup_at, next_wakeup_reason) = if inst.is_structured() {
+            // Archived sessions are sunk and not live; their wakeup/monitor
+            // badge is meaningless, so skip the per-poll SQLite lookups for
+            // them. Unarchiving restores the queries. latest_plan stays
+            // ungated: a collapsed archived row may still show a plan summary.
+            let structured_live = inst.is_structured() && !inst.is_archived();
+            let (next_wakeup_at, next_wakeup_reason) = if structured_live {
                 match state.acp_event_store.latest_pending_wakeup(&inst.id) {
                     Some((at, reason)) => (Some(at.to_rfc3339()), reason),
                     None => (None, None),
@@ -470,7 +486,7 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
             } else {
                 (None, None)
             };
-            let active_monitor = if inst.is_structured() {
+            let active_monitor = if structured_live {
                 state.acp_event_store.latest_active_monitor(&inst.id)
             } else {
                 None
@@ -573,7 +589,7 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
     // in-flight set; `pending` from the shared eligibility predicate, so the
     // chip cannot drift from the runtime gate. Config resolved once per profile.
     {
-        use crate::session::smart_rename::{check_eligible, SmartRenameState};
+        use crate::session::smart_rename::{check_eligible_resolved, SmartRenameState};
         use std::collections::{HashMap, HashSet};
         let inflight: HashSet<String> = state
             .smart_rename_inflight
@@ -585,8 +601,10 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
             .lock()
             .map(|g| g.clone())
             .unwrap_or_default();
-        let mut cfg_cache: HashMap<String, (bool, HashMap<String, String>)> = HashMap::new();
+        let mut cfg_cache: HashMap<String, (bool, String, HashMap<String, String>)> =
+            HashMap::new();
         for (resp, inst) in sessions.iter_mut().zip(instances.iter()) {
+            resp.default_name = crate::session::civilizations::is_default_civ_name(&inst.title);
             if inflight.contains(&inst.id) {
                 resp.smart_rename = SmartRenameState::Running;
                 continue;
@@ -596,23 +614,28 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
             if attempted.contains(&inst.id) {
                 continue;
             }
-            let (setting_on, overrides) = cfg_cache
+            let (setting_on, rename_agent, overrides) = cfg_cache
                 .entry(inst.source_profile.clone())
                 .or_insert_with(|| {
                     let cfg = crate::session::profile_config::resolve_config_or_warn(
                         &inst.source_profile,
                     )
                     .session;
-                    (cfg.smart_rename, cfg.agent_command_override)
+                    (
+                        cfg.smart_rename,
+                        cfg.smart_rename_agent,
+                        cfg.agent_command_override,
+                    )
                 });
-            let eligible = check_eligible(
+            let eligible = check_eligible_resolved(
                 inst.is_structured(),
                 *setting_on,
                 &inst.title,
-                crate::agents::get_agent(&inst.tool),
+                &inst.tool,
+                rename_agent,
                 inst.is_sandboxed(),
                 &inst.command,
-                overrides.contains_key(&inst.tool),
+                overrides,
             )
             .is_ok();
             if eligible {
@@ -2110,6 +2133,113 @@ pub async fn update_session_archive(
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
 
+/// `POST /api/sessions/:id/smart-rename`. Manual "Auto-name now" recovery for
+/// a structured-view session whose automatic smart rename never landed (the
+/// one-shot timed out, returned unusable output, or the daemon restarted with
+/// the in-memory attempted set cleared). Clears the per-session attempted gate
+/// and re-runs the one-shot against the session's first prompt.
+///
+/// Only targets a still-default-named session: a session the user (or a prior
+/// rename) already named is left alone, so this never overwrites a chosen
+/// title. The actual rename runs detached and best-effort, exactly like the
+/// prompt-handler trigger; a `202` means "re-run started", not "renamed".
+pub async fn force_smart_rename(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Some(resp) = super::acp::read_only_block(&state) {
+        return resp;
+    }
+
+    let Some((profile, tool, command, sandboxed, title, structured)) = ({
+        let instances = state.instances.read().await;
+        instances.iter().find(|i| i.id == id).map(|i| {
+            (
+                i.source_profile.clone(),
+                i.tool.clone(),
+                i.command.clone(),
+                i.is_sandboxed(),
+                i.title.clone(),
+                i.is_structured(),
+            )
+        })
+    }) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "message": "Session not found" })),
+        )
+            .into_response();
+    };
+
+    // Preflight the SAME gate the spawned try_smart_rename re-applies, so the
+    // action never reports success (202) for a session the gate would silently
+    // drop (disabled, sandboxed, or a resolved rename agent with no one-shot /
+    // an overridden command). Without this, the sidebar would show success
+    // while no title job runs.
+    let config = crate::session::profile_config::resolve_config_or_warn(&profile);
+    if let Err(reason) = crate::session::smart_rename::check_eligible_resolved(
+        structured,
+        config.session.smart_rename,
+        &title,
+        &tool,
+        &config.session.smart_rename_agent,
+        sandboxed,
+        &command,
+        &config.session.agent_command_override,
+    ) {
+        use crate::session::smart_rename::SkipReason;
+        let (status, message) = match reason {
+            SkipReason::NotStructured => (
+                StatusCode::BAD_REQUEST,
+                "Session is not a structured-view session",
+            ),
+            SkipReason::NameNotDefault => {
+                (StatusCode::CONFLICT, "Session already has a custom name")
+            }
+            SkipReason::Disabled => (StatusCode::CONFLICT, "Smart rename is disabled in settings"),
+            SkipReason::Sandboxed => (
+                StatusCode::CONFLICT,
+                "Smart rename is not available for sandboxed sessions",
+            ),
+            SkipReason::NoOneshot => (
+                StatusCode::CONFLICT,
+                "The smart-rename agent has no one-shot mode",
+            ),
+            SkipReason::CommandOverridden => (
+                StatusCode::CONFLICT,
+                "The smart-rename agent's command is overridden",
+            ),
+        };
+        return (status, Json(serde_json::json!({ "message": message }))).into_response();
+    }
+
+    let Some(first_message) = state.acp_event_store.first_user_prompt(&id) else {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "message": "No prompt to name this session from yet" })),
+        )
+            .into_response();
+    };
+
+    // Clear the attempted gate so try_smart_rename does not short-circuit on a
+    // prior failed attempt. The inflight guard inside try_smart_rename still
+    // prevents a concurrent one-shot for the same session.
+    {
+        let mut attempted = state
+            .smart_rename_attempted
+            .lock()
+            .expect("smart_rename_attempted poisoned");
+        attempted.remove(&id);
+    }
+
+    tokio::spawn(crate::session::smart_rename::try_smart_rename(
+        state.clone(),
+        id.clone(),
+        first_message,
+    ));
+    StatusCode::ACCEPTED.into_response()
+}
+
 /// Stop a session, matching the TUI's `x` keybind: kill the tmux pane and
 /// stop (but do not remove) the Docker container for plain sessions; shut down
 /// the worker for structured-view sessions. The session record is preserved
@@ -3055,6 +3185,14 @@ pub struct CreateSessionBody {
     /// `trust_hooks: true`. Already-trusted hooks run regardless.
     #[serde(default)]
     pub trust_hooks: Option<bool>,
+    /// Import an existing Claude Code session: the on-disk session id (the
+    /// `<sessionId>.jsonl` stem) to resume via `session/load`. When set, the
+    /// new session adopts this id as its `acp_session_id`, is forced to the
+    /// structured view, and seeds its transcript from the agent's history
+    /// replay. `path` must be the session's original cwd. See #2276.
+    #[cfg(feature = "serve")]
+    #[serde(default)]
+    pub import_acp_session_id: Option<String>,
 }
 
 fn validate_session_tool_identity(
@@ -3452,6 +3590,54 @@ pub async fn create_session(
             .into_response();
     }
 
+    // Importing an existing Claude session (#2276) is tightly scoped: it
+    // resumes a specific on-disk session id in its original cwd via the claude
+    // structured agent. Reject any request that pairs the id with a different
+    // workspace shape, a non-claude agent, or a cwd the id doesn't belong to,
+    // so a stale or hand-written request can't seed the transcript in the
+    // wrong place. Runs after tool-identity validation so it sits ahead of
+    // the build's spawn_blocking but behind the agent check.
+    #[cfg(feature = "serve")]
+    if let Some(import_id) = body
+        .import_acp_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let bad = |msg: &str| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "validation_failed", "message": msg})),
+            )
+                .into_response()
+        };
+        if body.tool != "claude"
+            || body
+                .agent_name
+                .as_deref()
+                .is_some_and(|n| !n.trim().is_empty())
+        {
+            return bad("Importing a Claude session requires the built-in claude agent");
+        }
+        if body.scratch || body.worktree_branch.is_some() || !body.extra_repo_paths.is_empty() {
+            return bad(
+                "Importing a Claude session cannot use scratch, a worktree, or extra repos",
+            );
+        }
+        let import_cwd = body.path.trim().to_string();
+        let import_id_owned = import_id.to_string();
+        let belongs = tokio::task::spawn_blocking(move || {
+            crate::acp::claude_import::scan_sessions()
+                .into_iter()
+                .any(|s| s.session_id == import_id_owned && s.cwd == import_cwd)
+        })
+        .await
+        .unwrap_or(false);
+        if !belongs {
+            return bad("Unknown Claude session for this directory");
+        }
+    }
+
     let profile = body.profile.unwrap_or_else(|| state.profile.clone());
     let instances = state.instances.read().await;
     let existing_titles: Vec<String> = instances.iter().map(|i| i.title.clone()).collect();
@@ -3562,6 +3748,20 @@ pub async fn create_session(
         #[cfg(feature = "serve")]
         let agent_effort = {
             instance.view = body.view;
+            // #2276: importing an existing Claude session forces the
+            // structured view and adopts the on-disk session id, so the
+            // structured spawn resumes it via session/load and seeds the
+            // transcript from the agent's history replay. `path` is the
+            // session's original cwd (the wizard prefills it).
+            if let Some(import_id) = body
+                .import_acp_session_id
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+            {
+                instance.view = crate::session::View::Structured;
+                instance.acp_session_id = Some(import_id);
+                instance.import_pending = Some(true);
+            }
             instance.agent_name = body.agent_name;
             let agent_key = instance
                 .agent_name
@@ -3737,6 +3937,7 @@ pub async fn create_session(
                     instance.source_profile.clone(),
                     instance.yolo_mode,
                     instance.command.clone(),
+                    instance.import_pending == Some(true),
                 ))
             } else {
                 None
@@ -3763,6 +3964,7 @@ pub async fn create_session(
                 source_profile,
                 yolo_mode,
                 command,
+                seed_history_replay,
             )) = acp_spawn_target
             {
                 let agent = state
@@ -3816,6 +4018,7 @@ pub async fn create_session(
                             source_profile: source_profile_for_spawn,
                             yolo_mode,
                             agent_command_override: command_override,
+                            seed_history_replay,
                         })
                         .await
                     {
@@ -4448,15 +4651,23 @@ const MAX_CONTENTS_LINES: usize = 200_000;
 
 /// Validate a user-supplied relative file path against a workdir.
 ///
-/// Returns the canonicalized absolute path if the requested path is safe to
-/// read (no absolute, no `..`, no symlink-escape out of the workdir) and
-/// appears in `changed_files` (so only actually-diffed files are exposed).
-/// Returns `Err(status, message)` otherwise.
+/// Returns `(canonical_path, is_changed)` if the requested path is safe to read
+/// (no absolute, no `..`, no symlink-escape out of the workdir). `is_changed`
+/// is true when the path appears in `changed_files` (diffable); false marks an
+/// in-repo file with no diff against the base, served via the full-file
+/// fallback (gated further on being a tracked blob; see
+/// [`crate::git::diff::compute_unchanged_file_contents`]). See #1810.
+///
+/// A path that is neither in the changed set nor present on disk yields
+/// `NOT_FOUND`. The non-canonical fallback is reserved for the changed-set case
+/// (a file deleted in the working tree but still diffable); the unchanged
+/// branch requires canonicalization to succeed. Returns `Err(status, message)`
+/// otherwise.
 fn validate_diff_path(
     workdir: &std::path::Path,
     requested: &std::path::Path,
     changed_files: &[crate::git::diff::DiffFile],
-) -> Result<std::path::PathBuf, (StatusCode, &'static str)> {
+) -> Result<(std::path::PathBuf, bool), (StatusCode, &'static str)> {
     use std::path::Component;
 
     if requested.as_os_str().is_empty() {
@@ -4474,13 +4685,7 @@ fn validate_diff_path(
         }
     }
 
-    // Cross-check: path must be one of the currently-changed files.
-    // This is the narrowest trust boundary: only files the user actually
-    // modified on this branch are diffable, not arbitrary files in the worktree.
-    let matches_changed = changed_files.iter().any(|f| f.path == requested);
-    if !matches_changed {
-        return Err((StatusCode::NOT_FOUND, "file not in changed set"));
-    }
+    let is_changed = changed_files.iter().any(|f| f.path == requested);
 
     // Canonicalize both sides and verify containment as defense in depth
     // against symlinks that might point outside the workdir.
@@ -4491,19 +4696,20 @@ fn validate_diff_path(
         )
     })?;
     let full = canonical_workdir.join(requested);
-    // The file may not exist on disk (e.g., deleted in the working tree), in
-    // which case canonicalize fails; fall back to the non-canonical path and
-    // just verify textual containment.
-    let final_path = match full.canonicalize() {
+    match full.canonicalize() {
         Ok(c) => {
             if !c.starts_with(&canonical_workdir) {
                 return Err((StatusCode::BAD_REQUEST, "path escapes workdir"));
             }
-            c
+            Ok((c, is_changed))
         }
-        Err(_) => full,
-    };
-    Ok(final_path)
+        // The file isn't on disk. A changed file may have been deleted in the
+        // working tree but is still diffable, so fall back to the non-canonical
+        // (component-vetted) path. An unchanged path that isn't on disk has
+        // nothing to show.
+        Err(_) if is_changed => Ok((full, true)),
+        Err(_) => Err((StatusCode::NOT_FOUND, "file not found")),
+    }
 }
 
 /// One repo's worth of diff context: a name (for workspace members)
@@ -4753,21 +4959,64 @@ pub async fn session_diff_file(
                 repo_path,
             );
 
-            // Validate the requested path against the set of actually-changed files.
-            // This is the primary security boundary: only files modified on this
-            // branch are diffable, preventing arbitrary file reads via ?path=...
+            // Validate the requested path. Files in the changed set are diffed;
+            // an in-repo file with no diff against the base is served through
+            // the full-file fallback below. The path-traversal and containment
+            // checks are the security boundary preventing arbitrary reads.
             let changed_files = scan_state
                 .changed_files_cached(repo_path, &base_branch)
                 .map_err(|e| DiffFileError::Internal(e.into()))?;
-            match validate_diff_path(repo_path, file_path, &changed_files) {
-                Ok(_) => {}
-                Err((status, msg)) => {
-                    return Err(if status == StatusCode::NOT_FOUND {
-                        DiffFileError::NotFound(msg)
-                    } else {
-                        DiffFileError::BadRequest(msg)
-                    });
-                }
+            let (canonical_path, is_changed) =
+                match validate_diff_path(repo_path, file_path, &changed_files) {
+                    Ok(v) => v,
+                    Err((status, msg)) => {
+                        return Err(if status == StatusCode::NOT_FOUND {
+                            DiffFileError::NotFound(msg)
+                        } else {
+                            DiffFileError::BadRequest(msg)
+                        });
+                    }
+                };
+
+            // Full-file fallback: an agent-cited file with no diff against the
+            // base. Render its current contents instead of a dead end. See #1810.
+            if !is_changed {
+                let full =
+                    diff::compute_unchanged_file_contents(repo_path, file_path, &canonical_path)
+                        .map_err(|e| DiffFileError::Internal(e.into()))?
+                        .ok_or(DiffFileError::NotFound("file not found"))?;
+                let file = RichDiffFileInfo {
+                    path: query.path.clone(),
+                    old_path: None,
+                    status: "unchanged".to_string(),
+                    additions: 0,
+                    deletions: 0,
+                    repo_name: selected_repo_name.clone(),
+                };
+                let total_lines = full.content.lines().count();
+                let resp = if full.content.len() > MAX_CONTENTS_BYTES
+                    || total_lines > MAX_CONTENTS_LINES
+                {
+                    RichFileContentsResponse {
+                        file,
+                        old_content: String::new(),
+                        new_content: String::new(),
+                        patch: String::new(),
+                        is_binary: full.is_binary,
+                        truncated: true,
+                    }
+                } else {
+                    RichFileContentsResponse {
+                        file,
+                        old_content: String::new(),
+                        new_content: full.content,
+                        patch: String::new(),
+                        is_binary: full.is_binary,
+                        truncated: false,
+                    }
+                };
+                return Ok(serde_json::to_value(resp)
+                    .expect("RichFileContentsResponse is always serializable"));
             }
 
             // Hand the client raw old/new text plus a server-computed unified
@@ -5952,13 +6201,29 @@ mod tests {
     }
 
     #[test]
-    fn validate_diff_path_rejects_unchanged_file() {
+    fn validate_diff_path_accepts_unchanged_existing_file() {
+        // An in-repo file that exists on disk but is not in the changed set is
+        // now accepted for the full-file fallback (#1810), flagged
+        // `is_changed = false`. The tracked-blob gate that blocks `.git/` and
+        // gitignored secrets lives in compute_unchanged_file_contents, not here.
         let dir = TempDir::new().unwrap();
         std::fs::write(dir.path().join("existing.txt"), "hello").unwrap();
-        // File exists inside workdir but is not in the changed set.
-        let err = validate_diff_path(
+        let (_, is_changed) = validate_diff_path(
             dir.path(),
             std::path::Path::new("existing.txt"),
+            &changed(&["src/main.rs"]),
+        )
+        .unwrap();
+        assert!(!is_changed);
+    }
+
+    #[test]
+    fn validate_diff_path_rejects_nonexistent_unchanged_file() {
+        // Not in the changed set and not on disk: nothing to show.
+        let dir = TempDir::new().unwrap();
+        let err = validate_diff_path(
+            dir.path(),
+            std::path::Path::new("ghost.txt"),
             &changed(&["src/main.rs"]),
         )
         .unwrap_err();
@@ -5969,12 +6234,13 @@ mod tests {
     fn validate_diff_path_accepts_changed_file() {
         let dir = TempDir::new().unwrap();
         std::fs::write(dir.path().join("changed.txt"), "hello").unwrap();
-        let ok = validate_diff_path(
+        let (_, is_changed) = validate_diff_path(
             dir.path(),
             std::path::Path::new("changed.txt"),
             &changed(&["changed.txt"]),
-        );
-        assert!(ok.is_ok(), "expected Ok, got {:?}", ok);
+        )
+        .unwrap();
+        assert!(is_changed);
     }
 
     #[test]
@@ -5984,12 +6250,13 @@ mod tests {
         // what was removed. canonicalize() on the joined path will fail,
         // so the validator must fall back to the non-canonical path.
         let dir = TempDir::new().unwrap();
-        let ok = validate_diff_path(
+        let (_, is_changed) = validate_diff_path(
             dir.path(),
             std::path::Path::new("deleted.txt"),
             &changed(&["deleted.txt"]),
-        );
-        assert!(ok.is_ok(), "expected Ok, got {:?}", ok);
+        )
+        .unwrap();
+        assert!(is_changed);
     }
 
     #[test]
@@ -6901,6 +7168,7 @@ mod workspace_ordering_tests {
             has_managed_worktree: false,
             tie_workdir_to_name: false,
             smart_rename: crate::session::smart_rename::SmartRenameState::Inactive,
+            default_name: false,
             has_terminal: false,
             profile: "default".to_string(),
             cleanup_defaults: CleanupDefaults {

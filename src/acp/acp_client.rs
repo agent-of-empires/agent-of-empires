@@ -23,14 +23,15 @@ use agent_client_protocol::schema::{
     CreateTerminalResponse, ElicitationAction, ElicitationCapabilities,
     ElicitationFormCapabilities, EmbeddedResource, EmbeddedResourceResource,
     FileSystemCapabilities, ImageContent, InitializeRequest, KillTerminalRequest,
-    KillTerminalResponse, LoadSessionRequest, McpServer, NewSessionRequest, PermissionOptionKind,
-    PromptRequest, ProtocolVersion, ReadTextFileRequest, ReadTextFileResponse,
-    ReleaseTerminalRequest, ReleaseTerminalResponse, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
-    SessionConfigId, SessionConfigValueId, SessionId, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionModeRequest, StopReason, TerminalId,
-    TerminalOutputRequest, TerminalOutputResponse, TextContent, WaitForTerminalExitRequest,
-    WaitForTerminalExitResponse, WriteTextFileRequest, WriteTextFileResponse,
+    KillTerminalResponse, LoadSessionRequest, McpServer, MessageId, NewSessionRequest,
+    PermissionOptionKind, PromptRequest, ProtocolVersion, ReadTextFileRequest,
+    ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    SelectedPermissionOutcome, SessionConfigId, SessionConfigValueId, SessionId,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest,
+    StopReason, TerminalId, TerminalOutputRequest, TerminalOutputResponse, TextContent,
+    WaitForTerminalExitRequest, WaitForTerminalExitResponse, WriteTextFileRequest,
+    WriteTextFileResponse,
 };
 use agent_client_protocol::{
     Agent, ByteStreams, Client, ConnectionTo, JsonRpcRequest, JsonRpcResponse, Responder,
@@ -320,6 +321,12 @@ pub struct SpawnConfig {
     /// advertise) happens later, against the `initialize` response. Empty when
     /// no config file exists, which preserves pre-feature behavior.
     pub mcp_servers: Vec<McpServer>,
+    /// When true and this spawn resumes via `session/load`, seed the event
+    /// store from the agent's history replay instead of suppressing it.
+    /// Set for the first spawn of an imported Claude session whose store is
+    /// empty; false for normal reattach (the transcript is already stored,
+    /// so re-ingesting would duplicate-key panic). See #2276.
+    pub seed_history_replay: bool,
 }
 
 /// Commands sent from `AcpClient` methods to the background connection task.
@@ -376,6 +383,10 @@ enum ClientCmd {
 enum ConnectMode {
     Fresh {
         stored_acp_session_id: Option<String>,
+        /// Seed the event store from the `session/load` history replay
+        /// instead of suppressing it (imported session, empty store). See
+        /// #2276.
+        seed_history_replay: bool,
     },
     Resume {
         acp_session_id: String,
@@ -462,6 +473,24 @@ const SILENT_ORPHAN_FAST_GRACE_DEFAULT: std::time::Duration = std::time::Duratio
 /// on-signal so the prompt loop owns the timer without needing the
 /// notification handler to reach back into a pinned `tokio::time::sleep`.
 const SILENT_ORPHAN_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Idle grace for the between-prompt watchdog once the cost-bearing
+/// end-of-turn `UsageUpdate` has arrived. Much shorter than the per-prompt
+/// `SILENT_ORPHAN_FAST_GRACE_DEFAULT`: that one also waits out a
+/// possibly-late `PromptResponse` over the wire, but a between-prompt
+/// agent-initiated turn has no RPC to wait for, so once it emits its
+/// end-of-turn marker and goes quiet a few seconds is enough. Kept low so
+/// the "monitoring" badge and running status clear promptly after a monitor
+/// turn finishes. A turn that actually continues emits fresh progress,
+/// which resets the idle timer and clears `cost_seen`, so this cannot cut a
+/// live turn short. See #2325.
+const BETWEEN_PROMPT_IDLE_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Tick cadence for the between-prompt idle check. Faster than
+/// `SILENT_ORPHAN_CHECK_INTERVAL` so the badge and status clear within a few
+/// seconds of the turn ending. Only polled while the command loop is parked
+/// between prompts, so the extra wakeups are cheap. See #2325.
+const BETWEEN_PROMPT_IDLE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Classification of an inbound ACP `SessionUpdate` for the silent-
 /// orphan watchdog state machine. Sent from the notification handler
@@ -885,6 +914,90 @@ fn terminal_stop_reason(
     } else {
         "prompt_complete"
     }
+}
+
+/// Decide whether the between-prompt idle watchdog should synthesize a
+/// terminal `Stopped` for an agent-initiated turn that ran with no
+/// aoe-issued `session/prompt`. A claude-code Monitor (or any backgrounded
+/// task) can fire AFTER the prompt that armed it already completed,
+/// resuming the agent into a fresh turn the per-prompt watchdog never
+/// saw; without this the turn never ends and the UI stays "running"
+/// forever. See #2325.
+///
+/// Pure so the precedence is unit-testable without the connection loop.
+/// Times are wall-clock millis (`chrono::Utc::now().timestamp_millis()`),
+/// matching the resume-idle watchdog. Mirrors the per-prompt watchdog's
+/// grace policy: the cost-bearing `UsageUpdate` is claude-agent-acp's
+/// end-of-turn marker, so once it has arrived the fast grace applies;
+/// otherwise the vendor-agnostic off-protocol floor governs. A pending
+/// scheduled wake (`wake_until` in the future) suppresses firing so a
+/// legitimately-sleeping monitor is never killed early.
+/// State update the between-prompt watchdog should apply for one inbound
+/// notification's classified signals. `None` when neither a lifecycle nor a
+/// wakeup signal is present (ambient updates do not touch the watchdog).
+///
+/// Extracted as a pure function so the cost / progress / wake bookkeeping is
+/// unit-testable without the notification closure. Every tracked signal
+/// refreshes `last_lifecycle_at` to `now_ms`, including `TerminalUsage`: the
+/// cost-bearing `UsageUpdate` is the end-of-turn marker, and the fast grace
+/// must measure from it (when the turn wrapped up) rather than from a
+/// possibly-stale earlier progress event. See #2325.
+#[derive(Debug, PartialEq)]
+struct BetweenPromptUpdate {
+    cost_seen: bool,
+    last_lifecycle_at: i64,
+    wake_until: i64,
+}
+
+fn between_prompt_signal_update(
+    lifecycle: Option<&LifecycleSignal>,
+    wakeup: Option<&LifecycleSignal>,
+    now_ms: i64,
+    prev_wake_until: i64,
+) -> Option<BetweenPromptUpdate> {
+    let mut update = match lifecycle {
+        Some(LifecycleSignal::TerminalUsage) => Some(BetweenPromptUpdate {
+            cost_seen: true,
+            last_lifecycle_at: now_ms,
+            wake_until: prev_wake_until,
+        }),
+        Some(_) => Some(BetweenPromptUpdate {
+            cost_seen: false,
+            last_lifecycle_at: now_ms,
+            wake_until: prev_wake_until,
+        }),
+        None => None,
+    };
+    // A scheduled wake (a re-armed monitor) suppresses firing until its
+    // deadline. Multiple wakes extend, never shorten, suppression.
+    if let Some(LifecycleSignal::WakeupPending { at }) = wakeup {
+        let deadline = at.timestamp_millis() + OFF_PROTOCOL_WORK_GRACE_FLOOR.as_millis() as i64;
+        update = Some(BetweenPromptUpdate {
+            cost_seen: false,
+            last_lifecycle_at: now_ms,
+            wake_until: deadline.max(prev_wake_until),
+        });
+    }
+    update
+}
+
+fn between_prompt_should_fire(
+    active: bool,
+    now_ms: i64,
+    last_lifecycle_ms: i64,
+    wake_until_ms: i64,
+    cost_seen: bool,
+    fast_grace: std::time::Duration,
+    floor: std::time::Duration,
+) -> bool {
+    if !active {
+        return false;
+    }
+    if now_ms < wake_until_ms {
+        return false;
+    }
+    let grace = if cost_seen { fast_grace } else { floor };
+    now_ms - last_lifecycle_ms >= grace.as_millis() as i64
 }
 
 /// Tagged lifecycle signal carried over the watchdog mpsc. The
@@ -1394,6 +1507,7 @@ impl AcpClient {
         //    a real `aoe` binary, and as a safety valve.
         let mode = ConnectMode::Fresh {
             stored_acp_session_id: config.stored_acp_session_id.clone(),
+            seed_history_replay: config.seed_history_replay,
         };
         let sandbox_pair = if let Some(info) = &config.sandbox_info {
             Some(SessionSandbox::from_info(
@@ -3032,6 +3146,101 @@ fn is_compact_completion(text: &str) -> bool {
     text.contains("Compacting completed.")
 }
 
+/// Tracks the in-flight assistant text block so claude-agent-acp's leaked
+/// consolidated `agent_message_chunk` restatement can be dropped before it
+/// reaches the watchdog, the event store, or any client. The adapter streams a
+/// text block as incremental chunks, then re-sends the whole block as one
+/// chunk; its own dedup (`streamedTextIds`) is meant to suppress that copy but
+/// misses on a message-id mismatch (deterministic right after an Opus to Sonnet
+/// switch, intermittent otherwise), so both reach us and every reducer appends
+/// both, doubling the message. See #2281.
+///
+/// The adapter's `message_id` only ever marks a new message, never reuses one
+/// across messages, so a same-id chunk is always a genuine delta and is never
+/// dropped (a legitimately repeated delta keeps the same id, for example
+/// streamed "ha" then "ha"). Any other chunk whose text restates the open
+/// block's accumulated text verbatim is the leaked consolidated copy, regardless
+/// of whether its id is present, absent, or merely different from the block's.
+/// Matching on content rather than on both ids being present closes the
+/// id-presence-asymmetry hole the adapter hits when `message_start` carries no
+/// id: the streamed deltas then arrive id-less while the restatement still
+/// carries a fallback uuid, so the two ids differ and the restatement is caught.
+/// claude-agent-acp >=0.49.0 dedups by content upstream (#800), so this is a
+/// backstop for that and for any other adapter that leaks the copy. The only
+/// shape left unfiltered is both sides genuinely id-less, where a verbatim
+/// repeat is indistinguishable from a leak; that degrades to the same-id append
+/// path rather than risk corrupting real output.
+#[derive(Default)]
+struct AgentMessageDedup {
+    block: Option<AgentTextBlock>,
+}
+
+struct AgentTextBlock {
+    id: Option<MessageId>,
+    text: String,
+}
+
+impl AgentMessageDedup {
+    /// Forget any in-flight block. Called while post-load history replay is
+    /// suppressed so replayed chunks cannot poison live block tracking once
+    /// suppression lifts.
+    fn reset(&mut self) {
+        self.block = None;
+    }
+
+    /// Returns true when `update` is the leaked consolidated restatement and the
+    /// whole notification should be skipped (not mapped, not emitted).
+    fn observe(&mut self, update: &SessionUpdate) -> bool {
+        let SessionUpdate::AgentMessageChunk(chunk) = update else {
+            // Any non-message-chunk update ends the current text block. The
+            // event stream never interleaves ambient updates inside a streamed
+            // block, so this is a safe block terminator.
+            self.block = None;
+            return false;
+        };
+        let ContentBlock::Text(t) = &chunk.content else {
+            // Non-text content (image, audio) ends the text block.
+            self.block = None;
+            return false;
+        };
+        if t.text.is_empty() {
+            // The adapter emits an empty chunk at each block start; treat it as
+            // the boundary so adjacent blocks never merge in the accumulator.
+            // Empty text renders nothing, so keep forwarding it.
+            self.block = Some(AgentTextBlock {
+                id: chunk.message_id.clone(),
+                text: String::new(),
+            });
+            return false;
+        }
+        match &mut self.block {
+            Some(block) if block.id == chunk.message_id => {
+                // Same message: a genuine streamed delta (or both ids absent).
+                // Never dropped.
+                block.text.push_str(&t.text);
+                false
+            }
+            Some(block) if block.text == t.text => {
+                // Arm 1 already consumed the equal-id case, so the ids differ
+                // here (present-and-different, or one side absent). A non-empty
+                // chunk restating the whole block verbatim under a different id
+                // is the leaked consolidated copy. Drop it and close the block.
+                self.block = None;
+                true
+            }
+            _ => {
+                // A genuinely new block (id changed, text differs) or no open
+                // block: start tracking fresh.
+                self.block = Some(AgentTextBlock {
+                    id: chunk.message_id.clone(),
+                    text: t.text.clone(),
+                });
+                false
+            }
+        }
+    }
+}
+
 /// Map an ACP `SessionUpdate` to the structured view's typed `Event`. Variants we
 /// don't yet handle pass through as `RawAgentUpdate` so UI clients can at
 /// least see them; we'll narrow these as the schema stabilises.
@@ -3077,6 +3286,19 @@ fn map_update_to_events(
                 }
                 events
             }
+            other => vec![raw_event(&other)],
+        },
+        // Replayed user turns (#2276): claude-agent-acp re-emits each prior
+        // user message as a user_message_chunk during session/load. Live user
+        // prompts are recorded by the send_prompt path as UserPromptSent, so
+        // this only fires on replay; mapping it to UserPromptSent makes the
+        // imported transcript show the user's bubbles. On a normal reattach
+        // these are suppressed (already in the store) by is_transcript_event.
+        SessionUpdate::UserMessageChunk(chunk) => match chunk.content {
+            ContentBlock::Text(text) => vec![Event::UserPromptSent {
+                text: text.text,
+                attachments: Vec::new(),
+            }],
             other => vec![raw_event(&other)],
         },
         SessionUpdate::AgentThoughtChunk(_) => vec![Event::ThinkingStarted],
@@ -4110,8 +4332,37 @@ async fn run_connection_task<W, R>(
     let first_event_after_attach = Arc::new(AtomicBool::new(false));
     let prompt_sent_since_attach = Arc::new(AtomicBool::new(false));
     let watchdog_fired = Arc::new(AtomicBool::new(false));
+    // Between-prompt idle watchdog state (#2325). Tracks an agent-initiated
+    // turn (Monitor / scheduled-wake resume) that runs with no aoe-issued
+    // `session/prompt`, so the outer command loop's idle tick can synthesize
+    // its terminal Stopped. `last_lifecycle_at` is updated only on transcript
+    // progress (NOT ambient AvailableCommandsUpdate), so periodic
+    // command-list refreshes can't keep resetting the idle timer.
+    let last_lifecycle_at = Arc::new(AtomicI64::new(now_ms));
+    let between_prompt_active = Arc::new(AtomicBool::new(false));
+    let between_prompt_cost_seen = Arc::new(AtomicBool::new(false));
+    let between_prompt_wake_until = Arc::new(AtomicI64::new(0));
+    let prompt_in_flight = Arc::new(AtomicBool::new(false));
     let last_event_at_for_notif = last_event_at.clone();
     let first_event_after_attach_for_notif = first_event_after_attach.clone();
+    let last_lifecycle_at_for_notif = last_lifecycle_at.clone();
+    let between_prompt_active_for_notif = between_prompt_active.clone();
+    let between_prompt_cost_seen_for_notif = between_prompt_cost_seen.clone();
+    let between_prompt_wake_until_for_notif = between_prompt_wake_until.clone();
+    let prompt_in_flight_for_notif = prompt_in_flight.clone();
+
+    // Per-session tracker that drops claude-agent-acp's leaked consolidated
+    // agent_message_chunk restatement before it doubles the rendered message.
+    // See AgentMessageDedup and #2281. std Mutex (not tokio) so the critical
+    // section stays synchronous and the guard never crosses an await.
+    let agent_msg_dedup = Arc::new(std::sync::Mutex::new(AgentMessageDedup::default()));
+    let agent_msg_dedup_for_notif = agent_msg_dedup.clone();
+    // The prompt loop resets the deduper at turn boundaries (a new prompt, and
+    // the turn's terminal Stopped). Turn completion is not a SessionUpdate, so
+    // without this an open text block could survive into the next turn and a
+    // new turn that legitimately reuses the prior turn's trailing text under a
+    // fresh message_id would be misclassified as a restatement. See #2281.
+    let agent_msg_dedup_for_block = agent_msg_dedup.clone();
 
     let result = Client
         .builder()
@@ -4126,10 +4377,38 @@ async fn run_connection_task<W, R>(
                     first_event_after_attach_for_notif.clone();
                 let lifecycle_signal_tx = lifecycle_signal_tx_for_notif.clone();
                 let current_prompt_epoch = current_prompt_epoch_for_notif.clone();
+                let agent_msg_dedup = agent_msg_dedup_for_notif.clone();
+                let last_lifecycle_at = last_lifecycle_at_for_notif.clone();
+                let between_prompt_active = between_prompt_active_for_notif.clone();
+                let between_prompt_cost_seen =
+                    between_prompt_cost_seen_for_notif.clone();
+                let between_prompt_wake_until =
+                    between_prompt_wake_until_for_notif.clone();
+                let prompt_in_flight = prompt_in_flight_for_notif.clone();
                 async move {
                     last_event_at
                         .store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
                     let suppressing = suppress.load(Ordering::Relaxed);
+                    // Drop claude-agent-acp's leaked consolidated
+                    // agent_message_chunk restatement before it reaches the
+                    // watchdog, the event store, or any client (#2281). During
+                    // post-load history replay the deduper is reset rather than
+                    // fed, so replayed chunks can't poison live block tracking.
+                    {
+                        let mut dedup = agent_msg_dedup
+                            .lock()
+                            .expect("agent message dedup mutex poisoned");
+                        if suppressing {
+                            dedup.reset();
+                        } else if dedup.observe(&notification.update) {
+                            debug!(
+                                target: "acp.protocol",
+                                session = %session_label,
+                                "dropping leaked consolidated agent_message_chunk restatement (#2281)"
+                            );
+                            return Ok(());
+                        }
+                    }
                     // Snapshot the prompt epoch ONCE per notification so
                     // every signal derived from this update shares the
                     // same epoch. If the prompt loop bumps the atomic
@@ -4157,6 +4436,32 @@ async fn run_connection_task<W, R>(
                     // not proof of in-flight turn progress.
                     if lifecycle_signal.is_some() || wakeup_signal.is_some() {
                         first_event_after_attach.store(true, Ordering::Relaxed);
+                    }
+                    // Between-prompt idle tracking (#2325). Only while no
+                    // aoe-issued prompt is in flight: a lifecycle signal here
+                    // means the agent resumed itself (Monitor / scheduled
+                    // wake), a turn the per-prompt watchdog never sees. Mirror
+                    // its cost/progress/wake semantics so the outer loop's
+                    // idle tick applies the same grace. During a real prompt
+                    // the per-prompt watchdog owns this, so skip.
+                    if !prompt_in_flight.load(Ordering::Relaxed) {
+                        let now = chrono::Utc::now().timestamp_millis();
+                        if let Some(u) = between_prompt_signal_update(
+                            lifecycle_signal.as_ref(),
+                            wakeup_signal.as_ref(),
+                            now,
+                            between_prompt_wake_until.load(Ordering::Relaxed),
+                        ) {
+                            between_prompt_active.store(true, Ordering::Relaxed);
+                            between_prompt_cost_seen.store(u.cost_seen, Ordering::Relaxed);
+                            // Refresh from `now` on every tracked signal,
+                            // including TerminalUsage, so the fast grace
+                            // measures from when the turn wrapped up rather
+                            // than from a possibly-stale earlier progress
+                            // event. See #2325 review.
+                            last_lifecycle_at.store(u.last_lifecycle_at, Ordering::Relaxed);
+                            between_prompt_wake_until.store(u.wake_until, Ordering::Relaxed);
+                        }
                     }
                     let mapped_events =
                         map_update_to_events(notification.update, profile);
@@ -4403,6 +4708,21 @@ async fn run_connection_task<W, R>(
                 "initialize handshake complete"
             );
 
+            // Signal handshake-ready now: the ACP `initialize` handshake (what
+            // the spawn timeout actually bounds) is done. session/new and
+            // session/load run below and stream their results as events; for a
+            // resumed/imported session the adapter replays the whole transcript
+            // before answering session/load, which can take far longer than the
+            // handshake timeout. Firing ready here keeps that replay out of the
+            // timeout window (the events still reach the UI as they arrive), so
+            // importing or resuming a large conversation no longer times out
+            // and gets the worker killed. A later session/new failure surfaces
+            // as an AgentStartupError event instead of a spawn() error. See
+            // #2276.
+            if let Some(tx) = ready_for_block.lock().await.take() {
+                let _ = tx.send(Ok(()));
+            }
+
             // Track the mode channels the agent advertised so we can skip
             // session/set_mode requests for modes the agent doesn't support.
             // When new_session.modes is present, only those IDs are valid.
@@ -4467,6 +4787,7 @@ async fn run_connection_task<W, R>(
                 }
                 ConnectMode::Fresh {
                     stored_acp_session_id,
+                    seed_history_replay,
                 } => {
                     // Decide whether to resume the prior agent session or create
                     // a fresh one. session/load is only attempted when the agent
@@ -4492,7 +4813,16 @@ async fn run_connection_task<W, R>(
                             // next reload (assistant-ui then panics with "Duplicate
                             // key toolCallId-..."). Cleared on Err below if we fall
                             // back to session/new, which has no replay payload.
-                            suppress_for_block.store(true, Ordering::Relaxed);
+                            //
+                            // Exception: an imported session (#2276) has an empty
+                            // event store, so we WANT the replay to populate it and
+                            // render the transcript. No existing rows means no
+                            // duplicate-key risk. The server clears import_pending
+                            // once this load lands, so a later reattach suppresses
+                            // normally.
+                            if !seed_history_replay {
+                                suppress_for_block.store(true, Ordering::Relaxed);
+                            }
                             let req = LoadSessionRequest::new(stored.clone(), cwd.clone())
                                 .mcp_servers(mcp_servers.clone());
                             match connection.send_request(req).block_task().await {
@@ -4552,6 +4882,25 @@ async fn run_connection_task<W, R>(
                                         let _ = event_tx_for_block.send(event).await;
                                     }
                                     acp_session_id = Some(SessionId::from(stored));
+                                }
+                                Err(e) if seed_history_replay => {
+                                    // Import seed (#2276): the replay may have
+                                    // partially populated the (otherwise empty)
+                                    // event store before load failed. Falling
+                                    // back to session/new would leave a fresh
+                                    // session inheriting that partial external
+                                    // transcript, so fail the import instead.
+                                    // import_pending stays set (no
+                                    // AcpSessionAssigned), and the next spawn
+                                    // clears the store and re-seeds before
+                                    // retrying.
+                                    warn!(
+                                        target: "acp.protocol",
+                                        session = %session_label,
+                                        stored_id = %stored,
+                                        "session/load failed for imported session; failing import (no session/new fallback): {e}"
+                                    );
+                                    return Err(e);
                                 }
                                 Err(e) => {
                                     warn!(
@@ -4708,10 +5057,6 @@ async fn run_connection_task<W, R>(
                 }
             };
 
-            if let Some(tx) = ready_for_block.lock().await.take() {
-                let _ = tx.send(Ok(()));
-            }
-
             // Arm the resume-idle watchdog. The agent's response to the
             // orphaned in-flight `session/prompt` (from the previous
             // daemon) carries a request id this client never issued and
@@ -4777,10 +5122,55 @@ async fn run_connection_task<W, R>(
                 });
             }
 
+            // The idle tick fires the between-prompt watchdog (#2325). It is
+            // only polled while this loop is parked at `cmd_rx.recv()`, i.e.
+            // between prompts; during a prompt the inner drain owns the
+            // connection and this arm never runs, so the per-prompt watchdog
+            // stays the sole idle authority there. Emitting Stopped from the
+            // command loop (never a detached task) keeps it serialized with
+            // every other command, so it can't race a new prompt's events.
+            let mut between_prompt_idle_tick =
+                tokio::time::interval(BETWEEN_PROMPT_IDLE_CHECK_INTERVAL);
+            between_prompt_idle_tick
+                .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                let cmd = cmd_rx.recv().await;
+                let cmd = tokio::select! {
+                    cmd = cmd_rx.recv() => cmd,
+                    _ = between_prompt_idle_tick.tick() => {
+                        let now = chrono::Utc::now().timestamp_millis();
+                        if between_prompt_should_fire(
+                            between_prompt_active.load(Ordering::Relaxed),
+                            now,
+                            last_lifecycle_at.load(Ordering::Relaxed),
+                            between_prompt_wake_until.load(Ordering::Relaxed),
+                            between_prompt_cost_seen.load(Ordering::Relaxed),
+                            BETWEEN_PROMPT_IDLE_GRACE,
+                            OFF_PROTOCOL_WORK_GRACE_FLOOR,
+                        ) {
+                            between_prompt_active.store(false, Ordering::Relaxed);
+                            info!(
+                                target: "acp.protocol",
+                                session = %session_label,
+                                "between-prompt idle watchdog: synthesizing Stopped for completed agent-initiated turn"
+                            );
+                            let _ = event_tx_for_block
+                                .send(Event::Stopped {
+                                    reason: "agent_idle".into(),
+                                })
+                                .await;
+                        }
+                        continue;
+                    }
+                };
                 match cmd {
                     Some(ClientCmd::Prompt(blocks)) => {
+                        // Scope the agent-message deduper to one turn: a new
+                        // prompt starts a fresh assistant block, so forget any
+                        // block left open by the prior turn. See #2281.
+                        agent_msg_dedup_for_block
+                            .lock()
+                            .expect("agent message dedup mutex poisoned")
+                            .reset();
                         // First user prompt after session/load: stop
                         // dropping notifications. The agent's history-
                         // replay window is over; everything from now on
@@ -4797,6 +5187,13 @@ async fn run_connection_task<W, R>(
                         // transition, so we no longer need to synthesize
                         // one for the orphaned prior turn.
                         prompt_sent_since_attach.store(true, Ordering::Relaxed);
+                        // A real prompt supersedes any agent-initiated turn the
+                        // between-prompt idle watchdog was tracking; this
+                        // prompt's own Stopped will own the next transition.
+                        // The per-prompt watchdog owns idle detection until the
+                        // Stopped emit below clears `prompt_in_flight`. See #2325.
+                        prompt_in_flight.store(true, Ordering::Relaxed);
+                        between_prompt_active.store(false, Ordering::Relaxed);
                         info!(target: "acp.protocol", "sending prompt ({} content blocks)", blocks.len());
                         // Drive the prompt request concurrently with the
                         // command channel so out-of-band notifications
@@ -5365,6 +5762,18 @@ async fn run_connection_task<W, R>(
                                 reason: reason.into(),
                             })
                             .await;
+                        // Turn ended: close any open assistant text block so a
+                        // restatement can never be matched across the turn
+                        // boundary. The next prompt also resets, this is the
+                        // belt to that suspenders. See #2281.
+                        agent_msg_dedup_for_block
+                            .lock()
+                            .expect("agent message dedup mutex poisoned")
+                            .reset();
+                        // The prompt drain is done; hand idle ownership back to
+                        // the between-prompt watchdog for any agent-initiated
+                        // turn that fires after this point. See #2325.
+                        prompt_in_flight.store(false, Ordering::Relaxed);
                         if shutdown {
                             break;
                         }
@@ -6373,6 +6782,196 @@ mod tests {
         );
     }
 
+    // Between-prompt idle watchdog fire decision (#2325). Wall-clock millis.
+    // Bind to the production constants so the test tracks the real grace.
+    const FAST: std::time::Duration = BETWEEN_PROMPT_IDLE_GRACE;
+    const FLOOR: std::time::Duration = OFF_PROTOCOL_WORK_GRACE_FLOOR;
+
+    #[test]
+    fn between_prompt_inactive_never_fires() {
+        // No agent-initiated turn tracked, even long past any grace.
+        assert!(!between_prompt_should_fire(
+            false, 10_000_000, 0, 0, true, FAST, FLOOR
+        ));
+    }
+
+    #[test]
+    fn between_prompt_fires_after_fast_grace_when_cost_seen() {
+        let last = 1_000_000;
+        let grace_ms = FAST.as_millis() as i64;
+        // Just under the fast grace: still waiting.
+        assert!(!between_prompt_should_fire(
+            true,
+            last + grace_ms - 500,
+            last,
+            0,
+            true,
+            FAST,
+            FLOOR
+        ));
+        // Past the fast grace: the completed turn ends.
+        assert!(between_prompt_should_fire(
+            true,
+            last + grace_ms + 500,
+            last,
+            0,
+            true,
+            FAST,
+            FLOOR
+        ));
+    }
+
+    #[test]
+    fn between_prompt_uses_floor_without_cost() {
+        let last = 1_000_000;
+        // 21s idle but no cost marker: the generous floor governs, no fire.
+        assert!(!between_prompt_should_fire(
+            true,
+            last + 21_000,
+            last,
+            0,
+            false,
+            FAST,
+            FLOOR
+        ));
+        // Past the 30-minute floor: fire even without a cost marker.
+        assert!(between_prompt_should_fire(
+            true,
+            last + 30 * 60 * 1000 + 1,
+            last,
+            0,
+            false,
+            FAST,
+            FLOOR
+        ));
+    }
+
+    #[test]
+    fn between_prompt_suppressed_while_wake_pending() {
+        let last = 1_000_000;
+        let now = last + 60_000; // idle well past fast grace
+        let wake_until = now + 5_000; // a re-armed monitor still sleeping
+                                      // Suppressed: the agent is deliberately asleep on a scheduled wake.
+        assert!(!between_prompt_should_fire(
+            true, now, last, wake_until, true, FAST, FLOOR
+        ));
+        // Once the wake deadline passes, the idle grace governs again.
+        assert!(between_prompt_should_fire(
+            true,
+            wake_until + 21_000,
+            last,
+            wake_until,
+            true,
+            FAST,
+            FLOOR
+        ));
+    }
+
+    #[test]
+    fn between_prompt_signal_update_terminal_usage_refreshes_timestamp() {
+        // TerminalUsage marks cost_seen AND refreshes last_lifecycle_at to
+        // `now`, so the fast grace measures from the cost marker, not a
+        // stale earlier progress event. See #2325 review.
+        let u =
+            between_prompt_signal_update(Some(&LifecycleSignal::TerminalUsage), None, 500_000, 0)
+                .expect("TerminalUsage is a tracked signal");
+        assert_eq!(
+            u,
+            BetweenPromptUpdate {
+                cost_seen: true,
+                last_lifecycle_at: 500_000,
+                wake_until: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn between_prompt_signal_update_progress_clears_cost_and_refreshes() {
+        let u = between_prompt_signal_update(Some(&LifecycleSignal::Progress), None, 500_000, 0)
+            .expect("Progress is a tracked signal");
+        assert_eq!(
+            u,
+            BetweenPromptUpdate {
+                cost_seen: false,
+                last_lifecycle_at: 500_000,
+                wake_until: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn between_prompt_signal_update_ambient_is_none() {
+        // No lifecycle and no wakeup signal: ambient update, no state change.
+        assert!(between_prompt_signal_update(None, None, 500_000, 42).is_none());
+    }
+
+    #[test]
+    fn between_prompt_signal_update_wakeup_extends_suppression() {
+        let at = chrono::DateTime::from_timestamp_millis(600_000).unwrap();
+        let expected_deadline = 600_000 + OFF_PROTOCOL_WORK_GRACE_FLOOR.as_millis() as i64;
+        // A later wake deadline wins; an earlier prev does not shorten it.
+        let u = between_prompt_signal_update(
+            None,
+            Some(&LifecycleSignal::WakeupPending { at }),
+            500_000,
+            1_000,
+        )
+        .expect("WakeupPending is a tracked signal");
+        assert_eq!(
+            u,
+            BetweenPromptUpdate {
+                cost_seen: false,
+                last_lifecycle_at: 500_000,
+                wake_until: expected_deadline,
+            }
+        );
+        // A larger prev_wake_until is preserved (suppression only extends).
+        let u2 = between_prompt_signal_update(
+            None,
+            Some(&LifecycleSignal::WakeupPending { at }),
+            500_000,
+            expected_deadline + 10_000,
+        )
+        .unwrap();
+        assert_eq!(u2.wake_until, expected_deadline + 10_000);
+    }
+
+    #[test]
+    fn between_prompt_stale_progress_plus_cost_marker_does_not_fire_early() {
+        // Regression for the state-update path (#2325 review): a progress
+        // event 10s ago, then a cost-bearing UsageUpdate now. The cost marker
+        // refreshes last_lifecycle_at, so 2s later (under the 3s grace) the
+        // watchdog must NOT fire even though cost_seen is true and the prior
+        // progress is older than the grace.
+        let cost_now = 1_000_000;
+        let stale_progress = cost_now - 10_000;
+        let u =
+            between_prompt_signal_update(Some(&LifecycleSignal::TerminalUsage), None, cost_now, 0)
+                .unwrap();
+        // The refresh, not the stale progress, governs the grace window.
+        assert_eq!(u.last_lifecycle_at, cost_now);
+        assert_ne!(u.last_lifecycle_at, stale_progress);
+        assert!(!between_prompt_should_fire(
+            true,
+            cost_now + 2_000,
+            u.last_lifecycle_at,
+            u.wake_until,
+            u.cost_seen,
+            FAST,
+            FLOOR,
+        ));
+        // After the full grace it does fire.
+        assert!(between_prompt_should_fire(
+            true,
+            cost_now + FAST.as_millis() as i64 + 1,
+            u.last_lifecycle_at,
+            u.wake_until,
+            u.cost_seen,
+            FAST,
+            FLOOR,
+        ));
+    }
+
     #[tokio::test]
     async fn watchdog_progress_after_terminal_usage_clears_fast_grace() {
         let cfg = watchdog_test_cfg();
@@ -6864,6 +7463,7 @@ mod tests {
             default_effort: None,
             socket_path: None,
             stored_acp_session_id: None,
+            seed_history_replay: false,
             sandbox_info: Some(sandbox.clone()),
             source_profile: None,
             mcp_servers: Vec::new(),
@@ -6932,6 +7532,7 @@ mod tests {
             default_effort: None,
             socket_path: None,
             stored_acp_session_id: None,
+            seed_history_replay: false,
             sandbox_info: Some(sandbox.clone()),
             source_profile: None,
             mcp_servers: Vec::new(),
@@ -7002,6 +7603,7 @@ mod tests {
             default_effort: None,
             socket_path: None,
             stored_acp_session_id: None,
+            seed_history_replay: false,
             sandbox_info: Some(sandbox.clone()),
             source_profile: None,
             mcp_servers: Vec::new(),
@@ -7048,6 +7650,7 @@ mod tests {
             default_effort: None,
             socket_path: None,
             stored_acp_session_id: None,
+            seed_history_replay: false,
             sandbox_info: None,
             source_profile: None,
             mcp_servers: Vec::new(),
@@ -7080,6 +7683,7 @@ mod tests {
             default_effort: None,
             socket_path: None,
             stored_acp_session_id: None,
+            seed_history_replay: false,
             sandbox_info: None,
             source_profile: None,
             mcp_servers: Vec::new(),
@@ -7194,6 +7798,108 @@ mod tests {
             _ => None,
         });
         assert!(started.unwrap().parent_tool_call_id.is_none());
+    }
+
+    fn text_chunk(text: &str, id: Option<&str>) -> SessionUpdate {
+        use agent_client_protocol::schema::{ContentBlock, ContentChunk, TextContent};
+        let mut chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text)));
+        if let Some(id) = id {
+            chunk = chunk.message_id(id);
+        }
+        SessionUpdate::AgentMessageChunk(chunk)
+    }
+
+    fn tool_update() -> SessionUpdate {
+        use agent_client_protocol::schema::ToolCall as AcpToolCall;
+        SessionUpdate::ToolCall(AcpToolCall::new("t-dedup", "Read"))
+    }
+
+    #[test]
+    fn dedup_drops_consolidated_restatement_after_deltas() {
+        // The reported leak: empty marker + two streamed deltas sharing the
+        // streamed id, then the whole block re-sent under a different id.
+        let mut d = AgentMessageDedup::default();
+        assert!(!d.observe(&text_chunk("", Some("m1"))));
+        assert!(!d.observe(&text_chunk(
+            "Concrete repro. Let me inspect the events around lgtm and",
+            Some("m1")
+        )));
+        assert!(!d.observe(&text_chunk(
+            " the \"Plan approved\" message in that session.",
+            Some("m1")
+        )));
+        // Consolidated copy carries the mismatched id and restates the block.
+        assert!(d.observe(&text_chunk(
+            "Concrete repro. Let me inspect the events around lgtm and the \"Plan approved\" message in that session.",
+            Some("m2")
+        )));
+    }
+
+    #[test]
+    fn dedup_drops_restatement_when_delta_ids_absent() {
+        // The recurrence (sessions 0c425453, 614231): when `message_start`
+        // carries no id, the streamed deltas arrive id-less, but the leaked
+        // consolidated copy still carries a fallback uuid. The ids differ by
+        // presence, so the verbatim restatement must still be dropped.
+        let mut d = AgentMessageDedup::default();
+        assert!(!d.observe(&text_chunk("", None)));
+        assert!(!d.observe(&text_chunk("Getting the real failure log,", None)));
+        assert!(!d.observe(&text_chunk(" not guessing this time.", None)));
+        assert!(d.observe(&text_chunk(
+            "Getting the real failure log, not guessing this time.",
+            Some("uuid-1")
+        )));
+    }
+
+    #[test]
+    fn dedup_drops_single_delta_restatement() {
+        let mut d = AgentMessageDedup::default();
+        assert!(!d.observe(&text_chunk("hello world", Some("m1"))));
+        assert!(d.observe(&text_chunk("hello world", Some("m2"))));
+    }
+
+    #[test]
+    fn dedup_keeps_legitimate_repeated_same_id_delta() {
+        // Two identical deltas that share a message id are genuine streamed
+        // output ("haha"), not a restatement. Never dropped.
+        let mut d = AgentMessageDedup::default();
+        assert!(!d.observe(&text_chunk("", Some("m1"))));
+        assert!(!d.observe(&text_chunk("ha", Some("m1"))));
+        assert!(!d.observe(&text_chunk("ha", Some("m1"))));
+    }
+
+    #[test]
+    fn dedup_resets_on_boundary_and_handles_adjacent_blocks() {
+        let mut d = AgentMessageDedup::default();
+        // Block 1: delta then restatement, dropped.
+        assert!(!d.observe(&text_chunk("ab", Some("m1"))));
+        assert!(d.observe(&text_chunk("ab", Some("m2"))));
+        // A tool call ends the block.
+        assert!(!d.observe(&tool_update()));
+        // Block 2 reuses text "ab": the first chunk after the boundary must
+        // not be mistaken for a restatement of the closed block.
+        assert!(!d.observe(&text_chunk("ab", Some("m3"))));
+        assert!(d.observe(&text_chunk("ab", Some("m4"))));
+    }
+
+    #[test]
+    fn dedup_never_drops_when_ids_absent() {
+        // Without message ids the delta-vs-restatement distinction is
+        // ambiguous; degrade to never-drop so real output is never corrupted.
+        let mut d = AgentMessageDedup::default();
+        assert!(!d.observe(&text_chunk("", None)));
+        assert!(!d.observe(&text_chunk("done", None)));
+        assert!(!d.observe(&text_chunk("done", None)));
+    }
+
+    #[test]
+    fn dedup_reset_forgets_in_flight_block() {
+        // Mirrors the suppression path: reset() between a block's deltas and
+        // its restatement means the restatement is treated as a fresh block.
+        let mut d = AgentMessageDedup::default();
+        assert!(!d.observe(&text_chunk("ab", Some("m1"))));
+        d.reset();
+        assert!(!d.observe(&text_chunk("ab", Some("m2"))));
     }
 
     #[test]
@@ -7878,6 +8584,27 @@ mod tests {
                 assert_eq!(content, "abc1234 first commit");
             }
             other => panic!("expected ToolCallCompleted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_user_message_chunk_becomes_user_prompt_sent() {
+        // Imported sessions replay prior user turns as user_message_chunk
+        // (#2276); they must map to UserPromptSent so the user's bubbles
+        // render, not get dropped to a raw event.
+        use agent_client_protocol::schema::{ContentBlock, ContentChunk, TextContent};
+        let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new("hello from the past")));
+        let events = map_update_to_events(
+            SessionUpdate::UserMessageChunk(chunk),
+            &agent_profiles::CLAUDE,
+        );
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            Event::UserPromptSent { text, attachments } => {
+                assert_eq!(text, "hello from the past");
+                assert!(attachments.is_empty());
+            }
+            other => panic!("expected UserPromptSent, got {other:?}"),
         }
     }
 

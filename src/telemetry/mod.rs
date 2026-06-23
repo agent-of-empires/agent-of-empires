@@ -486,7 +486,6 @@ fn assemble_usage_snapshot(
         approvals_resolved: acp_counts.approvals_resolved(),
         approvals_by_decision: acp_counts.approvals_by_decision(),
         agent_switches: acp_counts.agent_switches,
-        view_toggles: acp_counts.view_toggles,
         plan_mode_seen: acp_counts.plan_mode_seen,
         prompts_queued: acp_counts.prompts_queued,
     }
@@ -791,7 +790,6 @@ mod tests {
             approvals_resolved: 0,
             approvals_by_decision: BTreeMap::new(),
             agent_switches: 0,
-            view_toggles: 0,
             plan_mode_seen: false,
             prompts_queued: 0,
         }

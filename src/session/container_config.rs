@@ -701,6 +701,31 @@ fn prepare_sandbox_dir(mount: &AgentConfigMount, home: &Path) -> Result<std::pat
     }
 
     if host_dir.exists() {
+        // Codex writes `trusted_hash` into `[hooks.state]` of the sandbox
+        // copy of `config.toml` when the user accepts a hook hash inside
+        // the container; that copy is overwritten on each
+        // `sync_agent_config` from the host. Snapshot here and restore
+        // after the sync so accepted hashes survive the host-to-sandbox
+        // refresh (the sandbox value wins by design, since trust is local
+        // to the container). The codex config lock is released between
+        // snapshot and restore; the sandbox path is process-private, so
+        // no concurrent writer is expected.
+        let preserved_codex_state = if agent_format_is_codex_json(mount.tool_name) {
+            let sandbox_config = sandbox_dir.join("config.toml");
+            crate::hooks::snapshot_codex_hooks_state(&sandbox_config)
+                .inspect_err(|e| {
+                    tracing::warn!(target: "session.profile",
+                        "Failed to snapshot Codex [hooks.state] from {}: {}",
+                        sandbox_config.display(),
+                        e
+                    );
+                })
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+
         sync_agent_config(
             &host_dir,
             &sandbox_dir,
@@ -709,6 +734,22 @@ fn prepare_sandbox_dir(mount: &AgentConfigMount, home: &Path) -> Result<std::pat
             mount.copy_dirs,
             mount.preserve_files,
         )?;
+
+        if let Some(state) = preserved_codex_state {
+            let sandbox_config = sandbox_dir.join("config.toml");
+            if !sandbox_config.exists() {
+                tracing::warn!(target: "session.profile",
+                    "Codex [hooks.state] snapshotted but sandbox config.toml absent after sync at {}; trust block dropped",
+                    sandbox_config.display()
+                );
+            } else if let Err(e) = crate::hooks::restore_codex_hooks_state(&sandbox_config, state) {
+                tracing::warn!(target: "session.profile",
+                    "Failed to restore Codex [hooks.state] in {}: {}",
+                    sandbox_config.display(),
+                    e
+                );
+            }
+        }
 
         if mount.tool_name == "claude" {
             if let Err(e) = rewrite_claude_plugin_paths(&sandbox_dir, home) {
@@ -939,30 +980,11 @@ pub(crate) fn refresh_agent_configs() {
 
     for mount in AGENT_CONFIG_MOUNTS {
         let refresh_codex_hooks = hooks_enabled && should_refresh_codex_hooks(mount, &home);
-        let preserved_codex_state = if refresh_codex_hooks {
-            let config_path = home
-                .join(mount.host_rel)
-                .join(SANDBOX_SUBDIR)
-                .join("config.toml");
-            match crate::hooks::snapshot_codex_hooks_state(&config_path) {
-                Ok(state) => state,
-                Err(e) => {
-                    tracing::warn!(target: "session.profile",
-                        "Failed to read Codex sandbox hook state from {}: {}",
-                        config_path.display(),
-                        e
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
 
         match prepare_sandbox_dir(mount, &home) {
             Ok(sandbox_dir) => {
                 if refresh_codex_hooks {
-                    refresh_codex_sandbox_hooks(&sandbox_dir, preserved_codex_state);
+                    refresh_codex_sandbox_hooks(mount, &sandbox_dir);
                 }
             }
             Err(e) => {
@@ -976,35 +998,45 @@ pub(crate) fn refresh_agent_configs() {
     }
 }
 
+/// True iff `tool_name` resolves to a registered agent declaring
+/// [`crate::agents::HookFormat::CodexJson`]. Centralises the dispatch
+/// predicate so `prepare_sandbox_dir` and `should_refresh_codex_hooks`
+/// stay aligned.
+fn agent_format_is_codex_json(tool_name: &str) -> bool {
+    crate::agents::get_agent(tool_name)
+        .and_then(|a| a.hook_config.as_ref())
+        .is_some_and(|c| c.format == crate::agents::HookFormat::CodexJson)
+}
+
 fn should_refresh_codex_hooks(mount: &AgentConfigMount, home: &Path) -> bool {
-    if mount.tool_name != "codex" || mount.host_rel != ".codex" {
+    if !agent_format_is_codex_json(mount.tool_name) {
         return false;
     }
 
-    let host_config = home.join(mount.host_rel).join("config.toml");
-    let sandbox_config = home
+    let host_hooks = home.join(mount.host_rel).join("hooks.json");
+    let sandbox_hooks = home
         .join(mount.host_rel)
         .join(SANDBOX_SUBDIR)
-        .join("config.toml");
-    host_config.exists() || sandbox_config.exists()
+        .join("hooks.json");
+    host_hooks.exists() || sandbox_hooks.exists()
 }
 
-fn refresh_codex_sandbox_hooks(sandbox_dir: &Path, preserved_state: Option<toml_edit::Item>) {
-    let Some(hook_cfg) = crate::agents::get_agent("codex").and_then(|a| a.hook_config.as_ref())
+fn refresh_codex_sandbox_hooks(mount: &AgentConfigMount, sandbox_dir: &Path) {
+    let Some(hook_cfg) =
+        crate::agents::get_agent(mount.tool_name).and_then(|a| a.hook_config.as_ref())
     else {
         return;
     };
 
-    let config_path = sandbox_dir.join("config.toml");
-    if let Err(e) = crate::hooks::install_codex_hooks_with_preserved_state(
-        &config_path,
+    let hooks_path = sandbox_dir.join("hooks.json");
+    if let Err(e) = crate::hooks::install_hooks(
+        &hooks_path,
         hook_cfg.events,
-        preserved_state,
         crate::hooks::HookInstallTarget::Sandbox,
     ) {
         tracing::warn!(
             "Failed to refresh Codex hooks in sandbox config {}: {}",
-            config_path.display(),
+            hooks_path.display(),
             e
         );
     }
@@ -1457,18 +1489,15 @@ pub(crate) fn build_container_config(
                     if std::path::Path::new(mount.host_rel) == config_dir_name {
                         let sandbox_dir = home.join(mount.host_rel).join(SANDBOX_SUBDIR);
                         let settings_file = sandbox_dir.join(config_file_name);
-                        let result = if agent.name == "codex" {
-                            crate::hooks::install_codex_hooks(
-                                &settings_file,
-                                hook_cfg.events,
-                                crate::hooks::HookInstallTarget::Sandbox,
-                            )
-                        } else {
-                            crate::hooks::install_hooks(
-                                &settings_file,
-                                hook_cfg.events,
-                                crate::hooks::HookInstallTarget::Sandbox,
-                            )
+                        let result = match hook_cfg.format {
+                            crate::agents::HookFormat::CodexJson
+                            | crate::agents::HookFormat::JsonSettings => {
+                                crate::hooks::install_hooks(
+                                    &settings_file,
+                                    hook_cfg.events,
+                                    crate::hooks::HookInstallTarget::Sandbox,
+                                )
+                            }
                         };
                         if let Err(e) = result {
                             tracing::warn!(target: "session.profile", "Failed to install hooks in sandbox config: {}", e);
@@ -3200,12 +3229,13 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
         .unwrap();
 
         let codex_sandbox = temp_home.path().join(".codex").join(SANDBOX_SUBDIR);
-        assert!(codex_sandbox.join("config.toml").exists());
-        assert!(!codex_sandbox.join("hooks.json").exists());
+        assert!(codex_sandbox.join("hooks.json").exists());
+        assert!(!codex_sandbox.join("config.toml").exists());
         assert!(!codex_sandbox.join("settings.json").exists());
-        let codex_config = fs::read_to_string(codex_sandbox.join("config.toml")).unwrap();
-        assert!(codex_config.contains("[[hooks.PreToolUse]]"));
-        assert!(codex_config.contains("aoe-hooks"));
+        let codex_hooks = fs::read_to_string(codex_sandbox.join("hooks.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&codex_hooks).unwrap();
+        assert!(parsed["hooks"]["PreToolUse"].is_array());
+        assert!(codex_hooks.contains("aoe-hooks"));
         assert!(config.volumes.iter().any(|v| {
             v.host_path == codex_sandbox.to_string_lossy() && v.container_path == "/root/.codex"
         }));
@@ -3462,14 +3492,15 @@ agent_detect_as = { "wrapped-codex" = "codex" }
         .unwrap();
 
         let codex_sandbox = temp_home.path().join(".codex").join(SANDBOX_SUBDIR);
-        assert!(codex_sandbox.join("config.toml").exists());
+        assert!(codex_sandbox.join("hooks.json").exists());
         assert!(config.volumes.iter().any(|v| {
             v.host_path == codex_sandbox.to_string_lossy() && v.container_path == "/root/.codex"
         }));
 
-        let codex_config = fs::read_to_string(codex_sandbox.join("config.toml")).unwrap();
-        assert!(codex_config.contains("[[hooks.PreToolUse]]"));
-        assert!(codex_config.contains("aoe-hooks"));
+        let codex_hooks = fs::read_to_string(codex_sandbox.join("hooks.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&codex_hooks).unwrap();
+        assert!(parsed["hooks"]["PreToolUse"].is_array());
+        assert!(codex_hooks.contains("aoe-hooks"));
 
         let hook_dir =
             crate::hooks::hook_status_dir(instance_id).expect("test id must be allowlist-safe");
@@ -3542,8 +3573,15 @@ trusted_hash = "keep"
             config["hooks"]["state"]["trusted"]["trusted_hash"].as_str(),
             Some("keep")
         );
-        assert!(config_text.contains("[[hooks.PreToolUse]]"));
-        assert!(config_text.contains("aoe-hooks"));
+
+        let hooks_path = codex_sandbox.join("hooks.json");
+        let hooks_text = fs::read_to_string(&hooks_path).unwrap();
+        let hooks: serde_json::Value = serde_json::from_str(&hooks_text).unwrap();
+        assert!(
+            hooks["hooks"]["PreToolUse"].is_array(),
+            "PreToolUse array must be installed in sandbox hooks.json"
+        );
+        assert!(hooks_text.contains("aoe-hooks"));
         crate::hooks::cleanup_hook_status_dir(instance_id);
     }
 
@@ -3581,7 +3619,7 @@ trusted_hash = "keep"
         .unwrap();
 
         let codex_sandbox = temp_home.path().join(".codex").join(SANDBOX_SUBDIR);
-        assert!(codex_sandbox.join("config.toml").exists());
+        assert!(codex_sandbox.join("hooks.json").exists());
         assert!(config.volumes.iter().any(|v| {
             v.host_path == codex_sandbox.to_string_lossy()
                 && v.container_path == "/root/custom-codex"
@@ -3636,7 +3674,7 @@ environment = ["CODEX_HOME=/root/profile-codex"]
         .unwrap();
 
         let codex_sandbox = temp_home.path().join(".codex").join(SANDBOX_SUBDIR);
-        assert!(codex_sandbox.join("config.toml").exists());
+        assert!(codex_sandbox.join("hooks.json").exists());
         assert!(config.volumes.iter().any(|v| {
             v.host_path == codex_sandbox.to_string_lossy()
                 && v.container_path == "/root/profile-codex"

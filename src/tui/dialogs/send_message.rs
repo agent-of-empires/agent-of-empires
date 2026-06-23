@@ -104,6 +104,17 @@ impl SendMessageDialog {
                 self.text_area.insert_newline();
                 DialogResult::Continue
             }
+            // Ctrl+J is how crossterm decodes a bare line feed (\n, 0x0A) once
+            // raw mode is on; some terminals send that for Shift+Enter (e.g. a
+            // Ghostty `keybind = shift+enter=text:\n`). Treat it as a newline
+            // like the rest of the Enter family. Without this it falls through
+            // to the textarea, whose default binds Ctrl+J to delete-to-line-head
+            // and silently wipes the input.
+            KeyCode::Char('j') if ctrl => {
+                self.restore_armed = false;
+                self.text_area.insert_newline();
+                DialogResult::Continue
+            }
             // Plain Enter sends
             KeyCode::Enter => {
                 let value = self.get_text().trim().to_string();
@@ -282,6 +293,20 @@ mod tests {
         let mut dialog = SendMessageDialog::new("Test Session");
         dialog.handle_key(key(KeyCode::Char('a')));
         let result = dialog.handle_key(shift_key(KeyCode::Enter));
+        assert!(matches!(result, DialogResult::Continue));
+        dialog.handle_key(key(KeyCode::Char('b')));
+        assert_eq!(dialog.get_text(), "a\nb");
+    }
+
+    #[test]
+    fn test_ctrl_j_adds_newline() {
+        // crossterm decodes a bare line feed (\n, 0x0A) as Ctrl+J in raw mode;
+        // some terminals send that for Shift+Enter (e.g. Ghostty
+        // `keybind = shift+enter=text:\n`). It must insert a newline, not fall
+        // through to the textarea's delete-to-line-head default.
+        let mut dialog = SendMessageDialog::new("Test Session");
+        dialog.handle_key(key(KeyCode::Char('a')));
+        let result = dialog.handle_key(ctrl_key(KeyCode::Char('j')));
         assert!(matches!(result, DialogResult::Continue));
         dialog.handle_key(key(KeyCode::Char('b')));
         assert_eq!(dialog.get_text(), "a\nb");

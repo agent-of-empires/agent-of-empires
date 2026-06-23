@@ -711,9 +711,15 @@ impl HomeView {
         Ok(())
     }
 
-    pub(super) fn group_has_managed_worktrees(&self, group_path: &str, prefix: &str) -> bool {
+    pub(super) fn group_has_managed_worktrees(
+        &self,
+        group_path: &str,
+        prefix: &str,
+        owning_profile: Option<&str>,
+    ) -> bool {
         self.instances().iter().any(|i| {
             (i.group_path == group_path || i.group_path.starts_with(prefix))
+                && owning_profile.is_none_or(|p| i.source_profile == p)
                 && (i.worktree_info.as_ref().is_some_and(|wt| wt.managed_by_aoe)
                     || i.workspace_info
                         .as_ref()
@@ -721,9 +727,15 @@ impl HomeView {
         })
     }
 
-    pub(super) fn group_has_containers(&self, group_path: &str, prefix: &str) -> bool {
+    pub(super) fn group_has_containers(
+        &self,
+        group_path: &str,
+        prefix: &str,
+        owning_profile: Option<&str>,
+    ) -> bool {
         self.instances().iter().any(|i| {
             (i.group_path == group_path || i.group_path.starts_with(prefix))
+                && owning_profile.is_none_or(|p| i.source_profile == p)
                 && i.sandbox_info.as_ref().is_some_and(|s| s.enabled)
         })
     }
@@ -1104,6 +1116,13 @@ impl HomeView {
                             }
                         }
                     })?;
+
+                    // Drop the source profile's now-empty copy of the group so
+                    // it does not linger as a duplicate header alongside the
+                    // target profile's copy in unified view. `current_group` is
+                    // the session's pre-move path; the restart-with-edits path
+                    // does the same after its own `move_to_profile`.
+                    self.prune_empty_group(&current_profile, &current_group);
 
                     self.rebuild_group_trees();
                     if !effective_group.is_empty() {

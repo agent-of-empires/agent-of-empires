@@ -5,6 +5,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useReducer,
   useRef,
@@ -58,7 +59,13 @@ import { useIdleDecayWindowMs } from "../lib/idleDecay";
 import { exceedsTouchSlop } from "../lib/longPress";
 import { useUnreadIndicatorEnabled } from "../lib/unreadIndicator";
 import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
-import { renameSession, setSessionNotifications, setWorktreeName, updateSessionGroup } from "../lib/api";
+import {
+  renameSession,
+  setSessionNotifications,
+  setWorktreeName,
+  smartRenameSession,
+  updateSessionGroup,
+} from "../lib/api";
 import { useServerDown, OFFLINE_TITLE } from "../lib/connectionState";
 import { requestOpenSession } from "../lib/sessionRoute";
 import { requestSwitchAgent } from "../lib/switchAgentTrigger";
@@ -82,9 +89,8 @@ import {
 } from "../lib/sidebarOptimistic";
 import { useSidebarTriage } from "../hooks/useSidebarTriage";
 import { EMPTY_SELECTION, classifyClick, selectionReducer } from "../lib/sidebarSelection";
-import { bucketSelectionForBulk, summarizeBulkResults } from "../lib/sidebarBulk";
+import { bucketSelectionForBulk, summarizeBulkResults, type BulkTriageBuckets } from "../lib/sidebarBulk";
 import { reportError, reportInfo } from "../lib/toastBus";
-import { BulkActionBar } from "./BulkActionBar";
 // Re-exported for back-compat with `SnoozeModal.test.tsx`, which imports it
 // from this module; the definition now lives in `sidebarOptimistic.ts`.
 export { makeOptimisticSnoozedUntil } from "../lib/sidebarOptimistic";
@@ -116,6 +122,120 @@ export const SNOOZE_PRESETS: readonly { label: string; minutes: number }[] = [
   { label: "1 day", minutes: 1440 },
   { label: "1 week", minutes: 10080 },
 ];
+
+/** Whether a row's right-click context menu acts on just that row or on the
+ *  whole multi-selection. `prepareScope` decides at right-click time. See
+ *  #2312. */
+type RowContextScope = { kind: "single" } | { kind: "bulk"; count: number; buckets: BulkTriageBuckets };
+
+/** Stable bridge passed to every SessionRow so the in-row context menu can
+ *  drive bulk triage over the selection without prop-drilling the selection
+ *  arrays (which would defeat React.memo). The parent keeps the live selection
+ *  in a ref; this object's identity never changes. See #2312. */
+export interface RowBulkApi {
+  prepareScope: (ws: Workspace) => RowContextScope;
+  pin: (workspaces: Workspace[], pinned: boolean) => void;
+  archive: (workspaces: Workspace[], archived: boolean) => void;
+  snooze: (workspaces: Workspace[], minutes: number | null) => void;
+}
+
+const CTX_ITEM =
+  "w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2";
+
+/** Triage actions for the right-click menu when more than one row is selected.
+ *  Reuses the same eligibility buckets as the old bulk bar so a mixed
+ *  selection shows count-labelled actions ("Pin 3" / "Unpin 2"). Single-only
+ *  actions (rename, switch agent, stop/start) are intentionally absent in this
+ *  branch. See #2312. */
+function BulkTriageMenuItems({
+  count,
+  buckets,
+  api,
+  onDone,
+}: {
+  count: number;
+  buckets: BulkTriageBuckets;
+  api: RowBulkApi;
+  onDone: () => void;
+}) {
+  const act = (run: () => void) => {
+    onDone();
+    run();
+  };
+  return (
+    <>
+      <div className="px-3 py-1 text-[11px] font-mono uppercase tracking-widest text-text-muted">{count} selected</div>
+      {buckets.pinnable.length > 0 && (
+        <button
+          data-testid="sidebar-context-menu-bulk-pin"
+          className={CTX_ITEM}
+          onClick={() => act(() => api.pin(buckets.pinnable, true))}
+        >
+          <Pin className="h-3.5 w-3.5 shrink-0 -rotate-45" />
+          Pin {buckets.pinnable.length}
+        </button>
+      )}
+      {buckets.unpinnable.length > 0 && (
+        <button
+          data-testid="sidebar-context-menu-bulk-unpin"
+          className={CTX_ITEM}
+          onClick={() => act(() => api.pin(buckets.unpinnable, false))}
+        >
+          <Pin className="h-3.5 w-3.5 shrink-0 -rotate-45" />
+          Unpin {buckets.unpinnable.length}
+        </button>
+      )}
+      {buckets.archivable.length > 0 && (
+        <button
+          data-testid="sidebar-context-menu-bulk-archive"
+          className={CTX_ITEM}
+          onClick={() => act(() => api.archive(buckets.archivable, true))}
+        >
+          <Archive className="h-3.5 w-3.5 shrink-0" />
+          Archive {buckets.archivable.length}
+        </button>
+      )}
+      {buckets.unarchivable.length > 0 && (
+        <button
+          data-testid="sidebar-context-menu-bulk-unarchive"
+          className={CTX_ITEM}
+          onClick={() => act(() => api.archive(buckets.unarchivable, false))}
+        >
+          <Archive className="h-3.5 w-3.5 shrink-0" />
+          Unarchive {buckets.unarchivable.length}
+        </button>
+      )}
+      {buckets.snoozable.length > 0 && (
+        <>
+          <div className="px-3 py-1 text-[11px] font-mono uppercase tracking-widest text-text-muted">
+            Snooze {buckets.snoozable.length}
+          </div>
+          {SNOOZE_PRESETS.map((preset) => (
+            <button
+              key={preset.minutes}
+              data-testid="sidebar-context-menu-bulk-snooze"
+              className={`${CTX_ITEM} pl-6`}
+              onClick={() => act(() => api.snooze(buckets.snoozable, preset.minutes))}
+            >
+              <Moon className="h-3.5 w-3.5 shrink-0" />
+              {preset.label}
+            </button>
+          ))}
+        </>
+      )}
+      {buckets.unsnoozable.length > 0 && (
+        <button
+          data-testid="sidebar-context-menu-bulk-unsnooze"
+          className={CTX_ITEM}
+          onClick={() => act(() => api.snooze(buckets.unsnoozable, null))}
+        >
+          <Moon className="h-3.5 w-3.5 shrink-0" />
+          Unsnooze {buckets.unsnoozable.length}
+        </button>
+      )}
+    </>
+  );
+}
 
 // Group headers and session rows are both sortable inside the one
 // sidebar DndContext, so a header drag must not collide with a session
@@ -411,6 +531,7 @@ function SortableSessionRow({
   onArchiveToggle: (ws: Workspace, archived: boolean) => void;
   onSnooze: (ws: Workspace, minutes: number | null) => void;
   onUnreadToggle: (ws: Workspace, markUnread: boolean) => void;
+  bulkApi: RowBulkApi;
 }) {
   const dragSuppressRef = useDragSuppressRef();
   // `disabled` no-ops the sensor listeners. `readOnly` covers viewers
@@ -533,6 +654,7 @@ export const SessionRow = memo(function SessionRow({
   onArchiveToggle,
   onSnooze,
   onUnreadToggle,
+  bulkApi,
 }: {
   workspace: Workspace;
   isActive: boolean;
@@ -559,6 +681,8 @@ export const SessionRow = memo(function SessionRow({
   onArchiveToggle: (ws: Workspace, archived: boolean) => void;
   onSnooze: (ws: Workspace, minutes: number | null) => void;
   onUnreadToggle: (ws: Workspace, markUnread: boolean) => void;
+  // Stable bridge for bulk triage from the right-click menu. See #2312.
+  bulkApi: RowBulkApi;
 }) {
   const idleDecayWindowMs = useIdleDecayWindowMs();
   const unreadIndicatorEnabled = useUnreadIndicatorEnabled();
@@ -709,6 +833,20 @@ export const SessionRow = memo(function SessionRow({
     requestSwitchAgent(acpSession.id);
   };
 
+  // Re-run smart rename ("Auto-name now") for a structured session whose
+  // automatic rename never landed. Best-effort and async: a success just means
+  // the one-shot was re-triggered; the title updates over the live session
+  // stream when it completes. Only offered while the session is still
+  // default-named (see the menu gate), so it never overwrites a chosen title.
+  const handleAutoNameNow = async () => {
+    setContextMenu(null);
+    if (!acpSession) return;
+    const result = await smartRenameSession(acpSession.id);
+    if (!result.ok) {
+      reportError(result.message ?? "Could not start auto-name. Please try again.");
+    }
+  };
+
   // Effective state for rendering: optimistic overrides win until the
   // sidebar's overlay reconciler drops them once the prop catches up.
   const effectivePinned = effectivePinnedOf(optimistic, isPinned);
@@ -719,6 +857,8 @@ export const SessionRow = memo(function SessionRow({
   const [contextMenu, setContextMenu] = useState<{
     x: number;
     y: number;
+    // Single-row menu, or bulk over the active multi-selection. See #2312.
+    scope: RowContextScope;
   } | null>(null);
   const [renaming, setRenaming] = useState(false);
   const [renameValue, setRenameValue] = useState(label);
@@ -772,7 +912,7 @@ export const SessionRow = memo(function SessionRow({
     if (isDeleting) return;
     e.preventDefault();
     closeOtherContextMenus();
-    setContextMenu({ x: e.clientX, y: e.clientY });
+    setContextMenu({ x: e.clientX, y: e.clientY, scope: bulkApi.prepareScope(workspace) });
   };
 
   const clearLongPress = () => {
@@ -795,7 +935,7 @@ export const SessionRow = memo(function SessionRow({
       longPressFired.current = true;
       touchOpenedAt.current = Date.now();
       closeOtherContextMenus();
-      setContextMenu({ x: tx, y: ty });
+      setContextMenu({ x: tx, y: ty, scope: bulkApi.prepareScope(workspace) });
     }, 500);
   };
 
@@ -1104,201 +1244,224 @@ export const SessionRow = memo(function SessionRow({
               maxHeight: "calc(100vh - 16px)",
             }}
           >
-            {!readOnly && onCreateSession && newSessionRepoPath && (
-              <button
-                onClick={() => {
-                  setContextMenu(null);
-                  onCreateSession(newSessionRepoPath);
-                }}
-                data-testid="sidebar-context-menu-new-session"
-                className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
-              >
-                <Plus className="h-3.5 w-3.5 shrink-0" />
-                New Session
-              </button>
-            )}
-            <button
-              onClick={startRename}
-              data-testid="sidebar-context-menu-rename"
-              className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors"
-            >
-              Rename
-            </button>
-            {!readOnly && canEditWorkdir && (
-              <button
-                onClick={openWorkdirModal}
-                data-testid="sidebar-context-menu-edit-workdir"
-                className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors"
-              >
-                Edit workdir name
-              </button>
-            )}
-            {!readOnly && (
-              <button
-                onClick={startGroupEdit}
-                data-testid="sidebar-context-menu-edit-group"
-                className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors"
-              >
-                Edit group
-              </button>
-            )}
-            {!readOnly && acpSession && (
-              <button
-                onClick={handleSwitchAgent}
-                data-testid="sidebar-context-menu-switch-agent"
-                className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
-              >
-                <ArrowLeftRight className="h-3.5 w-3.5 shrink-0" />
-                Switch agent
-              </button>
-            )}
-            {!readOnly && canStop && (
-              <button
-                onClick={handleStop}
-                data-testid="sidebar-context-menu-stop"
-                className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
-              >
-                <CircleStop className="h-3.5 w-3.5 shrink-0" />
-                Stop
-              </button>
-            )}
-            {!readOnly && canStart && (
-              <button
-                onClick={handleStart}
-                data-testid="sidebar-context-menu-start"
-                className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
-              >
-                <Play className="h-3.5 w-3.5 shrink-0" />
-                Start
-              </button>
-            )}
-            <div className="border-t border-surface-700/20 my-1" />
-            <div className="px-3 py-1 text-[11px] font-mono uppercase tracking-widest text-text-muted">
-              Notifications
-            </div>
-            {(["off", "default", "all"] as const).map((preset) => {
-              const label = preset === "off" ? "Off" : preset === "default" ? "Default" : "All events";
-              const selected = notifyPreset === preset;
-              return (
-                <button
-                  key={preset}
-                  onClick={() => void setNotifyPreset(preset)}
-                  className={`w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2 ${
-                    selected ? "text-text-primary" : "text-text-secondary"
-                  }`}
-                >
-                  <span className="w-3 text-brand-500">{selected ? "✓" : ""}</span>
-                  {label}
-                </button>
-              );
-            })}
-            {!readOnly && (
+            {contextMenu.scope.kind === "bulk" ? (
+              <BulkTriageMenuItems
+                count={contextMenu.scope.count}
+                buckets={contextMenu.scope.buckets}
+                api={bulkApi}
+                onDone={() => setContextMenu(null)}
+              />
+            ) : (
               <>
+                {!readOnly && onCreateSession && newSessionRepoPath && (
+                  <button
+                    onClick={() => {
+                      setContextMenu(null);
+                      onCreateSession(newSessionRepoPath);
+                    }}
+                    data-testid="sidebar-context-menu-new-session"
+                    className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+                  >
+                    <Plus className="h-3.5 w-3.5 shrink-0" />
+                    New Session
+                  </button>
+                )}
+                <button
+                  onClick={startRename}
+                  data-testid="sidebar-context-menu-rename"
+                  className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors"
+                >
+                  Rename
+                </button>
+                {!readOnly && canEditWorkdir && (
+                  <button
+                    onClick={openWorkdirModal}
+                    data-testid="sidebar-context-menu-edit-workdir"
+                    className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors"
+                  >
+                    Edit workdir name
+                  </button>
+                )}
+                {!readOnly && (
+                  <button
+                    onClick={startGroupEdit}
+                    data-testid="sidebar-context-menu-edit-group"
+                    className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors"
+                  >
+                    Edit group
+                  </button>
+                )}
+                {!readOnly && acpSession && (
+                  <button
+                    onClick={handleSwitchAgent}
+                    data-testid="sidebar-context-menu-switch-agent"
+                    className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+                  >
+                    <ArrowLeftRight className="h-3.5 w-3.5 shrink-0" />
+                    Switch agent
+                  </button>
+                )}
+                {!readOnly && acpSession?.default_name && (
+                  <button
+                    onClick={() => void handleAutoNameNow()}
+                    data-testid="sidebar-context-menu-auto-name"
+                    className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+                  >
+                    <Sparkles className="h-3.5 w-3.5 shrink-0" />
+                    Auto-name now
+                  </button>
+                )}
+                {!readOnly && canStop && (
+                  <button
+                    onClick={handleStop}
+                    data-testid="sidebar-context-menu-stop"
+                    className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+                  >
+                    <CircleStop className="h-3.5 w-3.5 shrink-0" />
+                    Stop
+                  </button>
+                )}
+                {!readOnly && canStart && (
+                  <button
+                    onClick={handleStart}
+                    data-testid="sidebar-context-menu-start"
+                    className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+                  >
+                    <Play className="h-3.5 w-3.5 shrink-0" />
+                    Start
+                  </button>
+                )}
                 <div className="border-t border-surface-700/20 my-1" />
-                <div className="px-3 py-1 text-[11px] font-mono uppercase tracking-widest text-text-muted">Triage</div>
-                {(() => {
-                  // Menu actions are gated by the row's current triage
-                  // state so contradictory toggles never appear in the
-                  // UI: an archived row only offers Unarchive, a snoozed
-                  // row only offers Unsnooze. A pinned row also offers
-                  // Archive/Snooze, since those are valid transitions
-                  // (the backend clears the pin) and match the TUI. The
-                  // shape helper lives in `lib/sidebarSort.ts` so it can
-                  // be unit tested. See #1581.
-                  const shape = triageMenuShape(
-                    triageStateOf({
-                      isPinned: effectivePinned,
-                      isArchived: effectiveArchived,
-                      isSnoozed: effectiveSnoozed,
-                    }),
-                  );
+                <div className="px-3 py-1 text-[11px] font-mono uppercase tracking-widest text-text-muted">
+                  Notifications
+                </div>
+                {(["off", "default", "all"] as const).map((preset) => {
+                  const label = preset === "off" ? "Off" : preset === "default" ? "Default" : "All events";
+                  const selected = notifyPreset === preset;
                   return (
-                    <>
-                      {shape.showPin && (
-                        <button
-                          onClick={() => void togglePin()}
-                          data-testid="sidebar-context-menu-pin"
-                          className="w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
-                        >
-                          <Pin className="h-3.5 w-3.5 shrink-0 -rotate-45" />
-                          Pin
-                        </button>
-                      )}
-                      {shape.showUnpin && (
-                        <button
-                          onClick={() => void togglePin()}
-                          data-testid="sidebar-context-menu-pin"
-                          className="w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
-                        >
-                          <Pin className="h-3.5 w-3.5 shrink-0 -rotate-45" />
-                          Unpin
-                        </button>
-                      )}
-                      {shape.showArchive && (
-                        <button
-                          onClick={() => void toggleArchive()}
-                          data-testid="sidebar-context-menu-archive"
-                          className="w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
-                        >
-                          <Archive className="h-3.5 w-3.5 shrink-0" />
-                          Archive
-                        </button>
-                      )}
-                      {shape.showUnarchive && (
-                        <button
-                          onClick={() => void toggleArchive()}
-                          data-testid="sidebar-context-menu-archive"
-                          className="w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
-                        >
-                          <Archive className="h-3.5 w-3.5 shrink-0" />
-                          Unarchive
-                        </button>
-                      )}
-                      {shape.showSnooze && (
-                        <button
-                          onClick={openSnoozeModal}
-                          data-testid="sidebar-context-menu-snooze"
-                          className="w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
-                        >
-                          <Moon className="h-3.5 w-3.5 shrink-0" />
-                          Snooze…
-                        </button>
-                      )}
-                      {shape.showUnsnooze && (
-                        <button
-                          onClick={() => void applySnooze(null)}
-                          data-testid="sidebar-context-menu-unsnooze"
-                          className="w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
-                        >
-                          <Moon className="h-3.5 w-3.5 shrink-0" />
-                          Unsnooze
-                        </button>
-                      )}
-                      {/* Unlike the others, the unread toggle is always
+                    <button
+                      key={preset}
+                      onClick={() => void setNotifyPreset(preset)}
+                      className={`w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2 ${
+                        selected ? "text-text-primary" : "text-text-secondary"
+                      }`}
+                    >
+                      <span className="w-3 text-brand-500">{selected ? "✓" : ""}</span>
+                      {label}
+                    </button>
+                  );
+                })}
+                {!readOnly && (
+                  <>
+                    <div className="border-t border-surface-700/20 my-1" />
+                    <div className="px-3 py-1 text-[11px] font-mono uppercase tracking-widest text-text-muted">
+                      Triage
+                    </div>
+                    {(() => {
+                      // Menu actions are gated by the row's current triage
+                      // state so contradictory toggles never appear in the
+                      // UI: an archived row only offers Unarchive, a snoozed
+                      // row only offers Unsnooze. A pinned row also offers
+                      // Archive/Snooze, since those are valid transitions
+                      // (the backend clears the pin) and match the TUI. The
+                      // shape helper lives in `lib/sidebarSort.ts` so it can
+                      // be unit tested. See #1581.
+                      const shape = triageMenuShape(
+                        triageStateOf({
+                          isPinned: effectivePinned,
+                          isArchived: effectiveArchived,
+                          isSnoozed: effectiveSnoozed,
+                        }),
+                      );
+                      return (
+                        <>
+                          {shape.showPin && (
+                            <button
+                              onClick={() => void togglePin()}
+                              data-testid="sidebar-context-menu-pin"
+                              className="w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+                            >
+                              <Pin className="h-3.5 w-3.5 shrink-0 -rotate-45" />
+                              Pin
+                            </button>
+                          )}
+                          {shape.showUnpin && (
+                            <button
+                              onClick={() => void togglePin()}
+                              data-testid="sidebar-context-menu-pin"
+                              className="w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+                            >
+                              <Pin className="h-3.5 w-3.5 shrink-0 -rotate-45" />
+                              Unpin
+                            </button>
+                          )}
+                          {shape.showArchive && (
+                            <button
+                              onClick={() => void toggleArchive()}
+                              data-testid="sidebar-context-menu-archive"
+                              className="w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+                            >
+                              <Archive className="h-3.5 w-3.5 shrink-0" />
+                              Archive
+                            </button>
+                          )}
+                          {shape.showUnarchive && (
+                            <button
+                              onClick={() => void toggleArchive()}
+                              data-testid="sidebar-context-menu-archive"
+                              className="w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+                            >
+                              <Archive className="h-3.5 w-3.5 shrink-0" />
+                              Unarchive
+                            </button>
+                          )}
+                          {shape.showSnooze && (
+                            <button
+                              onClick={openSnoozeModal}
+                              data-testid="sidebar-context-menu-snooze"
+                              className="w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+                            >
+                              <Moon className="h-3.5 w-3.5 shrink-0" />
+                              Snooze…
+                            </button>
+                          )}
+                          {shape.showUnsnooze && (
+                            <button
+                              onClick={() => void applySnooze(null)}
+                              data-testid="sidebar-context-menu-unsnooze"
+                              className="w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+                            >
+                              <Moon className="h-3.5 w-3.5 shrink-0" />
+                              Unsnooze
+                            </button>
+                          )}
+                          {/* Unlike the others, the unread toggle is always
                           offered (any sort), gated only on the feature
                           flag; the label flips to "Mark as read" when the
                           row already carries a marker. */}
-                      {unreadIndicatorEnabled && (
-                        <button
-                          onClick={() => void toggleUnread()}
-                          data-testid="sidebar-context-menu-unread"
-                          className="w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
-                        >
-                          <CircleDot className="h-3.5 w-3.5 shrink-0" />
-                          {effectiveUnread ? "Mark as read" : "Mark as unread"}
-                        </button>
-                      )}
-                    </>
-                  );
-                })()}
-                <div className="border-t border-surface-700/20 my-1" />
-                <button
-                  onClick={handleDelete}
-                  data-testid="sidebar-context-menu-delete"
-                  className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-status-error hover:bg-status-error/10 cursor-pointer transition-colors"
-                >
-                  Delete
-                </button>
+                          {unreadIndicatorEnabled && (
+                            <button
+                              onClick={() => void toggleUnread()}
+                              data-testid="sidebar-context-menu-unread"
+                              className="w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+                            >
+                              <CircleDot className="h-3.5 w-3.5 shrink-0" />
+                              {effectiveUnread ? "Mark as read" : "Mark as unread"}
+                            </button>
+                          )}
+                        </>
+                      );
+                    })()}
+                    <div className="border-t border-surface-700/20 my-1" />
+                    <button
+                      onClick={handleDelete}
+                      data-testid="sidebar-context-menu-delete"
+                      className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-status-error hover:bg-status-error/10 cursor-pointer transition-colors"
+                    >
+                      Delete
+                    </button>
+                  </>
+                )}
               </>
             )}
           </div>,
@@ -2371,10 +2534,6 @@ export function WorkspaceSidebar({
     () => allWorkspaces.filter((w) => selection.selectedIds.has(w.id)),
     [allWorkspaces, selection.selectedIds],
   );
-  const bulkBuckets = useMemo(
-    () => bucketSelectionForBulk(selectedWorkspaces, triage.optimisticFor),
-    [selectedWorkspaces, triage],
-  );
 
   // Run a bulk triage action over its eligible subset, then summarize and
   // clear the selection. One summary toast instead of per-row toasts.
@@ -2404,6 +2563,72 @@ export function WorkspaceSidebar({
       void runBulkAction(minutes == null ? "Unsnoozed" : "Snoozed", () => triage.bulkSnooze(wss, minutes)),
     [runBulkAction, triage],
   );
+
+  // Live selection state behind a ref so `rowBulkApi` keeps a stable identity:
+  // passing the selection arrays/handlers to every memo'd SessionRow would
+  // defeat React.memo. Refreshed on every render. See #2312.
+  const bulkStateRef = useRef({
+    selectedIds: selection.selectedIds,
+    selectedWorkspaces,
+    optimisticFor: triage.optimisticFor,
+    readOnly,
+    onBulkPin,
+    onBulkArchive,
+    onBulkSnooze,
+  });
+  // Keep the ref current after each commit (prepareScope only reads it on a
+  // user right-click, well after the effect has run). Writing it during render
+  // trips react-hooks/refs.
+  useLayoutEffect(() => {
+    bulkStateRef.current = {
+      selectedIds: selection.selectedIds,
+      selectedWorkspaces,
+      optimisticFor: triage.optimisticFor,
+      readOnly,
+      onBulkPin,
+      onBulkArchive,
+      onBulkSnooze,
+    };
+  });
+  const rowBulkApi = useMemo<RowBulkApi>(
+    () => ({
+      prepareScope: (ws) => {
+        const { selectedIds, selectedWorkspaces, optimisticFor, readOnly } = bulkStateRef.current;
+        if (selectedIds.has(ws.id) && selectedIds.size > 1) {
+          return {
+            kind: "bulk",
+            count: selectedWorkspaces.length,
+            buckets: bucketSelectionForBulk(selectedWorkspaces, optimisticFor),
+          };
+        }
+        // Right-clicking a row outside the selection makes it the sole
+        // selection (without navigating), matching file-manager behavior. Skip
+        // it for read-only viewers who can't act on a selection anyway.
+        if (!readOnly && !(selectedIds.has(ws.id) && selectedIds.size === 1)) {
+          dispatchSelection({ type: "select-only", id: ws.id });
+        }
+        return { kind: "single" };
+      },
+      pin: (wss, pinned) => bulkStateRef.current.onBulkPin(wss, pinned),
+      archive: (wss, archived) => bulkStateRef.current.onBulkArchive(wss, archived),
+      snooze: (wss, minutes) => bulkStateRef.current.onBulkSnooze(wss, minutes),
+    }),
+    [],
+  );
+
+  // Escape clears the multi-selection (plain-clicking a row also clears it via
+  // navigate). Ignored while typing in an input/textarea. See #2312.
+  useEffect(() => {
+    if (selection.selectedIds.size === 0) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+      dispatchSelection({ type: "clear" });
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [selection.selectedIds.size]);
 
   // Archive every active session under a group at once. Archiving a whole
   // project is a bigger hammer than a single row, so it confirms first
@@ -2446,7 +2671,7 @@ export function WorkspaceSidebar({
       const intent = classifyClick(e);
       switch (intent) {
         case "navigate":
-          dispatchSelection({ type: "clear" });
+          dispatchSelection({ type: "navigate", id: workspaceId });
           setOptimisticActive({ id: workspaceId, fromActiveId: activeId });
           onSelect(workspaceId);
           break;
@@ -2619,18 +2844,6 @@ export function WorkspaceSidebar({
           </div>
         )}
 
-        {!readOnly && (
-          <BulkActionBar
-            selectedCount={selection.selectedIds.size}
-            buckets={bulkBuckets}
-            snoozePresets={SNOOZE_PRESETS}
-            onBulkPin={onBulkPin}
-            onBulkArchive={onBulkArchive}
-            onBulkSnooze={onBulkSnooze}
-            onClear={clearSelection}
-          />
-        )}
-
         <div className="flex-1 overflow-y-auto overflow-x-hidden border-t border-surface-700/60">
           {!isNested && (
             <DragSuppressContext.Provider value={dragSuppressRef}>
@@ -2708,6 +2921,7 @@ export function WorkspaceSidebar({
                                     onArchiveToggle={triage.archiveToggle}
                                     onSnooze={triage.snooze}
                                     onUnreadToggle={triage.unreadToggle}
+                                    bulkApi={rowBulkApi}
                                     // Drag is disabled when the tier
                                     // comparator already controls placement:
                                     // lastActivity mode has no manual
@@ -2814,6 +3028,7 @@ export function WorkspaceSidebar({
                                 onArchiveToggle={triage.archiveToggle}
                                 onSnooze={triage.snooze}
                                 onUnreadToggle={triage.unreadToggle}
+                                bulkApi={rowBulkApi}
                                 indented
                               />
                             ))}
@@ -2893,6 +3108,7 @@ export function WorkspaceSidebar({
                       onArchiveToggle={triage.archiveToggle}
                       onSnooze={triage.snooze}
                       onUnreadToggle={triage.unreadToggle}
+                      bulkApi={rowBulkApi}
                       indented
                     />
                   ))}

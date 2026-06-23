@@ -59,6 +59,11 @@ export interface WizardData {
   useStructuredView: boolean;
   agentModel: string;
   agentEffort: string;
+  /** When non-empty, this create is importing an existing Claude Code
+   *  session: the on-disk session id to resume via `session/load`. Set by
+   *  the ProjectStep import tab, which also forces `tool: "claude"`,
+   *  structured view on, and worktree off. See #2276. */
+  importAcpSessionId: string;
   [key: string]: unknown;
 }
 
@@ -123,6 +128,7 @@ export const initialData: WizardData = {
   useStructuredView: true,
   agentModel: "",
   agentEffort: "",
+  importAcpSessionId: "",
 };
 
 export function reducer(state: WizardState, action: Action): WizardState {
@@ -145,12 +151,20 @@ export function reducer(state: WizardState, action: Action): WizardState {
         newData.path = "";
         newData.extraRepoPaths = [];
         newData.useWorktree = false;
+        // Leaving the import flow for scratch: drop the import id so it
+        // can't ride along on the submit. See #2276.
+        newData.importAcpSessionId = "";
       }
       if (
         (action.field === "path" && typeof action.value === "string" && action.value.length > 0) ||
         (action.field === "extraRepoPaths" && Array.isArray(action.value) && action.value.length > 0)
       ) {
         newData.scratch = false;
+        // A path chosen from Browse / Recent / Clone is not an import; clear
+        // the stale import id so it isn't submitted with the wrong path
+        // (#2276). The import picker dispatches `importAcpSessionId` AFTER
+        // `path`, so its own selection survives this.
+        newData.importAcpSessionId = "";
       }
       // Mark dirty whenever the user manually edits an agent-step
       // field. Guarded against `state.data.profile` previously, but the

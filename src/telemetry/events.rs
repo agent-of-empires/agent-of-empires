@@ -31,7 +31,11 @@ use serde::Serialize;
 /// v11 (#1888): added the structured-interaction aggregates (`approvals_resolved`,
 /// `approvals_by_decision`, `agent_switches`, `view_toggles`,
 /// `plan_mode_seen`, `prompts_queued`).
-pub const SCHEMA_VERSION: u32 = 11;
+/// v12: retired `view_toggles`. The terminal<->structured swap it counted has no
+/// trigger in the shipped UI (structured view is the default since #1925), so it
+/// only ever reported zero. The `acp_enable` / `acp_disable` endpoints stay; they
+/// just no longer feed a dead metric.
+pub const SCHEMA_VERSION: u32 = 12;
 
 /// Which surface emitted the event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -258,10 +262,6 @@ pub struct UsageSnapshot {
     pub approvals_by_decision: BTreeMap<String, u32>,
     /// Mid-session agent switches since the last snapshot.
     pub agent_switches: u32,
-    /// Structured-view/terminal view toggles since the last snapshot. Only real
-    /// transitions count; an enable on an already-structured session (or a disable
-    /// on an already-terminal session) is a no-op and is not counted.
-    pub view_toggles: u32,
     /// A session entered plan mode at least once since the last snapshot.
     pub plan_mode_seen: bool,
     /// Prompts the web structured view queued (parked because the agent was busy)
@@ -280,7 +280,6 @@ pub struct StructuredInteractionCounts {
     pub approvals_allow_always: u32,
     pub approvals_deny: u32,
     pub agent_switches: u32,
-    pub view_toggles: u32,
     pub plan_mode_seen: bool,
     pub prompts_queued: u32,
 }

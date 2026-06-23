@@ -13,9 +13,11 @@ import { CommentCard } from "./comments/CommentCard";
 import { CommentForm } from "./comments/CommentForm";
 import type { AnchoredComment, DiffSide } from "./comments/types";
 import { DiffWorkerPoolProvider } from "./pierre/DiffWorkerPoolProvider";
+import { FullFileViewer } from "./FullFileViewer";
 import { FindBar } from "./find/FindBar";
 import { changedLines } from "./find/changedLines";
 import type { FindMatch } from "./find/findMatches";
+import { targetScrollFraction } from "./scrollFraction";
 
 interface Props {
   sessionId: string;
@@ -23,6 +25,9 @@ interface Props {
   /** Workspace repo name; passed through to the diff endpoint so the file is
    *  resolved against the correct repo for multi-repo workspaces. See #1047. */
   repoName?: string;
+  /** 1-based new-side source line to scroll into view (and highlight) when the
+   *  file is opened from a transcript `path:line` link. See #1809. */
+  targetLine?: number;
   /** Triggers a re-fetch when the file list changes. */
   revision?: number;
   /** Called when the user wants to return to the terminal view. */
@@ -42,6 +47,7 @@ const STATUS_LABELS: Record<string, string> = {
   copied: "Copied",
   untracked: "Untracked",
   conflicted: "Conflicted",
+  unchanged: "Unchanged",
 };
 
 const STATUS_COLORS: Record<string, string> = {
@@ -52,6 +58,7 @@ const STATUS_COLORS: Record<string, string> = {
   copied: "text-accent-600",
   untracked: "text-text-muted",
   conflicted: "text-status-waiting",
+  unchanged: "text-text-muted",
 };
 
 /** Transient draft for an in-progress comment range. */
@@ -73,6 +80,7 @@ export function DiffFileViewer({
   sessionId,
   filePath,
   repoName,
+  targetLine,
   revision,
   onClose,
   commentsEnabled = false,
@@ -102,15 +110,24 @@ export function DiffFileViewer({
   const scrollResetRef = useRef<HTMLDivElement | null>(null);
   const scrollerRef = useRef<HTMLElement | null>(null);
   const userScrolledRef = useRef(false);
+  // Scroll fraction to hold the diff at while a cited line is targeted; null
+  // means "hold at the top" (the default). Maintained across the virtualizer's
+  // async reflows by the ResizeObserver below, until the user scrolls. #1809.
+  const targetFracRef = useRef<number | null>(null);
 
-  // Reset transient state when the viewer switches files / repos / sessions.
-  // Synced at render time (not in an effect) to avoid set-state-in-effect.
-  const syncKey = JSON.stringify([sessionId, repoName ?? null, filePath, revision]);
+  // Reset transient state when the viewer switches files / repos / sessions,
+  // or when a new cited line is targeted. Synced at render time (not in an
+  // effect) to avoid set-state-in-effect. When a `path:line` link opened this
+  // file, seed the selection with the cited line so it renders highlighted
+  // (the scroll-to it lives in the effect below). #1809.
+  const syncKey = JSON.stringify([sessionId, repoName ?? null, filePath, revision, targetLine ?? null]);
   const [handledSyncKey, setHandledSyncKey] = useState(syncKey);
   if (syncKey !== handledSyncKey) {
     setHandledSyncKey(syncKey);
     setDraft(null);
-    setSelected(null);
+    setSelected(
+      targetLine != null ? { start: targetLine, end: targetLine, side: "additions", endSide: "additions" } : null,
+    );
     setFindOpen(false);
   }
 
@@ -238,14 +255,15 @@ export function DiffFileViewer({
       diffStyle: splitActive ? "split" : "unified",
       theme,
       disableFileHeader: true,
-      // Enable selection for commenting, and also while find is open so the
-      // jumped-to match line renders its selection highlight.
-      enableLineSelection: commentsActive || findOpen,
+      // Enable selection for commenting, while find is open so the jumped-to
+      // match renders its highlight, and when a cited line was targeted so its
+      // scroll-to highlight renders even in a non-comment session (#1809).
+      enableLineSelection: commentsActive || findOpen || targetLine != null,
       controlledSelection: true,
       onLineSelectionChange: setSelected,
       onLineSelected: handleLineSelected,
     }),
-    [splitActive, theme, commentsActive, findOpen, handleLineSelected],
+    [splitActive, theme, commentsActive, findOpen, targetLine, handleLineSelected],
   );
 
   // Searchable line set for find: the diff's changed lines, read straight off
@@ -286,11 +304,14 @@ export function DiffFileViewer({
     }
   }, []);
 
-  // Keep the diff scrolled to the top when a file first opens. The
-  // virtualized renderer reconciles row heights asynchronously (and again
-  // when off-thread highlighting lands), which otherwise settles the scroll
-  // position at the bottom of large diffs. We force the top across those
-  // reflows until the user scrolls, then get out of the way.
+  // Position the diff scroll when a file first opens: held at the top by
+  // default, or at the cited line's approximate fraction when opened from a
+  // transcript `path:line` link (#1809). The virtualized renderer reconciles
+  // row heights asynchronously (and again when off-thread highlighting lands),
+  // which otherwise settles the scroll elsewhere, so we re-apply the desired
+  // position across those reflows until the user scrolls, then get out of the
+  // way. Co-opting one observer (rather than racing a second effect against
+  // this one) keeps the target stable without polling.
   useEffect(() => {
     const wrap = scrollResetRef.current;
     if (!wrap) return;
@@ -299,16 +320,21 @@ export function DiffFileViewer({
     if (!scroller || !content) return;
     scrollerRef.current = scroller;
     userScrolledRef.current = false;
+    targetFracRef.current =
+      targetLine != null && fileDiff ? targetScrollFraction(fileDiff, targetLine, newContent.split("\n").length) : null;
+    const apply = () => {
+      if (userScrolledRef.current) return;
+      const frac = targetFracRef.current;
+      scroller.scrollTop = frac == null ? 0 : frac * (scroller.scrollHeight - scroller.clientHeight);
+    };
     const markUser = () => {
       userScrolledRef.current = true;
     };
     scroller.addEventListener("wheel", markUser, { passive: true });
     scroller.addEventListener("pointerdown", markUser, { passive: true });
     scroller.addEventListener("keydown", markUser);
-    scroller.scrollTop = 0;
-    const ro = new ResizeObserver(() => {
-      if (!userScrolledRef.current) scroller.scrollTop = 0;
-    });
+    apply();
+    const ro = new ResizeObserver(apply);
     ro.observe(content);
     return () => {
       ro.disconnect();
@@ -317,7 +343,7 @@ export function DiffFileViewer({
       scroller.removeEventListener("keydown", markUser);
       if (scrollerRef.current === scroller) scrollerRef.current = null;
     };
-  }, [resolvedPath, repoName, splitActive, oldContent, newContent]);
+  }, [resolvedPath, repoName, splitActive, oldContent, newContent, fileDiff, targetLine]);
 
   if (loading && !contents) {
     return (
@@ -344,6 +370,9 @@ export function DiffFileViewer({
   const statusColor = STATUS_COLORS[contents.file.status] ?? "text-text-muted";
   const statusLabel = STATUS_LABELS[contents.file.status] ?? contents.file.status;
   const noChanges = oldContent === newContent;
+  // Full-file fallback: an agent-cited file with no diff against the base. The
+  // server sends its whole body in new_content with an empty patch. See #1810.
+  const isFullFile = contents.file.status === "unchanged";
 
   return (
     <div className="flex-1 flex flex-col bg-surface-900 overflow-hidden" onKeyDown={onKeyDown}>
@@ -445,7 +474,7 @@ export function DiffFileViewer({
         )}
         {contents.is_binary ? (
           <div className="flex-1 flex items-center justify-center text-text-dim">
-            <span className="text-sm">Binary file changed</span>
+            <span className="text-sm">{isFullFile ? "Binary file" : "Binary file changed"}</span>
           </div>
         ) : contents.truncated ? (
           <div className="flex-1 flex items-center justify-center text-text-dim">
@@ -454,6 +483,8 @@ export function DiffFileViewer({
               <p className="text-xs">Open it in your editor to review the changes.</p>
             </div>
           </div>
+        ) : isFullFile ? (
+          <FullFileViewer content={newContent} filePath={resolvedPath} />
         ) : noChanges && staleComments.length === 0 ? (
           <div className="flex-1 flex items-center justify-center text-text-dim">
             <span className="text-sm">No changes in this file</span>

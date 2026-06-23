@@ -1402,6 +1402,10 @@ fn build_router(state: Arc<AppState>) -> Router {
             patch(api::update_session_unread),
         )
         .route("/api/sessions/{id}/stop", post(api::stop_session))
+        .route(
+            "/api/sessions/{id}/smart-rename",
+            post(api::force_smart_rename),
+        )
         .route("/api/sessions/{id}/start", post(api::start_session))
         .route("/api/sessions/{id}/terminal", post(api::ensure_terminal))
         .route(
@@ -1442,6 +1446,9 @@ fn build_router(state: Arc<AppState>) -> Router {
             get(api::get_settings).patch(api::update_settings),
         )
         .route("/api/settings/schema", get(api::get_settings_schema))
+        .route("/api/tips", get(api::get_tips))
+        .route("/api/tips/show", post(api::set_show_tips))
+        .route("/api/app-state/tip-seen", post(api::mark_tip_seen))
         .route(
             "/api/app-state/web-tour-seen",
             post(api::mark_web_tour_seen),
@@ -1582,7 +1589,8 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/api/sessions/{id}/acp/elicitations/{nonce}",
             post(api::resolve_elicitation),
         )
-        .route("/api/acp/agents", get(api::list_acp_agents));
+        .route("/api/acp/agents", get(api::list_acp_agents))
+        .route("/api/claude-sessions", get(api::list_claude_sessions));
 
     app
         // Static assets (Vite build output: assets/, manifest.json, sw.js, icons)
@@ -2665,7 +2673,6 @@ pub struct StructuredTelemetryCounters {
     pub approvals_allow_always: std::sync::atomic::AtomicU32,
     pub approvals_deny: std::sync::atomic::AtomicU32,
     pub agent_switches: std::sync::atomic::AtomicU32,
-    pub view_toggles: std::sync::atomic::AtomicU32,
     pub plan_mode_seen: std::sync::atomic::AtomicU32,
     pub prompts_queued: std::sync::atomic::AtomicU32,
 }
@@ -2691,7 +2698,6 @@ struct ReportedAcpCounts {
     approvals_allow_always: u32,
     approvals_deny: u32,
     agent_switches: u32,
-    view_toggles: u32,
     plan_mode: u32,
     prompts_queued: u32,
 }
@@ -2722,7 +2728,6 @@ async fn build_serve_snapshot(
         approvals_allow_always: c.approvals_allow_always.load(Ordering::Relaxed),
         approvals_deny: c.approvals_deny.load(Ordering::Relaxed),
         agent_switches: c.agent_switches.load(Ordering::Relaxed),
-        view_toggles: c.view_toggles.load(Ordering::Relaxed),
         plan_mode: c.plan_mode_seen.load(Ordering::Relaxed),
         prompts_queued: c.prompts_queued.load(Ordering::Relaxed),
     };
@@ -2731,7 +2736,6 @@ async fn build_serve_snapshot(
         approvals_allow_always: reported_acp.approvals_allow_always,
         approvals_deny: reported_acp.approvals_deny,
         agent_switches: reported_acp.agent_switches,
-        view_toggles: reported_acp.view_toggles,
         plan_mode_seen: reported_acp.plan_mode > 0,
         prompts_queued: reported_acp.prompts_queued,
     };
@@ -2790,7 +2794,6 @@ fn clear_reported_serve_signals(state: &AppState, outcome: crate::telemetry::Sen
     decrement_reported_count(&c.approvals_allow_always, rc.approvals_allow_always);
     decrement_reported_count(&c.approvals_deny, rc.approvals_deny);
     decrement_reported_count(&c.agent_switches, rc.agent_switches);
-    decrement_reported_count(&c.view_toggles, rc.view_toggles);
     decrement_reported_count(&c.plan_mode_seen, rc.plan_mode);
     decrement_reported_count(&c.prompts_queued, rc.prompts_queued);
 }
@@ -2938,6 +2941,52 @@ async fn status_poll_loop(state: Arc<AppState>) {
             }
 
             reload_state_instances_from_disk(&state, instances, StatusSource::TmuxApplied).await;
+
+            // Drain poller observations into sessions.json so daemon-only
+            // sessions (no attached TUI) persist post-`/clear` sids (#2291).
+            // Snapshot + spawn_blocking + reapply, never holding AppState
+            // across the flock or tmux exec, per storage.rs:46.
+            let snapshot = state.instances.read().await.clone();
+            let drain_state = state.clone();
+            match tokio::task::spawn_blocking(move || {
+                let mut snapshot = snapshot;
+                let outcome = crate::session::sync::drain_and_persist_session_ids(
+                    &mut snapshot,
+                    &drain_state.file_watch,
+                );
+                (outcome, snapshot)
+            })
+            .await
+            {
+                Ok((outcome, mutated)) if outcome.touched() => {
+                    // Reapply only for ids the helper actually touched, so a
+                    // peer that wrote `agent_session_id` (e.g. the restart-
+                    // completion path) on the live state during the
+                    // spawn_blocking window is not silently reverted.
+                    let touched: std::collections::HashSet<&str> = outcome
+                        .applied
+                        .iter()
+                        .chain(outcome.rolled_back.iter())
+                        .map(String::as_str)
+                        .collect();
+                    if !touched.is_empty() {
+                        let mut guard = state.instances.write().await;
+                        for src in mutated.iter().filter(|i| touched.contains(i.id.as_str())) {
+                            if let Some(dst) = guard.iter_mut().find(|i| i.id == src.id) {
+                                dst.agent_session_id = src.agent_session_id.clone();
+                                dst.resume_probe_failed_sid = src.resume_probe_failed_sid.clone();
+                            }
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::error!(
+                        target: "session.sync",
+                        "drain_and_persist task failed: {e}",
+                    );
+                }
+            }
 
             #[cfg(feature = "serve")]
             acp_reconciler::reconcile_acp_workers(
@@ -3744,15 +3793,28 @@ fn apply_acp_session_change(
             // that the client parked waiting for a worker that never returns.
             // See #2237.
             let cleared_stale_dormant = inst.idle_dormant_since.take().is_some();
-            if inst.acp_session_id.as_deref() == Some(new_id.as_str()) {
+            let same_acp_session = inst.acp_session_id.as_deref() == Some(new_id.as_str());
+            // #2276: clear import_pending only when the assigned id matches the
+            // imported one, i.e. the import's session/load actually landed and
+            // its replay is now in the event store. A fallback session/new (or
+            // a stale worker) reports a different id; consuming the marker then
+            // would block a later retry from re-seeding the transcript.
+            let cleared_import_pending = if same_acp_session {
+                inst.import_pending.take().unwrap_or(false)
+            } else {
+                false
+            };
+            if same_acp_session {
                 // Same id (a reattach / session/load reuses it). Only persist
-                // if we actually cleared a stale dormant marker; otherwise the
-                // id is already on disk and there is nothing to rewrite.
-                if cleared_stale_dormant {
+                // if we actually cleared a stale dormant marker or the import
+                // flag; otherwise the id is already on disk and there is
+                // nothing to rewrite.
+                if cleared_stale_dormant || cleared_import_pending {
                     tracing::info!(
                         target: "acp.event_listener",
                         session = %session_id,
-                        "cleared stale idle-dormant marker on worker (re)assign"
+                        cleared_import_pending,
+                        "cleared stale idle-dormant / import marker on worker (re)assign"
                     );
                     return Some(inst.source_profile.clone());
                 }

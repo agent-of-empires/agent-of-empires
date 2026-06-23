@@ -729,6 +729,26 @@ pub struct AppStateConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_section_collapsed: Option<bool>,
 
+    /// Ids of tips the user has already seen/acknowledged. Drives the unseen
+    /// badge count and stops earned tips from re-popping. Ids come from
+    /// [`crate::tips`] and are stable, so this list stays meaningful across
+    /// upgrades.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tips_seen: Vec<String>,
+
+    /// How many times the new-session dialog has been opened while a project or
+    /// session was selected. Once this passes
+    /// [`crate::tips::NEW_FROM_SELECTION_TIP_THRESHOLD`], the "new from
+    /// selection" tip becomes eligible (the earned trigger that closes #2262).
+    #[serde(default)]
+    pub new_session_with_selection_count: u32,
+
+    /// Set once the user has actually used `N` (new-from-selection). They've
+    /// discovered the feature, so the tip that teaches it is suppressed even if
+    /// the count above crosses the threshold.
+    #[serde(default)]
+    pub used_new_from_selection: bool,
+
     /// Server-side mirror of the web dashboard's syncable UI state, keyed by
     /// the frontend's localStorage key (the value is the opaque string the
     /// browser stored). Single-tenant: there is one user, so these prefs
@@ -800,6 +820,20 @@ pub struct SessionConfig {
     #[serde(default = "default_true")]
     #[setting(label = "Smart Session Rename", widget = "toggle", category = "Agents")]
     pub smart_rename: bool,
+
+    /// Agent used for the one-shot smart-rename title call. Empty means use the
+    /// session's own agent. Set this to point smart rename at a cheaper or more
+    /// obedient title model (e.g. codex or opencode) without changing the
+    /// session's working agent. Only agents with a one-shot mode qualify; an
+    /// unknown or one-shot-incapable value falls back to leaving the generated
+    /// name. The picker lists installed one-shot-capable agents.
+    #[serde(default)]
+    #[setting(
+        label = "Smart-rename agent",
+        widget = "custom:smart-rename-agent",
+        category = "Agents"
+    )]
+    pub smart_rename_agent: String,
 
     /// Request xterm mouse tracking so the TUI handles the scroll wheel
     /// (preview-pane scroll) and click-to-select rows. Disable to hand the
@@ -1045,6 +1079,20 @@ pub struct SessionConfig {
     )]
     pub unread_indicator: bool,
 
+    /// Show occasional discovery tips: the `💡` badge in the footer, the
+    /// browsable tips overlay, and the one-time earned pop. Turn this off to
+    /// hide the badge and stop tips from popping; seen/earned state still lives
+    /// in `app_state`. A global UX preference, not profile-overridable. See
+    /// [`crate::tips`].
+    #[serde(default = "default_true")]
+    #[setting(
+        label = "Show tips",
+        widget = "toggle",
+        category = "Interaction",
+        global_only
+    )]
+    pub show_tips: bool,
+
     /// Keep an aoe-managed worktree session's directory leaf in sync with its
     /// title. When enabled (default), renaming the session also moves its
     /// worktree directory, and new sessions derive the directory leaf from the
@@ -1151,6 +1199,7 @@ impl Default for SessionConfig {
             agent_command_override: HashMap::new(),
             agent_status_hooks: true,
             smart_rename: true,
+            smart_rename_agent: String::new(),
             mouse_capture: true,
             custom_agents: HashMap::new(),
             agent_detect_as: HashMap::new(),
@@ -1169,6 +1218,7 @@ impl Default for SessionConfig {
             click_action: ClickAction::default(),
             confirm_before_quit: true,
             unread_indicator: true,
+            show_tips: true,
             tie_workdir_to_name: true,
         }
     }
@@ -2615,6 +2665,40 @@ mod tests {
         let app: AppStateConfig = toml::from_str(toml).unwrap();
         assert!(app.has_seen_web_tour);
         assert!(!app.has_seen_welcome);
+    }
+
+    #[test]
+    fn test_app_state_config_tips_defaults_and_roundtrip() {
+        // Absent from old configs: nothing seen, zero count. (The on/off toggle
+        // lives in `SessionConfig::show_tips`, not here.)
+        let app = AppStateConfig::default();
+        assert!(app.tips_seen.is_empty());
+        assert_eq!(app.new_session_with_selection_count, 0);
+        assert!(!app.used_new_from_selection);
+
+        let toml = r#"
+            tips_seen = ["new-from-selection"]
+            new_session_with_selection_count = 4
+            used_new_from_selection = true
+        "#;
+        let app: AppStateConfig = toml::from_str(toml).unwrap();
+        assert_eq!(app.tips_seen, vec!["new-from-selection"]);
+        assert_eq!(app.new_session_with_selection_count, 4);
+        assert!(app.used_new_from_selection);
+
+        // Round-trips back out.
+        let serialized = toml::to_string(&app).unwrap();
+        let reparsed: AppStateConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.tips_seen, app.tips_seen);
+        assert_eq!(reparsed.new_session_with_selection_count, 4);
+    }
+
+    #[test]
+    fn test_session_config_show_tips_defaults_on() {
+        // Absent from old configs, tips default to on.
+        let toml = "default_tool = \"claude\"\n";
+        let session: SessionConfig = toml::from_str(toml).unwrap();
+        assert!(session.show_tips);
     }
 
     // Full config serialization roundtrip

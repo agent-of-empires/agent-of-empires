@@ -723,9 +723,17 @@ export interface AcpState {
    *  Unlike a scheduled wakeup it has no fire time, so the UI shows a
    *  static "monitoring" badge, not a countdown. A monitor firing
    *  re-invokes the agent with activity but never a `UserPromptSent`, so
-   *  this persists across re-fires and clears only on the next
-   *  `UserPromptSent` (the user takes over). */
+   *  this persists across the wait and clears when the user takes over
+   *  (`UserPromptSent`) or the monitor fires and that turn ends: a tool
+   *  call started after the arm (`monitorWorkSeen`) followed by a
+   *  `Stopped`. See #2325. */
   monitorArmed: boolean;
+  /** True once a tool call has started after the latest `MonitorArmed`,
+   *  i.e. the monitor fired and the agent acted on it. Gates the badge
+   *  clear on the next `Stopped` so the arming turn ending while the
+   *  monitor is still pending does not clear it. Reset by `MonitorArmed`
+   *  and `UserPromptSent`. See #2325. */
+  monitorWorkSeen: boolean;
   /** The `description` the agent gave the `Monitor` tool, shown as the
    *  badge tooltip. Null when none was provided or no monitor is armed. */
   monitorDescription: string | null;
@@ -935,6 +943,7 @@ export function emptyAcpState(): AcpState {
     nextWakeupAt: null,
     nextWakeupReason: null,
     monitorArmed: false,
+    monitorWorkSeen: false,
     monitorDescription: null,
     cancelling: false,
     cancelEscalatesAt: null,
@@ -998,6 +1007,7 @@ function applyNewTurnResets(next: AcpState): void {
   // self-fires a prompt, so any UserPromptSent reaching here is the user
   // taking over: clear the "monitoring" badge unconditionally.
   next.monitorArmed = false;
+  next.monitorWorkSeen = false;
   next.monitorDescription = null;
   // Any pending context-primer offer is consumed once the user submits
   // a new prompt; the recovery affordance is one-shot.
@@ -1105,6 +1115,13 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       return next;
     }
     next.inFlightTool = tc;
+    // A tool call after the monitor armed means the monitor fired and the
+    // agent is acting on it; gate the badge clear on the next Stopped. The
+    // Monitor tool's own start precedes its MonitorArmed, so it never marks
+    // itself. See #2325.
+    if (next.monitorArmed) {
+      next.monitorWorkSeen = true;
+    }
     // The reasoning block produced output (a tool call), so the agent is
     // no longer thinking. The adapter often skips ThinkingEnded when it
     // transitions into tool calls, so clear it here. See #1213.
@@ -1436,6 +1453,20 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     next.cancelEscalatesAt = null;
     next.lastStoppedSeq = Math.min(next.lastStoppedSeq + 1, next.pendingUserPromptSeq);
     next.turnActive = isTurnActive(next);
+    // Clear the "monitoring" badge once the monitor has fired and that turn
+    // ends. The monitor firing makes the agent act (a tool call after the
+    // arm, tracked by `monitorWorkSeen`); the badge then retires on the next
+    // Stopped. This covers both shapes: the agent ending the arming turn and
+    // resuming later between prompts (closed by `agent_idle`), and the
+    // monitor blocking the arming turn in-band (closed by `prompt_complete`).
+    // A Stopped with no post-arm work is the arming turn ending while the
+    // monitor is still pending, so it deliberately leaves the badge up. See
+    // #2325.
+    if (next.monitorArmed && next.monitorWorkSeen) {
+      next.monitorArmed = false;
+      next.monitorWorkSeen = false;
+      next.monitorDescription = null;
+    }
     // The "user_stopped" / "restart_pending" reasons are published by
     // the supervisor's reap_user_stopped pass when it detects an
     // out-of-band CLI teardown. Surface a distinct UI state for each:
@@ -1738,6 +1769,8 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   }
   if ("MonitorArmed" in event) {
     next.monitorArmed = true;
+    // Reset the fired-work gate: work only counts once it follows THIS arm.
+    next.monitorWorkSeen = false;
     next.monitorDescription = event.MonitorArmed.description ?? null;
     return next;
   }

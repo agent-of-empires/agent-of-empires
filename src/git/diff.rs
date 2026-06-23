@@ -598,6 +598,61 @@ fn is_binary_bytes(content: &[u8]) -> bool {
     content.iter().take(8000).any(|&b| b == 0)
 }
 
+/// Full working-directory contents of a tracked file that has no diff against
+/// the base branch (an agent-cited but unchanged file). See #1810.
+#[derive(Debug, Clone)]
+pub struct FullFileContents {
+    pub content: String,
+    pub is_binary: bool,
+}
+
+/// Read the full contents of an unchanged, agent-cited file for the full-file
+/// fallback in the structured-view diff viewer. See #1810.
+///
+/// Membership is gated on the path being a tracked **blob** in `HEAD`. That
+/// excludes `.git/` internals, gitignored secrets like `.env`, and submodule
+/// gitlinks (a commit entry, not a blob), none of which should be readable
+/// through this endpoint. The *contents* are then read from the working
+/// directory via `canonical_path` (already canonicalized and containment-checked
+/// by the caller) so what renders matches what the agent actually saw and any
+/// symlink resolves through the same containment guard.
+///
+/// Returns `Ok(None)` when the path is not a tracked blob or is not a regular
+/// file on disk, so the caller answers `404` without disclosing whether an
+/// untracked file exists.
+pub fn compute_unchanged_file_contents(
+    repo_path: &Path,
+    file_path: &Path,
+    canonical_path: &Path,
+) -> Result<Option<FullFileContents>> {
+    let repo = super::open_repo_at(repo_path)?;
+    // Unborn HEAD (no commits yet) means nothing is tracked.
+    let head_tree = match repo.head().and_then(|h| h.peel_to_tree()) {
+        Ok(t) => t,
+        Err(_) => return Ok(None),
+    };
+    // Only serve tracked blobs. Directories (trees) and submodules (gitlink
+    // commits) are rejected, as are paths absent from HEAD (untracked/ignored).
+    match head_tree.get_path(file_path) {
+        Ok(entry) if entry.kind() == Some(git2::ObjectType::Blob) => {}
+        _ => return Ok(None),
+    }
+    // `canonical_path` is the already-resolved working-dir path; require a
+    // regular file so a cited directory or special file yields 404, not a read
+    // error.
+    if !canonical_path.is_file() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(canonical_path).map_err(GitError::IoError)?;
+    let is_binary = is_binary_bytes(&bytes);
+    let content = if is_binary {
+        String::new()
+    } else {
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    Ok(Some(FullFileContents { content, is_binary }))
+}
+
 /// Get the content of a file from the working directory
 pub fn get_working_file_content(repo_path: &Path, file_path: &Path) -> Result<String> {
     let repo = super::open_repo_at(repo_path)?;
@@ -795,6 +850,40 @@ mod tests {
         let parents: Vec<&git2::Commit> = parent.iter().collect();
         repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &parents)
             .unwrap();
+    }
+
+    #[test]
+    fn unchanged_file_contents_serves_tracked_file() {
+        let (dir, _repo) = setup_test_repo();
+        let canonical = dir.path().join("test.txt").canonicalize().unwrap();
+        let out = compute_unchanged_file_contents(dir.path(), Path::new("test.txt"), &canonical)
+            .unwrap()
+            .expect("tracked file should be served");
+        assert_eq!(out.content, "line 1\nline 2\nline 3\n");
+        assert!(!out.is_binary);
+    }
+
+    #[test]
+    fn unchanged_file_contents_rejects_untracked_file() {
+        // A gitignored secret never committed: present on disk, not in HEAD, so
+        // the tracked-blob gate refuses it (returns None -> 404). See #1810.
+        let (dir, _repo) = setup_test_repo();
+        let secret = dir.path().join(".env");
+        fs::write(&secret, "API_KEY=supersecret\n").unwrap();
+        let canonical = secret.canonicalize().unwrap();
+        let out =
+            compute_unchanged_file_contents(dir.path(), Path::new(".env"), &canonical).unwrap();
+        assert!(out.is_none(), "untracked .env must not be served");
+    }
+
+    #[test]
+    fn unchanged_file_contents_rejects_git_internals() {
+        // `.git/config` lives inside the worktree but is not a tracked blob.
+        let (dir, _repo) = setup_test_repo();
+        let canonical = dir.path().join(".git/config").canonicalize().unwrap();
+        let out = compute_unchanged_file_contents(dir.path(), Path::new(".git/config"), &canonical)
+            .unwrap();
+        assert!(out.is_none(), ".git internals must not be served");
     }
 
     /// Ensure a local branch exists at the given commit.

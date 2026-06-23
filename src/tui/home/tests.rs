@@ -1502,6 +1502,324 @@ fn test_enter_clears_matches_so_n_opens_new_dialog() {
     assert!(env.view.new_dialog.is_some());
 }
 
+// The only catalog tip is earned, so it (and the badge) appears only after the
+// `new_session_with_selection` counter crosses its threshold. Set that on disk
+// and refresh the cached badge so a test starts with the tip eligible.
+fn earn_tip(env: &mut TestEnv) {
+    let mut config = crate::session::config::load_config()
+        .unwrap()
+        .unwrap_or_default();
+    config.app_state.new_session_with_selection_count =
+        crate::tips::NEW_FROM_SELECTION_TIP_THRESHOLD;
+    crate::session::config::save_config(&config).unwrap();
+    env.view.tips_unseen = crate::tui::home::tips_unseen_count(&config);
+}
+
+#[test]
+#[serial]
+fn open_tips_dialog_opens_even_with_no_eligible_tips() {
+    // No tip earned yet: "Show tips" still opens the overlay (an empty state)
+    // rather than silently doing nothing.
+    let mut env = create_test_env_empty();
+    assert!(env.view.tips_dialog.is_none());
+    env.view.open_tips_dialog();
+    assert!(env.view.tips_dialog.is_some());
+}
+
+#[test]
+#[serial]
+fn persist_tips_outcome_merges_seen_sets_disabled_and_updates_badge() {
+    use crate::tui::dialogs::TipsOutcome;
+
+    let mut env = create_test_env_empty();
+    earn_tip(&mut env);
+    let before = env.view.tips_unseen;
+    assert!(before > 0);
+
+    env.view.persist_tips_outcome(TipsOutcome {
+        newly_seen: vec!["new-from-selection".to_string()],
+        disabled: Some(true),
+    });
+
+    let config = crate::session::config::load_config()
+        .unwrap()
+        .unwrap_or_default();
+    assert!(config
+        .app_state
+        .tips_seen
+        .iter()
+        .any(|s| s == "new-from-selection"));
+    assert!(!config.session.show_tips);
+    // Disabling tips zeroes the cached badge count.
+    assert_eq!(env.view.tips_unseen, 0);
+}
+
+#[test]
+#[serial]
+fn tips_badge_renders_with_count_and_hides_when_zero() {
+    use crate::tui::styles::load_theme;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut env = create_test_env_with_sessions(1);
+    let theme = load_theme("empire");
+
+    let render = |env: &mut TestEnv| -> String {
+        let backend = TestBackend::new(200, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                env.view.render(f, area, &theme, None, None, None);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    };
+
+    // Earn the tip so the badge shows a count.
+    earn_tip(&mut env);
+    let n = env.view.tips_unseen;
+    assert!(n > 0);
+    let shown = render(&mut env);
+    assert!(
+        shown.contains(&format!("{n} tips")),
+        "badge should show the unseen count\n{shown}"
+    );
+
+    // Zero unseen (or disabled) hides the badge entirely.
+    env.view.tips_unseen = 0;
+    let hidden = render(&mut env);
+    assert!(
+        !hidden.contains("tips"),
+        "no badge when nothing is unseen\n{hidden}"
+    );
+}
+
+#[test]
+#[serial]
+fn footer_hints_yield_to_tips_badge_when_thin() {
+    use crate::tui::styles::load_theme;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut env = create_test_env_with_sessions(1);
+    let theme = load_theme("empire");
+    earn_tip(&mut env);
+    let n = env.view.tips_unseen;
+    assert!(n > 0);
+    let badge = format!("{n} tips");
+
+    let render_at = |env: &mut TestEnv, w: u16| -> String {
+        let backend = TestBackend::new(w, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                env.view.render(f, area, &theme, None, None, None);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    };
+
+    // Wide: the badge and even a low-priority hint (Diff) both fit.
+    let wide = render_at(&mut env, 200);
+    assert!(wide.contains(&badge), "badge shows when wide\n{wide}");
+    assert!(
+        wide.contains("Diff"),
+        "low-priority hint present when wide\n{wide}"
+    );
+
+    // Thin: the badge still shows (it takes priority); the hints yield.
+    let thin = render_at(&mut env, 30);
+    assert!(
+        thin.contains(&badge),
+        "badge survives on a thin footer\n{thin}"
+    );
+    assert!(
+        !thin.contains("Diff"),
+        "low-priority hints drop to make room for the badge\n{thin}"
+    );
+}
+
+#[test]
+#[serial]
+fn clicking_footer_tips_badge_opens_overlay() {
+    use crate::tui::styles::load_theme;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut env = create_test_env_with_sessions(1);
+    let theme = load_theme("empire");
+    earn_tip(&mut env);
+    assert!(env.view.tips_unseen > 0);
+
+    // Render once so the footer captures the badge's clickable rect.
+    let backend = TestBackend::new(200, 40);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|f| {
+            let area = f.area();
+            env.view.render(f, area, &theme, None, None, None);
+        })
+        .unwrap();
+    let rect = env
+        .view
+        .tips_badge_rect
+        .expect("badge rect should be captured when shown");
+
+    assert!(env.view.tips_dialog.is_none());
+    let handled = env.view.handle_tips_badge_click(rect.x, rect.y);
+    assert!(handled, "click on the badge is handled");
+    assert!(
+        env.view.tips_dialog.is_some(),
+        "clicking the badge opens the tips overlay"
+    );
+}
+
+#[test]
+#[serial]
+fn hovering_footer_tips_badge_sets_hover_state() {
+    use crate::tui::styles::load_theme;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut env = create_test_env_with_sessions(1);
+    let theme = load_theme("empire");
+    earn_tip(&mut env);
+
+    // Render once so the badge's rect is captured.
+    let backend = TestBackend::new(200, 40);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|f| {
+            let area = f.area();
+            env.view.render(f, area, &theme, None, None, None);
+        })
+        .unwrap();
+    let rect = env.view.tips_badge_rect.expect("badge rect captured");
+
+    assert!(!env.view.tips_badge_hovered);
+    // Hovering the badge sets the highlight and reports a change.
+    assert!(env.view.handle_hover(rect.x, rect.y));
+    assert!(env.view.tips_badge_hovered);
+    // Moving off clears it.
+    assert!(env.view.handle_hover(0, 0));
+    assert!(!env.view.tips_badge_hovered);
+}
+
+#[test]
+#[serial]
+fn earned_new_from_selection_tip_pops_after_repeated_n_with_selection() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances[0].id.clone();
+    env.view.selected_session = Some(id);
+    let before = env.view.tips_unseen;
+
+    // Open + cancel `n` with a selection enough times to earn the tip.
+    for _ in 0..crate::tips::NEW_FROM_SELECTION_TIP_THRESHOLD {
+        env.view.handle_key(key(KeyCode::Char('n')), None);
+        assert!(
+            env.view.new_dialog.is_some(),
+            "n opens the new-session dialog"
+        );
+        env.view.handle_key(key(KeyCode::Esc), None);
+    }
+
+    // The earned tip is now in the badge and queued to pop.
+    assert_eq!(
+        env.view.tips_unseen,
+        before + 1,
+        "earned tip joins the badge"
+    );
+    assert!(
+        env.view.pending_tip_pop.is_some(),
+        "earned tip should be queued after the threshold"
+    );
+
+    // The next idle keystroke drains the queue into the tips overlay.
+    assert!(env.view.tips_dialog.is_none());
+    env.view.handle_key(key(KeyCode::Char('j')), None);
+    assert!(
+        env.view.tips_dialog.is_some(),
+        "queued earned tip should pop on the next keystroke"
+    );
+    assert!(env.view.pending_tip_pop.is_none(), "pop is drained once");
+}
+
+#[test]
+#[serial]
+fn earned_tip_does_not_pop_when_tips_disabled() {
+    use crate::tui::dialogs::TipsOutcome;
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances[0].id.clone();
+    env.view.selected_session = Some(id);
+    env.view.persist_tips_outcome(TipsOutcome {
+        newly_seen: vec![],
+        disabled: Some(true),
+    });
+
+    for _ in 0..crate::tips::NEW_FROM_SELECTION_TIP_THRESHOLD {
+        env.view.handle_key(key(KeyCode::Char('n')), None);
+        env.view.handle_key(key(KeyCode::Esc), None);
+    }
+
+    assert!(
+        env.view.pending_tip_pop.is_none(),
+        "disabled tips must not queue a pop"
+    );
+    assert_eq!(env.view.tips_unseen, 0, "disabled tips => empty badge");
+}
+
+#[test]
+#[serial]
+fn using_n_suppresses_the_earned_tip() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances[0].id.clone();
+    env.view.selected_session = Some(id);
+    // Earn the tip (badge showing) without queueing a pop.
+    earn_tip(&mut env);
+    let earned = env.view.tips_unseen;
+    assert!(earned > 0, "tip is earned and badged");
+
+    // The user discovers N for themselves: open new-from-selection.
+    env.view.handle_key(key(KeyCode::Char('N')), None);
+    assert!(
+        env.view.new_dialog.is_some(),
+        "N opens the new-from-selection dialog"
+    );
+    // The earned tip drops from the badge (rotation tips, if any, remain).
+    assert_eq!(
+        env.view.tips_unseen,
+        earned - 1,
+        "using N suppresses the tip that teaches it"
+    );
+
+    let config = crate::session::config::load_config()
+        .unwrap()
+        .unwrap_or_default();
+    assert!(
+        config.app_state.used_new_from_selection,
+        "N use is persisted"
+    );
+}
+
 #[test]
 #[serial]
 fn test_reload_does_not_snap_cursor_after_enter() {
@@ -2026,8 +2344,8 @@ fn test_group_has_managed_worktrees() {
     view.flat_items = view.build_flat_items();
     view.update_selected();
 
-    assert!(view.group_has_managed_worktrees("work", "work/"));
-    assert!(!view.group_has_managed_worktrees("other", "other/"));
+    assert!(view.group_has_managed_worktrees("work", "work/", None));
+    assert!(!view.group_has_managed_worktrees("other", "other/", None));
 }
 
 #[test]
@@ -2076,8 +2394,8 @@ fn test_group_has_containers() {
     view.flat_items = view.build_flat_items();
     view.update_selected();
 
-    assert!(view.group_has_containers("work", "work/"));
-    assert!(!view.group_has_containers("other", "other/"));
+    assert!(view.group_has_containers("work", "work/", None));
+    assert!(!view.group_has_containers("other", "other/", None));
 }
 
 #[test]
@@ -4274,6 +4592,136 @@ fn test_delete_group_scoped_to_owning_profile() {
     assert_eq!(
         beta_inst.group_path, "work",
         "beta's instance should still be in 'work'"
+    );
+}
+
+/// Opening the group-delete dialog must scope its session count to the
+/// selected group's profile. Two profiles can own a same-named group; an
+/// empty group in one profile should open the simple confirm, not the
+/// "delete N sessions" options dialog driven by its populated twin in
+/// another profile. Regression for the group-key conflict where the empty
+/// group was not the one the delete modal acted on.
+#[test]
+#[serial]
+fn test_group_delete_dialog_scoped_to_owning_profile() {
+    use crate::session::GroupTree;
+
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+
+    // alpha owns an EMPTY "work" group (group exists, no sessions).
+    let storage_a = Storage::new_unwatched("alpha").unwrap();
+    let mut tree_a = GroupTree::new_with_groups(&[], &[]);
+    tree_a.create_group("work");
+    storage_a
+        .update(|i, g| {
+            *i = vec![];
+            *g = tree_a.get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    // beta owns a same-named "work" group that still has a session.
+    let storage_b = Storage::new_unwatched("beta").unwrap();
+    let mut inst_b = Instance::new("B1", "/tmp/b");
+    inst_b.group_path = "work".to_string();
+    let tree_b = GroupTree::new_with_groups(&[inst_b.clone()], &[]);
+    storage_b
+        .update(|i, g| {
+            *i = [inst_b].to_vec();
+            *g = tree_b.get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
+    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.flat_items = view.build_flat_items();
+    view.update_selected();
+
+    // Select alpha's (empty) "work" group.
+    let work_indices: Vec<usize> = view
+        .flat_items
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, item)| match item {
+            Item::Group { path, .. } if path == "work" => Some(idx),
+            _ => None,
+        })
+        .collect();
+    for idx in work_indices {
+        view.cursor = idx;
+        view.update_selected();
+        if view.selected_group_profile.as_deref() == Some("alpha") {
+            break;
+        }
+    }
+    assert_eq!(view.selected_group_profile.as_deref(), Some("alpha"));
+
+    view.open_delete_for_selected();
+
+    assert!(
+        view.group_delete_options_dialog.is_none(),
+        "empty group must not trigger the with-sessions options dialog from a same-named group in another profile"
+    );
+    assert!(
+        view.confirm_dialog.is_some(),
+        "empty group should open the simple delete-group confirm"
+    );
+}
+
+/// Changing a session's profile via the rename dialog must prune the
+/// source profile's now-empty group, just like the restart-with-edits
+/// path does. Without the prune the source keeps an empty group with the
+/// same name as the target's copy, which renders as a duplicate header and
+/// collides on the shared group key.
+#[test]
+#[serial]
+fn test_rename_profile_change_prunes_source_group() {
+    use crate::session::GroupTree;
+
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+
+    // alpha has one session in "work"; beta exists but is empty.
+    let storage_a = Storage::new_unwatched("alpha").unwrap();
+    let mut inst_a = Instance::new("A1", "/tmp/a");
+    inst_a.group_path = "work".to_string();
+    let id = inst_a.id.clone();
+    let tree_a = GroupTree::new_with_groups(&[inst_a.clone()], &[]);
+    storage_a
+        .update(|i, g| {
+            *i = [inst_a].to_vec();
+            *g = tree_a.get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+    let _storage_b = Storage::new_unwatched("beta").unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
+    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.flat_items = view.build_flat_items();
+    view.selected_session = Some(id.clone());
+
+    // Move the session alpha -> beta, keeping the same group name.
+    view.rename_selected("", None, Some("beta"), false).unwrap();
+
+    let moved = view.instances().iter().find(|i| i.id == id).unwrap();
+    assert_eq!(moved.source_profile, "beta");
+    assert_eq!(moved.group_path, "work");
+    assert!(
+        view.group_trees.get("beta").unwrap().group_exists("work"),
+        "beta should own the 'work' group after the move"
+    );
+    assert!(
+        !view
+            .group_trees
+            .get("alpha")
+            .map(|t| t.group_exists("work"))
+            .unwrap_or(false),
+        "alpha's now-empty 'work' group should be pruned after the profile move"
     );
 }
 
@@ -8999,12 +9447,12 @@ mod footer_toolbar {
     fn hover_tracks_button_under_pointer() {
         let mut env = create_test_env_with_sessions(3);
         render_at(&mut env, 120, 12);
-        let (rect, _) = env.view.footer_buttons[1];
+        let (rect, key) = env.view.footer_buttons[1];
 
         assert!(env.view.footer_hover.is_none());
         let changed = env.view.handle_hover(rect.x + 1, rect.y);
         assert!(changed, "moving onto a button is a hover change");
-        assert_eq!(env.view.footer_hover, Some(1));
+        assert_eq!(env.view.footer_hover, Some(key));
 
         // Same button, no change reported.
         assert!(!env.view.handle_hover(rect.x, rect.y));

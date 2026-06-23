@@ -26,6 +26,7 @@ pub mod settings_schema;
 pub mod smart_rename;
 pub mod stop;
 mod storage;
+pub(crate) mod sync;
 pub mod worktree_edit;
 
 pub use crate::sound::SoundConfig;

@@ -1,10 +1,12 @@
 import { test, expect } from "./helpers/mockedTest";
 import { Page } from "@playwright/test";
 
-// Mocked coverage for sidebar multi-select gestures (#1724):
+// Mocked coverage for sidebar multi-select gestures (#1724, #2312):
 //   - Cmd/Ctrl+click toggles a row into the selection without navigating.
 //   - Shift+click selects a contiguous range across the rendered rows.
-//   - The bulk bar then fans out one PATCH per selected session.
+//   - Bulk triage is driven from the right-click context menu (the old
+//     BulkActionBar popup was removed in #2312); right-clicking a selected
+//     row acts on the whole selection, an unselected row resets to itself.
 
 interface MockSession {
   id: string;
@@ -52,7 +54,7 @@ const THREE: MockSession[] = [
   { id: "s-3", title: "Persians", project_path: "/tmp/repo-c" },
 ];
 
-test.describe("Sidebar multi-select (#1724)", () => {
+test.describe("Sidebar multi-select (#1724, #2312)", () => {
   test("Cmd/Ctrl+click toggles selection without navigating", async ({ page }) => {
     await mockApis(page, THREE);
     await page.goto("/");
@@ -61,26 +63,24 @@ test.describe("Sidebar multi-select (#1724)", () => {
     const rows = page.locator("[data-testid='sidebar-session-row']");
     await expect(rows).toHaveCount(3);
 
-    // Additive toggle on two rows; the bulk bar reflects the count and the
+    // Additive toggle on two rows; the rows show the selected highlight and the
     // route never changes to a /session/ path.
     await rows.nth(0).click({ modifiers: ["ControlOrMeta"] });
     await rows.nth(1).click({ modifiers: ["ControlOrMeta"] });
 
-    const bar = page.locator("[data-testid='sidebar-bulk-bar']");
-    await expect(bar).toBeVisible();
-    await expect(bar).toContainText("2 selected");
+    await expect(page.locator("[data-testid='sidebar-session-row'][data-selected]")).toHaveCount(2);
     expect(page.url()).not.toContain("/session/");
 
     // Toggling the first row off drops it back out of the selection.
     await rows.nth(0).click({ modifiers: ["ControlOrMeta"] });
-    await expect(bar).toContainText("1 selected");
+    await expect(page.locator("[data-testid='sidebar-session-row'][data-selected]")).toHaveCount(1);
 
-    // Clear empties the selection and hides the bar.
-    await page.locator("[data-testid='sidebar-bulk-clear']").click();
-    await expect(bar).toHaveCount(0);
+    // Escape clears the selection.
+    await page.keyboard.press("Escape");
+    await expect(page.locator("[data-testid='sidebar-session-row'][data-selected]")).toHaveCount(0);
   });
 
-  test("Shift+click range selects every row in between, then bulk archives", async ({ page }) => {
+  test("right-click a selected row bulk-archives the whole selection", async ({ page }) => {
     await mockApis(page, THREE);
     const archived: Array<{ id: string; body: unknown }> = [];
     await page.route("**/api/sessions/*/archive", (r) => {
@@ -100,13 +100,16 @@ test.describe("Sidebar multi-select (#1724)", () => {
     // the last to select the contiguous range.
     await rows.nth(0).click({ modifiers: ["ControlOrMeta"] });
     await rows.nth(2).click({ modifiers: ["Shift"] });
+    await expect(page.locator("[data-testid='sidebar-session-row'][data-selected]")).toHaveCount(3);
 
-    const bar = page.locator("[data-testid='sidebar-bulk-bar']");
-    await expect(bar).toContainText("3 selected");
+    // Right-clicking a row that is part of the selection opens a bulk menu.
+    await rows.nth(1).click({ button: "right" });
+    const menu = page.locator("[data-testid='sidebar-context-menu']");
+    await expect(menu).toContainText("3 selected");
 
-    const archiveBtn = page.locator("[data-testid='sidebar-bulk-archive']");
-    await expect(archiveBtn).toContainText("Archive 3");
-    await archiveBtn.click();
+    const archiveItem = menu.locator("[data-testid='sidebar-context-menu-bulk-archive']");
+    await expect(archiveItem).toContainText("Archive 3");
+    await archiveItem.click();
 
     // Serial fan-out hits all three sessions with the archive payload.
     await expect.poll(() => archived.length).toBe(3);
@@ -115,6 +118,43 @@ test.describe("Sidebar multi-select (#1724)", () => {
       expect(a.body).toEqual({ archived: true, kill_pane: true });
     }
     // Selection clears once the bulk action completes.
-    await expect(bar).toHaveCount(0);
+    await expect(page.locator("[data-testid='sidebar-session-row'][data-selected]")).toHaveCount(0);
+  });
+
+  test("right-click an unselected row resets the selection to that row (#2312)", async ({ page }) => {
+    await mockApis(page, THREE);
+    await page.goto("/");
+    const rows = page.locator("[data-testid='sidebar-session-row']");
+    await expect(rows).toHaveCount(3);
+
+    // Build a two-row selection, then right-click a row outside it.
+    await rows.nth(0).click({ modifiers: ["ControlOrMeta"] });
+    await rows.nth(1).click({ modifiers: ["ControlOrMeta"] });
+    await expect(page.locator("[data-testid='sidebar-session-row'][data-selected]")).toHaveCount(2);
+
+    await rows.nth(2).click({ button: "right" });
+
+    // The old multi-selection is gone; only the right-clicked row is selected
+    // and the menu is the single-row menu (no "N selected" header).
+    await expect(page.locator("[data-testid='sidebar-session-row'][data-selected]")).toHaveCount(1);
+    const menu = page.locator("[data-testid='sidebar-context-menu']");
+    await expect(menu).toBeVisible();
+    await expect(menu).not.toContainText("selected");
+    await expect(menu.locator("[data-testid='sidebar-context-menu-bulk-archive']")).toHaveCount(0);
+  });
+
+  test("plain click then Shift+click selects the range from the navigated row (#2312)", async ({ page }) => {
+    await mockApis(page, THREE);
+    await page.goto("/");
+    const rows = page.locator("[data-testid='sidebar-session-row']");
+    await expect(rows).toHaveCount(3);
+
+    // Plain click navigates to the first session and leaves it as the anchor;
+    // no intervening Cmd+click is needed before the range works.
+    await rows.nth(0).click();
+    await expect.poll(() => page.url()).toContain("/session/s-1");
+
+    await rows.nth(2).click({ modifiers: ["Shift"] });
+    await expect(page.locator("[data-testid='sidebar-session-row'][data-selected]")).toHaveCount(3);
   });
 });

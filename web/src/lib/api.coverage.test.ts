@@ -63,6 +63,7 @@ import {
   logout,
   renameSession,
   setWorktreeName,
+  smartRenameSession,
   setSessionNotifications,
   setSessionDiffBase,
   stopSession,
@@ -1183,6 +1184,35 @@ describe("renameSession", () => {
   it("returns ok=false with no message on a thrown fetch", async () => {
     fetchSpy.mockRejectedValueOnce(new Error("offline"));
     expect(await renameSession("s1", "x")).toEqual({ ok: false });
+  });
+});
+
+describe("smartRenameSession", () => {
+  it("POSTs the smart-rename endpoint and returns ok on 202", async () => {
+    fetchSpy.mockResolvedValueOnce(new Response("", { status: 202 }));
+    const result = await smartRenameSession("s1");
+    expect(result).toEqual({ ok: true });
+    const [url, init] = lastCall();
+    expect(url).toBe("/api/sessions/s1/smart-rename");
+    expect(init?.method).toBe("POST");
+  });
+
+  it("surfaces the server message on a 409", async () => {
+    fetchSpy.mockResolvedValueOnce(
+      new Response(JSON.stringify({ message: "Session already has a custom name" }), { status: 409 }),
+    );
+    const result = await smartRenameSession("s1");
+    expect(result).toEqual({ ok: false, message: "Session already has a custom name" });
+  });
+
+  it("returns ok=false with no message on a non-JSON error body", async () => {
+    fetchSpy.mockResolvedValueOnce(new Response("nope", { status: 500 }));
+    expect(await smartRenameSession("s1")).toEqual({ ok: false });
+  });
+
+  it("returns ok=false on a thrown fetch", async () => {
+    fetchSpy.mockRejectedValueOnce(new Error("offline"));
+    expect(await smartRenameSession("s1")).toEqual({ ok: false });
   });
 });
 

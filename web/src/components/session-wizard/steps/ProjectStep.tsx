@@ -2,14 +2,16 @@
 import { useEffect, useMemo, useState } from "react";
 import { fetchSessions, fetchRecentProjects, fetchProjects, cloneRepo } from "../../../lib/api";
 import type { RecentProjectEntry } from "../../../lib/api";
-import type { ProjectInfo, SessionResponse } from "../../../lib/types";
+import type { AgentInfo, ClaudeSessionSummary, ProjectInfo, SessionResponse } from "../../../lib/types";
 import { DirectoryBrowser } from "../../DirectoryBrowser";
 import { ExtraReposPicker } from "./ExtraReposPicker";
+import { ClaudeSessionPicker } from "./ClaudeSessionPicker";
 
 interface WizardData {
   path: string;
   extraRepoPaths: string[];
   scratch: boolean;
+  importAcpSessionId?: string;
   [key: string]: unknown;
 }
 
@@ -46,12 +48,15 @@ function Toggle({
   );
 }
 
-type Tab = "recent" | "browse" | "clone";
+type Tab = "recent" | "browse" | "clone" | "import";
 
 interface Props {
   data: WizardData;
   onChange: (field: string, value: unknown) => void;
   initialTab?: Tab;
+  /** Built-in + custom agents, used only to gate the Claude import tab.
+   *  Optional so render sites that never reach import (and tests) can omit it. */
+  agents?: AgentInfo[];
 }
 
 interface RecentProject {
@@ -155,7 +160,7 @@ function timeAgo(ts: string | null): string {
   return `${days}d ago`;
 }
 
-export function ProjectStep({ data, onChange, initialTab }: Props) {
+export function ProjectStep({ data, onChange, initialTab, agents = [] }: Props) {
   const [recent, setRecent] = useState<RecentProject[]>([]);
   const [saved, setSaved] = useState<ProjectInfo[]>([]);
   const [loading, setLoading] = useState(true);
@@ -243,11 +248,35 @@ export function ProjectStep({ data, onChange, initialTab }: Props) {
     }
   };
 
+  // Claude import needs both the claude CLI and the claude-agent-acp adapter
+  // resolvable on the host; gate the tab on both so it never shows when
+  // either is missing. See #2276.
+  const claudeImportAvailable = agents.some((a) => a.name === "claude" && a.installed && a.acp_installed);
+
   const tabs: { id: Tab; label: string }[] = [
     ...(hasPicks ? [{ id: "recent" as Tab, label: "Recent" }] : []),
     { id: "browse", label: "Browse" },
     { id: "clone", label: "Clone URL" },
+    // Only offer the Claude import when claude and its ACP adapter are both
+    // installed; importing resumes via claude-agent-acp, so without it the
+    // tab can only ever fail at spawn. See #2276.
+    ...(claudeImportAvailable ? [{ id: "import" as Tab, label: "Import from Claude" }] : []),
   ];
+
+  // #2276: importing an existing Claude Code session prefills the original
+  // cwd and forces a structured-view claude session that resumes it. Worktree
+  // and scratch are cleared: the on-disk session id only resolves in its
+  // recorded cwd.
+  const handleImportSelect = (s: ClaudeSessionSummary) => {
+    onChange("scratch", false);
+    onChange("path", s.cwd);
+    onChange("tool", "claude");
+    onChange("useStructuredView", true);
+    onChange("useWorktree", false);
+    onChange("attachExisting", false);
+    onChange("importAcpSessionId", s.session_id);
+    if (s.title) onChange("title", s.title.slice(0, 60));
+  };
 
   return (
     <div>
@@ -390,6 +419,11 @@ export function ProjectStep({ data, onChange, initialTab }: Props) {
 
           {/* Browse tab */}
           {!loading && activeTab === "browse" && <DirectoryBrowser onSelect={handleBrowseSelect} />}
+
+          {/* Import an existing Claude Code session (#2276) */}
+          {!loading && activeTab === "import" && claudeImportAvailable && (
+            <ClaudeSessionPicker onSelect={handleImportSelect} selectedSessionId={data.importAcpSessionId} />
+          )}
 
           {/* Clone from URL tab */}
           {!loading && activeTab === "clone" && (

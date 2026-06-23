@@ -276,3 +276,32 @@ describe("ApprovalCard (destructive)", () => {
     expect(onResolve).toHaveBeenCalledWith("Deny");
   });
 });
+
+describe("ApprovalCard (permission identifier humanization)", () => {
+  function permissionApproval(name: string): Approval {
+    return makeApproval({
+      tool_call: {
+        id: "t-1",
+        name,
+        kind: "other",
+        args_preview: "",
+        started_at: "2026-05-21T00:00:00Z",
+      },
+    });
+  }
+
+  it("humanizes a known permission identifier in the title and accessible name", () => {
+    const onResolve = vi.fn().mockResolvedValue(undefined);
+    render(<ApprovalCard approval={permissionApproval("external_directory")} onResolve={onResolve} />);
+    expect(screen.getByText("External directory access")).toBeTruthy();
+    expect(screen.getByRole("alertdialog", { name: /Approval needed: External directory access/i })).toBeTruthy();
+    // The raw protocol identifier is no longer shown to the user.
+    expect(screen.queryByText("external_directory")).toBeNull();
+  });
+
+  it("passes an unknown identifier through verbatim", () => {
+    const onResolve = vi.fn().mockResolvedValue(undefined);
+    render(<ApprovalCard approval={permissionApproval("some_future_kind")} onResolve={onResolve} />);
+    expect(screen.getByText("some_future_kind")).toBeTruthy();
+  });
+});

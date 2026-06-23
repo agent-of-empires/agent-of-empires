@@ -406,8 +406,14 @@ function writeFakeAcpShim(
   for (const [key, value] of Object.entries(extraEnv ?? {})) {
     scriptLines.push(`export ${key}=${JSON.stringify(value)}`);
   }
-  const script = `#!/bin/bash\n${scriptLines.join("\n")}\nexec node ${JSON.stringify(fakeAgentJs)} "$@"\n`;
   for (const name of ["claude", "claude-agent-acp", "aoe-agent", "opencode"]) {
+    // The agent_compat gate keys its version floor off the spawned binary
+    // name. When the fake stands in for opencode it must report opencode's
+    // handshake (name + a version at or above the opencode floor), or the
+    // gate rejects it and the opencode live specs fail; FAKE_ACP_IMPERSONATE
+    // tells fakeAcpAgent.mjs which identity to present.
+    const perName = name === "opencode" ? [...scriptLines, "export FAKE_ACP_IMPERSONATE=opencode"] : scriptLines;
+    const script = `#!/bin/bash\n${perName.join("\n")}\nexec node ${JSON.stringify(fakeAgentJs)} "$@"\n`;
     const path = join(binDir, name);
     writeFileSync(path, script);
     chmodSync(path, 0o755);

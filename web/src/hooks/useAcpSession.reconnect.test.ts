@@ -9,7 +9,7 @@
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { ACP_MAX_RETRIES_EXPORT, acpRetryDelayMs, useAcpSession } from "./useAcpSession";
+import { ACP_MAX_RETRIES_EXPORT, ACP_WS_STALE_MS, acpRetryDelayMs, useAcpSession } from "./useAcpSession";
 
 describe("acpRetryDelayMs", () => {
   it("returns 1s for the first attempt", () => {
@@ -258,5 +258,77 @@ describe("useAcpSession reconnect (#1130)", () => {
     });
     expect(result.current.retryCount).toBe(0);
     expect(result.current.reconnecting).toBe(false);
+  });
+});
+
+describe("useAcpSession liveness watchdog (#2287)", () => {
+  // Deliver a server heartbeat frame on the captured socket.
+  function heartbeat(sock: FakeSocket): void {
+    sock.onmessage?.({ data: JSON.stringify({ kind: "heartbeat" }) } as MessageEvent);
+  }
+
+  it("force-redials a stale OPEN socket the browser still reports as alive (zombie)", async () => {
+    renderHook(() => useAcpSession("sess-zombie"));
+    await flushAsync();
+    expect(sockets).toHaveLength(1);
+    const first = sockets[0]!;
+    act(() => {
+      first.readyState = FakeWebSocket.OPEN;
+      first.onopen?.({} as Event);
+    });
+
+    // No frames or heartbeats arrive: the proxy reset the socket without
+    // the browser seeing onclose, so readyState stays OPEN forever. The
+    // watchdog must notice the silence and re-dial without any user
+    // action and WITHOUT depending on the dead socket firing onclose.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(ACP_WS_STALE_MS + 15000);
+    });
+    await flushAsync();
+
+    expect(first.readyState).toBe(FakeWebSocket.CLOSED);
+    expect(sockets.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("does not reconnect while heartbeats keep the socket fresh", async () => {
+    renderHook(() => useAcpSession("sess-alive"));
+    await flushAsync();
+    expect(sockets).toHaveLength(1);
+    const first = sockets[0]!;
+    act(() => {
+      first.readyState = FakeWebSocket.OPEN;
+      first.onopen?.({} as Event);
+    });
+
+    // Heartbeat every 30s for two minutes; the watchdog must never trip.
+    for (let i = 0; i < 4; i++) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30000);
+      });
+      act(() => heartbeat(first));
+    }
+    await flushAsync();
+
+    expect(sockets).toHaveLength(1);
+    expect(first.readyState).toBe(FakeWebSocket.OPEN);
+  });
+
+  it("watchdog never dials a socket that is not OPEN (no resurrection)", async () => {
+    // The watchdog redial is gated on readyState === OPEN precisely so it
+    // can't fire on a socket that is connecting, closed, or
+    // retry-exhausted (wsRef nulled) and step on the backoff / manual
+    // affordance that owns those states. Hold the dial in CONNECTING (the
+    // canonical non-OPEN state with no pending backoff timer) and prove
+    // the watchdog stays idle across several intervals.
+    renderHook(() => useAcpSession("sess-connecting"));
+    await flushAsync();
+    expect(sockets).toHaveLength(1);
+    expect(sockets[0]!.readyState).toBe(FakeWebSocket.CONNECTING);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(ACP_WS_STALE_MS + 30000);
+    });
+    await flushAsync();
+    expect(sockets).toHaveLength(1);
   });
 });

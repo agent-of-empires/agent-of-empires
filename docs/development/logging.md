@@ -29,6 +29,7 @@ Top-level roots:
 | `hooks` | Agent hook install/uninstall, status-file lifecycle, hook command + watcher failures. |
 | `sound` | Notification sound download/install and per-event playback. |
 | `telemetry` | Opt-in usage telemetry (all `debug`); consent route emits under `http.api.telemetry`. |
+| `smart_rename` | First-message auto-rename of structured-view sessions: eligibility skips (`debug`) and the rename outcome (`info`). |
 | `log.runtime` | Filter swaps (REST + runner file-watch). A swap matching the active directive is a silent no-op, so a watcher write cannot re-trigger itself. |
 
 ## Levels

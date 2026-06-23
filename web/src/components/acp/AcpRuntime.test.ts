@@ -168,6 +168,47 @@ describe("activityToThreadMessages; tool-call grouping (#1057)", () => {
     expect(payload.children.map((c: { toolCallId: string }) => c.toolCallId)).toEqual(["td1", "td2", "td3"]);
   });
 
+  it("folds a run ending in an empty TodoWrite clear into the todo group (#2003)", () => {
+    // The real regression carries the bare tool name "TodoWrite", so the
+    // `_aoe_title` "Update TODOs" rescue branch does NOT fire and the
+    // empty clear must be recognized purely by its `todos: []` array.
+    const todoWrite = (id: string, todos: Array<{ content: string; status: string }>): ActivityRow => ({
+      id: `start-${id}`,
+      kind: "tool_start",
+      text: "TodoWrite",
+      toolCallId: id,
+      tool: {
+        id,
+        name: "TodoWrite",
+        kind: "think",
+        args_preview: JSON.stringify({ todos }),
+        started_at: "2026-05-12T00:00:00Z",
+      },
+      at: "2026-05-12T00:00:00Z",
+    });
+    const messages = activityToThreadMessages(
+      [
+        userRow("go"),
+        todoWrite("td1", [{ content: "a", status: "pending" }]),
+        todoWrite("td2", [{ content: "a", status: "in_progress" }]),
+        todoWrite("td3", []),
+      ],
+      false,
+    );
+    const assistant = messages.find((m) => m.role === "assistant")!;
+    const parts = assistant.content as Array<{
+      type: string;
+      toolName?: string;
+    }>;
+    const toolParts = parts.filter((p) => p.type === "tool-call");
+    // The empty clear is a real todo snapshot, so it stays in the fold
+    // instead of leaking out as a separate ungrouped think card.
+    expect(toolParts).toHaveLength(1);
+    expect(toolParts[0]!.toolName).toBe(TODO_GROUP_NAME);
+    const payload = JSON.parse((toolParts[0] as { argsText?: string }).argsText!);
+    expect(payload.children.map((c: { toolCallId: string }) => c.toolCallId)).toEqual(["td1", "td2", "td3"]);
+  });
+
   it("uses the generic group for todo-shaped runs when todos are disabled", () => {
     const messages = activityToThreadMessages(
       [

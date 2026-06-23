@@ -302,6 +302,7 @@ shows `Reconnecting (N/7) in Xs...` while the auto-retry is armed, and a manual
 **Reconnect** button after the attempts exhaust. Returning the tab to the
 foreground triggers an immediate reconnect.
 
+
 ### Approval card vanished without resolving
 
 Approvals expire after `approval_timeout_secs` (default 300). The agent receives

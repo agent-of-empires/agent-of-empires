@@ -36,7 +36,10 @@ async function openSession(page: Page, handle: MockHandle) {
 
 test.describe("Mobile fullscreen-agent layout", () => {
   test("short agent UI bottom-aligns with the trailing blank rows trimmed", async ({ page }) => {
-    const handle = await mockTerminalApis(page);
+    // Fresh fullscreen agent: no scrollback, so the live-edge buffer has no
+    // history to load above the screen (keeps the bottom-align/cursor math on
+    // the screen rows alone).
+    const handle = await mockTerminalApis(page, { liveHistory: 0 });
     await page.goto("/");
     await openSession(page, handle);
 
@@ -60,7 +63,10 @@ test.describe("Mobile fullscreen-agent layout", () => {
   });
 
   test("cursor parked below the captured content is not painted at the bottom", async ({ page }) => {
-    const handle = await mockTerminalApis(page);
+    // Fresh fullscreen agent: no scrollback, so the live-edge buffer has no
+    // history to load above the screen (keeps the bottom-align/cursor math on
+    // the screen rows alone).
+    const handle = await mockTerminalApis(page, { liveHistory: 0 });
     await page.goto("/");
     await openSession(page, handle);
 

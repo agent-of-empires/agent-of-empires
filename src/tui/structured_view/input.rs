@@ -203,6 +203,14 @@ fn composer_keys(key: &KeyEvent, ctx: InputContext) -> Intent {
         (m, KeyCode::Enter) if m.is_empty() => Intent::SubmitPrompt,
         // Shift+Enter inserts a newline (passed through to textarea).
         (m, KeyCode::Enter) if m.contains(KeyModifiers::SHIFT) => Intent::Compose(*key),
+        // Ctrl+J is crossterm's raw-mode decoding of a bare line feed (\n),
+        // which some terminals send for Shift+Enter (e.g. a Ghostty
+        // `keybind = shift+enter=text:\n`). Forward a plain Enter so the
+        // textarea inserts a newline; passing the raw Ctrl+J through would hit
+        // the textarea's default delete-to-line-head binding and wipe the line.
+        (m, KeyCode::Char('j')) if m == KeyModifiers::CONTROL => {
+            Intent::Compose(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        }
         // Esc moves focus to the transcript so the user can scroll or
         // pick an approval card. This also dismisses any accidental
         // composer focus (e.g. after typing then changing their mind).
@@ -483,6 +491,23 @@ mod tests {
             ctx(),
         );
         assert!(matches!(intent, Intent::Compose(_)));
+    }
+
+    #[test]
+    fn ctrl_j_in_composer_inserts_newline() {
+        // A bare line feed (\n) decodes to Ctrl+J in raw mode; some terminals
+        // send it for Shift+Enter (e.g. Ghostty `shift+enter=text:\n`). It must
+        // forward a plain Enter so the textarea inserts a newline rather than
+        // running its default Ctrl+J delete-to-line-head binding.
+        let intent = dispatch(
+            Focus::Composer,
+            &key_mod(KeyCode::Char('j'), KeyModifiers::CONTROL),
+            ctx(),
+        );
+        assert_eq!(
+            intent,
+            Intent::Compose(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        );
     }
 
     #[test]

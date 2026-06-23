@@ -119,12 +119,17 @@ pub fn codex_config_path_display() -> String {
         .unwrap_or_else(|| "~/.codex/config.toml".to_string())
 }
 
+// `hooks.json` is the production target for codex hooks; these
+// `config.toml` path helpers stay as test scaffolding for the
+// empty-`CODEX_HOME` fallback assertions in this module's unit tests.
+#[cfg(test)]
 pub(crate) fn codex_config_path_for_host_environment(entries: &[String]) -> Result<PathBuf> {
     let home =
         dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
     Ok(codex_config_path_in(&home, entries))
 }
 
+#[cfg(test)]
 pub(crate) fn codex_config_path_display_for_host_environment(entries: &[String]) -> String {
     crate::session::environment::resolve_host_environment_value(entries, "CODEX_HOME")
         .filter(|v| !v.is_empty())
@@ -135,6 +140,56 @@ pub(crate) fn codex_config_path_display_for_host_environment(entries: &[String])
                 .to_string()
         })
         .unwrap_or_else(codex_config_path_display)
+}
+
+/// Home-injectable variant of [`codex_hooks_json_path_for_host_environment`]:
+/// resolves Codex's `hooks.json` under the given `home` directory, honoring
+/// an explicit `CODEX_HOME` in `host_env` (or the AoE process env), then
+/// falling back to `<home>/.codex/hooks.json`.
+pub(crate) fn codex_hooks_json_path_in(home: &Path, host_env: &[String]) -> PathBuf {
+    if let Some(codex_home) =
+        crate::session::environment::resolve_host_environment_value(host_env, "CODEX_HOME")
+            .or_else(|| std::env::var("CODEX_HOME").ok())
+            .filter(|v| !v.is_empty())
+    {
+        return PathBuf::from(codex_home).join("hooks.json");
+    }
+    home.join(".codex").join("hooks.json")
+}
+
+/// Process-env variant of [`codex_hooks_json_path_in`]: resolves Codex's
+/// `hooks.json` against the live `dirs::home_dir()` so install paths
+/// outside the migration boot loop share a single call shape.
+pub(crate) fn codex_hooks_json_path_for_host_environment(entries: &[String]) -> Result<PathBuf> {
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+    Ok(codex_hooks_json_path_in(&home, entries))
+}
+
+/// Display-string variant of [`codex_hooks_json_path_for_host_environment`]
+/// used by the TUI consent dialog; falls back to the literal
+/// `~/.codex/hooks.json` string when the home directory cannot be resolved.
+pub(crate) fn codex_hooks_json_path_display_for_host_environment(entries: &[String]) -> String {
+    crate::session::environment::resolve_host_environment_value(entries, "CODEX_HOME")
+        .filter(|v| !v.is_empty())
+        .map(|codex_home| {
+            PathBuf::from(codex_home)
+                .join("hooks.json")
+                .display()
+                .to_string()
+        })
+        .unwrap_or_else(|| {
+            std::env::var("CODEX_HOME")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .map(|codex_home| {
+                    PathBuf::from(codex_home)
+                        .join("hooks.json")
+                        .display()
+                        .to_string()
+                })
+                .unwrap_or_else(|| "~/.codex/hooks.json".to_string())
+        })
 }
 
 /// Resolve the host settings-file path for an agent whose config directory may
@@ -375,8 +430,14 @@ pub(crate) enum HookTargetKind {
     /// `hooks.<event>[].hooks[].command`.
     JsonSettings,
     /// Codex `config.toml`: file-locked, symlink-resolved, with a user-trust
-    /// `[hooks].state` block to preserve.
+    /// `[hooks.state]` block to preserve. Only the v018 legacy-cleanup
+    /// migration constructs this variant; no agent declares
+    /// `HookFormat::CodexToml`.
     CodexToml,
+    /// Codex `hooks.json`: same JSON payload shape as `JsonSettings`, but
+    /// the path is resolved through `codex_hooks_json_path_in`
+    /// (`CODEX_HOME` aware).
+    CodexJson,
     /// settl/hermes/kiro: a config format the JSON path cannot emit; install
     /// goes through the agent's bundled `SidecarHooks` function pointers.
     Sidecar(&'static crate::agents::SidecarHooks),
@@ -420,23 +481,23 @@ pub(crate) fn iter_hook_targets_in(home: &Path, env_lists: &[Vec<String>]) -> Ve
     let mut out: Vec<HookTarget> = Vec::new();
     for agent in crate::agents::AGENTS {
         if let Some(hook_cfg) = agent.hook_config.as_ref() {
-            let kind = if agent.name == "codex" {
-                HookTargetKind::CodexToml
-            } else {
-                HookTargetKind::JsonSettings
-            };
             let mut paths: Vec<PathBuf> = Vec::new();
             let resolve = |env: &[String]| -> PathBuf {
-                if matches!(kind, HookTargetKind::CodexToml) {
-                    codex_config_path_in(home, env)
-                } else {
-                    agent_settings_path_in(home, hook_cfg, env)
+                match hook_cfg.format {
+                    crate::agents::HookFormat::JsonSettings => {
+                        agent_settings_path_in(home, hook_cfg, env)
+                    }
+                    crate::agents::HookFormat::CodexJson => codex_hooks_json_path_in(home, env),
                 }
             };
             push_unique_target_path(&mut paths, resolve(&[]));
             for env in env_lists {
                 push_unique_target_path(&mut paths, resolve(env));
             }
+            let kind = match hook_cfg.format {
+                crate::agents::HookFormat::JsonSettings => HookTargetKind::JsonSettings,
+                crate::agents::HookFormat::CodexJson => HookTargetKind::CodexJson,
+            };
             for path in paths {
                 out.push(HookTarget {
                     agent_name: agent.name,
@@ -505,18 +566,15 @@ pub(crate) fn has_aoe_marker(target: &HookTarget) -> bool {
         return false;
     }
     match target.kind {
-        HookTargetKind::JsonSettings => json_settings_has_aoe_marker(&target.path),
-        HookTargetKind::CodexToml => codex_config_has_aoe_marker(&target.path),
-        HookTargetKind::Sidecar(sidecar) => {
-            let sub = sidecar.host_config_subpath;
-            if sub.ends_with(".toml") {
-                settl_config_has_aoe_marker(&target.path)
-            } else if sub.ends_with(".yaml") || sub.ends_with(".yml") {
-                hermes_config_has_aoe_marker(&target.path)
-            } else {
-                kiro_config_has_aoe_marker(&target.path)
-            }
+        HookTargetKind::JsonSettings | HookTargetKind::CodexJson => {
+            json_settings_has_aoe_marker(&target.path)
         }
+        HookTargetKind::CodexToml => codex_config_has_aoe_marker(&target.path),
+        HookTargetKind::Sidecar(sidecar) => match sidecar.format {
+            crate::agents::SidecarFormat::SettlToml => settl_config_has_aoe_marker(&target.path),
+            crate::agents::SidecarFormat::HermesYaml => hermes_config_has_aoe_marker(&target.path),
+            crate::agents::SidecarFormat::KiroJson => kiro_config_has_aoe_marker(&target.path),
+        },
     }
 }
 
@@ -765,6 +823,9 @@ fn remove_aoe_entries(matchers: &mut Vec<Value>) {
 /// Merges AoE hook entries into the existing hooks configuration, preserving
 /// any user-defined hooks. Existing AoE hooks are replaced (idempotent).
 ///
+/// Idempotent on disk: when the on-disk file already encodes the same
+/// AoE-managed hook subtree, it is not rewritten (same inode, same bytes).
+///
 /// If the file doesn't exist, it will be created with just the hooks.
 pub fn install_hooks(
     settings_path: &Path,
@@ -781,6 +842,8 @@ pub fn install_hooks(
         } else {
             serde_json::json!({})
         };
+
+        let before = settings.clone();
 
         let aoe_hooks = build_aoe_hooks(events, target);
 
@@ -812,6 +875,13 @@ pub fn install_hooks(
             }
         }
 
+        if settings == before {
+            tracing::debug!(target: "hooks.install",
+                "AoE hooks in {} already up to date; skipping write",
+                settings_path.display());
+            return Ok(());
+        }
+
         if let Some(parent) = settings_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -839,7 +909,11 @@ const CODEX_HOOK_EVENT_NAMES: &[&str] = &[
 /// Codex also stores hook trust state in this file. Keep every AoE mutation
 /// behind the lock and atomic replace below so repeated launches cannot leave
 /// duplicated hook blocks or torn TOML.
-pub fn install_codex_hooks(
+///
+/// Idempotent on disk: when the on-disk file already encodes the same
+/// AoE-managed hook subtree, it is not rewritten (same inode, same bytes).
+#[cfg(test)]
+pub(crate) fn install_codex_hooks(
     config_path: &Path,
     events: &[crate::agents::HookEvent],
     target: HookInstallTarget,
@@ -847,6 +921,10 @@ pub fn install_codex_hooks(
     install_codex_hooks_with_preserved_state(config_path, events, None, target)
 }
 
+/// Read `[hooks.state]` from `config_path` under the codex config lock and
+/// return it for later restoration. Inverse of [`restore_codex_hooks_state`];
+/// returns `Ok(None)` when the file is absent so callers can no-op the
+/// snapshot/restore bracket.
 pub(crate) fn snapshot_codex_hooks_state(config_path: &Path) -> Result<Option<toml_edit::Item>> {
     if !config_path.exists() {
         return Ok(None);
@@ -862,6 +940,23 @@ pub(crate) fn snapshot_codex_hooks_state(config_path: &Path) -> Result<Option<to
     })
 }
 
+/// Write `state` back into the `[hooks.state]` table of `config_path`,
+/// taking the codex config lock. Inverse of [`snapshot_codex_hooks_state`];
+/// together they bracket destructive rewrites of `config.toml` (e.g. the
+/// host-to-sandbox refresh in [`crate::session::container_config`]) so
+/// Codex's user-trust block survives. Unconditionally overwrites any
+/// `state` already present at `config_path`; pair only with a fresh
+/// snapshot from the authoritative source.
+pub(crate) fn restore_codex_hooks_state(config_path: &Path, state: toml_edit::Item) -> Result<()> {
+    with_codex_config_lock(config_path, || {
+        let mut config = read_codex_config(config_path)?;
+        let hooks = ensure_codex_hooks_table(&mut config)?;
+        hooks.insert("state", state);
+        write_codex_config(config_path, &config)?;
+        Ok(())
+    })
+}
+
 pub(crate) fn install_codex_hooks_with_preserved_state(
     config_path: &Path,
     events: &[crate::agents::HookEvent],
@@ -874,6 +969,8 @@ pub(crate) fn install_codex_hooks_with_preserved_state(
             return Ok(());
         }
 
+        let before = config.to_string();
+
         if let Some(state) = preserved_state {
             let hooks = ensure_codex_hooks_table(&mut config)?;
             if !hooks.contains_key("state") {
@@ -882,12 +979,19 @@ pub(crate) fn install_codex_hooks_with_preserved_state(
         }
         remove_codex_aoe_hooks(&mut config)?;
         merge_codex_hooks(&mut config, events, target)?;
-        write_codex_config(config_path, &config)?;
-        Ok(())
-    })?;
 
-    tracing::info!(target: "hooks.install", "Installed AoE hooks in {}", config_path.display());
-    Ok(())
+        if config.to_string() == before {
+            tracing::debug!(target: "hooks.install",
+                "AoE hooks in {} already up to date; skipping write",
+                config_path.display());
+            return Ok(());
+        }
+
+        write_codex_config(config_path, &config)?;
+        tracing::info!(target: "hooks.install",
+            "Installed AoE hooks in {}", config_path.display());
+        Ok(())
+    })
 }
 
 fn with_codex_config_lock<T>(config_path: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
@@ -1269,6 +1373,9 @@ const SETTL_HOOKS: &[(&str, &str)] = &[
 /// previous AoE-managed hooks (identified by the marker), and adds hooks
 /// for the three status transitions: TurnStarted->running,
 /// WaitingForHuman->waiting, GameWon->idle.
+///
+/// Idempotent on disk: when the on-disk file already encodes the same
+/// AoE-managed hook subtree, it is not rewritten (same inode, same bytes).
 pub fn install_settl_hooks(config_path: &Path, target: HookInstallTarget) -> Result<()> {
     with_config_lock(config_path, "toml.lock", || {
         let mut config: toml::Value = if config_path.exists() {
@@ -1280,6 +1387,8 @@ pub fn install_settl_hooks(config_path: &Path, target: HookInstallTarget) -> Res
         } else {
             toml::Value::Table(toml::map::Map::new())
         };
+
+        let before = config.clone();
 
         let table = config
             .as_table_mut()
@@ -1307,6 +1416,13 @@ pub fn install_settl_hooks(config_path: &Path, target: HookInstallTarget) -> Res
                 toml::Value::String(hook_command(status, target)),
             );
             hooks_arr.push(toml::Value::Table(entry));
+        }
+
+        if config == before {
+            tracing::debug!(target: "hooks.install",
+                "AoE hooks in {} already up to date; skipping write",
+                config_path.display());
+            return Ok(());
         }
 
         if let Some(parent) = config_path.parent() {
@@ -1386,6 +1502,9 @@ const HERMES_HOOKS: &[(&str, &str)] = &[
 /// itself tolerates a missing/stale allowlist by re-prompting for
 /// consent, which is recoverable. Hardening to atomic-write across both
 /// files is tracked as a follow-up.
+///
+/// Idempotent on disk: when the YAML config and the allowlist already
+/// encode the same AoE state, neither is rewritten (same inode, same bytes).
 pub fn install_hermes_hooks(config_path: &Path, target: HookInstallTarget) -> Result<()> {
     with_config_lock(config_path, "yaml.lock", || {
         let mut config: serde_yaml::Value = if config_path.exists() {
@@ -1399,6 +1518,8 @@ pub fn install_hermes_hooks(config_path: &Path, target: HookInstallTarget) -> Re
         } else {
             serde_yaml::Value::Mapping(serde_yaml::Mapping::new())
         };
+
+        let yaml_before = config.clone();
 
         let root = config
             .as_mapping_mut()
@@ -1439,24 +1560,46 @@ pub fn install_hermes_hooks(config_path: &Path, target: HookInstallTarget) -> Re
             arr.push(serde_yaml::Value::Mapping(entry));
         }
 
-        let formatted = serde_yaml::to_string(&config)?;
+        let yaml_changed = config != yaml_before;
+
         let config_dir = config_path
             .parent()
             .ok_or_else(|| anyhow::anyhow!("config path has no parent"))?;
         let (allowlist_path, allowlist_formatted) = render_hermes_allowlist(config_dir, target)?;
+        // Byte-compare (vs the structural YAML compare above) is sound:
+        // render_hermes_allowlist preserves approved_at on (event, command)
+        // collision and serde_json::to_string_pretty is deterministic, so
+        // a clean reinstall is byte-identical from the second install onward.
+        let allowlist_changed = if allowlist_path.exists() {
+            std::fs::read(&allowlist_path)? != allowlist_formatted.as_bytes()
+        } else {
+            true
+        };
 
-        if let Some(parent) = config_path.parent() {
-            std::fs::create_dir_all(parent)?;
+        if !yaml_changed && !allowlist_changed {
+            tracing::debug!(target: "hooks.install",
+                "AoE hooks in {} already up to date; skipping write",
+                config_path.display());
+            return Ok(());
         }
-        crate::session::atomic_write_following_symlinks(config_path, formatted.as_bytes())?;
 
-        if let Some(parent) = allowlist_path.parent() {
-            std::fs::create_dir_all(parent)?;
+        if yaml_changed {
+            if let Some(parent) = config_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let formatted = serde_yaml::to_string(&config)?;
+            crate::session::atomic_write_following_symlinks(config_path, formatted.as_bytes())?;
         }
-        crate::session::atomic_write_following_symlinks(
-            &allowlist_path,
-            allowlist_formatted.as_bytes(),
-        )?;
+
+        if allowlist_changed {
+            if let Some(parent) = allowlist_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            crate::session::atomic_write_following_symlinks(
+                &allowlist_path,
+                allowlist_formatted.as_bytes(),
+            )?;
+        }
 
         tracing::info!(target: "hooks.install", "Installed AoE hooks in {}", config_path.display());
         Ok(())
@@ -1631,6 +1774,9 @@ pub const KIRO_HOOKS_AGENT_FILE: &str = concat!(".kiro/agents/", kiro_hooks_agen
 /// from any context (host install, sandbox provisioning, tests). To make
 /// the agent the active default on the host, call
 /// [`set_kiro_default_agent_if_builtin`] after this returns.
+///
+/// Idempotent on disk: when the on-disk file already encodes the same
+/// AoE-managed hook subtree, it is not rewritten (same inode, same bytes).
 pub fn install_kiro_hooks(agent_config_path: &Path, target: HookInstallTarget) -> Result<()> {
     with_config_lock(agent_config_path, "json.lock", || {
         let mut config: serde_json::Map<String, Value> = if agent_config_path.exists() {
@@ -1639,6 +1785,8 @@ pub fn install_kiro_hooks(agent_config_path: &Path, target: HookInstallTarget) -
         } else {
             serde_json::Map::new()
         };
+
+        let before = config.clone();
 
         config
             .entry("name".to_string())
@@ -1669,6 +1817,13 @@ pub fn install_kiro_hooks(agent_config_path: &Path, target: HookInstallTarget) -
         }
 
         config.insert("hooks".to_string(), Value::Object(hooks_obj));
+
+        if config == before {
+            tracing::debug!(target: "hooks.install",
+                "AoE hooks in {} already up to date; skipping write",
+                agent_config_path.display());
+            return Ok(());
+        }
 
         if let Some(parent) = agent_config_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -1795,7 +1950,9 @@ pub fn uninstall_kiro_hooks(agent_config_path: &Path) -> Result<bool> {
 pub fn uninstall_all_hooks() {
     for target in iter_hook_targets() {
         let result = match target.kind {
-            HookTargetKind::JsonSettings => uninstall_hooks(&target.path),
+            HookTargetKind::JsonSettings | HookTargetKind::CodexJson => {
+                uninstall_hooks(&target.path)
+            }
             HookTargetKind::CodexToml => uninstall_codex_hooks(&target.path),
             HookTargetKind::Sidecar(sidecar) => (sidecar.uninstall)(&target.path),
         };
@@ -2358,12 +2515,12 @@ mod tests {
 
         let codex_paths: Vec<_> = iter_hook_targets()
             .into_iter()
-            .filter(|t| t.agent_name == "codex")
+            .filter(|t| matches!(t.kind, HookTargetKind::CodexJson))
             .map(|t| t.path)
             .collect();
 
-        assert!(codex_paths.contains(&tmp.path().join(".codex").join("config.toml")));
-        assert!(codex_paths.contains(&codex_home.join("config.toml")));
+        assert!(codex_paths.contains(&tmp.path().join(".codex").join("hooks.json")));
+        assert!(codex_paths.contains(&codex_home.join("hooks.json")));
     }
 
     #[test]
@@ -4154,5 +4311,272 @@ hooks_auto_accept: false
             HOOK_STATUS_BASE_IN_CONTAINER.contains(AOE_HOOK_MARKER),
             "container base path must embed AOE_HOOK_MARKER verbatim"
         );
+    }
+
+    #[test]
+    fn test_install_hooks_preserves_statusline_foreign_key() {
+        let tmp = TempDir::new().unwrap();
+        let settings_path = tmp.path().join("settings.json");
+
+        let existing = serde_json::json!({
+            "statusLine": {"type": "command", "command": "my-status"},
+            "model": "opus",
+            "hooks": {}
+        });
+        std::fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&existing).unwrap(),
+        )
+        .unwrap();
+
+        install_hooks(&settings_path, claude_events(), HookInstallTarget::Host).unwrap();
+
+        let content: Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(content["statusLine"]["type"], "command");
+        assert_eq!(content["statusLine"]["command"], "my-status");
+        assert_eq!(content["model"], "opus");
+        assert!(
+            content["hooks"].is_object(),
+            "AoE hooks subtree must be present"
+        );
+        assert!(
+            content["hooks"]["SessionStart"].is_array(),
+            "AoE SessionStart hook must be installed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_install_hooks_no_rewrite_when_unchanged() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = TempDir::new().unwrap();
+        let settings_path = tmp.path().join("settings.json");
+
+        install_hooks(&settings_path, claude_events(), HookInstallTarget::Host).unwrap();
+        let ino_before = std::fs::metadata(&settings_path).unwrap().ino();
+        let bytes_before = std::fs::read(&settings_path).unwrap();
+
+        install_hooks(&settings_path, claude_events(), HookInstallTarget::Host).unwrap();
+        assert_eq!(
+            std::fs::metadata(&settings_path).unwrap().ino(),
+            ino_before,
+            "second install must not replace the inode"
+        );
+        assert_eq!(
+            std::fs::read(&settings_path).unwrap(),
+            bytes_before,
+            "second install must leave bytes byte-identical"
+        );
+    }
+
+    #[test]
+    fn test_install_settl_hooks_preserves_foreign_root_key() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "model = \"settl-pro\"\n").unwrap();
+
+        install_settl_hooks(&config_path, HookInstallTarget::Host).unwrap();
+
+        let config: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(config["model"].as_str(), Some("settl-pro"));
+        assert!(config["hooks"].is_array(), "AoE hooks must be installed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_install_settl_hooks_no_rewrite_when_unchanged() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        install_settl_hooks(&config_path, HookInstallTarget::Host).unwrap();
+        let ino_before = std::fs::metadata(&config_path).unwrap().ino();
+        let bytes_before = std::fs::read(&config_path).unwrap();
+
+        install_settl_hooks(&config_path, HookInstallTarget::Host).unwrap();
+        assert_eq!(
+            std::fs::metadata(&config_path).unwrap().ino(),
+            ino_before,
+            "second install must not replace the inode"
+        );
+        assert_eq!(
+            std::fs::read(&config_path).unwrap(),
+            bytes_before,
+            "second install must leave bytes byte-identical"
+        );
+    }
+
+    #[test]
+    fn test_install_hermes_hooks_preserves_foreign_yaml_and_allowlist_keys() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.yaml");
+        std::fs::write(
+            &config_path,
+            "model: hermes-pro\nhooks_auto_accept: false\n",
+        )
+        .unwrap();
+        let allowlist_path = tmp.path().join("shell-hooks-allowlist.json");
+        std::fs::write(&allowlist_path, "{\"version\":7,\"approvals\":[]}").unwrap();
+
+        install_hermes_hooks(&config_path, HookInstallTarget::Host).unwrap();
+
+        let yaml: serde_yaml::Value =
+            serde_yaml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(
+            yaml.get("model").and_then(|v| v.as_str()),
+            Some("hermes-pro")
+        );
+        assert_eq!(
+            yaml.get("hooks_auto_accept").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert!(yaml.get("hooks").is_some());
+
+        let allowlist: Value =
+            serde_json::from_str(&std::fs::read_to_string(&allowlist_path).unwrap()).unwrap();
+        assert_eq!(allowlist["version"], 7);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_install_hermes_hooks_no_rewrite_when_unchanged() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.yaml");
+        let allowlist_path = tmp.path().join("shell-hooks-allowlist.json");
+
+        install_hermes_hooks(&config_path, HookInstallTarget::Host).unwrap();
+        let yaml_ino_before = std::fs::metadata(&config_path).unwrap().ino();
+        let yaml_bytes_before = std::fs::read(&config_path).unwrap();
+        let allowlist_ino_before = std::fs::metadata(&allowlist_path).unwrap().ino();
+        let allowlist_bytes_before = std::fs::read(&allowlist_path).unwrap();
+
+        install_hermes_hooks(&config_path, HookInstallTarget::Host).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&config_path).unwrap().ino(),
+            yaml_ino_before,
+            "config.yaml inode must be stable on a second clean install"
+        );
+        assert_eq!(std::fs::read(&config_path).unwrap(), yaml_bytes_before);
+        assert_eq!(
+            std::fs::metadata(&allowlist_path).unwrap().ino(),
+            allowlist_ino_before,
+            "shell-hooks-allowlist.json inode must be stable on a second clean install"
+        );
+        assert_eq!(
+            std::fs::read(&allowlist_path).unwrap(),
+            allowlist_bytes_before
+        );
+    }
+
+    #[test]
+    fn test_install_kiro_hooks_preserves_foreign_root_keys() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("aoe-hooks.json");
+        std::fs::write(&path, "{\"description\":\"keep me\",\"version\":3}").unwrap();
+
+        install_kiro_hooks(&path, HookInstallTarget::Host).unwrap();
+
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["description"], "keep me");
+        assert_eq!(v["version"], 3);
+        assert!(v["hooks"].is_object());
+        assert!(
+            v["hooks"]["preToolUse"].is_array(),
+            "AoE preToolUse hook must be installed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_install_kiro_hooks_no_rewrite_when_unchanged() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("aoe-hooks.json");
+
+        install_kiro_hooks(&path, HookInstallTarget::Host).unwrap();
+        let ino_before = std::fs::metadata(&path).unwrap().ino();
+        let bytes_before = std::fs::read(&path).unwrap();
+
+        install_kiro_hooks(&path, HookInstallTarget::Host).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().ino(),
+            ino_before,
+            "second install must not replace the inode"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes_before);
+    }
+
+    #[test]
+    fn test_install_codex_hooks_preserves_foreign_root_key_and_comment() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let original = "# user comment\n\
+                        model = \"gpt-5.3-codex\"\n\
+                        approval_policy = \"on-failure\"\n";
+        std::fs::write(&config_path, original).unwrap();
+
+        install_codex_hooks(&config_path, codex_events(), HookInstallTarget::Host).unwrap();
+
+        let after = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            after.contains("# user comment"),
+            "user comment must survive toml_edit round-trip; got:\n{after}"
+        );
+        assert!(after.contains("model = \"gpt-5.3-codex\""));
+        assert!(after.contains("approval_policy = \"on-failure\""));
+        let parsed: toml::Value = toml::from_str(&after).unwrap();
+        assert!(parsed["hooks"]["SessionStart"].is_array());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_install_codex_hooks_no_rewrite_when_unchanged() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        install_codex_hooks(&config_path, codex_events(), HookInstallTarget::Host).unwrap();
+        let ino_before = std::fs::metadata(&config_path).unwrap().ino();
+        let bytes_before = std::fs::read(&config_path).unwrap();
+
+        install_codex_hooks(&config_path, codex_events(), HookInstallTarget::Host).unwrap();
+        assert_eq!(
+            std::fs::metadata(&config_path).unwrap().ino(),
+            ino_before,
+            "second install must not replace the inode"
+        );
+        assert_eq!(std::fs::read(&config_path).unwrap(), bytes_before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_install_codex_with_preserved_state_no_rewrite_when_unchanged() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        install_codex_hooks(&config_path, codex_events(), HookInstallTarget::Host).unwrap();
+        let preserved = snapshot_codex_hooks_state(&config_path).unwrap();
+        let ino_before = std::fs::metadata(&config_path).unwrap().ino();
+        let bytes_before = std::fs::read(&config_path).unwrap();
+
+        install_codex_hooks_with_preserved_state(
+            &config_path,
+            codex_events(),
+            preserved,
+            HookInstallTarget::Host,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&config_path).unwrap().ino(),
+            ino_before,
+            "preserved-state install must not replace the inode when state and events are clean"
+        );
+        assert_eq!(std::fs::read(&config_path).unwrap(), bytes_before);
     }
 }

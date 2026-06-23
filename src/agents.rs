@@ -59,6 +59,24 @@ pub struct HookEvent {
     pub session_id_capture: bool,
 }
 
+/// On-disk format an agent uses for its status-detection hooks. Each variant
+/// drives one install path: `JsonSettings` goes through the generic
+/// `hooks.<event>[].hooks[].command` JSON writer used by Claude-shape agents;
+/// `CodexJson` shares the same JSON payload but resolves its path through
+/// Codex's `CODEX_HOME` convention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookFormat {
+    /// JSON `settings.json` with `hooks.<event>[].hooks[].command`. Used by
+    /// Claude, Cursor, Gemini, Qwen, and any future agent that adopts this
+    /// shape.
+    JsonSettings,
+    /// Codex `hooks.json`. Identical JSON payload shape to `JsonSettings`,
+    /// but the path is resolved via `CODEX_HOME` → `~/.codex/hooks.json`.
+    /// Codex's `[hooks.state]` trust block lives in `config.toml` and is
+    /// untouched by this writer.
+    CodexJson,
+}
+
 /// Configuration for installing status-detection hooks into an agent's settings file.
 #[derive(Debug)]
 pub struct AgentHookConfig {
@@ -73,6 +91,10 @@ pub struct AgentHookConfig {
     pub config_dir_env_var: Option<&'static str>,
     /// Hook events to register (status transitions and session lifecycle).
     pub events: &'static [HookEvent],
+    /// On-disk format of the settings file. Drives target-kind selection in
+    /// [`crate::hooks::iter_hook_targets_in`], which feeds the v015 marker
+    /// walker and the uninstall path.
+    pub format: HookFormat,
 }
 
 /// Installer for an agent whose status hooks live in a config format the
@@ -102,6 +124,23 @@ pub struct SidecarHooks {
     /// Optional host-only follow-up run after a successful host install
     /// (e.g. kiro promotes its `aoe-hooks` agent to the active default).
     pub post_install_host: Option<fn()>,
+    /// On-disk format of the sidecar's config file. Drives marker-presence
+    /// walker dispatch in [`crate::hooks::has_aoe_marker`].
+    pub format: SidecarFormat,
+}
+
+/// On-disk format of a sidecar agent's config file. Drives
+/// marker-presence walker dispatch in [`crate::hooks::has_aoe_marker`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidecarFormat {
+    /// Settl `[[hooks]]` table in `.settl/config.toml`.
+    SettlToml,
+    /// Hermes `hooks: { event: [...] }` map in `.hermes/config.yaml` (or
+    /// `.hermes/sandbox/config.yaml`).
+    HermesYaml,
+    /// Kiro per-agent JSON with a flat `hooks.{event}: [{command, ...}]`
+    /// shape under `.kiro/...` agent files.
+    KiroJson,
 }
 
 /// Everything we know about a single agent CLI.
@@ -275,8 +314,7 @@ const QWEN_HOOK_EVENTS: &[HookEvent] = &[
     },
 ];
 
-/// Codex hook events. Codex loads these from the `[hooks]` table in
-/// `~/.codex/config.toml`.
+/// Codex hook events. AoE installs these into `~/.codex/hooks.json`.
 const CODEX_HOOK_EVENTS: &[HookEvent] = &[
     HookEvent {
         name: "SessionStart",
@@ -332,6 +370,7 @@ pub const AGENTS: &[AgentDef] = &[
             settings_rel_path: ".claude/settings.json",
             config_dir_env_var: Some("CLAUDE_CONFIG_DIR"),
             events: CLAUDE_HOOK_EVENTS,
+            format: HookFormat::JsonSettings,
         }),
         sidecar_hooks: None,
         resume_strategy: ResumeStrategy::FlagPair {
@@ -392,11 +431,12 @@ pub const AGENTS: &[AgentDef] = &[
         detect_status: status_detection::detect_codex_status,
         container_env: &[],
         hook_config: Some(AgentHookConfig {
-            settings_rel_path: ".codex/config.toml",
-            // Codex resolves its config dir via `CODEX_HOME` through a bespoke
-            // path pair; install/uninstall are special-cased on agent name.
+            settings_rel_path: ".codex/hooks.json",
+            // Codex's config dir resolves via `CODEX_HOME`, not a generic
+            // `config_dir_env_var`; the `CodexJson` writer handles that itself.
             config_dir_env_var: None,
             events: CODEX_HOOK_EVENTS,
+            format: HookFormat::CodexJson,
         }),
         sidecar_hooks: None,
         resume_strategy: ResumeStrategy::Subcommand("resume"),
@@ -447,6 +487,7 @@ pub const AGENTS: &[AgentDef] = &[
                     session_id_capture: false,
                 },
             ],
+            format: HookFormat::JsonSettings,
         }),
         sidecar_hooks: None,
         resume_strategy: ResumeStrategy::Flag("--resume"),
@@ -469,6 +510,7 @@ pub const AGENTS: &[AgentDef] = &[
             settings_rel_path: ".cursor/settings.json",
             config_dir_env_var: Some("CURSOR_CONFIG_DIR"),
             events: CURSOR_HOOK_EVENTS,
+            format: HookFormat::JsonSettings,
         }),
         sidecar_hooks: None,
         resume_strategy: ResumeStrategy::Unsupported,
@@ -552,6 +594,7 @@ pub const AGENTS: &[AgentDef] = &[
             install: crate::hooks::install_settl_hooks,
             uninstall: crate::hooks::uninstall_settl_hooks,
             post_install_host: None,
+            format: SidecarFormat::SettlToml,
         }),
         resume_strategy: ResumeStrategy::Unsupported,
         host_only: true,
@@ -585,6 +628,7 @@ pub const AGENTS: &[AgentDef] = &[
             install: crate::hooks::install_hermes_hooks,
             uninstall: crate::hooks::uninstall_hermes_hooks,
             post_install_host: None,
+            format: SidecarFormat::HermesYaml,
         }),
         resume_strategy: ResumeStrategy::Flag("--resume"),
         host_only: false,
@@ -616,6 +660,7 @@ pub const AGENTS: &[AgentDef] = &[
             install: crate::hooks::install_kiro_hooks,
             uninstall: crate::hooks::uninstall_kiro_hooks,
             post_install_host: Some(crate::hooks::set_kiro_default_agent_if_builtin),
+            format: SidecarFormat::KiroJson,
         }),
         resume_strategy: ResumeStrategy::Flag("--resume-id"),
         host_only: false,
@@ -637,6 +682,7 @@ pub const AGENTS: &[AgentDef] = &[
             settings_rel_path: ".qwen/settings.json",
             config_dir_env_var: None,
             events: QWEN_HOOK_EVENTS,
+            format: HookFormat::JsonSettings,
         }),
         sidecar_hooks: None,
         resume_strategy: ResumeStrategy::FlagPair {
@@ -668,6 +714,24 @@ pub const AGENTS: &[AgentDef] = &[
 ];
 
 /// Look up an agent by canonical name.
+impl AgentDef {
+    /// Extra argv tokens inserted between the one-shot flag and the prompt for a
+    /// one-shot (smart-rename) title call. These are static, never user input,
+    /// so the no-injection contract (prompt stays the final argv element) holds.
+    ///
+    /// Codex's `exec` refuses to run outside a trusted git repo
+    /// ("Not inside a trusted directory and --skip-git-repo-check was not
+    /// specified", exit 1), so a one-shot in a scratch or other non-repo session
+    /// cwd fails. `--skip-git-repo-check` lets the title call run anywhere; the
+    /// title task does not touch the repo, so skipping the check is safe.
+    pub fn oneshot_extra_args(&self) -> &'static [&'static str] {
+        match self.name {
+            "codex" => &["--skip-git-repo-check"],
+            _ => &[],
+        }
+    }
+}
+
 pub fn get_agent(name: &str) -> Option<&'static AgentDef> {
     AGENTS.iter().find(|a| a.name == name)
 }
@@ -729,6 +793,17 @@ pub fn name_from_settings_index(index: usize) -> Option<&'static str> {
     } else {
         AGENTS.get(index - 1).map(|a| a.name)
     }
+}
+
+/// Names of built-in agents that can run a one-shot title call (a non-`None`
+/// `oneshot_flag`). The smart-rename agent picker lists these, since only
+/// these agents can be used for the one-shot rename.
+pub fn oneshot_capable_names() -> Vec<&'static str> {
+    AGENTS
+        .iter()
+        .filter(|a| a.oneshot_flag.is_some())
+        .map(|a| a.name)
+        .collect()
 }
 
 #[cfg(test)]
@@ -955,5 +1030,85 @@ mod tests {
             Some("curl -fsSL https://antigravity.google/cli/install.sh | bash")
         );
         assert!(install_hint("unknown").is_none());
+    }
+
+    #[test]
+    fn test_all_hook_configs_declare_expected_format() {
+        // Adding or changing an agent's hook format requires updating both
+        // this list and the declaration in `AGENTS`. The dispatch in
+        // `crate::hooks::iter_hook_targets_in` is keyed off this field, so
+        // drift here is a behavior change.
+        let expected: &[(&str, HookFormat)] = &[
+            ("claude", HookFormat::JsonSettings),
+            ("codex", HookFormat::CodexJson),
+            ("gemini", HookFormat::JsonSettings),
+            ("cursor", HookFormat::JsonSettings),
+            ("qwen", HookFormat::JsonSettings),
+        ];
+        for (name, fmt) in expected {
+            let agent = get_agent(name).unwrap_or_else(|| panic!("missing agent {name}"));
+            let cfg = agent
+                .hook_config
+                .as_ref()
+                .unwrap_or_else(|| panic!("agent {name} must have hook_config"));
+            assert_eq!(cfg.format, *fmt, "agent {name} hook format must be {fmt:?}");
+        }
+        let declared: Vec<&str> = AGENTS
+            .iter()
+            .filter(|a| a.hook_config.is_some())
+            .map(|a| a.name)
+            .collect();
+        let expected_names: Vec<&str> = expected.iter().map(|(n, _)| *n).collect();
+        assert_eq!(
+            declared, expected_names,
+            "hook_config agent set drifted; update test_all_hook_configs_declare_expected_format"
+        );
+    }
+
+    #[test]
+    fn test_all_sidecar_hooks_declare_expected_format() {
+        // Mirror of `test_all_hook_configs_declare_expected_format` for the
+        // sidecar path. The dispatch in `crate::hooks::has_aoe_marker` is
+        // keyed off this field.
+        let expected: &[(&str, SidecarFormat)] = &[
+            ("settl", SidecarFormat::SettlToml),
+            ("hermes", SidecarFormat::HermesYaml),
+            ("kiro", SidecarFormat::KiroJson),
+        ];
+        for (name, fmt) in expected {
+            let agent = get_agent(name).unwrap_or_else(|| panic!("missing agent {name}"));
+            let sidecar = agent
+                .sidecar_hooks
+                .as_ref()
+                .unwrap_or_else(|| panic!("agent {name} must have sidecar_hooks"));
+            assert_eq!(
+                sidecar.format, *fmt,
+                "agent {name} sidecar format must be {fmt:?}"
+            );
+        }
+        let declared: Vec<&str> = AGENTS
+            .iter()
+            .filter(|a| a.sidecar_hooks.is_some())
+            .map(|a| a.name)
+            .collect();
+        let expected_names: Vec<&str> = expected.iter().map(|(n, _)| *n).collect();
+        assert_eq!(
+            declared, expected_names,
+            "sidecar_hooks agent set drifted; update test_all_sidecar_hooks_declare_expected_format"
+        );
+    }
+
+    #[test]
+    fn test_hook_config_and_sidecar_hooks_are_mutually_exclusive() {
+        // `SidecarHooks` doc states the two are mutually exclusive. Lock
+        // the invariant so a future agent does not silently get hooks
+        // installed by both paths.
+        for agent in AGENTS {
+            assert!(
+                !(agent.hook_config.is_some() && agent.sidecar_hooks.is_some()),
+                "agent {} must not declare both hook_config and sidecar_hooks",
+                agent.name
+            );
+        }
     }
 }

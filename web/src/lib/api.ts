@@ -11,6 +11,7 @@ import type {
   ProjectInfo,
   DockerStatusResponse,
   CreateSessionRequest,
+  ClaudeSessionSummary,
   SettingsFieldDescriptor,
 } from "./types";
 import { clearDeviceBindingSecret, getOrCreateDeviceBindingSecret } from "./deviceBinding";
@@ -208,6 +209,59 @@ export async function markWebTourSeen(): Promise<boolean> {
   try {
     const res = await fetch("/api/app-state/web-tour-seen", {
       method: "POST",
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+// --- Tips ---
+
+export interface TipDto {
+  id: string;
+  title: string;
+  body: string;
+  seen: boolean;
+}
+
+export interface TipsResponse {
+  /** Mirror of `session.show_tips`; the badge and panel hide when false. */
+  enabled: boolean;
+  /** Web-eligible tips in catalog order, each flagged with its seen state. */
+  tips: TipDto[];
+}
+
+/** Fetch the web-surface tips and whether tips are enabled. Null on failure so
+ *  the caller simply shows no badge. */
+export function fetchTips(): Promise<TipsResponse | null> {
+  return fetchJson<TipsResponse>("/api/tips");
+}
+
+/** Mark one tip seen (mark-seen-on-view). Best-effort; returns success. Mirrors
+ *  {@link markWebTourSeen}: off the elevation wall, blocked on read-only. */
+export async function markTipSeen(id: string): Promise<boolean> {
+  try {
+    const res = await fetch("/api/app-state/tip-seen", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/** Set "Show tips on startup" (`session.show_tips`). Dedicated endpoint, not
+ *  `PATCH /api/settings`, so this cosmetic toggle stays off the passphrase/
+ *  elevation wall. Returns false on read-only (403) or network failure. */
+export async function setShowTips(enabled: boolean): Promise<boolean> {
+  try {
+    const res = await fetch("/api/tips/show", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled }),
     });
     return res.ok;
   } catch {
@@ -810,6 +864,12 @@ export async function fetchProjects(scope?: "global" | "profile"): Promise<Proje
   return (await fetchJson<ProjectInfo[]>(url)) ?? [];
 }
 
+/** Existing Claude Code sessions on disk, newest first, for the import
+ *  picker (#2276). Empty when Claude Code was never run. */
+export async function listClaudeSessions(): Promise<ClaudeSessionSummary[]> {
+  return (await fetchJson<ClaudeSessionSummary[]>("/api/claude-sessions")) ?? [];
+}
+
 export async function createProject(body: {
   path: string;
   name?: string;
@@ -1199,6 +1259,32 @@ export async function renameSession(id: string, title: string): Promise<{ ok: bo
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ title }),
+    });
+    if (res.ok) return { ok: true };
+    let message: string | undefined;
+    try {
+      const body = await res.json();
+      message = typeof body?.message === "string" ? body.message : undefined;
+    } catch {
+      // non-JSON error body; fall through with no message
+    }
+    return { ok: false, message };
+  } catch {
+    return { ok: false };
+  }
+}
+
+/**
+ * Manually re-run smart rename ("Auto-name now") for a still-default-named
+ * structured-view session whose automatic rename never landed. Best-effort and
+ * async: a 202 means the one-shot was re-triggered, not that the title changed.
+ * Returns the server message on failure (409 when the session already has a
+ * custom name or has no prompt yet) so the caller can surface it.
+ */
+export async function smartRenameSession(id: string): Promise<{ ok: boolean; message?: string }> {
+  try {
+    const res = await fetch(`/api/sessions/${encodeURIComponent(id)}/smart-rename`, {
+      method: "POST",
     });
     if (res.ok) return { ok: true };
     let message: string | undefined;

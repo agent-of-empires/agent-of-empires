@@ -81,10 +81,10 @@ A session is never pinned and sunk at once, but the transitions are one-step in 
 Select multiple rows to act on the whole selection:
 
 - **Cmd/Ctrl+click**: toggle a row in or out of the selection without navigating.
-- **Shift+click**: select every visible row between the last clicked and this one (collapsed groups and an active filter trim the range).
-- **Plain click**: clears the selection and opens that session.
+- **Shift+click**: select every visible row between the last clicked and this one (collapsed groups and an active filter trim the range). The row you most recently plain-clicked or toggled is the anchor, so plain-click one row then Shift+click another to select the range between them.
+- **Plain click**: clears the selection and opens that session (it stays the anchor for the next Shift+click).
 
-With a selection active, a bulk action bar shows the count and applicable actions, split by the rows they affect (e.g. **Pin 3** alongside **Unpin 2**). Bulk actions are best-effort: each session updates independently and the bar reports a summary, then clears the selection. The selection survives collapse and filter changes but is not saved across reloads. Hidden in read-only mode.
+With more than one row selected, right-click (long-press on touch) any selected row to act on the whole selection: the menu opens with a **N selected** header and triage actions split by the rows they affect (e.g. **Pin 3** alongside **Unpin 2**). Right-clicking a row that is not in the selection resets the selection to that row and shows its single-row menu. Bulk actions are best-effort: each session updates independently, a summary is reported, then the selection clears. Clear the selection with **Escape** or by plain-clicking a row. The selection survives collapse and filter changes but is not saved across reloads. Bulk actions are hidden in read-only mode.
 
 ## Projects
 

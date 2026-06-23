@@ -39,7 +39,7 @@ import type {
   PromptAttachmentInput,
   ToolCall,
 } from "../../lib/acpTypes";
-import { hasTodoItemsArgsText, parseJsonObject } from "../../lib/acpArgs";
+import { hasTodoArrayArgsText, parseJsonObject } from "../../lib/acpArgs";
 import { useHistoryWindow } from "../../hooks/useHistoryWindow";
 import { canOfferEarlier, earlierAction } from "../../lib/historyScroll";
 import { useAgentProfile } from "../../lib/agentProfileContext";
@@ -584,7 +584,7 @@ function isTodoWriteArgsText(argsText: string, todosEnabled: boolean): boolean {
       return true;
     }
   }
-  return hasTodoItemsArgsText(argsText);
+  return hasTodoArrayArgsText(argsText);
 }
 
 /** Synthetic toolName for a Claude sub-agent (Task) and its child tool

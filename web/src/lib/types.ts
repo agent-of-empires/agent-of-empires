@@ -100,6 +100,13 @@ export interface SessionResponse {
    *  a one-shot title call is in flight; `inactive`/absent otherwise. Drives
    *  the sidebar auto-name chip. See session::smart_rename. */
   smart_rename?: "inactive" | "pending" | "running";
+  /** True when the session still carries its auto-generated civilization name.
+   *  Gates the sidebar "Auto-name now" action, which only re-runs smart rename
+   *  on a still-default session. More reliable than `smart_rename` for this: a
+   *  timed-out one-shot stays `pending` while an unusable-output one goes
+   *  `inactive`, but both leave the name default and recoverable. Populated by
+   *  the session list; absent on single-session responses. */
+  default_name?: boolean;
   /** True when this session's agent can run in acp: a built-in with
    *  an ACP adapter, or a custom agent whose profile config declares a
    *  valid `agent_acp_cmd`. The terminal view's "switch to acp"
@@ -228,7 +235,7 @@ export interface TimingPongMessage {
 export interface RichDiffFile {
   path: string;
   old_path: string | null;
-  status: "added" | "modified" | "deleted" | "renamed" | "copied" | "untracked" | "conflicted";
+  status: "added" | "modified" | "deleted" | "renamed" | "copied" | "untracked" | "conflicted" | "unchanged";
   additions: number;
   deletions: number;
   /** Workspace repo this file belongs to. Omitted for single-repo
@@ -333,11 +340,19 @@ export interface AgentInfo {
   host_only: boolean;
   installed: boolean;
   install_hint: string;
+  /** True when the agent has a one-shot mode (so it can run the smart-rename
+   *  title call). The settings smart-rename agent picker filters on this
+   *  together with `installed`. Always false for custom agents. Optional so
+   *  existing test fixtures need not set it; the backend always sends it. */
+  oneshot_capable?: boolean;
   /** True when the agent can run in acp: a built-in with an ACP
    *  adapter, or a custom agent that declares a valid `agent_acp_cmd`.
    *  The wizard reads this to decide whether a new session runs in
    *  acp or tmux, replacing the hardcoded client-side tool list. */
   acp_capable: boolean;
+  /** True when the agent's ACP adapter binary is actually resolvable on the
+   *  host (not just registered). The import tab gates on this for claude. */
+  acp_installed: boolean;
   /** The ACP command a built-in agent launches in acp (e.g.
    *  `claude-agent-acp`, `opencode`), post `${aoe_data_dir}`
    *  substitution. Can differ from `binary`. Absent for custom agents,
@@ -458,6 +473,20 @@ export interface CreateSessionRequest {
    *  unset, the server returns a `hooks_need_trust` 403; the wizard then
    *  prompts and resubmits with this set to true. */
   trust_hooks?: boolean;
+  /** Import an existing Claude Code session: the on-disk session id to
+   *  resume via `session/load`. Forces the structured view; `path` must be
+   *  the session's original cwd. See #2276. */
+  import_acp_session_id?: string;
+}
+
+/** A discoverable existing Claude Code session on disk, returned by
+ *  `GET /api/claude-sessions` for the import picker. See #2276. */
+export interface ClaudeSessionSummary {
+  session_id: string;
+  cwd: string;
+  title: string | null;
+  last_modified_ms: number;
+  cwd_exists: boolean;
 }
 
 /** Live acp worker lifecycle, mirrored from

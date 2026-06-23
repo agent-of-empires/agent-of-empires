@@ -1109,6 +1109,60 @@ describe("applyEvent / MonitorArmed lifecycle", () => {
     expect(state.monitorArmed).toBe(false);
     expect(state.monitorDescription).toBeNull();
   });
+
+  it("persists on the arming turn's Stopped while the monitor is still pending", () => {
+    // Arm, then end the turn with no post-arm tool work: the monitor has not
+    // fired yet, the badge must stay up. See #2325.
+    let state = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: { MonitorArmed: { description: "watch" } },
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: { Stopped: { reason: "prompt_complete" } },
+    });
+    expect(state.monitorArmed).toBe(true);
+  });
+
+  it.each(["prompt_complete", "agent_idle"])(
+    "clears once the monitor fired (tool started after arm) and the turn ends with %s",
+    (reason) => {
+      // The fire makes the agent act (a tool call after the arm); the badge
+      // then retires on the next Stopped, covering both the in-band
+      // (prompt_complete) and between-prompt (agent_idle) shapes. See #2325.
+      let state = applyEvent(emptyAcpState(), {
+        session_id: "s-1",
+        seq: 1,
+        event: { MonitorArmed: { description: "watch" } },
+      });
+      state = applyEvent(state, {
+        session_id: "s-1",
+        seq: 2,
+        event: {
+          ToolCallStarted: {
+            tool_call: {
+              id: "tc-1",
+              name: "Read File",
+              kind: "read",
+              args_preview: "{}",
+              started_at: new Date().toISOString(),
+            },
+          },
+        },
+      });
+      // Fired-work seen but turn not ended yet: badge still up.
+      expect(state.monitorArmed).toBe(true);
+      state = applyEvent(state, {
+        session_id: "s-1",
+        seq: 3,
+        event: { Stopped: { reason } },
+      });
+      expect(state.monitorArmed).toBe(false);
+      expect(state.monitorDescription).toBeNull();
+    },
+  );
 });
 
 describe("applyEvent / CancelRequested lifecycle (#1727)", () => {

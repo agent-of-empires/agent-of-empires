@@ -147,6 +147,7 @@ pub const DEFAULT_TARGET_ROOTS: &[&str] = &[
     "hooks",
     "sound",
     "telemetry",
+    "smart_rename",
 ];
 
 /// Sub-targets users can tune individually from the settings UI.
@@ -1096,6 +1097,19 @@ mod tests {
                 "missing {root} in {s}"
             );
         }
+    }
+
+    #[test]
+    fn smart_rename_target_is_captured_by_default_filter() {
+        // The expanded filter has no global default directive, so a target that
+        // is not a known root is dropped at every level. smart_rename emits under
+        // `target: "smart_rename"`; without a root entry its skip/success lines
+        // are invisible and the feature cannot be diagnosed.
+        let s = LogConfig::filter_for_level(LogLevel::Debug);
+        assert!(
+            s.contains("smart_rename=debug"),
+            "smart_rename root missing from filter: {s}"
+        );
     }
 
     #[test]

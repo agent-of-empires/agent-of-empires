@@ -17,10 +17,12 @@ import { useIsCoarsePointer } from "../hooks/useIsCoarsePointer";
 // Reading model (mirrors the TUI's "capture window follows the scroll
 // offset", adapted for a network hop):
 //
-//   live    — pinned to the live edge. The capture window is just the
-//             screen, so frames are small and fast.
-//   reading — the user scrolled up. One window request covers the
-//             ENTIRE history; the spacer (sized from tmux's
+//   live    — pinned to the live edge. The capture window is the screen
+//             plus a small scrollback buffer (LIVE_WINDOW_SCREENS), kept
+//             small enough for fast echo but big enough that a peek-up
+//             lands on real content instead of the blank history spacer.
+//   reading — the user scrolled past the buffer. One window request
+//             covers the ENTIRE history; the spacer (sized from tmux's
 //             #{history_size}) already made the area scrollable, so a
 //             flick lands wherever it lands and the content fills in
 //             underneath it in one round trip. The stream keeps flowing
@@ -52,6 +54,14 @@ const RESIZE_DEBOUNCE_MS = 150;
  *  shrinks, so a spinner toggling the lowest non-blank row can't flutter the
  *  viewport. Comfortably longer than an agent's redraw cadence. */
 const SHRINK_DELAY_MS = 600;
+/** Live-edge capture window in screenfuls: the visible screen plus this much
+ *  scrollback kept loaded ABOVE it, so a scroll-up lands on real content
+ *  instead of the blank history spacer (which otherwise only fills on a
+ *  network round-trip once reading mode engages). The full-history fetch is
+ *  still triggered when the user keeps scrolling past the buffer. Kept at/
+ *  below the server's fast-cadence window bound (screen * 4) so live echo
+ *  stays at the tight interval. */
+const LIVE_WINDOW_SCREENS = 2;
 
 export interface MobileLiveTerminalProps {
   frame: LiveFrame | null;
@@ -273,13 +283,18 @@ export function MobileLiveTerminal({
   // scroller back under a starting gesture, while appended output still
   // follows the live tail.
   //
-  // The scrollTop comparison covers the gap touchActiveRef can't: a
-  // flick lifts the finger immediately, and on a busy session a live
-  // frame can land in the first ~50ms of momentum while the scroller
-  // is still inside the at-bottom threshold. Pinning there snaps the
-  // view back AND cancels iOS momentum, making scroll-up nearly
-  // impossible to start. Upward motion since the last mutation means
-  // the user is heading into scrollback; never pin against it.
+  // A sticky "detached from the live tail" latch covers the gap
+  // touchActiveRef can't: a flick lifts the finger immediately, and on a
+  // busy session a live frame can land in the first ~50ms of momentum
+  // while the scroller is still inside the at-bottom threshold. Pinning
+  // there snaps the view back AND cancels iOS momentum, making scroll-up
+  // nearly impossible to start. The latch detaches the instant scrollTop
+  // drops below where the pin last left it and re-attaches only when the
+  // user returns to the live target, so a small scroll-up that pauses
+  // inside the threshold is NOT re-pinned by the next frame. An earlier
+  // per-frame "moving up since the last mutation" test re-attached on any
+  // single still frame, so a paused nudge got yanked back to the bottom
+  // (the herky-jerky stutter before the scroll could start).
   //
   // The live-edge scroll target is the literal bottom, with ONE
   // exception: while the soft keyboard has the container shrunk below
@@ -314,6 +329,11 @@ export function MobileLiveTerminal({
     [lineH],
   );
   const geomRef = useRef({ target: -1, clientHeight: 0, scrollTop: 0 });
+  // Sticky live-tail attachment. False = following the bottom (pin to it
+  // as output appends); true = the user scrolled up to read, so leave
+  // scrollTop alone. Latched, not recomputed per frame, so one paused
+  // frame can't re-attach and snap the reader back down.
+  const liveDetachedRef = useRef(false);
   // A height change observed while pinning was suppressed (finger down,
   // gesture in flight) would otherwise be consumed without effect and
   // the cursor anchor never applied; latch it until a pin actually runs.
@@ -323,29 +343,52 @@ export function MobileLiveTerminal({
     if (!el) return;
     const prev = geomRef.current;
     const target = liveScrollTarget(el);
-    const wasAtLive = prev.target < 0 || el.scrollTop >= prev.target - lineH * 1.5;
+    const heightChanged = prev.target >= 0 && Math.abs(el.clientHeight - prev.clientHeight) > 1;
+    // scrollTop fell since the last pin: the user is dragging up (or iOS
+    // momentum is carrying up after a flick).
     const movingUp = prev.target >= 0 && el.scrollTop < prev.scrollTop - 0.5;
-    // Pin downward freely (following appended output); pin upward only
-    // when the viewport height changed (keyboard transition). An upward
-    // pin at constant height would yank a user who deliberately
-    // scrolled below the cursor anchor.
-    if (prev.target >= 0 && Math.abs(el.clientHeight - prev.clientHeight) > 1) {
+    // Detach when the user drags up off the last pinned position. The
+    // conditions together distinguish a real scroll-up (scrollTop moved up
+    // AND now sits meaningfully above the live target) from the benign cases
+    // that also drop scrollTop below target: appended output growing the
+    // target away from a stationary scrollTop (we still follow it), the
+    // browser clamping scrollTop down when content shrinks (it lands AT the
+    // new bottom), and a viewport-height change (keyboard) that moves the
+    // target out from under a clamped scrollTop in the same frame. The last
+    // is why a height change suppresses the detach test entirely: the
+    // scrollTop delta there is the keyboard's doing, not the user's, and it
+    // must instead trigger the anchor pin below.
+    if (!heightChanged && prev.target >= 0 && el.scrollTop < prev.scrollTop - 0.5 && el.scrollTop < target - 2) {
+      liveDetachedRef.current = true;
+    }
+    // Re-attaching (following again) is NOT done here: re-grabbing whenever
+    // scrollTop is merely near the bottom is what fought the start of a drag
+    // (the first pixels sit near the bottom too). It happens explicitly instead
+    // when the user reaches the literal bottom (onScroll), lifts at the bottom
+    // (onTouchEnd), or taps the jump-to-latest button.
+    if (heightChanged) {
       pendingHeightPinRef.current = true;
     }
-    if (!wasAtLive) {
+    if (liveDetachedRef.current) {
       // The user is reading scrollback; a keyboard transition there
       // must not yank them later.
       pendingHeightPinRef.current = false;
     } else if (
-      !movingUp &&
       !touchActiveRef.current &&
-      (prev.target < 0 || pendingHeightPinRef.current || target > el.scrollTop)
+      // First frame and keyboard (height) pins always apply. The
+      // follow-the-tail pin (`target > scrollTop`) is additionally gated on
+      // NOT moving up: the detach latch only trips past ~2px, so without this
+      // a streamed frame landing in the first pixels of an upward flick would
+      // pin scrollTop back to the bottom and cancel iOS momentum (the residual
+      // flutter where gentle flicks die before they get going). A keyboard
+      // pin still bypasses it: there the scrollTop drop is a clamp, not a drag.
+      (prev.target < 0 || pendingHeightPinRef.current || (!movingUp && target > el.scrollTop))
     ) {
       el.scrollTop = target;
       pendingHeightPinRef.current = false;
     }
     geomRef.current = { target, clientHeight: el.clientHeight, scrollTop: el.scrollTop };
-  }, [lineH, liveScrollTarget]);
+  }, [liveScrollTarget]);
   const lines = useMemo(() => (frame ? ansiToLines(frame.content) : []), [frame]);
   // Columns this viewer renders at. Normally the pane is exactly this
   // wide and wrapping is the identity; when another writer resizes the
@@ -440,6 +483,25 @@ export function MobileLiveTerminal({
     [],
   );
 
+  // --- row virtualization ----------------------------------------------------
+  // Only the rows near the visible window are mounted; the rest collapse into
+  // top/bottom padding of the EXACT same height (every row is `lineH` tall), so
+  // scrollHeight and every pin / anchor / spacer pixel is unchanged. Reading a
+  // multi-thousand-line history would otherwise mount that many DOM rows and
+  // re-render all of them on each streamed frame (the churn behind the drag
+  // flash). `view` is the scroller's current scrollTop + height; it drives the
+  // window and updates on scroll and after a pin.
+  const [view, setView] = useState({ top: 0, height: 0 });
+  const syncView = useCallback(() => {
+    const el = scrollerRef.current;
+    if (!el) return;
+    setView((prev) =>
+      prev.top === el.scrollTop && prev.height === el.clientHeight
+        ? prev
+        : { top: el.scrollTop, height: el.clientHeight },
+    );
+  }, []);
+
   // Cursor cell -> the VISUAL ROW + COLUMN to box inline (see Row). Shown only
   // at the live edge; reading scrollback hides it. `top` is the row's pixel
   // top, fed to cursorAnchorRef so the keyboard-shrunk scroll target can keep
@@ -473,24 +535,41 @@ export function MobileLiveTerminal({
     return el.scrollTop >= liveScrollTarget(el) - lineH * 1.5;
   }, [lineH, liveScrollTarget]);
 
+  // Last scrollTop seen by onScroll, to read the scroll DIRECTION (our pin
+  // filters itself out by landing exactly on the target).
+  const onScrollLastTopRef = useRef(0);
   const onScroll = useCallback(() => {
     // Forward mode pins the live edge (overflow hidden); the wheel goes to
     // the app, so there is no scrollback reading state to enter.
+    syncView();
     if (forwardModeRef.current) return;
+    const el = scrollerRef.current;
+    if (!el) return;
+    const movingUp = el.scrollTop < onScrollLastTopRef.current - 0.5;
+    onScrollLastTopRef.current = el.scrollTop;
     if (!atBottom()) {
       enterReading(rowsRef.current);
     } else if (!touchActiveRef.current) {
       // Mid-gesture passes over the bottom edge are settled on touchend;
       // re-entering live here would let the next frame pin against the
       // user's finger.
-      returnToLive(rowsRef.current);
+      returnToLive(rowsRef.current * LIVE_WINDOW_SCREENS);
     }
-  }, [atBottom, enterReading, returnToLive]);
+    // Re-attach the follow latch only when the user has scrolled DOWN to the
+    // literal bottom (not the first pixels of an up-scroll, which sit within a
+    // couple px of the bottom too, nor a clamp, which lands here while moving
+    // up). This is the one place auto-follow resumes for a mouse/non-touch
+    // scroll-to-bottom; touch lifts and the jump button re-attach explicitly.
+    if (el.scrollHeight - el.clientHeight - el.scrollTop < 2 && !movingUp) {
+      liveDetachedRef.current = false;
+    }
+  }, [atBottom, enterReading, returnToLive, syncView]);
 
   const jumpToLatest = useCallback(() => {
     const el = scrollerRef.current;
     if (el) el.scrollTop = liveScrollTarget(el);
-    returnToLive(rowsRef.current);
+    liveDetachedRef.current = false;
+    returnToLive(rowsRef.current * LIVE_WINDOW_SCREENS);
   }, [returnToLive, liveScrollTarget]);
 
   // Tap anywhere on the terminal brings up the soft keyboard, so the user does
@@ -552,6 +631,9 @@ export function MobileLiveTerminal({
   // --- pinch zoom (two-finger) ---------------------------------------------
   const pinchRef = useRef<{ startDist: number; startSize: number; changed: boolean } | null>(null);
   const persistTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Finger Y at the start of a single-finger capture-mode drag, used to tell a
+  // real scroll from a tap before the native scroll has moved far.
+  const touchScrollStartYRef = useRef<number | null>(null);
   const onTouchStart = useCallback(
     (e: React.TouchEvent) => {
       touchActiveRef.current = true;
@@ -565,10 +647,19 @@ export function MobileLiveTerminal({
           changed: false,
         };
         touchForwardYRef.current = null;
+        touchScrollStartYRef.current = null;
       } else if (e.touches.length === 1 && forwardModeRef.current) {
         // Single-finger drag drives the app's wheel in forward mode.
         touchForwardYRef.current = e.touches[0]!.clientY;
         wheelAccumRef.current = 0;
+      } else if (e.touches.length === 1) {
+        // Taking hold of the scroller to drag. Detach from the live tail NOW so
+        // the pin cannot snap the view back to the bottom mid-drag: iOS fires
+        // touchcancel when it promotes the drag to native scrolling, which
+        // flips touchActiveRef off while the finger is still down and would
+        // otherwise re-arm the pin. A tap (no scroll) re-attaches on touchend.
+        liveDetachedRef.current = true;
+        touchScrollStartYRef.current = e.touches[0]!.clientY;
       }
     },
     [fontSize],
@@ -596,19 +687,39 @@ export function MobileLiveTerminal({
         const dy = y - touchForwardYRef.current;
         touchForwardYRef.current = y;
         forwardWheelDelta(-dy, e.touches[0]!.clientX, y);
+        return;
+      }
+      if (e.touches.length === 1 && !forwardModeRef.current && touchScrollStartYRef.current != null) {
+        // Once the finger has clearly started a scroll (not a tap), switch to
+        // the reading model immediately: anchor the capture window to the
+        // history and drop to idle cadence. At the live edge the window is "the
+        // bottom N lines", so every streamed line slides it and re-renders
+        // every row under the finger (the flash). Reading mode anchors the
+        // window so appends only add off-screen rows at the bottom. enterReading
+        // is idempotent; the 8px gate keeps a tap (or a horizontal swipe) from
+        // tripping it.
+        if (Math.abs(e.touches[0]!.clientY - touchScrollStartYRef.current) > 8) {
+          enterReading(rowsRef.current);
+        }
       }
     },
-    [forwardWheelDelta],
+    [forwardWheelDelta, enterReading],
   );
   const onTouchEnd = useCallback(
     (e: React.TouchEvent) => {
       if (e.touches.length === 0) {
         touchActiveRef.current = false;
         touchForwardYRef.current = null;
+        touchScrollStartYRef.current = null;
         // Settle the live-edge decision deferred by onScroll; momentum
-        // scroll events after this keep re-evaluating via onScroll.
+        // scroll events after this keep re-evaluating via onScroll. Ending at
+        // the bottom (a tap that never scrolled, or a scroll back down) must
+        // re-attach the pin: the touchstart detach would otherwise strand a tap
+        // one line off a streaming tail (the pin's own re-attach needs scrollTop
+        // within 2px of the GROWN target, which an append just moved away).
         if (atBottom()) {
-          returnToLive(rowsRef.current);
+          liveDetachedRef.current = false;
+          returnToLive(rowsRef.current * LIVE_WINDOW_SCREENS);
         }
       }
       if (e.touches.length < 2 && pinchRef.current) {
@@ -623,6 +734,29 @@ export function MobileLiveTerminal({
     },
     [fontKey, fontSize, update, returnToLive, atBottom],
   );
+  // touchcancel is NOT touchend: iOS fires it when it promotes the drag to
+  // native scrolling, with the finger usually STILL down. Treat it as "stop
+  // tracking" only, never as a settle. Settling here (re-attaching at the
+  // bottom, like onTouchEnd) is what let a still-held finger get snapped back
+  // to the live tail mid-drag. Re-follow resumes when the scroll genuinely
+  // reaches the bottom (onScroll) or the jump button is tapped.
+  const onTouchCancel = useCallback(() => {
+    touchActiveRef.current = false;
+    touchForwardYRef.current = null;
+    touchScrollStartYRef.current = null;
+    // A pinch that changed the font size still persists, exactly like a clean
+    // end; only the scroll-settle (re-attach to live) is skipped on cancel.
+    if (pinchRef.current) {
+      const changed = pinchRef.current.changed;
+      pinchRef.current = null;
+      if (changed) {
+        if (persistTimerRef.current) clearTimeout(persistTimerRef.current);
+        persistTimerRef.current = setTimeout(() => {
+          update({ [fontKey]: fontSize });
+        }, 400);
+      }
+    }
+  }, [fontKey, fontSize, update]);
   useEffect(
     () => () => {
       if (persistTimerRef.current) clearTimeout(persistTimerRef.current);
@@ -663,7 +797,7 @@ export function MobileLiveTerminal({
       setRenderCols(cols);
       sendResize(cols, rows);
       if (!readingRef.current) {
-        setWindow(rows);
+        setWindow(rows * LIVE_WINDOW_SCREENS);
       }
     };
     const ro = new ResizeObserver(() => {
@@ -699,11 +833,19 @@ export function MobileLiveTerminal({
     // bottom and back.
     if (live.top != null) cursorAnchorRef.current = live.top;
     pinIfWasAtBottom();
+    // Match the virtualization window to the (possibly just-pinned) position
+    // before paint, so a content frame never renders the wrong row slice.
+    syncView();
     // When not pinned, scrollTop is left alone. Above-viewport height is
     // invariant (spacer rows convert to content rows 1:1; appends only
     // extend the bottom), so the browser-preserved offset keeps the
     // same lines in view.
-  }, [lines, spacerLines, lineH, live, pinIfWasAtBottom]);
+    //
+    // `renderRowCount` is a dep because it sets the rendered content height
+    // when not reading (trailing blanks trimmed); without it a settle that
+    // grows/shrinks the document by a few rows would change scrollHeight while
+    // following WITHOUT re-pinning, leaving scrollTop short of the new bottom.
+  }, [lines, spacerLines, lineH, live, renderRowCount, pinIfWasAtBottom, syncView]);
 
   // --- keyboard input -----------------------------------------------------------
   const composingRef = useRef(false);
@@ -835,6 +977,23 @@ export function MobileLiveTerminal({
   // scrollHeight under the reader and snap the viewport.
   const visibleRowCount = reading ? visual.rows.length : renderRowCount;
 
+  // Virtualization window over [0, visibleRowCount): the rows whose document
+  // position (effectiveSpacerLines + i) * lineH falls within the viewport, plus
+  // one viewport of overscan each side so a fast flick does not outrun the
+  // re-render. Off-window rows become top/bottom padding of identical height.
+  // height == 0 (pre-measure / jsdom) renders everything, the safe default.
+  let winStart = 0;
+  let winEnd = visibleRowCount;
+  if (view.height > 0 && lineH > 0) {
+    const overscan = Math.ceil(view.height / lineH);
+    const firstVisible = Math.floor(view.top / lineH) - effectiveSpacerLines;
+    const lastVisible = Math.ceil((view.top + view.height) / lineH) - effectiveSpacerLines;
+    winStart = Math.max(0, Math.min(visibleRowCount, firstVisible - overscan));
+    winEnd = Math.max(winStart, Math.min(visibleRowCount, lastVisible + overscan));
+  }
+  const topPadLines = effectiveSpacerLines + winStart;
+  const bottomPadLines = visibleRowCount - winEnd;
+
   return (
     <div className="absolute inset-0" data-live-terminal>
       <div
@@ -845,7 +1004,7 @@ export function MobileLiveTerminal({
         onTouchStart={onTouchStart}
         onTouchMove={onTouchMove}
         onTouchEnd={onTouchEnd}
-        onTouchCancel={onTouchEnd}
+        onTouchCancel={onTouchCancel}
         className={`absolute inset-0 font-mono flex flex-col ${
           forwardMode ? "overflow-hidden" : "overflow-y-auto overflow-x-hidden"
         }`}
@@ -881,12 +1040,12 @@ export function MobileLiveTerminal({
             opt out (`bottomAlign=false`) so a near-empty bash prompt sits at
             the top like a normal terminal. */}
         <div className={`relative whitespace-pre ${bottomAlign ? "mt-auto" : ""}`} data-live-content>
-          {effectiveSpacerLines > 0 && (
-            <div style={{ height: `${effectiveSpacerLines * lineH}px` }} aria-hidden="true" />
-          )}
-          {visual.rows.slice(0, visibleRowCount).map((segs, i) => (
-            <Row key={i} segs={segs} cursorCol={i === cursorRow ? live.col : null} />
-          ))}
+          {topPadLines > 0 && <div style={{ height: `${topPadLines * lineH}px` }} aria-hidden="true" />}
+          {visual.rows.slice(winStart, winEnd).map((segs, j) => {
+            const i = winStart + j;
+            return <Row key={i} segs={segs} cursorCol={i === cursorRow ? live.col : null} />;
+          })}
+          {bottomPadLines > 0 && <div style={{ height: `${bottomPadLines * lineH}px` }} aria-hidden="true" />}
         </div>
       </div>
 

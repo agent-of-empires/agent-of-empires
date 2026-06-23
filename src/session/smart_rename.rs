@@ -16,6 +16,7 @@
 use crate::agents;
 use crate::session::civilizations::is_default_civ_name;
 use serde::Serialize;
+use std::collections::HashMap;
 
 /// Per-session smart-rename state surfaced to the dashboard so the sidebar can
 /// show that a session will be (or is being) auto-named. `Inactive` for
@@ -95,6 +96,60 @@ pub fn check_eligible(
     Ok(())
 }
 
+/// Resolve the tool name used for the one-shot rename: the configured
+/// `smart_rename_agent` when non-empty, otherwise the session's own tool. A
+/// blank or whitespace-only setting means "same as session".
+pub fn resolve_rename_tool<'a>(session_tool: &'a str, rename_setting: &'a str) -> &'a str {
+    let setting = rename_setting.trim();
+    if setting.is_empty() {
+        session_tool
+    } else {
+        setting
+    }
+}
+
+/// Resolve the rename agent from the `smart_rename_agent` setting and gate it,
+/// returning the resolved built-in agent on success. This is the single place
+/// the command-override semantics differ by rename target: when the rename
+/// agent is the session's own agent, the session's launch command and an
+/// override of that agent count (exactly as before). When the rename agent is
+/// a DIFFERENT agent, the session's launch command is irrelevant (the one-shot
+/// spawns the built-in binary fresh), so only a config override of the rename
+/// agent's own binary disqualifies it. Both the runtime gate
+/// (`try_smart_rename`) and the sidebar `Pending` indicator call this so they
+/// cannot drift.
+// One more input than `check_eligible` (the rename-agent setting); a params
+// struct would only add boilerplate to the two call sites and the unit tests.
+#[allow(clippy::too_many_arguments)]
+pub fn check_eligible_resolved(
+    structured: bool,
+    setting_on: bool,
+    title: &str,
+    session_tool: &str,
+    rename_setting: &str,
+    sandboxed: bool,
+    session_command: &str,
+    overrides: &HashMap<String, String>,
+) -> Result<&'static agents::AgentDef, SkipReason> {
+    let rename_tool = resolve_rename_tool(session_tool, rename_setting);
+    let agent = agents::get_agent(rename_tool);
+    let (command, command_override_in_cfg) = if rename_tool == session_tool {
+        (session_command, overrides.contains_key(session_tool))
+    } else {
+        ("", overrides.contains_key(rename_tool))
+    };
+    check_eligible(
+        structured,
+        setting_on,
+        title,
+        agent,
+        sandboxed,
+        command,
+        command_override_in_cfg,
+    )?;
+    Ok(agent.expect("check_eligible Ok implies a built-in agent"))
+}
+
 /// Hard cap on how much of the user's first message is handed to the one-shot
 /// call. A title needs only the opening intent, and very large argv values can
 /// trip some shells/agents.
@@ -108,8 +163,11 @@ const MAX_TITLE_WORDS: usize = 8;
 /// has the least possible work to do; anything off-format is rejected, never
 /// salvaged.
 const INSTRUCTION: &str = "Generate a concise 3 to 5 word title summarizing the following task. \
-Respond with ONLY the title: no quotes, no markdown, no surrounding punctuation, no explanation. \
-If you cannot, respond with exactly NONE.";
+Output the title and nothing else: no quotes, no markdown, no code fences, no labels, \
+no preamble, no explanation, no trailing punctuation. The entire response must be just \
+the title on a single line. Do not refuse: if the task is unclear, still produce your \
+best-guess title rather than commentary. Only if you truly cannot produce any title, \
+respond with exactly NONE.";
 
 /// Build the prompt string for the one-shot title call: the fixed instruction
 /// plus the (NUL-stripped, trimmed, byte-capped) first user message.
@@ -126,11 +184,13 @@ pub fn build_prompt(user_message: &str) -> String {
 /// into a shell string, so untrusted user text cannot inject arguments.
 pub fn build_oneshot_argv(agent: &agents::AgentDef, prompt: &str) -> Option<Vec<String>> {
     let token = agent.oneshot_flag?;
-    Some(vec![
-        agent.binary.to_string(),
-        token.to_string(),
-        prompt.to_string(),
-    ])
+    let mut argv = vec![agent.binary.to_string(), token.to_string()];
+    // Static per-agent flags (e.g. codex `--skip-git-repo-check`) go between the
+    // one-shot token and the prompt; the prompt stays the final argv element so
+    // untrusted user text can never be read as an argument.
+    argv.extend(agent.oneshot_extra_args().iter().map(|s| s.to_string()));
+    argv.push(prompt.to_string());
+    Some(argv)
 }
 
 /// Turn raw agent stdout into a clean title, or `None` to keep the generated
@@ -247,7 +307,14 @@ mod serve {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    const ONESHOT_TIMEOUT: Duration = Duration::from_secs(12);
+    // The one-shot is spawned from the prompt handler at the same instant the
+    // session's own worker starts its first heavy turn, so the two contend for
+    // CPU and the same provider API. Standalone the call finishes well under
+    // 12s; under that contention it can run far longer. 120s absorbs the
+    // contention without a deeper scheduling change (deferring the one-shot
+    // until the live turn settles is tracked as a follow-up). The child is
+    // killed on drop, so a timed-out call leaves no orphan.
+    const ONESHOT_TIMEOUT: Duration = Duration::from_secs(120);
 
     /// Marks a session as having an in-flight one-shot rename so a burst of
     /// rapid first prompts cannot spawn concurrent title generators. Removed on
@@ -306,29 +373,43 @@ mod serve {
         };
 
         let config = crate::session::profile_config::resolve_config_or_warn(&profile);
-        let agent = agents::get_agent(&tool);
-        let command_override_in_cfg = config.session.agent_command_override.contains_key(&tool);
-        if let Err(reason) = check_eligible(
+        let agent = match check_eligible_resolved(
             structured,
             config.session.smart_rename,
             &title,
-            agent,
+            &tool,
+            &config.session.smart_rename_agent,
             sandboxed,
             &command,
-            command_override_in_cfg,
+            &config.session.agent_command_override,
         ) {
-            tracing::debug!(target: "smart_rename", session = %session_id, tool = %tool, reason = reason.as_str(), "skip");
-            return;
-        }
-        let agent = agent.expect("check_eligible Ok implies a built-in agent");
+            Ok(agent) => agent,
+            Err(reason) => {
+                tracing::debug!(target: "smart_rename", session = %session_id, tool = %tool, reason = reason.as_str(), "skip");
+                return;
+            }
+        };
 
         let Some(_guard) = InflightGuard::acquire(&state.smart_rename_inflight, &session_id) else {
             return;
         };
 
-        // One attempt per session lifetime. A failed or unusable first try
-        // leaves the name default; without this guard every later prompt would
-        // respawn a one-shot agent (12s + tokens) until one happened to succeed.
+        let prompt = build_prompt(&first_message);
+        let Some(argv) = build_oneshot_argv(agent, &prompt) else {
+            return;
+        };
+
+        // A spawn error, timeout, or non-zero exit returns None. Do NOT mark the
+        // session attempted in that case: a transient slow first prompt (cold
+        // agent start) must not permanently disable naming. A later prompt
+        // retries. The inflight guard above already prevents concurrent spawns.
+        let Some(raw) = run_oneshot(&argv, &project_path).await else {
+            return;
+        };
+
+        // The agent produced output (usable or not). Mark attempted now, once per
+        // session lifetime: an answer the sanitizer rejects is not worth respawning
+        // a one-shot agent (tokens) for on every later prompt.
         {
             let mut attempted = state
                 .smart_rename_attempted
@@ -338,15 +419,6 @@ mod serve {
                 return;
             }
         }
-
-        let prompt = build_prompt(&first_message);
-        let Some(argv) = build_oneshot_argv(agent, &prompt) else {
-            return;
-        };
-
-        let Some(raw) = run_oneshot(&argv, &project_path).await else {
-            return;
-        };
         let Some(new_title) = sanitize_title(&raw, &first_message) else {
             tracing::debug!(target: "smart_rename", session = %session_id, "skip: agent output not a usable title");
             return;
@@ -367,7 +439,10 @@ mod serve {
         cmd.args(&argv[1..])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
+            // Capture stderr so a non-zero exit logs WHY (e.g. codex's
+            // "Not inside a trusted directory"); without it the failure is an
+            // opaque exit code.
+            .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
         if !cwd.is_empty() {
             cmd.current_dir(cwd);
@@ -384,7 +459,17 @@ mod serve {
                 Some(String::from_utf8_lossy(&out.stdout).into_owned())
             }
             Ok(Ok(out)) => {
-                tracing::debug!(target: "smart_rename", "one-shot exited {:?}", out.status.code());
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let tail: String = stderr
+                    .trim()
+                    .chars()
+                    .rev()
+                    .take(300)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                tracing::debug!(target: "smart_rename", code = ?out.status.code(), stderr = %tail, "one-shot exited non-zero");
                 None
             }
             Ok(Err(e)) => {
@@ -441,6 +526,24 @@ mod serve {
                 tracing::info!(target: "smart_rename", session = %id, old = %inst.title, new = %new_title, "renamed session from first message");
                 inst.title = new_title.to_string();
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn run_oneshot_returns_none_on_spawn_failure() {
+            // A failed spawn must surface as None so try_smart_rename leaves the
+            // session un-attempted and a later prompt can retry. A binary that
+            // does not exist is the deterministic, machine-independent failure.
+            let argv = vec![
+                "aoe-smart-rename-nonexistent-binary-xyz".to_string(),
+                "-p".to_string(),
+                "title this".to_string(),
+            ];
+            assert!(run_oneshot(&argv, "").await.is_none());
         }
     }
 }
@@ -513,6 +616,129 @@ mod tests {
         );
         // Command equal to the agent binary is not an override.
         assert!(check_eligible(true, true, "Vikings", c, false, "claude", false).is_ok());
+    }
+
+    #[test]
+    fn argv_codex_skips_git_repo_check_with_prompt_last() {
+        // codex `exec` refuses to run outside a git repo without this flag, so a
+        // scratch-session one-shot would exit non-zero. The flag goes between
+        // the token and the prompt; the prompt stays the final element.
+        let argv = build_oneshot_argv(agents::get_agent("codex").unwrap(), "name this")
+            .expect("codex one-shot");
+        assert_eq!(
+            argv,
+            vec!["codex", "exec", "--skip-git-repo-check", "name this"]
+        );
+        // claude takes no extra args: still [binary, flag, prompt].
+        assert_eq!(
+            build_oneshot_argv(claude(), "name this").unwrap(),
+            vec!["claude", "-p", "name this"]
+        );
+    }
+
+    #[test]
+    fn resolve_rename_tool_falls_back_to_session() {
+        // Empty / whitespace setting => use the session's own tool.
+        assert_eq!(resolve_rename_tool("claude", ""), "claude");
+        assert_eq!(resolve_rename_tool("claude", "   "), "claude");
+        // Non-empty setting => use it verbatim (trimmed).
+        assert_eq!(resolve_rename_tool("claude", "codex"), "codex");
+        assert_eq!(resolve_rename_tool("claude", "  codex "), "codex");
+    }
+
+    #[test]
+    fn resolved_unset_uses_session_agent() {
+        let overrides = HashMap::new();
+        // Unset rename agent => resolves to the session's claude agent.
+        let agent =
+            check_eligible_resolved(true, true, "Vikings", "claude", "", false, "", &overrides)
+                .expect("eligible");
+        assert_eq!(agent.binary, "claude");
+    }
+
+    #[test]
+    fn resolved_picks_distinct_rename_agent() {
+        let overrides = HashMap::new();
+        let agent = check_eligible_resolved(
+            true, true, "Vikings", "claude", "codex", false, "", &overrides,
+        )
+        .expect("eligible");
+        assert_eq!(agent.binary, "codex");
+    }
+
+    #[test]
+    fn resolved_override_gate_targets_the_right_agent() {
+        // A session-agent command override only blocks when the rename agent IS
+        // the session agent.
+        let mut overrides = HashMap::new();
+        overrides.insert("claude".to_string(), "my-wrapper".to_string());
+        assert!(matches!(
+            check_eligible_resolved(true, true, "Vikings", "claude", "", false, "", &overrides),
+            Err(SkipReason::CommandOverridden)
+        ));
+        // ...but when the rename agent is a DIFFERENT agent (codex), the
+        // session's claude override is irrelevant: the one-shot launches codex
+        // fresh, so it stays eligible.
+        assert!(check_eligible_resolved(
+            true, true, "Vikings", "claude", "codex", false, "", &overrides
+        )
+        .is_ok());
+        // An override of the RENAME agent's own binary does block it.
+        let mut codex_override = HashMap::new();
+        codex_override.insert("codex".to_string(), "my-codex".to_string());
+        assert!(matches!(
+            check_eligible_resolved(
+                true,
+                true,
+                "Vikings",
+                "claude",
+                "codex",
+                false,
+                "",
+                &codex_override
+            ),
+            Err(SkipReason::CommandOverridden)
+        ));
+    }
+
+    #[test]
+    fn resolved_session_command_ignored_for_distinct_rename_agent() {
+        // The instance's launch command (for the session agent) must not be
+        // matched against a different rename agent's binary.
+        let overrides = HashMap::new();
+        assert!(check_eligible_resolved(
+            true, true, "Vikings", "opencode", "claude", false, "opencode", &overrides
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn resolved_unknown_rename_agent_is_no_oneshot() {
+        let overrides = HashMap::new();
+        assert!(matches!(
+            check_eligible_resolved(
+                true,
+                true,
+                "Vikings",
+                "claude",
+                "not-a-real-agent",
+                false,
+                "",
+                &overrides
+            ),
+            Err(SkipReason::NoOneshot)
+        ));
+    }
+
+    #[test]
+    fn sanitize_picks_title_from_chatty_output() {
+        // The tightened instruction asks for the bare title, but a chatty agent
+        // may still wrap it; the last qualifying line is the title.
+        let raw = "Sure, here is a concise title:\n\nFix login redirect bug\n";
+        assert_eq!(
+            sanitize_title(raw, "fix the login redirect").as_deref(),
+            Some("Fix login redirect bug")
+        );
     }
 
     #[test]

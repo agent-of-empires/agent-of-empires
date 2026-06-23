@@ -10,7 +10,16 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { useRef, type ReactNode } from "react";
 
 import { reportError } from "../../lib/toastBus";
-import { DragSuppressContext, SessionRow } from "../WorkspaceSidebar";
+import { DragSuppressContext, SessionRow, type RowBulkApi } from "../WorkspaceSidebar";
+
+// Single-row stub for the bulk-triage bridge; this harness mounts one
+// unselected row, so the menu is always single-scope. See #2312.
+const SINGLE_BULK_API: RowBulkApi = {
+  prepareScope: () => ({ kind: "single" }),
+  pin: () => {},
+  archive: () => {},
+  snooze: () => {},
+};
 
 vi.mock("../../lib/toastBus", () => ({
   reportError: vi.fn(),
@@ -103,6 +112,7 @@ function openMenu(ws: Workspace) {
         onPinToggle={() => {}}
         onArchiveToggle={() => {}}
         onSnooze={() => {}}
+        bulkApi={SINGLE_BULK_API}
       />
     </Wrap>,
   );

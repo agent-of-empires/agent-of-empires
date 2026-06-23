@@ -24,6 +24,9 @@ interface Props {
    *  the port is not visible in the window chrome. Driven by
    *  `ServerAbout.build_flavor === "debug"`. See #1055. */
   isDevBuild: boolean;
+  /** Opens the tip-of-the-day modal; wired into the overflow menu so tips are
+   *  re-readable any time, like GIMP/DBeaver's Help menu entry. */
+  onOpenTips: () => void;
   onGoDashboard: () => void;
   /** When true (desktop, sidebar open, not in a full-width settings/projects
    *  view), the header's left zone widens to match the sidebar column and the
@@ -50,6 +53,7 @@ export function TopBar({
   loginRequired,
   isOffline,
   isDevBuild,
+  onOpenTips,
   onGoDashboard,
   sidebarColumnVisible,
   rightColumnVisible,
@@ -58,11 +62,12 @@ export function TopBar({
     const items: OverflowItem[] = [
       { label: "Help", onClick: onOpenHelp },
       { label: "Show tutorial", onClick: onStartTutorial },
+      { label: "Tips", onClick: onOpenTips },
       { label: "About", onClick: onOpenAbout },
     ];
     if (loginRequired) items.push({ label: "Sign out", onClick: onLogout });
     return items;
-  }, [onOpenHelp, onStartTutorial, onOpenAbout, onLogout, loginRequired]);
+  }, [onOpenHelp, onStartTutorial, onOpenTips, onOpenAbout, onLogout, loginRequired]);
 
   return (
     <header {...tourAnchor(TOUR_ANCHORS.topbar)} className="h-12 bg-surface-850 flex items-stretch shrink-0">

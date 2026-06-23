@@ -1,8 +1,14 @@
 import { useEffect, useRef, useState } from "react";
 import { fetchAbout } from "../lib/api";
+import { writeClipboard } from "../lib/clipboard";
+import { reportError, reportInfo } from "../lib/toastBus";
 
 interface Props {
   onClose: () => void;
+  /** Id of the currently-open session, or null on the dashboard / no session.
+   *  When set, the modal shows a "Copy session id" row; the id is otherwise
+   *  unreachable in a PWA install where the URL bar is hidden. */
+  sessionId: string | null;
 }
 
 interface LinkRow {
@@ -53,7 +59,7 @@ function buildFeedbackUrl(version: string | null): string {
   return `https://github.com/agent-of-empires/agent-of-empires/issues/new?${params.toString()}`;
 }
 
-export function AboutModal({ onClose }: Props) {
+export function AboutModal({ onClose, sessionId }: Props) {
   const closeRef = useRef<HTMLButtonElement>(null);
   const [version, setVersion] = useState<string | null>(null);
 
@@ -100,6 +106,27 @@ export function AboutModal({ onClose }: Props) {
           <p className="text-sm text-text-secondary">
             Terminal session manager for parallel AI coding agents. Open source, cross-platform, sandboxed.
           </p>
+
+          {sessionId && (
+            <button
+              type="button"
+              onClick={async () => {
+                const ok = await writeClipboard(sessionId);
+                if (ok) reportInfo("Copied session id");
+                else reportError("Copy failed");
+              }}
+              className="w-full flex items-center justify-between gap-3 px-3 py-2 rounded-md bg-surface-900 border border-surface-700/50 hover:border-surface-700 hover:bg-surface-850 transition-colors group cursor-pointer text-left"
+              title="Copy session id to clipboard"
+              aria-label="Copy session id"
+            >
+              <span className="font-mono text-[11px] uppercase tracking-wider text-text-muted shrink-0">
+                Session id
+              </span>
+              <span className="text-sm text-text-secondary group-hover:text-text-primary font-mono truncate">
+                {sessionId}
+              </span>
+            </button>
+          )}
 
           <div className="space-y-2">
             {LINKS.map((link) => (
