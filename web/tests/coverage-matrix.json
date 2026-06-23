@@ -2524,6 +2524,13 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
+      "id": "sidebar.auto-name-action",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/sidebar-auto-name.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
       "id": "sidebar.multi-select-logic",
       "kind": "vitest",
       "risk": "high",
