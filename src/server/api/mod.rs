@@ -38,11 +38,12 @@ pub use mcp::{drop_mcp_server, get_mcp_servers, keep_mcp_server, resolve_mcp_con
 pub use projects::{create_project, delete_project, list_projects, update_project};
 pub use sessions::{
     create_session, delete_session, ensure_container_terminal, ensure_session, ensure_terminal,
-    get_recent_projects, list_sessions, preview_volume_ignores_globs, read_output, rename_session,
-    send_message, session_diff_file, session_diff_files, set_worktree_name, start_session,
-    stop_session, update_session_archive, update_session_diff_base, update_session_group,
-    update_session_notifications, update_session_pin, update_session_snooze, update_session_unread,
-    update_workspace_ordering, CleanupDefaults, OutputQuery, SendMessageRequest, SessionResponse,
+    force_smart_rename, get_recent_projects, list_sessions, preview_volume_ignores_globs,
+    read_output, rename_session, send_message, session_diff_file, session_diff_files,
+    set_worktree_name, start_session, stop_session, update_session_archive,
+    update_session_diff_base, update_session_group, update_session_notifications,
+    update_session_pin, update_session_snooze, update_session_unread, update_workspace_ordering,
+    CleanupDefaults, OutputQuery, SendMessageRequest, SessionResponse,
 };
 // Shared by the status poll loop's auto-unread persistence; not a route handler.
 pub(crate) use sessions::persist_session_update;
@@ -165,6 +166,7 @@ mod tests {
                     "update_session_snooze",
                     "update_session_unread",
                     "stop_session",
+                    "force_smart_rename",
                     "start_session",
                     "update_workspace_ordering",
                 ],

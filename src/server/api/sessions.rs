@@ -110,6 +110,15 @@ pub struct SessionResponse {
     /// `session::smart_rename`.
     #[serde(default)]
     pub smart_rename: crate::session::smart_rename::SmartRenameState,
+    /// Whether the session still carries its auto-generated civilization name.
+    /// The sidebar gates the manual "Auto-name now" action on this (it only
+    /// targets a still-default session, never overwriting a chosen title), and
+    /// it is a more reliable signal than `smart_rename`: a timed-out one-shot
+    /// stays `pending` while an unusable-output one goes `inactive`, but both
+    /// leave the name default and recoverable. Populated by `list_sessions`;
+    /// single-session responses leave it `false`.
+    #[serde(default)]
+    pub default_name: bool,
     pub has_terminal: bool,
     pub profile: String,
     pub cleanup_defaults: CleanupDefaults,
@@ -305,6 +314,8 @@ impl SessionResponse {
             tie_workdir_to_name: false,
             // Overlaid in list_sessions; single-session responses stay inactive.
             smart_rename: crate::session::smart_rename::SmartRenameState::Inactive,
+            // Overlaid in list_sessions; single-session responses stay false.
+            default_name: false,
             has_terminal: inst.terminal_info.is_some(),
             profile: inst.source_profile.clone(),
             cleanup_defaults: CleanupDefaults {
@@ -593,6 +604,7 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
         let mut cfg_cache: HashMap<String, (bool, String, HashMap<String, String>)> =
             HashMap::new();
         for (resp, inst) in sessions.iter_mut().zip(instances.iter()) {
+            resp.default_name = crate::session::civilizations::is_default_civ_name(&inst.title);
             if inflight.contains(&inst.id) {
                 resp.smart_rename = SmartRenameState::Running;
                 continue;
@@ -2119,6 +2131,77 @@ pub async fn update_session_archive(
         }
     };
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
+}
+
+/// `POST /api/sessions/:id/smart-rename`. Manual "Auto-name now" recovery for
+/// a structured-view session whose automatic smart rename never landed (the
+/// one-shot timed out, returned unusable output, or the daemon restarted with
+/// the in-memory attempted set cleared). Clears the per-session attempted gate
+/// and re-runs the one-shot against the session's first prompt.
+///
+/// Only targets a still-default-named session: a session the user (or a prior
+/// rename) already named is left alone, so this never overwrites a chosen
+/// title. The actual rename runs detached and best-effort, exactly like the
+/// prompt-handler trigger; a `202` means "re-run started", not "renamed".
+pub async fn force_smart_rename(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Some(resp) = super::acp::read_only_block(&state) {
+        return resp;
+    }
+
+    let (title, structured) = {
+        let instances = state.instances.read().await;
+        let Some(inst) = instances.iter().find(|i| i.id == id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "message": "Session not found" })),
+            )
+                .into_response();
+        };
+        (inst.title.clone(), inst.is_structured())
+    };
+
+    if !structured {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "message": "Session is not a structured-view session" })),
+        )
+            .into_response();
+    }
+    if !crate::session::civilizations::is_default_civ_name(&title) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "message": "Session already has a custom name" })),
+        )
+            .into_response();
+    }
+    let Some(first_message) = state.acp_event_store.first_user_prompt(&id) else {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "message": "No prompt to name this session from yet" })),
+        )
+            .into_response();
+    };
+
+    // Clear the attempted gate so try_smart_rename does not short-circuit on a
+    // prior failed attempt. The inflight guard inside try_smart_rename still
+    // prevents a concurrent one-shot for the same session.
+    {
+        let mut attempted = state
+            .smart_rename_attempted
+            .lock()
+            .expect("smart_rename_attempted poisoned");
+        attempted.remove(&id);
+    }
+
+    tokio::spawn(crate::session::smart_rename::try_smart_rename(
+        state.clone(),
+        id.clone(),
+        first_message,
+    ));
+    StatusCode::ACCEPTED.into_response()
 }
 
 /// Stop a session, matching the TUI's `x` keybind: kill the tmux pane and
@@ -6985,6 +7068,7 @@ mod workspace_ordering_tests {
             has_managed_worktree: false,
             tie_workdir_to_name: false,
             smart_rename: crate::session::smart_rename::SmartRenameState::Inactive,
+            default_name: false,
             has_terminal: false,
             profile: "default".to_string(),
             cleanup_defaults: CleanupDefaults {

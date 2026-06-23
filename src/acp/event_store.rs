@@ -1175,6 +1175,42 @@ impl EventStore {
         json.and_then(|s| serde_json::from_str(&s).ok())
     }
 
+    /// Text of the session's first `UserPromptSent` event, if any. The manual
+    /// "Auto-name now" recovery re-runs smart rename against the original
+    /// intent (the first prompt), so it reads the earliest prompt here rather
+    /// than depending on the in-memory prompt that the original auto-trigger
+    /// saw. Returns `None` when the session has no prompt event (e.g. the first
+    /// one was pruned on a very long session), which the caller treats as
+    /// "nothing to rename from".
+    pub fn first_user_prompt(&self, session_id: &str) -> Option<String> {
+        let conn = match self.conn.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let json: Option<String> = conn
+            .query_row(
+                "SELECT event_json FROM acp_events
+                 WHERE session_id = ?1
+                   AND json_extract(event_json, '$.UserPromptSent') IS NOT NULL
+                 ORDER BY seq ASC
+                 LIMIT 1",
+                params![session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .unwrap_or_else(|e| {
+                warn!(
+                    target: "acp.event_store",
+                    "first_user_prompt query for {session_id}: {e}"
+                );
+                None
+            });
+        match json.and_then(|s| serde_json::from_str::<Event>(&s).ok()) {
+            Some(Event::UserPromptSent { text, .. }) => Some(text),
+            _ => None,
+        }
+    }
+
     /// Nonces of `ApprovalRequested` events for the session that lack a
     /// later `ApprovalResolved` with the same nonce. Used on reattach
     /// to surface "this approval card is dead, the previous daemon's
@@ -1634,6 +1670,27 @@ mod tests {
                 size: 7,
             }],
         }
+    }
+
+    #[test]
+    fn first_user_prompt_returns_earliest_prompt_text() {
+        let (_tmp, store) = open_store(1000);
+        let prompt = |text: &str| Event::UserPromptSent {
+            text: text.into(),
+            attachments: vec![],
+        };
+        // A session with no prompt yet => None (manual rename has nothing to
+        // name from).
+        assert!(store.first_user_prompt("s-1").is_none());
+        // Earliest UserPromptSent by seq wins, even when recorded out of order.
+        store.record("s-1", 2, &prompt("second prompt")).unwrap();
+        store.record("s-1", 1, &prompt("first prompt")).unwrap();
+        assert_eq!(
+            store.first_user_prompt("s-1").as_deref(),
+            Some("first prompt")
+        );
+        // Scoped per session.
+        assert!(store.first_user_prompt("s-2").is_none());
     }
 
     #[test]
