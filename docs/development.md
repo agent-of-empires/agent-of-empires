@@ -167,6 +167,8 @@ Some integration tests require `tmux` to be available and will skip if it's not 
 
 ## Demo GIFs (rarely touched)
 
-**TUI demo** (`docs/assets/demo.gif`): uses [VHS](https://github.com/charmbracelet/vhs). `brew install vhs`, `cargo build --release --features serve`, then `vhs assets/demo.tape` from the repo root. The tape runs `aoe -p demo` and cleans its own demo profile, so your real profile is untouched.
+All three demos show the same flow on a different surface: create a real Claude Code session, send a message, and watch its status update in the sidebar. They are recorded against a live `aoe` (no mocks) by driving it with Playwright and converting the WebM to GIF via ffmpeg. Both recorders document their full setup recipe (isolated `$HOME`/`XDG_CONFIG_HOME` with Claude credentials, a scratch git repo, the `claude-agent-acp` adapter) at the top of the file.
 
-**Web dashboard GIFs** (`docs/assets/web-{desktop,mobile}.gif`): recorded against a real `aoe serve` with real opencode sessions (no mocks) by `web/scripts/record-web-demo.mjs`, which drives the live dashboard with Playwright and converts WebM to GIF via ffmpeg. The recipe (build with `--features serve`, set up an isolated `$HOME`/`XDG_CONFIG_HOME` profile with two scratch git repos + two `opencode` sessions, `aoe serve --no-auth`, then run the recorder per viewport) is at the top of that script. opencode's free tier needs no credentials, so recordings get real LLM responses; reset between runs with `HOME=$SANDBOX/home tmux kill-server`.
+**TUI demo** (`docs/assets/demo.gif`): `web/scripts/record-tui-demo.mjs` runs `aoe` inside [ttyd](https://github.com/tsl0922/ttyd) and creates a session that launches into live mode. Needs the profile's `new_session_attach_mode = "live_send"`.
+
+**Web dashboard GIFs** (`docs/assets/web-{desktop,mobile}.gif`): `web/scripts/record-web-demo.mjs --viewport desktop|mobile --project <repo>` drives the structured (ACP) view against a real `aoe serve --no-auth`.

@@ -56,9 +56,18 @@ See the [full features inventory](https://www.agent-of-empires.com/docs/features
 
 Access your agents from any browser. The real agent terminal renders in the page; switch sessions, type into the terminal, and review diffs without leaving the tab. Press `R` in the TUI to start the server, or see the [web dashboard guide](https://www.agent-of-empires.com/guides/web-dashboard/) for details.
 
-<p align="center">
-  <img src="docs/assets/web-desktop.gif" alt="Web dashboard" width="800">
-</p>
+<table align="center">
+  <tr>
+    <td align="center" valign="middle">
+      <img src="docs/assets/web-desktop.gif" alt="Web dashboard on a laptop" width="560">
+      <br><sub><b>Desktop</b> — full dashboard, terminal, and diffs</sub>
+    </td>
+    <td align="center" valign="middle">
+      <img src="docs/assets/web-mobile.gif" alt="Web dashboard on a phone" width="200">
+      <br><sub><b>Phone</b> — structured view</sub>
+    </td>
+  </tr>
+</table>
 
 ## How It Works
 

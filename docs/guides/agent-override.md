@@ -8,7 +8,7 @@ or under a sandbox such as [nono](https://github.com/always-further/nono/).
 
 ### Via the TUI
 
-The "Agent Command Override" setting can be found under the "Session" setting group.
+The "Agent Command Override" setting can be found under the "Agents" setting group.
 
 ![](../assets/tui_session_settings.png)
 
