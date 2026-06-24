@@ -2,8 +2,8 @@
 
 The stable types a plugin author (and the in-tree host) compiles against for
 the [Agent of Empires](https://github.com/agent-of-empires/agent-of-empires)
-plugin system: the `aoe-plugin.toml` manifest schema (`PluginManifest` and its
-contribution types), the `Capability` set, and the `PluginId` newtype.
+plugin system: the `aoe-plugin.toml` manifest schema (`PluginManifest`) and the
+`PluginId` newtype.
 
 Plugins do not depend on this crate to run; a worker speaks newline-delimited
 JSON-RPC over stdio in any language. This crate is the host-side schema and the
