@@ -158,7 +158,8 @@ fn test_serve_refuses_when_web_plugin_disabled() {
         "serve must start once aoe.web is enabled:\n{}",
         String::from_utf8_lossy(&started.stderr)
     );
-    h.run_cli(&["serve", "--stop"]);
+    let stopped = h.run_cli(&["serve", "--stop"]);
+    assert!(stopped.status.success(), "serve --stop must succeed");
 }
 
 /// The command palette opens the plugin manager, which lists the bundled
