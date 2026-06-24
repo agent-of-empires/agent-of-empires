@@ -9,6 +9,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::cli::truncate_id;
 use crate::containers::{self, DockerContainer};
 use crate::tmux;
 
@@ -793,18 +794,53 @@ fn override_if_distinct(stored: Option<&str>, fresh: String) -> Option<String> {
     }
 }
 
+fn tmux_env_session_name_for_instance_id(instance_id: &str) -> Option<String> {
+    let suffix = format!("_{}", truncate_id(instance_id, 8));
+    let output = std::process::Command::new("tmux")
+        .args(["list-sessions", "-F", "#{session_name}"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let mut agent = None;
+    let mut terminal = None;
+    let mut container = None;
+    for name in String::from_utf8_lossy(&output.stdout).lines() {
+        if !name.ends_with(&suffix)
+            || name.starts_with(tmux::TOOL_PREFIX)
+            || crate::tmux::utils::is_pane_dead(name)
+        {
+            continue;
+        }
+
+        if name.starts_with(tmux::TERMINAL_PREFIX) {
+            terminal.get_or_insert_with(|| name.to_string());
+        } else if name.starts_with(tmux::CONTAINER_TERMINAL_PREFIX) {
+            container.get_or_insert_with(|| name.to_string());
+        } else if name.starts_with(tmux::SESSION_PREFIX) {
+            agent.get_or_insert_with(|| name.to_string());
+        }
+    }
+
+    agent.or(terminal).or(container)
+}
+
 /// Publish a captured session ID to the tmux environment only.
 ///
 /// Background threads (poller on_change) call this so that
 /// `build_exclusion_set()` on other instances can see the captured ID
 /// without racing with the TUI thread's `save()`.
-fn publish_session_to_tmux_env(tmux_session_name: &str, session_id: &str) {
-    if let Err(e) = crate::tmux::env::set_hidden_env(
-        tmux_session_name,
-        crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
-        session_id,
-    ) {
-        tracing::warn!(target: "session.store", "Failed to write captured session ID to tmux env: {}", e);
+fn publish_session_to_tmux_env(tmux_session_name: &str, instance_id: &str, session_id: &str) {
+    for (key, value) in [
+        (crate::tmux::env::AOE_INSTANCE_ID_KEY, instance_id),
+        (crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY, session_id),
+    ] {
+        if let Err(e) = crate::tmux::env::set_hidden_env(tmux_session_name, key, value) {
+            tracing::warn!(target: "session.store", "Failed to write {} to tmux env: {}", key, e);
+            return;
+        }
     }
 }
 
@@ -1689,6 +1725,10 @@ impl Instance {
         tmux::Session::new(&self.id, &self.title)
     }
 
+    pub(crate) fn tmux_env_session_name(&self) -> Option<String> {
+        tmux_env_session_name_for_instance_id(&self.id)
+    }
+
     pub fn terminal_tmux_session(&self) -> Result<tmux::TerminalSession> {
         tmux::TerminalSession::new(&self.id, &self.title)
     }
@@ -1756,9 +1796,7 @@ impl Instance {
     /// `exists()` alone is insufficient: a pane can exist while its agent
     /// has died. Used by recovery, status polling, and TUI reload.
     pub fn has_live_tmux_pane(&self) -> bool {
-        self.tmux_session()
-            .map(|s| s.exists() && !s.is_pane_dead())
-            .unwrap_or(false)
+        self.tmux_env_session_name().is_some()
     }
 
     pub fn start_container_terminal_with_size(&mut self, size: Option<(u16, u16)>) -> Result<()> {
@@ -2698,8 +2736,8 @@ impl Instance {
         let tool = self.tool.as_str();
 
         let tmux_session_name = self
-            .tmux_session()
-            .map(|s| s.name().to_string())
+            .tmux_env_session_name()
+            .or_else(|| self.tmux_session().ok().map(|s| s.name().to_string()))
             .unwrap_or_default();
         let mut poller = SessionPoller::new(tmux_session_name.clone());
         let instance_id = self.id.clone();
@@ -2863,15 +2901,11 @@ impl Instance {
         };
 
         let cb_instance_id = self.id.clone();
-        let cb_tmux_name = self
-            .tmux_session()
-            .map(|s| s.name().to_string())
-            .unwrap_or_default();
 
         let on_change: Box<dyn Fn(&str) + Send + 'static> = Box::new(move |new_id: &str| {
             tracing::info!(target: "session.store", "Session ID changed for {}: {}", cb_instance_id, new_id);
-            if !cb_tmux_name.is_empty() {
-                publish_session_to_tmux_env(&cb_tmux_name, new_id);
+            if let Some(tmux_name) = tmux_env_session_name_for_instance_id(&cb_instance_id) {
+                publish_session_to_tmux_env(&tmux_name, &cb_instance_id, new_id);
             }
         });
 
@@ -7689,8 +7723,9 @@ mod tests {
     }
 
     mod publish_captured_sid {
-        use super::super::{Instance, ResumeIntent};
+        use super::super::{publish_session_to_tmux_env, Instance, ResumeIntent};
         use serial_test::serial;
+        use std::collections::HashSet;
         use std::process::Command;
         use tempfile::{tempdir, TempDir};
 
@@ -7701,7 +7736,14 @@ mod tests {
 
         impl TmuxSession {
             fn create(id: &str, title: &str) -> Self {
-                let name = crate::tmux::Session::generate_name(id, title);
+                Self::create_named(crate::tmux::Session::generate_name(id, title))
+            }
+
+            fn create_terminal(id: &str, title: &str) -> Self {
+                Self::create_named(crate::tmux::TerminalSession::generate_name(id, title))
+            }
+
+            fn create_named(name: String) -> Self {
                 let _ = Command::new("tmux")
                     .args(["kill-session", "-t", &name])
                     .output();
@@ -7712,6 +7754,7 @@ mod tests {
                 assert!(status.success(), "tmux new-session failed for {}", name);
                 Self(name)
             }
+
             fn name(&self) -> &str {
                 &self.0
             }
@@ -7743,6 +7786,10 @@ mod tests {
             crate::tmux::env::get_hidden_env(name, crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY)
         }
 
+        fn instance_env(name: &str) -> Option<String> {
+            crate::tmux::env::get_hidden_env(name, crate::tmux::env::AOE_INSTANCE_ID_KEY)
+        }
+
         fn make_inst(profile: &str, title: &str) -> Instance {
             let mut inst = Instance::new(title, "/tmp/x");
             inst.tool = "claude".to_string();
@@ -7764,6 +7811,52 @@ mod tests {
                     Ok(())
                 })
                 .unwrap();
+        }
+
+        #[test]
+        #[serial]
+        fn poller_publish_writes_terminal_session_env() {
+            if skip_if_no_tmux() {
+                return;
+            }
+
+            let mut inst = make_inst("publish-terminal", "tailscale-operator-followup");
+            inst.terminal_info = Some(crate::session::TerminalInfo { created: true });
+            let tmux = TmuxSession::create_terminal(&inst.id, &inst.title);
+            inst.title = "renamed-after-terminal-create".to_string();
+
+            assert_eq!(inst.tmux_env_session_name().as_deref(), Some(tmux.name()));
+            assert!(tmux.name().starts_with(crate::tmux::TERMINAL_PREFIX));
+            assert!(tmux.name().contains("tailscale-operator-f"));
+
+            let agent_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+            publish_session_to_tmux_env(tmux.name(), &inst.id, VALID_SID);
+
+            assert!(captured_env(&agent_name).is_none());
+            assert_eq!(instance_env(tmux.name()).as_deref(), Some(inst.id.as_str()));
+            assert_eq!(captured_env(tmux.name()).as_deref(), Some(VALID_SID));
+        }
+
+        #[test]
+        #[serial]
+        fn terminal_publish_feeds_exclusion_set_for_other_instances() {
+            if skip_if_no_tmux() {
+                return;
+            }
+
+            let mut peer = make_inst("publish-terminal-exclusion", "peer-terminal");
+            peer.terminal_info = Some(crate::session::TerminalInfo { created: true });
+            let tmux = TmuxSession::create_terminal(&peer.id, &peer.title);
+
+            publish_session_to_tmux_env(tmux.name(), &peer.id, PEER_SID);
+
+            let extra = HashSet::new();
+            let other_exclusion =
+                crate::session::capture::compose_exclusion("other-instance", &extra);
+            assert!(other_exclusion.contains(PEER_SID));
+
+            let own_exclusion = crate::session::capture::compose_exclusion(&peer.id, &extra);
+            assert!(!own_exclusion.contains(PEER_SID));
         }
 
         #[test]

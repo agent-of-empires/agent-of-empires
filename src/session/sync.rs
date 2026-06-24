@@ -211,17 +211,9 @@ fn publish_tmux_env(
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
             continue;
         };
-        let tmux_name = match inst.tmux_session() {
-            Ok(s) if s.exists() && !s.is_pane_dead() => s.name().to_string(),
-            Ok(_) => continue,
-            Err(e) => {
-                tracing::warn!(
-                    target: "session.sync",
-                    instance = %id,
-                    "Skipping tmux env publish; tmux_session() error: {e}",
-                );
-                continue;
-            }
+        let tmux_name = match inst.tmux_env_session_name() {
+            Some(name) => name,
+            None => continue,
         };
         match &inst.agent_session_id {
             Some(sid) => set_batch.push((

@@ -13424,7 +13424,14 @@ mod apply_session_id_updates {
 
     impl TmuxSession {
         fn create(id: &str, title: &str) -> Self {
-            let name = crate::tmux::Session::generate_name(id, title);
+            Self::create_named(crate::tmux::Session::generate_name(id, title))
+        }
+
+        fn create_terminal(id: &str, title: &str) -> Self {
+            Self::create_named(crate::tmux::TerminalSession::generate_name(id, title))
+        }
+
+        fn create_named(name: String) -> Self {
             let _ = Command::new("tmux")
                 .args(["kill-session", "-t", &name])
                 .output();
@@ -13527,6 +13534,31 @@ mod apply_session_id_updates {
 
         let updated = view.apply_session_id_updates();
         assert!(updated, "Applied CAS must report a touch");
+        assert_eq!(captured_env(tmux.name()).as_deref(), Some(NEW_SID));
+    }
+
+    #[test]
+    #[serial]
+    fn apply_session_id_updates_publishes_to_terminal_session() {
+        if skip_if_no_tmux() {
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        setup_test_home(&temp);
+
+        let profile = "apply-terminal-publish";
+        let mut inst = fresh_instance(profile, "terminal-post-cas");
+        inst.terminal_info = Some(crate::session::TerminalInfo { created: true });
+        let mut view = build_view_with_inst(profile, &inst);
+
+        let tmux = TmuxSession::create_terminal(&inst.id, &inst.title);
+        let agent_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+
+        attach_poller_with_update(&mut view, &inst.id, NEW_SID);
+
+        let updated = view.apply_session_id_updates();
+        assert!(updated, "Applied CAS must report a touch");
+        assert!(captured_env(&agent_name).is_none());
         assert_eq!(captured_env(tmux.name()).as_deref(), Some(NEW_SID));
     }
 

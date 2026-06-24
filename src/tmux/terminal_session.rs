@@ -191,6 +191,10 @@ impl TerminalSession {
         PairedTerminal::generate_name(TerminalKind::Host, id, title)
     }
 
+    pub fn name(&self) -> &str {
+        &self.inner.name
+    }
+
     pub fn exists(&self) -> bool {
         self.inner.exists()
     }
@@ -244,6 +248,10 @@ impl ContainerTerminalSession {
 
     pub fn generate_name(id: &str, title: &str) -> String {
         PairedTerminal::generate_name(TerminalKind::Container, id, title)
+    }
+
+    pub fn name(&self) -> &str {
+        &self.inner.name
     }
 
     pub fn exists(&self) -> bool {

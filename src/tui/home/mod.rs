@@ -1572,9 +1572,8 @@ impl HomeView {
             let mut set_batch: Vec<(String, String, String)> = Vec::new();
             let mut unset_batch: Vec<(String, String)> = Vec::new();
             for inst in &view.instances {
-                let tmux_name = match inst.tmux_session() {
-                    Ok(s) if s.exists() && !s.is_pane_dead() => s.name().to_string(),
-                    _ => continue,
+                let Some(tmux_name) = inst.tmux_env_session_name() else {
+                    continue;
                 };
 
                 set_batch.push((

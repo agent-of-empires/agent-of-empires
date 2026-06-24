@@ -745,9 +745,9 @@ pub(crate) fn compose_exclusion(
 
 /// Build the set of session IDs already claimed by other live AoE instances.
 ///
-/// Reads every other AoE-prefixed tmux session's hidden env to find which
-/// session IDs are currently bound to which instance, and returns the set
-/// of captured IDs that belong to instances OTHER than `current_instance_id`.
+/// Reads every other live AoE tmux session's hidden env to find which session
+/// IDs are currently bound to which instance, and returns the set of captured
+/// IDs that belong to instances OTHER than `current_instance_id`.
 /// Used by post-launch poll closures to avoid re-importing another
 /// instance's session via filesystem scan.
 ///
@@ -769,8 +769,7 @@ fn build_exclusion_set(current_instance_id: &str) -> HashSet<String> {
         .lines()
         .filter(|name| {
             name.starts_with(crate::tmux::SESSION_PREFIX)
-                && !name.starts_with(crate::tmux::TERMINAL_PREFIX)
-                && !name.starts_with(crate::tmux::CONTAINER_TERMINAL_PREFIX)
+                && !name.starts_with(crate::tmux::TOOL_PREFIX)
         })
         .collect();
 
@@ -785,7 +784,11 @@ fn build_exclusion_set(current_instance_id: &str) -> HashSet<String> {
 
     let other_sessions: Vec<&str> = instance_ids
         .iter()
-        .filter(|(_, owner)| owner.as_deref() != Some(current_instance_id))
+        .filter(|(_, owner)| {
+            owner
+                .as_deref()
+                .is_some_and(|owner| owner != current_instance_id)
+        })
         .map(|(name, _)| name.as_str())
         .collect();
 
