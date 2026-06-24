@@ -106,7 +106,6 @@ impl SettingsView {
 
         // Normal mode
         match (key.code, key.modifiers) {
-
             // Close from anywhere
             (KeyCode::Char('q'), _) => {
                 if self.has_changes {
