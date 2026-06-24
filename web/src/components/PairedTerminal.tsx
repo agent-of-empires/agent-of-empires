@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import { LiveTerminalView } from "./LiveTerminalView";
 import type { SessionResponse } from "../lib/types";
 
@@ -11,13 +11,10 @@ type ShellMode = "host" | "container";
 export function PairedShellPane({ session, sessionId }: { session: SessionResponse | null; sessionId: string | null }) {
   const [shellMode, setShellMode] = useState<ShellMode>("host");
   const isSandboxed = session?.is_sandboxed ?? false;
-
-  // Reset to host mode if container becomes unavailable
-  useEffect(() => {
-    if (!isSandboxed && shellMode === "container") {
-      setShellMode("host");
-    }
-  }, [isSandboxed, shellMode]);
+  // Container mode is only valid while the session is sandboxed; derive the
+  // effective mode during render rather than resetting state in an effect, so
+  // a session that loses its container falls back to host without a stale tab.
+  const effectiveMode: ShellMode = isSandboxed ? shellMode : "host";
 
   const shellTabClass = (active: boolean) =>
     `text-[12px] px-2 py-0.5 rounded cursor-pointer transition-colors ${
@@ -28,11 +25,11 @@ export function PairedShellPane({ session, sessionId }: { session: SessionRespon
     <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
       <div className="flex items-center gap-1 px-2 py-1 bg-surface-900 border-b border-surface-700/20 shrink-0">
         <span className="text-xs text-text-dim mr-1">Shell</span>
-        <button onClick={() => setShellMode("host")} className={shellTabClass(shellMode === "host")}>
+        <button onClick={() => setShellMode("host")} className={shellTabClass(effectiveMode === "host")}>
           Host
         </button>
         {isSandboxed && (
-          <button onClick={() => setShellMode("container")} className={shellTabClass(shellMode === "container")}>
+          <button onClick={() => setShellMode("container")} className={shellTabClass(effectiveMode === "container")}>
             Container
           </button>
         )}
@@ -44,9 +41,9 @@ export function PairedShellPane({ session, sessionId }: { session: SessionRespon
         </div>
       ) : (
         <LiveTerminalView
-          key={`${sessionId}-${shellMode}`}
+          key={`${sessionId}-${effectiveMode}`}
           session={session}
-          surface={shellMode === "container" ? "paired-container" : "paired-host"}
+          surface={effectiveMode === "container" ? "paired-container" : "paired-host"}
         />
       )}
     </div>
