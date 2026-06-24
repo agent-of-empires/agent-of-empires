@@ -7,7 +7,9 @@
 //! return in follow-up PRs.
 
 pub mod install;
+pub mod lockfile;
 pub mod registry;
+pub mod source;
 pub mod view;
 
 use std::sync::{Arc, RwLock};
