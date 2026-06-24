@@ -96,8 +96,9 @@ pub struct Config {
     pub plugins: std::collections::BTreeMap<String, PluginConfig>,
 }
 
-/// Configuration for one bundled plugin: whether it is enabled, plus its
-/// schema-free persisted settings.
+/// Configuration for one plugin: whether it is enabled, its install source and
+/// capability grant (external plugins only), plus its schema-free persisted
+/// settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginConfig {
     /// Whether the plugin is active. A disabled plugin contributes nothing to
@@ -105,14 +106,41 @@ pub struct PluginConfig {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
 
+    /// Install source for an external plugin: a `gh:owner/repo[@ref]` slug or a
+    /// local path. Absent for builtins, which are compiled in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+
     /// The plugin's persisted settings (`[plugins."<id>".settings]`). Kept as
     /// an opaque `toml::Table` so values survive on disk even while the plugin
     /// is disabled; the typed schema that validates and renders them lands
-    /// with Tier 0 registries (#2094). Declared after `enabled` so the scalar
-    /// reads above the nested table; the toml serializer emits scalars before
-    /// subtables regardless, so the order is for readability. Empty is omitted.
+    /// with Tier 0 registries (#2094). The toml serializer emits scalars before
+    /// subtables regardless, so field order here is for readability. Empty is
+    /// omitted.
     #[serde(default, skip_serializing_if = "toml::Table::is_empty")]
     pub settings: toml::Table,
+
+    /// The capability grant the user approved for an external plugin, pinned to
+    /// the manifest hash it was approved against. Absent until granted;
+    /// builtins are auto-granted and never store one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant: Option<CapabilityGrant>,
+}
+
+/// A user's approval of an external plugin's requested capabilities, pinned to
+/// the exact manifest it was approved against. When the installed manifest hash
+/// later differs (an update that changed the capability set), the grant no
+/// longer applies and the plugin's runtime contributions stay inactive until
+/// re-approved.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapabilityGrant {
+    /// `sha256:<hex>` of the manifest bytes this grant was approved against.
+    pub manifest_hash: String,
+    /// The capabilities the user approved.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    /// When the user approved the grant.
+    pub granted_at: chrono::DateTime<chrono::Utc>,
 }
 
 fn default_enabled() -> bool {
@@ -123,7 +151,9 @@ impl Default for PluginConfig {
     fn default() -> Self {
         Self {
             enabled: default_enabled(),
+            source: None,
             settings: toml::Table::new(),
+            grant: None,
         }
     }
 }

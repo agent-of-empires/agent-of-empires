@@ -34,10 +34,10 @@ pub use crate::status_hooks::StatusHookConfig;
 pub(crate) use capture::is_valid_session_id;
 pub use config::{
     get_telemetry_settings, get_update_settings, load_config, save_config,
-    validate_snooze_duration, ClickAction, Config, ContainerRuntimeName, DefaultTerminalMode,
-    GroupByMode, NewSessionAttachMode, PluginConfig, RowTagMode, SandboxConfig, SessionConfig,
-    TelemetryConfig, ThemeConfig, TmuxClipboardMode, TmuxMouseMode, TmuxStatusBarMode,
-    UpdatesConfig, VolumeIgnoresStrategy, WorktreeConfig,
+    validate_snooze_duration, CapabilityGrant, ClickAction, Config, ContainerRuntimeName,
+    DefaultTerminalMode, GroupByMode, NewSessionAttachMode, PluginConfig, RowTagMode,
+    SandboxConfig, SessionConfig, TelemetryConfig, ThemeConfig, TmuxClipboardMode, TmuxMouseMode,
+    TmuxStatusBarMode, UpdatesConfig, VolumeIgnoresStrategy, WorktreeConfig,
 };
 pub(crate) use environment::user_shell;
 pub use environment::{validate_env_entries, validate_env_entry};
