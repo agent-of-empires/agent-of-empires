@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { LiveTerminalView } from "./LiveTerminalView";
 import type { SessionResponse } from "../lib/types";
 
@@ -11,6 +11,13 @@ type ShellMode = "host" | "container";
 export function PairedShellPane({ session, sessionId }: { session: SessionResponse | null; sessionId: string | null }) {
   const [shellMode, setShellMode] = useState<ShellMode>("host");
   const isSandboxed = session?.is_sandboxed ?? false;
+
+  // Reset to host mode if container becomes unavailable
+  useEffect(() => {
+    if (!isSandboxed && shellMode === "container") {
+      setShellMode("host");
+    }
+  }, [isSandboxed, shellMode]);
 
   const shellTabClass = (active: boolean) =>
     `text-[12px] px-2 py-0.5 rounded cursor-pointer transition-colors ${
