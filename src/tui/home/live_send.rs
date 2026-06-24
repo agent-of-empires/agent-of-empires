@@ -1022,6 +1022,17 @@ pub fn translate(key: KeyEvent) -> LiveDispatch {
         return LiveDispatch::Send(TmuxKey::Literal(c.to_string()));
     }
 
+    // Shift+Enter: tmux delivers the `S-Enter` named key as a bare CR
+    // (0x0d), identical to plain Enter, so the agent can't tell them
+    // apart and submits instead of inserting a soft newline (#2316).
+    // Emit ESC+CR explicitly, the same bytes Option/Alt+Enter produces,
+    // which Claude Code (and other agents that follow the Meta+Enter
+    // convention) read as "insert newline". Scoped to the bare chord;
+    // Ctrl/Alt+Enter keep their existing named-key translation.
+    if key.code == KeyCode::Enter && shift && !ctrl && !alt {
+        return LiveDispatch::Send(TmuxKey::HexBytes(vec![0x1b, 0x0d]));
+    }
+
     // Named-key path: Shift IS meaningful (S-Up vs Up for editor text
     // selection). BackTab is shift+Tab semantically by its own keycode,
     // so it gets the no-shift prefix.
@@ -1096,6 +1107,32 @@ mod tests {
     // Exit-chord detection moved out of translate() into
     // handle_live_send_key. Translate now never emits Exit; the
     // chord-list tests below cover the configurable exit path.
+
+    #[test]
+    fn translate_shift_enter_emits_esc_cr() {
+        // tmux flattens `S-Enter` to a bare CR, so the agent can't tell
+        // it from plain Enter and submits. We remap Shift+Enter to ESC+CR
+        // (the Option/Alt+Enter newline bytes) so it inserts a soft
+        // newline instead of submitting (#2316).
+        match translate(k_mod(KeyCode::Enter, KeyModifiers::SHIFT)) {
+            LiveDispatch::Send(TmuxKey::HexBytes(bytes)) => {
+                assert_eq!(bytes, vec![0x1b, 0x0d]);
+            }
+            other => panic!("expected HexBytes([1b, 0d]) for Shift+Enter, got {other:?}"),
+        }
+        // Plain Enter still rides the named-key path unchanged.
+        assert_named(translate(k(KeyCode::Enter)), "Enter");
+        // Ctrl+Enter and Alt+Enter keep their existing named translation;
+        // only the bare Shift+Enter chord is remapped.
+        assert_named(
+            translate(k_mod(KeyCode::Enter, KeyModifiers::CONTROL)),
+            "C-Enter",
+        );
+        assert_named(
+            translate(k_mod(KeyCode::Enter, KeyModifiers::ALT)),
+            "M-Enter",
+        );
+    }
 
     #[test]
     fn translate_never_emits_exit_for_ctrl_q() {
