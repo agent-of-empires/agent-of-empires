@@ -2656,6 +2656,19 @@ impl HomeView {
     fn open_serve(&mut self) {
         #[cfg(feature = "serve")]
         {
+            let web_disabled = crate::plugin::registry()
+                .get("aoe.web")
+                .is_some_and(|p| !p.enabled);
+            if web_disabled {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Web dashboard disabled",
+                    "The aoe.web plugin is disabled, so the web dashboard cannot \
+                     be served.\n\n\
+                     Re-enable it in Settings > Plugins (or run \
+                     `aoe plugin enable aoe.web`), then press R again.",
+                ));
+                return;
+            }
             self.serve_view = Some(crate::tui::dialogs::ServeView::new());
         }
         #[cfg(not(feature = "serve"))]

@@ -192,7 +192,7 @@ impl PluginManagerDialog {
         let list = List::new(items)
             .highlight_style(
                 Style::default()
-                    .bg(theme.accent)
+                    .bg(theme.selection)
                     .add_modifier(Modifier::BOLD),
             )
             .highlight_symbol("> ");

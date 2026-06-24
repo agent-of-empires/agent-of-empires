@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 
 import { fetchPlugins, setPluginEnabled, type PluginListResponse, type PluginView } from "../../lib/api";
+import { reportInfo } from "../../lib/toastBus";
 
 /// Plugin management: list every known plugin (name, version, description,
 /// enabled state) and toggle it on or off. The toggle POSTs to
@@ -41,6 +42,12 @@ export function PluginsSettings() {
       if (result.kind === "ok") {
         // The server returns the refreshed list, so adopt it directly.
         setData(result.data);
+        // The serve gate is startup-only: disabling aoe.web rewrites config
+        // but the running daemon keeps serving until it restarts. Say so,
+        // otherwise the toggle looks like a no-op (#2311 testing feedback).
+        if (plugin.id === "aoe.web" && !enabled) {
+          reportInfo("Web dashboard stays up until aoe serve is restarted.");
+        }
       } else {
         // The toggle did not take effect; the checkbox is controlled by the
         // unchanged `plugin.enabled`, so the existing `data` already reflects

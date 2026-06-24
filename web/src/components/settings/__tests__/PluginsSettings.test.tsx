@@ -13,10 +13,15 @@ import type { PluginListResponse, PluginToggleResult } from "../../../lib/api";
 
 const fetchPlugins = vi.fn<[], Promise<PluginListResponse | null>>();
 const setPluginEnabled = vi.fn<[string, boolean], Promise<PluginToggleResult>>();
+const reportInfo = vi.fn<[string], void>();
 
 vi.mock("../../../lib/api", () => ({
   fetchPlugins: () => fetchPlugins(),
   setPluginEnabled: (id: string, enabled: boolean) => setPluginEnabled(id, enabled),
+}));
+
+vi.mock("../../../lib/toastBus", () => ({
+  reportInfo: (message: string) => reportInfo(message),
 }));
 
 // Imported after the mock is registered.
@@ -50,6 +55,7 @@ function listResponse(overrides: Partial<PluginListResponse> = {}): PluginListRe
 beforeEach(() => {
   fetchPlugins.mockReset();
   setPluginEnabled.mockReset();
+  reportInfo.mockReset();
   fetchPlugins.mockResolvedValue(listResponse());
 });
 
@@ -78,6 +84,42 @@ describe("PluginsSettings", () => {
     await waitFor(() => {
       expect((toggle as HTMLInputElement).checked).toBe(false);
     });
+  });
+
+  it("warns about the startup-only serve gate when aoe.web is disabled", async () => {
+    const web = {
+      id: "aoe.web",
+      name: "Web Dashboard",
+      version: "1.0.0",
+      description: "The web dashboard.",
+      enabled: true,
+      builtin: true,
+    };
+    fetchPlugins.mockResolvedValue(listResponse({ plugins: [web] }));
+    setPluginEnabled.mockResolvedValue({
+      kind: "ok",
+      data: listResponse({ plugins: [{ ...web, enabled: false }] }),
+    });
+
+    const { findByLabelText } = render(<PluginsSettings />);
+    fireEvent.click(await findByLabelText("Enable Web Dashboard"));
+
+    await waitFor(() => {
+      expect(reportInfo).toHaveBeenCalledWith("Web dashboard stays up until aoe serve is restarted.");
+    });
+  });
+
+  it("does not warn when a non-web plugin is disabled", async () => {
+    const disabled = listResponse({
+      plugins: [{ ...listResponse().plugins[0]!, enabled: false }, listResponse().plugins[1]!],
+    });
+    setPluginEnabled.mockResolvedValue({ kind: "ok", data: disabled });
+    const { findByLabelText } = render(<PluginsSettings />);
+    fireEvent.click(await findByLabelText("Enable Agent Status Detection"));
+    await waitFor(() => {
+      expect(setPluginEnabled).toHaveBeenCalledWith("aoe.status", false);
+    });
+    expect(reportInfo).not.toHaveBeenCalled();
   });
 
   it("surfaces the error message when a toggle is rejected", async () => {
