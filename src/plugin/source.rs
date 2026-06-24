@@ -73,11 +73,16 @@ impl PluginSource {
         }
     }
 
-    /// The `https://github.com/owner/repo.git` clone URL for a GitHub source.
+    /// The clone URL for a GitHub source. The host base defaults to
+    /// `https://github.com` and is overridable via `AOE_GITHUB_CLONE_BASE` (a
+    /// GitHub Enterprise host, or a local path/`file://` base in tests).
     pub fn github_clone_url(&self) -> Option<String> {
         match self {
             PluginSource::Github { owner, repo, .. } => {
-                Some(format!("https://github.com/{owner}/{repo}.git"))
+                let base = std::env::var("AOE_GITHUB_CLONE_BASE")
+                    .unwrap_or_else(|_| "https://github.com".to_string());
+                let base = base.trim_end_matches('/');
+                Some(format!("{base}/{owner}/{repo}.git"))
             }
             PluginSource::Local(_) => None,
         }
