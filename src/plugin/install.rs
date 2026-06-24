@@ -5,8 +5,8 @@ use anyhow::{bail, Result};
 
 use crate::session::{save_config, Config, PluginConfig};
 
-/// Set the enabled flag for a known plugin id in the global config, preserving
-/// any stored settings, then reload the registry so the change takes effect.
+/// Set the enabled flag for a known plugin id in the global config, then reload
+/// the registry so the change takes effect.
 pub fn set_enabled(plugin_id: &str, enabled: bool) -> Result<()> {
     let registry = super::registry();
     if registry.get(plugin_id).is_none() {
