@@ -220,6 +220,6 @@ mod tests {
         for _ in 0..30 {
             dialog.handle_key(key(KeyCode::Down));
         }
-        assert!(dialog.selected >= CORE_OPTIONS.len() - 1);
+        assert_eq!(dialog.selected, CORE_OPTIONS.len() - 1);
     }
 }
