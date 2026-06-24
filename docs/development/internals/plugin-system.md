@@ -106,9 +106,81 @@ dependency arrow runs consumer -> substrate):
   first consumer (`Schema::new("acp")` keeps the existing `acp_events` tables,
   so no migration).
 
+## Contribution schema (#2093)
+
+`PluginManifest` extends past identity to the contribution sections a plugin
+declares: `commands`, `keybinds`, `settings`, `themes`, `ui`, `status`,
+`panes`, and a `runtime` worker entrypoint. These are defined in
+`aoe-plugin-api` and parsed/validated by the host, but consumed by later issues
+(the settings registry in #2094, the runtime host in #2095, the
+command/keybind/UI surfaces in #2366). `api_version` is bumped to 2; an
+`api_version` 1 manifest still loads. Unknown top-level keys remain a hard
+parse error (`deny_unknown_fields`).
+
+The `runtime` section is one of two kinds: `command` (an argv launched from the
+plugin directory) or `release-binary` (a compiled worker shipped as a GitHub
+release asset). Only installation acts on `release-binary` today (it downloads
+the asset); launching either worker is #2095.
+
+## Capabilities and grants (#2093)
+
+Static contributions are not capabilities; a theme or a command needs no
+approval. A capability gates runtime access to a resource that can affect user
+data, host state, the OS, or the network. The v1 set
+(`aoe_plugin_api::KNOWN_CAPABILITIES`): `runtime.worker`, `session.read`,
+`session.write`, `config.read`, `config.write`, `process.spawn`, `net`,
+`fs.read`, `fs.write`, `clipboard.read`, `clipboard.write`, `notifications`. A
+plugin's own declared settings need no `config.*`; that gates host/global or
+other-plugin config.
+
+Capabilities are open strings (`CapabilityId`), so a follow-up can add one
+without an `api_version` bump. An unknown capability still parses (forward
+compatibility) but is rejected at install (`unsupported capability; upgrade
+aoe`), never silently granted.
+
+A grant (`PluginConfig.grant`, in `config.toml`) records the capabilities the
+user approved and is pinned to the `sha256` of the installed manifest bytes
+(`PluginManifest::hash_bytes`). The registry treats a community plugin as
+active only when enabled AND the grant covers the installed manifest (same hash,
+all declared capabilities present). A changed manifest, hence a changed hash or
+capability set, invalidates the grant: the plugin stays installed but inactive
+(`needs_reapproval`) until `aoe plugin update` re-prompts and re-approves.
+Builtins are first-party, auto-granted, and never store a grant.
+
+## External install, trust, and the lockfile (#2093)
+
+`aoe plugin install <source>` installs an external plugin under
+`<app_dir>/plugins/<id>/`; `aoe plugin` stays reserved for management (D4), so
+there is no web install path. A source is a `gh:owner/repo[@ref]` slug or a
+local directory (`src/plugin/source.rs`).
+
+`src/plugin/fetch.rs` stages a plugin before install. A GitHub source is
+`git clone`d (shallow when possible, a full clone plus checkout for a commit
+ref), the exact commit is resolved, and `.git` is stripped; the clone base
+defaults to `https://github.com` and is overridable via `AOE_GITHUB_CLONE_BASE`
+(a GitHub Enterprise host, or a local `file://` base in tests). A local source
+is copied (minus `.git` and symlinks). When the manifest declares a
+`release-binary` runtime, the matching release asset for the host platform
+(`${os}`/`${arch}`/`${version}` in the asset template) is downloaded via the
+GitHub client and unpacked (raw or `.tar.gz`) into the tree, made executable.
+The staging tree lives under the plugins dir so the final move into place is an
+atomic same-filesystem rename.
+
+Trust is host-assigned (`TrustLevel`): `builtin` (compiled in, auto-granted) or
+`community` (external, capabilities gated). An external plugin whose id sits in
+a reserved namespace (`aoe.*` / `agent-of-empires.*`, lifted only by featured
+verification in #2364) or collides with a builtin is rejected at install and
+skipped at load.
+
+`plugins.lock` (`<app_dir>/plugins.lock`, TOML, keyed by id, deterministic and
+timestamp-free like `Cargo.lock`) records each external plugin's resolved
+identity: source slug, requested ref, resolved commit, version, manifest hash,
+trust, and (for a release-binary) the release tag, asset name, and asset
+sha256.
+
 ## What comes next
 
 Each deferred piece returns as its own PR once the core is proven: the
-contribution schema and registries, the JSON-RPC worker runtime built on the
-substrate above, the capability model, external (GitHub/local) installation,
-and the discovery/featured supply-chain layer.
+contribution registries and the JSON-RPC worker runtime and event bus built on
+the substrate above (#2094 / #2095 / #2366), and the discovery / featured
+supply-chain layer with integrity hashing (#2364 / #2365).

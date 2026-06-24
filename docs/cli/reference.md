@@ -43,6 +43,9 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe plugin info`↴](#aoe-plugin-info)
 * [`aoe plugin enable`↴](#aoe-plugin-enable)
 * [`aoe plugin disable`↴](#aoe-plugin-disable)
+* [`aoe plugin install`↴](#aoe-plugin-install)
+* [`aoe plugin update`↴](#aoe-plugin-update)
+* [`aoe plugin uninstall`↴](#aoe-plugin-uninstall)
 * [`aoe profile`↴](#aoe-profile)
 * [`aoe profile list`↴](#aoe-profile-list)
 * [`aoe profile create`↴](#aoe-profile-create)
@@ -118,7 +121,7 @@ Run without arguments to launch the TUI dashboard.
 * `killall` — Force-stop everything aoe is running: the serve daemon, all agent workers, and all aoe tmux sessions. Destructive and unprompted
 * `session` — Manage session lifecycle (start, stop, attach, etc.)
 * `group` — Manage groups for organizing sessions
-* `plugin` — Manage plugins (list, info, enable, disable)
+* `plugin` — Manage plugins (list, info, enable, disable, install, update, uninstall)
 * `profile` — Manage profiles (separate workspaces)
 * `project` — Manage the project registry used by multi-repo session pickers
 * `worktree` — Manage git worktrees for parallel development
@@ -663,22 +666,25 @@ Move session to group
 
 ## `aoe plugin`
 
-Manage plugins (list, info, enable, disable)
+Manage plugins (list, info, enable, disable, install, update, uninstall)
 
 **Usage:** `aoe plugin <COMMAND>`
 
 ###### **Subcommands:**
 
-* `list` — List every known plugin with version and state
+* `list` — List every known plugin with version, trust, and state
 * `info` — Show one plugin's manifest details
 * `enable` — Enable a plugin's contributions
 * `disable` — Disable a plugin; its settings stay on disk for re-enabling
+* `install` — Install an external plugin from a `gh:owner/repo[@ref]` slug or a local directory. Community plugins run at your own risk
+* `update` — Update an installed external plugin from its recorded source
+* `uninstall` — Uninstall an external plugin, removing its files and capability grant
 
 
 
 ## `aoe plugin list`
 
-List every known plugin with version and state
+List every known plugin with version, trust, and state
 
 **Usage:** `aoe plugin list`
 
@@ -713,6 +719,46 @@ Enable a plugin's contributions
 Disable a plugin; its settings stay on disk for re-enabling
 
 **Usage:** `aoe plugin disable <ID>`
+
+###### **Arguments:**
+
+* `<ID>` — Plugin id
+
+
+
+## `aoe plugin install`
+
+Install an external plugin from a `gh:owner/repo[@ref]` slug or a local directory. Community plugins run at your own risk
+
+**Usage:** `aoe plugin install [OPTIONS] <SOURCE>`
+
+###### **Arguments:**
+
+* `<SOURCE>` — `gh:owner/repo[@ref]` or a local directory path
+
+###### **Options:**
+
+* `--yes` — Grant all requested capabilities without prompting
+
+
+
+## `aoe plugin update`
+
+Update an installed external plugin from its recorded source
+
+**Usage:** `aoe plugin update <ID>`
+
+###### **Arguments:**
+
+* `<ID>` — Plugin id
+
+
+
+## `aoe plugin uninstall`
+
+Uninstall an external plugin, removing its files and capability grant
+
+**Usage:** `aoe plugin uninstall <ID>`
 
 ###### **Arguments:**
 
