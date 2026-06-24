@@ -6,13 +6,21 @@
 //! installs, capability grants, and the Tier 0 / Tier 1 contribution surface
 //! return in follow-up PRs.
 
+pub mod fetch;
 pub mod install;
 pub mod lockfile;
 pub mod registry;
 pub mod source;
 pub mod view;
 
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
+
+/// Directory holding externally installed plugins, one subdir per plugin id:
+/// `<app_dir>/plugins/<id>/`.
+pub fn plugins_dir() -> anyhow::Result<PathBuf> {
+    Ok(crate::session::get_app_dir()?.join("plugins"))
+}
 
 pub use registry::{LoadedPlugin, PluginRegistry};
 pub use view::PluginView;

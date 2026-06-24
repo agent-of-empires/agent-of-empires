@@ -28,13 +28,24 @@ pub struct GitHubClient {
     api_base: String,
 }
 
-/// A GitHub release, the only DTO needed by the current callers.
+/// A GitHub release.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GitHubRelease {
     pub tag_name: String,
     #[serde(default)]
     pub body: Option<String>,
     pub published_at: Option<String>,
+    /// Release assets (downloadable binaries). Empty for the update check; used
+    /// by plugin install to fetch a release-binary worker.
+    #[serde(default)]
+    pub assets: Vec<GitHubAsset>,
+}
+
+/// A single downloadable asset attached to a release.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GitHubAsset {
+    pub name: String,
+    pub browser_download_url: String,
 }
 
 #[derive(Deserialize)]
@@ -85,6 +96,20 @@ impl GitHubClient {
     /// `GET /repos/{owner}/{repo}/releases/latest`
     pub async fn latest_release(&self, owner: &str, repo: &str) -> Result<GitHubRelease> {
         let url = format!("{}/repos/{}/{}/releases/latest", self.api_base, owner, repo);
+        self.send_json(self.http.get(url)).await
+    }
+
+    /// `GET /repos/{owner}/{repo}/releases/tags/{tag}`
+    pub async fn release_by_tag(
+        &self,
+        owner: &str,
+        repo: &str,
+        tag: &str,
+    ) -> Result<GitHubRelease> {
+        let url = format!(
+            "{}/repos/{}/{}/releases/tags/{}",
+            self.api_base, owner, repo, tag
+        );
         self.send_json(self.http.get(url)).await
     }
 

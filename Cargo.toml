@@ -156,12 +156,13 @@ agent-client-protocol = { version = "0.14", optional = true, features = ["unstab
 # Semver parsing for ACP adapter compatibility checks (see src/acp/agent_compat.rs).
 semver = { version = "1", optional = true }
 
-# Node tarball download + extraction for the structured view's bundled-Node
-# fallback. xz2 needs the system liblzma; we use it for tar.xz
-# extraction. The `tar` crate handles the tarball stream. Hex used
-# for nonce display lives in the structured view/approvals module's local
-# hex helper, no crate needed.
-tar = { version = "0.4", optional = true }
+# Tar stream handling. Used by the structured view's bundled-Node fallback
+# (with xz2 for tar.xz) and by external plugin install (with flate2 for
+# tar.gz). The `tar` and `flate2` crates are pure Rust and unconditional so
+# plugin install works in a TUI-only build; xz2 needs system liblzma and stays
+# gated to the structured view (serve).
+tar = "0.4"
+flate2 = "1"
 xz2 = { version = "0.1", optional = true }
 
 # WebSocket client for the structured view-in-TUI view: subscribes to the daemon's
@@ -212,7 +213,6 @@ serve = [
     # under src/acp/).
     "agent-client-protocol",
     "semver",
-    "tar",
     "xz2",
     "tokio-tungstenite",
 ]

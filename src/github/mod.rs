@@ -9,7 +9,7 @@
 pub mod client;
 pub mod error;
 
-pub use client::{GitHubClient, GitHubClientConfig, GitHubRelease};
+pub use client::{GitHubAsset, GitHubClient, GitHubClientConfig, GitHubRelease};
 pub use error::{GitHubError, Result};
 
 /// Default GitHub REST API base.
