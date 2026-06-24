@@ -46,6 +46,7 @@ impl PluginManagerDialog {
             embedded: false,
         };
         dialog.reload();
+        dialog.mutated = false; // Initial load is not a user mutation.
         dialog
     }
 
