@@ -98,7 +98,7 @@ pub struct Config {
 
 /// Configuration for one bundled plugin: just whether it is enabled. Richer
 /// per-plugin settings return in a follow-up PR.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginConfig {
     /// Whether the plugin is active. A disabled plugin contributes nothing to
     /// any surface.
@@ -108,6 +108,14 @@ pub struct PluginConfig {
 
 fn default_enabled() -> bool {
     true
+}
+
+impl Default for PluginConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_enabled(),
+        }
+    }
 }
 
 /// Configuration for a user-defined tool session (lazygit, yazi, tig, etc.)
