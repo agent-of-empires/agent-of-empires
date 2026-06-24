@@ -1,4 +1,4 @@
-use aoe_plugin_api::{ManifestError, PluginManifest};
+use aoe_plugin_api::{ManifestError, PluginManifest, RuntimeSpec};
 
 #[test]
 fn minimal_manifest_parses_and_round_trips() {
@@ -6,18 +6,31 @@ fn minimal_manifest_parses_and_round_trips() {
 id = "aoe.web"
 name = "Web Dashboard"
 version = "1.0.0"
-api_version = 1
+api_version = 2
 description = "The aoe serve web dashboard."
 "#;
     let manifest = PluginManifest::from_toml_str(toml).expect("valid manifest parses");
     assert_eq!(manifest.id.as_str(), "aoe.web");
     assert_eq!(manifest.name, "Web Dashboard");
     assert_eq!(manifest.version, "1.0.0");
-    assert_eq!(manifest.api_version, 1);
+    assert_eq!(manifest.api_version, 2);
 
     let serialized = toml::to_string(&manifest).expect("serializes");
     let reparsed = PluginManifest::from_toml_str(&serialized).expect("round-trips");
     assert_eq!(reparsed.id.as_str(), "aoe.web");
+}
+
+#[test]
+fn api_version_1_still_parses() {
+    // The bundled aoe.web manifest still targets api_version 1; an older
+    // manifest must keep loading on a newer host.
+    let toml = r#"
+id = "aoe.web"
+name = "Web Dashboard"
+version = "1.0.0"
+api_version = 1
+"#;
+    PluginManifest::from_toml_str(toml).expect("api_version 1 stays supported");
 }
 
 #[test]
@@ -26,10 +39,131 @@ fn description_defaults_to_empty() {
 id = "acme.thing"
 name = "Thing"
 version = "0.1.0"
-api_version = 1
+api_version = 2
 "#;
     let manifest = PluginManifest::from_toml_str(toml).expect("description is optional");
     assert!(manifest.description.is_empty());
+}
+
+#[test]
+fn contribution_sections_parse() {
+    let toml = r#"
+id = "acme.kit"
+name = "Kit"
+version = "0.1.0"
+api_version = 2
+capabilities = ["session.read", "net"]
+
+[[commands]]
+id = "do-thing"
+title = "Do Thing"
+
+[[keybinds]]
+command = "plugin.acme.kit.do-thing"
+key = "Ctrl+K"
+
+[[settings]]
+key = "endpoint"
+label = "Endpoint"
+
+[[themes]]
+name = "midnight"
+path = "themes/midnight.toml"
+
+[[ui]]
+slot = "sidebar"
+id = "panel"
+
+[[status]]
+id = "build"
+
+[[panes]]
+id = "logs"
+title = "Logs"
+"#;
+    let m = PluginManifest::from_toml_str(toml).expect("contribution sections parse");
+    assert_eq!(m.capabilities.len(), 2);
+    assert!(m.capabilities[0].is_known());
+    assert_eq!(m.commands.len(), 1);
+    assert_eq!(m.keybinds[0].key, "Ctrl+K");
+    assert_eq!(m.settings[0].key, "endpoint");
+    assert_eq!(m.themes[0].name, "midnight");
+    assert_eq!(m.ui[0].slot, "sidebar");
+    assert_eq!(m.status[0].id, "build");
+    assert_eq!(m.panes[0].title, "Logs");
+}
+
+#[test]
+fn unknown_capability_string_parses_but_reports_unknown() {
+    // Capabilities are open strings: a capability this host does not recognize
+    // still parses (forward compatibility); the host rejects it at install.
+    let toml = r#"
+id = "acme.thing"
+name = "Thing"
+version = "0.1.0"
+api_version = 2
+capabilities = ["some.future.cap"]
+"#;
+    let m = PluginManifest::from_toml_str(toml).expect("unknown capability still parses");
+    assert!(!m.capabilities[0].is_known());
+}
+
+#[test]
+fn runtime_command_parses() {
+    let toml = r#"
+id = "acme.thing"
+name = "Thing"
+version = "0.1.0"
+api_version = 2
+
+[runtime]
+kind = "command"
+command = ["python3", "worker.py"]
+"#;
+    let m = PluginManifest::from_toml_str(toml).expect("runtime command parses");
+    match m.runtime.expect("has runtime") {
+        RuntimeSpec::Command { command } => assert_eq!(command, ["python3", "worker.py"]),
+        other => panic!("expected command runtime, got {other:?}"),
+    }
+}
+
+#[test]
+fn runtime_release_binary_parses() {
+    let toml = r#"
+id = "acme.thing"
+name = "Thing"
+version = "0.1.0"
+api_version = 2
+
+[runtime]
+kind = "release-binary"
+asset = "thing-${target}.tar.gz"
+bin = "thing"
+"#;
+    let m = PluginManifest::from_toml_str(toml).expect("runtime release-binary parses");
+    match m.runtime.expect("has runtime") {
+        RuntimeSpec::ReleaseBinary { asset, bin } => {
+            assert_eq!(asset, "thing-${target}.tar.gz");
+            assert_eq!(bin.as_deref(), Some("thing"));
+        }
+        other => panic!("expected release-binary runtime, got {other:?}"),
+    }
+}
+
+#[test]
+fn empty_runtime_command_is_rejected() {
+    let toml = r#"
+id = "acme.thing"
+name = "Thing"
+version = "0.1.0"
+api_version = 2
+
+[runtime]
+kind = "command"
+command = []
+"#;
+    let err = PluginManifest::from_toml_str(toml).unwrap_err();
+    assert!(matches!(err, ManifestError::Invalid(_)), "got {err:?}");
 }
 
 #[test]
@@ -38,11 +172,11 @@ fn unknown_fields_are_rejected() {
 id = "acme.thing"
 name = "Thing"
 version = "0.1.0"
-api_version = 1
-capabilities = ["pane-read"]
+api_version = 2
+frobnicate = true
 "#;
-    // Contribution sections are not part of the core schema yet, so an
-    // unrecognized key is a hard parse error rather than silently ignored.
+    // A top-level key outside the schema is a hard parse error, not silently
+    // ignored.
     let err = PluginManifest::from_toml_str(toml).unwrap_err();
     assert!(matches!(err, ManifestError::Parse(_)), "got {err:?}");
 }
@@ -53,7 +187,7 @@ fn empty_name_and_version_collect_all_problems() {
 id = "acme.thing"
 name = ""
 version = ""
-api_version = 1
+api_version = 2
 "#;
     let err = PluginManifest::from_toml_str(toml).unwrap_err();
     let messages = match err {
@@ -83,4 +217,14 @@ api_version = 9999
         ),
         "got {err:?}"
     );
+}
+
+#[test]
+fn manifest_hash_is_stable_and_prefixed() {
+    let bytes = b"id = \"acme.thing\"\n";
+    let a = PluginManifest::hash_bytes(bytes);
+    let b = PluginManifest::hash_bytes(bytes);
+    assert_eq!(a, b);
+    assert!(a.starts_with("sha256:"));
+    assert_ne!(a, PluginManifest::hash_bytes(b"different"));
 }

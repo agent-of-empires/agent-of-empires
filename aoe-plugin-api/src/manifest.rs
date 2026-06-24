@@ -1,13 +1,15 @@
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
-use crate::{PluginId, API_VERSION};
+use crate::{CapabilityId, PluginId, API_VERSION};
 
 /// Parsed `aoe-plugin.toml`.
 ///
-/// This is the minimal core schema: a plugin's identity and the manifest/API
-/// version it targets. Contribution sections (settings, keybinds, themes,
-/// commands, status detection, UI slots, panes, runtime workers) return in
-/// follow-up PRs; see `docs/development/internals/plugin-system.md`.
+/// Identity (`id`, `name`, `version`, `api_version`, `description`) plus the
+/// contribution sections a plugin declares. The contribution sections are
+/// defined here but consumed by later issues: the settings registry (#2094),
+/// the runtime host (#2095), and the command/keybind/UI surfaces (#2366). This
+/// host parses and validates them; it does not yet act on them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
@@ -20,6 +22,133 @@ pub struct PluginManifest {
     pub api_version: u32,
     #[serde(default)]
     pub description: String,
+
+    /// Resource/effect capabilities the plugin requests. Static contributions
+    /// below are NOT listed here; only runtime resource access is. The user
+    /// grants these once at install (community plugins); builtins are
+    /// auto-granted. See [`crate::capability`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<CapabilityId>,
+
+    /// Commands the plugin contributes (palette / CLI). Consumed by #2366.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commands: Vec<CommandContribution>,
+
+    /// Keybinds the plugin contributes. Consumed by #2366.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keybinds: Vec<KeybindContribution>,
+
+    /// Settings the plugin declares. The typed schema that validates and
+    /// renders them lands with #2094.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub settings: Vec<SettingContribution>,
+
+    /// Themes the plugin ships. Consumed by #2366.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub themes: Vec<ThemeContribution>,
+
+    /// UI slots the plugin renders into. Consumed by #2366.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ui: Vec<UiContribution>,
+
+    /// Status detectors the plugin contributes. Consumed by #2366.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub status: Vec<StatusContribution>,
+
+    /// Panes the plugin contributes. Consumed by #2366.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub panes: Vec<PaneContribution>,
+
+    /// The worker entrypoint. Defined here so installation can fetch a
+    /// release-binary worker; actually launching it is #2095.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeSpec>,
+}
+
+/// A command the plugin contributes. The host namespaces it as
+/// `plugin.<plugin-id>.<id>`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandContribution {
+    pub id: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+/// A keybind the plugin contributes, binding a key chord to a command.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeybindContribution {
+    /// Command id this binds to (a plugin command or a core command).
+    pub command: String,
+    /// Key chord, e.g. `Ctrl+K`. Parsed by the consuming surface (#2366).
+    pub key: String,
+}
+
+/// A setting the plugin declares. The typed schema arrives with #2094; here it
+/// is just the key and human-facing labels.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SettingContribution {
+    pub key: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+/// A theme the plugin ships, by name and a path relative to the plugin dir.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThemeContribution {
+    pub name: String,
+    pub path: String,
+}
+
+/// A UI contribution targeting a named slot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UiContribution {
+    pub slot: String,
+    #[serde(default)]
+    pub id: String,
+}
+
+/// A status detector the plugin contributes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatusContribution {
+    pub id: String,
+    #[serde(default)]
+    pub label: String,
+}
+
+/// A pane the plugin contributes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaneContribution {
+    pub id: String,
+    #[serde(default)]
+    pub title: String,
+}
+
+/// How the plugin's worker is launched. Defined here; executed by #2095.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum RuntimeSpec {
+    /// A worker launched by running a command from the plugin directory (a
+    /// script, an interpreter invocation, or an in-tree binary).
+    Command {
+        /// argv; the first element is the program, the rest its arguments.
+        command: Vec<String>,
+    },
+    /// A worker binary downloaded from the source repo's GitHub release assets.
+    /// Installation resolves the asset for the host platform, downloads it, and
+    /// places the binary in the plugin directory.
+    ReleaseBinary {
+        /// Asset name template. `${os}`, `${arch}`, and `${target}` are
+        /// substituted with the host's values before matching the release.
+        asset: String,
+        /// Executable to run after extraction (the path within an archive). The
+        /// downloaded asset itself when omitted (a raw, non-archive binary).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bin: Option<String>,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -57,8 +186,31 @@ impl PluginManifest {
         Ok(manifest)
     }
 
+    /// sha256 over the raw `aoe-plugin.toml` bytes as installed, formatted
+    /// `sha256:<hex>`. A capability grant is pinned to this; an update whose
+    /// manifest bytes (hence possibly its capability set) change re-prompts.
+    /// Hashing the raw bytes, not a reserialized struct, avoids depending on
+    /// serializer canonicalization.
+    pub fn hash_bytes(bytes: &[u8]) -> String {
+        use std::fmt::Write;
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        let digest = hasher.finalize();
+        let mut out = String::with_capacity(7 + digest.len() * 2);
+        out.push_str("sha256:");
+        for byte in digest {
+            let _ = write!(out, "{byte:02x}");
+        }
+        out
+    }
+
     /// Structural validation; collects every problem instead of stopping at
     /// the first so a plugin author sees the full list in one pass.
+    ///
+    /// Capability strings are deliberately not validated here: they are open
+    /// strings (forward-compatible), and the host rejects an unknown one at
+    /// install rather than at parse, so a manifest targeting a newer host still
+    /// parses on an older one.
     pub fn validate(&self) -> Result<(), ManifestError> {
         let mut errors = Vec::new();
         let mut check = |ok: bool, msg: String| {
@@ -76,6 +228,19 @@ impl PluginManifest {
         );
         check(!self.version.is_empty(), "version must not be empty".into());
         check(!self.name.is_empty(), "name must not be empty".into());
+
+        if let Some(RuntimeSpec::Command { command }) = &self.runtime {
+            check(
+                !command.is_empty(),
+                "runtime command must not be empty".into(),
+            );
+        }
+        if let Some(RuntimeSpec::ReleaseBinary { asset, .. }) = &self.runtime {
+            check(
+                !asset.is_empty(),
+                "runtime release-binary asset must not be empty".into(),
+            );
+        }
 
         if errors.is_empty() {
             Ok(())
