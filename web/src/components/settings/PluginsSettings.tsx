@@ -58,10 +58,10 @@ export function PluginsSettings() {
 
   return (
     <div className="space-y-4">
-      {error && <p className="text-sm text-red-400">{error}</p>}
+      {error && <p className="text-sm text-status-error">{error}</p>}
 
       {data && data.load_errors.length > 0 && (
-        <div className="rounded border border-yellow-700 bg-yellow-950/40 p-3 text-xs text-yellow-300">
+        <div className="rounded border border-status-warning bg-status-warning/10 p-3 text-xs text-status-warning">
           <p className="mb-1 font-semibold">Plugin load problems</p>
           {data.load_errors.map((e) => (
             <p key={e}>{e}</p>
@@ -87,7 +87,7 @@ export function PluginsSettings() {
                   <span className="font-medium">{plugin.name}</span>
                   <span className="text-xs text-text-dim">v{plugin.version}</span>
                   {plugin.builtin && (
-                    <span className="rounded bg-blue-900/60 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-blue-300">
+                    <span className="rounded bg-accent-primary/20 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-accent-primary">
                       builtin
                     </span>
                   )}
