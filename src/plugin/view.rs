@@ -16,9 +16,19 @@ pub struct PluginView {
     pub version: String,
     pub description: String,
     pub enabled: bool,
-    /// First-party builtin (always true in the current core; installed plugins
-    /// return in a follow-up).
+    /// First-party builtin (compiled in) versus an externally installed plugin.
     pub builtin: bool,
+    /// `builtin` or `community`.
+    pub trust: String,
+    /// Install source for an external plugin (`gh:owner/repo` or a path).
+    pub source: Option<String>,
+    /// Capabilities the plugin's manifest declares.
+    pub capabilities: Vec<String>,
+    /// Whether the user's grant covers the installed manifest (always true for
+    /// builtins).
+    pub granted: bool,
+    /// Installed but inactive: a community plugin awaiting capability approval.
+    pub needs_reapproval: bool,
 }
 
 impl LoadedPlugin {
@@ -30,7 +40,17 @@ impl LoadedPlugin {
             version: self.manifest.version.clone(),
             description: self.manifest.description.clone(),
             enabled: self.enabled,
-            builtin: true,
+            builtin: self.builtin(),
+            trust: self.trust.as_str().to_string(),
+            source: self.source.clone(),
+            capabilities: self
+                .manifest
+                .capabilities
+                .iter()
+                .map(|c| c.as_str().to_string())
+                .collect(),
+            granted: self.granted,
+            needs_reapproval: self.needs_reapproval(),
         }
     }
 }
