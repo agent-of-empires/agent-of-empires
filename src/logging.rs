@@ -1146,6 +1146,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn from_env_no_vars() {
         let _g = ENV_LOCK.lock().unwrap();
         std::env::remove_var("AOE_LOG_LEVEL");
@@ -1159,6 +1160,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn from_env_aoe_log_level() {
         let _g = ENV_LOCK.lock().unwrap();
         std::env::set_var("AOE_LOG_LEVEL", "trace");
@@ -1169,6 +1171,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn from_env_legacy_debug_flag() {
         let _g = ENV_LOCK.lock().unwrap();
         std::env::remove_var("AOE_LOG_LEVEL");

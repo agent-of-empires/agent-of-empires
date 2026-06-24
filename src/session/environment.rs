@@ -917,6 +917,7 @@ environment = ["GH_TOKEN=write_token"]
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_host_environment_prefix_dollar_var_reads_host_env() {
         std::env::set_var("AOE_TEST_HOST_ENV_PREFIX", "from-host");
         let prefix = host_environment_prefix(&["FORWARDED=$AOE_TEST_HOST_ENV_PREFIX".to_string()]);
@@ -925,6 +926,7 @@ environment = ["GH_TOKEN=write_token"]
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_host_environment_prefix_dollar_var_missing_is_skipped() {
         std::env::remove_var("AOE_TEST_DEFINITELY_NOT_SET");
         let prefix = host_environment_prefix(&[
@@ -935,6 +937,7 @@ environment = ["GH_TOKEN=write_token"]
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_host_environment_prefix_bare_key_passthrough() {
         std::env::set_var("AOE_TEST_BARE_PASSTHROUGH", "v");
         let prefix = host_environment_prefix(&["AOE_TEST_BARE_PASSTHROUGH".to_string()]);
@@ -950,6 +953,7 @@ environment = ["GH_TOKEN=write_token"]
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_resolve_host_environment_value_uses_last_resolved_entry() {
         std::env::remove_var("AOE_TEST_MISSING_HOST_ENV_VALUE");
         let entries = vec![
@@ -966,6 +970,7 @@ environment = ["GH_TOKEN=write_token"]
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_resolve_host_environment_value_matches_host_env_grammar() {
         std::env::set_var("AOE_TEST_CODEX_HOME_REF", "/from-host");
         let entries = vec!["CODEX_HOME=$AOE_TEST_CODEX_HOME_REF".to_string()];
@@ -984,6 +989,7 @@ environment = ["GH_TOKEN=write_token"]
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_collect_environment_passthrough() {
         std::env::set_var("AOE_TEST_ENV_PT", "test_value");
         let config = SandboxConfig {
@@ -1008,6 +1014,7 @@ environment = ["GH_TOKEN=write_token"]
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_resolve_host_env_pairs_grammar() {
         std::env::set_var("AOE_TEST_HOST_PAIR_REF", "from_host");
         std::env::set_var("AOE_TEST_HOST_PAIR_BARE", "bare_val");
@@ -1217,6 +1224,7 @@ environment = ["GH_TOKEN=write_token"]
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_collect_environment_extra_env() {
         std::env::set_var("AOE_TEST_EXTRA", "extra_val");
         let config = SandboxConfig::default();
@@ -1284,6 +1292,7 @@ environment = ["GH_TOKEN=write_token"]
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_collect_environment_dollar_ref() {
         std::env::set_var("AOE_TEST_HOST_REF", "host_val");
         let config = SandboxConfig {
@@ -1330,6 +1339,7 @@ environment = ["GH_TOKEN=write_token"]
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_validate_env_entry_bare_key_present() {
         std::env::set_var("AOE_TEST_VALIDATE_BARE", "exists");
         assert_eq!(validate_env_entry("AOE_TEST_VALIDATE_BARE"), None);
@@ -1337,6 +1347,7 @@ environment = ["GH_TOKEN=write_token"]
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_validate_env_entry_bare_key_missing() {
         std::env::remove_var("AOE_TEST_VALIDATE_MISSING_BARE");
         let result = validate_env_entry("AOE_TEST_VALIDATE_MISSING_BARE");
@@ -1345,6 +1356,7 @@ environment = ["GH_TOKEN=write_token"]
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_validate_env_entry_key_dollar_var_present() {
         std::env::set_var("AOE_TEST_VALIDATE_REF", "value");
         assert_eq!(validate_env_entry("MY_KEY=$AOE_TEST_VALIDATE_REF"), None);
@@ -1352,6 +1364,7 @@ environment = ["GH_TOKEN=write_token"]
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_validate_env_entry_key_dollar_var_missing() {
         std::env::remove_var("AOE_TEST_VALIDATE_MISSING_REF");
         let result = validate_env_entry("MY_KEY=$AOE_TEST_VALIDATE_MISSING_REF");
@@ -1370,6 +1383,7 @@ environment = ["GH_TOKEN=write_token"]
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_validate_env_entries_returns_one_warning_per_missing_var() {
         // Use unique names to avoid collisions with other tests' env state.
         std::env::remove_var("AOE_TEST_BATCH_MISSING_A");
@@ -1440,6 +1454,7 @@ environment = ["GH_TOKEN=write_token"]
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_build_docker_env_args_inherit_uses_key_only_in_args() {
         // Inherited (secret) env vars must NOT have values in docker_args.
         // Values are in exports for injection via tmux send-keys.
@@ -1478,6 +1493,7 @@ environment = ["GH_TOKEN=write_token"]
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_build_docker_env_args_inherit_with_different_key() {
         std::env::set_var("AOE_TEST_SOURCE", "secret456");
         let sandbox = SandboxInfo {
@@ -1512,6 +1528,7 @@ environment = ["GH_TOKEN=write_token"]
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_build_docker_env_args_bare_key_uses_export() {
         // Bare keys (pass-through from host) are Inherit entries,
         // so they must use exports, not inline values.
@@ -1580,6 +1597,7 @@ environment = ["GH_TOKEN=write_token"]
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_build_docker_env_args_mixed_inherit_and_literal() {
         std::env::set_var("AOE_TEST_SECRET", "mysecret");
         let sandbox = SandboxInfo {

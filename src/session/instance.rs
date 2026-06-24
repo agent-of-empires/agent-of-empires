@@ -4927,6 +4927,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_yolo_envvar_command_is_quoted() {
         // EnvVar values containing JSON must be shell-escaped to prevent
         // the inner bash from expanding special characters ({, *, ").
