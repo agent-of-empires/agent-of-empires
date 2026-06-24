@@ -67,15 +67,16 @@ while `aoe.web` is disabled (`src/cli/serve.rs`).
 ## Persisted plugin state (#2091)
 
 Two storage slots hold plugin data on disk ahead of the APIs that read and
-write them, so no migration is needed later when those APIs land:
+write them, so the later API PRs (#2094, #2095) stay focused on behavior:
 
 - **Per-plugin settings.** `PluginConfig.settings` (`src/session/config.rs`) is
   an opaque `toml::Table` persisted as `[plugins."<id>".settings]` in
   `config.toml`. It is kept schema-free on purpose: values survive on disk even
   while the plugin is disabled, and the typed schema that validates and renders
-  them arrives with the Tier 0 settings registry (#2094). `enabled` serializes
-  before `settings` so the value precedes the nested table, as TOML requires;
-  an empty table is omitted.
+  them arrives with the Tier 0 settings registry (#2094). `enabled` is declared
+  before `settings` so the scalar reads above the nested table; the toml
+  serializer emits scalars before subtables regardless, so the order is for
+  readability. An empty table is omitted.
 - **Per-session plugin data.** `Instance.plugin_meta`
   (`src/session/instance.rs`) is a `BTreeMap<String, serde_json::Value>` keyed
   by plugin id, persisted per session in `sessions.json`. Each plugin owns only

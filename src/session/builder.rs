@@ -1043,7 +1043,6 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
     fn test_git_sanitize_branch_name_replaces_forbidden_chars() {
         assert_eq!(git_sanitize_branch_name("has spaces"), "has-spaces");
         assert_eq!(git_sanitize_branch_name("a:b?c*d"), "a-b-c-d");

@@ -108,8 +108,9 @@ pub struct PluginConfig {
     /// The plugin's persisted settings (`[plugins."<id>".settings]`). Kept as
     /// an opaque `toml::Table` so values survive on disk even while the plugin
     /// is disabled; the typed schema that validates and renders them lands
-    /// with Tier 0 registries (#2094). `enabled` is serialized before this so
-    /// the value precedes the nested table, as TOML requires.
+    /// with Tier 0 registries (#2094). Declared after `enabled` so the scalar
+    /// reads above the nested table; the toml serializer emits scalars before
+    /// subtables regardless, so the order is for readability. Empty is omitted.
     #[serde(default, skip_serializing_if = "toml::Table::is_empty")]
     pub settings: toml::Table,
 }
