@@ -102,8 +102,12 @@ pub struct Config {
 pub struct PluginConfig {
     /// Whether the plugin is active. A disabled plugin contributes nothing to
     /// any surface.
-    #[serde(default)]
+    #[serde(default = "default_enabled")]
     pub enabled: bool,
+}
+
+fn default_enabled() -> bool {
+    true
 }
 
 /// Configuration for a user-defined tool session (lazygit, yazi, tig, etc.)
