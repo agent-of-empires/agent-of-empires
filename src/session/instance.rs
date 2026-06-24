@@ -454,6 +454,15 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pinned_at: Option<DateTime<Utc>>,
 
+    /// Namespaced per-session plugin data, keyed by plugin id. Each plugin
+    /// owns only its own slot (`plugin_meta["<id>"]`), an opaque JSON value it
+    /// reads and writes through the host API that lands with the Tier 1 host
+    /// (#2095). Data for an uninstalled plugin is retained, since it is cheap
+    /// and reinstalling restores the session's state. Additive: absent in
+    /// older `sessions.json` rows, so no migration is needed.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub plugin_meta: std::collections::BTreeMap<String, serde_json::Value>,
+
     /// Scratch-session marker. When true, `project_path` points at an
     /// auto-provisioned directory under `<app_dir>/scratch/<id>/` that the
     /// deletion path removes on `aoe rm` (unless the user opts in to keeping
@@ -831,6 +840,7 @@ impl Instance {
             unread: false,
             idle_dormant_since: None,
             pinned_at: None,
+            plugin_meta: std::collections::BTreeMap::new(),
             scratch: false,
             worktree_info: None,
             workspace_info: None,
@@ -4194,6 +4204,37 @@ mod tests {
             json.get("unread").is_none(),
             "false must skip serialization"
         );
+    }
+
+    #[test]
+    fn test_plugin_meta_serde_round_trip() {
+        // Empty map is omitted from disk.
+        let inst = Instance::new("t", "/tmp");
+        let json = serde_json::to_value(&inst).unwrap();
+        assert!(
+            json.get("plugin_meta").is_none(),
+            "empty plugin_meta must skip serialization"
+        );
+
+        // A plugin's namespaced slot round-trips.
+        let mut set = Instance::new("t", "/tmp");
+        set.plugin_meta
+            .insert("aoe.status".to_string(), serde_json::json!({ "score": 3 }));
+        let json = serde_json::to_value(&set).unwrap();
+        let back: Instance = serde_json::from_value(json).unwrap();
+        assert_eq!(back.plugin_meta["aoe.status"]["score"], 3);
+
+        // Rows written before the field existed deserialize to an empty map.
+        let inst: Instance = serde_json::from_value(serde_json::json!({
+            "id": "abc",
+            "title": "t",
+            "project_path": "/tmp",
+            "tool": "claude",
+            "status": "idle",
+            "created_at": "2026-01-01T00:00:00Z",
+        }))
+        .expect("deserialize without plugin_meta");
+        assert!(inst.plugin_meta.is_empty());
     }
 
     #[test]

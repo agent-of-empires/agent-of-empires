@@ -96,14 +96,22 @@ pub struct Config {
     pub plugins: std::collections::BTreeMap<String, PluginConfig>,
 }
 
-/// Configuration for one bundled plugin: just whether it is enabled. Richer
-/// per-plugin settings return in a follow-up PR.
+/// Configuration for one bundled plugin: whether it is enabled, plus its
+/// schema-free persisted settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginConfig {
     /// Whether the plugin is active. A disabled plugin contributes nothing to
     /// any surface.
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+
+    /// The plugin's persisted settings (`[plugins."<id>".settings]`). Kept as
+    /// an opaque `toml::Table` so values survive on disk even while the plugin
+    /// is disabled; the typed schema that validates and renders them lands
+    /// with Tier 0 registries (#2094). `enabled` is serialized before this so
+    /// the value precedes the nested table, as TOML requires.
+    #[serde(default, skip_serializing_if = "toml::Table::is_empty")]
+    pub settings: toml::Table,
 }
 
 fn default_enabled() -> bool {
@@ -114,6 +122,7 @@ impl Default for PluginConfig {
     fn default() -> Self {
         Self {
             enabled: default_enabled(),
+            settings: toml::Table::new(),
         }
     }
 }
@@ -2455,6 +2464,46 @@ mod tests {
         assert!(
             !serialized.contains("[plugins"),
             "empty plugins map must not serialize a stray section"
+        );
+    }
+
+    #[test]
+    fn test_plugin_settings_persist_even_while_disabled() {
+        // Disabling a plugin hides its settings from every surface but must
+        // never destroy them: the values survive a save/load round-trip.
+        let toml_in = r#"
+            [plugins."aoe.status"]
+            enabled = false
+
+            [plugins."aoe.status".settings]
+            poll_interval_ms = 1000
+            verbose = true
+        "#;
+        let config: Config = toml::from_str(toml_in).unwrap();
+        let plugin = &config.plugins["aoe.status"];
+        assert!(!plugin.enabled);
+        assert_eq!(plugin.settings["poll_interval_ms"].as_integer(), Some(1000));
+
+        let serialized = toml::to_string(&config).unwrap();
+        let reloaded: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(
+            reloaded.plugins["aoe.status"].settings["verbose"].as_bool(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_plugin_empty_settings_omitted_from_toml() {
+        let toml_in = r#"
+            [plugins."aoe.web"]
+            enabled = true
+        "#;
+        let config: Config = toml::from_str(toml_in).unwrap();
+        assert!(config.plugins["aoe.web"].settings.is_empty());
+        let serialized = toml::to_string(&config).unwrap();
+        assert!(
+            !serialized.contains("settings"),
+            "empty plugin settings must not serialize a stray section"
         );
     }
 
