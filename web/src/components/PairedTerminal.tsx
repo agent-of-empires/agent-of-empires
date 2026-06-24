@@ -18,7 +18,7 @@ export function PairedShellPane({ session, sessionId }: { session: SessionRespon
 
   const shellTabClass = (active: boolean) =>
     `text-[12px] px-2 py-0.5 rounded cursor-pointer transition-colors ${
-      active ? "text-accent-primary bg-accent-primary/10" : "text-text-dim hover:text-text-muted"
+      active ? "text-accent-500 bg-accent-500/10" : "text-text-dim hover:text-text-muted"
     }`;
 
   return (

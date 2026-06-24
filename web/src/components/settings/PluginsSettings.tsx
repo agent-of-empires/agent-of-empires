@@ -87,7 +87,7 @@ export function PluginsSettings() {
                   <span className="font-medium">{plugin.name}</span>
                   <span className="text-xs text-text-dim">v{plugin.version}</span>
                   {plugin.builtin && (
-                    <span className="rounded bg-accent-primary/20 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-accent-primary">
+                    <span className="rounded bg-accent-500/20 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-accent-500">
                       builtin
                     </span>
                   )}
