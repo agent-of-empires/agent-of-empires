@@ -86,6 +86,14 @@ impl SettingsView {
             return self.handle_search_key(key);
         }
 
+        // Save is always reachable
+        if key.code == KeyCode::Char('s') && key.modifiers == KeyModifiers::CONTROL {
+            if let Err(e) = self.save() {
+                self.error_message = Some(format!("Failed to save: {}", e));
+            }
+            return SettingsAction::Continue;
+        }
+
         // The Plugins category hosts the plugin manager inline. While the right
         // pane is focused the manager owns the keys: Space stages an
         // enable/disable into this view's config, Esc steps back to the
@@ -98,13 +106,6 @@ impl SettingsView {
 
         // Normal mode
         match (key.code, key.modifiers) {
-            // Save
-            (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
-                if let Err(e) = self.save() {
-                    self.error_message = Some(format!("Failed to save: {}", e));
-                }
-                SettingsAction::Continue
-            }
 
             // Close from anywhere
             (KeyCode::Char('q'), _) => {
