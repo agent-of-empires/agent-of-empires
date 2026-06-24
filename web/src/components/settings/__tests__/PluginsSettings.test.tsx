@@ -99,4 +99,10 @@ describe("PluginsSettings", () => {
     const { findByText } = render(<PluginsSettings />);
     await findByText(/manifest is invalid/);
   });
+
+  it("shows an error when the plugin list fails to load", async () => {
+    fetchPlugins.mockResolvedValue(null);
+    const { findByText } = render(<PluginsSettings />);
+    await findByText("Failed to load plugins.");
+  });
 });
