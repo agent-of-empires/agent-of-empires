@@ -4641,7 +4641,7 @@ mod tests {
         // pid_max (4_194_304), so signal_runner_group's killpg+kill both
         // ESRCH and the test never signals an unrelated process.
         let socket_path = tmp.path().join("registry-race.sock");
-        let record = crate::acp::worker_registry::WorkerRecord::new(
+        let record = crate::process::worker_registry::WorkerRecord::new(
             "s-registry-race".into(),
             999_999_999,
             socket_path,
@@ -4654,7 +4654,7 @@ mod tests {
             None,
             None,
         );
-        crate::acp::worker_registry::save(&record).unwrap();
+        crate::process::worker_registry::save(&record).unwrap();
 
         // The registry-terminate branch only seeds the breadcrumb when
         // `pending_has_it` is true, mirroring the writer at line 2264.
