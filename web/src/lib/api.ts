@@ -206,6 +206,15 @@ export function fetchPlugins(): Promise<PluginListResponse | null> {
   return fetchJson<PluginListResponse>("/api/plugins");
 }
 
+function isValidPluginListResponse(payload: unknown): payload is PluginListResponse {
+  return (
+    typeof payload === "object" &&
+    payload !== null &&
+    Array.isArray((payload as Record<string, unknown>).plugins) &&
+    Array.isArray((payload as Record<string, unknown>).load_errors)
+  );
+}
+
 export async function setPluginEnabled(id: string, enabled: boolean): Promise<PluginToggleResult> {
   try {
     const res = await fetch(`/api/plugins/${encodeURIComponent(id)}/enabled`, {
@@ -214,8 +223,8 @@ export async function setPluginEnabled(id: string, enabled: boolean): Promise<Pl
       body: JSON.stringify({ enabled }),
     });
     const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null;
-    if (res.ok && payload) {
-      return { kind: "ok", data: payload as unknown as PluginListResponse };
+    if (res.ok && payload && isValidPluginListResponse(payload)) {
+      return { kind: "ok", data: payload };
     }
     const message =
       typeof payload?.message === "string"
