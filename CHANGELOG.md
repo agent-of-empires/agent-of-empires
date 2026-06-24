@@ -4,17 +4,6 @@ All notable changes to Agent of Empires will be documented in this file.
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
-## Unreleased
-
-### Breaking Changes
-
-- The default Cargo features are now `["serve", "default-plugins"]`. `cargo
-  build` and `cargo test` (without extra flags) build the web dashboard
-  (needs Node.js + npm) and bundle the first-party plugins, and the default
-  `nix` package ships both. Escape hatches: `cargo build --no-default-features`
-  (TUI-only, no Node toolchain), `nix build .#aoe-tui`, and `cargo test
-  --no-default-features --lib --bins` on Node-less runners.
-
 ## [1.11.2](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.11.2) - 2026-06-24
 
 

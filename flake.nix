@@ -32,12 +32,6 @@
             src = craneLib.cleanCargoSource ./.;
             strictDeps = true;
             inherit nativeBuildInputs buildInputs;
-            # Default cargo features now include `serve` (web dashboard),
-            # whose build.rs step wants npm or AOE_WEB_DIST. The base
-            # derivation and checks build TUI-only so they stay hermetic
-            # without the frontend; the web-enabled build (the flake's
-            # default package) opts back in below via AOE_WEB_DIST.
-            cargoExtraArgs = "--no-default-features";
           };
 
           # Build only workspace dependencies first (for caching)
@@ -45,7 +39,7 @@
 
           aoe = craneLib.buildPackage (commonArgs // {
             inherit cargoArtifacts;
-            cargoExtraArgs = "--package agent-of-empires --no-default-features";
+            cargoExtraArgs = "--package agent-of-empires";
             doCheck = false;
             postInstall = ''
               installShellCompletion --cmd aoe \
@@ -93,11 +87,10 @@
           # build.rs respects AOE_WEB_DIST to use the pre-built frontend.
           # buildDepsOnly uses a dummy crate source so AOE_WEB_DIST is irrelevant there.
           commonArgsWithWeb = commonArgs // {
-            # Default features include `serve`, so no explicit flag needed.
-            cargoExtraArgs = "--package agent-of-empires";
+            cargoExtraArgs = "--package agent-of-empires --features serve";
           };
 
-          # Rust dep cache compiled with the serve deps (no npm involved).
+          # Rust dep cache compiled with --features serve (no npm involved).
           cargoArtifactsWithWeb = craneLib.buildDepsOnly commonArgsWithWeb;
 
           aoeWithWeb = craneLib.buildPackage (commonArgsWithWeb // {
@@ -119,12 +112,7 @@
           });
         in
         {
-          # The default package matches the cargo default: web dashboard
-          # included (frontend injected hermetically via AOE_WEB_DIST).
-          packages.default = aoeWithWeb;
-          # TUI-only binary, no web assets, smaller closure.
-          packages.aoe-tui = aoe;
-          # Back-compat alias; same derivation as the default package.
+          packages.default = aoe;
           packages.aoe-with-web = aoeWithWeb;
           # Just the npm + vite build. Exposed so the PR-CI Nix Build
           # Web job can validate npmDepsHash + frontend build in ~1-2
@@ -162,7 +150,7 @@
             packages = with pkgs; [
               rust-analyzer
               tmux
-              nodejs # for web frontend development (default build includes the dashboard)
+              nodejs # for web frontend development (--features serve)
             ];
           };
         };

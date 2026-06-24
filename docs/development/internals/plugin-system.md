@@ -28,8 +28,10 @@ schema/host version this crate understands.
 `src/plugin/registry.rs` owns the in-process registry.
 
 - `BUILTINS` is a static slice of `BuiltinPlugin`, each embedding its manifest
-  TOML via `include_str!`. The `aoe.web` marker is gated on the `serve` +
-  `default-plugins` cargo features.
+  TOML via `include_str!`. The `aoe.web` marker is gated on the `serve` cargo
+  feature, so it is present in every dashboard/release build and absent from a
+  TUI-only build. `default-plugins` (on by default) reserves the on-by-default
+  slot for bundled plugins that do not require the dashboard.
 - `PluginRegistry::load(config)` parses every builtin manifest, resolves each
   plugin's enabled flag from `[plugins."<id>"]` in `config.toml` (default
   enabled), and collects any parse errors as non-fatal `load_errors`.

@@ -19,9 +19,10 @@ pub struct BuiltinPlugin {
 /// system is proven out: just the `aoe.web` dashboard marker (under `serve`).
 /// More land as each piece is verified.
 pub static BUILTINS: &[BuiltinPlugin] = &[
-    // The web dashboard's management marker only exists when the dashboard is
-    // compiled in at all.
-    #[cfg(all(feature = "serve", feature = "default-plugins"))]
+    // The web dashboard's management marker is present whenever the dashboard
+    // is compiled in (`feature = "serve"`), so serve and release builds always
+    // surface aoe.web; a TUI-only build has an empty registry.
+    #[cfg(feature = "serve")]
     BuiltinPlugin {
         manifest_toml: include_str!("../../plugins/aoe-web/aoe-plugin.toml"),
     },

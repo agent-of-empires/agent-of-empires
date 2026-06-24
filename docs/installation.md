@@ -4,7 +4,7 @@
 
 - [tmux](https://github.com/tmux/tmux/wiki) (required)
 - [Docker](https://www.docker.com/) (optional, for sandboxing agents in containers)
-- [Node.js](https://nodejs.org/) (needed when building from source; the default build includes the web dashboard. TUI-only source builds skip it with `cargo build --no-default-features`)
+- [Node.js](https://nodejs.org/) (optional, only needed when building the web dashboard from source with `--features serve`)
 
 ## Install Agent of Empires
 
@@ -37,7 +37,7 @@ The binary will be at `target/release/aoe`.
 To include the web dashboard (browser access):
 
 ```bash
-cargo build --release
+cargo build --release --features serve
 ```
 
 This requires Node.js and npm. The web frontend is built automatically during compilation.

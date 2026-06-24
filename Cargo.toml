@@ -175,17 +175,19 @@ tokio-tungstenite = { version = "0.29", default-features = false, features = ["r
 libc = "0.2"
 
 [features]
-# The web dashboard ships by default so plain `cargo build` produces the
-# full binary (#268 task: aoe.web is a default-enabled builtin plugin).
-# TUI-only builds without Node/npm: `cargo build --no-default-features`.
-default = ["serve", "default-plugins"]
+# Lean by default: a plain `cargo build` needs no Node/npm. `serve` (the web
+# dashboard) stays opt-in (`cargo build --features serve`); the aoe.web builtin
+# rides along with it. Released binaries are built `--features serve`, so every
+# distributed binary ships the dashboard. `default-plugins` stays on by default
+# so the bundled-plugin set is the norm for source builds; it currently gates
+# nothing on its own (aoe.web needs `serve`), but reserves the on-by-default
+# slot for first-party plugins that do not require the dashboard.
+default = ["default-plugins"]
 # Re-exports private tmux env helpers via `crate::tmux::test_support` so that
 # integration tests in `tests/` can poke them. Not enabled by default — only
 # used by `cargo test`.
 test-support = []
-# Compile in the bundled first-party plugins (status detection, attention
-# sort, the aoe.web marker). Additive and on by default so `--all-features`
-# and `cargo test --all-features` keep them. Build the bare core (acceptance
+# Compile in the bundled first-party plugins. Build the bare core (acceptance
 # criterion 1 of #268) by opting out with `--no-default-features`.
 default-plugins = []
 serve = [
