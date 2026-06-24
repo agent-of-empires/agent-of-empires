@@ -188,6 +188,11 @@ export interface PluginView {
   description: string;
   enabled: boolean;
   builtin: boolean;
+  trust: string;
+  source: string | null;
+  capabilities: string[];
+  granted: boolean;
+  needs_reapproval: boolean;
 }
 
 export interface PluginListResponse {

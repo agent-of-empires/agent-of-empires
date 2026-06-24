@@ -1,7 +1,8 @@
-//! Plugin manager: list builtin plugins and enable/disable them from the TUI.
-//! The TUI twin of `aoe plugin list` and the web Plugins tab. This is the
-//! minimal core: a browse list with an enable/disable toggle. Install, update,
-//! uninstall, discovery, and capability approval return in follow-up PRs.
+//! Plugin manager: list plugins (builtin and external) with their trust and
+//! enabled/approval state, and enable/disable them from the TUI. The TUI twin
+//! of `aoe plugin list` and the web Plugins tab. Installing, updating, and
+//! capability approval are CLI-driven (`aoe plugin install`); the TUI shows the
+//! resulting state but does not perform installs.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
@@ -174,17 +175,23 @@ impl PluginManagerDialog {
             .rows
             .iter()
             .map(|row| {
-                let state = if row.enabled {
-                    ("enabled", theme.running)
-                } else {
+                let state = if !row.enabled {
                     ("disabled", theme.dimmed)
+                } else if row.needs_reapproval {
+                    ("needs approval", theme.error)
+                } else {
+                    ("enabled", theme.running)
                 };
                 let spans = vec![
                     Span::styled(
                         format!("{:<28}", format!("{} v{}", row.name, row.version)),
                         Style::default().fg(theme.text),
                     ),
-                    Span::styled(format!("{:<12}", state.0), Style::default().fg(state.1)),
+                    Span::styled(
+                        format!("{:<10}", row.trust),
+                        Style::default().fg(theme.dimmed),
+                    ),
+                    Span::styled(format!("{:<14}", state.0), Style::default().fg(state.1)),
                 ];
                 ListItem::new(Line::from(spans))
             })
