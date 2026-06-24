@@ -856,6 +856,21 @@ pub struct SessionConfig {
     #[setting(label = "Agent Status Hooks", widget = "toggle", category = "Agents")]
     pub agent_status_hooks: bool,
 
+    /// For agents whose hooks are scoped to a user-selected named agent (e.g.
+    /// Kiro's `--agent NAME`), install AoE's status hooks into that agent's own
+    /// config file so status detection keeps working. Such CLIs have no global
+    /// hooks, so without this AoE's standalone hooks agent is never loaded for a
+    /// user-selected agent and status goes dark. When disabled, AoE installs its
+    /// standalone hooks agent instead and leaves the user's agent file
+    /// untouched.
+    #[serde(default = "default_true")]
+    #[setting(
+        label = "Merge Hooks Into Selected Agent",
+        widget = "toggle",
+        category = "Agents"
+    )]
+    pub merge_hooks_into_selected_agent: bool,
+
     /// Auto-rename a new structured-view (ACP) session from its first message,
     /// using the session's own agent in one-shot mode (e.g. `claude -p`). Only
     /// applies while the session still carries its auto-generated name; a
@@ -1244,6 +1259,7 @@ impl Default for SessionConfig {
             agent_extra_args: HashMap::new(),
             agent_command_override: HashMap::new(),
             agent_status_hooks: true,
+            merge_hooks_into_selected_agent: true,
             smart_rename: true,
             smart_rename_agent: String::new(),
             mouse_capture: true,

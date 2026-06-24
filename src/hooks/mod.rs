@@ -1836,6 +1836,22 @@ pub fn install_kiro_hooks(agent_config_path: &Path, target: HookInstallTarget) -
     })
 }
 
+/// Home-relative path to a user's Kiro agent config file by name, e.g.
+/// `custom-agent` → `.kiro/agents/custom-agent.json`. Wired into `kiro`'s
+/// [`crate::agents::SelectedAgentHooks::config_subpath`] so the install site can
+/// target the selected agent's own file. The caller is responsible for
+/// validating `name` (see [`crate::agents::parse_selected_agent`], which rejects
+/// path separators) before joining to `$HOME`.
+///
+/// Installing into this path reuses [`install_kiro_hooks`], which preserves any
+/// existing user hooks and is idempotent; [`uninstall_kiro_hooks`] strips only
+/// the AoE-tagged entries.
+pub fn kiro_agent_file_for(name: &str) -> PathBuf {
+    Path::new(".kiro")
+        .join("agents")
+        .join(format!("{name}.json"))
+}
+
 /// Make `aoe-hooks` the active default Kiro agent if the user is still on
 /// Kiro's built-in default. Skipped when a user has chosen a custom default
 /// so we never silently override their preference. Best-effort: any failure
@@ -3556,6 +3572,71 @@ hooks_auto_accept: false
         let config_path = tmp.path().join("nonexistent.json");
         let modified = uninstall_kiro_hooks(&config_path).unwrap();
         assert!(!modified);
+    }
+
+    #[test]
+    fn test_kiro_agent_file_for() {
+        assert_eq!(
+            kiro_agent_file_for("custom-agent"),
+            Path::new(".kiro/agents/custom-agent.json")
+        );
+    }
+
+    #[test]
+    fn test_install_into_selected_kiro_agent_creates_file() {
+        // No pre-existing agent file: installing into the selected agent's path
+        // creates it with AoE hooks, just like the dedicated aoe-hooks agent.
+        // Mirrors how `install_sidecar_host_hooks` composes the path helper with
+        // the sidecar installer.
+        let home = TempDir::new().unwrap();
+        let path = home.path().join(kiro_agent_file_for("custom-agent"));
+        install_kiro_hooks(&path, HookInstallTarget::Host).unwrap();
+
+        let config: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        for (event, _) in KIRO_HOOKS {
+            let entries = config["hooks"][event].as_array().unwrap();
+            assert_eq!(
+                entries.len(),
+                1,
+                "event {} should have one AoE entry",
+                event
+            );
+            assert!(is_aoe_hook_command(entries[0]["command"].as_str().unwrap()));
+        }
+    }
+
+    #[test]
+    fn test_install_into_selected_kiro_agent_preserves_user_config() {
+        // A real user agent has its own name/prompt/tools/hooks. Installing must
+        // keep all of that and only add AoE hook entries.
+        let home = TempDir::new().unwrap();
+        let path = home.path().join(kiro_agent_file_for("custom-agent"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"name":"custom-agent","prompt":"custom helper","tools":["read","shell"],"hooks":{"preToolUse":[{"command":"echo mine"}]}}"#,
+        )
+        .unwrap();
+
+        install_kiro_hooks(&path, HookInstallTarget::Host).unwrap();
+
+        let config: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        // User fields untouched.
+        assert_eq!(config["name"].as_str().unwrap(), "custom-agent");
+        assert_eq!(config["prompt"].as_str().unwrap(), "custom helper");
+        assert_eq!(config["tools"].as_array().unwrap().len(), 2);
+        // User's own preToolUse hook is preserved, AoE's appended after it.
+        let pre = config["hooks"]["preToolUse"].as_array().unwrap();
+        assert_eq!(pre[0]["command"].as_str().unwrap(), "echo mine");
+        assert!(pre
+            .iter()
+            .any(|h| is_aoe_hook_command(h["command"].as_str().unwrap())));
+        // And it's reversible without harming the user's hook.
+        assert!(uninstall_kiro_hooks(&path).unwrap());
+        let after: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let pre_after = after["hooks"]["preToolUse"].as_array().unwrap();
+        assert_eq!(pre_after.len(), 1);
+        assert_eq!(pre_after[0]["command"].as_str().unwrap(), "echo mine");
     }
 
     fn run_session_id_hook(payload: &str, instance_id: &str, base: &Path) -> std::process::Output {

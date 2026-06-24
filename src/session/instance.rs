@@ -1695,6 +1695,34 @@ impl Instance {
         }
     }
 
+    /// The text searched for a user-selected `--agent NAME` flag: both the
+    /// command override (where a custom command like `kiro-cli chat --agent x`
+    /// may live) and the extra-args field (the usual place). Joined so a flag
+    /// in either is found.
+    fn selected_agent_args(&self) -> String {
+        if self.command.is_empty() {
+            self.extra_args.clone()
+        } else if self.extra_args.is_empty() {
+            self.command.clone()
+        } else {
+            format!("{} {}", self.command, self.extra_args)
+        }
+    }
+
+    /// Launch command including any agent `launch_subcommand` (e.g.
+    /// `kiro-cli chat`). A user command override takes precedence verbatim and
+    /// the subcommand is not applied to it. Used when assembling the launch
+    /// command so subcommand-scoped flags (yolo, resume) parse correctly.
+    fn get_launch_command(&self) -> String {
+        if self.command.is_empty() {
+            crate::agents::get_agent(&self.tool)
+                .map(|a| a.launch_base_command())
+                .unwrap_or_else(|| "bash".to_string())
+        } else {
+            self.command.clone()
+        }
+    }
+
     pub fn tmux_session(&self) -> Result<tmux::Session> {
         tmux::Session::new(&self.id, &self.title)
     }
@@ -2009,10 +2037,11 @@ impl Instance {
                 }
             }
 
+            let launch_cmd = self.get_launch_command();
             let base_cmd = if self.extra_args.is_empty() {
-                self.get_tool_command().to_string()
+                launch_cmd
             } else {
-                format!("{} {}", self.get_tool_command(), self.extra_args)
+                format!("{} {}", launch_cmd, self.extra_args)
             };
             let mut tool_cmd = if self.is_yolo_mode() {
                 if let Some(ref yolo) = agent.and_then(|a| a.yolo.as_ref()) {
@@ -2111,10 +2140,8 @@ impl Instance {
     /// Respects the `agent_status_hooks` config setting.
     fn install_agent_status_hooks(&self, agent: Option<&'static crate::agents::AgentDef>) {
         let profile = self.effective_profile();
-        let hooks_enabled = super::profile_config::resolve_config_or_warn(&profile)
-            .session
-            .agent_status_hooks;
-        if !hooks_enabled {
+        let session_cfg = super::profile_config::resolve_config_or_warn(&profile).session;
+        if !session_cfg.agent_status_hooks {
             return;
         }
         if let Some(sidecar) = agent.and_then(|a| a.sidecar_hooks.as_ref()) {
@@ -2124,16 +2151,7 @@ impl Instance {
             // sandboxed, so the gate is a no-op for them.
             if !self.is_sandboxed() {
                 if let Some(home) = dirs::home_dir() {
-                    let config_path = home.join(sidecar.host_config_subpath);
-                    match (sidecar.install)(&config_path, crate::hooks::HookInstallTarget::Host) {
-                        Ok(()) => {
-                            if let Some(post_install) = sidecar.post_install_host {
-                                post_install();
-                            }
-                        }
-                        Err(e) => tracing::warn!(target: "session.store",
-                            "Failed to install {} hooks: {}", self.tool, e),
-                    }
+                    self.install_sidecar_host_hooks(sidecar, &home, &session_cfg);
                 }
             }
         } else if let Some(hook_cfg) = agent.and_then(|a| a.hook_config.as_ref()) {
@@ -2146,6 +2164,51 @@ impl Instance {
                 }
             }
             // Sandboxed sessions install via build_container_config.
+        }
+    }
+
+    /// Install a sidecar agent's host hooks. For agents whose hooks are scoped
+    /// to a user-selected named agent (`selected_agent_hooks`, e.g. Kiro), and
+    /// when the user actually selected one and the merge setting is on, install
+    /// into that agent's own config file and stop. Otherwise install into the
+    /// agent's standalone config and run any `post_install_host` follow-up.
+    fn install_sidecar_host_hooks(
+        &self,
+        sidecar: &'static crate::agents::SidecarHooks,
+        home: &Path,
+        session_cfg: &super::config::SessionConfig,
+    ) {
+        if session_cfg.merge_hooks_into_selected_agent {
+            if let Some(sel) = sidecar.selected_agent_hooks.as_ref() {
+                if let Some(name) =
+                    crate::agents::parse_selected_agent(&self.selected_agent_args(), sel.flag)
+                {
+                    // The selected agent is what the CLI loads; install AoE's
+                    // hooks into its config (these CLIs have no global hooks) and
+                    // skip the standalone-agent install + post_install_host.
+                    let path = home.join((sel.config_subpath)(&name));
+                    match (sidecar.install)(&path, crate::hooks::HookInstallTarget::Host) {
+                        Ok(()) => tracing::info!(target: "session.store",
+                            "Installed AoE status hooks into {} agent '{}'", self.tool, name),
+                        Err(e) => tracing::warn!(target: "session.store",
+                            "Failed to install AoE hooks into {} agent '{}': {}", self.tool, name, e),
+                    }
+                    return;
+                }
+            }
+        }
+
+        let config_path = home.join(sidecar.host_config_subpath);
+        match (sidecar.install)(&config_path, crate::hooks::HookInstallTarget::Host) {
+            Ok(()) => {
+                tracing::info!(target: "session.store",
+                    "Installed AoE status hooks for {} via standalone hooks agent", self.tool);
+                if let Some(post_install) = sidecar.post_install_host {
+                    post_install();
+                }
+            }
+            Err(e) => tracing::warn!(target: "session.store",
+                "Failed to install {} hooks: {}", self.tool, e),
         }
     }
 
@@ -2241,7 +2304,7 @@ impl Instance {
         if self.command.is_empty() {
             match crate::agents::get_agent(&self.tool) {
                 Some(a) => {
-                    let mut cmd = a.binary.to_string();
+                    let mut cmd = a.launch_base_command();
                     if !self.extra_args.is_empty() {
                         cmd = format!("{} {}", cmd, self.extra_args);
                     }
@@ -5773,6 +5836,90 @@ mod tests {
         assert!(cmd_str.contains("TERM=xterm-256color"));
         assert!(cmd_str.contains("COLORTERM=truecolor"));
         assert!(cmd_str.contains("agy"));
+    }
+
+    #[test]
+    fn test_build_host_command_kiro_uses_chat_subcommand() {
+        // Regression: Kiro must launch via `kiro-cli chat` so the binary
+        // accepts chat-scoped flags. Bare `kiro-cli` rejects --trust-all-tools.
+        let mut inst = Instance::new("test", "/tmp/test");
+        inst.tool = "kiro".to_string();
+        let (cmd, _) = inst
+            .build_host_command(crate::agents::get_agent("kiro"), &None)
+            .unwrap();
+        assert!(cmd.unwrap().contains("kiro-cli chat"));
+    }
+
+    #[test]
+    fn test_build_host_command_kiro_yolo_after_chat() {
+        // YOLO flag must follow the `chat` subcommand, not precede it.
+        let mut inst = Instance::new("test", "/tmp/test");
+        inst.tool = "kiro".to_string();
+        inst.yolo_mode = true;
+        let (cmd, _) = inst
+            .build_host_command(crate::agents::get_agent("kiro"), &None)
+            .unwrap();
+        let cmd_str = cmd.unwrap();
+        let chat_pos = cmd_str
+            .find("kiro-cli chat")
+            .expect("chat subcommand present");
+        let yolo_pos = cmd_str
+            .find("--trust-all-tools")
+            .expect("yolo flag present");
+        assert!(
+            yolo_pos > chat_pos,
+            "--trust-all-tools must come after `kiro-cli chat`: {cmd_str}"
+        );
+    }
+
+    #[test]
+    fn test_build_host_command_custom_override_skips_subcommand() {
+        // A user command override is passed through verbatim; AoE must not
+        // inject a launch subcommand into it (the user is in full control).
+        let mut inst = Instance::new("test", "/tmp/test");
+        inst.tool = "kiro".to_string();
+        inst.command = "kiro-cli chat --trust-all-tools".to_string();
+        let (cmd, _) = inst
+            .build_host_command(crate::agents::get_agent("kiro"), &None)
+            .unwrap();
+        let cmd_str = cmd.unwrap();
+        // Exactly one "chat" token — no doubled `chat chat`.
+        assert_eq!(
+            cmd_str.matches("chat").count(),
+            1,
+            "no duplicate subcommand: {cmd_str}"
+        );
+    }
+
+    #[test]
+    fn test_selected_agent_args_combines_command_and_extra() {
+        let mut inst = Instance::new("test", "/tmp/test");
+        inst.tool = "kiro".to_string();
+        inst.extra_args = "--agent custom-agent".to_string();
+        assert_eq!(
+            crate::agents::parse_selected_agent(&inst.selected_agent_args(), "--agent"),
+            Some("custom-agent".to_string())
+        );
+
+        // Agent named inside a command override is also found.
+        let mut inst2 = Instance::new("test", "/tmp/test");
+        inst2.tool = "kiro".to_string();
+        inst2.command = "kiro-cli chat --agent custom-agent".to_string();
+        assert_eq!(
+            crate::agents::parse_selected_agent(&inst2.selected_agent_args(), "--agent"),
+            Some("custom-agent".to_string())
+        );
+
+        // extra_args is appended after the command override, so a per-session
+        // --agent there wins over one baked into the override (last wins).
+        let mut inst3 = Instance::new("test", "/tmp/test");
+        inst3.tool = "kiro".to_string();
+        inst3.command = "kiro-cli chat --agent from-command".to_string();
+        inst3.extra_args = "--agent from-extra".to_string();
+        assert_eq!(
+            crate::agents::parse_selected_agent(&inst3.selected_agent_args(), "--agent"),
+            Some("from-extra".to_string())
+        );
     }
 
     #[test]
