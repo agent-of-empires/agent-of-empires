@@ -337,11 +337,22 @@ impl PluginManifest {
                     }
                 }
                 if s.value_type == SettingType::Integer {
-                    if let (Some(v), Some(lo), Some(hi)) = (def.as_integer(), s.min, s.max) {
-                        check(
-                            v >= lo && v <= hi,
-                            format!("settings[{i}].default {v} is outside range [{lo}, {hi}]"),
-                        );
+                    if let Some(v) = def.as_integer() {
+                        // Check each bound independently so a single-sided range
+                        // (only min, or only max) still rejects an out-of-range
+                        // default.
+                        if let Some(lo) = s.min {
+                            check(
+                                v >= lo,
+                                format!("settings[{i}].default {v} is below min {lo}"),
+                            );
+                        }
+                        if let Some(hi) = s.max {
+                            check(
+                                v <= hi,
+                                format!("settings[{i}].default {v} is above max {hi}"),
+                            );
+                        }
                     }
                 }
             }

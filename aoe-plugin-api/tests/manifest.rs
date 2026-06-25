@@ -200,9 +200,14 @@ default = "not-an-int"
 [[settings]]
 key = "n"
 type = "integer"
-min = 0
 max = 5
 default = 9
+
+[[settings]]
+key = "lo"
+type = "integer"
+min = 10
+default = 1
 
 [[settings]]
 key = "mode"
@@ -220,16 +225,23 @@ default = "turbo"
             .any(|m| m.contains("settings[0].default does not match")),
         "{messages:?}"
     );
+    // Single-sided bounds are each enforced.
     assert!(
         messages
             .iter()
-            .any(|m| m.contains("settings[1].default 9 is outside range")),
+            .any(|m| m.contains("settings[1].default 9 is above max 5")),
         "{messages:?}"
     );
     assert!(
         messages
             .iter()
-            .any(|m| m.contains("settings[2].default") && m.contains("not one of the options")),
+            .any(|m| m.contains("settings[2].default 1 is below min 10")),
+        "{messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("settings[3].default") && m.contains("not one of the options")),
         "{messages:?}"
     );
 }
