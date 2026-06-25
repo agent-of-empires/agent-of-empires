@@ -79,7 +79,8 @@ def main() -> None:
     except Exception as exc:  # noqa: BLE001
         sys.exit(f"failed to exchange PIN for an access token: {exc}")
 
-    who = "unknown (could not verify)"
+    who = None
+    verify_error = None
     try:
         client = tweepy.Client(
             consumer_key=consumer_key,
@@ -90,16 +91,24 @@ def main() -> None:
         me = client.get_me()
         if me and me.data:
             who = me.data.username
-    except Exception:  # noqa: BLE001 - verification is best-effort
-        pass
+    except Exception as exc:  # noqa: BLE001 - report it, do not mask it
+        verify_error = exc
 
-    print(f"\nThis token posts as: @{who}")
-    if who.lower() != "agentofempires":
-        print(
-            "WARNING: that is not @agentofempires. You likely authorized while "
-            "logged in as the wrong account.\nRe-run and approve in a window "
-            "logged in as @agentofempires.\n"
-        )
+    if who:
+        print(f"\nThis token posts as: @{who}")
+        if who.lower() != "agentofempires":
+            print(
+                "WARNING: that is not @agentofempires. You likely authorized while "
+                "logged in as the wrong account.\nRe-run and approve in a window "
+                "logged in as @agentofempires.\n"
+            )
+    else:
+        # Verification failed (network/API), which is NOT the same as a
+        # wrong-account result. Say so plainly instead of crying wrong-account.
+        detail = f": {verify_error}" if verify_error else "."
+        print(f"\nCould not verify which account this token posts as{detail}")
+        print("Confirm you authorized as @agentofempires before relying on it.")
+
     print("\nAdd these two lines to ~/.zshrc, then `source ~/.zshrc`:\n")
     print(f'export X_ACCESS_TOKEN="{access_token}"')
     print(f'export X_ACCESS_SECRET="{access_secret}"')

@@ -1,6 +1,6 @@
 # Only needed for the --send path. The dry-run preview has no dependencies.
 # tweepy posts the tweet (v2); requests + requests-oauthlib do the v2 media
 # upload directly, since tweepy only offers the retired v1.1 media endpoint.
-tweepy>=4.14
-requests>=2.31
-requests-oauthlib>=1.3
+tweepy>=4.14,<5
+requests>=2.31,<3
+requests-oauthlib>=1.3,<3

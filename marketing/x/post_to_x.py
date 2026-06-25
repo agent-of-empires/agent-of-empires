@@ -51,6 +51,9 @@ LINK_RE = re.compile(r"https?://", re.IGNORECASE)
 # level, while v2 create_tweet works. So we do the v2 chunked flow by hand.
 MEDIA_UPLOAD_URL = "https://api.x.com/2/media/upload"
 CHUNK_SIZE = 4 * 1024 * 1024  # 4 MB per APPEND segment
+REQUEST_TIMEOUT = (10, 60)  # (connect, read) seconds, so a hang fails instead of stalling
+PROCESSING_TIMEOUT_SECS = 300  # hard cap on waiting for async media processing
+EXPECTED_USERNAME = "agentofempires"  # refuse to post from any other account
 
 MEDIA_TYPES = {
     ".gif": "image/gif",
@@ -173,6 +176,7 @@ def _upload_one(requests, auth, path: Path) -> str:
             "total_bytes": total,
             "media_category": media_category(path),
         },
+        timeout=REQUEST_TIMEOUT,
     )
     _check(init, "INIT")
     media_id = init.json()["data"]["id"]
@@ -188,20 +192,29 @@ def _upload_one(requests, auth, path: Path) -> str:
                 auth=auth,
                 data={"segment_index": str(segment)},
                 files={"media": ("chunk", chunk, "application/octet-stream")},
+                timeout=REQUEST_TIMEOUT,
             )
             _check(append, f"APPEND segment {segment}")
             segment += 1
 
-    final = requests.post(f"{MEDIA_UPLOAD_URL}/{media_id}/finalize", auth=auth)
+    final = requests.post(
+        f"{MEDIA_UPLOAD_URL}/{media_id}/finalize",
+        auth=auth,
+        timeout=REQUEST_TIMEOUT,
+    )
     _check(final, "FINALIZE")
 
     info = (final.json().get("data") or {}).get("processing_info")
+    deadline = time.monotonic() + PROCESSING_TIMEOUT_SECS
     while info and info.get("state") in ("pending", "in_progress"):
+        if time.monotonic() > deadline:
+            sys.exit(f"media processing timed out after {PROCESSING_TIMEOUT_SECS}s: {info}")
         time.sleep(info.get("check_after_secs", 1))
         status = requests.get(
             MEDIA_UPLOAD_URL,
             auth=auth,
             params={"command": "STATUS", "media_id": media_id},
+            timeout=REQUEST_TIMEOUT,
         )
         _check(status, "STATUS")
         info = (status.json().get("data") or {}).get("processing_info")
@@ -209,6 +222,26 @@ def _upload_one(requests, auth, path: Path) -> str:
         sys.exit(f"media processing failed: {info}")
 
     return media_id
+
+
+def require_brand_account(client) -> None:
+    """Refuse to post unless the credentials authenticate as EXPECTED_USERNAME.
+
+    A terminal can hold tokens for the wrong handle; verify before anything goes
+    out so we never post from the wrong account.
+    """
+    try:
+        me = client.get_me()
+    except Exception as exc:  # noqa: BLE001 - surface the real cause
+        sys.exit(f"refusing to send: could not verify the X account: {exc}")
+    username = getattr(me.data, "username", None) if me else None
+    if not username:
+        sys.exit("refusing to send: could not read the authenticated username.")
+    if username.lower() != EXPECTED_USERNAME:
+        sys.exit(
+            f"refusing to send: credentials authenticate as @{username}, "
+            f"expected @{EXPECTED_USERNAME}."
+        )
 
 
 def send(text: str, media: list[str], reply: str | None) -> None:
@@ -220,6 +253,7 @@ def send(text: str, media: list[str], reply: str | None) -> None:
         access_token=creds["X_ACCESS_TOKEN"],
         access_token_secret=creds["X_ACCESS_SECRET"],
     )
+    require_brand_account(client)
 
     media_ids = upload_media(creds, media) if media else None
     resp = client.create_tweet(text=text, media_ids=media_ids)
@@ -230,6 +264,25 @@ def send(text: str, media: list[str], reply: str | None) -> None:
         reply_resp = client.create_tweet(text=reply, in_reply_to_tweet_id=tweet_id)
         reply_id = reply_resp.data["id"]
         print(f"reply:  https://x.com/agentofempires/status/{reply_id}")
+
+
+def validate_media(paths: list[str]) -> None:
+    """Enforce X's attachment limits locally before uploading anything."""
+    if not paths:
+        return
+    categories = []
+    for raw in paths:
+        path = Path(raw)
+        if not path.is_file():
+            sys.exit(f"media file not found: {path}")
+        if path.suffix.lower() not in MEDIA_TYPES:
+            sys.exit(f"unsupported media type: {path.suffix or path}")
+        categories.append(media_category(path))
+    animated = any(c in ("tweet_video", "tweet_gif") for c in categories)
+    if animated and len(paths) > 1:
+        sys.exit("refusing to send: a gif or video post can attach only one file.")
+    if not animated and len(paths) > 4:
+        sys.exit("refusing to send: an image post can attach at most 4 files.")
 
 
 def main() -> None:
@@ -264,6 +317,7 @@ def main() -> None:
     if len(args.text) > MAX_LEN or (args.reply and len(args.reply) > MAX_LEN):
         sys.exit("refusing to send: a post exceeds 280 chars. Trim it and retry.")
 
+    validate_media(args.media)
     send(args.text, args.media, args.reply)
 
 

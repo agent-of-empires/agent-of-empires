@@ -38,8 +38,14 @@ See `exports.example.sh` for a copy-paste block. Add the filled-in lines to
 `~/.zshrc`, then `source ~/.zshrc` or open a new terminal. Verify with:
 
 ```bash
-env | grep -E '^X_(API|ACCESS)' | sed -E 's/=.*/=<set>/'
+for v in X_API_KEY X_API_SECRET X_ACCESS_TOKEN X_ACCESS_SECRET; do
+  eval "val=\$$v"
+  [ -n "$val" ] && echo "$v: set" || echo "$v: MISSING or empty"
+done
 ```
+
+It must report all four as `set`. If any shows `MISSING or empty`, you likely
+sourced the template (`exports.example.sh`) without filling in the values.
 
 ## One-time setup
 
@@ -101,7 +107,7 @@ link shows up in the main post.
 
 ## Voice rules (for whatever drafts these)
 
-- No em dashes, no `--` as a separator. Use commas, periods, or rephrase.
+- No em dashes, and no double-hyphen separators in prose. Use commas, periods, or rephrase.
 - No hashtag spam. One tasteful tag at most, usually zero.
 - Show, do not tell: a 15-second clip of the dashboard beats three sentences of
   adjectives.
