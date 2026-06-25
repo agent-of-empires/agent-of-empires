@@ -82,7 +82,7 @@ write them, so the later API PRs (#2094, #2095) stay focused on behavior:
   by plugin id, persisted per session in `sessions.json`. Each plugin owns only
   its own slot; data for an uninstalled plugin is retained (cheap, and
   reinstalling restores it). The read/write/cas host API over it
-  (`session.meta.{get,set,cas}`) lands with the Tier 1 host (#2095).
+  (`session.meta.{get,set,cas}`) ships with the Tier 1 host (see below).
 
 Both fields are additive (`#[serde(default, skip_serializing_if = ...)]`):
 absent in older on-disk rows, so they deserialize to empty and need no data
@@ -124,8 +124,8 @@ exists, so no schema lands in core ahead of one (#2386). With
 
 The `runtime` section is one of two kinds: `command` (an argv launched from the
 plugin directory) or `release-binary` (a compiled worker shipped as a GitHub
-release asset). Only installation acts on `release-binary` today (it downloads
-the asset); launching either worker is #2095.
+release asset). Installation resolves and downloads a `release-binary` asset;
+the Tier 1 host (below) launches and supervises both kinds.
 
 ## Capabilities and grants (#2093)
 
@@ -226,11 +226,100 @@ plugin tampered after install.
 `aoe plugin hash <dir>` prints the tree hash for a plugin directory so an author
 can produce the value a maintainer pins. Run it on a clean checkout.
 
+## Tier 1 worker host (#2095)
+
+The worker host runs inside the `aoe serve` daemon (it is `serve`-gated, like
+`aoe.web`), because the host API it exposes reads and writes the event store and
+session storage the daemon owns. A TUI-only build has no host. The daemon builds
+one `PluginHost` at startup, launches a worker for every active plugin that
+declares a `[runtime]`, and reaps them all on shutdown
+(`AppState.plugin_host`, `src/server/mod.rs`).
+
+### Launching a worker, language-agnostically
+
+The host, not the plugin, decides how to resolve and execute a worker.
+`src/plugin/launch.rs` turns a `LoadedPlugin` into a `ResolvedLaunch { program,
+args, cwd, env }`, dispatched off the `[runtime]` kind in a single `match`.
+Adding a new runtime kind later is a new arm there; the supervisor and the
+transport only ever see a `ResolvedLaunch`, so nothing downstream changes.
+
+- `command`: `argv[0]` resolves on `PATH` via `which` when it is a bare name (a
+  console-script entrypoint like `aoe-github-worker`, or an interpreter like
+  `python3`), or relative to the plugin directory when it contains a separator
+  (an in-tree script or binary), verified executable. Absolute and
+  parent-traversal paths are rejected.
+- `release-binary`: the per-platform binary that installation already placed in
+  the plugin directory.
+
+A missing runtime fails loudly with an actionable hint naming the program (and,
+for a binary, the host `os-arch`), matching the project's error-with-hint style.
+Filesystem and `PATH` probing go through a `LaunchResolver` trait so the
+resolution policy is unit-tested with no real filesystem.
+
+Builtins do not declare a `[runtime]` in this release, so `resolve_launch`
+returns "no worker" for them. The `aoe __plugin-worker` self-exec path for a
+builtin worker, and the worker-side SDK, arrive with the first builtin worker
+that needs them; shipping them now would be unused code.
+
+### Transport and supervision
+
+A worker is an executable speaking newline-delimited JSON-RPC 2.0
+(`src/plugin/protocol.rs`) over its stdio: it writes one request object per line
+to stdout and reads one response per line on stdin. The host is the server. Any
+language that speaks this wire is a valid worker.
+
+The worker is a child owned by the daemon, not a detached process (this is the
+ACP supervision model minus its persistence half). There is no socket, no
+on-disk runner record, and no reattach: a plugin worker is a stateless
+transformer over a host-owned event stream, so surviving a daemon restart would
+only strand it with a stale view. The daemon dies, its workers die, a fresh
+daemon respawns them. What is kept from ACP: process-group reaping (a worker
+that forks helpers is torn down whole), a per-worker respawn budget so a crash
+loop does not spin, and a concurrency cap. The worker's stderr drains to
+`<app_dir>/plugin-workers/<id>.log`.
+
+### Capability-gated host API
+
+Each host method maps to a capability the plugin declared and was granted; the
+middleware refuses an undeclared or ungranted call before the method runs
+(`src/plugin/host_api.rs`). No new capabilities are introduced; the v1 methods
+reuse the existing taxonomy:
+
+| Method | Capability |
+| --- | --- |
+| `events.publish` / `events.subscribe` | `runtime.worker` |
+| `session.meta.get` | `session.read` |
+| `session.meta.set` / `session.meta.cas` | `session.write` |
+| `sessions.list` | `session.read` |
+
+`events.*` run over a shared plugin event bus (a `plugin_host` schema on the
+durable event-log substrate, `src/events/`); `subscribe { topics, after_seq }`
+is a replay-after-cursor read, so a worker polls forward from the last seq it
+saw. Session metadata is always read and written under the calling plugin's own
+`plugin_meta[<plugin-id>]` slot: the worker sends only a `key`, never another
+plugin's id, so one plugin cannot reach another's data. A `session.meta.cas`
+that loses returns the current value rather than clobbering it. Writes go
+through `Storage`'s cross-process lock, so the daemon picks them up on its next
+session reload (eventual consistency, not a live push).
+
+### Sandboxing
+
+`SandboxBackend` (`src/plugin/sandbox.rs`) is the seam between a resolved launch
+and the spawn. The only v1 backend is `NoSandbox`, which runs the worker as an
+ordinary child. Per D8 this is honest, not complete: capability gating at the
+host API boundary stops a cooperative plugin from overreaching, but a granted
+worker has no OS-level isolation, so an adversarial plugin is not contained. The
+capability grant prompt states this on every install. Restricted-environment,
+landlock, and `sandbox-exec` backends land later behind the same trait, with no
+change to the resolver or the supervisor.
+
 ## What comes next
 
-Each deferred piece returns as its own PR once the core is proven: the
-contribution registries and the JSON-RPC worker runtime and event bus built on
-the substrate above (issues 2094, 2095, and 2366), and the discovery layer over
-the featured index (issue 2365). Pinning a featured plugin's release-binary
-asset hash in `featured.toml` (so a featured worker is attested, not just its
-source) is a follow-up; today a release-binary plugin cannot be featured.
+Each deferred piece returns as its own PR once the core is proven: the Tier 0
+contribution registries and the command/keybind/UI surfaces (issues 2094 and
+2366), the builtin worker self-exec path and worker SDK (with the first builtin
+worker that needs them), and the discovery / featured supply-chain layer with
+integrity hashing (issues 2364 and 2365). Pinning a featured plugin's
+release-binary asset hash in `featured.toml` (so a featured worker is attested,
+not just its source) is a follow-up; today a release-binary plugin cannot be
+featured.
