@@ -109,13 +109,18 @@ dependency arrow runs consumer -> substrate):
 ## Contribution schema (#2093)
 
 `PluginManifest` extends past identity to the contribution sections a plugin
-declares: `commands`, `keybinds`, `settings`, `themes`, `ui`, `status`,
-`panes`, and a `runtime` worker entrypoint. These are defined in
-`aoe-plugin-api` and parsed/validated by the host, but consumed by later issues
-(the settings registry in #2094, the runtime host in #2095, the
-command/keybind/UI surfaces in #2366). `api_version` is bumped to 2; an
-`api_version` 1 manifest still loads. Unknown top-level keys remain a hard
-parse error (`deny_unknown_fields`).
+declares: `capabilities`, `commands`, `keybinds`, `settings`, `ui`, and a
+`runtime` worker entrypoint. These are the sections the first external plugin
+declares; they are defined in `aoe-plugin-api` and parsed/validated by the
+host, but consumed by later issues (the settings registry in #2094, the runtime
+host in #2095, the command/keybind/UI surfaces in #2366). `api_version` is
+bumped to 2; an `api_version` 1 manifest still loads. Unknown top-level keys
+remain a hard parse error (`deny_unknown_fields`).
+
+The `themes`, `status`, and `panes` sections are deferred until a consumer
+exists, so no schema lands in core ahead of one (#2386). With
+`deny_unknown_fields`, a manifest declaring `[[themes]]`, `[[status]]`, or
+`[[panes]]` is a hard parse error today.
 
 The `runtime` section is one of two kinds: `command` (an argv launched from the
 plugin directory) or `release-binary` (a compiled worker shipped as a GitHub
