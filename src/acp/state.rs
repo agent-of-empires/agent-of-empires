@@ -534,6 +534,13 @@ pub enum Event {
     TodoListUpdated {
         todos: Vec<Todo>,
     },
+    /// The agent pushed a session title via ACP `session_info_update`
+    /// (claude-agent-acp >=0.52 emits this at every turn-end). The title is
+    /// already normalized. Not part of `AcpState`; the daemon's
+    /// `acp_event_listener` applies it to the session's `Instance.title`.
+    SessionTitleSuggested {
+        title: String,
+    },
     ToolCallStarted {
         tool_call: ToolCall,
     },
@@ -914,6 +921,9 @@ impl AcpState {
         match event {
             Event::PlanUpdated { plan } => self.current_plan = Some(plan),
             Event::TodoListUpdated { todos } => self.todos = todos,
+            // Session title lives on `Instance`, not `AcpState`; the daemon's
+            // `acp_event_listener` applies it. No transcript state to mutate.
+            Event::SessionTitleSuggested { .. } => {}
             Event::ToolCallStarted { tool_call } => self.in_flight_tool = Some(tool_call),
             Event::ToolCallCompleted { tool_call_id, .. } => {
                 if self

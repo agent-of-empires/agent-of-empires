@@ -1033,11 +1033,16 @@ pub async fn acp_prompt(
     // Best-effort: auto-rename a still-default-named session from this first
     // message via the agent's one-shot mode. Detached so it never blocks or
     // fails the prompt; all gating lives inside. See session::smart_rename.
-    tokio::spawn(crate::session::smart_rename::try_smart_rename(
-        state.clone(),
-        id.clone(),
-        req.text.clone(),
-    ));
+    // Skipped for adapters that push the session title natively at turn-end
+    // (claude-agent-acp >=0.52): that path renames without a second process,
+    // and skipping keeps each session to a single title writer. See #2396.
+    if !state.acp_supervisor.pushes_native_session_title(&id).await {
+        tokio::spawn(crate::session::smart_rename::try_smart_rename(
+            state.clone(),
+            id.clone(),
+            req.text.clone(),
+        ));
+    }
     match state
         .acp_supervisor
         .send_prompt(&id, &req.text, &attachments)

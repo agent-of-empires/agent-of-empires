@@ -226,6 +226,34 @@ pub fn sanitize_title(raw: &str, user_message: &str) -> Option<String> {
     best
 }
 
+/// Cap for a native `session_info_update` title. Higher than `MAX_TITLE_CHARS`
+/// (the one-shot path's 3-to-5 word budget) because a native title can be a
+/// deliberate user `/rename`, not just a generated summary; render layers
+/// truncate further for display.
+#[cfg(feature = "serve")]
+const MAX_NATIVE_TITLE_CHARS: usize = 120;
+
+/// Normalize a claude-agent-acp native title for storage: strip ANSI, take the
+/// first non-empty cleaned line, and cap the length. Returns `None` when the
+/// result is empty or is itself a default civ name (which would re-arm the
+/// auto-overwrite gate and churn the title). Unlike `sanitize_title` this does
+/// not scan for refusals or enforce a word budget: the agent already produced a
+/// real title (possibly a user-set one), it just needs to be safe to persist.
+#[cfg(feature = "serve")]
+pub(crate) fn normalize_native_title(raw: &str) -> Option<String> {
+    let cleaned = strip_ansi(raw);
+    let line = cleaned.lines().map(clean_line).find(|l| !l.is_empty())?;
+    let capped = line
+        .chars()
+        .take(MAX_NATIVE_TITLE_CHARS)
+        .collect::<String>();
+    let capped = capped.trim().to_string();
+    if capped.is_empty() || is_default_civ_name(&capped) {
+        return None;
+    }
+    Some(capped)
+}
+
 /// Strip leading markdown markers / list numbering, wrapping quotes and
 /// backticks, trailing sentence punctuation, and collapse inner whitespace.
 fn clean_line(line: &str) -> String {
@@ -296,6 +324,8 @@ fn truncate_bytes(s: &str, max: usize) -> &str {
     &s[..end]
 }
 
+#[cfg(feature = "serve")]
+pub(crate) use serve::apply_auto_title;
 #[cfg(feature = "serve")]
 pub use serve::try_smart_rename;
 
@@ -424,10 +454,9 @@ mod serve {
             return;
         };
 
-        // Serialize against manual rename / worktree edits on this session.
-        let lock = state.instance_lock(&session_id).await;
-        let _serialized = lock.lock().await;
-        apply_title_only(&state, &session_id, &profile, &new_title).await;
+        // Serialization against manual rename / worktree edits is handled
+        // inside apply_auto_title via the per-session instance lock.
+        apply_auto_title(&state, &session_id, &profile, &new_title).await;
     }
 
     /// Run the agent one-shot in the session's working directory, capturing
@@ -483,10 +512,27 @@ mod serve {
         }
     }
 
-    /// Persist the new title (re-checking the still-default gate under the
-    /// storage lock) then mirror it into the in-memory instance list so
-    /// connected clients see it without waiting for a reload.
-    async fn apply_title_only(state: &Arc<AppState>, id: &str, profile: &str, new_title: &str) {
+    /// Apply an automatically-generated title to a session, persisting to
+    /// storage and mirroring the in-memory instance list so connected clients
+    /// see it without a reload. The write happens only while the current title
+    /// is still a default civ name or still equals the last auto title we wrote
+    /// (`title_is_auto_overwritable`), so a manual rename is never clobbered
+    /// while successive native pushes keep tracking the agent's title across
+    /// turns. Serializes against manual renames / worktree edits on this session
+    /// via the per-session instance lock, and mirrors memory only when the
+    /// storage write actually happened so the two never diverge.
+    ///
+    /// Used by both the `smart_rename` one-shot and the claude-agent-acp native
+    /// `session_info_update` push (via the daemon's `acp_event_listener`).
+    pub(crate) async fn apply_auto_title(
+        state: &Arc<AppState>,
+        id: &str,
+        profile: &str,
+        new_title: &str,
+    ) {
+        let lock = state.instance_lock(id).await;
+        let _serialized = lock.lock().await;
+
         let storage = match crate::session::storage::Storage::new(profile, state.file_watch.clone())
         {
             Ok(s) => s,
@@ -499,17 +545,20 @@ mod serve {
         let title_owned = new_title.to_string();
         let persisted = tokio::task::spawn_blocking(move || {
             storage.update(|instances, _groups| {
-                if let Some(inst) = instances.iter_mut().find(|i| i.id == id_owned) {
-                    if is_default_civ_name(&inst.title) {
-                        inst.title = title_owned.clone();
-                    }
+                let Some(inst) = instances.iter_mut().find(|i| i.id == id_owned) else {
+                    return Ok(false);
+                };
+                if title_is_auto_overwritable(inst) {
+                    inst.title = title_owned.clone();
+                    inst.last_auto_title = Some(title_owned.clone());
+                    return Ok(true);
                 }
-                Ok(())
+                Ok(false)
             })
         })
         .await;
-        match persisted {
-            Ok(Ok(())) => {}
+        let wrote = match persisted {
+            Ok(Ok(wrote)) => wrote,
             Ok(Err(e)) => {
                 tracing::warn!(target: "smart_rename", session = %id, "persist failed: {e}");
                 return;
@@ -518,15 +567,27 @@ mod serve {
                 tracing::warn!(target: "smart_rename", session = %id, "persist join failed: {e}");
                 return;
             }
+        };
+        if !wrote {
+            return;
         }
 
         let mut instances = state.instances.write().await;
         if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-            if is_default_civ_name(&inst.title) {
-                tracing::info!(target: "smart_rename", session = %id, old = %inst.title, new = %new_title, "renamed session from first message");
-                inst.title = new_title.to_string();
-            }
+            tracing::info!(target: "smart_rename", session = %id, old = %inst.title, new = %new_title, "auto-renamed session");
+            inst.title = new_title.to_string();
+            inst.last_auto_title = Some(new_title.to_string());
         }
+    }
+
+    /// Whether an automatic renamer may overwrite this session's title: either
+    /// it is still a default civ name (never explicitly set), or it still
+    /// matches the last title an auto renamer wrote (so native pushes keep
+    /// tracking the agent's evolving title). A manual rename leaves `title`
+    /// diverged from `last_auto_title`, which freezes it against auto writes.
+    pub(crate) fn title_is_auto_overwritable(inst: &crate::session::instance::Instance) -> bool {
+        is_default_civ_name(&inst.title)
+            || inst.last_auto_title.as_deref() == Some(inst.title.as_str())
     }
 
     #[cfg(test)]

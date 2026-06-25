@@ -881,6 +881,7 @@ fn event_kind(event: &crate::acp::Event) -> &'static str {
     match event {
         Event::PlanUpdated { .. } => "plan_updated",
         Event::TodoListUpdated { .. } => "todo_list_updated",
+        Event::SessionTitleSuggested { .. } => "session_title_suggested",
         Event::ToolCallStarted { .. } => "tool_call_started",
         Event::ToolCallCompleted { .. } => "tool_call_completed",
         Event::ToolCallContent { .. } => "tool_call_content",

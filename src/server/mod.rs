@@ -3599,6 +3599,39 @@ async fn acp_event_listener(state: Arc<AppState>) {
             });
         }
 
+        // Native session title push (claude-agent-acp >=0.52 emits
+        // `session_info_update` at turn-end). Apply it to `Instance.title`
+        // via the shared auto-rename helper, which keeps tracking the agent's
+        // title across turns while leaving a manual rename untouched. Gated on
+        // the `smart_rename` setting since this is still automatic renaming.
+        // Spawned so the listener loop never blocks on storage I/O.
+        if let crate::acp::state::Event::SessionTitleSuggested { title } = frame.event.as_ref() {
+            let profile = {
+                let instances = state.instances.read().await;
+                match instances.iter().find(|i| i.id == frame.session_id) {
+                    Some(inst) if inst.is_structured() => Some(inst.source_profile.clone()),
+                    _ => None,
+                }
+            };
+            if let Some(profile) = profile {
+                let cfg = crate::session::profile_config::resolve_config_or_warn(&profile);
+                if cfg.session.smart_rename {
+                    let state_for_title = state.clone();
+                    let session_id = frame.session_id.clone();
+                    let title = title.clone();
+                    tokio::spawn(async move {
+                        crate::session::smart_rename::apply_auto_title(
+                            &state_for_title,
+                            &session_id,
+                            &profile,
+                            &title,
+                        )
+                        .await;
+                    });
+                }
+            }
+        }
+
         let status_intent = derive_acp_status(frame.event.as_ref());
         let acp_change = derive_acp_session_change(frame.event.as_ref());
         if status_intent.is_none() && acp_change.is_none() {

@@ -731,6 +731,20 @@ impl<S: BroadcastSink> Supervisor<S> {
         AcpWorkerState::Absent
     }
 
+    /// Whether the live worker for this session is connected to an adapter
+    /// that pushes session titles natively via ACP `session_info_update`
+    /// (claude-agent-acp >=0.52). False when there is no live worker or the
+    /// adapter does not push, so callers fall back to the smart_rename
+    /// one-shot for renaming.
+    pub async fn pushes_native_session_title(&self, session_id: &str) -> bool {
+        self.workers
+            .lock()
+            .await
+            .get(session_id)
+            .map(|h| h.client.pushes_native_title())
+            .unwrap_or(false)
+    }
+
     /// Resolve the agent spec from the registry. Surfaces UnknownAgent
     /// when the caller picks a name that hasn't been configured.
     pub async fn resolve_agent(&self, name: &str) -> Result<AgentSpec, SupervisorError> {

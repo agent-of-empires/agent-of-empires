@@ -1379,6 +1379,12 @@ pub struct AcpClient {
     inbound: Option<mpsc::Receiver<Event>>,
     cmd_tx: Option<mpsc::Sender<ClientCmd>>,
     pending_responders: PendingResponders,
+    /// Whether the connected adapter pushes session titles natively via ACP
+    /// `session_info_update` (claude-agent-acp >=0.52). Set once during the
+    /// handshake by the connection task; `None`/`false` until known and for
+    /// adapters that don't push. Shared `Arc` so the connection task can set
+    /// it after `Self` is built. Read via `pushes_native_title`.
+    native_title: Arc<std::sync::OnceLock<bool>>,
     /// Hold the subprocess so it gets killed when the client is dropped.
     _child: Option<Arc<Mutex<tokio::process::Child>>>,
 }
@@ -1482,6 +1488,7 @@ impl AcpClient {
             inbound: Some(event_rx),
             cmd_tx: None,
             pending_responders: Arc::new(Mutex::new(HashMap::new())),
+            native_title: Arc::new(std::sync::OnceLock::new()),
             _child: None,
         };
         (client, event_tx)
@@ -1520,9 +1527,19 @@ impl AcpClient {
             inbound: Some(event_rx),
             cmd_tx: Some(cmd_tx),
             pending_responders: Arc::new(Mutex::new(HashMap::new())),
+            native_title: Arc::new(std::sync::OnceLock::new()),
             _child: None,
         };
         (client, event_tx, saw_delete)
+    }
+
+    /// Whether the connected adapter pushes session titles natively via ACP
+    /// `session_info_update` at turn-end (claude-agent-acp >=0.52). `false`
+    /// until the handshake resolves and for adapters that don't push. The
+    /// supervisor reads this to skip the `smart_rename` one-shot for capable
+    /// claude sessions.
+    pub fn pushes_native_title(&self) -> bool {
+        self.native_title.get().copied().unwrap_or(false)
     }
 
     /// Spawn an ACP agent subprocess, run the handshake + create a
@@ -1683,6 +1700,7 @@ impl AcpClient {
         };
 
         let (ready_tx, ready_rx) = oneshot::channel::<Result<(), AcpError>>();
+        let native_title = Arc::new(std::sync::OnceLock::new());
 
         // Wrap the per-session connection task in a span carrying the
         // session id so every nested event inherits it; the daemon's
@@ -1704,6 +1722,7 @@ impl AcpClient {
                 Some(ready_tx),
                 profile,
                 expected_agent,
+                native_title.clone(),
                 source_profile,
                 default_effort,
                 mcp_servers,
@@ -1718,6 +1737,7 @@ impl AcpClient {
             inbound: Some(event_rx),
             cmd_tx: Some(cmd_tx),
             pending_responders,
+            native_title,
             _child: Some(child),
         })
     }
@@ -1791,6 +1811,7 @@ impl AcpClient {
         let expected_agent = ExpectedAgent::from_command(&install_binary);
 
         let (ready_tx, ready_rx) = oneshot::channel::<Result<(), AcpError>>();
+        let native_title = Arc::new(std::sync::OnceLock::new());
 
         // See the sibling spawn in `spawn`: the connection task runs inside
         // an `acp_session` span so per-session log teeing (#1864) catches
@@ -1811,6 +1832,7 @@ impl AcpClient {
                 Some(ready_tx),
                 profile,
                 expected_agent,
+                native_title.clone(),
                 source_profile,
                 default_effort,
                 mcp_servers,
@@ -1825,6 +1847,7 @@ impl AcpClient {
             inbound: Some(event_rx),
             cmd_tx: Some(cmd_tx),
             pending_responders,
+            native_title,
             _child: None,
         })
     }
@@ -3698,6 +3721,16 @@ fn map_update_to_events(
             );
             vec![Event::ConfigOptionsUpdated { options }]
         }
+        // claude-agent-acp >=0.52 pushes the session title at every turn-end.
+        // Normalize and forward it as a typed event; the daemon's
+        // acp_event_listener applies it to Instance.title (gated). A null/empty
+        // or unusable title yields no event.
+        SessionUpdate::SessionInfoUpdate(info) => info
+            .title
+            .take()
+            .and_then(|t| crate::session::smart_rename::normalize_native_title(&t))
+            .map(|title| vec![Event::SessionTitleSuggested { title }])
+            .unwrap_or_default(),
         // Variants we don't have a typed mapping for yet pass through as
         // RawAgentUpdate so the UI can render best-effort and we can
         // narrow these as we go.
@@ -4294,6 +4327,7 @@ async fn run_connection_task<W, R>(
     ready_tx: Option<oneshot::Sender<Result<(), AcpError>>>,
     profile: &'static agent_profiles::AgentProfile,
     expected_agent: ExpectedAgent,
+    native_title: Arc<std::sync::OnceLock<bool>>,
     source_profile: Option<String>,
     default_effort: Option<String>,
     mcp_servers: Vec<McpServer>,
@@ -4779,6 +4813,12 @@ async fn run_connection_task<W, R>(
                 }
                 return Ok(());
             }
+
+            // Record whether this adapter pushes session titles natively
+            // (claude-agent-acp >=0.52). The supervisor reads it via the
+            // client to skip the smart_rename one-shot for capable sessions.
+            let _ =
+                native_title.set(agent_compat::pushes_native_session_title(expected_agent, &init));
 
             let load_session_capable = init.agent_capabilities.load_session;
             // Surface the agent's prompt capabilities to the structured view so

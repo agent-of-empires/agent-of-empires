@@ -247,6 +247,9 @@ impl AcpTranscript {
 
     fn apply_event(&mut self, event: &Event) {
         match event {
+            // Session title is shown in the session list/header, not the
+            // activity transcript; the daemon applies it to Instance.title.
+            Event::SessionTitleSuggested { .. } => {}
             Event::AgentMessageChunk { text } => {
                 if let Some(idx) = self.pending_message_idx {
                     if let Some(ActivityRow::AgentMessage(buf)) = self.rows.get_mut(idx) {
