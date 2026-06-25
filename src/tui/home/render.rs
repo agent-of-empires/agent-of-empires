@@ -3117,8 +3117,11 @@ impl HomeView {
         let text = if let Some(s) = status {
             format!(" {s}  [Ctrl+x] dismiss")
         } else if let Some(info) = info {
+            // Reassure users (issue #2220) that updating is safe: it never
+            // tears down or interrupts running sessions. Kept after the keys so
+            // the action hints stay visible first on narrow terminals.
             format!(
-                " update available {} → {}  [{update_key}] update  [Ctrl+x] dismiss",
+                " update available {} → {}  [{update_key}] update  [Ctrl+x] dismiss  ·  running sessions stay safe",
                 info.current_version, info.latest_version
             )
         } else if image_update.is_some() {

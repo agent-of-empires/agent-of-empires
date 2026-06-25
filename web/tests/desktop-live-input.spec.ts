@@ -47,6 +47,65 @@ test.describe("Desktop live terminal input", () => {
     await expect(pane).not.toHaveAttribute("data-pane-focused", "true");
   });
 
+  test("Ctrl+V pastes as a bracketed paste instead of sending a literal ^V", async ({ page }) => {
+    // The Ctrl+letter chord handler used to swallow Ctrl+V into a ^V (0x16) to
+    // tmux and preventDefault the keydown, blocking the browser's paste event.
+    // It must now fall through so the native paste reaches onPaste. (#2384)
+    const handle = await mockTerminalApis(page);
+    await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+    await page.goto("/");
+    await clickSidebarSession(page, "pinch-test");
+    await page.locator("[data-live-terminal]").first().waitFor({ state: "visible", timeout: 10_000 });
+    await page.locator("[data-live-terminal]").first().click();
+    await expect(page.locator('textarea[aria-label="Live terminal input"]').first()).toBeFocused();
+
+    await page.evaluate(() => navigator.clipboard.writeText("pasted text"));
+    const before = handle.liveMessages.length;
+    await page.keyboard.press("Control+v");
+
+    await expect
+      .poll(() => handle.liveMessages.slice(before).map((m) => m.toString("utf8")))
+      .toContainEqual("\x1b[200~pasted text\x1b[201~");
+    const sentCtrlV = handle.liveMessages.slice(before).some((m) => m.toString("utf8") === "\x16");
+    expect(sentCtrlV).toBe(false);
+  });
+
+  test("Ctrl+Shift+C copies the terminal selection without sending ^C", async ({ page }) => {
+    // The hidden input is focused, so the browser's own copy targets the empty
+    // textarea; the handler reads the rendered DOM selection and copies it
+    // explicitly. Plain Ctrl+C stays SIGINT. (#2384)
+    const handle = await mockTerminalApis(page);
+    await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+    await page.goto("/");
+    await clickSidebarSession(page, "pinch-test");
+    await page.locator("[data-live-content]").first().waitFor({ state: "visible", timeout: 10_000 });
+
+    // Focus the input the way a user does (click the pane), then select a
+    // rendered terminal row. The selection lives in the DOM while the hidden
+    // input keeps focus, which is exactly the state Ctrl+Shift+C must read.
+    await page.locator("[data-live-terminal]").first().click();
+    const selected = await page.evaluate(() => {
+      const content = document.querySelector("[data-live-content]")!;
+      const row = Array.from(content.querySelectorAll("div")).find((d) => (d.textContent ?? "").trim().length > 0);
+      if (!row) throw new Error("no non-empty terminal row to select");
+      const range = document.createRange();
+      range.selectNodeContents(row);
+      const sel = window.getSelection()!;
+      sel.removeAllRanges();
+      sel.addRange(range);
+      return sel.toString();
+    });
+    expect(selected.trim().length).toBeGreaterThan(0);
+    await expect(page.locator('textarea[aria-label="Live terminal input"]').first()).toBeFocused();
+
+    const before = handle.liveMessages.length;
+    await page.keyboard.press("Control+Shift+C");
+
+    await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(selected);
+    const sentSigint = handle.liveMessages.slice(before).some((m) => m.toString("utf8") === "\x03");
+    expect(sentSigint).toBe(false);
+  });
+
   test("renders at the desktop font size, not the small mobile default", async ({ page }) => {
     // The live view used to always read `mobileFontSize` (default 8px), so on
     // desktop it came up tiny and ignored the dashboard's terminal font-size

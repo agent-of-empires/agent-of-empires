@@ -80,6 +80,13 @@
       "components": ["web/src/components/MobileLiveTerminal.tsx"]
     },
     {
+      "id": "terminal.clipboard-chords",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/__tests__/MobileLiveTerminal.paste.test.tsx"],
+      "components": ["web/src/components/MobileLiveTerminal.tsx"]
+    },
+    {
       "id": "terminal.mobile-live-scrollback",
       "kind": "mocked-playwright",
       "risk": "high",
@@ -2682,7 +2689,7 @@
       "kind": "mocked-playwright",
       "risk": "high",
       "specs": ["tests/desktop-live-input.spec.ts"],
-      "components": ["web/src/components/LiveTerminalView.tsx"]
+      "components": ["web/src/components/LiveTerminalView.tsx", "web/src/components/MobileLiveTerminal.tsx"]
     }
   ]
 }

@@ -6343,6 +6343,86 @@ fn app_update_banner_takes_precedence_over_image_banner() {
     );
 }
 
+/// Issue #2220: the app-update banner reassures users that updating is safe
+/// for running sessions. The reassurance must render alongside the version and
+/// action keys so users know `u` won't tear down their work.
+#[test]
+#[serial]
+fn app_update_banner_reassures_running_sessions_are_safe() {
+    use crate::tui::styles::load_theme;
+    use crate::update::UpdateInfo;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut env = create_test_env_empty();
+    let backend = TestBackend::new(120, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let theme = load_theme("empire");
+
+    let update_info = UpdateInfo {
+        available: true,
+        current_version: "1.0.0".to_string(),
+        latest_version: "1.1.0".to_string(),
+    };
+
+    terminal
+        .draw(|f| {
+            let area = f.area();
+            env.view
+                .render(f, area, &theme, Some(&update_info), None, None);
+        })
+        .unwrap();
+
+    let buf = terminal.backend().buffer();
+    let mut out = String::new();
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            out.push_str(buf[(x, y)].symbol());
+        }
+        out.push('\n');
+    }
+
+    assert!(
+        out.contains("running sessions stay safe"),
+        "expected the update banner to reassure that running sessions are safe.\nFull buffer:\n{out}"
+    );
+    assert!(
+        out.contains("[u] update"),
+        "the action key must still render alongside the reassurance.\nFull buffer:\n{out}"
+    );
+
+    // Narrow-terminal contract: the reassurance is appended after the keys
+    // precisely so the action hints survive when the line is too narrow to
+    // hold everything. At 72 columns the keys fit but the reassurance clips.
+    let narrow = TestBackend::new(72, 30);
+    let mut narrow_terminal = Terminal::new(narrow).unwrap();
+    narrow_terminal
+        .draw(|f| {
+            let area = f.area();
+            env.view
+                .render(f, area, &theme, Some(&update_info), None, None);
+        })
+        .unwrap();
+
+    let nbuf = narrow_terminal.backend().buffer();
+    let mut nout = String::new();
+    for y in 0..nbuf.area.height {
+        for x in 0..nbuf.area.width {
+            nout.push_str(nbuf[(x, y)].symbol());
+        }
+        nout.push('\n');
+    }
+
+    assert!(
+        nout.contains("[u] update") && nout.contains("[Ctrl+x] dismiss"),
+        "the action keys must survive clipping on a narrow terminal.\nFull buffer:\n{nout}"
+    );
+    assert!(
+        !nout.contains("running sessions stay safe"),
+        "the trailing reassurance is expected to clip first on a narrow terminal.\nFull buffer:\n{nout}"
+    );
+}
+
 /// Regression for the e2e CI failure (job 76034901940):
 /// `test_command_palette_fuzzy_search_settings` and
 /// `test_profile_picker_create_new_profile` failed because the harness types
