@@ -272,16 +272,23 @@ fn session_meta_set(
     let storage = state
         .storage()
         .map_err(|e| DispatchError::internal(e.to_string()))?;
-    storage
+    // An unknown session is bad caller input, not a host failure, so the
+    // closure reports it as Ok(false) and we map that to INVALID_PARAMS,
+    // matching session_meta_get. Only a genuine storage error is INTERNAL.
+    let found = storage
         .update(|instances, _groups| {
-            let inst = instances
-                .iter_mut()
-                .find(|i| i.id == session_id)
-                .ok_or_else(|| anyhow::anyhow!("unknown session {session_id:?}"))?;
+            let Some(inst) = instances.iter_mut().find(|i| i.id == session_id) else {
+                return Ok(false);
+            };
             set_in_slot(inst, &plugin_id, &key, value.clone());
-            Ok(())
+            Ok(true)
         })
         .map_err(|e| DispatchError::internal(e.to_string()))?;
+    if !found {
+        return Err(DispatchError::invalid_params(format!(
+            "unknown session {session_id:?}"
+        )));
+    }
     Ok(json!({ "ok": true }))
 }
 
@@ -304,12 +311,13 @@ fn session_meta_cas(
     let storage = state
         .storage()
         .map_err(|e| DispatchError::internal(e.to_string()))?;
-    let (swapped, current) = storage
+    // Ok(None) means the session does not exist (bad caller input ->
+    // INVALID_PARAMS, like session_meta_get); Ok(Some(..)) carries the result.
+    let outcome = storage
         .update(|instances, _groups| {
-            let inst = instances
-                .iter_mut()
-                .find(|i| i.id == session_id)
-                .ok_or_else(|| anyhow::anyhow!("unknown session {session_id:?}"))?;
+            let Some(inst) = instances.iter_mut().find(|i| i.id == session_id) else {
+                return Ok(None);
+            };
             let current = inst
                 .plugin_meta
                 .get(&plugin_id)
@@ -318,12 +326,14 @@ fn session_meta_cas(
                 .unwrap_or(Value::Null);
             if current == expected {
                 set_in_slot(inst, &plugin_id, &key, value.clone());
-                Ok((true, value.clone()))
+                Ok(Some((true, value.clone())))
             } else {
-                Ok((false, current))
+                Ok(Some((false, current)))
             }
         })
         .map_err(|e| DispatchError::internal(e.to_string()))?;
+    let (swapped, current) = outcome
+        .ok_or_else(|| DispatchError::invalid_params(format!("unknown session {session_id:?}")))?;
     Ok(json!({ "swapped": swapped, "current": current }))
 }
 
