@@ -598,5 +598,5 @@ command = ["false"]
         "lockfile still records the working version"
     );
     // No leftover backup directory from the failed update.
-    assert!(!installed.with_extension("bak").exists());
+    assert!(!installed.with_file_name("acme.upd.bak").exists());
 }

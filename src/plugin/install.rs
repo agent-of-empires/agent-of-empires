@@ -438,7 +438,10 @@ fn run_build(plugin_id: &str, dir: &Path, steps: &[BuildStep]) -> Result<()> {
 /// success drop the backup, on failure restore it so the user is never left
 /// worse off than before the update.
 fn replace_and_build(plugin_id: &str, fetched: &FetchedPlugin, final_dir: &Path) -> Result<()> {
-    let backup_dir = final_dir.with_extension("bak");
+    // `with_file_name`, not `with_extension`: a plugin id like `acme.worker`
+    // has a dot, and `with_extension("bak")` would replace `.worker`, yielding
+    // `acme.bak` and colliding with every other `acme.*` plugin's backup.
+    let backup_dir = final_dir.with_file_name(format!("{plugin_id}.bak"));
 
     if backup_dir.exists() {
         if final_dir.exists() {
