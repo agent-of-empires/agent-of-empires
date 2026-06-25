@@ -5,7 +5,7 @@ use agent_of_empires::logging::{self, LogConfig, ProcessContext, SubscriberTarge
 use agent_of_empires::migrations;
 use agent_of_empires::tui;
 use anyhow::Result;
-use clap::{CommandFactory, Parser};
+use clap::{CommandFactory, FromArgMatches};
 use clap_complete::generate;
 
 /// Did the user invoke `aoe serve`? Feature-gated because `Commands::Serve`
@@ -40,7 +40,15 @@ fn is_serve_daemon_child(_cli: &Cli) -> bool {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    // Parse against the clap tree augmented with active plugins' commands, so a
+    // grafted command shows in `aoe --help` and parses. The core derive is tried
+    // first; a grafted plugin command falls through to the plugin dispatcher.
+    // With no plugin commands this is equivalent to `Cli::parse()`.
+    let matches = cli::graft::augmented_command().get_matches();
+    let cli = match Cli::from_arg_matches(&matches) {
+        Ok(cli) => cli,
+        Err(_) => return cli::graft::dispatch_plugin_command(&matches),
+    };
 
     // If the user passed --daemon-url, mirror the value into the env
     // var so the acp::client::discovery layer (used by both the
