@@ -169,6 +169,7 @@ pub const KNOWN_SUB_TARGETS: &[&str] = &[
     "acp.supervisor",
     "acp.event_store",
     "acp.runner",
+    "plugin.host",
     "terminal.ws",
     "terminal.ws.bytes",
     "auth.token",
