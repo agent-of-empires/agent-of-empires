@@ -72,7 +72,12 @@ pub async fn install(input: &str, assume_yes: bool) -> Result<InstallReport> {
     move_into_place(&fetched, &final_dir)?;
 
     let manifest_hash = PluginManifest::hash_bytes(&fetched.manifest_bytes);
-    persist_install(input, &id, &capabilities, &manifest_hash)?;
+    persist_install(
+        &persisted_source(&source, input),
+        &id,
+        &capabilities,
+        &manifest_hash,
+    )?;
     write_lock(&id, &fetched, &manifest_hash)?;
     super::reload_registry();
 
@@ -119,23 +124,22 @@ pub async fn update(id: &str) -> Result<InstallReport> {
     let new_caps: BTreeSet<&str> = capabilities.iter().map(String::as_str).collect();
     let caps_changed = prior_caps != new_caps;
 
-    let final_dir = super::plugins_dir()?.join(id);
-    move_into_place(&fetched, &final_dir)?;
-
-    // Decide the grant. Unchanged caps: re-pin the prior grant to the new
-    // manifest hash. Changed caps: re-prompt; if declined or non-interactive,
-    // leave the plugin ungranted so its contributions stay inactive.
-    let grant = if !caps_changed {
-        prior_grant.map(|g| CapabilityGrant {
-            manifest_hash: manifest_hash.clone(),
-            capabilities: g.capabilities,
-            granted_at: g.granted_at,
-        })
-    } else if capabilities.is_empty() {
+    // Decide the grant BEFORE touching the installed tree, so a declined or
+    // non-interactive prompt bails while the old install, config, and lockfile
+    // are still consistent. An empty capability set always (re)grants, so an
+    // update that drops all capabilities reactivates the plugin even if it was
+    // previously left ungranted.
+    let grant = if capabilities.is_empty() {
         Some(CapabilityGrant {
             manifest_hash: manifest_hash.clone(),
             capabilities: vec![],
             granted_at: chrono::Utc::now(),
+        })
+    } else if !caps_changed {
+        prior_grant.map(|g| CapabilityGrant {
+            manifest_hash: manifest_hash.clone(),
+            capabilities: g.capabilities,
+            granted_at: g.granted_at,
         })
     } else if confirm_capabilities(id, &capabilities)? {
         Some(CapabilityGrant {
@@ -146,6 +150,9 @@ pub async fn update(id: &str) -> Result<InstallReport> {
     } else {
         None
     };
+
+    let final_dir = super::plugins_dir()?.join(id);
+    move_into_place(&fetched, &final_dir)?;
 
     let granted = grant.is_some();
     persist_update(id, &source_str, grant)?;
@@ -271,8 +278,21 @@ fn move_into_place(fetched: &FetchedPlugin, final_dir: &std::path::Path) -> Resu
     })
 }
 
+/// The source string to persist for a later `update`. A GitHub source keeps the
+/// original `gh:owner/repo[@ref]` so the ref survives; a local source is
+/// canonicalized to an absolute path so `update` does not resolve relative to
+/// whatever directory happened to be current at install time.
+fn persisted_source(source: &PluginSource, input: &str) -> String {
+    match source {
+        PluginSource::Github { .. } => input.to_string(),
+        PluginSource::Local(path) => std::fs::canonicalize(path)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| input.to_string()),
+    }
+}
+
 fn persist_install(
-    input: &str,
+    source: &str,
     id: &str,
     capabilities: &[String],
     manifest_hash: &str,
@@ -282,7 +302,7 @@ fn persist_install(
         .plugins
         .entry(id.to_string())
         .or_insert_with(PluginConfig::default);
-    entry.source = Some(input.to_string());
+    entry.source = Some(source.to_string());
     entry.grant = Some(CapabilityGrant {
         manifest_hash: manifest_hash.to_string(),
         capabilities: capabilities.to_vec(),
