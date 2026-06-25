@@ -221,6 +221,56 @@ function isValidPluginListResponse(payload: unknown): payload is PluginListRespo
   );
 }
 
+// --- Plugin UI extension points (#2366) ---
+
+/** Display tone a plugin attaches to a slot entry or notification. The host
+ *  validates it to this closed set; each surface maps it to a color. */
+export type PluginUiTone = "neutral" | "info" | "success" | "warn" | "danger";
+
+/** The nine host-rendered slots, kebab-case as the host serializes them. */
+export type PluginUiSlot =
+  | "status-bar"
+  | "row-badge"
+  | "row-column"
+  | "sort-key"
+  | "filter-facet"
+  | "card"
+  | "detail-panel"
+  | "detail-badge"
+  | "notification";
+
+/** One piece of UI state a worker pushed. `payload` shape is determined by
+ *  `slot`; the dashboard renders it (no plugin code runs here). */
+export interface PluginUiEntry {
+  plugin_id: string;
+  slot: PluginUiSlot;
+  id: string;
+  session_id?: string;
+  payload: Record<string, unknown>;
+}
+
+/** A notification pushed via `ui.notify`. `seq` is monotonic so the client
+ *  toasts each one exactly once. */
+export interface PluginUiNotification {
+  seq: number;
+  plugin_id: string;
+  tone: PluginUiTone;
+  title: string;
+  body?: string;
+  session_id?: string;
+}
+
+export interface PluginUiState {
+  entries: PluginUiEntry[];
+  notifications: PluginUiNotification[];
+}
+
+/** The host's aggregated UI-state snapshot. Returns an empty state (not null)
+ *  shape on the server when no plugin host is running. */
+export function fetchPluginUiState(): Promise<PluginUiState | null> {
+  return fetchJson<PluginUiState>("/api/plugins/ui-state");
+}
+
 export async function setPluginEnabled(id: string, enabled: boolean): Promise<PluginToggleResult> {
   try {
     const res = await fetch(`/api/plugins/${encodeURIComponent(id)}/enabled`, {
