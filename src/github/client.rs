@@ -5,8 +5,21 @@
 //! typed [`GitHubError`] taxonomy. Only unauthenticated public reads (such as
 //! the update check) are wired up today via [`GitHubClient::unauthenticated`].
 
+use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT};
 use reqwest::StatusCode;
+
+/// Characters to percent-encode inside a single URL path segment (a release
+/// tag). Encodes the path separator and other reserved/query characters while
+/// leaving unreserved ones like `.`, `-`, `_` intact.
+const TAG_SEGMENT: &AsciiSet = &CONTROLS
+    .add(b'/')
+    .add(b' ')
+    .add(b'?')
+    .add(b'#')
+    .add(b'%')
+    .add(b'&')
+    .add(b'+');
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use std::time::Duration;
@@ -106,6 +119,9 @@ impl GitHubClient {
         repo: &str,
         tag: &str,
     ) -> Result<GitHubRelease> {
+        // A tag like `release/1.2.3` is valid and must not split into extra path
+        // segments, or the API 404s on a real tag.
+        let tag = utf8_percent_encode(tag, TAG_SEGMENT);
         let url = format!(
             "{}/repos/{}/{}/releases/tags/{}",
             self.api_base, owner, repo, tag
@@ -345,5 +361,17 @@ mod tests {
     #[test]
     fn api_message_falls_back_to_raw_body() {
         assert_eq!(api_message("plain text error"), "plain text error");
+    }
+
+    #[test]
+    fn tag_segment_encodes_slash_but_keeps_dots() {
+        assert_eq!(
+            utf8_percent_encode("release/1.2.3", TAG_SEGMENT).to_string(),
+            "release%2F1.2.3"
+        );
+        assert_eq!(
+            utf8_percent_encode("v1.2.3", TAG_SEGMENT).to_string(),
+            "v1.2.3"
+        );
     }
 }

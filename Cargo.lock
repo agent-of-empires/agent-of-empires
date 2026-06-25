@@ -125,6 +125,7 @@ dependencies = [
  "notify",
  "nucleo-matcher",
  "p256",
+ "percent-encoding",
  "portable-pty",
  "pulldown-cmark",
  "qrcode",

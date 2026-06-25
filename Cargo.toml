@@ -84,6 +84,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # HTTP client (for updates)
 reqwest = { version = "0.13", features = ["json", "rustls", "stream"], default-features = false }
 
+# Percent-encode path segments (release tags) for GitHub API URLs.
+percent-encoding = "2"
+
 # Unix sockets + futures-compat for ACP byte streams
 tokio-util = { version = "0.7", features = ["codec", "compat"] }
 
