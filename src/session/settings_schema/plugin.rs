@@ -161,7 +161,11 @@ fn widget_and_validation(s: &SettingContribution) -> (WidgetKind, ValidationKind
             WidgetKind::Select {
                 options: s.options.iter().map(|o| SelectOption::new(o, o)).collect(),
             },
-            ValidationKind::None,
+            // Gate the value against the declared options server-side so an
+            // off-menu value can never reach storage.
+            ValidationKind::OneOf {
+                options: s.options.clone(),
+            },
         ),
     }
 }
@@ -300,5 +304,31 @@ mod tests {
         let mut body = good;
         rewrite_plugin_sections(&mut body);
         assert_eq!(body["plugins"]["acme.kit"]["settings"]["retries"], json!(4));
+    }
+
+    #[test]
+    fn select_value_is_gated_against_options() {
+        let descriptors = plugin_field_descriptors(
+            "acme.kit",
+            &[SettingContribution {
+                options: vec!["fast".into(), "slow".into()],
+                ..contrib("mode", SettingType::Select)
+            }],
+        );
+        // An on-menu value passes; an off-menu value is rejected.
+        assert!(super::super::validate_patch_with(
+            &descriptors,
+            &json!({ "plugin:acme.kit": { "mode": "fast" } }),
+            super::super::Scope::Global,
+            true
+        )
+        .is_ok());
+        assert!(super::super::validate_patch_with(
+            &descriptors,
+            &json!({ "plugin:acme.kit": { "mode": "turbo" } }),
+            super::super::Scope::Global,
+            true
+        )
+        .is_err());
     }
 }

@@ -71,6 +71,19 @@ pub fn validate_value(kind: &ValidationKind, value: &Value) -> Result<(), Valida
         ValidationKind::PortMappingList => {
             validate_string_list(value, crate::session::validate_port_mapping_format)
         }
+        ValidationKind::OneOf { options } => {
+            let s = value
+                .as_str()
+                .ok_or_else(|| ValidationError::new("expected a string"))?;
+            if options.iter().any(|o| o == s) {
+                Ok(())
+            } else {
+                Err(ValidationError::new(format!(
+                    "must be one of: {}",
+                    options.join(", ")
+                )))
+            }
+        }
     }
 }
 
@@ -142,6 +155,16 @@ mod tests {
         assert!(validate_value(&ValidationKind::EnvList, &json!(["1BAD=v"])).is_err());
         assert!(validate_value(&ValidationKind::EnvList, &json!(["has space"])).is_err());
         assert!(validate_value(&ValidationKind::EnvList, &json!("notalist")).is_err());
+    }
+
+    #[test]
+    fn one_of_membership() {
+        let kind = ValidationKind::OneOf {
+            options: vec!["fast".into(), "slow".into()],
+        };
+        assert!(validate_value(&kind, &json!("fast")).is_ok());
+        assert!(validate_value(&kind, &json!("turbo")).is_err());
+        assert!(validate_value(&kind, &json!(3)).is_err());
     }
 
     #[test]

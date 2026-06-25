@@ -130,6 +130,12 @@ pub enum ValidationKind {
     EnvList,
     /// Each list entry must be a `host:container` port mapping (digits only).
     PortMappingList,
+    /// Value must be one of a closed set of strings. Used by plugin `select`
+    /// settings so an off-menu value cannot be persisted (core selects encode
+    /// their options in the widget and need no separate rule).
+    OneOf {
+        options: Vec<String>,
+    },
 }
 
 /// One configurable field, emitted by the `SettingsSection` derive. Owned
