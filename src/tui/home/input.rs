@@ -3294,20 +3294,30 @@ impl HomeView {
     /// redraw. Scrolls do not cross pane boundaries: a wheel over the
     /// preview never moves the list cursor, even when the preview is at
     /// its scroll boundary or has no session selected.
-    /// When a live-send target is a full-screen (alternate-screen) app
-    /// that has mouse tracking on, the preview's capture-window scroll is
-    /// useless: the alternate screen has no scrollback, so growing the
-    /// window only exposes the unrelated normal-buffer history underneath
-    /// and the view bottoms out at the session's start. Instead, forward
-    /// the wheel to the app as a mouse event, exactly as a terminal does
-    /// when you wheel over a mouse-tracking pane on attach, so the app
-    /// scrolls its OWN content.
+    /// When a live-send target is a full-screen (alternate-screen) app, the
+    /// preview's capture-window scroll is useless: the alternate screen has
+    /// no scrollback, so growing the window only exposes the unrelated
+    /// normal-buffer history underneath and the view bottoms out at the
+    /// session's start. Instead, forward the wheel to the app so it scrolls
+    /// its OWN content, exactly as a terminal does on direct attach. Two
+    /// cases, branched on what the app asked for:
     ///
-    /// Gated on mouse tracking (`mouse_tracking`): with no mouse mode the
-    /// app would read the bytes as garbage keystrokes, so the caller keeps
-    /// the capture-window scroll. The encoding follows the app: SGR (1006)
-    /// when `mouse_sgr` is set, otherwise the legacy X10 encoding. Returns
-    /// true when the event was forwarded.
+    /// * **Mouse tracking on** (`mouse_tracking`): forward the wheel as a
+    ///   mouse event, the encoding following the app (SGR 1006 when
+    ///   `mouse_sgr` is set, otherwise the legacy X10 encoding).
+    /// * **Mouse tracking off**: the app relies on the terminal's
+    ///   alternate-scroll behavior (DECSET 1007) to turn the wheel into
+    ///   cursor-key presses. Claude Code's fullscreen renderer is exactly
+    ///   this: it sets `1049h` + `1007h` but never requests mouse tracking,
+    ///   so a raw mouse byte would land as a garbage keystroke (#2407).
+    ///   Send `Up`/`Down` named keys instead; `send-keys` renders them in
+    ///   the pane's current application-cursor-key mode, matching what tmux
+    ///   itself sends on attach. The step (3 keys) matches tmux's own
+    ///   alternate-scroll and the capture-window `STEP`.
+    ///
+    /// Only alternate-screen panes are forwarded; on the normal buffer the
+    /// capture-window scroll reaches real scrollback, so the caller keeps
+    /// it. Returns true when the event was forwarded.
     fn forward_wheel_to_live_pane(&self, up: bool, col: u16, row: u16) -> bool {
         if self.live_send.is_none() {
             return false;
@@ -3320,11 +3330,22 @@ impl HomeView {
             .as_ref()
             .and_then(|w| w.current_cursor());
         let Some(cursor) = cursor else { return false };
-        if !(cursor.alternate_on && cursor.mouse_tracking) {
+        if !cursor.alternate_on {
             return false;
         }
-        let bytes = wheel_mouse_bytes(up, cursor.mouse_sgr, self.preview_text_view.pane, col, row);
-        worker.send(crate::tui::home::live_send::TmuxKey::HexBytes(bytes));
+        if cursor.mouse_tracking {
+            let bytes =
+                wheel_mouse_bytes(up, cursor.mouse_sgr, self.preview_text_view.pane, col, row);
+            worker.send(crate::tui::home::live_send::TmuxKey::HexBytes(bytes));
+        } else {
+            const WHEEL_ARROW_STEP: usize = 3;
+            let name = if up { "Up" } else { "Down" };
+            for _ in 0..WHEEL_ARROW_STEP {
+                worker.send(crate::tui::home::live_send::TmuxKey::Named(
+                    name.to_string(),
+                ));
+            }
+        }
         true
     }
 
