@@ -1005,7 +1005,16 @@ export function MobileLiveTerminal({
         onTouchMove={onTouchMove}
         onTouchEnd={onTouchEnd}
         onTouchCancel={onTouchCancel}
-        className={`absolute inset-0 font-mono flex flex-col ${
+        // Leave 8px of breathing room below the grid so the cursor/input row
+        // doesn't sit flush against the pane's bottom edge. This is a bottom
+        // inset rather than padding on purpose: an `absolute inset-0` child
+        // fills its containing block's padding box, so padding here would be
+        // overlapped (no gap), and padding that DID register would inflate
+        // `clientHeight`, over-counting the rows reported to tmux below. A
+        // bottom inset shrinks the measured box instead, so the grid math stays
+        // honest and the exposed strip shows the wrapper's matching --term-bg,
+        // reading as terminal inner-padding.
+        className={`absolute inset-x-0 top-0 bottom-[8px] font-mono flex flex-col ${
           forwardMode ? "overflow-hidden" : "overflow-y-auto overflow-x-hidden"
         }`}
         style={{
