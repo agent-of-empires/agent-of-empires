@@ -815,39 +815,43 @@ pub fn get_agent(name: &str) -> Option<&'static AgentDef> {
 /// Extract the agent name a user selected via `<flag> NAME` or `<flag>=NAME`
 /// in a command/extra-args string (e.g. Kiro's `--agent custom-agent`). The flag
 /// comes from [`SelectedAgentHooks::flag`] so the convention stays data on the
-/// agent definition. Returns `None` when the flag is absent or has no value.
+/// agent definition. Returns `None` when the flag is absent, has no value, or
+/// its final occurrence carries a rejected value.
 ///
-/// The **last** occurrence wins, matching how clap-based CLIs (Kiro included)
-/// resolve a repeated single-value flag: `--agent a --agent b` loads `b`, so AoE
-/// must install hooks into `b`, not `a`. This also gives extra-args the final
+/// The **last** occurrence decides the result, matching how clap-based CLIs
+/// (Kiro included) resolve a repeated single-value flag: `--agent a --agent b`
+/// loads `b`. Crucially, a later occurrence overwrites an earlier one even when
+/// its value is rejected, so `--agent good --agent ..` returns `None` rather
+/// than `good`: the CLI itself would load `..` (and reject it / fall back to its
+/// default), so AoE must not install hooks into `good`, an agent the CLI is not
+/// running. Returning `None` makes AoE fall back to its standalone hooks agent,
+/// which is what the CLI effectively does. This also gives extra-args the final
 /// say over a command override when [`crate::session::Instance::selected_agent_args`]
 /// concatenates command then extra-args.
 ///
-/// Names that are empty, contain path separators, or are `.`/`..` are rejected
-/// so a parsed value can be safely joined to an agents directory without path
-/// traversal. Whitespace-tokenized, which matches how AoE assembles the launch
-/// string; quoted values containing spaces are not handled (agent names do not
-/// contain spaces in practice).
+/// A value is rejected by [`is_safe_agent_name`] (empty, `.`/`..`, leading dash,
+/// or a path separator) so a parsed value can be safely joined to an agents
+/// directory without path traversal. Whitespace-tokenized, which matches how AoE
+/// assembles the launch string; quoted values containing spaces are not handled
+/// (agent names do not contain spaces in practice).
 pub fn parse_selected_agent(args: &str, flag: &str) -> Option<String> {
     let eq_prefix = format!("{flag}=");
-    let mut tokens = args.split_whitespace().peekable();
+    let mut tokens = args.split_whitespace();
     let mut selected = None;
     while let Some(tok) = tokens.next() {
-        let candidate = if let Some(rest) = tok.strip_prefix(&eq_prefix) {
+        // The value of this flag occurrence: the text after `=`, the next token
+        // for the space-separated form, or `None` for a dangling flag.
+        let value = if let Some(rest) = tok.strip_prefix(&eq_prefix) {
             Some(rest)
         } else if tok == flag {
             tokens.next()
         } else {
-            None
+            continue;
         };
-        if let Some(name) = candidate {
-            // A later valid occurrence overrides an earlier one; an invalid
-            // value (empty / path-unsafe) is ignored rather than clearing a
-            // prior valid selection.
-            if is_safe_agent_name(name) {
-                selected = Some(name.to_string());
-            }
-        }
+        // Last occurrence wins: overwrite with this occurrence's validated
+        // value, so a trailing rejected/missing value clears an earlier valid
+        // one (mirroring the CLI's last-wins resolution).
+        selected = value.filter(|&v| is_safe_agent_name(v)).map(str::to_string);
     }
     selected
 }
@@ -1141,7 +1145,7 @@ mod tests {
     fn test_launch_subcommand_not_combined_with_subcommand_resume() {
         // `append_resume_flags` inserts a Subcommand resume token after the
         // first whitespace token, which for a launch_subcommand agent is the
-        // binary — landing the resume token before the subcommand and producing
+        // binary. That lands the resume token before the subcommand and produces
         // a malformed command (e.g. `kiro-cli resume <id> chat ...`). Forbid the
         // pairing until that insertion is made subcommand-aware.
         for agent in AGENTS {
@@ -1186,11 +1190,21 @@ mod tests {
             parse_selected_agent("--agent first --agent second", "--agent"),
             Some("second".to_string())
         );
-        // A trailing invalid value does not clear an earlier valid one.
+        // Last-wins is honored even when the trailing value is rejected: the CLI
+        // would load `..` (and reject / fall back), so AoE must NOT keep `good`
+        // and write hooks into an agent the CLI is not running. Returns None so
+        // AoE falls back to its standalone hooks agent.
         assert_eq!(
             parse_selected_agent("--agent good --agent ..", "--agent"),
-            Some("good".to_string())
+            None
         );
+        // A trailing dangling flag likewise clears an earlier valid value.
+        assert_eq!(
+            parse_selected_agent("--agent good --agent", "--agent"),
+            None
+        );
+        // `--agent=` (empty value) is rejected.
+        assert_eq!(parse_selected_agent("--agent=", "--agent"), None);
         // Path-traversal / unsafe names are rejected.
         assert_eq!(
             parse_selected_agent("--agent ../../etc/passwd", "--agent"),

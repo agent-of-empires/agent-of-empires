@@ -858,11 +858,11 @@ pub struct SessionConfig {
 
     /// For agents whose hooks are scoped to a user-selected named agent (e.g.
     /// Kiro's `--agent NAME`), install AoE's status hooks into that agent's own
-    /// config file so status detection keeps working. Such CLIs have no global
-    /// hooks, so without this AoE's standalone hooks agent is never loaded for a
-    /// user-selected agent and status goes dark. When disabled, AoE installs its
-    /// standalone hooks agent instead and leaves the user's agent file
-    /// untouched.
+    /// config file so status detection keeps working, on both host and sandbox
+    /// sessions. Such CLIs have no global hooks, so without this AoE's standalone
+    /// hooks agent is never loaded for a user-selected agent and status goes
+    /// dark. When disabled, AoE installs its standalone hooks agent instead and
+    /// leaves the user's agent file untouched.
     #[serde(default = "default_true")]
     #[setting(
         label = "Merge Hooks Into Selected Agent",

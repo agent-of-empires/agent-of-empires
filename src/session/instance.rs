@@ -2697,10 +2697,29 @@ impl Instance {
             .sandbox_info
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("sandbox_info missing for sandboxed session"))?;
+        // Resolve the user-selected agent (e.g. Kiro `--agent NAME`) so the
+        // sandbox installs status hooks into that agent's config, matching the
+        // host path. Gated by the same setting; only applies to agents that
+        // declare selected_agent_hooks.
+        let merge_selected =
+            super::profile_config::resolve_config_or_warn(&self.effective_profile())
+                .session
+                .merge_hooks_into_selected_agent;
+        let selected_agent = if merge_selected {
+            crate::agents::get_agent(&self.tool)
+                .and_then(|a| a.sidecar_hooks.as_ref())
+                .and_then(|s| s.selected_agent_hooks.as_ref())
+                .and_then(|sel| {
+                    crate::agents::parse_selected_agent(&self.selected_agent_args(), sel.flag)
+                })
+        } else {
+            None
+        };
         container_config::build_container_config(
             &self.project_path,
             sandbox,
-            container_config::ContainerAgentSelection::new(&self.tool, Some(&self.detect_as)),
+            container_config::ContainerAgentSelection::new(&self.tool, Some(&self.detect_as))
+                .with_selected_agent(selected_agent.as_deref()),
             self.is_yolo_mode(),
             &self.id,
             self.workspace_info.as_ref(),
@@ -5883,7 +5902,7 @@ mod tests {
             .build_host_command(crate::agents::get_agent("kiro"), &None)
             .unwrap();
         let cmd_str = cmd.unwrap();
-        // Exactly one "chat" token — no doubled `chat chat`.
+        // Exactly one "chat" token (no doubled `chat chat`).
         assert_eq!(
             cmd_str.matches("chat").count(),
             1,
