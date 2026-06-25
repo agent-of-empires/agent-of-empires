@@ -237,9 +237,12 @@ fn git_clone_checkout(url: &str, reference: Option<&str>, dest: &Path) -> Result
     Ok(sha)
 }
 
-/// Recursively copy `src` into `dst`, skipping `.git` and symlinks.
-// ponytail: symlinks are skipped rather than followed; a local plugin dir with
-// symlinked content is rare and following them risks escaping the tree.
+/// Recursively copy `src` into `dst`, skipping `.git` and rejecting symlinks.
+///
+/// A symlink is a hard error rather than a silent skip: `integrity::tree_hash`
+/// also rejects symlinks, so skipping one here would make the install-time hash
+/// disagree with the `aoe plugin hash` an author runs on the same directory
+/// (and following one risks escaping the tree).
 fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
     std::fs::create_dir_all(dst).with_context(|| format!("creating {}", dst.display()))?;
     for entry in std::fs::read_dir(src).with_context(|| format!("reading {}", src.display()))? {
@@ -252,7 +255,10 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
         let from = entry.path();
         let to = dst.join(&name);
         if file_type.is_symlink() {
-            continue;
+            bail!(
+                "plugin source contains a symlink ({}); symlinks are not allowed",
+                from.display()
+            );
         } else if file_type.is_dir() {
             copy_tree(&from, &to)?;
         } else {
@@ -467,7 +473,7 @@ mod tests {
     }
 
     #[test]
-    fn copy_tree_skips_git_and_symlinks() {
+    fn copy_tree_skips_git() {
         let src = tempfile::tempdir().unwrap();
         std::fs::write(src.path().join("aoe-plugin.toml"), b"x").unwrap();
         std::fs::create_dir(src.path().join(".git")).unwrap();
@@ -477,5 +483,18 @@ mod tests {
         copy_tree(src.path(), &into).unwrap();
         assert!(into.join("aoe-plugin.toml").exists());
         assert!(!into.join(".git").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_tree_rejects_symlinks() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("real"), b"x").unwrap();
+        std::os::unix::fs::symlink("real", src.path().join("link")).unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let err = copy_tree(src.path(), &dst.path().join("tree"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("symlink"), "got: {err}");
     }
 }
