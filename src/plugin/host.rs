@@ -89,23 +89,26 @@ impl PluginHost {
     /// missing interpreter or binary) is logged and skipped; it does not block
     /// the others.
     pub async fn start(self: &Arc<Self>, registry: &PluginRegistry) {
-        for plugin in registry.active() {
-            if plugin.manifest.runtime.is_none() {
-                continue;
+        let candidates: Vec<String> = registry
+            .active()
+            .filter(|p| p.manifest.runtime.is_some())
+            .map(|p| p.id().to_string())
+            .collect();
+        tracing::info!(
+            target: "plugin.host",
+            count = candidates.len(),
+            "launching plugin workers"
+        );
+        for id in candidates {
+            if self.running.lock().await.len() >= MAX_WORKERS {
+                tracing::warn!(
+                    target: "plugin.host",
+                    cap = MAX_WORKERS,
+                    "plugin worker concurrency cap reached; not launching {id}"
+                );
+                break;
             }
-            {
-                let running = self.running.lock().await;
-                if running.len() >= MAX_WORKERS {
-                    tracing::warn!(
-                        target: "plugin.host",
-                        cap = MAX_WORKERS,
-                        "plugin worker concurrency cap reached; not launching {}",
-                        plugin.id()
-                    );
-                    break;
-                }
-            }
-            self.clone().launch(plugin.id().to_string()).await;
+            self.clone().launch(id).await;
         }
     }
 
