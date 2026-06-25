@@ -221,7 +221,7 @@ function isValidPluginListResponse(payload: unknown): payload is PluginListRespo
   );
 }
 
-// --- Plugin UI extension points (#2366) ---
+// Plugin UI extension points (#2366).
 
 /** Display tone a plugin attaches to a slot entry or notification. The host
  *  validates it to this closed set; each surface maps it to a color. */
