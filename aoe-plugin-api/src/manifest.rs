@@ -234,12 +234,71 @@ impl PluginManifest {
                 !command.is_empty(),
                 "runtime command must not be empty".into(),
             );
+            check(
+                command.iter().all(|arg| !arg.is_empty()),
+                "runtime command must not contain empty arguments".into(),
+            );
         }
-        if let Some(RuntimeSpec::ReleaseBinary { asset, .. }) = &self.runtime {
+        if let Some(RuntimeSpec::ReleaseBinary { asset, bin }) = &self.runtime {
             check(
                 !asset.is_empty(),
                 "runtime release-binary asset must not be empty".into(),
             );
+            check(
+                bin.as_ref().map(|b| !b.is_empty()).unwrap_or(true),
+                "runtime release-binary bin must not be empty".into(),
+            );
+        }
+
+        // Contribution sections declare required identifiers; an empty one would
+        // install and persist a malformed manifest, so reject it here rather
+        // than push the cleanup onto the later consumers (#2094 / #2095 / #2366).
+        for (i, c) in self.commands.iter().enumerate() {
+            check(
+                !c.id.is_empty(),
+                format!("commands[{i}].id must not be empty"),
+            );
+        }
+        for (i, k) in self.keybinds.iter().enumerate() {
+            check(
+                !k.command.is_empty(),
+                format!("keybinds[{i}].command must not be empty"),
+            );
+            check(
+                !k.key.is_empty(),
+                format!("keybinds[{i}].key must not be empty"),
+            );
+        }
+        for (i, s) in self.settings.iter().enumerate() {
+            check(
+                !s.key.is_empty(),
+                format!("settings[{i}].key must not be empty"),
+            );
+        }
+        for (i, t) in self.themes.iter().enumerate() {
+            check(
+                !t.name.is_empty(),
+                format!("themes[{i}].name must not be empty"),
+            );
+            check(
+                !t.path.is_empty(),
+                format!("themes[{i}].path must not be empty"),
+            );
+        }
+        for (i, u) in self.ui.iter().enumerate() {
+            check(
+                !u.slot.is_empty(),
+                format!("ui[{i}].slot must not be empty"),
+            );
+        }
+        for (i, s) in self.status.iter().enumerate() {
+            check(
+                !s.id.is_empty(),
+                format!("status[{i}].id must not be empty"),
+            );
+        }
+        for (i, p) in self.panes.iter().enumerate() {
+            check(!p.id.is_empty(), format!("panes[{i}].id must not be empty"));
         }
 
         if errors.is_empty() {

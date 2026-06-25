@@ -167,6 +167,59 @@ command = []
 }
 
 #[test]
+fn empty_contribution_fields_are_rejected() {
+    let toml = r#"
+id = "acme.thing"
+name = "Thing"
+version = "0.1.0"
+api_version = 2
+
+[[commands]]
+id = ""
+
+[[themes]]
+name = "x"
+path = ""
+
+[[ui]]
+slot = ""
+"#;
+    let err = PluginManifest::from_toml_str(toml).unwrap_err();
+    let messages = match err {
+        ManifestError::Invalid(m) => m,
+        other => panic!("expected Invalid, got {other:?}"),
+    };
+    assert!(
+        messages.iter().any(|m| m.contains("commands[0].id")),
+        "{messages:?}"
+    );
+    assert!(
+        messages.iter().any(|m| m.contains("themes[0].path")),
+        "{messages:?}"
+    );
+    assert!(
+        messages.iter().any(|m| m.contains("ui[0].slot")),
+        "{messages:?}"
+    );
+}
+
+#[test]
+fn empty_command_argument_is_rejected() {
+    let toml = r#"
+id = "acme.thing"
+name = "Thing"
+version = "0.1.0"
+api_version = 2
+
+[runtime]
+kind = "command"
+command = [""]
+"#;
+    let err = PluginManifest::from_toml_str(toml).unwrap_err();
+    assert!(matches!(err, ManifestError::Invalid(_)), "got {err:?}");
+}
+
+#[test]
 fn unknown_fields_are_rejected() {
     let toml = r#"
 id = "acme.thing"
