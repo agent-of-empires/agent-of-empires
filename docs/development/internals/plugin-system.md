@@ -211,11 +211,17 @@ for tests; a release binary always uses the compiled-in index, since the curated
 set is a root of trust and must not be redefinable by the environment.
 
 Every surface (CLI `aoe plugin list` / `info`, the TUI plugin manager, the web
-Plugins panel) shows a `ValidationState`: `builtin`, `featured` (installed from a
-featured-verified source), `community` (an unvetted GitHub install), or `local`
-(a local-directory install). It is recorded at install time via the lockfile's
-`trust` and read back at load, not recomputed each load; the manifest-hash grant
-check is what catches a community plugin tampered after install.
+Plugins panel) shows a `ValidationState`: `builtin`, `featured`, `community` (an
+unvetted GitHub install), or `local` (a local-directory install). `featured` is
+re-derived live at load (the id is in the embedded index and the on-disk tree
+hashes to the pin), not trusted from the lockfile, since that same derivation
+gates the reserved-namespace lift and the lockfile is user-writable; `community`
+vs `local` is derived from the install source. The lockfile records the tree
+hash and the install-time `trust` as a resolved record, but the load path does
+not depend on them for validation. The recompute is cheap (only ids the index
+names, and a featured plugin ships no release-binary, so its installed tree
+equals its source tree). The manifest-hash grant check still catches a community
+plugin tampered after install.
 
 `aoe plugin hash <dir>` prints the tree hash for a plugin directory so an author
 can produce the value a maintainer pins. Run it on a clean checkout.

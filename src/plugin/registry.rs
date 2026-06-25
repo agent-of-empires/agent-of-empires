@@ -7,21 +7,24 @@
 //! contributions go live only once the user has granted the capability set the
 //! installed manifest declares (the grant is pinned to the manifest hash).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use aoe_plugin_api::{PluginManifest, TrustLevel};
 
-use super::lockfile::{LockedPlugin, Lockfile};
+use super::featured::FeaturedIndex;
+use super::integrity;
 use crate::session::{CapabilityGrant, Config};
 
 /// How an installed plugin was validated, the finer provenance the surfaces
 /// show. `TrustLevel` (builtin vs community) stays the coarse capability-policy
 /// axis; this is the user-facing "is this safe" label.
 ///
-/// Recorded at install time (via the lockfile's `trust`) rather than recomputed
-/// on every load: the source tree hash is captured before any release-binary is
-/// injected, so re-hashing the installed directory would not reproduce it, and
-/// walking every plugin tree on each registry load is needless work. The
+/// `Featured` is re-derived live from the embedded index and the on-disk tree
+/// hash, never trusted from the (user-writable) lockfile: that derivation also
+/// gates the reserved-namespace lift, so it must not rest on data an attacker
+/// could edit. A featured plugin cannot ship a release-binary, so its installed
+/// tree equals its source tree and the recompute reproduces the pinned hash; it
+/// is also only run for the handful of ids the index actually names. The
 /// manifest-hash grant check still deactivates a community plugin whose
 /// manifest is tampered after install.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,11 +171,11 @@ impl PluginRegistry {
             }
         }
 
-        let lock = Lockfile::load().unwrap_or_else(|e| {
-            load_errors.push(format!("reading plugins.lock: {e:#}"));
-            Lockfile::default()
+        let featured = FeaturedIndex::load().unwrap_or_else(|e| {
+            load_errors.push(format!("reading featured plugin index: {e:#}"));
+            FeaturedIndex::default()
         });
-        load_external(config, &lock, &mut plugins, &mut load_errors);
+        load_external(config, &featured, &mut plugins, &mut load_errors);
 
         Self {
             plugins,
@@ -201,14 +204,22 @@ impl PluginRegistry {
 
 /// Load external plugins from `<app_dir>/plugins/<id>/aoe-plugin.toml`. Each
 /// problem is collected as a non-fatal load error rather than aborting the set.
-/// The display provenance for an external plugin: featured when the lockfile
-/// recorded a featured-verified install, otherwise local or community by source
-/// kind.
-fn validation_for(lock: Option<&LockedPlugin>, source: Option<&str>) -> ValidationState {
-    if lock.is_some_and(|l| l.trust == "featured") {
-        return ValidationState::Featured;
+/// The display provenance for an external plugin. `Featured` is verified live:
+/// the id must be in the embedded index and the on-disk tree must hash to the
+/// pin. The source-slug match is enforced at install (where the slug is
+/// canonical); here the content hash is the gate, since it is the strong check
+/// and avoids depending on how a persisted source string was canonicalized.
+fn validation_for(
+    featured: &FeaturedIndex,
+    id: &str,
+    dir: &Path,
+    source: Option<&str>,
+) -> ValidationState {
+    if let Some(entry) = featured.get(id) {
+        if integrity::tree_hash(dir).is_ok_and(|h| h == entry.tree_hash) {
+            return ValidationState::Featured;
+        }
     }
-    let source = source.or(lock.map(|l| l.source.as_str()));
     match source {
         Some(s) if s.starts_with("gh:") => ValidationState::Community,
         _ => ValidationState::Local,
@@ -217,7 +228,7 @@ fn validation_for(lock: Option<&LockedPlugin>, source: Option<&str>) -> Validati
 
 fn load_external(
     config: &Config,
-    lock: &Lockfile,
+    featured: &FeaturedIndex,
     plugins: &mut Vec<LoadedPlugin>,
     load_errors: &mut Vec<String>,
 ) {
@@ -276,7 +287,14 @@ fn load_external(
         };
         let id = manifest.id.as_str().to_string();
 
-        if manifest.id.is_reserved_namespace() {
+        let plugin_config = config.plugins.get(&id);
+        let source = plugin_config.and_then(|p| p.source.clone());
+        let validation = validation_for(featured, &id, &dir, source.as_deref());
+
+        // A reserved namespace is only allowed for a live featured-verified
+        // plugin; this is the load-time twin of the install gate, and it
+        // re-derives featured status rather than trusting the lockfile.
+        if manifest.id.is_reserved_namespace() && validation != ValidationState::Featured {
             load_errors.push(format!(
                 "plugin {id:?} at {} uses a reserved namespace and was skipped",
                 dir.display()
@@ -292,14 +310,11 @@ fn load_external(
         }
 
         let manifest_hash = PluginManifest::hash_bytes(&bytes);
-        let plugin_config = config.plugins.get(&id);
         let enabled = plugin_config.map(|p| p.enabled).unwrap_or(true);
-        let source = plugin_config.and_then(|p| p.source.clone());
         let granted = plugin_config
             .and_then(|p| p.grant.as_ref())
             .map(|g| grant_covers(g, &manifest, &manifest_hash))
             .unwrap_or(false);
-        let validation = validation_for(lock.get(&id), source.as_deref());
 
         plugins.push(LoadedPlugin {
             manifest,
