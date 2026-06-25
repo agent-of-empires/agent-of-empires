@@ -2,9 +2,11 @@
 
 use std::collections::BTreeSet;
 use std::io::{self, IsTerminal, Write};
+use std::path::Path;
+use std::process::Stdio;
 
 use anyhow::{anyhow, bail, Context, Result};
-use aoe_plugin_api::{PluginManifest, RuntimeSpec};
+use aoe_plugin_api::{BuildStep, PluginManifest, RuntimeSpec};
 
 use crate::session::{save_config, CapabilityGrant, Config, PluginConfig};
 
@@ -62,16 +64,28 @@ pub async fn install(input: &str, assume_yes: bool) -> Result<InstallReport> {
     }
 
     let capabilities = capability_strings(&fetched)?;
-    let granted = if capabilities.is_empty() || assume_yes {
+    let build = build_steps(&fetched.manifest);
+    // A build step runs arbitrary, unsandboxed code as the user at install
+    // time, so it requires the same explicit consent as a capability even when
+    // the plugin requests no capabilities at all (where install would
+    // otherwise auto-grant silently).
+    let granted = if assume_yes || (capabilities.is_empty() && build.is_empty()) {
         true
     } else {
-        confirm_capabilities(&id, &capabilities)?
+        confirm_capabilities(&id, &capabilities, build)?
     };
     if !granted {
         bail!("install cancelled; no capabilities were granted");
     }
 
     move_into_place(&fetched, &final_dir)?;
+    if let Err(e) = build_in_place(&id, &final_dir, &fetched.manifest) {
+        // A failed build must not leave a half-installed tree behind; nothing
+        // is persisted to config or the lockfile, so removing the directory
+        // returns the host to its pre-install state.
+        let _ = std::fs::remove_dir_all(&final_dir);
+        return Err(e);
+    }
 
     let manifest_hash = PluginManifest::hash_bytes(&fetched.manifest_bytes);
     persist_install(
@@ -144,7 +158,7 @@ pub async fn update(id: &str) -> Result<InstallReport> {
             capabilities: g.capabilities,
             granted_at: g.granted_at,
         })
-    } else if confirm_capabilities(id, &capabilities)? {
+    } else if confirm_capabilities(id, &capabilities, build_steps(&fetched.manifest))? {
         Some(CapabilityGrant {
             manifest_hash: manifest_hash.clone(),
             capabilities: capabilities.clone(),
@@ -155,7 +169,14 @@ pub async fn update(id: &str) -> Result<InstallReport> {
     };
 
     let final_dir = super::plugins_dir()?.join(id);
-    move_into_place(&fetched, &final_dir)?;
+    // A declined re-approval must not run the plugin's build steps (arbitrary
+    // code the user just refused). With no build steps the tree is still
+    // updated and left inactive (the prior behavior); with build steps a
+    // decline aborts the update, leaving the prior version untouched.
+    if grant.is_none() && caps_changed && !build_steps(&fetched.manifest).is_empty() {
+        bail!("update cancelled for {id}; its build steps were not approved, prior version kept");
+    }
+    replace_and_build(id, &fetched, &final_dir)?;
 
     let granted = grant.is_some();
     persist_update(id, &source_str, grant)?;
@@ -276,27 +297,44 @@ fn capability_strings(fetched: &FetchedPlugin) -> Result<Vec<String>> {
         .collect())
 }
 
-/// Prompt the user to grant a plugin's capabilities. Fails on a non-interactive
-/// stdin rather than silently granting; the caller can pass `--yes` there.
-fn confirm_capabilities(id: &str, capabilities: &[String]) -> Result<bool> {
+/// Prompt the user to grant a plugin's capabilities and run any build steps.
+/// Fails on a non-interactive stdin rather than silently granting; the caller
+/// can pass `--yes` there. Build steps are disclosed verbatim because they run
+/// as the user, outside capability enforcement, before the plugin is
+/// registered.
+fn confirm_capabilities(id: &str, capabilities: &[String], build: &[BuildStep]) -> Result<bool> {
     if !io::stdin().is_terminal() {
         bail!(
-            "{id} requests capabilities [{}] but stdin is not a terminal; re-run with --yes to grant them",
-            capabilities.join(", ")
+            "{id} requests capabilities [{}]{} but stdin is not a terminal; re-run with --yes to grant them",
+            capabilities.join(", "),
+            if build.is_empty() { "" } else { " and declares build steps" },
         );
     }
-    println!("Plugin {id} requests these capabilities:");
-    for capability in capabilities {
-        println!("  - {capability}");
+    if !capabilities.is_empty() {
+        println!("Plugin {id} requests these capabilities:");
+        for capability in capabilities {
+            println!("  - {capability}");
+        }
+    }
+    if !build.is_empty() {
+        println!(
+            "Plugin {id} will run these build commands now, in its install directory,\n\
+             as your user and outside capability enforcement:"
+        );
+        for step in build {
+            println!("  $ {}", step.command.join(" "));
+        }
     }
     // The honest model (D8): the host enforces these capabilities at its API
     // boundary, which stops a cooperative plugin from overreaching. It does NOT
     // contain an adversarial plugin: a granted worker runs as an ordinary
-    // process with no OS-level isolation. State this on every grant prompt.
+    // process with no OS-level isolation. Build steps run with the same trust,
+    // earlier. State this on every grant prompt.
     println!(
-        "Note: granting a capability trusts this plugin. The host checks capabilities at its API\n\
-         boundary, but a plugin worker runs without OS-level sandboxing, so a malicious plugin is\n\
-         not contained. Only install plugins you trust."
+        "Note: installing trusts this plugin. The host checks capabilities at its API boundary,\n\
+         but a plugin worker (and any build step) runs without OS-level sandboxing, so a malicious\n\
+         plugin is not contained. Build steps run as your user before any capability gate. Only\n\
+         install plugins you trust."
     );
     print!("Grant them and install? [y/N] ");
     io::stdout().flush()?;
@@ -322,6 +360,125 @@ fn move_into_place(fetched: &FetchedPlugin, final_dir: &std::path::Path) -> Resu
             final_dir.display()
         )
     })
+}
+
+/// The build steps a `command` runtime declares, or an empty slice for any
+/// other (or absent) runtime.
+fn build_steps(manifest: &PluginManifest) -> &[BuildStep] {
+    match &manifest.runtime {
+        Some(RuntimeSpec::Command { build, .. }) => build,
+        _ => &[],
+    }
+}
+
+/// Run a plugin's declared build steps in its final directory, then confirm the
+/// worker entrypoint is runnable. Builds run in the final directory (not the
+/// staging tree) because tools like Python venvs embed absolute paths and are
+/// not relocatable, so a build followed by a rename would break the worker.
+fn build_in_place(plugin_id: &str, dir: &Path, manifest: &PluginManifest) -> Result<()> {
+    run_build(plugin_id, dir, build_steps(manifest))?;
+    // A build can succeed by exit code yet not produce the entrypoint (every
+    // step skipped on this platform, or a no-op build against a broken
+    // project). Resolve the launch command now, while the user is watching, so
+    // the failure is a clear install error instead of an opaque launch error
+    // the next time the daemon starts.
+    if let Some(RuntimeSpec::Command { command, .. }) = &manifest.runtime {
+        super::launch::resolve_command(plugin_id, dir, command, &super::launch::OsLaunchResolver)
+            .with_context(|| {
+            format!(
+                "plugin {plugin_id}: worker command is not runnable after install \
+                     (a build step may have been skipped on this platform, or did not produce it)"
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// Execute build steps sequentially in `dir`. Each step's argv is resolved with
+/// the same policy as the launch command, immediately before it runs, so a step
+/// like `.venv/bin/pip` resolves once the prior step created it. Build stdin is
+/// `/dev/null` so an interactive prompt cannot hang a `--yes` install; stdout
+/// and stderr inherit the terminal so the user sees build progress.
+fn run_build(plugin_id: &str, dir: &Path, steps: &[BuildStep]) -> Result<()> {
+    let os = std::env::consts::OS;
+    for (i, step) in steps.iter().enumerate() {
+        if !step.platforms.is_empty() && !step.platforms.iter().any(|p| p == os) {
+            continue;
+        }
+        let pretty = step.command.join(" ");
+        let (program, args) = super::launch::resolve_command(
+            plugin_id,
+            dir,
+            &step.command,
+            &super::launch::OsLaunchResolver,
+        )
+        .with_context(|| format!("resolving build step {} ({pretty})", i + 1))?;
+        eprintln!("  building {plugin_id}: {pretty}");
+        let status = std::process::Command::new(&program)
+            .args(&args)
+            .current_dir(dir)
+            .env("AOE_PLUGIN_ID", plugin_id)
+            .stdin(Stdio::null())
+            .status()
+            .with_context(|| format!("spawning build step {} ({pretty})", i + 1))?;
+        if !status.success() {
+            bail!("build step {} ({pretty}) failed with {status}", i + 1);
+        }
+    }
+    Ok(())
+}
+
+/// Replace an installed plugin's directory with a freshly fetched tree and run
+/// its build, keeping the prior version intact if the build fails.
+///
+/// A leftover `<id>.bak` means a previous update was interrupted between
+/// exposing the new tree and finishing the build, leaving a possibly half-built
+/// `<id>`; the backup is the last known-good version, so recover it first.
+/// Then move the current install aside, place the new tree, and build: on
+/// success drop the backup, on failure restore it so the user is never left
+/// worse off than before the update.
+fn replace_and_build(plugin_id: &str, fetched: &FetchedPlugin, final_dir: &Path) -> Result<()> {
+    let backup_dir = final_dir.with_extension("bak");
+
+    if backup_dir.exists() {
+        if final_dir.exists() {
+            let _ = std::fs::remove_dir_all(final_dir);
+        }
+        std::fs::rename(&backup_dir, final_dir)
+            .with_context(|| format!("recovering interrupted update backup for {plugin_id}"))?;
+    }
+
+    let had_prior = final_dir.exists();
+    if had_prior {
+        std::fs::rename(final_dir, &backup_dir)
+            .with_context(|| format!("backing up current {plugin_id} before update"))?;
+    }
+
+    let place_and_build = (|| -> Result<()> {
+        std::fs::rename(&fetched.tree, final_dir).with_context(|| {
+            format!(
+                "moving plugin into {} (cross-device staging?)",
+                final_dir.display()
+            )
+        })?;
+        build_in_place(plugin_id, final_dir, &fetched.manifest)
+    })();
+
+    match place_and_build {
+        Ok(()) => {
+            if had_prior {
+                let _ = std::fs::remove_dir_all(&backup_dir);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(final_dir);
+            if had_prior {
+                let _ = std::fs::rename(&backup_dir, final_dir);
+            }
+            Err(e)
+        }
+    }
 }
 
 /// The source string to persist for a later `update`. A GitHub source keeps the
