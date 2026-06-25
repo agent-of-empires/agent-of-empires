@@ -115,17 +115,15 @@ impl PluginHost {
     async fn launch(self: Arc<Self>, plugin_id: String) {
         let host = self.clone();
         let id_for_task = plugin_id.clone();
+        // Hold the lock across spawn and insert so `supervise` (which updates
+        // the pid under the same lock) cannot run its first `spawn_once` before
+        // the placeholder entry exists. Otherwise the pid update would no-op and
+        // shutdown could never reap the worker.
+        let mut running = self.running.lock().await;
         let task = tokio::spawn(async move {
             host.supervise(id_for_task).await;
         });
-        // The pid is filled in by `supervise` on each spawn; record the task so
-        // shutdown can reap. A placeholder pid of 0 until the first spawn writes
-        // the real one is never used for signalling (supervise reaps its own
-        // child by the live pid it holds).
-        self.running
-            .lock()
-            .await
-            .insert(plugin_id, RunningWorker { pid: 0, task });
+        running.insert(plugin_id, RunningWorker { pid: 0, task });
     }
 
     /// Drive one plugin's worker: spawn, serve, respawn within budget.
