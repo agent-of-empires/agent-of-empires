@@ -177,7 +177,14 @@ fn load_external(config: &Config, plugins: &mut Vec<LoadedPlugin>, load_errors: 
         }
     };
 
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                load_errors.push(format!("reading an entry in {}: {e}", root.display()));
+                continue;
+            }
+        };
         let dir = entry.path();
         let name = entry.file_name();
         let name = name.to_string_lossy();
@@ -188,7 +195,13 @@ fn load_external(config: &Config, plugins: &mut Vec<LoadedPlugin>, load_errors: 
         let manifest_path = dir.join("aoe-plugin.toml");
         let bytes = match std::fs::read(&manifest_path) {
             Ok(bytes) => bytes,
-            Err(_) => continue, // not a plugin dir
+            // A directory without a manifest is simply not a plugin; anything
+            // else (a permission error, a short read) is worth surfacing.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                load_errors.push(format!("reading {}: {e}", manifest_path.display()));
+                continue;
+            }
         };
         let manifest = match std::str::from_utf8(&bytes)
             .map_err(|e| e.to_string())
