@@ -600,3 +600,77 @@ command = ["false"]
     // No leftover backup directory from the failed update.
     assert!(!installed.with_file_name("acme.upd.bak").exists());
 }
+
+/// A changed build recipe on update must re-prompt even when capabilities are
+/// unchanged, so a modified (possibly malicious) build cannot run unattended.
+/// Non-interactively that prompt bails, leaving the prior version untouched.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn update_reprompts_when_build_recipe_changes() {
+    let _home = isolate();
+    let src = tempfile::tempdir().unwrap();
+
+    write_plugin_dir(
+        src.path(),
+        r#"
+id = "acme.recipe"
+name = "Recipe"
+version = "0.1.0"
+api_version = 2
+capabilities = ["net"]
+
+[runtime]
+kind = "command"
+command = ["sh"]
+
+[[runtime.build]]
+command = ["cp", "aoe-plugin.toml", "marker-v1"]
+"#,
+    );
+    let dir = src.path().join("src-plugin");
+    install::install(dir.to_str().unwrap(), true).await.unwrap();
+
+    // Same capability, but the build recipe changed.
+    std::fs::write(
+        dir.join("aoe-plugin.toml"),
+        r#"
+id = "acme.recipe"
+name = "Recipe"
+version = "0.2.0"
+api_version = 2
+capabilities = ["net"]
+
+[runtime]
+kind = "command"
+command = ["sh"]
+
+[[runtime.build]]
+command = ["cp", "aoe-plugin.toml", "marker-v2"]
+"#,
+    )
+    .unwrap();
+
+    // The changed recipe forces a prompt, which bails on non-terminal stdin
+    // instead of silently running the new build.
+    let err = install::update("acme.recipe")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("not a terminal"), "got: {err}");
+
+    // Prior version is fully intact: v1 artifact present, v2 never ran.
+    let installed = agent_of_empires::plugin::plugins_dir()
+        .unwrap()
+        .join("acme.recipe");
+    assert!(installed.join("marker-v1").exists());
+    assert!(!installed.join("marker-v2").exists());
+    assert_eq!(
+        Lockfile::load()
+            .unwrap()
+            .get("acme.recipe")
+            .unwrap()
+            .version,
+        "0.1.0"
+    );
+}

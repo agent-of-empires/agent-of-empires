@@ -141,40 +141,56 @@ pub async fn update(id: &str) -> Result<InstallReport> {
     let new_caps: BTreeSet<&str> = capabilities.iter().map(String::as_str).collect();
     let caps_changed = prior_caps != new_caps;
 
+    // Build steps run unsandboxed at update time, so a changed build recipe
+    // must re-prompt even when the capability set is unchanged; a static
+    // capability list must not let modified build commands run unattended. The
+    // manifest hash covers the build steps, so a hash change with build steps
+    // present means the recipe could have changed.
+    let manifest_changed =
+        prior_grant.as_ref().map(|g| g.manifest_hash.as_str()) != Some(manifest_hash.as_str());
+    let build_changed = manifest_changed && !build_steps(&fetched.manifest).is_empty();
+    // Prompt when there is something to consent to: capabilities that changed,
+    // or build steps that could have changed. Dropping all capabilities with no
+    // build steps has nothing to grant, so it still (re)grants silently.
+    let needs_prompt = (!capabilities.is_empty() && caps_changed) || build_changed;
+
     // Decide the grant BEFORE touching the installed tree, so a declined or
     // non-interactive prompt bails while the old install, config, and lockfile
-    // are still consistent. An empty capability set always (re)grants, so an
-    // update that drops all capabilities reactivates the plugin even if it was
-    // previously left ungranted.
-    let grant = if capabilities.is_empty() {
+    // are still consistent.
+    let grant = if needs_prompt {
+        if confirm_capabilities(id, &capabilities, build_steps(&fetched.manifest))? {
+            Some(CapabilityGrant {
+                manifest_hash: manifest_hash.clone(),
+                capabilities: capabilities.clone(),
+                granted_at: chrono::Utc::now(),
+            })
+        } else {
+            None
+        }
+    } else if capabilities.is_empty() {
+        // Nothing to grant; an empty capability set keeps the plugin active.
         Some(CapabilityGrant {
             manifest_hash: manifest_hash.clone(),
             capabilities: vec![],
             granted_at: chrono::Utc::now(),
         })
-    } else if !caps_changed {
+    } else {
+        // Capabilities unchanged and the build recipe (if any) unchanged: carry
+        // the prior grant forward, refreshed to the new manifest hash.
         prior_grant.map(|g| CapabilityGrant {
             manifest_hash: manifest_hash.clone(),
             capabilities: g.capabilities,
             granted_at: g.granted_at,
         })
-    } else if confirm_capabilities(id, &capabilities, build_steps(&fetched.manifest))? {
-        Some(CapabilityGrant {
-            manifest_hash: manifest_hash.clone(),
-            capabilities: capabilities.clone(),
-            granted_at: chrono::Utc::now(),
-        })
-    } else {
-        None
     };
 
     let final_dir = super::plugins_dir()?.join(id);
-    // A declined re-approval must not run the plugin's build steps (arbitrary
-    // code the user just refused). With no build steps the tree is still
-    // updated and left inactive (the prior behavior); with build steps a
-    // decline aborts the update, leaving the prior version untouched.
-    if grant.is_none() && caps_changed && !build_steps(&fetched.manifest).is_empty() {
-        bail!("update cancelled for {id}; its build steps were not approved, prior version kept");
+    // A declined prompt must not run the plugin's build steps (arbitrary code
+    // the user just refused): abort and keep the prior version. A capabilities
+    // decline with no build steps keeps the prior behavior (tree updated, left
+    // inactive until re-approved).
+    if needs_prompt && grant.is_none() && !build_steps(&fetched.manifest).is_empty() {
+        bail!("update cancelled for {id}; build steps were not approved, prior version kept");
     }
     replace_and_build(id, &fetched, &final_dir)?;
 
