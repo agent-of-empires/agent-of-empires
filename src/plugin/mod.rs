@@ -6,6 +6,7 @@
 //! installs, capability grants, and the Tier 0 / Tier 1 contribution surface
 //! return in follow-up PRs.
 
+pub mod contributions;
 pub mod featured;
 pub mod fetch;
 pub mod install;
@@ -76,6 +77,14 @@ pub fn registry() -> Arc<PluginRegistry> {
     let reg = Arc::new(PluginRegistry::load(&config));
     *slot = Some(reg.clone());
     reg
+}
+
+/// Themes contributed by the active plugin set, as `(name, resolved path)`
+/// pairs. The theme registry layers these below builtins and user themes.
+pub fn active_plugin_themes() -> Vec<(String, PathBuf)> {
+    let reg = registry();
+    let active: Vec<&LoadedPlugin> = reg.active().collect();
+    contributions::active_themes(&active)
 }
 
 /// Rebuild the registry from the current on-disk config (after an

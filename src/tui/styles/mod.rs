@@ -111,11 +111,29 @@ pub fn discover_custom_themes() -> Vec<(String, PathBuf)> {
     themes
 }
 
-/// Return the full list of available theme names: built-in themes first,
-/// then custom.
+/// Themes contributed by active plugins, as (name, path) pairs. Layered below
+/// builtins and user custom themes: a plugin cannot shadow a builtin or a theme
+/// the user dropped in their own themes dir. Names already claimed by a builtin
+/// or a user theme are filtered out.
+pub fn discover_plugin_themes() -> Vec<(String, PathBuf)> {
+    let claimed: std::collections::HashSet<String> = builtin_theme_names()
+        .map(|s| s.to_string())
+        .chain(discover_custom_themes().into_iter().map(|(n, _)| n))
+        .collect();
+    crate::plugin::active_plugin_themes()
+        .into_iter()
+        .filter(|(name, _)| !claimed.contains(name) && !is_builtin_theme(name))
+        .collect()
+}
+
+/// Return the full list of available theme names: built-in themes first, then
+/// user custom themes, then active-plugin themes.
 pub fn available_themes() -> Vec<String> {
     let mut names: Vec<String> = builtin_theme_names().map(|s| s.to_string()).collect();
     for (name, _) in discover_custom_themes() {
+        names.push(name);
+    }
+    for (name, _) in discover_plugin_themes() {
         names.push(name);
     }
     names
@@ -180,6 +198,19 @@ pub fn load_theme(name: &str) -> Theme {
                 debug!(
                     theme = name,
                     source = "custom",
+                    path = %path.display(),
+                    "loaded theme"
+                );
+                return theme;
+            }
+        }
+    }
+    for (theme_name, path) in discover_plugin_themes() {
+        if theme_name == name {
+            if let Some(theme) = load_custom_theme(&path) {
+                debug!(
+                    theme = name,
+                    source = "plugin",
                     path = %path.display(),
                     "loaded theme"
                 );
