@@ -756,18 +756,25 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // the worker log dir) is cheap and side-effect-free until workers launch,
     // which happens after the daemon is up. A failure here is logged, not fatal:
     // the daemon serves fine without plugin workers.
+    // The host API includes mutating session.meta.set/cas, so a read-only
+    // daemon must not run plugin workers at all: gate the host on !read_only.
     #[cfg(feature = "serve")]
-    let plugin_host = match crate::session::get_app_dir() {
-        Ok(app_dir) => match crate::plugin::host::PluginHost::new(&app_dir, profile) {
-            Ok(host) => Some(host),
+    let plugin_host = if read_only {
+        tracing::info!(target: "plugin.host", "plugin host disabled in read-only serve mode");
+        None
+    } else {
+        match crate::session::get_app_dir() {
+            Ok(app_dir) => match crate::plugin::host::PluginHost::new(&app_dir, profile) {
+                Ok(host) => Some(host),
+                Err(e) => {
+                    tracing::warn!(target: "plugin.host", "plugin host disabled: {e:#}");
+                    None
+                }
+            },
             Err(e) => {
                 tracing::warn!(target: "plugin.host", "plugin host disabled: {e:#}");
                 None
             }
-        },
-        Err(e) => {
-            tracing::warn!(target: "plugin.host", "plugin host disabled: {e:#}");
-            None
         }
     };
 
