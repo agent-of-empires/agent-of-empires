@@ -1585,6 +1585,14 @@ pub async fn get_profile_settings(
                 "logging".to_string(),
                 serde_json::to_value(&global.logging)?,
             );
+            // Plugin settings live in the global config (global-only at Tier 0),
+            // not the profile override. Splice them in so the dashboard's plugin
+            // settings render their persisted values instead of reverting to the
+            // manifest default on every profile-view load (#2094).
+            obj.insert(
+                "plugins".to_string(),
+                serde_json::to_value(&global.plugins)?,
+            );
         }
         Ok::<_, anyhow::Error>(val)
     })
