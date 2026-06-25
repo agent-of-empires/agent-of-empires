@@ -256,7 +256,12 @@ impl PluginHost {
         // reap awaits a grace period, and we must not hold the running lock
         // across that await.
         let workers: Vec<_> = self.running.lock().await.drain().collect();
-        for (plugin_id, w) in workers {
+        // Reap in parallel: each escalating reap awaits up to REAP_GRACE before
+        // SIGKILL, so a sequential loop would make total shutdown scale with the
+        // worker count. The daemon's shutdown grace-period force-exit is armed
+        // only after this returns, so a bounded reap keeps that safety net
+        // meaningful. join_all bounds the whole thing to one REAP_GRACE.
+        futures_util::future::join_all(workers.into_iter().map(|(plugin_id, w)| async move {
             w.task.abort();
             if w.pid != 0 {
                 // SIGTERM the group, wait the grace, then SIGKILL: a worker or
@@ -264,7 +269,8 @@ impl PluginHost {
                 worker::reap_group_escalating(w.pid, REAP_GRACE).await;
             }
             tracing::debug!(target: "plugin.host", plugin = %plugin_id, "stopped plugin worker");
-        }
+        }))
+        .await;
     }
 }
 
