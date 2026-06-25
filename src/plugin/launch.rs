@@ -157,7 +157,9 @@ pub fn resolve_launch(
         })?;
 
     let (program, args) = match runtime {
-        RuntimeSpec::Command { command } => resolve_command(&plugin_id, dir, command, resolver)?,
+        RuntimeSpec::Command { command, .. } => {
+            resolve_command(&plugin_id, dir, command, resolver)?
+        }
         RuntimeSpec::ReleaseBinary { asset, bin } => {
             let target = bin.as_deref().unwrap_or(asset.as_str());
             let path = resolve_in_tree(&plugin_id, dir, target, resolver, |path| {
@@ -189,7 +191,12 @@ pub fn resolve_launch(
 /// breaks portability); a path containing a separator is resolved relative to
 /// the plugin directory and verified executable; a bare name is resolved on
 /// `PATH` via `which` (the console-script / interpreter case).
-fn resolve_command(
+///
+/// Shared with the install-time build runner (`crate::plugin::install`): a
+/// build step's argv is resolved with the exact same policy, against the same
+/// plugin directory, so a step like `.venv/bin/pip` resolves once the prior
+/// step created it.
+pub(crate) fn resolve_command(
     plugin_id: &str,
     dir: &Path,
     command: &[String],
