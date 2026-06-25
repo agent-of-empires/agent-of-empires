@@ -178,7 +178,9 @@ impl PluginManagerDialog {
                 let state = if !row.enabled {
                     ("disabled", theme.dimmed)
                 } else if row.needs_reapproval {
-                    ("needs approval", theme.error)
+                    // Waiting on the user to re-approve, not failed: use the
+                    // attention-needed color, not the error color.
+                    ("needs approval", theme.waiting)
                 } else {
                     ("enabled", theme.running)
                 };
