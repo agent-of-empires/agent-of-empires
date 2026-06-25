@@ -1,6 +1,7 @@
-//! Hook target enumeration and marker-walker machinery for the v015 install /
-//! uninstall pipeline. Extracted from `src/hooks/mod.rs` as a pure file-split
-//! refactor (#2188); no behavior change.
+//! Hook target enumeration and marker-presence walker shared by the live
+//! install/uninstall lifecycle and the hook-rewrite migrations (v015, v017,
+//! v018). Extracted from `src/hooks/mod.rs` as a pure file-split refactor
+//! (#2188); no behavior change.
 
 use std::path::{Path, PathBuf};
 

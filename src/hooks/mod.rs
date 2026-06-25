@@ -30,8 +30,6 @@ pub use status_file::{
     cleanup_hook_status_dir, hook_status_dir, read_hook_session_id, read_hook_status,
     read_hook_urgent,
 };
-#[cfg(test)]
-use targets::collect_env_lists_from_session;
 pub(crate) use targets::{
     has_aoe_marker, iter_hook_targets, iter_hook_targets_in, HookTarget, HookTargetKind,
 };
@@ -1718,6 +1716,7 @@ pub fn uninstall_all_hooks() {
 
 #[cfg(test)]
 mod tests {
+    use super::targets::collect_env_lists_from_session;
     use super::*;
     use tempfile::TempDir;
 
