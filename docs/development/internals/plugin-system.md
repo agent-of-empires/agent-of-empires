@@ -226,6 +226,60 @@ plugin tampered after install.
 `aoe plugin hash <dir>` prints the tree hash for a plugin directory so an author
 can produce the value a maintainer pins. Run it on a clean checkout.
 
+## Tier 0 contribution registries (#2094)
+
+Tier 0 wires a plugin's declarative manifest contributions into the host's
+registries, with no plugin code execution (that is the Tier 1 host, #2095). Four
+registries consume the manifest:
+
+### Settings
+
+A plugin's `[[settings]]` are typed: `type` (`string` / `bool` / `integer` /
+`select`), with `options`, `min`/`max`, a `default`, and `advanced`. The host
+maps each to its single-source settings schema as a virtual `plugin:<id>`
+section. `settings_schema::runtime_schema()` returns the static core schema plus
+those sections; `GET /api/settings/schema` serves it, the server validates
+PATCHes against it (`validate_patch_with`), and the TUI/web render it through the
+same generic field path as core settings. The API/validation layer speaks the
+flat `plugin:<id>.<key>` shape; only the merge boundary translates to the on-disk
+storage path `plugins.<id>.settings.<key>` (`settings_schema::plugin`). Plugin
+settings are global-only at Tier 0 (not profile-overridable). In the TUI they
+render read-only under the Plugins tab; edit them from the web dashboard or
+`aoe settings`.
+
+A manifest may also override the *default* of a core setting via
+`[setting_defaults]` (keyed by the core `section.field`). Resolution layers, in
+order: the user's value (when it differs from the baseline default) > the
+highest-priority active plugin's `setting_defaults` override > the core schema
+default. A plugin's own setting layers stored value > manifest default.
+`settings_schema::resolve` returns the effective value, its source, and the full
+candidate chain; `aoe settings explain <key>` and `GET /api/settings/resolved`
+surface it. "Highest priority" is active-plugin order (builtins first).
+
+### Themes
+
+A plugin's `[[themes]]` (`name`, `path`) add theme TOMLs to the picker. Each
+`path` is resolved under the plugin's install directory (absolute or
+parent-escaping paths are rejected); precedence is builtin > user custom >
+plugin, so a plugin can never shadow a builtin or a user theme.
+
+### Keybinds
+
+A plugin's `[[keybinds]]` resolve through a merged resolver
+(`tui::home::bindings::resolve_action`): the static core table is tried first and
+always shadows a plugin binding on the same chord; active plugins' keybinds are
+consulted only after. A resolved plugin keybind is inspectable but not runnable
+at Tier 0 (it shows a "needs the plugin runtime" notice); `aoe plugin info` lists
+a plugin's keybinds and flags any chord core shadows. Execution lands with #2095.
+
+### CLI grafting
+
+Active plugins' `[[commands]]` are grafted onto the derived clap tree at runtime
+(`cli::graft`), so they appear in `aoe --help` and parse. Core commands always
+win a name conflict. Dispatch tries the core derive first; a grafted command
+falls through to the plugin dispatcher, which at Tier 0 reports that running it
+needs the runtime (#2095).
+
 ## Tier 1 worker host (#2095)
 
 The worker host runs inside the `aoe serve` daemon (it is `serve`-gated, like

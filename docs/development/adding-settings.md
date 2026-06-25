@@ -115,6 +115,14 @@ are not user-facing settings. A few things are deliberately not schematized:
   endpoint (it records "has responded" and honors `DO_NOT_TRACK`), not the
   generic PATCH.
 
+## Plugin settings
+
+The above is for core settings. A plugin declares its own settings in its
+`aoe-plugin.toml` manifest, not in a `Config` struct; the host turns each into a
+virtual `plugin:<id>` schema section that renders and validates through the same
+path. See the Tier 0 registries section in
+[the plugin system internals](internals/plugin-system.md).
+
 ## Breaking changes
 
 Renaming or relocating a stored field is a breaking change to `config.toml`;

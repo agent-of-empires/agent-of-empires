@@ -71,6 +71,8 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe theme list`↴](#aoe-theme-list)
 * [`aoe theme export`↴](#aoe-theme-export)
 * [`aoe theme dir`↴](#aoe-theme-dir)
+* [`aoe settings`↴](#aoe-settings)
+* [`aoe settings explain`↴](#aoe-settings-explain)
 * [`aoe telemetry`↴](#aoe-telemetry)
 * [`aoe telemetry status`↴](#aoe-telemetry-status)
 * [`aoe telemetry enable`↴](#aoe-telemetry-enable)
@@ -129,6 +131,7 @@ Run without arguments to launch the TUI dashboard.
 * `tmux` — tmux integration utilities
 * `sounds` — Manage sound effects for agent state transitions
 * `theme` — Manage color themes (list, export, customize)
+* `settings` — Inspect resolved settings and their provenance
 * `telemetry` — Manage anonymous opt-in usage telemetry
 * `mcp` — Inspect the effective MCP server set (provenance, conflicts, drift)
 * `serve` — Start a web dashboard for remote session access
@@ -1085,6 +1088,30 @@ Export a built-in theme as a TOML file for customization
 Show the custom themes directory path
 
 **Usage:** `aoe theme dir`
+
+
+
+## `aoe settings`
+
+Inspect resolved settings and their provenance
+
+**Usage:** `aoe settings <COMMAND>`
+
+###### **Subcommands:**
+
+* `explain` — Explain where a setting's effective value comes from. KEY is a core `section.field` (e.g. `acp.default_agent`) or a plugin `plugin:<id>.<field>` (e.g. `plugin:acme.kit.retries`)
+
+
+
+## `aoe settings explain`
+
+Explain where a setting's effective value comes from. KEY is a core `section.field` (e.g. `acp.default_agent`) or a plugin `plugin:<id>.<field>` (e.g. `plugin:acme.kit.retries`)
+
+**Usage:** `aoe settings explain <KEY>`
+
+###### **Arguments:**
+
+* `<KEY>` — The setting key to explain
 
 
 
