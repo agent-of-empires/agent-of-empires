@@ -114,9 +114,10 @@ pub fn append_pane_base_index_args(args: &mut Vec<String>, target: &str) {
 /// Required for the web dashboard's two-finger scroll on mobile when the
 /// underlying agent uses tmux copy-mode for scrollback (the default
 /// renderer for Claude Code, and all other agents). Claude Code's
-/// fullscreen renderer (`/tui fullscreen`) bypasses tmux copy-mode and
-/// handles wheel events itself, so the option is harmless but unused in
-/// that mode.
+/// fullscreen renderer (`/tui fullscreen`) bypasses tmux copy-mode: it
+/// runs on the alternate screen and relies on alternate-scroll turning the
+/// wheel into arrow keys (it binds the arrows to scroll), so this option is
+/// harmless but unused in that mode.
 pub fn append_mouse_on_args(args: &mut Vec<String>, target: &str) {
     args.extend([
         ";".to_string(),

@@ -3305,15 +3305,17 @@ impl HomeView {
     /// * **Mouse tracking on** (`mouse_tracking`): forward the wheel as a
     ///   mouse event, the encoding following the app (SGR 1006 when
     ///   `mouse_sgr` is set, otherwise the legacy X10 encoding).
-    /// * **Mouse tracking off**: the app relies on the terminal's
-    ///   alternate-scroll behavior (DECSET 1007) to turn the wheel into
-    ///   cursor-key presses. Claude Code's fullscreen renderer is exactly
-    ///   this: it sets `1049h` + `1007h` but never requests mouse tracking,
-    ///   so a raw mouse byte would land as a garbage keystroke (#2407).
-    ///   Send `Up`/`Down` named keys instead; `send-keys` renders them in
-    ///   the pane's current application-cursor-key mode, matching what tmux
-    ///   itself sends on attach. The step (3 keys) matches tmux's own
-    ///   alternate-scroll and the capture-window `STEP`.
+    /// * **Mouse tracking off**: an alternate-screen app with no mouse mode
+    ///   gets its wheel via the terminal's alternate-scroll behavior, which
+    ///   turns the wheel into cursor-key presses. tmux does this for any
+    ///   such pane on attach (`alternate-scroll`, on by default), so we
+    ///   replicate it: send `Up`/`Down` instead of raw mouse bytes (which
+    ///   the app would read as garbage keystrokes). Claude Code's fullscreen
+    ///   renderer is the motivating case: it sets `1049h` + `1007h` but
+    ///   never requests mouse tracking, and binds the arrow keys to scroll
+    ///   in that mode (#2407). `send-keys -N` renders all 3 presses in the
+    ///   pane's current application-cursor-key mode in a single fork; the
+    ///   step matches tmux's own alternate-scroll and the capture `STEP`.
     ///
     /// Only alternate-screen panes are forwarded; on the normal buffer the
     /// capture-window scroll reaches real scrollback, so the caller keeps
@@ -3340,11 +3342,10 @@ impl HomeView {
         } else {
             const WHEEL_ARROW_STEP: usize = 3;
             let name = if up { "Up" } else { "Down" };
-            for _ in 0..WHEEL_ARROW_STEP {
-                worker.send(crate::tui::home::live_send::TmuxKey::Named(
-                    name.to_string(),
-                ));
-            }
+            worker.send(crate::tui::home::live_send::TmuxKey::NamedRepeat {
+                name: name.to_string(),
+                count: WHEEL_ARROW_STEP,
+            });
         }
         true
     }
