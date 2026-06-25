@@ -2690,6 +2690,17 @@
       "risk": "high",
       "specs": ["tests/desktop-live-input.spec.ts"],
       "components": ["web/src/components/LiveTerminalView.tsx", "web/src/components/MobileLiveTerminal.tsx"]
+    },
+    {
+      "id": "plugins.ui-slots",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/plugin/__tests__/PluginSlots.test.tsx",
+        "src/lib/__tests__/pluginUi.test.ts",
+        "src/hooks/usePluginUiState.test.tsx"
+      ],
+      "components": ["web/src/components/plugin/PluginSlots.tsx"]
     }
   ]
 }
