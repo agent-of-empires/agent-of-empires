@@ -1093,6 +1093,36 @@ mod tests {
         }
     }
 
+    fn wait_for_latest(worker: &LiveCaptureWorker, timeout: std::time::Duration) -> Option<String> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(value) = worker.take_latest() {
+                return Some(value);
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    fn assert_no_latest_for(
+        worker: &LiveCaptureWorker,
+        timeout: std::time::Duration,
+        message: &str,
+    ) {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(value) = worker.take_latest() {
+                panic!("{message}: got {value:?}");
+            }
+            if std::time::Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     // Exit-chord detection moved out of translate() into
     // handle_live_send_key. Translate now never emits Exit; the
     // chord-list tests below cover the configurable exit path.
@@ -1619,9 +1649,9 @@ mod tests {
         // so nothing crosses the channel. (`capture_lines == 0` guard.)
         let worker = LiveCaptureWorker::spawn(std::sync::Arc::new(tokio::sync::Notify::new()));
         worker.set_target("aoe_test_capture_no_geometry".into());
-        std::thread::sleep(std::time::Duration::from_millis(60));
-        assert!(
-            worker.take_latest().is_none(),
+        assert_no_latest_for(
+            &worker,
+            std::time::Duration::from_millis(500),
             "worker should stay idle until set_capture_lines is called",
         );
     }
@@ -1634,16 +1664,13 @@ mod tests {
         // without a real tmux session: a missing pane always reads empty.
         let worker = LiveCaptureWorker::spawn(std::sync::Arc::new(tokio::sync::Notify::new()));
         worker.set_target("aoe_test_capture_missing_session".into());
-        // Fast cadence so the worker actually captures (and drops the empty
-        // frame) within the wait, instead of still being in its first idle
-        // sleep when we assert.
+        // Fast cadence so the worker actually captures and drops the empty
+        // frame during the polling window.
         worker.set_live(true);
         worker.set_capture_lines(40);
-        std::thread::sleep(std::time::Duration::from_millis(
-            LIVE_CAPTURE_INTERVAL_FAST_MS + 60,
-        ));
-        assert!(
-            worker.take_latest().is_none(),
+        assert_no_latest_for(
+            &worker,
+            std::time::Duration::from_millis(500),
             "empty captures must never be forwarded",
         );
     }
@@ -1673,15 +1700,11 @@ mod tests {
         let worker = LiveCaptureWorker::spawn(std::sync::Arc::new(tokio::sync::Notify::new()));
         worker.set_target("aoe_test_capture_forward_empty".into());
         worker.set_forward_empty(true);
-        // Fast cadence so the worker captures within the wait rather than
-        // still being in its first idle sleep when we assert.
+        // Fast cadence so the worker captures during the polling window.
         worker.set_live(true);
         worker.set_capture_lines(40);
-        std::thread::sleep(std::time::Duration::from_millis(
-            LIVE_CAPTURE_INTERVAL_FAST_MS + 60,
-        ));
         assert_eq!(
-            worker.take_latest(),
+            wait_for_latest(&worker, std::time::Duration::from_secs(2)),
             Some(String::new()),
             "forward-empty policy must surface empty captures",
         );
