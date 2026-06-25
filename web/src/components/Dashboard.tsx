@@ -159,10 +159,9 @@ export function Dashboard({ sessions, onNewSession, onCloneFromUrl, onToggleSide
         </div>
       )}
 
-      {/* Plugin-contributed dashboard cards (#2366). */}
-      <div className="mt-4 max-w-2xl w-full">
-        <PluginCards />
-      </div>
+      {/* Plugin-contributed dashboard cards (#2366). Renders nothing (and adds
+          no spacing) until a plugin pushes a card. */}
+      <PluginCards />
 
       {/* Keyboard hint (desktop only) */}
       {!readOnly && (

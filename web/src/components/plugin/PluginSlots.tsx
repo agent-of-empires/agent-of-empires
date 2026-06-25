@@ -15,8 +15,8 @@ function Badge({ entry }: { entry: PluginUiEntry }) {
   const tooltip = payloadStr(entry, "tooltip");
   return (
     <span
-      className={`font-mono text-[11px] px-1.5 py-0.5 rounded-full ${toneClasses(entryTone(entry))}`}
-      title={tooltip || `${entry.plugin_id}`}
+      className={`inline-flex max-w-48 min-w-0 items-center truncate font-mono text-[11px] px-1.5 py-0.5 rounded-full ${toneClasses(entryTone(entry))}`}
+      title={tooltip || text}
       data-plugin-slot={entry.slot}
       data-plugin-id={entry.plugin_id}
     >
@@ -58,19 +58,19 @@ export function PluginRowColumn({ sessionId }: { sessionId: string }) {
   const entries = sessionEntries(usePluginUiEntries(), "row-column", sessionId);
   if (entries.length === 0) return null;
   return (
-    <span className="flex items-center gap-1.5">
+    <span className="flex min-w-0 items-center gap-1.5">
       {entries.map((e) => {
         const text = entryText(e);
         if (!text) return null;
         return (
           <span
             key={`${e.plugin_id}:${e.id}`}
-            className={`font-mono text-[11px] ${
+            className={`max-w-32 truncate font-mono text-[11px] ${
               toneClasses(entryTone(e))
                 .split(" ")
                 .find((c) => c.startsWith("text-")) ?? "text-text-dim"
             }`}
-            title={payloadStr(e, "tooltip") || e.plugin_id}
+            title={payloadStr(e, "tooltip") || text}
             data-plugin-slot="row-column"
             data-plugin-id={e.plugin_id}
           >
@@ -87,7 +87,10 @@ export function PluginCards() {
   const entries = globalEntries(usePluginUiEntries(), "card");
   if (entries.length === 0) return null;
   return (
-    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3" data-testid="plugin-cards">
+    <div
+      className="mt-4 w-full max-w-2xl grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3"
+      data-testid="plugin-cards"
+    >
       {entries.map((e) => {
         const title = payloadStr(e, "title");
         const body = payloadStr(e, "body");
