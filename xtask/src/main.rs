@@ -62,9 +62,9 @@ fn run_dev(_args: DevArgs) {
 #[cfg(unix)]
 fn build_serve() -> bool {
     use std::process::Command;
-    eprintln!("[xtask dev] building aoe (default features include serve)...");
+    eprintln!("[xtask dev] building aoe --features serve...");
     Command::new("cargo")
-        .args(["build"])
+        .args(["build", "--features", "serve"])
         .status()
         .map(|s| s.success())
         .unwrap_or_else(|e| {
