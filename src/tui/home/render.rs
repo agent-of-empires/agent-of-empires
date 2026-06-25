@@ -102,9 +102,10 @@ fn truncate_to_width(text: &str, max_width: usize) -> String {
 /// `output`, so a screen row maps to `output.y + (visible_rows - pane_height)
 /// + cursor.y`. When the pane is sized to the output area (the live-send
 /// resize) the delta is zero and this is just `output.y + cursor.y`; the delta
-/// only bites for the frame or two after a resize. A hidden cursor, or one
-/// that maps outside `output` (e.g. a pane taller than the output area clips
-/// its top rows), yields `None` so nothing is painted.
+/// only bites for the frame or two after a resize. A hidden cursor
+/// (`cursor_flag` 0, e.g. a pager that hides its caret), or one that maps
+/// outside `output` (e.g. a pane taller than the output area clips its top
+/// rows), yields `None` so nothing is painted.
 fn map_live_preview_cursor(
     output: Rect,
     visible_rows: usize,
@@ -2373,18 +2374,17 @@ impl HomeView {
             }
         }
 
-        // In live-send mode, place a real terminal cursor over the preview at
+        // In live-send mode, paint a block cursor into the captured cells at
         // the target pane's cursor cell. `capture-pane` carries only cell text
         // (plus SGR color), not the cursor, so without this the
         // "feels-attached" preview shows no cursor for programs that rely on
         // the hardware cursor (shells, codex, anything using DECTCEM) even
-        // though a direct tmux attach would. Programs that paint their own
-        // caret into the cells (e.g. Claude Code's reverse-video block) hide
-        // the hardware cursor, so `cursor_flag` is 0 and this paints nothing
-        // over them, avoiding a double cursor.
-        if let Some(pos) = self.live_preview_cursor_pos() {
-            frame.set_cursor_position(pos);
-        }
+        // though a direct tmux attach would. We paint a cell rather than using
+        // the terminal's hardware cursor: ratatui re-emits a hardware
+        // hide/show on every ~30fps frame, and a state-syncing remote
+        // transport (mosh) samples that mid-toggle and renders a flickering
+        // caret. A painted cell is identical every frame, so it stays put.
+        self.paint_preview_cursor(frame, theme);
 
         // Selection highlight goes last so it sits on top of whatever
         // the active ViewMode painted into the inner area. The handlers
@@ -2409,6 +2409,24 @@ impl HomeView {
         }
         let cursor = self.preview_capture_worker.as_ref()?.current_cursor()?;
         map_live_preview_cursor(self.preview_pane_area, self.preview_visible_rows, cursor)
+    }
+
+    /// Paint an opaque block cursor into the captured preview cells at the
+    /// live-send cursor position. Style is set absolutely (the cell's existing
+    /// fg/bg and any inherited reverse/blink modifiers are reset) so the block
+    /// is a consistent cursor regardless of the styling the agent painted into
+    /// that cell, and is byte-identical frame to frame. A no-op when no cursor
+    /// is shown this frame, or the mapped cell fell outside the buffer after a
+    /// resize race (mirrors `paint_preview_selection`'s bounds guard).
+    fn paint_preview_cursor(&self, frame: &mut Frame, theme: &Theme) {
+        let Some(pos) = self.live_preview_cursor_pos() else {
+            return;
+        };
+        let buf = frame.buffer_mut();
+        if !buf.area.contains(pos) {
+            return;
+        }
+        buf[(pos.x, pos.y)].set_style(Style::reset().fg(theme.background).bg(theme.text));
     }
 
     /// Apply the drag-select highlight to cells inside the preview
