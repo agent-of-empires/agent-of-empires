@@ -194,6 +194,16 @@ fn events_subscribe(state: &HostApiState, params: &Value) -> Result<Value, Dispa
         .get("topics")
         .and_then(Value::as_array)
         .ok_or_else(|| DispatchError::invalid_params("missing array param \"topics\""))?;
+    // `after_seq` is a single cursor, but each topic carries its own seq
+    // sequence (events_publish allocates per topic). Returning one `high_seq`
+    // across several topics would let a client advance past a slower topic and
+    // skip its later events. Until the response carries per-topic cursors, v1
+    // accepts exactly one topic per call.
+    if topics.len() != 1 {
+        return Err(DispatchError::invalid_params(
+            "\"topics\" currently supports exactly one topic; per-topic cursors are not implemented yet",
+        ));
+    }
     let after_seq = params.get("after_seq").and_then(Value::as_u64).unwrap_or(0);
 
     let conn = state.events.lock().unwrap_or_else(|p| p.into_inner());
