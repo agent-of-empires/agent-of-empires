@@ -329,6 +329,7 @@ capabilities = ["runtime.worker"]
             manifest,
             enabled: true,
             trust: TrustLevel::Community,
+            validation: crate::plugin::registry::ValidationState::Community,
             source: Some("gh:acme/worker".into()),
             dir: dir.map(PathBuf::from),
             manifest_hash: "sha256:test".into(),
