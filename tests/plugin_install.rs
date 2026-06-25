@@ -14,10 +14,17 @@ use serial_test::serial;
 use tempfile::TempDir;
 
 /// Isolate the app dir under a fresh temp HOME for the duration of a test.
+///
+/// Also clears `AOE_FEATURED_INDEX_PATH`: it is a process-global env var, and
+/// these tests are `#[serial]`, so a featured test that aborts before its own
+/// cleanup would otherwise leave a stale (deleted-tempdir) path that breaks
+/// every later test. Clearing it at the start of each test makes the isolation
+/// robust regardless of ordering or prior failures.
 fn isolate() -> TempDir {
     let home = tempfile::tempdir().expect("tempdir");
     std::env::set_var("HOME", home.path());
     std::env::set_var("XDG_CONFIG_HOME", home.path().join(".config"));
+    std::env::remove_var("AOE_FEATURED_INDEX_PATH");
     home
 }
 
