@@ -1,0 +1,336 @@
+//! The Tier 1 plugin worker host: launch and supervise plugin workers.
+//!
+//! The host runs inside the `aoe serve` daemon. For each active community
+//! plugin that declares a `[runtime]`, it resolves a launch
+//! ([`crate::plugin::launch::resolve_launch`]), applies the sandbox backend
+//! ([`crate::plugin::sandbox`]), and spawns the worker as a child process that
+//! speaks newline-delimited JSON-RPC ([`crate::plugin::protocol`]) over its
+//! stdio. Each worker call is checked against the plugin's granted
+//! capabilities and dispatched to the host API
+//! ([`crate::plugin::host_api`]).
+//!
+//! Supervision is the ACP supervision model minus the persistence half: the
+//! worker is a child owned by this daemon, not a detached process. There is no
+//! socket, no on-disk runner record, and no reattach: a plugin worker is a
+//! stateless transformer over a host-owned event stream, so surviving a daemon
+//! restart would only strand it with a stale view. The daemon dies, the
+//! workers die, and a fresh daemon respawns them. What is kept from ACP:
+//! process-group reaping (a worker that forks helpers is torn down whole), a
+//! per-worker respawn budget so a crash loop does not spin, and a concurrency
+//! cap. The worker's stderr drains to `<plugin-workers>/<id>.log`.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result};
+use serde_json::Value;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::Mutex;
+
+use crate::plugin::host_api::{dispatch, HostApiState, PluginRpcContext};
+use crate::plugin::launch::{resolve_launch, OsLaunchResolver};
+use crate::plugin::protocol::{self, codes, RpcResponse};
+use crate::plugin::registry::PluginRegistry;
+use crate::plugin::sandbox::{NoSandbox, SandboxBackend};
+use crate::process::worker;
+
+/// Events kept per topic on the plugin event bus before the oldest are pruned.
+const EVENT_RETENTION_PER_TOPIC: usize = 10_000;
+/// Most workers the host runs at once. A cooperative cap, not a security one.
+const MAX_WORKERS: usize = 32;
+/// Respawn budget: at most this many restarts within [`RESPAWN_WINDOW`] before
+/// the host gives up on a crash-looping worker.
+const MAX_RESPAWNS: usize = 3;
+const RESPAWN_WINDOW: Duration = Duration::from_secs(60);
+/// Grace period between SIGTERM and SIGKILL when reaping a worker tree.
+const REAP_GRACE: Duration = Duration::from_secs(2);
+
+/// One supervised worker: the plugin it runs, its pid, and the task driving it.
+struct RunningWorker {
+    pid: u32,
+    task: tokio::task::JoinHandle<()>,
+}
+
+/// The plugin worker host, owned by the daemon for its lifetime.
+pub struct PluginHost {
+    api: Arc<HostApiState>,
+    sandbox: Arc<dyn SandboxBackend>,
+    workers_dir: PathBuf,
+    /// Running workers keyed by plugin id (one worker per plugin in v1).
+    running: Mutex<HashMap<String, RunningWorker>>,
+}
+
+impl PluginHost {
+    /// Build a host bound to `app_dir` (where the worker logs and the plugin
+    /// event-bus database live) and `profile` (whose session storage the host
+    /// API reads and writes). The only v1 sandbox backend is [`NoSandbox`].
+    pub fn new(app_dir: &std::path::Path, profile: &str) -> Result<Arc<Self>> {
+        let workers_dir = app_dir.join("plugin-workers");
+        worker::ensure_dir(&workers_dir)
+            .with_context(|| format!("prepare {}", workers_dir.display()))?;
+        let api = HostApiState::open(
+            &app_dir.join("plugin_events.db"),
+            profile,
+            EVENT_RETENTION_PER_TOPIC,
+        )?;
+        Ok(Arc::new(Self {
+            api: Arc::new(api),
+            sandbox: Arc::new(NoSandbox),
+            workers_dir,
+            running: Mutex::new(HashMap::new()),
+        }))
+    }
+
+    /// Launch a worker for every active plugin that declares a runtime, up to
+    /// the concurrency cap. A plugin whose runtime cannot be resolved (a
+    /// missing interpreter or binary) is logged and skipped; it does not block
+    /// the others.
+    pub async fn start(self: &Arc<Self>, registry: &PluginRegistry) {
+        for plugin in registry.active() {
+            if plugin.manifest.runtime.is_none() {
+                continue;
+            }
+            {
+                let running = self.running.lock().await;
+                if running.len() >= MAX_WORKERS {
+                    tracing::warn!(
+                        target: "plugin.host",
+                        cap = MAX_WORKERS,
+                        "plugin worker concurrency cap reached; not launching {}",
+                        plugin.id()
+                    );
+                    break;
+                }
+            }
+            self.clone().launch(plugin.id().to_string()).await;
+        }
+    }
+
+    /// Spawn the supervising task for one plugin id. The task spawns the worker
+    /// process, runs its protocol loop, and respawns within the budget if it
+    /// exits.
+    async fn launch(self: Arc<Self>, plugin_id: String) {
+        let host = self.clone();
+        let id_for_task = plugin_id.clone();
+        let task = tokio::spawn(async move {
+            host.supervise(id_for_task).await;
+        });
+        // The pid is filled in by `supervise` on each spawn; record the task so
+        // shutdown can reap. A placeholder pid of 0 until the first spawn writes
+        // the real one is never used for signalling (supervise reaps its own
+        // child by the live pid it holds).
+        self.running
+            .lock()
+            .await
+            .insert(plugin_id, RunningWorker { pid: 0, task });
+    }
+
+    /// Drive one plugin's worker: spawn, serve, respawn within budget.
+    async fn supervise(self: Arc<Self>, plugin_id: String) {
+        let mut restarts: Vec<Instant> = Vec::new();
+        loop {
+            match self.spawn_once(&plugin_id).await {
+                Ok(()) => {}
+                Err(e) => {
+                    tracing::error!(
+                        target: "plugin.host",
+                        plugin = %plugin_id,
+                        "failed to launch plugin worker: {e:#}"
+                    );
+                    return;
+                }
+            }
+            let now = Instant::now();
+            restarts.retain(|t| now.duration_since(*t) < RESPAWN_WINDOW);
+            restarts.push(now);
+            if restarts.len() > MAX_RESPAWNS {
+                tracing::error!(
+                    target: "plugin.host",
+                    plugin = %plugin_id,
+                    "plugin worker exceeded respawn budget ({MAX_RESPAWNS} in {}s); giving up",
+                    RESPAWN_WINDOW.as_secs()
+                );
+                self.running.lock().await.remove(&plugin_id);
+                return;
+            }
+            tracing::warn!(
+                target: "plugin.host",
+                plugin = %plugin_id,
+                "plugin worker exited; respawning"
+            );
+        }
+    }
+
+    /// Spawn the worker process once and run its protocol loop until it exits.
+    /// Resolution and the granted-capability list are recomputed from the live
+    /// registry each spawn so an enable/disable/regrant between restarts is
+    /// honored.
+    async fn spawn_once(&self, plugin_id: &str) -> Result<()> {
+        let registry = crate::plugin::registry();
+        let plugin = registry
+            .get(plugin_id)
+            .filter(|p| p.active())
+            .ok_or_else(|| anyhow::anyhow!("plugin {plugin_id} is no longer active"))?;
+        let granted: Vec<String> = plugin
+            .manifest
+            .capabilities
+            .iter()
+            .map(|c| c.as_str().to_string())
+            .collect();
+
+        let launch = resolve_launch(plugin, &OsLaunchResolver)?;
+        let prepared = self.sandbox.prepare(&launch)?;
+
+        let worker_id = uuid::Uuid::new_v4().to_string();
+        let log_path = worker::log_path(&self.workers_dir, &worker_id)?;
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .with_context(|| format!("open worker log {}", log_path.display()))?;
+
+        let mut cmd = tokio::process::Command::new(&prepared.program);
+        cmd.args(&prepared.args)
+            .current_dir(&prepared.cwd)
+            .env("AOE_PLUGIN_WORKER_ID", &worker_id)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::from(log))
+            .kill_on_drop(true);
+        for (k, v) in &prepared.env {
+            cmd.env(k, v);
+        }
+        // New session so the worker and any helpers it forks share one process
+        // group, reapable in one signal.
+        #[cfg(unix)]
+        unsafe {
+            cmd.pre_exec(|| {
+                nix::unistd::setsid().map_err(std::io::Error::other)?;
+                Ok(())
+            });
+        }
+
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("spawn worker for {plugin_id}"))?;
+        let pid = child.id().unwrap_or(0);
+        tracing::info!(
+            target: "plugin.host",
+            plugin = %plugin_id,
+            pid,
+            program = %prepared.program.display(),
+            "launched plugin worker"
+        );
+        if let Some(w) = self.running.lock().await.get_mut(plugin_id) {
+            w.pid = pid;
+        }
+
+        let stdin = child.stdin.take().context("worker stdin missing")?;
+        let stdout = child.stdout.take().context("worker stdout missing")?;
+        let ctx = PluginRpcContext {
+            plugin_id: plugin_id.to_string(),
+            granted_capabilities: granted,
+        };
+        serve_connection(&self.api, &ctx, stdout, stdin).await;
+
+        // The loop returned: the worker closed its stdout (exited or crashed).
+        // Reap the whole group so no forked helper is left behind, then let the
+        // caller decide whether to respawn.
+        if pid != 0 {
+            worker::reap_group_escalating(pid, REAP_GRACE).await;
+        }
+        let _ = child.wait().await;
+        Ok(())
+    }
+
+    /// Reap every running worker. Called on daemon shutdown.
+    pub async fn shutdown(&self) {
+        let mut running = self.running.lock().await;
+        for (plugin_id, w) in running.drain() {
+            w.task.abort();
+            if w.pid != 0 {
+                worker::terminate_process_group(w.pid);
+            }
+            tracing::debug!(target: "plugin.host", plugin = %plugin_id, "stopped plugin worker");
+        }
+    }
+}
+
+/// Read JSON-RPC requests from a worker's stdout, dispatch each through the
+/// capability-gated host API, and write the response to its stdin. Returns when
+/// the worker closes stdout or sends an unparseable line (fatal).
+async fn serve_connection(
+    api: &Arc<HostApiState>,
+    ctx: &PluginRpcContext,
+    stdout: tokio::process::ChildStdout,
+    mut stdin: tokio::process::ChildStdin,
+) {
+    let mut lines = BufReader::new(stdout).lines();
+    // Unbounded line read: per the honest model (D8) the worker is cooperative,
+    // not adversarial, so a malicious oversized line is out of scope here; an
+    // OS-level sandbox backend is where that ceiling belongs.
+    loop {
+        let line = match lines.next_line().await {
+            Ok(Some(line)) => line,
+            Ok(None) => return, // EOF: worker exited.
+            Err(e) => {
+                tracing::warn!(target: "plugin.host", plugin = %ctx.plugin_id, "worker read error: {e}");
+                return;
+            }
+        };
+        let request = match protocol::parse_request(&line) {
+            Ok(Some(req)) => req,
+            Ok(None) => continue, // blank line
+            Err(e) => {
+                // A malformed line is a protocol violation; answer with a parse
+                // error (best effort) and stop reading from this worker.
+                let resp =
+                    RpcResponse::error(Value::Null, codes::PARSE_ERROR, e.to_string()).to_line();
+                let _ = stdin.write_all(resp.as_bytes()).await;
+                return;
+            }
+        };
+
+        // Dispatch does blocking SQLite and session-storage IO; run it off the
+        // async runtime. The handler is fully synchronous and self-contained.
+        let api = api.clone();
+        let ctx_id = ctx.plugin_id.clone();
+        let caps = ctx.granted_capabilities.clone();
+        let method = request.method.clone();
+        let params = request.params.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            let ctx = PluginRpcContext {
+                plugin_id: ctx_id,
+                granted_capabilities: caps,
+            };
+            dispatch(&api, &ctx, &method, &params)
+        })
+        .await;
+
+        // A notification (no id) gets no response, but still ran for its side
+        // effects above.
+        let Some(id) = request.id else {
+            continue;
+        };
+
+        let response = match outcome {
+            Ok(Ok(result)) => RpcResponse::success(id, result),
+            Ok(Err(e)) => RpcResponse::error(id, e.code, e.message),
+            Err(join_err) => RpcResponse::error(
+                id,
+                codes::INTERNAL_ERROR,
+                format!("host dispatch task failed: {join_err}"),
+            ),
+        };
+        if stdin
+            .write_all(response.to_line().as_bytes())
+            .await
+            .is_err()
+        {
+            return; // worker closed stdin; nothing more to say.
+        }
+    }
+}

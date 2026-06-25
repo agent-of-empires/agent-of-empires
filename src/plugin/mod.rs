@@ -15,6 +15,20 @@ pub mod registry;
 pub mod source;
 pub mod view;
 
+// The Tier 1 worker host runs only in the `aoe serve` daemon, where the event
+// store and session storage it serves over the capability-gated API live. A
+// TUI-only build has no host, so these modules are gated with it.
+#[cfg(feature = "serve")]
+pub mod host;
+#[cfg(feature = "serve")]
+pub mod host_api;
+#[cfg(feature = "serve")]
+pub mod launch;
+#[cfg(feature = "serve")]
+pub mod protocol;
+#[cfg(feature = "serve")]
+pub mod sandbox;
+
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
