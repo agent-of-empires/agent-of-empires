@@ -257,9 +257,9 @@ Filesystem and `PATH` probing go through a `LaunchResolver` trait so the
 resolution policy is unit-tested with no real filesystem.
 
 Builtins do not declare a `[runtime]` in this release, so `resolve_launch`
-returns "no worker" for them. The `aoe __plugin-worker` self-exec path for a
-builtin worker, and the worker-side SDK, arrive with the first builtin worker
-that needs them; shipping them now would be unused code.
+returns `Err(LaunchError::NoRuntime)` for them. The `aoe __plugin-worker`
+self-exec path for a builtin worker, and the worker-side SDK, arrive with the
+first builtin worker that needs them; shipping them now would be unused code.
 
 ### Transport and supervision
 
