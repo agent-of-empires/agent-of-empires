@@ -146,10 +146,12 @@ command = [".venv/bin/pip", "install", "."]
 platforms = ["linux", "macos"]              # optional; omitted runs everywhere
 ```
 
-Each step's argv resolves with the same policy as the launch `command` (bare
-name on PATH, separator path relative to the plugin dir, absolute rejected),
-evaluated just before the step runs so `.venv/bin/pip` resolves once the prior
-step created it. A step's optional `platforms` (`linux` / `macos` / `windows`)
+Each step's argv resolves through the host's argv resolver (bare name on PATH,
+separator path relative to the plugin dir, absolute rejected), evaluated just
+before the step runs so `.venv/bin/pip` resolves once the prior step created it.
+Build steps are free to name bare PATH programs (`python3`, `node`, `uv`): they
+run in the user's interactive shell where PATH is reliable, which is exactly why
+the worker entrypoint, launched later by the daemon, is not. A step's optional `platforms` (`linux` / `macos` / `windows`)
 restricts it to matching hosts. Builds run with cwd set to the plugin dir, with
 stdin closed and stdout/stderr inherited so the user sees progress.
 
@@ -162,11 +164,31 @@ a staging tree that is then renamed. A failed build aborts the install with no
 trace; a failed update restores the prior version from a backup, and a leftover
 backup from an interrupted update is recovered on the next install/update.
 
-A worker whose env it manages itself, for example `command = ["uv", "run",
-"worker"]`, needs no build step, but then depends on that one system tool
-(`uv`) being on the daemon's PATH. That is the author's call: depending on a
-system toolchain is fine, but a plugin's own entrypoint should be
-plugin-relative so it is never subject to the daemon's PATH.
+The worker entrypoint (`command`'s `argv[0]`) must be plugin-relative: a path
+containing a separator (`.venv/bin/worker`), resolved inside the install
+directory. The host enforces this at manifest validation, so the
+PATH-independent shape is the default and a bare program name is rejected rather
+than silently resolved against whatever PATH the daemon happens to have. An
+absolute path is rejected in every mode (it pins a host path).
+
+A worker that genuinely depends on a system tool, for example `command = ["uv",
+"run", "worker"]`, opts into that PATH dependency explicitly with `system =
+true`:
+
+```toml
+[runtime]
+kind = "command"
+command = ["uv", "run", "worker"]
+system = true   # argv[0] is a bare PATH program, resolved at launch
+```
+
+`system = true` requires a bare program name (a path is contradictory and
+rejected) and moves resolution to launch time against the daemon's PATH. It is
+the conscious "I accept the daemon must have this tool" choice, not a fallback a
+manifest falls into by naming a program that happens not to be on PATH. Because
+its program is resolved at launch, a `system` worker is also not PATH-checked at
+install (the install shell's PATH is not the daemon's), so it installs even when
+the tool is absent from the install environment.
 
 Two trust notes for build steps. They run as the user, unsandboxed, before any
 capability gate (the same honest D8 model as the worker, just earlier), so a

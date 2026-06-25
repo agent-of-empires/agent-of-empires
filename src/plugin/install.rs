@@ -398,7 +398,18 @@ fn build_in_place(plugin_id: &str, dir: &Path, manifest: &PluginManifest) -> Res
     // project). Resolve the launch command now, while the user is watching, so
     // the failure is a clear install error instead of an opaque launch error
     // the next time the daemon starts.
-    if let Some(RuntimeSpec::Command { command, .. }) = &manifest.runtime {
+    //
+    // Only for an in-tree entrypoint. A `system = true` worker resolves its
+    // program on PATH, and the install shell's PATH is not the daemon's PATH:
+    // checking it here neither guarantees the daemon can launch the worker nor
+    // should it reject a valid system-tool plugin whose tool is simply absent
+    // from the install shell. Leave that entrypoint to resolve at launch.
+    if let Some(RuntimeSpec::Command {
+        command,
+        system: false,
+        ..
+    }) = &manifest.runtime
+    {
         super::launch::resolve_command(plugin_id, dir, command, &super::launch::OsLaunchResolver)
             .with_context(|| {
             format!(

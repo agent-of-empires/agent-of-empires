@@ -434,6 +434,7 @@ api_version = 2
 [runtime]
 kind = "command"
 command = ["sh"]
+system = true
 
 [[runtime.build]]
 command = ["cp", "aoe-plugin.toml", "build-marker"]
@@ -470,6 +471,7 @@ api_version = 2
 [runtime]
 kind = "command"
 command = ["sh"]
+system = true
 
 [[runtime.build]]
 command = ["cp", "aoe-plugin.toml", "should-not-exist"]
@@ -492,6 +494,42 @@ platforms = ["windows"]
     );
 }
 
+/// A `system = true` worker resolves its program on PATH at launch, not at
+/// install. Install must not gate on the install shell's PATH (which is not the
+/// daemon's PATH), so a system-tool entrypoint absent from the install
+/// environment still installs and is left to resolve at launch.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn system_worker_absent_from_install_path_still_installs() {
+    let _home = isolate();
+    let src = tempfile::tempdir().unwrap();
+    let dir = write_plugin_dir(
+        src.path(),
+        r#"
+id = "acme.systool"
+name = "SysTool"
+version = "0.1.0"
+api_version = 2
+
+[runtime]
+kind = "command"
+command = ["aoe-definitely-not-on-path-xyz", "run", "worker"]
+system = true
+"#,
+    );
+
+    install::install(dir.to_str().unwrap(), true)
+        .await
+        .expect("system-tool worker installs without an install-time PATH check");
+
+    let installed = agent_of_empires::plugin::plugins_dir()
+        .unwrap()
+        .join("acme.systool");
+    assert!(installed.exists(), "plugin dir is in place");
+    assert!(load_registry().get("acme.systool").is_some());
+}
+
 /// A failing build aborts the install and leaves no trace: no installed
 /// directory, no registry entry, no lockfile entry.
 #[cfg(unix)]
@@ -511,6 +549,7 @@ api_version = 2
 [runtime]
 kind = "command"
 command = ["sh"]
+system = true
 
 [[runtime.build]]
 command = ["false"]
@@ -552,6 +591,7 @@ api_version = 2
 [runtime]
 kind = "command"
 command = ["sh"]
+system = true
 
 [[runtime.build]]
 command = ["cp", "aoe-plugin.toml", "v1-marker"]
@@ -576,6 +616,7 @@ api_version = 2
 [runtime]
 kind = "command"
 command = ["sh"]
+system = true
 
 [[runtime.build]]
 command = ["false"]
@@ -623,6 +664,7 @@ capabilities = ["net"]
 [runtime]
 kind = "command"
 command = ["sh"]
+system = true
 
 [[runtime.build]]
 command = ["cp", "aoe-plugin.toml", "marker-v1"]
@@ -644,6 +686,7 @@ capabilities = ["net"]
 [runtime]
 kind = "command"
 command = ["sh"]
+system = true
 
 [[runtime.build]]
 command = ["cp", "aoe-plugin.toml", "marker-v2"]

@@ -354,7 +354,7 @@ capabilities = ["runtime.worker"]
     #[test]
     fn command_bare_name_resolves_on_path() {
         let p = plugin(
-            Some("[runtime]\nkind = \"command\"\ncommand = [\"python3\", \"-m\", \"acme.main\"]"),
+            Some("[runtime]\nkind = \"command\"\ncommand = [\"python3\", \"-m\", \"acme.main\"]\nsystem = true"),
             Some("/plugins/acme.worker"),
         );
         let resolver = FakeResolver::new().on_path("python3", "/usr/bin/python3");
@@ -371,7 +371,7 @@ capabilities = ["runtime.worker"]
     #[test]
     fn command_console_script_missing_on_path_fails_loudly() {
         let p = plugin(
-            Some("[runtime]\nkind = \"command\"\ncommand = [\"aoe-github-worker\"]"),
+            Some("[runtime]\nkind = \"command\"\ncommand = [\"aoe-github-worker\"]\nsystem = true"),
             Some("/plugins/acme.worker"),
         );
         let err = resolve_launch(&p, &FakeResolver::new()).unwrap_err();
@@ -417,13 +417,16 @@ capabilities = ["runtime.worker"]
         } else {
             "/usr/bin/python3"
         };
-        let p = plugin(
-            Some(&format!(
-                "[runtime]\nkind = \"command\"\ncommand = [\"{argv0}\"]"
-            )),
-            Some("/plugins/acme.worker"),
-        );
-        let err = resolve_launch(&p, &FakeResolver::new()).unwrap_err();
+        // An absolute argv[0] never survives manifest validation, so exercise
+        // the resolver directly: it still guards build-step argv, which is not
+        // shape-validated up front.
+        let err = resolve_command(
+            "acme.worker",
+            Path::new("/plugins/acme.worker"),
+            &[argv0.to_string()],
+            &FakeResolver::new(),
+        )
+        .unwrap_err();
         assert!(matches!(err, LaunchError::AbsoluteArgv0 { .. }));
     }
 
