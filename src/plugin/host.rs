@@ -249,11 +249,16 @@ impl PluginHost {
 
     /// Reap every running worker. Called on daemon shutdown.
     pub async fn shutdown(&self) {
-        let mut running = self.running.lock().await;
-        for (plugin_id, w) in running.drain() {
+        // Drain under the lock, then reap without holding it: the escalating
+        // reap awaits a grace period, and we must not hold the running lock
+        // across that await.
+        let workers: Vec<_> = self.running.lock().await.drain().collect();
+        for (plugin_id, w) in workers {
             w.task.abort();
             if w.pid != 0 {
-                worker::terminate_process_group(w.pid);
+                // SIGTERM the group, wait the grace, then SIGKILL: a worker or
+                // forked helper that ignores SIGTERM must not survive shutdown.
+                worker::reap_group_escalating(w.pid, REAP_GRACE).await;
             }
             tracing::debug!(target: "plugin.host", plugin = %plugin_id, "stopped plugin worker");
         }
