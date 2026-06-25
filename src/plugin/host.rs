@@ -138,6 +138,9 @@ impl PluginHost {
                         plugin = %plugin_id,
                         "failed to launch plugin worker: {e:#}"
                     );
+                    // Drop the entry so a dead worker does not count against the
+                    // concurrency cap or block a later retry.
+                    self.running.lock().await.remove(&plugin_id);
                     return;
                 }
             }
