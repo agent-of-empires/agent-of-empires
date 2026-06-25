@@ -13,8 +13,10 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-/// Current lockfile schema version.
-const LOCK_VERSION: u32 = 1;
+/// Current lockfile schema version. Bumped to 2 when `tree_hash` was added: an
+/// older aoe must refuse a v2 lock (the `lock_version > LOCK_VERSION` guard)
+/// rather than round-trip it and silently drop the integrity field.
+const LOCK_VERSION: u32 = 2;
 
 /// The parsed `plugins.lock`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,7 +52,11 @@ pub struct LockedPlugin {
     pub version: String,
     /// `sha256:<hex>` of the installed manifest bytes.
     pub manifest_hash: String,
-    /// `builtin` or `community`.
+    /// `sha256:<hex>` over the source tree (see [`crate::plugin::integrity`]).
+    /// Defaulted when reading a pre-v2 lock; always written going forward.
+    #[serde(default)]
+    pub tree_hash: String,
+    /// `featured`, `community`, or (historically) `builtin`.
     pub trust: String,
     /// The release tag the worker binary was pulled from (release-binary only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -130,6 +136,7 @@ mod tests {
                 resolved_commit: Some("deadbeef".into()),
                 version: "1.0.0".into(),
                 manifest_hash: "sha256:abc".into(),
+                tree_hash: "sha256:tree".into(),
                 trust: "community".into(),
                 release_tag: Some("v1.0.0".into()),
                 asset_name: Some("widget-x86_64.tar.gz".into()),
@@ -156,6 +163,7 @@ mod tests {
                 resolved_commit: None,
                 version: "0.1.0".into(),
                 manifest_hash: "sha256:abc".into(),
+                tree_hash: "sha256:tree".into(),
                 trust: "community".into(),
                 release_tag: None,
                 asset_name: None,

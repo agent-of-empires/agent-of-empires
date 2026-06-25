@@ -18,8 +18,8 @@ pub struct PluginView {
     pub enabled: bool,
     /// First-party builtin (compiled in) versus an externally installed plugin.
     pub builtin: bool,
-    /// `builtin` or `community`.
-    pub trust: String,
+    /// Validation provenance: `builtin`, `featured`, `community`, or `local`.
+    pub validation: String,
     /// Install source for an external plugin (`gh:owner/repo` or a path).
     pub source: Option<String>,
     /// Capabilities the plugin's manifest declares.
@@ -41,7 +41,7 @@ impl LoadedPlugin {
             description: self.manifest.description.clone(),
             enabled: self.enabled,
             builtin: self.builtin(),
-            trust: self.trust.as_str().to_string(),
+            validation: self.validation.as_str().to_string(),
             source: self.source.clone(),
             capabilities: self
                 .manifest

@@ -4,10 +4,11 @@ use std::collections::BTreeSet;
 use std::io::{self, IsTerminal, Write};
 
 use anyhow::{anyhow, bail, Context, Result};
-use aoe_plugin_api::{PluginManifest, TrustLevel};
+use aoe_plugin_api::{PluginManifest, RuntimeSpec};
 
 use crate::session::{save_config, CapabilityGrant, Config, PluginConfig};
 
+use super::featured::FeaturedIndex;
 use super::fetch::{self, FetchedPlugin};
 use super::lockfile::{LockedPlugin, Lockfile};
 use super::source::PluginSource;
@@ -52,7 +53,8 @@ pub async fn install(input: &str, assume_yes: bool) -> Result<InstallReport> {
     let fetched = fetch::fetch(&source).await?;
 
     let id = fetched.manifest.id.as_str().to_string();
-    reject_reserved_or_builtin(&fetched.manifest)?;
+    let featured_verified = verify_featured(&FeaturedIndex::load()?, &fetched)?;
+    reject_reserved_or_builtin(&fetched.manifest, featured_verified)?;
 
     let final_dir = super::plugins_dir()?.join(&id);
     if final_dir.exists() {
@@ -78,7 +80,7 @@ pub async fn install(input: &str, assume_yes: bool) -> Result<InstallReport> {
         &capabilities,
         &manifest_hash,
     )?;
-    write_lock(&id, &fetched, &manifest_hash)?;
+    write_lock(&id, &fetched, &manifest_hash, featured_verified)?;
     super::reload_registry();
 
     Ok(InstallReport {
@@ -112,7 +114,8 @@ pub async fn update(id: &str) -> Result<InstallReport> {
             fetched.manifest.id.as_str()
         );
     }
-    reject_reserved_or_builtin(&fetched.manifest)?;
+    let featured_verified = verify_featured(&FeaturedIndex::load()?, &fetched)?;
+    reject_reserved_or_builtin(&fetched.manifest, featured_verified)?;
 
     let capabilities = capability_strings(&fetched)?;
     let manifest_hash = PluginManifest::hash_bytes(&fetched.manifest_bytes);
@@ -156,7 +159,7 @@ pub async fn update(id: &str) -> Result<InstallReport> {
 
     let granted = grant.is_some();
     persist_update(id, &source_str, grant)?;
-    write_lock(id, &fetched, &manifest_hash)?;
+    write_lock(id, &fetched, &manifest_hash, featured_verified)?;
     super::reload_registry();
 
     if caps_changed && !granted {
@@ -201,18 +204,52 @@ pub fn uninstall(id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Reject a manifest whose id is reserved for first-party plugins (`aoe.*` /
-/// `agent-of-empires.*`, lifted only by featured verification in #2364) or
-/// collides with a compiled-in builtin.
-fn reject_reserved_or_builtin(manifest: &PluginManifest) -> Result<()> {
+/// Reject a manifest that collides with a compiled-in builtin (always) or that
+/// claims a reserved first-party namespace (`aoe.*` / `agent-of-empires.*`)
+/// without being featured-verified. A featured-verified plugin is the one case
+/// allowed into a reserved namespace (#2364).
+fn reject_reserved_or_builtin(manifest: &PluginManifest, featured_verified: bool) -> Result<()> {
     let id = manifest.id.as_str();
-    if manifest.id.is_reserved_namespace() {
-        bail!("plugin id {id:?} uses a reserved namespace (aoe.* / agent-of-empires.*); external plugins cannot");
-    }
     if super::registry::is_builtin_id(id) {
         bail!("plugin id {id:?} collides with a builtin plugin");
     }
+    if manifest.id.is_reserved_namespace() && !featured_verified {
+        bail!("plugin id {id:?} uses a reserved namespace (aoe.* / agent-of-empires.*); only a featured-verified plugin may claim one");
+    }
     Ok(())
+}
+
+/// Check a fetched plugin against the curated index. Returns whether it is a
+/// verified featured plugin.
+///
+/// If the id is in the index, the install MUST match the pin: the source slug
+/// (case-insensitively, GitHub slugs are not case-sensitive) and the source
+/// tree hash both have to match, and a release-binary worker is refused (its
+/// bytes are not covered by the tree hash yet, so a featured pin cannot vouch
+/// for them). Any mismatch is a hard error, not a silent demotion: a featured
+/// id is only ever installed at its vetted tree.
+fn verify_featured(featured: &FeaturedIndex, fetched: &FetchedPlugin) -> Result<bool> {
+    let id = fetched.manifest.id.as_str();
+    let Some(entry) = featured.get(id) else {
+        return Ok(false);
+    };
+    if matches!(
+        fetched.manifest.runtime,
+        Some(RuntimeSpec::ReleaseBinary { .. })
+    ) {
+        bail!("{id} is featured but ships a release-binary worker, which the featured index cannot pin yet; refusing install");
+    }
+    let slug = fetched.source.slug();
+    if !slug.eq_ignore_ascii_case(&entry.source) {
+        bail!(
+            "{id} is featured from {:?} but you are installing from {slug:?}; refusing install",
+            entry.source
+        );
+    }
+    if fetched.tree_hash != entry.tree_hash {
+        bail!("{id} does not match its featured pin (source tree hash mismatch); refusing install");
+    }
+    Ok(true)
 }
 
 /// The manifest's capabilities as strings, rejecting any this host does not
@@ -322,7 +359,12 @@ fn persist_update(id: &str, source: &str, grant: Option<CapabilityGrant>) -> Res
     save_config(&config)
 }
 
-fn write_lock(id: &str, fetched: &FetchedPlugin, manifest_hash: &str) -> Result<()> {
+fn write_lock(
+    id: &str,
+    fetched: &FetchedPlugin,
+    manifest_hash: &str,
+    featured_verified: bool,
+) -> Result<()> {
     let mut lock = Lockfile::load()?;
     lock.upsert(
         id,
@@ -332,7 +374,13 @@ fn write_lock(id: &str, fetched: &FetchedPlugin, manifest_hash: &str) -> Result<
             resolved_commit: fetched.resolved_commit.clone(),
             version: fetched.manifest.version.clone(),
             manifest_hash: manifest_hash.to_string(),
-            trust: TrustLevel::Community.as_str().to_string(),
+            tree_hash: fetched.tree_hash.clone(),
+            trust: if featured_verified {
+                "featured"
+            } else {
+                "community"
+            }
+            .to_string(),
             release_tag: fetched.release_tag.clone(),
             asset_name: fetched.asset_name.clone(),
             asset_sha256: fetched.asset_sha256.clone(),

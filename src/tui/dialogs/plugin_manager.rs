@@ -190,7 +190,7 @@ impl PluginManagerDialog {
                         Style::default().fg(theme.text),
                     ),
                     Span::styled(
-                        format!("{:<10}", row.trust),
+                        format!("{:<10}", row.validation),
                         Style::default().fg(theme.dimmed),
                     ),
                     Span::styled(format!("{:<14}", state.0), Style::default().fg(state.1)),

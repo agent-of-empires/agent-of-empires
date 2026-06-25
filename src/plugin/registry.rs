@@ -11,7 +11,42 @@ use std::path::PathBuf;
 
 use aoe_plugin_api::{PluginManifest, TrustLevel};
 
+use super::lockfile::{LockedPlugin, Lockfile};
 use crate::session::{CapabilityGrant, Config};
+
+/// How an installed plugin was validated, the finer provenance the surfaces
+/// show. `TrustLevel` (builtin vs community) stays the coarse capability-policy
+/// axis; this is the user-facing "is this safe" label.
+///
+/// Recorded at install time (via the lockfile's `trust`) rather than recomputed
+/// on every load: the source tree hash is captured before any release-binary is
+/// injected, so re-hashing the installed directory would not reproduce it, and
+/// walking every plugin tree on each registry load is needless work. The
+/// manifest-hash grant check still deactivates a community plugin whose
+/// manifest is tampered after install.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidationState {
+    /// Compiled into the binary.
+    Builtin,
+    /// External, installed from a featured-verified source (matched the curated
+    /// pin at install).
+    Featured,
+    /// External GitHub install, not in the featured index.
+    Community,
+    /// External local-directory install.
+    Local,
+}
+
+impl ValidationState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ValidationState::Builtin => "builtin",
+            ValidationState::Featured => "featured",
+            ValidationState::Community => "community",
+            ValidationState::Local => "local",
+        }
+    }
+}
 
 /// A plugin compiled into the aoe binary.
 pub struct BuiltinPlugin {
@@ -47,6 +82,8 @@ pub struct LoadedPlugin {
     pub enabled: bool,
     /// Builtin (auto-granted) or community (capabilities gated).
     pub trust: TrustLevel,
+    /// Finer provenance for display (builtin / featured / community / local).
+    pub validation: ValidationState,
     /// Install source for an external plugin; `None` for builtins.
     pub source: Option<String>,
     /// On-disk directory for an external plugin; `None` for builtins.
@@ -117,6 +154,7 @@ impl PluginRegistry {
                         manifest,
                         enabled,
                         trust: TrustLevel::Builtin,
+                        validation: ValidationState::Builtin,
                         source: None,
                         dir: None,
                         manifest_hash,
@@ -130,7 +168,11 @@ impl PluginRegistry {
             }
         }
 
-        load_external(config, &mut plugins, &mut load_errors);
+        let lock = Lockfile::load().unwrap_or_else(|e| {
+            load_errors.push(format!("reading plugins.lock: {e:#}"));
+            Lockfile::default()
+        });
+        load_external(config, &lock, &mut plugins, &mut load_errors);
 
         Self {
             plugins,
@@ -159,7 +201,26 @@ impl PluginRegistry {
 
 /// Load external plugins from `<app_dir>/plugins/<id>/aoe-plugin.toml`. Each
 /// problem is collected as a non-fatal load error rather than aborting the set.
-fn load_external(config: &Config, plugins: &mut Vec<LoadedPlugin>, load_errors: &mut Vec<String>) {
+/// The display provenance for an external plugin: featured when the lockfile
+/// recorded a featured-verified install, otherwise local or community by source
+/// kind.
+fn validation_for(lock: Option<&LockedPlugin>, source: Option<&str>) -> ValidationState {
+    if lock.is_some_and(|l| l.trust == "featured") {
+        return ValidationState::Featured;
+    }
+    let source = source.or(lock.map(|l| l.source.as_str()));
+    match source {
+        Some(s) if s.starts_with("gh:") => ValidationState::Community,
+        _ => ValidationState::Local,
+    }
+}
+
+fn load_external(
+    config: &Config,
+    lock: &Lockfile,
+    plugins: &mut Vec<LoadedPlugin>,
+    load_errors: &mut Vec<String>,
+) {
     let root = match super::plugins_dir() {
         Ok(root) => root,
         Err(e) => {
@@ -238,11 +299,13 @@ fn load_external(config: &Config, plugins: &mut Vec<LoadedPlugin>, load_errors: 
             .and_then(|p| p.grant.as_ref())
             .map(|g| grant_covers(g, &manifest, &manifest_hash))
             .unwrap_or(false);
+        let validation = validation_for(lock.get(&id), source.as_deref());
 
         plugins.push(LoadedPlugin {
             manifest,
             enabled,
             trust: TrustLevel::Community,
+            validation,
             source,
             dir: Some(dir),
             manifest_hash,

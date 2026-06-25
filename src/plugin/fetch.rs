@@ -33,6 +33,9 @@ pub struct FetchedPlugin {
     pub manifest: PluginManifest,
     /// Raw `aoe-plugin.toml` bytes, for hashing the grant against.
     pub manifest_bytes: Vec<u8>,
+    /// `sha256:<hex>` over the source tree, computed before any release-binary
+    /// is injected so it matches an author's `aoe plugin hash` of the checkout.
+    pub tree_hash: String,
     pub source: PluginSource,
     pub requested_ref: Option<String>,
     pub resolved_commit: Option<String>,
@@ -78,6 +81,11 @@ pub async fn fetch(source: &PluginSource) -> Result<FetchedPlugin> {
 
     let (manifest, manifest_bytes) = read_manifest(&tree)?;
 
+    // Hash the source tree before any release-binary is injected below, so the
+    // value matches `aoe plugin hash` run on the author's checkout (which has
+    // no downloaded worker) and can be checked against the featured pin.
+    let tree_hash = super::integrity::tree_hash(&tree)?;
+
     let mut release_tag = None;
     let mut asset_name = None;
     let mut asset_sha256 = None;
@@ -109,6 +117,7 @@ pub async fn fetch(source: &PluginSource) -> Result<FetchedPlugin> {
         tree,
         manifest,
         manifest_bytes,
+        tree_hash,
         source: source.clone(),
         requested_ref,
         resolved_commit,
@@ -163,21 +172,49 @@ fn path_arg(path: &Path) -> Result<&str> {
 fn git_clone_checkout(url: &str, reference: Option<&str>, dest: &Path) -> Result<String> {
     let dest_str = path_arg(dest)?;
 
+    // `core.autocrlf=false` keeps the checkout byte-for-byte as committed, so
+    // the tree hash is the same on every platform; without it a Windows clone
+    // would rewrite line endings and never match a pin generated on Linux.
     let shallow = match reference {
         Some(reference) => run_git(
             &[
-                "clone", "--depth", "1", "--branch", reference, "--", url, dest_str,
+                "-c",
+                "core.autocrlf=false",
+                "clone",
+                "--depth",
+                "1",
+                "--branch",
+                reference,
+                "--",
+                url,
+                dest_str,
             ],
             None,
         )
         .is_ok(),
-        None => run_git(&["clone", "--depth", "1", "--", url, dest_str], None).is_ok(),
+        None => run_git(
+            &[
+                "-c",
+                "core.autocrlf=false",
+                "clone",
+                "--depth",
+                "1",
+                "--",
+                url,
+                dest_str,
+            ],
+            None,
+        )
+        .is_ok(),
     };
 
     if !shallow {
         // A partial clone may have created dest; clear it before retrying.
         let _ = std::fs::remove_dir_all(dest);
-        run_git(&["clone", "--", url, dest_str], None)?;
+        run_git(
+            &["-c", "core.autocrlf=false", "clone", "--", url, dest_str],
+            None,
+        )?;
         if let Some(reference) = reference {
             // `--` separates the revision from pathspecs so a ref that begins
             // with a dash is not parsed as a flag.

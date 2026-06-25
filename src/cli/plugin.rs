@@ -43,6 +43,12 @@ pub enum PluginCommands {
         /// Plugin id
         id: String,
     },
+    /// Print the deterministic source tree hash for a plugin directory, the
+    /// value a maintainer pins in the featured index
+    Hash {
+        /// Path to the plugin directory
+        path: String,
+    },
 }
 
 pub async fn run(command: PluginCommands) -> Result<()> {
@@ -54,7 +60,14 @@ pub async fn run(command: PluginCommands) -> Result<()> {
         PluginCommands::Install { source, yes } => run_install(&source, yes).await,
         PluginCommands::Update { id } => run_update(&id).await,
         PluginCommands::Uninstall { id } => run_uninstall(&id),
+        PluginCommands::Hash { path } => run_hash(&path),
     }
+}
+
+fn run_hash(path: &str) -> Result<()> {
+    let hash = crate::plugin::integrity::tree_hash(std::path::Path::new(path))?;
+    println!("{hash}");
+    Ok(())
 }
 
 fn state_label(plugin: &crate::plugin::LoadedPlugin) -> &'static str {
@@ -72,13 +85,13 @@ fn run_list() -> Result<()> {
     if registry.all().is_empty() {
         println!("No plugins installed.");
     } else {
-        println!("{:<20} {:<9} {:<10} STATE", "ID", "VERSION", "TRUST");
+        println!("{:<20} {:<9} {:<12} STATE", "ID", "VERSION", "VALIDATION");
         for plugin in registry.all() {
             println!(
-                "{:<20} {:<9} {:<10} {}",
+                "{:<20} {:<9} {:<12} {}",
                 plugin.id(),
                 plugin.manifest.version,
-                plugin.trust,
+                plugin.validation.as_str(),
                 state_label(plugin),
             );
         }
@@ -96,18 +109,18 @@ fn run_info(id: &str) -> Result<()> {
     };
     let m = &plugin.manifest;
     println!("{} ({})", m.name, m.id);
-    println!("  version:  {}", m.version);
-    println!("  trust:    {}", plugin.trust);
-    println!("  state:    {}", state_label(plugin));
+    println!("  version:    {}", m.version);
+    println!("  validation: {}", plugin.validation.as_str());
+    println!("  state:      {}", state_label(plugin));
     if let Some(source) = &plugin.source {
-        println!("  source:   {source}");
+        println!("  source:     {source}");
     }
     if m.capabilities.is_empty() {
-        println!("  caps:     none");
+        println!("  caps:       none");
     } else {
         let caps: Vec<&str> = m.capabilities.iter().map(|c| c.as_str()).collect();
         println!(
-            "  caps:     {} ({})",
+            "  caps:       {} ({})",
             caps.join(", "),
             if plugin.granted {
                 "granted"
@@ -117,7 +130,7 @@ fn run_info(id: &str) -> Result<()> {
         );
     }
     if !m.description.is_empty() {
-        println!("  about:    {}", m.description);
+        println!("  about:      {}", m.description);
     }
     Ok(())
 }

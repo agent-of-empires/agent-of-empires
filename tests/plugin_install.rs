@@ -97,7 +97,18 @@ api_version = 2
         "no-capability community plugin is active once installed"
     );
     assert_eq!(plugin.trust.as_str(), "community");
-    assert!(Lockfile::load().unwrap().get("acme.local").is_some());
+    assert_eq!(
+        plugin.validation.as_str(),
+        "local",
+        "a local-directory install validates as local"
+    );
+    let locked = Lockfile::load().unwrap();
+    let locked = locked.get("acme.local").expect("lock entry");
+    assert!(
+        locked.tree_hash.starts_with("sha256:"),
+        "tree hash recorded: {:?}",
+        locked.tree_hash
+    );
 
     install::uninstall("acme.local").unwrap();
     assert!(load_registry().get("acme.local").is_none());
@@ -215,8 +226,104 @@ api_version = 2
         "resolved commit recorded: {:?}",
         locked.resolved_commit
     );
+    assert!(
+        locked.tree_hash.starts_with("sha256:"),
+        "tree hash recorded: {:?}",
+        locked.tree_hash
+    );
+    assert_eq!(
+        load_registry()
+            .get("acme.widget")
+            .unwrap()
+            .validation
+            .as_str(),
+        "community",
+        "an unfeatured GitHub install validates as community"
+    );
 
     std::env::remove_var("AOE_GITHUB_CLONE_BASE");
+}
+
+/// Write a featured index file and point `AOE_FEATURED_INDEX_PATH` at it (debug
+/// builds only; tests run in debug).
+fn write_featured(dir: &Path, id: &str, source: &str, tree_hash: &str) -> PathBuf {
+    let path = dir.join("featured.toml");
+    std::fs::write(
+        &path,
+        format!("[plugins.\"{id}\"]\nsource = \"{source}\"\ntree_hash = \"{tree_hash}\"\n"),
+    )
+    .unwrap();
+    std::env::set_var("AOE_FEATURED_INDEX_PATH", &path);
+    path
+}
+
+#[tokio::test]
+#[serial]
+async fn featured_verified_reserved_namespace_installs() {
+    let _home = isolate();
+    let src = tempfile::tempdir().unwrap();
+    // A reserved-namespace id is normally rejected; a matching featured pin
+    // lifts it.
+    let dir = write_plugin_dir(
+        src.path(),
+        r#"
+id = "agent-of-empires.official"
+name = "Official"
+version = "1.0.0"
+api_version = 2
+"#,
+    );
+    let tree_hash = agent_of_empires::plugin::integrity::tree_hash(&dir).unwrap();
+    write_featured(
+        src.path(),
+        "agent-of-empires.official",
+        dir.to_str().unwrap(),
+        &tree_hash,
+    );
+
+    install::install(dir.to_str().unwrap(), true).await.unwrap();
+
+    let reg = load_registry();
+    let plugin = reg.get("agent-of-empires.official").expect("installed");
+    assert_eq!(plugin.validation.as_str(), "featured");
+    let lock = Lockfile::load().unwrap();
+    let locked = lock.get("agent-of-empires.official").unwrap();
+    assert_eq!(locked.trust, "featured");
+    assert_eq!(locked.tree_hash, tree_hash);
+
+    std::env::remove_var("AOE_FEATURED_INDEX_PATH");
+}
+
+#[tokio::test]
+#[serial]
+async fn featured_hash_mismatch_is_refused() {
+    let _home = isolate();
+    let src = tempfile::tempdir().unwrap();
+    let dir = write_plugin_dir(
+        src.path(),
+        r#"
+id = "acme.featured"
+name = "Featured"
+version = "1.0.0"
+api_version = 2
+"#,
+    );
+    // Pin a hash that does not match the actual tree.
+    write_featured(
+        src.path(),
+        "acme.featured",
+        dir.to_str().unwrap(),
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    );
+
+    let err = install::install(dir.to_str().unwrap(), true)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("featured pin"), "got: {err}");
+    assert!(load_registry().get("acme.featured").is_none());
+
+    std::env::remove_var("AOE_FEATURED_INDEX_PATH");
 }
 
 #[tokio::test]
