@@ -330,13 +330,29 @@ fn install_asset_into(
             .with_context(|| format!("unpacking {asset_name}"))?;
         let bin_rel =
             bin.ok_or_else(|| anyhow!("a release-binary archive asset must set `bin`"))?;
-        ensure_executable(&tree.join(bin_rel))
+        ensure_executable(&safe_tree_path(tree, bin_rel)?)
     } else {
         let name = bin.unwrap_or(asset_name);
-        let path = tree.join(name);
+        let path = safe_tree_path(tree, name)?;
         std::fs::write(&path, bytes).with_context(|| format!("writing {}", path.display()))?;
         ensure_executable(&path)
     }
+}
+
+/// Join a manifest-provided relative path onto the plugin tree, rejecting
+/// anything that would escape it. `bin` is untrusted manifest input, so an
+/// absolute path or a `..` component must not turn install into an arbitrary
+/// write or chmod outside the staging dir.
+fn safe_tree_path(tree: &Path, rel: &str) -> Result<PathBuf> {
+    use std::path::Component;
+    let candidate = Path::new(rel);
+    let safe = candidate
+        .components()
+        .all(|c| matches!(c, Component::Normal(_) | Component::CurDir));
+    if !safe || candidate.as_os_str().is_empty() {
+        bail!("plugin path {rel:?} must be a relative path inside the plugin (no absolute path or `..`)");
+    }
+    Ok(tree.join(candidate))
 }
 
 #[cfg(unix)]
@@ -376,6 +392,19 @@ mod tests {
         assert!(rendered.ends_with("-1.2.3.tar.gz"));
         assert!(rendered.contains(std::env::consts::OS));
         assert!(rendered.contains(std::env::consts::ARCH));
+    }
+
+    #[test]
+    fn safe_tree_path_rejects_escapes() {
+        let tree = Path::new("/plugins/acme");
+        assert!(safe_tree_path(tree, "bin/worker").is_ok());
+        assert!(safe_tree_path(tree, "worker").is_ok());
+        for bad in ["../../.bashrc", "/etc/passwd", "a/../../b", ""] {
+            assert!(
+                safe_tree_path(tree, bad).is_err(),
+                "{bad} should be rejected"
+            );
+        }
     }
 
     #[test]
