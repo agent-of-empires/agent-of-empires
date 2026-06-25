@@ -245,6 +245,12 @@ impl UiStore {
     pub fn begin_generation(&self, plugin_id: &str) -> u64 {
         let gen = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let mut inner = self.write();
+        // A fresh worker starts from a clean slate: drop any entries the
+        // previous generation left behind. This makes eviction robust against a
+        // fast respawn (begin running before the exited worker's clear_plugin),
+        // where clearing by the old generation would otherwise no-op and leave
+        // its entries visible until the new worker happened to overwrite them.
+        inner.entries.retain(|k, _| k.plugin_id != plugin_id);
         inner.active.insert(plugin_id.to_string(), gen);
         gen
     }
@@ -289,7 +295,10 @@ impl UiStore {
         Ok(())
     }
 
-    /// Remove one entry. A remove of an absent entry is a no-op success.
+    /// Remove one entry. A remove of an absent entry is a no-op success, but a
+    /// scope mismatch (a per-session slot without a `session_id`, or vice versa)
+    /// is rejected, same as `set`, so a bad call is an error rather than a silent
+    /// no-op that leaves the real entry standing.
     pub fn remove(
         &self,
         plugin_id: &str,
@@ -298,6 +307,7 @@ impl UiStore {
         id: &str,
         session_id: Option<&str>,
     ) -> Result<(), UiError> {
+        check_scope(slot, session_id)?;
         let key = EntryKey {
             plugin_id: plugin_id.to_string(),
             slot,
@@ -379,8 +389,16 @@ impl UiStore {
             })
             .collect();
         // Deterministic order so the snapshot does not jitter between polls.
+        // `slot` is part of the key (a plugin may reuse one id across two slots),
+        // so it is part of the sort key too, or those entries would compare equal
+        // and fall back to HashMap iteration order.
         entries.sort_by(|a, b| {
-            (&a.plugin_id, &a.id, &a.session_id).cmp(&(&b.plugin_id, &b.id, &b.session_id))
+            (&a.plugin_id, a.slot, &a.id, &a.session_id).cmp(&(
+                &b.plugin_id,
+                b.slot,
+                &b.id,
+                &b.session_id,
+            ))
         });
         UiSnapshot {
             entries,
@@ -506,6 +524,12 @@ mod tests {
             ),
             Err(UiError::BadRequest(_))
         ));
+        // remove enforces the same scope rules, so a wrong-scope remove is a
+        // rejection rather than a silent no-op that leaves the entry standing.
+        assert!(matches!(
+            s.remove("acme.kit", g, UiSlot::RowBadge, "x", None),
+            Err(UiError::BadRequest(_))
+        ));
     }
 
     #[test]
@@ -563,8 +587,12 @@ mod tests {
             &json!({"title": "Hi"}),
         )
         .unwrap();
-        // Worker respawns: new generation supersedes g1.
+        assert_eq!(s.snapshot().entries.len(), 1);
+        // Worker respawns: starting the new generation evicts the old
+        // generation's entries up front, so no stale state survives even when
+        // begin runs before the exited worker's clear_plugin.
         let g2 = s.begin_generation("acme.kit");
+        assert_eq!(s.snapshot().entries.len(), 0);
         // A late write from the old generation is rejected, not applied.
         assert_eq!(
             s.set(
@@ -579,7 +607,6 @@ mod tests {
         );
         // The old worker's exit must NOT wipe the live g2 state.
         assert!(!s.clear_plugin("acme.kit", g1));
-        assert_eq!(s.snapshot().entries.len(), 1);
         // The current generation can write and be cleared.
         s.set(
             "acme.kit",

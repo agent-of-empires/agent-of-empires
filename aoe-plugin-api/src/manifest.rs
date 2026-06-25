@@ -153,7 +153,7 @@ pub struct ThemeContribution {
 /// than carried forward. The worker pushes typed state into a declared slot
 /// over the `ui.state.*` host RPCs; the host renders it (the dashboard runs no
 /// plugin code).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum UiSlot {
     /// A segment in the dashboard status/top bar (global).
