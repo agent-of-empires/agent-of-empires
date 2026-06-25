@@ -677,7 +677,7 @@ Manage plugins (list, info, enable, disable, install, update, uninstall)
 * `enable` — Enable a plugin's contributions
 * `disable` — Disable a plugin; its settings stay on disk for re-enabling
 * `install` — Install an external plugin from a `gh:owner/repo[@ref]` slug or a local directory. Community plugins run at your own risk
-* `update` — Update an installed external plugin from its recorded source
+* `update` — Update an installed external plugin from its recorded source. Prompts to re-approve capabilities if the update changes the capability set
 * `uninstall` — Uninstall an external plugin, removing its files and capability grant
 
 
@@ -744,7 +744,7 @@ Install an external plugin from a `gh:owner/repo[@ref]` slug or a local director
 
 ## `aoe plugin update`
 
-Update an installed external plugin from its recorded source
+Update an installed external plugin from its recorded source. Prompts to re-approve capabilities if the update changes the capability set
 
 **Usage:** `aoe plugin update <ID>`
 

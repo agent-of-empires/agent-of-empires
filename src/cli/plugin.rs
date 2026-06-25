@@ -32,7 +32,8 @@ pub enum PluginCommands {
         #[arg(long)]
         yes: bool,
     },
-    /// Update an installed external plugin from its recorded source
+    /// Update an installed external plugin from its recorded source. Prompts to
+    /// re-approve capabilities if the update changes the capability set.
     Update {
         /// Plugin id
         id: String,

@@ -182,5 +182,5 @@ sha256.
 
 Each deferred piece returns as its own PR once the core is proven: the
 contribution registries and the JSON-RPC worker runtime and event bus built on
-the substrate above (#2094 / #2095 / #2366), and the discovery / featured
-supply-chain layer with integrity hashing (#2364 / #2365).
+the substrate above (issues 2094, 2095, and 2366), and the discovery / featured
+supply-chain layer with integrity hashing (issues 2364 and 2365).
