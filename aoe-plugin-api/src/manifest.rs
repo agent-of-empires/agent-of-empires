@@ -313,6 +313,38 @@ impl PluginManifest {
                 },
                 format!("settings[{i}].min must not exceed max"),
             );
+            // A declared default must match the value type, so an author learns
+            // of a type mismatch at parse time rather than at render/store time.
+            if let Some(def) = &s.default {
+                let type_ok = match s.value_type {
+                    SettingType::String | SettingType::Select => def.is_str(),
+                    SettingType::Bool => def.as_bool().is_some(),
+                    SettingType::Integer => def.as_integer().is_some(),
+                };
+                check(
+                    type_ok,
+                    format!(
+                        "settings[{i}].default does not match type {:?}",
+                        s.value_type
+                    ),
+                );
+                if s.value_type == SettingType::Select {
+                    if let (Some(d), false) = (def.as_str(), s.options.is_empty()) {
+                        check(
+                            s.options.iter().any(|o| o == d),
+                            format!("settings[{i}].default {d:?} is not one of the options"),
+                        );
+                    }
+                }
+                if s.value_type == SettingType::Integer {
+                    if let (Some(v), Some(lo), Some(hi)) = (def.as_integer(), s.min, s.max) {
+                        check(
+                            v >= lo && v <= hi,
+                            format!("settings[{i}].default {v} is outside range [{lo}, {hi}]"),
+                        );
+                    }
+                }
+            }
         }
         for (i, t) in self.themes.iter().enumerate() {
             check(

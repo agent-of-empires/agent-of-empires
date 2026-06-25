@@ -183,6 +183,58 @@ path = ""
 }
 
 #[test]
+fn setting_default_must_match_type() {
+    let toml = r#"
+id = "acme.kit"
+name = "Kit"
+version = "0.1.0"
+api_version = 2
+
+[[settings]]
+key = "retries"
+type = "integer"
+min = 0
+max = 5
+default = "not-an-int"
+
+[[settings]]
+key = "n"
+type = "integer"
+min = 0
+max = 5
+default = 9
+
+[[settings]]
+key = "mode"
+type = "select"
+options = ["fast", "slow"]
+default = "turbo"
+"#;
+    let messages = match PluginManifest::from_toml_str(toml).unwrap_err() {
+        ManifestError::Invalid(m) => m,
+        other => panic!("expected Invalid, got {other:?}"),
+    };
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("settings[0].default does not match")),
+        "{messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("settings[1].default 9 is outside range")),
+        "{messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("settings[2].default") && m.contains("not one of the options")),
+        "{messages:?}"
+    );
+}
+
+#[test]
 fn deferred_sections_are_rejected() {
     // status / panes are still deferred until a consumer exists (#2386); with
     // deny_unknown_fields a manifest declaring one must fail to parse. themes
