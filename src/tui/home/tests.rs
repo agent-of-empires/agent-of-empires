@@ -6390,6 +6390,37 @@ fn app_update_banner_reassures_running_sessions_are_safe() {
         out.contains("[u] update"),
         "the action key must still render alongside the reassurance.\nFull buffer:\n{out}"
     );
+
+    // Narrow-terminal contract: the reassurance is appended after the keys
+    // precisely so the action hints survive when the line is too narrow to
+    // hold everything. At 72 columns the keys fit but the reassurance clips.
+    let narrow = TestBackend::new(72, 30);
+    let mut narrow_terminal = Terminal::new(narrow).unwrap();
+    narrow_terminal
+        .draw(|f| {
+            let area = f.area();
+            env.view
+                .render(f, area, &theme, Some(&update_info), None, None);
+        })
+        .unwrap();
+
+    let nbuf = narrow_terminal.backend().buffer();
+    let mut nout = String::new();
+    for y in 0..nbuf.area.height {
+        for x in 0..nbuf.area.width {
+            nout.push_str(nbuf[(x, y)].symbol());
+        }
+        nout.push('\n');
+    }
+
+    assert!(
+        nout.contains("[u] update") && nout.contains("[Ctrl+x] dismiss"),
+        "the action keys must survive clipping on a narrow terminal.\nFull buffer:\n{nout}"
+    );
+    assert!(
+        !nout.contains("running sessions stay safe"),
+        "the trailing reassurance is expected to clip first on a narrow terminal.\nFull buffer:\n{nout}"
+    );
 }
 
 /// Regression for the e2e CI failure (job 76034901940):
