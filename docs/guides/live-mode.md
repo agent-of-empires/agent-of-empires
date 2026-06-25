@@ -97,3 +97,41 @@ herdr users already know as a leader. If you run AoE inside your own
 tmux session that also uses `Ctrl+B`, the outer tmux will claim it
 first; rebind `live_send_leader` to something free (for example `C-a` or
 `F1`), and remember that `Ctrl+Q` always exits regardless.
+
+## Troubleshooting
+
+### The cursor flickers or the preview stutters over SSH
+
+If you run AoE on a remote host and reach it over SSH, you may see the
+agent's input cursor blink out and back, or the preview stutter as you
+type. On an otherwise idle screen the agent's blinking cursor is usually
+the only thing moving, so it is the one place the stutter shows up.
+
+This is your SSH connection, not AoE. AoE captures the agent's pane
+locally on the box where AoE runs and renders the result there. When you
+view that over SSH, the rendered screen (cursor included) travels back to
+your terminal as one ordered TCP stream. On a lossy or high-latency link
+TCP holds the stream until dropped packets are resent, so redraws arrive
+late and in bursts.
+
+Quick check: run `vim` or `htop` over the same SSH session. If their
+cursors stutter the same way, it is the link.
+
+What helps, by leverage:
+
+* **Use [`mosh`](https://mosh.org) instead of `ssh` for flaky links.**
+  Mosh runs over UDP with local echo prediction and adapts its frame
+  rate to the connection, dropping stale frames instead of replaying a
+  backlog. On a shaky link you get a slightly-behind but stable cursor
+  instead of a stuttering one, and AoE manages its own screen so mosh's
+  lack of scrollback passthrough does not affect it. The trade: on a fast
+  clean link mosh's keystroke latency can be marginally worse than ssh,
+  and a very large redraw can blank the screen a touch longer while mosh
+  rebuilds it.
+* **[Eternal Terminal](https://eternalterminal.dev) (`et`)** is a
+  TCP-based alternative with fast reconnect if you would rather not run
+  mosh.
+
+This only applies when AoE itself runs on the remote host. Running AoE
+locally, even with the agent sandboxed in a container, renders everything
+on your machine and is not affected.
