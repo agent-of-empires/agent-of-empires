@@ -3,6 +3,7 @@ import type { CSSProperties, ReactNode, RefObject } from "react";
 import type { AnsiSegment, AnsiStyle } from "../lib/ansi";
 import { ansiToLines, wrapLine } from "../lib/liveTermLines";
 import { wheelNotches } from "../lib/liveMouse";
+import { writeClipboard } from "../lib/clipboard";
 import type { LiveFrame } from "../hooks/useLiveTerminal";
 import { useWebSettings } from "../hooks/useWebSettings";
 import { useIsCoarsePointer } from "../hooks/useIsCoarsePointer";
@@ -934,8 +935,24 @@ export function MobileLiveTerminal({
         sendData(seq);
         return;
       }
-      // Hardware Ctrl+letter chords (bluetooth keyboards).
-      if (e.ctrlKey && !e.metaKey && !e.altKey && e.key.length === 1) {
+      // Ctrl+Shift+C copies the current terminal selection (the terminal-
+      // emulator convention), distinct from plain Ctrl+C below which stays
+      // SIGINT. The hidden input is focused, so the browser's own copy would
+      // target the empty textarea rather than the rendered selection; read the
+      // document selection and copy it explicitly. No selection is a no-op, not
+      // a control code.
+      if (e.ctrlKey && e.shiftKey && !e.metaKey && !e.altKey && e.key.toLowerCase() === "c") {
+        e.preventDefault();
+        const text = window.getSelection()?.toString() ?? "";
+        if (text) void writeClipboard(text);
+        return;
+      }
+      // Hardware Ctrl+letter chords (bluetooth keyboards). Ctrl+V (and
+      // Ctrl+Shift+V) is the exception: on Linux/Windows it is the paste
+      // shortcut, so let the browser's native paste event fire (onPaste turns
+      // it into a bracketed paste) instead of swallowing it into a literal ^V
+      // to tmux. Mac's Cmd+C / Cmd+V already fall through via the metaKey guard.
+      if (e.ctrlKey && !e.metaKey && !e.altKey && e.key.length === 1 && e.key.toLowerCase() !== "v") {
         const code = e.key.toUpperCase().charCodeAt(0);
         if (code >= 65 && code <= 90) {
           e.preventDefault();
