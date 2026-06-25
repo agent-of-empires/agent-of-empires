@@ -401,8 +401,18 @@ capabilities = ["runtime.worker"]
 
     #[test]
     fn command_absolute_argv0_rejected() {
+        // `Path::is_absolute` is platform-specific: a Unix-style path is not
+        // absolute on Windows (it lacks a drive/UNC prefix), so pick an
+        // argv[0] that is absolute under the host's own semantics.
+        let argv0 = if cfg!(windows) {
+            "C:/Windows/py.exe"
+        } else {
+            "/usr/bin/python3"
+        };
         let p = plugin(
-            Some("[runtime]\nkind = \"command\"\ncommand = [\"/usr/bin/python3\"]"),
+            Some(&format!(
+                "[runtime]\nkind = \"command\"\ncommand = [\"{argv0}\"]"
+            )),
             Some("/plugins/acme.worker"),
         );
         let err = resolve_launch(&p, &FakeResolver::new()).unwrap_err();
