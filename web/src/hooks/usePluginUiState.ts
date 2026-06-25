@@ -25,32 +25,46 @@ export function usePluginUiState() {
   // Highest notification seq already toasted. Seeded from the first snapshot so
   // a page load does not replay the whole backlog as fresh toasts.
   const lastNotifySeqRef = useRef<number | null>(null);
-  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
     let cancelled = false;
-    const poll = async () => {
-      const state = await fetchPluginUiState();
-      if (cancelled || state === null) return;
-      setEntries(state.entries);
+    let timer: ReturnType<typeof setTimeout> | null = null;
 
-      const maxSeq = state.notifications.reduce((m, n) => Math.max(m, n.seq), 0);
-      if (lastNotifySeqRef.current === null) {
-        // First snapshot: adopt the backlog as already-seen, toast nothing.
+    const apply = (notifications: PluginUiNotification[]) => {
+      const maxSeq = notifications.reduce((m, n) => Math.max(m, n.seq), 0);
+      const seen = lastNotifySeqRef.current;
+      // Seed on the first snapshot, and re-seed when maxSeq drops below the
+      // watermark: the ring is in-memory and dies with the daemon, so after a
+      // restart seqs start low again. Treat that as a fresh ring and adopt the
+      // current backlog as seen rather than filtering every new toast out.
+      if (seen === null || maxSeq < seen) {
         lastNotifySeqRef.current = maxSeq;
-      } else {
-        const seen = lastNotifySeqRef.current;
-        for (const n of state.notifications) {
-          if (n.seq > seen) toast(n);
-        }
-        lastNotifySeqRef.current = Math.max(seen, maxSeq);
+        return;
+      }
+      for (const n of notifications) {
+        if (n.seq > seen) toast(n);
+      }
+      lastNotifySeqRef.current = Math.max(seen, maxSeq);
+    };
+
+    // Recursive setTimeout, not setInterval: the next poll is scheduled only
+    // after the current one settles, so requests never overlap and a slow
+    // response cannot land after a newer one and roll the dashboard back to
+    // stale plugin UI. A failed fetch (null) just skips this round.
+    const tick = async () => {
+      try {
+        const state = await fetchPluginUiState();
+        if (cancelled || state === null) return;
+        setEntries(state.entries);
+        apply(state.notifications);
+      } finally {
+        if (!cancelled) timer = setTimeout(() => void tick(), POLL_INTERVAL);
       }
     };
-    void poll();
-    intervalRef.current = setInterval(() => void poll(), POLL_INTERVAL);
+    void tick();
     return () => {
       cancelled = true;
-      if (intervalRef.current) clearInterval(intervalRef.current);
+      if (timer) clearTimeout(timer);
     };
   }, []);
 

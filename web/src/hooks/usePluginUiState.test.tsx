@@ -72,4 +72,39 @@ describe("usePluginUiState notifications", () => {
     });
     expect(reportError).toHaveBeenCalledTimes(1);
   });
+
+  it("re-seeds when the ring resets (daemon restart) so new toasts fire", async () => {
+    fetchMock
+      // Seed high.
+      .mockResolvedValueOnce(snapshot([{ seq: 5, plugin_id: "acme.kit", tone: "info", title: "old" }]))
+      // Daemon restarted: ring starts low again, below the watermark.
+      .mockResolvedValueOnce(snapshot([{ seq: 1, plugin_id: "acme.kit", tone: "info", title: "after restart" }]))
+      // A genuinely new one after the reset must toast.
+      .mockResolvedValue(
+        snapshot([
+          { seq: 1, plugin_id: "acme.kit", tone: "info", title: "after restart" },
+          { seq: 2, plugin_id: "acme.kit", tone: "info", title: "fresh" },
+        ]),
+      );
+
+    renderHook(() => usePluginUiState());
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(reportInfo).not.toHaveBeenCalled();
+
+    // The lower maxSeq is treated as a fresh ring: re-seed, still no toast.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+    expect(reportInfo).not.toHaveBeenCalled();
+
+    // seq 2 now exceeds the re-seeded watermark of 1: toast once.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+    expect(reportInfo).toHaveBeenCalledTimes(1);
+    expect(reportInfo).toHaveBeenCalledWith("fresh");
+  });
 });
