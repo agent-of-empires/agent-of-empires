@@ -431,4 +431,95 @@ mod tests {
         assert_eq!(events[0]["payload"]["n"], json!(2));
         assert_eq!(got["high_seq"], json!(3));
     }
+
+    /// Session metadata round-trip against real session storage: set, get, a
+    /// compare-and-swap that loses and one that wins, per-plugin namespace
+    /// isolation, and sessions.list. Isolated under a temp `XDG_CONFIG_HOME` so
+    /// it never touches real user state; serial because it mutates the env.
+    #[test]
+    #[serial_test::serial]
+    fn session_meta_cas_namespace_and_list() {
+        use crate::session::{Instance, Storage};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+
+        // Seed one session in the default profile's storage.
+        let storage = Storage::new_unwatched("default").unwrap();
+        let session_id = storage
+            .update(|instances, _groups| {
+                let inst = Instance::new("sess", "/tmp/plugin-host-test");
+                let id = inst.id.clone();
+                instances.push(inst);
+                Ok(id)
+            })
+            .unwrap();
+
+        let state =
+            HostApiState::open(&tmp.path().join("plugin_events.db"), "default", 100).unwrap();
+        let a = ctx(&[CAP_SESSION_READ, CAP_SESSION_WRITE]);
+
+        // set then get.
+        dispatch(
+            &state,
+            &a,
+            "session.meta.set",
+            &json!({"session_id": session_id, "key": "k", "value": 42}),
+        )
+        .unwrap();
+        let got = dispatch(
+            &state,
+            &a,
+            "session.meta.get",
+            &json!({"session_id": session_id, "key": "k"}),
+        )
+        .unwrap();
+        assert_eq!(got["value"], json!(42));
+
+        // CAS that loses (wrong expected) reports the current value, no clobber.
+        let lose = dispatch(
+            &state,
+            &a,
+            "session.meta.cas",
+            &json!({"session_id": session_id, "key": "k", "expected": 0, "value": 99}),
+        )
+        .unwrap();
+        assert_eq!(lose["swapped"], json!(false));
+        assert_eq!(lose["current"], json!(42));
+
+        // CAS that wins.
+        let win = dispatch(
+            &state,
+            &a,
+            "session.meta.cas",
+            &json!({"session_id": session_id, "key": "k", "expected": 42, "value": 99}),
+        )
+        .unwrap();
+        assert_eq!(win["swapped"], json!(true));
+
+        // A different plugin cannot see plugin "acme.worker"'s slot.
+        let b = PluginRpcContext {
+            plugin_id: "other.plugin".to_string(),
+            granted_capabilities: vec![CAP_SESSION_READ.to_string()],
+        };
+        let other = dispatch(
+            &state,
+            &b,
+            "session.meta.get",
+            &json!({"session_id": session_id, "key": "k"}),
+        )
+        .unwrap();
+        assert_eq!(other["value"], json!(null));
+
+        // sessions.list surfaces the seeded session.
+        let list = dispatch(&state, &a, "sessions.list", &json!({})).unwrap();
+        let sessions = list["sessions"].as_array().unwrap();
+        assert!(sessions.iter().any(|s| s["id"] == json!(session_id)));
+
+        match prev {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+    }
 }

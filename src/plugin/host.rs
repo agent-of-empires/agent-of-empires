@@ -334,3 +334,85 @@ async fn serve_connection(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plugin::host_api::PluginRpcContext;
+    use serde_json::json;
+
+    /// End-to-end over a real child process: a Node worker speaks ndjson
+    /// JSON-RPC through `serve_connection`, hits the capability gate on a method
+    /// it was not granted (`session.meta.set` with only `runtime.worker`), then
+    /// publishes the refusal code over the granted events path. The test reads
+    /// the event back, proving the wire, the capability gate, and the host
+    /// dispatch all work through a genuine subprocess. Node-gated like the ACP
+    /// fake-agent e2e; the capability refusal happens before any storage access,
+    /// so this needs no profile isolation.
+    #[tokio::test]
+    async fn worker_subprocess_round_trip_and_capability_gate() {
+        if which::which("node").is_err() {
+            eprintln!("skipping: node not found on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let api = Arc::new(
+            HostApiState::open(&tmp.path().join("plugin_events.db"), "default", 100).unwrap(),
+        );
+        // Granted only runtime.worker: events.* succeed, session.meta.set is
+        // refused with FORBIDDEN.
+        let ctx = PluginRpcContext {
+            plugin_id: "acme.worker".to_string(),
+            granted_capabilities: vec!["runtime.worker".to_string()],
+        };
+
+        // The worker: request a forbidden method, then publish the error code it
+        // got back over the granted events bus, then exit.
+        const WORKER: &str = r#"
+const rl = require('readline').createInterface({ input: process.stdin });
+let step = 0;
+rl.on('line', (line) => {
+  const resp = JSON.parse(line);
+  if (step === 0) {
+    step = 1;
+    const code = resp.error ? resp.error.code : 0;
+    process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:2,method:"events.publish",params:{topic:"result",payload:{forbidden_code:code}}}) + "\n");
+  } else {
+    process.exit(0);
+  }
+});
+process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:1,method:"session.meta.set",params:{session_id:"x",key:"k",value:1}}) + "\n");
+"#;
+
+        let mut child = tokio::process::Command::new("node")
+            .arg("-e")
+            .arg(WORKER)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+
+        serve_connection(&api, &ctx, stdout, stdin).await;
+        let _ = child.wait().await;
+
+        // Read the event the worker published: it carries the FORBIDDEN code the
+        // host returned for the ungranted session.meta.set.
+        let got = dispatch(
+            &api,
+            &ctx,
+            "events.subscribe",
+            &json!({ "topics": ["result"], "after_seq": 0 }),
+        )
+        .unwrap();
+        let events = got["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1, "worker should have published one result");
+        assert_eq!(
+            events[0]["payload"]["forbidden_code"],
+            json!(codes::FORBIDDEN)
+        );
+    }
+}
