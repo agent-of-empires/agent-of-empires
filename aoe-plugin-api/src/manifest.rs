@@ -147,10 +147,54 @@ pub struct ThemeContribution {
     pub path: String,
 }
 
-/// A UI contribution targeting a named slot.
+/// A host-rendered UI slot a plugin may push state into (#2366). A closed set,
+/// unlike the open-string capabilities: the host must know how to render each
+/// slot, so an unknown slot is unrenderable and rejected at parse time rather
+/// than carried forward. The worker pushes typed state into a declared slot
+/// over the `ui.state.*` host RPCs; the host renders it (the dashboard runs no
+/// plugin code).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum UiSlot {
+    /// A segment in the dashboard status/top bar (global).
+    StatusBar,
+    /// A badge on a session row (per session).
+    RowBadge,
+    /// A text column on a session row, carrying optional sort/filter scalars
+    /// (per session).
+    RowColumn,
+    /// A named sort option over a `RowColumn`'s scalar value (global).
+    SortKey,
+    /// A named filter over a `RowColumn`'s scalar value (global).
+    FilterFacet,
+    /// A card on the dashboard overview (global).
+    Card,
+    /// A panel in a session's detail view (per session).
+    DetailPanel,
+    /// A badge in a session's detail view (per session).
+    DetailBadge,
+    /// A transient notification, pushed via `ui.notify` (gated by the
+    /// `notifications` capability rather than a slot declaration).
+    Notification,
+}
+
+impl UiSlot {
+    /// Whether entries in this slot are scoped to a single session (and so must
+    /// carry a `session_id`), versus global to the dashboard.
+    pub fn is_per_session(self) -> bool {
+        matches!(
+            self,
+            UiSlot::RowBadge | UiSlot::RowColumn | UiSlot::DetailPanel | UiSlot::DetailBadge
+        )
+    }
+}
+
+/// A UI contribution: the plugin declares it may fill `slot` with entries
+/// addressed by `id`. The host gates `ui.state.set`/`ui.state.remove` on the
+/// `(slot, id)` pair being declared here.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiContribution {
-    pub slot: String,
+    pub slot: UiSlot,
     #[serde(default)]
     pub id: String,
 }
@@ -484,10 +528,11 @@ impl PluginManifest {
             );
         }
         for (i, u) in self.ui.iter().enumerate() {
-            check(
-                !u.slot.is_empty(),
-                format!("ui[{i}].slot must not be empty"),
-            );
+            // `slot` is a typed enum, so an unknown slot is already a parse
+            // error; only the addressing `id` needs checking. A UI entry is
+            // pushed and gated by its `(slot, id)` pair, so an empty id leaves
+            // it unaddressable.
+            check(!u.id.is_empty(), format!("ui[{i}].id must not be empty"));
         }
 
         if errors.is_empty() {
