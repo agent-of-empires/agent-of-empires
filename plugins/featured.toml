@@ -1,0 +1,20 @@
+# Curated / featured plugin index (issue #2364).
+#
+# This file is compiled into the aoe binary. Each entry is a maintainer's
+# attestation that an exact plugin source tree was reviewed: install and update
+# refuse unless the plugin's fetched source slug and tree hash match the pin,
+# and a featured entry is the only thing that lets a community install claim a
+# reserved (`aoe.*` / `agent-of-empires.*`) namespace.
+#
+# An entry's `tree_hash` is produced by `aoe plugin hash <plugin-dir>` on a
+# clean checkout. Generate it on a canonical platform with LF line endings; the
+# hash covers source files only (a release-binary worker is not pinned here, so
+# release-binary plugins cannot be featured yet).
+#
+# Schema (one vetted pin per plugin id):
+#
+#   [plugins."agent-of-empires.example"]
+#   source = "gh:agent-of-empires/example"
+#   tree_hash = "sha256:<hex>"
+
+[plugins]

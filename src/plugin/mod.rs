@@ -6,8 +6,10 @@
 //! installs, capability grants, and the Tier 0 / Tier 1 contribution surface
 //! return in follow-up PRs.
 
+pub mod featured;
 pub mod fetch;
 pub mod install;
+pub mod integrity;
 pub mod lockfile;
 pub mod registry;
 pub mod source;
