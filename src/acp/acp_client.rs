@@ -9527,6 +9527,33 @@ mod tests {
     }
 
     #[test]
+    fn map_session_info_update_emits_title_event() {
+        use agent_client_protocol::schema::SessionInfoUpdate;
+        let info = SessionInfoUpdate::new().title("Fix the flaky test".to_string());
+        let events = map_update_to_events(
+            SessionUpdate::SessionInfoUpdate(info),
+            &agent_profiles::CLAUDE,
+        );
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            Event::SessionTitleSuggested { title } => assert_eq!(title, "Fix the flaky test"),
+            other => panic!("expected SessionTitleSuggested, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_session_info_update_without_title_emits_nothing() {
+        use agent_client_protocol::schema::SessionInfoUpdate;
+        // Null/undefined title (e.g. a timestamp-only update) yields no event.
+        let info = SessionInfoUpdate::new().updated_at("2026-06-25T00:00:00Z".to_string());
+        let events = map_update_to_events(
+            SessionUpdate::SessionInfoUpdate(info),
+            &agent_profiles::CLAUDE,
+        );
+        assert!(events.is_empty());
+    }
+
+    #[test]
     fn map_usage_update_emits_typed_usage_event() {
         use agent_client_protocol::schema::{Cost, UsageUpdate};
         let u = UsageUpdate::new(12_345, 200_000).cost(Cost::new(0.42, "USD"));

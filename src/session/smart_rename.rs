@@ -606,6 +606,46 @@ mod serve {
             ];
             assert!(run_oneshot(&argv, "").await.is_none());
         }
+
+        #[test]
+        fn auto_overwritable_tracks_until_manual_rename() {
+            use crate::session::instance::Instance;
+            // A still-default civ name is overwritable.
+            let mut inst = Instance::new("Britons", "/tmp");
+            assert!(title_is_auto_overwritable(&inst));
+            // After an auto write, title == last_auto_title, so successive
+            // native pushes keep tracking the agent's title across turns.
+            inst.title = "Fix login redirect".to_string();
+            inst.last_auto_title = Some("Fix login redirect".to_string());
+            assert!(title_is_auto_overwritable(&inst));
+            // A manual rename diverges title from last_auto_title: frozen.
+            inst.title = "Production hotfix".to_string();
+            assert!(!title_is_auto_overwritable(&inst));
+            // Legacy record: a non-default title with no recorded auto title
+            // is left untouched.
+            let mut legacy = Instance::new("Vikings", "/tmp");
+            legacy.title = "Hand-picked name".to_string();
+            legacy.last_auto_title = None;
+            assert!(!title_is_auto_overwritable(&legacy));
+        }
+
+        #[test]
+        fn normalize_native_title_cleans_and_rejects() {
+            // Strips ANSI, takes the first non-empty line, drops markdown.
+            assert_eq!(
+                normalize_native_title("\x1b[1m# Fix the flaky test\x1b[0m\nsecond line")
+                    .as_deref(),
+                Some("Fix the flaky test"),
+            );
+            // Empty / whitespace yields nothing.
+            assert!(normalize_native_title("   \n  ").is_none());
+            // A civ-name candidate is rejected so it cannot re-arm the gate.
+            assert!(normalize_native_title("Romans").is_none());
+            // Overlong titles are capped.
+            let long = "word ".repeat(80);
+            let out = normalize_native_title(&long).expect("non-empty");
+            assert!(out.chars().count() <= 120);
+        }
     }
 }
 

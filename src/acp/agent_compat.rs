@@ -508,6 +508,41 @@ mod tests {
     }
 
     #[test]
+    fn native_session_title_gate() {
+        // claude >= 0.52 pushes titles natively.
+        assert!(pushes_native_session_title(
+            ExpectedAgent::ClaudeAgentAcp,
+            &make_init("@agentclientprotocol/claude-agent-acp", "0.52.0"),
+        ));
+        assert!(pushes_native_session_title(
+            ExpectedAgent::ClaudeAgentAcp,
+            &make_init("@agentclientprotocol/claude-agent-acp", "0.60.1"),
+        ));
+        // claude below 0.52 (but above the 0.49 floor): no native push, one-shot fallback.
+        assert!(!pushes_native_session_title(
+            ExpectedAgent::ClaudeAgentAcp,
+            &make_init("@agentclientprotocol/claude-agent-acp", "0.49.0"),
+        ));
+        // Fail-closed: name mismatch, unparseable version, missing agent_info, non-claude.
+        assert!(!pushes_native_session_title(
+            ExpectedAgent::ClaudeAgentAcp,
+            &make_init("some-wrapper", "9.9.9"),
+        ));
+        assert!(!pushes_native_session_title(
+            ExpectedAgent::ClaudeAgentAcp,
+            &make_init("@agentclientprotocol/claude-agent-acp", "not-semver"),
+        ));
+        assert!(!pushes_native_session_title(
+            ExpectedAgent::ClaudeAgentAcp,
+            &make_init_no_info(),
+        ));
+        assert!(!pushes_native_session_title(
+            ExpectedAgent::CodexAcp,
+            &make_init("codex", "1.0.0"),
+        ));
+    }
+
+    #[test]
     fn auto_install_only_for_npm_agents() {
         assert!(auto_install_for(ExpectedAgent::ClaudeAgentAcp));
         assert!(auto_install_for(ExpectedAgent::CodexAcp));

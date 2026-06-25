@@ -4218,6 +4218,81 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn native_title_apply_persists_tracks_and_protects_manual() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // SAFETY: serialized test; no other test mutates HOME concurrently.
+        unsafe { std::env::set_var("HOME", temp.path()) };
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        }
+
+        let mut inst = Instance::new("Britons", "/tmp/native-title");
+        inst.source_profile = "native-title".to_string();
+        let id = inst.id.clone();
+
+        let storage = crate::session::Storage::new_unwatched("native-title").expect("storage");
+        storage
+            .update(|instances, _groups| {
+                *instances = vec![inst.clone()];
+                Ok(())
+            })
+            .expect("seed write");
+
+        let state = test_support::build_test_app_state(vec![inst]);
+        let load = || {
+            crate::session::Storage::new_unwatched("native-title")
+                .unwrap()
+                .load()
+                .unwrap()
+        };
+
+        // First native push: a still-default civ name is renamed and the
+        // applied title is recorded as the last auto title.
+        crate::session::smart_rename::apply_auto_title(
+            &state,
+            &id,
+            "native-title",
+            "Fix login redirect",
+        )
+        .await;
+        let loaded = load();
+        assert_eq!(loaded[0].title, "Fix login redirect");
+        assert_eq!(
+            loaded[0].last_auto_title.as_deref(),
+            Some("Fix login redirect")
+        );
+
+        // A later turn pushes a new title; it keeps tracking the agent.
+        crate::session::smart_rename::apply_auto_title(
+            &state,
+            &id,
+            "native-title",
+            "Add regression tests",
+        )
+        .await;
+        assert_eq!(load()[0].title, "Add regression tests");
+
+        // A manual rename diverges title from last_auto_title; subsequent
+        // pushes must not clobber it.
+        storage
+            .update(|instances, _groups| {
+                instances[0].title = "Production hotfix".to_string();
+                Ok(())
+            })
+            .expect("manual rename");
+        crate::session::smart_rename::apply_auto_title(
+            &state,
+            &id,
+            "native-title",
+            "Should be ignored",
+        )
+        .await;
+        assert_eq!(load()[0].title, "Production hotfix");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn init_disk_watch_subscriptions_bootstraps_one_reload_after_wiring() {
         let temp = tempfile::tempdir().expect("tempdir");
         // SAFETY: serialized test; no other test mutates HOME concurrently.
