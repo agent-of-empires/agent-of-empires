@@ -673,7 +673,7 @@ Manage plugins (list, info, enable, disable, install, update, uninstall)
 
 ###### **Subcommands:**
 
-* `list` — List every known plugin with version, trust, and state
+* `list` — List every known plugin with version, validation, and state
 * `info` — Show one plugin's manifest details
 * `enable` — Enable a plugin's contributions
 * `disable` — Disable a plugin; its settings stay on disk for re-enabling
@@ -686,7 +686,7 @@ Manage plugins (list, info, enable, disable, install, update, uninstall)
 
 ## `aoe plugin list`
 
-List every known plugin with version, trust, and state
+List every known plugin with version, validation, and state
 
 **Usage:** `aoe plugin list`
 

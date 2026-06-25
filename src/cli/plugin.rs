@@ -6,7 +6,7 @@ use clap::Subcommand;
 
 #[derive(Subcommand)]
 pub enum PluginCommands {
-    /// List every known plugin with version, trust, and state
+    /// List every known plugin with version, validation, and state
     List,
     /// Show one plugin's manifest details
     Info {
