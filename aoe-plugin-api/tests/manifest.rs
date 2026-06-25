@@ -302,9 +302,80 @@ command = ["python3", "worker.py"]
 "#;
     let m = PluginManifest::from_toml_str(toml).expect("runtime command parses");
     match m.runtime.expect("has runtime") {
-        RuntimeSpec::Command { command } => assert_eq!(command, ["python3", "worker.py"]),
+        RuntimeSpec::Command { command, build } => {
+            assert_eq!(command, ["python3", "worker.py"]);
+            assert!(build.is_empty());
+        }
         other => panic!("expected command runtime, got {other:?}"),
     }
+}
+
+#[test]
+fn runtime_command_build_steps_parse() {
+    let toml = r#"
+id = "acme.thing"
+name = "Thing"
+version = "0.1.0"
+api_version = 2
+
+[runtime]
+kind = "command"
+command = [".venv/bin/worker"]
+
+[[runtime.build]]
+command = ["python3", "-m", "venv", ".venv"]
+
+[[runtime.build]]
+command = [".venv/bin/pip", "install", "."]
+platforms = ["linux", "macos"]
+"#;
+    let m = PluginManifest::from_toml_str(toml).expect("build steps parse");
+    match m.runtime.expect("has runtime") {
+        RuntimeSpec::Command { command, build } => {
+            assert_eq!(command, [".venv/bin/worker"]);
+            assert_eq!(build.len(), 2);
+            assert_eq!(build[0].command, ["python3", "-m", "venv", ".venv"]);
+            assert!(build[0].platforms.is_empty());
+            assert_eq!(build[1].command, [".venv/bin/pip", "install", "."]);
+            assert_eq!(build[1].platforms, ["linux", "macos"]);
+        }
+        other => panic!("expected command runtime, got {other:?}"),
+    }
+}
+
+#[test]
+fn build_step_empty_command_and_unknown_platform_rejected() {
+    let toml = r#"
+id = "acme.thing"
+name = "Thing"
+version = "0.1.0"
+api_version = 2
+
+[runtime]
+kind = "command"
+command = [".venv/bin/worker"]
+
+[[runtime.build]]
+command = [""]
+platforms = ["linux", "plan9"]
+"#;
+    let err = PluginManifest::from_toml_str(toml).unwrap_err();
+    let messages = match err {
+        ManifestError::Invalid(m) => m,
+        other => panic!("expected Invalid, got {other:?}"),
+    };
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("runtime.build[0].command")),
+        "{messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("runtime.build[0].platforms") && m.contains("plan9")),
+        "{messages:?}"
+    );
 }
 
 #[test]

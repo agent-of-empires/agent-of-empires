@@ -17,8 +17,8 @@ mod manifest;
 pub use capability::{CapabilityId, TrustLevel, KNOWN_CAPABILITIES};
 pub use id::{InvalidPluginId, PluginId};
 pub use manifest::{
-    CommandContribution, KeybindContribution, ManifestError, PluginManifest, RuntimeSpec,
-    SettingContribution, SettingType, ThemeContribution, UiContribution,
+    BuildStep, CommandContribution, KeybindContribution, ManifestError, PluginManifest,
+    RuntimeSpec, SettingContribution, SettingType, ThemeContribution, UiContribution,
 };
 
 /// Version of the manifest schema and host API this crate describes.

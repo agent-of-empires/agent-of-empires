@@ -164,6 +164,17 @@ pub enum RuntimeSpec {
     Command {
         /// argv; the first element is the program, the rest its arguments.
         command: Vec<String>,
+        /// Ordered build steps the host runs once at install and update,
+        /// inside the installed plugin directory, before the plugin is
+        /// registered (e.g. create a venv, `pip install`, `npm ci`). They run
+        /// in the user's interactive shell at install time, where PATH is
+        /// reliable, so an interpreted worker can produce a self-contained
+        /// in-tree environment and then launch via a plugin-relative
+        /// `command`, never depending on the daemon's PATH. Builds run in the
+        /// final directory, not a staging tree, because tools like Python
+        /// venvs embed absolute paths and are not relocatable.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        build: Vec<BuildStep>,
     },
     /// A worker binary downloaded from the source repo's GitHub release assets.
     /// Installation resolves the asset for the host platform, downloads it, and
@@ -178,6 +189,27 @@ pub enum RuntimeSpec {
         bin: Option<String>,
     },
 }
+
+/// One install/update build command for a `command` runtime.
+///
+/// `command` is argv (program then arguments), resolved with the same policy
+/// as the launch `command`: a bare name on the install-time PATH, a
+/// separator-bearing path relative to the plugin directory, an absolute path
+/// rejected. `platforms`, when non-empty, restricts the step to host OSes
+/// matching `std::env::consts::OS` (`linux`, `macos`, `windows`); an empty
+/// `platforms` runs on every platform.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuildStep {
+    pub command: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub platforms: Vec<String>,
+}
+
+/// Host OS names a build step's `platforms` may name. These match
+/// `std::env::consts::OS`; a typo is rejected at parse rather than silently
+/// skipping the step on every platform.
+const KNOWN_PLATFORMS: [&str; 3] = ["linux", "macos", "windows"];
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -257,7 +289,7 @@ impl PluginManifest {
         check(!self.version.is_empty(), "version must not be empty".into());
         check(!self.name.is_empty(), "name must not be empty".into());
 
-        if let Some(RuntimeSpec::Command { command }) = &self.runtime {
+        if let Some(RuntimeSpec::Command { command, build }) = &self.runtime {
             check(
                 !command.is_empty(),
                 "runtime command must not be empty".into(),
@@ -266,6 +298,24 @@ impl PluginManifest {
                 command.iter().all(|arg| !arg.is_empty()),
                 "runtime command must not contain empty arguments".into(),
             );
+            for (i, step) in build.iter().enumerate() {
+                check(
+                    !step.command.is_empty(),
+                    format!("runtime.build[{i}].command must not be empty"),
+                );
+                check(
+                    step.command.iter().all(|arg| !arg.is_empty()),
+                    format!("runtime.build[{i}].command must not contain empty arguments"),
+                );
+                for p in &step.platforms {
+                    check(
+                        KNOWN_PLATFORMS.contains(&p.as_str()),
+                        format!(
+                            "runtime.build[{i}].platforms contains unknown platform {p:?}; expected one of linux, macos, windows"
+                        ),
+                    );
+                }
+            }
         }
         if let Some(RuntimeSpec::ReleaseBinary { asset, bin }) = &self.runtime {
             check(
