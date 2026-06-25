@@ -289,6 +289,15 @@ fn confirm_capabilities(id: &str, capabilities: &[String]) -> Result<bool> {
     for capability in capabilities {
         println!("  - {capability}");
     }
+    // The honest model (D8): the host enforces these capabilities at its API
+    // boundary, which stops a cooperative plugin from overreaching. It does NOT
+    // contain an adversarial plugin: a granted worker runs as an ordinary
+    // process with no OS-level isolation. State this on every grant prompt.
+    println!(
+        "Note: granting a capability trusts this plugin. The host checks capabilities at its API\n\
+         boundary, but a plugin worker runs without OS-level sandboxing, so a malicious plugin is\n\
+         not contained. Only install plugins you trust."
+    );
     print!("Grant them and install? [y/N] ");
     io::stdout().flush()?;
     let mut line = String::new();

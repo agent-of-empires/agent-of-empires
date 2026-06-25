@@ -368,6 +368,10 @@ pub struct AppState {
     #[cfg(feature = "serve")]
     pub acp_supervisor:
         Arc<crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>>,
+    /// The Tier 1 plugin worker host. `None` in test harnesses that do not
+    /// stand up a host; `Some` in a live daemon.
+    #[cfg(feature = "serve")]
+    pub plugin_host: Option<Arc<crate::plugin::host::PluginHost>>,
     /// Epoch-millis timestamp of the most recent authenticated API request.
     /// Updated by auth middleware on every successful auth. The push consumer
     /// checks this to suppress notifications when someone is actively using
@@ -748,6 +752,24 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         supervisor.hydrate_seqs(acp_event_store.all_session_seqs());
         supervisor
     };
+    // The Tier 1 plugin worker host. Opening it (the plugin event-bus database,
+    // the worker log dir) is cheap and side-effect-free until workers launch,
+    // which happens after the daemon is up. A failure here is logged, not fatal:
+    // the daemon serves fine without plugin workers.
+    #[cfg(feature = "serve")]
+    let plugin_host = match crate::session::get_app_dir() {
+        Ok(app_dir) => match crate::plugin::host::PluginHost::new(&app_dir, profile) {
+            Ok(host) => Some(host),
+            Err(e) => {
+                tracing::warn!(target: "plugin.host", "plugin host disabled: {e:#}");
+                None
+            }
+        },
+        Err(e) => {
+            tracing::warn!(target: "plugin.host", "plugin host disabled: {e:#}");
+            None
+        }
+    };
 
     // Telemetry (opt-in, no-op otherwise): announce the serve surface on boot.
     // The boot announcement fires here, before transport setup, so a launch
@@ -977,6 +999,8 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         acp_event_store: acp_event_store.clone(),
         #[cfg(feature = "serve")]
         acp_supervisor: acp_supervisor.clone(),
+        #[cfg(feature = "serve")]
+        plugin_host: plugin_host.clone(),
         push: push_state,
         push_enabled,
         web_config: config.web.clone(),
@@ -1147,6 +1171,14 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // (feature disabled via web.notifications_enabled=false).
     push::spawn_consumer(state.clone());
 
+    // Launch plugin workers for every active plugin that declares a runtime.
+    // Non-blocking: each worker runs in its own supervised task. A daemon with
+    // no community plugin workers (the common case) does nothing here.
+    #[cfg(feature = "serve")]
+    if let Some(host) = state.plugin_host.clone() {
+        host.start(&crate::plugin::registry()).await;
+    }
+
     rate_limiter.spawn_cleanup_task(state.shutdown.clone());
     login_manager.spawn_cleanup_task(state.shutdown.clone());
 
@@ -1297,6 +1329,12 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
             tracing::info!(target: "serve.shutdown", "received ctrl-c, shutting down");
         }
         shutdown_state.shutdown.cancel();
+        // Reap plugin workers before the force-exit deadline so no worker tree
+        // is left behind when the daemon stops.
+        #[cfg(feature = "serve")]
+        if let Some(host) = shutdown_state.plugin_host.clone() {
+            host.shutdown().await;
+        }
         tokio::spawn(async {
             tokio::time::sleep(SHUTDOWN_GRACE).await;
             tracing::warn!(
@@ -3976,6 +4014,7 @@ pub mod test_support {
             acp_events_tx,
             acp_event_store: event_store,
             acp_supervisor: supervisor,
+            plugin_host: None,
             push: None,
             push_enabled: false,
             web_config: crate::session::config::WebConfig::default(),
