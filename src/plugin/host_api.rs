@@ -18,11 +18,17 @@
 //! - `session.meta.set { session_id, key, value }` and
 //!   `session.meta.cas { session_id, key, expected, value }` (`session.write`).
 //! - `sessions.list` (`session.read`).
+//! - `config.get { key }` (`runtime.worker`): the value at
+//!   `plugins.<plugin-id>.settings.<key>` for the calling plugin's own id.
 //!
 //! Per-plugin namespace: session metadata is always read and written under the
-//! calling plugin's own `Instance.plugin_meta[<plugin-id>]` slot. The worker
-//! sends only `key`; it can never name another plugin's id, so one plugin
-//! cannot touch another's metadata.
+//! calling plugin's own `Instance.plugin_meta[<plugin-id>]` slot, and
+//! `config.get` reads only the caller's own `plugins.<plugin-id>.settings`
+//! table. The worker sends only `key`; it can never name another plugin's id,
+//! so one plugin cannot touch another's metadata or settings. Reading one's own
+//! declared settings needs no `config.*` capability (those gate host/global or
+//! other-plugin config); `runtime.worker`, which every worker holds to run at
+//! all, is enough.
 
 use std::sync::Mutex;
 
@@ -159,6 +165,10 @@ pub fn dispatch(
         "sessions.list" => {
             ctx.require(CAP_SESSION_READ)?;
             sessions_list(state)
+        }
+        "config.get" => {
+            ctx.require(CAP_WORKER)?;
+            config_get(ctx, params)
         }
         other => Err(DispatchError::method_not_found(other)),
     }
@@ -359,6 +369,29 @@ fn sessions_list(state: &HostApiState) -> Result<Value, DispatchError> {
     Ok(json!({ "sessions": sessions }))
 }
 
+/// Read `plugins.<plugin_id>.settings.<key>` for the calling plugin's own id,
+/// or `Value::Null` when the plugin has no config entry or the key is unset, so
+/// the worker can fall back to its own default. The id is always the caller's
+/// own ([`PluginRpcContext::plugin_id`]), never a request parameter, so one
+/// plugin can never read another's settings.
+fn config_get(ctx: &PluginRpcContext, params: &Value) -> Result<Value, DispatchError> {
+    let key = str_param(params, "key")?;
+    let config =
+        crate::session::Config::load().map_err(|e| DispatchError::internal(e.to_string()))?;
+    let value = match config
+        .plugins
+        .get(&ctx.plugin_id)
+        .and_then(|plugin| plugin.settings.get(key))
+    {
+        // The stored value is TOML; hand it back to the worker as JSON.
+        Some(toml_value) => {
+            serde_json::to_value(toml_value).map_err(|e| DispatchError::internal(e.to_string()))?
+        }
+        None => Value::Null,
+    };
+    Ok(json!({ "value": value }))
+}
+
 /// Set `key = value` inside `inst.plugin_meta[plugin_id]`, creating the slot as
 /// a JSON object if absent. The slot is namespaced to the plugin id, never a
 /// request parameter, which is what keeps one plugin out of another's data.
@@ -548,5 +581,75 @@ mod tests {
         let list = dispatch(&state, &a, "sessions.list", &json!({})).unwrap();
         let sessions = list["sessions"].as_array().unwrap();
         assert!(sessions.iter().any(|s| s["id"] == json!(session_id)));
+    }
+
+    /// `config.get` reads the calling plugin's own persisted settings, gated by
+    /// `runtime.worker`: a granted worker reads its value, an unset key returns
+    /// null, a different plugin id cannot see it, and a worker without
+    /// `runtime.worker` is refused. Isolated under a temp `XDG_CONFIG_HOME` so it
+    /// never touches real user config; serial because it mutates the env.
+    #[test]
+    #[serial_test::serial]
+    fn config_get_scopes_to_caller_and_requires_worker() {
+        use crate::session::{save_config, Config, PluginConfig};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+
+        // Seed the global config with one setting under "acme.worker".
+        let mut config = Config::default();
+        let mut plugin = PluginConfig::default();
+        plugin
+            .settings
+            .insert("poll_interval_ms".to_string(), toml::Value::Integer(5000));
+        config.plugins.insert("acme.worker".to_string(), plugin);
+        save_config(&config).unwrap();
+
+        let state = state(tmp.path());
+        let worker = ctx(&[CAP_WORKER]);
+
+        // The owning plugin reads its own setting back as JSON.
+        let got = dispatch(
+            &state,
+            &worker,
+            "config.get",
+            &json!({"key": "poll_interval_ms"}),
+        )
+        .unwrap();
+        assert_eq!(got["value"], json!(5000));
+
+        // An unset key returns null so the worker falls back to its default.
+        let missing = dispatch(&state, &worker, "config.get", &json!({"key": "nope"})).unwrap();
+        assert_eq!(missing["value"], json!(null));
+
+        // A different plugin id cannot see "acme.worker"'s settings.
+        let other = PluginRpcContext {
+            plugin_id: "other.plugin".to_string(),
+            granted_capabilities: vec![CAP_WORKER.to_string()],
+        };
+        let other_got = dispatch(
+            &state,
+            &other,
+            "config.get",
+            &json!({"key": "poll_interval_ms"}),
+        )
+        .unwrap();
+        assert_eq!(other_got["value"], json!(null));
+
+        // Without runtime.worker the call is forbidden.
+        let err = dispatch(
+            &state,
+            &ctx(&[CAP_SESSION_READ]),
+            "config.get",
+            &json!({"key": "poll_interval_ms"}),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, codes::FORBIDDEN);
+
+        match prev {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
     }
 }

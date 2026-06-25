@@ -353,6 +353,7 @@ reuse the existing taxonomy:
 | `session.meta.get` | `session.read` |
 | `session.meta.set` / `session.meta.cas` | `session.write` |
 | `sessions.list` | `session.read` |
+| `config.get` | `runtime.worker` |
 
 `events.*` run over a shared plugin event bus (a `plugin_host` schema on the
 durable event-log substrate, `src/events/`); `subscribe { topics, after_seq }`
@@ -363,6 +364,15 @@ plugin's id, so one plugin cannot reach another's data. A `session.meta.cas`
 that loses returns the current value rather than clobbering it. Writes go
 through `Storage`'s cross-process lock, so the daemon picks them up on its next
 session reload (eventual consistency, not a live push).
+
+`config.get { key }` returns the value at `plugins.<plugin-id>.settings.<key>`
+for the calling plugin's own id, so a worker reads back the settings the user
+edited on the TUI/web surfaces, falling back to its own default when the key is
+unset (the call returns null). The id is the caller's own, never a request
+parameter, so a plugin can only read its own table. Reading one's own declared
+settings needs no `config.*` capability: `config.read` / `config.write` gate
+host/global or other-plugin configuration, which no host method exposes yet, so
+`config.get` rides on `runtime.worker` like `events.*`.
 
 ### Sandboxing
 
