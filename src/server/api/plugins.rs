@@ -66,9 +66,15 @@ pub async fn list_plugins() -> Json<serde_json::Value> {
 pub async fn plugin_ui_state(
     State(state): State<std::sync::Arc<AppState>>,
 ) -> Json<serde_json::Value> {
+    let empty = || json!({ "entries": [], "notifications": [] });
     match state.plugin_host.as_ref().map(|h| h.ui_snapshot()) {
-        Some(snapshot) => Json(serde_json::to_value(snapshot).unwrap_or(serde_json::Value::Null)),
-        None => Json(json!({ "entries": [], "notifications": [] })),
+        Some(snapshot) => Json(serde_json::to_value(snapshot).unwrap_or_else(|e| {
+            // Serializing the snapshot should never fail; if it somehow does,
+            // keep the response shape stable rather than returning JSON null.
+            tracing::warn!(target: "serve.api", "failed to serialize plugin UI snapshot: {e}");
+            empty()
+        })),
+        None => Json(empty()),
     }
 }
 
