@@ -1,10 +1,17 @@
 //! Settings resolution with provenance (#2094).
 //!
-//! A setting's effective value can come from more than one layer. Core settings
-//! layer: the user's value (when it differs from the baseline default) over the
-//! highest-priority active plugin's `setting_defaults` override over the core
-//! schema default. A plugin's own settings layer: the stored value over the
-//! plugin's manifest default.
+//! A setting's effective value can come from more than one layer.
+//!
+//! For a **core** key at Tier 0 the effective value is the user's value (when it
+//! differs from the baseline default), else the core schema default. A plugin's
+//! `setting_defaults` override of a core key is surfaced as a *candidate* so it
+//! is observable, but it does NOT win: nothing applies it during real `Config`
+//! load or merge yet, so the running app uses the user value or the struct
+//! default. The runtime host applies these overrides for real (#2095); until
+//! then a `plugin_default` candidate is "declared, not yet in effect".
+//!
+//! For a **plugin's own** setting the effective value is the stored value, else
+//! the plugin's manifest default.
 //!
 //! [`resolve`] returns the winning value, its [`SettingSource`], and every
 //! candidate that was considered, so `aoe settings explain` and
@@ -22,7 +29,10 @@ pub enum SettingSource {
     /// The user's stored value (a core field changed from its default, or a
     /// stored plugin setting value).
     User,
-    /// A plugin's `setting_defaults` override of a core setting.
+    /// A plugin's `setting_defaults` override of a core setting. At Tier 0 this
+    /// only ever appears as a candidate, never as the winning source: it is
+    /// declared but not yet applied at runtime (the runtime host applies it,
+    /// #2095).
     PluginDefault { plugin: String },
     /// The owning plugin's manifest default for one of its own settings.
     ManifestDefault { plugin: String },
@@ -120,20 +130,24 @@ fn resolve_core(
         .unwrap_or(Value::Null);
     let stored = cfg.get(section).and_then(|s| s.get(field)).cloned();
 
-    let mut candidates = Vec::new();
-
     // A user value is one that differs from the baseline default.
-    if let Some(v) = &stored {
-        if *v != schema_default {
-            candidates.push(Candidate {
-                source: SettingSource::User,
-                value: v.clone(),
-            });
-        }
+    let user = stored.filter(|v| *v != schema_default);
+
+    let mut candidates = Vec::new();
+    if let Some(v) = &user {
+        candidates.push(Candidate {
+            source: SettingSource::User,
+            value: v.clone(),
+        });
     }
 
-    // Plugin overrides, in active-plugin order (builtins first); the first is
-    // the highest priority.
+    // Plugin overrides, in active-plugin order (builtins first). At Tier 0 these
+    // are recorded as candidates so they are observable, but they do NOT win:
+    // nothing applies a plugin's core-default override during real Config load
+    // or merge yet, so the running app uses the user value or the struct
+    // default. The runtime host applies these for real (#2095). Reporting one
+    // as the effective value here would misrepresent what every core consumer
+    // actually reads.
     for p in crate::plugin::registry().active() {
         if let Some(tv) = p.manifest.setting_defaults.get(key) {
             if let Ok(v) = serde_json::to_value(tv) {
@@ -149,10 +163,22 @@ fn resolve_core(
 
     candidates.push(Candidate {
         source: SettingSource::SchemaDefault,
-        value: schema_default,
+        value: schema_default.clone(),
     });
 
-    finish(key, candidates)
+    // The effective value is what the app actually uses today: the user value,
+    // else the struct default. Plugin core-default overrides stay in
+    // `candidates` only.
+    let (source, value) = match user {
+        Some(v) => (SettingSource::User, v),
+        None => (SettingSource::SchemaDefault, schema_default),
+    };
+    ResolvedSetting {
+        key: key.to_string(),
+        value,
+        source,
+        candidates,
+    }
 }
 
 fn resolve_plugin_own(key: &str, plugin_id: &str, field: &str, cfg: &Value) -> ResolvedSetting {

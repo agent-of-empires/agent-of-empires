@@ -247,14 +247,22 @@ settings are global-only at Tier 0 (not profile-overridable). In the TUI they
 render read-only under the Plugins tab; edit them from the web dashboard or
 `aoe settings`.
 
-A manifest may also override the *default* of a core setting via
-`[setting_defaults]` (keyed by the core `section.field`). Resolution layers, in
-order: the user's value (when it differs from the baseline default) > the
-highest-priority active plugin's `setting_defaults` override > the core schema
-default. A plugin's own setting layers stored value > manifest default.
+A manifest may also declare a *default* override for a core setting via
+`[setting_defaults]` (keyed by the core `section.field`).
 `settings_schema::resolve` returns the effective value, its source, and the full
 candidate chain; `aoe settings explain <key>` and `GET /api/settings/resolved`
-surface it. "Highest priority" is active-plugin order (builtins first).
+surface it.
+
+The effective value of a core key at Tier 0 is the user's value (when it differs
+from the baseline default), else the core schema default. A plugin's
+`setting_defaults` override is included in the candidate chain so it is
+observable, but it is NOT applied at runtime yet, so it never reports as the
+effective `source`: nothing layers it during real `Config` load/merge, so every
+core consumer still reads the struct default. The runtime host applies these
+overrides for real (#2095); until then a `plugin_default` candidate is
+"declared, not yet in effect". A plugin's own setting layers stored value >
+manifest default. "Highest priority" (for the candidate ordering) is
+active-plugin order, builtins first.
 
 ### Themes
 

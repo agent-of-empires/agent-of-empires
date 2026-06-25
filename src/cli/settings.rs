@@ -25,7 +25,9 @@ pub fn run(command: SettingsCommands) -> Result<()> {
 fn source_label(source: &SettingSource) -> String {
     match source {
         SettingSource::User => "user value".to_string(),
-        SettingSource::PluginDefault { plugin } => format!("plugin default ({plugin})"),
+        SettingSource::PluginDefault { plugin } => {
+            format!("plugin default ({plugin}, declared, not yet applied at runtime)")
+        }
         SettingSource::ManifestDefault { plugin } => format!("manifest default ({plugin})"),
         SettingSource::SchemaDefault => "schema default".to_string(),
     }
