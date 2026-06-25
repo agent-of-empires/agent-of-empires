@@ -300,12 +300,27 @@ async fn serve_connection(
             }
         };
 
+        // The JSON parsed; now check the JSON-RPC envelope. A well-formed JSON
+        // object with the wrong shape is an invalid request, distinct from
+        // malformed JSON (PARSE_ERROR above). This message is rejected; the
+        // connection continues.
+        let method = match request.validate_envelope() {
+            Ok(m) => m.to_string(),
+            Err(msg) => {
+                let id = request.id.clone().unwrap_or(Value::Null);
+                let resp = RpcResponse::error(id, codes::INVALID_REQUEST, msg).to_line();
+                if stdin.write_all(resp.as_bytes()).await.is_err() {
+                    return;
+                }
+                continue;
+            }
+        };
+
         // Dispatch does blocking SQLite and session-storage IO; run it off the
         // async runtime. The handler is fully synchronous and self-contained.
         let api = api.clone();
         let ctx_id = ctx.plugin_id.clone();
         let caps = ctx.granted_capabilities.clone();
-        let method = request.method.clone();
         let params = request.params.clone();
         let outcome = tokio::task::spawn_blocking(move || {
             let ctx = PluginRpcContext {

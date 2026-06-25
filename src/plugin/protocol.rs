@@ -28,11 +28,20 @@ pub mod codes {
 }
 
 /// One inbound request from a worker. `id` is absent for a notification.
+///
+/// Every field is optional at the serde layer so that any well-formed JSON
+/// object deserializes; the JSON-RPC 2.0 envelope is then validated by
+/// [`RpcRequest::validate_envelope`]. This keeps a parse failure meaning
+/// "malformed JSON" (PARSE_ERROR) and a bad request shape meaning
+/// "invalid request" (INVALID_REQUEST), rather than conflating the two.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RpcRequest {
     #[serde(default)]
+    pub jsonrpc: Option<String>,
+    #[serde(default)]
     pub id: Option<Value>,
-    pub method: String,
+    #[serde(default)]
+    pub method: Option<String>,
     #[serde(default)]
     pub params: Value,
 }
@@ -41,6 +50,20 @@ impl RpcRequest {
     /// A request with no `id` is a notification: the host must not answer it.
     pub fn is_notification(&self) -> bool {
         self.id.is_none()
+    }
+
+    /// Validate the JSON-RPC 2.0 envelope, returning the method name on success.
+    /// `jsonrpc` must be exactly `"2.0"` and `method` must be present and
+    /// non-empty; otherwise the request is well-formed JSON but not a valid
+    /// request, which the host reports as `INVALID_REQUEST`.
+    pub fn validate_envelope(&self) -> Result<&str, &'static str> {
+        if self.jsonrpc.as_deref() != Some("2.0") {
+            return Err("jsonrpc field must be \"2.0\"");
+        }
+        match self.method.as_deref() {
+            Some(m) if !m.is_empty() => Ok(m),
+            _ => Err("missing or empty \"method\""),
+        }
     }
 }
 
@@ -117,7 +140,7 @@ mod tests {
         let req = parse_request(r#"{"jsonrpc":"2.0","id":7,"method":"sessions.list","params":{}}"#)
             .unwrap()
             .unwrap();
-        assert_eq!(req.method, "sessions.list");
+        assert_eq!(req.validate_envelope().unwrap(), "sessions.list");
         assert_eq!(req.id, Some(json!(7)));
         assert!(!req.is_notification());
     }
@@ -128,6 +151,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(req.is_notification());
+        assert_eq!(req.validate_envelope().unwrap(), "events.publish");
     }
 
     #[test]
@@ -139,6 +163,23 @@ mod tests {
     #[test]
     fn malformed_line_is_error() {
         assert!(parse_request("{not json").is_err());
+    }
+
+    #[test]
+    fn well_formed_json_with_bad_envelope_is_not_a_parse_error() {
+        // Missing jsonrpc: parses fine, but the envelope is invalid.
+        let req = parse_request(r#"{"method":"sessions.list"}"#)
+            .unwrap()
+            .unwrap();
+        assert!(req.validate_envelope().is_err());
+        // Wrong jsonrpc version.
+        let req = parse_request(r#"{"jsonrpc":"1.0","method":"sessions.list"}"#)
+            .unwrap()
+            .unwrap();
+        assert!(req.validate_envelope().is_err());
+        // Missing method.
+        let req = parse_request(r#"{"jsonrpc":"2.0"}"#).unwrap().unwrap();
+        assert!(req.validate_envelope().is_err());
     }
 
     #[test]
