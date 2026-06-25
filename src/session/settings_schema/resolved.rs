@@ -13,7 +13,7 @@
 use serde::Serialize;
 use serde_json::Value;
 
-use super::{runtime_schema, section_plugin_id};
+use super::{runtime_schema, section_plugin_id, FieldDescriptor};
 
 /// Where a resolved value came from.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -62,24 +62,38 @@ fn split_key(key: &str) -> Option<(&str, &str)> {
 pub fn resolve(key: &str) -> Option<ResolvedSetting> {
     let cfg = serde_json::to_value(crate::session::Config::load_or_warn()).ok()?;
     let default_cfg = serde_json::to_value(crate::session::Config::default()).ok()?;
-    resolve_with(key, &cfg, &default_cfg)
+    resolve_with(key, &cfg, &default_cfg, &runtime_schema())
 }
 
 /// Resolve every known setting (core plus active-plugin). Used by
-/// `GET /api/settings/resolved`. Loads the config once for the whole set.
+/// `GET /api/settings/resolved`. Loads the config and builds the schema once
+/// for the whole set rather than per field.
 pub fn resolve_all() -> Vec<ResolvedSetting> {
     let cfg = serde_json::to_value(crate::session::Config::load_or_warn()).unwrap_or(Value::Null);
     let default_cfg =
         serde_json::to_value(crate::session::Config::default()).unwrap_or(Value::Null);
-    runtime_schema()
+    let schema = runtime_schema();
+    schema
         .iter()
-        .filter_map(|d| resolve_with(&format!("{}.{}", d.section, d.field), &cfg, &default_cfg))
+        .filter_map(|d| {
+            resolve_with(
+                &format!("{}.{}", d.section, d.field),
+                &cfg,
+                &default_cfg,
+                &schema,
+            )
+        })
         .collect()
 }
 
-fn resolve_with(key: &str, cfg: &Value, default_cfg: &Value) -> Option<ResolvedSetting> {
+fn resolve_with(
+    key: &str,
+    cfg: &Value,
+    default_cfg: &Value,
+    schema: &[FieldDescriptor],
+) -> Option<ResolvedSetting> {
     let (section, field) = split_key(key)?;
-    if !runtime_schema()
+    if !schema
         .iter()
         .any(|d| d.section == section && d.field == field)
     {
