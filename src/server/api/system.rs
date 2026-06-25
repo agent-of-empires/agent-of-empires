@@ -307,6 +307,20 @@ pub async fn get_settings_schema() -> Json<Vec<crate::session::settings_schema::
     Json(runtime_schema())
 }
 
+/// `GET /api/settings/resolved` returns every setting's effective value plus
+/// its provenance chain (user value > highest-priority plugin default > schema
+/// default for core; stored value > manifest default for plugin settings). The
+/// dashboard uses it to show where a value comes from. Pure metadata derived
+/// from the same schema the surfaces render, so only normal authentication.
+pub async fn get_settings_resolved() -> Json<Vec<crate::session::settings_schema::ResolvedSetting>>
+{
+    Json(
+        tokio::task::spawn_blocking(crate::session::settings_schema::resolve_all)
+            .await
+            .unwrap_or_default(),
+    )
+}
+
 /// Body of `PATCH /api/theme`. Either field may be omitted to leave it
 /// unchanged.
 #[derive(serde::Deserialize)]

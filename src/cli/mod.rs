@@ -23,6 +23,7 @@ pub mod send;
 #[cfg(feature = "serve")]
 pub mod serve;
 pub mod session;
+pub mod settings;
 pub mod sounds;
 pub mod status;
 pub mod telemetry;

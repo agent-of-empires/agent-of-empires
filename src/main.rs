@@ -255,6 +255,7 @@ async fn main() -> Result<()> {
                 ThemeCommands::Dir => cli::theme::run_dir(),
             };
         }
+        Some(Commands::Settings { command }) => return cli::settings::run(command),
         Some(Commands::Telemetry { command }) => return cli::telemetry::run(command),
         Some(Commands::Mcp { command }) => {
             let profile = cli.profile.clone().unwrap_or_default();

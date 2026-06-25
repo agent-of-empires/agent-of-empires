@@ -22,6 +22,7 @@ mod merge;
 mod plugin;
 mod policy;
 mod registry;
+mod resolved;
 mod validate;
 
 pub use merge::{clear_path, merge_json};
@@ -31,6 +32,7 @@ pub use plugin::{
 };
 pub use policy::{strip_local_only, validate_patch, validate_patch_with, PatchRejection, Scope};
 pub use registry::{descriptor, runtime_schema, schema};
+pub use resolved::{resolve, resolve_all, Candidate, ResolvedSetting, SettingSource};
 pub use validate::{validate_value, ValidationError};
 
 /// Widget the surfaces render for a field. The variant carries everything a
