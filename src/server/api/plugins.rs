@@ -59,6 +59,19 @@ pub async fn list_plugins() -> Json<serde_json::Value> {
     }))
 }
 
+/// `GET /api/plugins/ui-state`: the plugin host's aggregated UI-state snapshot
+/// (the slots workers have pushed, plus the notification ring). Empty when no
+/// host is running (read-only mode, or a TUI-only build with no daemon). The
+/// dashboard polls this alongside `/api/sessions` and renders each slot itself.
+pub async fn plugin_ui_state(
+    State(state): State<std::sync::Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    match state.plugin_host.as_ref().map(|h| h.ui_snapshot()) {
+        Some(snapshot) => Json(serde_json::to_value(snapshot).unwrap_or_else(|_| json!(null))),
+        None => Json(json!({ "entries": [], "notifications": [] })),
+    }
+}
+
 #[derive(Deserialize)]
 pub struct SetEnabledBody {
     pub enabled: bool,
