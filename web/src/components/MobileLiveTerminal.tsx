@@ -1022,8 +1022,17 @@ export function MobileLiveTerminal({
           lineHeight: `${lineH}px`,
           background: "var(--term-bg, #1c1c1f)",
           color: "var(--term-fg, #e4e4e7)",
+          // A terminal is a fixed grid: never ligate or substitute contextual
+          // glyphs (e.g. `->`, `!=`, `==`), which would merge cells and read as
+          // fuzz. Inherited by the row spans below.
+          fontVariantLigatures: "none",
+          fontFeatureSettings: '"liga" 0, "calt" 0',
           overscrollBehavior: "contain",
-          WebkitOverflowScrolling: "touch",
+          // Do NOT set `-webkit-overflow-scrolling: touch` here. It promotes
+          // this opaque scroll region to a composited layer that macOS/iOS
+          // Safari rasterizes at 1x, making the DOM terminal text look
+          // pixelated/low-res. It is deprecated and a no-op on iOS 13+
+          // (momentum scrolling is always on), so omitting it costs nothing.
           // The spacer model keeps above-viewport pixels invariant by
           // construction, so a preserved scrollTop is always correct.
           // The browser's own scroll anchoring doesn't know that: when
