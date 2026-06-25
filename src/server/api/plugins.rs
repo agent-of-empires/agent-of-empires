@@ -67,7 +67,7 @@ pub async fn plugin_ui_state(
     State(state): State<std::sync::Arc<AppState>>,
 ) -> Json<serde_json::Value> {
     match state.plugin_host.as_ref().map(|h| h.ui_snapshot()) {
-        Some(snapshot) => Json(serde_json::to_value(snapshot).unwrap_or_else(|_| json!(null))),
+        Some(snapshot) => Json(serde_json::to_value(snapshot).unwrap_or(serde_json::Value::Null)),
         None => Json(json!({ "entries": [], "notifications": [] })),
     }
 }
