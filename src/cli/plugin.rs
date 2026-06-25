@@ -132,6 +132,18 @@ fn run_info(id: &str) -> Result<()> {
     if !m.description.is_empty() {
         println!("  about:      {}", m.description);
     }
+    if !m.keybinds.is_empty() {
+        println!("  keybinds:");
+        for kb in &m.keybinds {
+            // A core binding on the same chord always wins; flag the conflict so
+            // the author knows the plugin keybind will never fire (#2094).
+            let shadowed = crate::tui::home::bindings::parse_chord(&kb.key)
+                .map(|c| crate::tui::home::bindings::core_shadows(&c))
+                .unwrap_or(false);
+            let note = if shadowed { "  (shadowed by core)" } else { "" };
+            println!("    {} -> {}{note}", kb.key, kb.command);
+        }
+    }
     Ok(())
 }
 

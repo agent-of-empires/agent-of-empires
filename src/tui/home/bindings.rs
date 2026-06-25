@@ -81,7 +81,7 @@ pub enum ActionId {
 /// the uppercase letter `code` (terminals deliver `Shift+d` as `Char('D')`,
 /// and iOS Mosh delivers a bare uppercase keycode with no Shift modifier, so
 /// matching on the uppercase code rather than a Shift flag covers both).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Chord {
     pub code: KeyCode,
     pub ctrl: bool,
@@ -194,6 +194,118 @@ pub fn resolve(key: &KeyEvent, strict: bool, ctx: &Ctx) -> Option<ActionId> {
         }
     }
     None
+}
+
+/// A plugin-contributed action a key resolved to: a plugin id plus the command
+/// the keybind targets. At Tier 0 there is no executor, so resolving one is
+/// inspectable (and surfaces a "needs runtime" notice) but not yet runnable;
+/// the executor lands with the runtime host (#2095).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginAction {
+    pub plugin_id: String,
+    pub action: String,
+}
+
+impl PluginAction {
+    /// Canonical external name, `plugin.<id>.<action>`.
+    pub fn canonical(&self) -> String {
+        format!("plugin.{}.{}", self.plugin_id, self.action)
+    }
+}
+
+/// The merged resolver's result: a core action, or a plugin action. Core always
+/// shadows a plugin binding on the same chord (core is resolved first).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedAction {
+    Core(ActionId),
+    Plugin(PluginAction),
+}
+
+/// Resolve a key across the merged core + plugin binding tables. Core bindings
+/// (the static [`BINDINGS`] table, honoring strict mode and context) are tried
+/// first and always win; only then are active plugins' declared keybinds
+/// consulted. Returns `None` if nothing claims the chord.
+pub fn resolve_action(key: &KeyEvent, strict: bool, ctx: &Ctx) -> Option<ResolvedAction> {
+    if let Some(id) = resolve(key, strict, ctx) {
+        return Some(ResolvedAction::Core(id));
+    }
+    for (chord, action) in plugin_bindings() {
+        if chord_matches(&chord, key) {
+            return Some(ResolvedAction::Plugin(action));
+        }
+    }
+    None
+}
+
+/// The active plugins' declared keybinds, parsed into `(chord, action)`. A
+/// keybind whose key string does not parse is skipped (its conflict-free state
+/// is surfaced by `aoe plugin info`).
+// ponytail: rebuilt per unmatched keypress; the active set is tiny and this is
+// not a hot path. Cache behind the registry generation if that ever changes.
+fn plugin_bindings() -> Vec<(Chord, PluginAction)> {
+    let mut out = Vec::new();
+    for p in crate::plugin::registry().active() {
+        for kb in &p.manifest.keybinds {
+            if let Some(chord) = parse_chord(&kb.key) {
+                out.push((
+                    chord,
+                    PluginAction {
+                        plugin_id: p.id().to_string(),
+                        action: kb.command.clone(),
+                    },
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// Parse a key-chord string like `Ctrl+K`, `Shift+D`, `F5`, or `q` into a
+/// [`Chord`]. Supports `Ctrl`/`Shift` modifiers, single characters, and
+/// function keys. Returns `None` for anything else.
+pub fn parse_chord(s: &str) -> Option<Chord> {
+    let mut ctrl = false;
+    let mut shift = false;
+    let mut key: Option<&str> = None;
+    for tok in s.split('+').map(str::trim).filter(|t| !t.is_empty()) {
+        match tok.to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => ctrl = true,
+            "shift" => shift = true,
+            _ => key = Some(tok),
+        }
+    }
+    let key = key?;
+    let code = if key.len() == 1 {
+        // Match the table's convention: bare letters are lowercase chars, Shift
+        // is encoded as the uppercase char (terminals deliver Ctrl+k as a
+        // lowercase Char with the CONTROL modifier, Shift+d as Char('D')).
+        let c = key.chars().next().unwrap();
+        let c = if shift {
+            c.to_ascii_uppercase()
+        } else {
+            c.to_ascii_lowercase()
+        };
+        KeyCode::Char(c)
+    } else if let Some(n) = key
+        .strip_prefix(['F', 'f'])
+        .and_then(|n| n.parse::<u8>().ok())
+    {
+        KeyCode::F(n)
+    } else {
+        return None;
+    };
+    Some(Chord { code, ctrl })
+}
+
+/// Whether a core binding already claims `chord` in either mode. Used by
+/// `aoe plugin info` to flag a plugin keybind that core shadows.
+pub fn core_shadows(chord: &Chord) -> bool {
+    BINDINGS.iter().any(|b| {
+        b.non_strict
+            .iter()
+            .chain(b.strict)
+            .any(|c| c.code == chord.code && c.ctrl == chord.ctrl)
+    })
 }
 
 /// Human-readable label for a binding's primary chord in the given mode, e.g.
@@ -815,6 +927,71 @@ mod tests {
 
     fn ctrl_key(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn parse_chord_handles_modifiers_and_keys() {
+        assert_eq!(
+            parse_chord("Ctrl+K"),
+            Some(Chord {
+                code: KeyCode::Char('k'),
+                ctrl: true
+            })
+        );
+        assert_eq!(
+            parse_chord("Shift+D"),
+            Some(Chord {
+                code: KeyCode::Char('D'),
+                ctrl: false
+            })
+        );
+        assert_eq!(
+            parse_chord("q"),
+            Some(Chord {
+                code: KeyCode::Char('q'),
+                ctrl: false
+            })
+        );
+        assert_eq!(
+            parse_chord("F5"),
+            Some(Chord {
+                code: KeyCode::F(5),
+                ctrl: false
+            })
+        );
+        assert_eq!(parse_chord(""), None);
+        assert_eq!(parse_chord("Ctrl+"), None);
+    }
+
+    #[test]
+    fn core_shadows_known_core_chords() {
+        // `q` is the Quit binding; an unbound chord is not shadowed.
+        assert!(core_shadows(&parse_chord("q").unwrap()));
+        assert!(!core_shadows(&Chord {
+            code: KeyCode::Char('z'),
+            ctrl: true
+        }));
+    }
+
+    #[test]
+    fn resolve_action_wraps_core_bindings() {
+        // With no active plugins in the test process, the merged resolver just
+        // returns the core action, wrapped as Core.
+        let c = ctx();
+        assert_eq!(
+            resolve_action(&key('q'), false, &c),
+            Some(ResolvedAction::Core(ActionId::Quit))
+        );
+        assert_eq!(resolve_action(&ctrl_key('z'), false, &c), None);
+    }
+
+    #[test]
+    fn plugin_action_canonical_is_namespaced() {
+        let a = PluginAction {
+            plugin_id: "acme.kit".to_string(),
+            action: "do-thing".to_string(),
+        };
+        assert_eq!(a.canonical(), "plugin.acme.kit.do-thing");
     }
 
     #[test]

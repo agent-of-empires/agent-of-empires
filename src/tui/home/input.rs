@@ -2250,8 +2250,22 @@ impl HomeView {
             has_search: !self.search_matches.is_empty(),
             project_group_selected: self.project_group_at_cursor().is_some(),
         };
-        if let Some(id) = bindings::resolve(&key, self.strict_hotkeys, &ctx) {
-            return self.run_action(id, update_info);
+        match bindings::resolve_action(&key, self.strict_hotkeys, &ctx) {
+            Some(bindings::ResolvedAction::Core(id)) => return self.run_action(id, update_info),
+            Some(bindings::ResolvedAction::Plugin(action)) => {
+                // Tier 0 has no plugin executor; the binding resolves and is
+                // inspectable, but running it waits for the runtime host (#2095).
+                self.info_dialog = Some(InfoDialog::sized_to_fit(
+                    "Plugin action",
+                    &format!(
+                        "{} is a plugin action. Running plugin actions needs the plugin runtime, \
+                         which is not available yet.",
+                        action.canonical()
+                    ),
+                ));
+                return None;
+            }
+            None => {}
         }
 
         // Navigation / structural keys: identical in both modes, never relocate.
