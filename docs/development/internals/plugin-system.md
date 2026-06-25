@@ -459,13 +459,63 @@ capability grant prompt states this on every install. Restricted-environment,
 landlock, and `sandbox-exec` backends land later behind the same trait, with no
 change to the resolver or the supervisor.
 
+## UI extension points (#2366)
+
+A plugin worker pushes typed UI state to the host over capability-gated RPCs;
+the **host** renders every slot, on the web dashboard. No plugin code runs in
+the dashboard and the render path never awaits a worker: the host keeps an
+in-memory snapshot the dashboard reads synchronously.
+
+The nine slots are a closed `UiSlot` set (`aoe-plugin-api`), kebab-case on the
+wire: `status-bar`, `row-badge`, `row-column`, `sort-key`, `filter-facet`,
+`card`, `detail-panel`, `detail-badge`, `notification`. A plugin declares the
+`(slot, id)` pairs it may fill in its manifest `[[ui]]` section; an unknown
+slot is a hard parse error (the host must know how to render each).
+
+### RPCs (`src/plugin/host_api.rs`)
+
+- `ui.state.set { slot, id, session_id?, payload }` and
+  `ui.state.remove { slot, id, session_id? }`. Gated by `runtime.worker` **and**
+  the `(slot, id)` being declared in the manifest: no dedicated `ui` capability
+  is introduced. The `payload` is validated against the slot's typed shape and
+  stored normalized; an unknown field or bad tone is rejected. Per-session slots
+  (`row-badge`, `row-column`, `detail-panel`, `detail-badge`) require a
+  `session_id`; global slots must not carry one.
+- `ui.notify { tone, title, body?, session_id? }`. Gated by the existing
+  `notifications` capability (not a slot declaration). Returns a monotonic
+  `seq`.
+
+### Store and lifecycle (`src/plugin/ui_state.rs`)
+
+State is in-memory and dies with the daemon, like the rest of the Tier 1 host.
+Each worker spawn takes a *generation*; a plugin's entries are cleared when its
+worker exits, guarded by the generation so a late write or an instant respawn
+cannot resurrect or clobber the live worker's state. Notifications ride a
+separate bounded ring and survive a worker exit (a plugin that posts then
+crashes still reaches the browser). Per-plugin quotas bound memory.
+
+### Delivery
+
+`GET /api/plugins/ui-state` returns the full snapshot (entries grouped nowhere,
+plus the notification ring); it is small and bounded, so there is no
+incremental cursor. The dashboard polls it on the same cadence as
+`/api/sessions` and renders per-session entries only for sessions present in
+the live list. Notifications surface as toasts, deduped by `seq`.
+
+`sort-key` and `filter-facet` are accepted and stored by the host but their
+dashboard rendering (which needs changes to the sidebar's sort/filter core),
+and TUI rendering of any slot (the standalone TUI has no daemon link), are
+deferred to follow-ups.
+
 ## What comes next
 
 Each deferred piece returns as its own PR once the core is proven: the Tier 0
-contribution registries and the command/keybind/UI surfaces (issues 2094 and
-2366), the builtin worker self-exec path and worker SDK (with the first builtin
-worker that needs them), and the discovery / featured supply-chain layer with
-integrity hashing (issues 2364 and 2365). Pinning a featured plugin's
+contribution registries (issue 2094), the UI extension points (issue 2366,
+above), the builtin worker self-exec path and worker SDK (with the first
+builtin worker that needs them), and the discovery / featured supply-chain
+layer with integrity hashing (issues 2364 and 2365). Within #2366, dashboard
+rendering of the `sort-key` and `filter-facet` slots and TUI rendering of any
+slot are themselves follow-ups. Pinning a featured plugin's
 release-binary asset hash in `featured.toml` (so a featured worker is attested,
 not just its source) is a follow-up; today a release-binary plugin cannot be
 featured.
