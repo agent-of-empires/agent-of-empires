@@ -147,9 +147,14 @@ pub struct SidecarHooks {
 pub struct SelectedAgentHooks {
     /// CLI flag a user passes to choose a named agent (e.g. `"--agent"`).
     pub flag: &'static str,
-    /// Maps a selected agent name to the home-relative path of that agent's
-    /// config file (e.g. `custom-agent` → `.kiro/agents/custom-agent.json`).
-    pub config_subpath: fn(&str) -> std::path::PathBuf,
+    /// Absolute path, under the given agents directory, of the config file the
+    /// CLI actually loads for the selected agent name. The first argument is
+    /// the agents directory to resolve within (host: `$HOME/.kiro/agents`;
+    /// sandbox: the staged `.kiro/sandbox/agents`), the second is the validated
+    /// selected agent name. Resolves by the `name` field inside each config
+    /// rather than the filename, since generator-managed agents name files
+    /// `<prefix>-<name>.json`. See [`crate::hooks::resolve_kiro_agent_file`].
+    pub resolve_config_file: fn(&std::path::Path, &str) -> std::path::PathBuf,
 }
 
 /// On-disk format of a sidecar agent's config file. Drives
@@ -720,7 +725,7 @@ pub const AGENTS: &[AgentDef] = &[
             // agent, and skip the set-default promotion above.
             selected_agent_hooks: Some(SelectedAgentHooks {
                 flag: "--agent",
-                config_subpath: crate::hooks::kiro_agent_file_for,
+                resolve_config_file: crate::hooks::resolve_kiro_agent_file,
             }),
             format: SidecarFormat::KiroJson,
         }),
@@ -1233,9 +1238,12 @@ mod tests {
             .as_ref()
             .expect("kiro declares selected_agent_hooks");
         assert_eq!(sel.flag, "--agent");
+        // With no matching agent file in the dir, the resolver falls back to
+        // `<dir>/<name>.json` (the create-path for a brand-new user agent).
+        let tmp = tempfile::TempDir::new().unwrap();
         assert_eq!(
-            (sel.config_subpath)("custom-agent"),
-            std::path::Path::new(".kiro/agents/custom-agent.json")
+            (sel.resolve_config_file)(tmp.path(), "custom-agent"),
+            tmp.path().join("custom-agent.json")
         );
         // The other sidecar agents do not (their hooks apply globally).
         for name in ["settl", "hermes"] {

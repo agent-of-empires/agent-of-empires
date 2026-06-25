@@ -1500,9 +1500,13 @@ pub(crate) fn build_container_config(
                     .as_ref()
                     .zip(agent_selection.selected_agent)
                     .and_then(|(sel, name)| {
-                        let sandbox_dir = Path::new(sidecar.sandbox_config_subpath).parent()?;
-                        let file_name = (sel.config_subpath)(name).file_name()?.to_owned();
-                        Some(home.join(sandbox_dir).join(file_name))
+                        // The selected agent's dir is staged into the sandbox
+                        // (parent of sandbox_config_subpath, e.g.
+                        // `.kiro/sandbox/agents`) before this install runs, so
+                        // the resolver can match by `name` there as on the host.
+                        let agents_dir =
+                            home.join(Path::new(sidecar.sandbox_config_subpath).parent()?);
+                        Some((sel.resolve_config_file)(&agents_dir, name))
                     })
                     .unwrap_or_else(|| home.join(sidecar.sandbox_config_subpath));
                 if let Err(e) =
@@ -3441,6 +3445,78 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
         assert!(
             !standalone.exists(),
             "standalone aoe-hooks sandbox config must not be written when an agent is selected"
+        );
+
+        crate::hooks::cleanup_hook_status_dir(instance_id);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_build_container_config_resolves_selected_kiro_agent_by_name_in_sandbox() {
+        // The host `.kiro/agents` dir is staged into `.kiro/sandbox/agents`
+        // before hook install, so a prefixed agent file (filename != name) must
+        // be resolved by its `name` field there, mirroring the host path.
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let temp_home = TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+        let host_agents = temp_home.path().join(".kiro/agents");
+        std::fs::create_dir_all(&host_agents).unwrap();
+        std::fs::write(
+            host_agents.join("TeamAgents-custom-agent.json"),
+            r#"{"name":"custom-agent","hooks":{"agentSpawn":[{"command":"team-tool emit"}]}}"#,
+        )
+        .unwrap();
+
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+
+        let instance_id = "kiro-managed-agent-sandbox-test";
+        build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &super::super::instance::SandboxInfo {
+                enabled: true,
+                container_id: None,
+                image: "test:latest".to_string(),
+                container_name: "test-container".to_string(),
+                extra_env: None,
+                custom_instruction: None,
+                before_start_env: Vec::new(),
+            },
+            ContainerAgentSelection::new("kiro", None).with_selected_agent(Some("custom-agent")),
+            false,
+            instance_id,
+            None,
+            "",
+        )
+        .unwrap();
+
+        let matched = temp_home
+            .path()
+            .join(".kiro/sandbox/agents/TeamAgents-custom-agent.json");
+        assert!(
+            matched.exists(),
+            "hooks should install into the name-matched staged file at {}",
+            matched.display()
+        );
+        let body = fs::read_to_string(&matched).unwrap();
+        assert!(
+            body.contains("aoe-hooks"),
+            "AoE hook command must be present"
+        );
+        assert!(
+            body.contains("agentSpawn"),
+            "the agent's own hook must be preserved"
+        );
+
+        let stem_clone = temp_home
+            .path()
+            .join(".kiro/sandbox/agents/custom-agent.json");
+        assert!(
+            !stem_clone.exists(),
+            "must not create a filename-stem clone the CLI never loads"
         );
 
         crate::hooks::cleanup_hook_status_dir(instance_id);

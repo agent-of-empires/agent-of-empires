@@ -2203,13 +2203,21 @@ impl Instance {
                 {
                     // The selected agent is what the CLI loads; install AoE's
                     // hooks into its config (these CLIs have no global hooks) and
-                    // skip the standalone-agent install + post_install_host.
-                    let path = home.join((sel.config_subpath)(&name));
+                    // skip the standalone-agent install + post_install_host. The
+                    // agents directory is the parent of the standalone hooks
+                    // agent's config (e.g. `.kiro/agents`); the resolver picks the
+                    // right file within it by `name`.
+                    let agents_dir = home.join(
+                        Path::new(sidecar.host_config_subpath)
+                            .parent()
+                            .unwrap_or(Path::new(".")),
+                    );
+                    let path = (sel.resolve_config_file)(&agents_dir, &name);
                     match (sidecar.install)(&path, crate::hooks::HookInstallTarget::Host) {
                         Ok(()) => tracing::info!(target: "session.store",
-                            "Installed AoE status hooks into {} agent '{}'", self.tool, name),
+                            "Installed AoE status hooks into {} agent '{}' at {}", self.tool, name, path.display()),
                         Err(e) => tracing::warn!(target: "session.store",
-                            "Failed to install AoE hooks into {} agent '{}': {}", self.tool, name, e),
+                            "Failed to install AoE hooks into {} agent '{}' at {}: {}", self.tool, name, path.display(), e),
                     }
                     return;
                 }

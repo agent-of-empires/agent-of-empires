@@ -14,6 +14,13 @@
 //! shell (`sh -lc`) that re-resolves `kiro-cli` from the real PATH, so a stub
 //! would be shadowed; `pane_start_command` captures the exact intended command
 //! regardless of whether the binary is installed.
+//!
+//! A separate test covers the other half of `--agent` support: that AoE's
+//! status hooks are installed into the agent config Kiro actually loads. Kiro
+//! resolves `--agent NAME` by the `name` field inside `~/.kiro/agents/*.json`,
+//! not the filename, so a generator-managed agent stored as
+//! `<prefix>-NAME.json` must still receive the hooks. This drives the full
+//! launch path against a seeded agents dir and asserts the on-disk result.
 
 use crate::harness::{require_tmux, TuiTestHarness};
 use serde_json::Value;
@@ -149,5 +156,72 @@ fn test_kiro_yolo_passes_trust_all_tools_after_chat() {
     assert!(
         yolo > chat,
         "--trust-all-tools must come after `kiro-cli chat`, got: {cmd:?}"
+    );
+}
+
+/// `--agent NAME` must install AoE's status hooks into the config file Kiro
+/// actually loads. Kiro resolves the agent by the `name` field inside each
+/// `~/.kiro/agents/*.json`, not the filename, and generator-managed agents are
+/// stored as `<prefix>-NAME.json`. This seeds such a file under the harness's
+/// isolated `$HOME`, launches a kiro session selecting it, and asserts the hooks
+/// merged into that prefixed file (preserving its own hook) rather than a
+/// `NAME.json` clone the CLI never reads.
+#[test]
+#[serial]
+fn test_kiro_agent_hooks_install_into_name_matched_file() {
+    require_tmux!();
+
+    let mut h = TuiTestHarness::new("kiro_agent_hooks");
+
+    // Seed a generator-managed agent whose filename stem differs from its
+    // logical `name`. Its only hook is the generator's own agentSpawn: AoE's
+    // three events are absent, so finding them post-launch proves the install
+    // ran against this file (not stale state) and that agentSpawn is preserved.
+    let agents_dir = h.home_path().join(".kiro").join("agents");
+    std::fs::create_dir_all(&agents_dir).expect("create .kiro/agents");
+    let managed = agents_dir.join("TeamAgents-custom-agent.json");
+    std::fs::write(
+        &managed,
+        r#"{"name":"custom-agent","hooks":{"agentSpawn":[{"command":"team-tool emit"}]}}"#,
+    )
+    .expect("seed managed agent file");
+
+    // Guard kills the tmux session on scope exit; the launch command itself is
+    // covered by the sibling tests, so only the on-disk result matters here.
+    let _guard = launch_kiro_and_read_command(
+        &mut h,
+        "KiroAgentHooks",
+        &["--extra-args", "--agent custom-agent"],
+    )
+    .1;
+
+    let installed: Value = serde_json::from_str(
+        &std::fs::read_to_string(&managed).expect("managed agent file still present"),
+    )
+    .expect("managed agent file is valid JSON");
+    let hooks = installed["hooks"]
+        .as_object()
+        .expect("hooks object present after install");
+    for event in ["preToolUse", "userPromptSubmit", "stop"] {
+        assert!(
+            hooks.contains_key(event),
+            "AoE status hook '{event}' must be installed into the name-matched file, got: {:?}",
+            hooks.keys().collect::<Vec<_>>()
+        );
+    }
+    assert!(
+        hooks.contains_key("agentSpawn"),
+        "the agent's own agentSpawn hook must be preserved"
+    );
+    assert_eq!(
+        installed["name"].as_str(),
+        Some("custom-agent"),
+        "the agent's name field must be left intact"
+    );
+
+    // And NOT into a filename-stem clone the CLI would never load.
+    assert!(
+        !agents_dir.join("custom-agent.json").exists(),
+        "must not create a `custom-agent.json` clone derived from the filename stem"
     );
 }

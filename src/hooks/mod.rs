@@ -1788,9 +1788,13 @@ pub fn install_kiro_hooks(agent_config_path: &Path, target: HookInstallTarget) -
 
         let before = config.clone();
 
+        let default_name = agent_config_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(KIRO_HOOKS_AGENT_NAME);
         config
             .entry("name".to_string())
-            .or_insert_with(|| Value::String(KIRO_HOOKS_AGENT_NAME.to_string()));
+            .or_insert_with(|| Value::String(default_name.to_string()));
         config
             .entry("tools".to_string())
             .or_insert_with(|| serde_json::json!(["*"]));
@@ -1836,20 +1840,56 @@ pub fn install_kiro_hooks(agent_config_path: &Path, target: HookInstallTarget) -
     })
 }
 
-/// Home-relative path to a user's Kiro agent config file by name, e.g.
-/// `custom-agent` → `.kiro/agents/custom-agent.json`. Wired into `kiro`'s
-/// [`crate::agents::SelectedAgentHooks::config_subpath`] so the install site can
-/// target the selected agent's own file. The caller is responsible for
-/// validating `name` (see [`crate::agents::parse_selected_agent`], which rejects
-/// path separators) before joining to `$HOME`.
+/// Resolve which file under `agents_dir` holds the agent Kiro loads for
+/// `--agent <name>`, returning the path AoE installs its status hooks into.
 ///
-/// Installing into this path reuses [`install_kiro_hooks`], which preserves any
-/// existing user hooks and is idempotent; [`uninstall_kiro_hooks`] strips only
-/// the AoE-tagged entries.
-pub fn kiro_agent_file_for(name: &str) -> PathBuf {
-    Path::new(".kiro")
-        .join("agents")
-        .join(format!("{name}.json"))
+/// Kiro resolves `--agent <name>` by the `name` field inside each
+/// `<agents_dir>/*.json`, not by the filename stem. Generators (plugin/managed
+/// agent tooling) render files as `<prefix>-<name>.json`, so filename and
+/// logical name diverge; assuming `filename == name` installs into a file Kiro
+/// never loads and status detection silently fails. Matching the `name` field
+/// is therefore mandatory, not a nicety.
+///
+/// Falls back to `<agents_dir>/<name>.json` when no file declares that name:
+/// the correct create-path for a brand-new agent, which Kiro then reads `name`
+/// from. The caller validates `name` (rejecting path separators and `..`, see
+/// [`crate::agents::parse_selected_agent`]) so the fallback stays inside
+/// `agents_dir`.
+pub fn resolve_kiro_agent_file(agents_dir: &Path, name: &str) -> PathBuf {
+    if let Some(path) = find_kiro_agent_file_by_name(agents_dir, name) {
+        return path;
+    }
+    agents_dir.join(format!("{name}.json"))
+}
+
+/// First `<agents_dir>/*.json` whose top-level `name` equals `name`, or `None`.
+/// Sorted so a duplicate-name tie resolves deterministically; unreadable or
+/// non-object files are skipped rather than failing the scan. Two files
+/// declaring the same `name` is a user misconfiguration (Kiro warns about it
+/// too): we pick the lexicographically-first and `warn!` so the divergence is
+/// debuggable, since installing into the wrong one silently breaks detection.
+fn find_kiro_agent_file_by_name(agents_dir: &Path, name: &str) -> Option<PathBuf> {
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(agents_dir)
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    entries.sort();
+    let mut matches = entries.into_iter().filter(|path| {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|content| serde_json::from_str::<Value>(&content).ok())
+            .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(|n| n == name))
+            .unwrap_or(false)
+    });
+    let first = matches.next()?;
+    if let Some(second) = matches.next() {
+        tracing::warn!(target: "hooks.install",
+            "multiple Kiro agent files in {} declare name '{}' (e.g. {} and {}); \
+             installing hooks into the first. Remove the duplicate to avoid ambiguity.",
+            agents_dir.display(), name, first.display(), second.display());
+    }
+    Some(first)
 }
 
 /// Make `aoe-hooks` the active default Kiro agent if the user is still on
@@ -3575,10 +3615,90 @@ hooks_auto_accept: false
     }
 
     #[test]
-    fn test_kiro_agent_file_for() {
+    fn test_resolve_kiro_agent_file_falls_back_to_name_json_when_dir_absent() {
+        // Brand-new agent, nothing on disk yet: resolve to `<dir>/<name>.json`,
+        // the path Kiro will read the name from once the file is written.
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("agents");
         assert_eq!(
-            kiro_agent_file_for("custom-agent"),
-            Path::new(".kiro/agents/custom-agent.json")
+            resolve_kiro_agent_file(&missing, "custom-agent"),
+            missing.join("custom-agent.json")
+        );
+    }
+
+    #[test]
+    fn test_resolve_kiro_agent_file_falls_back_when_no_name_matches() {
+        // The directory exists and has files, but none declares the selected
+        // name. Fall back to the create-path so a new agent can be added.
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("something-else.json"),
+            r#"{"name":"something-else"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_kiro_agent_file(dir.path(), "custom-agent"),
+            dir.path().join("custom-agent.json")
+        );
+    }
+
+    #[test]
+    fn test_resolve_kiro_agent_file_matches_name_field_not_filename() {
+        // Regression: a generator renders the `custom-agent` agent under a
+        // prefixed filename, so the file Kiro loads for `--agent custom-agent`
+        // is name-matched, not stem-matched. The resolver must return it and
+        // ignore a decoy whose stem matches but whose `name` does not.
+        let dir = TempDir::new().unwrap();
+        let managed_file = dir.path().join("TeamAgents-custom-agent.json");
+        std::fs::write(
+            &managed_file,
+            r#"{"name":"custom-agent","hooks":{"agentSpawn":[{"command":"team-tool emit"}]}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("custom-agent.json"),
+            r#"{"name":"aoe-hooks"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_kiro_agent_file(dir.path(), "custom-agent"),
+            managed_file,
+            "must resolve by the JSON name field, not the filename stem"
+        );
+    }
+
+    #[test]
+    fn test_resolve_kiro_agent_file_ignores_non_json_and_invalid_files() {
+        // Unreadable-as-JSON and non-.json files in the dir must not break the
+        // scan or produce a false match.
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "name: custom-agent").unwrap();
+        std::fs::write(dir.path().join("broken.json"), "{ not json").unwrap();
+        let good = dir.path().join("AcmePkg-custom-agent.json");
+        std::fs::write(&good, r#"{"name":"custom-agent"}"#).unwrap();
+        assert_eq!(resolve_kiro_agent_file(dir.path(), "custom-agent"), good);
+    }
+
+    #[test]
+    fn test_resolve_kiro_agent_file_duplicate_names_pick_lexicographic_first() {
+        // Two files declaring the same name is a misconfiguration; resolution
+        // must be deterministic (lexicographically-first filename) so the
+        // install target does not flip between launches.
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("ZZZ-custom.json"),
+            r#"{"name":"custom-agent"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("AAA-custom.json"),
+            r#"{"name":"custom-agent"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_kiro_agent_file(dir.path(), "custom-agent"),
+            dir.path().join("AAA-custom.json"),
         );
     }
 
@@ -3586,13 +3706,16 @@ hooks_auto_accept: false
     fn test_install_into_selected_kiro_agent_creates_file() {
         // No pre-existing agent file: installing into the selected agent's path
         // creates it with AoE hooks, just like the dedicated aoe-hooks agent.
-        // Mirrors how `install_sidecar_host_hooks` composes the path helper with
+        // Mirrors how `install_sidecar_host_hooks` resolves the path then calls
         // the sidecar installer.
-        let home = TempDir::new().unwrap();
-        let path = home.path().join(kiro_agent_file_for("custom-agent"));
+        let agents_dir = TempDir::new().unwrap();
+        let path = resolve_kiro_agent_file(agents_dir.path(), "custom-agent");
         install_kiro_hooks(&path, HookInstallTarget::Host).unwrap();
 
         let config: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        // The created file's name must match the selected agent, not the
+        // standalone "aoe-hooks" default, so Kiro loads it for --agent custom-agent.
+        assert_eq!(config["name"].as_str(), Some("custom-agent"));
         for (event, _) in KIRO_HOOKS {
             let entries = config["hooks"][event].as_array().unwrap();
             assert_eq!(
@@ -3608,15 +3731,21 @@ hooks_auto_accept: false
     #[test]
     fn test_install_into_selected_kiro_agent_preserves_user_config() {
         // A real user agent has its own name/prompt/tools/hooks. Installing must
-        // keep all of that and only add AoE hook entries.
-        let home = TempDir::new().unwrap();
-        let path = home.path().join(kiro_agent_file_for("custom-agent"));
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // keep all of that and only add AoE hook entries. The file uses the
+        // `<prefix>-<name>.json` generator convention to prove the resolver
+        // targets it by `name` rather than the filename stem.
+        let agents_dir = TempDir::new().unwrap();
         std::fs::write(
-            &path,
+            agents_dir.path().join("CustomPkg-custom-agent.json"),
             r#"{"name":"custom-agent","prompt":"custom helper","tools":["read","shell"],"hooks":{"preToolUse":[{"command":"echo mine"}]}}"#,
         )
         .unwrap();
+        let path = resolve_kiro_agent_file(agents_dir.path(), "custom-agent");
+        assert_eq!(
+            path,
+            agents_dir.path().join("CustomPkg-custom-agent.json"),
+            "resolver must target the name-matched file, not custom-agent.json"
+        );
 
         install_kiro_hooks(&path, HookInstallTarget::Host).unwrap();
 
