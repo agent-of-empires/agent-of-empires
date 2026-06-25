@@ -17,4 +17,6 @@
 #   source = "gh:agent-of-empires/example"
 #   tree_hash = "sha256:<hex>"
 
-[plugins]
+[plugins."agent-of-empires.github"]
+source = "gh:agent-of-empires/plugin-github"
+tree_hash = "sha256:f5f204416197c99c47f46d1e0d5c7f16cbc95150bf6a8b7ad2420851886d974b"
