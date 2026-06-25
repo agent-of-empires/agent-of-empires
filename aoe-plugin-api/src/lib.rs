@@ -3,10 +3,12 @@
 //! This crate is the stable surface a plugin author (and the in-tree host)
 //! compiles against: the `aoe-plugin.toml` manifest schema, the capability
 //! taxonomy, and the validation rules that gate a manifest before it loads.
-//! The contribution sections (capabilities, commands, keybinds, settings, ui,
-//! runtime worker) are defined here but consumed by follow-up PRs (#2094 /
-//! #2095 / #2366). Themes, status, and panes are deferred until a consumer
-//! exists. See `docs/development/internals/plugin-system.md`.
+//! The contribution sections (capabilities, commands, keybinds, settings,
+//! themes, ui, runtime worker) are defined here. Settings and themes are
+//! consumed by the Tier 0 registries (#2094); keybinds/commands resolve and
+//! graft at Tier 0 but execute only with the runtime host (#2095); ui slots
+//! land with #2366. Status and panes are deferred until a consumer exists
+//! (#2386). See `docs/development/internals/plugin-system.md`.
 
 mod capability;
 mod id;
@@ -16,7 +18,7 @@ pub use capability::{CapabilityId, TrustLevel, KNOWN_CAPABILITIES};
 pub use id::{InvalidPluginId, PluginId};
 pub use manifest::{
     CommandContribution, KeybindContribution, ManifestError, PluginManifest, RuntimeSpec,
-    SettingContribution, UiContribution,
+    SettingContribution, SettingType, ThemeContribution, UiContribution,
 };
 
 /// Version of the manifest schema and host API this crate describes.

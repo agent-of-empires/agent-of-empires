@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -38,10 +40,25 @@ pub struct PluginManifest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub keybinds: Vec<KeybindContribution>,
 
-    /// Settings the plugin declares. The typed schema that validates and
-    /// renders them lands with #2094.
+    /// Settings the plugin declares. Each is a typed field the host renders in
+    /// the settings surfaces (TUI / web) and persists under
+    /// `[plugins."<id>".settings]`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub settings: Vec<SettingContribution>,
+
+    /// Default overrides the plugin applies to *core* settings, keyed by the
+    /// core canonical path (`"theme.idle_decay_minutes"`). Resolution layers a
+    /// user value over the highest-priority active plugin override over the core
+    /// schema default; see the host's settings resolution (#2094). A plugin
+    /// cannot override another plugin's settings at Tier 0.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub setting_defaults: BTreeMap<String, toml::Value>,
+
+    /// Color themes the plugin ships. Each `path` is a theme TOML relative to
+    /// the plugin's install directory; the host adds them to the theme picker
+    /// (#2094).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub themes: Vec<ThemeContribution>,
 
     /// UI slots the plugin renders into. Consumed by #2366.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -73,8 +90,10 @@ pub struct KeybindContribution {
     pub key: String,
 }
 
-/// A setting the plugin declares. The typed schema arrives with #2094; here it
-/// is just the key and human-facing labels.
+/// A setting the plugin declares. The host renders it on every settings surface
+/// and persists its value under `[plugins."<id>".settings.<key>]`. The fields
+/// map directly onto the host's settings schema (widget + validation) without
+/// this crate depending on host types.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SettingContribution {
     pub key: String,
@@ -82,6 +101,50 @@ pub struct SettingContribution {
     pub label: String,
     #[serde(default)]
     pub description: String,
+    /// Value type. Drives the rendered widget and server-side validation.
+    #[serde(rename = "type", default)]
+    pub value_type: SettingType,
+    /// Allowed values for a `select`; ignored otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<String>,
+    /// Inclusive bounds for an `integer`; ignored otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<i64>,
+    /// The plugin's declared default (the "owning manifest default" layer in
+    /// settings resolution). Absent means the type's zero value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<toml::Value>,
+    /// Group under an "Advanced" fold on the settings surfaces.
+    #[serde(default)]
+    pub advanced: bool,
+}
+
+/// The type of a plugin setting value. One declaration drives both the widget
+/// the surfaces render and the validation the server enforces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SettingType {
+    /// Free text, rendered as a text input.
+    #[default]
+    String,
+    /// On/off, rendered as a toggle.
+    Bool,
+    /// Integer, rendered as a number input (bounded by `min`/`max`).
+    Integer,
+    /// Closed set of strings, rendered as a select over `options`.
+    Select,
+}
+
+/// A color theme the plugin ships. `path` is a theme TOML relative to the
+/// plugin's install directory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThemeContribution {
+    /// Name shown in the theme picker; must not collide with a builtin.
+    pub name: String,
+    /// Theme TOML path, relative to the plugin directory.
+    pub path: String,
 }
 
 /// A UI contribution targeting a named slot.
@@ -238,6 +301,33 @@ impl PluginManifest {
             check(
                 !s.key.is_empty(),
                 format!("settings[{i}].key must not be empty"),
+            );
+            check(
+                s.value_type != SettingType::Select || !s.options.is_empty(),
+                format!("settings[{i}] is a select but declares no options"),
+            );
+            check(
+                match (s.min, s.max) {
+                    (Some(lo), Some(hi)) => lo <= hi,
+                    _ => true,
+                },
+                format!("settings[{i}].min must not exceed max"),
+            );
+        }
+        for (i, t) in self.themes.iter().enumerate() {
+            check(
+                !t.name.is_empty(),
+                format!("themes[{i}].name must not be empty"),
+            );
+            check(
+                !t.path.is_empty(),
+                format!("themes[{i}].path must not be empty"),
+            );
+        }
+        for key in self.setting_defaults.keys() {
+            check(
+                key.contains('.') && !key.starts_with('.') && !key.ends_with('.'),
+                format!("setting_defaults key {key:?} must be a dotted core path like \"section.field\""),
             );
         }
         for (i, u) in self.ui.iter().enumerate() {

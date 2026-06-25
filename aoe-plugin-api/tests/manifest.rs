@@ -1,4 +1,4 @@
-use aoe_plugin_api::{ManifestError, PluginManifest, RuntimeSpec};
+use aoe_plugin_api::{ManifestError, PluginManifest, RuntimeSpec, SettingType};
 
 #[test]
 fn minimal_manifest_parses_and_round_trips() {
@@ -76,14 +76,118 @@ id = "panel"
     assert_eq!(m.commands.len(), 1);
     assert_eq!(m.keybinds[0].key, "Ctrl+K");
     assert_eq!(m.settings[0].key, "endpoint");
+    assert_eq!(m.settings[0].value_type, SettingType::String);
     assert_eq!(m.ui[0].slot, "sidebar");
 }
 
 #[test]
+fn typed_settings_and_defaults_and_themes_parse() {
+    let toml = r#"
+id = "acme.kit"
+name = "Kit"
+version = "0.1.0"
+api_version = 2
+
+[[settings]]
+key = "enabled"
+label = "Enabled"
+type = "bool"
+default = true
+
+[[settings]]
+key = "retries"
+type = "integer"
+min = 0
+max = 10
+default = 3
+advanced = true
+
+[[settings]]
+key = "mode"
+type = "select"
+options = ["fast", "slow"]
+default = "fast"
+
+[setting_defaults]
+"theme.idle_decay_minutes" = 10
+
+[[themes]]
+name = "kit-dark"
+path = "themes/dark.toml"
+"#;
+    let m = PluginManifest::from_toml_str(toml).expect("typed contributions parse");
+    assert_eq!(m.settings[0].value_type, SettingType::Bool);
+    assert_eq!(m.settings[1].value_type, SettingType::Integer);
+    assert_eq!(m.settings[1].min, Some(0));
+    assert!(m.settings[1].advanced);
+    assert_eq!(m.settings[2].options, ["fast", "slow"]);
+    assert_eq!(
+        m.setting_defaults.get("theme.idle_decay_minutes"),
+        Some(&toml::Value::Integer(10))
+    );
+    assert_eq!(m.themes[0].name, "kit-dark");
+    assert_eq!(m.themes[0].path, "themes/dark.toml");
+}
+
+#[test]
+fn invalid_typed_settings_and_themes_collect_problems() {
+    let toml = r#"
+id = "acme.kit"
+name = "Kit"
+version = "0.1.0"
+api_version = 2
+
+[[settings]]
+key = "mode"
+type = "select"
+
+[[settings]]
+key = "n"
+type = "integer"
+min = 9
+max = 1
+
+[setting_defaults]
+"nosection" = 1
+
+[[themes]]
+name = ""
+path = ""
+"#;
+    let messages = match PluginManifest::from_toml_str(toml).unwrap_err() {
+        ManifestError::Invalid(m) => m,
+        other => panic!("expected Invalid, got {other:?}"),
+    };
+    assert!(
+        messages.iter().any(|m| m.contains("select")),
+        "{messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("min must not exceed max")),
+        "{messages:?}"
+    );
+    assert!(
+        messages.iter().any(|m| m.contains("setting_defaults key")),
+        "{messages:?}"
+    );
+    assert!(
+        messages.iter().any(|m| m.contains("themes[0].name")),
+        "{messages:?}"
+    );
+    assert!(
+        messages.iter().any(|m| m.contains("themes[0].path")),
+        "{messages:?}"
+    );
+}
+
+#[test]
 fn deferred_sections_are_rejected() {
-    // themes / status / panes are deferred until a consumer exists; with
-    // deny_unknown_fields a manifest declaring one must fail to parse.
-    for section in ["themes", "status", "panes"] {
+    // status / panes are still deferred until a consumer exists (#2386); with
+    // deny_unknown_fields a manifest declaring one must fail to parse. themes
+    // is now consumed (#2094) and parses, asserted above.
+    for section in ["status", "panes"] {
         let toml = format!(
             r#"
 id = "acme.thing"
