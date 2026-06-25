@@ -340,8 +340,18 @@ pub(in crate::tui) fn format_target_label(title: &str, target: LiveSendTarget) -
 pub(super) enum TmuxAction {
     Literal(String),
     Named(String),
+    /// `send-keys -N <count> <name>`: the named key repeated `count` times
+    /// in one fork. Consecutive runs of the same key (e.g. several wheel
+    /// notches drained in one batch) fold their counts together.
+    NamedRepeat {
+        name: String,
+        count: usize,
+    },
     HexBytes(Vec<u8>),
-    Resize { cols: u16, rows: u16 },
+    Resize {
+        cols: u16,
+        rows: u16,
+    },
 }
 
 /// Fold a batch of `WorkerMsg`s into the smallest sequence of
@@ -365,6 +375,16 @@ pub(super) fn coalesce(batch: Vec<WorkerMsg>) -> Vec<TmuxAction> {
             WorkerMsg::Send(TmuxKey::Named(name)) => {
                 flush(&mut out, &mut run);
                 out.push(TmuxAction::Named(name));
+            }
+            WorkerMsg::Send(TmuxKey::NamedRepeat { name, count }) => {
+                flush(&mut out, &mut run);
+                match out.last_mut() {
+                    Some(TmuxAction::NamedRepeat {
+                        name: prev_name,
+                        count: prev_count,
+                    }) if *prev_name == name => *prev_count += count,
+                    _ => out.push(TmuxAction::NamedRepeat { name, count }),
+                }
             }
             WorkerMsg::Send(TmuxKey::HexBytes(bytes)) => {
                 flush(&mut out, &mut run);
@@ -893,6 +913,14 @@ fn dispatch_via_fork(tmux_name: &str, action: &TmuxAction) -> anyhow::Result<()>
         TmuxAction::Named(name) => {
             cmd.args(["send-keys", "-t", &target, name.as_str()]);
         }
+        TmuxAction::NamedRepeat { name, count } => {
+            // `-N <count>` repeats the key `count` times in one fork. tmux
+            // renders each press in the pane's current cursor-key mode, so
+            // the wheel-forward arrows honor DECCKM just like a single
+            // `Named` does.
+            let count = count.to_string();
+            cmd.args(["send-keys", "-t", &target, "-N", &count, name.as_str()]);
+        }
         TmuxAction::HexBytes(bytes) => {
             // `-H` sends each subsequent arg as the hex byte value of an
             // ASCII character. We use this for control bytes (CR, TAB,
@@ -978,13 +1006,22 @@ pub(super) enum LiveDispatch {
 
 /// How the translator wants the keystroke delivered. `Literal` payloads
 /// go through `tmux send-keys -l --`, named keys through `tmux send-keys`,
-/// and `HexBytes` through `tmux send-keys -H <byte> <byte> ...` for raw
-/// bytes that can't ride a literal payload (control bytes like ESC, CR,
-/// TAB, and the bracketed-paste markers).
+/// `NamedRepeat` through `tmux send-keys -N <count>` (one fork for N
+/// presses of the same key), and `HexBytes` through
+/// `tmux send-keys -H <byte> <byte> ...` for raw bytes that can't ride a
+/// literal payload (control bytes like ESC, CR, TAB, and the
+/// bracketed-paste markers).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum TmuxKey {
     Literal(String),
     Named(String),
+    /// A named key sent `count` times in a single fork. The wheel-forward
+    /// path uses this to deliver a notch's worth of arrow presses without
+    /// one fork per press.
+    NamedRepeat {
+        name: String,
+        count: usize,
+    },
     HexBytes(Vec<u8>),
 }
 
@@ -1511,6 +1548,69 @@ mod tests {
             vec![
                 TmuxAction::Named("Up".into()),
                 TmuxAction::Named("Up".into()),
+            ]
+        );
+    }
+
+    fn snd_named_repeat(name: &str, count: usize) -> WorkerMsg {
+        WorkerMsg::Send(TmuxKey::NamedRepeat {
+            name: name.into(),
+            count,
+        })
+    }
+
+    #[test]
+    fn coalesce_same_named_repeats_fold_counts() {
+        // Several wheel notches drained in one batch collapse to a single
+        // `send-keys -N <total>` fork.
+        let out = coalesce(vec![snd_named_repeat("Up", 3), snd_named_repeat("Up", 3)]);
+        assert_eq!(
+            out,
+            vec![TmuxAction::NamedRepeat {
+                name: "Up".into(),
+                count: 6,
+            }]
+        );
+    }
+
+    #[test]
+    fn coalesce_different_named_repeats_do_not_fold() {
+        // A direction change (Up then Down) must not merge; the counts and
+        // order have to survive so the agent scrolls each way in turn.
+        let out = coalesce(vec![snd_named_repeat("Up", 3), snd_named_repeat("Down", 3)]);
+        assert_eq!(
+            out,
+            vec![
+                TmuxAction::NamedRepeat {
+                    name: "Up".into(),
+                    count: 3,
+                },
+                TmuxAction::NamedRepeat {
+                    name: "Down".into(),
+                    count: 3,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn coalesce_named_repeat_flushes_literal_run() {
+        // Order must hold: literals typed before the wheel notch flush
+        // ahead of the arrow repeat, never after it.
+        let out = coalesce(vec![
+            snd_lit("ab"),
+            snd_named_repeat("Down", 3),
+            snd_lit("cd"),
+        ]);
+        assert_eq!(
+            out,
+            vec![
+                TmuxAction::Literal("ab".into()),
+                TmuxAction::NamedRepeat {
+                    name: "Down".into(),
+                    count: 3,
+                },
+                TmuxAction::Literal("cd".into()),
             ]
         );
     }

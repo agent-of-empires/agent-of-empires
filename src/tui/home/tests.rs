@@ -8934,20 +8934,28 @@ mod scroll_pane_isolation {
         assert_eq!(env.view.preview_scroll_offset, 0);
     }
 
-    /// Guard the gate: a full-screen app WITHOUT any mouse tracking must
-    /// not get raw SGR bytes (it would read them as garbage keystrokes).
-    /// The wheel falls back to the existing capture-window scroll.
+    /// A full-screen app WITHOUT mouse tracking (e.g. Claude Code's
+    /// fullscreen renderer: `1049h` + `1007h`, no mouse) relies on the
+    /// terminal's alternate-scroll to turn the wheel into cursor keys. The
+    /// raw SGR/X10 bytes would land as garbage keystrokes, so we forward
+    /// `Up`/`Down` named keys instead and pin the preview to the live edge,
+    /// just like the mouse-tracking case. Regression test for #2407.
     #[test]
     #[serial]
-    fn wheel_over_alt_screen_without_mouse_uses_capture_scroll() {
+    fn wheel_over_alt_screen_without_mouse_forwards_arrow_keys() {
         let mut env = live_env_with_cursor(alt_screen_cursor(true, false, false));
 
         let up = env.view.handle_scroll_up(50, 10);
-        assert!(up);
-        assert!(
-            env.view.preview_scroll_offset > 10,
-            "no mouse tracking: keep the capture-window scroll (offset advances)"
+        assert!(up, "wheel over a full-screen no-mouse pane is handled");
+        assert_eq!(
+            env.view.preview_scroll_offset, 0,
+            "arrow-key forwarding pins the preview to the live edge, never the normal-buffer history"
         );
+
+        env.view.preview_scroll_offset = 10;
+        let down = env.view.handle_scroll_down(50, 10);
+        assert!(down);
+        assert_eq!(env.view.preview_scroll_offset, 0);
     }
 
     /// A full-screen app with mouse tracking but in the LEGACY (non-SGR)

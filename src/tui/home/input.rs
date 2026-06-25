@@ -223,6 +223,42 @@ fn wheel_mouse_bytes(
     }
 }
 
+/// Arrow presses delivered per wheel notch when emulating alternate-scroll
+/// for a no-mouse full-screen app. Matches tmux's own alternate-scroll step
+/// and the capture-window `STEP` in `handle_scroll_up`.
+const WHEEL_ARROW_STEP: usize = 3;
+
+/// Decide what to forward to a full-screen live-send pane for one wheel
+/// notch, or `None` to fall back to the capture-window scroll. Pure so the
+/// branch the fix turns on (named arrow keys vs. raw mouse bytes vs. no
+/// forward) is asserted directly, without standing up a worker. See
+/// `forward_wheel_to_live_pane` for the full rationale.
+fn wheel_forward_key(
+    cursor: &crate::tmux::PaneCursor,
+    up: bool,
+    pane: ratatui::layout::Rect,
+    col: u16,
+    row: u16,
+) -> Option<live_send::TmuxKey> {
+    if !cursor.alternate_on {
+        return None;
+    }
+    if cursor.mouse_tracking {
+        Some(live_send::TmuxKey::HexBytes(wheel_mouse_bytes(
+            up,
+            cursor.mouse_sgr,
+            pane,
+            col,
+            row,
+        )))
+    } else {
+        Some(live_send::TmuxKey::NamedRepeat {
+            name: if up { "Up" } else { "Down" }.to_string(),
+            count: WHEEL_ARROW_STEP,
+        })
+    }
+}
+
 fn resolve_hook_install_agent(
     tool_name: &str,
     session_config: &crate::session::config::SessionConfig,
@@ -3294,20 +3330,32 @@ impl HomeView {
     /// redraw. Scrolls do not cross pane boundaries: a wheel over the
     /// preview never moves the list cursor, even when the preview is at
     /// its scroll boundary or has no session selected.
-    /// When a live-send target is a full-screen (alternate-screen) app
-    /// that has mouse tracking on, the preview's capture-window scroll is
-    /// useless: the alternate screen has no scrollback, so growing the
-    /// window only exposes the unrelated normal-buffer history underneath
-    /// and the view bottoms out at the session's start. Instead, forward
-    /// the wheel to the app as a mouse event, exactly as a terminal does
-    /// when you wheel over a mouse-tracking pane on attach, so the app
-    /// scrolls its OWN content.
+    /// When a live-send target is a full-screen (alternate-screen) app, the
+    /// preview's capture-window scroll is useless: the alternate screen has
+    /// no scrollback, so growing the window only exposes the unrelated
+    /// normal-buffer history underneath and the view bottoms out at the
+    /// session's start. Instead, forward the wheel to the app so it scrolls
+    /// its OWN content, exactly as a terminal does on direct attach. Two
+    /// cases, branched on what the app asked for:
     ///
-    /// Gated on mouse tracking (`mouse_tracking`): with no mouse mode the
-    /// app would read the bytes as garbage keystrokes, so the caller keeps
-    /// the capture-window scroll. The encoding follows the app: SGR (1006)
-    /// when `mouse_sgr` is set, otherwise the legacy X10 encoding. Returns
-    /// true when the event was forwarded.
+    /// * **Mouse tracking on** (`mouse_tracking`): forward the wheel as a
+    ///   mouse event, the encoding following the app (SGR 1006 when
+    ///   `mouse_sgr` is set, otherwise the legacy X10 encoding).
+    /// * **Mouse tracking off**: an alternate-screen app with no mouse mode
+    ///   gets its wheel via the terminal's alternate-scroll behavior, which
+    ///   turns the wheel into cursor-key presses. tmux does this for any
+    ///   such pane on attach (`alternate-scroll`, on by default), so we
+    ///   replicate it: send `Up`/`Down` instead of raw mouse bytes (which
+    ///   the app would read as garbage keystrokes). Claude Code's fullscreen
+    ///   renderer is the motivating case: it sets `1049h` + `1007h` but
+    ///   never requests mouse tracking, and binds the arrow keys to scroll
+    ///   in that mode (#2407). `send-keys -N` renders all 3 presses in the
+    ///   pane's current application-cursor-key mode in a single fork; the
+    ///   step matches tmux's own alternate-scroll and the capture `STEP`.
+    ///
+    /// Only alternate-screen panes are forwarded; on the normal buffer the
+    /// capture-window scroll reaches real scrollback, so the caller keeps
+    /// it. Returns true when the event was forwarded.
     fn forward_wheel_to_live_pane(&self, up: bool, col: u16, row: u16) -> bool {
         if self.live_send.is_none() {
             return false;
@@ -3320,11 +3368,11 @@ impl HomeView {
             .as_ref()
             .and_then(|w| w.current_cursor());
         let Some(cursor) = cursor else { return false };
-        if !(cursor.alternate_on && cursor.mouse_tracking) {
+        let Some(key) = wheel_forward_key(&cursor, up, self.preview_text_view.pane, col, row)
+        else {
             return false;
-        }
-        let bytes = wheel_mouse_bytes(up, cursor.mouse_sgr, self.preview_text_view.pane, col, row);
-        worker.send(crate::tui::home::live_send::TmuxKey::HexBytes(bytes));
+        };
+        worker.send(key);
         true
     }
 
@@ -5199,6 +5247,83 @@ mod tests {
         assert_eq!(
             wheel_mouse_bytes(true, false, wide, 300, 300),
             vec![0x1b, b'[', b'M', 64 + 32, 223 + 32, 223 + 32]
+        );
+    }
+
+    fn cursor_for(
+        alternate_on: bool,
+        mouse_tracking: bool,
+        mouse_sgr: bool,
+    ) -> crate::tmux::PaneCursor {
+        crate::tmux::PaneCursor {
+            x: 0,
+            y: 0,
+            visible: true,
+            pane_height: 24,
+            history_size: 0,
+            pane_width: 80,
+            alternate_on,
+            mouse_tracking,
+            mouse_sgr,
+        }
+    }
+
+    /// The fix for #2407: a full-screen pane with no mouse tracking must
+    /// forward named arrow keys (repeated per notch), NOT raw mouse bytes.
+    /// Asserting the key variant guards against a regression to mouse-byte
+    /// forwarding that the preview-offset behavioral test can't catch.
+    #[test]
+    fn wheel_forward_key_no_mouse_alt_screen_is_arrow_repeat() {
+        use ratatui::layout::Rect;
+        let pane = Rect::new(0, 0, 80, 24);
+        let cursor = cursor_for(true, false, false);
+        assert_eq!(
+            wheel_forward_key(&cursor, true, pane, 10, 10),
+            Some(live_send::TmuxKey::NamedRepeat {
+                name: "Up".into(),
+                count: WHEEL_ARROW_STEP,
+            })
+        );
+        assert_eq!(
+            wheel_forward_key(&cursor, false, pane, 10, 10),
+            Some(live_send::TmuxKey::NamedRepeat {
+                name: "Down".into(),
+                count: WHEEL_ARROW_STEP,
+            })
+        );
+    }
+
+    /// A mouse-tracking full-screen pane still gets a forwarded mouse event
+    /// (SGR or legacy X10 bytes), never arrow keys.
+    #[test]
+    fn wheel_forward_key_mouse_tracking_is_hex_bytes() {
+        use ratatui::layout::Rect;
+        let pane = Rect::new(0, 0, 80, 24);
+        match wheel_forward_key(&cursor_for(true, true, true), true, pane, 10, 10) {
+            Some(live_send::TmuxKey::HexBytes(b)) => assert_eq!(b[0], 0x1b),
+            other => panic!("expected SGR HexBytes, got {other:?}"),
+        }
+        match wheel_forward_key(&cursor_for(true, true, false), true, pane, 10, 10) {
+            Some(live_send::TmuxKey::HexBytes(b)) => {
+                assert_eq!(&b[..3], &[0x1b, b'[', b'M'])
+            }
+            other => panic!("expected legacy HexBytes, got {other:?}"),
+        }
+    }
+
+    /// A normal-screen pane is never forwarded; the caller keeps the
+    /// capture-window scroll, which can reach real scrollback there.
+    #[test]
+    fn wheel_forward_key_normal_screen_is_none() {
+        use ratatui::layout::Rect;
+        let pane = Rect::new(0, 0, 80, 24);
+        assert_eq!(
+            wheel_forward_key(&cursor_for(false, false, false), true, pane, 10, 10),
+            None
+        );
+        assert_eq!(
+            wheel_forward_key(&cursor_for(false, true, true), true, pane, 10, 10),
+            None
         );
     }
 
