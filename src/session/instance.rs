@@ -2706,7 +2706,11 @@ impl Instance {
                 .session
                 .merge_hooks_into_selected_agent;
         let selected_agent = if merge_selected {
+            // Mirror the host path's agent resolution (a custom wrapper detected
+            // as kiro carries kiro's sidecar via detect_as), and the sandbox's
+            // own `resolve_active_agent`, which also falls back to detect_as.
             crate::agents::get_agent(&self.tool)
+                .or_else(|| crate::agents::get_agent(&self.detect_as))
                 .and_then(|a| a.sidecar_hooks.as_ref())
                 .and_then(|s| s.selected_agent_hooks.as_ref())
                 .and_then(|sel| {
