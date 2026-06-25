@@ -461,8 +461,20 @@ mod tests {
     fn session_meta_cas_namespace_and_list() {
         use crate::session::{Instance, Storage};
 
+        // Restore XDG_CONFIG_HOME on drop, so a failing assertion does not leak
+        // the override into the rest of the test process.
+        struct XdgGuard(Option<std::ffi::OsString>);
+        impl Drop for XdgGuard {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                    None => std::env::remove_var("XDG_CONFIG_HOME"),
+                }
+            }
+        }
+
         let tmp = tempfile::tempdir().unwrap();
-        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        let _xdg = XdgGuard(std::env::var_os("XDG_CONFIG_HOME"));
         std::env::set_var("XDG_CONFIG_HOME", tmp.path());
 
         // Seed one session in the default profile's storage.
@@ -536,10 +548,5 @@ mod tests {
         let list = dispatch(&state, &a, "sessions.list", &json!({})).unwrap();
         let sessions = list["sessions"].as_array().unwrap();
         assert!(sessions.iter().any(|s| s["id"] == json!(session_id)));
-
-        match prev {
-            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-            None => std::env::remove_var("XDG_CONFIG_HOME"),
-        }
     }
 }
