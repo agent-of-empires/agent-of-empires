@@ -116,14 +116,20 @@ pub fn discover_custom_themes() -> Vec<(String, PathBuf)> {
 /// the user dropped in their own themes dir. Names already claimed by a builtin
 /// or a user theme are filtered out.
 pub fn discover_plugin_themes() -> Vec<(String, PathBuf)> {
-    let claimed: std::collections::HashSet<String> = builtin_theme_names()
+    let mut claimed: std::collections::HashSet<String> = builtin_theme_names()
         .map(|s| s.to_string())
         .chain(discover_custom_themes().into_iter().map(|(n, _)| n))
         .collect();
-    crate::plugin::active_plugin_themes()
-        .into_iter()
-        .filter(|(name, _)| !claimed.contains(name) && !is_builtin_theme(name))
-        .collect()
+    // De-dup across plugins too: two plugins contributing the same name would
+    // otherwise show as indistinguishable picker entries, and load_theme can
+    // only resolve the first. First active plugin to claim a name wins.
+    let mut out = Vec::new();
+    for (name, path) in crate::plugin::active_plugin_themes() {
+        if claimed.insert(name.clone()) {
+            out.push((name, path));
+        }
+    }
+    out
 }
 
 /// Return the full list of available theme names: built-in themes first, then

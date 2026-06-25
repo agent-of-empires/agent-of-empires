@@ -34,7 +34,9 @@ use super::{contrast::contrast_ratio as wcag_contrast_ratio, load_theme, Theme, 
 pub enum ResolvedThemeSource {
     Builtin,
     Custom,
-    /// The requested theme name didn't match any builtin or custom
+    /// Contributed by an active plugin's manifest.
+    Plugin,
+    /// The requested theme name didn't match any builtin, custom, or plugin
     /// theme; the resolver returned the `default` builtin as a safety net.
     Fallback,
 }
@@ -130,6 +132,12 @@ fn classify_source(name: &str) -> ResolvedThemeSource {
         .any(|(n, _)| n == name)
     {
         return ResolvedThemeSource::Custom;
+    }
+    if super::discover_plugin_themes()
+        .iter()
+        .any(|(n, _)| n == name)
+    {
+        return ResolvedThemeSource::Plugin;
     }
     ResolvedThemeSource::Fallback
 }
