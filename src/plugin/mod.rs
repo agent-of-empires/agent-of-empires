@@ -27,6 +27,8 @@ pub mod host_api;
 pub mod protocol;
 #[cfg(feature = "serve")]
 pub mod sandbox;
+#[cfg(feature = "serve")]
+pub mod ui_state;
 
 // Launch resolution is pure (PATH / filesystem probing) and is shared by the
 // serve-only host and the always-present installer, which runs a plugin's
