@@ -226,6 +226,21 @@ fn str_param<'a>(params: &'a Value, key: &str) -> Result<&'a str, DispatchError>
         .ok_or_else(|| DispatchError::invalid_params(format!("missing string param {key:?}")))
 }
 
+/// An optional string param: absent or `null` is `None`, a string is `Some`, and
+/// any other JSON type is a hard error. Reading these (`session_id`, `body`)
+/// with a bare `as_str` would silently treat a non-string as absent, which can
+/// turn a malformed per-session call into a global one; rejecting keeps the wire
+/// contract honest.
+fn optional_str_param<'a>(params: &'a Value, key: &str) -> Result<Option<&'a str>, DispatchError> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value)),
+        Some(_) => Err(DispatchError::invalid_params(format!(
+            "param {key:?} must be a string"
+        ))),
+    }
+}
+
 fn events_publish(state: &HostApiState, params: &Value) -> Result<Value, DispatchError> {
     let topic = str_param(params, "topic")?;
     let payload = params
@@ -493,7 +508,7 @@ fn ui_state_set(
     let slot = parse_ui_slot(params)?;
     let id = str_param(params, "id")?;
     require_declared_slot(ctx, slot, id)?;
-    let session_id = params.get("session_id").and_then(Value::as_str);
+    let session_id = optional_str_param(params, "session_id")?;
     let payload = params
         .get("payload")
         .ok_or_else(|| DispatchError::invalid_params("missing param \"payload\""))?;
@@ -519,7 +534,7 @@ fn ui_state_remove(
     let slot = parse_ui_slot(params)?;
     let id = str_param(params, "id")?;
     require_declared_slot(ctx, slot, id)?;
-    let session_id = params.get("session_id").and_then(Value::as_str);
+    let session_id = optional_str_param(params, "session_id")?;
     state
         .ui
         .remove(&ctx.plugin_id, ctx.ui_generation, slot, id, session_id)
@@ -533,14 +548,8 @@ fn ui_notify(
     params: &Value,
 ) -> Result<Value, DispatchError> {
     let title = str_param(params, "title")?.to_string();
-    let body = params
-        .get("body")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let session_id = params
-        .get("session_id")
-        .and_then(Value::as_str)
-        .map(str::to_string);
+    let body = optional_str_param(params, "body")?.map(str::to_string);
+    let session_id = optional_str_param(params, "session_id")?.map(str::to_string);
     let tone = match params.get("tone") {
         None => Tone::Info,
         Some(v) => serde_json::from_value::<Tone>(v.clone())
