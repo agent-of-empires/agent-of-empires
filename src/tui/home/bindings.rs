@@ -207,8 +207,14 @@ pub struct PluginAction {
 }
 
 impl PluginAction {
-    /// Canonical external name, `plugin.<id>.<action>`.
+    /// Canonical external name, `plugin.<id>.<action>`. Idempotent: a manifest
+    /// keybind may already target a fully-qualified `plugin.<id>.<cmd>` command,
+    /// so an action that is already canonical is returned unchanged rather than
+    /// double-prefixed.
     pub fn canonical(&self) -> String {
+        if self.action.starts_with("plugin.") {
+            return self.action.clone();
+        }
         format!("plugin.{}.{}", self.plugin_id, self.action)
     }
 }
@@ -271,7 +277,12 @@ pub fn parse_chord(s: &str) -> Option<Chord> {
         match tok.to_ascii_lowercase().as_str() {
             "ctrl" | "control" => ctrl = true,
             "shift" => shift = true,
-            _ => key = Some(tok),
+            // Unsupported modifiers and a second key token are rejected rather
+            // than silently remapped: `Alt+K` must not collapse to a bare `k`
+            // that hijacks core navigation.
+            "alt" | "option" | "meta" | "super" | "cmd" => return None,
+            _ if key.is_none() => key = Some(tok),
+            _ => return None,
         }
     }
     let key = key?;
@@ -964,6 +975,16 @@ mod tests {
     }
 
     #[test]
+    fn parse_chord_rejects_unsupported_and_repeated_tokens() {
+        // Unknown modifiers must not collapse to a bare key that hijacks core
+        // navigation, and a chord may carry at most one key token.
+        assert_eq!(parse_chord("Alt+K"), None);
+        assert_eq!(parse_chord("Ctrl+Alt+K"), None);
+        assert_eq!(parse_chord("Ctrl+K+J"), None);
+        assert_eq!(parse_chord("Meta+K"), None);
+    }
+
+    #[test]
     fn core_shadows_known_core_chords() {
         // `q` is the Quit binding; an unbound chord is not shadowed.
         assert!(core_shadows(&parse_chord("q").unwrap()));
@@ -992,6 +1013,13 @@ mod tests {
             action: "do-thing".to_string(),
         };
         assert_eq!(a.canonical(), "plugin.acme.kit.do-thing");
+
+        // Idempotent when the manifest already targets a canonical command.
+        let already = PluginAction {
+            plugin_id: "acme.kit".to_string(),
+            action: "plugin.acme.kit.do-thing".to_string(),
+        };
+        assert_eq!(already.canonical(), "plugin.acme.kit.do-thing");
     }
 
     #[test]
