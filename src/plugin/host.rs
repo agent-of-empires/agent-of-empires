@@ -19,13 +19,14 @@
 //! per-worker respawn budget so a crash loop does not spin, and a concurrency
 //! cap. The worker's stderr drains to `<plugin-workers>/<id>.log`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use aoe_plugin_api::UiSlot;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
@@ -82,6 +83,12 @@ impl PluginHost {
             workers_dir,
             running: Mutex::new(HashMap::new()),
         }))
+    }
+
+    /// The aggregated UI-state snapshot for the web to render. Read
+    /// synchronously off the in-memory store; never awaits a worker.
+    pub fn ui_snapshot(&self) -> crate::plugin::ui_state::UiSnapshot {
+        self.api.ui_snapshot()
     }
 
     /// Launch a worker for every active plugin that declares a runtime, up to
@@ -184,6 +191,13 @@ impl PluginHost {
             .iter()
             .map(|c| c.as_str().to_string())
             .collect();
+        // The slots the plugin may push into; gates every ui.state.* call.
+        let ui_contributions: HashSet<(UiSlot, String)> = plugin
+            .manifest
+            .ui
+            .iter()
+            .map(|u| (u.slot, u.id.clone()))
+            .collect();
 
         let launch = resolve_launch(plugin, &OsLaunchResolver)?;
         let prepared = self.sandbox.prepare(&launch)?;
@@ -234,15 +248,25 @@ impl PluginHost {
 
         let stdin = child.stdin.take().context("worker stdin missing")?;
         let stdout = child.stdout.take().context("worker stdout missing")?;
+        // A fresh UI generation per spawn: every ui.state.* write the worker
+        // makes is stamped with it, so once this generation is retired below a
+        // late write cannot resurrect state, and an instant respawn owns a new
+        // generation that this worker's cleanup will not touch.
+        let ui_generation = self.api.begin_ui_generation(plugin_id);
         let ctx = PluginRpcContext {
             plugin_id: plugin_id.to_string(),
             granted_capabilities: granted,
+            ui_contributions,
+            ui_generation,
         };
         serve_connection(&self.api, &ctx, stdout, stdin).await;
 
         // The loop returned: the worker closed its stdout (exited or crashed).
-        // Reap the whole group so no forked helper is left behind, then let the
-        // caller decide whether to respawn.
+        // Drop this generation's UI state (a respawn repopulates it); guarded by
+        // the generation so it never wipes a newer worker's state. Then reap the
+        // whole group so no forked helper is left behind, and let the caller
+        // decide whether to respawn.
+        self.api.clear_ui(plugin_id, ui_generation);
         if pid != 0 {
             worker::reap_group_escalating(pid, REAP_GRACE).await;
         }
@@ -330,11 +354,15 @@ async fn serve_connection(
         let api = api.clone();
         let ctx_id = ctx.plugin_id.clone();
         let caps = ctx.granted_capabilities.clone();
+        let ui_contributions = ctx.ui_contributions.clone();
+        let ui_generation = ctx.ui_generation;
         let params = request.params.clone();
         let outcome = tokio::task::spawn_blocking(move || {
             let ctx = PluginRpcContext {
                 plugin_id: ctx_id,
                 granted_capabilities: caps,
+                ui_contributions,
+                ui_generation,
             };
             dispatch(&api, &ctx, &method, &params)
         })
@@ -394,6 +422,8 @@ mod tests {
         let ctx = PluginRpcContext {
             plugin_id: "acme.worker".to_string(),
             granted_capabilities: vec!["runtime.worker".to_string()],
+            ui_contributions: std::collections::HashSet::new(),
+            ui_generation: 0,
         };
 
         // The worker: request a forbidden method, then publish the error code it
