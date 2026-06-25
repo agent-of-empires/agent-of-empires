@@ -76,7 +76,20 @@ impl Lockfile {
         }
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
-        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+        let lockfile: Lockfile =
+            toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        // Refuse a lockfile written by a newer aoe: saving it back would silently
+        // drop fields this version does not know, breaking the forward-migration
+        // contract. The user should upgrade rather than downgrade-corrupt it.
+        if lockfile.lock_version > LOCK_VERSION {
+            anyhow::bail!(
+                "{} is lock_version {} but this aoe understands {}; upgrade aoe",
+                path.display(),
+                lockfile.lock_version,
+                LOCK_VERSION
+            );
+        }
+        Ok(lockfile)
     }
 
     /// Persist the lockfile.
