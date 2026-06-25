@@ -179,8 +179,16 @@ fn git_clone_checkout(url: &str, reference: Option<&str>, dest: &Path) -> Result
         let _ = std::fs::remove_dir_all(dest);
         run_git(&["clone", "--", url, dest_str], None)?;
         if let Some(reference) = reference {
+            // `--` separates the revision from pathspecs so a ref that begins
+            // with a dash is not parsed as a flag.
             run_git(
-                &["-c", "advice.detachedHead=false", "checkout", reference],
+                &[
+                    "-c",
+                    "advice.detachedHead=false",
+                    "checkout",
+                    reference,
+                    "--",
+                ],
                 Some(dest),
             )?;
         }
