@@ -66,20 +66,9 @@ key = "Ctrl+K"
 key = "endpoint"
 label = "Endpoint"
 
-[[themes]]
-name = "midnight"
-path = "themes/midnight.toml"
-
 [[ui]]
 slot = "sidebar"
 id = "panel"
-
-[[status]]
-id = "build"
-
-[[panes]]
-id = "logs"
-title = "Logs"
 "#;
     let m = PluginManifest::from_toml_str(toml).expect("contribution sections parse");
     assert_eq!(m.capabilities.len(), 2);
@@ -87,10 +76,33 @@ title = "Logs"
     assert_eq!(m.commands.len(), 1);
     assert_eq!(m.keybinds[0].key, "Ctrl+K");
     assert_eq!(m.settings[0].key, "endpoint");
-    assert_eq!(m.themes[0].name, "midnight");
     assert_eq!(m.ui[0].slot, "sidebar");
-    assert_eq!(m.status[0].id, "build");
-    assert_eq!(m.panes[0].title, "Logs");
+}
+
+#[test]
+fn deferred_sections_are_rejected() {
+    // themes / status / panes are deferred until a consumer exists; with
+    // deny_unknown_fields a manifest declaring one must fail to parse.
+    for section in ["themes", "status", "panes"] {
+        let toml = format!(
+            r#"
+id = "acme.thing"
+name = "Thing"
+version = "0.1.0"
+api_version = 2
+
+[[{section}]]
+id = "x"
+name = "x"
+path = "x"
+"#
+        );
+        let err = PluginManifest::from_toml_str(&toml).unwrap_err();
+        assert!(
+            matches!(err, ManifestError::Parse(_)),
+            "[[{section}]] should be a hard parse error, got {err:?}"
+        );
+    }
 }
 
 #[test]
@@ -177,9 +189,9 @@ api_version = 2
 [[commands]]
 id = ""
 
-[[themes]]
-name = "x"
-path = ""
+[[keybinds]]
+command = ""
+key = ""
 
 [[ui]]
 slot = ""
@@ -194,7 +206,7 @@ slot = ""
         "{messages:?}"
     );
     assert!(
-        messages.iter().any(|m| m.contains("themes[0].path")),
+        messages.iter().any(|m| m.contains("keybinds[0].command")),
         "{messages:?}"
     );
     assert!(

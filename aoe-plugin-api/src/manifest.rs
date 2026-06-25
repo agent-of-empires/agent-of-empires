@@ -43,21 +43,9 @@ pub struct PluginManifest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub settings: Vec<SettingContribution>,
 
-    /// Themes the plugin ships. Consumed by #2366.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub themes: Vec<ThemeContribution>,
-
     /// UI slots the plugin renders into. Consumed by #2366.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ui: Vec<UiContribution>,
-
-    /// Status detectors the plugin contributes. Consumed by #2366.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub status: Vec<StatusContribution>,
-
-    /// Panes the plugin contributes. Consumed by #2366.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub panes: Vec<PaneContribution>,
 
     /// The worker entrypoint. Defined here so installation can fetch a
     /// release-binary worker; actually launching it is #2095.
@@ -96,35 +84,12 @@ pub struct SettingContribution {
     pub description: String,
 }
 
-/// A theme the plugin ships, by name and a path relative to the plugin dir.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ThemeContribution {
-    pub name: String,
-    pub path: String,
-}
-
 /// A UI contribution targeting a named slot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiContribution {
     pub slot: String,
     #[serde(default)]
     pub id: String,
-}
-
-/// A status detector the plugin contributes.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StatusContribution {
-    pub id: String,
-    #[serde(default)]
-    pub label: String,
-}
-
-/// A pane the plugin contributes.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PaneContribution {
-    pub id: String,
-    #[serde(default)]
-    pub title: String,
 }
 
 /// How the plugin's worker is launched. Defined here; executed by #2095.
@@ -275,30 +240,11 @@ impl PluginManifest {
                 format!("settings[{i}].key must not be empty"),
             );
         }
-        for (i, t) in self.themes.iter().enumerate() {
-            check(
-                !t.name.is_empty(),
-                format!("themes[{i}].name must not be empty"),
-            );
-            check(
-                !t.path.is_empty(),
-                format!("themes[{i}].path must not be empty"),
-            );
-        }
         for (i, u) in self.ui.iter().enumerate() {
             check(
                 !u.slot.is_empty(),
                 format!("ui[{i}].slot must not be empty"),
             );
-        }
-        for (i, s) in self.status.iter().enumerate() {
-            check(
-                !s.id.is_empty(),
-                format!("status[{i}].id must not be empty"),
-            );
-        }
-        for (i, p) in self.panes.iter().enumerate() {
-            check(!p.id.is_empty(), format!("panes[{i}].id must not be empty"));
         }
 
         if errors.is_empty() {
