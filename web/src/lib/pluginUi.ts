@@ -39,26 +39,23 @@ export function sessionEntries(
   return entries.filter((e) => e.slot === slot && e.session_id === sessionId);
 }
 
-/** A row-column entry's string text, if present. */
+/** A string field of an entry's payload, or "" when absent/non-string. */
+export function payloadStr(entry: PluginUiEntry, key: string): string {
+  const v = entry.payload[key];
+  return typeof v === "string" ? v : "";
+}
+
+/** An entry's primary `text` field. */
 export function entryText(entry: PluginUiEntry): string {
-  const text = entry.payload.text;
-  return typeof text === "string" ? text : "";
+  return payloadStr(entry, "text");
 }
 
-/** A row-column entry's sort scalar (number or string), for client-side
- *  ordering. `undefined` sorts last. */
-export function entrySortValue(entry: PluginUiEntry): number | string | undefined {
-  const v = entry.payload.sort_value;
-  if (typeof v === "number" || typeof v === "string") return v;
+/** An entry's optional `tone`, validated to the closed set (anything else
+ *  reads as neutral). */
+export function entryTone(entry: PluginUiEntry): PluginUiTone | undefined {
+  const t = entry.payload.tone;
+  if (t === "info" || t === "success" || t === "warn" || t === "danger" || t === "neutral") {
+    return t;
+  }
   return undefined;
-}
-
-/** Compare two optional sort scalars; undefined sorts after defined values.
- *  Numbers compare numerically, strings lexically, mixed by type name. */
-export function compareSortValues(a: number | string | undefined, b: number | string | undefined): number {
-  if (a === undefined && b === undefined) return 0;
-  if (a === undefined) return 1;
-  if (b === undefined) return -1;
-  if (typeof a === "number" && typeof b === "number") return a - b;
-  return String(a).localeCompare(String(b));
 }

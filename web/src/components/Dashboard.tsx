@@ -4,6 +4,7 @@ import { isSessionActive } from "../lib/session";
 import { useIdleDecayWindowMs } from "../lib/idleDecay";
 import { AOE_BRAND_MARK_COLORS, AOE_BRAND_MARK_TEXT_SHADOW } from "../lib/brandMark";
 import { TOUR_ANCHORS, type TourAnchorId } from "../lib/tourSteps";
+import { PluginCards } from "./plugin/PluginSlots";
 
 interface Props {
   sessions: SessionResponse[];
@@ -157,6 +158,11 @@ export function Dashboard({ sessions, onNewSession, onCloneFromUrl, onToggleSide
           />
         </div>
       )}
+
+      {/* Plugin-contributed dashboard cards (#2366). */}
+      <div className="mt-4 max-w-2xl w-full">
+        <PluginCards />
+      </div>
 
       {/* Keyboard hint (desktop only) */}
       {!readOnly && (

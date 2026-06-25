@@ -99,6 +99,7 @@ import { OwnerAvatar } from "./OwnerAvatar";
 import { SessionGroupModal } from "./SessionGroupModal";
 import { SidebarSortPicker } from "./SidebarSortPicker";
 import { Tooltip } from "./Tooltip";
+import { PluginRowBadges, PluginRowColumn } from "./plugin/PluginSlots";
 
 const SIDEBAR_WIDTH_KEY = "aoe-sidebar-width";
 const SUNK_EXPANDED_KEY = "aoe-sidebar-sunk-expanded";
@@ -1195,6 +1196,8 @@ export const SessionRow = memo(function SessionRow({
                 <WakeupCountdown wakeAt={firstSession.next_wakeup_at} reason={firstSession.next_wakeup_reason} />
               )}
               {firstSession?.monitor_active && <MonitorBadge description={firstSession.monitor_description} />}
+              {firstSession && <PluginRowBadges sessionId={firstSession.id} />}
+              {firstSession && <PluginRowColumn sessionId={firstSession.id} />}
             </span>
             {subtitle && (
               <span className="block text-[11px] font-mono text-text-dim truncate" title={subtitleTitle ?? subtitle}>

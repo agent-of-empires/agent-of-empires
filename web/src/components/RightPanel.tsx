@@ -5,6 +5,7 @@ import { PairedShellPane } from "./PairedTerminal";
 import { safeGetItem, safeSetItem } from "../lib/safeStorage";
 import type { RepoBase, RichDiffFile, SessionResponse } from "../lib/types";
 import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
+import { PluginDetailBadges, PluginDetailPanels } from "./plugin/PluginSlots";
 
 const VSPLIT_STORAGE_KEY = "aoe-right-vsplit";
 const DEFAULT_TOP_RATIO = 0.5;
@@ -152,6 +153,12 @@ export function RightPanel({
             onSend={onOpenSendDialog}
             onDiscardAll={onDiscardAllComments}
           />
+        )}
+        {sessionId && (
+          <div className="shrink-0 flex flex-col gap-2 p-2 empty:hidden">
+            <PluginDetailBadges sessionId={sessionId} />
+            <PluginDetailPanels sessionId={sessionId} />
+          </div>
         )}
         <DiffFileList
           files={files}
