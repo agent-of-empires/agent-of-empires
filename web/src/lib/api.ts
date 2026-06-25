@@ -188,7 +188,8 @@ export interface PluginView {
   description: string;
   enabled: boolean;
   builtin: boolean;
-  trust: string;
+  /** Validation provenance: "builtin" | "featured" | "community" | "local". */
+  validation: string;
   source: string | null;
   capabilities: string[];
   granted: boolean;

@@ -46,6 +46,7 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe plugin install`↴](#aoe-plugin-install)
 * [`aoe plugin update`↴](#aoe-plugin-update)
 * [`aoe plugin uninstall`↴](#aoe-plugin-uninstall)
+* [`aoe plugin hash`↴](#aoe-plugin-hash)
 * [`aoe profile`↴](#aoe-profile)
 * [`aoe profile list`↴](#aoe-profile-list)
 * [`aoe profile create`↴](#aoe-profile-create)
@@ -679,6 +680,7 @@ Manage plugins (list, info, enable, disable, install, update, uninstall)
 * `install` — Install an external plugin from a `gh:owner/repo[@ref]` slug or a local directory. Community plugins run at your own risk
 * `update` — Update an installed external plugin from its recorded source. Prompts to re-approve capabilities if the update changes the capability set
 * `uninstall` — Uninstall an external plugin, removing its files and capability grant
+* `hash` — Print the deterministic source tree hash for a plugin directory, the value a maintainer pins in the featured index
 
 
 
@@ -763,6 +765,18 @@ Uninstall an external plugin, removing its files and capability grant
 ###### **Arguments:**
 
 * `<ID>` — Plugin id
+
+
+
+## `aoe plugin hash`
+
+Print the deterministic source tree hash for a plugin directory, the value a maintainer pins in the featured index
+
+**Usage:** `aoe plugin hash <PATH>`
+
+###### **Arguments:**
+
+* `<PATH>` — Path to the plugin directory
 
 
 

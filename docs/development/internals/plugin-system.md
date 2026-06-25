@@ -180,12 +180,51 @@ skipped at load.
 `plugins.lock` (`<app_dir>/plugins.lock`, TOML, keyed by id, deterministic and
 timestamp-free like `Cargo.lock`) records each external plugin's resolved
 identity: source slug, requested ref, resolved commit, version, manifest hash,
-trust, and (for a release-binary) the release tag, asset name, and asset
-sha256.
+tree hash (see below), trust, and (for a release-binary) the release tag, asset
+name, and asset sha256. `lock_version` is 2; a `tree_hash`-less v1 lock still
+reads (the field defaults) and is repopulated on the next install/update.
+
+## Integrity hashing and the featured index (#2364)
+
+`plugin::integrity::tree_hash` is a deterministic `sha256:<hex>` over a plugin's
+source tree. Files are sorted by their forward-slash relative path and hashed
+under a versioned header (`aoe-plugin-tree-hash-v1`) as `file\0<path>\0<len>
+<content>`. `.git` is skipped (it is stripped from an installed tree); a symlink
+or non-UTF-8 path is a hard error so nothing installed escapes the hash. File
+mode is excluded for cross-platform determinism, and `git clone` runs with
+`core.autocrlf=false` so line endings never differ by platform. The hash is
+computed over the staged source **before** any release-binary worker is
+injected, so an author's `aoe plugin hash <checkout>` reproduces the
+install-time value; the downloaded worker stays pinned separately by the lock's
+`asset_sha256`.
+
+`plugins/featured.toml` is the curated index, compiled into the binary. Each
+entry pins one vetted release per plugin id to its `{source, tree_hash}`: a
+maintainer's attestation that this exact tree was reviewed. When a plugin id
+appears in the index, install and update **refuse** unless the fetched source
+slug (case-insensitive) and tree hash both match the pin, and a release-binary
+manifest is refused outright (its worker bytes are not covered by the tree hash
+yet). A featured-verified install is the one case allowed to claim a reserved
+(`aoe.*` / `agent-of-empires.*`) namespace; a builtin-id collision is always
+rejected. In debug builds `AOE_FEATURED_INDEX_PATH` overrides the embedded index
+for tests; a release binary always uses the compiled-in index, since the curated
+set is a root of trust and must not be redefinable by the environment.
+
+Every surface (CLI `aoe plugin list` / `info`, the TUI plugin manager, the web
+Plugins panel) shows a `ValidationState`: `builtin`, `featured` (installed from a
+featured-verified source), `community` (an unvetted GitHub install), or `local`
+(a local-directory install). It is recorded at install time via the lockfile's
+`trust` and read back at load, not recomputed each load; the manifest-hash grant
+check is what catches a community plugin tampered after install.
+
+`aoe plugin hash <dir>` prints the tree hash for a plugin directory so an author
+can produce the value a maintainer pins. Run it on a clean checkout.
 
 ## What comes next
 
 Each deferred piece returns as its own PR once the core is proven: the
 contribution registries and the JSON-RPC worker runtime and event bus built on
-the substrate above (issues 2094, 2095, and 2366), and the discovery / featured
-supply-chain layer with integrity hashing (issues 2364 and 2365).
+the substrate above (issues 2094, 2095, and 2366), and the discovery layer over
+the featured index (issue 2365). Pinning a featured plugin's release-binary
+asset hash in `featured.toml` (so a featured worker is attested, not just its
+source) is a follow-up; today a release-binary plugin cannot be featured.

@@ -4,8 +4,8 @@ import { fetchPlugins, setPluginEnabled, type PluginListResponse, type PluginVie
 import { reportInfo } from "../../lib/toastBus";
 
 /// Plugin management: list every known plugin (name, version, description,
-/// trust level, capabilities, and enabled / approval state) and toggle it on or
-/// off. Installing and capability approval are CLI-driven (`aoe plugin
+/// validation provenance, capabilities, and enabled / approval state) and
+/// toggle it on or off. Installing and capability approval are CLI-driven (`aoe plugin
 /// install`); this panel shows the resulting state. The toggle POSTs to
 /// `/api/plugins/{id}/enabled`; it is a host mutation, so it needs read-write
 /// mode and (when login is enabled) an elevated session. A `403
@@ -97,9 +97,9 @@ export function PluginsSettings() {
                   <span className="text-xs text-text-dim">v{plugin.version}</span>
                   <span
                     className="rounded bg-accent-500/20 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-accent-500"
-                    data-testid={`plugin-trust-${plugin.id}`}
+                    data-testid={`plugin-validation-${plugin.id}`}
                   >
-                    {plugin.trust}
+                    {plugin.validation}
                   </span>
                   {plugin.needs_reapproval && (
                     <span
