@@ -357,6 +357,7 @@ async fn serve_connection(
         let ui_contributions = ctx.ui_contributions.clone();
         let ui_generation = ctx.ui_generation;
         let params = request.params.clone();
+        let method_log = method.clone();
         let outcome = tokio::task::spawn_blocking(move || {
             let ctx = PluginRpcContext {
                 plugin_id: ctx_id,
@@ -367,6 +368,30 @@ async fn serve_connection(
             dispatch(&api, &ctx, &method, &params)
         })
         .await;
+
+        // Trace every dispatch outcome host-side, before the notification
+        // early-return below: a rejected call (a worker pushing an undeclared
+        // slot, a malformed payload, an ungranted capability) is otherwise
+        // invisible here, since the only signal is the error response the
+        // worker may or may not log. A notification (no id) is logged the same
+        // way even though it gets no response.
+        match &outcome {
+            Ok(Ok(_)) => tracing::debug!(
+                target: "plugin.host",
+                plugin = %ctx.plugin_id,
+                method = %method_log,
+                "worker rpc ok"
+            ),
+            Ok(Err(e)) => tracing::warn!(
+                target: "plugin.host",
+                plugin = %ctx.plugin_id,
+                method = %method_log,
+                code = e.code,
+                "worker rpc rejected: {}",
+                e.message
+            ),
+            Err(_) => {}
+        }
 
         // A notification (no id) gets no response, but still ran for its side
         // effects above.
