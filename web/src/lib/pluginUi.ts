@@ -4,21 +4,22 @@
 
 import type { PluginUiEntry, PluginUiSlot, PluginUiTone } from "./api";
 
-/** Tailwind classes per tone, shared by every slot renderer so a plugin's
- *  tone maps to one consistent palette. `undefined`/unknown falls back to
- *  neutral. */
+/** Theme-backed classes per tone, shared by every slot renderer so a plugin's
+ *  tone maps to one consistent palette that repaints with the user's theme
+ *  (the `status-*` colors are CSS-variable backed). `undefined`/unknown falls
+ *  back to neutral. */
 export function toneClasses(tone: PluginUiTone | undefined): string {
   switch (tone) {
     case "info":
-      return "bg-sky-500/15 text-sky-300";
+      return "bg-status-unread/15 text-status-unread";
     case "success":
-      return "bg-emerald-500/15 text-emerald-300";
+      return "bg-status-running/15 text-status-running";
     case "warn":
-      return "bg-amber-500/15 text-amber-300";
+      return "bg-status-waiting/15 text-status-waiting";
     case "danger":
-      return "bg-rose-500/15 text-rose-300";
+      return "bg-status-error/15 text-status-error";
     default:
-      return "bg-slate-500/15 text-slate-300";
+      return "bg-status-idle/15 text-status-idle";
   }
 }
 

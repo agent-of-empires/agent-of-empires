@@ -49,9 +49,9 @@ describe("pluginUi selectors", () => {
     expect(entryTone(entry("status-bar"))).toBeUndefined();
   });
 
-  it("toneClasses maps every tone and falls back to neutral", () => {
-    expect(toneClasses("success")).toContain("emerald");
-    expect(toneClasses("danger")).toContain("rose");
-    expect(toneClasses(undefined)).toContain("slate");
+  it("toneClasses maps every tone to theme tokens and falls back to neutral", () => {
+    expect(toneClasses("success")).toContain("status-running");
+    expect(toneClasses("danger")).toContain("status-error");
+    expect(toneClasses(undefined)).toContain("status-idle");
   });
 });
