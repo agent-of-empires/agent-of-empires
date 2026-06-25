@@ -20,6 +20,7 @@ import { SelectField } from "./settings/FormFields";
 import { DiffSettings } from "./settings/DiffSettings";
 import { TelemetrySettings } from "./settings/TelemetrySettings";
 import { PluginsSettings } from "./settings/PluginsSettings";
+import { PluginSettingsSections } from "./settings/PluginSettingsSections";
 import { SettingsHeader } from "./settings/SettingsHeader";
 import { ProfilesSection } from "./profiles/ProfilesSection";
 import type { SettingsSearchHit } from "./settings/settingsSearchIndex";
@@ -545,7 +546,12 @@ export function SettingsView({
         );
 
       case "plugins":
-        return <PluginsSettings />;
+        return (
+          <div className="space-y-6">
+            <PluginsSettings />
+            {schemaGuard() ?? <PluginSettingsSections schema={schema} settings={settings} onSaved={loadSettings} />}
+          </div>
+        );
 
       case "notifications":
         return (

@@ -101,6 +101,10 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                 profile_overridable: #overridable,
                 validation: #validation,
                 advanced: #advanced,
+                // Core fields always exist in the serialized Config via the
+                // struct Default, so they need no schema-carried default; only
+                // plugin fields set this.
+                default: ::core::option::Option::None,
             }
         });
     }

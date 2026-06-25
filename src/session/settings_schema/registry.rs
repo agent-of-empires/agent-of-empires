@@ -30,6 +30,22 @@ pub fn schema() -> Vec<FieldDescriptor> {
     out
 }
 
+/// The schema as the running process sees it: the static core [`schema`] plus
+/// one virtual `plugin:<id>` section per active plugin's declared settings. The
+/// server serves this over `GET /api/settings/schema`, validates PATCHes against
+/// it, and the TUI builds its Plugins tab from it, so plugin settings render and
+/// validate through the exact same path as core settings.
+pub fn runtime_schema() -> Vec<FieldDescriptor> {
+    let mut out = schema();
+    for p in crate::plugin::registry().active() {
+        out.extend(super::plugin::plugin_field_descriptors(
+            p.id(),
+            &p.manifest.settings,
+        ));
+    }
+    out
+}
+
 /// Look up a single field's descriptor by `section` and `field`.
 pub fn descriptor(section: &str, field: &str) -> Option<FieldDescriptor> {
     schema()

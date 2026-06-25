@@ -204,6 +204,19 @@ impl SettingField {
         matches!(self.value, FieldValue::SectionHeader)
     }
 
+    /// Human-readable rendering of the current value (for read-only displays).
+    pub fn display_value(&self) -> String {
+        value_display_string(&self.value)
+    }
+
+    /// The schema `section` this row edits, if it is a schema-backed row.
+    pub fn schema_section(&self) -> Option<&str> {
+        match &self.kind {
+            FieldKind::Schema { section, .. } => Some(section),
+            _ => None,
+        }
+    }
+
     /// Stable identifier used by the search overlay to relocate the cursor
     /// after a jump, and by input handlers that special-case a specific field.
     pub fn ident(&self) -> String {
@@ -695,7 +708,7 @@ pub fn build_fields_for_category(
         });
     }
 
-    for desc in crate::session::settings_schema::schema()
+    for desc in crate::session::settings_schema::runtime_schema()
         .into_iter()
         .filter(|d| d.category == category.schema_name())
         // Global-only fields (e.g. the theme) are not profile-overridable, so
@@ -766,7 +779,19 @@ fn build_schema_row(
     desc: &FieldDescriptor,
     ctx: &BuildCtx,
 ) -> SettingField {
-    let current = json_at(ctx.effective_json, &desc.section, &desc.field);
+    // Plugin settings (`plugin:<id>` sections) live at a different storage
+    // path (`plugins.<id>.settings.<field>`) and fall back to the manifest's
+    // declared default when unset; core fields read their `section.field` leaf,
+    // which always exists via the struct Default.
+    let current = match crate::session::settings_schema::section_plugin_id(&desc.section) {
+        Some(id) => crate::session::settings_schema::plugin_storage_value(
+            ctx.effective_json,
+            id,
+            &desc.field,
+        )
+        .or(desc.default.as_ref()),
+        None => json_at(ctx.effective_json, &desc.section, &desc.field),
+    };
     let value = value_from_json(&desc.widget, current);
     let has_override = desc.profile_overridable && ctx.has_override(&desc.section, &desc.field);
     let inherited_display = if has_override {
@@ -958,10 +983,32 @@ pub fn apply_field_to_config(
     };
 
     match scope {
-        SettingsScope::Global => set_config_path(global, &section, &sub, leaf),
+        SettingsScope::Global => {
+            // Plugin settings are global-only and persist under
+            // `plugins.<id>.settings`; core fields write their `section.field`.
+            match crate::session::settings_schema::section_plugin_id(&section) {
+                Some(id) => set_config_plugin_path(global, id, &sub, leaf),
+                None => set_config_path(global, &section, &sub, leaf),
+            }
+        }
+        // Plugin fields are filtered out of Profile/Repo scope (not
+        // profile_overridable), so only core fields reach here.
         SettingsScope::Profile | SettingsScope::Repo => {
             set_override_path(profile, &section, &sub, leaf)
         }
+    }
+}
+
+/// Write a plugin setting leaf into `plugins.<id>.settings.<field>` of the
+/// global config.
+fn set_config_plugin_path(config: &mut Config, plugin_id: &str, field: &str, leaf: Value) {
+    let mut j = serde_json::to_value(&*config).unwrap_or_else(|_| json!({}));
+    merge_json(
+        &mut j,
+        &crate::session::settings_schema::plugin_storage_leaf(plugin_id, field, leaf),
+    );
+    if let Ok(updated) = serde_json::from_value(j) {
+        *config = updated;
     }
 }
 

@@ -193,6 +193,17 @@
       ]
     },
     {
+      "id": "settings.plugin-settings",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/settings/__tests__/PluginSettingsSections.test.tsx"],
+      "components": [
+        "web/src/components/SettingsView.tsx",
+        "web/src/components/settings/PluginSettingsSections.tsx",
+        "web/src/components/settings/SchemaSection.tsx"
+      ]
+    },
+    {
       "id": "settings.mobile-header",
       "kind": "mocked-playwright",
       "risk": "medium",

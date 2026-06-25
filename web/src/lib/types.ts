@@ -563,4 +563,8 @@ export interface SettingsFieldDescriptor {
   validation: SettingsValidation;
   /** Operational tuning shown under an "Advanced" fold. */
   advanced: boolean;
+  /** Default value shown before anything is stored. Present on plugin
+   *  (`plugin:<id>`) fields, which have no value in the config until saved;
+   *  omitted for core fields (their value always exists in the config). */
+  default?: unknown;
 }

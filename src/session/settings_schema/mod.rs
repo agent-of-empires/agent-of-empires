@@ -19,13 +19,18 @@
 use serde::{Deserialize, Serialize};
 
 mod merge;
+mod plugin;
 mod policy;
 mod registry;
 mod validate;
 
 pub use merge::{clear_path, merge_json};
+pub use plugin::{
+    plugin_field_descriptors, plugin_section_id, rewrite_plugin_sections, section_plugin_id,
+    storage_leaf as plugin_storage_leaf, storage_value as plugin_storage_value, PLUGIN_CATEGORY,
+};
 pub use policy::{strip_local_only, validate_patch, validate_patch_with, PatchRejection, Scope};
-pub use registry::{descriptor, schema};
+pub use registry::{descriptor, runtime_schema, schema};
 pub use validate::{validate_value, ValidationError};
 
 /// Widget the surfaces render for a field. The variant carries everything a
@@ -150,6 +155,13 @@ pub struct FieldDescriptor {
     /// renders them after the primary fields under an "Advanced" divider.
     #[serde(default)]
     pub advanced: bool,
+    /// The field's default value, shown when no value is stored yet. Core
+    /// fields leave this `None` (their value always exists in the serialized
+    /// `Config` via the struct's `Default`); plugin fields carry the
+    /// manifest-declared default so the surfaces and the resolution chain show
+    /// it before the user has saved anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<serde_json::Value>,
 }
 
 impl FieldDescriptor {
