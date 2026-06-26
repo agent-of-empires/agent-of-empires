@@ -30,16 +30,20 @@ export const BUILTIN_PANES: PaneDescriptor[] = [
 // their kind id.
 export const TERMINAL_KIND = "terminal";
 
+// Only `terminal:<digits>` is a valid terminal tab id. Strict matching keeps a
+// malformed id (e.g. "terminal:1junk") from aliasing a real tmux pane index.
+const TERMINAL_TAB_ID_RE = /^terminal:(\d+)$/;
+
 export function terminalTabId(index: number): string {
   return `terminal:${index}`;
 }
 
 export function isTerminalTabId(id: string): boolean {
-  return id.startsWith("terminal:");
+  return TERMINAL_TAB_ID_RE.test(id);
 }
 
 /** Backend tmux index for a "terminal:<n>" tab id; 0 for anything malformed. */
 export function terminalIndexOf(id: string): number {
-  const n = Number.parseInt(id.slice("terminal:".length), 10);
-  return Number.isFinite(n) && n >= 0 ? n : 0;
+  const m = TERMINAL_TAB_ID_RE.exec(id);
+  return m ? Number.parseInt(m[1]!, 10) : 0;
 }
