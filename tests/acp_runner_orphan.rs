@@ -19,7 +19,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
-/// App data dir for the debug binary, which uses the `-dev` namespace.
+/// App data dir for the debug binary under this test's env. The runner sees
+/// `XDG_CONFIG_HOME`, so macOS follows the same XDG path as Linux.
 fn app_dir(home: &Path, xdg: &Path) -> PathBuf {
     if cfg!(any(target_os = "linux", target_os = "macos")) {
         xdg.join("agent-of-empires-dev")
