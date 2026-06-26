@@ -78,6 +78,26 @@ describe("ApprovalCard (benign)", () => {
     expect(screen.getByText("Deny")).toBeTruthy();
   });
 
+  it("collapses opencode filepath metadata to a path preview", () => {
+    const onResolve = vi.fn().mockResolvedValue(undefined);
+    render(
+      <ApprovalCard
+        approval={makeApproval({
+          tool_call: {
+            id: "t-1",
+            name: "external_directory",
+            kind: "other",
+            args_preview: JSON.stringify({ filepath: "/tmp/opencode", parentDir: "/tmp" }),
+            started_at: "2026-05-21T00:00:00Z",
+          },
+        })}
+        onResolve={onResolve}
+      />,
+    );
+    expect(screen.getByText("/tmp/opencode")).toBeTruthy();
+    expect(screen.queryByText("filepath")).toBeNull();
+  });
+
   it("renders the args JSON as a key/value list once expanded", () => {
     const onResolve = vi.fn().mockResolvedValue(undefined);
     render(

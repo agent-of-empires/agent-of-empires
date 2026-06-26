@@ -45,7 +45,7 @@ export function previewFromArgs(argsPreview: string): string | null {
   const args = parseJsonObject(argsPreview);
   return pickFirst(
     pickStr(args, "command", "cmd", "args"),
-    pickStr(args, "path", "file_path", "filePath", "filename"),
+    pickStr(args, "path", "file_path", "filePath", "filepath", "filename"),
     pickStr(args, "query", "pattern"),
     pickStr(args, "url"),
     pickStr(args, "_aoe_title"),

@@ -126,6 +126,7 @@ describe("previewFromArgs", () => {
 
   it("falls back to a file path for read/edit shapes", () => {
     expect(previewFromArgs(JSON.stringify({ file_path: "src/a.ts" }))).toBe("src/a.ts");
+    expect(previewFromArgs(JSON.stringify({ filepath: "/tmp/opencode" }))).toBe("/tmp/opencode");
   });
 
   it("surfaces query/pattern and url shapes", () => {

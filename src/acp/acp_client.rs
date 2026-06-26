@@ -11,7 +11,7 @@
 //! initialize once, create one ACP session, then pump commands from an
 //! mpsc channel into ACP requests until shutdown.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -1477,6 +1477,141 @@ struct ElicitationResolutionMessage {
 }
 
 type PendingResponders = Arc<Mutex<HashMap<Nonce, PendingResponder>>>;
+
+type ToolContextCache = Arc<std::sync::Mutex<ToolCallContextCache>>;
+
+const TOOL_CONTEXT_CACHE_LIMIT: usize = 256;
+
+#[derive(Debug, Default)]
+struct ToolCallContextCache {
+    raw_inputs: HashMap<String, serde_json::Value>,
+    insertion_order: VecDeque<String>,
+}
+
+impl ToolCallContextCache {
+    fn record(&mut self, tool_call_id: String, raw_input: serde_json::Value) {
+        if raw_input_has_no_user_context(&raw_input) {
+            return;
+        }
+        if !self.raw_inputs.contains_key(&tool_call_id) {
+            self.insertion_order.push_back(tool_call_id.clone());
+        }
+        self.raw_inputs.insert(tool_call_id, raw_input);
+        self.enforce_limit();
+    }
+
+    fn get(&self, tool_call_id: &str) -> Option<serde_json::Value> {
+        self.raw_inputs.get(tool_call_id).cloned()
+    }
+
+    fn remove(&mut self, tool_call_id: &str) {
+        self.raw_inputs.remove(tool_call_id);
+    }
+
+    fn enforce_limit(&mut self) {
+        while self.raw_inputs.len() > TOOL_CONTEXT_CACHE_LIMIT {
+            let Some(oldest) = self.insertion_order.pop_front() else {
+                break;
+            };
+            self.raw_inputs.remove(&oldest);
+        }
+    }
+}
+
+fn permission_raw_input_with_context(
+    permission_raw: Option<&serde_json::Value>,
+    cached_raw: Option<&serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let cached_raw =
+        cached_raw.and_then(|cached| (!raw_input_has_no_user_context(cached)).then_some(cached));
+    match (permission_raw, cached_raw) {
+        (Some(permission), Some(cached)) => Some(merge_permission_raw_input(permission, cached)),
+        (Some(permission), None) if permission.is_null() => None,
+        (Some(permission), None) => Some(permission.clone()),
+        (None, Some(cached)) => Some(cached.clone()),
+        (None, None) => None,
+    }
+}
+
+fn merge_permission_raw_input(
+    permission_raw: &serde_json::Value,
+    cached_raw: &serde_json::Value,
+) -> serde_json::Value {
+    if let (serde_json::Value::Object(permission), serde_json::Value::Object(cached)) =
+        (permission_raw, cached_raw)
+    {
+        let mut merged = cached.clone();
+        for (key, value) in permission {
+            merged.insert(key.clone(), value.clone());
+        }
+        return serde_json::Value::Object(merged);
+    }
+
+    if raw_input_has_no_user_context(permission_raw) {
+        cached_raw.clone()
+    } else {
+        permission_raw.clone()
+    }
+}
+
+fn raw_input_has_no_user_context(raw_input: &serde_json::Value) -> bool {
+    match raw_input {
+        serde_json::Value::Null => true,
+        serde_json::Value::Object(map) => map.keys().all(|key| key.starts_with("_aoe_")),
+        _ => false,
+    }
+}
+
+fn update_tool_context_cache(
+    cache: &ToolContextCache,
+    event: &Event,
+    source_update: &SessionUpdate,
+) {
+    match event {
+        Event::ToolCallStarted { tool_call } => {
+            if let Some(raw_input) = raw_input_for_tool_event(source_update, &tool_call.id) {
+                cache
+                    .lock()
+                    .expect("tool context cache mutex poisoned")
+                    .record(tool_call.id.clone(), raw_input);
+            }
+        }
+        Event::ToolCallUpdated { tool_call_id, .. } => {
+            if let Some(raw_input) = raw_input_for_tool_event(source_update, tool_call_id) {
+                cache
+                    .lock()
+                    .expect("tool context cache mutex poisoned")
+                    .record(tool_call_id.clone(), raw_input);
+            }
+        }
+        Event::ToolCallCompleted { tool_call_id, .. } => {
+            cache
+                .lock()
+                .expect("tool context cache mutex poisoned")
+                .remove(tool_call_id);
+        }
+        _ => {}
+    }
+}
+
+fn raw_input_for_tool_event(
+    source_update: &SessionUpdate,
+    tool_call_id: &str,
+) -> Option<serde_json::Value> {
+    match source_update {
+        SessionUpdate::ToolCall(tool_call)
+            if tool_call.tool_call_id.0.to_string() == tool_call_id =>
+        {
+            tool_call.raw_input.clone()
+        }
+        SessionUpdate::ToolCallUpdate(update)
+            if update.tool_call_id.0.to_string() == tool_call_id =>
+        {
+            update.fields.raw_input.clone()
+        }
+        _ => None,
+    }
+}
 
 /// Top-level ACP client. Owns the subprocess lifetime and pumps events
 /// from the connection task.
@@ -4483,6 +4618,10 @@ async fn run_connection_task<W, R>(
     let event_tx_for_block = event_tx.clone();
     let pending_for_perm = pending_responders.clone();
     let pending_for_elicit = pending_responders.clone();
+    let tool_context_cache: ToolContextCache =
+        Arc::new(std::sync::Mutex::new(ToolCallContextCache::default()));
+    let tool_context_cache_for_notif = tool_context_cache.clone();
+    let tool_context_cache_for_perm = tool_context_cache.clone();
     let mut cmd_rx = cmd_rx;
     let session_label_for_log = session_label.clone();
 
@@ -4624,6 +4763,7 @@ async fn run_connection_task<W, R>(
                 let between_prompt_off_protocol =
                     between_prompt_off_protocol_for_notif.clone();
                 let prompt_in_flight = prompt_in_flight_for_notif.clone();
+                let tool_context_cache = tool_context_cache_for_notif.clone();
                 async move {
                     last_event_at
                         .store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
@@ -4740,8 +4880,8 @@ async fn run_connection_task<W, R>(
                             _ => {}
                         }
                     }
-                    let mapped_events =
-                        map_update_to_events(notification.update, profile);
+                    let update_for_tool_context = notification.update.clone();
+                    let mapped_events = map_update_to_events(notification.update, profile);
                     // Deliver lifecycle signals BEFORE publishing the
                     // user-visible event vector. The watchdog uses
                     // ToolStarted / ToolCompleted / WakeupPending /
@@ -4794,6 +4934,11 @@ async fn run_connection_task<W, R>(
                             );
                             continue;
                         }
+                        update_tool_context_cache(
+                            &tool_context_cache,
+                            &event,
+                            &update_for_tool_context,
+                        );
                         if event_tx.send(event).await.is_err() {
                             break;
                         }
@@ -4809,9 +4954,17 @@ async fn run_connection_task<W, R>(
                   _conn| {
                 let event_tx = event_tx_for_perm.clone();
                 let pending = pending_for_perm.clone();
+                let tool_context_cache = tool_context_cache_for_perm.clone();
                 async move {
-                    handle_permission_request(request, responder, event_tx, pending, profile)
-                        .await
+                    handle_permission_request(
+                        request,
+                        responder,
+                        event_tx,
+                        pending,
+                        profile,
+                        tool_context_cache,
+                    )
+                    .await
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -6718,6 +6871,7 @@ async fn handle_permission_request(
     event_tx: mpsc::Sender<Event>,
     pending: PendingResponders,
     profile: &'static agent_profiles::AgentProfile,
+    tool_context_cache: ToolContextCache,
 ) -> agent_client_protocol::Result<()> {
     let enter_ns = enter_timestamp_ns();
     let tool_call_id = request.tool_call.tool_call_id.0.to_string();
@@ -6735,10 +6889,20 @@ async fn handle_permission_request(
         .title
         .clone()
         .unwrap_or_else(|| "tool call".into());
-    // Empty (not the literal "null") when the permission request ships no
-    // raw_input, which Gemini's confirm-required tools routinely do. The
-    // approval card then renders a clean empty-state. See #1713.
-    let args_preview = preview_optional_args(request.tool_call.fields.raw_input.as_ref());
+    let cached_raw_input = tool_context_cache
+        .lock()
+        .expect("tool context cache mutex poisoned")
+        .get(&tool_call_id);
+    // Empty (not the literal "null") when neither the permission request nor a
+    // previously forwarded tool update has raw_input. Gemini's confirm-required
+    // tools routinely do this. See #1713. opencode sometimes sends an
+    // external_directory permission reusing a tool_call_id whose earlier tool
+    // update had the command, so merge that context before emitting events.
+    let enriched_raw_input = permission_raw_input_with_context(
+        request.tool_call.fields.raw_input.as_ref(),
+        cached_raw_input.as_ref(),
+    );
+    let args_preview = preview_optional_args(enriched_raw_input.as_ref());
     let tool_call = ToolCall {
         id: request.tool_call.tool_call_id.0.to_string(),
         name: title,
@@ -8717,6 +8881,91 @@ mod tests {
         assert_eq!(preview_optional_args(Some(&serde_json::Value::Null)), "");
         let obj = serde_json::json!({ "command": "ls" });
         assert_eq!(preview_optional_args(Some(&obj)), r#"{"command":"ls"}"#);
+    }
+
+    #[test]
+    fn permission_raw_input_uses_cached_context_when_request_is_empty() {
+        let cached = serde_json::json!({ "command": "mkdir -p /tmp/opencode", "workdir": "/tmp" });
+        let enriched = permission_raw_input_with_context(None, Some(&cached))
+            .expect("cached context should be used");
+
+        assert_eq!(enriched.get("command"), cached.get("command"));
+        assert_eq!(enriched.get("workdir"), cached.get("workdir"));
+    }
+
+    #[test]
+    fn permission_raw_input_merges_cached_context_without_overwriting_request() {
+        let permission =
+            serde_json::json!({ "filepath": "/tmp/opencode", "command": "permission command" });
+        let cached = serde_json::json!({ "command": "mkdir -p /tmp/opencode", "workdir": "/tmp" });
+        let enriched = permission_raw_input_with_context(Some(&permission), Some(&cached))
+            .expect("non-empty permission args should remain present");
+
+        assert_eq!(enriched.get("command"), permission.get("command"));
+        assert_eq!(enriched.get("filepath"), permission.get("filepath"));
+        assert_eq!(enriched.get("workdir"), cached.get("workdir"));
+    }
+
+    #[test]
+    fn permission_raw_input_preserves_aoe_metadata_when_falling_back() {
+        let permission = serde_json::json!({ "_aoe_title": "external_directory" });
+        let cached = serde_json::json!({ "command": "mkdir -p /tmp/opencode" });
+        let enriched = permission_raw_input_with_context(Some(&permission), Some(&cached))
+            .expect("cached context should enrich bookkeeping-only requests");
+
+        assert_eq!(enriched.get("_aoe_title"), permission.get("_aoe_title"));
+        assert_eq!(enriched.get("command"), cached.get("command"));
+    }
+
+    #[test]
+    fn permission_raw_input_keeps_non_empty_non_object_request() {
+        let permission = serde_json::json!(["already", "specific"]);
+        let cached = serde_json::json!({ "command": "mkdir -p /tmp/opencode" });
+        let enriched = permission_raw_input_with_context(Some(&permission), Some(&cached))
+            .expect("non-empty permission args should remain present");
+
+        assert_eq!(enriched, permission);
+    }
+
+    #[test]
+    fn permission_raw_input_ignores_empty_cached_context() {
+        let cached = serde_json::json!({});
+        let enriched = permission_raw_input_with_context(None, Some(&cached));
+
+        assert!(enriched.is_none());
+    }
+
+    #[test]
+    fn tool_context_cache_ignores_empty_context_entries() {
+        let mut cache = ToolCallContextCache::default();
+        cache.record("tc-1".to_string(), serde_json::json!({}));
+
+        assert!(cache.get("tc-1").is_none());
+    }
+
+    #[test]
+    fn tool_context_cache_removes_completed_entries() {
+        let mut cache = ToolCallContextCache::default();
+        cache.record("tc-1".to_string(), serde_json::json!({ "command": "ls" }));
+        assert!(cache.get("tc-1").is_some());
+
+        cache.remove("tc-1");
+
+        assert!(cache.get("tc-1").is_none());
+    }
+
+    #[test]
+    fn tool_context_cache_enforces_bounded_size() {
+        let mut cache = ToolCallContextCache::default();
+        for idx in 0..=TOOL_CONTEXT_CACHE_LIMIT {
+            cache.record(format!("tc-{idx}"), serde_json::json!({ "idx": idx }));
+        }
+
+        assert_eq!(cache.raw_inputs.len(), TOOL_CONTEXT_CACHE_LIMIT);
+        assert!(cache.get("tc-0").is_none());
+        assert!(cache
+            .get(&format!("tc-{TOOL_CONTEXT_CACHE_LIMIT}"))
+            .is_some());
     }
 
     #[test]
