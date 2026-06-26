@@ -51,12 +51,27 @@ export function entryText(entry: PluginUiEntry): string {
   return payloadStr(entry, "text");
 }
 
-/** An entry's optional `tone`, validated to the closed set (anything else
- *  reads as neutral). */
-export function entryTone(entry: PluginUiEntry): PluginUiTone | undefined {
-  const t = entry.payload.tone;
+/** Validate an arbitrary value against the closed tone set (used for badge
+ *  items and detail blocks where the tone is nested, not on the entry). */
+export function validTone(t: unknown): PluginUiTone | undefined {
   if (t === "info" || t === "success" || t === "warn" || t === "danger" || t === "neutral") {
     return t;
   }
   return undefined;
+}
+
+/** An entry's optional `tone`, validated to the closed set (anything else
+ *  reads as neutral). */
+export function entryTone(entry: PluginUiEntry): PluginUiTone | undefined {
+  return validTone(entry.payload.tone);
+}
+
+/** Just the `text-*` color class for a tone, for surfaces that tint text/icons
+ *  without a filled background (row columns, detail rows). */
+export function toneTextClass(tone: PluginUiTone | undefined): string {
+  return (
+    toneClasses(tone)
+      .split(" ")
+      .find((c) => c.startsWith("text-")) ?? "text-text-dim"
+  );
 }

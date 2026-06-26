@@ -6,52 +6,129 @@
 // sort-key and filter-facet are deferred (see #2366 follow-ups).
 
 import { createElement } from "react";
-import { icons } from "lucide-react";
+import {
+  CircleAlert,
+  CircleCheck,
+  CircleDot,
+  Clock,
+  GitMerge,
+  GitPullRequestArrow,
+  GitPullRequestClosed,
+  GitPullRequestDraft,
+  type LucideIcon,
+} from "lucide-react";
 
 import { usePluginUiEntries } from "../../lib/pluginUiContext";
-import { entryText, entryTone, globalEntries, payloadStr, sessionEntries, toneClasses } from "../../lib/pluginUi";
-import type { PluginUiEntry } from "../../lib/api";
+import {
+  entryText,
+  entryTone,
+  globalEntries,
+  payloadStr,
+  sessionEntries,
+  toneClasses,
+  toneTextClass,
+  validTone,
+} from "../../lib/pluginUi";
+import type { PluginUiEntry, PluginUiTone } from "../../lib/api";
 
-// A plugin names an icon by its lucide kebab name (e.g. "git-pull-request-arrow");
-// lucide keys its `icons` record by PascalCase, so convert. Any lucide icon is
-// allowed; an unknown name renders no icon. Icons use currentColor, so
-// toneClasses tints them.
-function lucideIcon(name: string) {
-  if (!name) return undefined;
-  const pascal = name
-    .split("-")
-    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-    .join("");
-  return icons[pascal as keyof typeof icons];
+// Plugins name an icon by its lucide kebab name. The set is an explicit
+// allowlist, not the whole lucide barrel: that keeps the bundle small and means
+// a plugin can never name an arbitrary import. An unknown name renders nothing.
+const ICONS: Record<string, LucideIcon> = {
+  "git-pull-request-arrow": GitPullRequestArrow,
+  "git-pull-request-draft": GitPullRequestDraft,
+  "git-pull-request-closed": GitPullRequestClosed,
+  "git-merge": GitMerge,
+  "circle-alert": CircleAlert,
+  "circle-check": CircleCheck,
+  "circle-dot": CircleDot,
+  clock: Clock,
+};
+
+function lucideIcon(name: string | undefined): LucideIcon | undefined {
+  return name ? ICONS[name] : undefined;
 }
 
-function Badge({ entry }: { entry: PluginUiEntry }) {
-  const text = entryText(entry);
-  if (!text) return null;
-  const tooltip = payloadStr(entry, "tooltip");
-  const icon = lucideIcon(payloadStr(entry, "icon"));
-  const href = payloadStr(entry, "href");
-  const className = `inline-flex max-w-48 min-w-0 items-center gap-1 truncate font-mono text-[11px] px-1.5 py-0.5 rounded-full ${toneClasses(entryTone(entry))}`;
+// Plugin strings are untrusted: only follow http/https hrefs, never
+// javascript:/data: and friends. Returns undefined for anything else, so the
+// badge/row renders as plain text instead of a link.
+function safeHref(href: string | undefined): string | undefined {
+  return href && /^https?:\/\//i.test(href) ? href : undefined;
+}
+
+function isObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+function str(obj: Record<string, unknown>, key: string): string | undefined {
+  const v = obj[key];
+  return typeof v === "string" ? v : undefined;
+}
+
+/** Objects in a payload's `items`/`blocks` array, or undefined when absent. */
+function objectList(payload: Record<string, unknown>, key: string): Record<string, unknown>[] | undefined {
+  const v = payload[key];
+  return Array.isArray(v) ? v.filter(isObject) : undefined;
+}
+
+/** One pill: an optional tone-tinted icon plus optional text, wrapped in a
+ *  link when the href is a safe http(s) URL. Shared by the single-badge slots
+ *  and each entry in a `row-badge` `items` list. */
+function BadgeChip({
+  text,
+  icon,
+  tone,
+  href,
+  tooltip,
+  slot,
+  pluginId,
+}: {
+  text?: string;
+  icon?: string;
+  tone?: PluginUiTone;
+  href?: string;
+  tooltip?: string;
+  slot: string;
+  pluginId: string;
+}) {
+  const iconComp = lucideIcon(icon);
+  if (!iconComp && !text) return null;
+  const safe = safeHref(href);
+  const className = `inline-flex max-w-48 min-w-0 items-center gap-1 truncate font-mono text-[11px] px-1.5 py-0.5 rounded-full ${toneClasses(tone)}`;
   const inner = (
     <>
-      {icon && createElement(icon, { className: "size-3 shrink-0", "aria-hidden": true })}
-      <span className="truncate">{text}</span>
+      {iconComp && createElement(iconComp, { className: "size-3 shrink-0", "aria-hidden": true })}
+      {text && <span className="truncate">{text}</span>}
     </>
   );
   const common = {
     className,
-    title: tooltip || text,
-    "data-plugin-slot": entry.slot,
-    "data-plugin-id": entry.plugin_id,
+    title: tooltip || text || undefined,
+    "data-plugin-slot": slot,
+    "data-plugin-id": pluginId,
   };
-  if (href) {
+  if (safe) {
     return (
-      <a {...common} href={href} target="_blank" rel="noopener noreferrer">
+      <a {...common} href={safe} target="_blank" rel="noopener noreferrer">
         {inner}
       </a>
     );
   }
   return <span {...common}>{inner}</span>;
+}
+
+function Badge({ entry }: { entry: PluginUiEntry }) {
+  return (
+    <BadgeChip
+      text={entryText(entry) || undefined}
+      icon={payloadStr(entry, "icon") || undefined}
+      tone={entryTone(entry)}
+      href={payloadStr(entry, "href") || undefined}
+      tooltip={payloadStr(entry, "tooltip") || undefined}
+      slot={entry.slot}
+      pluginId={entry.plugin_id}
+    />
+  );
 }
 
 /** status-bar: global segments in the top bar's right zone. */
@@ -67,15 +144,33 @@ export function PluginStatusBarSegments() {
   );
 }
 
-/** row-badge: per-session badges shown inline on a session row. */
+/** row-badge: per-session badges on a session row. An entry is either a single
+ *  badge (`{ text, tone, icon, href, tooltip }`) or a list (`items: BadgeItem[]`)
+ *  so one entry can show several icon badges. An empty `items: []` clears the
+ *  row (renders nothing). */
 export function PluginRowBadges({ sessionId }: { sessionId: string }) {
   const entries = sessionEntries(usePluginUiEntries(), "row-badge", sessionId);
   if (entries.length === 0) return null;
   return (
     <>
-      {entries.map((e) => (
-        <Badge key={`${e.plugin_id}:${e.id}`} entry={e} />
-      ))}
+      {entries.map((e) => {
+        const items = objectList(e.payload, "items");
+        if (items) {
+          return items.map((it, i) => (
+            <BadgeChip
+              key={`${e.plugin_id}:${e.id}:${i}`}
+              text={str(it, "text")}
+              icon={str(it, "icon")}
+              tone={validTone(it.tone)}
+              href={str(it, "href")}
+              tooltip={str(it, "tooltip")}
+              slot="row-badge"
+              pluginId={e.plugin_id}
+            />
+          ));
+        }
+        return <Badge key={`${e.plugin_id}:${e.id}`} entry={e} />;
+      })}
     </>
   );
 }
@@ -151,13 +246,87 @@ export function PluginDetailBadges({ sessionId }: { sessionId: string }) {
   );
 }
 
-/** detail-panel: per-session panels in the session detail view. */
+/** A clickable-when-href detail row: tone-tinted icon, primary label, secondary
+ *  value, muted sublabel. */
+function BlockRow({ block }: { block: Record<string, unknown> }) {
+  const label = str(block, "label");
+  const value = str(block, "value");
+  const sublabel = str(block, "sublabel");
+  const iconComp = lucideIcon(str(block, "icon"));
+  const tone = validTone(block.tone);
+  const safe = safeHref(str(block, "href"));
+  if (!label && !value && !iconComp) return null;
+  const inner = (
+    <span className="flex min-w-0 items-center gap-2">
+      {iconComp &&
+        createElement(iconComp, { className: `size-4 shrink-0 ${toneTextClass(tone)}`, "aria-hidden": true })}
+      <span className="min-w-0 truncate">
+        {label && <span className="font-medium text-text-primary">{label}</span>}
+        {value && <span className="ml-1.5 text-text-secondary">{value}</span>}
+        {sublabel && <span className="ml-1.5 text-[11px] text-text-dim">{sublabel}</span>}
+      </span>
+    </span>
+  );
+  return safe ? (
+    <a
+      className="block rounded px-1 py-0.5 text-xs hover:bg-surface-700/40"
+      href={safe}
+      target="_blank"
+      rel="noopener noreferrer"
+    >
+      {inner}
+    </a>
+  ) : (
+    <div className="px-1 py-0.5 text-xs">{inner}</div>
+  );
+}
+
+/** Render one detail-panel block. The block vocabulary is forward-compatible:
+ *  an unknown `kind` (or a known kind missing its required field) renders
+ *  nothing rather than throwing, so a newer plugin can push kinds an older host
+ *  has never heard of. */
+function DetailBlock({ block, pluginId }: { block: Record<string, unknown>; pluginId: string }) {
+  switch (str(block, "kind")) {
+    case "heading": {
+      const text = str(block, "text");
+      return text ? <div className="font-semibold text-sm text-text-primary">{text}</div> : null;
+    }
+    case "row":
+      return <BlockRow block={block} />;
+    case "note": {
+      const text = str(block, "text");
+      return text ? <p className={`text-xs ${toneTextClass(validTone(block.tone))}`}>{text}</p> : null;
+    }
+    case "divider":
+      return <hr className="border-surface-700/60" />;
+    case "section": {
+      const title = str(block, "title");
+      const children = Array.isArray(block.children) ? block.children.filter(isObject) : [];
+      return (
+        <section className="flex flex-col gap-1">
+          {title && <div className="text-[11px] font-semibold uppercase tracking-wide text-text-dim">{title}</div>}
+          {children.map((c, i) => (
+            <DetailBlock key={i} block={c} pluginId={pluginId} />
+          ))}
+        </section>
+      );
+    }
+    default:
+      // Unknown kind: ignored, not rendered, never throws.
+      return null;
+  }
+}
+
+/** detail-panel: per-session panels in the session detail view. An entry is
+ *  either a `blocks` list (the flexible, forward-compatible pane) or the simple
+ *  `{ title, body }` form. */
 export function PluginDetailPanels({ sessionId }: { sessionId: string }) {
   const entries = sessionEntries(usePluginUiEntries(), "detail-panel", sessionId);
   if (entries.length === 0) return null;
   return (
     <div className="flex flex-col gap-2" data-testid="plugin-detail-panels">
       {entries.map((e) => {
+        const blocks = objectList(e.payload, "blocks");
         const title = payloadStr(e, "title");
         const body = payloadStr(e, "body");
         return (
@@ -166,8 +335,18 @@ export function PluginDetailPanels({ sessionId }: { sessionId: string }) {
             className="rounded-lg p-3 ring-1 ring-surface-700/60 bg-surface-800/40"
             data-plugin-id={e.plugin_id}
           >
-            {title && <div className="font-semibold text-sm text-text-primary">{title}</div>}
-            <div className="mt-1 text-xs text-text-secondary whitespace-pre-wrap">{body}</div>
+            {blocks ? (
+              <div className="flex flex-col gap-1.5">
+                {blocks.map((b, i) => (
+                  <DetailBlock key={i} block={b} pluginId={e.plugin_id} />
+                ))}
+              </div>
+            ) : (
+              <>
+                {title && <div className="font-semibold text-sm text-text-primary">{title}</div>}
+                {body && <div className="mt-1 text-xs text-text-secondary whitespace-pre-wrap">{body}</div>}
+              </>
+            )}
           </section>
         );
       })}

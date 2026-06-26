@@ -96,4 +96,84 @@ describe("plugin slot renderers", () => {
     expect(screen.getByText("Logs")).toBeTruthy();
     expect(screen.getByText("tail...")).toBeTruthy();
   });
+
+  it("row-badge items render one clickable icon per item", () => {
+    set([
+      {
+        plugin_id: "acme.kit",
+        slot: "row-badge",
+        id: "repos",
+        session_id: "s1",
+        payload: {
+          items: [
+            { icon: "git-pull-request-arrow", tone: "success", href: "https://x/pr/1", tooltip: "PR #1" },
+            { icon: "git-pull-request-draft", tone: "warn", href: "https://x/pr/2", tooltip: "PR #2" },
+          ],
+        },
+      },
+    ]);
+    const { container } = render(<PluginRowBadges sessionId="s1" />);
+    const links = screen.getAllByRole("link");
+    expect(links).toHaveLength(2);
+    expect(links[0]!.getAttribute("href")).toBe("https://x/pr/1");
+    expect(links[1]!.getAttribute("rel")).toContain("noopener");
+    expect(container.querySelectorAll("svg")).toHaveLength(2);
+  });
+
+  it("row-badge empty items clears the row (renders nothing)", () => {
+    set([{ plugin_id: "acme.kit", slot: "row-badge", id: "repos", session_id: "s1", payload: { items: [] } }]);
+    const { container } = render(<PluginRowBadges sessionId="s1" />);
+    expect(container.querySelector("a, span")).toBeNull();
+  });
+
+  it("row-badge item with a non-http href is not a link", () => {
+    set([
+      {
+        plugin_id: "acme.kit",
+        slot: "row-badge",
+        id: "repos",
+        session_id: "s1",
+        payload: { items: [{ text: "evil", href: "javascript:alert(1)" }] },
+      },
+    ]);
+    render(<PluginRowBadges sessionId="s1" />);
+    expect(screen.queryByRole("link")).toBeNull();
+    expect(screen.getByText("evil")).toBeTruthy();
+  });
+
+  it("detail-panel blocks render heading, row, note, divider and skip unknown kinds", () => {
+    set([
+      {
+        plugin_id: "acme.kit",
+        slot: "detail-panel",
+        id: "gh",
+        session_id: "s1",
+        payload: {
+          blocks: [
+            { kind: "heading", text: "GitHub" },
+            {
+              kind: "row",
+              icon: "git-pull-request-arrow",
+              tone: "success",
+              label: "nexus",
+              value: "PR #12",
+              sublabel: "o/nexus",
+              href: "https://github.com/o/nexus/pull/12",
+            },
+            { kind: "note", text: "3 repos have no open PR", tone: "neutral" },
+            { kind: "divider" },
+            { kind: "some-future-kind", payload: { nested: true } },
+          ],
+        },
+      },
+    ]);
+    const { container } = render(<PluginDetailPanels sessionId="s1" />);
+    expect(screen.getByText("GitHub")).toBeTruthy();
+    expect(screen.getByText("nexus")).toBeTruthy();
+    expect(screen.getByText("3 repos have no open PR")).toBeTruthy();
+    // The row with an href is an anchor; the unknown kind contributed nothing.
+    const link = screen.getByRole("link", { name: /nexus/ });
+    expect(link.getAttribute("href")).toBe("https://github.com/o/nexus/pull/12");
+    expect(container.querySelector("hr")).toBeTruthy();
+  });
 });

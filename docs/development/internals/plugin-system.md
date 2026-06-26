@@ -488,12 +488,38 @@ manager, and the web Plugins panel (via `PluginView.ui_contributions`).
   (`row-badge`, `row-column`, `detail-panel`, `detail-badge`) require a
   `session_id`; global slots must not carry one. The text-based slots
   (`status-bar`, `row-badge`, `detail-badge`) accept optional `icon` (a lucide
-  icon name in kebab-case, e.g. `git-pull-request-arrow`; an unknown name
-  renders nothing) and `href` (when set, the badge renders as a link that opens
-  in a new tab).
+  icon name in kebab-case, e.g. `git-pull-request-arrow`; the client maps it
+  through an allowlist, an unknown name renders nothing) and `href` (when set,
+  the badge renders as a link that opens in a new tab; only `http`/`https` URLs
+  are followed).
 - `ui.notify { tone, title, body?, session_id? }`. Gated by the existing
   `notifications` capability (not a slot declaration). Returns a monotonic
   `seq`.
+
+#### Richer payloads: `row-badge` items and the `detail-panel` block list
+
+Two slots carry more than a single value, so one entry (one declared
+`(slot, id)`) can render a list:
+
+- `row-badge` also accepts `items: BadgeItem[]` where
+  `BadgeItem = { text?, icon?, tone?, href?, tooltip? }`. Each item renders as a
+  compact, tone-tinted icon (falling back to `text`), linked when `href` is a
+  safe URL. The single `{ text, tone, tooltip, icon, href }` form still works.
+  An empty `items: []` clears the row.
+- `detail-panel` also accepts `blocks: Block[]`, an ordered list of typed
+  blocks. The host knows these kinds: `heading { text }`,
+  `row { label, value?, sublabel?, icon?, tone?, href? }`, `note { text, tone? }`,
+  `divider {}`, and `section { title?, children: Block[] }` (nested blocks). The
+  simple `{ title, body }` form still works when `blocks` is absent.
+
+**Block parsing is forward-compatible by design.** The host stores `blocks` as
+opaque JSON (`Vec<Value>`); it validates only that the payload envelope is
+well-formed, not the block kinds. The web renderer draws the kinds it knows and
+silently ignores any unknown `kind` or unknown field within a block. So a plugin
+can add a field to an existing kind, or push a brand new kind, without any host
+change: an older host simply renders what it understands and drops the rest.
+This is deliberate, the GitHub plugin's pane keeps growing (PR state today,
+review/CI/timelines later) and must not require lockstep host releases.
 
 ### Store and lifecycle (`src/plugin/ui_state.rs`)
 

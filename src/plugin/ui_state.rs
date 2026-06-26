@@ -99,6 +99,44 @@ struct TextPayload {
     href: Option<String>,
 }
 
+/// One icon/text badge inside a `row-badge` `items` list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BadgeItem {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    icon: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tone: Option<Tone>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    href: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tooltip: Option<String>,
+}
+
+/// `row-badge` payload: the single-badge fields (back-compat with any plugin
+/// pushing `{ text, tone, tooltip, icon, href }`) plus an optional `items` list
+/// so one entry can carry several icon badges. `text` is optional here: an
+/// items-only badge has no top-level text. Empty `items: []` is valid (clears
+/// the row).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RowBadgePayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tone: Option<Tone>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tooltip: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    icon: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    href: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    items: Vec<BadgeItem>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RowColumnPayload {
@@ -146,11 +184,21 @@ struct CardPayload {
     tone: Option<Tone>,
 }
 
+/// `detail-panel` payload. Either the simple `{ title, body }` form or an
+/// ordered `blocks` list. The blocks are kept as opaque JSON on purpose: the
+/// host validates only the envelope (an array of objects) and the web renders
+/// the block kinds it knows, dropping the rest. This is the forward-compat
+/// contract: a plugin can add fields to a known kind, or a whole new kind, and
+/// never need a host change; only the web renderer grows.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DetailPanelPayload {
-    title: String,
-    body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    body: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    blocks: Option<Vec<Value>>,
 }
 
 /// Why a `ui.state.set`/`ui.state.remove` was rejected. The host API maps each
@@ -450,7 +498,8 @@ fn validate_payload(slot: UiSlot, raw: &Value) -> Result<Value, String> {
         serde_json::to_value(parsed).map_err(|e| e.to_string())
     }
     match slot {
-        UiSlot::StatusBar | UiSlot::RowBadge | UiSlot::DetailBadge => normalize::<TextPayload>(raw),
+        UiSlot::StatusBar | UiSlot::DetailBadge => normalize::<TextPayload>(raw),
+        UiSlot::RowBadge => normalize::<RowBadgePayload>(raw),
         UiSlot::RowColumn => normalize::<RowColumnPayload>(raw),
         UiSlot::SortKey => normalize::<SortKeyPayload>(raw),
         UiSlot::FilterFacet => normalize::<FilterFacetPayload>(raw),
@@ -544,14 +593,14 @@ mod tests {
     fn malformed_payload_rejected() {
         let s = store();
         let g = s.begin_generation("acme.kit");
-        // Missing required `text`.
+        // Missing required `text` on a text slot (status-bar still requires it).
         assert!(matches!(
             s.set(
                 "acme.kit",
                 g,
-                UiSlot::RowBadge,
+                UiSlot::StatusBar,
                 "b",
-                Some("s1"),
+                None,
                 &json!({"tone": "info"})
             ),
             Err(UiError::BadRequest(_))
@@ -670,6 +719,87 @@ mod tests {
             s.notify("acme.kit", Tone::Info, String::new(), None, None),
             Err(UiError::BadRequest(_))
         ));
+    }
+
+    #[test]
+    fn row_badge_accepts_items_list() {
+        let s = store();
+        let g = s.begin_generation("acme.kit");
+        s.set(
+            "acme.kit",
+            g,
+            UiSlot::RowBadge,
+            "repos",
+            Some("s1"),
+            &json!({"items": [
+                {"icon": "git-pull-request-arrow", "tone": "success", "href": "https://x/pr/1", "tooltip": "PR #1"},
+                {"icon": "git-pull-request-draft", "tone": "warn"}
+            ]}),
+        )
+        .unwrap();
+        let snap = s.snapshot();
+        assert_eq!(
+            snap.entries[0].payload["items"].as_array().unwrap().len(),
+            2
+        );
+        // Empty items is valid (clears the row).
+        s.set(
+            "acme.kit",
+            g,
+            UiSlot::RowBadge,
+            "repos",
+            Some("s1"),
+            &json!({"items": []}),
+        )
+        .unwrap();
+        // A bad tone inside an item is still rejected.
+        assert!(matches!(
+            s.set(
+                "acme.kit",
+                g,
+                UiSlot::RowBadge,
+                "repos",
+                Some("s1"),
+                &json!({"items": [{"tone": "rainbow"}]})
+            ),
+            Err(UiError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn detail_panel_blocks_are_forward_compatible() {
+        let s = store();
+        let g = s.begin_generation("acme.kit");
+        // A mix of known kinds and an unknown kind: the unknown one is accepted
+        // and stored verbatim, not rejected, so an old host renders what it knows.
+        s.set(
+            "acme.kit",
+            g,
+            UiSlot::DetailPanel,
+            "gh",
+            Some("s1"),
+            &json!({"title": "GitHub", "blocks": [
+                {"kind": "heading", "text": "GitHub"},
+                {"kind": "row", "label": "nexus", "value": "PR #12", "href": "https://x/pr/12"},
+                {"kind": "divider"},
+                {"kind": "some-future-kind", "whatever": {"nested": true}}
+            ]}),
+        )
+        .unwrap();
+        let snap = s.snapshot();
+        let blocks = snap.entries[0].payload["blocks"].as_array().unwrap();
+        assert_eq!(blocks.len(), 4);
+        assert_eq!(blocks[3]["kind"], json!("some-future-kind"));
+        // The simple title/body form still works.
+        s.set(
+            "acme.kit",
+            g,
+            UiSlot::DetailPanel,
+            "gh",
+            Some("s1"),
+            &json!({"title": "T", "body": "B"}),
+        )
+        .unwrap();
     }
 
     #[test]
