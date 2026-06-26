@@ -769,7 +769,23 @@ impl LiveCaptureWorker {
                 // condvar so a cadence or target change is picked up at once
                 // rather than after the current sleep. Spurious wakeups just
                 // run an extra capture cycle, which the dedup makes harmless.
-                let ms = interval_cell.load(Ordering::Relaxed);
+                //
+                // A live in-process vt channel samples the grid cheaply (no
+                // `capture-pane` fork) and dedups unchanged frames, so the idle
+                // throttle buys nothing there: pace it fast so the PREVIEWED
+                // pane scrolls / streams as smoothly as the active live pane,
+                // even when it isn't the live-send target. The idle cadence
+                // still governs the capture-pane fallback, whose every sample is
+                // an expensive fork.
+                #[cfg(unix)]
+                let vt_active = vt_source.as_ref().is_some_and(|v| v.is_alive());
+                #[cfg(not(unix))]
+                let vt_active = false;
+                let ms = if vt_active {
+                    LIVE_CAPTURE_INTERVAL_FAST_MS
+                } else {
+                    interval_cell.load(Ordering::Relaxed)
+                };
                 if let Ok(guard) = nudge_thread.0.lock() {
                     let _ = nudge_thread
                         .1
