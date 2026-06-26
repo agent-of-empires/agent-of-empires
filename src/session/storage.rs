@@ -392,18 +392,6 @@ impl Storage {
         Ok(instances)
     }
 
-    /// Write corrupt session rows to a sibling `sessions.corrupt.jsonl`
-    /// quarantine file (one JSON object per line) for later inspection and
-    /// manual recovery. Best-effort: a failure to write the sidecar is
-    /// logged but never fails the load, since the whole point is to keep the
-    /// surviving sessions reachable.
-    ///
-    /// Truncates rather than appends: `load()` runs on read-only refresh
-    /// paths (TUI reconcile, web list, CLI) that never rewrite
-    /// `sessions.json`, so a persistently corrupt row would otherwise be
-    /// re-appended on every load and grow the sidecar without bound. Each
-    /// load sees the full current corrupt set, so an overwrite is a
-    /// complete, deduplicated snapshot.
     fn quarantine_corrupt_rows(&self, rows: &[serde_json::Value]) {
         let path = self.sessions_path.with_file_name("sessions.corrupt.jsonl");
         Self::write_corrupt_rows_quarantine(&path, rows, "session");
@@ -414,6 +402,18 @@ impl Storage {
         Self::write_corrupt_rows_quarantine(&path, rows, "group");
     }
 
+    /// Write corrupt rows to a sibling quarantine sidecar for later inspection
+    /// and manual recovery. Each line preserves one original JSON value; rows
+    /// are not limited to objects because a malformed element can be any JSON
+    /// value. Best-effort: a failure to write the sidecar is logged but never
+    /// fails the load, since the whole point is to keep surviving sessions and
+    /// groups reachable.
+    ///
+    /// Truncates rather than appends: load paths can run on read-only refresh
+    /// flows (TUI reconcile, web list, CLI) that never rewrite the source JSON,
+    /// so a persistently corrupt row would otherwise be re-appended on every
+    /// load and grow the sidecar without bound. Each load sees the full current
+    /// corrupt set, so an overwrite is a complete, deduplicated snapshot.
     fn write_corrupt_rows_quarantine(path: &Path, rows: &[serde_json::Value], row_kind: &str) {
         let mut buf = String::new();
         for row in rows {
@@ -435,9 +435,10 @@ impl Storage {
 
         // `atomic_write` (not `fs::write`) so the sidecar matches the
         // durability and privacy guarantees of the source JSON file: a crash
-        // mid-write cannot tear the only surviving copy of the lost row, the
-        // file lands at 0o600, and concurrently-reachable read callers
-        // collapse to a benign last-writer-wins instead of interleaving bytes.
+        // mid-write cannot tear the only surviving copy of the lost row, fresh
+        // sidecars land at 0o600 while existing permissions are preserved, and
+        // concurrently-reachable read callers collapse to a benign
+        // last-writer-wins instead of interleaving bytes.
         if let Err(e) = atomic_write(path, buf.as_bytes()) {
             tracing::warn!(
                 error = %e,
