@@ -14,11 +14,14 @@
       "kind": "vitest",
       "risk": "medium",
       "specs": ["src/components/__tests__/Dock.test.tsx"],
-      "components": [
-        "web/src/components/Dock.tsx",
-        "web/src/components/PaneFrame.tsx",
-        "web/src/components/BottomDock.tsx"
-      ]
+      "components": ["web/src/components/Dock.tsx", "web/src/components/PaneFrame.tsx"]
+    },
+    {
+      "id": "app-shell.bottom-dock",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/__tests__/BottomDock.test.tsx"],
+      "components": ["web/src/components/BottomDock.tsx"]
     },
     {
       "id": "settings.mcp-servers",
