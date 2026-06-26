@@ -1506,6 +1506,7 @@ impl ToolCallContextCache {
 
     fn remove(&mut self, tool_call_id: &str) {
         self.raw_inputs.remove(tool_call_id);
+        self.insertion_order.retain(|id| id != tool_call_id);
     }
 
     fn enforce_limit(&mut self) {
@@ -8952,6 +8953,7 @@ mod tests {
         cache.remove("tc-1");
 
         assert!(cache.get("tc-1").is_none());
+        assert!(!cache.insertion_order.iter().any(|id| id == "tc-1"));
     }
 
     #[test]
