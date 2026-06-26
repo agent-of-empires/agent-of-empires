@@ -1805,7 +1805,14 @@ impl Instance {
     }
 
     pub fn terminal_tmux_session(&self) -> Result<tmux::TerminalSession> {
-        tmux::TerminalSession::new(&self.id, &self.title)
+        self.terminal_tmux_session_indexed(0)
+    }
+
+    /// Paired host terminal at `index`. Index 0 is the historical single
+    /// terminal (the only one the TUI uses); index >= 1 are the additional
+    /// web dashboard terminal tabs (#2437).
+    pub fn terminal_tmux_session_indexed(&self, index: u32) -> Result<tmux::TerminalSession> {
+        tmux::TerminalSession::new_indexed(&self.id, &self.title, index)
     }
 
     pub fn has_terminal(&self) -> bool {
@@ -1820,25 +1827,39 @@ impl Instance {
     }
 
     pub fn start_terminal_with_size(&mut self, size: Option<(u16, u16)>) -> Result<()> {
-        let session = self.terminal_tmux_session()?;
+        self.start_terminal_with_size_indexed(0, size)
+    }
+
+    pub fn start_terminal_with_size_indexed(
+        &mut self,
+        index: u32,
+        size: Option<(u16, u16)>,
+    ) -> Result<()> {
+        let session = self.terminal_tmux_session_indexed(index)?;
 
         let is_new = !session.exists();
         if is_new {
             session.create_with_size(&self.project_path, None, size)?;
+            // Apply all configured tmux options to terminal sessions too
+            self.apply_terminal_tmux_options(index);
         }
 
-        // Apply all configured tmux options to terminal sessions too
-        if is_new {
-            self.apply_terminal_tmux_options();
+        // The persisted `terminal_info` cache is the index-0 fast path the TUI
+        // reads; additional terminals (index >= 1) are tracked by the web
+        // dashboard and queried straight from tmux, like container terminals.
+        if index == 0 {
+            self.terminal_info = Some(TerminalInfo { created: true });
         }
-
-        self.terminal_info = Some(TerminalInfo { created: true });
 
         Ok(())
     }
 
     pub fn kill_terminal(&self) -> Result<()> {
-        let session = self.terminal_tmux_session()?;
+        self.kill_terminal_indexed(0)
+    }
+
+    pub fn kill_terminal_indexed(&self, index: u32) -> Result<()> {
+        let session = self.terminal_tmux_session_indexed(index)?;
         if session.exists() {
             session.kill()?;
         }
@@ -1850,7 +1871,11 @@ impl Instance {
     /// Returns true if a kill happened so the caller knows to re-spawn.
     /// A missing session or a live pane both return Ok(false).
     pub fn kill_terminal_if_dead(&self) -> Result<bool> {
-        let session = self.terminal_tmux_session()?;
+        self.kill_terminal_if_dead_indexed(0)
+    }
+
+    pub fn kill_terminal_if_dead_indexed(&self, index: u32) -> Result<bool> {
+        let session = self.terminal_tmux_session_indexed(index)?;
         if session.exists() && session.is_pane_dead() {
             let _ = session.kill();
             return Ok(true);
@@ -1859,7 +1884,14 @@ impl Instance {
     }
 
     pub fn container_terminal_tmux_session(&self) -> Result<tmux::ContainerTerminalSession> {
-        tmux::ContainerTerminalSession::new(&self.id, &self.title)
+        self.container_terminal_tmux_session_indexed(0)
+    }
+
+    pub fn container_terminal_tmux_session_indexed(
+        &self,
+        index: u32,
+    ) -> Result<tmux::ContainerTerminalSession> {
+        tmux::ContainerTerminalSession::new_indexed(&self.id, &self.title, index)
     }
 
     pub fn has_container_terminal(&self) -> bool {
@@ -1875,6 +1907,14 @@ impl Instance {
     }
 
     pub fn start_container_terminal_with_size(&mut self, size: Option<(u16, u16)>) -> Result<()> {
+        self.start_container_terminal_with_size_indexed(0, size)
+    }
+
+    pub fn start_container_terminal_with_size_indexed(
+        &mut self,
+        index: u32,
+        size: Option<(u16, u16)>,
+    ) -> Result<()> {
         if !self.is_sandboxed() {
             anyhow::bail!("Cannot create container terminal for non-sandboxed session");
         }
@@ -1914,18 +1954,22 @@ impl Instance {
             format!("{}; exec {}", exports, cmd)
         };
 
-        let session = self.container_terminal_tmux_session()?;
+        let session = self.container_terminal_tmux_session_indexed(index)?;
         let is_new = !session.exists();
         if is_new {
             session.create_with_size(&self.project_path, Some(&session_cmd), size)?;
-            self.apply_container_terminal_tmux_options();
+            self.apply_container_terminal_tmux_options(index);
         }
 
         Ok(())
     }
 
     pub fn kill_container_terminal(&self) -> Result<()> {
-        let session = self.container_terminal_tmux_session()?;
+        self.kill_container_terminal_indexed(0)
+    }
+
+    pub fn kill_container_terminal_indexed(&self, index: u32) -> Result<()> {
+        let session = self.container_terminal_tmux_session_indexed(index)?;
         if session.exists() {
             session.kill()?;
         }
@@ -1934,7 +1978,11 @@ impl Instance {
 
     /// Container counterpart of [`Self::kill_terminal_if_dead`].
     pub fn kill_container_terminal_if_dead(&self) -> Result<bool> {
-        let session = self.container_terminal_tmux_session()?;
+        self.kill_container_terminal_if_dead_indexed(0)
+    }
+
+    pub fn kill_container_terminal_if_dead_indexed(&self, index: u32) -> Result<bool> {
+        let session = self.container_terminal_tmux_session_indexed(index)?;
         if session.exists() && session.is_pane_dead() {
             let _ = session.kill();
             return Ok(true);
@@ -1970,8 +2018,9 @@ impl Instance {
         );
     }
 
-    fn apply_container_terminal_tmux_options(&self) {
-        let name = tmux::ContainerTerminalSession::generate_name(&self.id, &self.title);
+    fn apply_container_terminal_tmux_options(&self, index: u32) {
+        let name =
+            tmux::ContainerTerminalSession::generate_name_indexed(&self.id, &self.title, index);
         self.apply_session_tmux_options(&name, &format!("{} (container)", self.title));
     }
 
@@ -2720,8 +2769,8 @@ impl Instance {
 }
 
 impl Instance {
-    fn apply_terminal_tmux_options(&self) {
-        let name = tmux::TerminalSession::generate_name(&self.id, &self.title);
+    fn apply_terminal_tmux_options(&self, index: u32) {
+        let name = tmux::TerminalSession::generate_name_indexed(&self.id, &self.title, index);
         self.apply_session_tmux_options(&name, &format!("{} (terminal)", self.title));
     }
 
@@ -3573,24 +3622,10 @@ impl Instance {
     /// with caller-specific tracing while still letting all other
     /// kinds be cleaned up consistently.
     pub fn kill_ancillary_tmux_sessions(&self) {
-        if let Err(e) = self.kill_terminal() {
-            tracing::debug!(
-                target: "session.tmux_cleanup",
-                session_id = %self.id,
-                kind = "terminal",
-                error = %e,
-                "kill_ancillary_tmux_sessions: kill failed"
-            );
-        }
-        if let Err(e) = self.kill_container_terminal() {
-            tracing::debug!(
-                target: "session.tmux_cleanup",
-                session_id = %self.id,
-                kind = "container_terminal",
-                error = %e,
-                "kill_ancillary_tmux_sessions: kill failed"
-            );
-        }
+        // Reaps every paired terminal (host + container, index 0 and the
+        // additional web terminal tabs) in one tmux scan, so multi-terminal
+        // sessions (#2437) do not leak panes on teardown.
+        crate::tmux::kill_all_terminals_for_id(&self.id);
         crate::tmux::kill_all_tool_sessions_for_id(&self.id);
     }
 
