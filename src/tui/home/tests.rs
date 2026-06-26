@@ -10485,6 +10485,38 @@ mod click_to_select {
         );
     }
 
+    /// Two presses on the same preview row but different columns are unrelated
+    /// clicks (e.g. tapping two different words), not a double-click: only a
+    /// same-cell second press within the window activates.
+    #[test]
+    #[serial]
+    fn preview_two_presses_on_same_row_different_col_do_not_activate() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+        use std::time::{Duration, Instant};
+
+        let mut env = create_test_env_with_sessions(3);
+        env.view.preview_area = Rect::new(30, 0, 100, 40);
+        env.view.cursor = 1;
+        env.view.update_selected();
+
+        let down = MouseEventKind::Down(MouseButton::Left);
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(150);
+        // Same row 10, columns 40 then 70: within the time window but a
+        // different cell, so the second press is a fresh single click.
+        assert_eq!(
+            env.view
+                .preview_double_click_action_at(t0, down, KeyModifiers::NONE, 40, 10),
+            None
+        );
+        assert_eq!(
+            env.view
+                .preview_double_click_action_at(t1, down, KeyModifiers::NONE, 70, 10),
+            None,
+            "a different-column second press on the same row must not activate"
+        );
+    }
+
     #[test]
     #[serial]
     fn two_clicks_on_different_rows_do_not_activate() {

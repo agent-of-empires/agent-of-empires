@@ -706,7 +706,7 @@ impl HomeView {
         // page-key fallback stays slow: each press scrolls a WHOLE page, so a
         // held edge at the fast cadence would rocket through the transcript.
         const AUTOSCROLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(40);
-        const PAGE_FORWARD_INTERVAL: std::time::Duration = std::time::Duration::from_millis(150);
+        const PAGE_FORWARD_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
         let now = std::time::Instant::now();
         let forward_interval = if self.preview_forwards_mouse().is_some() {
             AUTOSCROLL_INTERVAL
@@ -4459,10 +4459,11 @@ impl HomeView {
     /// to a plain (no-Shift) left press over the preview with no overlay on top.
     /// The previewed pane is always `selected_session`, so it activates the
     /// right row without touching `cursor`. Returns the activation `Action` on
-    /// the second qualifying press within `DOUBLE_CLICK_THRESHOLD`, else `None`
-    /// (a single press, whose timing it records; the caller still forwards that
-    /// press to a mouse-tracking agent). Shift falls through so aoe's own
-    /// preview selection runs, matching the mouse-forward gate.
+    /// the second qualifying press on the SAME cell within
+    /// `DOUBLE_CLICK_THRESHOLD`, else `None` (a single press, whose timing it
+    /// records; the caller still forwards that press to a mouse-tracking
+    /// agent). Shift falls through so aoe's own preview selection runs, matching
+    /// the mouse-forward gate.
     pub fn preview_double_click_action(
         &mut self,
         kind: crossterm::event::MouseEventKind,
@@ -4493,10 +4494,16 @@ impl HomeView {
         if self.has_non_live_send_overlay() || !self.hit_preview(col, row) {
             return None;
         }
+        // Match the SAME cell, not just the row: the sidebar can key by row
+        // because a row identifies an item, but a preview row is just a line of
+        // text, so two unrelated presses on the same line (different columns)
+        // must not count as a double-click.
         let is_double = matches!(
             self.last_preview_click,
-            Some((prev_time, _, prev_row))
-                if prev_row == row && now.duration_since(prev_time) <= DOUBLE_CLICK_THRESHOLD
+            Some((prev_time, prev_col, prev_row))
+                if prev_col == col
+                    && prev_row == row
+                    && now.duration_since(prev_time) <= DOUBLE_CLICK_THRESHOLD
         );
         if is_double {
             // Reset so a triple-click doesn't immediately re-fire activation.
