@@ -3,9 +3,13 @@ import { test, expect } from "./helpers/mockedTest";
 const LAYOUT_KEY = "aoe-pane-layout";
 const LEGACY_KEY = "aoe-right-collapsed";
 
+// The stored layout is `{ diff: { open, dock }, ... }`; these tests only assert
+// the open flags, so flatten each pane to its boolean `open`.
 async function getLayout(page: import("@playwright/test").Page) {
   const raw = await page.evaluate((k) => localStorage.getItem(k), LAYOUT_KEY);
-  return raw ? JSON.parse(raw) : null;
+  if (!raw) return null;
+  const parsed = JSON.parse(raw) as Record<string, { open: boolean }>;
+  return Object.fromEntries(Object.entries(parsed).map(([k, v]) => [k, v.open]));
 }
 
 test.describe("Right dock pane-layout persistence", () => {
