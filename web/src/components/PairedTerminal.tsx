@@ -8,7 +8,17 @@ type ShellMode = "host" | "container";
  *  desktop right-panel split and as the promoted single full-viewport mobile
  *  pane. Renders the capture-snapshot live view on every device (same
  *  architecture as the agent pane); the xterm.js PTY relay was removed. */
-export function PairedShellPane({ session, sessionId }: { session: SessionResponse | null; sessionId: string | null }) {
+export function PairedShellPane({
+  session,
+  sessionId,
+  terminalIndex = 0,
+}: {
+  session: SessionResponse | null;
+  sessionId: string | null;
+  /** Which paired-terminal instance this tab renders (#2437). 0 is the
+   *  primary shell shared with the native TUI. */
+  terminalIndex?: number;
+}) {
   const [shellMode, setShellMode] = useState<ShellMode>("host");
   const isSandboxed = session?.is_sandboxed ?? false;
   // Container mode is only valid while the session is sandboxed; derive the
@@ -41,9 +51,10 @@ export function PairedShellPane({ session, sessionId }: { session: SessionRespon
         </div>
       ) : (
         <LiveTerminalView
-          key={`${sessionId}-${effectiveMode}`}
+          key={`${sessionId}-${effectiveMode}-${terminalIndex}`}
           session={session}
           surface={effectiveMode === "container" ? "paired-container" : "paired-host"}
+          terminalIndex={terminalIndex}
         />
       )}
     </div>

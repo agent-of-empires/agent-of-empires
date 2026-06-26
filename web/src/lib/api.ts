@@ -107,11 +107,25 @@ export async function ensureSession(id: string, signal?: AbortSignal): Promise<E
   }
 }
 
-export async function ensureTerminal(id: string, container = false): Promise<boolean> {
+export async function ensureTerminal(id: string, index = 0, container = false): Promise<boolean> {
   const path = container ? "container-terminal" : "terminal";
   try {
-    const res = await fetch(`/api/sessions/${id}/${path}`, {
+    const res = await fetch(`/api/sessions/${id}/${path}?index=${index}`, {
       method: "POST",
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/** Kill an extra terminal tab's host + container shells (index >= 1). Index 0
+ *  is the primary terminal shared with the native TUI and cannot be killed
+ *  from the web UI (the server rejects it); closing that tab only hides it. */
+export async function killTerminal(id: string, index: number): Promise<boolean> {
+  try {
+    const res = await fetch(`/api/sessions/${id}/terminal?index=${index}`, {
+      method: "DELETE",
     });
     return res.ok;
   } catch {

@@ -22,6 +22,9 @@ interface Props {
    *  default; the paired host/container shells reuse the same chrome
    *  with their own WS route, ensure call, and focus target. */
   surface?: "agent" | "paired-host" | "paired-container";
+  /** Paired-terminal instance index for the tabbed terminal groups (#2437).
+   *  Ignored for the agent surface; 0 is the primary paired shell. */
+  terminalIndex?: number;
 }
 
 const SURFACES = {
@@ -45,8 +48,18 @@ const SURFACES = {
  * not shrink. The pane re-pins itself to the bottom when its container
  * resizes, which is all a bottom-anchored chat-style surface needs.
  */
-export function LiveTerminalView({ session, active = true, surface = "agent" }: Props) {
-  const { wsPath, focusTarget, dataTerm } = SURFACES[surface];
+export function LiveTerminalView({
+  session,
+  active = true,
+  surface = "agent",
+  terminalIndex = 0,
+}: Props) {
+  const base = SURFACES[surface];
+  const { focusTarget, dataTerm } = base;
+  // Paired terminals carry their instance index as a query param so the
+  // server attaches the right tmux session; the agent surface ignores it.
+  const wsPath =
+    surface === "agent" ? base.wsPath : `${base.wsPath}?index=${terminalIndex}`;
   // Touch-only chrome (the soft-keyboard toolbar and its toggle FAB) is
   // pointless with a physical keyboard, so it stays off fine-pointer devices
   // now that this view also renders on desktop.
@@ -93,7 +106,7 @@ export function LiveTerminalView({ session, active = true, surface = "agent" }: 
     const ensure =
       surface === "agent"
         ? ensureSession(session.id, controller.signal)
-        : ensureTerminal(session.id, surface === "paired-container").then((ok) => ({
+        : ensureTerminal(session.id, terminalIndex, surface === "paired-container").then((ok) => ({
             ok,
             message: null as string | null,
           }));
@@ -108,7 +121,7 @@ export function LiveTerminalView({ session, active = true, surface = "agent" }: 
       }
     });
     return () => controller.abort();
-  }, [session.id, focusSelf, surface, focusTarget]);
+  }, [session.id, focusSelf, surface, focusTarget, terminalIndex]);
 
   // Drain a pending focus latch once the pane is mounted.
   useEffect(() => {
@@ -136,7 +149,7 @@ export function LiveTerminalView({ session, active = true, surface = "agent" }: 
       const ensure =
         surface === "agent"
           ? ensureSession(session.id, controller.signal)
-          : ensureTerminal(session.id, surface === "paired-container").then((ok) => ({
+          : ensureTerminal(session.id, terminalIndex, surface === "paired-container").then((ok) => ({
               ok,
               message: null as string | null,
             }));
@@ -152,7 +165,7 @@ export function LiveTerminalView({ session, active = true, surface = "agent" }: 
       });
       return "pending";
     });
-  }, [session.id, surface]);
+  }, [session.id, surface, terminalIndex]);
 
   // Focus/blur MUST be first in the handler so iOS keeps the user-gesture
   // chain and actually shows the keyboard.
