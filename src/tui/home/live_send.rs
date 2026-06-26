@@ -940,6 +940,17 @@ fn dispatch_via_fork(tmux_name: &str, action: &TmuxAction) -> anyhow::Result<()>
 const MAX_INFLIGHT_ONESHOT: usize = 8;
 static INFLIGHT_ONESHOT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Releases one `INFLIGHT_ONESHOT` slot on drop, so the count is balanced even
+/// if the fork thread panics (otherwise a leaked slot would permanently shrink
+/// the cap). Constructed inside the spawned closure, so a spawn that never
+/// starts must release its reserved slot itself.
+struct OneshotSlot;
+impl Drop for OneshotSlot {
+    fn drop(&mut self) {
+        INFLIGHT_ONESHOT.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 /// Forward a single translated key to a tmux pane with a one-shot
 /// `tmux send-keys` fork on a detached thread. Used by the passive-preview
 /// wheel forward, where there is no long-lived `LiveSendWorker` to enqueue
@@ -963,17 +974,31 @@ pub(super) fn send_key_oneshot(tmux_name: &str, key: TmuxKey) {
         TmuxKey::NamedRepeat { name, count } => TmuxAction::NamedRepeat { name, count },
         TmuxKey::HexBytes(bytes) => TmuxAction::HexBytes(bytes),
     };
-    std::thread::spawn(move || {
-        if let Err(err) = dispatch_via_fork(&tmux_name, &action) {
-            tracing::warn!(
-                target: "tui.live_send",
-                error = %err,
-                action = ?action,
-                "passive-preview wheel forward fork failed; notch dropped",
-            );
-        }
+    // `Builder::spawn` returns the OS error instead of panicking (`spawn`
+    // panics if the OS refuses a new thread), so a thread-creation failure
+    // under load can't take down the UI thread we're called from. The slot is
+    // released by the `OneshotSlot` guard inside the closure on completion or
+    // panic; if the spawn never starts, release the reserved slot here.
+    let spawned = std::thread::Builder::new()
+        .name("aoe-wheel-forward".to_string())
+        .spawn(move || {
+            let _slot = OneshotSlot;
+            if let Err(err) = dispatch_via_fork(&tmux_name, &action) {
+                tracing::warn!(
+                    target: "tui.live_send",
+                    error = %err,
+                    action = ?action,
+                    "passive-preview wheel forward fork failed; notch dropped",
+                );
+            }
+        });
+    if spawned.is_err() {
         INFLIGHT_ONESHOT.fetch_sub(1, Ordering::AcqRel);
-    });
+        tracing::warn!(
+            target: "tui.live_send",
+            "could not spawn wheel-forward thread; notch dropped",
+        );
+    }
 }
 
 /// Upper bound on the number of bytes encoded into a single

@@ -286,14 +286,18 @@ async fn handle_live_ws(
             .await;
 
             match captured {
-                Ok(Ok((content, cursor))) if !content.is_empty() || cursor.is_some() => {
+                // A position-unreliable cursor (the pane scrolled between the
+                // capture's two probes) is treated as "no cursor" here: the web
+                // frame has no `position_reliable` channel and its renderer maps
+                // the cursor row onto the content, so painting it would land on
+                // the wrong row. Folding `position_reliable` into the guard (not
+                // just `is_some`) keeps the empty-content case routing to the
+                // dead-probe arm exactly as it did before this flag existed.
+                Ok(Ok((content, cursor)))
+                    if !content.is_empty()
+                        || cursor.as_ref().is_some_and(|c| c.position_reliable) =>
+                {
                     dead_probes = 0;
-                    // The web frame has no `position_reliable` channel and its
-                    // renderer maps the cursor row onto the content, so a
-                    // position-unreliable cursor (the pane scrolled between the
-                    // capture's two cursor probes) would paint on the wrong
-                    // row. Drop it, preserving the pre-`position_reliable` web
-                    // behavior; this path does not consume the mode flags.
                     let cursor = cursor.filter(|c| c.position_reliable);
                     // Keep the size-owner lock alive while we hold it, and
                     // notice promptly if another client took over (then we
