@@ -759,6 +759,12 @@ fn kiro_config_has_aoe_marker(path: &Path) -> bool {
 ///
 /// An event with both produces two `hooks` array entries under the same
 /// matcher block. An event with neither is skipped.
+///
+/// Multiple events may share a `name` with different matchers (e.g. Claude's
+/// `Notification` splits `permission_prompt|elicitation_dialog` → waiting from
+/// `idle_prompt` → idle). Each becomes its own matcher block appended to that
+/// event name's array, so they coexist instead of the later one clobbering the
+/// earlier.
 fn build_aoe_hooks(events: &[crate::agents::HookEvent], target: HookInstallTarget) -> Value {
     let mut hooks_obj = serde_json::Map::new();
     for event in events {
@@ -787,10 +793,14 @@ fn build_aoe_hooks(events: &[crate::agents::HookEvent], target: HookInstallTarge
             })
             .collect();
         entry.insert("hooks".to_string(), Value::Array(hook_entries));
-        hooks_obj.insert(
-            event.name.to_string(),
-            Value::Array(vec![Value::Object(entry)]),
-        );
+        match hooks_obj
+            .entry(event.name.to_string())
+            .or_insert_with(|| Value::Array(Vec::new()))
+        {
+            Value::Array(groups) => groups.push(Value::Object(entry)),
+            // or_insert_with only ever seeds an Array, so this arm is unreachable.
+            _ => unreachable!("hook event group is always a JSON array"),
+        }
     }
 
     Value::Object(hooks_obj)
@@ -2984,11 +2994,40 @@ command = "echo user-hook"
     fn test_notification_hook_has_matcher() {
         let hooks = build_aoe_hooks(claude_events(), HookInstallTarget::Sandbox);
         let notification = hooks["Notification"].as_array().unwrap();
-        assert_eq!(notification.len(), 1);
-        let matcher = notification[0]["matcher"].as_str().unwrap();
-        assert!(matcher.contains("permission_prompt"));
-        assert!(matcher.contains("elicitation_dialog"));
-        assert!(!matcher.contains("idle_prompt"));
+        // Two matcher groups: permission/elicitation → waiting, idle_prompt → idle.
+        assert_eq!(notification.len(), 2);
+
+        let waiting = notification
+            .iter()
+            .find(|g| {
+                g["matcher"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("permission_prompt"))
+            })
+            .expect("waiting matcher group present");
+        let waiting_matcher = waiting["matcher"].as_str().unwrap();
+        assert!(waiting_matcher.contains("permission_prompt"));
+        assert!(waiting_matcher.contains("elicitation_dialog"));
+        assert!(!waiting_matcher.contains("idle_prompt"));
+        assert!(
+            waiting["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .contains("printf waiting"),
+            "permission/elicitation notification should write waiting"
+        );
+
+        let idle = notification
+            .iter()
+            .find(|g| g["matcher"].as_str() == Some("idle_prompt"))
+            .expect("idle_prompt matcher group present");
+        assert!(
+            idle["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .contains("printf idle"),
+            "idle_prompt notification should write idle"
+        );
     }
 
     #[test]
@@ -2999,6 +3038,21 @@ command = "echo user-hook"
         assert!(
             cmd.contains("printf idle"),
             "Stop hook should write idle status: {}",
+            cmd
+        );
+    }
+
+    #[test]
+    fn test_stop_failure_hook_writes_idle() {
+        // A turn killed by an API error fires StopFailure, not Stop, so this is
+        // the only thing that clears the trailing `running` write in that path.
+        let hooks = build_aoe_hooks(claude_events(), HookInstallTarget::Sandbox);
+        let stop_failure = hooks["StopFailure"].as_array().unwrap();
+        assert_eq!(stop_failure.len(), 1);
+        let cmd = stop_failure[0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(
+            cmd.contains("printf idle"),
+            "StopFailure hook should write idle status: {}",
             cmd
         );
     }
