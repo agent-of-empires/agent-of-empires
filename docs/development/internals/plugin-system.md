@@ -464,9 +464,11 @@ change to the resolver or the supervisor.
 ## UI extension points (#2366)
 
 A plugin worker pushes typed UI state to the host over capability-gated RPCs;
-the **host** renders every slot, on the web dashboard. No plugin code runs in
-the dashboard and the render path never awaits a worker: the host keeps an
-in-memory snapshot the dashboard reads synchronously.
+the **host** renders every slot, on the web dashboard and (the
+terminal-applicable subset) in the daemon-connected TUI. No plugin code runs in
+either surface and the render path never awaits a worker: the host keeps an
+in-memory snapshot each surface reads synchronously (see Delivery below for what
+the TUI renders).
 
 The nine slots are a closed `UiSlot` set (`aoe-plugin-api`), kebab-case on the
 wire: `status-bar`, `row-badge`, `row-column`, `sort-key`, `filter-facet`,
@@ -563,9 +565,19 @@ incremental cursor. The dashboard polls it on the same cadence as
 the live list. Notifications surface as toasts, deduped by `seq`.
 
 `sort-key` and `filter-facet` are accepted and stored by the host but their
-dashboard rendering (which needs changes to the sidebar's sort/filter core),
-and TUI rendering of any slot (the standalone TUI has no daemon link), are
-deferred to follow-ups.
+dashboard rendering (which needs changes to the sidebar's sort/filter core) is
+deferred to a follow-up.
+
+The native **structured-view** TUI (`aoe acp attach`, the remote-home picker)
+polls the same endpoint on a 3-second cadence and renders the slots a terminal
+can show: global `status-bar` segments and the open session's `detail-badge`
+entries, tone-colored, in its status line, plus `notification`s as toasts
+(deduped by `seq`, queued so a burst shows one at a time). It renders text and
+tone only; `icon`, `tooltip`, and `href` are dropped, and `card`, `pane`,
+`row-badge`, `row-column`, `sort-key`, and `filter-facet` have no structured-view
+surface. The standalone home screen reads local session storage and has no
+daemon link, so it renders no plugin slots; rendering there is a follow-up
+(#2402).
 
 ## What comes next
 
@@ -574,8 +586,9 @@ contribution registries (issue 2094), the UI extension points (issue 2366,
 above), the builtin worker self-exec path and worker SDK (with the first
 builtin worker that needs them), and the discovery / featured supply-chain
 layer with integrity hashing (issues 2364 and 2365). Within #2366, dashboard
-rendering of the `sort-key` and `filter-facet` slots and TUI rendering of any
-slot are themselves follow-ups. Pinning a featured plugin's
+rendering of the `sort-key` and `filter-facet` slots is itself a follow-up, as
+is rendering plugin slots in the standalone (non-daemon) home screen (the
+structured-view TUI already renders them, #2402). Pinning a featured plugin's
 release-binary asset hash in `featured.toml` (so a featured worker is attested,
 not just its source) is a follow-up; today a release-binary plugin cannot be
 featured.
