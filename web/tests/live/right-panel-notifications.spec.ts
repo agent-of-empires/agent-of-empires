@@ -41,7 +41,7 @@ base(
       // above the Host / Container picker; assert it to scope subsequent
       // selectors. The dashboard mounts both a desktop and a mobile right panel
       // (one hidden via CSS), so use first() on visible-anywhere assertions.
-      await page.getByTestId("pane-tab-terminal:0").first().click({ timeout: 10_000 });
+      await page.getByTestId("pane-tab-terminal:0").filter({ visible: true }).click({ timeout: 10_000 });
       await expect(page.getByText("Shell", { exact: true }).first()).toBeVisible({
         timeout: 10_000,
       });
