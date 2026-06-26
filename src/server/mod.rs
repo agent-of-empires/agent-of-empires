@@ -3666,7 +3666,7 @@ async fn acp_event_listener(state: Arc<AppState>) {
                     let session_id = frame.session_id.clone();
                     let title = title.clone();
                     tokio::spawn(async move {
-                        crate::session::smart_rename::apply_auto_title(
+                        crate::session::smart_rename::apply_native_title_suggestion(
                             &state_for_title,
                             &session_id,
                             &profile,
@@ -4296,7 +4296,7 @@ mod tests {
 
         // First native push: a still-default civ name is renamed and the
         // applied title is recorded as the last auto title.
-        crate::session::smart_rename::apply_auto_title(
+        crate::session::smart_rename::apply_native_title_suggestion(
             &state,
             &id,
             "native-title",
@@ -4311,7 +4311,7 @@ mod tests {
         );
 
         // A later turn pushes a new title; it keeps tracking the agent.
-        crate::session::smart_rename::apply_auto_title(
+        crate::session::smart_rename::apply_native_title_suggestion(
             &state,
             &id,
             "native-title",
@@ -4328,7 +4328,7 @@ mod tests {
                 Ok(())
             })
             .expect("manual rename");
-        crate::session::smart_rename::apply_auto_title(
+        crate::session::smart_rename::apply_native_title_suggestion(
             &state,
             &id,
             "native-title",
@@ -4336,6 +4336,75 @@ mod tests {
         )
         .await;
         assert_eq!(load()[0].title, "Production hotfix");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn native_title_prompt_echo_is_dropped_but_later_summary_applies() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // SAFETY: serialized test; no other test mutates HOME concurrently.
+        unsafe { std::env::set_var("HOME", temp.path()) };
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        }
+
+        let mut inst = Instance::new("Britons", "/tmp/native-title-echo");
+        inst.source_profile = "native-title-echo".to_string();
+        let id = inst.id.clone();
+
+        let storage = crate::session::Storage::new_unwatched("native-title-echo").expect("storage");
+        storage
+            .update(|instances, _groups| {
+                *instances = vec![inst.clone()];
+                Ok(())
+            })
+            .expect("seed write");
+
+        let state = test_support::build_test_app_state(vec![inst]);
+        let first_prompt = "Please fix the login redirect by updating auth middleware";
+        state
+            .acp_event_store
+            .record(
+                &id,
+                1,
+                &crate::acp::Event::UserPromptSent {
+                    text: first_prompt.to_string(),
+                    attachments: vec![],
+                },
+            )
+            .expect("record prompt");
+        let load = || {
+            crate::session::Storage::new_unwatched("native-title-echo")
+                .unwrap()
+                .load()
+                .unwrap()
+        };
+
+        crate::session::smart_rename::apply_native_title_suggestion(
+            &state,
+            &id,
+            "native-title-echo",
+            first_prompt,
+        )
+        .await;
+        let loaded = load();
+        assert_eq!(loaded[0].title, "Britons");
+        assert_eq!(loaded[0].last_auto_title, None);
+
+        crate::session::smart_rename::apply_native_title_suggestion(
+            &state,
+            &id,
+            "native-title-echo",
+            "Fix login redirect",
+        )
+        .await;
+        let loaded = load();
+        assert_eq!(loaded[0].title, "Fix login redirect");
+        assert_eq!(
+            loaded[0].last_auto_title.as_deref(),
+            Some("Fix login redirect")
+        );
     }
 
     #[tokio::test]
