@@ -187,6 +187,76 @@ fn lf_to_crlf(raw: &[u8]) -> Vec<u8> {
     out
 }
 
+/// (Re)build `parser` from tmux's authoritative `capture-pane` at `cols`x`rows`,
+/// resetting any prior content. `pipe-pane` carries only the app's incremental
+/// output, never tmux's reflow, so on a resize a grid that merely `set_size`d
+/// itself would keep its pre-resize layout while the app reprints onto it,
+/// duplicating the prompt and stranding the cursor on the wrong row (the app
+/// may never emit anything else, so the divergence is permanent). Rebuilding
+/// from `capture-pane` re-syncs the grid to tmux exactly.
+///
+/// The seed is rendered content (`capture-pane -e`), so it carries no DEC
+/// private-mode SETs; the pane's current modes are queried and replayed as a
+/// prefix first, then the body is CRLF-translated (capture-pane uses bare LF;
+/// the parser needs CR to reset the column or each row staircases).
+fn seed_parser(
+    target: &str,
+    parser: &Mutex<vt100::Parser>,
+    app_cursor: &AtomicBool,
+    cols: u16,
+    rows: u16,
+) {
+    let (alt, mouse, mouse_sgr) = pane_modes(target).unwrap_or((false, false, false));
+    let mut prefix: Vec<u8> = Vec::new();
+    if alt {
+        prefix.extend_from_slice(b"\x1b[?1049h");
+    }
+    if mouse {
+        prefix.extend_from_slice(b"\x1b[?1000h");
+    }
+    if mouse_sgr {
+        prefix.extend_from_slice(b"\x1b[?1006h");
+    }
+    // The alternate screen has no scrollback, so only the normal buffer pulls
+    // history (`-S`); the pane keeps that history across re-arms.
+    let seed_start = format!("-{SCROLLBACK_LINES}");
+    let mut seed_args = vec!["capture-pane", "-t", target, "-p", "-e"];
+    if !alt {
+        seed_args.extend_from_slice(&["-S", &seed_start]);
+    }
+    let Ok(out) = Command::new("tmux").args(&seed_args).output() else {
+        return;
+    };
+    // Trim trailing blank rows: capture-pane pads the body out to the full pane
+    // height, and feeding those empty rows would march the parser's cursor down
+    // to the bottom, stranding it well below the app's actual last line. With
+    // them gone the cursor naturally lands right after the final glyph (the
+    // prompt), matching the app, and the position is in the grid's own
+    // coordinates so it can't drift a row off a separately-queried cursor.
+    let body = trim_trailing_blank_rows(&out.stdout);
+    if let Ok(mut p) = parser.lock() {
+        *p = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
+        if !prefix.is_empty() {
+            p.process(&prefix);
+        }
+        p.process(&lf_to_crlf(body));
+        app_cursor.store(p.screen().application_cursor(), Ordering::Relaxed);
+    }
+}
+
+/// Drop trailing whitespace (blank rows, trailing newlines, trailing spaces)
+/// from a `capture-pane` body, so the seeded cursor ends right after the last
+/// real glyph instead of marching down through the pane's empty rows. The
+/// column it lands on doesn't matter to viewers (only the row is rendered as a
+/// cursor cell); a fullscreen app fills the screen so there is nothing to trim.
+fn trim_trailing_blank_rows(raw: &[u8]) -> &[u8] {
+    let mut end = raw.len();
+    while end > 0 && matches!(raw[end - 1], b' ' | b'\n' | b'\r' | b'\t') {
+        end -= 1;
+    }
+    &raw[..end]
+}
+
 /// `pipe-pane -I` (input injection) landed in tmux 2.8, and a dead-pane write
 /// crash was fixed in 3.4, so we require >= 3.4 before arming a channel. Older
 /// tmux (or a `tmux -V` we can't parse) falls back to the capture path. Cached:
@@ -614,50 +684,9 @@ impl VtChannel {
             std::thread::sleep(Duration::from_millis(2));
         }
 
-        // Reconstruct the app's terminal modes from tmux's flags before seeding.
-        // The seed is rendered content (`capture-pane`), which does NOT carry
-        // the DEC private mode SET escapes, and a running app won't re-emit
-        // them. Without this, a channel armed while an app is already on the
-        // alternate screen (e.g. Claude `/tui fullscreen`) would parse a normal
-        // screen, so `alternate_screen()` reads false and the wheel-forward /
-        // scroll decisions (which key off it) break.
-        let (alt, mouse, mouse_sgr) = pane_modes(&target).unwrap_or((false, false, false));
-        let mut prefix: Vec<u8> = Vec::new();
-        if alt {
-            prefix.extend_from_slice(b"\x1b[?1049h");
-        }
-        if mouse {
-            prefix.extend_from_slice(b"\x1b[?1000h");
-        }
-        if mouse_sgr {
-            prefix.extend_from_slice(b"\x1b[?1006h");
-        }
-
         // Seed the current screen so an already-running agent shows up
-        // immediately instead of starting blank (pipe-pane has no backlog). The
-        // alternate screen has no scrollback, so only the normal buffer pulls
-        // history (`-S`); the pane keeps that history across re-arms, so a
-        // freshly armed channel can scroll right away.
-        let seed_start = format!("-{SCROLLBACK_LINES}");
-        let mut seed_args = vec!["capture-pane", "-t", &target, "-p", "-e"];
-        if !alt {
-            seed_args.extend_from_slice(&["-S", &seed_start]);
-        }
-        if let Ok(out) = Command::new("tmux").args(&seed_args).output() {
-            if let Ok(mut p) = parser.lock() {
-                if !prefix.is_empty() {
-                    p.process(&prefix);
-                }
-                // `capture-pane` separates rows with a bare LF, but the parser
-                // needs a CR to return to column 0 - without it each seeded row
-                // starts at the previous row's end column and the screen
-                // staircases. The first live repaint normally masks this, but
-                // an idle pane that never repaints (or one whose repaint is
-                // dropped) would render the seed staircased. Translate to CRLF.
-                p.process(&lf_to_crlf(&out.stdout));
-                app_cursor.store(p.screen().application_cursor(), Ordering::Relaxed);
-            }
-        }
+        // immediately instead of starting blank (pipe-pane has no backlog).
+        seed_parser(&target, &parser, &app_cursor, cols, rows);
         seeded.store(true, Ordering::Relaxed);
         tracing::info!(%target, cols, rows, "vt channel armed (pipe-pane -IO <-> vt100 grid)");
 
@@ -681,7 +710,10 @@ impl VtChannel {
     }
 
     /// Reconcile the parser size with the pane at most once a second (a
-    /// `display-message` fork; rate-limited so it adds no periodic hitch).
+    /// `display-message` fork; rate-limited so it adds no periodic hitch). On a
+    /// change, re-seed from `capture-pane` rather than just `set_size`: tmux
+    /// reflows on resize but pipe-pane carries no reflow redraw, so a bare
+    /// `set_size` would leave the grid diverged from tmux (see `seed_parser`).
     fn reconcile_size(&self) {
         let mut guard = self.last_size_check.lock().unwrap();
         if guard.elapsed() < Duration::from_secs(1) {
@@ -698,16 +730,19 @@ impl VtChannel {
             {
                 self.cols.store(c, Ordering::Relaxed);
                 self.rows.store(r, Ordering::Relaxed);
-                if let Ok(mut p) = self.parser.lock() {
-                    p.screen_mut().set_size(r, c);
-                }
+                seed_parser(&self.target, &self.parser, &self.app_cursor, c, r);
             }
         }
     }
 
-    /// Resize the in-process grid immediately. The size-owner calls this right
-    /// after `resize-window` so the parser tracks the new pane geometry without
-    /// waiting for the periodic `reconcile_size`. Server-only.
+    /// Re-sync the in-process grid to the new pane size immediately. The
+    /// size-owner calls this right after `resize-window` so the grid tracks the
+    /// new geometry without waiting for the periodic `reconcile_size`. It
+    /// re-seeds from `capture-pane` (tmux's authoritative reflowed state) rather
+    /// than locally `set_size`-ing: tmux reflows on resize but pipe-pane carries
+    /// no reflow redraw, so a bare `set_size` would leave the grid diverged from
+    /// tmux - a duplicated prompt and a cursor stranded on the wrong row that no
+    /// later output reconciles (see `seed_parser`). Server-only.
     #[cfg(feature = "serve")]
     pub(crate) fn set_grid_size(&self, cols: u16, rows: u16) {
         if cols == 0 || rows == 0 {
@@ -721,9 +756,7 @@ impl VtChannel {
         {
             self.cols.store(cols, Ordering::Relaxed);
             self.rows.store(rows, Ordering::Relaxed);
-            if let Ok(mut p) = self.parser.lock() {
-                p.screen_mut().set_size(rows, cols);
-            }
+            seed_parser(&self.target, &self.parser, &self.app_cursor, cols, rows);
         }
     }
 
@@ -869,6 +902,20 @@ mod tests {
     fn lf_to_crlf_leaves_existing_crlf_alone() {
         assert_eq!(lf_to_crlf(b"a\r\nb"), b"a\r\nb");
         assert_eq!(lf_to_crlf(b"a\nb"), b"a\r\nb");
+    }
+
+    #[test]
+    fn trim_trailing_blank_rows_strips_pane_padding() {
+        // capture-pane pads the body to the full pane height; without trimming,
+        // the seeded cursor would march down those empty rows and land far
+        // below the prompt (regression: cursor one row below the input box).
+        assert_eq!(
+            trim_trailing_blank_rows(b"line-1\nREADY> \n\n\n"),
+            b"line-1\nREADY>"
+        );
+        assert_eq!(trim_trailing_blank_rows(b"READY>"), b"READY>");
+        // Interior blanks are preserved; only the trailing run is trimmed.
+        assert_eq!(trim_trailing_blank_rows(b"a\n\nb\n  \n"), b"a\n\nb");
     }
 
     #[test]
