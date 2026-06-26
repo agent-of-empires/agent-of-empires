@@ -2378,13 +2378,13 @@ impl HomeView {
         // `capture-pane` carries only cell text (plus SGR color), not the
         // cursor, so without this the "feels-attached" preview shows no cursor
         // for programs that rely on the hardware cursor (shells, codex, anything
-        // using DECTCEM) even though a direct tmux attach would. The default is
-        // a painted block cell: ratatui re-emits a hardware hide/show on every
-        // ~30fps frame, and a state-syncing remote transport (mosh) samples that
-        // mid-toggle into a flickering caret, whereas a painted cell is
-        // identical every frame. `session.live_send_block_cursor = false`
-        // switches back to the native hardware cursor (its blink and shape, at
-        // the cost of that flicker over such links).
+        // using DECTCEM) even though a direct tmux attach would. By default we
+        // place the native hardware cursor (its blink and shape). ratatui
+        // re-emits a hardware hide/show on every ~30fps frame, and a
+        // state-syncing remote transport (mosh) can sample that mid-toggle into
+        // a flickering caret, so `session.live_send_block_cursor = true`
+        // switches to a painted block cell that is identical every frame and
+        // stays steady over such links.
         if self.live_send_block_cursor {
             self.paint_preview_cursor(frame, theme);
         } else if let Some(pos) = self.live_preview_cursor_pos() {
