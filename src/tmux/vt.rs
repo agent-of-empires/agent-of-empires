@@ -375,6 +375,42 @@ impl VtChannel {
         })
     }
 
+    /// `false` once the pane has died: the reader thread runs until the
+    /// forwarder closes (pane gone) or `stop`, so a finished reader means the
+    /// channel can no longer receive output. Viewers poll this to close, since
+    /// the grid keeps returning its last state otherwise. Server-only.
+    #[cfg(feature = "serve")]
+    pub(crate) fn is_alive(&self) -> bool {
+        self.reader
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|h| !h.is_finished())
+            .unwrap_or(false)
+    }
+
+    /// Resize the in-process grid immediately. The size-owner calls this right
+    /// after `resize-window` so the parser tracks the new pane geometry without
+    /// waiting for the periodic `reconcile_size`. Server-only.
+    #[cfg(feature = "serve")]
+    pub(crate) fn set_grid_size(&self, cols: u16, rows: u16) {
+        if cols == 0 || rows == 0 {
+            return;
+        }
+        if (cols, rows)
+            != (
+                self.cols.load(Ordering::Relaxed),
+                self.rows.load(Ordering::Relaxed),
+            )
+        {
+            self.cols.store(cols, Ordering::Relaxed);
+            self.rows.store(rows, Ordering::Relaxed);
+            if let Ok(mut p) = self.parser.lock() {
+                p.screen_mut().set_size(rows, cols);
+            }
+        }
+    }
+
     /// Reconcile the parser size with the pane at most once a second (a
     /// `display-message` fork; rate-limited so it adds no periodic hitch).
     fn reconcile_size(&self) {
