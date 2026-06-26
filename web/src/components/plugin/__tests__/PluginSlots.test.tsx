@@ -226,11 +226,12 @@ describe("plugin slot renderers", () => {
       },
     };
     render(<PluginPaneBody entry={entry} />);
+    // jsdom normalizes the hex to rgb when it lands on the style attribute.
     const merged = screen.getByText("MERGED #12");
-    expect(merged.getAttribute("style")).toContain("8957e5");
+    expect(merged.style.color).toBe("rgb(137, 87, 229)");
     // An invalid color leaves the value untinted (no inline color style).
     const other = screen.getByText("open");
-    expect(other.getAttribute("style") ?? "").not.toContain("javascript");
+    expect(other.style.color).toBe("");
   });
 
   it("comment blocks render read-only with author, location and resolved state", () => {
@@ -245,7 +246,15 @@ describe("plugin slot renderers", () => {
             kind: "section",
             title: "Unresolved comments: 1",
             children: [
-              { kind: "comment", author: "alice", body: "handle the nil case", path: "src/foo.py", line: 42, href: "https://github.com/o/r/pull/1#c1", resolved: false },
+              {
+                kind: "comment",
+                author: "alice",
+                body: "handle the nil case",
+                path: "src/foo.py",
+                line: 42,
+                href: "https://github.com/o/r/pull/1#c1",
+                resolved: false,
+              },
             ],
           },
         ],

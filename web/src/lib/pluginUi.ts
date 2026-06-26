@@ -90,10 +90,9 @@ export function entryText(entry: PluginUiEntry): string {
  *  (e.g. a merged PR's purple). */
 export function validColor(v: unknown): string | undefined {
   if (typeof v !== "string") return undefined;
-  const short = /^#([0-9a-f]{3})$/i.exec(v);
+  const short = /^#([0-9a-f]{3})$/i.exec(v)?.[1];
   if (short) {
-    const [r, g, b] = short[1].split("");
-    return `#${r}${r}${g}${g}${b}${b}`.toLowerCase();
+    return ("#" + short.replace(/./g, (c) => c + c)).toLowerCase();
   }
   return /^#[0-9a-f]{6}$/i.test(v) ? v.toLowerCase() : undefined;
 }
