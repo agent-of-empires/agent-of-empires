@@ -531,6 +531,9 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     setPickerOpen(false);
     setPairedMounted(false);
     setSelectedFile(null);
+    // Plugin pane open/dock overrides are keyed by pane id only (not session),
+    // so clear them on a session switch to keep them session-local as intended.
+    setPluginPaneOverrides({});
   }
 
   // Inline derivation for diffFiles validation: clear a stale diff-list
