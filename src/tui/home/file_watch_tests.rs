@@ -571,7 +571,7 @@ async fn rewire_no_op_preserves_latched_disk_watcher_init_failure() {
     );
 
     view.reload_failure_state
-        .record_disk_watcher_init_failure("hv-noop: simulated prior failure");
+        .record_disk_watcher_init_failure("hv-noop", "simulated prior failure");
     assert!(
         view.reload_failure_state.has_any_failure(),
         "precondition: latch is set"
@@ -609,7 +609,7 @@ async fn rewire_disk_clears_stale_latch_when_failing_profile_is_removed() {
     .expect("HomeView::new");
 
     view.reload_failure_state
-        .record_disk_watcher_init_failure("ghost: simulated subscribe failure");
+        .record_disk_watcher_init_failure("ghost", "simulated subscribe failure");
     assert!(
         view.reload_failure_state.has_any_failure(),
         "precondition: latch is set, references the now-deleted profile"
@@ -645,7 +645,7 @@ async fn rewire_config_clears_stale_latch_when_failing_profile_is_removed() {
     .expect("HomeView::new");
 
     view.reload_failure_state
-        .record_config_watcher_init_failure("profile ghost config: simulated subscribe failure");
+        .record_config_watcher_init_failure(Some("ghost"), "simulated subscribe failure");
     assert!(
         view.reload_failure_state.has_any_failure(),
         "precondition: latch is set, references the now-deleted profile"
@@ -683,7 +683,7 @@ async fn config_init_failure_survives_concurrent_disk_rewire_clear() {
     .expect("HomeView::new");
 
     view.reload_failure_state
-        .record_config_watcher_init_failure("seed: config init failed");
+        .record_config_watcher_init_failure(None, "seed: config init failed");
     assert!(
         view.reload_failure_state.has_any_failure(),
         "precondition: config latch is set"
@@ -749,8 +749,8 @@ fn reload_failure_state_dialog_body_aggregates_all_four_sources() {
     let mut state = super::ReloadFailureState::default();
     state.record_storage(&Err::<(), _>(anyhow::anyhow!("storage err")));
     state.record_config(&Err::<(), _>(anyhow::anyhow!("config err")));
-    state.record_disk_watcher_init_failure("disk subscribe denied");
-    state.record_config_watcher_init_failure("config subscribe denied");
+    state.record_disk_watcher_init_failure("agg-disk", "disk subscribe denied");
+    state.record_config_watcher_init_failure(None, "config subscribe denied");
 
     let body = state.build_dialog_body();
     assert!(
@@ -762,11 +762,11 @@ fn reload_failure_state_dialog_body_aggregates_all_four_sources() {
         "missing config line: {body}"
     );
     assert!(
-        body.contains("- Disk watcher init: disk subscribe denied"),
+        body.contains("- Disk watcher init: agg-disk: disk subscribe denied"),
         "missing disk watcher-init line: {body}"
     );
     assert!(
-        body.contains("- Config watcher init: config subscribe denied"),
+        body.contains("- Config watcher init: global config: config subscribe denied"),
         "missing config watcher-init line: {body}"
     );
 }
@@ -775,13 +775,13 @@ fn reload_failure_state_dialog_body_aggregates_all_four_sources() {
 fn reload_failure_state_watcher_init_failure_lifecycle_is_per_source() {
     let mut state = super::ReloadFailureState::default();
 
-    state.record_disk_watcher_init_failure("first disk install failed");
+    state.record_disk_watcher_init_failure("life-disk", "first disk install failed");
     assert!(
         state.has_unacknowledged_failure(),
         "disk_watcher_init_error contributes to has_any_failure"
     );
 
-    state.record_config_watcher_init_failure("first config install failed");
+    state.record_config_watcher_init_failure(None, "first config install failed");
     state.acknowledge_dialog();
 
     state.clear_disk_watcher_init_failure();
