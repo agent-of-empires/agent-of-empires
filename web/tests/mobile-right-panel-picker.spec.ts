@@ -147,9 +147,11 @@ test.describe("Desktop right panel split is unchanged (#1452)", () => {
     await clickSidebarSession(page, "pinch-test");
     await page.locator("[data-live-terminal]").first().waitFor({ state: "visible", timeout: 10_000 });
 
-    // The desktop split renders the resize handle and never the picker.
+    // The desktop split renders the resize handle and the activity bar, never
+    // the mobile picker or its trigger ("Toggle panels" is md:hidden).
     await expect(page.getByTestId("content-split-resize-handle")).toBeVisible();
-    await page.getByRole("button", { name: "Toggle panels" }).click();
+    await expect(page.getByTestId("activity-bar")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Toggle panels" })).toHaveCount(0);
     await expect(page.getByTestId("mobile-right-panel-picker")).toHaveCount(0);
   });
 });

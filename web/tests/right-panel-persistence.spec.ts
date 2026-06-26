@@ -52,11 +52,10 @@ test.describe("Right dock pane-layout persistence", () => {
     await expect(page.locator("header")).toBeVisible();
     expect(await getLayout(page)).toEqual({ diff: true, terminal: true });
 
-    // ControlOrMeta+Alt+B = right panel toggle (see useKeyboardShortcuts),
-    // which now toggles the diff pane. Focus the body first so the handler
-    // reliably receives the event.
+    // Shift+D toggles the diff pane specifically (Ctrl+Alt+B now collapses the
+    // whole dock). Focus the body first so the handler receives the event.
     await page.locator("body").click();
-    await page.keyboard.press("ControlOrMeta+Alt+B");
+    await page.keyboard.press("Shift+D");
     await expect.poll(() => getLayout(page)).toEqual({ diff: false, terminal: true });
 
     await page.reload();

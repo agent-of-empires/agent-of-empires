@@ -889,6 +889,29 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     }
   }, [isMdUp, togglePane]);
 
+  // Collapse or restore the whole right dock (the "toggle right panel"
+  // shortcut). Collapse closes every pane docked right; restore reopens the
+  // built-in diff + terminal that live there. ponytail: restore reopens the
+  // defaults rather than remembering the exact pre-collapse set, which is a
+  // fine approximation for a collapse/expand toggle.
+  const toggleRightDock = useCallback(() => {
+    if (!isMdUp) {
+      setPickerOpen((o) => !o);
+      return;
+    }
+    const open = !rightDockCollapsed;
+    (["diff", "terminal"] as BuiltinPaneId[]).forEach((id) => {
+      if (paneLayout[id].dock === "right") setPaneOpen(id, !open);
+    });
+    setPluginPaneOverrides((o) => {
+      const next = { ...o };
+      for (const p of pluginPanes) {
+        if ((next[p.id]?.dock ?? p.defaultDock) === "right") next[p.id] = { ...next[p.id], open: !open };
+      }
+      return next;
+    });
+  }, [isMdUp, rightDockCollapsed, paneLayout, setPaneOpen, pluginPanes]);
+
   const handlePickView = useCallback((view: RightPanelView) => {
     setRightPanelView(view);
     setPickerOpen(false);
@@ -1095,11 +1118,12 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
         onSettings: () => (showSettings ? handleCloseSettings() : navigate("/settings")),
         onPalette: () => setShowPalette((p) => !p),
         onToggleSidebar: () => setSidebarOpen((o) => !o),
-        onToggleRightPanel: () => toggleDiff(),
+        onToggleRightPanel: () => toggleRightDock(),
         onToggleTerminalFocus: handleToggleTerminalFocus,
       }),
       [
         toggleDiff,
+        toggleRightDock,
         showPalette,
         deletingWorkspaceId,
         stoppingWorkspaceId,

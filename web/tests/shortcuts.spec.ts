@@ -1,14 +1,14 @@
 // Keyboard-shortcut stories ported from the live suite (#1419 era
 // acp-stories): Cmd/Ctrl+B toggles the workspace sidebar, Shift+D
-// toggles the diff (right) panel, and Cmd/Ctrl+Alt+B toggles the
-// right panel via the chord binding. All three flip App.tsx state
-// through useKeyboardShortcuts; the chords bind on e.code === "KeyB"
+// toggles the diff pane specifically, and Cmd/Ctrl+Alt+B collapses or
+// restores the whole right dock via the chord binding. All flip App.tsx
+// state through useKeyboardShortcuts; the chords bind on e.code === "KeyB"
 // so Mac layouts where Option+B emits "∫" still match.
 //
-// The panel toggles need a mounted session view: ContentSplit only
-// renders its drag handle (data-testid="content-split-resize-handle")
-// when a session is open and the right pane is expanded, so the
-// handle's presence is the user-visible signal.
+// These need a mounted session view. The whole-dock toggle is observed via
+// ContentSplit's drag handle (data-testid="content-split-resize-handle",
+// present only when a session is open and the right dock has panes); the
+// per-pane diff toggle is observed via its activity-bar button's aria-pressed.
 
 import { test, expect } from "./helpers/mockedTest";
 import type { Page } from "@playwright/test";
@@ -61,24 +61,25 @@ test("Cmd/Ctrl+B toggles the workspace sidebar", async ({ page }) => {
   await expect(sessionRow).toBeVisible();
 });
 
-test("Shift+D toggles the diff panel on a session view", async ({ page }) => {
+test("Shift+D toggles the diff pane on a session view", async ({ page }) => {
   await mockTerminalApis(page);
   await page.setViewportSize({ width: 1280, height: 720 });
   await page.goto("/session/pinch-test");
 
-  const handle = page.locator('[data-testid="content-split-resize-handle"]');
-  await expect(handle).toBeVisible();
+  // Shift+D toggles the diff pane specifically (not the whole dock); the
+  // activity-bar toggle's pressed state reflects whether diff is open.
+  const diffToggle = page.locator('[data-testid="pane-toggle-diff"]');
+  await expect(diffToggle).toHaveAttribute("aria-pressed", "true");
 
   await blurToBody(page);
   await page.keyboard.press("Shift+D");
-  await expect(handle).toBeHidden();
+  await expect(diffToggle).toHaveAttribute("aria-pressed", "false");
 
-  // Collapsing re-layouts the split, which can hand focus back to the
-  // terminal via xterm's ResizeObserver focus-restore; re-blur so the
-  // second press is a shortcut and not a literal "D" keystroke.
+  // Re-blur: collapsing re-layouts the split, which can hand focus back to
+  // the terminal via xterm's ResizeObserver focus-restore.
   await blurToBody(page);
   await page.keyboard.press("Shift+D");
-  await expect(handle).toBeVisible();
+  await expect(diffToggle).toHaveAttribute("aria-pressed", "true");
 });
 
 test("Cmd/Ctrl+Alt+B toggles the right panel on a session view", async ({ page }) => {
