@@ -4,6 +4,8 @@
 //! happen from [`super::mod`]'s async loop; this struct stays a plain
 //! POD so the render layer can borrow it freely.
 
+use std::collections::VecDeque;
+
 use ratatui_textarea::TextArea;
 
 use super::input::Focus;
@@ -12,7 +14,15 @@ use super::reducer::AcpTranscript;
 use super::slash;
 use crate::acp::client::{DaemonEndpoint, HttpClient, WsHandle};
 use crate::acp::state::AvailableCommand;
+use crate::plugin::ui_state::{Notification, UiSnapshot};
 use crate::session::config::QueueDrainMode;
+use crate::tui::plugin_ui;
+
+/// Most plugin notifications buffered locally awaiting a free toast slot. The
+/// daemon already bounds its notification ring; this is a second guard so a
+/// burst can't grow the view's memory, and old un-shown toasts drop rather
+/// than the newest.
+const MAX_PENDING_PLUGIN_TOASTS: usize = 20;
 
 pub struct StructuredViewState {
     pub session_id: String,
@@ -68,6 +78,30 @@ pub struct StructuredViewState {
     /// Active ArrowUp/ArrowDown queue-recall browse, or `None` when the
     /// composer is in its normal typing mode. See [`RecallState`].
     pub recall: Option<RecallState>,
+    /// Latest plugin UI-state snapshot polled from the daemon (#2402). Empty
+    /// until the first poll lands; the status line renders the
+    /// TUI-applicable slots (global `StatusBar`, this session's
+    /// `DetailBadge`) from it.
+    pub plugin_ui: UiSnapshot,
+    /// Notification bookkeeping so each `ui.notify` toasts once. See
+    /// [`PluginNotifyState`].
+    pub plugin_notify: PluginNotifyState,
+}
+
+/// Tracks which plugin notifications have been shown and buffers any awaiting
+/// a free toast slot, so a poll that returns several new notifications shows
+/// them in turn instead of clobbering the single-slot banner down to the last.
+#[derive(Debug, Default)]
+pub struct PluginNotifyState {
+    /// Highest notification seq already accounted for. Notifications at or
+    /// below this are not re-toasted.
+    pub last_seen_seq: u64,
+    /// False until the first snapshot establishes the baseline. The first
+    /// snapshot only sets `last_seen_seq` (pre-existing notifications must not
+    /// toast on open); subsequent ones enqueue what is genuinely new.
+    pub initialized: bool,
+    /// Notifications waiting to be shown, oldest first.
+    pub pending: VecDeque<Notification>,
 }
 
 /// In-progress shell-history-style browse of the prompt queue. The user
@@ -147,7 +181,44 @@ impl StructuredViewState {
             mention: None,
             dismissed_mention: None,
             recall: None,
+            plugin_ui: UiSnapshot {
+                entries: Vec::new(),
+                notifications: Vec::new(),
+            },
+            plugin_notify: PluginNotifyState::default(),
         }
+    }
+
+    /// Fold a freshly-polled plugin UI snapshot into state: store it for the
+    /// renderer and enqueue any genuinely-new notifications for this session
+    /// as toasts. The first snapshot only baselines the seq watermark (so
+    /// notifications that predate opening the view stay silent); a snapshot
+    /// whose max seq regressed below the watermark is treated as a daemon
+    /// restart (seq ring reset) and re-baselines without toasting.
+    pub fn ingest_plugin_ui(&mut self, snapshot: UiSnapshot) {
+        let max_seq = plugin_ui::max_notification_seq(&snapshot);
+        if !self.plugin_notify.initialized || max_seq < self.plugin_notify.last_seen_seq {
+            self.plugin_notify.last_seen_seq = max_seq;
+            self.plugin_notify.initialized = true;
+        } else {
+            for n in plugin_ui::new_notifications(
+                &snapshot,
+                self.plugin_notify.last_seen_seq,
+                &self.session_id,
+            ) {
+                self.plugin_notify.pending.push_back(n.clone());
+                while self.plugin_notify.pending.len() > MAX_PENDING_PLUGIN_TOASTS {
+                    self.plugin_notify.pending.pop_front();
+                }
+            }
+            self.plugin_notify.last_seen_seq = max_seq;
+        }
+        self.plugin_ui = snapshot;
+    }
+
+    /// Pop the next buffered plugin notification to show, if any.
+    pub fn next_plugin_toast(&mut self) -> Option<Notification> {
+        self.plugin_notify.pending.pop_front()
     }
 
     /// Whether a fresh Enter should park in the queue rather than send
@@ -636,5 +707,79 @@ mod tests {
         state.transcript.available_commands = vec![cmd("compact")];
         state.reconcile_slash_selection();
         assert_eq!(state.slash_selected, 0);
+    }
+
+    fn notify_snapshot(notifications: serde_json::Value) -> UiSnapshot {
+        serde_json::from_value(serde_json::json!({
+            "entries": [],
+            "notifications": notifications,
+        }))
+        .expect("snapshot deserializes")
+    }
+
+    #[test]
+    fn first_snapshot_baselines_without_toasting() {
+        // test_state uses session "s-1".
+        let mut state = test_state(None);
+        state.ingest_plugin_ui(notify_snapshot(serde_json::json!([
+            {"seq": 5, "plugin_id": "p", "tone": "info", "title": "old"}
+        ])));
+        assert!(
+            state.next_plugin_toast().is_none(),
+            "pre-open notifications stay silent"
+        );
+        assert_eq!(state.plugin_notify.last_seen_seq, 5);
+    }
+
+    #[test]
+    fn later_snapshot_enqueues_only_new_matching_once() {
+        let mut state = test_state(None);
+        state.ingest_plugin_ui(notify_snapshot(serde_json::json!([
+            {"seq": 1, "plugin_id": "p", "tone": "info", "title": "old"}
+        ])));
+        // seq 2 (global) and seq 3 (this session) are new; seq 4 targets
+        // another session and must not toast here.
+        state.ingest_plugin_ui(notify_snapshot(serde_json::json!([
+            {"seq": 1, "plugin_id": "p", "tone": "info", "title": "old"},
+            {"seq": 2, "plugin_id": "p", "tone": "info", "title": "global"},
+            {"seq": 3, "plugin_id": "p", "tone": "warn", "title": "mine", "session_id": "s-1"},
+            {"seq": 4, "plugin_id": "p", "tone": "info", "title": "other", "session_id": "s-2"}
+        ])));
+        assert_eq!(state.next_plugin_toast().unwrap().title, "global");
+        assert_eq!(state.next_plugin_toast().unwrap().title, "mine");
+        assert!(state.next_plugin_toast().is_none());
+
+        // Re-polling the same snapshot enqueues nothing new.
+        state.ingest_plugin_ui(notify_snapshot(serde_json::json!([
+            {"seq": 4, "plugin_id": "p", "tone": "info", "title": "other", "session_id": "s-2"}
+        ])));
+        assert!(state.next_plugin_toast().is_none());
+    }
+
+    #[test]
+    fn pending_queue_is_bounded_dropping_oldest() {
+        let mut state = test_state(None);
+        state.ingest_plugin_ui(notify_snapshot(serde_json::json!([])));
+        let many: Vec<serde_json::Value> = (1..=MAX_PENDING_PLUGIN_TOASTS as u64 + 5)
+            .map(|seq| serde_json::json!({"seq": seq, "plugin_id": "p", "tone": "info", "title": format!("n{seq}")}))
+            .collect();
+        state.ingest_plugin_ui(notify_snapshot(serde_json::json!(many)));
+        assert_eq!(state.plugin_notify.pending.len(), MAX_PENDING_PLUGIN_TOASTS);
+        // Oldest dropped: the front is n6, not n1.
+        assert_eq!(state.next_plugin_toast().unwrap().title, "n6");
+    }
+
+    #[test]
+    fn seq_rollback_rebaselines_without_toasting() {
+        let mut state = test_state(None);
+        state.ingest_plugin_ui(notify_snapshot(serde_json::json!([
+            {"seq": 50, "plugin_id": "p", "tone": "info", "title": "high"}
+        ])));
+        // Daemon restarts: seq ring resets, max seq drops below the watermark.
+        state.ingest_plugin_ui(notify_snapshot(serde_json::json!([
+            {"seq": 1, "plugin_id": "p", "tone": "info", "title": "fresh"}
+        ])));
+        assert!(state.next_plugin_toast().is_none());
+        assert_eq!(state.plugin_notify.last_seen_seq, 1);
     }
 }

@@ -246,25 +246,27 @@ struct EntryKey {
 }
 
 /// A notification as rendered: the seq lets the client toast each one once.
-#[derive(Debug, Clone, Serialize)]
+/// `Deserialize` so daemon-connected clients (the native TUI structured view,
+/// #2402) can decode the same wire shape the web frontend consumes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Notification {
     pub seq: u64,
     pub plugin_id: String,
     pub tone: Tone,
     pub title: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
 }
 
 /// One entry in the snapshot the web renders.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiEntry {
     pub plugin_id: String,
     pub slot: UiSlot,
     pub id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     /// Normalized, slot-validated payload. The `slot` tells the client its
     /// shape.
@@ -273,7 +275,7 @@ pub struct UiEntry {
 
 /// The full UI state the dashboard polls each tick. Bounded and small, so it is
 /// sent whole rather than incrementally (verdict: no since_seq/tombstones).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiSnapshot {
     pub entries: Vec<UiEntry>,
     pub notifications: Vec<Notification>,

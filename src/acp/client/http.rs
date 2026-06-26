@@ -17,6 +17,7 @@ use crate::acp::protocol::{
     ApprovalDecisionWire, FilesResponse, PromptRequest, ReplayResponse, ResolveApprovalRequest,
     SwitchAgentRequest, SwitchAgentResponse,
 };
+use crate::plugin::ui_state::UiSnapshot;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -204,6 +205,18 @@ impl HttpClient {
         )
     }
 
+    /// `GET /api/plugins/ui-state`. The daemon-wide plugin UI snapshot
+    /// (host-rendered slots + notifications) the web dashboard polls; the
+    /// native structured view renders the TUI-applicable subset (#2402).
+    /// Global, not session-scoped, so a miss must not be classified as a
+    /// session-not-found.
+    pub async fn plugin_ui_state(&self) -> Result<UiSnapshot, HttpError> {
+        let url = format!("{}/api/plugins/ui-state", self.endpoint.base_url);
+        let res = self.auth(self.http.get(&url)).send().await?;
+        let res = check_global_status(res).await?;
+        Ok(res.json::<UiSnapshot>().await?)
+    }
+
     /// `POST /api/sessions/{id}/acp/cancel`.
     pub async fn cancel(&self, session_id: &str) -> Result<(), HttpError> {
         let url = format!(
@@ -341,6 +354,25 @@ async fn check_status(
     }
     let body = res.text().await.unwrap_or_default();
     Err(classify_error(status, &body, session_id))
+}
+
+/// Status check for daemon-wide (non-session) endpoints. Like
+/// [`check_status`] but never mints `SessionNotFound`: a 404 here means the
+/// route is absent (e.g. an older daemon without the plugin UI endpoint),
+/// not a missing session, so it maps to a plain `Server` error.
+async fn check_global_status(res: reqwest::Response) -> Result<reqwest::Response, HttpError> {
+    let status = res.status();
+    if status.is_success() {
+        return Ok(res);
+    }
+    let body = res.text().await.unwrap_or_default();
+    match status {
+        StatusCode::UNAUTHORIZED => Err(HttpError::Unauthorized),
+        StatusCode::FORBIDDEN if body.contains("read-only") || body.contains("read_only") => {
+            Err(HttpError::ReadOnly)
+        }
+        _ => Err(HttpError::Server { status, body }),
+    }
 }
 
 /// Map a non-success daemon response onto a typed error. Split out from

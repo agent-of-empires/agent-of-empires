@@ -35,6 +35,7 @@ use crate::acp::client::{
 };
 use crate::acp::elicitations::ElicitationResolution;
 use crate::acp::protocol::ApprovalDecisionWire;
+use crate::plugin::ui_state::{Tone, UiSnapshot};
 use crate::session::config::{resolve_theme_name, resolve_theme_palette_mode};
 use crate::tui::styles::Theme;
 
@@ -44,6 +45,11 @@ use crate::tui::styles::Theme;
 const REDRAW_INTERVAL: Duration = Duration::from_millis(120);
 /// Toasts auto-clear after this long.
 const TOAST_TTL: Duration = Duration::from_secs(4);
+/// How often to poll the daemon's plugin UI-state snapshot (#2402). Matches
+/// the web dashboard's cadence. The fetch runs on its own task so a slow or
+/// unreachable daemon never blocks the event loop on the HTTP client's
+/// 15-second timeout.
+const PLUGIN_UI_POLL_INTERVAL: Duration = Duration::from_secs(3);
 
 /// Set up an alternate-screen terminal, run the structured view against
 /// the given session, and tear it back down on exit. Used by the
@@ -232,6 +238,34 @@ pub async fn run_for_endpoint(
     let mut redraw_ticker = tokio::time::interval(REDRAW_INTERVAL);
     redraw_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    // Poll the daemon's plugin UI-state on its own task and stream snapshots
+    // back over a channel, so a slow daemon stalls neither input nor render.
+    // The task exits once the view returns and drops the receiver.
+    let (plugin_tx, mut plugin_rx) = tokio::sync::mpsc::channel::<UiSnapshot>(8);
+    {
+        let http = state.http.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(PLUGIN_UI_POLL_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                match http.plugin_ui_state().await {
+                    Ok(snapshot) => {
+                        if plugin_tx.send(snapshot).await.is_err() {
+                            break; // view exited; receiver gone.
+                        }
+                    }
+                    // Transient or older-daemon-without-the-endpoint: keep the
+                    // last good snapshot and retry on the next tick rather than
+                    // toasting repeatedly.
+                    Err(e) => {
+                        tracing::debug!(target: "acp.tui", "plugin ui-state poll failed: {e}");
+                    }
+                }
+            }
+        });
+    }
+
     loop {
         tokio::select! {
             biased;
@@ -338,6 +372,11 @@ pub async fn run_for_endpoint(
                     }
                 }
             }
+            Some(snapshot) = plugin_rx.recv() => {
+                state.ingest_plugin_ui(snapshot);
+                drain_plugin_toast(&mut state, &mut toast_deadline);
+                redraw(terminal, theme, &state)?;
+            }
             _ = redraw_ticker.tick() => {
                 let now = Instant::now();
                 if let Some(deadline) = toast_deadline {
@@ -346,10 +385,33 @@ pub async fn run_for_endpoint(
                         toast_deadline = None;
                     }
                 }
+                // A freed slot lets the next buffered plugin notification show.
+                drain_plugin_toast(&mut state, &mut toast_deadline);
                 redraw(terminal, theme, &state)?;
             }
         }
     }
+}
+
+/// Show the next buffered plugin notification as a toast, but only when no
+/// toast is currently up, so app toasts (errors, send confirmations) are not
+/// pre-empted and queued notifications show one at a time.
+fn drain_plugin_toast(state: &mut StructuredViewState, toast_deadline: &mut Option<Instant>) {
+    if state.toast.is_some() {
+        return;
+    }
+    let Some(n) = state.next_plugin_toast() else {
+        return;
+    };
+    let kind = match n.tone {
+        Tone::Warn | Tone::Danger => ToastKind::Error,
+        _ => ToastKind::Info,
+    };
+    let text = match &n.body {
+        Some(body) => format!("{}: {body}", n.title),
+        None => n.title.clone(),
+    };
+    set_toast(state, toast_deadline, text, kind);
 }
 
 async fn handle_terminal_event(

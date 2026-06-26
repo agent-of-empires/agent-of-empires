@@ -16,10 +16,13 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wr
 use ratatui::Frame;
 use similar::{ChangeTag, TextDiff};
 
+use aoe_plugin_api::UiSlot;
+
 use super::input::Focus;
 use super::reducer::{AcpTranscript, ActivityRow, NoteKind, ToolCallRow};
 use super::state::{FileIndex, StructuredViewState};
 use crate::acp::approvals::ApprovalDecision;
+use crate::tui::plugin_ui;
 use crate::tui::styles::Theme;
 
 pub fn render(frame: &mut Frame, area: Rect, theme: &Theme, state: &StructuredViewState) {
@@ -407,6 +410,19 @@ fn render_status(frame: &mut Frame, area: Rect, theme: &Theme, state: &Structure
             ),
             Style::default().fg(theme.error),
         ));
+    }
+    // Plugin host-rendered slots (#2402): global status-bar segments and this
+    // session's detail badges, tone-colored. Icons / tooltips / hrefs have no
+    // terminal surface and are dropped; malformed entries are skipped.
+    for entry in plugin_ui::global_entries(&state.plugin_ui, UiSlot::StatusBar).chain(
+        plugin_ui::session_entries(&state.plugin_ui, UiSlot::DetailBadge, &state.session_id),
+    ) {
+        if let Some(text) = plugin_ui::entry_text(entry) {
+            spans.push(Span::styled(
+                format!(" {text} "),
+                plugin_ui::tone_style(plugin_ui::entry_tone(entry), theme),
+            ));
+        }
     }
     if spans.is_empty() {
         // Footer help when nothing else is going on.
