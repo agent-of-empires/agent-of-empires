@@ -326,10 +326,7 @@ mod tests {
                         .iter()
                         .filter(|e| e.name == event_name)
                         .collect();
-                    assert!(
-                        !event_defs.is_empty(),
-                        "unknown Claude event: {event_name}"
-                    );
+                    assert!(!event_defs.is_empty(), "unknown Claude event: {event_name}");
                     let mut canonical_set: Vec<String> = Vec::new();
                     for event_def in event_defs {
                         if event_def.session_id_capture {
