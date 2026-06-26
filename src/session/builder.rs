@@ -798,16 +798,14 @@ pub(crate) fn resolve_title(
     existing_titles: &[&str],
     taken_branches: &HashSet<String>,
 ) -> Result<String> {
+    let taken_branch_keys = branch_collision_keys(taken_branches);
     let resolved = if title.is_empty() {
         if worktree_enabled {
             if let Some(branch) = worktree_branch.filter(|b| !b.trim().is_empty()) {
                 branch.trim().to_string()
             } else {
                 civilizations::generate_random_title_filtered(existing_titles, |candidate| {
-                    branch_name_taken_case_insensitive(
-                        &branch_name_from_title(candidate),
-                        taken_branches,
-                    )
+                    branch_key_taken(&branch_name_from_title(candidate), &taken_branch_keys)
                 })
                 .ok_or_else(|| {
                     anyhow::anyhow!(
@@ -935,25 +933,26 @@ fn branch_collision_key(branch: &str) -> String {
     branch.to_ascii_lowercase()
 }
 
-fn branch_name_taken_case_insensitive(branch: &str, taken: &HashSet<String>) -> bool {
-    let key = branch_collision_key(branch);
+fn branch_collision_keys(taken: &HashSet<String>) -> HashSet<String> {
     taken
         .iter()
-        .any(|candidate| branch_collision_key(candidate) == key)
+        .map(|branch| branch_collision_key(branch))
+        .collect()
+}
+
+fn branch_key_taken(branch: &str, taken_keys: &HashSet<String>) -> bool {
+    taken_keys.contains(&branch_collision_key(branch))
 }
 
 fn dedupe_branch_name(base: &str, taken: &HashSet<String>) -> String {
-    let taken_keys: HashSet<String> = taken
-        .iter()
-        .map(|branch| branch_collision_key(branch))
-        .collect();
-    if !taken_keys.contains(&branch_collision_key(base)) {
+    let taken_keys = branch_collision_keys(taken);
+    if !branch_key_taken(base, &taken_keys) {
         return base.to_string();
     }
     let mut n = 2usize;
     loop {
         let candidate = format!("{}-{}", base, n);
-        if !taken_keys.contains(&branch_collision_key(&candidate)) {
+        if !branch_key_taken(&candidate, &taken_keys) {
             return candidate;
         }
         n += 1;
@@ -1132,9 +1131,8 @@ mod tests {
 
     #[test]
     fn test_empty_worktree_title_errors_when_generation_exhausts() {
-        let existing: Vec<&str> = civilizations::CIVILIZATIONS.iter().copied().collect();
+        let existing: Vec<&str> = civilizations::CIVILIZATIONS.to_vec();
         let mut taken = HashSet::new();
-        let timestamp = chrono::Utc::now().timestamp();
 
         for civ in civilizations::CIVILIZATIONS {
             for n in 2..=1000 {
@@ -1144,6 +1142,10 @@ mod tests {
                     roman_for_test(n)
                 )));
             }
+        }
+
+        let timestamp = chrono::Utc::now().timestamp();
+        for civ in civilizations::CIVILIZATIONS {
             for n in timestamp - 60..timestamp + 1060 {
                 taken.insert(branch_name_from_title(&format!("{} {}", civ, n)));
             }
