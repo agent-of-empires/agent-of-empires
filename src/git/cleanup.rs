@@ -365,6 +365,10 @@ pub fn manual_submodule_worktree_cleanup(
 ) -> Vec<String> {
     let mut errors = Vec::new();
 
+    // This path reaps the admin entry with `prune` (below), which skips locked
+    // worktrees; unlock first so an aoe-locked entry is actually removed.
+    git_wt.unlock_worktree(worktree_path);
+
     if let Some(name) = read_linked_worktree_name(worktree_path) {
         let modules_dir = main_repo.join(".git/worktrees").join(&name).join("modules");
         if modules_dir.exists() {
@@ -486,6 +490,12 @@ pub fn remove_managed_worktree(
         // For non-sandboxed sessions, missing `.git` typically means
         // the user did something manual; keep strict behavior gated on
         // the explicit `force` flag.
+        // This branch removes the directory by hand and reaps the admin entry
+        // with `prune`, which skips locked worktrees. Unlock first (best-effort;
+        // resolves from the admin side even though `.git` is already gone) so
+        // the aoe lock does not strand the entry.
+        git_wt.unlock_worktree(worktree_path);
+
         let effective_force = force || instance.is_sandboxed();
         match remove_worktree_dir(worktree_path, main_repo, effective_force) {
             Ok(()) => {
