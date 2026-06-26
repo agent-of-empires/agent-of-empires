@@ -29,7 +29,7 @@ use anyhow::{Context, Result};
 use aoe_plugin_api::UiSlot;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 
 use crate::plugin::host_api::{dispatch, HostApiState, PluginRpcContext};
 use crate::plugin::launch::{resolve_launch, OsLaunchResolver};
@@ -53,6 +53,11 @@ const REAP_GRACE: Duration = Duration::from_secs(2);
 struct RunningWorker {
     pid: u32,
     task: tokio::task::JoinHandle<()>,
+    /// Sender into the worker's stdin, set while a worker generation is being
+    /// served. Lets the host push an unsolicited request (a notification) to the
+    /// worker, e.g. a UI action forwarded from the dashboard. `None` between
+    /// spawns. See [`PluginHost::notify_worker`].
+    inbound: Option<mpsc::UnboundedSender<String>>,
 }
 
 /// The plugin worker host, owned by the daemon for its lifetime.
@@ -89,6 +94,23 @@ impl PluginHost {
     /// synchronously off the in-memory store; never awaits a worker.
     pub fn ui_snapshot(&self) -> crate::plugin::ui_state::UiSnapshot {
         self.api.ui_snapshot()
+    }
+
+    /// Push a fire-and-forget JSON-RPC notification (no id, so the worker sends
+    /// no reply) to a running worker's stdin. Used to forward a dashboard UI
+    /// action (e.g. a pane's "Refresh" button) to the worker method the plugin
+    /// named for it. Returns `false` if the plugin has no live worker. The
+    /// worker is the trust boundary: it acts only on methods it implements and
+    /// ignores the rest (the honest-plugin model, D8).
+    pub async fn notify_worker(&self, plugin_id: &str, method: &str, params: Value) -> bool {
+        let line = serde_json::json!({ "jsonrpc": "2.0", "method": method, "params": params })
+            .to_string()
+            + "\n";
+        let running = self.running.lock().await;
+        match running.get(plugin_id).and_then(|w| w.inbound.as_ref()) {
+            Some(tx) => tx.send(line).is_ok(),
+            None => false,
+        }
     }
 
     /// Launch a worker for every active plugin that declares a runtime, up to
@@ -133,7 +155,14 @@ impl PluginHost {
         let task = tokio::spawn(async move {
             host.supervise(id_for_task).await;
         });
-        running.insert(plugin_id, RunningWorker { pid: 0, task });
+        running.insert(
+            plugin_id,
+            RunningWorker {
+                pid: 0,
+                task,
+                inbound: None,
+            },
+        );
     }
 
     /// Drive one plugin's worker: spawn, serve, respawn within budget.
@@ -248,6 +277,22 @@ impl PluginHost {
 
         let stdin = child.stdin.take().context("worker stdin missing")?;
         let stdout = child.stdout.take().context("worker stdout missing")?;
+
+        // One task owns stdin; both the RPC response path and host-initiated
+        // pushes (notify_worker) feed it through this channel, so there is a
+        // single writer. Registered in `running` so notify_worker can reach it.
+        let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel::<String>();
+        let writer = tokio::spawn(async move {
+            let mut stdin = stdin;
+            while let Some(line) = inbound_rx.recv().await {
+                if stdin.write_all(line.as_bytes()).await.is_err() {
+                    break; // worker closed stdin; nothing more to send.
+                }
+            }
+        });
+        if let Some(w) = self.running.lock().await.get_mut(plugin_id) {
+            w.inbound = Some(inbound_tx.clone());
+        }
         // A fresh UI generation per spawn: every ui.state.* write the worker
         // makes is stamped with it, so once this generation is retired below a
         // late write cannot resurrect state, and an instant respawn owns a new
@@ -259,7 +304,13 @@ impl PluginHost {
             ui_contributions,
             ui_generation,
         };
-        serve_connection(&self.api, &ctx, stdout, stdin).await;
+        serve_connection(&self.api, &ctx, stdout, inbound_tx).await;
+        // Serving ended; stop accepting host-initiated pushes and tear down the
+        // stdin writer so it does not outlive the worker.
+        if let Some(w) = self.running.lock().await.get_mut(plugin_id) {
+            w.inbound = None;
+        }
+        writer.abort();
 
         // The loop returned: the worker closed its stdout (exited or crashed).
         // Drop this generation's UI state (a respawn repopulates it); guarded by
@@ -305,7 +356,7 @@ async fn serve_connection(
     api: &Arc<HostApiState>,
     ctx: &PluginRpcContext,
     stdout: tokio::process::ChildStdout,
-    mut stdin: tokio::process::ChildStdin,
+    stdin: mpsc::UnboundedSender<String>,
 ) {
     let mut lines = BufReader::new(stdout).lines();
     // Unbounded line read: per the honest model (D8) the worker is cooperative,
@@ -328,7 +379,7 @@ async fn serve_connection(
                 // error (best effort) and stop reading from this worker.
                 let resp =
                     RpcResponse::error(Value::Null, codes::PARSE_ERROR, e.to_string()).to_line();
-                let _ = stdin.write_all(resp.as_bytes()).await;
+                let _ = stdin.send(resp);
                 return;
             }
         };
@@ -342,7 +393,7 @@ async fn serve_connection(
             Err(msg) => {
                 let id = request.id.clone().unwrap_or(Value::Null);
                 let resp = RpcResponse::error(id, codes::INVALID_REQUEST, msg).to_line();
-                if stdin.write_all(resp.as_bytes()).await.is_err() {
+                if stdin.send(resp).is_err() {
                     return;
                 }
                 continue;
@@ -408,12 +459,8 @@ async fn serve_connection(
                 format!("host dispatch task failed: {join_err}"),
             ),
         };
-        if stdin
-            .write_all(response.to_line().as_bytes())
-            .await
-            .is_err()
-        {
-            return; // worker closed stdin; nothing more to say.
+        if stdin.send(response.to_line()).is_err() {
+            return; // writer task gone; nothing more to say.
         }
     }
 }
@@ -423,6 +470,21 @@ mod tests {
     use super::*;
     use crate::plugin::host_api::PluginRpcContext;
     use serde_json::json;
+
+    /// Spawn the single stdin-writer task `serve_connection` now expects, and
+    /// return its sender (mirrors what `spawn_once` wires in production).
+    fn stdin_writer(stdin: tokio::process::ChildStdin) -> mpsc::UnboundedSender<String> {
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        tokio::spawn(async move {
+            let mut stdin = stdin;
+            while let Some(line) = rx.recv().await {
+                if stdin.write_all(line.as_bytes()).await.is_err() {
+                    break;
+                }
+            }
+        });
+        tx
+    }
 
     /// End-to-end over a real child process: a Node worker speaks ndjson
     /// JSON-RPC through `serve_connection`, hits the capability gate on a method
@@ -481,7 +543,7 @@ process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:1,method:"session.meta.set
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
 
-        serve_connection(&api, &ctx, stdout, stdin).await;
+        serve_connection(&api, &ctx, stdout, stdin_writer(stdin)).await;
         let _ = child.wait().await;
 
         // Read the event the worker published: it carries the FORBIDDEN code the
@@ -499,5 +561,74 @@ process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:1,method:"session.meta.set
             events[0]["payload"]["forbidden_code"],
             json!(codes::FORBIDDEN)
         );
+    }
+
+    /// The host->worker push path (what `notify_worker` uses): a notification
+    /// written to the worker's stdin reaches it and is acted on. The worker waits
+    /// idle, then on an unsolicited `host.ping` notification publishes an event,
+    /// proving the unsolicited stdin write landed.
+    #[tokio::test]
+    async fn host_initiated_notification_reaches_worker() {
+        if which::which("node").is_err() {
+            eprintln!("skipping: node not found on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let api = Arc::new(
+            HostApiState::open(&tmp.path().join("plugin_events.db"), "default", 100).unwrap(),
+        );
+        let ctx = PluginRpcContext {
+            plugin_id: "acme.worker".to_string(),
+            granted_capabilities: vec!["runtime.worker".to_string()],
+            ui_contributions: std::collections::HashSet::new(),
+            ui_generation: 0,
+        };
+
+        // Worker initiates nothing; it reacts to the host's `host.ping` push by
+        // publishing, then exits once it sees the publish response.
+        const WORKER: &str = r#"
+const rl = require('readline').createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  const m = JSON.parse(line);
+  if (m.method === 'host.ping') {
+    process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:1,method:"events.publish",params:{topic:"pinged",payload:{ok:true}}}) + "\n");
+  } else if (m.id === 1) {
+    process.exit(0);
+  }
+});
+"#;
+
+        let mut child = tokio::process::Command::new("node")
+            .arg("-e")
+            .arg(WORKER)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+
+        let tx = stdin_writer(stdin);
+        // Host-initiated push, exactly as notify_worker builds it.
+        tx.send(
+            json!({ "jsonrpc": "2.0", "method": "host.ping", "params": {} }).to_string() + "\n",
+        )
+        .unwrap();
+
+        serve_connection(&api, &ctx, stdout, tx).await;
+        let _ = child.wait().await;
+
+        let got = dispatch(
+            &api,
+            &ctx,
+            "events.subscribe",
+            &json!({ "topics": ["pinged"], "after_seq": 0 }),
+        )
+        .unwrap();
+        let events = got["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1, "worker should react to the host push");
+        assert_eq!(events[0]["payload"]["ok"], json!(true));
     }
 }

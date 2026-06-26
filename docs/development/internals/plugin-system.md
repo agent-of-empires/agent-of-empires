@@ -511,8 +511,10 @@ Two slots carry more than a single value, so one entry (one declared
 - `pane` also accepts `blocks: Block[]`, an ordered list of typed
   blocks. The host knows these kinds: `heading { text }`,
   `row { label, value?, sublabel?, icon?, tone?, href? }`, `note { text, tone? }`,
-  `divider {}`, and `section { title?, children: Block[] }` (nested blocks). The
-  simple `{ title, body }` form still works when `blocks` is absent. A `pane`
+  `divider {}`, `section { title?, children: Block[] }` (nested blocks), and
+  `action { label, method, icon? }` (a button that forwards `method` to the
+  plugin's worker, see below). The simple `{ title, body }` form still works
+  when `blocks` is absent. A `pane`
   also takes an optional `default_location` (`right` | `bottom`) choosing the
   dock it first opens in; the user can move it between docks afterward, and an
   optional `icon` (any lucide icon name, kebab-case) for its activity-bar
@@ -528,6 +530,16 @@ can add a field to an existing kind, or push a brand new kind, without any host
 change: an older host simply renders what it understands and drops the rest.
 This is deliberate, the GitHub plugin's pane keeps growing (PR state today,
 review/CI/timelines later) and must not require lockstep host releases.
+
+**Pane actions (host to worker).** An `action` block is a button. When clicked,
+the dashboard POSTs `/api/plugins/{id}/action { method, params? }`; the host
+writes that JSON-RPC method to the worker's stdin as a notification (no id, so
+no reply) via `PluginHost::notify_worker`. The worker runs the method (e.g.
+`github.refresh`) and re-pushes its UI state, which the next `ui-state` poll
+renders. The plugin names the `method` in its own block, and the worker is the
+trust boundary: it acts only on methods it implements and ignores the rest (the
+honest-plugin model). The endpoint is gated like other mutations (read-write
+mode plus an elevated session when login is on).
 
 ### Store and lifecycle (`src/plugin/ui_state.rs`)
 

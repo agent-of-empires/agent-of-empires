@@ -1500,6 +1500,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/plugins", get(api::list_plugins))
         .route("/api/plugins/ui-state", get(api::plugin_ui_state))
         .route("/api/plugins/{id}/enabled", post(api::set_plugin_enabled))
+        .route("/api/plugins/{id}/action", post(api::invoke_plugin_action))
         .route(
             "/api/app-state/web-tour-seen",
             post(api::mark_web_tour_seen),

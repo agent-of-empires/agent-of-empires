@@ -5,8 +5,9 @@
 // pane, detail-badge. Notifications surface as toasts via the hook;
 // sort-key and filter-facet are deferred (see #2366 follow-ups).
 
-import { createElement } from "react";
+import { createElement, useState } from "react";
 
+import { invokePluginAction } from "../../lib/api";
 import { usePluginUiEntries } from "../../lib/pluginUiContext";
 import {
   entryText,
@@ -259,6 +260,39 @@ function BlockRow({ block }: { block: Record<string, unknown> }) {
   );
 }
 
+/** An `action` pane block: a button that forwards a worker method (named by the
+ *  plugin) to that plugin's worker. Fire-and-forget; the worker re-pushes its
+ *  UI state, which the next poll renders. Disabled briefly so a double-click
+ *  does not double-fire. An icon is optional. */
+function BlockAction({ block, pluginId }: { block: Record<string, unknown>; pluginId: string }) {
+  const label = str(block, "label");
+  const method = str(block, "method");
+  const iconComp = lucideIcon(str(block, "icon"));
+  const [busy, setBusy] = useState(false);
+  if (!label || !method) return null;
+  const onClick = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await invokePluginAction(pluginId, method);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={busy}
+      data-testid="plugin-pane-action"
+      className="self-start inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-xs cursor-pointer bg-surface-700/50 text-text-secondary hover:text-text-primary hover:bg-surface-700 disabled:opacity-50 disabled:cursor-default transition-colors"
+    >
+      {iconComp && createElement(iconComp, { className: "size-3.5", "aria-hidden": true })}
+      {label}
+    </button>
+  );
+}
+
 /** Render one pane block. The block vocabulary is forward-compatible:
  *  an unknown `kind` (or a known kind missing its required field) renders
  *  nothing rather than throwing, so a newer plugin can push kinds an older host
@@ -277,6 +311,8 @@ function DetailBlock({ block, pluginId }: { block: Record<string, unknown>; plug
     }
     case "divider":
       return <hr className="border-surface-700/60" />;
+    case "action":
+      return <BlockAction block={block} pluginId={pluginId} />;
     case "section": {
       const title = str(block, "title");
       const children = Array.isArray(block.children) ? block.children.filter(isObject) : [];

@@ -296,6 +296,29 @@ export async function setPluginEnabled(id: string, enabled: boolean): Promise<Pl
   }
 }
 
+/**
+ * Forward a plugin pane's UI action (e.g. a "Refresh" button) to the plugin's
+ * worker. Fire-and-forget: the worker runs the named method and re-pushes its
+ * UI state, which the next ui-state poll renders. Returns false on read-only
+ * (403), no running worker (404), or network failure.
+ */
+export async function invokePluginAction(
+  pluginId: string,
+  method: string,
+  params: Record<string, unknown> = {},
+): Promise<boolean> {
+  try {
+    const res = await fetch(`/api/plugins/${encodeURIComponent(pluginId)}/action`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ method, params }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
 export async function updateSettings(updates: Record<string, unknown>): Promise<boolean> {
   try {
     const res = await fetch("/api/settings", {

@@ -79,6 +79,46 @@ pub async fn plugin_ui_state(
 }
 
 #[derive(Deserialize)]
+pub struct PluginActionBody {
+    /// The worker method to invoke (the plugin names it in its pane's action
+    /// block, e.g. `github.refresh`).
+    pub method: String,
+    #[serde(default)]
+    pub params: serde_json::Value,
+}
+
+/// `POST /api/plugins/{id}/action`: forward a dashboard UI action (a pane
+/// button) to the plugin's worker as a fire-and-forget JSON-RPC notification.
+/// The worker is the trust boundary: it acts only on methods it implements and
+/// ignores the rest, so this never waits for or returns a worker result.
+pub async fn invoke_plugin_action(
+    State(state): State<std::sync::Arc<AppState>>,
+    session: Option<axum::Extension<AuthenticatedSession>>,
+    Path(id): Path<String>,
+    Json(body): Json<PluginActionBody>,
+) -> Response {
+    if let Err(resp) = mutation_gate(&state, session.as_deref()).await {
+        return resp;
+    }
+    let Some(host) = state.plugin_host.as_ref() else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no_host",
+            "Plugin host is not running".into(),
+        );
+    };
+    if host.notify_worker(&id, &body.method, body.params).await {
+        (StatusCode::ACCEPTED, Json(json!({ "ok": true }))).into_response()
+    } else {
+        error_response(
+            StatusCode::NOT_FOUND,
+            "no_worker",
+            format!("No running worker for plugin {id}"),
+        )
+    }
+}
+
+#[derive(Deserialize)]
 pub struct SetEnabledBody {
     pub enabled: bool,
 }

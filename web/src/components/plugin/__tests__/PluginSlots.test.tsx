@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import type { PluginUiEntry } from "../../../lib/api";
 import { PluginCards, PluginPaneBody, PluginRowBadges, PluginStatusBarSegments } from "../PluginSlots";
@@ -11,6 +11,10 @@ const { entriesRef } = vi.hoisted(() => ({ entriesRef: { current: [] as PluginUi
 vi.mock("../../../lib/pluginUiContext", () => ({
   usePluginUiEntries: () => entriesRef.current,
 }));
+
+// The action block forwards to the worker via this; stub it.
+const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn(async () => true) }));
+vi.mock("../../../lib/api", () => ({ invokePluginAction: invokeMock }));
 
 function set(entries: PluginUiEntry[]) {
   entriesRef.current = entries;
@@ -80,6 +84,33 @@ describe("plugin slot renderers", () => {
     render(<PluginCards />);
     expect(screen.getByText("Coverage")).toBeTruthy();
     expect(screen.getByText("92%")).toBeTruthy();
+  });
+
+  it("pane action button forwards the named worker method", async () => {
+    const entry: PluginUiEntry = {
+      plugin_id: "acme.kit",
+      slot: "pane",
+      id: "p",
+      session_id: "s1",
+      payload: { title: "GitHub", blocks: [{ kind: "action", label: "Refresh", method: "github.refresh" }] },
+    };
+    render(<PluginPaneBody entry={entry} />);
+    const btn = screen.getByTestId("plugin-pane-action");
+    expect(btn.textContent).toContain("Refresh");
+    fireEvent.click(btn);
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("acme.kit", "github.refresh"));
+  });
+
+  it("pane action block without a method renders nothing", () => {
+    const entry: PluginUiEntry = {
+      plugin_id: "acme.kit",
+      slot: "pane",
+      id: "p",
+      session_id: "s1",
+      payload: { blocks: [{ kind: "action", label: "Refresh" }] },
+    };
+    render(<PluginPaneBody entry={entry} />);
+    expect(screen.queryByTestId("plugin-pane-action")).toBeNull();
   });
 
   it("pane renders its title/body", () => {
