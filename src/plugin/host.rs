@@ -281,6 +281,10 @@ impl PluginHost {
         // One task owns stdin; both the RPC response path and host-initiated
         // pushes (notify_worker) feed it through this channel, so there is a
         // single writer. Registered in `running` so notify_worker can reach it.
+        // ponytail: unbounded by design. A worker that stops draining stdin
+        // could let lines accumulate, but under the honest-plugin trust model
+        // (D8) that is out of scope; bound this channel if a real backpressure
+        // need shows up.
         let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel::<String>();
         let writer = tokio::spawn(async move {
             let mut stdin = stdin;
