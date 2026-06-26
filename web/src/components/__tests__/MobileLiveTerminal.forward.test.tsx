@@ -137,6 +137,21 @@ describe("MobileLiveTerminal wheel forwarding", () => {
     expect(forwardButton).not.toHaveBeenCalled();
   });
 
+  it("forwards a drag motion report and finalizes on release", () => {
+    // Exact per-cell dedupe counts depend on measured char metrics, which are
+    // unstable in jsdom; that is asserted in the real browser by
+    // tests/live-click-forward.spec.ts. Here we just lock the gesture shape:
+    // press (no motion) -> drag (motion bit) -> release.
+    const { scroller, forwardButton } = renderTerm(frame({ altScreen: true, mouse: true, mouseSgr: true }));
+    fireEvent.pointerDown(scroller, { pointerType: "mouse", button: 0, clientX: 10, clientY: 10 });
+    fireEvent.pointerMove(scroller, { pointerType: "mouse", clientX: 120, clientY: 10 });
+    fireEvent.pointerUp(scroller, { pointerType: "mouse", button: 0, clientX: 120, clientY: 10 });
+    const calls = forwardButton.mock.calls;
+    expect(calls[0]!.slice(1, 3)).toEqual([false, false]); // press: not release, not motion
+    expect(calls.some((c) => c[1] === false && c[2] === true)).toBe(true); // a drag (motion) report
+    expect(calls.at(-1)![1]).toBe(true); // release last
+  });
+
   it("does not enter reading mode on scroll while forwarding", () => {
     const enterReading = vi.fn();
     const utils = render(

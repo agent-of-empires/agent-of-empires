@@ -73,7 +73,7 @@ const CAPTURE_INTERVAL_FAST_MS: u64 = 50;
 /// at this rate a streaming agent costs at most a few frames per second.
 const CAPTURE_INTERVAL_IDLE_MS: u64 = 250;
 /// Minimum gap between samples when a vt channel drives the loop on output
-/// (the `wait_changed` arm). The channel wakes us the instant the grid
+/// (the grid-change watch arm). The channel wakes us the instant the grid
 /// changes, so the cadence above is no longer the latency floor; this caps a
 /// spewing pane at ~60fps instead of letting it busy-loop the socket. Only the
 /// live-edge (small-window) path is event-driven, so this never applies while
@@ -300,6 +300,10 @@ async fn handle_live_ws(
     #[cfg(unix)]
     let capture_vt = vt.clone();
     let capture_task = tokio::spawn(async move {
+        // This connection's own change receiver: every viewer of the shared
+        // channel gets one, so a grid change wakes all of them (not just one).
+        #[cfg(unix)]
+        let mut vt_rx = capture_vt.as_ref().map(|ch| ch.subscribe());
         let mut last_published: Option<(String, Option<crate::tmux::PaneCursor>)> = None;
         let mut dead_probes: u32 = 0;
         let mut last_reassert = std::time::Instant::now() - REASSERT_MIN_INTERVAL;
@@ -318,15 +322,21 @@ async fn handle_live_ws(
             #[cfg(unix)]
             {
                 outcome = match &capture_vt {
-                    Some(ch) if !ch.is_alive() => CaptureOutcome::Dead,
-                    Some(ch) => {
+                    Some(ch) if ch.is_alive() => {
                         let ch = ch.clone();
                         match tokio::task::spawn_blocking(move || ch.sample(lines)).await {
                             Ok((content, cursor)) => CaptureOutcome::Frame(content, cursor),
                             Err(_) => break,
                         }
                     }
-                    None => {
+                    // No channel, or the held channel's forwarder has died (a
+                    // pipe failure, not necessarily a dead pane): fall back to
+                    // the legacy capture-pane fork rather than black-holing.
+                    // If the pane is truly gone the fork returns empty -> Dead
+                    // and the connection still closes; if only the pipe died
+                    // the pane keeps rendering, so we recover. Input mirrors
+                    // this by gating `armed` on `is_alive` below.
+                    _ => {
                         let name = capture_tmux.clone();
                         match tokio::task::spawn_blocking(move || {
                             crate::tmux::Session::from_name(&name).capture_pane_with_cursor(lines)
@@ -490,10 +500,11 @@ async fn handle_live_ws(
             };
 
             // Rate cap: hold each cycle to at least FRAME_MIN so a pane spewing
-            // output (the `wait_changed` arm fires back-to-back) is bounded to
-            // ~60fps rather than busy-looping. A nudge or grid change that
-            // lands during this pad stores a permit, so the wait below returns
-            // immediately and no wake is lost.
+            // output (the grid-change arm fires back-to-back) is bounded to
+            // ~60fps rather than busy-looping. A nudge or grid bump that lands
+            // during this pad is retained (the watch keeps its version, the
+            // nudge keeps a permit), so the wait below returns immediately and
+            // no wake is lost.
             let since = sample_started.elapsed();
             let floor = Duration::from_millis(FRAME_MIN_INTERVAL_MS);
             if since < floor {
@@ -511,8 +522,17 @@ async fn handle_live_ws(
                 _ = tokio::time::sleep(Duration::from_millis(ms)) => {}
                 _ = capture_nudge.notified() => {}
                 _ = async {
-                    match &capture_vt {
-                        Some(ch) => ch.wait_changed().await,
+                    match &mut vt_rx {
+                        // `changed()` resolves on the next grid bump, or
+                        // immediately if one happened since the last wait, so
+                        // output between waits is never missed. Err (sender
+                        // gone) can't happen while we hold the channel Arc;
+                        // park if it ever does rather than spin.
+                        Some(rx) => {
+                            if rx.changed().await.is_err() {
+                                std::future::pending::<()>().await
+                            }
+                        }
                         None => std::future::pending::<()>().await,
                     }
                 }, if small_window => {}
@@ -575,8 +595,13 @@ async fn handle_live_ws(
                         // interleave two writers on the pty input). Otherwise fork
                         // send-keys as before. The browser already sends raw bytes,
                         // so no key encoding is needed on this path.
+                        // Gate on `is_alive`, not just `is_some`: a held
+                        // channel whose forwarder has died must fall back to
+                        // send-keys, or input would be written into a dead
+                        // socket and silently dropped (capture falls back the
+                        // same way above).
                         #[cfg(unix)]
-                        let armed = vt.is_some();
+                        let armed = vt.as_ref().is_some_and(|ch| ch.is_alive());
                         #[cfg(not(unix))]
                         let armed = false;
                         if armed {

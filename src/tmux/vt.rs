@@ -415,10 +415,13 @@ pub(crate) struct VtChannel {
     /// true, so a live channel is the single-writer; once it clears, input and
     /// capture both fall back to the legacy tmux path instead of black-holing.
     alive: Arc<AtomicBool>,
-    /// Notified by the reader thread on each grid change (and on death) so a
-    /// web viewer renders on output rather than polling. Server-only.
+    /// Bumped by the reader thread on each grid change (and on death). A watch
+    /// (not a `Notify`) so EVERY viewer of this shared channel wakes on a
+    /// change, not just one; `subscribe` hands each connection its own
+    /// receiver. Server-only. The carried value is unused (it is the version
+    /// bump that matters), so it is `()`.
     #[cfg(feature = "serve")]
-    changed: Arc<tokio::sync::Notify>,
+    changed_tx: Arc<tokio::sync::watch::Sender<()>>,
     /// Owner-only (0700) directory holding `sock_path`; removed on drop.
     sock_dir: PathBuf,
     sock_path: PathBuf,
@@ -465,11 +468,13 @@ impl VtChannel {
         let stream: Arc<Mutex<Option<UnixStream>>> = Arc::new(Mutex::new(None));
         let app_cursor = Arc::new(AtomicBool::new(false));
         let alive = Arc::new(AtomicBool::new(false));
-        // Notified by the reader thread on every grid change (and on death) so
+        // Bumped by the reader thread on every grid change (and on death) so
         // a web viewer can render on output instead of polling on a cadence.
-        // Server-only; the TUI repaints from its own draw loop.
+        // A watch so all viewers wake, not just one. Server-only; the TUI
+        // repaints from its own draw loop. The initial receiver is dropped;
+        // `subscribe` mints one per connection.
         #[cfg(feature = "serve")]
-        let changed = Arc::new(tokio::sync::Notify::new());
+        let changed_tx = Arc::new(tokio::sync::watch::channel(()).0);
 
         // Bind the socket inside an owner-only (0700) directory so other users
         // on a shared host cannot connect to the pane channel and capture
@@ -497,7 +502,7 @@ impl VtChannel {
             let app_cursor = app_cursor.clone();
             let alive = alive.clone();
             #[cfg(feature = "serve")]
-            let changed = changed.clone();
+            let changed_tx = changed_tx.clone();
             std::thread::spawn(move || {
                 let Ok((conn, _)) = listener.accept() else {
                     return;
@@ -526,11 +531,12 @@ impl VtChannel {
                                 app_cursor
                                     .store(p.screen().application_cursor(), Ordering::Relaxed);
                             }
-                            // Wake any viewer waiting on output. `notify_one`
-                            // stores a permit if no one is parked, so a chunk
-                            // that lands between waits is coalesced, not lost.
+                            // Wake every viewer waiting on output. The watch
+                            // coalesces (a viewer that wasn't parked sees the
+                            // bumped version on its next wait), so a chunk that
+                            // lands between waits is not lost.
                             #[cfg(feature = "serve")]
-                            changed.notify_one();
+                            changed_tx.send_modify(|_| {});
                         }
                         Err(ref e)
                             if e.kind() == std::io::ErrorKind::WouldBlock
@@ -542,10 +548,10 @@ impl VtChannel {
                 // forwarder is gone, so the channel is no longer the live
                 // single-writer. Input dispatch and capture both fall back.
                 alive.store(false, Ordering::Relaxed);
-                // Wake a parked viewer so it observes the death promptly
-                // instead of waiting out its heartbeat sleep.
+                // Wake parked viewers so they observe the death promptly
+                // instead of waiting out their heartbeat sleep.
                 #[cfg(feature = "serve")]
-                changed.notify_one();
+                changed_tx.send_modify(|_| {});
             })
         };
 
@@ -639,7 +645,7 @@ impl VtChannel {
             app_cursor,
             alive,
             #[cfg(feature = "serve")]
-            changed,
+            changed_tx,
             sock_dir,
             sock_path,
             stop,
@@ -724,14 +730,14 @@ impl VtChannel {
         self.alive.load(Ordering::Relaxed)
     }
 
-    /// Resolve when the grid next changes (output arrived) or the channel dies.
-    /// A permit stored by `notify_one` since the last call resolves this
-    /// immediately, so output that lands between waits is never missed. Lets a
-    /// viewer render on output instead of polling on a fixed cadence.
-    /// Server-only.
+    /// A receiver that fires whenever the grid changes (output arrived) or the
+    /// channel dies. Each connection holds its own, so every viewer of this
+    /// shared channel wakes on a change; `changed()` also returns immediately
+    /// if a bump happened since the last wait, so output between waits is never
+    /// missed. Lets a viewer render on output instead of polling. Server-only.
     #[cfg(feature = "serve")]
-    pub(crate) async fn wait_changed(&self) {
-        self.changed.notified().await;
+    pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<()> {
+        self.changed_tx.subscribe()
     }
 
     fn write_input(&self, bytes: &[u8]) -> bool {
