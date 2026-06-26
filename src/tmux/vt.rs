@@ -415,6 +415,10 @@ pub(crate) struct VtChannel {
     /// true, so a live channel is the single-writer; once it clears, input and
     /// capture both fall back to the legacy tmux path instead of black-holing.
     alive: Arc<AtomicBool>,
+    /// Notified by the reader thread on each grid change (and on death) so a
+    /// web viewer renders on output rather than polling. Server-only.
+    #[cfg(feature = "serve")]
+    changed: Arc<tokio::sync::Notify>,
     /// Owner-only (0700) directory holding `sock_path`; removed on drop.
     sock_dir: PathBuf,
     sock_path: PathBuf,
@@ -461,6 +465,11 @@ impl VtChannel {
         let stream: Arc<Mutex<Option<UnixStream>>> = Arc::new(Mutex::new(None));
         let app_cursor = Arc::new(AtomicBool::new(false));
         let alive = Arc::new(AtomicBool::new(false));
+        // Notified by the reader thread on every grid change (and on death) so
+        // a web viewer can render on output instead of polling on a cadence.
+        // Server-only; the TUI repaints from its own draw loop.
+        #[cfg(feature = "serve")]
+        let changed = Arc::new(tokio::sync::Notify::new());
 
         // Bind the socket inside an owner-only (0700) directory so other users
         // on a shared host cannot connect to the pane channel and capture
@@ -487,6 +496,8 @@ impl VtChannel {
             let stream = stream.clone();
             let app_cursor = app_cursor.clone();
             let alive = alive.clone();
+            #[cfg(feature = "serve")]
+            let changed = changed.clone();
             std::thread::spawn(move || {
                 let Ok((conn, _)) = listener.accept() else {
                     return;
@@ -515,6 +526,11 @@ impl VtChannel {
                                 app_cursor
                                     .store(p.screen().application_cursor(), Ordering::Relaxed);
                             }
+                            // Wake any viewer waiting on output. `notify_one`
+                            // stores a permit if no one is parked, so a chunk
+                            // that lands between waits is coalesced, not lost.
+                            #[cfg(feature = "serve")]
+                            changed.notify_one();
                         }
                         Err(ref e)
                             if e.kind() == std::io::ErrorKind::WouldBlock
@@ -526,6 +542,10 @@ impl VtChannel {
                 // forwarder is gone, so the channel is no longer the live
                 // single-writer. Input dispatch and capture both fall back.
                 alive.store(false, Ordering::Relaxed);
+                // Wake a parked viewer so it observes the death promptly
+                // instead of waiting out its heartbeat sleep.
+                #[cfg(feature = "serve")]
+                changed.notify_one();
             })
         };
 
@@ -618,6 +638,8 @@ impl VtChannel {
             stream,
             app_cursor,
             alive,
+            #[cfg(feature = "serve")]
+            changed,
             sock_dir,
             sock_path,
             stop,
@@ -700,6 +722,16 @@ impl VtChannel {
     /// of writing into a dead socket or sampling a frozen grid.
     pub(crate) fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Relaxed)
+    }
+
+    /// Resolve when the grid next changes (output arrived) or the channel dies.
+    /// A permit stored by `notify_one` since the last call resolves this
+    /// immediately, so output that lands between waits is never missed. Lets a
+    /// viewer render on output instead of polling on a fixed cadence.
+    /// Server-only.
+    #[cfg(feature = "serve")]
+    pub(crate) async fn wait_changed(&self) {
+        self.changed.notified().await;
     }
 
     fn write_input(&self, bytes: &[u8]) -> bool {

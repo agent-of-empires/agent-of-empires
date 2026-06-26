@@ -72,6 +72,13 @@ const CAPTURE_INTERVAL_FAST_MS: u64 = 50;
 /// scrolled-up window can be thousands of lines, so frames are big;
 /// at this rate a streaming agent costs at most a few frames per second.
 const CAPTURE_INTERVAL_IDLE_MS: u64 = 250;
+/// Minimum gap between samples when a vt channel drives the loop on output
+/// (the `wait_changed` arm). The channel wakes us the instant the grid
+/// changes, so the cadence above is no longer the latency floor; this caps a
+/// spewing pane at ~60fps instead of letting it busy-loop the socket. Only the
+/// live-edge (small-window) path is event-driven, so this never applies while
+/// a client reads scrollback.
+const FRAME_MIN_INTERVAL_MS: u64 = 16;
 /// Upper bound on the capture window. tmux history defaults to 2000
 /// lines per pane; this leaves headroom for raised limits without
 /// letting a client demand unbounded captures.
@@ -298,6 +305,7 @@ async fn handle_live_ws(
         let mut last_reassert = std::time::Instant::now() - REASSERT_MIN_INTERVAL;
         let mut last_heartbeat = std::time::Instant::now() - SIZE_OWNER_HEARTBEAT;
         loop {
+            let sample_started = std::time::Instant::now();
             let lines = capture_settings.window_lines.load(Ordering::Relaxed);
 
             // Fetch one frame: from the shared vt100 grid when a channel is
@@ -480,6 +488,36 @@ async fn handle_live_ws(
             } else {
                 CAPTURE_INTERVAL_IDLE_MS
             };
+
+            // Rate cap: hold each cycle to at least FRAME_MIN so a pane spewing
+            // output (the `wait_changed` arm fires back-to-back) is bounded to
+            // ~60fps rather than busy-looping. A nudge or grid change that
+            // lands during this pad stores a permit, so the wait below returns
+            // immediately and no wake is lost.
+            let since = sample_started.elapsed();
+            let floor = Duration::from_millis(FRAME_MIN_INTERVAL_MS);
+            if since < floor {
+                tokio::time::sleep(floor - since).await;
+            }
+
+            // Wait for the next reason to sample. `ms` is the ceiling (death
+            // detection, size-owner heartbeat); a nudge wakes us for typed
+            // echo; and when a vt channel drives a live-edge window it wakes us
+            // the instant the grid changes, so output latency is one socket
+            // hop, not a cadence tick. The grid arm is gated to `small_window`
+            // so a client reading scrollback keeps the big-frame throttle.
+            #[cfg(unix)]
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(ms)) => {}
+                _ = capture_nudge.notified() => {}
+                _ = async {
+                    match &capture_vt {
+                        Some(ch) => ch.wait_changed().await,
+                        None => std::future::pending::<()>().await,
+                    }
+                }, if small_window => {}
+            }
+            #[cfg(not(unix))]
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_millis(ms)) => {}
                 _ = capture_nudge.notified() => {}
