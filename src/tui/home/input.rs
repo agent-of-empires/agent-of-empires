@@ -3478,7 +3478,7 @@ impl HomeView {
                 if self.has_non_live_send_overlay() {
                     return false;
                 }
-                if self.preview_forwards_mouse().is_none() || !self.hit_preview(col, row) {
+                if !self.hit_preview(col, row) {
                     return false;
                 }
                 (base(b), false, false)
@@ -3489,9 +3489,11 @@ impl HomeView {
             MouseEventKind::Up(b) if self.mouse_forward_btn.is_some() => (base(b), true, false),
             _ => return false,
         };
+        // The single mouse-forwarding gate, shared by press/drag/release: a
+        // press over a non-mouse pane bails here, and a gesture whose pane
+        // stopped being a mouse agent mid-drag drops its tracked button so we
+        // don't strand it.
         let Some(cursor) = self.preview_forwards_mouse() else {
-            // The pane stopped being a mouse agent mid-gesture; drop the
-            // tracked button so we don't strand it.
             self.mouse_forward_btn = None;
             return false;
         };
@@ -5421,6 +5423,10 @@ mod tests {
             mouse_event_bytes(0, true, false, false, pane, 10, 5),
             vec![0x1b, b'[', b'M', 3 + 32, 11 + 32, 6 + 32]
         ); // release => button 3
+        assert_eq!(
+            mouse_event_bytes(0, false, true, false, pane, 10, 5),
+            vec![0x1b, b'[', b'M', 0 + 32 + 32, 11 + 32, 6 + 32]
+        ); // left drag => button 0 + motion bit 32
     }
 
     fn cursor_for(
