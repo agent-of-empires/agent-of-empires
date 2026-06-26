@@ -697,21 +697,28 @@ impl HomeView {
             self.preview_autoscroll_at = None;
             return false;
         }
-        // Pace the scroll to a steady cadence regardless of how often the
-        // loop woke this iteration, so the speed is even instead of racing
-        // with capture-worker activity. The aoe-side line scroll runs at a
-        // smooth per-line cadence; the agent scroll-forward fallback below runs
-        // slower, since each notch scrolls a whole page and a held edge would
-        // otherwise rocket through the transcript.
+        // Pace the scroll to a steady cadence regardless of how often the loop
+        // woke this iteration, so the speed is even instead of racing with
+        // capture-worker activity. The aoe-side line scroll and the wheel
+        // forward to a mouse agent are both fine-grained (one line / one wheel
+        // notch), so they run at the fast cadence and read as smooth, like the
+        // native wheel forward when the live pane is active. The no-mouse
+        // page-key fallback stays slow: each press scrolls a WHOLE page, so a
+        // held edge at the fast cadence would rocket through the transcript.
         const AUTOSCROLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(40);
         const PAGE_FORWARD_INTERVAL: std::time::Duration = std::time::Duration::from_millis(150);
         let now = std::time::Instant::now();
+        let forward_interval = if self.preview_forwards_mouse().is_some() {
+            AUTOSCROLL_INTERVAL
+        } else {
+            PAGE_FORWARD_INTERVAL
+        };
         let line_ready = self
             .preview_autoscroll_at
             .is_none_or(|prev| now.duration_since(prev) >= AUTOSCROLL_INTERVAL);
-        let page_ready = self
+        let forward_ready = self
             .preview_autoscroll_at
-            .is_none_or(|prev| now.duration_since(prev) >= PAGE_FORWARD_INTERVAL);
+            .is_none_or(|prev| now.duration_since(prev) >= forward_interval);
         // First try the aoe-side capture-window scroll (normal-buffer panes
         // with real scrollback).
         if line_ready {
@@ -747,7 +754,7 @@ impl HomeView {
         // the way the wheel forward does (#2421). The extent stays pinned to the
         // screen edge; the agent's redraw is what reveals more text under the
         // held selection.
-        if page_ready && self.forward_scroll_to_preview(at_top, col, row) {
+        if forward_ready && self.forward_scroll_to_preview(at_top, col, row) {
             self.preview_autoscroll_at = Some(now);
             return true;
         }
