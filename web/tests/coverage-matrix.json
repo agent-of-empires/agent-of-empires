@@ -39,11 +39,7 @@
       "id": "session.create-worktree-name-collisions",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": ["tests/live/session-create-duplicate-worktree.spec.ts"],
-      "components": [
-        "web/src/components/session-wizard/SessionWizard.tsx",
-        "web/src/components/session-wizard/LaunchFooter.tsx"
-      ]
+      "specs": ["tests/live/session-create-duplicate-worktree.spec.ts"]
     },
     {
       "id": "terminal.mobile-backspace-autorepeat",
