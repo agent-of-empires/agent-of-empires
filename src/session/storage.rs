@@ -424,7 +424,7 @@ impl Storage {
                 }
                 Err(e) => tracing::warn!(
                     error = %e,
-                    row_kind,
+                    row_kind = %row_kind,
                     "failed to serialise corrupt row for quarantine"
                 ),
             }
@@ -442,7 +442,7 @@ impl Storage {
             tracing::warn!(
                 error = %e,
                 path = %path.display(),
-                row_kind,
+                row_kind = %row_kind,
                 "failed to write quarantine file"
             );
         }
