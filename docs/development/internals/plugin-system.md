@@ -486,7 +486,11 @@ manager, and the web Plugins panel (via `PluginView.ui_contributions`).
   is introduced. The `payload` is validated against the slot's typed shape and
   stored normalized; an unknown field or bad tone is rejected. Per-session slots
   (`row-badge`, `row-column`, `detail-panel`, `detail-badge`) require a
-  `session_id`; global slots must not carry one.
+  `session_id`; global slots must not carry one. The text-based slots
+  (`status-bar`, `row-badge`, `detail-badge`) accept optional `icon` (a lucide
+  icon name in kebab-case, e.g. `git-pull-request-arrow`; an unknown name
+  renders nothing) and `href` (when set, the badge renders as a link that opens
+  in a new tab).
 - `ui.notify { tone, title, body?, session_id? }`. Gated by the existing
   `notifications` capability (not a slot declaration). Returns a monotonic
   `seq`.

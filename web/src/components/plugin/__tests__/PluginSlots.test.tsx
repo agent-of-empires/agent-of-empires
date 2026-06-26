@@ -37,6 +37,44 @@ describe("plugin slot renderers", () => {
     expect(screen.queryByText("other")).toBeNull();
   });
 
+  it("row-badge with href renders a clickable link with a lucide icon", () => {
+    set([
+      {
+        plugin_id: "acme.kit",
+        slot: "row-badge",
+        id: "b",
+        session_id: "s1",
+        payload: {
+          text: "PR #12",
+          icon: "git-pull-request-arrow",
+          href: "https://github.com/o/r/pull/12",
+        },
+      },
+    ]);
+    const { container } = render(<PluginRowBadges sessionId="s1" />);
+    const link = screen.getByRole("link", { name: /PR #12/ });
+    expect(link.getAttribute("href")).toBe("https://github.com/o/r/pull/12");
+    expect(link.getAttribute("target")).toBe("_blank");
+    expect(link.getAttribute("rel")).toContain("noopener");
+    // The lucide icon renders as an inline svg.
+    expect(container.querySelector("svg")).toBeTruthy();
+  });
+
+  it("row-badge with an unknown icon name renders text and no svg", () => {
+    set([
+      {
+        plugin_id: "acme.kit",
+        slot: "row-badge",
+        id: "b",
+        session_id: "s1",
+        payload: { text: "plain", icon: "not-a-real-icon" },
+      },
+    ]);
+    const { container } = render(<PluginRowBadges sessionId="s1" />);
+    expect(screen.getByText("plain")).toBeTruthy();
+    expect(container.querySelector("svg")).toBeNull();
+  });
+
   it("card renders title and body", () => {
     set([{ plugin_id: "acme.kit", slot: "card", id: "c", payload: { title: "Coverage", body: "92%" } }]);
     render(<PluginCards />);

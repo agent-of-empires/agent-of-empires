@@ -89,6 +89,14 @@ struct TextPayload {
     tone: Option<Tone>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tooltip: Option<String>,
+    /// Lucide icon name, e.g. "git-pull-request-arrow". The client maps it
+    /// through a small allowlist; an unknown name renders no icon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    icon: Option<String>,
+    /// URL to open (e.g. the PR). When set, the client renders the badge as a
+    /// link instead of static text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    href: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

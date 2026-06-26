@@ -5,24 +5,53 @@
 // detail-panel, detail-badge. Notifications surface as toasts via the hook;
 // sort-key and filter-facet are deferred (see #2366 follow-ups).
 
+import { createElement } from "react";
+import { icons } from "lucide-react";
+
 import { usePluginUiEntries } from "../../lib/pluginUiContext";
 import { entryText, entryTone, globalEntries, payloadStr, sessionEntries, toneClasses } from "../../lib/pluginUi";
 import type { PluginUiEntry } from "../../lib/api";
+
+// A plugin names an icon by its lucide kebab name (e.g. "git-pull-request-arrow");
+// lucide keys its `icons` record by PascalCase, so convert. Any lucide icon is
+// allowed; an unknown name renders no icon. Icons use currentColor, so
+// toneClasses tints them.
+function lucideIcon(name: string) {
+  if (!name) return undefined;
+  const pascal = name
+    .split("-")
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join("");
+  return icons[pascal as keyof typeof icons];
+}
 
 function Badge({ entry }: { entry: PluginUiEntry }) {
   const text = entryText(entry);
   if (!text) return null;
   const tooltip = payloadStr(entry, "tooltip");
-  return (
-    <span
-      className={`inline-flex max-w-48 min-w-0 items-center truncate font-mono text-[11px] px-1.5 py-0.5 rounded-full ${toneClasses(entryTone(entry))}`}
-      title={tooltip || text}
-      data-plugin-slot={entry.slot}
-      data-plugin-id={entry.plugin_id}
-    >
-      {text}
-    </span>
+  const icon = lucideIcon(payloadStr(entry, "icon"));
+  const href = payloadStr(entry, "href");
+  const className = `inline-flex max-w-48 min-w-0 items-center gap-1 truncate font-mono text-[11px] px-1.5 py-0.5 rounded-full ${toneClasses(entryTone(entry))}`;
+  const inner = (
+    <>
+      {icon && createElement(icon, { className: "size-3 shrink-0", "aria-hidden": true })}
+      <span className="truncate">{text}</span>
+    </>
   );
+  const common = {
+    className,
+    title: tooltip || text,
+    "data-plugin-slot": entry.slot,
+    "data-plugin-id": entry.plugin_id,
+  };
+  if (href) {
+    return (
+      <a {...common} href={href} target="_blank" rel="noopener noreferrer">
+        {inner}
+      </a>
+    );
+  }
+  return <span {...common}>{inner}</span>;
 }
 
 /** status-bar: global segments in the top bar's right zone. */
