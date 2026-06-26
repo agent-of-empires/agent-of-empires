@@ -24,6 +24,18 @@
       "components": ["web/src/components/BottomDock.tsx"]
     },
     {
+      "id": "app-shell.pane-docking",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/pane-docking.spec.ts"],
+      "components": [
+        "web/src/components/ActivityBar.tsx",
+        "web/src/components/Dock.tsx",
+        "web/src/components/PaneFrame.tsx",
+        "web/src/components/plugin/PluginSlots.tsx"
+      ]
+    },
+    {
       "id": "settings.mcp-servers",
       "kind": "live-playwright",
       "risk": "high",
