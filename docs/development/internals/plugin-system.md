@@ -113,9 +113,11 @@ declares: `capabilities`, `commands`, `keybinds`, `settings`, `ui`, and a
 `runtime` worker entrypoint. These are the sections the first external plugin
 declares; they are defined in `aoe-plugin-api` and parsed/validated by the
 host, but consumed by later issues (the settings registry in #2094, the runtime
-host in #2095, the command/keybind/UI surfaces in #2366). `api_version` is
-bumped to 2; an `api_version` 1 manifest still loads. Unknown top-level keys
-remain a hard parse error (`deny_unknown_fields`).
+host in #2095, the command/keybind/UI surfaces in #2366). `api_version` is now
+3 (bumped to 2 for the contribution sections, then 3 when the `detail-panel`
+slot became the dockable `pane` slot); an older `api_version` manifest still
+loads as long as it targets no newer slot. Unknown top-level keys remain a hard
+parse error (`deny_unknown_fields`).
 
 The `themes`, `status`, and `panes` sections are deferred until a consumer
 exists, so no schema lands in core ahead of one (#2386). With
@@ -468,7 +470,7 @@ in-memory snapshot the dashboard reads synchronously.
 
 The nine slots are a closed `UiSlot` set (`aoe-plugin-api`), kebab-case on the
 wire: `status-bar`, `row-badge`, `row-column`, `sort-key`, `filter-facet`,
-`card`, `detail-panel`, `detail-badge`, `notification`. A plugin declares the
+`card`, `pane`, `detail-badge`, `notification`. A plugin declares the
 `(slot, id)` pairs it may fill in its manifest `[[ui]]` section; an unknown
 slot is a hard parse error (the host must know how to render each).
 
@@ -485,7 +487,7 @@ manager, and the web Plugins panel (via `PluginView.ui_contributions`).
   the `(slot, id)` being declared in the manifest: no dedicated `ui` capability
   is introduced. The `payload` is validated against the slot's typed shape and
   stored normalized; an unknown field or bad tone is rejected. Per-session slots
-  (`row-badge`, `row-column`, `detail-panel`, `detail-badge`) require a
+  (`row-badge`, `row-column`, `pane`, `detail-badge`) require a
   `session_id`; global slots must not carry one. The text-based slots
   (`status-bar`, `row-badge`, `detail-badge`) accept optional `icon` (a lucide
   icon name in kebab-case, e.g. `git-pull-request-arrow`; the client maps it
@@ -496,7 +498,7 @@ manager, and the web Plugins panel (via `PluginView.ui_contributions`).
   `notifications` capability (not a slot declaration). Returns a monotonic
   `seq`.
 
-#### Richer payloads: `row-badge` items and the `detail-panel` block list
+#### Richer payloads: `row-badge` items and the `pane` block list
 
 Two slots carry more than a single value, so one entry (one declared
 `(slot, id)`) can render a list:
@@ -506,11 +508,15 @@ Two slots carry more than a single value, so one entry (one declared
   compact, tone-tinted icon (falling back to `text`), linked when `href` is a
   safe URL. The single `{ text, tone, tooltip, icon, href }` form still works.
   An empty `items: []` clears the row.
-- `detail-panel` also accepts `blocks: Block[]`, an ordered list of typed
+- `pane` also accepts `blocks: Block[]`, an ordered list of typed
   blocks. The host knows these kinds: `heading { text }`,
   `row { label, value?, sublabel?, icon?, tone?, href? }`, `note { text, tone? }`,
   `divider {}`, and `section { title?, children: Block[] }` (nested blocks). The
-  simple `{ title, body }` form still works when `blocks` is absent.
+  simple `{ title, body }` form still works when `blocks` is absent. A `pane`
+  also takes an optional `default_location` (`right` | `bottom`) choosing the
+  dock it first opens in; the user can move it between docks afterward. The host
+  renders each `pane` as a dockable tool-window (activity-bar toggle, move,
+  close) alongside the built-in diff and terminal panes.
 
 **Block parsing is forward-compatible by design.** The host stores `blocks` as
 opaque JSON (`Vec<Value>`); it validates only that the payload envelope is

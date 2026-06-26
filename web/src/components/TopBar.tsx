@@ -5,8 +5,7 @@ import { OverflowMenu, type OverflowItem } from "./OverflowMenu";
 import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
 import { PluginStatusBarSegments } from "./plugin/PluginSlots";
 import { ActivityBar } from "./ActivityBar";
-import type { PaneLayout } from "../lib/paneLayout";
-import type { BuiltinPaneId } from "../lib/panes";
+import type { PaneDisplay } from "./Dock";
 
 interface Props {
   activeWorkspace: Workspace | undefined;
@@ -16,8 +15,11 @@ interface Props {
   /** Mobile (below md): opens the view picker. The desktop activity bar uses
    *  `onTogglePane` instead. */
   onToggleDiff: () => void;
-  paneLayout: PaneLayout;
-  onTogglePane: (id: BuiltinPaneId) => void;
+  /** All dockable pane ids (built-in + plugin) for the active session. */
+  paneIds: string[];
+  paneDescriptor: (id: string) => PaneDisplay;
+  isPaneOpen: (id: string) => boolean;
+  onTogglePane: (id: string) => void;
   onOpenHelp: () => void;
   onOpenAbout: () => void;
   onStartTutorial: () => void;
@@ -52,7 +54,9 @@ export function TopBar({
   onToggleSidebar,
   onOpenPalette,
   onToggleDiff,
-  paneLayout,
+  paneIds,
+  paneDescriptor,
+  isPaneOpen,
   onTogglePane,
   onOpenHelp,
   onOpenAbout,
@@ -159,7 +163,7 @@ export function TopBar({
             {/* Desktop: per-pane toggles. Mobile: one button that opens the
                 full-viewport view picker (#1452); there is no side dock to
                 toggle pane-by-pane below md. */}
-            <ActivityBar layout={paneLayout} onToggle={onTogglePane} />
+            <ActivityBar paneIds={paneIds} descriptorFor={paneDescriptor} isOpen={isPaneOpen} onToggle={onTogglePane} />
             <button
               onClick={onToggleDiff}
               className="md:hidden w-8 h-8 flex items-center justify-center cursor-pointer rounded-md transition-colors text-text-secondary hover:text-text-primary hover:bg-surface-700/50"

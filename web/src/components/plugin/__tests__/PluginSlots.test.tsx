@@ -3,7 +3,7 @@
 import { render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import type { PluginUiEntry } from "../../../lib/api";
-import { PluginCards, PluginDetailPanels, PluginRowBadges, PluginStatusBarSegments } from "../PluginSlots";
+import { PluginCards, PluginPaneBody, PluginRowBadges, PluginStatusBarSegments } from "../PluginSlots";
 
 // The slot components read entries from context; mock that hook so each test
 // drives a fixed snapshot.
@@ -82,17 +82,15 @@ describe("plugin slot renderers", () => {
     expect(screen.getByText("92%")).toBeTruthy();
   });
 
-  it("detail-panel renders for its session", () => {
-    set([
-      {
-        plugin_id: "acme.kit",
-        slot: "detail-panel",
-        id: "p",
-        session_id: "s1",
-        payload: { title: "Logs", body: "tail..." },
-      },
-    ]);
-    render(<PluginDetailPanels sessionId="s1" />);
+  it("pane renders its title/body", () => {
+    const entry: PluginUiEntry = {
+      plugin_id: "acme.kit",
+      slot: "pane",
+      id: "p",
+      session_id: "s1",
+      payload: { title: "Logs", body: "tail..." },
+    };
+    render(<PluginPaneBody entry={entry} />);
     expect(screen.getByText("Logs")).toBeTruthy();
     expect(screen.getByText("tail...")).toBeTruthy();
   });
@@ -143,33 +141,31 @@ describe("plugin slot renderers", () => {
     expect(screen.getByText("evil")).toBeTruthy();
   });
 
-  it("detail-panel blocks render heading, row, note, divider and skip unknown kinds", () => {
-    set([
-      {
-        plugin_id: "acme.kit",
-        slot: "detail-panel",
-        id: "gh",
-        session_id: "s1",
-        payload: {
-          blocks: [
-            { kind: "heading", text: "GitHub" },
-            {
-              kind: "row",
-              icon: "git-pull-request-arrow",
-              tone: "success",
-              label: "nexus",
-              value: "PR #12",
-              sublabel: "o/nexus",
-              href: "https://github.com/o/nexus/pull/12",
-            },
-            { kind: "note", text: "3 repos have no open PR", tone: "neutral" },
-            { kind: "divider" },
-            { kind: "some-future-kind", payload: { nested: true } },
-          ],
-        },
+  it("pane blocks render heading, row, note, divider and skip unknown kinds", () => {
+    const entry: PluginUiEntry = {
+      plugin_id: "acme.kit",
+      slot: "pane",
+      id: "gh",
+      session_id: "s1",
+      payload: {
+        blocks: [
+          { kind: "heading", text: "GitHub" },
+          {
+            kind: "row",
+            icon: "git-pull-request-arrow",
+            tone: "success",
+            label: "nexus",
+            value: "PR #12",
+            sublabel: "o/nexus",
+            href: "https://github.com/o/nexus/pull/12",
+          },
+          { kind: "note", text: "3 repos have no open PR", tone: "neutral" },
+          { kind: "divider" },
+          { kind: "some-future-kind", payload: { nested: true } },
+        ],
       },
-    ]);
-    const { container } = render(<PluginDetailPanels sessionId="s1" />);
+    };
+    const { container } = render(<PluginPaneBody entry={entry} />);
     expect(screen.getByText("GitHub")).toBeTruthy();
     expect(screen.getByText("nexus")).toBeTruthy();
     expect(screen.getByText("3 repos have no open PR")).toBeTruthy();

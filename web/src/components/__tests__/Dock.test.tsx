@@ -8,15 +8,27 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render } from "@testing-library/react";
 
 import { Dock } from "../Dock";
+import { BUILTIN_PANES } from "../../lib/panes";
 
 afterEach(() => cleanup());
 
 const body = (id: string) => <div data-testid={`body-${id}`}>{id}</div>;
+const descriptorFor = (id: string) => {
+  const d = BUILTIN_PANES.find((p) => p.id === id)!;
+  return { title: d.title, icon: d.icon };
+};
 
 describe("Dock", () => {
   it("frames each open pane with its registry title", () => {
     const { getByText, getByTestId } = render(
-      <Dock location="right" paneIds={["diff", "terminal"]} renderBody={body} onMove={vi.fn()} onClose={vi.fn()} />,
+      <Dock
+        location="right"
+        paneIds={["diff", "terminal"]}
+        descriptorFor={descriptorFor}
+        renderBody={body}
+        onMove={vi.fn()}
+        onClose={vi.fn()}
+      />,
     );
     expect(getByText("Diff")).toBeTruthy();
     expect(getByText("Terminal")).toBeTruthy();
@@ -27,7 +39,14 @@ describe("Dock", () => {
 
   it("omits the resize handle with a single open pane", () => {
     const { queryByTestId } = render(
-      <Dock location="bottom" paneIds={["terminal"]} renderBody={body} onMove={vi.fn()} onClose={vi.fn()} />,
+      <Dock
+        location="bottom"
+        paneIds={["terminal"]}
+        descriptorFor={descriptorFor}
+        renderBody={body}
+        onMove={vi.fn()}
+        onClose={vi.fn()}
+      />,
     );
     expect(queryByTestId("dock-resize-bottom")).toBeNull();
   });
@@ -36,7 +55,14 @@ describe("Dock", () => {
     const onMove = vi.fn();
     const onClose = vi.fn();
     const { getByLabelText } = render(
-      <Dock location="right" paneIds={["diff"]} renderBody={body} onMove={onMove} onClose={onClose} />,
+      <Dock
+        location="right"
+        paneIds={["diff"]}
+        descriptorFor={descriptorFor}
+        renderBody={body}
+        onMove={onMove}
+        onClose={onClose}
+      />,
     );
     // Right-docked pane moves to the bottom dock.
     fireEvent.click(getByLabelText("Move diff to bottom dock"));

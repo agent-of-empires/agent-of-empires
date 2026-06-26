@@ -1,4 +1,5 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Puzzle } from "lucide-react";
 import { useMatch, useNavigate, useSearchParams } from "react-router-dom";
 import { IDLE_DECAY_WINDOW_MS, isSessionActive } from "./lib/session";
 import { diffSelectionStale } from "./lib/diffSelection";
@@ -31,7 +32,9 @@ import { useEdgeSwipe } from "./hooks/useEdgeSwipe";
 import { useIsCoarsePointer } from "./hooks/useIsCoarsePointer";
 import { useIsWideViewport } from "./hooks/useIsWideViewport";
 import type { RightPanelView } from "./lib/rightPanelView";
-import { openPanesAt, usePaneLayout } from "./lib/paneLayout";
+import { usePaneLayout } from "./lib/paneLayout";
+import { isPluginPaneId, usePluginPanes, type PluginPane } from "./lib/pluginPanes";
+import { PluginPaneBody } from "./components/plugin/PluginSlots";
 import { TOUR_ANCHORS, tourAnchor } from "./lib/tourSteps";
 import {
   loginStatus,
@@ -77,11 +80,11 @@ const StructuredView = lazy(() =>
     default: m.StructuredView,
   })),
 );
-import { Dock } from "./components/Dock";
+import { Dock, type PaneDisplay } from "./components/Dock";
 import { BottomDock } from "./components/BottomDock";
 import { DiffPane } from "./components/DiffPane";
 import { PairedShellPane } from "./components/PairedTerminal";
-import type { BuiltinPaneId } from "./lib/panes";
+import { BUILTIN_PANES, type BuiltinPaneId, type DockLocation } from "./lib/panes";
 import { MobileRightPanelPicker } from "./components/MobileRightPanelPicker";
 import { MobileMainPane } from "./components/MobileMainPane";
 import { DiffFileViewer } from "./components/diff/DiffFileViewer";
@@ -350,14 +353,76 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   const selectedFilePath = selectedFile?.path ?? null;
   const selectedRepoName = selectedFile?.repoName;
   const selectedFileLine = selectedFile?.line;
-  // Per-pane open state for the right dock (diff + terminal, plus plugin panes
-  // later). `rightDockCollapsed` stands in for the old single "right column
-  // hidden" flag wherever the layout only cares whether the column shows.
+  // Dock panes are the built-in diff + terminal (open/dock persisted) plus any
+  // plugin-contributed `pane` slots for the active session. Plugin panes are
+  // dynamic and per-session, so their open/dock overrides live in ephemeral
+  // state defaulting to the plugin's declared `default_location`.
+  // ponytail: plugin-pane layout is session-only, not persisted; persist it
+  // when someone needs panes to remember their spot across reloads.
   const { layout: paneLayout, togglePane, setPaneOpen, movePane } = usePaneLayout();
-  const rightPaneIds = openPanesAt(paneLayout, "right");
-  const bottomPaneIds = openPanesAt(paneLayout, "bottom");
+  const pluginPanes = usePluginPanes(activeSessionId);
+  const [pluginPaneOverrides, setPluginPaneOverrides] = useState<
+    Record<string, { open?: boolean; dock?: DockLocation }>
+  >({});
+  const pluginPaneById = useMemo(() => {
+    const m = new Map<string, PluginPane>();
+    for (const p of pluginPanes) m.set(p.id, p);
+    return m;
+  }, [pluginPanes]);
+
+  const isPaneOpen = (id: string): boolean => {
+    const plugin = pluginPaneById.get(id);
+    if (plugin) return pluginPaneOverrides[id]?.open ?? true;
+    return paneLayout[id as BuiltinPaneId].open;
+  };
+  const paneDock = (id: string): DockLocation => {
+    const plugin = pluginPaneById.get(id);
+    if (plugin) return pluginPaneOverrides[id]?.dock ?? plugin.defaultDock;
+    return paneLayout[id as BuiltinPaneId].dock;
+  };
+  const paneDescriptor = (id: string): PaneDisplay => {
+    const plugin = pluginPaneById.get(id);
+    if (plugin) return { title: plugin.title, icon: Puzzle };
+    const d = BUILTIN_PANES.find((p) => p.id === id)!;
+    return { title: d.title, icon: d.icon };
+  };
+
+  const allPaneIds: string[] = ["diff", "terminal", ...pluginPanes.map((p) => p.id)];
+  const rightPaneIds = allPaneIds.filter((id) => isPaneOpen(id) && paneDock(id) === "right");
+  const bottomPaneIds = allPaneIds.filter((id) => isPaneOpen(id) && paneDock(id) === "bottom");
   const rightDockCollapsed = rightPaneIds.length === 0;
   const terminalOpen = paneLayout.terminal.open;
+
+  const togglePaneAny = useCallback(
+    (id: string) => {
+      if (isPluginPaneId(id)) {
+        setPluginPaneOverrides((o) => ({ ...o, [id]: { ...o[id], open: !(o[id]?.open ?? true) } }));
+      } else {
+        togglePane(id as BuiltinPaneId);
+      }
+    },
+    [togglePane],
+  );
+  const movePaneAny = useCallback(
+    (id: string, dock: DockLocation) => {
+      if (isPluginPaneId(id)) {
+        setPluginPaneOverrides((o) => ({ ...o, [id]: { ...o[id], dock } }));
+      } else {
+        movePane(id as BuiltinPaneId, dock);
+      }
+    },
+    [movePane],
+  );
+  const closePaneAny = useCallback(
+    (id: string) => {
+      if (isPluginPaneId(id)) {
+        setPluginPaneOverrides((o) => ({ ...o, [id]: { ...o[id], open: false } }));
+      } else {
+        setPaneOpen(id as BuiltinPaneId, false);
+      }
+    },
+    [setPaneOpen],
+  );
   // Layout topology is width-driven so it stays aligned with the `md:`
   // Tailwind classes the rest of the layout uses. At md and up the
   // side-by-side ContentSplit renders; below md a single full-viewport
@@ -1156,32 +1221,32 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     // Render a pane body by id. Passed to the docks as a callback (rather than
     // building an array of {icon, body} objects here) so the per-session JSX is
     // constructed inside the dock, not threaded through a prop object.
-    const renderPaneBody = (id: BuiltinPaneId): ReactNode => {
-      switch (id) {
-        case "diff":
-          return (
-            <DiffPane
-              session={activeSession ?? null}
-              sessionId={activeSessionId}
-              files={diffFiles}
-              perRepoBases={perRepoBases}
-              warning={warning}
-              filesLoading={diffFilesLoading}
-              selectedFilePath={selectedFilePath}
-              selectedRepoName={selectedRepoName}
-              onSelectFile={handleSelectFile}
-              onDiffRefresh={refreshDiffFiles}
-              commentsEnabled={commentsEnabled}
-              commentsCount={diffComments.count}
-              commentsSendEnabled={commentSendEnabled}
-              commentsSendDisabledReason={commentSendDisabledReason}
-              onOpenSendDialog={() => setSendDialogOpen(true)}
-              onDiscardAllComments={diffComments.clearComments}
-            />
-          );
-        case "terminal":
-          return <PairedShellPane session={activeSession ?? null} sessionId={activeSessionId} />;
+    const renderPaneBody = (id: string): ReactNode => {
+      const plugin = pluginPaneById.get(id);
+      if (plugin) return <PluginPaneBody entry={plugin.entry} />;
+      if (id === "diff") {
+        return (
+          <DiffPane
+            session={activeSession ?? null}
+            sessionId={activeSessionId}
+            files={diffFiles}
+            perRepoBases={perRepoBases}
+            warning={warning}
+            filesLoading={diffFilesLoading}
+            selectedFilePath={selectedFilePath}
+            selectedRepoName={selectedRepoName}
+            onSelectFile={handleSelectFile}
+            onDiffRefresh={refreshDiffFiles}
+            commentsEnabled={commentsEnabled}
+            commentsCount={diffComments.count}
+            commentsSendEnabled={commentSendEnabled}
+            commentsSendDisabledReason={commentSendDisabledReason}
+            onOpenSendDialog={() => setSendDialogOpen(true)}
+            onDiscardAllComments={diffComments.clearComments}
+          />
+        );
       }
+      return <PairedShellPane session={activeSession ?? null} sessionId={activeSessionId} />;
     };
     return (
       <div className="flex-1 flex flex-col min-h-0">
@@ -1233,9 +1298,10 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
               <Dock
                 location="right"
                 paneIds={rightPaneIds}
+                descriptorFor={paneDescriptor}
                 renderBody={renderPaneBody}
-                onMove={movePane}
-                onClose={(id) => setPaneOpen(id, false)}
+                onMove={movePaneAny}
+                onClose={closePaneAny}
               />
             </div>
           }
@@ -1243,9 +1309,10 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
         {bottomPaneIds.length > 0 && (
           <BottomDock
             paneIds={bottomPaneIds}
+            descriptorFor={paneDescriptor}
             renderBody={renderPaneBody}
-            onMove={movePane}
-            onClose={(id) => setPaneOpen(id, false)}
+            onMove={movePaneAny}
+            onClose={closePaneAny}
           />
         )}
         {sendDialogOpen && commentsEnabled && activeSessionId && (
@@ -1428,8 +1495,10 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
             onToggleSidebar={handleToggleSidebar}
             onOpenPalette={() => setShowPalette(true)}
             onToggleDiff={toggleDiff}
-            paneLayout={paneLayout}
-            onTogglePane={togglePane}
+            paneIds={allPaneIds}
+            paneDescriptor={paneDescriptor}
+            isPaneOpen={isPaneOpen}
+            onTogglePane={togglePaneAny}
             onOpenHelp={handleOpenHelp}
             onOpenAbout={handleOpenAbout}
             onStartTutorial={tour.startTour}

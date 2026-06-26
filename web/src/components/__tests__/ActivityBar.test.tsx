@@ -1,17 +1,25 @@
 // @vitest-environment jsdom
-import { afterEach } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
 
 import { ActivityBar } from "../ActivityBar";
+import { BUILTIN_PANES } from "../../lib/panes";
 
 afterEach(() => cleanup());
 
+const descriptorFor = (id: string) => {
+  const d = BUILTIN_PANES.find((p) => p.id === id)!;
+  return { title: d.title, icon: d.icon };
+};
+
 describe("ActivityBar", () => {
-  it("renders one toggle per built-in pane and reflects open state", () => {
+  it("renders one toggle per pane and reflects open state", () => {
+    const open = new Set(["diff"]);
     const { getByTestId } = render(
       <ActivityBar
-        layout={{ diff: { open: true, dock: "right" }, terminal: { open: false, dock: "right" } }}
+        paneIds={["diff", "terminal"]}
+        descriptorFor={descriptorFor}
+        isOpen={(id) => open.has(id)}
         onToggle={vi.fn()}
       />,
     );
@@ -23,7 +31,9 @@ describe("ActivityBar", () => {
     const onToggle = vi.fn();
     const { getByTestId } = render(
       <ActivityBar
-        layout={{ diff: { open: true, dock: "right" }, terminal: { open: true, dock: "right" } }}
+        paneIds={["diff", "terminal"]}
+        descriptorFor={descriptorFor}
+        isOpen={() => true}
         onToggle={onToggle}
       />,
     );

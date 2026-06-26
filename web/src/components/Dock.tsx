@@ -1,15 +1,25 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import type { LucideIcon } from "lucide-react";
 
 import { safeGetItem, safeSetItem } from "../lib/safeStorage";
 import { PaneFrame } from "./PaneFrame";
-import { BUILTIN_PANES, type BuiltinPaneId, type DockLocation } from "../lib/panes";
+import type { DockLocation } from "../lib/panes";
+
+export interface PaneDisplay {
+  title: string;
+  icon: LucideIcon;
+}
 
 interface Props {
   location: DockLocation;
-  paneIds: BuiltinPaneId[];
-  renderBody: (id: BuiltinPaneId) => ReactNode;
-  onMove: (id: BuiltinPaneId, dock: DockLocation) => void;
-  onClose: (id: BuiltinPaneId) => void;
+  paneIds: string[];
+  /** Title + icon for a pane id (built-in from the registry, or a plugin pane).
+   *  A callback rather than an array prop so the icon component is resolved
+   *  inside the dock, keeping the parent's render free of element arrays. */
+  descriptorFor: (id: string) => PaneDisplay;
+  renderBody: (id: string) => ReactNode;
+  onMove: (id: string, dock: DockLocation) => void;
+  onClose: (id: string) => void;
 }
 
 const DEFAULT_RATIO = 0.5;
@@ -37,7 +47,7 @@ function loadRatio(location: DockLocation): number {
  *  ponytail: a single draggable divider between two panes. Two built-in panes
  *  (diff, terminal) means a dock holds at most two today; a third would render
  *  at an equal flex share with no handle until this grows a multi-divider model. */
-export function Dock({ location, paneIds, renderBody, onMove, onClose }: Props) {
+export function Dock({ location, paneIds, descriptorFor, renderBody, onMove, onClose }: Props) {
   const vertical = location === "right";
   const [ratio, setRatio] = useState(() => loadRatio(location));
   const containerRef = useRef<HTMLDivElement>(null);
@@ -91,8 +101,8 @@ export function Dock({ location, paneIds, renderBody, onMove, onClose }: Props) 
   }, [vertical, location]);
 
   const split = paneIds.length === 2;
-  const paneBox = (id: BuiltinPaneId, basis: number | null) => {
-    const desc = BUILTIN_PANES.find((p) => p.id === id)!;
+  const paneBox = (id: string, basis: number | null) => {
+    const desc = descriptorFor(id);
     return (
       <div
         key={id}

@@ -1,6 +1,6 @@
 import { DiffFileList } from "./diff/DiffFileList";
 import { CommentsBanner } from "./diff/comments/CommentsBanner";
-import { PluginDetailBadges, PluginDetailPanels } from "./plugin/PluginSlots";
+import { PluginDetailBadges } from "./plugin/PluginSlots";
 import type { RepoBase, RichDiffFile, SessionResponse } from "../lib/types";
 
 interface Props {
@@ -57,7 +57,6 @@ export function DiffPane({
       {sessionId && (
         <div className="shrink-0 flex flex-col gap-2 p-2 empty:hidden">
           <PluginDetailBadges sessionId={sessionId} />
-          <PluginDetailPanels sessionId={sessionId} />
         </div>
       )}
       <DiffFileList

@@ -2,7 +2,7 @@
 // typed display state; these components draw it. No plugin code runs here.
 // Each reads the shared snapshot via context and the pure selectors in
 // `pluginUi.ts`. Slots shipped here: status-bar, row-badge, row-column, card,
-// detail-panel, detail-badge. Notifications surface as toasts via the hook;
+// pane, detail-badge. Notifications surface as toasts via the hook;
 // sort-key and filter-facet are deferred (see #2366 follow-ups).
 
 import { createElement } from "react";
@@ -287,7 +287,7 @@ function BlockRow({ block }: { block: Record<string, unknown> }) {
   );
 }
 
-/** Render one detail-panel block. The block vocabulary is forward-compatible:
+/** Render one pane block. The block vocabulary is forward-compatible:
  *  an unknown `kind` (or a known kind missing its required field) renders
  *  nothing rather than throwing, so a newer plugin can push kinds an older host
  *  has never heard of. */
@@ -323,39 +323,28 @@ function DetailBlock({ block, pluginId }: { block: Record<string, unknown>; plug
   }
 }
 
-/** detail-panel: per-session panels in the session detail view. An entry is
- *  either a `blocks` list (the flexible, forward-compatible pane) or the simple
- *  `{ title, body }` form. */
-export function PluginDetailPanels({ sessionId }: { sessionId: string }) {
-  const entries = sessionEntries(usePluginUiEntries(), "detail-panel", sessionId);
-  if (entries.length === 0) return null;
+/** pane: the body of one dockable plugin pane. An entry is either a `blocks`
+ *  list (the flexible, forward-compatible form) or the simple `{ title, body }`
+ *  form. The dock supplies the frame (title bar, move, close) and the
+ *  `default_location`; this renders only the scrollable content. */
+export function PluginPaneBody({ entry }: { entry: PluginUiEntry }) {
+  const blocks = objectList(entry.payload, "blocks");
+  const title = payloadStr(entry, "title");
+  const body = payloadStr(entry, "body");
   return (
-    <div className="flex flex-col gap-2" data-testid="plugin-detail-panels">
-      {entries.map((e) => {
-        const blocks = objectList(e.payload, "blocks");
-        const title = payloadStr(e, "title");
-        const body = payloadStr(e, "body");
-        return (
-          <section
-            key={`${e.plugin_id}:${e.id}`}
-            className="rounded-lg p-3 ring-1 ring-surface-700/60 bg-surface-800/40"
-            data-plugin-id={e.plugin_id}
-          >
-            {blocks ? (
-              <div className="flex flex-col gap-1.5">
-                {blocks.map((b, i) => (
-                  <DetailBlock key={i} block={b} pluginId={e.plugin_id} />
-                ))}
-              </div>
-            ) : (
-              <>
-                {title && <div className="font-semibold text-sm text-text-primary">{title}</div>}
-                {body && <div className="mt-1 text-xs text-text-secondary whitespace-pre-wrap">{body}</div>}
-              </>
-            )}
-          </section>
-        );
-      })}
+    <div className="flex-1 min-h-0 overflow-auto p-3" data-testid="plugin-pane-body" data-plugin-id={entry.plugin_id}>
+      {blocks ? (
+        <div className="flex flex-col gap-1.5">
+          {blocks.map((b, i) => (
+            <DetailBlock key={i} block={b} pluginId={entry.plugin_id} />
+          ))}
+        </div>
+      ) : (
+        <>
+          {title && <div className="font-semibold text-sm text-text-primary">{title}</div>}
+          {body && <div className="mt-1 text-xs text-text-secondary whitespace-pre-wrap">{body}</div>}
+        </>
+      )}
     </div>
   );
 }

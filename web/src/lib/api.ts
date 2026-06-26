@@ -239,7 +239,7 @@ export type PluginUiSlot =
   | "sort-key"
   | "filter-facet"
   | "card"
-  | "detail-panel"
+  | "pane"
   | "detail-badge"
   | "notification";
 
