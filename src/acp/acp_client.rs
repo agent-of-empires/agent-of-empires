@@ -6094,7 +6094,7 @@ async fn run_connection_task<W, R>(
                             && watchdog.off_protocol_work_seen().is_none()
                         {
                             if let Some(message) = recover_opencode_prompt_error(
-                                acp_session_id.as_ref(),
+                                &acp_session_id.0,
                                 prompt_started_at_ms,
                             ) {
                                 let _ = event_tx_for_block
