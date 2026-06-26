@@ -1593,11 +1593,19 @@ impl AcpClient {
             seed_history_replay: config.seed_history_replay,
         };
         let sandbox_pair = if let Some(info) = &config.sandbox_info {
-            Some(SessionSandbox::from_info(
-                info,
-                config.cwd.as_path(),
-                config.source_profile.clone(),
-            )?)
+            // `from_info` resolves the container workdir, which touches git2 and
+            // (for a legacy session with no pinned workdir) shells out to
+            // `docker inspect`. Run it off the async executor.
+            let info = info.clone();
+            let cwd = config.cwd.clone();
+            let profile = config.source_profile.clone();
+            Some(
+                tokio::task::spawn_blocking(move || {
+                    SessionSandbox::from_info(&info, cwd.as_path(), profile)
+                })
+                .await
+                .map_err(|e| AcpError::Spawn(format!("sandbox resolve task panicked: {e}")))??,
+            )
         } else {
             None
         };

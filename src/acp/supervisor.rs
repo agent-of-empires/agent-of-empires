@@ -2463,11 +2463,23 @@ impl<S: BroadcastSink> Supervisor<S> {
         // case `current_env_entries` warns and falls back to the global
         // default profile (matching pre-persistence behavior).
         let sandbox_resources = match sandbox {
-            Some(info) => Some(super::acp_client::SessionSandbox::from_info(
-                &info,
-                cwd.as_path(),
-                record.source_profile.clone(),
-            )?),
+            Some(info) => {
+                // `from_info` resolves the container workdir, which touches git2
+                // and (for a legacy session with no pinned workdir) shells out to
+                // `docker inspect`. Run it off the async executor, mirroring how
+                // `ensure_container_for_session` wraps its docker work.
+                let cwd = cwd.clone();
+                let profile = record.source_profile.clone();
+                Some(
+                    tokio::task::spawn_blocking(move || {
+                        super::acp_client::SessionSandbox::from_info(&info, cwd.as_path(), profile)
+                    })
+                    .await
+                    .map_err(|e| {
+                        AcpError::Spawn(format!("sandbox resolve task panicked: {e}"))
+                    })??,
+                )
+            }
             None => None,
         };
         // Prefer the persisted registry key; fall back to the legacy

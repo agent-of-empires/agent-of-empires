@@ -257,6 +257,16 @@ mod tests {
     }
 
     #[test]
+    fn holds_worktree_short_circuits_without_sandbox() {
+        // The gate that guards `set_worktree_name_for_selected` and
+        // `rename_selected` (#2117, #2414): a non-sandbox session must return
+        // false before touching the container runtime, so a plain worktree
+        // rename never pays a `docker inspect`. The live-container branch is the
+        // same helper the tied-rename path already relies on.
+        assert!(!sandbox_container_holds_worktree("any-session-id", false));
+    }
+
+    #[test]
     fn leaf_from_title_slugifies() {
         assert_eq!(worktree_leaf_from_title("Auth refactor"), "auth-refactor");
         assert_eq!(
