@@ -187,6 +187,23 @@ impl UiSlot {
             UiSlot::RowBadge | UiSlot::RowColumn | UiSlot::DetailPanel | UiSlot::DetailBadge
         )
     }
+
+    /// The kebab-case wire name, matching the serde representation. Handy for
+    /// display (install prompt, plugin info) without round-tripping through
+    /// serde.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UiSlot::StatusBar => "status-bar",
+            UiSlot::RowBadge => "row-badge",
+            UiSlot::RowColumn => "row-column",
+            UiSlot::SortKey => "sort-key",
+            UiSlot::FilterFacet => "filter-facet",
+            UiSlot::Card => "card",
+            UiSlot::DetailPanel => "detail-panel",
+            UiSlot::DetailBadge => "detail-badge",
+            UiSlot::Notification => "notification",
+        }
+    }
 }
 
 /// A UI contribution: the plugin declares it may fill `slot` with entries

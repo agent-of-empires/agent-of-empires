@@ -117,6 +117,11 @@ export function PluginsSettings() {
                     {plugin.granted ? "" : " (not granted)"}
                   </p>
                 )}
+                {(plugin.ui_contributions ?? []).length > 0 && (
+                  <p className="mt-1 text-[11px] text-text-dim">
+                    UI: {[...new Set((plugin.ui_contributions ?? []).map((u) => u.slot))].join(", ")}
+                  </p>
+                )}
                 {plugin.needs_reapproval && (
                   <p className="mt-1 text-[11px] text-status-warning">
                     Installed but inactive. Re-approve with <code>aoe plugin update {plugin.id}</code>.

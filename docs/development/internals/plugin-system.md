@@ -472,6 +472,12 @@ wire: `status-bar`, `row-badge`, `row-column`, `sort-key`, `filter-facet`,
 `(slot, id)` pairs it may fill in its manifest `[[ui]]` section; an unknown
 slot is a hard parse error (the host must know how to render each).
 
+A UI contribution is not a capability and needs no grant, but the slots a
+plugin declares are disclosed so the user knows it modifies the dashboard
+before trusting it: the `aoe plugin install` prompt lists them alongside the
+requested capabilities, and they show in `aoe plugin info`, the TUI plugin
+manager, and the web Plugins panel (via `PluginView.ui_contributions`).
+
 ### RPCs (`src/plugin/host_api.rs`)
 
 - `ui.state.set { slot, id, session_id?, payload }` and

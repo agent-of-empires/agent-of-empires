@@ -553,6 +553,20 @@ id = "panel"
 }
 
 #[test]
+fn ui_slot_as_str_round_trips_the_wire_name() {
+    // as_str (used for the install prompt / plugin info disclosure) must match
+    // the kebab-case serde name a manifest declares.
+    for (toml_slot, slot) in [
+        ("status-bar", UiSlot::StatusBar),
+        ("row-badge", UiSlot::RowBadge),
+        ("detail-panel", UiSlot::DetailPanel),
+        ("notification", UiSlot::Notification),
+    ] {
+        assert_eq!(slot.as_str(), toml_slot);
+    }
+}
+
+#[test]
 fn empty_command_argument_is_rejected() {
     let toml = r#"
 id = "acme.thing"

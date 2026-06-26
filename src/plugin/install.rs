@@ -6,7 +6,7 @@ use std::path::Path;
 use std::process::Stdio;
 
 use anyhow::{anyhow, bail, Context, Result};
-use aoe_plugin_api::{BuildStep, PluginManifest, RuntimeSpec};
+use aoe_plugin_api::{BuildStep, PluginManifest, RuntimeSpec, UiContribution};
 
 use crate::session::{save_config, CapabilityGrant, Config, PluginConfig};
 
@@ -72,7 +72,7 @@ pub async fn install(input: &str, assume_yes: bool) -> Result<InstallReport> {
     let granted = if assume_yes || (capabilities.is_empty() && build.is_empty()) {
         true
     } else {
-        confirm_capabilities(&id, &capabilities, build)?
+        confirm_capabilities(&id, &capabilities, &fetched.manifest.ui, build)?
     };
     if !granted {
         bail!("install cancelled; no capabilities were granted");
@@ -158,7 +158,12 @@ pub async fn update(id: &str) -> Result<InstallReport> {
     // non-interactive prompt bails while the old install, config, and lockfile
     // are still consistent.
     let grant = if needs_prompt {
-        if confirm_capabilities(id, &capabilities, build_steps(&fetched.manifest))? {
+        if confirm_capabilities(
+            id,
+            &capabilities,
+            &fetched.manifest.ui,
+            build_steps(&fetched.manifest),
+        )? {
             Some(CapabilityGrant {
                 manifest_hash: manifest_hash.clone(),
                 capabilities: capabilities.clone(),
@@ -318,7 +323,12 @@ fn capability_strings(fetched: &FetchedPlugin) -> Result<Vec<String>> {
 /// can pass `--yes` there. Build steps are disclosed verbatim because they run
 /// as the user, outside capability enforcement, before the plugin is
 /// registered.
-fn confirm_capabilities(id: &str, capabilities: &[String], build: &[BuildStep]) -> Result<bool> {
+fn confirm_capabilities(
+    id: &str,
+    capabilities: &[String],
+    ui: &[UiContribution],
+    build: &[BuildStep],
+) -> Result<bool> {
     if !io::stdin().is_terminal() {
         bail!(
             "{id} requests capabilities [{}]{} but stdin is not a terminal; re-run with --yes to grant them",
@@ -330,6 +340,14 @@ fn confirm_capabilities(id: &str, capabilities: &[String], build: &[BuildStep]) 
         println!("Plugin {id} requests these capabilities:");
         for capability in capabilities {
             println!("  - {capability}");
+        }
+    }
+    // UI contributions are not capabilities (they need no grant), but the user
+    // should know the plugin will render into the dashboard before trusting it.
+    if !ui.is_empty() {
+        println!("Plugin {id} will add UI elements to these dashboard slots:");
+        for u in ui {
+            println!("  - {} ({})", u.slot.as_str(), u.id);
         }
     }
     if !build.is_empty() {

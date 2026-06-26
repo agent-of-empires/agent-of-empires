@@ -192,6 +192,10 @@ export interface PluginView {
   validation: string;
   source: string | null;
   capabilities: string[];
+  /** UI slots the plugin declares it will render into (#2366), disclosed so the
+   *  user sees the plugin modifies the dashboard. Not a capability (needs no
+   *  grant). `slot` is the kebab-case slot name. */
+  ui_contributions: { slot: string; id: string }[];
   granted: boolean;
   needs_reapproval: boolean;
 }
