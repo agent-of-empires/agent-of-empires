@@ -744,6 +744,7 @@ environment = ["GH_TOKEN=write_token"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
         let project_path = temp_home.path().join("nonexistent_project");
 
@@ -1004,6 +1005,7 @@ environment = ["GH_TOKEN=write_token"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
 
         let result = collect_environment(&config, &info);
@@ -1095,6 +1097,7 @@ environment = ["GH_TOKEN=write_token"]
             extra_env: Some(vec!["TEST_VAR=foo".to_string(), "OTHER=bar".to_string()]),
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
         let pairs = session_host_env_pairs("any-profile", tmp.path(), &info);
         assert_eq!(
@@ -1123,6 +1126,7 @@ environment = ["GH_TOKEN=write_token"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: vec![("GH_TOKEN".to_string(), "ghs_fresh".to_string())],
+            container_workdir: None,
         };
 
         let result = collect_environment(&config, &info);
@@ -1149,6 +1153,7 @@ environment = ["GH_TOKEN=write_token"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
 
         let result = collect_environment(&config, &info);
@@ -1168,6 +1173,7 @@ environment = ["GH_TOKEN=write_token"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
 
         let result = collect_environment(&config, &info);
@@ -1205,6 +1211,7 @@ environment = ["GH_TOKEN=write_token"]
             ]),
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
 
         let result = collect_environment(&config, &info);
@@ -1236,6 +1243,7 @@ environment = ["GH_TOKEN=write_token"]
             extra_env: Some(vec!["AOE_TEST_EXTRA".to_string(), "FOO=bar".to_string()]),
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
 
         let result = collect_environment(&config, &info);
@@ -1262,6 +1270,7 @@ environment = ["GH_TOKEN=write_token"]
             extra_env: Some(vec!["DUP_KEY=from_session".to_string()]),
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
 
         let result = collect_environment(&config, &info);
@@ -1284,6 +1293,7 @@ environment = ["GH_TOKEN=write_token"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
 
         let result = collect_environment(&config, &info);
@@ -1307,6 +1317,7 @@ environment = ["GH_TOKEN=write_token"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
 
         let result = collect_environment(&config, &info);
@@ -1330,6 +1341,7 @@ environment = ["GH_TOKEN=write_token"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
 
         let result = collect_environment(&config, &info);
@@ -1467,6 +1479,7 @@ environment = ["GH_TOKEN=write_token"]
             extra_env: Some(vec!["AOE_TEST_TOKEN=$AOE_TEST_TOKEN".to_string()]),
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
         let result = build_docker_env_args("", &sandbox, std::path::Path::new("/nonexistent"));
         // docker_args should have the key but NOT the secret value
@@ -1504,6 +1517,7 @@ environment = ["GH_TOKEN=write_token"]
             extra_env: Some(vec!["MY_MAPPED=$AOE_TEST_SOURCE".to_string()]),
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
         let result = build_docker_env_args("", &sandbox, std::path::Path::new("/nonexistent"));
         assert!(
@@ -1541,6 +1555,7 @@ environment = ["GH_TOKEN=write_token"]
             extra_env: Some(vec!["AOE_TEST_BARE".to_string()]),
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
         let result = build_docker_env_args("", &sandbox, std::path::Path::new("/nonexistent"));
         assert!(
@@ -1576,6 +1591,7 @@ environment = ["GH_TOKEN=write_token"]
             extra_env: Some(vec!["MY_LITERAL=some_value".to_string()]),
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
         let result = build_docker_env_args("", &sandbox, std::path::Path::new("/nonexistent"));
         assert!(
@@ -1611,6 +1627,7 @@ environment = ["GH_TOKEN=write_token"]
             ]),
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
         let result = build_docker_env_args("", &sandbox, std::path::Path::new("/nonexistent"));
         // Secret: key only in docker_args, value in exports
@@ -1712,6 +1729,7 @@ environment = ["GH_TOKEN=write_token"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
 
         let result = collect_environment(&config, &info);
@@ -1748,6 +1766,7 @@ environment = ["GH_TOKEN=write_token"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
 
         let result = collect_environment(&config, &info);
@@ -1775,6 +1794,7 @@ environment = ["GH_TOKEN=write_token"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
 
         let result = collect_environment(&config, &info);
@@ -1801,6 +1821,7 @@ environment = ["GH_TOKEN=write_token"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
 
         let result = collect_environment(&config, &info);
@@ -1830,6 +1851,7 @@ environment = ["GH_TOKEN=write_token"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
 
         let result = collect_environment(&config, &info);

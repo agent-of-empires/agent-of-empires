@@ -708,6 +708,7 @@ pub fn build_instance(
             },
             custom_instruction: config.sandbox.custom_instruction.clone(),
             before_start_env: Vec::new(),
+            container_workdir: None,
         });
     }
 

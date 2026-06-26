@@ -689,6 +689,7 @@ mod tests {
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         });
 
         let worktree = std::path::PathBuf::from("/tmp/aoe-cleanup-test-nonexistent");
@@ -762,6 +763,7 @@ mod tests {
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         });
 
         let git_wt = GitWorktree::new(main_repo.clone()).unwrap();

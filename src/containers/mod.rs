@@ -86,6 +86,13 @@ impl DockerContainer {
         self.runtime.is_container_running(&self.name)
     }
 
+    /// The container's configured working directory, read from the live
+    /// container. `None` if it can't be determined; see
+    /// [`ContainerRuntime::container_working_dir`].
+    pub fn working_dir(&self) -> Option<String> {
+        self.runtime.container_working_dir(&self.name)
+    }
+
     pub fn build_create_args(&self, config: &ContainerConfig) -> Vec<String> {
         self.runtime
             .build_create_args(&self.name, &self.image, config)

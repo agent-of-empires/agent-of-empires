@@ -696,6 +696,7 @@ mod tests {
                 extra_env: None,
                 custom_instruction: None,
                 before_start_env: Vec::new(),
+                container_workdir: None,
             });
 
             let request = DeletionRequest {
@@ -1001,6 +1002,7 @@ mod tests {
                 extra_env: None,
                 custom_instruction: None,
                 before_start_env: Vec::new(),
+                container_workdir: None,
             });
 
             (tmp, main_repo, worktree_path, instance)

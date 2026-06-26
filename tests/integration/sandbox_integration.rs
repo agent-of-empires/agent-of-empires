@@ -24,6 +24,7 @@ fn test_sandbox_info_serialization() {
         extra_env: Some(vec!["MY_VAR".to_string()]),
         custom_instruction: None,
         before_start_env: Vec::new(),
+        container_workdir: None,
     };
 
     let json = serde_json::to_string(&sandbox_info).unwrap();
@@ -49,6 +50,7 @@ fn test_instance_is_sandboxed() {
         extra_env: None,
         custom_instruction: None,
         before_start_env: Vec::new(),
+        container_workdir: None,
     });
     assert!(inst.is_sandboxed());
 
@@ -60,6 +62,7 @@ fn test_instance_is_sandboxed() {
         extra_env: None,
         custom_instruction: None,
         before_start_env: Vec::new(),
+        container_workdir: None,
     });
     assert!(!inst.is_sandboxed());
 }
@@ -85,6 +88,7 @@ fn test_sandbox_info_persists_across_save_load() {
         extra_env: Some(vec!["API_KEY".to_string(), "SECRET=my_secret".to_string()]),
         custom_instruction: None,
         before_start_env: Vec::new(),
+        container_workdir: None,
     });
 
     let seeded = vec![inst.clone()];

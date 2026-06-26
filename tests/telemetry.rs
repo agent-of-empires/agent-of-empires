@@ -267,6 +267,7 @@ fn with_sandbox(mut inst: Instance, enabled: bool) -> Instance {
         extra_env: None,
         custom_instruction: None,
         before_start_env: Vec::new(),
+        container_workdir: None,
     });
     inst
 }

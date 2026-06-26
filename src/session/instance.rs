@@ -303,6 +303,15 @@ pub struct SandboxInfo {
     /// Custom instruction text to inject into agent launch command
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_instruction: Option<String>,
+    /// The container's working directory, captured from
+    /// `ContainerConfig::working_dir` when the container is created (and
+    /// backfilled from a live container for sessions created before this field
+    /// existed). [`Instance::container_workdir`] returns this verbatim so every
+    /// `docker exec -w` targets the path the container was actually built with,
+    /// instead of a live recomputation that can drift once the host worktree's
+    /// git linkage breaks (#2414).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_workdir: Option<String>,
     /// `KEY=VALUE` pairs minted on the host by `host_hooks.before_start` when
     /// the container last came up. Injected into the container environment as
     /// inherited (leak-safe) entries by [`super::environment::collect_environment`].
@@ -2730,6 +2739,7 @@ impl Instance {
             // fresh process attached to a running container with no values yet.
             self.ensure_before_start_env(false)?;
             container_config::refresh_agent_configs();
+            self.backfill_container_workdir(&container);
             return Ok(container);
         }
 
@@ -2739,6 +2749,7 @@ impl Instance {
             self.ensure_before_start_env(true)?;
             container_config::refresh_agent_configs();
             container.start()?;
+            self.backfill_container_workdir(&container);
             return Ok(container);
         }
 
@@ -2754,13 +2765,62 @@ impl Instance {
 
         if let Some(ref mut sandbox) = self.sandbox_info {
             sandbox.container_id = Some(container_id);
+            // Pin the workdir to exactly what the container was built with, so
+            // later `docker exec -w` can never drift from it (#2414).
+            sandbox.container_workdir = Some(config.working_dir.clone());
         }
 
         Ok(container)
     }
 
+    /// Backfill [`SandboxInfo::container_workdir`] from a live container for a
+    /// session created before that field existed (or one whose value was
+    /// cleared). Authoritative: the value is the container's own
+    /// `Config.WorkingDir`, so a later host-side git-linkage break can't make
+    /// [`Self::container_workdir`] drift from the path the container was built
+    /// with (#2414). No-op once the value is set, when the session is not
+    /// sandboxed, or when the runtime can't report it (the live fallback
+    /// stands). Not persisted here; the next start re-backfills if needed.
+    fn backfill_container_workdir(&mut self, container: &containers::DockerContainer) {
+        let needs_backfill = self
+            .sandbox_info
+            .as_ref()
+            .is_some_and(|s| s.container_workdir.is_none());
+        if !needs_backfill {
+            return;
+        }
+        if let Some(workdir) = container.working_dir() {
+            if let Some(sandbox) = self.sandbox_info.as_mut() {
+                sandbox.container_workdir = Some(workdir);
+            }
+        }
+    }
+
     /// Get the container working directory for this instance.
+    /// The working directory a `docker exec` into this session's sandbox must
+    /// chdir to. Pinned to what the container was actually created with
+    /// ([`SandboxInfo::container_workdir`]): set at create time from
+    /// `ContainerConfig::working_dir` and backfilled from a live container for
+    /// sessions that predate the field.
+    ///
+    /// Recomputing it live from `compute_volume_paths` is unsafe, which is what
+    /// #2414 hit: that helper resolves the worktree's git linkage, and once the
+    /// container is up that linkage can break on the host (e.g. the worktree's
+    /// admin entry under `<main>/.git/worktrees/<name>` is pruned). When it
+    /// can't resolve, `compute_volume_paths` silently collapses to
+    /// `/workspace/<basename>` -- a path the container never mounted -- and the
+    /// exec dies with `chdir to cwd ("/workspace/<name>") ... no such file or
+    /// directory`. The live computation survives only as a fallback for a
+    /// session whose container has not been created yet, where there is nothing
+    /// to pin to.
     pub fn container_workdir(&self) -> String {
+        if let Some(pinned) = self
+            .sandbox_info
+            .as_ref()
+            .and_then(|s| s.container_workdir.clone())
+        {
+            return pinned;
+        }
         container_config::compute_volume_paths(Path::new(&self.project_path), &self.project_path)
             .map(|(_, wd)| wd)
             .unwrap_or_else(|_| "/workspace".to_string())
@@ -4086,6 +4146,55 @@ mod tests {
         }
     }
 
+    /// Regression for issue #2414: a sandboxed worktree session's
+    /// `container_workdir()` must stay pinned to what the container was created
+    /// with, even after the host worktree's git linkage breaks.
+    ///
+    /// When the worktree's admin entry under `<main>/.git/worktrees/<name>` is
+    /// pruned, the `.git` file's gitdir no longer resolves, `compute_volume_paths`
+    /// can't find the main repo, and it silently collapses to
+    /// `/workspace/<basename>` -- a path the container never mounted -- so a
+    /// `docker exec -w` dies with `chdir to cwd ... no such file or directory`.
+    /// The create-time-pinned `SandboxInfo::container_workdir` defends against
+    /// that drift.
+    #[test]
+    fn container_workdir_stays_pinned_when_worktree_linkage_breaks() {
+        use tempfile::TempDir;
+        let root = TempDir::new().unwrap();
+        // An orphaned worktree: a `.git` file whose gitdir points nowhere,
+        // exactly the state a pruned admin entry leaves behind.
+        let worktree = root.path().join("myrepo-worktrees").join("contexec");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            "gitdir: ../../does-not-exist/.git/worktrees/contexec\n",
+        )
+        .unwrap();
+
+        let mut inst = Instance::new("contexec", worktree.to_str().unwrap());
+        inst.sandbox_info = Some(SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "img".to_string(),
+            container_name: "aoe-sandbox-test".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        });
+
+        // Bug reproduction: with nothing pinned, the live recompute can't resolve
+        // the orphaned worktree and falls back to the basename. This is the path
+        // that produced the `chdir to cwd ("/workspace/contexec")` failure.
+        assert_eq!(inst.container_workdir(), "/workspace/contexec");
+
+        // Fix: the value the container was actually built with is returned
+        // verbatim, so the exec targets a path that exists in the container.
+        let pinned = "/workspace/myrepo-worktrees/contexec".to_string();
+        inst.sandbox_info.as_mut().unwrap().container_workdir = Some(pinned.clone());
+        assert_eq!(inst.container_workdir(), pinned);
+    }
+
     #[test]
     fn test_new_instance() {
         let inst = Instance::new("test", "/tmp/test");
@@ -5245,6 +5354,7 @@ mod tests {
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         });
         assert!(!inst.is_sandboxed());
     }
@@ -5260,6 +5370,7 @@ mod tests {
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         });
         assert!(inst.is_sandboxed());
     }
@@ -5366,6 +5477,7 @@ mod tests {
             extra_env: Some(vec!["MY_VAR".to_string(), "OTHER_VAR".to_string()]),
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
 
         let json = serde_json::to_string(&info).unwrap();
@@ -6693,6 +6805,7 @@ mod tests {
                 extra_env: None,
                 custom_instruction: None,
                 before_start_env: Vec::new(),
+                container_workdir: None,
             });
             let on_disk = inst.clone();
             storage
@@ -7457,6 +7570,7 @@ mod tests {
                     extra_env: None,
                     custom_instruction: None,
                     before_start_env: Vec::new(),
+                    container_workdir: None,
                 });
                 assert!(inst.is_sandboxed());
 

@@ -1420,9 +1420,27 @@ impl SessionSandbox {
         source_profile: Option<String>,
     ) -> Result<(Self, SandboxPathMap), AcpError> {
         let project_path_str = project_path.to_string_lossy().to_string();
-        let (volumes, workdir) =
+        let (volumes, computed_workdir) =
             crate::session::container_config::compute_volume_paths(project_path, &project_path_str)
                 .map_err(|e| AcpError::Spawn(format!("compute container workdir: {e}")))?;
+        // The workdir must be what the container was actually created with, not
+        // a live recompute. `compute_volume_paths` resolves the worktree's git
+        // linkage and silently collapses to `/workspace/<basename>` once that
+        // linkage breaks on the host (and it ignores multi-repo `workspace_info`),
+        // which would `docker exec -w` into a path the container never mounted
+        // (#2414). Prefer the create-time-pinned value, then the live container's
+        // own `WorkingDir`, and only fall back to the recompute when neither is
+        // available (no container created yet). The mount map stays the computed
+        // project volumes; making it workspace-complete needs `workspace_info`,
+        // which the reattach path does not carry (tracked separately).
+        let workdir = sandbox
+            .container_workdir
+            .clone()
+            .or_else(|| {
+                crate::containers::get_container_runtime()
+                    .container_working_dir(&sandbox.container_name)
+            })
+            .unwrap_or(computed_workdir);
         let mounts: Vec<(PathBuf, PathBuf)> = volumes
             .into_iter()
             .map(|v| (PathBuf::from(v.container_path), PathBuf::from(v.host_path)))
@@ -7795,6 +7813,51 @@ mod tests {
         assert!(classify_rate_limit_from_message("connection refused").is_none());
     }
 
+    /// Regression for issue #2414 on the structured-view path: `from_info`
+    /// must use the create-time-pinned `SandboxInfo::container_workdir`, not a
+    /// live recompute. With the worktree's git linkage broken,
+    /// `compute_volume_paths` collapses to `/workspace/<basename>` (a path the
+    /// container never mounted), so the pin has to win.
+    #[test]
+    fn from_info_prefers_pinned_workdir_over_live_recompute() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Orphaned worktree: a `.git` file whose gitdir points nowhere.
+        let worktree = tmp.path().join("repo-worktrees").join("feature");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            "gitdir: ../../does-not-exist/.git/worktrees/feature\n",
+        )
+        .unwrap();
+
+        let sandbox = SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "alpine:latest".into(),
+            container_name: "aoe-sandbox-pinned1".into(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: Some("/workspace/repo-worktrees/feature".into()),
+        };
+
+        // Pin present, so no live inspect is attempted; the pinned value is used.
+        let (resources, _map) = SessionSandbox::from_info(&sandbox, &worktree, None).unwrap();
+        assert_eq!(
+            resources.container_workdir,
+            PathBuf::from("/workspace/repo-worktrees/feature"),
+        );
+
+        // The pin is load-bearing: the live recompute on this orphaned worktree
+        // collapses to the basename, which is the path that never got mounted.
+        let (_volumes, computed) = crate::session::container_config::compute_volume_paths(
+            &worktree,
+            &worktree.to_string_lossy(),
+        )
+        .unwrap();
+        assert_eq!(computed, "/workspace/feature");
+    }
+
     /// Sandboxed structured view spawn must wrap the agent command in
     /// `docker exec` argv with `-i`, the container workdir, an `-e`
     /// flag per env entry, then the container name, then the agent
@@ -7813,6 +7876,7 @@ mod tests {
             extra_env: Some(vec!["MY_LITERAL=hello".into()]),
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
         let config = SpawnConfig {
             agent_key: "claude".into(),
@@ -7881,6 +7945,7 @@ mod tests {
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
         let config = SpawnConfig {
             agent_key: "claude".into(),
@@ -7953,6 +8018,7 @@ mod tests {
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
         let config = SpawnConfig {
             agent_key: "claude".into(),

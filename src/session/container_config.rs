@@ -2960,6 +2960,7 @@ extra_volumes = ["/host/data:/container/data:ro"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
 
         let project_path_str = project_dir.path().to_str().unwrap();
@@ -3067,6 +3068,7 @@ volume_ignores = ["**/bin", "**/obj", "target"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
 
         let project_path_str = project_dir.path().to_str().unwrap();
@@ -3209,6 +3211,7 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
 
         let config = build_container_config(
@@ -3254,6 +3257,7 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
         let instance_id = "codex-sandbox-hooks-test";
         let config = build_container_config(
@@ -3346,6 +3350,7 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
                 extra_env: None,
                 custom_instruction: None,
                 before_start_env: Vec::new(),
+                container_workdir: None,
             };
             let instance_id = format!("{}-sidecar-sandbox-test", agent.name);
             let config = build_container_config(
@@ -3414,6 +3419,7 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
         let instance_id = "kiro-selected-agent-sandbox-test";
         build_container_config(
@@ -3484,6 +3490,7 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
                 extra_env: None,
                 custom_instruction: None,
                 before_start_env: Vec::new(),
+                container_workdir: None,
             },
             ContainerAgentSelection::new("kiro", None).with_selected_agent(Some("custom-agent")),
             false,
@@ -3541,6 +3548,7 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
 
         let result = build_container_config(
@@ -3590,6 +3598,7 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
         let instance_id = "codex-sandbox-hooks-disabled-test";
         let config = build_container_config(
@@ -3652,6 +3661,7 @@ agent_detect_as = { "wrapped-codex" = "codex" }
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
         let instance_id = "wrapped-codex-sandbox-hooks-test";
         let config = build_container_config(
@@ -3711,6 +3721,7 @@ agent_detect_as = { "wrapped-codex" = "codex" }
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
         let instance_id = "codex-sandbox-refresh-hooks-test";
         build_container_config(
@@ -3779,6 +3790,7 @@ trusted_hash = "keep"
             extra_env: Some(vec!["CODEX_HOME=/root/custom-codex".to_string()]),
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
         let instance_id = "codex-sandbox-extra-env-hooks-test";
         let config = build_container_config(
@@ -3834,6 +3846,7 @@ environment = ["CODEX_HOME=/root/profile-codex"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
         let instance_id = "codex-sandbox-config-env-hooks-test";
         let config = build_container_config(
@@ -3923,6 +3936,7 @@ extra_volumes = ["/host/personal-only:/container/personal-only:ro"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
 
         let has_volume = |config: &crate::containers::container_interface::ContainerConfig,
@@ -4074,6 +4088,7 @@ volume_ignores = ["target", "node_modules"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
 
         let project_path_str = worktree_path.to_str().unwrap();
@@ -4168,6 +4183,7 @@ volume_ignores = ["target"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
 
         let project_path_str = worktree_path.to_str().unwrap();
@@ -4323,6 +4339,7 @@ volume_ignores = ["target"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         }
     }
 

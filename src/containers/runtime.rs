@@ -166,6 +166,32 @@ impl ContainerRuntime {
         }
     }
 
+    /// The container's configured working directory (`Config.WorkingDir`), or
+    /// `None` if it can't be determined (container gone, inspect failed, or the
+    /// field is empty). Used to backfill the create-time-pinned workdir for
+    /// sandbox sessions that predate it (#2414). Works on stopped containers
+    /// too, since `inspect` reads static config.
+    ///
+    /// Apple's `container` CLI does not expose this via a stable `inspect`
+    /// field we rely on, so it returns `None` there and the caller keeps the
+    /// create-time value (or the live fallback for legacy sessions).
+    pub fn container_working_dir(&self, name: &str) -> Option<String> {
+        if !matches!(self.kind, RuntimeKind::Docker | RuntimeKind::Podman) {
+            return None;
+        }
+        let output = self
+            .base
+            .command()
+            .args(["container", "inspect", "-f", "{{.Config.WorkingDir}}", name])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let wd = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        (!wd.is_empty()).then_some(wd)
+    }
+
     pub fn build_create_args(
         &self,
         name: &str,
