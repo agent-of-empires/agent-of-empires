@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 /// App data dir for the debug binary, which uses the `-dev` namespace.
 fn app_dir(home: &Path, xdg: &Path) -> PathBuf {
-    if cfg!(target_os = "linux") {
+    if cfg!(any(target_os = "linux", target_os = "macos")) {
         xdg.join("agent-of-empires-dev")
     } else {
         home.join(".agent-of-empires-dev")
