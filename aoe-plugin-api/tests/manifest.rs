@@ -559,7 +559,7 @@ fn ui_slot_as_str_round_trips_the_wire_name() {
     for (toml_slot, slot) in [
         ("status-bar", UiSlot::StatusBar),
         ("row-badge", UiSlot::RowBadge),
-        ("detail-panel", UiSlot::DetailPanel),
+        ("pane", UiSlot::Pane),
         ("notification", UiSlot::Notification),
     ] {
         assert_eq!(slot.as_str(), toml_slot);

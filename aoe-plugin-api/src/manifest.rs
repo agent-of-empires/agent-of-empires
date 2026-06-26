@@ -169,8 +169,9 @@ pub enum UiSlot {
     FilterFacet,
     /// A card on the dashboard overview (global).
     Card,
-    /// A panel in a session's detail view (per session).
-    DetailPanel,
+    /// A dockable tool-window pane in a session's view (per session). The host
+    /// renders it in the right or bottom dock per the entry's `default_location`.
+    Pane,
     /// A badge in a session's detail view (per session).
     DetailBadge,
     /// A transient notification, pushed via `ui.notify` (gated by the
@@ -184,7 +185,7 @@ impl UiSlot {
     pub fn is_per_session(self) -> bool {
         matches!(
             self,
-            UiSlot::RowBadge | UiSlot::RowColumn | UiSlot::DetailPanel | UiSlot::DetailBadge
+            UiSlot::RowBadge | UiSlot::RowColumn | UiSlot::Pane | UiSlot::DetailBadge
         )
     }
 
@@ -199,7 +200,7 @@ impl UiSlot {
             UiSlot::SortKey => "sort-key",
             UiSlot::FilterFacet => "filter-facet",
             UiSlot::Card => "card",
-            UiSlot::DetailPanel => "detail-panel",
+            UiSlot::Pane => "pane",
             UiSlot::DetailBadge => "detail-badge",
             UiSlot::Notification => "notification",
         }

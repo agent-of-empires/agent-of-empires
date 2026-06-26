@@ -184,21 +184,34 @@ struct CardPayload {
     tone: Option<Tone>,
 }
 
-/// `detail-panel` payload. Either the simple `{ title, body }` form or an
-/// ordered `blocks` list. The blocks are kept as opaque JSON on purpose: the
-/// host validates only the envelope (an array of objects) and the web renders
-/// the block kinds it knows, dropping the rest. This is the forward-compat
-/// contract: a plugin can add fields to a known kind, or a whole new kind, and
-/// never need a host change; only the web renderer grows.
+/// Which dock a [`UiSlot::Pane`] opens in by default. A closed set so a plugin
+/// cannot name an arbitrary location; the user can still move the pane after.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PaneLocation {
+    Right,
+    Bottom,
+}
+
+/// `pane` payload (the dockable tool-window slot). Either the simple
+/// `{ title, body }` form or an ordered `blocks` list, plus an optional
+/// `default_location` picking the dock it first opens in (defaults to the
+/// right dock host-side when omitted). The blocks are kept as opaque JSON on
+/// purpose: the host validates only the envelope (an array of objects) and the
+/// web renders the block kinds it knows, dropping the rest. This is the
+/// forward-compat contract: a plugin can add fields to a known kind, or a whole
+/// new kind, and never need a host change; only the web renderer grows.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct DetailPanelPayload {
+struct PanePayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     body: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     blocks: Option<Vec<Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    default_location: Option<PaneLocation>,
 }
 
 /// Why a `ui.state.set`/`ui.state.remove` was rejected. The host API maps each
@@ -504,7 +517,7 @@ fn validate_payload(slot: UiSlot, raw: &Value) -> Result<Value, String> {
         UiSlot::SortKey => normalize::<SortKeyPayload>(raw),
         UiSlot::FilterFacet => normalize::<FilterFacetPayload>(raw),
         UiSlot::Card => normalize::<CardPayload>(raw),
-        UiSlot::DetailPanel => normalize::<DetailPanelPayload>(raw),
+        UiSlot::Pane => normalize::<PanePayload>(raw),
         UiSlot::Notification => Err("notification is pushed via ui.notify".into()),
     }
 }
@@ -767,7 +780,7 @@ mod tests {
     }
 
     #[test]
-    fn detail_panel_blocks_are_forward_compatible() {
+    fn pane_blocks_are_forward_compatible() {
         let s = store();
         let g = s.begin_generation("acme.kit");
         // A mix of known kinds and an unknown kind: the unknown one is accepted
@@ -775,10 +788,10 @@ mod tests {
         s.set(
             "acme.kit",
             g,
-            UiSlot::DetailPanel,
+            UiSlot::Pane,
             "gh",
             Some("s1"),
-            &json!({"title": "GitHub", "blocks": [
+            &json!({"title": "GitHub", "default_location": "bottom", "blocks": [
                 {"kind": "heading", "text": "GitHub"},
                 {"kind": "row", "label": "nexus", "value": "PR #12", "href": "https://x/pr/12"},
                 {"kind": "divider"},
@@ -790,16 +803,34 @@ mod tests {
         let blocks = snap.entries[0].payload["blocks"].as_array().unwrap();
         assert_eq!(blocks.len(), 4);
         assert_eq!(blocks[3]["kind"], json!("some-future-kind"));
-        // The simple title/body form still works.
+        assert_eq!(snap.entries[0].payload["default_location"], json!("bottom"));
+        // The simple title/body form still works, and default_location is optional.
         s.set(
             "acme.kit",
             g,
-            UiSlot::DetailPanel,
+            UiSlot::Pane,
             "gh",
             Some("s1"),
             &json!({"title": "T", "body": "B"}),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn pane_rejects_unknown_default_location() {
+        let s = store();
+        let g = s.begin_generation("acme.kit");
+        assert!(matches!(
+            s.set(
+                "acme.kit",
+                g,
+                UiSlot::Pane,
+                "gh",
+                Some("s1"),
+                &json!({"default_location": "sideways"})
+            ),
+            Err(UiError::BadRequest(_))
+        ));
     }
 
     #[test]
