@@ -904,6 +904,7 @@ fn event_kind(event: &crate::acp::Event) -> &'static str {
         Event::ConfigOptionsUpdated { .. } => "config_options_updated",
         Event::ConfigOptionSwitchFailed { .. } => "config_option_switch_failed",
         Event::RawAgentUpdate { .. } => "raw_agent_update",
+        Event::PromptRuntimeError { .. } => "prompt_runtime_error",
         Event::AgentMessageChunk { .. } => "agent_message_chunk",
         Event::CancelRequested { .. } => "cancel_requested",
         Event::Stopped { .. } => "stopped",
