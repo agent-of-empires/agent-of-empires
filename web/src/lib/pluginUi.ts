@@ -2,7 +2,7 @@
 // slots through these so the filtering rules (and the per-session tearing
 // guard) live in one tested place rather than scattered across the UI.
 
-import { createElement, forwardRef, type ComponentType } from "react";
+import { createElement, forwardRef, type ComponentType, type CSSProperties } from "react";
 import type { LucideIcon, LucideProps } from "lucide-react";
 import { DynamicIcon, iconNames } from "lucide-react/dynamic";
 
@@ -80,6 +80,39 @@ export function payloadStr(entry: PluginUiEntry, key: string): string {
 /** An entry's primary `text` field. */
 export function entryText(entry: PluginUiEntry): string {
   return payloadStr(entry, "text");
+}
+
+/** Validate a plugin-supplied color to a normalized lowercase `#rrggbb`, or
+ *  undefined for anything else. Only `#rgb`/`#rrggbb` hex literals are accepted:
+ *  no CSS names, `rgb()`, `var()`, or `url()`, so the value can never carry
+ *  arbitrary CSS. The closed `tone` set stays the semantic axis; `color` is an
+ *  optional literal accent the worker uses where a tone cannot name the hue
+ *  (e.g. a merged PR's purple). */
+export function validColor(v: unknown): string | undefined {
+  if (typeof v !== "string") return undefined;
+  const short = /^#([0-9a-f]{3})$/i.exec(v);
+  if (short) {
+    const [r, g, b] = short[1].split("");
+    return `#${r}${r}${g}${g}${b}${b}`.toLowerCase();
+  }
+  return /^#[0-9a-f]{6}$/i.test(v) ? v.toLowerCase() : undefined;
+}
+
+/** A React style object applying a validated `color` as the foreground tint,
+ *  with a theme-aware translucent fill when `withFill` is set (for pills). The
+ *  hex reaches the DOM only as the value of fixed color properties, never as a
+ *  class or raw CSS, so the host's no-arbitrary-CSS guarantee holds. Returns
+ *  undefined when the color is absent/invalid, so the caller falls back to its
+ *  tone classes.
+ *
+ *  Trust boundary: `validColor` is the ONLY thing standing between plugin input
+ *  and the `color-mix(...)` CSS string below. It must keep rejecting anything
+ *  that is not a bare `#rrggbb` hex; never loosen it without re-auditing this
+ *  interpolation, or the fill becomes a CSS-injection vector. */
+export function accentStyle(color: unknown, withFill = false): CSSProperties | undefined {
+  const c = validColor(color);
+  if (!c) return undefined;
+  return withFill ? { color: c, backgroundColor: `color-mix(in oklab, ${c} 15%, transparent)` } : { color: c };
 }
 
 /** Validate an arbitrary value against the closed tone set (used for badge

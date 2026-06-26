@@ -211,4 +211,54 @@ describe("plugin slot renderers", () => {
     expect(link.getAttribute("href")).toBe("https://github.com/o/nexus/pull/12");
     expect(container.querySelector("hr")).toBeTruthy();
   });
+
+  it("a row with a validated hex color tints via inline style; junk is ignored", () => {
+    const entry: PluginUiEntry = {
+      plugin_id: "acme.kit",
+      slot: "pane",
+      id: "gh",
+      session_id: "s1",
+      payload: {
+        blocks: [
+          { kind: "row", icon: "git-merge", label: "nexus", value: "MERGED #12", color: "#8957e5" },
+          { kind: "row", label: "other", value: "open", color: "javascript:alert(1)" },
+        ],
+      },
+    };
+    render(<PluginPaneBody entry={entry} />);
+    const merged = screen.getByText("MERGED #12");
+    expect(merged.getAttribute("style")).toContain("8957e5");
+    // An invalid color leaves the value untinted (no inline color style).
+    const other = screen.getByText("open");
+    expect(other.getAttribute("style") ?? "").not.toContain("javascript");
+  });
+
+  it("comment blocks render read-only with author, location and resolved state", () => {
+    const entry: PluginUiEntry = {
+      plugin_id: "acme.kit",
+      slot: "pane",
+      id: "gh",
+      session_id: "s1",
+      payload: {
+        blocks: [
+          {
+            kind: "section",
+            title: "Unresolved comments: 1",
+            children: [
+              { kind: "comment", author: "alice", body: "handle the nil case", path: "src/foo.py", line: 42, href: "https://github.com/o/r/pull/1#c1", resolved: false },
+            ],
+          },
+        ],
+      },
+    };
+    render(<PluginPaneBody entry={entry} />);
+    expect(screen.getByText("alice")).toBeTruthy();
+    expect(screen.getByText("handle the nil case")).toBeTruthy();
+    expect(screen.getByText("src/foo.py:42")).toBeTruthy();
+    expect(screen.getByText("unresolved")).toBeTruthy();
+    const link = screen.getByRole("link");
+    expect(link.getAttribute("href")).toBe("https://github.com/o/r/pull/1#c1");
+    // Read-only: no reply/resolve controls.
+    expect(screen.queryByRole("button")).toBeNull();
+  });
 });

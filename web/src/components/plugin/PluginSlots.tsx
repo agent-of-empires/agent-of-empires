@@ -10,6 +10,7 @@ import { createElement, useState } from "react";
 import { invokePluginAction } from "../../lib/api";
 import { usePluginUiEntries } from "../../lib/pluginUiContext";
 import {
+  accentStyle,
   entryText,
   entryTone,
   globalEntries,
@@ -234,6 +235,9 @@ function BlockRow({ block }: { block: Record<string, unknown> }) {
   const sublabel = str(block, "sublabel");
   const iconComp = lucideIcon(str(block, "icon"));
   const tone = validTone(block.tone);
+  // A validated hex `color` overrides the tone color for the icon and value
+  // (e.g. a merged PR's purple, which no semantic tone names).
+  const accent = accentStyle(block.color);
   const safe = safeHref(str(block, "href"));
   if (!label && !value && !iconComp) return null;
   // Name the link from its text so an icon-only row is not announced unlabeled.
@@ -241,10 +245,18 @@ function BlockRow({ block }: { block: Record<string, unknown> }) {
   const inner = (
     <span className="flex min-w-0 items-center gap-2">
       {iconComp &&
-        createElement(iconComp, { className: `size-4 shrink-0 ${toneTextClass(tone)}`, "aria-hidden": true })}
+        createElement(iconComp, {
+          className: `size-4 shrink-0 ${accent ? "" : toneTextClass(tone)}`,
+          style: accent,
+          "aria-hidden": true,
+        })}
       <span className="min-w-0 truncate">
         {label && <span className="font-medium text-text-primary">{label}</span>}
-        {value && <span className="ml-1.5 text-text-secondary">{value}</span>}
+        {value && (
+          <span className="ml-1.5 text-text-secondary" style={accent}>
+            {value}
+          </span>
+        )}
         {sublabel && <span className="ml-1.5 text-[11px] text-text-dim">{sublabel}</span>}
       </span>
     </span>
@@ -297,6 +309,43 @@ function BlockAction({ block, pluginId }: { block: Record<string, unknown>; plug
   );
 }
 
+/** A read-only PR review comment: author, optional file:line, a wrapped body
+ *  excerpt, and an unresolved/resolved marker. Wrapped in a link when `href` is
+ *  a safe http(s) URL. There are no reply/resolve controls; this only surfaces
+ *  what is already on the PR. */
+function BlockComment({ block }: { block: Record<string, unknown> }) {
+  const author = str(block, "author");
+  const body = str(block, "body");
+  const path = str(block, "path");
+  const line = typeof block.line === "number" ? block.line : undefined;
+  const resolved = block.resolved === true;
+  const safe = safeHref(str(block, "href"));
+  if (!author && !body) return null;
+  const where = path ? `${path}${line ? `:${line}` : ""}` : undefined;
+  const inner = (
+    <>
+      <div className="flex items-center justify-between gap-2 text-text-secondary">
+        <span className="font-medium truncate">{author}</span>
+        <span className="flex shrink-0 items-center gap-1.5">
+          {where && <span className="font-mono text-[10px] text-text-dim truncate max-w-40">{where}</span>}
+          <span className={`text-[10px] ${resolved ? "text-status-running" : "text-status-waiting"}`}>
+            {resolved ? "resolved" : "unresolved"}
+          </span>
+        </span>
+      </div>
+      {body && <div className="mt-0.5 line-clamp-3 whitespace-pre-wrap text-text-primary">{body}</div>}
+    </>
+  );
+  const className = "block rounded bg-surface-700/30 p-2 text-xs";
+  return safe ? (
+    <a className={`${className} hover:bg-surface-700/50`} href={safe} target="_blank" rel="noopener noreferrer">
+      {inner}
+    </a>
+  ) : (
+    <div className={className}>{inner}</div>
+  );
+}
+
 /** Render one pane block. The block vocabulary is forward-compatible:
  *  an unknown `kind` (or a known kind missing its required field) renders
  *  nothing rather than throwing, so a newer plugin can push kinds an older host
@@ -309,6 +358,8 @@ function DetailBlock({ block, pluginId }: { block: Record<string, unknown>; plug
     }
     case "row":
       return <BlockRow block={block} />;
+    case "comment":
+      return <BlockComment block={block} />;
     case "note": {
       const text = str(block, "text");
       return text ? <p className={`text-xs ${toneTextClass(validTone(block.tone))}`}>{text}</p> : null;

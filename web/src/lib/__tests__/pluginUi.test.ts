@@ -1,6 +1,15 @@
 import { describe, expect, it } from "vitest";
 import type { PluginUiEntry, PluginUiSlot } from "../api";
-import { entryText, entryTone, globalEntries, payloadStr, sessionEntries, toneClasses } from "../pluginUi";
+import {
+  accentStyle,
+  entryText,
+  entryTone,
+  globalEntries,
+  payloadStr,
+  sessionEntries,
+  toneClasses,
+  validColor,
+} from "../pluginUi";
 
 function entry(slot: PluginUiSlot, over: Partial<PluginUiEntry> = {}): PluginUiEntry {
   return {
@@ -53,5 +62,23 @@ describe("pluginUi selectors", () => {
     expect(toneClasses("success")).toContain("status-running");
     expect(toneClasses("danger")).toContain("status-error");
     expect(toneClasses(undefined)).toContain("status-idle");
+  });
+
+  it("validColor accepts only hex literals and normalizes them", () => {
+    expect(validColor("#8957E5")).toBe("#8957e5");
+    expect(validColor("#abc")).toBe("#aabbcc"); // shorthand expanded
+    expect(validColor("red")).toBeUndefined();
+    expect(validColor("rgb(1,2,3)")).toBeUndefined();
+    expect(validColor("var(--x)")).toBeUndefined();
+    expect(validColor("# <script>")).toBeUndefined();
+    expect(validColor(123)).toBeUndefined();
+  });
+
+  it("accentStyle tints from a valid color and ignores junk", () => {
+    expect(accentStyle("#8957e5")).toEqual({ color: "#8957e5" });
+    const filled = accentStyle("#8957e5", true);
+    expect(filled?.color).toBe("#8957e5");
+    expect(String(filled?.backgroundColor)).toContain("#8957e5");
+    expect(accentStyle("red")).toBeUndefined();
   });
 });

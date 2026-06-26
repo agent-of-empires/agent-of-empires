@@ -511,11 +511,19 @@ Two slots carry more than a single value, so one entry (one declared
   safe URL. The single `{ text, tone, tooltip, icon, href }` form still works.
   An empty `items: []` clears the row.
 - `pane` also accepts `blocks: Block[]`, an ordered list of typed
-  blocks. The host knows these kinds: `heading { text }`,
-  `row { label, value?, sublabel?, icon?, tone?, href? }`, `note { text, tone? }`,
-  `divider {}`, `section { title?, children: Block[] }` (nested blocks), and
+  blocks. The web renderer knows these kinds: `heading { text }`,
+  `row { label, value?, sublabel?, icon?, tone?, color?, href? }`,
+  `note { text, tone? }`, `divider {}`,
+  `section { title?, children: Block[] }` (nested blocks),
+  `comment { author, body, path?, line?, resolved?, href? }` (a read-only PR
+  review comment: author, optional file:line, a wrapped body excerpt, and an
+  unresolved/resolved marker), and
   `action { label, method, icon? }` (a button that forwards `method` to the
-  plugin's worker, see below). The simple `{ title, body }` form still works
+  plugin's worker, see below). A block's optional `color` is a validated hex
+  literal (`#rgb`/`#rrggbb`, normalized; no CSS names, `rgb()`, `var()`, or
+  `url()`, so it can never carry arbitrary CSS) that tints the block's
+  icon/value where a semantic `tone` cannot name the hue, e.g. a merged PR's
+  purple. The simple `{ title, body }` form still works
   when `blocks` is absent. A `pane`
   also takes an optional `default_location` (`right` | `bottom`) choosing the
   dock it first opens in; the user can move it between docks afterward, and an
