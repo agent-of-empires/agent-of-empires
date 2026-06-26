@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
 import { getOrCreateDeviceBindingSecret } from "../lib/deviceBinding";
 import { getToken } from "../lib/token";
-import { wheelMouseBytes } from "../lib/liveMouse";
+import { buttonMouseBytes, wheelMouseBytes } from "../lib/liveMouse";
 import { MAX_RETRIES, retryDelayMs } from "../lib/wsBackoff";
 import { reportTelemetrySeen } from "../lib/api";
 
@@ -352,6 +352,19 @@ export function useLiveTerminal(sessionId: string | null, wsPath: string = "live
     }
   }, []);
 
+  /** Forward a mouse button press/drag/release to a full-screen mouse app,
+   *  encoded as the app expects. Sent as raw input bytes on the same path as
+   *  the wheel; the app reacts and the next frame reflects it. */
+  const forwardButton = useCallback(
+    (baseButton: number, release: boolean, motion: boolean, sgr: boolean, col: number, row: number) => {
+      const ws = wsRef.current;
+      if (ws?.readyState === WebSocket.OPEN) {
+        ws.send(buttonMouseBytes(baseButton, release, motion, sgr, col, row));
+      }
+    },
+    [],
+  );
+
   const sendResize = useCallback((cols: number, rows: number) => {
     // Dedup: the sizing observer recomputes on every container change,
     // but rows are latched to the no-keyboard height, so keyboard cycles
@@ -429,6 +442,7 @@ export function useLiveTerminal(sessionId: string | null, wsPath: string = "live
     state,
     sendData,
     forwardWheel,
+    forwardButton,
     sendResize,
     setWindow,
     setCadence,

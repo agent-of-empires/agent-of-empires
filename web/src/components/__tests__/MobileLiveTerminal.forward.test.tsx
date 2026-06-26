@@ -38,7 +38,7 @@ function frame(over: Partial<LiveFrame>): LiveFrame {
   };
 }
 
-function renderTerm(f: LiveFrame, forwardWheel = vi.fn()) {
+function renderTerm(f: LiveFrame, forwardWheel = vi.fn(), forwardButton = vi.fn()) {
   const utils = render(
     <MobileLiveTerminal
       frame={f}
@@ -52,6 +52,7 @@ function renderTerm(f: LiveFrame, forwardWheel = vi.fn()) {
       returnToLive={vi.fn()}
       sendData={vi.fn()}
       forwardWheel={forwardWheel}
+      forwardButton={forwardButton}
       ctrlActiveRef={createRef<boolean>() as React.RefObject<boolean>}
       clearCtrl={vi.fn()}
       inputRef={createRef<HTMLTextAreaElement>()}
@@ -60,7 +61,7 @@ function renderTerm(f: LiveFrame, forwardWheel = vi.fn()) {
     />,
   );
   const scroller = utils.container.querySelector("[data-live-terminal] > div") as HTMLElement;
-  return { ...utils, scroller, forwardWheel };
+  return { ...utils, scroller, forwardWheel, forwardButton };
 }
 
 describe("MobileLiveTerminal wheel forwarding", () => {
@@ -108,6 +109,34 @@ describe("MobileLiveTerminal wheel forwarding", () => {
     expect(forwardWheel.mock.calls[0][0]).toBe(false); // up === false (wheel down)
   });
 
+  it("forwards a mouse click (press then release) to a full-screen mouse app", () => {
+    const { scroller, forwardButton } = renderTerm(frame({ altScreen: true, mouse: true, mouseSgr: true }));
+    fireEvent.pointerDown(scroller, { pointerType: "mouse", button: 0, clientX: 10, clientY: 10 });
+    fireEvent.pointerUp(scroller, { pointerType: "mouse", button: 0, clientX: 10, clientY: 10 });
+    expect(forwardButton).toHaveBeenCalledTimes(2);
+    // press: base left=0, release=false; then release=true.
+    expect(forwardButton.mock.calls[0].slice(0, 3)).toEqual([0, false, false]);
+    expect(forwardButton.mock.calls[1][1]).toBe(true);
+  });
+
+  it("does NOT forward a click for a normal-screen agent", () => {
+    const { scroller, forwardButton } = renderTerm(frame({ altScreen: false, mouse: true, mouseSgr: true }));
+    fireEvent.pointerDown(scroller, { pointerType: "mouse", button: 0, clientX: 10, clientY: 10 });
+    expect(forwardButton).not.toHaveBeenCalled();
+  });
+
+  it("does NOT forward a Shift+click (keeps local text selection)", () => {
+    const { scroller, forwardButton } = renderTerm(frame({ altScreen: true, mouse: true, mouseSgr: true }));
+    fireEvent.pointerDown(scroller, { pointerType: "mouse", button: 0, shiftKey: true, clientX: 10, clientY: 10 });
+    expect(forwardButton).not.toHaveBeenCalled();
+  });
+
+  it("does NOT forward a touch pointer (touch keeps its own scroll path)", () => {
+    const { scroller, forwardButton } = renderTerm(frame({ altScreen: true, mouse: true, mouseSgr: true }));
+    fireEvent.pointerDown(scroller, { pointerType: "touch", button: 0, clientX: 10, clientY: 10 });
+    expect(forwardButton).not.toHaveBeenCalled();
+  });
+
   it("does not enter reading mode on scroll while forwarding", () => {
     const enterReading = vi.fn();
     const utils = render(
@@ -123,6 +152,7 @@ describe("MobileLiveTerminal wheel forwarding", () => {
         returnToLive={vi.fn()}
         sendData={vi.fn()}
         forwardWheel={vi.fn()}
+        forwardButton={vi.fn()}
         ctrlActiveRef={createRef<boolean>() as React.RefObject<boolean>}
         clearCtrl={vi.fn()}
         inputRef={createRef<HTMLTextAreaElement>()}

@@ -68,6 +68,28 @@ describe("useLiveTerminal forwardWheel", () => {
     expect(sentBytes(ws).length).toBe(0);
   });
 
+  it("sends SGR button press / drag / release bytes", () => {
+    const { result } = renderHook(() => useLiveTerminal("s", "live-ws"));
+    const ws = FakeWS.last!;
+    const decode = (b: Uint8Array) => new TextDecoder().decode(b);
+    act(() => result.current.forwardButton(0, false, false, true, 4, 2)); // left press
+    act(() => result.current.forwardButton(0, false, true, true, 5, 2)); // drag
+    act(() => result.current.forwardButton(0, true, false, true, 6, 2)); // release
+    const seen = sentBytes(ws).map(decode);
+    expect(seen).toContain("\x1b[<0;4;2M");
+    expect(seen).toContain("\x1b[<32;5;2M");
+    expect(seen).toContain("\x1b[<0;6;2m");
+  });
+
+  it("does not send a button when the socket is not open", () => {
+    const { result } = renderHook(() => useLiveTerminal("s", "live-ws"));
+    const ws = FakeWS.last!;
+    ws.readyState = FakeWS.CLOSED;
+    ws.sent.length = 0;
+    act(() => result.current.forwardButton(0, false, false, true, 1, 1));
+    expect(sentBytes(ws).length).toBe(0);
+  });
+
   it("surfaces altScreen / mouse / mouseSgr from incoming frames", () => {
     const { result } = renderHook(() => useLiveTerminal("s", "live-ws"));
     const ws = FakeWS.last!;

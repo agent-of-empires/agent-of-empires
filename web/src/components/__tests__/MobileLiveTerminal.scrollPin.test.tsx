@@ -100,6 +100,7 @@ function props() {
     returnToLive: vi.fn(),
     sendData: vi.fn(),
     forwardWheel: vi.fn(),
+    forwardButton: vi.fn(),
     ctrlActiveRef: createRef<boolean>() as React.RefObject<boolean>,
     clearCtrl: vi.fn(),
     inputRef: createRef<HTMLTextAreaElement>(),

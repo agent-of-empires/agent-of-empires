@@ -34,6 +34,44 @@ export function wheelMouseBytes(up: boolean, sgr: boolean, col: number, row: num
 }
 
 /**
+ * Build a mouse button report (press / drag / release) for a full-screen
+ * mouse app, mirroring the TUI's `mouse_event_bytes` (src/tui/home/input.rs)
+ * so both surfaces speak the same encodings. `baseButton` is 0/1/2 for
+ * left/middle/right; `motion` sets the drag bit (button held while moving);
+ * `release` marks a button-up. `sgr` picks SGR (1006) vs legacy X10. `col`/
+ * `row` are 1-based pane cells.
+ */
+export function buttonMouseBytes(
+  baseButton: number,
+  release: boolean,
+  motion: boolean,
+  sgr: boolean,
+  col: number,
+  row: number,
+): Uint8Array<ArrayBuffer> {
+  // The drag (motion) bit rides on press/drag reports in both encodings.
+  const cb = baseButton + (motion ? 32 : 0);
+  const cx = Math.max(1, Math.floor(col));
+  const cy = Math.max(1, Math.floor(row));
+  if (sgr) {
+    // SGR (1006): press/drag end with `M`, release with `m`, so the button
+    // identity is preserved on release. Pure ASCII, no coord limit.
+    const end = release ? "m" : "M";
+    const s = `\x1b[<${cb};${cx};${cy}${end}`;
+    const out = new Uint8Array(s.length);
+    for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
+    return out;
+  }
+  // Legacy X10: `ESC [ M` then three bytes, each value + 32 (clamped at 223).
+  // A release can't carry button identity, so it uses the agnostic button 3.
+  const enc = (v: number) => Math.min(223, v) + 32;
+  const btn = release ? 3 : cb;
+  const out = new Uint8Array(6);
+  out.set([0x1b, 0x5b, 0x4d, enc(btn), enc(cx), enc(cy)]);
+  return out;
+}
+
+/**
  * Convert an accumulated scroll delta (in pixels, positive = scroll toward
  * newer/down) into a whole number of wheel notches plus the leftover that
  * didn't reach a full notch. `thresholdPx` is the pixels per notch (one

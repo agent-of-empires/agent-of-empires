@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { wheelMouseBytes, wheelNotches } from "../liveMouse";
+import { buttonMouseBytes, wheelMouseBytes, wheelNotches } from "../liveMouse";
 
 const bytes = (...n: number[]) => new Uint8Array(n);
 const ascii = (s: string) => new Uint8Array([...s].map((c) => c.charCodeAt(0)));
@@ -22,6 +22,37 @@ describe("wheelMouseBytes", () => {
 
   it("floors coordinates to at least 1", () => {
     expect(wheelMouseBytes(true, true, 0, -5)).toEqual(ascii("\x1b[<64;1;1M"));
+  });
+});
+
+describe("buttonMouseBytes", () => {
+  it("encodes SGR press/release for left/middle/right (M vs m)", () => {
+    expect(buttonMouseBytes(0, false, false, true, 5, 7)).toEqual(ascii("\x1b[<0;5;7M"));
+    expect(buttonMouseBytes(1, false, false, true, 5, 7)).toEqual(ascii("\x1b[<1;5;7M"));
+    expect(buttonMouseBytes(2, false, false, true, 5, 7)).toEqual(ascii("\x1b[<2;5;7M"));
+    // Release keeps button identity but ends with lowercase m.
+    expect(buttonMouseBytes(0, true, false, true, 5, 7)).toEqual(ascii("\x1b[<0;5;7m"));
+  });
+
+  it("sets the SGR drag (motion) bit at +32", () => {
+    expect(buttonMouseBytes(0, false, true, true, 5, 7)).toEqual(ascii("\x1b[<32;5;7M"));
+    expect(buttonMouseBytes(2, false, true, true, 5, 7)).toEqual(ascii("\x1b[<34;5;7M"));
+  });
+
+  it("encodes legacy X10 press with the motion bit and value + 32", () => {
+    expect(buttonMouseBytes(0, false, false, false, 3, 3)).toEqual(bytes(0x1b, 0x5b, 0x4d, 0 + 32, 3 + 32, 3 + 32));
+    expect(buttonMouseBytes(0, false, true, false, 3, 3)).toEqual(bytes(0x1b, 0x5b, 0x4d, 32 + 32, 3 + 32, 3 + 32));
+  });
+
+  it("uses the agnostic button 3 for a legacy X10 release", () => {
+    expect(buttonMouseBytes(2, true, false, false, 3, 3)).toEqual(bytes(0x1b, 0x5b, 0x4d, 3 + 32, 3 + 32, 3 + 32));
+  });
+
+  it("clamps legacy coordinates at 223 and floors cells to 1", () => {
+    expect(buttonMouseBytes(0, false, false, false, 300, 300)).toEqual(
+      bytes(0x1b, 0x5b, 0x4d, 0 + 32, 223 + 32, 223 + 32),
+    );
+    expect(buttonMouseBytes(0, false, false, true, 0, -5)).toEqual(ascii("\x1b[<0;1;1M"));
   });
 });
 

@@ -82,6 +82,17 @@ export interface MobileLiveTerminalProps {
    *  Used instead of capture-window scrolling when the frame reports the
    *  pane is such an app. */
   forwardWheel: (up: boolean, sgr: boolean, col: number, row: number) => void;
+  /** Forward a mouse button press/drag/release to a full-screen mouse app.
+   *  Used only when the frame reports the pane is such an app (altScreen &&
+   *  mouse), so a click drives the app instead of selecting page text. */
+  forwardButton: (
+    baseButton: number,
+    release: boolean,
+    motion: boolean,
+    sgr: boolean,
+    col: number,
+    row: number,
+  ) => void;
   /** Virtual Ctrl modifier from the mobile toolbar. */
   ctrlActiveRef: RefObject<boolean>;
   clearCtrl: () => void;
@@ -208,6 +219,7 @@ export function MobileLiveTerminal({
   returnToLive,
   sendData,
   forwardWheel,
+  forwardButton,
   ctrlActiveRef,
   clearCtrl,
   inputRef,
@@ -429,6 +441,12 @@ export function MobileLiveTerminal({
   // touch Y while forwarding a single-finger drag.
   const wheelAccumRef = useRef(0);
   const touchForwardYRef = useRef<number | null>(null);
+  // Base button (0/1/2) of an in-progress forwarded mouse press, so drag/
+  // release only forward if the press was (latches like the TUI's
+  // `mouse_forward_btn`), plus the last forwarded cell so a pixel-granular
+  // drag emits at most one motion report per cell.
+  const forwardBtnRef = useRef<number | null>(null);
+  const lastForwardCellRef = useRef<{ col: number; row: number } | null>(null);
   useEffect(() => {
     rowsRef.current = screenRows || rowsRef.current;
   }, [screenRows]);
@@ -627,6 +645,60 @@ export function MobileLiveTerminal({
       forwardWheelDelta(e.deltaY * factor, e.clientX, e.clientY);
     },
     [lineH, forwardWheelDelta],
+  );
+
+  // Mouse button (click/drag) forwarding for a full-screen mouse app, the
+  // pointer analog of the wheel path above. Touch keeps its own scroll/drag
+  // handlers, so this is gated to physical mouse input; Shift stays local so
+  // the user can still select page text. Coordinates come from `pointerCell`.
+  const onPointerDown = useCallback(
+    (e: React.PointerEvent) => {
+      if (e.pointerType !== "mouse" || !forwardModeRef.current || e.shiftKey) return;
+      const base = e.button === 1 ? 1 : e.button === 2 ? 2 : e.button === 0 ? 0 : -1;
+      if (base < 0) return;
+      e.preventDefault();
+      // Keep the hidden input focused so the physical keyboard still types
+      // even though we suppressed the click's default focus.
+      inputRef.current?.focus();
+      const { col, row } = pointerCell(e.clientX, e.clientY);
+      forwardButton(base, false, false, mouseSgrRef.current, col, row);
+      forwardBtnRef.current = base;
+      lastForwardCellRef.current = { col, row };
+      try {
+        (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+      } catch {
+        // jsdom / unsupported: capture is a nicety, not required.
+      }
+    },
+    [pointerCell, forwardButton, inputRef],
+  );
+  const onPointerMove = useCallback(
+    (e: React.PointerEvent) => {
+      if (e.pointerType !== "mouse" || forwardBtnRef.current == null) return;
+      const { col, row } = pointerCell(e.clientX, e.clientY);
+      const last = lastForwardCellRef.current;
+      if (last && last.col === col && last.row === row) return; // one report per cell
+      e.preventDefault();
+      lastForwardCellRef.current = { col, row };
+      forwardButton(forwardBtnRef.current, false, true, mouseSgrRef.current, col, row);
+    },
+    [pointerCell, forwardButton],
+  );
+  const endPointerForward = useCallback(
+    (e: React.PointerEvent) => {
+      if (e.pointerType !== "mouse" || forwardBtnRef.current == null) return;
+      e.preventDefault();
+      const { col, row } = pointerCell(e.clientX, e.clientY);
+      forwardButton(forwardBtnRef.current, true, false, mouseSgrRef.current, col, row);
+      forwardBtnRef.current = null;
+      lastForwardCellRef.current = null;
+      try {
+        (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
+      } catch {
+        // Capture may never have been taken (see onPointerDown).
+      }
+    },
+    [pointerCell, forwardButton],
   );
 
   // --- pinch zoom (two-finger) ---------------------------------------------
@@ -1018,6 +1090,15 @@ export function MobileLiveTerminal({
         onScroll={onScroll}
         onWheel={onWheel}
         onClick={focusInputOnTap}
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={endPointerForward}
+        onPointerCancel={endPointerForward}
+        // A forwarded right-click is the app's to handle; don't pop the
+        // browser context menu over it.
+        onContextMenu={(e) => {
+          if (forwardModeRef.current) e.preventDefault();
+        }}
         onTouchStart={onTouchStart}
         onTouchMove={onTouchMove}
         onTouchEnd={onTouchEnd}

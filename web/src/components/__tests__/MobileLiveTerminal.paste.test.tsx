@@ -58,6 +58,7 @@ function renderTerm() {
       returnToLive={vi.fn()}
       sendData={sendData}
       forwardWheel={vi.fn()}
+      forwardButton={vi.fn()}
       ctrlActiveRef={createRef<boolean>() as React.RefObject<boolean>}
       clearCtrl={vi.fn()}
       inputRef={inputRef}
