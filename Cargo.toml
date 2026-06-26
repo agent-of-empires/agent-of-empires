@@ -22,9 +22,9 @@ clap_complete = "4.6"
 ratatui = { version = "0.30", features = ["crossterm"] }
 crossterm = { version = "0.29", features = ["event-stream"] }
 ansi-to-tui = "8.0"
-# In-process VT emulator for the experimental `AOE_VT_LIVE` live-preview path
-# (src/tui/home/vt_source.rs): parse a pane's raw byte stream into an owned grid
-# instead of scraping `capture-pane` snapshots.
+# In-process VT emulator for the default live-preview path (`src/tmux/vt.rs`,
+# opt out with `AOE_VT_LIVE=0`): parse a pane's raw byte stream into an owned
+# grid instead of scraping `capture-pane` snapshots.
 vt100 = "0.16"
 ratatui-textarea = "0.9"
 tui-input = "0.15"

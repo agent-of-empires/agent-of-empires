@@ -23,7 +23,7 @@ pub(crate) mod styles;
 pub use app::*;
 
 /// Entry point for the hidden `aoe __vt-pipe <socket>` helper subprocess used
-/// by the experimental `AOE_VT_LIVE` live-preview path. Copies the pane's piped
+/// by the `AOE_VT_LIVE` live-preview path (default on). Copies the pane's piped
 /// output (stdin) to the unix socket, unbuffered. Dispatched in `main` before
 /// clap so it stays off the CLI/docs surface.
 #[cfg(unix)]
@@ -89,11 +89,21 @@ struct TerminalGuard {
 
 impl TerminalGuard {
     fn enter(enable_mouse: bool, mosh_active: bool) -> Result<Self> {
+        // Roll back any already-applied state if a later step fails, so a
+        // partial enter (e.g. raw mode on, alternate screen failed) never
+        // leaves the shell wedged before a guard exists to restore it on drop.
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+        if let Err(err) = execute!(stdout, EnterAlternateScreen, EnableBracketedPaste) {
+            let _ = disable_raw_mode();
+            return Err(err.into());
+        }
         if enable_mouse {
-            execute!(stdout, EnableMouseCapture)?;
+            if let Err(err) = execute!(stdout, EnableMouseCapture) {
+                let _ = execute!(stdout, LeaveAlternateScreen, DisableBracketedPaste);
+                let _ = disable_raw_mode();
+                return Err(err.into());
+            }
         }
         Ok(Self {
             disable_mouse: !mosh_active,

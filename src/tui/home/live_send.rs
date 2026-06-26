@@ -714,6 +714,13 @@ impl LiveCaptureWorker {
                             vt_arm_attempted = true;
                             vt_source = crate::tmux::vt::VtChannel::acquire(&name);
                         }
+                        // A channel whose forwarder has disconnected stops
+                        // updating its grid; drop it and fall back to capture
+                        // for this pane (no re-arm until the target changes, so
+                        // we don't thrash on a permanently broken pane).
+                        if vt_source.as_ref().is_some_and(|v| !v.is_alive()) {
+                            vt_source = None;
+                        }
                         match vt_source.as_ref() {
                             Some(v) => {
                                 let (content, cur) = v.sample(lines);
@@ -921,14 +928,17 @@ fn dispatch_batch(tmux_name: &str, batch: Vec<WorkerMsg>) {
 fn dispatch_via_fork(tmux_name: &str, action: &TmuxAction) -> anyhow::Result<()> {
     use std::process::{Command, Stdio};
 
-    // Fast path (AOE_VT_LIVE): when a persistent input channel is armed for this
+    // Fast path (AOE_VT_LIVE): when a *live* input channel is armed for this
     // pane, ALL pane input goes through the socket, never `send-keys`. This is a
     // single-writer invariant: mixing the socket and `send-keys` would interleave
     // two writers on the one pty input stream and can corrupt multi-byte
     // sequences (tmux pipe-pane -I shares the input stream with no arbitration).
-    // Keys are encoded to bytes here using the pane's cursor-key mode (DECCKM)
-    // from the grid, since we bypass tmux's own key translation. `Resize` is not
-    // pane input (it's `resize-window`), so it still forks below.
+    // `input_mode` returns `Some` only while the forwarder is connected, so a
+    // not-yet-connected or dead channel reports `None` and input falls through
+    // to the `send-keys` fork below instead of vanishing. Keys are encoded to
+    // bytes here using the pane's cursor-key mode (DECCKM) from the grid, since
+    // we bypass tmux's own key translation. `Resize` is not pane input (it's
+    // `resize-window`), so it still forks below.
     #[cfg(unix)]
     if let Some(app_cursor) = crate::tmux::vt::input_mode(tmux_name) {
         if !matches!(action, TmuxAction::Resize { .. }) {

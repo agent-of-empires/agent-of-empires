@@ -95,13 +95,17 @@ fn lookup(session: &str) -> Option<Arc<VtChannel>> {
         .and_then(Weak::upgrade)
 }
 
-/// If `session` has an armed channel, return its current cursor-key mode
+/// If `session` has a *live* armed channel, return its current cursor-key mode
 /// (DECCKM): `Some(true)` = application cursor keys (`ESC O A`), `Some(false)` =
-/// normal (`ESC [ A`). `None` means no channel is armed. Presence of `Some` is
-/// the single-writer signal: while armed, ALL pane input must go through
-/// [`try_send_input`] (never `send-keys`), so the two writers don't interleave.
+/// normal (`ESC [ A`). `None` means no channel is armed, or its forwarder has
+/// disconnected. Presence of `Some` is the single-writer signal: while live,
+/// ALL pane input must go through [`try_send_input`] (never `send-keys`), so
+/// the two writers don't interleave. Gating on liveness means a dead channel
+/// reports `None` and input falls back to `send-keys` rather than vanishing.
 pub(crate) fn input_mode(session: &str) -> Option<bool> {
-    lookup(session).map(|c| c.app_cursor.load(Ordering::Relaxed))
+    lookup(session)
+        .filter(|c| c.is_alive())
+        .map(|c| c.app_cursor.load(Ordering::Relaxed))
 }
 
 /// Deliver raw `bytes` to `session`'s pane via its channel. Returns `true` if
@@ -276,6 +280,14 @@ pub(crate) struct VtChannel {
     stream: Arc<Mutex<Option<UnixStream>>>,
     /// DECCKM snapshot, refreshed by the reader thread on each grid change.
     app_cursor: Arc<AtomicBool>,
+    /// `true` while the forwarder is connected and the reader loop is running.
+    /// Set once `accept` publishes the writable half; cleared when the reader
+    /// exits (pipe EOF / socket error). `acquire` only returns after this goes
+    /// true, so a live channel is the single-writer; once it clears, input and
+    /// capture both fall back to the legacy tmux path instead of black-holing.
+    alive: Arc<AtomicBool>,
+    /// Owner-only (0700) directory holding `sock_path`; removed on drop.
+    sock_dir: PathBuf,
     sock_path: PathBuf,
     stop: Arc<AtomicBool>,
     reader: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -291,11 +303,19 @@ impl VtChannel {
     /// returned `Arc` keeps the channel alive; drop it to release this viewer's
     /// hold (the channel tears down when the last `Arc` drops).
     pub(crate) fn acquire(session: &str) -> Option<Arc<VtChannel>> {
-        let mut reg = REGISTRY.lock().unwrap();
-        if let Some(ch) = reg.get(session).and_then(Weak::upgrade) {
+        if let Some(ch) = lookup(session) {
             return Some(ch);
         }
+        // Arm WITHOUT holding the registry lock: `arm` blocks up to ~500ms
+        // waiting for the forwarder to connect, and the global lock is taken on
+        // every `input_mode` / `try_send_input` for every session, so holding it
+        // that long would stall all pane input. Re-check under the lock and
+        // prefer a channel another thread armed in the meantime (ours drops).
         let ch = Arc::new(Self::arm(session)?);
+        let mut reg = REGISTRY.lock().unwrap();
+        if let Some(existing) = reg.get(session).and_then(Weak::upgrade) {
+            return Some(existing);
+        }
         reg.insert(session.to_string(), Arc::downgrade(&ch));
         Some(ch)
     }
@@ -311,11 +331,24 @@ impl VtChannel {
         let seeded = Arc::new(AtomicBool::new(false));
         let stream: Arc<Mutex<Option<UnixStream>>> = Arc::new(Mutex::new(None));
         let app_cursor = Arc::new(AtomicBool::new(false));
+        let alive = Arc::new(AtomicBool::new(false));
 
+        // Bind the socket inside an owner-only (0700) directory so other users
+        // on a shared host cannot connect to the pane channel and capture
+        // keystrokes or spoof rendered output (mirrors the worker-dir
+        // convention in `src/process/worker.rs`). On macOS/BSD the socket
+        // file's own mode is ignored by `connect`, so the 0700 parent is the
+        // real gate; the short per-channel path also stays well under the
+        // macOS `sun_path` limit.
         let n = SOCK_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let sock_path =
-            std::env::temp_dir().join(format!("aoe-vt-{}-{n}.sock", std::process::id()));
-        let _ = std::fs::remove_file(&sock_path);
+        let sock_dir = std::env::temp_dir().join(format!("aoe-vt-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&sock_dir);
+        std::fs::create_dir_all(&sock_dir).ok()?;
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&sock_dir, std::fs::Permissions::from_mode(0o700)).ok()?;
+        }
+        let sock_path = sock_dir.join("s.sock");
         let listener = UnixListener::bind(&sock_path).ok()?;
 
         let reader = {
@@ -324,6 +357,7 @@ impl VtChannel {
             let seeded = seeded.clone();
             let stream = stream.clone();
             let app_cursor = app_cursor.clone();
+            let alive = alive.clone();
             std::thread::spawn(move || {
                 let Ok((conn, _)) = listener.accept() else {
                     return;
@@ -332,6 +366,9 @@ impl VtChannel {
                 if let Ok(w) = conn.try_clone() {
                     *stream.lock().unwrap() = Some(w);
                 }
+                // The forwarder is connected: the channel is now the live
+                // single-writer. `acquire` is blocked until this flips.
+                alive.store(true, Ordering::Relaxed);
                 let mut conn = conn;
                 let _ = conn.set_read_timeout(Some(Duration::from_millis(200)));
                 let mut buf = [0u8; 8192];
@@ -356,6 +393,10 @@ impl VtChannel {
                         Err(_) => break,
                     }
                 }
+                // Reader is exiting (pipe EOF / socket error / stop): the
+                // forwarder is gone, so the channel is no longer the live
+                // single-writer. Input dispatch and capture both fall back.
+                alive.store(false, Ordering::Relaxed);
             })
         };
 
@@ -374,8 +415,30 @@ impl VtChannel {
             stop.store(true, Ordering::Relaxed);
             let _ = UnixStream::connect(&sock_path);
             let _ = reader.join();
-            let _ = std::fs::remove_file(&sock_path);
+            let _ = std::fs::remove_dir_all(&sock_dir);
             return None;
+        }
+
+        // Wait for the forwarder to actually connect before publishing the
+        // channel. `input_mode` treats a live channel as the single-writer and
+        // sends ALL pane input through the socket; if we returned during this
+        // startup gap, early keystrokes would hit a not-yet-connected socket
+        // and be dropped instead of falling back to `send-keys`. If the
+        // forwarder never connects, tear down and fall back to capture.
+        let connect_deadline = Instant::now() + Duration::from_millis(500);
+        while !alive.load(Ordering::Relaxed) {
+            if Instant::now() >= connect_deadline {
+                tracing::warn!(%target, "vt: forwarder did not connect; falling back to capture");
+                stop.store(true, Ordering::Relaxed);
+                let _ = Command::new("tmux")
+                    .args(["pipe-pane", "-t", &target])
+                    .output();
+                let _ = UnixStream::connect(&sock_path);
+                let _ = reader.join();
+                let _ = std::fs::remove_dir_all(&sock_dir);
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(2));
         }
 
         // Reconstruct the app's terminal modes from tmux's flags before seeding.
@@ -425,6 +488,8 @@ impl VtChannel {
             parser,
             stream,
             app_cursor,
+            alive,
+            sock_dir,
             sock_path,
             stop,
             reader: Mutex::new(Some(reader)),
@@ -478,6 +543,14 @@ impl VtChannel {
         (content, Some(cursor))
     }
 
+    /// Whether the forwarder is connected and the reader loop is running. A
+    /// channel that never connected, or whose pipe has since closed, reports
+    /// `false` so input and capture fall back to the legacy tmux path instead
+    /// of writing into a dead socket or sampling a frozen grid.
+    pub(crate) fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Relaxed)
+    }
+
     fn write_input(&self, bytes: &[u8]) -> bool {
         use std::io::Write;
         let mut guard = self.stream.lock().unwrap();
@@ -508,7 +581,8 @@ impl Drop for VtChannel {
         if let Some(h) = self.reader.lock().unwrap().take() {
             let _ = h.join();
         }
-        let _ = std::fs::remove_file(&self.sock_path);
+        // Remove the whole per-channel 0700 dir (socket included).
+        let _ = std::fs::remove_dir_all(&self.sock_dir);
     }
 }
 
