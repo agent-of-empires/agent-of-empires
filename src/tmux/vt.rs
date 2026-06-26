@@ -169,6 +169,24 @@ fn pane_modes(target: &str) -> Option<(bool, bool, bool)> {
     Some((alt, mouse, sgr))
 }
 
+/// Translate bare LF to CRLF so `capture-pane` seed rows (LF-separated) each
+/// start at column 0 in the parser instead of staircasing off the previous
+/// row's end column. An existing CR is left alone, so a stream that already
+/// uses CRLF is unchanged. `capture-pane` never emits CR, so in practice this
+/// just inserts one before each LF.
+fn lf_to_crlf(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len() + raw.len() / 40 + 8);
+    let mut prev = 0u8;
+    for &b in raw {
+        if b == b'\n' && prev != b'\r' {
+            out.push(b'\r');
+        }
+        out.push(b);
+        prev = b;
+    }
+    out
+}
+
 /// `pipe-pane -I` (input injection) landed in tmux 2.8, and a dead-pane write
 /// crash was fixed in 3.4, so we require >= 3.4 before arming a channel. Older
 /// tmux (or a `tmux -V` we can't parse) falls back to the capture path. Cached:
@@ -630,7 +648,13 @@ impl VtChannel {
                 if !prefix.is_empty() {
                     p.process(&prefix);
                 }
-                p.process(&out.stdout);
+                // `capture-pane` separates rows with a bare LF, but the parser
+                // needs a CR to return to column 0 - without it each seeded row
+                // starts at the previous row's end column and the screen
+                // staircases. The first live repaint normally masks this, but
+                // an idle pane that never repaints (or one whose repaint is
+                // dropped) would render the seed staircased. Translate to CRLF.
+                p.process(&lf_to_crlf(&out.stdout));
                 app_cursor.store(p.screen().application_cursor(), Ordering::Relaxed);
             }
         }
@@ -800,6 +824,51 @@ mod tests {
             !content.contains("\x1b[10C") && !content.contains("\x1b[C"),
             "cursor-forward escape leaked:\n{content:?}"
         );
+    }
+
+    #[test]
+    fn lf_to_crlf_unstaircases_seed_rows() {
+        // capture-pane joins rows with bare LF; fed raw, the vt100 parser
+        // staircases each row off the previous one's end column. lf_to_crlf
+        // must make every row start at column 0 (regression: an idle/parked
+        // prompt whose seed never gets a live repaint rendered staircased,
+        // putting the cursor on the wrong row).
+        let raw = b"line-1\nline-2\nREADY> ";
+        let mut staircased = vt100::Parser::new(6, 40, 0);
+        staircased.process(raw);
+        assert_eq!(
+            staircased
+                .screen()
+                .cell(1, 0)
+                .map(|c| c.contents())
+                .as_deref(),
+            Some(""),
+            "control: bare LF should staircase (row 1 col 0 empty)"
+        );
+
+        let mut fixed = vt100::Parser::new(6, 40, 0);
+        fixed.process(&lf_to_crlf(raw));
+        assert_eq!(
+            fixed.screen().cell(0, 0).map(|c| c.contents()).as_deref(),
+            Some("l"),
+            "row 0 starts at col 0"
+        );
+        assert_eq!(
+            fixed.screen().cell(1, 0).map(|c| c.contents()).as_deref(),
+            Some("l"),
+            "row 1 must start at col 0, not staircase"
+        );
+        assert_eq!(
+            fixed.screen().cell(2, 0).map(|c| c.contents()).as_deref(),
+            Some("R"),
+            "prompt row starts at col 0"
+        );
+    }
+
+    #[test]
+    fn lf_to_crlf_leaves_existing_crlf_alone() {
+        assert_eq!(lf_to_crlf(b"a\r\nb"), b"a\r\nb");
+        assert_eq!(lf_to_crlf(b"a\nb"), b"a\r\nb");
     }
 
     #[test]
