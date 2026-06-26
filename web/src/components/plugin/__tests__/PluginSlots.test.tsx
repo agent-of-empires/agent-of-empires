@@ -149,6 +149,12 @@ describe("plugin slot renderers", () => {
     await waitFor(() => expect(container.querySelectorAll("svg")).toHaveLength(2));
     // Icon-only links must carry an accessible name from the tooltip.
     expect(screen.getByRole("link", { name: "PR #1" })).toBeTruthy();
+    // Icon-only badges size to the icon: no text truncation (which clipped the
+    // icon), and shrink-0 so the row's flex cannot squeeze them.
+    for (const link of links) {
+      expect(link.className).not.toContain("truncate");
+      expect(link.className).toContain("shrink-0");
+    }
   });
 
   it("row-badge empty items clears the row (renders nothing)", () => {

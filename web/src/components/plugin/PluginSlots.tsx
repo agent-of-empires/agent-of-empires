@@ -67,7 +67,11 @@ function BadgeChip({
   const iconComp = lucideIcon(icon);
   if (!iconComp && !text) return null;
   const safe = safeHref(href);
-  const className = `inline-flex max-w-48 min-w-0 items-center gap-1 truncate font-mono text-[11px] px-1.5 py-0.5 rounded-full ${toneClasses(tone)}`;
+  // Truncation is only for text badges; an icon-only badge must size to its
+  // icon. Without this guard `truncate` (overflow-hidden) + `min-w-0` let the
+  // row's flex squeeze the chip and clip the icon (it overflowed to the right).
+  const fit = text ? "max-w-48 min-w-0 truncate" : "shrink-0";
+  const className = `inline-flex items-center gap-1 font-mono text-[11px] px-1.5 py-0.5 rounded-full ${fit} ${toneClasses(tone)}`;
   const inner = (
     <>
       {iconComp && createElement(iconComp, { className: "size-3 shrink-0", "aria-hidden": true })}
