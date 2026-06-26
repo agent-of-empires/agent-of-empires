@@ -200,7 +200,12 @@ export default function App() {
   return (
     <IdleDecayWindowContext.Provider value={idleDecayWindowMs}>
       <UnreadIndicatorContext.Provider value={unreadIndicatorEnabled}>
-        <AppContent loginRequired={loginRequired} onLogout={handleLogout} />
+        {/* PluginUiProvider must sit above AppContent: AppContent itself reads
+            the plugin UI snapshot (usePluginPanes), so the provider can't live
+            inside its own return. */}
+        <PluginUiProvider>
+          <AppContent loginRequired={loginRequired} onLogout={handleLogout} />
+        </PluginUiProvider>
         <ElevationPrompt />
       </UnreadIndicatorContext.Provider>
     </IdleDecayWindowContext.Provider>
@@ -1487,167 +1492,165 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
 
   return (
     <AcpPrefsProvider value={acpPrefs}>
-      <PluginUiProvider>
-        <div className="h-dvh flex flex-col bg-surface-900 text-text-primary overflow-hidden safe-area-inset">
-          <TopBar
-            activeWorkspace={activeWorkspace}
-            activeSession={activeSession ?? null}
-            onToggleSidebar={handleToggleSidebar}
-            onOpenPalette={() => setShowPalette(true)}
-            onToggleDiff={toggleDiff}
-            paneIds={allPaneIds}
-            paneDescriptor={paneDescriptor}
-            isPaneOpen={isPaneOpen}
-            onTogglePane={togglePaneAny}
-            onOpenHelp={handleOpenHelp}
-            onOpenAbout={handleOpenAbout}
-            onStartTutorial={tour.startTour}
-            onLogout={onLogout}
-            loginRequired={loginRequired}
-            isOffline={!!error}
-            isDevBuild={isDebugBuild(serverAbout)}
-            onOpenTips={tips.open}
-            onGoDashboard={handleGoDashboard}
-            sidebarColumnVisible={!showSettings && sidebarOpen}
-            rightColumnVisible={isMdUp && !showSettings && !!activeWorkspace && !!activeSession && !rightDockCollapsed}
-          />
+      <div className="h-dvh flex flex-col bg-surface-900 text-text-primary overflow-hidden safe-area-inset">
+        <TopBar
+          activeWorkspace={activeWorkspace}
+          activeSession={activeSession ?? null}
+          onToggleSidebar={handleToggleSidebar}
+          onOpenPalette={() => setShowPalette(true)}
+          onToggleDiff={toggleDiff}
+          paneIds={allPaneIds}
+          paneDescriptor={paneDescriptor}
+          isPaneOpen={isPaneOpen}
+          onTogglePane={togglePaneAny}
+          onOpenHelp={handleOpenHelp}
+          onOpenAbout={handleOpenAbout}
+          onStartTutorial={tour.startTour}
+          onLogout={onLogout}
+          loginRequired={loginRequired}
+          isOffline={!!error}
+          isDevBuild={isDebugBuild(serverAbout)}
+          onOpenTips={tips.open}
+          onGoDashboard={handleGoDashboard}
+          sidebarColumnVisible={!showSettings && sidebarOpen}
+          rightColumnVisible={isMdUp && !showSettings && !!activeWorkspace && !!activeSession && !rightDockCollapsed}
+        />
 
-          <DisconnectBanner />
-          <UpdateBanner />
-          <DashboardUpdateBanner />
+        <DisconnectBanner />
+        <UpdateBanner />
+        <DashboardUpdateBanner />
 
-          <div className="flex flex-1 min-h-0">
-            {!showSettings && (
-              <WorkspaceSidebar
-                groups={sidebarGroups}
-                nestedGroups={nestedGroups}
-                onToggleSubgroup={toggleSubgroupCollapsed}
-                onReorderWorkspaces={handleReorderWorkspaces}
-                onReorderGroups={reorderRepoGroups}
-                activeId={activeWorkspace?.id ?? null}
-                open={sidebarOpen}
-                onToggle={() => setSidebarOpen(false)}
-                onSelect={handleSelectWorkspace}
-                onToggleGroup={toggleSidebarGroup}
-                onUpdateRepoAppearance={updateRepoAppearance}
-                onNew={() => {
-                  setWizardPrefill(undefined);
-                  setShowSessionWizard(true);
-                }}
-                onCreateSession={handleCreateSession}
-                onPinProject={handlePinProject}
-                onUnpinProject={handleUnpinProject}
-                savedProjects={savedProjects}
-                onAddProject={handleAddProject}
-                onEditProject={handleEditProject}
-                onRemoveProject={handleRemoveProject}
-                onSettings={handleOpenSettings}
-                onDeleteSession={handleDeleteSession}
-                onStopSession={handleStopSession}
-                onStartSession={handleStartSession}
-                readOnly={serverAbout?.read_only}
-                sortMode={sidebarSortMode}
-                onSortModeChange={setSidebarSortMode}
-                axis={sidebarAxis}
-                onAxisChange={setSidebarAxis}
-              />
-            )}
-
-            <div className="flex-1 flex flex-col min-h-0 min-w-0">{renderContent()}</div>
-          </div>
-
-          {showSessionWizard && (
-            <SessionWizard
-              onClose={() => {
-                setShowSessionWizard(false);
+        <div className="flex flex-1 min-h-0">
+          {!showSettings && (
+            <WorkspaceSidebar
+              groups={sidebarGroups}
+              nestedGroups={nestedGroups}
+              onToggleSubgroup={toggleSubgroupCollapsed}
+              onReorderWorkspaces={handleReorderWorkspaces}
+              onReorderGroups={reorderRepoGroups}
+              activeId={activeWorkspace?.id ?? null}
+              open={sidebarOpen}
+              onToggle={() => setSidebarOpen(false)}
+              onSelect={handleSelectWorkspace}
+              onToggleGroup={toggleSidebarGroup}
+              onUpdateRepoAppearance={updateRepoAppearance}
+              onNew={() => {
                 setWizardPrefill(undefined);
+                setShowSessionWizard(true);
               }}
-              onCreated={(session?: SessionResponse) => {
-                if (session) {
-                  injectSession(session);
-                  navigate(`/session/${encodeURIComponent(session.id)}`);
-                  if (window.innerWidth < 768) setSidebarOpen(false);
-                }
-                setShowSessionWizard(false);
-                setWizardPrefill(undefined);
-              }}
-              prefill={wizardPrefill}
+              onCreateSession={handleCreateSession}
+              onPinProject={handlePinProject}
+              onUnpinProject={handleUnpinProject}
+              savedProjects={savedProjects}
+              onAddProject={handleAddProject}
+              onEditProject={handleEditProject}
+              onRemoveProject={handleRemoveProject}
+              onSettings={handleOpenSettings}
+              onDeleteSession={handleDeleteSession}
+              onStopSession={handleStopSession}
+              onStartSession={handleStartSession}
+              readOnly={serverAbout?.read_only}
+              sortMode={sidebarSortMode}
+              onSortModeChange={setSidebarSortMode}
+              axis={sidebarAxis}
+              onAxisChange={setSidebarAxis}
             />
           )}
 
-          {projectForm && (
-            <ProjectFormModal
-              initial={projectForm.editProject}
-              onClose={() => setProjectForm(null)}
-              onSaved={() => refreshProjects()}
-            />
-          )}
-
-          {welcome.showWelcome && <ThemeIntro onDone={welcome.dismissWelcome} />}
-
-          {tour.tourElement}
-
-          {showHelp && <HelpOverlay onClose={() => setShowHelp(false)} />}
-
-          {tips.isOpen && (
-            <TipsModal
-              tips={tips.tips}
-              startIndex={tips.startIndex}
-              enabled={tips.enabled}
-              onMarkSeen={tips.markSeen}
-              onSetEnabled={tips.setEnabled}
-              onClose={tips.close}
-            />
-          )}
-
-          {showAbout && <AboutModal onClose={() => setShowAbout(false)} sessionId={activeSessionId} />}
-          {telemetryConsentNeeded && <TelemetryConsentModal onChoose={handleTelemetryConsent} />}
-
-          {deletingSession && (
-            <DeleteSessionDialog
-              sessionTitle={deletingSession.title}
-              branchName={deletingSession.branch}
-              hasManagedWorktree={deletingSession.has_cleanable_worktree ?? false}
-              isSandboxed={deletingSession.is_sandboxed}
-              isScratch={deletingSession.scratch}
-              cleanupDefaults={deletingSession.cleanup_defaults}
-              onConfirm={handleConfirmDelete}
-              onCancel={() => setDeletingWorkspaceId(null)}
-            />
-          )}
-
-          {stoppingSession && (
-            <StopSessionDialog
-              sessionTitle={stoppingSession.title}
-              onConfirm={handleConfirmStop}
-              onCancel={() => setStoppingWorkspaceId(null)}
-            />
-          )}
-
-          <CommandPalette
-            open={showPalette}
-            onClose={() => setShowPalette(false)}
-            actions={[...commandActions, ...settingsCommands]}
-          />
-
-          {activeWorkspace && activeSession && (
-            <MobileRightPanelPicker
-              open={pickerOpen && singlePane}
-              active={rightPanelView}
-              onSelect={handlePickView}
-              onClose={() => setPickerOpen(false)}
-            />
-          )}
-
-          <textarea
-            ref={keyboardProxyRef}
-            aria-hidden="true"
-            tabIndex={-1}
-            className="fixed opacity-0 w-0 h-0 pointer-events-none"
-            style={{ top: -9999, left: -9999 }}
-          />
+          <div className="flex-1 flex flex-col min-h-0 min-w-0">{renderContent()}</div>
         </div>
-      </PluginUiProvider>
+
+        {showSessionWizard && (
+          <SessionWizard
+            onClose={() => {
+              setShowSessionWizard(false);
+              setWizardPrefill(undefined);
+            }}
+            onCreated={(session?: SessionResponse) => {
+              if (session) {
+                injectSession(session);
+                navigate(`/session/${encodeURIComponent(session.id)}`);
+                if (window.innerWidth < 768) setSidebarOpen(false);
+              }
+              setShowSessionWizard(false);
+              setWizardPrefill(undefined);
+            }}
+            prefill={wizardPrefill}
+          />
+        )}
+
+        {projectForm && (
+          <ProjectFormModal
+            initial={projectForm.editProject}
+            onClose={() => setProjectForm(null)}
+            onSaved={() => refreshProjects()}
+          />
+        )}
+
+        {welcome.showWelcome && <ThemeIntro onDone={welcome.dismissWelcome} />}
+
+        {tour.tourElement}
+
+        {showHelp && <HelpOverlay onClose={() => setShowHelp(false)} />}
+
+        {tips.isOpen && (
+          <TipsModal
+            tips={tips.tips}
+            startIndex={tips.startIndex}
+            enabled={tips.enabled}
+            onMarkSeen={tips.markSeen}
+            onSetEnabled={tips.setEnabled}
+            onClose={tips.close}
+          />
+        )}
+
+        {showAbout && <AboutModal onClose={() => setShowAbout(false)} sessionId={activeSessionId} />}
+        {telemetryConsentNeeded && <TelemetryConsentModal onChoose={handleTelemetryConsent} />}
+
+        {deletingSession && (
+          <DeleteSessionDialog
+            sessionTitle={deletingSession.title}
+            branchName={deletingSession.branch}
+            hasManagedWorktree={deletingSession.has_cleanable_worktree ?? false}
+            isSandboxed={deletingSession.is_sandboxed}
+            isScratch={deletingSession.scratch}
+            cleanupDefaults={deletingSession.cleanup_defaults}
+            onConfirm={handleConfirmDelete}
+            onCancel={() => setDeletingWorkspaceId(null)}
+          />
+        )}
+
+        {stoppingSession && (
+          <StopSessionDialog
+            sessionTitle={stoppingSession.title}
+            onConfirm={handleConfirmStop}
+            onCancel={() => setStoppingWorkspaceId(null)}
+          />
+        )}
+
+        <CommandPalette
+          open={showPalette}
+          onClose={() => setShowPalette(false)}
+          actions={[...commandActions, ...settingsCommands]}
+        />
+
+        {activeWorkspace && activeSession && (
+          <MobileRightPanelPicker
+            open={pickerOpen && singlePane}
+            active={rightPanelView}
+            onSelect={handlePickView}
+            onClose={() => setPickerOpen(false)}
+          />
+        )}
+
+        <textarea
+          ref={keyboardProxyRef}
+          aria-hidden="true"
+          tabIndex={-1}
+          className="fixed opacity-0 w-0 h-0 pointer-events-none"
+          style={{ top: -9999, left: -9999 }}
+        />
+      </div>
     </AcpPrefsProvider>
   );
 }
