@@ -223,16 +223,17 @@ fn wheel_mouse_bytes(
     }
 }
 
-/// Arrow presses delivered per wheel notch when emulating alternate-scroll
-/// for a no-mouse full-screen app. Matches tmux's own alternate-scroll step
-/// and the capture-window `STEP` in `handle_scroll_up`.
-const WHEEL_ARROW_STEP: usize = 3;
+/// Page presses delivered per wheel notch for a no-mouse full-screen app.
+/// One page per notch: full-screen apps that scroll on `PageUp`/`PageDown`
+/// (Claude Code's fullscreen renderer is the motivating case) have no finer
+/// keyboard step, and a page per notch reads as a normal "flick to scroll".
+const WHEEL_PAGE_STEP: usize = 1;
 
-/// Decide what to forward to a full-screen live-send pane for one wheel
+/// Decide what to forward to the previewed full-screen pane for one wheel
 /// notch, or `None` to fall back to the capture-window scroll. Pure so the
-/// branch the fix turns on (named arrow keys vs. raw mouse bytes vs. no
-/// forward) is asserted directly, without standing up a worker. See
-/// `forward_wheel_to_live_pane` for the full rationale.
+/// branch the fix turns on (page keys vs. raw mouse bytes vs. no forward) is
+/// asserted directly, without standing up a worker. See
+/// `forward_wheel_to_preview` for the full rationale.
 fn wheel_forward_key(
     cursor: &crate::tmux::PaneCursor,
     up: bool,
@@ -252,9 +253,14 @@ fn wheel_forward_key(
             row,
         )))
     } else {
+        // No mouse tracking: send `PageUp`/`PageDown`, NOT arrow keys. A
+        // full-screen app reads arrow keys as cursor / input-history
+        // navigation, not scroll (Claude Code 2.1.x even surfaces "Scroll
+        // wheel is sending arrow keys, use PgUp/PgDn to scroll"). The page
+        // keys scroll its transcript regardless of cursor-key mode.
         Some(live_send::TmuxKey::NamedRepeat {
-            name: if up { "Up" } else { "Down" }.to_string(),
-            count: WHEEL_ARROW_STEP,
+            name: if up { "PageUp" } else { "PageDown" }.to_string(),
+            count: WHEEL_PAGE_STEP,
         })
     }
 }
@@ -3324,45 +3330,33 @@ impl HomeView {
         }
     }
 
-    /// Route a mouse-wheel-up at (col, row) to the pane under the cursor:
-    /// diff view (if open) → diff scroll; list pane → list cursor up;
-    /// preview pane → preview scroll. Returns `true` if the UI should
-    /// redraw. Scrolls do not cross pane boundaries: a wheel over the
-    /// preview never moves the list cursor, even when the preview is at
-    /// its scroll boundary or has no session selected.
-    /// When a live-send target is a full-screen (alternate-screen) app, the
-    /// preview's capture-window scroll is useless: the alternate screen has
-    /// no scrollback, so growing the window only exposes the unrelated
-    /// normal-buffer history underneath and the view bottoms out at the
-    /// session's start. Instead, forward the wheel to the app so it scrolls
-    /// its OWN content, exactly as a terminal does on direct attach. Two
-    /// cases, branched on what the app asked for:
+    /// Forward one wheel notch to the previewed full-screen (alternate-screen)
+    /// pane so it scrolls its OWN content, exactly as a terminal does on
+    /// direct attach. Active in BOTH live-send and passive preview: the
+    /// alternate screen has no scrollback, so the preview's capture-window
+    /// scroll is inert there (growing the window only exposes the unrelated
+    /// normal-buffer history and bottoms out at the session start), and
+    /// forwarding is the only way to reach the agent's history. Branched on
+    /// what the app asked for (see `wheel_forward_key`):
     ///
-    /// * **Mouse tracking on** (`mouse_tracking`): forward the wheel as a
-    ///   mouse event, the encoding following the app (SGR 1006 when
-    ///   `mouse_sgr` is set, otherwise the legacy X10 encoding).
-    /// * **Mouse tracking off**: an alternate-screen app with no mouse mode
-    ///   gets its wheel via the terminal's alternate-scroll behavior, which
-    ///   turns the wheel into cursor-key presses. tmux does this for any
-    ///   such pane on attach (`alternate-scroll`, on by default), so we
-    ///   replicate it: send `Up`/`Down` instead of raw mouse bytes (which
-    ///   the app would read as garbage keystrokes). Claude Code's fullscreen
-    ///   renderer is the motivating case: it sets `1049h` + `1007h` but
-    ///   never requests mouse tracking, and binds the arrow keys to scroll
-    ///   in that mode (#2407). `send-keys -N` renders all 3 presses in the
-    ///   pane's current application-cursor-key mode in a single fork; the
-    ///   step matches tmux's own alternate-scroll and the capture `STEP`.
+    /// * **Mouse tracking on**: forward the wheel as a mouse event, encoding
+    ///   following the app (SGR 1006 when `mouse_sgr` is set, else legacy
+    ///   X10). The previewed pane is sized to the preview rect in both modes
+    ///   (`preview_pane_synced` / the live-send sync resize), so the mapped
+    ///   coordinates land inside it.
+    /// * **Mouse tracking off**: send `PageUp`/`PageDown`, not arrow keys. A
+    ///   full-screen app reads arrows as cursor / input-history navigation,
+    ///   not scroll; the page keys scroll its transcript regardless of mode.
+    ///   Claude Code's fullscreen renderer is the motivating case (#2407).
     ///
-    /// Only alternate-screen panes are forwarded; on the normal buffer the
-    /// capture-window scroll reaches real scrollback, so the caller keeps
-    /// it. Returns true when the event was forwarded.
-    fn forward_wheel_to_live_pane(&self, up: bool, col: u16, row: u16) -> bool {
-        if self.live_send.is_none() {
-            return false;
-        }
-        let Some(worker) = &self.live_send_worker else {
-            return false;
-        };
+    /// Normal-buffer panes get `None` from `wheel_forward_key`, so the caller
+    /// keeps the capture-window scroll (which reaches real scrollback there).
+    ///
+    /// In live-send the key rides the ordered `LiveSendWorker` so it stays in
+    /// sequence with typed keystrokes. In passive preview there is no worker,
+    /// so it goes out as a one-shot fork to the previewed pane's tmux target.
+    /// Returns true when the event was forwarded.
+    fn forward_wheel_to_preview(&self, up: bool, col: u16, row: u16) -> bool {
         let cursor = self
             .preview_capture_worker
             .as_ref()
@@ -3372,7 +3366,17 @@ impl HomeView {
         else {
             return false;
         };
-        worker.send(key);
+        // Live-send: keep scroll ordered against typed keystrokes via the
+        // long-lived worker. Passive preview: no worker exists, so fork a
+        // one-shot send to whatever pane the capture worker is showing.
+        if let Some(worker) = &self.live_send_worker {
+            worker.send(key);
+            return true;
+        }
+        let Some(target) = self.preview_capture_target.as_deref() else {
+            return false;
+        };
+        live_send::send_key_oneshot(target, key);
         true
     }
 
@@ -3411,9 +3415,10 @@ impl HomeView {
         if self.selected_session.is_none() {
             return false;
         }
-        // Full-screen mouse app under live-send: send the wheel to the app
-        // instead of scrolling the (irrelevant) normal-buffer capture.
-        if self.forward_wheel_to_live_pane(true, col, row) {
+        // Full-screen (alternate-screen) app: send the wheel to the app
+        // instead of scrolling the (irrelevant) normal-buffer capture. Fires
+        // in both live-send and passive preview.
+        if self.forward_wheel_to_preview(true, col, row) {
             self.preview_scroll_offset = 0;
             return true;
         }
@@ -4392,9 +4397,9 @@ impl HomeView {
         if self.selected_session.is_none() {
             return false;
         }
-        // Mirror handle_scroll_up: a full-screen mouse app gets the wheel
+        // Mirror handle_scroll_up: a full-screen app gets the wheel
         // forwarded rather than moving the preview's capture window.
-        if self.forward_wheel_to_live_pane(false, col, row) {
+        if self.forward_wheel_to_preview(false, col, row) {
             self.preview_scroll_offset = 0;
             return true;
         }
@@ -5269,26 +5274,27 @@ mod tests {
     }
 
     /// The fix for #2407: a full-screen pane with no mouse tracking must
-    /// forward named arrow keys (repeated per notch), NOT raw mouse bytes.
-    /// Asserting the key variant guards against a regression to mouse-byte
-    /// forwarding that the preview-offset behavioral test can't catch.
+    /// forward `PageUp`/`PageDown`, NOT arrow keys (which an app reads as
+    /// cursor / input-history navigation, not scroll) and NOT raw mouse
+    /// bytes. Asserting the key variant guards against a regression to
+    /// either that the preview-offset behavioral test can't catch.
     #[test]
-    fn wheel_forward_key_no_mouse_alt_screen_is_arrow_repeat() {
+    fn wheel_forward_key_no_mouse_alt_screen_is_page_key() {
         use ratatui::layout::Rect;
         let pane = Rect::new(0, 0, 80, 24);
         let cursor = cursor_for(true, false, false);
         assert_eq!(
             wheel_forward_key(&cursor, true, pane, 10, 10),
             Some(live_send::TmuxKey::NamedRepeat {
-                name: "Up".into(),
-                count: WHEEL_ARROW_STEP,
+                name: "PageUp".into(),
+                count: WHEEL_PAGE_STEP,
             })
         );
         assert_eq!(
             wheel_forward_key(&cursor, false, pane, 10, 10),
             Some(live_send::TmuxKey::NamedRepeat {
-                name: "Down".into(),
-                count: WHEEL_ARROW_STEP,
+                name: "PageDown".into(),
+                count: WHEEL_PAGE_STEP,
             })
         );
     }

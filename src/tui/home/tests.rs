@@ -8893,6 +8893,30 @@ mod scroll_pane_isolation {
         env
     }
 
+    /// Like `live_env_with_cursor` but WITHOUT entering live-send: the
+    /// session is merely previewed (the common "hover the preview" case).
+    /// No `live_send` / `live_send_worker`; the capture worker and its
+    /// target are set so `forward_wheel_to_preview` can take the passive
+    /// one-shot path.
+    fn passive_env_with_cursor(cursor: crate::tmux::PaneCursor) -> TestEnv {
+        let mut env = create_test_env_with_sessions(3);
+        setup_panes(&mut env);
+        env.view.cursor = 1;
+        env.view.update_selected();
+        env.view.preview_cache.dimensions = (80, 24);
+        env.view.preview_cache.captured_lines = 200;
+        env.view.preview_scroll_offset = 10;
+        env.view
+            .sync_preview_capture_worker(Some("fake".to_string()));
+        env.view.preview_capture_target = Some("fake".to_string());
+        env.view
+            .preview_capture_worker
+            .as_ref()
+            .expect("capture worker spawned")
+            .set_cursor_for_test(Some(cursor));
+        env
+    }
+
     fn alt_screen_cursor(
         alternate_on: bool,
         mouse_tracking: bool,
@@ -8935,14 +8959,13 @@ mod scroll_pane_isolation {
     }
 
     /// A full-screen app WITHOUT mouse tracking (e.g. Claude Code's
-    /// fullscreen renderer: `1049h` + `1007h`, no mouse) relies on the
-    /// terminal's alternate-scroll to turn the wheel into cursor keys. The
-    /// raw SGR/X10 bytes would land as garbage keystrokes, so we forward
-    /// `Up`/`Down` named keys instead and pin the preview to the live edge,
-    /// just like the mouse-tracking case. Regression test for #2407.
+    /// fullscreen renderer: `1049h` + `1007h`, no mouse) does not scroll on
+    /// arrow keys (it reads them as cursor / input-history navigation), so we
+    /// forward `PageUp`/`PageDown` named keys instead and pin the preview to
+    /// the live edge, just like the mouse-tracking case. Regression for #2407.
     #[test]
     #[serial]
-    fn wheel_over_alt_screen_without_mouse_forwards_arrow_keys() {
+    fn wheel_over_alt_screen_without_mouse_forwards_page_keys() {
         let mut env = live_env_with_cursor(alt_screen_cursor(true, false, false));
 
         let up = env.view.handle_scroll_up(50, 10);
@@ -8950,6 +8973,37 @@ mod scroll_pane_isolation {
         assert_eq!(
             env.view.preview_scroll_offset, 0,
             "arrow-key forwarding pins the preview to the live edge, never the normal-buffer history"
+        );
+
+        env.view.preview_scroll_offset = 10;
+        let down = env.view.handle_scroll_down(50, 10);
+        assert!(down);
+        assert_eq!(env.view.preview_scroll_offset, 0);
+    }
+
+    /// Passive preview (NOT live-send) over a full-screen agent must ALSO
+    /// forward the wheel. The alternate screen has no scrollback, so the
+    /// capture-window scroll is inert; without forwarding, "hover the
+    /// preview and scroll" does literally nothing (the reported regression
+    /// after Claude Code's fullscreen renderer landed). Forwarding pins the
+    /// preview to the live edge, exactly like the live-send path.
+    #[test]
+    #[serial]
+    fn wheel_over_alt_screen_passive_preview_forwards() {
+        let mut env = passive_env_with_cursor(alt_screen_cursor(true, true, true));
+        assert!(
+            env.view.live_send.is_none(),
+            "this exercises passive preview, not live-send"
+        );
+
+        let up = env.view.handle_scroll_up(50, 10);
+        assert!(
+            up,
+            "wheel over a full-screen pane in passive preview is forwarded"
+        );
+        assert_eq!(
+            env.view.preview_scroll_offset, 0,
+            "passive forwarding pins the preview to the live edge"
         );
 
         env.view.preview_scroll_offset = 10;

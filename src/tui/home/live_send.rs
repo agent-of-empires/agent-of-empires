@@ -594,15 +594,15 @@ pub(in crate::tui) struct LiveCaptureWorker {
     /// would lag the first fast capture by ~250ms.
     nudge: std::sync::Arc<(std::sync::Mutex<()>, std::sync::Condvar)>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Whether the displayed pane is the live-send target. Only then does the
-    /// worker pay for the cursor query (a one-line `display-message` folded
-    /// into the same fork) and publish a cursor; otherwise `cursor` stays
-    /// `None` so a backgrounded or merely-browsed preview paints no cursor.
-    live: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Newest pane cursor, refreshed every live cycle (even when the captured
-    /// text is unchanged, so a bare cursor move still updates). Cleared on
-    /// `set_live(false)` and `set_target`. The render loop reads it via
-    /// `current_cursor` to place a real terminal cursor over the live preview.
+    /// Newest pane cursor, refreshed every capture cycle (even when the
+    /// captured text is unchanged, so a bare cursor move still updates).
+    /// Cleared on `set_target` (the previewed pane changed). Two consumers: the
+    /// render loop paints a real terminal cursor over the preview ONLY while
+    /// live-send is active (`live_preview_cursor_pos` gates on `live_send`),
+    /// and the wheel forward reads it in BOTH live-send and passive preview
+    /// to decide whether/how to scroll an alternate-screen agent. So the
+    /// cursor query (a one-line `display-message` folded into the capture
+    /// fork) runs every cycle, not just live ones.
     cursor: std::sync::Arc<std::sync::Mutex<Option<crate::tmux::PaneCursor>>>,
 }
 
@@ -626,7 +626,6 @@ impl LiveCaptureWorker {
         let forward_empty = Arc::new(AtomicBool::new(false));
         let nudge: Arc<(Mutex<()>, Condvar)> = Arc::new((Mutex::new(()), Condvar::new()));
         let stop = Arc::new(AtomicBool::new(false));
-        let live = Arc::new(AtomicBool::new(false));
         let cursor: Arc<Mutex<Option<crate::tmux::PaneCursor>>> = Arc::new(Mutex::new(None));
         let lines_cell = capture_lines.clone();
         let target_cell = target.clone();
@@ -635,7 +634,6 @@ impl LiveCaptureWorker {
         let forward_empty_cell = forward_empty.clone();
         let nudge_thread = nudge.clone();
         let stop_flag = stop.clone();
-        let live_cell = live.clone();
         let cursor_cell = cursor.clone();
         std::thread::spawn(move || {
             let mut last_target = String::new();
@@ -659,27 +657,18 @@ impl LiveCaptureWorker {
                 if lines > 0 && !name.is_empty() {
                     let session = crate::tmux::Session::from_name(&name);
                     let forward_empty = forward_empty_cell.load(Ordering::Relaxed);
-                    // Only the live-send target pays for the cursor query; it
-                    // folds into the same fork as the capture, so a live cycle
-                    // is still one `tmux` invocation. Backgrounded / browsed
-                    // previews capture text only and carry no cursor.
-                    let is_live = live_cell.load(Ordering::Relaxed);
+                    // Always pay for the cursor query: it folds into the same
+                    // `tmux` fork as the capture (one invocation), and the
+                    // passive-preview wheel forward needs the cursor (is this
+                    // an alternate-screen app? mouse tracking on?) to decide
+                    // whether and how to scroll the agent, not just live-send.
                     // A failed fork reads as "gone". For preserve panes that
                     // means hold the last-good frame (drop it); for forward
                     // panes (terminals) surface it as empty so stale text clears.
-                    let (capture, cursor_now) = if is_live {
-                        match session.capture_pane_with_cursor(lines) {
-                            Ok((content, cur)) => (Some(content), cur),
-                            Err(_) if forward_empty => (Some(String::new()), None),
-                            Err(_) => (None, None),
-                        }
-                    } else {
-                        let cap = match session.capture_pane(lines) {
-                            Ok(content) => Some(content),
-                            Err(_) if forward_empty => Some(String::new()),
-                            Err(_) => None,
-                        };
-                        (cap, None)
+                    let (capture, cursor_now) = match session.capture_pane_with_cursor(lines) {
+                        Ok((content, cur)) => (Some(content), cur),
+                        Err(_) if forward_empty => (Some(String::new()), None),
+                        Err(_) => (None, None),
                     };
                     if let Some(content) = capture {
                         // Skip unchanged frames (no point waking a re-parse).
@@ -695,11 +684,11 @@ impl LiveCaptureWorker {
                         let still_current =
                             target_cell.lock().ok().map(|g| *g == name).unwrap_or(false);
                         if still_current {
-                            // Cursor refreshes every live cycle, independent of
-                            // the content dedup: a bare cursor move leaves the
+                            // Cursor refreshes every cycle, independent of the
+                            // content dedup: a bare cursor move leaves the
                             // captured cells unchanged but must still update the
-                            // painted cursor. When not live, `cursor_now` is None
-                            // so the slot clears and no cursor is painted.
+                            // cursor (the render paints it only under live-send;
+                            // the wheel forward reads it in passive preview too).
                             if let Ok(mut guard) = cursor_cell.lock() {
                                 *guard = cursor_now;
                             }
@@ -733,7 +722,6 @@ impl LiveCaptureWorker {
             forward_empty,
             nudge,
             stop,
-            live,
             cursor,
         }
     }
@@ -799,17 +787,10 @@ impl LiveCaptureWorker {
     /// Switch the capture cadence between live-send (fast) and background
     /// preview (idle). Cheap (one atomic store); called from the render
     /// reconcile so entering/leaving live mode retunes the worker in place
-    /// without a respawn.
+    /// without a respawn. Does NOT touch the cursor: it is published every
+    /// cycle now (the passive wheel forward reads it), and the render only
+    /// paints it under live-send, so a backgrounded preview never shows one.
     pub(in crate::tui) fn set_live(&self, live: bool) {
-        self.live.store(live, std::sync::atomic::Ordering::Relaxed);
-        if !live {
-            // Drop any painted cursor the moment the displayed pane stops
-            // being the live-send target, so a backgrounded preview doesn't
-            // keep a stale cursor from the last live cycle.
-            if let Ok(mut guard) = self.cursor.lock() {
-                *guard = None;
-            }
-        }
         let ms = if live {
             LIVE_CAPTURE_INTERVAL_FAST_MS
         } else {
@@ -949,6 +930,33 @@ fn dispatch_via_fork(tmux_name: &str, action: &TmuxAction) -> anyhow::Result<()>
         anyhow::bail!("live-send tmux subprocess exited non-zero for {:?}", action);
     }
     Ok(())
+}
+
+/// Forward a single translated key to a tmux pane with a one-shot
+/// `tmux send-keys` fork on a detached thread. Used by the passive-preview
+/// wheel forward, where there is no long-lived `LiveSendWorker` to enqueue
+/// onto: `dispatch_via_fork` blocks on the subprocess, so it must not run on
+/// the UI thread. Fire-and-forget; a dropped scroll notch is harmless and a
+/// failed fork is logged, not surfaced. Scroll notches carry no ordering
+/// relationship to each other, so racing forks are fine.
+pub(super) fn send_key_oneshot(tmux_name: &str, key: TmuxKey) {
+    let tmux_name = tmux_name.to_string();
+    let action = match key {
+        TmuxKey::Literal(s) => TmuxAction::Literal(s),
+        TmuxKey::Named(name) => TmuxAction::Named(name),
+        TmuxKey::NamedRepeat { name, count } => TmuxAction::NamedRepeat { name, count },
+        TmuxKey::HexBytes(bytes) => TmuxAction::HexBytes(bytes),
+    };
+    std::thread::spawn(move || {
+        if let Err(err) = dispatch_via_fork(&tmux_name, &action) {
+            tracing::warn!(
+                target: "tui.live_send",
+                error = %err,
+                action = ?action,
+                "passive-preview wheel forward fork failed; notch dropped",
+            );
+        }
+    });
 }
 
 /// Upper bound on the number of bytes encoded into a single
