@@ -160,7 +160,7 @@ test("auto-generated worktree branch avoids civilization branch collisions", asy
     const body = await res.json();
     expect(body.title).toMatch(/\bII\b/);
     expect(body.branch).toBeTruthy();
-    expect(CIVILIZATION_NAMES).not.toContain(body.branch);
+    expect(CIVILIZATION_NAMES.map((civ) => civ.toLowerCase())).not.toContain(String(body.branch).toLowerCase());
   } finally {
     await serve.stop();
   }
