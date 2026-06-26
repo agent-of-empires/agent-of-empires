@@ -24,11 +24,23 @@ pub struct PluginView {
     pub source: Option<String>,
     /// Capabilities the plugin's manifest declares.
     pub capabilities: Vec<String>,
+    /// UI slots the plugin declares it will render into (#2366). Disclosed
+    /// alongside capabilities so a surface can show the user that the plugin
+    /// modifies the dashboard, even though a UI contribution needs no grant.
+    pub ui_contributions: Vec<UiContributionView>,
     /// Whether the user's grant covers the installed manifest (always true for
     /// builtins).
     pub granted: bool,
     /// Installed but inactive: a community plugin awaiting capability approval.
     pub needs_reapproval: bool,
+}
+
+/// A declared UI contribution, flattened for display: the kebab-case slot name
+/// and the plugin-chosen entry id.
+#[derive(Debug, Clone, Serialize)]
+pub struct UiContributionView {
+    pub slot: String,
+    pub id: String,
 }
 
 impl LoadedPlugin {
@@ -48,6 +60,15 @@ impl LoadedPlugin {
                 .capabilities
                 .iter()
                 .map(|c| c.as_str().to_string())
+                .collect(),
+            ui_contributions: self
+                .manifest
+                .ui
+                .iter()
+                .map(|u| UiContributionView {
+                    slot: u.slot.as_str().to_string(),
+                    id: u.id.clone(),
+                })
                 .collect(),
             granted: self.granted,
             needs_reapproval: self.needs_reapproval(),

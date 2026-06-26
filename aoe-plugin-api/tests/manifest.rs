@@ -1,4 +1,4 @@
-use aoe_plugin_api::{ManifestError, PluginManifest, RuntimeSpec, SettingType};
+use aoe_plugin_api::{ManifestError, PluginManifest, RuntimeSpec, SettingType, UiSlot};
 
 #[test]
 fn minimal_manifest_parses_and_round_trips() {
@@ -67,7 +67,7 @@ key = "endpoint"
 label = "Endpoint"
 
 [[ui]]
-slot = "sidebar"
+slot = "status-bar"
 id = "panel"
 "#;
     let m = PluginManifest::from_toml_str(toml).expect("contribution sections parse");
@@ -77,7 +77,7 @@ id = "panel"
     assert_eq!(m.keybinds[0].key, "Ctrl+K");
     assert_eq!(m.settings[0].key, "endpoint");
     assert_eq!(m.settings[0].value_type, SettingType::String);
-    assert_eq!(m.ui[0].slot, "sidebar");
+    assert_eq!(m.ui[0].slot, UiSlot::StatusBar);
 }
 
 #[test]
@@ -299,11 +299,159 @@ api_version = 2
 [runtime]
 kind = "command"
 command = ["python3", "worker.py"]
+system = true
 "#;
     let m = PluginManifest::from_toml_str(toml).expect("runtime command parses");
     match m.runtime.expect("has runtime") {
-        RuntimeSpec::Command { command } => assert_eq!(command, ["python3", "worker.py"]),
+        RuntimeSpec::Command {
+            command,
+            system,
+            build,
+        } => {
+            assert_eq!(command, ["python3", "worker.py"]);
+            assert!(system);
+            assert!(build.is_empty());
+        }
         other => panic!("expected command runtime, got {other:?}"),
+    }
+}
+
+#[test]
+fn runtime_command_build_steps_parse() {
+    let toml = r#"
+id = "acme.thing"
+name = "Thing"
+version = "0.1.0"
+api_version = 2
+
+[runtime]
+kind = "command"
+command = [".venv/bin/worker"]
+
+[[runtime.build]]
+command = ["python3", "-m", "venv", ".venv"]
+
+[[runtime.build]]
+command = [".venv/bin/pip", "install", "."]
+platforms = ["linux", "macos"]
+"#;
+    let m = PluginManifest::from_toml_str(toml).expect("build steps parse");
+    match m.runtime.expect("has runtime") {
+        RuntimeSpec::Command {
+            command,
+            system,
+            build,
+        } => {
+            assert_eq!(command, [".venv/bin/worker"]);
+            assert!(!system);
+            assert_eq!(build.len(), 2);
+            assert_eq!(build[0].command, ["python3", "-m", "venv", ".venv"]);
+            assert!(build[0].platforms.is_empty());
+            assert_eq!(build[1].command, [".venv/bin/pip", "install", "."]);
+            assert_eq!(build[1].platforms, ["linux", "macos"]);
+        }
+        other => panic!("expected command runtime, got {other:?}"),
+    }
+}
+
+#[test]
+fn build_step_empty_command_and_unknown_platform_rejected() {
+    let toml = r#"
+id = "acme.thing"
+name = "Thing"
+version = "0.1.0"
+api_version = 2
+
+[runtime]
+kind = "command"
+command = [".venv/bin/worker"]
+
+[[runtime.build]]
+command = [""]
+platforms = ["linux", "plan9"]
+"#;
+    let err = PluginManifest::from_toml_str(toml).unwrap_err();
+    let messages = match err {
+        ManifestError::Invalid(m) => m,
+        other => panic!("expected Invalid, got {other:?}"),
+    };
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("runtime.build[0].command")),
+        "{messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("runtime.build[0].platforms") && m.contains("plan9")),
+        "{messages:?}"
+    );
+}
+
+/// The worker entrypoint must be plugin-relative by default; a bare program
+/// name is rejected unless the manifest opts into a PATH dependency with
+/// `system = true`.
+#[test]
+fn bare_worker_program_requires_system_opt_in() {
+    let manifest = |line: &str| {
+        format!(
+            r#"
+id = "acme.thing"
+name = "Thing"
+version = "0.1.0"
+api_version = 2
+
+[runtime]
+kind = "command"
+{line}
+"#
+        )
+    };
+
+    // Bare name, no opt-in: rejected, and the message points at the fix.
+    let err = PluginManifest::from_toml_str(&manifest("command = [\"worker\"]")).unwrap_err();
+    match err {
+        ManifestError::Invalid(messages) => assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("plugin-relative") && m.contains("system = true")),
+            "{messages:?}"
+        ),
+        other => panic!("expected Invalid, got {other:?}"),
+    }
+
+    // Same bare name with the opt-in parses.
+    PluginManifest::from_toml_str(&manifest(
+        "command = [\"uv\", \"run\", \"worker\"]\nsystem = true",
+    ))
+    .expect("system opt-in accepts a bare program name");
+
+    // A plugin-relative path is the default-accepted shape.
+    PluginManifest::from_toml_str(&manifest("command = [\".venv/bin/worker\"]"))
+        .expect("plugin-relative entrypoint accepted without opt-in");
+
+    // An absolute path pins a host path and is rejected in both modes.
+    let abs = if cfg!(windows) {
+        "C:/tools/worker.exe"
+    } else {
+        "/usr/bin/worker"
+    };
+    assert!(matches!(
+        PluginManifest::from_toml_str(&manifest(&format!("command = [\"{abs}\"]"))).unwrap_err(),
+        ManifestError::Invalid(_)
+    ));
+
+    // `system = true` with a path is contradictory and rejected.
+    let err =
+        PluginManifest::from_toml_str(&manifest("command = [\".venv/bin/worker\"]\nsystem = true"))
+            .unwrap_err();
+    match err {
+        ManifestError::Invalid(messages) => assert!(
+            messages.iter().any(|m| m.contains("system = true")),
+            "{messages:?}"
+        ),
+        other => panic!("expected Invalid, got {other:?}"),
     }
 }
 
@@ -362,7 +510,7 @@ command = ""
 key = ""
 
 [[ui]]
-slot = ""
+slot = "status-bar"
 "#;
     let err = PluginManifest::from_toml_str(toml).unwrap_err();
     let messages = match err {
@@ -378,9 +526,44 @@ slot = ""
         "{messages:?}"
     );
     assert!(
-        messages.iter().any(|m| m.contains("ui[0].slot")),
+        messages.iter().any(|m| m.contains("ui[0].id")),
         "{messages:?}"
     );
+}
+
+#[test]
+fn unknown_ui_slot_is_a_parse_error() {
+    // `slot` is a typed enum (closed set), so a slot this host does not render
+    // is rejected at parse time, not carried forward like an unknown capability.
+    let toml = r#"
+id = "acme.thing"
+name = "Thing"
+version = "0.1.0"
+api_version = 2
+
+[[ui]]
+slot = "sidebar"
+id = "panel"
+"#;
+    let err = PluginManifest::from_toml_str(toml).unwrap_err();
+    assert!(
+        matches!(err, ManifestError::Parse(_)),
+        "expected Parse, got {err:?}"
+    );
+}
+
+#[test]
+fn ui_slot_as_str_round_trips_the_wire_name() {
+    // as_str (used for the install prompt / plugin info disclosure) must match
+    // the kebab-case serde name a manifest declares.
+    for (toml_slot, slot) in [
+        ("status-bar", UiSlot::StatusBar),
+        ("row-badge", UiSlot::RowBadge),
+        ("pane", UiSlot::Pane),
+        ("notification", UiSlot::Notification),
+    ] {
+        assert_eq!(slot.as_str(), toml_slot);
+    }
 }
 
 #[test]

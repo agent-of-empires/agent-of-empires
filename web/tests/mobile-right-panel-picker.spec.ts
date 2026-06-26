@@ -44,7 +44,7 @@ async function setupAndOpenSession(page: Page) {
 }
 
 async function openPicker(page: Page) {
-  await page.getByRole("button", { name: "Toggle diff panel" }).click();
+  await page.getByRole("button", { name: "Toggle panels" }).click();
   await page.getByTestId("mobile-right-panel-picker").waitFor({
     state: "visible",
     timeout: 5_000,
@@ -147,9 +147,11 @@ test.describe("Desktop right panel split is unchanged (#1452)", () => {
     await clickSidebarSession(page, "pinch-test");
     await page.locator("[data-live-terminal]").first().waitFor({ state: "visible", timeout: 10_000 });
 
-    // The desktop split renders the resize handle and never the picker.
+    // The desktop split renders the resize handle and the activity bar, never
+    // the mobile picker or its trigger ("Toggle panels" is md:hidden).
     await expect(page.getByTestId("content-split-resize-handle")).toBeVisible();
-    await page.getByRole("button", { name: "Toggle diff panel" }).click();
+    await expect(page.getByTestId("activity-bar")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Toggle panels" })).toHaveCount(0);
     await expect(page.getByTestId("mobile-right-panel-picker")).toHaveCount(0);
   });
 });
@@ -195,7 +197,7 @@ async function setupAcpSession(page: Page) {
   await clickSidebarSession(page, "acp-mobile");
   // Structured view sessions render no xterm in the structured view; wait for the
   // right-panel toggle, which only appears once a session is active.
-  await page.getByRole("button", { name: "Toggle diff panel" }).waitFor({ state: "visible", timeout: 10_000 });
+  await page.getByRole("button", { name: "Toggle panels" }).waitFor({ state: "visible", timeout: 10_000 });
 }
 
 test.describe("Mobile picker on a structured view session (#1452)", () => {

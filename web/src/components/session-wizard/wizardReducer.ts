@@ -91,6 +91,7 @@ export type Action =
       type: "APPLY_PROFILE_DEFAULTS";
       yoloMode: boolean;
       sandboxEnabled: boolean;
+      worktreeEnabled: boolean;
       tool: string;
       extraEnv: string[];
       agentModel?: string;
@@ -108,7 +109,11 @@ export const initialData: WizardData = {
   title: "",
   worktreeBranch: "",
   worktreeBranchDirty: false,
-  useWorktree: true,
+  // Default off to match the backend `worktree.enabled` default
+  // (WorktreeConfig::default). SessionWizard seeds the real value from
+  // /api/settings on mount via APPLY_PROFILE_DEFAULTS; this fallback also
+  // covers the case where that fetch fails. See #2423.
+  useWorktree: false,
   attachExisting: false,
   baseBranch: "",
   group: "",
@@ -175,7 +180,11 @@ export function reducer(state: WizardState, action: Action): WizardState {
       // no-profile guard would leave profileDirty false. The picker
       // path's window.confirm() also benefits: picking a profile after
       // unprofiled edits now prompts before overwriting.
-      if (["yoloMode", "sandboxEnabled", "tool", "extraEnv", "agentModel", "agentEffort"].includes(action.field)) {
+      if (
+        ["yoloMode", "sandboxEnabled", "useWorktree", "tool", "extraEnv", "agentModel", "agentEffort"].includes(
+          action.field,
+        )
+      ) {
         newData.profileDirty = true;
       }
       return { ...state, data: newData, error: null };
@@ -210,6 +219,9 @@ export function reducer(state: WizardState, action: Action): WizardState {
           ...state.data,
           yoloMode: action.yoloMode,
           sandboxEnabled: action.sandboxEnabled,
+          // Scratch sessions never use a worktree; don't let the seeded
+          // default flip it back on. Mirrors the SET_FIELD scratch arm.
+          useWorktree: state.data.scratch ? false : action.worktreeEnabled,
           tool: action.tool || state.data.tool,
           extraEnv: action.extraEnv,
           agentModel: action.agentModel ?? "",

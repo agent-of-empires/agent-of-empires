@@ -869,6 +869,30 @@ describe("applyEvent / Stopped empty-output fallback", () => {
     });
     expect(state.activity.find((r) => r.kind === "empty_output")).toBeUndefined();
   });
+
+  it("suppresses the notice when a prompt runtime error was surfaced first", () => {
+    let state = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: { UserPromptSent: { text: "/aoe-investigate bug" } },
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: {
+        PromptRuntimeError: {
+          message: "Bad Request: model is not supported for this account.",
+        },
+      },
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 3,
+      event: { Stopped: {} },
+    });
+    expect(state.lastError).toBe("Bad Request: model is not supported for this account.");
+    expect(state.activity.find((r) => r.kind === "empty_output")).toBeUndefined();
+  });
 });
 
 describe("applyEvent / Stopped user_stopped", () => {

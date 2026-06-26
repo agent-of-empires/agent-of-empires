@@ -147,10 +147,72 @@ pub struct ThemeContribution {
     pub path: String,
 }
 
-/// A UI contribution targeting a named slot.
+/// A host-rendered UI slot a plugin may push state into (#2366). A closed set,
+/// unlike the open-string capabilities: the host must know how to render each
+/// slot, so an unknown slot is unrenderable and rejected at parse time rather
+/// than carried forward. The worker pushes typed state into a declared slot
+/// over the `ui.state.*` host RPCs; the host renders it (the dashboard runs no
+/// plugin code).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum UiSlot {
+    /// A segment in the dashboard status/top bar (global).
+    StatusBar,
+    /// A badge on a session row (per session).
+    RowBadge,
+    /// A text column on a session row, carrying optional sort/filter scalars
+    /// (per session).
+    RowColumn,
+    /// A named sort option over a `RowColumn`'s scalar value (global).
+    SortKey,
+    /// A named filter over a `RowColumn`'s scalar value (global).
+    FilterFacet,
+    /// A card on the dashboard overview (global).
+    Card,
+    /// A dockable tool-window pane in a session's view (per session). The host
+    /// renders it in the right or bottom dock per the entry's `default_location`.
+    Pane,
+    /// A badge in a session's detail view (per session).
+    DetailBadge,
+    /// A transient notification, pushed via `ui.notify` (gated by the
+    /// `notifications` capability rather than a slot declaration).
+    Notification,
+}
+
+impl UiSlot {
+    /// Whether entries in this slot are scoped to a single session (and so must
+    /// carry a `session_id`), versus global to the dashboard.
+    pub fn is_per_session(self) -> bool {
+        matches!(
+            self,
+            UiSlot::RowBadge | UiSlot::RowColumn | UiSlot::Pane | UiSlot::DetailBadge
+        )
+    }
+
+    /// The kebab-case wire name, matching the serde representation. Handy for
+    /// display (install prompt, plugin info) without round-tripping through
+    /// serde.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UiSlot::StatusBar => "status-bar",
+            UiSlot::RowBadge => "row-badge",
+            UiSlot::RowColumn => "row-column",
+            UiSlot::SortKey => "sort-key",
+            UiSlot::FilterFacet => "filter-facet",
+            UiSlot::Card => "card",
+            UiSlot::Pane => "pane",
+            UiSlot::DetailBadge => "detail-badge",
+            UiSlot::Notification => "notification",
+        }
+    }
+}
+
+/// A UI contribution: the plugin declares it may fill `slot` with entries
+/// addressed by `id`. The host gates `ui.state.set`/`ui.state.remove` on the
+/// `(slot, id)` pair being declared here.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiContribution {
-    pub slot: String,
+    pub slot: UiSlot,
     #[serde(default)]
     pub id: String,
 }
@@ -163,7 +225,34 @@ pub enum RuntimeSpec {
     /// script, an interpreter invocation, or an in-tree binary).
     Command {
         /// argv; the first element is the program, the rest its arguments.
+        ///
+        /// The program (`argv[0]`) must be plugin-relative (a path containing a
+        /// separator, like `.venv/bin/worker`, resolved inside the install
+        /// directory), unless `system` is set. A plugin-relative entrypoint is
+        /// PATH-independent: the daemon's PATH never decides whether the worker
+        /// launches. Validation rejects a bare program name here so the
+        /// PATH-independent shape is the default and a PATH dependency is a
+        /// conscious opt-in (`system = true`).
         command: Vec<String>,
+        /// Opt in to resolving `command`'s program (`argv[0]`) on the host PATH
+        /// at launch, instead of in the plugin directory. Set this only when the
+        /// worker genuinely depends on a system tool (`uv run worker`,
+        /// `python3 -m pkg`): it makes the daemon's PATH a launch dependency,
+        /// which is the fragility a plugin-relative entrypoint avoids. With
+        /// `system` set, `argv[0]` must be a bare program name, not a path.
+        #[serde(default, skip_serializing_if = "is_false")]
+        system: bool,
+        /// Ordered build steps the host runs once at install and update,
+        /// inside the installed plugin directory, before the plugin is
+        /// registered (e.g. create a venv, `pip install`, `npm ci`). They run
+        /// in the user's interactive shell at install time, where PATH is
+        /// reliable, so an interpreted worker can produce a self-contained
+        /// in-tree environment and then launch via a plugin-relative
+        /// `command`, never depending on the daemon's PATH. Builds run in the
+        /// final directory, not a staging tree, because tools like Python
+        /// venvs embed absolute paths and are not relocatable.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        build: Vec<BuildStep>,
     },
     /// A worker binary downloaded from the source repo's GitHub release assets.
     /// Installation resolves the asset for the host platform, downloads it, and
@@ -177,6 +266,40 @@ pub enum RuntimeSpec {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bin: Option<String>,
     },
+}
+
+/// One install/update build command for a `command` runtime.
+///
+/// `command` is argv (program then arguments), resolved with the same policy
+/// as the launch `command`: a bare name on the install-time PATH, a
+/// separator-bearing path relative to the plugin directory, an absolute path
+/// rejected. `platforms`, when non-empty, restricts the step to host OSes
+/// matching `std::env::consts::OS` (`linux`, `macos`, `windows`); an empty
+/// `platforms` runs on every platform.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuildStep {
+    pub command: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub platforms: Vec<String>,
+}
+
+/// Host OS names a build step's `platforms` may name. These match
+/// `std::env::consts::OS`; a typo is rejected at parse rather than silently
+/// skipping the step on every platform.
+const KNOWN_PLATFORMS: [&str; 3] = ["linux", "macos", "windows"];
+
+/// `skip_serializing_if` predicate for a defaulted `bool` flag.
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// Whether `arg` reads as a path (carries a separator, or is absolute) rather
+/// than a bare program name. The same classification the launch-time resolver
+/// applies to `argv[0]`, lifted here so validation rejects a misshapen worker
+/// entrypoint before install rather than at the first launch.
+fn looks_like_path(arg: &str) -> bool {
+    arg.contains('/') || arg.contains('\\') || std::path::Path::new(arg).is_absolute()
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -257,7 +380,12 @@ impl PluginManifest {
         check(!self.version.is_empty(), "version must not be empty".into());
         check(!self.name.is_empty(), "name must not be empty".into());
 
-        if let Some(RuntimeSpec::Command { command }) = &self.runtime {
+        if let Some(RuntimeSpec::Command {
+            command,
+            system,
+            build,
+        }) = &self.runtime
+        {
             check(
                 !command.is_empty(),
                 "runtime command must not be empty".into(),
@@ -266,6 +394,50 @@ impl PluginManifest {
                 command.iter().all(|arg| !arg.is_empty()),
                 "runtime command must not contain empty arguments".into(),
             );
+            // The worker entrypoint must be plugin-relative so the daemon's PATH
+            // never decides whether the worker launches; depending on a system
+            // tool is a conscious opt-in (`system = true`), not a fallback from
+            // a name that happens not to be on PATH. Enforce the two shapes are
+            // mutually exclusive: relative path by default, bare name with
+            // `system`.
+            if let Some(program) = command.first().filter(|a| !a.is_empty()) {
+                if *system {
+                    check(
+                        !looks_like_path(program),
+                        format!(
+                            "runtime command program {program:?} has `system = true` but is a path; \
+                             a system dependency must be a bare program name resolved on PATH (like \"uv\" or \"python3\")"
+                        ),
+                    );
+                } else {
+                    check(
+                        looks_like_path(program) && !std::path::Path::new(program).is_absolute(),
+                        format!(
+                            "runtime command program {program:?} must be a plugin-relative path \
+                             (containing a separator, like \".venv/bin/worker\"); set `system = true` \
+                             to depend on a program from the host PATH instead"
+                        ),
+                    );
+                }
+            }
+            for (i, step) in build.iter().enumerate() {
+                check(
+                    !step.command.is_empty(),
+                    format!("runtime.build[{i}].command must not be empty"),
+                );
+                check(
+                    step.command.iter().all(|arg| !arg.is_empty()),
+                    format!("runtime.build[{i}].command must not contain empty arguments"),
+                );
+                for p in &step.platforms {
+                    check(
+                        KNOWN_PLATFORMS.contains(&p.as_str()),
+                        format!(
+                            "runtime.build[{i}].platforms contains unknown platform {p:?}; expected one of linux, macos, windows"
+                        ),
+                    );
+                }
+            }
         }
         if let Some(RuntimeSpec::ReleaseBinary { asset, bin }) = &self.runtime {
             check(
@@ -374,10 +546,11 @@ impl PluginManifest {
             );
         }
         for (i, u) in self.ui.iter().enumerate() {
-            check(
-                !u.slot.is_empty(),
-                format!("ui[{i}].slot must not be empty"),
-            );
+            // `slot` is a typed enum, so an unknown slot is already a parse
+            // error; only the addressing `id` needs checking. A UI entry is
+            // pushed and gated by its `(slot, id)` pair, so an empty id leaves
+            // it unaddressable.
+            check(!u.id.is_empty(), format!("ui[{i}].id must not be empty"));
         }
 
         if errors.is_empty() {

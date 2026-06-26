@@ -30,13 +30,16 @@
 //! other-plugin config); `runtime.worker`, which every worker holds to run at
 //! all, is enough.
 
+use std::collections::HashSet;
 use std::sync::Mutex;
 
+use aoe_plugin_api::UiSlot;
 use rusqlite::Connection;
 use serde_json::{json, Value};
 
 use crate::events::{self, Order, Schema, SeqBound};
 use crate::plugin::protocol::codes;
+use crate::plugin::ui_state::{Tone, UiError, UiSnapshot, UiStore};
 use crate::session::Storage;
 
 /// Capability required by each host method. Reused from the manifest taxonomy
@@ -44,6 +47,10 @@ use crate::session::Storage;
 const CAP_WORKER: &str = "runtime.worker";
 const CAP_SESSION_READ: &str = "session.read";
 const CAP_SESSION_WRITE: &str = "session.write";
+/// `ui.notify` posts a notification; it reuses the existing `notifications`
+/// capability. `ui.state.*` need no extra capability beyond `runtime.worker`:
+/// the gate is the manifest `ui` slot declaration (see [`PluginRpcContext`]).
+const CAP_NOTIFICATIONS: &str = "notifications";
 
 /// Shared, host-owned state behind the API: the plugin event bus and the
 /// profile whose session storage the API reads and writes. One per running
@@ -55,6 +62,8 @@ pub struct HostApiState {
     retention: usize,
     /// Session-storage profile the API operates on (the daemon's profile).
     profile: String,
+    /// Host-rendered UI state pushed by workers over `ui.state.*`/`ui.notify`.
+    ui: UiStore,
 }
 
 impl HostApiState {
@@ -72,11 +81,28 @@ impl HostApiState {
             schema,
             retention,
             profile: profile.to_string(),
+            ui: UiStore::new(),
         })
     }
 
     fn storage(&self) -> anyhow::Result<Storage> {
         Storage::new_unwatched(&self.profile)
+    }
+
+    /// Register a freshly spawned worker's UI generation. The supervisor threads
+    /// the returned value into the worker's [`PluginRpcContext`].
+    pub fn begin_ui_generation(&self, plugin_id: &str) -> u64 {
+        self.ui.begin_generation(plugin_id)
+    }
+
+    /// Clear a worker's UI entries when it exits, guarded by its generation.
+    pub fn clear_ui(&self, plugin_id: &str, generation: u64) -> bool {
+        self.ui.clear_plugin(plugin_id, generation)
+    }
+
+    /// The full UI-state snapshot the web dashboard renders.
+    pub fn ui_snapshot(&self) -> UiSnapshot {
+        self.ui.snapshot()
     }
 }
 
@@ -85,6 +111,13 @@ impl HostApiState {
 pub struct PluginRpcContext {
     pub plugin_id: String,
     pub granted_capabilities: Vec<String>,
+    /// The `(slot, id)` pairs the plugin declared in its manifest `ui` section.
+    /// A `ui.state.set`/`ui.state.remove` for a pair not in this set is refused:
+    /// a plugin can only fill the slots it declared.
+    pub ui_contributions: HashSet<(UiSlot, String)>,
+    /// This worker spawn's UI generation, stamped on every `ui.state.*` write so
+    /// a stale worker cannot resurrect state after it exited.
+    pub ui_generation: u64,
 }
 
 impl PluginRpcContext {
@@ -170,6 +203,18 @@ pub fn dispatch(
             ctx.require(CAP_WORKER)?;
             config_get(ctx, params)
         }
+        "ui.state.set" => {
+            ctx.require(CAP_WORKER)?;
+            ui_state_set(state, ctx, params)
+        }
+        "ui.state.remove" => {
+            ctx.require(CAP_WORKER)?;
+            ui_state_remove(state, ctx, params)
+        }
+        "ui.notify" => {
+            ctx.require(CAP_NOTIFICATIONS)?;
+            ui_notify(state, ctx, params)
+        }
         other => Err(DispatchError::method_not_found(other)),
     }
 }
@@ -179,6 +224,21 @@ fn str_param<'a>(params: &'a Value, key: &str) -> Result<&'a str, DispatchError>
         .get(key)
         .and_then(Value::as_str)
         .ok_or_else(|| DispatchError::invalid_params(format!("missing string param {key:?}")))
+}
+
+/// An optional string param: absent or `null` is `None`, a string is `Some`, and
+/// any other JSON type is a hard error. Reading these (`session_id`, `body`)
+/// with a bare `as_str` would silently treat a non-string as absent, which can
+/// turn a malformed per-session call into a global one; rejecting keeps the wire
+/// contract honest.
+fn optional_str_param<'a>(params: &'a Value, key: &str) -> Result<Option<&'a str>, DispatchError> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value)),
+        Some(_) => Err(DispatchError::invalid_params(format!(
+            "param {key:?} must be a string"
+        ))),
+    }
 }
 
 fn events_publish(state: &HostApiState, params: &Value) -> Result<Value, DispatchError> {
@@ -392,6 +452,116 @@ fn config_get(ctx: &PluginRpcContext, params: &Value) -> Result<Value, DispatchE
     Ok(json!({ "value": value }))
 }
 
+/// Parse the `slot` param into a typed [`UiSlot`]. An unknown slot is bad
+/// input, not a host failure.
+fn parse_ui_slot(params: &Value) -> Result<UiSlot, DispatchError> {
+    let raw = params
+        .get("slot")
+        .ok_or_else(|| DispatchError::invalid_params("missing string param \"slot\""))?;
+    serde_json::from_value::<UiSlot>(raw.clone())
+        .map_err(|_| DispatchError::invalid_params(format!("unknown ui slot {raw}")))
+}
+
+/// Map a store-level [`UiError`] to a JSON-RPC error. A bad payload/scope is the
+/// caller's input (INVALID_PARAMS); a quota or stale-generation refusal is the
+/// host declining the mutation (FORBIDDEN, our reserved code).
+fn ui_dispatch_error(e: UiError) -> DispatchError {
+    match e {
+        UiError::BadRequest(message) => DispatchError::invalid_params(message),
+        UiError::QuotaExceeded => DispatchError {
+            code: codes::FORBIDDEN,
+            message: "plugin UI-state quota exceeded".into(),
+        },
+        UiError::StaleWorker => DispatchError {
+            code: codes::FORBIDDEN,
+            message: "worker generation is no longer active".into(),
+        },
+    }
+}
+
+/// Refuse a `ui.state.*` call unless the plugin declared this `(slot, id)` in
+/// its manifest `ui` section. This, plus `runtime.worker`, is the full gate on
+/// pushing UI state; no dedicated `ui` capability is introduced.
+fn require_declared_slot(
+    ctx: &PluginRpcContext,
+    slot: UiSlot,
+    id: &str,
+) -> Result<(), DispatchError> {
+    if ctx.ui_contributions.contains(&(slot, id.to_string())) {
+        Ok(())
+    } else {
+        Err(DispatchError {
+            code: codes::FORBIDDEN,
+            message: format!(
+                "plugin {} did not declare ui slot {slot:?} with id {id:?}",
+                ctx.plugin_id
+            ),
+        })
+    }
+}
+
+fn ui_state_set(
+    state: &HostApiState,
+    ctx: &PluginRpcContext,
+    params: &Value,
+) -> Result<Value, DispatchError> {
+    let slot = parse_ui_slot(params)?;
+    let id = str_param(params, "id")?;
+    require_declared_slot(ctx, slot, id)?;
+    let session_id = optional_str_param(params, "session_id")?;
+    let payload = params
+        .get("payload")
+        .ok_or_else(|| DispatchError::invalid_params("missing param \"payload\""))?;
+    state
+        .ui
+        .set(
+            &ctx.plugin_id,
+            ctx.ui_generation,
+            slot,
+            id,
+            session_id,
+            payload,
+        )
+        .map_err(ui_dispatch_error)?;
+    Ok(json!({ "ok": true }))
+}
+
+fn ui_state_remove(
+    state: &HostApiState,
+    ctx: &PluginRpcContext,
+    params: &Value,
+) -> Result<Value, DispatchError> {
+    let slot = parse_ui_slot(params)?;
+    let id = str_param(params, "id")?;
+    require_declared_slot(ctx, slot, id)?;
+    let session_id = optional_str_param(params, "session_id")?;
+    state
+        .ui
+        .remove(&ctx.plugin_id, ctx.ui_generation, slot, id, session_id)
+        .map_err(ui_dispatch_error)?;
+    Ok(json!({ "ok": true }))
+}
+
+fn ui_notify(
+    state: &HostApiState,
+    ctx: &PluginRpcContext,
+    params: &Value,
+) -> Result<Value, DispatchError> {
+    let title = str_param(params, "title")?.to_string();
+    let body = optional_str_param(params, "body")?.map(str::to_string);
+    let session_id = optional_str_param(params, "session_id")?.map(str::to_string);
+    let tone = match params.get("tone") {
+        None => Tone::Info,
+        Some(v) => serde_json::from_value::<Tone>(v.clone())
+            .map_err(|_| DispatchError::invalid_params(format!("unknown tone {v}")))?,
+    };
+    let seq = state
+        .ui
+        .notify(&ctx.plugin_id, tone, title, body, session_id)
+        .map_err(ui_dispatch_error)?;
+    Ok(json!({ "seq": seq }))
+}
+
 /// Set `key = value` inside `inst.plugin_meta[plugin_id]`, creating the slot as
 /// a JSON object if absent. The slot is namespaced to the plugin id, never a
 /// request parameter, which is what keeps one plugin out of another's data.
@@ -416,6 +586,8 @@ mod tests {
         PluginRpcContext {
             plugin_id: "acme.worker".to_string(),
             granted_capabilities: caps.iter().map(|c| c.to_string()).collect(),
+            ui_contributions: HashSet::new(),
+            ui_generation: 0,
         }
     }
 
@@ -567,6 +739,8 @@ mod tests {
         let b = PluginRpcContext {
             plugin_id: "other.plugin".to_string(),
             granted_capabilities: vec![CAP_SESSION_READ.to_string()],
+            ui_contributions: HashSet::new(),
+            ui_generation: 0,
         };
         let other = dispatch(
             &state,
@@ -627,6 +801,8 @@ mod tests {
         let other = PluginRpcContext {
             plugin_id: "other.plugin".to_string(),
             granted_capabilities: vec![CAP_WORKER.to_string()],
+            ui_contributions: HashSet::new(),
+            ui_generation: 0,
         };
         let other_got = dispatch(
             &state,
@@ -651,5 +827,115 @@ mod tests {
             Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
             None => std::env::remove_var("XDG_CONFIG_HOME"),
         }
+    }
+
+    /// Build a context that declared a single `(slot, id)` UI contribution and
+    /// holds the given capabilities, registered against `state` so its
+    /// generation is the active one.
+    fn ui_ctx(state: &HostApiState, caps: &[&str], slot: UiSlot, id: &str) -> PluginRpcContext {
+        let mut contributions = HashSet::new();
+        contributions.insert((slot, id.to_string()));
+        PluginRpcContext {
+            plugin_id: "acme.worker".to_string(),
+            granted_capabilities: caps.iter().map(|c| c.to_string()).collect(),
+            ui_contributions: contributions,
+            ui_generation: state.begin_ui_generation("acme.worker"),
+        }
+    }
+
+    #[test]
+    fn ui_state_set_requires_declared_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state(tmp.path());
+        // Declared status-bar/"main", but pushing row-badge/"main" is refused.
+        let c = ui_ctx(&state, &[CAP_WORKER], UiSlot::StatusBar, "main");
+        let err = dispatch(
+            &state,
+            &c,
+            "ui.state.set",
+            &json!({"slot": "row-badge", "id": "main", "session_id": "s1", "payload": {"text": "x"}}),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, codes::FORBIDDEN);
+
+        // The declared slot succeeds and surfaces in the snapshot.
+        dispatch(
+            &state,
+            &c,
+            "ui.state.set",
+            &json!({"slot": "status-bar", "id": "main", "payload": {"text": "ok", "tone": "success"}}),
+        )
+        .unwrap();
+        let snap = state.ui_snapshot();
+        assert_eq!(snap.entries.len(), 1);
+        assert_eq!(snap.entries[0].payload["text"], json!("ok"));
+    }
+
+    #[test]
+    fn ui_state_set_needs_worker_capability() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state(tmp.path());
+        let c = ui_ctx(&state, &[], UiSlot::StatusBar, "main");
+        let err = dispatch(
+            &state,
+            &c,
+            "ui.state.set",
+            &json!({"slot": "status-bar", "id": "main", "payload": {"text": "x"}}),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, codes::FORBIDDEN);
+    }
+
+    #[test]
+    fn ui_notify_requires_notifications_capability() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state(tmp.path());
+        // runtime.worker alone is not enough for ui.notify.
+        let c = ui_ctx(&state, &[CAP_WORKER], UiSlot::Notification, "n");
+        let err = dispatch(
+            &state,
+            &c,
+            "ui.notify",
+            &json!({"title": "Build failed", "tone": "danger"}),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, codes::FORBIDDEN);
+
+        // With the capability it posts and returns a seq.
+        let c = ui_ctx(&state, &[CAP_NOTIFICATIONS], UiSlot::Notification, "n");
+        let ok = dispatch(
+            &state,
+            &c,
+            "ui.notify",
+            &json!({"title": "Build failed", "tone": "danger"}),
+        )
+        .unwrap();
+        assert_eq!(ok["seq"], json!(1));
+        assert_eq!(state.ui_snapshot().notifications.len(), 1);
+    }
+
+    #[test]
+    fn ui_state_set_rejects_unknown_slot_and_bad_payload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state(tmp.path());
+        let c = ui_ctx(&state, &[CAP_WORKER], UiSlot::StatusBar, "main");
+        // Unknown slot string.
+        let err = dispatch(
+            &state,
+            &c,
+            "ui.state.set",
+            &json!({"slot": "sidebar", "id": "main", "payload": {"text": "x"}}),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, codes::INVALID_PARAMS);
+        // Declared slot, malformed payload (missing required `text`).
+        let err = dispatch(
+            &state,
+            &c,
+            "ui.state.set",
+            &json!({"slot": "status-bar", "id": "main", "payload": {"tone": "info"}}),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, codes::INVALID_PARAMS);
     }
 }

@@ -34,6 +34,7 @@ describe("SessionWizard reducer / APPLY_PROFILE_DEFAULTS (#1142)", () => {
       type: "APPLY_PROFILE_DEFAULTS",
       yoloMode: true,
       sandboxEnabled: false,
+      worktreeEnabled: false,
       tool: "claude",
       extraEnv: [],
       skipIfDirty: true,
@@ -49,6 +50,7 @@ describe("SessionWizard reducer / APPLY_PROFILE_DEFAULTS (#1142)", () => {
       type: "APPLY_PROFILE_DEFAULTS",
       yoloMode: false,
       sandboxEnabled: true,
+      worktreeEnabled: false,
       tool: "claude",
       extraEnv: ["FOO=1", "BAR=baz"],
       skipIfDirty: true,
@@ -65,6 +67,7 @@ describe("SessionWizard reducer / APPLY_PROFILE_DEFAULTS (#1142)", () => {
       type: "APPLY_PROFILE_DEFAULTS",
       yoloMode: false,
       sandboxEnabled: false,
+      worktreeEnabled: false,
       tool: "",
       extraEnv: [],
       skipIfDirty: true,
@@ -89,6 +92,7 @@ describe("SessionWizard reducer / APPLY_PROFILE_DEFAULTS (#1142)", () => {
       type: "APPLY_PROFILE_DEFAULTS",
       yoloMode: true,
       sandboxEnabled: true,
+      worktreeEnabled: true,
       tool: "claude",
       extraEnv: ["FOO=1"],
       skipIfDirty: true,
@@ -112,6 +116,7 @@ describe("SessionWizard reducer / APPLY_PROFILE_DEFAULTS (#1142)", () => {
       type: "APPLY_PROFILE_DEFAULTS",
       yoloMode: true,
       sandboxEnabled: true,
+      worktreeEnabled: true,
       tool: "claude",
       extraEnv: [],
     });
@@ -203,6 +208,7 @@ describe("SessionWizard reducer / APPLY_PROFILE_DEFAULTS (#1142)", () => {
       type: "APPLY_PROFILE_DEFAULTS",
       yoloMode: false,
       sandboxEnabled: false,
+      worktreeEnabled: false,
       tool: "claude",
       extraEnv: [],
       skipIfDirty: true,
@@ -243,6 +249,7 @@ describe("SessionWizard reducer / useStructuredView (#1580)", () => {
       type: "APPLY_PROFILE_DEFAULTS",
       yoloMode: true,
       sandboxEnabled: false,
+      worktreeEnabled: false,
       tool: "claude",
       extraEnv: [],
       skipIfDirty: true,
@@ -322,5 +329,76 @@ describe("SessionWizard reducer / import id clearing (#2276)", () => {
     });
     expect(withId.data.importAcpSessionId).toBe("imp-789");
     expect(withId.data.path).toBe("/Users/me/imported-cwd");
+  });
+});
+
+describe("SessionWizard reducer / worktree default from config (#2423)", () => {
+  it("defaults useWorktree to false so it matches the backend worktree.enabled default", () => {
+    // Before #2423 this was hardcoded true, so the wizard ignored both
+    // worktree.enabled and the web Settings toggle.
+    expect(initialData.useWorktree).toBe(false);
+  });
+
+  it("seeds useWorktree from worktreeEnabled on the mount fetch", () => {
+    const off = reducer(makeState(), {
+      type: "APPLY_PROFILE_DEFAULTS",
+      yoloMode: false,
+      sandboxEnabled: false,
+      worktreeEnabled: false,
+      tool: "claude",
+      extraEnv: [],
+      skipIfDirty: true,
+    });
+    expect(off.data.useWorktree).toBe(false);
+
+    const on = reducer(makeState(), {
+      type: "APPLY_PROFILE_DEFAULTS",
+      yoloMode: false,
+      sandboxEnabled: false,
+      worktreeEnabled: true,
+      tool: "claude",
+      extraEnv: [],
+      skipIfDirty: true,
+    });
+    expect(on.data.useWorktree).toBe(true);
+  });
+
+  it("never enables worktree for a scratch session even when worktreeEnabled is true", () => {
+    const scratch = makeState({ data: { ...initialData, scratch: true } });
+    const next = reducer(scratch, {
+      type: "APPLY_PROFILE_DEFAULTS",
+      yoloMode: false,
+      sandboxEnabled: false,
+      worktreeEnabled: true,
+      tool: "claude",
+      extraEnv: [],
+      skipIfDirty: true,
+    });
+    expect(next.data.useWorktree).toBe(false);
+  });
+
+  it("does not stomp a user worktree toggle made before the mount fetch resolves", () => {
+    // The user opens the wizard and turns the toggle off (or on) before
+    // /api/settings resolves. SET_FIELD on useWorktree marks profileDirty,
+    // so the late skipIfDirty apply must be a no-op.
+    const toggled = reducer(makeState(), {
+      type: "SET_FIELD",
+      field: "useWorktree",
+      value: true,
+    });
+    expect(toggled.data.useWorktree).toBe(true);
+    expect(toggled.data.profileDirty).toBe(true);
+
+    const late = reducer(toggled, {
+      type: "APPLY_PROFILE_DEFAULTS",
+      yoloMode: false,
+      sandboxEnabled: false,
+      worktreeEnabled: false,
+      tool: "claude",
+      extraEnv: [],
+      skipIfDirty: true,
+    });
+    expect(late).toBe(toggled);
+    expect(late.data.useWorktree).toBe(true);
   });
 });

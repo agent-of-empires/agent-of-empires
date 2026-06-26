@@ -129,6 +129,12 @@ fn run_info(id: &str) -> Result<()> {
             }
         );
     }
+    if !m.ui.is_empty() {
+        println!("  ui:");
+        for u in &m.ui {
+            println!("    - {} ({})", u.slot.as_str(), u.id);
+        }
+    }
     if !m.description.is_empty() {
         println!("  about:      {}", m.description);
     }

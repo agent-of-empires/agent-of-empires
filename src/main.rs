@@ -40,6 +40,18 @@ fn is_serve_daemon_child(_cli: &Cli) -> bool {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Hidden internal helper for the `AOE_VT_LIVE` live-preview path (default
+    // on): `aoe __vt-pipe <socket>` forwards a tmux pipe-pane stream to a unix
+    // socket. Handled before clap so it never appears on the CLI/docs surface.
+    {
+        let mut a = std::env::args();
+        let _ = a.next();
+        if a.next().as_deref() == Some("__vt-pipe") {
+            let sock = a.next().unwrap_or_default();
+            return agent_of_empires::tui::run_vt_pipe(&sock).map_err(Into::into);
+        }
+    }
+
     // Parse the core clap tree first. On success (every valid core command,
     // including the app-data-free ones like completion/init/agents) this never
     // touches the plugin registry. Only an error, --help/--version, or an

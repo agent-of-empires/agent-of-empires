@@ -24,11 +24,17 @@ pub mod host;
 #[cfg(feature = "serve")]
 pub mod host_api;
 #[cfg(feature = "serve")]
-pub mod launch;
-#[cfg(feature = "serve")]
 pub mod protocol;
 #[cfg(feature = "serve")]
 pub mod sandbox;
+#[cfg(feature = "serve")]
+pub mod ui_state;
+
+// Launch resolution is pure (PATH / filesystem probing) and is shared by the
+// serve-only host and the always-present installer, which runs a plugin's
+// build steps with the same argv-resolution policy. It carries no host state,
+// so it is not gated.
+pub mod launch;
 
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};

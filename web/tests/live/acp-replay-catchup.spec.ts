@@ -3,8 +3,8 @@
 // `GET /api/sessions/:id/acp/replay?since=N` returns
 // `{ frames, lost, highest_seq, lowest_seq }` out of the disk-backed
 // event store. This spec seeds a deterministic event stream via
-// `structured view/force_end_turn` (each call publishes a `Stopped` event with a
-// fresh seq), then verifies:
+// `structured view/force_end_turn` without starting the ACP worker. Each call
+// publishes a `Stopped` event with a fresh seq, then verifies:
 //   - replay from since=0 returns every seeded frame
 //   - replay from since=highest returns no frames but reports highest_seq
 //   - replay from a since cursor predating the lowest stored seq sets
@@ -12,7 +12,7 @@
 //     session; lowest_seq starts at 1 so since=0 alone is not enough)
 //
 // Independent of #1237: force_end_turn writes straight to the event
-// store without going through the prompt path.
+// store without going through the prompt path or a running worker.
 
 import { test, expect } from "@playwright/test";
 import { spawnAoeServe, listSessions, seedSessionViaAoeAdd } from "../helpers/aoeServe";
@@ -32,19 +32,15 @@ test("structured view/replay surfaces seeded events and signals lost frames", as
     const sessions = await listSessions(serve.baseUrl);
     const sessionId = sessions[0]!.id;
 
-    await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/acp/enable`, {
-      method: "POST",
-    });
+    // Keep the worker stopped. Replay is a store contract, and worker startup
+    // can append unrelated frames between the head snapshot and tail probe.
 
     for (let i = 0; i < SEED_EVENTS; i++) {
       const r = await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/acp/force_end_turn`, { method: "POST" });
       expect(r.status).toBe(202);
     }
 
-    // Poll for at least SEED_EVENTS user_forced events to land in the
-    // store. Other events (ModesAvailable, AvailableCommandsUpdated)
-    // may interleave from the supervisor startup; we just care that the
-    // user_forced count reaches the seeded value.
+    // Poll for at least SEED_EVENTS user_forced events to land in the store.
     let body: {
       frames: { seq: number }[];
       lost: boolean;
@@ -86,8 +82,8 @@ test("structured view/replay surfaces seeded events and signals lost frames", as
     // pages plus `next_cursor`/`has_more`, and following the cursor to
     // exhaustion reassembles the same transcript a single unbounded
     // (default-page) replay returns. `target` caps the loop at the
-    // snapshot head so a stray startup event appended mid-loop can't
-    // make the two reads disagree.
+    // snapshot head so any future append mid-loop can't make the two reads
+    // disagree.
     const full = body!;
     const target = full.highest_seq!;
     const fullSeqs = full.frames.map((f) => f.seq).filter((s) => s <= target);

@@ -22,6 +22,23 @@ pub(crate) mod styles;
 
 pub use app::*;
 
+/// Entry point for the hidden `aoe __vt-pipe <socket>` helper subprocess used
+/// by the `AOE_VT_LIVE` live-preview path (default on). Copies the pane's piped
+/// output (stdin) to the unix socket, unbuffered. Dispatched in `main` before
+/// clap so it stays off the CLI/docs surface.
+#[cfg(unix)]
+pub fn run_vt_pipe(socket: &str) -> std::io::Result<()> {
+    crate::tmux::vt::run_pipe(socket)
+}
+
+#[cfg(not(unix))]
+pub fn run_vt_pipe(_socket: &str) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "__vt-pipe is unix-only",
+    ))
+}
+
 use anyhow::Result;
 use crossterm::{
     event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
@@ -54,6 +71,60 @@ fn env_mouse_capture_allows() -> bool {
     std::env::var("AOE_MOUSE_CAPTURE")
         .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
         .unwrap_or(true)
+}
+
+/// RAII guard for the TUI's terminal mode. `enter` turns on raw mode, the
+/// alternate screen, bracketed paste, and (when requested) mouse capture; the
+/// `Drop` impl reverses all of it. Because it runs on drop, the terminal is
+/// restored on EVERY exit path, including a panic mid-render, where the old
+/// inline teardown was skipped and left the terminal wedged (raw mode / mouse
+/// reporting stuck on). Drop is best-effort and never panics.
+struct TerminalGuard {
+    /// Whether to emit `DisableMouseCapture` on teardown. Mirrors the startup
+    /// gate: under Mosh we never enable capture, so we must not disable it
+    /// either; otherwise we always disable (a mid-session settings toggle can
+    /// turn it on after startup, so we can't gate on the startup value).
+    disable_mouse: bool,
+}
+
+impl TerminalGuard {
+    fn enter(enable_mouse: bool, mosh_active: bool) -> Result<Self> {
+        // Roll back any already-applied state if a later step fails, so a
+        // partial enter (e.g. raw mode on, alternate screen failed) never
+        // leaves the shell wedged before a guard exists to restore it on drop.
+        enable_raw_mode()?;
+        let mut stdout = io::stdout();
+        if let Err(err) = execute!(stdout, EnterAlternateScreen, EnableBracketedPaste) {
+            let _ = disable_raw_mode();
+            return Err(err.into());
+        }
+        if enable_mouse {
+            if let Err(err) = execute!(stdout, EnableMouseCapture) {
+                let _ = execute!(stdout, LeaveAlternateScreen, DisableBracketedPaste);
+                let _ = disable_raw_mode();
+                return Err(err.into());
+            }
+        }
+        Ok(Self {
+            disable_mouse: !mosh_active,
+        })
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let mut stdout = io::stdout();
+        let _ = disable_raw_mode();
+        if self.disable_mouse {
+            let _ = execute!(stdout, DisableMouseCapture);
+        }
+        let _ = execute!(
+            stdout,
+            LeaveAlternateScreen,
+            DisableBracketedPaste,
+            crossterm::cursor::Show
+        );
+    }
 }
 use crate::session::get_update_settings;
 use crate::update::check_for_update;
@@ -160,11 +231,9 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
         anyhow::bail!("stdin is not a terminal; aoe requires an interactive TTY");
     }
 
-    // Setup terminal
-    // (mouse_capture_requested defined below; see top-of-file pub fn.)
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    // Setup terminal. Resolve the mouse/mosh policy BEFORE entering raw mode so
+    // the RAII `TerminalGuard` owns the whole enter/restore lifecycle.
+    //
     // Mouse capture is ON by default to preserve preview-pane wheel scroll
     // (#795); toggle it off via Settings > Interaction > Mouse Capture, or set
     // AOE_MOUSE_CAPTURE=0 as a backstop on iOS Mosh + Termius/Blink, which
@@ -182,10 +251,9 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
     let startup_session_config = crate::session::resolve_config(profile)
         .map(|c| c.session)
         .unwrap_or_default();
-    if mouse_capture_requested(&startup_session_config) && !mosh_active {
-        execute!(stdout, EnableMouseCapture)?;
-    }
-    let backend = CrosstermBackend::new(stdout);
+    let enable_mouse = mouse_capture_requested(&startup_session_config) && !mosh_active;
+    let _terminal_guard = TerminalGuard::enter(enable_mouse, mosh_active)?;
+    let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
 
     // Combine the caller-supplied startup warning (e.g. debug-log file
@@ -238,21 +306,10 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
 
     crate::session::clear_tui_heartbeat();
 
-    // Restore terminal
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableBracketedPaste
-    )?;
-    // Always disable on teardown (except Mosh, where we never enabled): a
-    // mid-session Settings toggle can turn capture on after startup, so gating
-    // disable on the startup snapshot would leave capture stuck on at exit.
-    if !mosh_active {
-        execute!(terminal.backend_mut(), DisableMouseCapture)?;
-    }
-    terminal.show_cursor()?;
-
+    // Terminal restore (raw mode, alternate screen, bracketed paste, mouse
+    // capture, cursor) happens in `_terminal_guard`'s Drop, so it runs on every
+    // exit path including a panic, not just this normal return.
+    drop(terminal);
     result
 }
 

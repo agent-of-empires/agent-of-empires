@@ -32,6 +32,7 @@ interface Props {
   onApplyProfileDefaults: (defaults: {
     yoloMode: boolean;
     sandboxEnabled: boolean;
+    worktreeEnabled: boolean;
     tool: string;
     extraEnv: string[];
     agentModel?: string;
@@ -167,6 +168,7 @@ export function AgentOptions({
         if (settings) {
           const session = settings.session as Record<string, unknown> | undefined;
           const sandbox = settings.sandbox as Record<string, unknown> | undefined;
+          const worktree = settings.worktree as Record<string, unknown> | undefined;
           // Pre-populate sandbox env from the profile so the user can see and edit
           // it before submission; without this, an empty extra_env is sent and the
           // backend falls back to the wrong (globally-default) profile's env vars.
@@ -179,6 +181,7 @@ export function AgentOptions({
           onApplyProfileDefaults({
             yoloMode: (session?.yolo_mode_default as boolean) ?? false,
             sandboxEnabled: (sandbox?.enabled_by_default as boolean) ?? false,
+            worktreeEnabled: (worktree?.enabled as boolean) ?? false,
             tool: defaultTool,
             extraEnv: env,
             agentModel: typeof acpDefault?.model === "string" ? acpDefault.model : "",

@@ -412,3 +412,308 @@ asset = "bin-${os}-${arch}"
     std::env::remove_var("AOE_UPDATE_API_BASE");
     server.abort();
 }
+
+/// Build steps run in the FINAL installed directory (not the staging tree that
+/// is renamed away), so a build artifact lands at `<plugins_dir>/<id>`. Uses a
+/// bare `sh` launch command (resolves on PATH) so install's post-build
+/// entrypoint check passes without the build having to produce an executable.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn build_step_runs_in_final_dir() {
+    let _home = isolate();
+    let src = tempfile::tempdir().unwrap();
+    let dir = write_plugin_dir(
+        src.path(),
+        r#"
+id = "acme.built"
+name = "Built"
+version = "0.1.0"
+api_version = 2
+
+[runtime]
+kind = "command"
+command = ["sh"]
+system = true
+
+[[runtime.build]]
+command = ["cp", "aoe-plugin.toml", "build-marker"]
+"#,
+    );
+
+    install::install(dir.to_str().unwrap(), true).await.unwrap();
+
+    let installed = agent_of_empires::plugin::plugins_dir()
+        .unwrap()
+        .join("acme.built");
+    assert!(
+        installed.join("build-marker").exists(),
+        "build step ran with cwd = the final plugin dir"
+    );
+}
+
+/// A build step whose `platforms` excludes the host OS is skipped, so its
+/// artifact is never produced and install still succeeds.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn build_step_skipped_on_non_matching_platform() {
+    let _home = isolate();
+    let src = tempfile::tempdir().unwrap();
+    let dir = write_plugin_dir(
+        src.path(),
+        r#"
+id = "acme.skip"
+name = "Skip"
+version = "0.1.0"
+api_version = 2
+
+[runtime]
+kind = "command"
+command = ["sh"]
+system = true
+
+[[runtime.build]]
+command = ["cp", "aoe-plugin.toml", "should-not-exist"]
+platforms = ["windows"]
+"#,
+    );
+
+    install::install(dir.to_str().unwrap(), true).await.unwrap();
+
+    let installed = agent_of_empires::plugin::plugins_dir()
+        .unwrap()
+        .join("acme.skip");
+    assert!(
+        installed.exists(),
+        "install succeeds with all steps skipped"
+    );
+    assert!(
+        !installed.join("should-not-exist").exists(),
+        "a platform-mismatched build step does not run"
+    );
+}
+
+/// A `system = true` worker resolves its program on PATH at launch, not at
+/// install. Install must not gate on the install shell's PATH (which is not the
+/// daemon's PATH), so a system-tool entrypoint absent from the install
+/// environment still installs and is left to resolve at launch.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn system_worker_absent_from_install_path_still_installs() {
+    let _home = isolate();
+    let src = tempfile::tempdir().unwrap();
+    let dir = write_plugin_dir(
+        src.path(),
+        r#"
+id = "acme.systool"
+name = "SysTool"
+version = "0.1.0"
+api_version = 2
+
+[runtime]
+kind = "command"
+command = ["aoe-definitely-not-on-path-xyz", "run", "worker"]
+system = true
+"#,
+    );
+
+    install::install(dir.to_str().unwrap(), true)
+        .await
+        .expect("system-tool worker installs without an install-time PATH check");
+
+    let installed = agent_of_empires::plugin::plugins_dir()
+        .unwrap()
+        .join("acme.systool");
+    assert!(installed.exists(), "plugin dir is in place");
+    assert!(load_registry().get("acme.systool").is_some());
+}
+
+/// A failing build aborts the install and leaves no trace: no installed
+/// directory, no registry entry, no lockfile entry.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn failed_build_aborts_install_and_cleans_up() {
+    let _home = isolate();
+    let src = tempfile::tempdir().unwrap();
+    let dir = write_plugin_dir(
+        src.path(),
+        r#"
+id = "acme.failbuild"
+name = "FailBuild"
+version = "0.1.0"
+api_version = 2
+
+[runtime]
+kind = "command"
+command = ["sh"]
+system = true
+
+[[runtime.build]]
+command = ["false"]
+"#,
+    );
+
+    let err = install::install(dir.to_str().unwrap(), true)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("build step"), "got: {err}");
+
+    let installed = agent_of_empires::plugin::plugins_dir()
+        .unwrap()
+        .join("acme.failbuild");
+    assert!(!installed.exists(), "no half-installed dir left behind");
+    assert!(load_registry().get("acme.failbuild").is_none());
+    assert!(Lockfile::load().unwrap().get("acme.failbuild").is_none());
+}
+
+/// A failing build during update restores the previously installed version
+/// instead of leaving the user with a broken plugin.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn failed_update_build_restores_prior_version() {
+    let _home = isolate();
+    let src = tempfile::tempdir().unwrap();
+
+    // v1 installs cleanly and produces a build artifact.
+    write_plugin_dir(
+        src.path(),
+        r#"
+id = "acme.upd"
+name = "Upd"
+version = "0.1.0"
+api_version = 2
+
+[runtime]
+kind = "command"
+command = ["sh"]
+system = true
+
+[[runtime.build]]
+command = ["cp", "aoe-plugin.toml", "v1-marker"]
+"#,
+    );
+    let dir = src.path().join("src-plugin");
+    install::install(dir.to_str().unwrap(), true).await.unwrap();
+    let installed = agent_of_empires::plugin::plugins_dir()
+        .unwrap()
+        .join("acme.upd");
+    assert!(installed.join("v1-marker").exists());
+
+    // v2 at the same source now has a failing build.
+    std::fs::write(
+        dir.join("aoe-plugin.toml"),
+        r#"
+id = "acme.upd"
+name = "Upd"
+version = "0.2.0"
+api_version = 2
+
+[runtime]
+kind = "command"
+command = ["sh"]
+system = true
+
+[[runtime.build]]
+command = ["false"]
+"#,
+    )
+    .unwrap();
+
+    let err = install::update("acme.upd").await.unwrap_err().to_string();
+    assert!(err.contains("build step"), "got: {err}");
+
+    // The prior install is intact: directory, artifact, and recorded version.
+    assert!(
+        installed.join("v1-marker").exists(),
+        "v1 build artifact restored after failed update"
+    );
+    assert!(load_registry().get("acme.upd").is_some());
+    assert_eq!(
+        Lockfile::load().unwrap().get("acme.upd").unwrap().version,
+        "0.1.0",
+        "lockfile still records the working version"
+    );
+    // No leftover backup directory from the failed update.
+    assert!(!installed.with_file_name("acme.upd.bak").exists());
+}
+
+/// A changed build recipe on update must re-prompt even when capabilities are
+/// unchanged, so a modified (possibly malicious) build cannot run unattended.
+/// Non-interactively that prompt bails, leaving the prior version untouched.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn update_reprompts_when_build_recipe_changes() {
+    let _home = isolate();
+    let src = tempfile::tempdir().unwrap();
+
+    write_plugin_dir(
+        src.path(),
+        r#"
+id = "acme.recipe"
+name = "Recipe"
+version = "0.1.0"
+api_version = 2
+capabilities = ["net"]
+
+[runtime]
+kind = "command"
+command = ["sh"]
+system = true
+
+[[runtime.build]]
+command = ["cp", "aoe-plugin.toml", "marker-v1"]
+"#,
+    );
+    let dir = src.path().join("src-plugin");
+    install::install(dir.to_str().unwrap(), true).await.unwrap();
+
+    // Same capability, but the build recipe changed.
+    std::fs::write(
+        dir.join("aoe-plugin.toml"),
+        r#"
+id = "acme.recipe"
+name = "Recipe"
+version = "0.2.0"
+api_version = 2
+capabilities = ["net"]
+
+[runtime]
+kind = "command"
+command = ["sh"]
+system = true
+
+[[runtime.build]]
+command = ["cp", "aoe-plugin.toml", "marker-v2"]
+"#,
+    )
+    .unwrap();
+
+    // The changed recipe forces a prompt, which bails on non-terminal stdin
+    // instead of silently running the new build.
+    let err = install::update("acme.recipe")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("not a terminal"), "got: {err}");
+
+    // Prior version is fully intact: v1 artifact present, v2 never ran.
+    let installed = agent_of_empires::plugin::plugins_dir()
+        .unwrap()
+        .join("acme.recipe");
+    assert!(installed.join("marker-v1").exists());
+    assert!(!installed.join("marker-v2").exists());
+    assert_eq!(
+        Lockfile::load()
+            .unwrap()
+            .get("acme.recipe")
+            .unwrap()
+            .version,
+        "0.1.0"
+    );
+}

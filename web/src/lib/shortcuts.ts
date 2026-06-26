@@ -182,7 +182,7 @@ export const SHORTCUTS: readonly ShortcutDef[] = [
   {
     id: "diff",
     action: "onDiff",
-    description: "Toggle diff panel",
+    description: "Toggle diff pane",
     chord: { base: "D" },
     trigger: {
       scope: "textless",

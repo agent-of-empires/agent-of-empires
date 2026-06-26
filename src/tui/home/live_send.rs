@@ -615,6 +615,21 @@ impl Drop for LiveCaptureWorker {
     }
 }
 
+/// The default capture transport: one `capture-pane` fork that folds in the
+/// cursor probe. Shared by the worker's non-VT path on all platforms.
+fn capture_via_tmux(
+    name: &str,
+    lines: usize,
+    forward_empty: bool,
+) -> (Option<String>, Option<crate::tmux::PaneCursor>) {
+    let session = crate::tmux::Session::from_name(name);
+    match session.capture_pane_with_cursor(lines) {
+        Ok((content, cur)) => (Some(content), cur),
+        Err(_) if forward_empty => (Some(String::new()), None),
+        Err(_) => (None, None),
+    }
+}
+
 impl LiveCaptureWorker {
     pub(in crate::tui) fn spawn(wake: std::sync::Arc<tokio::sync::Notify>) -> Self {
         use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -638,6 +653,25 @@ impl LiveCaptureWorker {
         std::thread::spawn(move || {
             let mut last_target = String::new();
             let mut last_captured: Option<String> = None;
+            // Render the live preview from an in-process vt100 grid fed by
+            // `tmux pipe-pane -IO` (and route input back through the same
+            // socket), instead of scraping `capture-pane` and forking
+            // `send-keys` per keystroke. This is the default; set
+            // `AOE_VT_LIVE=0` to fall back to the legacy capture/send-keys path.
+            // When a pane can't arm a VT channel (tmux < 3.4, stopped pane), the
+            // worker also falls back to capture for that pane.
+            #[cfg(unix)]
+            let vt_enabled = !matches!(
+                std::env::var("AOE_VT_LIVE").ok().as_deref(),
+                Some("0") | Some("false")
+            );
+            #[cfg(unix)]
+            let mut vt_source: Option<std::sync::Arc<crate::tmux::vt::VtChannel>> = None;
+            // Whether we've already attempted (and possibly failed) to arm a VT
+            // channel for the current target, so a failure falls back to capture
+            // without re-arming every tick. Reset on target change.
+            #[cfg(unix)]
+            let mut vt_arm_attempted = false;
             while !stop_flag.load(Ordering::Relaxed) {
                 let lines = lines_cell.load(Ordering::Relaxed);
                 // Read the target without holding the lock across the fork:
@@ -653,23 +687,52 @@ impl LiveCaptureWorker {
                 if name != last_target {
                     last_target = name.clone();
                     last_captured = None;
+                    // Tear down a VT source armed for the old target (also fires
+                    // on retarget-to-empty), disabling its `pipe-pane`, and allow
+                    // a fresh arm attempt for the new target.
+                    #[cfg(unix)]
+                    {
+                        vt_source = None;
+                        vt_arm_attempted = false;
+                    }
                 }
                 if lines > 0 && !name.is_empty() {
-                    let session = crate::tmux::Session::from_name(&name);
                     let forward_empty = forward_empty_cell.load(Ordering::Relaxed);
-                    // Always pay for the cursor query: it folds into the same
-                    // `tmux` fork as the capture (one invocation), and the
-                    // passive-preview wheel forward needs the cursor (is this
-                    // an alternate-screen app? mouse tracking on?) to decide
-                    // whether and how to scroll the agent, not just live-send.
-                    // A failed fork reads as "gone". For preserve panes that
-                    // means hold the last-good frame (drop it); for forward
-                    // panes (terminals) surface it as empty so stale text clears.
-                    let (capture, cursor_now) = match session.capture_pane_with_cursor(lines) {
-                        Ok((content, cur)) => (Some(content), cur),
-                        Err(_) if forward_empty => (Some(String::new()), None),
-                        Err(_) => (None, None),
+                    // Acquire one frame + cursor. Default: sample the in-process
+                    // vt100 grid, arming a `pipe-pane -IO` channel on first use
+                    // for this target (cursor and alt/mouse flags come
+                    // authoritatively from the grid). If arming fails (tmux too
+                    // old, stopped pane), fall back to a `capture-pane` fork for
+                    // this pane and don't retry until the target changes.
+                    //
+                    // Capture-path semantics on a failed fork: preserve panes
+                    // hold the last-good frame (drop it); forward panes
+                    // (terminals) surface empty so stale text clears.
+                    #[cfg(unix)]
+                    let (capture, cursor_now) = if vt_enabled {
+                        if vt_source.is_none() && !vt_arm_attempted {
+                            vt_arm_attempted = true;
+                            vt_source = crate::tmux::vt::VtChannel::acquire(&name);
+                        }
+                        // A channel whose forwarder has disconnected stops
+                        // updating its grid; drop it and fall back to capture
+                        // for this pane (no re-arm until the target changes, so
+                        // we don't thrash on a permanently broken pane).
+                        if vt_source.as_ref().is_some_and(|v| !v.is_alive()) {
+                            vt_source = None;
+                        }
+                        match vt_source.as_ref() {
+                            Some(v) => {
+                                let (content, cur) = v.sample(lines);
+                                (Some(content), cur)
+                            }
+                            None => capture_via_tmux(&name, lines, forward_empty),
+                        }
+                    } else {
+                        capture_via_tmux(&name, lines, forward_empty)
                     };
+                    #[cfg(not(unix))]
+                    let (capture, cursor_now) = capture_via_tmux(&name, lines, forward_empty);
                     if let Some(content) = capture {
                         // Skip unchanged frames (no point waking a re-parse).
                         // Empties are skipped too unless this pane forwards
@@ -864,6 +927,31 @@ fn dispatch_batch(tmux_name: &str, batch: Vec<WorkerMsg>) {
 /// from the spawned thread without holding a worker reference.
 fn dispatch_via_fork(tmux_name: &str, action: &TmuxAction) -> anyhow::Result<()> {
     use std::process::{Command, Stdio};
+
+    // Fast path (AOE_VT_LIVE): when a *live* input channel is armed for this
+    // pane, ALL pane input goes through the socket, never `send-keys`. This is a
+    // single-writer invariant: mixing the socket and `send-keys` would interleave
+    // two writers on the one pty input stream and can corrupt multi-byte
+    // sequences (tmux pipe-pane -I shares the input stream with no arbitration).
+    // `input_mode` returns `Some` only while the forwarder is connected, so a
+    // not-yet-connected or dead channel reports `None` and input falls through
+    // to the `send-keys` fork below instead of vanishing. Keys are encoded to
+    // bytes here using the pane's cursor-key mode (DECCKM) from the grid, since
+    // we bypass tmux's own key translation. `Resize` is not pane input (it's
+    // `resize-window`), so it still forks below.
+    #[cfg(unix)]
+    if let Some(app_cursor) = crate::tmux::vt::input_mode(tmux_name) {
+        if !matches!(action, TmuxAction::Resize { .. }) {
+            let bytes = encode_action_bytes(action, app_cursor);
+            if !bytes.is_empty() {
+                let _ = crate::tmux::vt::try_send_input(tmux_name, &bytes);
+            }
+            // Single-writer: never fall back to a fork for pane input while
+            // armed, even if encoding produced nothing (drop the rare key).
+            return Ok(());
+        }
+    }
+
     let target = format!("{}:^.0", tmux_name);
     let mut cmd = Command::new("tmux");
     cmd.stderr(Stdio::null());
@@ -930,6 +1018,247 @@ fn dispatch_via_fork(tmux_name: &str, action: &TmuxAction) -> anyhow::Result<()>
         anyhow::bail!("live-send tmux subprocess exited non-zero for {:?}", action);
     }
     Ok(())
+}
+
+/// Encode a `TmuxAction` to the raw terminal bytes for the persistent-input
+/// fast path. We bypass tmux's `send-keys` key translation, so we reproduce it
+/// here, honoring the pane's cursor-key mode (`app_cursor`, DECCKM) for arrows
+/// and nav keys. Returns an empty vec for a key we can't encode (dropped under
+/// the single-writer rule rather than forked). `Resize` never reaches here.
+#[cfg(unix)]
+fn encode_action_bytes(action: &TmuxAction, app_cursor: bool) -> Vec<u8> {
+    match action {
+        TmuxAction::Literal(s) => s.clone().into_bytes(),
+        // Already raw control bytes (CR/TAB/ESC, bracketed-paste markers).
+        TmuxAction::HexBytes(bytes) => bytes.clone(),
+        TmuxAction::Named(name) => encode_named_key(name, app_cursor),
+        TmuxAction::NamedRepeat { name, count } => {
+            let one = encode_named_key(name, app_cursor);
+            one.repeat(*count)
+        }
+        TmuxAction::Resize { .. } => Vec::new(),
+    }
+}
+
+/// Strip tmux modifier prefixes (`C-`, `M-`, `S-`, in any order) off a key
+/// name, returning `(ctrl, alt, shift, base)`.
+#[cfg(unix)]
+fn split_mods(name: &str) -> (bool, bool, bool, &str) {
+    let (mut ctrl, mut alt, mut shift) = (false, false, false);
+    let mut rest = name;
+    loop {
+        if let Some(r) = rest.strip_prefix("C-") {
+            ctrl = true;
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix("M-") {
+            alt = true;
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix("S-") {
+            shift = true;
+            rest = r;
+        } else {
+            break;
+        }
+    }
+    (ctrl, alt, shift, rest)
+}
+
+/// Encode one tmux key name (e.g. `Up`, `C-c`, `S-Up`, `M-x`, `F5`) to terminal
+/// bytes. Cursor/nav keys honor `app_cursor` (DECCKM) and the xterm modifier
+/// parameter (`1 + shift + alt*2 + ctrl*4`). Empty vec = unencodable.
+#[cfg(unix)]
+fn encode_named_key(name: &str, app_cursor: bool) -> Vec<u8> {
+    let (ctrl, alt, shift, base) = split_mods(name);
+    let modp = 1 + u8::from(shift) + 2 * u8::from(alt) + 4 * u8::from(ctrl);
+    let has_mod = modp != 1;
+    // ESC-prefix for Alt on the simple (non-CSI) byte forms; CSI forms carry
+    // Alt in `modp` instead.
+    let meta = |v: Vec<u8>| -> Vec<u8> {
+        if alt {
+            let mut out = vec![0x1b];
+            out.extend_from_slice(&v);
+            out
+        } else {
+            v
+        }
+    };
+
+    // Cursor + Home/End: SS3 vs CSI by DECCKM when unmodified; CSI 1;modp when
+    // modified.
+    if let Some(fin) = match base {
+        "Up" => Some(b'A'),
+        "Down" => Some(b'B'),
+        "Right" => Some(b'C'),
+        "Left" => Some(b'D'),
+        "Home" => Some(b'H'),
+        "End" => Some(b'F'),
+        _ => None,
+    } {
+        if has_mod {
+            return format!("\x1b[1;{modp}{}", fin as char).into_bytes();
+        }
+        return if app_cursor {
+            vec![0x1b, b'O', fin]
+        } else {
+            vec![0x1b, b'[', fin]
+        };
+    }
+
+    // Editing block (CSI n ~), modifier as `;modp`. Not affected by DECCKM.
+    if let Some(n) = match base {
+        "IC" => Some(2),
+        "DC" => Some(3),
+        "PPage" => Some(5),
+        "NPage" => Some(6),
+        _ => None,
+    } {
+        return if has_mod {
+            format!("\x1b[{n};{modp}~").into_bytes()
+        } else {
+            format!("\x1b[{n}~").into_bytes()
+        };
+    }
+
+    // Function keys: F1-F4 are SS3 P/Q/R/S (CSI 1;modp X when modified),
+    // F5-F12 are CSI n ~.
+    if let Some(rest) = base.strip_prefix('F') {
+        if let Ok(n) = rest.parse::<u8>() {
+            if (1..=4).contains(&n) {
+                let fin = b'P' + (n - 1);
+                return if has_mod {
+                    format!("\x1b[1;{modp}{}", fin as char).into_bytes()
+                } else {
+                    vec![0x1b, b'O', fin]
+                };
+            }
+            let code = match n {
+                5 => 15,
+                6 => 17,
+                7 => 18,
+                8 => 19,
+                9 => 20,
+                10 => 21,
+                11 => 23,
+                12 => 24,
+                _ => return Vec::new(),
+            };
+            return if has_mod {
+                format!("\x1b[{code};{modp}~").into_bytes()
+            } else {
+                format!("\x1b[{code}~").into_bytes()
+            };
+        }
+    }
+
+    match base {
+        "Enter" => meta(vec![b'\r']),
+        "Tab" => meta(vec![b'\t']),
+        "BTab" => b"\x1b[Z".to_vec(),
+        "BSpace" => meta(vec![0x7f]),
+        "Escape" => meta(vec![0x1b]),
+        "Space" => {
+            if ctrl {
+                vec![0] // Ctrl-Space -> NUL
+            } else {
+                meta(vec![b' '])
+            }
+        }
+        _ => {
+            // Single char: `C-<letter>` -> C0 control byte; otherwise the char,
+            // ESC-prefixed for Alt. (Shift never reaches here: plain chars are
+            // sent literally with case already applied.)
+            let b = base.as_bytes();
+            if b.len() == 1 {
+                let c = b[0];
+                if ctrl && c.is_ascii_alphabetic() {
+                    return meta(vec![c.to_ascii_lowercase() & 0x1f]);
+                }
+                if c.is_ascii_graphic() {
+                    return meta(vec![c]);
+                }
+            }
+            Vec::new()
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod vt_input_encode_tests {
+    use super::*;
+
+    fn enc(name: &str, app_cursor: bool) -> Vec<u8> {
+        encode_named_key(name, app_cursor)
+    }
+
+    #[test]
+    fn arrows_follow_decckm() {
+        assert_eq!(enc("Up", false), b"\x1b[A");
+        assert_eq!(enc("Up", true), b"\x1bOA");
+        assert_eq!(enc("Down", false), b"\x1b[B");
+        assert_eq!(enc("Right", true), b"\x1bOC");
+        assert_eq!(enc("Left", false), b"\x1b[D");
+        // Home/End are cursor-mode keys too.
+        assert_eq!(enc("Home", true), b"\x1bOH");
+        assert_eq!(enc("End", false), b"\x1b[F");
+    }
+
+    #[test]
+    fn modified_arrows_use_csi_param_not_decckm() {
+        // modifier param = 1 + shift + 2*alt + 4*ctrl; mode is irrelevant.
+        assert_eq!(enc("S-Up", false), b"\x1b[1;2A");
+        assert_eq!(enc("S-Up", true), b"\x1b[1;2A");
+        assert_eq!(enc("C-Up", false), b"\x1b[1;5A");
+        assert_eq!(enc("M-Up", false), b"\x1b[1;3A");
+        assert_eq!(enc("C-S-Left", false), b"\x1b[1;6D");
+    }
+
+    #[test]
+    fn editing_block_and_fkeys() {
+        assert_eq!(enc("PPage", false), b"\x1b[5~");
+        assert_eq!(enc("NPage", true), b"\x1b[6~"); // unaffected by DECCKM
+        assert_eq!(enc("DC", false), b"\x1b[3~");
+        assert_eq!(enc("S-DC", false), b"\x1b[3;2~");
+        assert_eq!(enc("F1", false), b"\x1bOP");
+        assert_eq!(enc("F4", false), b"\x1bOS");
+        assert_eq!(enc("F5", false), b"\x1b[15~");
+        assert_eq!(enc("F12", false), b"\x1b[24~");
+        assert_eq!(enc("C-F5", false), b"\x1b[15;5~");
+    }
+
+    #[test]
+    fn simple_keys_and_chords() {
+        assert_eq!(enc("Enter", false), b"\r");
+        assert_eq!(enc("Tab", false), b"\t");
+        assert_eq!(enc("BTab", false), b"\x1b[Z");
+        assert_eq!(enc("BSpace", false), vec![0x7f]);
+        assert_eq!(enc("Escape", false), vec![0x1b]);
+        assert_eq!(enc("Space", false), b" ");
+        assert_eq!(enc("C-Space", false), vec![0x00]);
+        assert_eq!(enc("C-c", false), vec![0x03]);
+        assert_eq!(enc("C-a", false), vec![0x01]);
+        assert_eq!(enc("M-x", false), b"\x1bx");
+        assert_eq!(enc("M-Enter", false), b"\x1b\r");
+    }
+
+    #[test]
+    fn action_literal_and_repeat() {
+        assert_eq!(
+            encode_action_bytes(&TmuxAction::Literal("hi".into()), false),
+            b"hi"
+        );
+        assert_eq!(
+            encode_action_bytes(
+                &TmuxAction::NamedRepeat {
+                    name: "Up".into(),
+                    count: 3
+                },
+                false
+            ),
+            b"\x1b[A\x1b[A\x1b[A"
+        );
+        // Resize is never pane input -> empty here (handled by the fork path).
+        assert!(encode_action_bytes(&TmuxAction::Resize { cols: 80, rows: 24 }, false).is_empty());
+    }
 }
 
 /// Cap on concurrently in-flight passive-preview send forks. A fast wheel

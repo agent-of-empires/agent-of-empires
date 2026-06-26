@@ -17,13 +17,15 @@ mod manifest;
 pub use capability::{CapabilityId, TrustLevel, KNOWN_CAPABILITIES};
 pub use id::{InvalidPluginId, PluginId};
 pub use manifest::{
-    CommandContribution, KeybindContribution, ManifestError, PluginManifest, RuntimeSpec,
-    SettingContribution, SettingType, ThemeContribution, UiContribution,
+    BuildStep, CommandContribution, KeybindContribution, ManifestError, PluginManifest,
+    RuntimeSpec, SettingContribution, SettingType, ThemeContribution, UiContribution, UiSlot,
 };
 
 /// Version of the manifest schema and host API this crate describes.
 ///
 /// A manifest declares the `api_version` it was written against; the host
 /// refuses manifests targeting a newer version than it understands. Bumped to
-/// 2 when the contribution sections and capability taxonomy were added.
-pub const API_VERSION: u32 = 2;
+/// 2 when the contribution sections and capability taxonomy were added; 3 when
+/// the `detail-panel` slot became the dockable `pane` slot (with
+/// `default_location`).
+pub const API_VERSION: u32 = 3;

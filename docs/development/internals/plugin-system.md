@@ -113,9 +113,11 @@ declares: `capabilities`, `commands`, `keybinds`, `settings`, `ui`, and a
 `runtime` worker entrypoint. These are the sections the first external plugin
 declares; they are defined in `aoe-plugin-api` and parsed/validated by the
 host, but consumed by later issues (the settings registry in #2094, the runtime
-host in #2095, the command/keybind/UI surfaces in #2366). `api_version` is
-bumped to 2; an `api_version` 1 manifest still loads. Unknown top-level keys
-remain a hard parse error (`deny_unknown_fields`).
+host in #2095, the command/keybind/UI surfaces in #2366). `api_version` is now
+3 (bumped to 2 for the contribution sections, then 3 when the `detail-panel`
+slot became the dockable `pane` slot); an older `api_version` manifest still
+loads as long as it targets no newer slot. Unknown top-level keys remain a hard
+parse error (`deny_unknown_fields`).
 
 The `themes`, `status`, and `panes` sections are deferred until a consumer
 exists, so no schema lands in core ahead of one (#2386). With
@@ -126,6 +128,78 @@ The `runtime` section is one of two kinds: `command` (an argv launched from the
 plugin directory) or `release-binary` (a compiled worker shipped as a GitHub
 release asset). Installation resolves and downloads a `release-binary` asset;
 the Tier 1 host (below) launches and supervises both kinds.
+
+A `command` runtime may declare ordered `[[runtime.build]]` steps, run once at
+install and update inside the installed plugin directory before the plugin is
+registered. This is how an interpreted worker sets itself up (create a venv,
+`pip install`, `npm ci`), so it can then launch via a plugin-relative
+`command` that never depends on the daemon's PATH:
+
+```toml
+[runtime]
+kind = "command"
+command = [".venv/bin/aoe-github-worker"]   # plugin-relative: PATH-independent
+
+[[runtime.build]]
+command = ["python3", "-m", "venv", ".venv"]
+
+[[runtime.build]]
+command = [".venv/bin/pip", "install", "."]
+platforms = ["linux", "macos"]              # optional; omitted runs everywhere
+```
+
+Each step's argv resolves through the host's argv resolver (bare name on PATH,
+separator path relative to the plugin dir, absolute rejected), evaluated just
+before the step runs so `.venv/bin/pip` resolves once the prior step created it.
+Build steps are free to name bare PATH programs (`python3`, `node`, `uv`): they
+run in the user's interactive shell where PATH is reliable, which is exactly why
+the worker entrypoint, launched later by the daemon, is not. A step's optional `platforms` (`linux` / `macos` / `windows`)
+restricts it to matching hosts. Builds run with cwd set to the plugin dir, with
+stdin closed and stdout/stderr inherited so the user sees progress.
+
+Why install time and the final dir, not launch or staging: `aoe plugin
+install` runs in the user's interactive shell, where `python3` / `node` / `uv`
+are reliably on PATH; the daemon that later launches the worker is not. And a
+Python venv is not relocatable (console-script shebangs and `pyvenv.cfg` embed
+absolute paths), so the build runs in the final `<plugins_dir>/<id>`, never in
+a staging tree that is then renamed. A failed build aborts the install with no
+trace; a failed update restores the prior version from a backup, and a leftover
+backup from an interrupted update is recovered on the next install/update.
+
+The worker entrypoint (`command`'s `argv[0]`) must be plugin-relative: a path
+containing a separator (`.venv/bin/worker`), resolved inside the install
+directory. The host enforces this at manifest validation, so the
+PATH-independent shape is the default and a bare program name is rejected rather
+than silently resolved against whatever PATH the daemon happens to have. An
+absolute path is rejected in every mode (it pins a host path).
+
+A worker that genuinely depends on a system tool, for example `command = ["uv",
+"run", "worker"]`, opts into that PATH dependency explicitly with `system =
+true`:
+
+```toml
+[runtime]
+kind = "command"
+command = ["uv", "run", "worker"]
+system = true   # argv[0] is a bare PATH program, resolved at launch
+```
+
+`system = true` requires a bare program name (a path is contradictory and
+rejected) and moves resolution to launch time against the daemon's PATH. It is
+the conscious "I accept the daemon must have this tool" choice, not a fallback a
+manifest falls into by naming a program that happens not to be on PATH. Because
+its program is resolved at launch, a `system` worker is also not PATH-checked at
+install (the install shell's PATH is not the daemon's), so it installs even when
+the tool is absent from the install environment.
+
+Two trust notes for build steps. They run as the user, unsandboxed, before any
+capability gate (the same honest D8 model as the worker, just earlier), so a
+plugin with build steps always prompts at install, even when it requests no
+capabilities, and discloses the commands verbatim; `--yes` consents to both.
+And a build that runs `pip install` pulls dependency bytes the source tree hash
+does not attest; a featured plugin should pin them (for example a hash-locked
+`requirements.txt`). First-class dependency and release-binary attestation are
+deferred.
 
 ## Capabilities and grants (#2093)
 
@@ -305,11 +379,13 @@ args, cwd, env }`, dispatched off the `[runtime]` kind in a single `match`.
 Adding a new runtime kind later is a new arm there; the supervisor and the
 transport only ever see a `ResolvedLaunch`, so nothing downstream changes.
 
-- `command`: `argv[0]` resolves on `PATH` via `which` when it is a bare name (a
-  console-script entrypoint like `aoe-github-worker`, or an interpreter like
-  `python3`), or relative to the plugin directory when it contains a separator
-  (an in-tree script or binary), verified executable. Absolute and
-  parent-traversal paths are rejected.
+- `command`: `argv[0]` resolves on `PATH` via `which` when it is a bare name (an
+  interpreter or system tool like `python3` / `uv`), or relative to the plugin
+  directory when it contains a separator (an in-tree script or binary, for
+  example a build-produced `.venv/bin/worker`), verified executable. Absolute
+  and parent-traversal paths are rejected. The same policy resolves each
+  `[[runtime.build]]` step at install time; a plugin's own entrypoint should be
+  plugin-relative so the daemon's PATH never decides whether it launches.
 - `release-binary`: the per-platform binary that installation already placed in
   the plugin directory.
 
@@ -385,13 +461,117 @@ capability grant prompt states this on every install. Restricted-environment,
 landlock, and `sandbox-exec` backends land later behind the same trait, with no
 change to the resolver or the supervisor.
 
+## UI extension points (#2366)
+
+A plugin worker pushes typed UI state to the host over capability-gated RPCs;
+the **host** renders every slot, on the web dashboard. No plugin code runs in
+the dashboard and the render path never awaits a worker: the host keeps an
+in-memory snapshot the dashboard reads synchronously.
+
+The nine slots are a closed `UiSlot` set (`aoe-plugin-api`), kebab-case on the
+wire: `status-bar`, `row-badge`, `row-column`, `sort-key`, `filter-facet`,
+`card`, `pane`, `detail-badge`, `notification`. A plugin declares the
+`(slot, id)` pairs it may fill in its manifest `[[ui]]` section; an unknown
+slot is a hard parse error (the host must know how to render each).
+
+A UI contribution is not a capability and needs no grant, but the slots a
+plugin declares are disclosed so the user knows it modifies the dashboard
+before trusting it: the `aoe plugin install` prompt lists them alongside the
+requested capabilities, and they show in `aoe plugin info`, the TUI plugin
+manager, and the web Plugins panel (via `PluginView.ui_contributions`).
+
+### RPCs (`src/plugin/host_api.rs`)
+
+- `ui.state.set { slot, id, session_id?, payload }` and
+  `ui.state.remove { slot, id, session_id? }`. Gated by `runtime.worker` **and**
+  the `(slot, id)` being declared in the manifest: no dedicated `ui` capability
+  is introduced. The `payload` is validated against the slot's typed shape and
+  stored normalized; an unknown field or bad tone is rejected. Per-session slots
+  (`row-badge`, `row-column`, `pane`, `detail-badge`) require a
+  `session_id`; global slots must not carry one. The text-based slots
+  (`status-bar`, `row-badge`, `detail-badge`) accept optional `icon` (a lucide
+  icon name in kebab-case, e.g. `git-pull-request-arrow`; the client maps it
+  through an allowlist, an unknown name renders nothing) and `href` (when set,
+  the badge renders as a link that opens in a new tab; only `http`/`https` URLs
+  are followed).
+- `ui.notify { tone, title, body?, session_id? }`. Gated by the existing
+  `notifications` capability (not a slot declaration). Returns a monotonic
+  `seq`.
+
+#### Richer payloads: `row-badge` items and the `pane` block list
+
+Two slots carry more than a single value, so one entry (one declared
+`(slot, id)`) can render a list:
+
+- `row-badge` also accepts `items: BadgeItem[]` where
+  `BadgeItem = { text?, icon?, tone?, href?, tooltip? }`. Each item renders as a
+  compact, tone-tinted icon (falling back to `text`), linked when `href` is a
+  safe URL. The single `{ text, tone, tooltip, icon, href }` form still works.
+  An empty `items: []` clears the row.
+- `pane` also accepts `blocks: Block[]`, an ordered list of typed
+  blocks. The host knows these kinds: `heading { text }`,
+  `row { label, value?, sublabel?, icon?, tone?, href? }`, `note { text, tone? }`,
+  `divider {}`, `section { title?, children: Block[] }` (nested blocks), and
+  `action { label, method, icon? }` (a button that forwards `method` to the
+  plugin's worker, see below). The simple `{ title, body }` form still works
+  when `blocks` is absent. A `pane`
+  also takes an optional `default_location` (`right` | `bottom`) choosing the
+  dock it first opens in; the user can move it between docks afterward, and an
+  optional `icon` (any lucide icon name, kebab-case) for its activity-bar
+  button, falling back to a generic plugin icon. The host renders each `pane` as
+  a dockable tool-window (activity-bar toggle, move, close) alongside the
+  built-in diff and terminal panes.
+
+**Block parsing is forward-compatible by design.** The host stores `blocks` as
+opaque JSON (`Vec<Value>`); it validates only that the payload envelope is
+well-formed, not the block kinds. The web renderer draws the kinds it knows and
+silently ignores any unknown `kind` or unknown field within a block. So a plugin
+can add a field to an existing kind, or push a brand new kind, without any host
+change: an older host simply renders what it understands and drops the rest.
+This is deliberate, the GitHub plugin's pane keeps growing (PR state today,
+review/CI/timelines later) and must not require lockstep host releases.
+
+**Pane actions (host to worker).** An `action` block is a button. When clicked,
+the dashboard POSTs `/api/plugins/{id}/action { method, params? }`; the host
+writes that JSON-RPC method to the worker's stdin as a notification (no id, so
+no reply) via `PluginHost::notify_worker`. The worker runs the method (e.g.
+`github.refresh`) and re-pushes its UI state, which the next `ui-state` poll
+renders. The plugin names the `method` in its own block, and the worker is the
+trust boundary: it acts only on methods it implements and ignores the rest (the
+honest-plugin model). The endpoint is gated like other mutations (read-write
+mode plus an elevated session when login is on).
+
+### Store and lifecycle (`src/plugin/ui_state.rs`)
+
+State is in-memory and dies with the daemon, like the rest of the Tier 1 host.
+Each worker spawn takes a *generation*; a plugin's entries are cleared when its
+worker exits, guarded by the generation so a late write or an instant respawn
+cannot resurrect or clobber the live worker's state. Notifications ride a
+separate bounded ring and survive a worker exit (a plugin that posts then
+crashes still reaches the browser). Per-plugin quotas bound memory.
+
+### Delivery
+
+`GET /api/plugins/ui-state` returns the full snapshot (entries grouped nowhere,
+plus the notification ring); it is small and bounded, so there is no
+incremental cursor. The dashboard polls it on the same cadence as
+`/api/sessions` and renders per-session entries only for sessions present in
+the live list. Notifications surface as toasts, deduped by `seq`.
+
+`sort-key` and `filter-facet` are accepted and stored by the host but their
+dashboard rendering (which needs changes to the sidebar's sort/filter core),
+and TUI rendering of any slot (the standalone TUI has no daemon link), are
+deferred to follow-ups.
+
 ## What comes next
 
 Each deferred piece returns as its own PR once the core is proven: the Tier 0
-contribution registries and the command/keybind/UI surfaces (issues 2094 and
-2366), the builtin worker self-exec path and worker SDK (with the first builtin
-worker that needs them), and the discovery / featured supply-chain layer with
-integrity hashing (issues 2364 and 2365). Pinning a featured plugin's
+contribution registries (issue 2094), the UI extension points (issue 2366,
+above), the builtin worker self-exec path and worker SDK (with the first
+builtin worker that needs them), and the discovery / featured supply-chain
+layer with integrity hashing (issues 2364 and 2365). Within #2366, dashboard
+rendering of the `sort-key` and `filter-facet` slots and TUI rendering of any
+slot are themselves follow-ups. Pinning a featured plugin's
 release-binary asset hash in `featured.toml` (so a featured worker is attested,
 not just its source) is a follow-up; today a release-binary plugin cannot be
 featured.

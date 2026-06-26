@@ -1,14 +1,15 @@
 // @vitest-environment jsdom
 //
-// Contract test for RightPanel's PairedTerminal "Starting terminal..."
-// placeholder. The full mounted-terminal path is exercised by the
-// Playwright suites; this just renders the early-return branch and
-// asserts the loading copy and basic shell mode controls are present.
+// Contract test for PairedShellPane's "Starting session..." placeholder and
+// shell-mode controls. The full mounted-terminal path is exercised by the
+// Playwright suites; this renders the early branches and asserts the loading
+// copy and shell picker are present. PairedShellPane is the body of the
+// "terminal" dock pane (previously the lower half of RightPanel).
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { cleanup, render, screen } from "@testing-library/react";
 
-import type { RichDiffFile, SessionResponse } from "../../lib/types";
+import type { SessionResponse } from "../../lib/types";
 
 const ensureTerminal = vi.fn();
 vi.mock("../../lib/api", () => ({
@@ -48,17 +49,7 @@ vi.mock("../../hooks/useMobileKeyboard", () => ({
   }),
 }));
 
-// The DiffFileList pulls in a heavy chain (shiki, diff library, etc).
-// We're only exercising the right pane's terminal placeholder branch,
-// so a stub is enough.
-vi.mock("../diff/DiffFileList", () => ({
-  DiffFileList: () => null,
-}));
-vi.mock("../diff/comments/CommentsBanner", () => ({
-  CommentsBanner: () => null,
-}));
-
-import { RightPanel } from "../RightPanel";
+import { PairedShellPane } from "../PairedTerminal";
 
 function makeSession(): SessionResponse {
   return {
@@ -82,49 +73,28 @@ function makeSession(): SessionResponse {
   } as SessionResponse;
 }
 
-const baseProps = {
-  session: makeSession(),
-  sessionId: "sess-rp-1",
-  files: [] as RichDiffFile[],
-  perRepoBases: [],
-  warning: null,
-  filesLoading: false,
-  selectedFilePath: null,
-  selectedRepoName: undefined,
-  onSelectFile: vi.fn(),
-  onDiffRefresh: vi.fn(),
-  commentsEnabled: false,
-  commentsCount: 0,
-  commentsSendEnabled: false,
-  onOpenSendDialog: vi.fn(),
-  onDiscardAllComments: vi.fn(),
-};
-
 afterEach(() => {
   ensureTerminal.mockReset();
+  cleanup();
 });
 
-describe("RightPanel PairedShellPane", () => {
+describe("PairedShellPane", () => {
   it("renders the ensure-pending placeholder while the shell starts", () => {
     // Never-resolving promise pins ensureState at "pending" so the
-    // LiveTerminalView placeholder branch stays mounted (the paired shell
-    // now renders the unified live view).
+    // LiveTerminalView placeholder branch stays mounted.
     ensureTerminal.mockReturnValue(new Promise(() => {}));
-    render(<RightPanel {...baseProps} />);
+    render(<PairedShellPane session={makeSession()} sessionId="sess-rp-1" />);
     expect(screen.getByText(/Starting session/i)).toBeDefined();
   });
 
   it("renders the shell mode picker with Host preselected", () => {
     ensureTerminal.mockReturnValue(new Promise(() => {}));
-    render(<RightPanel {...baseProps} />);
-    // The "Host" picker is rendered twice -- once for desktop, once
-    // for the mobile slide-in. Either match is fine; what matters is
-    // that the shell-mode toggle made it into the DOM.
+    render(<PairedShellPane session={makeSession()} sessionId="sess-rp-1" />);
     expect(screen.getAllByRole("button", { name: /^Host$/ }).length).toBeGreaterThan(0);
   });
 
   it("renders 'Select a session' when sessionId is null", () => {
-    render(<RightPanel {...baseProps} sessionId={null} session={null} />);
+    render(<PairedShellPane session={null} sessionId={null} />);
     expect(screen.getByText(/Select a session/i)).toBeDefined();
   });
 });

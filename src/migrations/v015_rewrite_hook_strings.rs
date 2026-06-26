@@ -184,7 +184,7 @@ fn rewrite_one(target: &HookTarget) -> Result<()> {
 /// Migrations run before the live process commits to the current `Config`
 /// schema, so we deliberately avoid `Config::load()` here. If the
 /// `environment` schema key is renamed, both this and
-/// `crate::hooks::collect_env_lists_from_session` must update.
+/// `crate::hooks::targets::collect_env_lists_from_session` must update.
 fn collect_env_lists(app_dir: &Path) -> Vec<Vec<String>> {
     let mut out = Vec::new();
     if let Some(env) = read_environment_from_toml(&app_dir.join("config.toml")) {
@@ -317,17 +317,26 @@ mod tests {
                     if !cmd.contains("aoe-hooks") {
                         continue;
                     }
-                    let event_def = claude_events
+                    // An event name may declare several matcher groups with
+                    // different statuses (Claude's `Notification` splits
+                    // permission/elicitation → waiting from idle_prompt →
+                    // idle), so the canonical set is the union over every event
+                    // def sharing this name, not just the first.
+                    let event_defs: Vec<_> = claude_events
                         .iter()
-                        .find(|e| e.name == event_name)
-                        .unwrap_or_else(|| panic!("unknown Claude event: {event_name}"));
+                        .filter(|e| e.name == event_name)
+                        .collect();
+                    assert!(!event_defs.is_empty(), "unknown Claude event: {event_name}");
                     let mut canonical_set: Vec<String> = Vec::new();
-                    if event_def.session_id_capture {
-                        canonical_set.push(canonical_session_id_command(HookInstallTarget::Host));
-                    }
-                    if let Some(status) = event_def.status {
-                        canonical_set
-                            .push(canonical_status_command(status, HookInstallTarget::Host));
+                    for event_def in event_defs {
+                        if event_def.session_id_capture {
+                            canonical_set
+                                .push(canonical_session_id_command(HookInstallTarget::Host));
+                        }
+                        if let Some(status) = event_def.status {
+                            canonical_set
+                                .push(canonical_status_command(status, HookInstallTarget::Host));
+                        }
                     }
                     assert!(
                         canonical_set.iter().any(|c| c == cmd),

@@ -162,7 +162,7 @@ pub(crate) fn run_in(home: &Path, app_dir: &Path) -> Result<()> {
 /// Mirrors `v015::collect_env_lists`: migrations run before the live
 /// process commits to the current `Config` schema, so we deliberately
 /// avoid `Config::load()` here. If the `environment` schema key is renamed,
-/// both this and `crate::hooks::collect_env_lists_from_session` must update.
+/// both this and `crate::hooks::targets::collect_env_lists_from_session` must update.
 fn collect_env_lists(app_dir: &Path) -> Vec<Vec<String>> {
     let mut out = Vec::new();
     if let Some(env) = read_environment_from_toml(&app_dir.join("config.toml")) {

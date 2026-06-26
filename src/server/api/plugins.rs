@@ -59,6 +59,65 @@ pub async fn list_plugins() -> Json<serde_json::Value> {
     }))
 }
 
+/// `GET /api/plugins/ui-state`: the plugin host's aggregated UI-state snapshot
+/// (the slots workers have pushed, plus the notification ring). Empty when no
+/// host is running (read-only mode, or a TUI-only build with no daemon). The
+/// dashboard polls this alongside `/api/sessions` and renders each slot itself.
+pub async fn plugin_ui_state(
+    State(state): State<std::sync::Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let empty = || json!({ "entries": [], "notifications": [] });
+    match state.plugin_host.as_ref().map(|h| h.ui_snapshot()) {
+        Some(snapshot) => Json(serde_json::to_value(snapshot).unwrap_or_else(|e| {
+            // Serializing the snapshot should never fail; if it somehow does,
+            // keep the response shape stable rather than returning JSON null.
+            tracing::warn!(target: "serve.api", "failed to serialize plugin UI snapshot: {e}");
+            empty()
+        })),
+        None => Json(empty()),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct PluginActionBody {
+    /// The worker method to invoke (the plugin names it in its pane's action
+    /// block, e.g. `github.refresh`).
+    pub method: String,
+    #[serde(default)]
+    pub params: serde_json::Value,
+}
+
+/// `POST /api/plugins/{id}/action`: forward a dashboard UI action (a pane
+/// button) to the plugin's worker as a fire-and-forget JSON-RPC notification.
+/// The worker is the trust boundary: it acts only on methods it implements and
+/// ignores the rest, so this never waits for or returns a worker result.
+pub async fn invoke_plugin_action(
+    State(state): State<std::sync::Arc<AppState>>,
+    session: Option<axum::Extension<AuthenticatedSession>>,
+    Path(id): Path<String>,
+    Json(body): Json<PluginActionBody>,
+) -> Response {
+    if let Err(resp) = mutation_gate(&state, session.as_deref()).await {
+        return resp;
+    }
+    let Some(host) = state.plugin_host.as_ref() else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no_host",
+            "Plugin host is not running".into(),
+        );
+    };
+    if host.notify_worker(&id, &body.method, body.params).await {
+        (StatusCode::ACCEPTED, Json(json!({ "ok": true }))).into_response()
+    } else {
+        error_response(
+            StatusCode::NOT_FOUND,
+            "no_worker",
+            format!("No running worker for plugin {id}"),
+        )
+    }
+}
+
 #[derive(Deserialize)]
 pub struct SetEnabledBody {
     pub enabled: bool,

@@ -479,6 +479,15 @@ impl AcpTranscript {
                 });
                 self.turn_active = false;
             }
+            Event::PromptRuntimeError { message } => {
+                self.flush_pending_chunk();
+                self.status_text = Some("prompt error".to_string());
+                self.rows.push(ActivityRow::Note {
+                    kind: NoteKind::Error,
+                    text: format!("prompt failed: {message}"),
+                });
+                self.turn_active = false;
+            }
             Event::IncompatibleAgent { .. } => {
                 // Structured detail for the web structured view's StartupErrorScreen.
                 // The TUI mirrors the textual signal via the parallel

@@ -1,0 +1,623 @@
+//! Shared in-process VT channel.
+//!
+//! A `tmux pipe-pane -IO` stream feeds a pane's raw output into an in-process
+//! [`vt100::Parser`] (a real grid: alt-screen buffer, cursor, mouse/DEC modes),
+//! and the same full-duplex unix socket carries keystroke bytes back to the
+//! pane. tmux still owns the pane (process, persistence, kill-tree); only the
+//! live render/input transport lives here.
+//!
+//! One [`VtChannel`] per tmux session, shared and refcounted: every viewer (the
+//! native TUI live preview and the web/mobile live terminal) holds an `Arc`, so
+//! a session is parsed once no matter how many surfaces watch it. The channel
+//! tears down (disables the pipe, stops the forwarder) when the last `Arc`
+//! drops. Unix-only; the whole module is `#[cfg(unix)]`.
+
+use std::collections::HashMap;
+use std::io::Read;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
+use std::time::{Duration, Instant};
+
+use crate::tmux::PaneCursor;
+
+/// `aoe __vt-pipe <socket>`: the bidirectional `pipe-pane -IO` forwarder. tmux
+/// connects the pane's OUTPUT to this process's stdin and the pane's INPUT to
+/// its stdout, so:
+///   - stdin (pane output) -> socket  (a viewer reads it into a vt100 grid)
+///   - socket -> stdout (pane input)  (a viewer writes keystrokes, no fork)
+///
+/// One full-duplex unix socket carries both directions. Unbuffered: direct
+/// `write(2)` per chunk so a keystroke is not stalled behind a stdio buffer.
+pub(crate) fn run_pipe(socket: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let sock_r = UnixStream::connect(socket)?;
+    let mut sock_w = sock_r.try_clone()?;
+
+    // stdin (pane output) -> socket
+    let pump_out = std::thread::spawn(move || {
+        let mut stdin = std::io::stdin().lock();
+        let mut buf = [0u8; 8192];
+        loop {
+            match stdin.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if sock_w.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = sock_w.shutdown(std::net::Shutdown::Write);
+    });
+
+    // socket -> stdout (pane input)
+    let mut sock_r = sock_r;
+    let mut stdout = std::io::stdout().lock();
+    let mut buf = [0u8; 4096];
+    loop {
+        match sock_r.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if stdout.write_all(&buf[..n]).is_err() {
+                    break;
+                }
+                let _ = stdout.flush();
+            }
+            Err(_) => break,
+        }
+    }
+    let _ = pump_out.join();
+    Ok(())
+}
+
+/// Live channels keyed by tmux session name, held weakly so the entry vanishes
+/// once the last viewer drops its `Arc`. `acquire` upgrades or re-arms.
+static REGISTRY: LazyLock<Mutex<HashMap<String, Weak<VtChannel>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+static SOCK_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Lines of scrollback the grid keeps, and how much history the seed pulls from
+/// the pane. Matches tmux's default `history-limit` so a freshly armed channel
+/// (e.g. after switching away from a session and back) has the pane's history
+/// immediately, not just the visible screen.
+const SCROLLBACK_LINES: usize = 2000;
+
+fn lookup(session: &str) -> Option<Arc<VtChannel>> {
+    REGISTRY
+        .lock()
+        .unwrap()
+        .get(session)
+        .and_then(Weak::upgrade)
+}
+
+/// If `session` has a *live* armed channel, return its current cursor-key mode
+/// (DECCKM): `Some(true)` = application cursor keys (`ESC O A`), `Some(false)` =
+/// normal (`ESC [ A`). `None` means no channel is armed, or its forwarder has
+/// disconnected. Presence of `Some` is the single-writer signal: while live,
+/// ALL pane input must go through [`try_send_input`] (never `send-keys`), so
+/// the two writers don't interleave. Gating on liveness means a dead channel
+/// reports `None` and input falls back to `send-keys` rather than vanishing.
+pub(crate) fn input_mode(session: &str) -> Option<bool> {
+    lookup(session)
+        .filter(|c| c.is_alive())
+        .map(|c| c.app_cursor.load(Ordering::Relaxed))
+}
+
+/// Deliver raw `bytes` to `session`'s pane via its channel. Returns `true` if
+/// written, `false` if no channel is armed or the forwarder hasn't connected.
+pub(crate) fn try_send_input(session: &str, bytes: &[u8]) -> bool {
+    lookup(session)
+        .map(|c| c.write_input(bytes))
+        .unwrap_or(false)
+}
+
+/// Single-quote a path for the `/bin/sh -c` line `tmux pipe-pane` runs.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+fn pane_size(target: &str) -> Option<(u16, u16)> {
+    let out = Command::new("tmux")
+        .args([
+            "display-message",
+            "-p",
+            "-t",
+            target,
+            "-F",
+            "#{pane_width} #{pane_height}",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    let mut it = s.split_whitespace();
+    let w = it.next()?.parse().ok()?;
+    let h = it.next()?.parse().ok()?;
+    Some((w, h))
+}
+
+/// Query the pane's terminal modes that the wheel-forward / scroll logic keys
+/// off: `(alternate_on, mouse_tracking, mouse_sgr)`. Used once at arm to seed
+/// the grid's modes, which the rendered-content seed can't carry.
+fn pane_modes(target: &str) -> Option<(bool, bool, bool)> {
+    let out = Command::new("tmux")
+        .args([
+            "display-message",
+            "-p",
+            "-t",
+            target,
+            "-F",
+            "#{alternate_on} #{mouse_any_flag} #{mouse_sgr_flag}",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    let mut it = s.split_whitespace();
+    let alt = it.next().map(|f| f != "0").unwrap_or(false);
+    let mouse = it.next().map(|f| f != "0").unwrap_or(false);
+    let sgr = it.next().map(|f| f != "0").unwrap_or(false);
+    Some((alt, mouse, sgr))
+}
+
+/// `pipe-pane -I` (input injection) landed in tmux 2.8, and a dead-pane write
+/// crash was fixed in 3.4, so we require >= 3.4 before arming a channel. Older
+/// tmux (or a `tmux -V` we can't parse) falls back to the capture path. Cached:
+/// the server version doesn't change under a running aoe.
+fn tmux_supports_pipe_pane_io() -> bool {
+    static SUPPORTED: LazyLock<bool> = LazyLock::new(|| {
+        let Ok(out) = Command::new("tmux").arg("-V").output() else {
+            return false;
+        };
+        let v = String::from_utf8_lossy(&out.stdout);
+        // e.g. "tmux 3.6", "tmux 3.4a", "tmux next-3.5".
+        let digits: String = v
+            .trim()
+            .trim_start_matches(|c: char| !c.is_ascii_digit())
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        let mut parts = digits.split('.');
+        let major: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let minor: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        (major, minor) >= (3, 4)
+    });
+    *SUPPORTED
+}
+
+fn cursor_from_screen(screen: &vt100::Screen, rows: u16, cols: u16) -> PaneCursor {
+    let (y, x) = screen.cursor_position();
+    PaneCursor {
+        x,
+        y,
+        visible: !screen.hide_cursor(),
+        pane_height: rows,
+        // Default; `sample` overrides this with the real scrollback depth.
+        history_size: 0,
+        pane_width: cols,
+        alternate_on: screen.alternate_screen(),
+        mouse_tracking: screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None,
+        mouse_sgr: screen.mouse_protocol_encoding() == vt100::MouseProtocolEncoding::Sgr,
+        // Authoritative: the cursor is read straight from the owned grid, not
+        // probed against a racing capture, so it is always trustworthy.
+        position_reliable: true,
+    }
+}
+
+/// Assemble the last `max_lines` rows of (scrollback + visible screen) as
+/// per-row ANSI, and return that plus the full scrollback depth. vt100 only
+/// formats the *visible* window, so we read it at successive scrollback offsets
+/// (steps of one screen height) and stitch by absolute row index, then restore
+/// the live-edge offset. Mirrors `capture-pane -S -<lines>`: history lines
+/// first, the live screen as the last `rows` lines, `history` = total
+/// scrollback.
+fn grid_content(
+    parser: &mut vt100::Parser,
+    max_lines: usize,
+    cols: u16,
+    rows: u16,
+) -> (String, usize) {
+    let h = (rows as usize).max(1);
+    let saved = parser.screen().scrollback();
+    // Clamp to the maximum to discover how much scrollback actually exists.
+    parser.screen_mut().set_scrollback(usize::MAX >> 4);
+    let total_sb = parser.screen().scrollback();
+    let total = total_sb + h;
+    let want = max_lines.clamp(h.min(total), total);
+    let target_low = total - want;
+
+    // Absolute row index (0 = oldest scrollback, total-1 = bottom of screen).
+    let mut buf: Vec<Option<String>> = vec![None; total];
+    let mut offset = 0usize;
+    loop {
+        let real = offset.min(total_sb);
+        parser.screen_mut().set_scrollback(real);
+        let base = total_sb - real; // absolute index of this window's top row
+        for (r, row) in parser.screen().rows_formatted(0, cols).enumerate() {
+            let g = base + r;
+            if g < total {
+                buf[g] = Some(String::from_utf8_lossy(&row).into_owned());
+            }
+        }
+        if real >= total_sb || base <= target_low {
+            break;
+        }
+        offset += h;
+    }
+    parser.screen_mut().set_scrollback(saved);
+
+    let mut content = String::new();
+    for line in buf[target_low..total].iter() {
+        if let Some(line) = line {
+            content.push_str(line);
+        }
+        // Reset between rows so no SGR state bleeds across the newline.
+        content.push_str("\x1b[0m\n");
+    }
+    (content, total_sb)
+}
+
+/// One shared pane channel: a vt100 grid fed by a `pipe-pane -IO` byte stream,
+/// plus the writable half of the same socket for keystroke injection. Methods
+/// take `&self` (interior mutability) so many viewers share one `Arc`.
+pub(crate) struct VtChannel {
+    /// tmux session name; the registry key.
+    name: String,
+    /// `name:^.0`, the pane target for tmux commands.
+    target: String,
+    parser: Arc<Mutex<vt100::Parser>>,
+    /// Writable half of the socket, `Some` once the forwarder connects. Shared
+    /// with the reader thread, which fills it after `accept`.
+    stream: Arc<Mutex<Option<UnixStream>>>,
+    /// DECCKM snapshot, refreshed by the reader thread on each grid change.
+    app_cursor: Arc<AtomicBool>,
+    /// `true` while the forwarder is connected and the reader loop is running.
+    /// Set once `accept` publishes the writable half; cleared when the reader
+    /// exits (pipe EOF / socket error). `acquire` only returns after this goes
+    /// true, so a live channel is the single-writer; once it clears, input and
+    /// capture both fall back to the legacy tmux path instead of black-holing.
+    alive: Arc<AtomicBool>,
+    /// Owner-only (0700) directory holding `sock_path`; removed on drop.
+    sock_dir: PathBuf,
+    sock_path: PathBuf,
+    stop: Arc<AtomicBool>,
+    reader: Mutex<Option<std::thread::JoinHandle<()>>>,
+    cols: AtomicU16,
+    rows: AtomicU16,
+    last_size_check: Mutex<Instant>,
+}
+
+impl VtChannel {
+    /// Get the shared channel for `session`, arming a new one if none is live.
+    /// Returns `None` if tmux is too old or the pane is gone or any tmux/socket
+    /// step fails; callers then use the legacy capture/send-keys path. The
+    /// returned `Arc` keeps the channel alive; drop it to release this viewer's
+    /// hold (the channel tears down when the last `Arc` drops).
+    pub(crate) fn acquire(session: &str) -> Option<Arc<VtChannel>> {
+        if let Some(ch) = lookup(session) {
+            return Some(ch);
+        }
+        // Arm WITHOUT holding the registry lock: `arm` blocks up to ~500ms
+        // waiting for the forwarder to connect, and the global lock is taken on
+        // every `input_mode` / `try_send_input` for every session, so holding it
+        // that long would stall all pane input. Re-check under the lock and
+        // prefer a channel another thread armed in the meantime (ours drops).
+        let ch = Arc::new(Self::arm(session)?);
+        let mut reg = REGISTRY.lock().unwrap();
+        if let Some(existing) = reg.get(session).and_then(Weak::upgrade) {
+            return Some(existing);
+        }
+        reg.insert(session.to_string(), Arc::downgrade(&ch));
+        Some(ch)
+    }
+
+    fn arm(name: &str) -> Option<Self> {
+        if !tmux_supports_pipe_pane_io() {
+            return None;
+        }
+        let target = format!("{name}:^.0");
+        let (cols, rows) = pane_size(&target)?;
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, SCROLLBACK_LINES)));
+        let stop = Arc::new(AtomicBool::new(false));
+        let seeded = Arc::new(AtomicBool::new(false));
+        let stream: Arc<Mutex<Option<UnixStream>>> = Arc::new(Mutex::new(None));
+        let app_cursor = Arc::new(AtomicBool::new(false));
+        let alive = Arc::new(AtomicBool::new(false));
+
+        // Bind the socket inside an owner-only (0700) directory so other users
+        // on a shared host cannot connect to the pane channel and capture
+        // keystrokes or spoof rendered output (mirrors the worker-dir
+        // convention in `src/process/worker.rs`). On macOS/BSD the socket
+        // file's own mode is ignored by `connect`, so the 0700 parent is the
+        // real gate; the short per-channel path also stays well under the
+        // macOS `sun_path` limit.
+        let n = SOCK_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let sock_dir = std::env::temp_dir().join(format!("aoe-vt-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&sock_dir);
+        std::fs::create_dir_all(&sock_dir).ok()?;
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&sock_dir, std::fs::Permissions::from_mode(0o700)).ok()?;
+        }
+        let sock_path = sock_dir.join("s.sock");
+        let listener = UnixListener::bind(&sock_path).ok()?;
+
+        let reader = {
+            let parser = parser.clone();
+            let stop = stop.clone();
+            let seeded = seeded.clone();
+            let stream = stream.clone();
+            let app_cursor = app_cursor.clone();
+            let alive = alive.clone();
+            std::thread::spawn(move || {
+                let Ok((conn, _)) = listener.accept() else {
+                    return;
+                };
+                // Publish the writable half so input dispatch can reach the pane.
+                if let Ok(w) = conn.try_clone() {
+                    *stream.lock().unwrap() = Some(w);
+                }
+                // The forwarder is connected: the channel is now the live
+                // single-writer. `acquire` is blocked until this flips.
+                alive.store(true, Ordering::Relaxed);
+                let mut conn = conn;
+                let _ = conn.set_read_timeout(Some(Duration::from_millis(200)));
+                let mut buf = [0u8; 8192];
+                while !stop.load(Ordering::Relaxed) {
+                    match conn.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            // Hold stream bytes until the seed is applied so the
+                            // seed can't clobber newer state.
+                            while !seeded.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed) {
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                            if let Ok(mut p) = parser.lock() {
+                                p.process(&buf[..n]);
+                                app_cursor
+                                    .store(p.screen().application_cursor(), Ordering::Relaxed);
+                            }
+                        }
+                        Err(ref e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                || e.kind() == std::io::ErrorKind::TimedOut => {}
+                        Err(_) => break,
+                    }
+                }
+                // Reader is exiting (pipe EOF / socket error / stop): the
+                // forwarder is gone, so the channel is no longer the live
+                // single-writer. Input dispatch and capture both fall back.
+                alive.store(false, Ordering::Relaxed);
+            })
+        };
+
+        let exe = std::env::current_exe().ok()?;
+        let pipe_cmd = format!(
+            "{} __vt-pipe {}",
+            sh_quote(&exe.to_string_lossy()),
+            sh_quote(&sock_path.to_string_lossy())
+        );
+        let armed = Command::new("tmux")
+            .args(["pipe-pane", "-IO", "-t", &target, &pipe_cmd])
+            .output()
+            .ok();
+        if !armed.map(|o| o.status.success()).unwrap_or(false) {
+            tracing::warn!(%target, "vt: tmux pipe-pane failed; falling back to capture");
+            stop.store(true, Ordering::Relaxed);
+            let _ = UnixStream::connect(&sock_path);
+            let _ = reader.join();
+            let _ = std::fs::remove_dir_all(&sock_dir);
+            return None;
+        }
+
+        // Wait for the forwarder to actually connect before publishing the
+        // channel. `input_mode` treats a live channel as the single-writer and
+        // sends ALL pane input through the socket; if we returned during this
+        // startup gap, early keystrokes would hit a not-yet-connected socket
+        // and be dropped instead of falling back to `send-keys`. If the
+        // forwarder never connects, tear down and fall back to capture.
+        let connect_deadline = Instant::now() + Duration::from_millis(500);
+        while !alive.load(Ordering::Relaxed) {
+            if Instant::now() >= connect_deadline {
+                tracing::warn!(%target, "vt: forwarder did not connect; falling back to capture");
+                stop.store(true, Ordering::Relaxed);
+                let _ = Command::new("tmux")
+                    .args(["pipe-pane", "-t", &target])
+                    .output();
+                let _ = UnixStream::connect(&sock_path);
+                let _ = reader.join();
+                let _ = std::fs::remove_dir_all(&sock_dir);
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        // Reconstruct the app's terminal modes from tmux's flags before seeding.
+        // The seed is rendered content (`capture-pane`), which does NOT carry
+        // the DEC private mode SET escapes, and a running app won't re-emit
+        // them. Without this, a channel armed while an app is already on the
+        // alternate screen (e.g. Claude `/tui fullscreen`) would parse a normal
+        // screen, so `alternate_screen()` reads false and the wheel-forward /
+        // scroll decisions (which key off it) break.
+        let (alt, mouse, mouse_sgr) = pane_modes(&target).unwrap_or((false, false, false));
+        let mut prefix: Vec<u8> = Vec::new();
+        if alt {
+            prefix.extend_from_slice(b"\x1b[?1049h");
+        }
+        if mouse {
+            prefix.extend_from_slice(b"\x1b[?1000h");
+        }
+        if mouse_sgr {
+            prefix.extend_from_slice(b"\x1b[?1006h");
+        }
+
+        // Seed the current screen so an already-running agent shows up
+        // immediately instead of starting blank (pipe-pane has no backlog). The
+        // alternate screen has no scrollback, so only the normal buffer pulls
+        // history (`-S`); the pane keeps that history across re-arms, so a
+        // freshly armed channel can scroll right away.
+        let seed_start = format!("-{SCROLLBACK_LINES}");
+        let mut seed_args = vec!["capture-pane", "-t", &target, "-p", "-e"];
+        if !alt {
+            seed_args.extend_from_slice(&["-S", &seed_start]);
+        }
+        if let Ok(out) = Command::new("tmux").args(&seed_args).output() {
+            if let Ok(mut p) = parser.lock() {
+                if !prefix.is_empty() {
+                    p.process(&prefix);
+                }
+                p.process(&out.stdout);
+                app_cursor.store(p.screen().application_cursor(), Ordering::Relaxed);
+            }
+        }
+        seeded.store(true, Ordering::Relaxed);
+        tracing::info!(%target, cols, rows, "vt channel armed (pipe-pane -IO <-> vt100 grid)");
+
+        Some(Self {
+            name: name.to_string(),
+            target,
+            parser,
+            stream,
+            app_cursor,
+            alive,
+            sock_dir,
+            sock_path,
+            stop,
+            reader: Mutex::new(Some(reader)),
+            cols: AtomicU16::new(cols),
+            rows: AtomicU16::new(rows),
+            last_size_check: Mutex::new(Instant::now()),
+        })
+    }
+
+    /// Reconcile the parser size with the pane at most once a second (a
+    /// `display-message` fork; rate-limited so it adds no periodic hitch).
+    fn reconcile_size(&self) {
+        let mut guard = self.last_size_check.lock().unwrap();
+        if guard.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        *guard = Instant::now();
+        drop(guard);
+        if let Some((c, r)) = pane_size(&self.target) {
+            if (c, r)
+                != (
+                    self.cols.load(Ordering::Relaxed),
+                    self.rows.load(Ordering::Relaxed),
+                )
+            {
+                self.cols.store(c, Ordering::Relaxed);
+                self.rows.store(r, Ordering::Relaxed);
+                if let Ok(mut p) = self.parser.lock() {
+                    p.screen_mut().set_size(r, c);
+                }
+            }
+        }
+    }
+
+    /// Serialise up to `max_lines` of (scrollback + screen) to per-row ANSI,
+    /// plus the authoritative cursor (with `history_size` set to the full
+    /// scrollback depth). `max_lines` mirrors the capture path's window: both
+    /// the TUI scroll and the web's virtual scroll spacer need real history
+    /// here, not just the visible screen.
+    pub(crate) fn sample(&self, max_lines: usize) -> (String, Option<PaneCursor>) {
+        self.reconcile_size();
+        let cols = self.cols.load(Ordering::Relaxed);
+        let rows = self.rows.load(Ordering::Relaxed);
+        let mut p = match self.parser.lock() {
+            Ok(p) => p,
+            Err(_) => return (String::new(), None),
+        };
+        let (content, history) = grid_content(&mut p, max_lines, cols, rows);
+        let mut cursor = cursor_from_screen(p.screen(), rows, cols);
+        cursor.history_size = history as u32;
+        (content, Some(cursor))
+    }
+
+    /// Whether the forwarder is connected and the reader loop is running. A
+    /// channel that never connected, or whose pipe has since closed, reports
+    /// `false` so input and capture fall back to the legacy tmux path instead
+    /// of writing into a dead socket or sampling a frozen grid.
+    pub(crate) fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Relaxed)
+    }
+
+    fn write_input(&self, bytes: &[u8]) -> bool {
+        use std::io::Write;
+        let mut guard = self.stream.lock().unwrap();
+        match guard.as_mut() {
+            Some(stream) => stream.write_all(bytes).is_ok(),
+            None => false,
+        }
+    }
+}
+
+impl Drop for VtChannel {
+    fn drop(&mut self) {
+        // Remove our registry entry, but only if it still points at us (a
+        // concurrent re-arm under the same name must not be clobbered): our
+        // weak no longer upgrades once we're dropping.
+        {
+            let mut reg = REGISTRY.lock().unwrap();
+            if reg.get(&self.name).is_some_and(|w| w.upgrade().is_none()) {
+                reg.remove(&self.name);
+            }
+        }
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = Command::new("tmux")
+            .args(["pipe-pane", "-t", &self.target])
+            .output();
+        // Unblock a reader still parked in accept().
+        let _ = UnixStream::connect(&self.sock_path);
+        if let Some(h) = self.reader.lock().unwrap().take() {
+            let _ = h.join();
+        }
+        // Remove the whole per-channel 0700 dir (socket included).
+        let _ = std::fs::remove_dir_all(&self.sock_dir);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grid_content_assembles_scrollback_and_screen() {
+        // 4-row screen; 12 distinct lines means several rows scroll into
+        // history. Markers are non-substrings of each other (LINE01 vs LINE12).
+        let mut p = vt100::Parser::new(4, 20, 100);
+        for i in 1..=12 {
+            p.process(format!("LINE{i:02}\r\n").as_bytes());
+        }
+
+        // A wide window returns history + screen, history_size > 0.
+        let (content, history) = grid_content(&mut p, 100, 20, 4);
+        assert!(history > 0, "expected scrollback depth, got {history}");
+        assert!(
+            content.contains("LINE01"),
+            "missing oldest line:\n{content}"
+        );
+        assert!(
+            content.contains("LINE12"),
+            "missing newest line:\n{content}"
+        );
+
+        // A screen-sized window returns only the live screen (no old history),
+        // and the offset is restored to the live edge afterward.
+        let (screen_only, _) = grid_content(&mut p, 4, 20, 4);
+        assert!(
+            !screen_only.contains("LINE01"),
+            "screen-only window should not include scrollback:\n{screen_only}"
+        );
+        assert_eq!(p.screen().scrollback(), 0, "live-edge offset not restored");
+    }
+}

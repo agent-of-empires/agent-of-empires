@@ -158,6 +158,19 @@ fn test_serve_refuses_when_web_plugin_disabled() {
         "serve must start once aoe.web is enabled:\n{}",
         String::from_utf8_lossy(&started.stderr)
     );
+    // `serve --daemon` returns once the child is spawned, before it has finished
+    // binding the port and writing serve.pid. Stopping in that window races the
+    // startup, so wait for the port to accept a connection first (mirrors the
+    // serve.rs lifecycle test).
+    let port: u16 = free_port.parse().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "daemon never bound port {port} after enabling aoe.web"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
     let stopped = h.run_cli(&["serve", "--stop"]);
     assert!(stopped.status.success(), "serve --stop must succeed");
 }

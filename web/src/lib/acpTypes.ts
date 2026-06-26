@@ -470,6 +470,7 @@ export type AcpEvent =
   | { CancelRequested: { escalates_at: string } }
   | { Stopped: { reason: string } }
   | { AgentStartupError: { message: string } }
+  | { PromptRuntimeError: { message: string } }
   | { IncompatibleAgent: { detail: IncompatibleAgentDetail } }
   | {
       UserPromptSent: { text: string; attachments?: PromptAttachmentRefWire[] };
@@ -1588,6 +1589,14 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // submitted. See #1170.
     next.lastStoppedSeq = Math.min(next.lastStoppedSeq + 1, next.pendingUserPromptSeq);
     next.turnActive = isTurnActive(next);
+    return next;
+  }
+  if ("PromptRuntimeError" in event) {
+    next.lastError = event.PromptRuntimeError.message;
+    // A real turn-level failure was surfaced, so the generic
+    // "Command produced no output." fallback must stay suppressed when
+    // the terminal Stopped arrives for the same turn.
+    next.turnHasOutput = true;
     return next;
   }
   if ("PromptCapabilities" in event) {

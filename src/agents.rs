@@ -243,6 +243,15 @@ pub struct AgentDef {
 /// its session UUID (`/clear`, `/new`, `--fork-session`, resume, compact).
 /// `claude_poll_fn` reads this sidecar before falling back to its disk
 /// scan.
+///
+/// `idle` has two sources, not just `Stop`. `Stop` does not fire on every
+/// turn-end path: a turn killed by an API error fires `StopFailure` instead,
+/// and a user interrupt fires nothing. Without a second idle signal the status
+/// file stays on the last `running` write and the session sticks on Running.
+/// `Notification` with matcher `idle_prompt` is Claude's explicit "done
+/// working, waiting for the user" signal and fires whenever Claude parks at the
+/// prompt regardless of why the turn ended, so it backstops `Stop`;
+/// `StopFailure` covers the API-error path deterministically.
 const CLAUDE_HOOK_EVENTS: &[HookEvent] = &[
     HookEvent {
         name: "SessionStart",
@@ -269,9 +278,21 @@ const CLAUDE_HOOK_EVENTS: &[HookEvent] = &[
         session_id_capture: false,
     },
     HookEvent {
+        name: "StopFailure",
+        matcher: None,
+        status: Some("idle"),
+        session_id_capture: false,
+    },
+    HookEvent {
         name: "Notification",
         matcher: Some("permission_prompt|elicitation_dialog"),
         status: Some("waiting"),
+        session_id_capture: false,
+    },
+    HookEvent {
+        name: "Notification",
+        matcher: Some("idle_prompt"),
+        status: Some("idle"),
         session_id_capture: false,
     },
     HookEvent {
