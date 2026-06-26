@@ -6,8 +6,19 @@
       "id": "terminal.paired-shell",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/components/__tests__/RightPanel.test.tsx"],
+      "specs": ["src/components/__tests__/PairedShellPane.test.tsx"],
       "components": ["web/src/components/PairedTerminal.tsx"]
+    },
+    {
+      "id": "app-shell.docks",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/__tests__/Dock.test.tsx"],
+      "components": [
+        "web/src/components/Dock.tsx",
+        "web/src/components/PaneFrame.tsx",
+        "web/src/components/BottomDock.tsx"
+      ]
     },
     {
       "id": "settings.mcp-servers",
@@ -1078,7 +1089,7 @@
         "tests/live/right-panel-notifications.spec.ts"
       ],
       "components": [
-        "web/src/components/RightPanel.tsx",
+        "web/src/components/DiffPane.tsx",
         "web/src/components/diff/DiffFileList.tsx",
         "web/src/components/diff/DiffFileViewer.tsx",
         "web/src/components/diff/DiffLine.tsx",
@@ -1160,8 +1171,7 @@
         "web/src/components/MobileRightPanelPicker.tsx",
         "web/src/components/MobileMainPane.tsx",
         "web/src/components/PairedTerminal.tsx",
-        "web/src/components/ContentSplit.tsx",
-        "web/src/components/RightPanel.tsx"
+        "web/src/components/ContentSplit.tsx"
       ]
     },
     {
@@ -2616,7 +2626,7 @@
         "web/src/components/OverflowMenu.tsx",
         "web/src/components/Dashboard.tsx",
         "web/src/components/WorkspaceSidebar.tsx",
-        "web/src/components/RightPanel.tsx",
+        "web/src/components/Dock.tsx",
         "web/src/components/acp/Composer.tsx"
       ]
     },

@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useMatch, useNavigate, useSearchParams } from "react-router-dom";
 import { IDLE_DECAY_WINDOW_MS, isSessionActive } from "./lib/session";
 import { diffSelectionStale } from "./lib/diffSelection";
@@ -31,7 +31,8 @@ import { useEdgeSwipe } from "./hooks/useEdgeSwipe";
 import { useIsCoarsePointer } from "./hooks/useIsCoarsePointer";
 import { useIsWideViewport } from "./hooks/useIsWideViewport";
 import type { RightPanelView } from "./lib/rightPanelView";
-import { usePaneLayout } from "./lib/paneLayout";
+import { openPanesAt, usePaneLayout } from "./lib/paneLayout";
+import { TOUR_ANCHORS, tourAnchor } from "./lib/tourSteps";
 import {
   loginStatus,
   logout,
@@ -76,7 +77,11 @@ const StructuredView = lazy(() =>
     default: m.StructuredView,
   })),
 );
-import { RightPanel } from "./components/RightPanel";
+import { Dock } from "./components/Dock";
+import { BottomDock } from "./components/BottomDock";
+import { DiffPane } from "./components/DiffPane";
+import { PairedShellPane } from "./components/PairedTerminal";
+import type { BuiltinPaneId } from "./lib/panes";
 import { MobileRightPanelPicker } from "./components/MobileRightPanelPicker";
 import { MobileMainPane } from "./components/MobileMainPane";
 import { DiffFileViewer } from "./components/diff/DiffFileViewer";
@@ -348,8 +353,11 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   // Per-pane open state for the right dock (diff + terminal, plus plugin panes
   // later). `rightDockCollapsed` stands in for the old single "right column
   // hidden" flag wherever the layout only cares whether the column shows.
-  const { layout: paneLayout, togglePane, setPaneOpen } = usePaneLayout();
-  const rightDockCollapsed = !paneLayout.diff && !paneLayout.terminal;
+  const { layout: paneLayout, togglePane, setPaneOpen, movePane } = usePaneLayout();
+  const rightPaneIds = openPanesAt(paneLayout, "right");
+  const bottomPaneIds = openPanesAt(paneLayout, "bottom");
+  const rightDockCollapsed = rightPaneIds.length === 0;
+  const terminalOpen = paneLayout.terminal.open;
   // Layout topology is width-driven so it stays aligned with the `md:`
   // Tailwind classes the rest of the layout uses. At md and up the
   // side-by-side ContentSplit renders; below md a single full-viewport
@@ -393,7 +401,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
 
   // Fetch the diff when the panel is actually showing: on desktop when the
   // split is expanded, on mobile when the diff view is the active pane.
-  const diffPanelActive = isMdUp ? paneLayout.diff : rightPanelView === "diff";
+  const diffPanelActive = isMdUp ? paneLayout.diff.open : rightPanelView === "diff";
   const {
     files: diffFiles,
     perRepoBases,
@@ -404,7 +412,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   } = useDiffFiles(activeSessionId, diffPanelActive);
 
   // Diff-viewer comments (#928). Acp-only and session-scoped. The
-  // banner lives in RightPanel while the inline UI lives inside
+  // banner lives in the diff pane while the inline UI lives inside
   // DiffFileViewer, so the store is lifted here and threaded to both.
   const diffComments = useDiffComments(activeSessionId);
   const commentsEnabled = activeSession?.view === "structured";
@@ -960,7 +968,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       return;
     }
 
-    if (target === "paired" && !paneLayout.terminal) {
+    if (target === "paired" && !terminalOpen) {
       // Terminal pane is closed, so the paired shell is unmounted. Set the
       // pending intent so PairedTerminal grabs focus once it mounts and its
       // PTY is ready, then open the terminal pane.
@@ -977,7 +985,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       return;
     }
     dispatchFocusTerminal(target);
-  }, [activeSessionId, singlePane, paneLayout.terminal, setPaneOpen, selectedFilePath]);
+  }, [activeSessionId, singlePane, terminalOpen, setPaneOpen, selectedFilePath]);
 
   useKeyboardShortcuts(
     useCallback(
@@ -1145,6 +1153,36 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       );
     }
 
+    // Render a pane body by id. Passed to the docks as a callback (rather than
+    // building an array of {icon, body} objects here) so the per-session JSX is
+    // constructed inside the dock, not threaded through a prop object.
+    const renderPaneBody = (id: BuiltinPaneId): ReactNode => {
+      switch (id) {
+        case "diff":
+          return (
+            <DiffPane
+              session={activeSession ?? null}
+              sessionId={activeSessionId}
+              files={diffFiles}
+              perRepoBases={perRepoBases}
+              warning={warning}
+              filesLoading={diffFilesLoading}
+              selectedFilePath={selectedFilePath}
+              selectedRepoName={selectedRepoName}
+              onSelectFile={handleSelectFile}
+              onDiffRefresh={refreshDiffFiles}
+              commentsEnabled={commentsEnabled}
+              commentsCount={diffComments.count}
+              commentsSendEnabled={commentSendEnabled}
+              commentsSendDisabledReason={commentSendDisabledReason}
+              onOpenSendDialog={() => setSendDialogOpen(true)}
+              onDiscardAllComments={diffComments.clearComments}
+            />
+          );
+        case "terminal":
+          return <PairedShellPane session={activeSession ?? null} sessionId={activeSessionId} />;
+      }
+    };
     return (
       <div className="flex-1 flex flex-col min-h-0">
         <ContentSplit
@@ -1191,28 +1229,25 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
             </div>
           }
           right={
-            <RightPanel
-              session={activeSession ?? null}
-              sessionId={activeSessionId}
-              files={diffFiles}
-              perRepoBases={perRepoBases}
-              warning={warning}
-              filesLoading={diffFilesLoading}
-              selectedFilePath={selectedFilePath}
-              selectedRepoName={selectedRepoName}
-              onSelectFile={handleSelectFile}
-              onDiffRefresh={refreshDiffFiles}
-              commentsEnabled={commentsEnabled}
-              commentsCount={diffComments.count}
-              commentsSendEnabled={commentSendEnabled}
-              commentsSendDisabledReason={commentSendDisabledReason}
-              onOpenSendDialog={() => setSendDialogOpen(true)}
-              onDiscardAllComments={diffComments.clearComments}
-              showDiff={paneLayout.diff}
-              showTerminal={paneLayout.terminal}
-            />
+            <div {...tourAnchor(TOUR_ANCHORS.rightPanel)} className="flex min-h-0 min-w-0 flex-1">
+              <Dock
+                location="right"
+                paneIds={rightPaneIds}
+                renderBody={renderPaneBody}
+                onMove={movePane}
+                onClose={(id) => setPaneOpen(id, false)}
+              />
+            </div>
           }
         />
+        {bottomPaneIds.length > 0 && (
+          <BottomDock
+            paneIds={bottomPaneIds}
+            renderBody={renderPaneBody}
+            onMove={movePane}
+            onClose={(id) => setPaneOpen(id, false)}
+          />
+        )}
         {sendDialogOpen && commentsEnabled && activeSessionId && (
           <SendCommentsDialog
             sessionId={activeSessionId}

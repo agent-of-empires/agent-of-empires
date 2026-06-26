@@ -7,13 +7,18 @@ import { FileDiff, SquareTerminal, type LucideIcon } from "lucide-react";
 
 export type BuiltinPaneId = "diff" | "terminal";
 
+/** Where a pane is docked. Right is a vertical column beside the main view;
+ *  bottom is a horizontal strip below it (left is intentionally deferred). */
+export type DockLocation = "right" | "bottom";
+
 export interface PaneDescriptor {
   id: BuiltinPaneId;
   title: string;
   icon: LucideIcon;
+  defaultDock: DockLocation;
 }
 
 export const BUILTIN_PANES: PaneDescriptor[] = [
-  { id: "diff", title: "Diff", icon: FileDiff },
-  { id: "terminal", title: "Terminal", icon: SquareTerminal },
+  { id: "diff", title: "Diff", icon: FileDiff, defaultDock: "right" },
+  { id: "terminal", title: "Terminal", icon: SquareTerminal, defaultDock: "right" },
 ];

@@ -16,7 +16,7 @@ export function ActivityBar({ layout, onToggle }: Props) {
   return (
     <div className="hidden md:flex items-center gap-0.5" data-testid="activity-bar">
       {BUILTIN_PANES.map((pane) => {
-        const open = layout[pane.id];
+        const open = layout[pane.id].open;
         const name = pane.title.toLowerCase();
         return (
           <button
