@@ -87,6 +87,16 @@ pub struct PaneCursor {
     /// can mean the legacy X10 encoding, which our SGR bytes would corrupt.
     /// Optional; parses as `false`.
     pub mouse_sgr: bool,
+    /// Whether `x`/`y` can be trusted to index the captured content. The
+    /// terminal-mode flags above (`alternate_on`, `mouse_tracking`,
+    /// `mouse_sgr`) are always valid, but `capture_pane_with_cursor` probes
+    /// the cursor twice and, if the pane scrolled mid-capture, the row no
+    /// longer maps onto the captured rows. It then publishes the cursor with
+    /// this `false` so the render skips painting it (avoiding the row-drift
+    /// bug), while the wheel forward, which reads only the mode flags, still
+    /// works while an agent streams. `parse` sets it `true`; only the
+    /// cross-probe check downgrades it.
+    pub position_reliable: bool,
 }
 
 impl PaneCursor {
@@ -117,7 +127,42 @@ impl PaneCursor {
             alternate_on,
             mouse_tracking,
             mouse_sgr,
+            // A single probe's own position is self-consistent; the
+            // cross-probe check in `capture_pane_with_cursor` is the only
+            // thing that downgrades this.
+            position_reliable: true,
         })
+    }
+}
+
+/// Reconcile the two cursor probes `capture_pane_with_cursor` takes around the
+/// capture. Only the VERTICAL-mapping inputs must be stable across the
+/// capture: if `history_size` or `pane_height` changed, the screen scrolled or
+/// resized mid-capture and the cursor's row no longer indexes the captured
+/// content (the row-drift bug). A blinking cursor or horizontal jitter from an
+/// animated TUI (claude's spinner) changes `visible`/`x` every frame but never
+/// moves the row, so comparing the whole struct would suppress the cursor on
+/// every frame of an actively repainting agent. Keep the post-capture cursor
+/// (closest to the freshest content); when the mapping moved, flag the
+/// POSITION as unreliable rather than dropping the whole cursor, so the wheel
+/// forward (which reads only the always-valid mode flags) still works while an
+/// agent streams, while the render skips painting on the drifted row. A probe
+/// that didn't parse (pane gone / malformed) carries no trustworthy mode flags
+/// either, so the result is `None`.
+fn merge_cursor_probes(
+    before: Option<PaneCursor>,
+    after: Option<PaneCursor>,
+) -> Option<PaneCursor> {
+    match (before, after) {
+        (Some(b), Some(a)) => {
+            let position_reliable =
+                b.history_size == a.history_size && b.pane_height == a.pane_height;
+            Some(PaneCursor {
+                position_reliable,
+                ..a
+            })
+        }
+        _ => None,
     }
 }
 
@@ -481,24 +526,7 @@ impl Session {
         };
         let before = PaneCursor::parse(cursor_line);
         let after = PaneCursor::parse(after_line);
-        // Only the VERTICAL-mapping inputs must be stable across the capture:
-        // if `history_size` or `pane_height` changed, the screen scrolled or
-        // resized mid-capture and the cursor's row no longer indexes the
-        // captured content (the row-drift bug). A blinking cursor or a
-        // horizontal jitter from an animated TUI (claude's spinner) changes
-        // `visible`/`x` every frame but never moves the row, so comparing the
-        // whole struct would suppress the cursor on every frame of an
-        // actively repainting agent. Keep the post-capture cursor (closest to
-        // the freshest content) when the mapping is stable.
-        let cursor = match (before, after) {
-            (Some(b), Some(a))
-                if b.history_size == a.history_size && b.pane_height == a.pane_height =>
-            {
-                Some(a)
-            }
-            _ => None,
-        };
-        Ok((content.to_string(), cursor))
+        Ok((content.to_string(), merge_cursor_probes(before, after)))
     }
 
     /// Deliver raw bytes to the session's active pane via `tmux send-keys
@@ -1010,6 +1038,7 @@ mod tests {
                 alternate_on: true,
                 mouse_tracking: true,
                 mouse_sgr: true,
+                position_reliable: true,
             }
         );
         // Legacy mouse (tracking on, SGR off) parses with mouse_sgr false.
@@ -1036,6 +1065,50 @@ mod tests {
         assert!(PaneCursor::parse("").is_none());
         assert!(PaneCursor::parse("1 2 3").is_none());
         assert!(PaneCursor::parse("a b c d").is_none());
+        // A freshly parsed probe trusts its own position.
+        assert!(
+            PaneCursor::parse("3 2 1 24 120 74 1 1 1")
+                .unwrap()
+                .position_reliable
+        );
+    }
+
+    #[test]
+    fn merge_cursor_probes_stable_mapping_keeps_after_and_trusts_position() {
+        // Cursor moved (x/y) but the vertical mapping (history_size,
+        // pane_height) held: the post-capture probe wins and is trusted.
+        let before = PaneCursor::parse("3 2 1 24 120 80 1 1 1").unwrap();
+        let after = PaneCursor::parse("5 4 1 24 120 80 1 1 1").unwrap();
+        let merged = merge_cursor_probes(Some(before), Some(after)).expect("both probes => Some");
+        assert_eq!((merged.x, merged.y), (5, 4));
+        assert!(merged.position_reliable);
+    }
+
+    #[test]
+    fn merge_cursor_probes_drift_keeps_modes_but_drops_position_trust() {
+        // history_size changed mid-capture (the pane scrolled): keep the mode
+        // flags so the wheel forward still works while the agent streams, but
+        // mark the row untrustworthy so the render won't paint on it.
+        let before = PaneCursor::parse("3 2 1 24 120 80 1 1 1").unwrap();
+        let after = PaneCursor::parse("3 2 1 24 137 80 1 1 1").unwrap();
+        let merged = merge_cursor_probes(Some(before), Some(after)).expect("both probes => Some");
+        assert!(!merged.position_reliable);
+        assert!(merged.alternate_on && merged.mouse_tracking && merged.mouse_sgr);
+
+        // pane_height change (resize mid-capture) is the other vertical-drift
+        // trigger and likewise drops position trust.
+        let before = PaneCursor::parse("3 2 1 24 120 80 1 0 0").unwrap();
+        let after = PaneCursor::parse("3 2 1 30 120 80 1 0 0").unwrap();
+        let merged = merge_cursor_probes(Some(before), Some(after)).expect("both probes => Some");
+        assert!(!merged.position_reliable);
+    }
+
+    #[test]
+    fn merge_cursor_probes_none_when_either_probe_missing() {
+        let c = PaneCursor::parse("3 2 1 24 120 80 1 1 1").unwrap();
+        assert!(merge_cursor_probes(None, Some(c)).is_none());
+        assert!(merge_cursor_probes(Some(c), None).is_none());
+        assert!(merge_cursor_probes(None, None).is_none());
     }
 
     #[test]

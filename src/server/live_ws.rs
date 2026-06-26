@@ -288,6 +288,13 @@ async fn handle_live_ws(
             match captured {
                 Ok(Ok((content, cursor))) if !content.is_empty() || cursor.is_some() => {
                     dead_probes = 0;
+                    // The web frame has no `position_reliable` channel and its
+                    // renderer maps the cursor row onto the content, so a
+                    // position-unreliable cursor (the pane scrolled between the
+                    // capture's two cursor probes) would paint on the wrong
+                    // row. Drop it, preserving the pre-`position_reliable` web
+                    // behavior; this path does not consume the mode flags.
+                    let cursor = cursor.filter(|c| c.position_reliable);
                     // Keep the size-owner lock alive while we hold it, and
                     // notice promptly if another client took over (then we
                     // demote ourselves to a read-only viewer).
@@ -634,6 +641,7 @@ mod tests {
             alternate_on: false,
             mouse_tracking: false,
             mouse_sgr: false,
+            position_reliable: true,
         };
         let json = frame_json("hello\nworld", Some(&cursor));
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -660,6 +668,7 @@ mod tests {
             alternate_on: true,
             mouse_tracking: true,
             mouse_sgr: false,
+            position_reliable: true,
         };
         let v: serde_json::Value = serde_json::from_str(&frame_json("x", Some(&cursor))).unwrap();
         assert_eq!(v["altScreen"], true);
@@ -679,6 +688,7 @@ mod tests {
             alternate_on: false,
             mouse_tracking: false,
             mouse_sgr: false,
+            position_reliable: true,
         };
         let v: serde_json::Value = serde_json::from_str(&frame_json("x", Some(&cursor))).unwrap();
         assert!(v["cursor"].is_null());

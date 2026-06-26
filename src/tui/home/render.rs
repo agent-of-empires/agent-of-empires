@@ -2400,14 +2400,20 @@ impl HomeView {
     ///
     /// Only fires while live-send is active and the preview is at the live
     /// tail (`preview_scroll_offset == 0`): over scrolled-back history the
-    /// live cursor would land on the wrong row. The capture worker only
-    /// publishes a cursor when the displayed pane IS the live-send target, so
-    /// a `Some` here already means "this pane is the one being driven."
+    /// live cursor would land on the wrong row. The capture worker now
+    /// publishes a cursor for every previewed pane (the wheel forward reads its
+    /// mode flags), so this gates on `live_send` to keep painting confined to
+    /// the driven pane, and on `position_reliable` (false while the pane
+    /// scrolled mid-capture) to avoid painting on a row the cursor no longer
+    /// indexes.
     fn live_preview_cursor_pos(&self) -> Option<Position> {
         if self.live_send.is_none() || self.preview_scroll_offset != 0 {
             return None;
         }
         let cursor = self.preview_capture_worker.as_ref()?.current_cursor()?;
+        if !cursor.position_reliable {
+            return None;
+        }
         map_live_preview_cursor(self.preview_pane_area, self.preview_visible_rows, cursor)
     }
 
@@ -3157,6 +3163,7 @@ mod tests {
             alternate_on: false,
             mouse_tracking: false,
             mouse_sgr: false,
+            position_reliable: true,
         }
     }
 

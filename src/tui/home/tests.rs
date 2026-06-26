@@ -8932,6 +8932,7 @@ mod scroll_pane_isolation {
             alternate_on,
             mouse_tracking,
             mouse_sgr,
+            position_reliable: true,
         }
     }
 

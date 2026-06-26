@@ -932,14 +932,30 @@ fn dispatch_via_fork(tmux_name: &str, action: &TmuxAction) -> anyhow::Result<()>
     Ok(())
 }
 
+/// Cap on concurrently in-flight passive-preview send forks. A fast wheel
+/// flick fires many notches in quick succession; without a ceiling each would
+/// spawn its own detached thread. Eight in flight keeps scroll responsive,
+/// and dropping a notch past that under rapid fire is harmless (the user is
+/// still scrolling, and the next notch after a slot frees goes through).
+const MAX_INFLIGHT_ONESHOT: usize = 8;
+static INFLIGHT_ONESHOT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Forward a single translated key to a tmux pane with a one-shot
 /// `tmux send-keys` fork on a detached thread. Used by the passive-preview
 /// wheel forward, where there is no long-lived `LiveSendWorker` to enqueue
 /// onto: `dispatch_via_fork` blocks on the subprocess, so it must not run on
 /// the UI thread. Fire-and-forget; a dropped scroll notch is harmless and a
 /// failed fork is logged, not surfaced. Scroll notches carry no ordering
-/// relationship to each other, so racing forks are fine.
+/// relationship to each other, so racing forks are fine, and the fan-out is
+/// bounded by `MAX_INFLIGHT_ONESHOT`.
 pub(super) fn send_key_oneshot(tmux_name: &str, key: TmuxKey) {
+    use std::sync::atomic::Ordering;
+    // Reserve a slot first; if we are already at the cap, drop this notch
+    // rather than pile another thread on.
+    if INFLIGHT_ONESHOT.fetch_add(1, Ordering::AcqRel) >= MAX_INFLIGHT_ONESHOT {
+        INFLIGHT_ONESHOT.fetch_sub(1, Ordering::AcqRel);
+        return;
+    }
     let tmux_name = tmux_name.to_string();
     let action = match key {
         TmuxKey::Literal(s) => TmuxAction::Literal(s),
@@ -956,6 +972,7 @@ pub(super) fn send_key_oneshot(tmux_name: &str, key: TmuxKey) {
                 "passive-preview wheel forward fork failed; notch dropped",
             );
         }
+        INFLIGHT_ONESHOT.fetch_sub(1, Ordering::AcqRel);
     });
 }
 

@@ -3366,16 +3366,22 @@ impl HomeView {
         else {
             return false;
         };
-        // Live-send: keep scroll ordered against typed keystrokes via the
-        // long-lived worker. Passive preview: no worker exists, so fork a
-        // one-shot send to whatever pane the capture worker is showing.
-        if let Some(worker) = &self.live_send_worker {
-            worker.send(key);
-            return true;
-        }
+        // The cursor and the mapped coordinates describe the pane the preview
+        // is showing (`preview_capture_target`), so the keys must go THERE.
+        // Route through the ordered live-send worker only when that pane is
+        // also the live-send target, so scroll stays in sequence with typed
+        // keystrokes; otherwise (passive preview, or live-send aimed at a
+        // different pane than the one on screen) fork a one-shot send to the
+        // displayed pane.
         let Some(target) = self.preview_capture_target.as_deref() else {
             return false;
         };
+        if let (Some(worker), Some(live)) = (&self.live_send_worker, &self.live_send) {
+            if live.tmux_name.as_str() == target {
+                worker.send(key);
+                return true;
+            }
+        }
         live_send::send_key_oneshot(target, key);
         true
     }
@@ -5270,6 +5276,7 @@ mod tests {
             alternate_on,
             mouse_tracking,
             mouse_sgr,
+            position_reliable: true,
         }
     }
 
