@@ -68,7 +68,7 @@ impl Drop for E2eDebugGuard {
 }
 
 /// Locks the adapter-spawn contract: real watcher events must flip
-/// `disk_dirty` through the `HomeView::new` wiring.
+/// `disk_watch.dirty` through the `HomeView::new` wiring.
 #[tokio::test]
 #[serial]
 async fn home_view_new_spawns_adapter_that_flips_disk_dirty() {
@@ -100,7 +100,7 @@ async fn home_view_new_spawns_adapter_that_flips_disk_dirty() {
         .expect("peer write");
 
     let flipped = wait_until(Duration::from_secs(2), || {
-        view.disk_dirty.load(Ordering::Acquire)
+        view.disk_watch.dirty.load(Ordering::Acquire)
     })
     .await;
     assert!(
@@ -110,7 +110,7 @@ async fn home_view_new_spawns_adapter_that_flips_disk_dirty() {
 }
 
 /// Locks the canonical remove path in `rewire_disk_subscriptions`:
-/// removing a profile must leave no stale `disk_watch_handles` entry
+/// removing a profile must leave no stale `disk_watch.handles` entry
 /// behind.
 #[tokio::test]
 #[serial]
@@ -131,26 +131,26 @@ async fn rewire_disk_subscriptions_drops_removed_profile_entry() {
 
     view.rewire_disk_subscriptions(&["hv-keep".to_string(), "hv-drop".to_string()]);
     assert!(
-        view.disk_watch_handles.contains_key("hv-keep"),
+        view.disk_watch.handles.contains_key("hv-keep"),
         "precondition: hv-keep installed"
     );
     assert!(
-        view.disk_watch_handles.contains_key("hv-drop"),
+        view.disk_watch.handles.contains_key("hv-drop"),
         "precondition: hv-drop installed"
     );
 
     view.rewire_disk_subscriptions(&["hv-keep".to_string()]);
 
     assert!(
-        view.disk_watch_handles.contains_key("hv-keep"),
+        view.disk_watch.handles.contains_key("hv-keep"),
         "rewire must keep entries for profiles still in the current set"
     );
     assert!(
-        !view.disk_watch_handles.contains_key("hv-drop"),
+        !view.disk_watch.handles.contains_key("hv-drop"),
         "rewire must drop+abort the entry for a removed profile"
     );
     assert_eq!(
-        view.disk_watch_handles.len(),
+        view.disk_watch.handles.len(),
         1,
         "exactly the surviving profile's disk_watch_handles entry remains; live `subscriber_count()` also includes config-watch subscriptions wired by `rewire_config_subscriptions` and is not the right invariant for the disk-only path"
     );
@@ -180,7 +180,8 @@ async fn config_subscriptions_remove_then_recreate_does_not_leak_or_double_subsc
     view.rewire_config_subscriptions(&["cfg-leak".to_string()]);
     let baseline = live.subscriber_count();
     assert!(
-        view.config_watch_handles
+        view.config_watch
+            .handles
             .contains_key(&ConfigWatchKey::profile("cfg-leak")),
         "precondition: profile config sub installed"
     );
@@ -188,14 +189,16 @@ async fn config_subscriptions_remove_then_recreate_does_not_leak_or_double_subsc
     view.rewire_config_subscriptions(&[]);
     assert!(
         !view
-            .config_watch_handles
+            .config_watch
+            .handles
             .contains_key(&ConfigWatchKey::profile("cfg-leak")),
         "remove must drop the per-profile entry"
     );
 
     view.rewire_config_subscriptions(&["cfg-leak".to_string()]);
     assert!(
-        view.config_watch_handles
+        view.config_watch
+            .handles
             .contains_key(&ConfigWatchKey::profile("cfg-leak")),
         "recreate must reinstall the per-profile entry"
     );
@@ -230,7 +233,8 @@ async fn rewire_config_subscriptions_does_not_resurrect_deleted_profile_dir() {
 
     view.rewire_config_subscriptions(&["ghost".to_string()]);
     assert!(
-        view.config_watch_handles
+        view.config_watch
+            .handles
             .contains_key(&ConfigWatchKey::profile("ghost")),
         "precondition: profile config sub installed"
     );
@@ -278,25 +282,27 @@ async fn reload_storage_only_keeps_disk_watch_scoped_in_single_profile_mode() {
 
     use super::ConfigWatchKey;
     assert_eq!(
-        view.disk_watch_handles.len(),
+        view.disk_watch.handles.len(),
         1,
         "single-profile mode must keep disk watches scoped to the active profile only; \
          got {} entries: {:?}",
-        view.disk_watch_handles.len(),
-        view.disk_watch_handles.keys().collect::<Vec<_>>()
+        view.disk_watch.handles.len(),
+        view.disk_watch.handles.keys().collect::<Vec<_>>()
     );
     assert!(
-        view.disk_watch_handles.contains_key("active-only"),
+        view.disk_watch.handles.contains_key("active-only"),
         "the active profile's disk watch must be present after reload"
     );
     assert!(
-        view.config_watch_handles
+        view.config_watch
+            .handles
             .contains_key(&ConfigWatchKey::profile("peer-one")),
         "peer profiles' CONFIG watches must be wired (asymmetric design): \
          peer config edits propagate to picker UI / status-hook cache"
     );
     assert!(
-        view.config_watch_handles
+        view.config_watch
+            .handles
             .contains_key(&ConfigWatchKey::profile("peer-two")),
         "all on-disk profiles must have config watches in single-profile mode"
     );
@@ -340,25 +346,27 @@ async fn rewire_after_profile_delete_keeps_disk_watch_scoped_in_single_profile_m
 
     use super::ConfigWatchKey;
     assert_eq!(
-        view.disk_watch_handles.len(),
+        view.disk_watch.handles.len(),
         1,
         "single-profile mode must keep disk watches scoped to the active profile after a peer delete; \
          got {} entries: {:?}",
-        view.disk_watch_handles.len(),
-        view.disk_watch_handles.keys().collect::<Vec<_>>()
+        view.disk_watch.handles.len(),
+        view.disk_watch.handles.keys().collect::<Vec<_>>()
     );
     assert!(
-        view.disk_watch_handles.contains_key("active-scoped"),
+        view.disk_watch.handles.contains_key("active-scoped"),
         "the active profile's disk watch must remain installed"
     );
     assert!(
-        view.config_watch_handles
+        view.config_watch
+            .handles
             .contains_key(&ConfigWatchKey::profile("peer-stays")),
         "remaining peer profiles' CONFIG watches must stay wired (asymmetric design)"
     );
     assert!(
         !view
-            .config_watch_handles
+            .config_watch
+            .handles
             .contains_key(&ConfigWatchKey::profile("peer-deleted")),
         "the deleted peer's config watch must be torn down"
     );
@@ -566,7 +574,7 @@ async fn rewire_no_op_preserves_latched_disk_watcher_init_failure() {
 
     view.rewire_disk_subscriptions(&["hv-noop".to_string()]);
     assert!(
-        view.disk_watch_handles.contains_key("hv-noop"),
+        view.disk_watch.handles.contains_key("hv-noop"),
         "precondition: hv-noop installed"
     );
 
@@ -951,12 +959,14 @@ async fn rewire_config_subscriptions_install_loop_skips_missing_profile_dir() {
     );
     assert!(
         !view
-            .config_watch_handles
+            .config_watch
+            .handles
             .contains_key(&ConfigWatchKey::profile(stale_name)),
         "no config-watch handle is installed for a missing profile dir"
     );
     assert!(
-        view.config_watch_handles
+        view.config_watch
+            .handles
             .contains_key(&ConfigWatchKey::profile("active")),
         "the active profile (which exists) is still subscribed"
     );
@@ -996,11 +1006,11 @@ async fn rewire_disk_subscriptions_install_loop_skips_missing_profile_dir() {
         "the disk-watch install loop must not recreate a deleted profile dir"
     );
     assert!(
-        !view.disk_watch_handles.contains_key(stale_name),
+        !view.disk_watch.handles.contains_key(stale_name),
         "no disk-watch handle is installed for a missing profile dir"
     );
     assert!(
-        view.disk_watch_handles.contains_key("disk-active"),
+        view.disk_watch.handles.contains_key("disk-active"),
         "the active profile (which exists) is still subscribed"
     );
 }
@@ -1169,7 +1179,8 @@ async fn rewire_config_invalidates_on_inode_change_with_same_canonical_path() {
 
     use super::ConfigWatchKey;
     let identity_before = view
-        .config_watch_handles
+        .config_watch
+        .handles
         .get(&ConfigWatchKey::profile("inode-drift-cfg"))
         .expect("initial install populated config entry")
         .installed_identity;
@@ -1186,7 +1197,8 @@ async fn rewire_config_invalidates_on_inode_change_with_same_canonical_path() {
     view.rewire_config_subscriptions(&["inode-drift-cfg".to_string()]);
 
     let identity_after = view
-        .config_watch_handles
+        .config_watch
+        .handles
         .get(&ConfigWatchKey::profile("inode-drift-cfg"))
         .expect("entry rebuilt after inode drift")
         .installed_identity;
@@ -1218,7 +1230,8 @@ async fn rewire_disk_invalidates_on_inode_change_with_same_canonical_path() {
     .expect("HomeView::new");
 
     let identity_before = view
-        .disk_watch_handles
+        .disk_watch
+        .handles
         .get("inode-drift-disk")
         .expect("initial install populated disk entry")
         .installed_identity;
@@ -1235,7 +1248,8 @@ async fn rewire_disk_invalidates_on_inode_change_with_same_canonical_path() {
     view.rewire_disk_subscriptions(&["inode-drift-disk".to_string()]);
 
     let identity_after = view
-        .disk_watch_handles
+        .disk_watch
+        .handles
         .get("inode-drift-disk")
         .expect("entry rebuilt after inode drift")
         .installed_identity;
