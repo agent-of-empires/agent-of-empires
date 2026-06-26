@@ -3697,29 +3697,19 @@ pub async fn create_session(
             body.trust_hooks.unwrap_or(false),
         )?;
 
-        // When worktree_branch is empty string, generate a name from civilizations.
-        // The generated name is used as both title and branch.
         let title = body.title.unwrap_or_default();
-        let worktree_branch = match body.worktree_branch {
-            Some(b) if b.is_empty() => {
-                let generated = crate::session::civilizations::generate_random_title(&title_refs);
-                Some(generated)
-            }
-            other => other,
-        };
-        // If title is empty and we generated a branch name, use it as the title too
-        let title = if title.is_empty() {
-            worktree_branch.clone().unwrap_or_default()
-        } else {
-            title
-        };
+        let worktree_enabled = body.worktree_branch.is_some();
+        let worktree_branch = body
+            .worktree_branch
+            .map(|b| b.trim().to_string())
+            .filter(|b| !b.is_empty());
 
         let params = InstanceParams {
             title,
             path: body.path,
             group: body.group,
             tool: body.tool,
-            worktree_enabled: worktree_branch.is_some(),
+            worktree_enabled,
             worktree_branch,
             create_new_branch: body.create_new_branch,
             base_branch: if body.create_new_branch {

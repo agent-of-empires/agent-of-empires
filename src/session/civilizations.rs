@@ -86,11 +86,18 @@ fn to_roman(n: u32) -> String {
 }
 
 pub fn generate_random_title(existing_titles: &[&str]) -> String {
+    generate_random_title_filtered(existing_titles, |_| false)
+}
+
+pub fn generate_random_title_filtered<F>(existing_titles: &[&str], is_unavailable: F) -> String
+where
+    F: Fn(&str) -> bool,
+{
     let mut rng = rand::rng();
 
     let available: Vec<&str> = CIVILIZATIONS
         .iter()
-        .filter(|civ| !existing_titles.contains(*civ))
+        .filter(|civ| !existing_titles.contains(*civ) && !is_unavailable(civ))
         .copied()
         .collect();
 
@@ -101,12 +108,20 @@ pub fn generate_random_title(existing_titles: &[&str]) -> String {
     let base = CIVILIZATIONS.choose(&mut rng).unwrap_or(&"Session");
     for n in 2..=1000 {
         let candidate = format!("{} {}", base, to_roman(n));
-        if !existing_titles.contains(&candidate.as_str()) {
+        if !existing_titles.contains(&candidate.as_str()) && !is_unavailable(&candidate) {
             return candidate;
         }
     }
 
-    format!("{} {}", base, chrono::Utc::now().timestamp())
+    let timestamp = chrono::Utc::now().timestamp();
+    for n in timestamp..timestamp + 1000 {
+        let candidate = format!("{} {}", base, n);
+        if !existing_titles.contains(&candidate.as_str()) && !is_unavailable(&candidate) {
+            return candidate;
+        }
+    }
+
+    format!("{} {}", base, timestamp)
 }
 
 /// True when `title` is one this module could have produced via
@@ -173,6 +188,23 @@ mod tests {
         let existing: Vec<&str> = CIVILIZATIONS.to_vec();
         let title = generate_random_title(&existing);
         assert!(title.contains(" II"));
+    }
+
+    #[test]
+    fn test_generate_random_title_filtered_skips_unavailable_civ() {
+        let existing: Vec<&str> = CIVILIZATIONS
+            .iter()
+            .copied()
+            .filter(|civ| *civ != "Tatars")
+            .collect();
+
+        let title = generate_random_title_filtered(&existing, |candidate| candidate == "Tatars");
+
+        assert_ne!(title, "Tatars");
+        assert!(
+            title.contains(" II"),
+            "expected suffixed fallback after the only bare civ was filtered, got: {title}"
+        );
     }
 
     #[test]

@@ -36,11 +36,14 @@
       ]
     },
     {
-      "id": "session.create-duplicate-worktree-error",
+      "id": "session.create-worktree-name-collisions",
       "kind": "live-playwright",
       "risk": "medium",
       "specs": ["tests/live/session-create-duplicate-worktree.spec.ts"],
-      "components": ["web/src/components/session-wizard/LaunchFooter.tsx"]
+      "components": [
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/components/session-wizard/LaunchFooter.tsx"
+      ]
     },
     {
       "id": "terminal.mobile-backspace-autorepeat",
