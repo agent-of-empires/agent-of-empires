@@ -118,6 +118,8 @@ describe("plugin slot renderers", () => {
     expect(links[0]!.getAttribute("href")).toBe("https://x/pr/1");
     expect(links[1]!.getAttribute("rel")).toContain("noopener");
     expect(container.querySelectorAll("svg")).toHaveLength(2);
+    // Icon-only links must carry an accessible name from the tooltip.
+    expect(screen.getByRole("link", { name: "PR #1" })).toBeTruthy();
   });
 
   it("row-badge empty items clears the row (renders nothing)", () => {

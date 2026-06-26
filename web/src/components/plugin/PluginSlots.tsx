@@ -104,6 +104,9 @@ function BadgeChip({
   const common = {
     className,
     title: tooltip || text || undefined,
+    // An icon-only badge has no visible text, so `title` alone leaves the link
+    // unlabeled for assistive tech: give it an explicit name from the tooltip.
+    "aria-label": text ? undefined : tooltip || undefined,
     "data-plugin-slot": slot,
     "data-plugin-id": pluginId,
   };
@@ -256,6 +259,8 @@ function BlockRow({ block }: { block: Record<string, unknown> }) {
   const tone = validTone(block.tone);
   const safe = safeHref(str(block, "href"));
   if (!label && !value && !iconComp) return null;
+  // Name the link from its text so an icon-only row is not announced unlabeled.
+  const ariaLabel = [label, value, sublabel].filter(Boolean).join(" · ") || undefined;
   const inner = (
     <span className="flex min-w-0 items-center gap-2">
       {iconComp &&
@@ -273,6 +278,7 @@ function BlockRow({ block }: { block: Record<string, unknown> }) {
       href={safe}
       target="_blank"
       rel="noopener noreferrer"
+      aria-label={ariaLabel}
     >
       {inner}
     </a>
