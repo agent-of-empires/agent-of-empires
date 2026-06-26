@@ -51,14 +51,22 @@ struct PairedTerminal {
 }
 
 impl PairedTerminal {
-    fn generate_name(kind: TerminalKind, id: &str, title: &str) -> String {
+    fn generate_name(kind: TerminalKind, id: &str, title: &str, index: u32) -> String {
         let safe_title = sanitize_session_name(title);
-        format!("{}{}_{}", kind.prefix(), safe_title, truncate_id(id, 8))
+        let base = format!("{}{}_{}", kind.prefix(), safe_title, truncate_id(id, 8));
+        // Index 0 keeps the historical name verbatim, so existing tmux
+        // sessions, URLs, and the native TUI (which only ever uses index 0)
+        // are untouched. Additional web terminals get a `_t{N}` suffix.
+        if index == 0 {
+            base
+        } else {
+            format!("{base}_t{index}")
+        }
     }
 
-    fn new(kind: TerminalKind, id: &str, title: &str) -> Self {
+    fn new(kind: TerminalKind, id: &str, title: &str, index: u32) -> Self {
         Self {
-            name: Self::generate_name(kind, id, title),
+            name: Self::generate_name(kind, id, title, index),
             kind,
         }
     }
@@ -182,13 +190,21 @@ pub struct TerminalSession {
 
 impl TerminalSession {
     pub fn new(id: &str, title: &str) -> Result<Self> {
+        Self::new_indexed(id, title, 0)
+    }
+
+    pub fn new_indexed(id: &str, title: &str, index: u32) -> Result<Self> {
         Ok(Self {
-            inner: PairedTerminal::new(TerminalKind::Host, id, title),
+            inner: PairedTerminal::new(TerminalKind::Host, id, title, index),
         })
     }
 
     pub fn generate_name(id: &str, title: &str) -> String {
-        PairedTerminal::generate_name(TerminalKind::Host, id, title)
+        Self::generate_name_indexed(id, title, 0)
+    }
+
+    pub fn generate_name_indexed(id: &str, title: &str, index: u32) -> String {
+        PairedTerminal::generate_name(TerminalKind::Host, id, title, index)
     }
 
     pub fn name(&self) -> &str {
@@ -241,13 +257,21 @@ pub struct ContainerTerminalSession {
 
 impl ContainerTerminalSession {
     pub fn new(id: &str, title: &str) -> Result<Self> {
+        Self::new_indexed(id, title, 0)
+    }
+
+    pub fn new_indexed(id: &str, title: &str, index: u32) -> Result<Self> {
         Ok(Self {
-            inner: PairedTerminal::new(TerminalKind::Container, id, title),
+            inner: PairedTerminal::new(TerminalKind::Container, id, title, index),
         })
     }
 
     pub fn generate_name(id: &str, title: &str) -> String {
-        PairedTerminal::generate_name(TerminalKind::Container, id, title)
+        Self::generate_name_indexed(id, title, 0)
+    }
+
+    pub fn generate_name_indexed(id: &str, title: &str, index: u32) -> String {
+        PairedTerminal::generate_name(TerminalKind::Container, id, title, index)
     }
 
     pub fn name(&self) -> &str {
@@ -288,6 +312,49 @@ impl ContainerTerminalSession {
     }
 }
 
+/// Kill every paired terminal tmux session (host and container, any index)
+/// belonging to `id`. The single-index `kill` methods only target one
+/// deterministic name; this scans the live session list so the multi-terminal
+/// web tabs (`_t{N}` suffixes) and any title-change orphans are all reaped on
+/// session teardown. Mirrors [`kill_all_tool_sessions_for_id`].
+pub fn kill_all_terminals_for_id(id: &str) {
+    let needle = format!("_{}", truncate_id(id, 8));
+
+    let output = Command::new("tmux")
+        .args(["list-sessions", "-F", "#{session_name}"])
+        .output();
+
+    if let Ok(out) = output {
+        if out.status.success() {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            for line in stdout.lines() {
+                if !line.starts_with(TERMINAL_PREFIX)
+                    && !line.starts_with(CONTAINER_TERMINAL_PREFIX)
+                {
+                    continue;
+                }
+                // The id segment is at the end for index 0, or immediately
+                // before the `_t{N}` suffix for additional terminals.
+                let Some(pos) = line.rfind(&needle) else {
+                    continue;
+                };
+                let after = &line[pos + needle.len()..];
+                if !after.is_empty() && !after.starts_with("_t") {
+                    continue;
+                }
+                if let Some(pid) = process::get_pane_pid(line) {
+                    process::kill_process_tree(pid);
+                }
+                let _ = Command::new("tmux")
+                    .args(["kill-session", "-t", line])
+                    .output();
+            }
+        }
+    }
+
+    refresh_session_cache();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,6 +384,32 @@ mod tests {
         assert_ne!(agent_name, terminal_name);
         assert!(agent_name.starts_with(SESSION_PREFIX));
         assert!(terminal_name.starts_with(TERMINAL_PREFIX));
+    }
+
+    #[test]
+    fn test_terminal_index_zero_matches_legacy_name() {
+        // Index 0 must be byte-identical to the historical single-terminal
+        // name so existing tmux sessions, URLs, and the TUI keep working.
+        let legacy = TerminalSession::generate_name("abc123def456", "My Project");
+        let indexed_zero = TerminalSession::generate_name_indexed("abc123def456", "My Project", 0);
+        assert_eq!(legacy, indexed_zero);
+
+        let legacy_c = ContainerTerminalSession::generate_name("abc123def456", "My Project");
+        let indexed_zero_c =
+            ContainerTerminalSession::generate_name_indexed("abc123def456", "My Project", 0);
+        assert_eq!(legacy_c, indexed_zero_c);
+    }
+
+    #[test]
+    fn test_terminal_index_nonzero_suffixed_and_distinct() {
+        let zero = TerminalSession::generate_name_indexed("abc123def456", "My Project", 0);
+        let one = TerminalSession::generate_name_indexed("abc123def456", "My Project", 1);
+        let two = TerminalSession::generate_name_indexed("abc123def456", "My Project", 2);
+        assert_ne!(zero, one);
+        assert_ne!(one, two);
+        assert!(one.ends_with("_t1"));
+        assert!(two.ends_with("_t2"));
+        assert!(one.starts_with(&zero));
     }
 
     #[test]
