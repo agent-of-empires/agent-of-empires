@@ -1100,6 +1100,21 @@ pub struct SessionConfig {
     )]
     pub live_send_leader: String,
 
+    /// Render the live-send preview cursor as a solid block painted into the
+    /// captured cells instead of the terminal's hardware cursor. The painted
+    /// block is identical every frame, so it stays steady over remote
+    /// transports that re-render and drop frames (notably mosh, where the
+    /// hardware cursor's per-frame hide/show shows up as a flickering caret).
+    /// Turn this off for the terminal's native hardware cursor, which keeps its
+    /// blink and shape but can flicker over such links.
+    #[serde(default = "default_true")]
+    #[setting(
+        label = "Live Preview Block Cursor",
+        widget = "toggle",
+        category = "Interaction"
+    )]
+    pub live_send_block_cursor: bool,
+
     /// What the TUI does immediately after a new session finishes
     /// creating. `Tmux` (default) drops into the tmux attach view, the
     /// historical behavior. `LiveSend` enters live-send mode against
@@ -1305,6 +1320,7 @@ impl Default for SessionConfig {
             session_id_poller_max_threads: default_session_id_poller_max_threads(),
             live_send_exit_chord: default_live_send_exit_chord(),
             live_send_leader: default_live_send_leader(),
+            live_send_block_cursor: true,
             new_session_attach_mode: NewSessionAttachMode::default(),
             default_attach_mode: NewSessionAttachMode::default(),
             click_action: ClickAction::default(),

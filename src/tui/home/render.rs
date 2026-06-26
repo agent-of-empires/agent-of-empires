@@ -2374,17 +2374,22 @@ impl HomeView {
             }
         }
 
-        // In live-send mode, paint a block cursor into the captured cells at
-        // the target pane's cursor cell. `capture-pane` carries only cell text
-        // (plus SGR color), not the cursor, so without this the
-        // "feels-attached" preview shows no cursor for programs that rely on
-        // the hardware cursor (shells, codex, anything using DECTCEM) even
-        // though a direct tmux attach would. We paint a cell rather than using
-        // the terminal's hardware cursor: ratatui re-emits a hardware
-        // hide/show on every ~30fps frame, and a state-syncing remote
-        // transport (mosh) samples that mid-toggle and renders a flickering
-        // caret. A painted cell is identical every frame, so it stays put.
-        self.paint_preview_cursor(frame, theme);
+        // In live-send mode, show the target pane's cursor over the preview.
+        // `capture-pane` carries only cell text (plus SGR color), not the
+        // cursor, so without this the "feels-attached" preview shows no cursor
+        // for programs that rely on the hardware cursor (shells, codex, anything
+        // using DECTCEM) even though a direct tmux attach would. The default is
+        // a painted block cell: ratatui re-emits a hardware hide/show on every
+        // ~30fps frame, and a state-syncing remote transport (mosh) samples that
+        // mid-toggle into a flickering caret, whereas a painted cell is
+        // identical every frame. `session.live_send_block_cursor = false`
+        // switches back to the native hardware cursor (its blink and shape, at
+        // the cost of that flicker over such links).
+        if self.live_send_block_cursor {
+            self.paint_preview_cursor(frame, theme);
+        } else if let Some(pos) = self.live_preview_cursor_pos() {
+            frame.set_cursor_position(pos);
+        }
 
         // Selection highlight goes last so it sits on top of whatever
         // the active ViewMode painted into the inner area. The handlers

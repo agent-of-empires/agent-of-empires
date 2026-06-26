@@ -444,6 +444,11 @@ pub struct HomeView {
     /// the render layer reads this rather than re-resolving the config on
     /// every paint.
     pub(super) row_tag_mode: crate::session::config::RowTagMode,
+    /// Whether the live-send preview paints a block cursor cell instead of
+    /// placing the terminal hardware cursor (config
+    /// `session.live_send_block_cursor`). Cached from resolved config like
+    /// `row_tag_mode`; the render layer reads it each paint.
+    pub(super) live_send_block_cursor: bool,
     /// Active profile's `default_attach_mode`, cached at construction and
     /// refreshed by `refresh_from_config` / `switch_profile`. The help
     /// overlay falls back to this when no session row is selected so the
@@ -1377,6 +1382,7 @@ impl HomeView {
             sort_order,
             group_by,
             row_tag_mode: resolved.session.row_tag,
+            live_send_block_cursor: resolved.session.live_send_block_cursor,
             profile_default_attach_mode: resolved.session.default_attach_mode,
             project_group_collapsed: user_config
                 .as_ref()
@@ -5664,6 +5670,7 @@ impl HomeView {
         self.strict_hotkeys = config.session.strict_hotkeys;
         self.confirm_before_quit = config.session.confirm_before_quit;
         self.row_tag_mode = config.session.row_tag;
+        self.live_send_block_cursor = config.session.live_send_block_cursor;
         self.profile_default_attach_mode = config.session.default_attach_mode;
         self.idle_decay_window =
             crate::tui::styles::idle_decay_window(config.theme.idle_decay_minutes);
