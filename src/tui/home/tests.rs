@@ -9016,6 +9016,244 @@ mod scroll_pane_isolation {
         assert_eq!(env.view.preview_scroll_offset, 0);
     }
 
+    /// In live-send over a mouse-tracking agent, a plain (no-Shift) left
+    /// press/release is forwarded to the agent and consumed, and the held
+    /// button is tracked so its release can't be stranded.
+    #[test]
+    #[serial]
+    fn forward_mouse_to_preview_left_click_forwards() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+        let mut env = live_env_with_cursor(alt_screen_cursor(true, true, true));
+        assert!(env.view.forward_mouse_to_preview(
+            MouseEventKind::Down(MouseButton::Left),
+            KeyModifiers::NONE,
+            50,
+            10
+        ));
+        assert_eq!(env.view.mouse_forward_btn, Some(0));
+        assert!(env.view.forward_mouse_to_preview(
+            MouseEventKind::Up(MouseButton::Left),
+            KeyModifiers::NONE,
+            50,
+            10
+        ));
+        assert_eq!(env.view.mouse_forward_btn, None);
+        // Forwarding never starts an aoe text selection.
+        assert!(env.view.drag_state.is_none());
+        assert!(env.view.preview_selection.is_none());
+    }
+
+    /// Passive preview (NOT live-send) over a mouse-tracking agent ALSO forwards
+    /// a plain press/drag/release, so hovering an agent and dragging drives its
+    /// native selection / scroll, exactly like the live-send case (and like the
+    /// passive wheel path). The one-shot send carries it with no live worker.
+    #[test]
+    #[serial]
+    fn forward_mouse_to_preview_passive_preview_forwards() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+        let mut env = passive_env_with_cursor(alt_screen_cursor(true, true, true));
+        assert!(
+            env.view.live_send.is_none(),
+            "this exercises passive preview, not live-send"
+        );
+        assert!(env.view.forward_mouse_to_preview(
+            MouseEventKind::Down(MouseButton::Left),
+            KeyModifiers::NONE,
+            50,
+            10
+        ));
+        assert_eq!(env.view.mouse_forward_btn, Some(0));
+        assert!(env.view.forward_mouse_to_preview(
+            MouseEventKind::Drag(MouseButton::Left),
+            KeyModifiers::NONE,
+            55,
+            12
+        ));
+        assert!(env.view.forward_mouse_to_preview(
+            MouseEventKind::Up(MouseButton::Left),
+            KeyModifiers::NONE,
+            55,
+            12
+        ));
+        assert_eq!(env.view.mouse_forward_btn, None);
+        // Forwarding never starts an aoe text selection, even passively.
+        assert!(env.view.drag_state.is_none());
+        assert!(env.view.preview_selection.is_none());
+    }
+
+    /// Shift+press is NOT forwarded: it falls through so aoe's own preview
+    /// text-selection (drag-to-copy) can run.
+    #[test]
+    #[serial]
+    fn forward_mouse_to_preview_shift_falls_through() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+        let mut env = live_env_with_cursor(alt_screen_cursor(true, true, true));
+        assert!(!env.view.forward_mouse_to_preview(
+            MouseEventKind::Down(MouseButton::Left),
+            KeyModifiers::SHIFT,
+            50,
+            10
+        ));
+        assert_eq!(env.view.mouse_forward_btn, None);
+    }
+
+    /// A non-mouse agent never forwards; the event falls through to aoe.
+    #[test]
+    #[serial]
+    fn forward_mouse_to_preview_non_mouse_agent_falls_through() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+        let mut env = live_env_with_cursor(alt_screen_cursor(true, false, false));
+        assert!(!env.view.forward_mouse_to_preview(
+            MouseEventKind::Down(MouseButton::Left),
+            KeyModifiers::NONE,
+            50,
+            10
+        ));
+    }
+
+    /// Once a press is forwarded, its drag and release keep forwarding even
+    /// after the pointer leaves the preview rect, so the agent always sees the
+    /// release (no stuck button).
+    #[test]
+    #[serial]
+    fn forward_mouse_to_preview_drag_and_release_track_button() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+        let mut env = live_env_with_cursor(alt_screen_cursor(true, true, true));
+        assert!(env.view.forward_mouse_to_preview(
+            MouseEventKind::Down(MouseButton::Left),
+            KeyModifiers::NONE,
+            50,
+            10
+        ));
+        // (1, 1) is outside the preview rect, but the drag still forwards.
+        assert!(env.view.forward_mouse_to_preview(
+            MouseEventKind::Drag(MouseButton::Left),
+            KeyModifiers::NONE,
+            1,
+            1
+        ));
+        assert_eq!(env.view.mouse_forward_btn, Some(0));
+        assert!(env.view.forward_mouse_to_preview(
+            MouseEventKind::Up(MouseButton::Left),
+            KeyModifiers::NONE,
+            1,
+            1
+        ));
+        assert_eq!(env.view.mouse_forward_btn, None);
+    }
+
+    /// A drag or release with no forwarded press in flight is ignored (it must
+    /// not start forwarding mid-gesture).
+    #[test]
+    #[serial]
+    fn forward_mouse_to_preview_orphan_drag_ignored() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+        let mut env = live_env_with_cursor(alt_screen_cursor(true, true, true));
+        assert!(!env.view.forward_mouse_to_preview(
+            MouseEventKind::Drag(MouseButton::Left),
+            KeyModifiers::NONE,
+            50,
+            10
+        ));
+        assert!(!env.view.forward_mouse_to_preview(
+            MouseEventKind::Up(MouseButton::Left),
+            KeyModifiers::NONE,
+            50,
+            10
+        ));
+        assert_eq!(env.view.mouse_forward_btn, None);
+    }
+
+    /// Stage an in-flight Shift-selection drag held at the preview's top
+    /// (`row == pane.y`) or bottom edge, plus a capture window with NO aoe-side
+    /// scrollback, so `tick_preview_autoscroll` exercises the agent
+    /// scroll-forward fallback rather than the capture-window line scroll.
+    fn stage_edge_drag_no_scrollback(env: &mut TestEnv, at_top: bool) {
+        use crate::tui::home::PreviewTextView;
+        // Visible == captured: `scroll_preview_offset` has nowhere to go, the
+        // alternate-screen reality the fallback exists for. The clamp reads
+        // `preview_visible_rows`, so pin it to the captured-line count to make
+        // the max offset zero (no scrollback to move into).
+        env.view.preview_cache.captured_lines = 23;
+        env.view.preview_visible_rows = 23;
+        env.view.preview_cache.dimensions = (80, 24);
+        env.view.preview_scroll_offset = 0;
+        let pane = Rect::new(30, 0, 100, 5);
+        env.view.preview_text_view = PreviewTextView {
+            pane,
+            first_line: 0,
+            total_lines: 23,
+        };
+        // Anchor away from the held edge, then drag onto it.
+        let (start_row, edge_row) = if at_top { (4, 0) } else { (0, 4) };
+        assert!(env.view.handle_drag_start(40, start_row));
+        assert!(env.view.handle_drag_move(40, edge_row));
+    }
+
+    /// Over a full-screen mouse-tracking agent the capture window has no
+    /// scrollback, so an edge-held selection forwards the same scroll input the
+    /// wheel does (a wheel-up/down mouse report, NOT PageUp, since the agent
+    /// owns the mouse) to scroll its own transcript instead of moving the inert
+    /// offset. The fallback delegates to `wheel_forward_key`, whose byte output
+    /// per branch is asserted in `wheel_forward_key_*`; here we verify the tick
+    /// forwards and pins the offset. Regression for the "autoscroll does nothing
+    /// over a mouse-tracking agent" report (PageUp was a no-op there).
+    #[test]
+    #[serial]
+    fn autoscroll_forwards_scroll_to_mouse_tracking_agent_at_top_edge() {
+        let mut env = live_env_with_cursor(alt_screen_cursor(true, true, true));
+        stage_edge_drag_no_scrollback(&mut env, true);
+        assert!(
+            env.view.tick_preview_autoscroll(),
+            "top-edge tick forwards a wheel notch to the agent"
+        );
+        // The inert capture-window offset never moved; the agent was scrolled.
+        assert_eq!(env.view.preview_scroll_offset, 0);
+    }
+
+    /// Same as above at the bottom edge: a wheel-down notch is forwarded.
+    #[test]
+    #[serial]
+    fn autoscroll_forwards_scroll_to_mouse_tracking_agent_at_bottom_edge() {
+        let mut env = live_env_with_cursor(alt_screen_cursor(true, true, true));
+        stage_edge_drag_no_scrollback(&mut env, false);
+        assert!(
+            env.view.tick_preview_autoscroll(),
+            "bottom-edge tick forwards a wheel notch to the agent"
+        );
+        assert_eq!(env.view.preview_scroll_offset, 0);
+    }
+
+    /// A full-screen agent WITHOUT mouse tracking (Claude Code's fullscreen
+    /// renderer: `1049h`, no mouse) gets `PageUp`/`PageDown` from the fallback
+    /// instead, matching the wheel path's no-mouse branch.
+    #[test]
+    #[serial]
+    fn autoscroll_forwards_page_keys_to_no_mouse_agent_at_top_edge() {
+        let mut env = live_env_with_cursor(alt_screen_cursor(true, false, false));
+        stage_edge_drag_no_scrollback(&mut env, true);
+        assert!(
+            env.view.tick_preview_autoscroll(),
+            "top-edge tick forwards a page key to the no-mouse agent"
+        );
+        assert_eq!(env.view.preview_scroll_offset, 0);
+    }
+
+    /// A normal-buffer pane (NOT alternate-screen) that has merely bottomed out
+    /// its scrollback must NOT get scroll input injected into its shell: the
+    /// tick is a no-op there.
+    #[test]
+    #[serial]
+    fn autoscroll_does_not_forward_to_normal_pane() {
+        let mut env = live_env_with_cursor(alt_screen_cursor(false, false, false));
+        stage_edge_drag_no_scrollback(&mut env, true);
+        assert!(
+            !env.view.tick_preview_autoscroll(),
+            "a non-alternate-screen pane never gets forwarded scroll input"
+        );
+        assert_eq!(env.view.preview_scroll_offset, 0);
+    }
+
     /// A full-screen app with mouse tracking but in the LEGACY (non-SGR)
     /// encoding is still forwarded; the byte builder emits X10-encoded
     /// bytes for it instead of SGR (see `wheel_mouse_bytes_legacy_encodes_x10`).
@@ -10160,6 +10398,125 @@ mod click_to_select {
         );
     }
 
+    /// A double-click on the preview pane produces the SAME activation Action a
+    /// sidebar double-click would (parity gesture): the first press is a no-op
+    /// that records timing, the second within threshold attaches the previewed
+    /// session.
+    #[test]
+    #[serial]
+    fn preview_double_click_attaches_like_sidebar() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+        use std::time::{Duration, Instant};
+
+        let mut env = create_test_env_with_sessions(3);
+        env.view.preview_area = Rect::new(30, 0, 100, 40);
+        env.view.cursor = 1;
+        env.view.update_selected();
+        let expected_id = env
+            .view
+            .selected_session
+            .clone()
+            .expect("a session is selected");
+
+        // (50, 10) is inside preview_area (30, 0, 100, 40).
+        let t0 = Instant::now();
+        assert_eq!(
+            env.view.preview_double_click_action_at(
+                t0,
+                MouseEventKind::Down(MouseButton::Left),
+                KeyModifiers::NONE,
+                50,
+                10
+            ),
+            None,
+            "a single preview press does not activate"
+        );
+        let t1 = t0 + Duration::from_millis(150);
+        assert_eq!(
+            env.view.preview_double_click_action_at(
+                t1,
+                MouseEventKind::Down(MouseButton::Left),
+                KeyModifiers::NONE,
+                50,
+                10
+            ),
+            Some(crate::tui::app::Action::AttachSession(expected_id)),
+            "a double-click on the preview attaches the session, same as the sidebar"
+        );
+    }
+
+    /// Shift+press (aoe's own selection escape hatch) and presses outside the
+    /// preview never activate, even repeated within the double-click window.
+    #[test]
+    #[serial]
+    fn preview_shift_and_off_pane_presses_never_activate() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+        use std::time::{Duration, Instant};
+
+        let mut env = create_test_env_with_sessions(3);
+        env.view.preview_area = Rect::new(30, 0, 100, 40);
+        env.view.cursor = 1;
+        env.view.update_selected();
+
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(150);
+        let down = MouseEventKind::Down(MouseButton::Left);
+        // Shift falls through to aoe selection: never tracked, never activates.
+        assert_eq!(
+            env.view
+                .preview_double_click_action_at(t0, down, KeyModifiers::SHIFT, 50, 10),
+            None
+        );
+        assert_eq!(
+            env.view
+                .preview_double_click_action_at(t1, down, KeyModifiers::SHIFT, 50, 10),
+            None
+        );
+        // A press in the list area (5, 3), outside the preview, is ignored too.
+        assert_eq!(
+            env.view
+                .preview_double_click_action_at(t0, down, KeyModifiers::NONE, 5, 3),
+            None
+        );
+        assert_eq!(
+            env.view
+                .preview_double_click_action_at(t1, down, KeyModifiers::NONE, 5, 3),
+            None
+        );
+    }
+
+    /// Two presses on the same preview row but different columns are unrelated
+    /// clicks (e.g. tapping two different words), not a double-click: only a
+    /// same-cell second press within the window activates.
+    #[test]
+    #[serial]
+    fn preview_two_presses_on_same_row_different_col_do_not_activate() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+        use std::time::{Duration, Instant};
+
+        let mut env = create_test_env_with_sessions(3);
+        env.view.preview_area = Rect::new(30, 0, 100, 40);
+        env.view.cursor = 1;
+        env.view.update_selected();
+
+        let down = MouseEventKind::Down(MouseButton::Left);
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(150);
+        // Same row 10, columns 40 then 70: within the time window but a
+        // different cell, so the second press is a fresh single click.
+        assert_eq!(
+            env.view
+                .preview_double_click_action_at(t0, down, KeyModifiers::NONE, 40, 10),
+            None
+        );
+        assert_eq!(
+            env.view
+                .preview_double_click_action_at(t1, down, KeyModifiers::NONE, 70, 10),
+            None,
+            "a different-column second press on the same row must not activate"
+        );
+    }
+
     #[test]
     #[serial]
     fn two_clicks_on_different_rows_do_not_activate() {
@@ -10780,9 +11137,11 @@ mod preview_drag_select {
         let total_lines = text.lines.len();
         env.view.preview_cache.parsed_text = Some(text);
         env.view.preview_cache.captured_lines = total_lines;
-        // `dimensions.1 - 1` is the visible-height the scroll clamp uses;
-        // pin it to the pane height so the auto-scroll max offset matches
-        // what `first_line` implies.
+        // `scroll_preview_offset` clamps the auto-scroll max offset against
+        // `preview_visible_rows` (the rendered output-body height, same as the
+        // per-frame `clamp_scroll_to_capture`); pin it to the pane height so the
+        // max offset matches what `first_line` implies.
+        env.view.preview_visible_rows = pane.height as usize;
         env.view.preview_cache.dimensions = (pane.width, pane.height + 1);
         env.view.preview_area = pane;
         env.view.preview_scroll_offset = total_lines

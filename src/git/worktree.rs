@@ -56,6 +56,14 @@ fn classify_worktree_add_failure(combined: &str, branch: &str) -> GitError {
 /// yet" path.
 const FETCH_REMOTE: &str = "origin";
 
+/// Reason recorded on every aoe-created worktree's `git worktree lock`. The
+/// lock makes `git worktree prune` skip the admin entry, so a prune run from a
+/// context that cannot see this checkout (a sibling sandbox, or the host when
+/// the worktree lives inside a container mount) cannot reap its
+/// `<main>/.git/worktrees/<name>` entry and break the git linkage (#2414 root
+/// cause). aoe unlocks again before every intentional remove/move.
+const WORKTREE_LOCK_REASON: &str = "aoe-managed worktree (prevents cross-boundary prune)";
+
 pub struct WorktreeEntry {
     pub path: PathBuf,
     pub branch: Option<String>,
@@ -494,7 +502,13 @@ impl GitWorktree {
         }
 
         // Prune stale worktree entries so git doesn't reject a path that was
-        // previously used by a now-deleted worktree directory.
+        // previously used by a now-deleted worktree directory. A stale entry at
+        // exactly this path may be one aoe locked (the directory was removed
+        // out-of-band, bypassing the unlock-on-remove path); `prune` skips
+        // locked entries, so unlock this path first (best-effort, resolves from
+        // the admin side even with the checkout gone) so its stale entry is
+        // reaped. Sibling locks stay intact: only the colliding path is touched.
+        self.unlock_worktree(path);
         let t = std::time::Instant::now();
         self.prune_worktrees()?;
         tracing::info!(target: "git.worktree", "worktree create: prune done in {:?}", t.elapsed());
@@ -723,6 +737,22 @@ impl GitWorktree {
             t.elapsed()
         );
 
+        // Lock the freshly-created worktree so a `git worktree prune` issued
+        // from a sandbox/host context that cannot see this checkout can no
+        // longer reap its admin entry and break the git linkage (#2414). The
+        // intentional remove/move paths unlock first. Best-effort: a lock
+        // failure is surfaced as a warning, never an abort, so session
+        // creation still succeeds without prune protection.
+        if let Err(e) = self.lock_worktree(path) {
+            let warning = format!(
+                "could not lock worktree {} (cross-boundary prune protection unavailable): {}",
+                path.display(),
+                e
+            );
+            tracing::warn!(target: "git.worktree", "worktree create: {}", warning);
+            warnings.push(warning);
+        }
+
         tracing::info!(target: "git.worktree",
             "worktree create: TOTAL {:?} branch={} path={} warnings={}",
             total_start.elapsed(),
@@ -744,6 +774,47 @@ impl GitWorktree {
         }
 
         Ok(())
+    }
+
+    /// Lock `path`'s linked-worktree admin entry so `git worktree prune` skips
+    /// it (see [`WORKTREE_LOCK_REASON`]). Called once at the end of
+    /// `create_worktree`. Returns an error the caller can surface as a
+    /// non-fatal warning; a missing lock only forfeits prune protection, it
+    /// does not make the worktree unusable.
+    pub fn lock_worktree(&self, path: &Path) -> Result<()> {
+        let path_str = path
+            .to_str()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid path"))?;
+        let output = super::command::run_git(
+            &self.repo_path,
+            [
+                "worktree",
+                "lock",
+                "--reason",
+                WORKTREE_LOCK_REASON,
+                path_str,
+            ],
+        )?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(GitError::WorktreeCommandFailed(stderr));
+        }
+        Ok(())
+    }
+
+    /// Unlock `path`'s admin entry, idempotently. MUST run before any
+    /// `git worktree remove`/`move` (git refuses both on a locked worktree even
+    /// with a single `--force`) and before any cleanup path that reaps the
+    /// entry via `prune` (prune skips locked entries). Best-effort by design:
+    /// `git worktree unlock` resolves the entry from the admin side, so it
+    /// still clears the lock when the checkout directory is already gone, and a
+    /// non-zero exit (already unlocked, or no such worktree) is a harmless
+    /// no-op rather than an error.
+    pub fn unlock_worktree(&self, path: &Path) {
+        let Some(path_str) = path.to_str() else {
+            return;
+        };
+        let _ = super::command::run_git(&self.repo_path, ["worktree", "unlock", path_str]);
     }
 
     /// Convert a worktree's .git file from absolute to relative path.
@@ -902,6 +973,12 @@ impl GitWorktree {
             return Err(GitError::WorktreeNotFound(path.to_path_buf()));
         }
 
+        // aoe locks every worktree it creates; `git worktree remove` refuses a
+        // locked tree even with a single `--force` (it wants `-f -f`). Unlock
+        // first so the existing single-`--force` semantics (dirty-tree
+        // override) are preserved unchanged.
+        self.unlock_worktree(path);
+
         let path_str = path
             .to_str()
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid path"))?;
@@ -1045,11 +1122,25 @@ impl GitWorktree {
             to = %to.display(),
             "move_worktree: invoking `git worktree move`"
         );
+        // `git worktree move` also refuses a locked tree; unlock, move, then
+        // re-lock at the destination so the relocated checkout keeps its prune
+        // protection.
+        self.unlock_worktree(from);
         let output =
             super::command::run_git(&self.repo_path, ["worktree", "move", from_str, to_str])?;
         if !output.status.success() {
+            // Restore the lock on the unmoved source so a failed move does not
+            // silently leave it unprotected.
+            let _ = self.lock_worktree(from);
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             return Err(GitError::WorktreeCommandFailed(stderr));
+        }
+        if let Err(e) = self.lock_worktree(to) {
+            tracing::warn!(target: "git.worktree",
+                to = %to.display(),
+                error = %e,
+                "move_worktree: could not re-lock worktree at new path"
+            );
         }
         Ok(())
     }
@@ -1876,6 +1967,52 @@ mod tests {
             .create_worktree("stale-branch", &wt_path, false, None)
             .unwrap();
         assert!(wt_path.exists());
+    }
+
+    #[test]
+    fn test_created_worktree_is_locked_and_survives_prune_when_unreachable() {
+        // Regression for #2414: a `git worktree prune` issued from a context
+        // that cannot see a sibling's checkout (a separate sandbox, or the host
+        // when the worktree lives in a container mount) must not reap that
+        // sibling's admin entry. aoe locks every worktree it creates; prune
+        // skips locked entries.
+        let (dir, repo) = setup_test_repo();
+        let repo_path = repo.path().parent().unwrap();
+        let head = repo.head().unwrap();
+        let commit = head.peel_to_commit().unwrap();
+        repo.branch("locked-branch", &commit, false).unwrap();
+
+        let wt_path = dir.path().join("locked-worktree");
+        let git_wt = GitWorktree::new(repo_path.to_path_buf()).unwrap();
+        git_wt
+            .create_worktree("locked-branch", &wt_path, false, None)
+            .unwrap();
+
+        let admin_dir = repo_path.join(".git/worktrees").join("locked-worktree");
+        assert!(
+            admin_dir.join("locked").exists(),
+            "create_worktree should lock the new worktree"
+        );
+
+        // Simulate the pruning process being unable to see the checkout by
+        // moving it aside, then prune. The locked admin entry must survive.
+        let hidden = dir.path().join("locked-worktree-HIDDEN");
+        std::fs::rename(&wt_path, &hidden).unwrap();
+        git_wt.prune_worktrees().unwrap();
+        assert!(
+            admin_dir.exists(),
+            "locked worktree admin entry must survive a prune while its checkout is unreachable"
+        );
+
+        // Restore the checkout; the git linkage is intact, and the managed
+        // remove path still works because it unlocks first.
+        std::fs::rename(&hidden, &wt_path).unwrap();
+        git_wt.remove_worktree(&wt_path, true).unwrap();
+        assert!(!wt_path.exists());
+        assert!(
+            !admin_dir.exists(),
+            "remove_worktree should unlock and reap the admin entry"
+        );
     }
 
     #[test]

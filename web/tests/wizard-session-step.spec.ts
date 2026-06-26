@@ -14,7 +14,14 @@ async function mockApis(page: Page) {
   for (const path of ["settings", "themes", "profiles", "groups", "devices", "about", "system/update-status"]) {
     await page.route(`**/api/${path}`, (r) =>
       r.fulfill({
-        json: path === "settings" || path === "about" || path === "system/update-status" ? {} : [],
+        // worktree.enabled drives the wizard's "Create a worktree" default (#2423);
+        // these worktree-flow specs assume it is on.
+        json:
+          path === "settings"
+            ? { worktree: { enabled: true } }
+            : path === "about" || path === "system/update-status"
+              ? {}
+              : [],
       }),
     );
   }
@@ -84,7 +91,9 @@ test.describe("Wizard session step (#1219)", () => {
     await expect(titleInput).toHaveValue("my-feature");
   });
 
-  test("worktree toggle is on by default and gates the branch input + Base branch section", async ({ page }) => {
+  test("worktree toggle follows worktree.enabled (on) and gates the branch input + Base branch section", async ({
+    page,
+  }) => {
     await mockApis(page);
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
@@ -109,6 +118,23 @@ test.describe("Wizard session step (#1219)", () => {
     await worktreeToggle.click();
     await expect(worktreeToggle).toHaveAttribute("aria-checked", "true");
     await expect(w.getByPlaceholder("Uses session title if empty")).toBeVisible();
+  });
+
+  test("worktree toggle defaults off when worktree.enabled is false (#2423)", async ({ page }) => {
+    await mockApis(page);
+    // Override the settings stub: worktree.enabled false must default the
+    // "Create a worktree" toggle off. The later route wins (LIFO).
+    await page.route("**/api/settings", (r) => r.fulfill({ json: { worktree: { enabled: false } } }));
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await page.goto("/");
+    await openWithProject(page);
+    await expandMoreOptions(page);
+    const w = wizard(page);
+    const worktreeToggle = w.getByRole("switch", { name: /Create a worktree/ });
+    await expect(worktreeToggle).toHaveAttribute("aria-checked", "false");
+    // Branch input + Base branch picker stay hidden while worktree is off.
+    await expect(w.getByPlaceholder("Uses session title if empty")).toHaveCount(0);
+    await expect(w.getByRole("button", { name: "Base branch" })).toHaveCount(0);
   });
 
   test("branch input mirrors the slugified title while not manually edited", async ({ page }) => {

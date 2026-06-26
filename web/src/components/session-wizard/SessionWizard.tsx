@@ -181,6 +181,7 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
         setCommandMaps(commandMapsFromSettings(s));
         const sandbox = s.sandbox as Record<string, unknown> | undefined;
         const session = s.session as Record<string, unknown> | undefined;
+        const worktree = s.worktree as Record<string, unknown> | undefined;
         const img = (sandbox?.default_image as string) || "";
         if (img) dispatch({ type: "SET_FIELD", field: "sandboxImage", value: img });
         const env = Array.isArray(sandbox?.environment)
@@ -196,6 +197,7 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
           type: "APPLY_PROFILE_DEFAULTS",
           yoloMode: prefill?.yoloMode ?? (session?.yolo_mode_default as boolean) ?? false,
           sandboxEnabled: prefill?.sandboxEnabled ?? (sandbox?.enabled_by_default as boolean) ?? false,
+          worktreeEnabled: (worktree?.enabled as boolean) ?? false,
           tool: defaultTool,
           extraEnv: env,
           agentModel: acpDefaults.model,
@@ -218,6 +220,7 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
     (defaults: {
       yoloMode: boolean;
       sandboxEnabled: boolean;
+      worktreeEnabled: boolean;
       tool: string;
       extraEnv: string[];
       agentModel?: string;

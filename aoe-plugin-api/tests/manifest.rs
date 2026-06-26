@@ -1,4 +1,4 @@
-use aoe_plugin_api::{ManifestError, PluginManifest, RuntimeSpec, SettingType};
+use aoe_plugin_api::{ManifestError, PluginManifest, RuntimeSpec, SettingType, UiSlot};
 
 #[test]
 fn minimal_manifest_parses_and_round_trips() {
@@ -67,7 +67,7 @@ key = "endpoint"
 label = "Endpoint"
 
 [[ui]]
-slot = "sidebar"
+slot = "status-bar"
 id = "panel"
 "#;
     let m = PluginManifest::from_toml_str(toml).expect("contribution sections parse");
@@ -77,7 +77,7 @@ id = "panel"
     assert_eq!(m.keybinds[0].key, "Ctrl+K");
     assert_eq!(m.settings[0].key, "endpoint");
     assert_eq!(m.settings[0].value_type, SettingType::String);
-    assert_eq!(m.ui[0].slot, "sidebar");
+    assert_eq!(m.ui[0].slot, UiSlot::StatusBar);
 }
 
 #[test]
@@ -510,7 +510,7 @@ command = ""
 key = ""
 
 [[ui]]
-slot = ""
+slot = "status-bar"
 "#;
     let err = PluginManifest::from_toml_str(toml).unwrap_err();
     let messages = match err {
@@ -526,9 +526,44 @@ slot = ""
         "{messages:?}"
     );
     assert!(
-        messages.iter().any(|m| m.contains("ui[0].slot")),
+        messages.iter().any(|m| m.contains("ui[0].id")),
         "{messages:?}"
     );
+}
+
+#[test]
+fn unknown_ui_slot_is_a_parse_error() {
+    // `slot` is a typed enum (closed set), so a slot this host does not render
+    // is rejected at parse time, not carried forward like an unknown capability.
+    let toml = r#"
+id = "acme.thing"
+name = "Thing"
+version = "0.1.0"
+api_version = 2
+
+[[ui]]
+slot = "sidebar"
+id = "panel"
+"#;
+    let err = PluginManifest::from_toml_str(toml).unwrap_err();
+    assert!(
+        matches!(err, ManifestError::Parse(_)),
+        "expected Parse, got {err:?}"
+    );
+}
+
+#[test]
+fn ui_slot_as_str_round_trips_the_wire_name() {
+    // as_str (used for the install prompt / plugin info disclosure) must match
+    // the kebab-case serde name a manifest declares.
+    for (toml_slot, slot) in [
+        ("status-bar", UiSlot::StatusBar),
+        ("row-badge", UiSlot::RowBadge),
+        ("pane", UiSlot::Pane),
+        ("notification", UiSlot::Notification),
+    ] {
+        assert_eq!(slot.as_str(), toml_slot);
+    }
 }
 
 #[test]

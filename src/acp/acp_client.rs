@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
 
 use agent_client_protocol::schema::ErrorCode;
 use agent_client_protocol::schema::{
@@ -492,6 +493,111 @@ const BETWEEN_PROMPT_IDLE_GRACE: std::time::Duration = std::time::Duration::from
 /// between prompts, so the extra wakeups are cheap. See #2325.
 const BETWEEN_PROMPT_IDLE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
+fn opencode_data_dir() -> Option<PathBuf> {
+    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+        if !xdg.is_empty() {
+            return Some(PathBuf::from(xdg).join("opencode"));
+        }
+    }
+    let home = std::env::var("HOME").ok()?;
+    Some(
+        PathBuf::from(home)
+            .join(".local")
+            .join("share")
+            .join("opencode"),
+    )
+}
+
+fn opencode_db_path() -> Option<PathBuf> {
+    if let Ok(raw) = std::env::var("OPENCODE_DB") {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed == ":memory:" {
+            return None;
+        }
+        let path = PathBuf::from(trimmed);
+        if path.is_absolute() {
+            return Some(path);
+        }
+        return opencode_data_dir().map(|dir| dir.join(path));
+    }
+
+    let data_dir = opencode_data_dir()?;
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    let entries = std::fs::read_dir(&data_dir).ok()?;
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let is_candidate =
+            name == "opencode.db" || (name.starts_with("opencode-") && name.ends_with(".db"));
+        if !is_candidate {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        if best
+            .as_ref()
+            .map(|(best_mtime, _)| modified > *best_mtime)
+            .unwrap_or(true)
+        {
+            best = Some((modified, path));
+        }
+    }
+    best.map(|(_, path)| path)
+        .or_else(|| Some(data_dir.join("opencode.db")))
+}
+
+fn recover_opencode_prompt_error_from_sqlite_at(
+    db_path: &Path,
+    acp_session_id: &str,
+    prompt_started_at_ms: i64,
+) -> Option<String> {
+    use rusqlite::{Connection, OpenFlags};
+
+    if !db_path.exists() {
+        return None;
+    }
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    let _ = conn.busy_timeout(Duration::from_millis(100));
+    let mut stmt = conn
+        .prepare(
+            "SELECT json_extract(data, '$.error.data.message')
+             FROM message
+             WHERE session_id = ?1
+               AND json_extract(data, '$.role') = 'assistant'
+               AND CAST(json_extract(data, '$.time.created') AS INTEGER) >= ?2
+               AND json_extract(data, '$.error.data.message') IS NOT NULL
+             ORDER BY CAST(json_extract(data, '$.time.created') AS INTEGER) DESC
+             LIMIT 1",
+        )
+        .ok()?;
+    let message: String = stmt
+        .query_row(
+            rusqlite::params![acp_session_id, prompt_started_at_ms],
+            |row| row.get(0),
+        )
+        .ok()?;
+    let trimmed = message.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn recover_opencode_prompt_error(
+    acp_session_id: &str,
+    prompt_started_at_ms: i64,
+) -> Option<String> {
+    let db_path = opencode_db_path()?;
+    recover_opencode_prompt_error_from_sqlite_at(&db_path, acp_session_id, prompt_started_at_ms)
+}
+
 /// Classification of an inbound ACP `SessionUpdate` for the silent-
 /// orphan watchdog state machine. Sent from the notification handler
 /// to the prompt loop via a dedicated mpsc; the prompt loop owns the
@@ -878,6 +984,10 @@ impl SilentOrphanWatchdog {
     /// cancel-and-restart orphan. See #2237.
     fn cost_seen(&self) -> bool {
         self.cost_seen
+    }
+
+    fn saw_progress(&self) -> bool {
+        self.saw_first_progress
     }
 }
 
@@ -2991,6 +3101,7 @@ fn is_transcript_event(event: &Event) -> bool {
             | Event::ApprovalRequested { .. }
             | Event::ApprovalResolved { .. }
             | Event::RawAgentUpdate { .. }
+            | Event::PromptRuntimeError { .. }
     )
 }
 
@@ -3014,6 +3125,7 @@ fn transcript_event_kind(event: &Event) -> &'static str {
         Event::ApprovalRequested { .. } => "approval_requested",
         Event::ApprovalResolved { .. } => "approval_resolved",
         Event::RawAgentUpdate { .. } => "raw_agent_update",
+        Event::PromptRuntimeError { .. } => "prompt_runtime_error",
         _ => "other",
     }
 }
@@ -5455,6 +5567,7 @@ async fn run_connection_task<W, R>(
                             tokio::time::sleep(silent_orphan_check_period);
                         tokio::pin!(silent_orphan_check);
 
+                        let prompt_started_at_ms = chrono::Utc::now().timestamp_millis();
                         let prompt_fut = connection
                             .send_request(PromptRequest::new(acp_session_id.clone(), blocks))
                             .block_task();
@@ -5975,6 +6088,20 @@ async fn run_connection_task<W, R>(
                         let finished_after_orphan_cancel = orphan_cancel_sent
                             && watchdog.cost_seen()
                             && watchdog.off_protocol_work_seen().is_none();
+                        if profile.key == "opencode"
+                            && watchdog.cost_seen()
+                            && !watchdog.saw_progress()
+                            && watchdog.off_protocol_work_seen().is_none()
+                        {
+                            if let Some(message) = recover_opencode_prompt_error(
+                                &acp_session_id.0,
+                                prompt_started_at_ms,
+                            ) {
+                                let _ = event_tx_for_block
+                                    .send(Event::PromptRuntimeError { message })
+                                    .await;
+                            }
+                        }
                         let reason = terminal_stop_reason(
                             rate_limited,
                             force_stopped,
@@ -6835,6 +6962,7 @@ async fn handle_elicitation_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection;
 
     #[tokio::test]
     async fn fake_client_round_trips_events() {
@@ -6868,6 +6996,74 @@ mod tests {
         // ellipsis. "ééé" is 6 bytes total, so we expect "éé...".
         let out = truncate_for_log("ééé", 5);
         assert_eq!(out, "éé...");
+    }
+
+    fn create_opencode_error_test_db(rows: &[(&str, i64, Option<&str>)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("opencode.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        for (idx, (session_id, created, error_message)) in rows.iter().enumerate() {
+            let data = if let Some(message) = error_message {
+                serde_json::json!({
+                    "role": "assistant",
+                    "time": { "created": created },
+                    "error": { "data": { "message": message } },
+                })
+            } else {
+                serde_json::json!({
+                    "role": "assistant",
+                    "time": { "created": created },
+                })
+            };
+            conn.execute(
+                "INSERT INTO message (id, session_id, time_created, time_updated, data)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    format!("msg-{idx}"),
+                    session_id,
+                    created,
+                    created,
+                    data.to_string()
+                ],
+            )
+            .unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn recover_opencode_prompt_error_from_sqlite_returns_latest_matching_error() {
+        let dir = create_opencode_error_test_db(&[
+            ("ses-1", 99, Some("old error")),
+            ("ses-1", 100, None),
+            ("ses-1", 110, Some("new error")),
+            ("ses-2", 120, Some("wrong session")),
+        ]);
+        let db_path = dir.path().join("opencode.db");
+        let result = recover_opencode_prompt_error_from_sqlite_at(&db_path, "ses-1", 100);
+        assert_eq!(result.as_deref(), Some("new error"));
+    }
+
+    #[test]
+    fn recover_opencode_prompt_error_from_sqlite_returns_none_without_match() {
+        let dir = create_opencode_error_test_db(&[
+            ("ses-1", 90, Some("too early")),
+            ("ses-1", 100, None),
+            ("ses-2", 110, Some("wrong session")),
+        ]);
+        let db_path = dir.path().join("opencode.db");
+        let result = recover_opencode_prompt_error_from_sqlite_at(&db_path, "ses-1", 100);
+        assert_eq!(result, None);
     }
 
     // -------------------------------------------------------------------

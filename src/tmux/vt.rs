@@ -81,6 +81,12 @@ static REGISTRY: LazyLock<Mutex<HashMap<String, Weak<VtChannel>>>> =
 
 static SOCK_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Lines of scrollback the grid keeps, and how much history the seed pulls from
+/// the pane. Matches tmux's default `history-limit` so a freshly armed channel
+/// (e.g. after switching away from a session and back) has the pane's history
+/// immediately, not just the visible screen.
+const SCROLLBACK_LINES: usize = 2000;
+
 fn lookup(session: &str) -> Option<Arc<VtChannel>> {
     REGISTRY
         .lock()
@@ -89,13 +95,17 @@ fn lookup(session: &str) -> Option<Arc<VtChannel>> {
         .and_then(Weak::upgrade)
 }
 
-/// If `session` has an armed channel, return its current cursor-key mode
+/// If `session` has a *live* armed channel, return its current cursor-key mode
 /// (DECCKM): `Some(true)` = application cursor keys (`ESC O A`), `Some(false)` =
-/// normal (`ESC [ A`). `None` means no channel is armed. Presence of `Some` is
-/// the single-writer signal: while armed, ALL pane input must go through
-/// [`try_send_input`] (never `send-keys`), so the two writers don't interleave.
+/// normal (`ESC [ A`). `None` means no channel is armed, or its forwarder has
+/// disconnected. Presence of `Some` is the single-writer signal: while live,
+/// ALL pane input must go through [`try_send_input`] (never `send-keys`), so
+/// the two writers don't interleave. Gating on liveness means a dead channel
+/// reports `None` and input falls back to `send-keys` rather than vanishing.
 pub(crate) fn input_mode(session: &str) -> Option<bool> {
-    lookup(session).map(|c| c.app_cursor.load(Ordering::Relaxed))
+    lookup(session)
+        .filter(|c| c.is_alive())
+        .map(|c| c.app_cursor.load(Ordering::Relaxed))
 }
 
 /// Deliver raw `bytes` to `session`'s pane via its channel. Returns `true` if
@@ -131,6 +141,32 @@ fn pane_size(target: &str) -> Option<(u16, u16)> {
     let w = it.next()?.parse().ok()?;
     let h = it.next()?.parse().ok()?;
     Some((w, h))
+}
+
+/// Query the pane's terminal modes that the wheel-forward / scroll logic keys
+/// off: `(alternate_on, mouse_tracking, mouse_sgr)`. Used once at arm to seed
+/// the grid's modes, which the rendered-content seed can't carry.
+fn pane_modes(target: &str) -> Option<(bool, bool, bool)> {
+    let out = Command::new("tmux")
+        .args([
+            "display-message",
+            "-p",
+            "-t",
+            target,
+            "-F",
+            "#{alternate_on} #{mouse_any_flag} #{mouse_sgr_flag}",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    let mut it = s.split_whitespace();
+    let alt = it.next().map(|f| f != "0").unwrap_or(false);
+    let mouse = it.next().map(|f| f != "0").unwrap_or(false);
+    let sgr = it.next().map(|f| f != "0").unwrap_or(false);
+    Some((alt, mouse, sgr))
 }
 
 /// `pipe-pane -I` (input injection) landed in tmux 2.8, and a dead-pane write
@@ -177,6 +213,134 @@ fn cursor_from_screen(screen: &vt100::Screen, rows: u16, cols: u16) -> PaneCurso
     }
 }
 
+/// Append the SGR parameters for one `vt100::Color` (foreground when `bg` is
+/// false, background when true) to `params`.
+fn push_color_params(params: &mut Vec<String>, color: vt100::Color, bg: bool) {
+    match color {
+        vt100::Color::Default => {}
+        vt100::Color::Idx(n) if n < 8 => {
+            params.push((u16::from(n) + if bg { 40 } else { 30 }).to_string());
+        }
+        vt100::Color::Idx(n) if n < 16 => {
+            params.push((u16::from(n - 8) + if bg { 100 } else { 90 }).to_string());
+        }
+        vt100::Color::Idx(n) => {
+            params.push(if bg { "48".into() } else { "38".into() });
+            params.push("5".into());
+            params.push(n.to_string());
+        }
+        vt100::Color::Rgb(r, g, b) => {
+            params.push(if bg { "48".into() } else { "38".into() });
+            params.push("2".into());
+            params.push(r.to_string());
+            params.push(g.to_string());
+            params.push(b.to_string());
+        }
+    }
+}
+
+/// Whether a cell carries any non-default styling (intensity, italic,
+/// underline, inverse, or a non-default fg/bg colour). A blank-but-styled cell
+/// is still visible: a background fill that runs to the edge of a row (a status
+/// bar, a selection) has no glyph yet must be drawn.
+fn cell_has_style(cell: &vt100::Cell) -> bool {
+    cell.bold()
+        || cell.dim()
+        || cell.italic()
+        || cell.underline()
+        || cell.inverse()
+        || !matches!(cell.fgcolor(), vt100::Color::Default)
+        || !matches!(cell.bgcolor(), vt100::Color::Default)
+}
+
+/// The SGR escape that reproduces a cell's attributes, or an empty string for a
+/// default (unstyled) cell.
+fn cell_sgr(cell: &vt100::Cell) -> String {
+    if !cell_has_style(cell) {
+        return String::new();
+    }
+    let mut params: Vec<String> = Vec::new();
+    if cell.bold() {
+        params.push("1".into());
+    }
+    if cell.dim() {
+        params.push("2".into());
+    }
+    if cell.italic() {
+        params.push("3".into());
+    }
+    if cell.underline() {
+        params.push("4".into());
+    }
+    if cell.inverse() {
+        params.push("7".into());
+    }
+    push_color_params(&mut params, cell.fgcolor(), false);
+    push_color_params(&mut params, cell.bgcolor(), true);
+    if params.is_empty() {
+        String::new()
+    } else {
+        format!("\x1b[{}m", params.join(";"))
+    }
+}
+
+/// Serialise one visible grid row to ANSI by walking its cells directly:
+/// explicit SGR plus a literal character (or a space for a blank cell). vt100's
+/// own `rows_formatted` encodes runs of blank cells as cursor-movement
+/// (`ESC [ n C`) and erase-char (`ESC [ n X`) sequences. `ansi_to_tui`, the
+/// downstream consumer that turns this string into a ratatui `Text`, ignores
+/// cursor movement, so every gap of padding collapsed and aligned TUIs rendered
+/// with their spaces stripped (#2433 regression). Emitting literal spaces keeps
+/// the column layout intact while preserving colour and intensity.
+fn row_to_ansi(screen: &vt100::Screen, row: u16, cols: u16) -> String {
+    // Trim trailing *unstyled* blank cells, mirroring `capture-pane`'s
+    // trailing-space trim, so a row never carries a full width of padding into
+    // ratatui's wrapper. A trailing blank that carries styling (a background
+    // fill running to the edge) is kept: it is drawn as a coloured space below,
+    // exactly as a mid-row styled blank already is.
+    let mut last = 0u16;
+    for col in 0..cols {
+        if screen
+            .cell(row, col)
+            .is_some_and(|cell| cell.has_contents() || cell_has_style(cell))
+        {
+            last = col + 1;
+        }
+    }
+
+    let mut out = String::new();
+    let mut cur_sgr: Option<String> = None;
+    let mut col = 0u16;
+    while col < last {
+        let Some(cell) = screen.cell(row, col) else {
+            out.push(' ');
+            col += 1;
+            continue;
+        };
+        // The trailing half of a wide character carries no contents of its own;
+        // the lead cell already emitted the glyph that spans both columns.
+        if cell.is_wide_continuation() {
+            col += 1;
+            continue;
+        }
+        let sgr = cell_sgr(cell);
+        if cur_sgr.as_deref() != Some(sgr.as_str()) {
+            // Reset first so a previous cell's attributes never bleed into this
+            // one, then apply this cell's own (possibly empty) escape.
+            out.push_str("\x1b[0m");
+            out.push_str(&sgr);
+            cur_sgr = Some(sgr);
+        }
+        if cell.has_contents() {
+            out.push_str(cell.contents());
+        } else {
+            out.push(' ');
+        }
+        col += if cell.is_wide() { 2 } else { 1 };
+    }
+    out
+}
+
 /// Assemble the last `max_lines` rows of (scrollback + visible screen) as
 /// per-row ANSI, and return that plus the full scrollback depth. vt100 only
 /// formats the *visible* window, so we read it at successive scrollback offsets
@@ -206,10 +370,11 @@ fn grid_content(
         let real = offset.min(total_sb);
         parser.screen_mut().set_scrollback(real);
         let base = total_sb - real; // absolute index of this window's top row
-        for (r, row) in parser.screen().rows_formatted(0, cols).enumerate() {
+        let screen = parser.screen();
+        for r in 0..h {
             let g = base + r;
             if g < total {
-                buf[g] = Some(String::from_utf8_lossy(&row).into_owned());
+                buf[g] = Some(row_to_ansi(screen, r as u16, cols));
             }
         }
         if real >= total_sb || base <= target_low {
@@ -244,6 +409,14 @@ pub(crate) struct VtChannel {
     stream: Arc<Mutex<Option<UnixStream>>>,
     /// DECCKM snapshot, refreshed by the reader thread on each grid change.
     app_cursor: Arc<AtomicBool>,
+    /// `true` while the forwarder is connected and the reader loop is running.
+    /// Set once `accept` publishes the writable half; cleared when the reader
+    /// exits (pipe EOF / socket error). `acquire` only returns after this goes
+    /// true, so a live channel is the single-writer; once it clears, input and
+    /// capture both fall back to the legacy tmux path instead of black-holing.
+    alive: Arc<AtomicBool>,
+    /// Owner-only (0700) directory holding `sock_path`; removed on drop.
+    sock_dir: PathBuf,
     sock_path: PathBuf,
     stop: Arc<AtomicBool>,
     reader: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -259,11 +432,19 @@ impl VtChannel {
     /// returned `Arc` keeps the channel alive; drop it to release this viewer's
     /// hold (the channel tears down when the last `Arc` drops).
     pub(crate) fn acquire(session: &str) -> Option<Arc<VtChannel>> {
-        let mut reg = REGISTRY.lock().unwrap();
-        if let Some(ch) = reg.get(session).and_then(Weak::upgrade) {
+        if let Some(ch) = lookup(session) {
             return Some(ch);
         }
+        // Arm WITHOUT holding the registry lock: `arm` blocks up to ~500ms
+        // waiting for the forwarder to connect, and the global lock is taken on
+        // every `input_mode` / `try_send_input` for every session, so holding it
+        // that long would stall all pane input. Re-check under the lock and
+        // prefer a channel another thread armed in the meantime (ours drops).
         let ch = Arc::new(Self::arm(session)?);
+        let mut reg = REGISTRY.lock().unwrap();
+        if let Some(existing) = reg.get(session).and_then(Weak::upgrade) {
+            return Some(existing);
+        }
         reg.insert(session.to_string(), Arc::downgrade(&ch));
         Some(ch)
     }
@@ -274,16 +455,29 @@ impl VtChannel {
         }
         let target = format!("{name}:^.0");
         let (cols, rows) = pane_size(&target)?;
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 2000)));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, SCROLLBACK_LINES)));
         let stop = Arc::new(AtomicBool::new(false));
         let seeded = Arc::new(AtomicBool::new(false));
         let stream: Arc<Mutex<Option<UnixStream>>> = Arc::new(Mutex::new(None));
         let app_cursor = Arc::new(AtomicBool::new(false));
+        let alive = Arc::new(AtomicBool::new(false));
 
+        // Bind the socket inside an owner-only (0700) directory so other users
+        // on a shared host cannot connect to the pane channel and capture
+        // keystrokes or spoof rendered output (mirrors the worker-dir
+        // convention in `src/process/worker.rs`). On macOS/BSD the socket
+        // file's own mode is ignored by `connect`, so the 0700 parent is the
+        // real gate; the short per-channel path also stays well under the
+        // macOS `sun_path` limit.
         let n = SOCK_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let sock_path =
-            std::env::temp_dir().join(format!("aoe-vt-{}-{n}.sock", std::process::id()));
-        let _ = std::fs::remove_file(&sock_path);
+        let sock_dir = std::env::temp_dir().join(format!("aoe-vt-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&sock_dir);
+        std::fs::create_dir_all(&sock_dir).ok()?;
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&sock_dir, std::fs::Permissions::from_mode(0o700)).ok()?;
+        }
+        let sock_path = sock_dir.join("s.sock");
         let listener = UnixListener::bind(&sock_path).ok()?;
 
         let reader = {
@@ -292,6 +486,7 @@ impl VtChannel {
             let seeded = seeded.clone();
             let stream = stream.clone();
             let app_cursor = app_cursor.clone();
+            let alive = alive.clone();
             std::thread::spawn(move || {
                 let Ok((conn, _)) = listener.accept() else {
                     return;
@@ -300,6 +495,9 @@ impl VtChannel {
                 if let Ok(w) = conn.try_clone() {
                     *stream.lock().unwrap() = Some(w);
                 }
+                // The forwarder is connected: the channel is now the live
+                // single-writer. `acquire` is blocked until this flips.
+                alive.store(true, Ordering::Relaxed);
                 let mut conn = conn;
                 let _ = conn.set_read_timeout(Some(Duration::from_millis(200)));
                 let mut buf = [0u8; 8192];
@@ -324,6 +522,10 @@ impl VtChannel {
                         Err(_) => break,
                     }
                 }
+                // Reader is exiting (pipe EOF / socket error / stop): the
+                // forwarder is gone, so the channel is no longer the live
+                // single-writer. Input dispatch and capture both fall back.
+                alive.store(false, Ordering::Relaxed);
             })
         };
 
@@ -342,17 +544,66 @@ impl VtChannel {
             stop.store(true, Ordering::Relaxed);
             let _ = UnixStream::connect(&sock_path);
             let _ = reader.join();
-            let _ = std::fs::remove_file(&sock_path);
+            let _ = std::fs::remove_dir_all(&sock_dir);
             return None;
         }
 
-        // Seed the visible screen so an already-running agent shows up
-        // immediately instead of starting blank (pipe-pane has no backlog).
-        if let Ok(out) = Command::new("tmux")
-            .args(["capture-pane", "-t", &target, "-p", "-e"])
-            .output()
-        {
+        // Wait for the forwarder to actually connect before publishing the
+        // channel. `input_mode` treats a live channel as the single-writer and
+        // sends ALL pane input through the socket; if we returned during this
+        // startup gap, early keystrokes would hit a not-yet-connected socket
+        // and be dropped instead of falling back to `send-keys`. If the
+        // forwarder never connects, tear down and fall back to capture.
+        let connect_deadline = Instant::now() + Duration::from_millis(500);
+        while !alive.load(Ordering::Relaxed) {
+            if Instant::now() >= connect_deadline {
+                tracing::warn!(%target, "vt: forwarder did not connect; falling back to capture");
+                stop.store(true, Ordering::Relaxed);
+                let _ = Command::new("tmux")
+                    .args(["pipe-pane", "-t", &target])
+                    .output();
+                let _ = UnixStream::connect(&sock_path);
+                let _ = reader.join();
+                let _ = std::fs::remove_dir_all(&sock_dir);
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        // Reconstruct the app's terminal modes from tmux's flags before seeding.
+        // The seed is rendered content (`capture-pane`), which does NOT carry
+        // the DEC private mode SET escapes, and a running app won't re-emit
+        // them. Without this, a channel armed while an app is already on the
+        // alternate screen (e.g. Claude `/tui fullscreen`) would parse a normal
+        // screen, so `alternate_screen()` reads false and the wheel-forward /
+        // scroll decisions (which key off it) break.
+        let (alt, mouse, mouse_sgr) = pane_modes(&target).unwrap_or((false, false, false));
+        let mut prefix: Vec<u8> = Vec::new();
+        if alt {
+            prefix.extend_from_slice(b"\x1b[?1049h");
+        }
+        if mouse {
+            prefix.extend_from_slice(b"\x1b[?1000h");
+        }
+        if mouse_sgr {
+            prefix.extend_from_slice(b"\x1b[?1006h");
+        }
+
+        // Seed the current screen so an already-running agent shows up
+        // immediately instead of starting blank (pipe-pane has no backlog). The
+        // alternate screen has no scrollback, so only the normal buffer pulls
+        // history (`-S`); the pane keeps that history across re-arms, so a
+        // freshly armed channel can scroll right away.
+        let seed_start = format!("-{SCROLLBACK_LINES}");
+        let mut seed_args = vec!["capture-pane", "-t", &target, "-p", "-e"];
+        if !alt {
+            seed_args.extend_from_slice(&["-S", &seed_start]);
+        }
+        if let Ok(out) = Command::new("tmux").args(&seed_args).output() {
             if let Ok(mut p) = parser.lock() {
+                if !prefix.is_empty() {
+                    p.process(&prefix);
+                }
                 p.process(&out.stdout);
                 app_cursor.store(p.screen().application_cursor(), Ordering::Relaxed);
             }
@@ -366,6 +617,8 @@ impl VtChannel {
             parser,
             stream,
             app_cursor,
+            alive,
+            sock_dir,
             sock_path,
             stop,
             reader: Mutex::new(Some(reader)),
@@ -373,42 +626,6 @@ impl VtChannel {
             rows: AtomicU16::new(rows),
             last_size_check: Mutex::new(Instant::now()),
         })
-    }
-
-    /// `false` once the pane has died: the reader thread runs until the
-    /// forwarder closes (pane gone) or `stop`, so a finished reader means the
-    /// channel can no longer receive output. Viewers poll this to close, since
-    /// the grid keeps returning its last state otherwise. Server-only.
-    #[cfg(feature = "serve")]
-    pub(crate) fn is_alive(&self) -> bool {
-        self.reader
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|h| !h.is_finished())
-            .unwrap_or(false)
-    }
-
-    /// Resize the in-process grid immediately. The size-owner calls this right
-    /// after `resize-window` so the parser tracks the new pane geometry without
-    /// waiting for the periodic `reconcile_size`. Server-only.
-    #[cfg(feature = "serve")]
-    pub(crate) fn set_grid_size(&self, cols: u16, rows: u16) {
-        if cols == 0 || rows == 0 {
-            return;
-        }
-        if (cols, rows)
-            != (
-                self.cols.load(Ordering::Relaxed),
-                self.rows.load(Ordering::Relaxed),
-            )
-        {
-            self.cols.store(cols, Ordering::Relaxed);
-            self.rows.store(rows, Ordering::Relaxed);
-            if let Ok(mut p) = self.parser.lock() {
-                p.screen_mut().set_size(rows, cols);
-            }
-        }
     }
 
     /// Reconcile the parser size with the pane at most once a second (a
@@ -436,6 +653,28 @@ impl VtChannel {
         }
     }
 
+    /// Resize the in-process grid immediately. The size-owner calls this right
+    /// after `resize-window` so the parser tracks the new pane geometry without
+    /// waiting for the periodic `reconcile_size`. Server-only.
+    #[cfg(feature = "serve")]
+    pub(crate) fn set_grid_size(&self, cols: u16, rows: u16) {
+        if cols == 0 || rows == 0 {
+            return;
+        }
+        if (cols, rows)
+            != (
+                self.cols.load(Ordering::Relaxed),
+                self.rows.load(Ordering::Relaxed),
+            )
+        {
+            self.cols.store(cols, Ordering::Relaxed);
+            self.rows.store(rows, Ordering::Relaxed);
+            if let Ok(mut p) = self.parser.lock() {
+                p.screen_mut().set_size(rows, cols);
+            }
+        }
+    }
+
     /// Serialise up to `max_lines` of (scrollback + screen) to per-row ANSI,
     /// plus the authoritative cursor (with `history_size` set to the full
     /// scrollback depth). `max_lines` mirrors the capture path's window: both
@@ -453,6 +692,14 @@ impl VtChannel {
         let mut cursor = cursor_from_screen(p.screen(), rows, cols);
         cursor.history_size = history as u32;
         (content, Some(cursor))
+    }
+
+    /// Whether the forwarder is connected and the reader loop is running. A
+    /// channel that never connected, or whose pipe has since closed, reports
+    /// `false` so input and capture fall back to the legacy tmux path instead
+    /// of writing into a dead socket or sampling a frozen grid.
+    pub(crate) fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Relaxed)
     }
 
     fn write_input(&self, bytes: &[u8]) -> bool {
@@ -485,13 +732,71 @@ impl Drop for VtChannel {
         if let Some(h) = self.reader.lock().unwrap().take() {
             let _ = h.join();
         }
-        let _ = std::fs::remove_file(&self.sock_path);
+        // Remove the whole per-channel 0700 dir (socket included).
+        let _ = std::fs::remove_dir_all(&self.sock_dir);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grid_content_preserves_interior_padding() {
+        // A TUI lays a row out by positioning the cursor, not by writing runs of
+        // spaces: "A" at col 0, then jump the cursor to col 11 (`ESC[12G`) and
+        // write "B". The 10 cells in between are *default* (never written), so
+        // vt100's `rows_formatted` skips them with `ESC[10C` (cursor forward).
+        // `ansi_to_tui` ignores cursor movement, so the gap collapsed to "AB"
+        // and aligned UIs lost their spacing (#2433). The literal serialiser
+        // must emit those columns as real spaces.
+        let mut p = vt100::Parser::new(2, 20, 0);
+        p.process(b"A\x1b[12GB");
+        let (content, _) = grid_content(&mut p, 2, 20, 2);
+        assert!(
+            content.contains("A          B"),
+            "interior padding collapsed:\n{content:?}"
+        );
+        // No cursor-forward escape may leak into preview content.
+        assert!(
+            !content.contains("\x1b[10C") && !content.contains("\x1b[C"),
+            "cursor-forward escape leaked:\n{content:?}"
+        );
+    }
+
+    #[test]
+    fn grid_content_preserves_color() {
+        // SGR 31 (red fg) on "X" must round-trip as an SGR escape, not a bare
+        // cursor move, so colour survives into the preview.
+        let mut p = vt100::Parser::new(2, 20, 0);
+        p.process(b"\x1b[31mX\x1b[0m");
+        let (content, _) = grid_content(&mut p, 2, 20, 2);
+        assert!(content.contains('X'), "glyph missing:\n{content:?}");
+        assert!(
+            content.contains("\x1b[31m") || content.contains("31m"),
+            "red foreground lost:\n{content:?}"
+        );
+    }
+
+    #[test]
+    fn grid_content_keeps_trailing_styled_fill() {
+        // "Hi" then a blue background erased to the end of the line (`ESC[K`
+        // with a bg set): cols 2..10 carry a bgcolor but no glyph, like a status
+        // bar or selection that runs to the right edge. They must survive as
+        // coloured spaces, not be trimmed as if blank.
+        let mut p = vt100::Parser::new(2, 10, 0);
+        p.process(b"Hi\x1b[44m\x1b[K");
+        let (content, _) = grid_content(&mut p, 2, 10, 2);
+        let first = content.split('\n').next().unwrap_or("");
+        assert!(
+            first.contains("44m"),
+            "trailing background fill dropped:\n{content:?}"
+        );
+        assert!(
+            first.matches(' ').count() >= 8,
+            "trailing fill should keep its eight cells as spaces:\n{content:?}"
+        );
+    }
 
     #[test]
     fn grid_content_assembles_scrollback_and_screen() {

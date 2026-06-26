@@ -40,6 +40,7 @@ function listResponse(overrides: Partial<PluginListResponse> = {}): PluginListRe
         validation: "builtin",
         source: null,
         capabilities: [],
+        ui_contributions: [],
         granted: true,
         needs_reapproval: false,
       },
@@ -53,6 +54,10 @@ function listResponse(overrides: Partial<PluginListResponse> = {}): PluginListRe
         validation: "community",
         source: "gh:example/plugin",
         capabilities: ["net"],
+        ui_contributions: [
+          { slot: "status-bar", id: "s" },
+          { slot: "row-badge", id: "b" },
+        ],
         granted: true,
         needs_reapproval: false,
       },
@@ -75,6 +80,12 @@ describe("PluginsSettings", () => {
     await findByText("Agent Status Detection");
     await findByText("v1.1.0");
     await findByText("A community plugin.");
+  });
+
+  it("discloses the UI slots a plugin renders into, deduped", async () => {
+    const { findByText } = render(<PluginsSettings />);
+    // example.plugin declares status-bar + row-badge (#2366).
+    await findByText("UI: status-bar, row-badge");
   });
 
   it("shows validation badges and a needs-approval state for an ungranted community plugin", async () => {

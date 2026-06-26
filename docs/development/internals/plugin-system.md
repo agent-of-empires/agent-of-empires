@@ -113,9 +113,11 @@ declares: `capabilities`, `commands`, `keybinds`, `settings`, `ui`, and a
 `runtime` worker entrypoint. These are the sections the first external plugin
 declares; they are defined in `aoe-plugin-api` and parsed/validated by the
 host, but consumed by later issues (the settings registry in #2094, the runtime
-host in #2095, the command/keybind/UI surfaces in #2366). `api_version` is
-bumped to 2; an `api_version` 1 manifest still loads. Unknown top-level keys
-remain a hard parse error (`deny_unknown_fields`).
+host in #2095, the command/keybind/UI surfaces in #2366). `api_version` is now
+3 (bumped to 2 for the contribution sections, then 3 when the `detail-panel`
+slot became the dockable `pane` slot); an older `api_version` manifest still
+loads as long as it targets no newer slot. Unknown top-level keys remain a hard
+parse error (`deny_unknown_fields`).
 
 The `themes`, `status`, and `panes` sections are deferred until a consumer
 exists, so no schema lands in core ahead of one (#2386). With
@@ -459,13 +461,117 @@ capability grant prompt states this on every install. Restricted-environment,
 landlock, and `sandbox-exec` backends land later behind the same trait, with no
 change to the resolver or the supervisor.
 
+## UI extension points (#2366)
+
+A plugin worker pushes typed UI state to the host over capability-gated RPCs;
+the **host** renders every slot, on the web dashboard. No plugin code runs in
+the dashboard and the render path never awaits a worker: the host keeps an
+in-memory snapshot the dashboard reads synchronously.
+
+The nine slots are a closed `UiSlot` set (`aoe-plugin-api`), kebab-case on the
+wire: `status-bar`, `row-badge`, `row-column`, `sort-key`, `filter-facet`,
+`card`, `pane`, `detail-badge`, `notification`. A plugin declares the
+`(slot, id)` pairs it may fill in its manifest `[[ui]]` section; an unknown
+slot is a hard parse error (the host must know how to render each).
+
+A UI contribution is not a capability and needs no grant, but the slots a
+plugin declares are disclosed so the user knows it modifies the dashboard
+before trusting it: the `aoe plugin install` prompt lists them alongside the
+requested capabilities, and they show in `aoe plugin info`, the TUI plugin
+manager, and the web Plugins panel (via `PluginView.ui_contributions`).
+
+### RPCs (`src/plugin/host_api.rs`)
+
+- `ui.state.set { slot, id, session_id?, payload }` and
+  `ui.state.remove { slot, id, session_id? }`. Gated by `runtime.worker` **and**
+  the `(slot, id)` being declared in the manifest: no dedicated `ui` capability
+  is introduced. The `payload` is validated against the slot's typed shape and
+  stored normalized; an unknown field or bad tone is rejected. Per-session slots
+  (`row-badge`, `row-column`, `pane`, `detail-badge`) require a
+  `session_id`; global slots must not carry one. The text-based slots
+  (`status-bar`, `row-badge`, `detail-badge`) accept optional `icon` (a lucide
+  icon name in kebab-case, e.g. `git-pull-request-arrow`; the client maps it
+  through an allowlist, an unknown name renders nothing) and `href` (when set,
+  the badge renders as a link that opens in a new tab; only `http`/`https` URLs
+  are followed).
+- `ui.notify { tone, title, body?, session_id? }`. Gated by the existing
+  `notifications` capability (not a slot declaration). Returns a monotonic
+  `seq`.
+
+#### Richer payloads: `row-badge` items and the `pane` block list
+
+Two slots carry more than a single value, so one entry (one declared
+`(slot, id)`) can render a list:
+
+- `row-badge` also accepts `items: BadgeItem[]` where
+  `BadgeItem = { text?, icon?, tone?, href?, tooltip? }`. Each item renders as a
+  compact, tone-tinted icon (falling back to `text`), linked when `href` is a
+  safe URL. The single `{ text, tone, tooltip, icon, href }` form still works.
+  An empty `items: []` clears the row.
+- `pane` also accepts `blocks: Block[]`, an ordered list of typed
+  blocks. The host knows these kinds: `heading { text }`,
+  `row { label, value?, sublabel?, icon?, tone?, href? }`, `note { text, tone? }`,
+  `divider {}`, `section { title?, children: Block[] }` (nested blocks), and
+  `action { label, method, icon? }` (a button that forwards `method` to the
+  plugin's worker, see below). The simple `{ title, body }` form still works
+  when `blocks` is absent. A `pane`
+  also takes an optional `default_location` (`right` | `bottom`) choosing the
+  dock it first opens in; the user can move it between docks afterward, and an
+  optional `icon` (any lucide icon name, kebab-case) for its activity-bar
+  button, falling back to a generic plugin icon. The host renders each `pane` as
+  a dockable tool-window (activity-bar toggle, move, close) alongside the
+  built-in diff and terminal panes.
+
+**Block parsing is forward-compatible by design.** The host stores `blocks` as
+opaque JSON (`Vec<Value>`); it validates only that the payload envelope is
+well-formed, not the block kinds. The web renderer draws the kinds it knows and
+silently ignores any unknown `kind` or unknown field within a block. So a plugin
+can add a field to an existing kind, or push a brand new kind, without any host
+change: an older host simply renders what it understands and drops the rest.
+This is deliberate, the GitHub plugin's pane keeps growing (PR state today,
+review/CI/timelines later) and must not require lockstep host releases.
+
+**Pane actions (host to worker).** An `action` block is a button. When clicked,
+the dashboard POSTs `/api/plugins/{id}/action { method, params? }`; the host
+writes that JSON-RPC method to the worker's stdin as a notification (no id, so
+no reply) via `PluginHost::notify_worker`. The worker runs the method (e.g.
+`github.refresh`) and re-pushes its UI state, which the next `ui-state` poll
+renders. The plugin names the `method` in its own block, and the worker is the
+trust boundary: it acts only on methods it implements and ignores the rest (the
+honest-plugin model). The endpoint is gated like other mutations (read-write
+mode plus an elevated session when login is on).
+
+### Store and lifecycle (`src/plugin/ui_state.rs`)
+
+State is in-memory and dies with the daemon, like the rest of the Tier 1 host.
+Each worker spawn takes a *generation*; a plugin's entries are cleared when its
+worker exits, guarded by the generation so a late write or an instant respawn
+cannot resurrect or clobber the live worker's state. Notifications ride a
+separate bounded ring and survive a worker exit (a plugin that posts then
+crashes still reaches the browser). Per-plugin quotas bound memory.
+
+### Delivery
+
+`GET /api/plugins/ui-state` returns the full snapshot (entries grouped nowhere,
+plus the notification ring); it is small and bounded, so there is no
+incremental cursor. The dashboard polls it on the same cadence as
+`/api/sessions` and renders per-session entries only for sessions present in
+the live list. Notifications surface as toasts, deduped by `seq`.
+
+`sort-key` and `filter-facet` are accepted and stored by the host but their
+dashboard rendering (which needs changes to the sidebar's sort/filter core),
+and TUI rendering of any slot (the standalone TUI has no daemon link), are
+deferred to follow-ups.
+
 ## What comes next
 
 Each deferred piece returns as its own PR once the core is proven: the Tier 0
-contribution registries and the command/keybind/UI surfaces (issues 2094 and
-2366), the builtin worker self-exec path and worker SDK (with the first builtin
-worker that needs them), and the discovery / featured supply-chain layer with
-integrity hashing (issues 2364 and 2365). Pinning a featured plugin's
+contribution registries (issue 2094), the UI extension points (issue 2366,
+above), the builtin worker self-exec path and worker SDK (with the first
+builtin worker that needs them), and the discovery / featured supply-chain
+layer with integrity hashing (issues 2364 and 2365). Within #2366, dashboard
+rendering of the `sort-key` and `filter-facet` slots and TUI rendering of any
+slot are themselves follow-ups. Pinning a featured plugin's
 release-binary asset hash in `featured.toml` (so a featured worker is attested,
 not just its source) is a follow-up; today a release-binary plugin cannot be
 featured.

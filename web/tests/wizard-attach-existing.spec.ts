@@ -13,7 +13,14 @@ async function mockApis(page: Page) {
   for (const path of ["settings", "themes", "profiles", "groups", "devices", "about", "system/update-status"]) {
     await page.route(`**/api/${path}`, (r) =>
       r.fulfill({
-        json: path === "settings" || path === "about" || path === "system/update-status" ? {} : [],
+        // worktree.enabled drives the wizard's "Create a worktree" default (#2423);
+        // the attach-existing toggle only renders while worktree is on.
+        json:
+          path === "settings"
+            ? { worktree: { enabled: true } }
+            : path === "about" || path === "system/update-status"
+              ? {}
+              : [],
       }),
     );
   }

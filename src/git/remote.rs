@@ -182,6 +182,33 @@ pub fn clone_bare_repo(url: &str, destination: &Path) -> Result<String> {
         )));
     }
 
+    // Lock the `main` worktree for the same cross-boundary prune protection
+    // `GitWorktree::create_worktree` applies to every session worktree (#2414):
+    // this is the one aoe-created worktree that does not go through
+    // `create_worktree`, so without this a prune from a context that cannot see
+    // `<destination>/main` would reap its admin entry. Best-effort: a lock
+    // failure only forfeits that protection, so warn and keep the clone.
+    match super::GitWorktree::new(destination.to_path_buf()) {
+        Ok(git_wt) => {
+            if let Err(e) = git_wt.lock_worktree(&worktree_path) {
+                tracing::warn!(
+                    target: "git.fetch",
+                    path = %worktree_path.display(),
+                    error = %e,
+                    "Bare clone: could not lock main worktree (cross-boundary prune protection unavailable)"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "git.fetch",
+                path = %destination.display(),
+                error = %e,
+                "Bare clone: could not open repo to lock main worktree (cross-boundary prune protection unavailable)"
+            );
+        }
+    }
+
     tracing::info!(
         target: "git.fetch",
         "Bare clone complete: {} -> {}",
@@ -516,6 +543,52 @@ mod tests {
         // Verify main is a valid worktree
         let main_path = dest_path.join("main");
         assert!(main_path.join(".git").exists(), "worktree .git missing");
+    }
+
+    #[test]
+    fn test_clone_bare_repo_locks_main_worktree() {
+        use tempfile::TempDir;
+
+        // Regression for #2414: the `main` worktree the bare clone creates is
+        // the one aoe-created worktree that does not go through
+        // `create_worktree`, so it must still be locked or a prune from a
+        // context that cannot see it would reap its admin entry.
+        let source_dir = TempDir::new().unwrap();
+        let source_repo = git2::Repository::init(source_dir.path()).unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        let tree_id = {
+            let mut index = source_repo.index().unwrap();
+            index.write_tree().unwrap()
+        };
+        let tree = source_repo.find_tree(tree_id).unwrap();
+        source_repo
+            .commit(Some("HEAD"), &sig, &sig, "Initial", &tree, &[])
+            .unwrap();
+
+        let dest_dir = TempDir::new().unwrap();
+        let dest_path = dest_dir.path().join("test-bare-clone");
+        let url = format!("file://{}", source_dir.path().display());
+        clone_bare_repo(&url, &dest_path).unwrap();
+
+        let admin_dir = dest_path.join(".bare/worktrees/main");
+        assert!(
+            admin_dir.join("locked").exists(),
+            "clone_bare_repo should lock the main worktree"
+        );
+
+        // Hide the checkout so a prune sees it as missing; the locked admin
+        // entry must survive.
+        let hidden = dest_path.join("main-HIDDEN");
+        std::fs::rename(dest_path.join("main"), &hidden).unwrap();
+        std::process::Command::new("git")
+            .args(["worktree", "prune"])
+            .current_dir(&dest_path)
+            .output()
+            .unwrap();
+        assert!(
+            admin_dir.exists(),
+            "locked main worktree admin entry must survive a prune while its checkout is unreachable"
+        );
     }
 
     #[test]

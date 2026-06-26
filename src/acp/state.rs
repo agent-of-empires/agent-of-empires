@@ -733,6 +733,13 @@ pub enum Event {
     RawAgentUpdate {
         payload: serde_json::Value,
     },
+    /// A prompt reached the adapter, but the adapter-side runtime failed
+    /// before any assistant transcript or tool event was emitted. Used
+    /// for recoverable turn failures, distinct from startup/handshake
+    /// errors that block the whole structured-view session. See #2426.
+    PromptRuntimeError {
+        message: String,
+    },
     /// An assistant message chunk (text). In ACP this comes as an
     /// `agent_message_chunk` session update.
     AgentMessageChunk {
@@ -1045,6 +1052,7 @@ impl AcpState {
             // clients see them in the replay buffer and know the session
             // made progress.
             Event::RawAgentUpdate { .. } => {}
+            Event::PromptRuntimeError { .. } => {}
             Event::AgentMessageChunk { .. } => {}
             // No in-memory mutation: the turn is still active (turnActive
             // stays true until a real `Stopped`). The reducer/UI derive the

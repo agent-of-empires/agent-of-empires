@@ -6,7 +6,7 @@ use std::path::Path;
 use std::process::Stdio;
 
 use anyhow::{anyhow, bail, Context, Result};
-use aoe_plugin_api::{BuildStep, PluginManifest, RuntimeSpec};
+use aoe_plugin_api::{BuildStep, PluginManifest, RuntimeSpec, UiContribution};
 
 use crate::session::{save_config, CapabilityGrant, Config, PluginConfig};
 
@@ -65,15 +65,12 @@ pub async fn install(input: &str, assume_yes: bool) -> Result<InstallReport> {
 
     let capabilities = capability_strings(&fetched)?;
     let build = build_steps(&fetched.manifest);
-    // A build step runs arbitrary, unsandboxed code as the user at install
-    // time, so it requires the same explicit consent as a capability even when
-    // the plugin requests no capabilities at all (where install would
-    // otherwise auto-grant silently).
-    let granted = if assume_yes || (capabilities.is_empty() && build.is_empty()) {
-        true
-    } else {
-        confirm_capabilities(&id, &capabilities, build)?
-    };
+    let granted =
+        if assume_yes || !install_needs_consent(&capabilities, build, &fetched.manifest.ui) {
+            true
+        } else {
+            confirm_capabilities(&id, &capabilities, &fetched.manifest.ui, build)?
+        };
     if !granted {
         bail!("install cancelled; no capabilities were granted");
     }
@@ -149,16 +146,28 @@ pub async fn update(id: &str) -> Result<InstallReport> {
     let manifest_changed =
         prior_grant.as_ref().map(|g| g.manifest_hash.as_str()) != Some(manifest_hash.as_str());
     let build_changed = manifest_changed && !build_steps(&fetched.manifest).is_empty();
-    // Prompt when there is something to consent to: capabilities that changed,
-    // or build steps that could have changed. Dropping all capabilities with no
-    // build steps has nothing to grant, so it still (re)grants silently.
-    let needs_prompt = (!capabilities.is_empty() && caps_changed) || build_changed;
+    // UI contributions are disclosed at install, so an update that changes the
+    // manifest while declaring UI slots must re-disclose them: otherwise an
+    // update could add new dashboard slots the user never saw. The manifest
+    // hash covers the `[[ui]]` section, so a hash change with UI present means
+    // the slots could have changed.
+    let ui_changed = manifest_changed && !fetched.manifest.ui.is_empty();
+    // Prompt when there is something to consent to or disclose: capabilities
+    // that changed, build steps that could have changed, or UI slots on a
+    // changed manifest. Dropping all capabilities with no build/UI has nothing
+    // to grant, so it still (re)grants silently.
+    let needs_prompt = (!capabilities.is_empty() && caps_changed) || build_changed || ui_changed;
 
     // Decide the grant BEFORE touching the installed tree, so a declined or
     // non-interactive prompt bails while the old install, config, and lockfile
     // are still consistent.
     let grant = if needs_prompt {
-        if confirm_capabilities(id, &capabilities, build_steps(&fetched.manifest))? {
+        if confirm_capabilities(
+            id,
+            &capabilities,
+            &fetched.manifest.ui,
+            build_steps(&fetched.manifest),
+        )? {
             Some(CapabilityGrant {
                 manifest_hash: manifest_hash.clone(),
                 capabilities: capabilities.clone(),
@@ -313,12 +322,29 @@ fn capability_strings(fetched: &FetchedPlugin) -> Result<Vec<String>> {
         .collect())
 }
 
+/// Whether an install must prompt for consent rather than auto-grant silently.
+/// Capabilities and build steps need a grant; UI contributions need no grant
+/// but are disclosed, so a UI-only plugin still prompts rather than installing
+/// silently (#2366).
+fn install_needs_consent(
+    capabilities: &[String],
+    build: &[BuildStep],
+    ui: &[UiContribution],
+) -> bool {
+    !capabilities.is_empty() || !build.is_empty() || !ui.is_empty()
+}
+
 /// Prompt the user to grant a plugin's capabilities and run any build steps.
 /// Fails on a non-interactive stdin rather than silently granting; the caller
 /// can pass `--yes` there. Build steps are disclosed verbatim because they run
 /// as the user, outside capability enforcement, before the plugin is
 /// registered.
-fn confirm_capabilities(id: &str, capabilities: &[String], build: &[BuildStep]) -> Result<bool> {
+fn confirm_capabilities(
+    id: &str,
+    capabilities: &[String],
+    ui: &[UiContribution],
+    build: &[BuildStep],
+) -> Result<bool> {
     if !io::stdin().is_terminal() {
         bail!(
             "{id} requests capabilities [{}]{} but stdin is not a terminal; re-run with --yes to grant them",
@@ -330,6 +356,14 @@ fn confirm_capabilities(id: &str, capabilities: &[String], build: &[BuildStep]) 
         println!("Plugin {id} requests these capabilities:");
         for capability in capabilities {
             println!("  - {capability}");
+        }
+    }
+    // UI contributions are not capabilities (they need no grant), but the user
+    // should know the plugin will render into the dashboard before trusting it.
+    if !ui.is_empty() {
+        println!("Plugin {id} will add UI elements to these dashboard slots:");
+        for u in ui {
+            println!("  - {} ({})", u.slot.as_str(), u.id);
         }
     }
     if !build.is_empty() {
@@ -583,4 +617,32 @@ fn write_lock(
         },
     );
     lock.save()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aoe_plugin_api::UiSlot;
+
+    fn ui(slot: UiSlot, id: &str) -> UiContribution {
+        UiContribution {
+            slot,
+            id: id.to_string(),
+        }
+    }
+
+    #[test]
+    fn install_consent_required_for_caps_build_or_ui() {
+        // Nothing declared: auto-grant is fine.
+        assert!(!install_needs_consent(&[], &[], &[]));
+        // A capability needs a grant.
+        assert!(install_needs_consent(&["net".to_string()], &[], &[]));
+        // A UI-only plugin must still prompt so the slots are disclosed (#2366):
+        // the regression this guards is auto-granting when only `ui` is set.
+        assert!(install_needs_consent(
+            &[],
+            &[],
+            &[ui(UiSlot::StatusBar, "s")]
+        ));
+    }
 }

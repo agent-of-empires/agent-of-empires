@@ -241,6 +241,15 @@ const MAX_NATIVE_TITLE_CHARS: usize = 120;
 /// real title (possibly a user-set one), it just needs to be safe to persist.
 #[cfg(feature = "serve")]
 pub(crate) fn normalize_native_title(raw: &str) -> Option<String> {
+    let capped = clean_capped_native_title(raw)?;
+    if capped.is_empty() || is_default_civ_name(&capped) {
+        return None;
+    }
+    Some(capped)
+}
+
+#[cfg(feature = "serve")]
+fn clean_capped_native_title(raw: &str) -> Option<String> {
     let cleaned = strip_ansi(raw);
     let line = cleaned.lines().map(clean_line).find(|l| !l.is_empty())?;
     let capped = line
@@ -248,10 +257,18 @@ pub(crate) fn normalize_native_title(raw: &str) -> Option<String> {
         .take(MAX_NATIVE_TITLE_CHARS)
         .collect::<String>();
     let capped = capped.trim().to_string();
-    if capped.is_empty() || is_default_civ_name(&capped) {
-        return None;
-    }
-    Some(capped)
+    (!capped.is_empty()).then_some(capped)
+}
+
+#[cfg(feature = "serve")]
+fn native_title_echoes_first_prompt(title: &str, first_prompt: &str) -> bool {
+    let Some(title_key) = clean_capped_native_title(title).map(|s| s.to_lowercase()) else {
+        return false;
+    };
+    let Some(prompt_key) = clean_capped_native_title(first_prompt).map(|s| s.to_lowercase()) else {
+        return false;
+    };
+    title_key == prompt_key
 }
 
 /// Strip leading markdown markers / list numbering, wrapping quotes and
@@ -325,7 +342,7 @@ fn truncate_bytes(s: &str, max: usize) -> &str {
 }
 
 #[cfg(feature = "serve")]
-pub(crate) use serve::apply_auto_title;
+pub(crate) use serve::apply_native_title_suggestion;
 #[cfg(feature = "serve")]
 pub use serve::try_smart_rename;
 
@@ -580,6 +597,24 @@ mod serve {
         }
     }
 
+    pub(crate) async fn apply_native_title_suggestion(
+        state: &Arc<AppState>,
+        id: &str,
+        profile: &str,
+        title: &str,
+    ) {
+        let Some(new_title) = normalize_native_title(title) else {
+            return;
+        };
+        if let Some(first_prompt) = state.acp_event_store.first_user_prompt(id) {
+            if native_title_echoes_first_prompt(&new_title, &first_prompt) {
+                tracing::debug!(target: "smart_rename", session = %id, "skip: native title echoes first prompt");
+                return;
+            }
+        }
+        apply_auto_title(state, id, profile, &new_title).await;
+    }
+
     /// Whether an automatic renamer may overwrite this session's title: either
     /// it is still a default civ name (never explicitly set), or it still
     /// matches the last title an auto renamer wrote (so native pushes keep
@@ -645,6 +680,26 @@ mod serve {
             let long = "word ".repeat(80);
             let out = normalize_native_title(&long).expect("non-empty");
             assert!(out.chars().count() <= 120);
+        }
+
+        #[test]
+        fn native_title_echo_compare_uses_capped_normalized_equality() {
+            let prompt = format!(
+                "Please refactor the authentication middleware to fix login redirects. {}",
+                "extra detail ".repeat(30)
+            );
+            let echoed = normalize_native_title(&prompt).expect("echo normalizes");
+            assert!(native_title_echoes_first_prompt(&echoed, &prompt));
+
+            assert!(!native_title_echoes_first_prompt(
+                "Fix login redirects",
+                "Fix login redirects and update the auth middleware"
+            ));
+
+            assert!(native_title_echoes_first_prompt(
+                "# FIX LOGIN REDIRECT.",
+                "fix login redirect"
+            ));
         }
     }
 }

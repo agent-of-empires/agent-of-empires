@@ -184,7 +184,7 @@ impl PluginManagerDialog {
                 } else {
                     ("enabled", theme.running)
                 };
-                let spans = vec![
+                let mut spans = vec![
                     Span::styled(
                         format!("{:<28}", format!("{} v{}", row.name, row.version)),
                         Style::default().fg(theme.text),
@@ -195,6 +195,21 @@ impl PluginManagerDialog {
                     ),
                     Span::styled(format!("{:<14}", state.0), Style::default().fg(state.1)),
                 ];
+                // Disclose the dashboard UI slots the plugin renders into, so the
+                // manager shows that a plugin modifies the UI (#2366). Distinct
+                // slot names only; ids are in `aoe plugin info`.
+                if !row.ui_contributions.is_empty() {
+                    let mut slots: Vec<&str> = Vec::new();
+                    for u in &row.ui_contributions {
+                        if !slots.contains(&u.slot.as_str()) {
+                            slots.push(u.slot.as_str());
+                        }
+                    }
+                    spans.push(Span::styled(
+                        format!("ui: {}", slots.join(", ")),
+                        Style::default().fg(theme.dimmed),
+                    ));
+                }
                 ListItem::new(Line::from(spans))
             })
             .collect();

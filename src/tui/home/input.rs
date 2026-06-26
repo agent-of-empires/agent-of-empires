@@ -188,14 +188,25 @@ fn split_bracketed_paste(text: &str) -> Vec<live_send::TmuxKey> {
     vec![live_send::TmuxKey::HexBytes(bytes)]
 }
 
+/// Map a hovered screen cell `(col, row)` into a forwarded app's 1-based
+/// mouse coordinate space, relative to its pane `pane` (the live-send target
+/// is sized to the preview output rect, so this maps directly), clamped
+/// inside the pane. An unpopulated rect falls back to the top-left cell.
+/// Shared by the wheel- and click-forward byte builders.
+fn map_pane_cell(pane: ratatui::layout::Rect, col: u16, row: u16) -> (u16, u16) {
+    if pane.width == 0 || pane.height == 0 {
+        (1u16, 1u16)
+    } else {
+        let cx = col.saturating_sub(pane.x).min(pane.width - 1) + 1;
+        let cy = row.saturating_sub(pane.y).min(pane.height - 1) + 1;
+        (cx, cy)
+    }
+}
+
 /// Build the mouse-wheel byte sequence to forward to a full-screen app
 /// under the live preview. `up` selects wheel-up (button 64) vs wheel-down
 /// (65); `sgr` selects the SGR (1006) encoding vs the legacy X10 encoding,
-/// matching whatever the app has enabled. The hovered screen cell
-/// `(col, row)` is mapped into the app's 1-based coordinate space relative
-/// to its pane `pane` (the live-send target is sized to the preview output
-/// rect, so this maps directly), clamped inside the pane; an unpopulated
-/// rect falls back to the top-left cell.
+/// matching whatever the app has enabled.
 fn wheel_mouse_bytes(
     up: bool,
     sgr: bool,
@@ -203,13 +214,7 @@ fn wheel_mouse_bytes(
     col: u16,
     row: u16,
 ) -> Vec<u8> {
-    let (cx, cy) = if pane.width == 0 || pane.height == 0 {
-        (1u16, 1u16)
-    } else {
-        let cx = col.saturating_sub(pane.x).min(pane.width - 1) + 1;
-        let cy = row.saturating_sub(pane.y).min(pane.height - 1) + 1;
-        (cx, cy)
-    };
+    let (cx, cy) = map_pane_cell(pane, col, row);
     let button: u16 = if up { 64 } else { 65 };
     if sgr {
         // SGR (1006): textual, press marker `M`. No coordinate limit.
@@ -220,6 +225,38 @@ fn wheel_mouse_bytes(
         // encoded; clamp there (preview cells are far below that anyway).
         let enc = |v: u16| (v.min(223) + 32) as u8;
         vec![0x1b, b'[', b'M', enc(button), enc(cx), enc(cy)]
+    }
+}
+
+/// Build the byte sequence for a single forwarded mouse button event at
+/// screen cell `(col, row)`, mapped into the app's pane. `base_button` is the
+/// SGR low-bits code (left=0, middle=1, right=2); `release` is a button-up;
+/// `motion` is a drag (button held while moving). `sgr` picks SGR (1006) vs
+/// the legacy X10 encoding, matching the app. Mirrors `wheel_mouse_bytes`,
+/// which is just the wheel buttons (64/65).
+fn mouse_event_bytes(
+    base_button: u16,
+    release: bool,
+    motion: bool,
+    sgr: bool,
+    pane: ratatui::layout::Rect,
+    col: u16,
+    row: u16,
+) -> Vec<u8> {
+    let (cx, cy) = map_pane_cell(pane, col, row);
+    // The motion bit (32) rides on press/drag reports in both encodings.
+    let cb = base_button + if motion { 32 } else { 0 };
+    if sgr {
+        // SGR (1006): press/drag end with `M`, release with `m`; the button
+        // identity survives on release (unlike X10).
+        let end = if release { 'm' } else { 'M' };
+        format!("\x1b[<{cb};{cx};{cy}{end}").into_bytes()
+    } else {
+        // Legacy X10: `ESC [ M` then three bytes, each value + 32 (clamped at
+        // 223). A release can't carry a button, so it uses the agnostic 3.
+        let enc = |v: u16| (v.min(223) + 32) as u8;
+        let btn = if release { 3 } else { cb };
+        vec![0x1b, b'[', b'M', enc(btn), enc(cx), enc(cy)]
     }
 }
 
@@ -660,42 +697,68 @@ impl HomeView {
             self.preview_autoscroll_at = None;
             return false;
         }
-        // Pace the scroll to a steady cadence regardless of how often the
-        // loop woke this iteration, so the speed is even instead of racing
-        // with capture-worker activity.
+        // Pace the scroll to a steady cadence regardless of how often the loop
+        // woke this iteration, so the speed is even instead of racing with
+        // capture-worker activity. The aoe-side line scroll and the wheel
+        // forward to a mouse agent are both fine-grained (one line / one wheel
+        // notch), so they run at the fast cadence and read as smooth, like the
+        // native wheel forward when the live pane is active. The no-mouse
+        // page-key fallback stays slow: each press scrolls a WHOLE page, so a
+        // held edge at the fast cadence would rocket through the transcript.
         const AUTOSCROLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(40);
+        const PAGE_FORWARD_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
         let now = std::time::Instant::now();
-        if let Some(prev) = self.preview_autoscroll_at {
-            if now.duration_since(prev) < AUTOSCROLL_INTERVAL {
-                return false;
+        let forward_interval = if self.preview_forwards_mouse().is_some() {
+            AUTOSCROLL_INTERVAL
+        } else {
+            PAGE_FORWARD_INTERVAL
+        };
+        let line_ready = self
+            .preview_autoscroll_at
+            .is_none_or(|prev| now.duration_since(prev) >= AUTOSCROLL_INTERVAL);
+        let forward_ready = self
+            .preview_autoscroll_at
+            .is_none_or(|prev| now.duration_since(prev) >= forward_interval);
+        // First try the aoe-side capture-window scroll (normal-buffer panes
+        // with real scrollback).
+        if line_ready {
+            let scrolled = if at_top {
+                self.scroll_preview_offset(1)
+            } else {
+                self.scroll_preview_offset(-1)
+            };
+            if scrolled {
+                self.preview_autoscroll_at = Some(now);
+                let col_off = col.clamp(pane.x, pane.right().saturating_sub(1)) - pane.x;
+                // Pin the extent to the now-revealed edge line in `from_bottom`
+                // terms, which the new scroll offset gives directly: the bottom
+                // visible line sits `offset` lines up from the newest line, the
+                // top visible line `offset + height - 1`. Deriving it from the
+                // offset (not the stale pre-scroll `total_lines`) keeps it
+                // correct even before the next frame re-captures.
+                let offset = self.preview_scroll_offset as usize;
+                let from_bottom = if at_top {
+                    offset + (pane.height as usize).saturating_sub(1)
+                } else {
+                    offset
+                };
+                if let Some(sel) = self.preview_selection.as_mut() {
+                    sel.extent = (col_off, from_bottom);
+                }
+                return true;
             }
         }
-        let scrolled = if at_top {
-            self.scroll_preview_offset(1)
-        } else {
-            self.scroll_preview_offset(-1)
-        };
-        if !scrolled {
-            return false;
+        // The capture-window scroll is inert: a full-screen (alternate-screen)
+        // agent has no aoe-side scrollback, so forward the same scroll input a
+        // wheel notch would to the agent instead, scrolling its OWN transcript
+        // the way the wheel forward does (#2421). The extent stays pinned to the
+        // screen edge; the agent's redraw is what reveals more text under the
+        // held selection.
+        if forward_ready && self.forward_scroll_to_preview(at_top, col, row) {
+            self.preview_autoscroll_at = Some(now);
+            return true;
         }
-        self.preview_autoscroll_at = Some(now);
-        let col_off = col.clamp(pane.x, pane.right().saturating_sub(1)) - pane.x;
-        // Pin the extent to the now-revealed edge line in `from_bottom`
-        // terms, which the new scroll offset gives directly: the bottom
-        // visible line sits `offset` lines up from the newest line, the top
-        // visible line `offset + height - 1`. Deriving it from the offset
-        // (not the stale pre-scroll `total_lines`) keeps it correct even
-        // before the next frame re-captures.
-        let offset = self.preview_scroll_offset as usize;
-        let from_bottom = if at_top {
-            offset + (pane.height as usize).saturating_sub(1)
-        } else {
-            offset
-        };
-        if let Some(sel) = self.preview_selection.as_mut() {
-            sel.extent = (col_off, from_bottom);
-        }
-        true
+        false
     }
 
     /// Shift the preview scroll offset by `delta` lines (positive scrolls
@@ -704,9 +767,18 @@ impl HomeView {
     /// handlers so the edge auto-scroll can move the pane without dragging
     /// the whole `handle_scroll_*` routing along with it.
     fn scroll_preview_offset(&mut self, delta: i32) -> bool {
-        let cache = self.active_preview_cache();
-        let visible_height = cache.dimensions.1.saturating_sub(1) as usize;
-        let real_max = cache.captured_lines.saturating_sub(visible_height) as i32;
+        // Use the same rendered output-body height the per-frame clamp uses
+        // (`clamp_scroll_to_capture`), NOT `dimensions.1 - 1`. The raw-height
+        // `- 1` over-counts the max offset by a row, so on an alternate-screen
+        // agent with no scrollback this would grant a phantom 1-row offset that
+        // render erases every frame: the offset oscillates 0->1->0, the view
+        // never moves, and because it returns `true` the caller never falls
+        // through to the agent scroll-forward fallback.
+        let visible_height = self.preview_visible_rows;
+        let real_max = self
+            .active_preview_cache()
+            .captured_lines
+            .saturating_sub(visible_height) as i32;
         let new = (self.preview_scroll_offset as i32 + delta).clamp(0, real_max) as u16;
         if new == self.preview_scroll_offset {
             return false;
@@ -3366,13 +3438,46 @@ impl HomeView {
         else {
             return false;
         };
-        // The cursor and the mapped coordinates describe the pane the preview
-        // is showing (`preview_capture_target`), so the keys must go THERE.
-        // Route through the ordered live-send worker only when that pane is
-        // also the live-send target, so scroll stays in sequence with typed
-        // keystrokes; otherwise (passive preview, or live-send aimed at a
-        // different pane than the one on screen) fork a one-shot send to the
-        // displayed pane.
+        self.send_to_preview_pane(key)
+    }
+
+    /// During an edge-held preview selection over a full-screen
+    /// (alternate-screen) agent, the aoe capture-window scroll is inert (the
+    /// alternate screen has no scrollback, so `scroll_preview_offset` can't
+    /// move), so forward the SAME scroll input one wheel notch would, scrolling
+    /// the agent's OWN transcript. Mirrors `forward_wheel_to_preview` by reusing
+    /// `wheel_forward_key`: a mouse-tracking app gets a wheel-up/down mouse
+    /// report at the held cell (PageUp does nothing while it owns the mouse), a
+    /// no-mouse app gets `PageUp`/`PageDown`. `wheel_forward_key` also enforces
+    /// the alternate-screen gate, so a normal-buffer pane that has merely
+    /// bottomed out its scrollback never gets scroll input injected into its
+    /// shell. `up` selects the top-edge (scroll back) vs bottom-edge (scroll
+    /// forward) direction; `col`/`row` is the held pointer cell, mapped into the
+    /// pane for the mouse-byte encoding. Returns true when something was sent.
+    fn forward_scroll_to_preview(&self, up: bool, col: u16, row: u16) -> bool {
+        let Some(cursor) = self
+            .preview_capture_worker
+            .as_ref()
+            .and_then(|w| w.current_cursor())
+        else {
+            return false;
+        };
+        let Some(key) = wheel_forward_key(&cursor, up, self.preview_text_view.pane, col, row)
+        else {
+            return false;
+        };
+        self.send_to_preview_pane(key)
+    }
+
+    /// Send a forwarded key/mouse-byte payload to the pane the preview is
+    /// showing (`preview_capture_target`). The cursor and mapped coordinates
+    /// describe THAT pane, so the bytes must go there. Route through the
+    /// ordered live-send worker only when the displayed pane is also the
+    /// live-send target, so the event stays in sequence with typed
+    /// keystrokes; otherwise (passive preview, or live-send aimed at a
+    /// different pane than the one on screen) fork a one-shot send. Returns
+    /// true when something was dispatched.
+    fn send_to_preview_pane(&self, key: live_send::TmuxKey) -> bool {
         let Some(target) = self.preview_capture_target.as_deref() else {
             return false;
         };
@@ -3384,6 +3489,91 @@ impl HomeView {
         }
         live_send::send_key_oneshot(target, key);
         true
+    }
+
+    /// The previewed agent's cursor when a mouse button event over the preview
+    /// should be forwarded to it instead of driving aoe's own UI: the pane must
+    /// be a full-screen app with mouse tracking on (the same gate as the wheel's
+    /// mouse-byte branch). Works in passive preview too, not just live-send,
+    /// mirroring `forward_wheel_to_preview`: hovering a mouse agent and dragging
+    /// drives its native selection/scroll, and `send_to_preview_pane` forks a
+    /// one-shot send when there's no live-send worker. `None` means let the
+    /// event fall through to aoe's handlers (selection, etc.); Shift is the
+    /// caller's escape hatch back to aoe-side selection / copy. Returns the
+    /// cursor so the caller can read `mouse_sgr` for the encoding.
+    fn preview_forwards_mouse(&self) -> Option<crate::tmux::PaneCursor> {
+        let cursor = self
+            .preview_capture_worker
+            .as_ref()
+            .and_then(|w| w.current_cursor())?;
+        (cursor.alternate_on && cursor.mouse_tracking).then_some(cursor)
+    }
+
+    /// Forward a mouse button event (press / release / drag) over the preview
+    /// straight to the previewed agent, the way a direct tmux attach would.
+    /// `Shift` is the escape hatch: a Shift-held event returns `false` so it
+    /// falls through to aoe's own preview text-selection. Returns `true` when
+    /// the event was forwarded (and should be consumed). Wheel and bare-motion
+    /// events are not handled here (the wheel has its own path; bare motion is
+    /// not forwarded).
+    ///
+    /// A button held down is tracked in `mouse_forward_btn` so its drag and
+    /// release reach the agent even if the pointer leaves the preview rect
+    /// mid-drag, which keeps the agent from seeing a stuck button.
+    pub fn forward_mouse_to_preview(
+        &mut self,
+        kind: crossterm::event::MouseEventKind,
+        modifiers: crossterm::event::KeyModifiers,
+        col: u16,
+        row: u16,
+    ) -> bool {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let base = |b: MouseButton| match b {
+            MouseButton::Left => 0u16,
+            MouseButton::Middle => 1,
+            MouseButton::Right => 2,
+        };
+        // Decide (button, release, motion) and whether this event even starts
+        // or continues a forwarded gesture.
+        let (base_button, release, motion) = match kind {
+            MouseEventKind::Down(b) => {
+                if modifiers.contains(crossterm::event::KeyModifiers::SHIFT) {
+                    return false; // Shift+press => aoe selection
+                }
+                // A modal over the preview owns the click (dismiss / button).
+                if self.has_non_live_send_overlay() {
+                    return false;
+                }
+                if !self.hit_preview(col, row) {
+                    return false;
+                }
+                (base(b), false, false)
+            }
+            // A drag / release only forwards if its press was forwarded (we're
+            // mid-gesture); position is no longer gated so the release lands.
+            MouseEventKind::Drag(b) if self.mouse_forward_btn.is_some() => (base(b), false, true),
+            MouseEventKind::Up(b) if self.mouse_forward_btn.is_some() => (base(b), true, false),
+            _ => return false,
+        };
+        // The single mouse-forwarding gate, shared by press/drag/release: a
+        // press over a non-mouse pane bails here, and a gesture whose pane
+        // stopped being a mouse agent mid-drag drops its tracked button so we
+        // don't strand it.
+        let Some(cursor) = self.preview_forwards_mouse() else {
+            self.mouse_forward_btn = None;
+            return false;
+        };
+        self.mouse_forward_btn = if release { None } else { Some(base_button) };
+        let bytes = mouse_event_bytes(
+            base_button,
+            release,
+            motion,
+            cursor.mouse_sgr,
+            self.preview_text_view.pane,
+            col,
+            row,
+        );
+        self.send_to_preview_pane(live_send::TmuxKey::HexBytes(bytes))
     }
 
     pub fn handle_scroll_up(&mut self, col: u16, row: u16) -> bool {
@@ -4259,6 +4449,69 @@ impl HomeView {
                     self.start_live_send()
                 }
             }
+        }
+    }
+
+    /// A double-click on the preview pane opens/attaches the previewed session,
+    /// producing the SAME `Action` a sidebar double-click (or `Enter`) would, so
+    /// the two gestures match. Mirrors `handle_click`'s double-click detection
+    /// but keyed to the preview rect via its own `last_preview_click`, and gated
+    /// to a plain (no-Shift) left press over the preview with no overlay on top.
+    /// The previewed pane is always `selected_session`, so it activates the
+    /// right row without touching `cursor`. Returns the activation `Action` on
+    /// the second qualifying press on the SAME cell within
+    /// `DOUBLE_CLICK_THRESHOLD`, else `None` (a single press, whose timing it
+    /// records; the caller still forwards that press to a mouse-tracking
+    /// agent). Shift falls through so aoe's own preview selection runs, matching
+    /// the mouse-forward gate.
+    pub fn preview_double_click_action(
+        &mut self,
+        kind: crossterm::event::MouseEventKind,
+        modifiers: crossterm::event::KeyModifiers,
+        col: u16,
+        row: u16,
+    ) -> Option<Action> {
+        self.preview_double_click_action_at(std::time::Instant::now(), kind, modifiers, col, row)
+    }
+
+    /// Same as `preview_double_click_action`, but the caller supplies `now` so
+    /// unit tests can drive double-click detection deterministically.
+    pub(super) fn preview_double_click_action_at(
+        &mut self,
+        now: std::time::Instant,
+        kind: crossterm::event::MouseEventKind,
+        modifiers: crossterm::event::KeyModifiers,
+        col: u16,
+        row: u16,
+    ) -> Option<Action> {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        if !matches!(kind, MouseEventKind::Down(MouseButton::Left)) {
+            return None;
+        }
+        if modifiers.contains(crossterm::event::KeyModifiers::SHIFT) {
+            return None;
+        }
+        if self.has_non_live_send_overlay() || !self.hit_preview(col, row) {
+            return None;
+        }
+        // Match the SAME cell, not just the row: the sidebar can key by row
+        // because a row identifies an item, but a preview row is just a line of
+        // text, so two unrelated presses on the same line (different columns)
+        // must not count as a double-click.
+        let is_double = matches!(
+            self.last_preview_click,
+            Some((prev_time, prev_col, prev_row))
+                if prev_col == col
+                    && prev_row == row
+                    && now.duration_since(prev_time) <= DOUBLE_CLICK_THRESHOLD
+        );
+        if is_double {
+            // Reset so a triple-click doesn't immediately re-fire activation.
+            self.last_preview_click = None;
+            self.activate_selected_session()
+        } else {
+            self.last_preview_click = Some((now, col, row));
+            None
         }
     }
 
@@ -5259,6 +5512,50 @@ mod tests {
             wheel_mouse_bytes(true, false, wide, 300, 300),
             vec![0x1b, b'[', b'M', 64 + 32, 223 + 32, 223 + 32]
         );
+    }
+
+    #[test]
+    fn mouse_event_bytes_sgr_press_release_and_drag() {
+        use ratatui::layout::Rect;
+        let pane = Rect::new(0, 0, 80, 24);
+        // Cell (10,5) maps to 1-based (11,6). SGR: press `M`, release `m`,
+        // keeping the button identity; a drag adds the motion bit (+32).
+        assert_eq!(
+            mouse_event_bytes(0, false, false, true, pane, 10, 5),
+            b"\x1b[<0;11;6M"
+        ); // left press
+        assert_eq!(
+            mouse_event_bytes(0, true, false, true, pane, 10, 5),
+            b"\x1b[<0;11;6m"
+        ); // left release
+        assert_eq!(
+            mouse_event_bytes(2, false, false, true, pane, 10, 5),
+            b"\x1b[<2;11;6M"
+        ); // right press
+        assert_eq!(
+            mouse_event_bytes(0, false, true, true, pane, 10, 5),
+            b"\x1b[<32;11;6M"
+        ); // left drag (0 + motion 32)
+    }
+
+    #[test]
+    fn mouse_event_bytes_x10_press_button_release_agnostic() {
+        use ratatui::layout::Rect;
+        let pane = Rect::new(0, 0, 80, 24);
+        // Legacy X10: ESC [ M then (button+32, cx+32, cy+32). Cell (10,5) =>
+        // (11,6). A release is the button-agnostic 3.
+        assert_eq!(
+            mouse_event_bytes(0, false, false, false, pane, 10, 5),
+            vec![0x1b, b'[', b'M', 0 + 32, 11 + 32, 6 + 32]
+        ); // left press
+        assert_eq!(
+            mouse_event_bytes(0, true, false, false, pane, 10, 5),
+            vec![0x1b, b'[', b'M', 3 + 32, 11 + 32, 6 + 32]
+        ); // release => button 3
+        assert_eq!(
+            mouse_event_bytes(0, false, true, false, pane, 10, 5),
+            vec![0x1b, b'[', b'M', 0 + 32 + 32, 11 + 32, 6 + 32]
+        ); // left drag => button 0 + motion bit 32
     }
 
     fn cursor_for(

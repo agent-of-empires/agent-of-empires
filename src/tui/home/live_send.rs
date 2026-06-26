@@ -714,6 +714,13 @@ impl LiveCaptureWorker {
                             vt_arm_attempted = true;
                             vt_source = crate::tmux::vt::VtChannel::acquire(&name);
                         }
+                        // A channel whose forwarder has disconnected stops
+                        // updating its grid; drop it and fall back to capture
+                        // for this pane (no re-arm until the target changes, so
+                        // we don't thrash on a permanently broken pane).
+                        if vt_source.as_ref().is_some_and(|v| !v.is_alive()) {
+                            vt_source = None;
+                        }
                         match vt_source.as_ref() {
                             Some(v) => {
                                 let (content, cur) = v.sample(lines);
@@ -762,7 +769,23 @@ impl LiveCaptureWorker {
                 // condvar so a cadence or target change is picked up at once
                 // rather than after the current sleep. Spurious wakeups just
                 // run an extra capture cycle, which the dedup makes harmless.
-                let ms = interval_cell.load(Ordering::Relaxed);
+                //
+                // A live in-process vt channel samples the grid cheaply (no
+                // `capture-pane` fork) and dedups unchanged frames, so the idle
+                // throttle buys nothing there: pace it fast so the PREVIEWED
+                // pane scrolls / streams as smoothly as the active live pane,
+                // even when it isn't the live-send target. The idle cadence
+                // still governs the capture-pane fallback, whose every sample is
+                // an expensive fork.
+                #[cfg(unix)]
+                let vt_active = vt_source.as_ref().is_some_and(|v| v.is_alive());
+                #[cfg(not(unix))]
+                let vt_active = false;
+                let ms = if vt_active {
+                    LIVE_CAPTURE_INTERVAL_FAST_MS
+                } else {
+                    interval_cell.load(Ordering::Relaxed)
+                };
                 if let Ok(guard) = nudge_thread.0.lock() {
                     let _ = nudge_thread
                         .1
@@ -921,14 +944,17 @@ fn dispatch_batch(tmux_name: &str, batch: Vec<WorkerMsg>) {
 fn dispatch_via_fork(tmux_name: &str, action: &TmuxAction) -> anyhow::Result<()> {
     use std::process::{Command, Stdio};
 
-    // Fast path (AOE_VT_LIVE): when a persistent input channel is armed for this
+    // Fast path (AOE_VT_LIVE): when a *live* input channel is armed for this
     // pane, ALL pane input goes through the socket, never `send-keys`. This is a
     // single-writer invariant: mixing the socket and `send-keys` would interleave
     // two writers on the one pty input stream and can corrupt multi-byte
     // sequences (tmux pipe-pane -I shares the input stream with no arbitration).
-    // Keys are encoded to bytes here using the pane's cursor-key mode (DECCKM)
-    // from the grid, since we bypass tmux's own key translation. `Resize` is not
-    // pane input (it's `resize-window`), so it still forks below.
+    // `input_mode` returns `Some` only while the forwarder is connected, so a
+    // not-yet-connected or dead channel reports `None` and input falls through
+    // to the `send-keys` fork below instead of vanishing. Keys are encoded to
+    // bytes here using the pane's cursor-key mode (DECCKM) from the grid, since
+    // we bypass tmux's own key translation. `Resize` is not pane input (it's
+    // `resize-window`), so it still forks below.
     #[cfg(unix)]
     if let Some(app_cursor) = crate::tmux::vt::input_mode(tmux_name) {
         if !matches!(action, TmuxAction::Resize { .. }) {
@@ -1095,11 +1121,15 @@ fn encode_named_key(name: &str, app_cursor: bool) -> Vec<u8> {
     }
 
     // Editing block (CSI n ~), modifier as `;modp`. Not affected by DECCKM.
+    // `PageUp`/`PageDown` are accepted alongside the tmux `PPage`/`NPage`
+    // names: the wheel- and edge-autoscroll page-forward paths emit the former
+    // (tmux `send-keys` takes both), and without the alias those keys would
+    // encode to nothing and be dropped on the VT input path.
     if let Some(n) = match base {
         "IC" => Some(2),
         "DC" => Some(3),
-        "PPage" => Some(5),
-        "NPage" => Some(6),
+        "PPage" | "PageUp" => Some(5),
+        "NPage" | "PageDown" => Some(6),
         _ => None,
     } {
         return if has_mod {
@@ -1206,6 +1236,11 @@ mod vt_input_encode_tests {
     fn editing_block_and_fkeys() {
         assert_eq!(enc("PPage", false), b"\x1b[5~");
         assert_eq!(enc("NPage", true), b"\x1b[6~"); // unaffected by DECCKM
+                                                    // PageUp/PageDown alias PPage/NPage: the page-forward paths emit these
+                                                    // names, so the encoder must not drop them on the VT input path.
+        assert_eq!(enc("PageUp", false), b"\x1b[5~");
+        assert_eq!(enc("PageDown", false), b"\x1b[6~");
+        assert_eq!(enc("C-PageUp", false), b"\x1b[5;5~");
         assert_eq!(enc("DC", false), b"\x1b[3~");
         assert_eq!(enc("S-DC", false), b"\x1b[3;2~");
         assert_eq!(enc("F1", false), b"\x1bOP");

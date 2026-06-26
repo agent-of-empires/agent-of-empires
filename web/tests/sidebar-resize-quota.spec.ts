@@ -15,7 +15,7 @@ import type { Page } from "@playwright/test";
 
 const SIDEBAR_WIDTH_KEY = "aoe-sidebar-width";
 const SPLIT_STORAGE_KEY = "aoe-split-ratio";
-const RIGHT_PANEL_KEY = "aoe-right-collapsed";
+const RIGHT_PANEL_KEY = "aoe-pane-layout";
 
 async function stubQuotaForKey(page: Page, key: string) {
   await page.addInitScript(
@@ -115,8 +115,8 @@ test.describe("#1345 localStorage QuotaExceeded crash regression", () => {
 
     await enableThrow(page, RIGHT_PANEL_KEY);
 
-    // ControlOrMeta+Alt+B toggles diffCollapsed, which runs the guarded
-    // useEffect that calls safeSetItem for RIGHT_PANEL_COLLAPSED_KEY.
+    // ControlOrMeta+Alt+B toggles the diff pane, which runs the guarded
+    // useEffect that calls safeSetItem for the pane-layout key.
     await page.locator("body").click();
     await page.keyboard.press("ControlOrMeta+Alt+B");
     await expect(page.locator("header")).toBeVisible();

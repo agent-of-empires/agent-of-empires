@@ -756,6 +756,12 @@ pub struct HomeView {
     /// session (same as pressing Enter on the selected row).
     pub(super) last_click: Option<(std::time::Instant, u16, u16)>,
 
+    /// Same as `last_click`, but for left-presses on the preview pane. Kept
+    /// separate so preview and sidebar double-click detection don't cross-talk.
+    /// A second qualifying press within `DOUBLE_CLICK_THRESHOLD` activates the
+    /// previewed session, matching a sidebar double-click.
+    pub(super) last_preview_click: Option<(std::time::Instant, u16, u16)>,
+
     /// Dwell tracker for unread clear-on-read: the currently-selected session
     /// id and the instant the selection landed on it (while the list is the
     /// foreground, no dialog/live-send). When the same row stays selected for
@@ -827,6 +833,12 @@ pub struct HomeView {
     /// `Down(Left)` over a draggable target (the list/preview divider
     /// today), updated on each `Drag(Left)`, cleared on `Up(Left)`.
     pub(super) drag_state: Option<DragKind>,
+
+    /// The SGR base button code (0/1/2) of a mouse press currently being
+    /// forwarded to the previewed agent (`forward_mouse_to_preview`), so its
+    /// drag and release reach the agent even after the pointer leaves the
+    /// preview rect. `None` when no forwarded button is held.
+    pub(super) mouse_forward_btn: Option<u16>,
 
     /// Last pointer cell reported during a `PreviewSelect` drag, `None`
     /// outside one. The event-loop ticker reads it (`tick_preview_autoscroll`)
@@ -1078,6 +1090,14 @@ fn drop_disk_watch_entry(entry: DiskWatchEntry) {
     forwarder.abort();
 }
 
+/// Latched record of a watcher init failure. The disk slot always carries
+/// `Some(profile)`; the config slot carries `None` for the global config
+/// watch and `Some(profile)` per-profile.
+pub(super) struct WatcherInitError {
+    profile: Option<String>,
+    message: String,
+}
+
 /// Per-tick reload failure tracking. Tick-driven reload paths in
 /// `App::run` (heartbeat `reload()`, watcher-driven `reload_storage_only()`,
 /// watcher-driven `refresh_from_config()`) route results through
@@ -1096,17 +1116,17 @@ pub(super) struct ReloadFailureState {
     storage_error: Option<String>,
     config_failed: bool,
     config_error: Option<String>,
-    /// Latched description of the most recent disk-watcher init failure
+    /// Latched record of the most recent disk-watcher init failure
     /// (typically `subscribe_channel` returning Err on disk rewire).
     /// Surfaced in the reload-failure dialog body. Cleared on the next
     /// successful disk rewire pass for the affected profile.
-    disk_watcher_init_error: Option<String>,
-    /// Latched description of the most recent config-watcher init failure
+    disk_watcher_init_error: Option<WatcherInitError>,
+    /// Latched record of the most recent config-watcher init failure
     /// (typically `subscribe_channel` returning Err on config rewire).
     /// Independent from `disk_watcher_init_error`: a config init failure
     /// is not overwritten by a disk rewire and persists until the next
     /// successful config rewire pass for the affected key.
-    config_watcher_init_error: Option<String>,
+    config_watcher_init_error: Option<WatcherInitError>,
     dialog_acknowledged: bool,
 }
 
@@ -1163,9 +1183,16 @@ impl ReloadFailureState {
         }
     }
 
-    pub(super) fn record_disk_watcher_init_failure(&mut self, detail: &str) {
+    pub(super) fn record_disk_watcher_init_failure(
+        &mut self,
+        profile: &str,
+        message: impl Into<String>,
+    ) {
         let was_clear = self.disk_watcher_init_error.is_none();
-        self.disk_watcher_init_error = Some(detail.to_string());
+        self.disk_watcher_init_error = Some(WatcherInitError {
+            profile: Some(profile.to_owned()),
+            message: message.into(),
+        });
         if was_clear {
             self.dialog_acknowledged = false;
         }
@@ -1180,9 +1207,16 @@ impl ReloadFailureState {
         }
     }
 
-    pub(super) fn record_config_watcher_init_failure(&mut self, detail: &str) {
+    pub(super) fn record_config_watcher_init_failure(
+        &mut self,
+        profile: Option<&str>,
+        message: impl Into<String>,
+    ) {
         let was_clear = self.config_watcher_init_error.is_none();
-        self.config_watcher_init_error = Some(detail.to_string());
+        self.config_watcher_init_error = Some(WatcherInitError {
+            profile: profile.map(str::to_owned),
+            message: message.into(),
+        });
         if was_clear {
             self.dialog_acknowledged = false;
         }
@@ -1197,42 +1231,24 @@ impl ReloadFailureState {
         }
     }
 
-    /// Whether the disk_watcher_init_error latch references a profile
-    /// name not in `current`. The latch detail string format is set by
-    /// `record_disk_watcher_init_failure` call sites in
-    /// `rewire_disk_subscriptions` as `"{profile_name}: {error}"`; the
-    /// extractor splits at the first `": "` to recover the name.
     pub(super) fn disk_watcher_init_error_references_missing_profile(
         &self,
         current: &[String],
     ) -> bool {
-        let Some(err) = self.disk_watcher_init_error.as_deref() else {
-            return false;
-        };
-        let Some((name, _)) = err.split_once(": ") else {
-            return false;
-        };
-        !current.iter().any(|p| p == name)
+        self.disk_watcher_init_error
+            .as_ref()
+            .and_then(|e| e.profile.as_deref())
+            .is_some_and(|name| !current.iter().any(|p| p == name))
     }
 
-    /// Whether the config_watcher_init_error latch references a
-    /// per-profile name not in `current`. The per-profile detail
-    /// string format is `"profile {name} config: {error}"`; the global
-    /// format `"global config: ..."` returns false.
     pub(super) fn config_watcher_init_error_references_missing_profile(
         &self,
         current: &[String],
     ) -> bool {
-        let Some(err) = self.config_watcher_init_error.as_deref() else {
-            return false;
-        };
-        let Some(rest) = err.strip_prefix("profile ") else {
-            return false;
-        };
-        let Some((name, _)) = rest.split_once(" config:") else {
-            return false;
-        };
-        !current.iter().any(|p| p == name)
+        self.config_watcher_init_error
+            .as_ref()
+            .and_then(|e| e.profile.as_deref())
+            .is_some_and(|name| !current.iter().any(|p| p == name))
     }
 
     pub(super) fn has_any_failure(&self) -> bool {
@@ -1255,10 +1271,18 @@ impl ReloadFailureState {
             lines.push(format!("- Config: {e}"));
         }
         if let Some(e) = &self.disk_watcher_init_error {
-            lines.push(format!("- Disk watcher init: {e}"));
+            let detail = match &e.profile {
+                Some(name) => format!("{name}: {}", e.message),
+                None => e.message.clone(),
+            };
+            lines.push(format!("- Disk watcher init: {detail}"));
         }
         if let Some(e) = &self.config_watcher_init_error {
-            lines.push(format!("- Config watcher init: {e}"));
+            let detail = match &e.profile {
+                Some(name) => format!("profile {name} config: {}", e.message),
+                None => format!("global config: {}", e.message),
+            };
+            lines.push(format!("- Config watcher init: {detail}"));
         }
         lines.push(String::new());
         lines.push("In-memory state preserved; sources retry automatically.".to_string());
@@ -1487,6 +1511,7 @@ impl HomeView {
             list_inner_area: Rect::default(),
             mouse_pos: None,
             last_click: None,
+            last_preview_click: None,
             unread_dwell: None,
             manual_unread_hold: None,
             terminal_modes: HashMap::new(),
@@ -1508,6 +1533,7 @@ impl HomeView {
             divider_col: None,
             main_area_width: 0,
             drag_state: None,
+            mouse_forward_btn: None,
             preview_drag_pos: None,
             preview_autoscroll_at: None,
             preview_selection: None,
@@ -2004,7 +2030,7 @@ impl HomeView {
                         "subscribe_channel failed; falling back to 5s heartbeat for this profile"
                     );
                     self.reload_failure_state
-                        .record_disk_watcher_init_failure(&format!("{}: {}", name, e));
+                        .record_disk_watcher_init_failure(name, e.to_string());
                 }
             }
         }
@@ -2213,7 +2239,7 @@ impl HomeView {
                                  falling back to settings-close + profile-switch reload"
                             );
                             self.reload_failure_state
-                                .record_config_watcher_init_failure(&format!("global config: {e}"));
+                                .record_config_watcher_init_failure(None, e.to_string());
                         }
                     }
                 }
@@ -2224,9 +2250,10 @@ impl HomeView {
                         "skipping global config subscribe; app dir resolution failed"
                     );
                     self.reload_failure_state
-                        .record_config_watcher_init_failure(&format!(
-                            "global config: app dir resolution failed: {e}"
-                        ));
+                        .record_config_watcher_init_failure(
+                            None,
+                            format!("app dir resolution failed: {e}"),
+                        );
                 }
             }
         }
@@ -2313,7 +2340,7 @@ impl HomeView {
                          falling back to settings-close + profile-switch reload for this profile"
                     );
                     self.reload_failure_state
-                        .record_config_watcher_init_failure(&format!("profile {name} config: {e}"));
+                        .record_config_watcher_init_failure(Some(name), e.to_string());
                 }
             }
         }
