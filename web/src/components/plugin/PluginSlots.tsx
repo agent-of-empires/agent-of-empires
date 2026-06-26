@@ -325,7 +325,7 @@ function BlockComment({ block }: { block: Record<string, unknown> }) {
   const inner = (
     <>
       <div className="flex items-center justify-between gap-2 text-text-secondary">
-        <span className="font-medium truncate">{author}</span>
+        <span className="min-w-0 truncate font-medium">{author}</span>
         <span className="flex shrink-0 items-center gap-1.5">
           {where && <span className="font-mono text-[10px] text-text-dim truncate max-w-40">{where}</span>}
           <span className={`text-[10px] ${resolved ? "text-status-running" : "text-status-waiting"}`}>
