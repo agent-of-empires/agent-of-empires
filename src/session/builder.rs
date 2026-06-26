@@ -455,7 +455,7 @@ pub fn build_instance(
         params.worktree_enabled,
         existing_titles,
         &taken_branches,
-    );
+    )?;
     let branch_source = resolve_worktree_branch(
         params.worktree_enabled,
         params.worktree_branch.as_deref(),
@@ -797,8 +797,8 @@ pub(crate) fn resolve_title(
     worktree_enabled: bool,
     existing_titles: &[&str],
     taken_branches: &HashSet<String>,
-) -> String {
-    if title.is_empty() {
+) -> Result<String> {
+    let resolved = if title.is_empty() {
         if worktree_enabled {
             if let Some(branch) = worktree_branch.filter(|b| !b.trim().is_empty()) {
                 branch.trim().to_string()
@@ -809,13 +809,20 @@ pub(crate) fn resolve_title(
                         taken_branches,
                     )
                 })
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Could not generate a unique worktree title or branch; please enter one manually."
+                    )
+                })?
             }
         } else {
             civilizations::generate_random_title(existing_titles)
         }
     } else {
         title.to_string()
-    }
+    };
+
+    Ok(resolved)
 }
 
 pub(crate) fn collect_taken_branches_for_derived_dedupe(
@@ -1043,15 +1050,41 @@ pub(crate) fn branch_name_from_title(title: &str) -> String {
 mod tests {
     use super::*;
 
+    fn roman_for_test(n: u32) -> String {
+        let mut remaining = n;
+        let mut result = String::new();
+        for (value, numeral) in [
+            (1000, "M"),
+            (900, "CM"),
+            (500, "D"),
+            (400, "CD"),
+            (100, "C"),
+            (90, "XC"),
+            (50, "L"),
+            (40, "XL"),
+            (10, "X"),
+            (9, "IX"),
+            (5, "V"),
+            (4, "IV"),
+            (1, "I"),
+        ] {
+            while remaining >= value {
+                result.push_str(numeral);
+                remaining -= value;
+            }
+        }
+        result
+    }
+
     #[test]
     fn test_empty_title_with_worktree_uses_branch_name() {
-        let title = resolve_title("", Some("feature-auth"), true, &[], &HashSet::new());
+        let title = resolve_title("", Some("feature-auth"), true, &[], &HashSet::new()).unwrap();
         assert_eq!(title, "feature-auth");
     }
 
     #[test]
     fn test_empty_title_without_worktree_uses_civilization() {
-        let title = resolve_title("", None, false, &[], &HashSet::new());
+        let title = resolve_title("", None, false, &[], &HashSet::new()).unwrap();
         assert!(
             civilizations::CIVILIZATIONS.contains(&title.as_str()),
             "Expected a civilization name, got: {}",
@@ -1067,13 +1100,14 @@ mod tests {
             true,
             &[],
             &HashSet::new(),
-        );
+        )
+        .unwrap();
         assert_eq!(title, "My Session");
     }
 
     #[test]
     fn test_provided_title_without_worktree_keeps_title() {
-        let title = resolve_title("Custom Name", None, false, &[], &HashSet::new());
+        let title = resolve_title("Custom Name", None, false, &[], &HashSet::new()).unwrap();
         assert_eq!(title, "Custom Name");
     }
 
@@ -1087,12 +1121,39 @@ mod tests {
         let mut taken = HashSet::new();
         taken.insert("tatars".to_string());
 
-        let title = resolve_title("", None, true, &existing, &taken);
+        let title = resolve_title("", None, true, &existing, &taken).unwrap();
 
         assert_ne!(title, "Tatars");
         assert!(
             title.contains(" II"),
             "expected suffixed fallback after the only bare civ branch was taken, got: {title}"
+        );
+    }
+
+    #[test]
+    fn test_empty_worktree_title_errors_when_generation_exhausts() {
+        let existing: Vec<&str> = civilizations::CIVILIZATIONS.iter().copied().collect();
+        let mut taken = HashSet::new();
+        let timestamp = chrono::Utc::now().timestamp();
+
+        for civ in civilizations::CIVILIZATIONS {
+            for n in 2..=1000 {
+                taken.insert(branch_name_from_title(&format!(
+                    "{} {}",
+                    civ,
+                    roman_for_test(n)
+                )));
+            }
+            for n in timestamp - 60..timestamp + 1060 {
+                taken.insert(branch_name_from_title(&format!("{} {}", civ, n)));
+            }
+        }
+
+        let err = resolve_title("", None, true, &existing, &taken).unwrap_err();
+
+        assert!(
+            err.to_string().contains("please enter one manually"),
+            "unexpected error: {err}"
         );
     }
 

@@ -86,10 +86,22 @@ fn to_roman(n: u32) -> String {
 }
 
 pub fn generate_random_title(existing_titles: &[&str]) -> String {
-    generate_random_title_filtered(existing_titles, |_| false)
+    generate_random_title_filtered(existing_titles, |_| false).unwrap_or_else(|| {
+        let timestamp = chrono::Utc::now().timestamp();
+        for n in timestamp.. {
+            let candidate = format!("Session {}", n);
+            if !existing_titles.contains(&candidate.as_str()) {
+                return candidate;
+            }
+        }
+        unreachable!("an unbounded suffix range always yields a free candidate")
+    })
 }
 
-pub fn generate_random_title_filtered<F>(existing_titles: &[&str], is_unavailable: F) -> String
+pub fn generate_random_title_filtered<F>(
+    existing_titles: &[&str],
+    is_unavailable: F,
+) -> Option<String>
 where
     F: Fn(&str) -> bool,
 {
@@ -102,14 +114,14 @@ where
         .collect();
 
     if let Some(&civ) = available.choose(&mut rng) {
-        return civ.to_string();
+        return Some(civ.to_string());
     }
 
     let base = CIVILIZATIONS.choose(&mut rng).unwrap_or(&"Session");
     for n in 2..=1000 {
         let candidate = format!("{} {}", base, to_roman(n));
         if !existing_titles.contains(&candidate.as_str()) && !is_unavailable(&candidate) {
-            return candidate;
+            return Some(candidate);
         }
     }
 
@@ -117,11 +129,11 @@ where
     for n in timestamp..timestamp + 1000 {
         let candidate = format!("{} {}", base, n);
         if !existing_titles.contains(&candidate.as_str()) && !is_unavailable(&candidate) {
-            return candidate;
+            return Some(candidate);
         }
     }
 
-    format!("{} {}", base, timestamp)
+    None
 }
 
 /// True when `title` is one this module could have produced via
@@ -198,13 +210,21 @@ mod tests {
             .filter(|civ| *civ != "Tatars")
             .collect();
 
-        let title = generate_random_title_filtered(&existing, |candidate| candidate == "Tatars");
+        let title = generate_random_title_filtered(&existing, |candidate| candidate == "Tatars")
+            .expect("filtered title should fall back to a suffixed civilization");
 
         assert_ne!(title, "Tatars");
         assert!(
             title.contains(" II"),
             "expected suffixed fallback after the only bare civ was filtered, got: {title}"
         );
+    }
+
+    #[test]
+    fn test_generate_random_title_filtered_returns_none_when_exhausted() {
+        let title = generate_random_title_filtered(&[], |_| true);
+
+        assert!(title.is_none());
     }
 
     #[test]

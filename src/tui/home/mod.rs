@@ -3168,13 +3168,15 @@ impl HomeView {
                 data.create_new_branch,
                 data.scratch,
             );
-            data.title = crate::session::builder::resolve_title(
+            if let Ok(title) = crate::session::builder::resolve_title(
                 &data.title,
                 data.worktree_branch.as_deref(),
                 data.worktree_enabled,
                 &existing_titles,
                 &taken_branches,
-            );
+            ) {
+                data.title = title;
+            }
         }
         let stub_title = data.title.clone();
         let mut stub = Instance::new(&stub_title, &data.path);
