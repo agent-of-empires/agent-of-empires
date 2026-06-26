@@ -98,6 +98,8 @@ const baseProps = {
   commentsSendEnabled: false,
   onOpenSendDialog: vi.fn(),
   onDiscardAllComments: vi.fn(),
+  showDiff: true,
+  showTerminal: true,
 };
 
 afterEach(() => {

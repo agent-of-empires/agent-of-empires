@@ -37,7 +37,8 @@ function renderTopBar(
       onToggleSidebar={vi.fn()}
       onOpenPalette={vi.fn()}
       onToggleDiff={vi.fn()}
-      diffCollapsed={true}
+      paneLayout={{ diff: true, terminal: true }}
+      onTogglePane={vi.fn()}
       onOpenHelp={vi.fn()}
       onOpenAbout={vi.fn()}
       onStartTutorial={vi.fn()}

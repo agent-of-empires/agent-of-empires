@@ -41,6 +41,11 @@ interface Props {
   commentsSendDisabledReason?: string;
   onOpenSendDialog: () => void;
   onDiscardAllComments: () => void;
+  /** Which right-dock panes are open. Both open renders the diff-over-terminal
+   *  vertical split; a single open pane fills the column. The parent collapses
+   *  the whole column (skips rendering RightPanel) when neither is open. */
+  showDiff: boolean;
+  showTerminal: boolean;
 }
 
 export function RightPanel({
@@ -60,6 +65,8 @@ export function RightPanel({
   commentsSendDisabledReason,
   onOpenSendDialog,
   onDiscardAllComments,
+  showDiff,
+  showTerminal,
 }: Props) {
   const [topRatio, setTopRatio] = useState(loadSavedRatio);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -134,60 +141,81 @@ export function RightPanel({
     };
   }, []);
 
+  // Neither pane open: the parent collapses the whole column, so this is a
+  // defensive no-op rather than an empty bordered box.
+  if (!showDiff && !showTerminal) return null;
+  const both = showDiff && showTerminal;
+
+  const diffPane = (
+    <>
+      {commentsEnabled && commentsCount > 0 && (
+        <CommentsBanner
+          count={commentsCount}
+          sendEnabled={commentsSendEnabled}
+          sendDisabledReason={commentsSendDisabledReason}
+          onSend={onOpenSendDialog}
+          onDiscardAll={onDiscardAllComments}
+        />
+      )}
+      {sessionId && (
+        <div className="shrink-0 flex flex-col gap-2 p-2 empty:hidden">
+          <PluginDetailBadges sessionId={sessionId} />
+          <PluginDetailPanels sessionId={sessionId} />
+        </div>
+      )}
+      <DiffFileList
+        files={files}
+        perRepoBases={perRepoBases}
+        warning={warning}
+        selectedPath={selectedFilePath}
+        selectedRepoName={selectedRepoName}
+        loading={filesLoading}
+        onSelectFile={onSelectFile}
+        sessionId={sessionId}
+        repoPath={session?.main_repo_path ?? session?.project_path ?? null}
+        baseBranchOverride={session?.base_branch_override ?? null}
+        onBaseBranchChanged={onDiffRefresh}
+      />
+    </>
+  );
+
   return (
     <div
       ref={containerRef}
       {...tourAnchor(TOUR_ANCHORS.rightPanel)}
       className="flex-1 flex flex-col min-h-0 overflow-hidden md:border-l md:border-surface-700/60 md:bg-surface-800"
     >
-      {/* Upper: file list */}
-      <div
-        style={{ flexBasis: `${topRatio * 100}%` }}
-        className="flex flex-col min-h-0 overflow-hidden md:border-b md:border-surface-700/60"
-      >
-        {commentsEnabled && commentsCount > 0 && (
-          <CommentsBanner
-            count={commentsCount}
-            sendEnabled={commentsSendEnabled}
-            sendDisabledReason={commentsSendDisabledReason}
-            onSend={onOpenSendDialog}
-            onDiscardAll={onDiscardAllComments}
-          />
-        )}
-        {sessionId && (
-          <div className="shrink-0 flex flex-col gap-2 p-2 empty:hidden">
-            <PluginDetailBadges sessionId={sessionId} />
-            <PluginDetailPanels sessionId={sessionId} />
-          </div>
-        )}
-        <DiffFileList
-          files={files}
-          perRepoBases={perRepoBases}
-          warning={warning}
-          selectedPath={selectedFilePath}
-          selectedRepoName={selectedRepoName}
-          loading={filesLoading}
-          onSelectFile={onSelectFile}
-          sessionId={sessionId}
-          repoPath={session?.main_repo_path ?? session?.project_path ?? null}
-          baseBranchOverride={session?.base_branch_override ?? null}
-          onBaseBranchChanged={onDiffRefresh}
-        />
-      </div>
+      {showDiff && (
+        <div
+          style={both ? { flexBasis: `${topRatio * 100}%` } : undefined}
+          className={`flex flex-col min-h-0 overflow-hidden ${
+            both ? "md:border-b md:border-surface-700/60" : "flex-1"
+          }`}
+        >
+          {diffPane}
+        </div>
+      )}
 
-      {/* Drag handle: taller on mobile for easier touch targeting */}
-      <div
-        onMouseDown={handleMouseDown}
-        onTouchStart={handleTouchStart}
-        className="h-3 md:h-1 cursor-row-resize shrink-0 hover:bg-brand-600/50 transition-colors duration-75 touch-none flex items-center justify-center"
-      >
-        <div className="w-8 h-0.5 rounded-full bg-surface-500/40 md:hidden" />
-      </div>
+      {/* Drag handle (only when both panes share the column): taller on mobile
+          for easier touch targeting. */}
+      {both && (
+        <div
+          onMouseDown={handleMouseDown}
+          onTouchStart={handleTouchStart}
+          className="h-3 md:h-1 cursor-row-resize shrink-0 hover:bg-brand-600/50 transition-colors duration-75 touch-none flex items-center justify-center"
+        >
+          <div className="w-8 h-0.5 rounded-full bg-surface-500/40 md:hidden" />
+        </div>
+      )}
 
-      {/* Lower: paired terminal */}
-      <div style={{ flexBasis: `${(1 - topRatio) * 100}%` }} className="flex flex-col min-h-0">
-        <PairedShellPane session={session} sessionId={sessionId} />
-      </div>
+      {showTerminal && (
+        <div
+          style={both ? { flexBasis: `${(1 - topRatio) * 100}%` } : undefined}
+          className={`flex flex-col min-h-0 ${both ? "" : "flex-1"}`}
+        >
+          <PairedShellPane session={session} sessionId={sessionId} />
+        </div>
+      )}
     </div>
   );
 }

@@ -4,14 +4,20 @@ import { PaletteTriggerPill } from "./PaletteTriggerPill";
 import { OverflowMenu, type OverflowItem } from "./OverflowMenu";
 import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
 import { PluginStatusBarSegments } from "./plugin/PluginSlots";
+import { ActivityBar } from "./ActivityBar";
+import type { PaneLayout } from "../lib/paneLayout";
+import type { BuiltinPaneId } from "../lib/panes";
 
 interface Props {
   activeWorkspace: Workspace | undefined;
   activeSession: SessionResponse | null;
   onToggleSidebar: () => void;
   onOpenPalette: () => void;
+  /** Mobile (below md): opens the view picker. The desktop activity bar uses
+   *  `onTogglePane` instead. */
   onToggleDiff: () => void;
-  diffCollapsed: boolean;
+  paneLayout: PaneLayout;
+  onTogglePane: (id: BuiltinPaneId) => void;
   onOpenHelp: () => void;
   onOpenAbout: () => void;
   onStartTutorial: () => void;
@@ -46,7 +52,8 @@ export function TopBar({
   onToggleSidebar,
   onOpenPalette,
   onToggleDiff,
-  diffCollapsed,
+  paneLayout,
+  onTogglePane,
   onOpenHelp,
   onOpenAbout,
   onStartTutorial,
@@ -148,28 +155,32 @@ export function TopBar({
         )}
 
         {activeWorkspace && activeSession && (
-          <button
-            onClick={onToggleDiff}
-            className={`w-8 h-8 flex items-center justify-center cursor-pointer rounded-md transition-colors hover:bg-surface-700/50 ${
-              diffCollapsed ? "text-text-dim hover:text-text-secondary" : "text-text-secondary hover:text-text-primary"
-            }`}
-            title="Toggle diff panel"
-            aria-label="Toggle diff panel"
-          >
-            <svg
-              width="16"
-              height="16"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="1.5"
-              strokeLinecap="round"
-              strokeLinejoin="round"
+          <>
+            {/* Desktop: per-pane toggles. Mobile: one button that opens the
+                full-viewport view picker (#1452); there is no side dock to
+                toggle pane-by-pane below md. */}
+            <ActivityBar layout={paneLayout} onToggle={onTogglePane} />
+            <button
+              onClick={onToggleDiff}
+              className="md:hidden w-8 h-8 flex items-center justify-center cursor-pointer rounded-md transition-colors text-text-secondary hover:text-text-primary hover:bg-surface-700/50"
+              title="Toggle panels"
+              aria-label="Toggle panels"
             >
-              <rect x="3" y="3" width="18" height="18" rx="2" />
-              <line x1="15" y1="3" x2="15" y2="21" />
-            </svg>
-          </button>
+              <svg
+                width="16"
+                height="16"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.5"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <rect x="3" y="3" width="18" height="18" rx="2" />
+                <line x1="15" y1="3" x2="15" y2="21" />
+              </svg>
+            </button>
+          </>
         )}
 
         <OverflowMenu items={overflowItems} triggerDataTour={TOUR_ANCHORS.topbarMore} />

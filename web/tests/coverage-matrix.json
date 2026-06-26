@@ -410,6 +410,13 @@
       "components": ["web/src/components/TopBar.tsx"]
     },
     {
+      "id": "app-shell.activity-bar",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/__tests__/ActivityBar.test.tsx"],
+      "components": ["web/src/components/ActivityBar.tsx"]
+    },
+    {
       "id": "app-shell.tips-badge",
       "kind": "vitest",
       "risk": "low",

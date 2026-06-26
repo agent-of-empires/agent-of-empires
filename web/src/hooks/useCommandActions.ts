@@ -78,7 +78,7 @@ export function useCommandActions({
     if (hasActiveSession) {
       actions.push({
         id: "action:toggle-diff",
-        title: "Toggle diff panel",
+        title: "Toggle diff pane",
         group: "Actions",
         keywords: ["changes", "files", "review"],
         shortcut: "D",

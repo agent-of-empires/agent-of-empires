@@ -51,7 +51,7 @@ describe("isSyncedKey", () => {
       "aoe-sidebar-width",
       "aoe-split-ratio",
       "aoe-right-vsplit",
-      "aoe-right-collapsed",
+      "aoe-pane-layout",
       "aoe-resolved-theme",
       "aoe-tour-seen",
       "aoe:acp-state:v1:abc",

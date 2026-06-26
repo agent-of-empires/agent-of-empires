@@ -6,7 +6,7 @@ import { useSessions } from "./hooks/useSessions";
 import { clearAcpCache } from "./hooks/useAcpSession";
 import { clearDraft, sweepOrphanDrafts } from "./lib/acpDrafts";
 import { AcpPrefsProvider } from "./lib/acpPrefs";
-import { safeGetItem, safeRemoveItem, safeSetItem } from "./lib/safeStorage";
+import { safeGetItem, safeRemoveItem } from "./lib/safeStorage";
 import { isAutomatedSession } from "./lib/onboarding";
 import { useWorkspaces } from "./hooks/useWorkspaces";
 import { useLastSessionRestore } from "./hooks/useLastSessionRestore";
@@ -31,6 +31,7 @@ import { useEdgeSwipe } from "./hooks/useEdgeSwipe";
 import { useIsCoarsePointer } from "./hooks/useIsCoarsePointer";
 import { useIsWideViewport } from "./hooks/useIsWideViewport";
 import type { RightPanelView } from "./lib/rightPanelView";
+import { usePaneLayout } from "./lib/paneLayout";
 import {
   loginStatus,
   logout,
@@ -103,7 +104,6 @@ import { ElevationPrompt } from "./components/ElevationPrompt";
 import { UpdateBanner } from "./components/UpdateBanner";
 import { DashboardUpdateBanner } from "./components/DashboardUpdateBanner";
 
-const RIGHT_PANEL_COLLAPSED_KEY = "aoe-right-collapsed";
 // Pre-#1832 per-browser tour-seen flag. Read once on load to migrate users who
 // already dismissed the tour to the backend; no longer written.
 const LEGACY_TOUR_SEEN_KEY = "aoe-tour-seen";
@@ -345,15 +345,11 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   const selectedFilePath = selectedFile?.path ?? null;
   const selectedRepoName = selectedFile?.repoName;
   const selectedFileLine = selectedFile?.line;
-  const [diffCollapsed, setDiffCollapsed] = useState(() => {
-    const stored = safeGetItem(RIGHT_PANEL_COLLAPSED_KEY);
-    if (stored === "1") return true;
-    if (stored === "0") return false;
-    return window.innerWidth < 768;
-  });
-  useEffect(() => {
-    safeSetItem(RIGHT_PANEL_COLLAPSED_KEY, diffCollapsed ? "1" : "0");
-  }, [diffCollapsed]);
+  // Per-pane open state for the right dock (diff + terminal, plus plugin panes
+  // later). `rightDockCollapsed` stands in for the old single "right column
+  // hidden" flag wherever the layout only cares whether the column shows.
+  const { layout: paneLayout, togglePane, setPaneOpen } = usePaneLayout();
+  const rightDockCollapsed = !paneLayout.diff && !paneLayout.terminal;
   // Layout topology is width-driven so it stays aligned with the `md:`
   // Tailwind classes the rest of the layout uses. At md and up the
   // side-by-side ContentSplit renders; below md a single full-viewport
@@ -397,7 +393,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
 
   // Fetch the diff when the panel is actually showing: on desktop when the
   // split is expanded, on mobile when the diff view is the active pane.
-  const diffPanelActive = isMdUp ? !diffCollapsed : rightPanelView === "diff";
+  const diffPanelActive = isMdUp ? paneLayout.diff : rightPanelView === "diff";
   const {
     files: diffFiles,
     perRepoBases,
@@ -806,11 +802,11 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   // is no split to collapse: it opens the view picker instead (#1452).
   const toggleDiff = useCallback(() => {
     if (isMdUp) {
-      setDiffCollapsed((c) => !c);
+      togglePane("diff");
     } else {
       setPickerOpen((o) => !o);
     }
-  }, [isMdUp]);
+  }, [isMdUp, togglePane]);
 
   const handlePickView = useCallback((view: RightPanelView) => {
     setRightPanelView(view);
@@ -889,11 +885,11 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   const openSidebar = useCallback(() => setSidebarOpen(true), []);
   const openDiff = useCallback(() => {
     if (isMdUp) {
-      setDiffCollapsed(false);
+      setPaneOpen("diff", true);
     } else {
       setPickerOpen(true);
     }
-  }, [isMdUp]);
+  }, [isMdUp, setPaneOpen]);
   useEdgeSwipe({
     edge: "left",
     enabled: !sidebarOpen,
@@ -905,7 +901,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   });
   useEdgeSwipe({
     edge: "right",
-    enabled: diffCollapsed && !!activeSessionId,
+    enabled: rightDockCollapsed && !!activeSessionId,
     onSwipe: openDiff,
   });
 
@@ -964,12 +960,12 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       return;
     }
 
-    if (target === "paired" && diffCollapsed) {
-      // Right panel is collapsed; paired terminal is unmounted. Set the
-      // pending intent so PairedTerminal grabs focus once it mounts and
-      // its PTY is ready, then expand the panel.
+    if (target === "paired" && !paneLayout.terminal) {
+      // Terminal pane is closed, so the paired shell is unmounted. Set the
+      // pending intent so PairedTerminal grabs focus once it mounts and its
+      // PTY is ready, then open the terminal pane.
       setPendingTerminalFocus("paired");
-      setDiffCollapsed(false);
+      setPaneOpen("terminal", true);
       return;
     }
     if (target === "agent" && selectedFilePath) {
@@ -981,7 +977,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       return;
     }
     dispatchFocusTerminal(target);
-  }, [activeSessionId, singlePane, diffCollapsed, selectedFilePath]);
+  }, [activeSessionId, singlePane, paneLayout.terminal, setPaneOpen, selectedFilePath]);
 
   useKeyboardShortcuts(
     useCallback(
@@ -1152,7 +1148,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     return (
       <div className="flex-1 flex flex-col min-h-0">
         <ContentSplit
-          collapsed={diffCollapsed}
+          collapsed={rightDockCollapsed}
           onToggleCollapse={toggleDiff}
           left={
             <div className="flex-1 flex flex-col min-h-0 overflow-hidden relative">
@@ -1212,6 +1208,8 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
               commentsSendDisabledReason={commentSendDisabledReason}
               onOpenSendDialog={() => setSendDialogOpen(true)}
               onDiscardAllComments={diffComments.clearComments}
+              showDiff={paneLayout.diff}
+              showTerminal={paneLayout.terminal}
             />
           }
         />
@@ -1395,7 +1393,8 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
             onToggleSidebar={handleToggleSidebar}
             onOpenPalette={() => setShowPalette(true)}
             onToggleDiff={toggleDiff}
-            diffCollapsed={diffCollapsed}
+            paneLayout={paneLayout}
+            onTogglePane={togglePane}
             onOpenHelp={handleOpenHelp}
             onOpenAbout={handleOpenAbout}
             onStartTutorial={tour.startTour}
@@ -1406,7 +1405,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
             onOpenTips={tips.open}
             onGoDashboard={handleGoDashboard}
             sidebarColumnVisible={!showSettings && sidebarOpen}
-            rightColumnVisible={isMdUp && !showSettings && !!activeWorkspace && !!activeSession && !diffCollapsed}
+            rightColumnVisible={isMdUp && !showSettings && !!activeWorkspace && !!activeSession && !rightDockCollapsed}
           />
 
           <DisconnectBanner />
