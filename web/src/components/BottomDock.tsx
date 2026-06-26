@@ -27,7 +27,7 @@ interface Props {
   onActivate: (id: string) => void;
   onClose: (id: string) => void;
   onMove: (id: string, dock: DockLocation) => void;
-  onNewTerminal: () => void;
+  onNewTerminal?: () => void;
 }
 
 /** Full-width bottom dock: a height-resizable strip below the main+right-dock

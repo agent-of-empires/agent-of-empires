@@ -212,6 +212,14 @@ test.describe("Cmd/Ctrl+` desktop", () => {
     await openSession(page);
     await focusKind(page, "agent");
 
+    // Tabbed docks (#2437): the paired tab mounts lazily on first focus. Warm it
+    // up once (and return to agent) so the rapid loop below toggles a mounted
+    // panel and stays deterministic, instead of racing the one-time mount.
+    await page.keyboard.press("ControlOrMeta+`");
+    await expect.poll(() => focusedKind(page)).toBe("paired");
+    await page.keyboard.press("ControlOrMeta+`");
+    await expect.poll(() => focusedKind(page)).toBe("agent");
+
     // 11 toggles total = odd flips from agent → paired.
     for (let i = 0; i < 11; i++) {
       await page.keyboard.press("ControlOrMeta+`");

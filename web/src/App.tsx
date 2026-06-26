@@ -448,7 +448,17 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       // have no backend shell to reap.
       if (isTerminalTabId(id)) {
         const idx = terminalIndexOf(id);
-        if (idx >= 1 && activeSessionId) void killTerminal(activeSessionId, idx);
+        if (idx >= 1) {
+          // Remove the tab only once the shell is actually killed; if the
+          // DELETE fails, keep the tab so the user can retry instead of
+          // silently leaking the shell with no way to close it.
+          if (activeSessionId) {
+            void killTerminal(activeSessionId, idx).then((ok) => {
+              if (ok) closeTab(id);
+            });
+          }
+          return;
+        }
       }
       closeTab(id);
     },
@@ -1087,19 +1097,22 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
 
     if (target === "paired") {
       // The paired shell only mounts when a terminal tab is the active tab of
-      // its dock. Latch the focus intent, then ensure a terminal tab exists and
-      // is active so it mounts; PairedTerminal grabs focus once its PTY is ready.
-      setPendingTerminalFocus("paired");
+      // its dock.
       const termTab =
         (["right", "bottom"] as DockLocation[]).flatMap((d) => dockTabs(paneLayout, d)).find(isTerminalTabId) ??
         terminalTabId(0);
       const termDock = dockOf(paneLayout, termTab);
-      if (termDock) {
-        activateTab(termDock, termTab);
-        requestAnimationFrame(() => dispatchFocusTerminal("paired"));
-      } else {
-        openTab(termTab, "right");
+      if (termDock && dockActive(paneLayout, termDock) === termTab) {
+        // Already the active tab (mounted): move focus synchronously so rapid
+        // agent<->paired toggles stay deterministic.
+        dispatchFocusTerminal("paired");
+        return;
       }
+      // Not mounted yet: latch the intent and activate/open its tab; the paired
+      // panel grabs focus once its PTY is ready.
+      setPendingTerminalFocus("paired");
+      if (termDock) activateTab(termDock, termTab);
+      else openTab(termTab, "right");
       return;
     }
     if (target === "agent" && selectedFilePath) {
@@ -1372,7 +1385,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
                 onActivate={(id) => activateTab("right", id)}
                 onMove={movePaneAny}
                 onClose={closePaneAny}
-                onNewTerminal={() => addTerminal("right")}
+                onNewTerminal={serverAbout?.read_only ? undefined : () => addTerminal("right")}
               />
             </div>
           }
@@ -1386,7 +1399,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
             onActivate={(id) => activateTab("bottom", id)}
             onMove={movePaneAny}
             onClose={closePaneAny}
-            onNewTerminal={() => addTerminal("bottom")}
+            onNewTerminal={serverAbout?.read_only ? undefined : () => addTerminal("bottom")}
           />
         )}
         {sendDialogOpen && commentsEnabled && activeSessionId && (

@@ -22,7 +22,9 @@ interface Props {
   onActivate: (id: string) => void;
   onClose: (id: string) => void;
   onMove: (id: string, dock: DockLocation) => void;
-  onNewTerminal: () => void;
+  /** Omitted on read-only servers, where the terminal ensure route is
+   *  rejected, so the new-terminal control is hidden rather than dead-ended. */
+  onNewTerminal?: () => void;
 }
 
 const btn =
@@ -66,24 +68,29 @@ export function Dock({
             return (
               <div
                 key={id}
-                role="tab"
-                aria-selected={isActive}
-                data-testid={`pane-tab-${id}`}
-                onClick={() => onActivate(id)}
-                className={`group flex items-center gap-1 pl-2 pr-1 cursor-pointer border-r border-surface-700/20 transition-colors ${
+                className={`group flex items-center border-r border-surface-700/20 transition-colors ${
                   isActive
                     ? "bg-surface-800 text-text-secondary"
                     : "text-text-dim hover:text-text-secondary hover:bg-surface-800/40"
                 }`}
               >
-                {createElement(desc.icon, { className: "size-3.5 shrink-0", "aria-hidden": true })}
-                <span className="text-[11px] font-medium truncate max-w-[10rem]">{desc.title}</span>
+                {/* A real button so the tab is keyboard-reachable and Enter /
+                    Space activate it, not a click-only div. */}
                 <button
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onClose(id);
-                  }}
-                  className={btn}
+                  type="button"
+                  role="tab"
+                  aria-selected={isActive}
+                  data-testid={`pane-tab-${id}`}
+                  onClick={() => onActivate(id)}
+                  className="flex items-center gap-1 pl-2 pr-1 cursor-pointer min-w-0"
+                >
+                  {createElement(desc.icon, { className: "size-3.5 shrink-0", "aria-hidden": true })}
+                  <span className="text-[11px] font-medium truncate max-w-[10rem]">{desc.title}</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onClose(id)}
+                  className={`${btn} mr-1`}
                   title={`Close ${name}`}
                   aria-label={`Close ${name}`}
                 >
@@ -102,9 +109,11 @@ export function Dock({
           >
             <MoveIcon className="size-3.5" aria-hidden />
           </button>
-          <button onClick={onNewTerminal} className={btn} title="New terminal" aria-label="New terminal">
-            <Plus className="size-3.5" aria-hidden />
-          </button>
+          {onNewTerminal && (
+            <button onClick={onNewTerminal} className={btn} title="New terminal" aria-label="New terminal">
+              <Plus className="size-3.5" aria-hidden />
+            </button>
+          )}
         </div>
       </div>
       <div className="flex-1 flex flex-col min-h-0 overflow-hidden">{renderBody(activeId)}</div>
