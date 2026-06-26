@@ -1105,11 +1105,15 @@ fn encode_named_key(name: &str, app_cursor: bool) -> Vec<u8> {
     }
 
     // Editing block (CSI n ~), modifier as `;modp`. Not affected by DECCKM.
+    // `PageUp`/`PageDown` are accepted alongside the tmux `PPage`/`NPage`
+    // names: the wheel- and edge-autoscroll page-forward paths emit the former
+    // (tmux `send-keys` takes both), and without the alias those keys would
+    // encode to nothing and be dropped on the VT input path.
     if let Some(n) = match base {
         "IC" => Some(2),
         "DC" => Some(3),
-        "PPage" => Some(5),
-        "NPage" => Some(6),
+        "PPage" | "PageUp" => Some(5),
+        "NPage" | "PageDown" => Some(6),
         _ => None,
     } {
         return if has_mod {
@@ -1216,6 +1220,11 @@ mod vt_input_encode_tests {
     fn editing_block_and_fkeys() {
         assert_eq!(enc("PPage", false), b"\x1b[5~");
         assert_eq!(enc("NPage", true), b"\x1b[6~"); // unaffected by DECCKM
+                                                    // PageUp/PageDown alias PPage/NPage: the page-forward paths emit these
+                                                    // names, so the encoder must not drop them on the VT input path.
+        assert_eq!(enc("PageUp", false), b"\x1b[5~");
+        assert_eq!(enc("PageDown", false), b"\x1b[6~");
+        assert_eq!(enc("C-PageUp", false), b"\x1b[5;5~");
         assert_eq!(enc("DC", false), b"\x1b[3~");
         assert_eq!(enc("S-DC", false), b"\x1b[3;2~");
         assert_eq!(enc("F1", false), b"\x1bOP");
