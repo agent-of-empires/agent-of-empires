@@ -4405,6 +4405,7 @@ pub async fn ensure_session(
 pub async fn ensure_terminal(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<crate::server::live_ws::TerminalIndexQuery>,
 ) -> impl IntoResponse {
     if state.read_only {
         return (
@@ -4412,6 +4413,14 @@ pub async fn ensure_terminal(
             Json(
                 serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
             ),
+        )
+            .into_response();
+    }
+    let index = q.index;
+    if index > crate::server::pane::MAX_TERMINAL_INDEX {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "index_out_of_range"})),
         )
             .into_response();
     }
@@ -4435,20 +4444,22 @@ pub async fn ensure_terminal(
     let _guard = inst_lock.lock().await;
 
     // Re-check after acquiring the lock; the first caller may have created it.
-    // `has_terminal()` only checks the in-memory `terminal_info.created` flag.
-    // The pane shell can exit (Ctrl+D, `exit`, SIGHUP from a destroyed tmux
-    // client, etc.) while the flag stays true and the session keeps existing
-    // (because we set tmux's `remain-on-exit on`). When that happens the web
-    // UI would attach to a dead pane that swallows every keystroke, so do
-    // the same kill+recreate dance the TUI runs in src/tui/app.rs around the
-    // attach path.
+    // Index 0 has the in-memory `terminal_info.created` fast path; additional
+    // terminals (index >= 1) are queried straight from tmux. Either way the
+    // pane shell can exit (Ctrl+D, `exit`, SIGHUP from a destroyed tmux client,
+    // etc.) while the session keeps existing (we set `remain-on-exit on`), so a
+    // live-but-dead pane must be respawned the same way the TUI does on attach.
     {
         let instances = state.instances.read().await;
         if let Some(i) = instances.iter().find(|i| i.id == id) {
-            if i.has_terminal() {
-                let pane_dead = i
-                    .terminal_tmux_session()
-                    .ok()
+            let session = i.terminal_tmux_session_indexed(index).ok();
+            let known = if index == 0 {
+                i.has_terminal()
+            } else {
+                session.as_ref().map(|s| s.exists()).unwrap_or(false)
+            };
+            if known {
+                let pane_dead = session
                     .map(|s| s.exists() && s.is_pane_dead())
                     .unwrap_or(false);
                 if !pane_dead {
@@ -4461,6 +4472,7 @@ pub async fn ensure_terminal(
                 tracing::warn!(
                     target: "terminal.ws",
                     session = %id,
+                    index,
                     "paired terminal pane is dead, respawning"
                 );
             }
@@ -4470,17 +4482,19 @@ pub async fn ensure_terminal(
     let mut inst_clone = inst;
 
     let result = tokio::task::spawn_blocking(move || {
-        let _ = inst_clone.kill_terminal_if_dead();
-        inst_clone.start_terminal()
+        let _ = inst_clone.kill_terminal_if_dead_indexed(index);
+        inst_clone.start_terminal_with_size_indexed(index, None)
     })
     .await;
 
     match result {
         Ok(Ok(())) => {
-            // Update in-memory cache
-            let mut instances = state.instances.write().await;
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                inst.terminal_info = Some(crate::session::TerminalInfo { created: true });
+            // Only index 0 carries an in-memory cache flag.
+            if index == 0 {
+                let mut instances = state.instances.write().await;
+                if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+                    inst.terminal_info = Some(crate::session::TerminalInfo { created: true });
+                }
             }
             (
                 StatusCode::CREATED,
@@ -4510,6 +4524,7 @@ pub async fn ensure_terminal(
 pub async fn ensure_container_terminal(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<crate::server::live_ws::TerminalIndexQuery>,
 ) -> impl IntoResponse {
     if state.read_only {
         return (
@@ -4517,6 +4532,14 @@ pub async fn ensure_container_terminal(
             Json(
                 serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
             ),
+        )
+            .into_response();
+    }
+    let index = q.index;
+    if index > crate::server::pane::MAX_TERMINAL_INDEX {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "index_out_of_range"})),
         )
             .into_response();
     }
@@ -4538,14 +4561,13 @@ pub async fn ensure_container_terminal(
 
     // Same dead-pane rescue as `ensure_terminal`: an existing-but-dead
     // pane would otherwise silently swallow every keystroke from the
-    // browser. See the longer comment in `ensure_terminal`.
+    // browser. Container terminals are always tmux-queried (no cache flag).
     {
         let instances = state.instances.read().await;
         if let Some(i) = instances.iter().find(|i| i.id == id) {
-            if i.has_container_terminal() {
-                let pane_dead = i
-                    .container_terminal_tmux_session()
-                    .ok()
+            let session = i.container_terminal_tmux_session_indexed(index).ok();
+            if session.as_ref().map(|s| s.exists()).unwrap_or(false) {
+                let pane_dead = session
                     .map(|s| s.exists() && s.is_pane_dead())
                     .unwrap_or(false);
                 if !pane_dead {
@@ -4558,6 +4580,7 @@ pub async fn ensure_container_terminal(
                 tracing::warn!(
                     target: "terminal.ws",
                     session = %id,
+                    index,
                     "container terminal pane is dead, respawning"
                 );
             }
@@ -4567,8 +4590,8 @@ pub async fn ensure_container_terminal(
     let mut inst_clone = inst;
 
     let result = tokio::task::spawn_blocking(move || {
-        let _ = inst_clone.kill_container_terminal_if_dead();
-        inst_clone.start_container_terminal_with_size(None)
+        let _ = inst_clone.kill_container_terminal_if_dead_indexed(index);
+        inst_clone.start_container_terminal_with_size_indexed(index, None)
     })
     .await;
 
@@ -4588,6 +4611,72 @@ pub async fn ensure_container_terminal(
         }
         Err(e) => {
             tracing::error!(target: "http.api.sessions", "Container terminal creation panicked: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Kill an additional paired terminal (host + container) at `index`. Used when
+/// the web dashboard closes an extra terminal tab so its tmux shell does not
+/// leak for the session's lifetime. Index 0 is the primary terminal shared with
+/// the native TUI; closing it in the web UI only hides the pane (the TUI keeps
+/// its shell), so this endpoint rejects index 0. See #2437.
+pub async fn kill_terminal(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<crate::server::live_ws::TerminalIndexQuery>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(
+                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
+            ),
+        )
+            .into_response();
+    }
+    let index = q.index;
+    if index == 0 || index > crate::server::pane::MAX_TERMINAL_INDEX {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "index_out_of_range"})),
+        )
+            .into_response();
+    }
+    let instances = state.instances.read().await;
+    let inst = match instances.iter().find(|i| i.id == id) {
+        Some(i) => i.clone(),
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "not_found"})),
+            )
+                .into_response();
+        }
+    };
+    drop(instances);
+
+    let inst_lock = state.instance_lock(&id).await;
+    let _guard = inst_lock.lock().await;
+
+    let result = tokio::task::spawn_blocking(move || {
+        let _ = inst.kill_terminal_indexed(index);
+        let _ = inst.kill_container_terminal_indexed(index);
+    })
+    .await;
+
+    match result {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "killed"})),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!(target: "http.api.sessions", "Terminal kill panicked: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),

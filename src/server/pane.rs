@@ -11,6 +11,12 @@ use axum::extract::ws::{CloseFrame, Message, WebSocket};
 
 use super::AppState;
 
+/// Upper bound on the paired-terminal index a client may request. The web
+/// dashboard owns the live set of terminal tabs, so a stray or hostile request
+/// could otherwise spawn unbounded tmux sessions; this caps the blast radius.
+/// 31 is far above any plausible tab count. See #2437.
+pub(crate) const MAX_TERMINAL_INDEX: u32 = 31;
+
 /// Close code we send when the live capture loop found the underlying pane
 /// gone. The web live hook treats this as "stop retrying immediately, surface
 /// the manual reconnect banner" rather than burning the retry budget against a
@@ -49,8 +55,10 @@ pub(crate) async fn respawn_paired_if_dead(
     state: &Arc<AppState>,
     id: &str,
     inst: &crate::session::Instance,
+    index: u32,
 ) -> anyhow::Result<String> {
-    let tmux_name = crate::tmux::TerminalSession::generate_name(&inst.id, &inst.title);
+    let tmux_name =
+        crate::tmux::TerminalSession::generate_name_indexed(&inst.id, &inst.title, index);
 
     // Serialize concurrent reconnects for the same session so two
     // simultaneous WS attaches don't both try to recreate the pane.
@@ -70,8 +78,10 @@ pub(crate) async fn respawn_paired_if_dead(
     //      the session in that case too so the retry click recovers
     //      instead of hot-looping. See #1107 follow-up.
     let respawned = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
-        let killed_dead = inst_for_blocking.kill_terminal_if_dead()?;
-        let session_missing = !inst_for_blocking.terminal_tmux_session()?.exists();
+        let killed_dead = inst_for_blocking.kill_terminal_if_dead_indexed(index)?;
+        let session_missing = !inst_for_blocking
+            .terminal_tmux_session_indexed(index)?
+            .exists();
         if !killed_dead && !session_missing {
             return Ok(false);
         }
@@ -88,13 +98,15 @@ pub(crate) async fn respawn_paired_if_dead(
                 "paired terminal session missing at WS upgrade, recreating"
             );
         }
-        inst_for_blocking.start_terminal()?;
+        inst_for_blocking.start_terminal_with_size_indexed(index, None)?;
         Ok(true)
     })
     .await
     .map_err(|e| anyhow::anyhow!("respawn task panicked: {e}"))??;
 
-    if respawned {
+    // Only index 0 has an in-memory cache flag; additional terminals are
+    // tmux-queried, so there is nothing to write back for them.
+    if respawned && index == 0 {
         let mut instances = state.instances.write().await;
         if let Some(stored) = instances.iter_mut().find(|i| i.id == id) {
             stored.terminal_info = Some(crate::session::TerminalInfo { created: true });
@@ -109,8 +121,10 @@ pub(crate) async fn respawn_container_if_dead(
     state: &Arc<AppState>,
     id: &str,
     inst: &crate::session::Instance,
+    index: u32,
 ) -> anyhow::Result<String> {
-    let tmux_name = crate::tmux::ContainerTerminalSession::generate_name(&inst.id, &inst.title);
+    let tmux_name =
+        crate::tmux::ContainerTerminalSession::generate_name_indexed(&inst.id, &inst.title, index);
 
     let lock = state.instance_lock(id).await;
     let _guard = lock.lock().await;
@@ -125,9 +139,9 @@ pub(crate) async fn respawn_container_if_dead(
     // `tmux kill-session` on a paired container terminal also has to
     // recreate from scratch, not just kill-then-respawn the pane.
     let _respawned = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
-        let killed_dead = inst_for_blocking.kill_container_terminal_if_dead()?;
+        let killed_dead = inst_for_blocking.kill_container_terminal_if_dead_indexed(index)?;
         let session_missing = !inst_for_blocking
-            .container_terminal_tmux_session()?
+            .container_terminal_tmux_session_indexed(index)?
             .exists();
         if !killed_dead && !session_missing {
             return Ok(false);
@@ -145,7 +159,7 @@ pub(crate) async fn respawn_container_if_dead(
                 "container terminal session missing at WS upgrade, recreating"
             );
         }
-        inst_for_blocking.start_container_terminal_with_size(None)?;
+        inst_for_blocking.start_container_terminal_with_size_indexed(index, None)?;
         Ok(true)
     })
     .await

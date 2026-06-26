@@ -1452,7 +1452,10 @@ fn build_router(state: Arc<AppState>) -> Router {
             post(api::force_smart_rename),
         )
         .route("/api/sessions/{id}/start", post(api::start_session))
-        .route("/api/sessions/{id}/terminal", post(api::ensure_terminal))
+        .route(
+            "/api/sessions/{id}/terminal",
+            post(api::ensure_terminal).delete(api::kill_terminal),
+        )
         .route(
             "/api/sessions/{id}/container-terminal",
             post(api::ensure_container_terminal),

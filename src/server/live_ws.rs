@@ -51,7 +51,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::response::IntoResponse;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -152,16 +152,33 @@ pub async fn live_terminal_ws(
     }
 }
 
+/// Index of the paired terminal a `live-ws` / ensure request targets.
+/// Defaults to 0 (the historical single terminal); index >= 1 are the
+/// additional web dashboard terminal tabs. See #2437.
+#[derive(Deserialize, Default)]
+pub struct TerminalIndexQuery {
+    #[serde(default)]
+    pub index: u32,
+}
+
 /// Live view for the paired host shell (TerminalSession). Mirrors the
 /// paired PTY route's pane revival so a dead shell heals on reconnect.
 pub async fn live_paired_terminal_ws(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    Query(q): Query<TerminalIndexQuery>,
 ) -> impl IntoResponse {
-    live_shell_ws(ws, state, id, "paired-live", |state, id, inst| {
-        Box::pin(super::pane::respawn_paired_if_dead(state, id, inst))
-    })
+    live_shell_ws(
+        ws,
+        state,
+        id,
+        q.index,
+        "paired-live",
+        |state, id, inst, index| {
+            Box::pin(super::pane::respawn_paired_if_dead(state, id, inst, index))
+        },
+    )
     .await
 }
 
@@ -170,10 +187,20 @@ pub async fn live_container_terminal_ws(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    Query(q): Query<TerminalIndexQuery>,
 ) -> impl IntoResponse {
-    live_shell_ws(ws, state, id, "container-live", |state, id, inst| {
-        Box::pin(super::pane::respawn_container_if_dead(state, id, inst))
-    })
+    live_shell_ws(
+        ws,
+        state,
+        id,
+        q.index,
+        "container-live",
+        |state, id, inst, index| {
+            Box::pin(super::pane::respawn_container_if_dead(
+                state, id, inst, index,
+            ))
+        },
+    )
     .await
 }
 
@@ -181,6 +208,7 @@ type RespawnFn = for<'a> fn(
     &'a Arc<AppState>,
     &'a str,
     &'a crate::session::Instance,
+    u32,
 ) -> std::pin::Pin<
     Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + 'a>,
 >;
@@ -189,10 +217,19 @@ async fn live_shell_ws(
     ws: WebSocketUpgrade,
     state: Arc<AppState>,
     id: String,
+    index: u32,
     kind: &'static str,
     respawn: RespawnFn,
 ) -> axum::response::Response {
-    debug!(target: "terminal.ws", session = %id, kind = %kind, "ws route entered");
+    debug!(target: "terminal.ws", session = %id, kind = %kind, index, "ws route entered");
+    if index > super::pane::MAX_TERMINAL_INDEX {
+        warn!(target: "terminal.ws", session = %id, kind = %kind, index, "terminal index out of range");
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            "Terminal index out of range",
+        )
+            .into_response();
+    }
     let instances = state.instances.read().await;
     let inst = instances.iter().find(|i| i.id == id).cloned();
     drop(instances);
@@ -202,7 +239,7 @@ async fn live_shell_ws(
         return (axum::http::StatusCode::NOT_FOUND, "Session not found").into_response();
     };
 
-    let tmux_name = match respawn(&state, &id, &inst).await {
+    let tmux_name = match respawn(&state, &id, &inst, index).await {
         Ok(name) => name,
         Err(e) => {
             warn!(target: "terminal.ws", session = %id, kind = %kind, "failed to revive shell: {}", e);

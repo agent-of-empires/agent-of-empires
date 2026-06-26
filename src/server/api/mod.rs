@@ -40,9 +40,9 @@ pub use plugins::{invoke_plugin_action, list_plugins, plugin_ui_state, set_plugi
 pub use projects::{create_project, delete_project, list_projects, update_project};
 pub use sessions::{
     create_session, delete_session, ensure_container_terminal, ensure_session, ensure_terminal,
-    force_smart_rename, get_recent_projects, list_sessions, preview_volume_ignores_globs,
-    read_output, rename_session, send_message, session_diff_file, session_diff_files,
-    set_worktree_name, start_session, stop_session, update_session_archive,
+    force_smart_rename, get_recent_projects, kill_terminal, list_sessions,
+    preview_volume_ignores_globs, read_output, rename_session, send_message, session_diff_file,
+    session_diff_files, set_worktree_name, start_session, stop_session, update_session_archive,
     update_session_diff_base, update_session_group, update_session_notifications,
     update_session_pin, update_session_snooze, update_session_unread, update_workspace_ordering,
     CleanupDefaults, OutputQuery, SendMessageRequest, SessionResponse,
