@@ -28,7 +28,7 @@ pub use app::*;
 /// clap so it stays off the CLI/docs surface.
 #[cfg(unix)]
 pub fn run_vt_pipe(socket: &str) -> std::io::Result<()> {
-    home::vt_source::run_pipe(socket)
+    crate::tmux::vt::run_pipe(socket)
 }
 
 #[cfg(not(unix))]

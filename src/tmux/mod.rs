@@ -9,6 +9,8 @@ mod terminal_session;
 mod test_helpers;
 mod tool_session;
 pub(crate) mod utils;
+#[cfg(unix)]
+pub(crate) mod vt;
 
 pub use session::{PaneCursor, Session, SIZE_OWNER_HEARTBEAT, SIZE_OWNER_TTL};
 pub use status_bar::{get_session_info_for_current, get_status_for_current_session};

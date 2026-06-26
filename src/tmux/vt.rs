@@ -1,39 +1,33 @@
-//! Experimental in-process VT rendering source for the live preview, gated by
-//! the `AOE_VT_LIVE` env var (see `LiveCaptureWorker`).
+//! Shared in-process VT channel.
 //!
-//! Instead of forking `tmux capture-pane` every cadence tick and re-parsing a
-//! lossy text snapshot through `ansi-to-tui`, this arms `tmux pipe-pane` once to
-//! stream the pane's RAW output bytes (escape sequences included) into an
-//! in-process [`vt100::Parser`] that owns a real grid (alt-screen buffer,
-//! cursor, mouse/DEC modes). The pipe target is `aoe __vt-pipe <socket>`, a
-//! tiny forwarder that copies stdin to a unix socket this process listens on
-//! (mirrors the ACP runner's socket plumbing; avoids a `cat` buffering relay).
+//! A `tmux pipe-pane -IO` stream feeds a pane's raw output into an in-process
+//! [`vt100::Parser`] (a real grid: alt-screen buffer, cursor, mouse/DEC modes),
+//! and the same full-duplex unix socket carries keystroke bytes back to the
+//! pane. tmux still owns the pane (process, persistence, kill-tree); only the
+//! live render/input transport lives here.
 //!
-//! `sample()` serialises the visible grid back to per-row ANSI via
-//! [`vt100::Screen::rows_formatted`], so the existing preview render path
-//! (`parse_output_text` -> `ansi-to-tui` -> `Paragraph`, plus the cursor
-//! overlay) consumes it unchanged. Only the transport changes.
-//!
-//! Scope (spike): visible screen only, no scrollback exposure, render-only
-//! (input still flows through `LiveSendWorker`). Unix-only; the whole module is
-//! `#[cfg(unix)]`.
+//! One [`VtChannel`] per tmux session, shared and refcounted: every viewer (the
+//! native TUI live preview and the web/mobile live terminal) holds an `Arc`, so
+//! a session is parsed once no matter how many surfaces watch it. The channel
+//! tears down (disables the pipe, stops the forwarder) when the last `Arc`
+//! drops. Unix-only; the whole module is `#[cfg(unix)]`.
 
 use std::collections::HashMap;
 use std::io::Read;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
+use std::time::{Duration, Instant};
 
 use crate::tmux::PaneCursor;
 
-/// `aoe __vt-pipe <socket>`: the bidirectional pipe-pane forwarder for
-/// `tmux pipe-pane -IO`. tmux connects the pane's OUTPUT to this process's
-/// stdin and the pane's INPUT to its stdout, so:
-///   - stdin (pane output) -> socket  (the TUI reads it into a vt100 grid)
-///   - socket -> stdout (pane input)  (the TUI writes keystrokes, no fork)
+/// `aoe __vt-pipe <socket>`: the bidirectional `pipe-pane -IO` forwarder. tmux
+/// connects the pane's OUTPUT to this process's stdin and the pane's INPUT to
+/// its stdout, so:
+///   - stdin (pane output) -> socket  (a viewer reads it into a vt100 grid)
+///   - socket -> stdout (pane input)  (a viewer writes keystrokes, no fork)
 ///
 /// One full-duplex unix socket carries both directions. Unbuffered: direct
 /// `write(2)` per chunk so a keystroke is not stalled behind a stdio buffer.
@@ -80,51 +74,37 @@ pub(crate) fn run_pipe(socket: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// One pane's input channel: the writable half of its socket (`Some` once the
-/// forwarder connects) plus a snapshot of the keyboard modes the encoder needs.
-/// `app_cursor` (DECCKM) is refreshed by the output reader thread each time the
-/// grid changes, so the input path can encode arrows correctly without locking
-/// the parser on every keystroke.
-pub(in crate::tui) struct InputChannel {
-    stream: Mutex<Option<UnixStream>>,
-    app_cursor: AtomicBool,
-}
-
-/// Per-session input channels keyed by tmux session name. The input dispatch
-/// path (`live_send::dispatch_via_fork`) consults this to write keystroke bytes
-/// straight to the pane instead of forking `tmux send-keys`.
-static VT_INPUT_SINKS: LazyLock<Mutex<HashMap<String, Arc<InputChannel>>>> =
+/// Live channels keyed by tmux session name, held weakly so the entry vanishes
+/// once the last viewer drops its `Arc`. `acquire` upgrades or re-arms.
+static REGISTRY: LazyLock<Mutex<HashMap<String, Weak<VtChannel>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-fn channel_for(session: &str) -> Option<Arc<InputChannel>> {
-    VT_INPUT_SINKS.lock().unwrap().get(session).cloned()
-}
-
-/// If `session` has an armed input channel, return its current cursor-key mode
-/// (DECCKM): `Some(true)` = application cursor keys (`ESC O A`), `Some(false)` =
-/// normal (`ESC [ A`). `None` means no channel is armed, so the caller must use
-/// the `send-keys` fork path. Presence of `Some` is the single-writer signal:
-/// while armed, ALL pane input must go through `try_send_input`.
-pub(in crate::tui) fn input_mode(session: &str) -> Option<bool> {
-    channel_for(session).map(|c| c.app_cursor.load(Ordering::Relaxed))
-}
-
-/// Deliver `bytes` to `session`'s pane via its persistent input channel.
-/// Returns `true` if written, `false` if the channel is gone or the forwarder
-/// has not connected yet.
-pub(in crate::tui) fn try_send_input(session: &str, bytes: &[u8]) -> bool {
-    use std::io::Write;
-    let Some(channel) = channel_for(session) else {
-        return false;
-    };
-    let mut guard = channel.stream.lock().unwrap();
-    match guard.as_mut() {
-        Some(stream) => stream.write_all(bytes).is_ok(),
-        None => false,
-    }
-}
-
 static SOCK_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn lookup(session: &str) -> Option<Arc<VtChannel>> {
+    REGISTRY
+        .lock()
+        .unwrap()
+        .get(session)
+        .and_then(Weak::upgrade)
+}
+
+/// If `session` has an armed channel, return its current cursor-key mode
+/// (DECCKM): `Some(true)` = application cursor keys (`ESC O A`), `Some(false)` =
+/// normal (`ESC [ A`). `None` means no channel is armed. Presence of `Some` is
+/// the single-writer signal: while armed, ALL pane input must go through
+/// [`try_send_input`] (never `send-keys`), so the two writers don't interleave.
+pub(crate) fn input_mode(session: &str) -> Option<bool> {
+    lookup(session).map(|c| c.app_cursor.load(Ordering::Relaxed))
+}
+
+/// Deliver raw `bytes` to `session`'s pane via its channel. Returns `true` if
+/// written, `false` if no channel is armed or the forwarder hasn't connected.
+pub(crate) fn try_send_input(session: &str, bytes: &[u8]) -> bool {
+    lookup(session)
+        .map(|c| c.write_input(bytes))
+        .unwrap_or(false)
+}
 
 /// Single-quote a path for the `/bin/sh -c` line `tmux pipe-pane` runs.
 fn sh_quote(s: &str) -> String {
@@ -154,9 +134,9 @@ fn pane_size(target: &str) -> Option<(u16, u16)> {
 }
 
 /// `pipe-pane -I` (input injection) landed in tmux 2.8, and a dead-pane write
-/// crash was fixed in 3.4, so we require >= 3.4 before arming a VT channel.
-/// Older tmux (or a `tmux -V` we can't parse) falls back to the capture path.
-/// Cached: the server version doesn't change under a running aoe.
+/// crash was fixed in 3.4, so we require >= 3.4 before arming a channel. Older
+/// tmux (or a `tmux -V` we can't parse) falls back to the capture path. Cached:
+/// the server version doesn't change under a running aoe.
 fn tmux_supports_pipe_pane_io() -> bool {
     static SUPPORTED: LazyLock<bool> = LazyLock::new(|| {
         let Ok(out) = Command::new("tmux").arg("-V").output() else {
@@ -185,8 +165,7 @@ fn cursor_from_screen(screen: &vt100::Screen, rows: u16, cols: u16) -> PaneCurso
         y,
         visible: !screen.hide_cursor(),
         pane_height: rows,
-        // Scrollback exposure is out of scope for the spike; the preview's
-        // own scroll math tolerates 0 here.
+        // Scrollback exposure is a follow-up; consumers tolerate 0 here.
         history_size: 0,
         pane_width: cols,
         alternate_on: screen.alternate_screen(),
@@ -198,29 +177,45 @@ fn cursor_from_screen(screen: &vt100::Screen, rows: u16, cols: u16) -> PaneCurso
     }
 }
 
-/// One armed pane: an in-process vt100 grid fed by a `pipe-pane -IO` byte
-/// stream, plus the writable half of the same socket for keystroke injection.
-pub(in crate::tui) struct VtSource {
-    /// tmux session name; the registry key for this pane's input channel.
+/// One shared pane channel: a vt100 grid fed by a `pipe-pane -IO` byte stream,
+/// plus the writable half of the same socket for keystroke injection. Methods
+/// take `&self` (interior mutability) so many viewers share one `Arc`.
+pub(crate) struct VtChannel {
+    /// tmux session name; the registry key.
     name: String,
     /// `name:^.0`, the pane target for tmux commands.
     target: String,
     parser: Arc<Mutex<vt100::Parser>>,
+    /// Writable half of the socket, `Some` once the forwarder connects. Shared
+    /// with the reader thread, which fills it after `accept`.
+    stream: Arc<Mutex<Option<UnixStream>>>,
+    /// DECCKM snapshot, refreshed by the reader thread on each grid change.
+    app_cursor: Arc<AtomicBool>,
     sock_path: PathBuf,
     stop: Arc<AtomicBool>,
-    reader: Option<std::thread::JoinHandle<()>>,
-    cols: u16,
-    rows: u16,
-    last_size_check: std::time::Instant,
+    reader: Mutex<Option<std::thread::JoinHandle<()>>>,
+    cols: AtomicU16,
+    rows: AtomicU16,
+    last_size_check: Mutex<Instant>,
 }
 
-impl VtSource {
-    /// Arm `pipe-pane -IO` for `name`, seed the current screen once, start
-    /// streaming output into a fresh parser, and register the socket's writable
-    /// half as the pane's input channel. Returns `None` if tmux is too old or
-    /// the pane is gone or any tmux/socket step fails; the worker then falls
-    /// back to the legacy capture/send-keys path for this pane.
-    pub(in crate::tui) fn arm(name: &str) -> Option<Self> {
+impl VtChannel {
+    /// Get the shared channel for `session`, arming a new one if none is live.
+    /// Returns `None` if tmux is too old or the pane is gone or any tmux/socket
+    /// step fails; callers then use the legacy capture/send-keys path. The
+    /// returned `Arc` keeps the channel alive; drop it to release this viewer's
+    /// hold (the channel tears down when the last `Arc` drops).
+    pub(crate) fn acquire(session: &str) -> Option<Arc<VtChannel>> {
+        let mut reg = REGISTRY.lock().unwrap();
+        if let Some(ch) = reg.get(session).and_then(Weak::upgrade) {
+            return Some(ch);
+        }
+        let ch = Arc::new(Self::arm(session)?);
+        reg.insert(session.to_string(), Arc::downgrade(&ch));
+        Some(ch)
+    }
+
+    fn arm(name: &str) -> Option<Self> {
         if !tmux_supports_pipe_pane_io() {
             return None;
         }
@@ -229,19 +224,8 @@ impl VtSource {
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 1000)));
         let stop = Arc::new(AtomicBool::new(false));
         let seeded = Arc::new(AtomicBool::new(false));
-
-        // Input channel: registered now (socket empty, filled once the
-        // forwarder connects). While registered, the dispatch path routes ALL
-        // pane input here (single-writer); the socket only carries bytes once
-        // connected, so keys before then are dropped rather than forked.
-        let channel = Arc::new(InputChannel {
-            stream: Mutex::new(None),
-            app_cursor: AtomicBool::new(false),
-        });
-        VT_INPUT_SINKS
-            .lock()
-            .unwrap()
-            .insert(name.to_string(), channel.clone());
+        let stream: Arc<Mutex<Option<UnixStream>>> = Arc::new(Mutex::new(None));
+        let app_cursor = Arc::new(AtomicBool::new(false));
 
         let n = SOCK_COUNTER.fetch_add(1, Ordering::Relaxed);
         let sock_path =
@@ -253,14 +237,15 @@ impl VtSource {
             let parser = parser.clone();
             let stop = stop.clone();
             let seeded = seeded.clone();
-            let channel = channel.clone();
+            let stream = stream.clone();
+            let app_cursor = app_cursor.clone();
             std::thread::spawn(move || {
                 let Ok((conn, _)) = listener.accept() else {
                     return;
                 };
                 // Publish the writable half so input dispatch can reach the pane.
                 if let Ok(w) = conn.try_clone() {
-                    *channel.stream.lock().unwrap() = Some(w);
+                    *stream.lock().unwrap() = Some(w);
                 }
                 let mut conn = conn;
                 let _ = conn.set_read_timeout(Some(Duration::from_millis(200)));
@@ -276,11 +261,7 @@ impl VtSource {
                             }
                             if let Ok(mut p) = parser.lock() {
                                 p.process(&buf[..n]);
-                                // Refresh the cursor-key mode for the input
-                                // encoder (cheap; the app toggles DECCKM via its
-                                // output, which only this thread sees).
-                                channel
-                                    .app_cursor
+                                app_cursor
                                     .store(p.screen().application_cursor(), Ordering::Relaxed);
                             }
                         }
@@ -303,10 +284,8 @@ impl VtSource {
             .args(["pipe-pane", "-IO", "-t", &target, &pipe_cmd])
             .output()
             .ok();
-        let armed_ok = armed.map(|o| o.status.success()).unwrap_or(false);
-        if !armed_ok {
-            tracing::warn!(%target, "vt_source: tmux pipe-pane failed; preview will be blank");
-            VT_INPUT_SINKS.lock().unwrap().remove(name);
+        if !armed.map(|o| o.status.success()).unwrap_or(false) {
+            tracing::warn!(%target, "vt: tmux pipe-pane failed; falling back to capture");
             stop.store(true, Ordering::Relaxed);
             let _ = UnixStream::connect(&sock_path);
             let _ = reader.join();
@@ -315,80 +294,108 @@ impl VtSource {
         }
 
         // Seed the visible screen so an already-running agent shows up
-        // immediately instead of starting blank.
+        // immediately instead of starting blank (pipe-pane has no backlog).
         if let Ok(out) = Command::new("tmux")
             .args(["capture-pane", "-t", &target, "-p", "-e"])
             .output()
         {
             if let Ok(mut p) = parser.lock() {
                 p.process(&out.stdout);
-                channel
-                    .app_cursor
-                    .store(p.screen().application_cursor(), Ordering::Relaxed);
+                app_cursor.store(p.screen().application_cursor(), Ordering::Relaxed);
             }
         }
         seeded.store(true, Ordering::Relaxed);
-        tracing::info!(%target, cols, rows, "vt_source armed (pipe-pane -IO <-> vt100 grid + input)");
+        tracing::info!(%target, cols, rows, "vt channel armed (pipe-pane -IO <-> vt100 grid)");
 
         Some(Self {
             name: name.to_string(),
             target,
             parser,
+            stream,
+            app_cursor,
             sock_path,
             stop,
-            reader: Some(reader),
-            cols,
-            rows,
-            last_size_check: std::time::Instant::now(),
+            reader: Mutex::new(Some(reader)),
+            cols: AtomicU16::new(cols),
+            rows: AtomicU16::new(rows),
+            last_size_check: Mutex::new(Instant::now()),
         })
     }
 
-    /// Serialise the current grid to per-row ANSI for the preview render path,
-    /// plus the authoritative cursor. Reconciles the parser size with the pane
-    /// at most once a second (a `display-message` fork; rate-limited so it does
-    /// not add a periodic hitch to the otherwise fork-free sample path).
-    pub(in crate::tui) fn sample(&mut self) -> (String, Option<PaneCursor>) {
-        if self.last_size_check.elapsed() >= Duration::from_secs(1) {
-            self.last_size_check = std::time::Instant::now();
-            if let Some((c, r)) = pane_size(&self.target) {
-                if (c, r) != (self.cols, self.rows) {
-                    self.cols = c;
-                    self.rows = r;
-                    if let Ok(mut p) = self.parser.lock() {
-                        p.screen_mut().set_size(r, c);
-                    }
+    /// Reconcile the parser size with the pane at most once a second (a
+    /// `display-message` fork; rate-limited so it adds no periodic hitch).
+    fn reconcile_size(&self) {
+        let mut guard = self.last_size_check.lock().unwrap();
+        if guard.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        *guard = Instant::now();
+        drop(guard);
+        if let Some((c, r)) = pane_size(&self.target) {
+            if (c, r)
+                != (
+                    self.cols.load(Ordering::Relaxed),
+                    self.rows.load(Ordering::Relaxed),
+                )
+            {
+                self.cols.store(c, Ordering::Relaxed);
+                self.rows.store(r, Ordering::Relaxed);
+                if let Ok(mut p) = self.parser.lock() {
+                    p.screen_mut().set_size(r, c);
                 }
             }
         }
+    }
 
+    /// Serialise the current grid to per-row ANSI plus the authoritative cursor,
+    /// for the render path (`ansi-to-tui` for the TUI, DOM spans for the web).
+    pub(crate) fn sample(&self) -> (String, Option<PaneCursor>) {
+        self.reconcile_size();
+        let cols = self.cols.load(Ordering::Relaxed);
+        let rows = self.rows.load(Ordering::Relaxed);
         let p = match self.parser.lock() {
             Ok(p) => p,
             Err(_) => return (String::new(), None),
         };
         let screen = p.screen();
         let mut content = String::new();
-        for row in screen.rows_formatted(0, self.cols) {
+        for row in screen.rows_formatted(0, cols) {
             content.push_str(&String::from_utf8_lossy(&row));
             // Reset between rows so no SGR state bleeds across the newline.
             content.push_str("\x1b[0m\n");
         }
-        let cursor = cursor_from_screen(screen, self.rows, self.cols);
+        let cursor = cursor_from_screen(screen, rows, cols);
         (content, Some(cursor))
+    }
+
+    fn write_input(&self, bytes: &[u8]) -> bool {
+        use std::io::Write;
+        let mut guard = self.stream.lock().unwrap();
+        match guard.as_mut() {
+            Some(stream) => stream.write_all(bytes).is_ok(),
+            None => false,
+        }
     }
 }
 
-impl Drop for VtSource {
+impl Drop for VtChannel {
     fn drop(&mut self) {
-        // Retire the input channel first so no keystroke races a dying socket.
-        VT_INPUT_SINKS.lock().unwrap().remove(&self.name);
+        // Remove our registry entry, but only if it still points at us (a
+        // concurrent re-arm under the same name must not be clobbered): our
+        // weak no longer upgrades once we're dropping.
+        {
+            let mut reg = REGISTRY.lock().unwrap();
+            if reg.get(&self.name).is_some_and(|w| w.upgrade().is_none()) {
+                reg.remove(&self.name);
+            }
+        }
         self.stop.store(true, Ordering::Relaxed);
-        // Disable the pipe so tmux stops the forwarder.
         let _ = Command::new("tmux")
             .args(["pipe-pane", "-t", &self.target])
             .output();
         // Unblock a reader still parked in accept().
         let _ = UnixStream::connect(&self.sock_path);
-        if let Some(h) = self.reader.take() {
+        if let Some(h) = self.reader.lock().unwrap().take() {
             let _ = h.join();
         }
         let _ = std::fs::remove_file(&self.sock_path);

@@ -5,8 +5,6 @@ mod input;
 mod live_send;
 mod operations;
 pub(crate) mod render;
-#[cfg(unix)]
-pub(crate) mod vt_source;
 
 #[cfg(test)]
 mod tests;

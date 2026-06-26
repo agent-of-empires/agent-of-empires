@@ -666,7 +666,7 @@ impl LiveCaptureWorker {
                 Some("0") | Some("false")
             );
             #[cfg(unix)]
-            let mut vt_source: Option<super::vt_source::VtSource> = None;
+            let mut vt_source: Option<std::sync::Arc<crate::tmux::vt::VtChannel>> = None;
             // Whether we've already attempted (and possibly failed) to arm a VT
             // channel for the current target, so a failure falls back to capture
             // without re-arming every tick. Reset on target change.
@@ -712,9 +712,9 @@ impl LiveCaptureWorker {
                     let (capture, cursor_now) = if vt_enabled {
                         if vt_source.is_none() && !vt_arm_attempted {
                             vt_arm_attempted = true;
-                            vt_source = super::vt_source::VtSource::arm(&name);
+                            vt_source = crate::tmux::vt::VtChannel::acquire(&name);
                         }
-                        match vt_source.as_mut() {
+                        match vt_source.as_ref() {
                             Some(v) => {
                                 let (content, cur) = v.sample();
                                 (Some(content), cur)
@@ -930,11 +930,11 @@ fn dispatch_via_fork(tmux_name: &str, action: &TmuxAction) -> anyhow::Result<()>
     // from the grid, since we bypass tmux's own key translation. `Resize` is not
     // pane input (it's `resize-window`), so it still forks below.
     #[cfg(unix)]
-    if let Some(app_cursor) = super::vt_source::input_mode(tmux_name) {
+    if let Some(app_cursor) = crate::tmux::vt::input_mode(tmux_name) {
         if !matches!(action, TmuxAction::Resize { .. }) {
             let bytes = encode_action_bytes(action, app_cursor);
             if !bytes.is_empty() {
-                let _ = super::vt_source::try_send_input(tmux_name, &bytes);
+                let _ = crate::tmux::vt::try_send_input(tmux_name, &bytes);
             }
             // Single-writer: never fall back to a fork for pane input while
             // armed, even if encoding produced nothing (drop the rare key).
