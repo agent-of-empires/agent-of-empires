@@ -165,7 +165,7 @@ fn cursor_from_screen(screen: &vt100::Screen, rows: u16, cols: u16) -> PaneCurso
         y,
         visible: !screen.hide_cursor(),
         pane_height: rows,
-        // Scrollback exposure is a follow-up; consumers tolerate 0 here.
+        // Default; `sample` overrides this with the real scrollback depth.
         history_size: 0,
         pane_width: cols,
         alternate_on: screen.alternate_screen(),
@@ -175,6 +175,59 @@ fn cursor_from_screen(screen: &vt100::Screen, rows: u16, cols: u16) -> PaneCurso
         // probed against a racing capture, so it is always trustworthy.
         position_reliable: true,
     }
+}
+
+/// Assemble the last `max_lines` rows of (scrollback + visible screen) as
+/// per-row ANSI, and return that plus the full scrollback depth. vt100 only
+/// formats the *visible* window, so we read it at successive scrollback offsets
+/// (steps of one screen height) and stitch by absolute row index, then restore
+/// the live-edge offset. Mirrors `capture-pane -S -<lines>`: history lines
+/// first, the live screen as the last `rows` lines, `history` = total
+/// scrollback.
+fn grid_content(
+    parser: &mut vt100::Parser,
+    max_lines: usize,
+    cols: u16,
+    rows: u16,
+) -> (String, usize) {
+    let h = (rows as usize).max(1);
+    let saved = parser.screen().scrollback();
+    // Clamp to the maximum to discover how much scrollback actually exists.
+    parser.screen_mut().set_scrollback(usize::MAX >> 4);
+    let total_sb = parser.screen().scrollback();
+    let total = total_sb + h;
+    let want = max_lines.clamp(h.min(total), total);
+    let target_low = total - want;
+
+    // Absolute row index (0 = oldest scrollback, total-1 = bottom of screen).
+    let mut buf: Vec<Option<String>> = vec![None; total];
+    let mut offset = 0usize;
+    loop {
+        let real = offset.min(total_sb);
+        parser.screen_mut().set_scrollback(real);
+        let base = total_sb - real; // absolute index of this window's top row
+        for (r, row) in parser.screen().rows_formatted(0, cols).enumerate() {
+            let g = base + r;
+            if g < total {
+                buf[g] = Some(String::from_utf8_lossy(&row).into_owned());
+            }
+        }
+        if real >= total_sb || base <= target_low {
+            break;
+        }
+        offset += h;
+    }
+    parser.screen_mut().set_scrollback(saved);
+
+    let mut content = String::new();
+    for line in buf[target_low..total].iter() {
+        if let Some(line) = line {
+            content.push_str(line);
+        }
+        // Reset between rows so no SGR state bleeds across the newline.
+        content.push_str("\x1b[0m\n");
+    }
+    (content, total_sb)
 }
 
 /// One shared pane channel: a vt100 grid fed by a `pipe-pane -IO` byte stream,
@@ -221,7 +274,7 @@ impl VtChannel {
         }
         let target = format!("{name}:^.0");
         let (cols, rows) = pane_size(&target)?;
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 1000)));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 2000)));
         let stop = Arc::new(AtomicBool::new(false));
         let seeded = Arc::new(AtomicBool::new(false));
         let stream: Arc<Mutex<Option<UnixStream>>> = Arc::new(Mutex::new(None));
@@ -347,24 +400,22 @@ impl VtChannel {
         }
     }
 
-    /// Serialise the current grid to per-row ANSI plus the authoritative cursor,
-    /// for the render path (`ansi-to-tui` for the TUI, DOM spans for the web).
-    pub(crate) fn sample(&self) -> (String, Option<PaneCursor>) {
+    /// Serialise up to `max_lines` of (scrollback + screen) to per-row ANSI,
+    /// plus the authoritative cursor (with `history_size` set to the full
+    /// scrollback depth). `max_lines` mirrors the capture path's window: both
+    /// the TUI scroll and the web's virtual scroll spacer need real history
+    /// here, not just the visible screen.
+    pub(crate) fn sample(&self, max_lines: usize) -> (String, Option<PaneCursor>) {
         self.reconcile_size();
         let cols = self.cols.load(Ordering::Relaxed);
         let rows = self.rows.load(Ordering::Relaxed);
-        let p = match self.parser.lock() {
+        let mut p = match self.parser.lock() {
             Ok(p) => p,
             Err(_) => return (String::new(), None),
         };
-        let screen = p.screen();
-        let mut content = String::new();
-        for row in screen.rows_formatted(0, cols) {
-            content.push_str(&String::from_utf8_lossy(&row));
-            // Reset between rows so no SGR state bleeds across the newline.
-            content.push_str("\x1b[0m\n");
-        }
-        let cursor = cursor_from_screen(screen, rows, cols);
+        let (content, history) = grid_content(&mut p, max_lines, cols, rows);
+        let mut cursor = cursor_from_screen(p.screen(), rows, cols);
+        cursor.history_size = history as u32;
         (content, Some(cursor))
     }
 
@@ -399,5 +450,41 @@ impl Drop for VtChannel {
             let _ = h.join();
         }
         let _ = std::fs::remove_file(&self.sock_path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grid_content_assembles_scrollback_and_screen() {
+        // 4-row screen; 12 distinct lines means several rows scroll into
+        // history. Markers are non-substrings of each other (LINE01 vs LINE12).
+        let mut p = vt100::Parser::new(4, 20, 100);
+        for i in 1..=12 {
+            p.process(format!("LINE{i:02}\r\n").as_bytes());
+        }
+
+        // A wide window returns history + screen, history_size > 0.
+        let (content, history) = grid_content(&mut p, 100, 20, 4);
+        assert!(history > 0, "expected scrollback depth, got {history}");
+        assert!(
+            content.contains("LINE01"),
+            "missing oldest line:\n{content}"
+        );
+        assert!(
+            content.contains("LINE12"),
+            "missing newest line:\n{content}"
+        );
+
+        // A screen-sized window returns only the live screen (no old history),
+        // and the offset is restored to the live edge afterward.
+        let (screen_only, _) = grid_content(&mut p, 4, 20, 4);
+        assert!(
+            !screen_only.contains("LINE01"),
+            "screen-only window should not include scrollback:\n{screen_only}"
+        );
+        assert_eq!(p.screen().scrollback(), 0, "live-edge offset not restored");
     }
 }

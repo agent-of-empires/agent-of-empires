@@ -716,7 +716,7 @@ impl LiveCaptureWorker {
                         }
                         match vt_source.as_ref() {
                             Some(v) => {
-                                let (content, cur) = v.sample();
+                                let (content, cur) = v.sample(lines);
                                 (Some(content), cur)
                             }
                             None => capture_via_tmux(&name, lines, forward_empty),
