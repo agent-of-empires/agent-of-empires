@@ -139,6 +139,32 @@ fn pane_size(target: &str) -> Option<(u16, u16)> {
     Some((w, h))
 }
 
+/// Query the pane's terminal modes that the wheel-forward / scroll logic keys
+/// off: `(alternate_on, mouse_tracking, mouse_sgr)`. Used once at arm to seed
+/// the grid's modes, which the rendered-content seed can't carry.
+fn pane_modes(target: &str) -> Option<(bool, bool, bool)> {
+    let out = Command::new("tmux")
+        .args([
+            "display-message",
+            "-p",
+            "-t",
+            target,
+            "-F",
+            "#{alternate_on} #{mouse_any_flag} #{mouse_sgr_flag}",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    let mut it = s.split_whitespace();
+    let alt = it.next().map(|f| f != "0").unwrap_or(false);
+    let mouse = it.next().map(|f| f != "0").unwrap_or(false);
+    let sgr = it.next().map(|f| f != "0").unwrap_or(false);
+    Some((alt, mouse, sgr))
+}
+
 /// `pipe-pane -I` (input injection) landed in tmux 2.8, and a dead-pane write
 /// crash was fixed in 3.4, so we require >= 3.4 before arming a channel. Older
 /// tmux (or a `tmux -V` we can't parse) falls back to the capture path. Cached:
@@ -352,16 +378,40 @@ impl VtChannel {
             return None;
         }
 
-        // Seed the screen plus scrollback so an already-running agent shows up
-        // immediately, with history, instead of starting blank (pipe-pane has
-        // no backlog). The pane keeps its own scrollback across re-arms, so a
+        // Reconstruct the app's terminal modes from tmux's flags before seeding.
+        // The seed is rendered content (`capture-pane`), which does NOT carry
+        // the DEC private mode SET escapes, and a running app won't re-emit
+        // them. Without this, a channel armed while an app is already on the
+        // alternate screen (e.g. Claude `/tui fullscreen`) would parse a normal
+        // screen, so `alternate_screen()` reads false and the wheel-forward /
+        // scroll decisions (which key off it) break.
+        let (alt, mouse, mouse_sgr) = pane_modes(&target).unwrap_or((false, false, false));
+        let mut prefix: Vec<u8> = Vec::new();
+        if alt {
+            prefix.extend_from_slice(b"\x1b[?1049h");
+        }
+        if mouse {
+            prefix.extend_from_slice(b"\x1b[?1000h");
+        }
+        if mouse_sgr {
+            prefix.extend_from_slice(b"\x1b[?1006h");
+        }
+
+        // Seed the current screen so an already-running agent shows up
+        // immediately instead of starting blank (pipe-pane has no backlog). The
+        // alternate screen has no scrollback, so only the normal buffer pulls
+        // history (`-S`); the pane keeps that history across re-arms, so a
         // freshly armed channel can scroll right away.
         let seed_start = format!("-{SCROLLBACK_LINES}");
-        if let Ok(out) = Command::new("tmux")
-            .args(["capture-pane", "-t", &target, "-p", "-e", "-S", &seed_start])
-            .output()
-        {
+        let mut seed_args = vec!["capture-pane", "-t", &target, "-p", "-e"];
+        if !alt {
+            seed_args.extend_from_slice(&["-S", &seed_start]);
+        }
+        if let Ok(out) = Command::new("tmux").args(&seed_args).output() {
             if let Ok(mut p) = parser.lock() {
+                if !prefix.is_empty() {
+                    p.process(&prefix);
+                }
                 p.process(&out.stdout);
                 app_cursor.store(p.screen().application_cursor(), Ordering::Relaxed);
             }
