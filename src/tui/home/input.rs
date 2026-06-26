@@ -699,40 +699,58 @@ impl HomeView {
         }
         // Pace the scroll to a steady cadence regardless of how often the
         // loop woke this iteration, so the speed is even instead of racing
-        // with capture-worker activity.
+        // with capture-worker activity. The aoe-side line scroll runs at a
+        // smooth per-line cadence; the agent page-forward fallback below runs
+        // slower, since each press scrolls a whole page and a held edge would
+        // otherwise rocket through the transcript.
         const AUTOSCROLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(40);
+        const PAGE_FORWARD_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
         let now = std::time::Instant::now();
-        if let Some(prev) = self.preview_autoscroll_at {
-            if now.duration_since(prev) < AUTOSCROLL_INTERVAL {
-                return false;
+        let line_ready = self
+            .preview_autoscroll_at
+            .is_none_or(|prev| now.duration_since(prev) >= AUTOSCROLL_INTERVAL);
+        let page_ready = self
+            .preview_autoscroll_at
+            .is_none_or(|prev| now.duration_since(prev) >= PAGE_FORWARD_INTERVAL);
+        // First try the aoe-side capture-window scroll (normal-buffer panes
+        // with real scrollback).
+        if line_ready {
+            let scrolled = if at_top {
+                self.scroll_preview_offset(1)
+            } else {
+                self.scroll_preview_offset(-1)
+            };
+            if scrolled {
+                self.preview_autoscroll_at = Some(now);
+                let col_off = col.clamp(pane.x, pane.right().saturating_sub(1)) - pane.x;
+                // Pin the extent to the now-revealed edge line in `from_bottom`
+                // terms, which the new scroll offset gives directly: the bottom
+                // visible line sits `offset` lines up from the newest line, the
+                // top visible line `offset + height - 1`. Deriving it from the
+                // offset (not the stale pre-scroll `total_lines`) keeps it
+                // correct even before the next frame re-captures.
+                let offset = self.preview_scroll_offset as usize;
+                let from_bottom = if at_top {
+                    offset + (pane.height as usize).saturating_sub(1)
+                } else {
+                    offset
+                };
+                if let Some(sel) = self.preview_selection.as_mut() {
+                    sel.extent = (col_off, from_bottom);
+                }
+                return true;
             }
         }
-        let scrolled = if at_top {
-            self.scroll_preview_offset(1)
-        } else {
-            self.scroll_preview_offset(-1)
-        };
-        if !scrolled {
-            return false;
+        // The capture-window scroll is inert: a full-screen (alternate-screen)
+        // agent has no aoe-side scrollback, so forward a PageUp/PageDown to the
+        // agent instead, scrolling its OWN transcript the way the wheel forward
+        // does (#2421). The extent stays pinned to the screen edge; the agent's
+        // redraw is what reveals more text under the held selection.
+        if page_ready && self.forward_page_to_preview(at_top) {
+            self.preview_autoscroll_at = Some(now);
+            return true;
         }
-        self.preview_autoscroll_at = Some(now);
-        let col_off = col.clamp(pane.x, pane.right().saturating_sub(1)) - pane.x;
-        // Pin the extent to the now-revealed edge line in `from_bottom`
-        // terms, which the new scroll offset gives directly: the bottom
-        // visible line sits `offset` lines up from the newest line, the top
-        // visible line `offset + height - 1`. Deriving it from the offset
-        // (not the stale pre-scroll `total_lines`) keeps it correct even
-        // before the next frame re-captures.
-        let offset = self.preview_scroll_offset as usize;
-        let from_bottom = if at_top {
-            offset + (pane.height as usize).saturating_sub(1)
-        } else {
-            offset
-        };
-        if let Some(sel) = self.preview_selection.as_mut() {
-            sel.extent = (col_off, from_bottom);
-        }
-        true
+        false
     }
 
     /// Shift the preview scroll offset by `delta` lines (positive scrolls
@@ -3404,6 +3422,32 @@ impl HomeView {
             return false;
         };
         self.send_to_preview_pane(key)
+    }
+
+    /// During an edge-held preview selection over a full-screen
+    /// (alternate-screen) agent, the aoe capture-window scroll is inert (the
+    /// alternate screen has no scrollback, so `scroll_preview_offset` can't
+    /// move), so forward a `PageUp`/`PageDown` to the agent to scroll its OWN
+    /// transcript, mirroring `forward_wheel_to_preview`. Gated on the previewed
+    /// pane being an alternate-screen app so a normal-buffer pane that has
+    /// merely bottomed out its scrollback never gets page keys injected into
+    /// its shell. `up` selects PageUp (top edge) vs PageDown (bottom edge).
+    /// Returns true when a key was sent.
+    fn forward_page_to_preview(&self, up: bool) -> bool {
+        let Some(cursor) = self
+            .preview_capture_worker
+            .as_ref()
+            .and_then(|w| w.current_cursor())
+        else {
+            return false;
+        };
+        if !cursor.alternate_on {
+            return false;
+        }
+        self.send_to_preview_pane(live_send::TmuxKey::NamedRepeat {
+            name: if up { "PageUp" } else { "PageDown" }.to_string(),
+            count: WHEEL_PAGE_STEP,
+        })
     }
 
     /// Send a forwarded key/mouse-byte payload to the pane the preview is

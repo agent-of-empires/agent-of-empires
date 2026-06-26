@@ -9126,6 +9126,73 @@ mod scroll_pane_isolation {
         assert_eq!(env.view.mouse_forward_btn, None);
     }
 
+    /// Stage an in-flight Shift-selection drag held at the preview's top
+    /// (`row == pane.y`) or bottom edge, plus a capture window with NO aoe-side
+    /// scrollback, so `tick_preview_autoscroll` exercises the agent
+    /// page-forward fallback rather than the capture-window line scroll.
+    fn stage_edge_drag_no_scrollback(env: &mut TestEnv, at_top: bool) {
+        use crate::tui::home::PreviewTextView;
+        // Visible == captured: `scroll_preview_offset` has nowhere to go, the
+        // alternate-screen reality the fallback exists for.
+        env.view.preview_cache.captured_lines = 23;
+        env.view.preview_cache.dimensions = (80, 24);
+        env.view.preview_scroll_offset = 0;
+        let pane = Rect::new(30, 0, 100, 5);
+        env.view.preview_text_view = PreviewTextView {
+            pane,
+            first_line: 0,
+            total_lines: 23,
+        };
+        // Anchor away from the held edge, then drag onto it.
+        let (start_row, edge_row) = if at_top { (4, 0) } else { (0, 4) };
+        assert!(env.view.handle_drag_start(40, start_row));
+        assert!(env.view.handle_drag_move(40, edge_row));
+    }
+
+    /// Over a full-screen mouse-tracking agent the capture window has no
+    /// scrollback, so an edge-held selection forwards PageUp to the agent
+    /// (scrolling its own transcript) instead of moving the inert offset.
+    #[test]
+    #[serial]
+    fn autoscroll_forwards_pageup_to_alt_screen_agent_at_top_edge() {
+        let mut env = live_env_with_cursor(alt_screen_cursor(true, true, true));
+        stage_edge_drag_no_scrollback(&mut env, true);
+        assert!(
+            env.view.tick_preview_autoscroll(),
+            "top-edge tick forwards a page to the agent"
+        );
+        // The inert capture-window offset never moved; the agent was paged.
+        assert_eq!(env.view.preview_scroll_offset, 0);
+    }
+
+    /// Same as above at the bottom edge: PageDown is forwarded.
+    #[test]
+    #[serial]
+    fn autoscroll_forwards_pagedown_to_alt_screen_agent_at_bottom_edge() {
+        let mut env = live_env_with_cursor(alt_screen_cursor(true, true, true));
+        stage_edge_drag_no_scrollback(&mut env, false);
+        assert!(
+            env.view.tick_preview_autoscroll(),
+            "bottom-edge tick forwards a page to the agent"
+        );
+        assert_eq!(env.view.preview_scroll_offset, 0);
+    }
+
+    /// A normal-buffer pane (NOT alternate-screen) that has merely bottomed out
+    /// its scrollback must NOT get page keys injected into its shell: the tick
+    /// is a no-op there.
+    #[test]
+    #[serial]
+    fn autoscroll_does_not_forward_page_to_normal_pane() {
+        let mut env = live_env_with_cursor(alt_screen_cursor(false, false, false));
+        stage_edge_drag_no_scrollback(&mut env, true);
+        assert!(
+            !env.view.tick_preview_autoscroll(),
+            "a non-alternate-screen pane never gets a forwarded page key"
+        );
+        assert_eq!(env.view.preview_scroll_offset, 0);
+    }
+
     /// A full-screen app with mouse tracking but in the LEGACY (non-SGR)
     /// encoding is still forwarded; the byte builder emits X10-encoded
     /// bytes for it instead of SGR (see `wheel_mouse_bytes_legacy_encodes_x10`).
