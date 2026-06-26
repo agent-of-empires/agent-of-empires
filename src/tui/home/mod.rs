@@ -756,6 +756,12 @@ pub struct HomeView {
     /// session (same as pressing Enter on the selected row).
     pub(super) last_click: Option<(std::time::Instant, u16, u16)>,
 
+    /// Same as `last_click`, but for left-presses on the preview pane. Kept
+    /// separate so preview and sidebar double-click detection don't cross-talk.
+    /// A second qualifying press within `DOUBLE_CLICK_THRESHOLD` activates the
+    /// previewed session, matching a sidebar double-click.
+    pub(super) last_preview_click: Option<(std::time::Instant, u16, u16)>,
+
     /// Dwell tracker for unread clear-on-read: the currently-selected session
     /// id and the instant the selection landed on it (while the list is the
     /// foreground, no dialog/live-send). When the same row stays selected for
@@ -1505,6 +1511,7 @@ impl HomeView {
             list_inner_area: Rect::default(),
             mouse_pos: None,
             last_click: None,
+            last_preview_click: None,
             unread_dwell: None,
             manual_unread_hold: None,
             terminal_modes: HashMap::new(),
