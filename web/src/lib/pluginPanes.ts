@@ -1,15 +1,20 @@
+import type { LucideIcon } from "lucide-react";
+
 import { usePluginUiEntries } from "./pluginUiContext";
-import { sessionEntries } from "./pluginUi";
+import { lucideIcon, sessionEntries } from "./pluginUi";
 import type { PluginUiEntry } from "./api";
 import type { DockLocation } from "./panes";
 
 /** A dockable pane contributed by a plugin via the `pane` slot, resolved for
  *  the active session. The id namespaces the plugin + entry so it never
- *  collides with the built-in "diff" / "terminal" pane ids. */
+ *  collides with the built-in "diff" / "terminal" pane ids. `icon` is the
+ *  plugin's chosen lucide icon (allowlisted), or undefined to fall back to the
+ *  generic plugin icon. */
 export interface PluginPane {
   id: string;
   title: string;
   defaultDock: DockLocation;
+  icon: LucideIcon | undefined;
   entry: PluginUiEntry;
 }
 
@@ -36,6 +41,7 @@ export function usePluginPanes(sessionId: string | null): PluginPane[] {
     id: `${PLUGIN_PANE_PREFIX}${entry.plugin_id}:${entry.id}`,
     title: paneTitle(entry),
     defaultDock: defaultDock(entry),
+    icon: lucideIcon(typeof entry.payload["icon"] === "string" ? entry.payload["icon"] : undefined),
     entry,
   }));
 }

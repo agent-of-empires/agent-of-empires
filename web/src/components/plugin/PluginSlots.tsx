@@ -6,23 +6,13 @@
 // sort-key and filter-facet are deferred (see #2366 follow-ups).
 
 import { createElement } from "react";
-import {
-  CircleAlert,
-  CircleCheck,
-  CircleDot,
-  Clock,
-  GitMerge,
-  GitPullRequestArrow,
-  GitPullRequestClosed,
-  GitPullRequestDraft,
-  type LucideIcon,
-} from "lucide-react";
 
 import { usePluginUiEntries } from "../../lib/pluginUiContext";
 import {
   entryText,
   entryTone,
   globalEntries,
+  lucideIcon,
   payloadStr,
   sessionEntries,
   toneClasses,
@@ -30,24 +20,6 @@ import {
   validTone,
 } from "../../lib/pluginUi";
 import type { PluginUiEntry, PluginUiTone } from "../../lib/api";
-
-// Plugins name an icon by its lucide kebab name. The set is an explicit
-// allowlist, not the whole lucide barrel: that keeps the bundle small and means
-// a plugin can never name an arbitrary import. An unknown name renders nothing.
-const ICONS: Record<string, LucideIcon> = {
-  "git-pull-request-arrow": GitPullRequestArrow,
-  "git-pull-request-draft": GitPullRequestDraft,
-  "git-pull-request-closed": GitPullRequestClosed,
-  "git-merge": GitMerge,
-  "circle-alert": CircleAlert,
-  "circle-check": CircleCheck,
-  "circle-dot": CircleDot,
-  clock: Clock,
-};
-
-function lucideIcon(name: string | undefined): LucideIcon | undefined {
-  return name ? ICONS[name] : undefined;
-}
 
 // Plugin strings are untrusted: only follow http/https hrefs, never
 // javascript:/data: and friends. Returns undefined for anything else, so the

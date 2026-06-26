@@ -514,9 +514,11 @@ Two slots carry more than a single value, so one entry (one declared
   `divider {}`, and `section { title?, children: Block[] }` (nested blocks). The
   simple `{ title, body }` form still works when `blocks` is absent. A `pane`
   also takes an optional `default_location` (`right` | `bottom`) choosing the
-  dock it first opens in; the user can move it between docks afterward. The host
-  renders each `pane` as a dockable tool-window (activity-bar toggle, move,
-  close) alongside the built-in diff and terminal panes.
+  dock it first opens in; the user can move it between docks afterward, and an
+  optional `icon` (any lucide icon name, kebab-case) for its activity-bar
+  button, falling back to a generic plugin icon. The host renders each `pane` as
+  a dockable tool-window (activity-bar toggle, move, close) alongside the
+  built-in diff and terminal panes.
 
 **Block parsing is forward-compatible by design.** The host stores `blocks` as
 opaque JSON (`Vec<Value>`); it validates only that the payload envelope is

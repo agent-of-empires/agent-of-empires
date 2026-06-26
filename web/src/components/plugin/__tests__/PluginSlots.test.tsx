@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import type { PluginUiEntry } from "../../../lib/api";
 import { PluginCards, PluginPaneBody, PluginRowBadges, PluginStatusBarSegments } from "../PluginSlots";
@@ -37,7 +37,7 @@ describe("plugin slot renderers", () => {
     expect(screen.queryByText("other")).toBeNull();
   });
 
-  it("row-badge with href renders a clickable link with a lucide icon", () => {
+  it("row-badge with href renders a clickable link with a lucide icon", async () => {
     set([
       {
         plugin_id: "acme.kit",
@@ -56,8 +56,8 @@ describe("plugin slot renderers", () => {
     expect(link.getAttribute("href")).toBe("https://github.com/o/r/pull/12");
     expect(link.getAttribute("target")).toBe("_blank");
     expect(link.getAttribute("rel")).toContain("noopener");
-    // The lucide icon renders as an inline svg.
-    expect(container.querySelector("svg")).toBeTruthy();
+    // The lucide icon lazy-loads (DynamicIcon) and renders as an inline svg.
+    await waitFor(() => expect(container.querySelector("svg")).toBeTruthy());
   });
 
   it("row-badge with an unknown icon name renders text and no svg", () => {
@@ -95,7 +95,7 @@ describe("plugin slot renderers", () => {
     expect(screen.getByText("tail...")).toBeTruthy();
   });
 
-  it("row-badge items render one clickable icon per item", () => {
+  it("row-badge items render one clickable icon per item", async () => {
     set([
       {
         plugin_id: "acme.kit",
@@ -115,7 +115,7 @@ describe("plugin slot renderers", () => {
     expect(links).toHaveLength(2);
     expect(links[0]!.getAttribute("href")).toBe("https://x/pr/1");
     expect(links[1]!.getAttribute("rel")).toContain("noopener");
-    expect(container.querySelectorAll("svg")).toHaveLength(2);
+    await waitFor(() => expect(container.querySelectorAll("svg")).toHaveLength(2));
     // Icon-only links must carry an accessible name from the tooltip.
     expect(screen.getByRole("link", { name: "PR #1" })).toBeTruthy();
   });

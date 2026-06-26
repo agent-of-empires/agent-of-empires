@@ -387,7 +387,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   };
   const paneDescriptor = (id: string): PaneDisplay => {
     const plugin = pluginPaneById.get(id);
-    if (plugin) return { title: plugin.title, icon: Puzzle };
+    if (plugin) return { title: plugin.title, icon: plugin.icon ?? Puzzle };
     const d = BUILTIN_PANES.find((p) => p.id === id)!;
     return { title: d.title, icon: d.icon };
   };

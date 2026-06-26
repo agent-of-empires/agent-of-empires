@@ -212,6 +212,11 @@ struct PanePayload {
     blocks: Option<Vec<Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     default_location: Option<PaneLocation>,
+    /// Lucide icon name for the pane's activity-bar/tool-window icon. Opaque to
+    /// the host (the web resolves it against its allowlist, falling back to a
+    /// generic icon); kept only so `deny_unknown_fields` accepts it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    icon: Option<String>,
 }
 
 /// Why a `ui.state.set`/`ui.state.remove` was rejected. The host API maps each

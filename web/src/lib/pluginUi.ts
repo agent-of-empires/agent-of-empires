@@ -2,7 +2,38 @@
 // slots through these so the filtering rules (and the per-session tearing
 // guard) live in one tested place rather than scattered across the UI.
 
+import { createElement, forwardRef, type ComponentType } from "react";
+import type { LucideIcon, LucideProps } from "lucide-react";
+import { DynamicIcon, iconNames } from "lucide-react/dynamic";
+
+// DynamicIcon types `name` as the full kebab-name union; plugins hand us a
+// runtime string we have already validated against `iconNames`, so widen it.
+const AnyIcon = DynamicIcon as ComponentType<LucideProps & { name: string }>;
+
 import type { PluginUiEntry, PluginUiSlot, PluginUiTone } from "./api";
+
+// Plugins name an icon by its lucide kebab name (badge items, pane chrome, etc.).
+// Any lucide icon is fair game: `DynamicIcon` code-splits each one into its own
+// lazy chunk, so the whole barrel never lands in the main bundle. We validate
+// against `iconNames` (lucide's own list) so an unknown name resolves to
+// undefined and each call site picks its own fallback, rather than rendering
+// lucide's missing-icon placeholder.
+const VALID = new Set<string>(iconNames);
+const cache = new Map<string, LucideIcon>();
+
+/** Resolve a lucide kebab name to a renderable icon component, or undefined for
+ *  an empty/unknown name. The component lazy-loads its icon; identity is cached
+ *  per name so it does not remount each render. */
+export function lucideIcon(name: string | undefined): LucideIcon | undefined {
+  if (!name || !VALID.has(name)) return undefined;
+  const hit = cache.get(name);
+  if (hit) return hit;
+  const Icon = forwardRef<SVGSVGElement, LucideProps>((props, ref) =>
+    createElement(AnyIcon, { name, ref, ...props }),
+  ) as LucideIcon;
+  cache.set(name, Icon);
+  return Icon;
+}
 
 /** Theme-backed classes per tone, shared by every slot renderer so a plugin's
  *  tone maps to one consistent palette that repaints with the user's theme
