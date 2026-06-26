@@ -27,25 +27,21 @@ base("Cmd/Ctrl+` activates the paired terminal panel", async ({ page }, testInfo
     const handle = page.locator('[data-testid="content-split-resize-handle"]');
     await expect(handle).toBeVisible({ timeout: 10_000 });
 
-    // The paired terminal panel mounts inside the right pane and is
-    // tagged with data-term="paired"; clicking Cmd/Ctrl+` should
-    // surface it as the active focus owner. Wait for both terminal
-    // PTY WebSockets (main session + paired right-pane) to be `open`
-    // before pressing the chord; while either side shows the
-    // `Reconnecting…` banner, the keyboard handler races the WS open
-    // and focus never lands on the connecting terminal.
+    // Tabbed docks (#2437): the paired terminal mounts only when its terminal
+    // tab is the active tab of its dock. The chord activates that tab (surfacing
+    // the data-term="paired" panel) and focuses it once its PTY is ready. The
+    // pending-focus latch handles the WS-open race, so a single press suffices.
+    await page.locator("body").click({ position: { x: 5, y: 5 } });
+    await page.keyboard.press(`${MOD}+Backquote`);
+
     const paired = page.locator('[data-term="paired"]').first();
-    await expect(paired).toBeVisible({ timeout: 10_000 });
+    await expect(paired).toBeVisible({ timeout: 15_000 });
     await expect(page.getByText(/Reconnecting/i)).toBeHidden({
       timeout: 15_000,
     });
 
-    await page.locator("body").click({ position: { x: 5, y: 5 } });
-    await page.keyboard.press(`${MOD}+Backquote`);
-
-    // Visibility alone can pass even if the chord no-ops because the
-    // right pane is already mounted. Confirm focus actually lives
-    // inside the paired panel after the chord; that's the real signal.
+    // Confirm focus actually lives inside the paired panel after the chord;
+    // that's the real signal, not mere visibility.
     await expect
       .poll(
         async () =>

@@ -36,11 +36,12 @@ base(
       await expect(sessionRow).toBeVisible({ timeout: 10_000 });
       await sessionRow.click();
 
-      // Paired-terminal pane lives in the lower half of RightPanel. The
-      // "Shell" label sits above the Host / Container picker; assert it
-      // first to scope subsequent selectors to that pane. The dashboard
-      // mounts both a desktop and a mobile right panel (one hidden via
-      // CSS), so use first() on visible-anywhere assertions.
+      // Tabbed docks (#2437): the paired-terminal pane is a tab and mounts only
+      // when active, so activate the Terminal tab first. Its "Shell" label sits
+      // above the Host / Container picker; assert it to scope subsequent
+      // selectors. The dashboard mounts both a desktop and a mobile right panel
+      // (one hidden via CSS), so use first() on visible-anywhere assertions.
+      await page.getByTestId("pane-tab-terminal:0").first().click({ timeout: 10_000 });
       await expect(page.getByText("Shell", { exact: true }).first()).toBeVisible({
         timeout: 10_000,
       });
