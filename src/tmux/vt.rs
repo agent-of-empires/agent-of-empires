@@ -81,6 +81,12 @@ static REGISTRY: LazyLock<Mutex<HashMap<String, Weak<VtChannel>>>> =
 
 static SOCK_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Lines of scrollback the grid keeps, and how much history the seed pulls from
+/// the pane. Matches tmux's default `history-limit` so a freshly armed channel
+/// (e.g. after switching away from a session and back) has the pane's history
+/// immediately, not just the visible screen.
+const SCROLLBACK_LINES: usize = 2000;
+
 fn lookup(session: &str) -> Option<Arc<VtChannel>> {
     REGISTRY
         .lock()
@@ -274,7 +280,7 @@ impl VtChannel {
         }
         let target = format!("{name}:^.0");
         let (cols, rows) = pane_size(&target)?;
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 2000)));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, SCROLLBACK_LINES)));
         let stop = Arc::new(AtomicBool::new(false));
         let seeded = Arc::new(AtomicBool::new(false));
         let stream: Arc<Mutex<Option<UnixStream>>> = Arc::new(Mutex::new(None));
@@ -346,10 +352,13 @@ impl VtChannel {
             return None;
         }
 
-        // Seed the visible screen so an already-running agent shows up
-        // immediately instead of starting blank (pipe-pane has no backlog).
+        // Seed the screen plus scrollback so an already-running agent shows up
+        // immediately, with history, instead of starting blank (pipe-pane has
+        // no backlog). The pane keeps its own scrollback across re-arms, so a
+        // freshly armed channel can scroll right away.
+        let seed_start = format!("-{SCROLLBACK_LINES}");
         if let Ok(out) = Command::new("tmux")
-            .args(["capture-pane", "-t", &target, "-p", "-e"])
+            .args(["capture-pane", "-t", &target, "-p", "-e", "-S", &seed_start])
             .output()
         {
             if let Ok(mut p) = parser.lock() {
