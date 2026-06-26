@@ -95,6 +95,13 @@ pub fn detect_status_from_content(content: &str, tool: &str) -> Status {
 /// reduced-motion mode renders a static `●`.
 const CLAUDE_SPINNER_CHARS: &[char] = &['·', '✢', '✳', '✶', '✻', '✽', '*', '●'];
 
+/// The banner Claude renders after the user cancels a turn with Esc:
+/// `⎿  Interrupted · What should Claude do instead?`. We key on the
+/// distinctive tail so a differently rendered separator doesn't break the
+/// match. This is the positive signal that an interrupted turn has parked at
+/// the prompt; see `reconcile_claude_hook_status`.
+const CLAUDE_INTERRUPT_MARKER: &str = "what should claude do instead";
+
 /// Claude Code status is primarily detected via hooks (file-based) installed
 /// in `~/.claude/settings.json`. When hooks aren't reachable (first few
 /// seconds before a hook fires, custom `--cmd` wrappers, `docker exec` into
@@ -132,21 +139,31 @@ pub fn detect_claude_status(content: &str) -> Status {
         return Status::Waiting;
     }
 
-    if recent_lower.contains("esc to interrupt") || recent_lower.contains("ctrl+c to interrupt") {
+    if claude_pane_has_running_signal(&recent, &recent_joined, &recent_lower) {
         return Status::Running;
-    }
-
-    if has_claude_live_token_counter(&recent_joined) {
-        return Status::Running;
-    }
-
-    for line in &recent {
-        if claude_line_is_active_spinner(line) {
-            return Status::Running;
-        }
     }
 
     Status::Idle
+}
+
+/// True when the recent pane lines show that a turn is actively generating:
+/// the interrupt hint, the live token counter, or the spinner+verb shape.
+/// `recent_joined` and `recent_lower` are the join/lowercased-join of `recent`,
+/// passed in so callers that already computed them don't redo the work.
+fn claude_pane_has_running_signal(
+    recent: &[&str],
+    recent_joined: &str,
+    recent_lower: &str,
+) -> bool {
+    if recent_lower.contains("esc to interrupt") || recent_lower.contains("ctrl+c to interrupt") {
+        return true;
+    }
+    if has_claude_live_token_counter(recent_joined) {
+        return true;
+    }
+    recent
+        .iter()
+        .any(|line| claude_line_is_active_spinner(line))
 }
 
 /// Detect the live token counter Claude Code prints during generation,
@@ -237,16 +254,49 @@ fn claude_pane_has_approval_prompt(raw_content: &str) -> bool {
     claude_has_approval_prompt(&recent, &recent_lower)
 }
 
-/// When Claude's status hook reports Running, the pane can still be parked on a
-/// blocking approval prompt. Claude keeps its live spinner rendered below the
-/// prompt and re-emits running-mapped hook events (`PreToolUse`,
-/// `UserPromptSubmit`) while the prompt is up, so the last hook write stays
-/// `running` even though the agent is blocked on the user. Mirrors
-/// `reconcile_codex_hook_status`: downgrade Running -> Waiting when the pane
-/// shows an approval prompt, otherwise trust the hook. See #1913.
+/// Claude has parked at the prompt after the user cancelled a turn with Esc.
+/// That path fires neither `Stop` nor an `idle_prompt` notification (verified
+/// against Claude Code 2.1.193: the `idle_prompt` timer is armed by turn
+/// completion, and an interrupt produces no completion), so the hook status
+/// file stays on its last `running` write. We require the interrupt banner
+/// *and* the absence of any active-turn signal so that a fresh turn started
+/// right after the interrupt (banner still in scrollback, spinner now showing)
+/// still reads as Running.
+fn claude_pane_shows_interrupted_turn(raw_content: &str) -> bool {
+    let clean = strip_ansi(raw_content);
+    let non_empty: Vec<&str> = clean.lines().filter(|l| !l.trim().is_empty()).collect();
+    let recent: Vec<&str> = non_empty.iter().rev().take(30).rev().copied().collect();
+    let recent_joined = recent.join("\n");
+    let recent_lower = recent_joined.to_lowercase();
+    recent_lower.contains(CLAUDE_INTERRUPT_MARKER)
+        && !claude_pane_has_running_signal(&recent, &recent_joined, &recent_lower)
+}
+
+/// When Claude's status hook reports Running, the pane is consulted to catch two
+/// cases the hook stream can't express on its own:
+///
+/// 1. A blocking approval prompt: Claude keeps its live spinner rendered below
+///    the prompt and re-emits running-mapped hook events (`PreToolUse`,
+///    `UserPromptSubmit`) while it waits, so the last hook write stays
+///    `running` even though the agent is blocked on the user. Downgrade to
+///    Waiting. See #1913.
+/// 2. An Esc-interrupted turn: cancelling a turn fires no `Stop` and no
+///    `idle_prompt`, so the status file sticks on `running` indefinitely.
+///    Downgrade to Idle when the pane shows the interrupt banner and no
+///    active-turn signal.
+///
+/// Otherwise trust the hook. Mirrors `reconcile_codex_hook_status`'s
+/// positive-evidence approach so an active turn whose pane hasn't rendered a
+/// spinner yet keeps Running rather than flickering Idle.
 pub(crate) fn reconcile_claude_hook_status(hook_status: Status, raw_content: &str) -> Status {
-    if hook_status == Status::Running && claude_pane_has_approval_prompt(raw_content) {
+    if hook_status != Status::Running {
+        return hook_status;
+    }
+    if claude_pane_has_approval_prompt(raw_content) {
         return Status::Waiting;
+    }
+    if claude_pane_shows_interrupted_turn(raw_content) {
+        return Status::Idle;
     }
     hook_status
 }
@@ -1734,6 +1784,49 @@ enter to select · esc to cancel";
         assert_eq!(
             reconcile_claude_hook_status(Status::Idle, "Do you want to proceed?\n1. Yes"),
             Status::Idle
+        );
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_idle_on_esc_interrupt() {
+        // The user cancelled a turn with Esc. Claude fires neither Stop nor an
+        // idle_prompt notification, so the hook stream is stuck on its last
+        // `running` write. The pane shows the interrupt banner and the idle
+        // footer with no active-turn signal, so the reconciler must fall to
+        // Idle. ANSI is preserved to exercise the strip path the live capture
+        // goes through.
+        let pane = "\x1b[2m  ⎿  Interrupted · What should Claude do instead?\x1b[0m\n\n\
+\x1b[1m❯ \x1b[0m\n\n  ? for shortcuts · ← for agents";
+        assert_eq!(
+            reconcile_claude_hook_status(Status::Running, pane),
+            Status::Idle
+        );
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_keeps_running_when_new_turn_follows_interrupt() {
+        // The interrupt banner lingers in scrollback, but the user has already
+        // started another turn (spinner + interrupt hint now showing). The
+        // active-turn signal must win so we don't flicker Idle mid-turn.
+        let pane = "  ⎿  Interrupted · What should Claude do instead?\n\
+● Picking up where we left off\n\
+✶ Herding… (3s · ↓ 42 tokens)\n  esc to interrupt";
+        assert_eq!(
+            reconcile_claude_hook_status(Status::Running, pane),
+            Status::Running
+        );
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_trusts_running_without_interrupt_banner() {
+        // No interrupt banner and no active-turn signal yet: the gap right
+        // after UserPromptSubmit before the spinner renders. We trust the
+        // hook's Running rather than flickering Idle on missing pane evidence
+        // (mirrors the conservative codex reconciler).
+        let pane = "❯ \n\n  ? for shortcuts · ← for agents";
+        assert_eq!(
+            reconcile_claude_hook_status(Status::Running, pane),
+            Status::Running
         );
     }
 
