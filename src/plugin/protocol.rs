@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// JSON-RPC error codes. The negative range below `-32000` is reserved by the
-/// spec for implementation-defined server errors; [`FORBIDDEN`] is ours, for a
+/// spec for implementation-defined server errors; [`codes::FORBIDDEN`] is ours, for a
 /// method whose capability the plugin did not declare or was not granted.
 pub mod codes {
     pub const PARSE_ERROR: i64 = -32700;

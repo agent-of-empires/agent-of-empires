@@ -141,7 +141,7 @@ pub fn merge_configs_generic(global: &Config, overrides: &serde_json::Value) -> 
     serde_json::from_value(base).expect("merged config deserializes")
 }
 
-/// Validate Docker volume format (host:container[:options])
+/// Validate Docker volume format (`host:container[:options]`)
 pub fn validate_volume_format(volume: &str) -> Result<(), String> {
     if volume.is_empty() {
         return Err("Volume cannot be empty".to_string());

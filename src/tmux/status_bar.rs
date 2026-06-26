@@ -208,7 +208,7 @@ pub fn get_session_info_for_current() -> Option<SessionInfo> {
 }
 
 /// Get formatted status string for the current tmux session.
-/// Returns a plain text string like "aoe: Title | branch | [container]"
+/// Returns a plain text string like `aoe: Title | branch | [container]`
 pub fn get_status_for_current_session() -> Option<String> {
     let info = get_session_info_for_current()?;
 
