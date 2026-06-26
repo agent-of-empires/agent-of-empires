@@ -4663,18 +4663,30 @@ pub async fn kill_terminal(
     let inst_lock = state.instance_lock(&id).await;
     let _guard = inst_lock.lock().await;
 
-    let result = tokio::task::spawn_blocking(move || {
-        let _ = inst.kill_terminal_indexed(index);
-        let _ = inst.kill_container_terminal_indexed(index);
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        // A missing session is success (the `kill_*` helpers no-op when the
+        // tmux session is absent); only a real tmux failure surfaces here, so
+        // the caller can retry instead of leaving an orphaned shell behind.
+        inst.kill_terminal_indexed(index)?;
+        inst.kill_container_terminal_indexed(index)?;
+        Ok(())
     })
     .await;
 
     match result {
-        Ok(()) => (
+        Ok(Ok(())) => (
             StatusCode::OK,
             Json(serde_json::json!({"status": "killed"})),
         )
             .into_response(),
+        Ok(Err(e)) => {
+            tracing::error!(target: "http.api.sessions", "Terminal kill failed: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "kill_failed", "message": "Failed to kill terminal"})),
+            )
+                .into_response()
+        }
         Err(e) => {
             tracing::error!(target: "http.api.sessions", "Terminal kill panicked: {}", e);
             (
