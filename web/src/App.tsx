@@ -32,7 +32,7 @@ import { useEdgeSwipe } from "./hooks/useEdgeSwipe";
 import { useIsCoarsePointer } from "./hooks/useIsCoarsePointer";
 import { useIsWideViewport } from "./hooks/useIsWideViewport";
 import type { RightPanelView } from "./lib/rightPanelView";
-import { usePaneLayout } from "./lib/paneLayout";
+import { usePaneLayout, dockTabs, dockActive, dockOf } from "./lib/paneLayout";
 import { isPluginPaneId, usePluginPanes, type PluginPane } from "./lib/pluginPanes";
 import { PluginPaneBody } from "./components/plugin/PluginSlots";
 import { TOUR_ANCHORS, tourAnchor } from "./lib/tourSteps";
@@ -54,6 +54,7 @@ import {
   setProjectPinned,
   deleteProject,
   setSessionUnread,
+  killTerminal,
 } from "./lib/api";
 import type { DeleteSessionOptions, ServerAbout } from "./lib/api";
 import { normalizeProjectPathKey } from "./lib/registeredProjects";
@@ -84,7 +85,7 @@ import { Dock, type PaneDisplay } from "./components/Dock";
 import { BottomDock } from "./components/BottomDock";
 import { DiffPane } from "./components/DiffPane";
 import { PairedShellPane } from "./components/PairedTerminal";
-import { BUILTIN_PANES, type BuiltinPaneId, type DockLocation } from "./lib/panes";
+import { BUILTIN_PANES, isTerminalTabId, terminalIndexOf, terminalTabId, type DockLocation } from "./lib/panes";
 import { MobileRightPanelPicker } from "./components/MobileRightPanelPicker";
 import { MobileMainPane } from "./components/MobileMainPane";
 import { DiffFileViewer } from "./components/diff/DiffFileViewer";
@@ -358,76 +359,102 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   const selectedFilePath = selectedFile?.path ?? null;
   const selectedRepoName = selectedFile?.repoName;
   const selectedFileLine = selectedFile?.line;
-  // Dock panes are the built-in diff + terminal (open/dock persisted) plus any
-  // plugin-contributed `pane` slots for the active session. Plugin panes are
-  // dynamic and per-session, so their open/dock overrides live in ephemeral
-  // state defaulting to the plugin's declared `default_location`.
-  // ponytail: plugin-pane layout is session-only, not persisted; persist it
-  // when someone needs panes to remember their spot across reloads.
-  const { layout: paneLayout, togglePane, setPaneOpen, movePane } = usePaneLayout();
+  // Dock panes render as tabbed groups (#2437): each dock holds an ordered set
+  // of tabs (diff, one-or-more terminals, plugin panes) with one active body.
+  // The tab membership + active tab + terminal count are persisted per session;
+  // dock sizes stay global (Dock/BottomDock own those localStorage keys).
+  const {
+    layout: paneLayout,
+    openTab,
+    addTerminal,
+    closeTab,
+    activateTab,
+    moveTab,
+    toggleKind,
+    togglePlugin,
+    syncPlugins,
+  } = usePaneLayout(activeSessionId);
   const pluginPanes = usePluginPanes(activeSessionId);
-  const [pluginPaneOverrides, setPluginPaneOverrides] = useState<
-    Record<string, { open?: boolean; dock?: DockLocation }>
-  >({});
   const pluginPaneById = useMemo(() => {
     const m = new Map<string, PluginPane>();
     for (const p of pluginPanes) m.set(p.id, p);
     return m;
   }, [pluginPanes]);
 
-  const isPaneOpen = (id: string): boolean => {
-    const plugin = pluginPaneById.get(id);
-    if (plugin) return pluginPaneOverrides[id]?.open ?? true;
-    return paneLayout[id as BuiltinPaneId].open;
-  };
-  const paneDock = (id: string): DockLocation => {
-    const plugin = pluginPaneById.get(id);
-    if (plugin) return pluginPaneOverrides[id]?.dock ?? plugin.defaultDock;
-    return paneLayout[id as BuiltinPaneId].dock;
-  };
+  // Auto-add newly available plugin panes as tabs in their default dock; the
+  // layout suppresses any the user explicitly closed.
+  useEffect(() => {
+    syncPlugins(pluginPanes.map((p) => ({ id: p.id, defaultDock: p.defaultDock })));
+  }, [pluginPanes, syncPlugins]);
+
   const paneDescriptor = (id: string): PaneDisplay => {
     const plugin = pluginPaneById.get(id);
     if (plugin) return { title: plugin.title, icon: plugin.icon ?? Puzzle };
+    if (isTerminalTabId(id)) {
+      const idx = terminalIndexOf(id);
+      const term = BUILTIN_PANES.find((p) => p.id === "terminal")!;
+      return { title: idx === 0 ? term.title : `${term.title} ${idx + 1}`, icon: term.icon };
+    }
     const d = BUILTIN_PANES.find((p) => p.id === id)!;
     return { title: d.title, icon: d.icon };
   };
 
-  const allPaneIds: string[] = ["diff", "terminal", ...pluginPanes.map((p) => p.id)];
-  const rightPaneIds = allPaneIds.filter((id) => isPaneOpen(id) && paneDock(id) === "right");
-  const bottomPaneIds = allPaneIds.filter((id) => isPaneOpen(id) && paneDock(id) === "bottom");
-  const rightDockCollapsed = rightPaneIds.length === 0;
-  const terminalOpen = paneLayout.terminal.open;
-
-  const togglePaneAny = useCallback(
-    (id: string) => {
-      if (isPluginPaneId(id)) {
-        setPluginPaneOverrides((o) => ({ ...o, [id]: { ...o[id], open: !(o[id]?.open ?? true) } }));
-      } else {
-        togglePane(id as BuiltinPaneId);
-      }
-    },
-    [togglePane],
+  // A persisted tab is visible only if its backing pane currently exists: diff
+  // and terminals always do; a plugin tab does only while its plugin is loaded.
+  const tabAvailable = useCallback(
+    (id: string) => !id.startsWith("plugin:") || pluginPaneById.has(id),
+    [pluginPaneById],
   );
-  const movePaneAny = useCallback(
-    (id: string, dock: DockLocation) => {
-      if (isPluginPaneId(id)) {
-        setPluginPaneOverrides((o) => ({ ...o, [id]: { ...o[id], dock } }));
-      } else {
-        movePane(id as BuiltinPaneId, dock);
-      }
+  const visibleTabs = useCallback(
+    (dock: DockLocation) => dockTabs(paneLayout, dock).filter(tabAvailable),
+    [paneLayout, tabAvailable],
+  );
+  const visibleActive = useCallback(
+    (dock: DockLocation): string | null => {
+      const vis = visibleTabs(dock);
+      const a = dockActive(paneLayout, dock);
+      return a && vis.includes(a) ? a : (vis[0] ?? null);
     },
-    [movePane],
+    [paneLayout, visibleTabs],
+  );
+
+  const rightTabs = visibleTabs("right");
+  const bottomTabs = visibleTabs("bottom");
+  const rightDockCollapsed = rightTabs.length === 0;
+  const terminalOpen = (["right", "bottom"] as DockLocation[]).some((d) =>
+    dockTabs(paneLayout, d).some(isTerminalTabId),
+  );
+
+  // Activity-bar entries are pane KINDS (diff, terminal, each plugin), not
+  // individual tabs; the strip's +/x manage terminal instances.
+  const allPaneIds: string[] = ["diff", "terminal", ...pluginPanes.map((p) => p.id)];
+  const isPaneOpen = (kind: string): boolean => {
+    if (kind === "terminal") return terminalOpen;
+    return dockOf(paneLayout, kind) !== null;
+  };
+  const togglePaneAny = useCallback(
+    (kind: string) => {
+      const defaultDock: DockLocation =
+        pluginPaneById.get(kind)?.defaultDock ?? BUILTIN_PANES.find((p) => p.id === kind)?.defaultDock ?? "right";
+      if (isPluginPaneId(kind)) togglePlugin(kind, defaultDock);
+      else toggleKind(kind as "diff" | "terminal", defaultDock);
+    },
+    [toggleKind, togglePlugin, pluginPaneById],
   );
   const closePaneAny = useCallback(
     (id: string) => {
-      if (isPluginPaneId(id)) {
-        setPluginPaneOverrides((o) => ({ ...o, [id]: { ...o[id], open: false } }));
-      } else {
-        setPaneOpen(id as BuiltinPaneId, false);
+      // Closing an extra terminal tab kills its tmux shell so it does not leak;
+      // terminal 0 (shared with the native TUI) only hides. Diff/plugin tabs
+      // have no backend shell to reap.
+      if (isTerminalTabId(id)) {
+        const idx = terminalIndexOf(id);
+        if (idx >= 1 && activeSessionId) void killTerminal(activeSessionId, idx);
       }
+      closeTab(id);
     },
-    [setPaneOpen],
+    [closeTab, activeSessionId],
   );
+  const movePaneAny = useCallback((id: string, dock: DockLocation) => moveTab(id, dock), [moveTab]);
   // Layout topology is width-driven so it stays aligned with the `md:`
   // Tailwind classes the rest of the layout uses. At md and up the
   // side-by-side ContentSplit renders; below md a single full-viewport
@@ -471,7 +498,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
 
   // Fetch the diff when the panel is actually showing: on desktop when the
   // split is expanded, on mobile when the diff view is the active pane.
-  const diffPanelActive = isMdUp ? paneLayout.diff.open : rightPanelView === "diff";
+  const diffPanelActive = isMdUp ? dockOf(paneLayout, "diff") !== null : rightPanelView === "diff";
   const {
     files: diffFiles,
     perRepoBases,
@@ -531,9 +558,6 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     setPickerOpen(false);
     setPairedMounted(false);
     setSelectedFile(null);
-    // Plugin pane open/dock overrides are keyed by pane id only (not session),
-    // so clear them on a session switch to keep them session-local as intended.
-    setPluginPaneOverrides({});
   }
 
   // Inline derivation for diffFiles validation: clear a stale diff-list
@@ -883,11 +907,11 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   // is no split to collapse: it opens the view picker instead (#1452).
   const toggleDiff = useCallback(() => {
     if (isMdUp) {
-      togglePane("diff");
+      toggleKind("diff", "right");
     } else {
       setPickerOpen((o) => !o);
     }
-  }, [isMdUp, togglePane]);
+  }, [isMdUp, toggleKind]);
 
   // Collapse or restore the whole right dock (the "toggle right panel"
   // shortcut). Collapse closes every pane docked right; restore reopens the
@@ -899,18 +923,15 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       setPickerOpen((o) => !o);
       return;
     }
-    const open = !rightDockCollapsed;
-    (["diff", "terminal"] as BuiltinPaneId[]).forEach((id) => {
-      if (paneLayout[id].dock === "right") setPaneOpen(id, !open);
-    });
-    setPluginPaneOverrides((o) => {
-      const next = { ...o };
-      for (const p of pluginPanes) {
-        if ((next[p.id]?.dock ?? p.defaultDock) === "right") next[p.id] = { ...next[p.id], open: !open };
-      }
-      return next;
-    });
-  }, [isMdUp, rightDockCollapsed, paneLayout, setPaneOpen, pluginPanes]);
+    if (rightDockCollapsed) {
+      // Restore the built-in defaults into the right dock.
+      openTab("diff", "right");
+      openTab(terminalTabId(0), "right");
+    } else {
+      // Collapse: close every tab currently in the right dock.
+      for (const id of dockTabs(paneLayout, "right")) closeTab(id);
+    }
+  }, [isMdUp, rightDockCollapsed, paneLayout, openTab, closeTab]);
 
   const handlePickView = useCallback((view: RightPanelView) => {
     setRightPanelView(view);
@@ -989,11 +1010,11 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   const openSidebar = useCallback(() => setSidebarOpen(true), []);
   const openDiff = useCallback(() => {
     if (isMdUp) {
-      setPaneOpen("diff", true);
+      openTab("diff", "right");
     } else {
       setPickerOpen(true);
     }
-  }, [isMdUp, setPaneOpen]);
+  }, [isMdUp, openTab]);
   useEdgeSwipe({
     edge: "left",
     enabled: !sidebarOpen,
@@ -1069,7 +1090,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       // pending intent so PairedTerminal grabs focus once it mounts and its
       // PTY is ready, then open the terminal pane.
       setPendingTerminalFocus("paired");
-      setPaneOpen("terminal", true);
+      openTab(terminalTabId(0), "right");
       return;
     }
     if (target === "agent" && selectedFilePath) {
@@ -1081,7 +1102,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       return;
     }
     dispatchFocusTerminal(target);
-  }, [activeSessionId, singlePane, terminalOpen, setPaneOpen, selectedFilePath]);
+  }, [activeSessionId, singlePane, terminalOpen, openTab, selectedFilePath]);
 
   useKeyboardShortcuts(
     useCallback(
@@ -1278,7 +1299,13 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
           />
         );
       }
-      return <PairedShellPane session={activeSession ?? null} sessionId={activeSessionId} />;
+      return (
+        <PairedShellPane
+          session={activeSession ?? null}
+          sessionId={activeSessionId}
+          terminalIndex={isTerminalTabId(id) ? terminalIndexOf(id) : 0}
+        />
+      );
     };
     return (
       <div className="flex-1 flex flex-col min-h-0">
@@ -1329,22 +1356,28 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
             <div {...tourAnchor(TOUR_ANCHORS.rightPanel)} className="flex min-h-0 min-w-0 flex-1">
               <Dock
                 location="right"
-                paneIds={rightPaneIds}
+                tabs={rightTabs}
+                active={visibleActive("right")}
                 descriptorFor={paneDescriptor}
                 renderBody={renderPaneBody}
+                onActivate={(id) => activateTab("right", id)}
                 onMove={movePaneAny}
                 onClose={closePaneAny}
+                onNewTerminal={() => addTerminal("right")}
               />
             </div>
           }
         />
-        {bottomPaneIds.length > 0 && (
+        {bottomTabs.length > 0 && (
           <BottomDock
-            paneIds={bottomPaneIds}
+            tabs={bottomTabs}
+            active={visibleActive("bottom")}
             descriptorFor={paneDescriptor}
             renderBody={renderPaneBody}
+            onActivate={(id) => activateTab("bottom", id)}
             onMove={movePaneAny}
             onClose={closePaneAny}
+            onNewTerminal={() => addTerminal("bottom")}
           />
         )}
         {sendDialogOpen && commentsEnabled && activeSessionId && (

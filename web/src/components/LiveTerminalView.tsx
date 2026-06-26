@@ -48,18 +48,12 @@ const SURFACES = {
  * not shrink. The pane re-pins itself to the bottom when its container
  * resizes, which is all a bottom-anchored chat-style surface needs.
  */
-export function LiveTerminalView({
-  session,
-  active = true,
-  surface = "agent",
-  terminalIndex = 0,
-}: Props) {
+export function LiveTerminalView({ session, active = true, surface = "agent", terminalIndex = 0 }: Props) {
   const base = SURFACES[surface];
   const { focusTarget, dataTerm } = base;
   // Paired terminals carry their instance index as a query param so the
   // server attaches the right tmux session; the agent surface ignores it.
-  const wsPath =
-    surface === "agent" ? base.wsPath : `${base.wsPath}?index=${terminalIndex}`;
+  const wsPath = surface === "agent" ? base.wsPath : `${base.wsPath}?index=${terminalIndex}`;
   // Touch-only chrome (the soft-keyboard toolbar and its toggle FAB) is
   // pointless with a physical keyboard, so it stays off fine-pointer devices
   // now that this view also renders on desktop.

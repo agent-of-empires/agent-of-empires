@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
 //
-// Contract test for the Dock + PaneFrame chrome: one framed pane per id, the
-// resize handle only when two panes share the dock, and the move/close
-// controls wired to their callbacks.
+// Contract test for the Dock tab strip: a tab per id, only the active tab's
+// body mounted, and the activate / close / move / new-terminal controls wired
+// to their callbacks.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render } from "@testing-library/react";
@@ -14,60 +14,69 @@ afterEach(() => cleanup());
 
 const body = (id: string) => <div data-testid={`body-${id}`}>{id}</div>;
 const descriptorFor = (id: string) => {
-  const d = BUILTIN_PANES.find((p) => p.id === id)!;
+  // Tests only feed built-in tab ids; resolve "terminal:0" to the terminal pane.
+  const kind = id.startsWith("terminal") ? "terminal" : id;
+  const d = BUILTIN_PANES.find((p) => p.id === kind)!;
   return { title: d.title, icon: d.icon };
 };
 
+function renderDock(props: Partial<React.ComponentProps<typeof Dock>> = {}) {
+  return render(
+    <Dock
+      location="right"
+      tabs={["diff", "terminal:0"]}
+      active="terminal:0"
+      descriptorFor={descriptorFor}
+      renderBody={body}
+      onActivate={vi.fn()}
+      onClose={vi.fn()}
+      onMove={vi.fn()}
+      onNewTerminal={vi.fn()}
+      {...props}
+    />,
+  );
+}
+
 describe("Dock", () => {
-  it("frames each open pane with its registry title", () => {
-    const { getByText, getByTestId } = render(
-      <Dock
-        location="right"
-        paneIds={["diff", "terminal"]}
-        descriptorFor={descriptorFor}
-        renderBody={body}
-        onMove={vi.fn()}
-        onClose={vi.fn()}
-      />,
-    );
-    expect(getByText("Diff")).toBeTruthy();
-    expect(getByText("Terminal")).toBeTruthy();
-    expect(getByTestId("body-diff")).toBeTruthy();
-    // Two panes share the dock, so the divider is present.
-    expect(getByTestId("dock-resize-right")).toBeTruthy();
+  it("renders one tab per id but only the active body", () => {
+    const { getByTestId, queryByTestId } = renderDock();
+    expect(getByTestId("pane-tab-diff")).toBeTruthy();
+    expect(getByTestId("pane-tab-terminal:0")).toBeTruthy();
+    // Only the active tab's body is mounted.
+    expect(getByTestId("body-terminal:0")).toBeTruthy();
+    expect(queryByTestId("body-diff")).toBeNull();
   });
 
-  it("omits the resize handle with a single open pane", () => {
-    const { queryByTestId } = render(
-      <Dock
-        location="bottom"
-        paneIds={["terminal"]}
-        descriptorFor={descriptorFor}
-        renderBody={body}
-        onMove={vi.fn()}
-        onClose={vi.fn()}
-      />,
-    );
-    expect(queryByTestId("dock-resize-bottom")).toBeNull();
+  it("renders nothing when there are no tabs", () => {
+    const { container } = renderDock({ tabs: [], active: null });
+    expect(container.firstChild).toBeNull();
   });
 
-  it("move and close controls fire with the pane id and target dock", () => {
-    const onMove = vi.fn();
+  it("activates a tab on click", () => {
+    const onActivate = vi.fn();
+    const { getByTestId } = renderDock({ onActivate });
+    fireEvent.click(getByTestId("pane-tab-diff"));
+    expect(onActivate).toHaveBeenCalledWith("diff");
+  });
+
+  it("closes a tab via its X control", () => {
     const onClose = vi.fn();
-    const { getByLabelText } = render(
-      <Dock
-        location="right"
-        paneIds={["diff"]}
-        descriptorFor={descriptorFor}
-        renderBody={body}
-        onMove={onMove}
-        onClose={onClose}
-      />,
-    );
-    // Right-docked pane moves to the bottom dock.
-    fireEvent.click(getByLabelText("Move diff to bottom dock"));
-    expect(onMove).toHaveBeenCalledWith("diff", "bottom");
+    const { getByLabelText } = renderDock({ onClose });
     fireEvent.click(getByLabelText("Close diff"));
     expect(onClose).toHaveBeenCalledWith("diff");
+  });
+
+  it("moves the active tab to the other dock", () => {
+    const onMove = vi.fn();
+    renderDock({ onMove });
+    fireEvent.click(document.querySelector('[aria-label="Move terminal to bottom dock"]')!);
+    expect(onMove).toHaveBeenCalledWith("terminal:0", "bottom");
+  });
+
+  it("requests a new terminal", () => {
+    const onNewTerminal = vi.fn();
+    const { getByLabelText } = renderDock({ onNewTerminal });
+    fireEvent.click(getByLabelText("New terminal"));
+    expect(onNewTerminal).toHaveBeenCalled();
   });
 });

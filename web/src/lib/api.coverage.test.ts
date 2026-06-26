@@ -15,6 +15,7 @@ import {
   updateWorkspaceOrdering,
   ensureSession,
   ensureTerminal,
+  killTerminal,
   getSessionDiffFiles,
   getSessionFileContents,
   fetchSettings,
@@ -185,16 +186,16 @@ describe("ensureSession", () => {
 });
 
 describe("ensureTerminal", () => {
-  it("POSTs the terminal path by default", async () => {
+  it("POSTs the terminal path with index 0 by default", async () => {
     fetchSpy.mockResolvedValueOnce(new Response("", { status: 200 }));
     expect(await ensureTerminal("s1")).toBe(true);
-    expect(lastCall()[0]).toBe("/api/sessions/s1/terminal");
+    expect(lastCall()[0]).toBe("/api/sessions/s1/terminal?index=0");
   });
 
-  it("POSTs the container-terminal path when container=true", async () => {
+  it("POSTs the container-terminal path with the given index", async () => {
     fetchSpy.mockResolvedValueOnce(new Response("", { status: 200 }));
-    await ensureTerminal("s1", true);
-    expect(lastCall()[0]).toBe("/api/sessions/s1/container-terminal");
+    await ensureTerminal("s1", 2, true);
+    expect(lastCall()[0]).toBe("/api/sessions/s1/container-terminal?index=2");
   });
 
   it("returns false on non-2xx", async () => {
@@ -205,6 +206,20 @@ describe("ensureTerminal", () => {
   it("returns false on network failure", async () => {
     fetchSpy.mockRejectedValueOnce(new Error("offline"));
     expect(await ensureTerminal("s1")).toBe(false);
+  });
+});
+
+describe("killTerminal", () => {
+  it("DELETEs the terminal path with the given index", async () => {
+    fetchSpy.mockResolvedValueOnce(new Response("", { status: 200 }));
+    expect(await killTerminal("s1", 2)).toBe(true);
+    expect(lastCall()[0]).toBe("/api/sessions/s1/terminal?index=2");
+    expect(lastCall()[1]?.method).toBe("DELETE");
+  });
+
+  it("returns false on network failure", async () => {
+    fetchSpy.mockRejectedValueOnce(new Error("offline"));
+    expect(await killTerminal("s1", 1)).toBe(false);
   });
 });
 

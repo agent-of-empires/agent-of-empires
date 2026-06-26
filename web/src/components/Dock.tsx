@@ -1,8 +1,6 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
-import type { LucideIcon } from "lucide-react";
+import { createElement, type ReactNode } from "react";
+import { PanelBottom, PanelRight, Plus, X, type LucideIcon } from "lucide-react";
 
-import { safeGetItem, safeSetItem } from "../lib/safeStorage";
-import { PaneFrame } from "./PaneFrame";
 import type { DockLocation } from "../lib/panes";
 
 export interface PaneDisplay {
@@ -12,133 +10,104 @@ export interface PaneDisplay {
 
 interface Props {
   location: DockLocation;
-  paneIds: string[];
-  /** Title + icon for a pane id (built-in from the registry, or a plugin pane).
+  /** Visible tab ids in strip order (the parent pre-filters availability). */
+  tabs: string[];
+  /** Active tab id; falls back to the first tab if stale/missing. */
+  active: string | null;
+  /** Title + icon for a tab id (built-in from the registry, or a plugin pane).
    *  A callback rather than an array prop so the icon component is resolved
    *  inside the dock, keeping the parent's render free of element arrays. */
   descriptorFor: (id: string) => PaneDisplay;
   renderBody: (id: string) => ReactNode;
-  onMove: (id: string, dock: DockLocation) => void;
+  onActivate: (id: string) => void;
   onClose: (id: string) => void;
+  onMove: (id: string, dock: DockLocation) => void;
+  onNewTerminal: () => void;
 }
 
-const DEFAULT_RATIO = 0.5;
-const MIN_PX = 80;
+const btn =
+  "w-5 h-5 flex items-center justify-center shrink-0 rounded text-text-dim hover:text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors";
 
-function ratioKey(location: DockLocation): string {
-  return `aoe-dock-split-${location}`;
-}
-
-function loadRatio(location: DockLocation): number {
-  const saved = safeGetItem(ratioKey(location));
-  if (saved) {
-    const r = parseFloat(saved);
-    if (r > 0 && r < 1) return r;
-  }
-  return DEFAULT_RATIO;
-}
-
-/** Renders the open panes for one dock location: a vertical split for the
- *  right dock, a horizontal split for the bottom dock. The parent passes the
- *  open pane ids plus a `renderBody` callback; this looks up each pane's title
- *  and icon from the registry and wraps the body in tool-window chrome. The
- *  parent hides the dock entirely when it has no open panes.
+/** Renders one dock location as a tabbed group: a tab strip plus the active
+ *  tab's body. Each tab carries its pane's icon, title, and a close control;
+ *  the strip also offers move-to-other-dock and a new-terminal button. Only the
+ *  active body is mounted; the terminal/diff state it shows is server-side
+ *  (tmux session, diff API), so re-mounting on a tab switch is cheap. The
+ *  parent hides the dock entirely when it has no tabs.
  *
- *  ponytail: a single draggable divider between two panes. Two built-in panes
- *  (diff, terminal) means a dock holds at most two today; a third would render
- *  at an equal flex share with no handle until this grows a multi-divider model. */
-export function Dock({ location, paneIds, descriptorFor, renderBody, onMove, onClose }: Props) {
-  const vertical = location === "right";
-  const [ratio, setRatio] = useState(() => loadRatio(location));
-  const containerRef = useRef<HTMLDivElement>(null);
-  const dragging = useRef(false);
-
-  const handleMouseDown = useCallback(
-    (e: React.MouseEvent) => {
-      e.preventDefault();
-      dragging.current = true;
-      document.body.style.cursor = vertical ? "row-resize" : "col-resize";
-      document.body.style.userSelect = "none";
-    },
-    [vertical],
-  );
-
-  useEffect(() => {
-    const apply = (client: number) => {
-      const el = containerRef.current;
-      if (!el) return;
-      const rect = el.getBoundingClientRect();
-      const span = vertical ? rect.height : rect.width;
-      const pos = client - (vertical ? rect.top : rect.left);
-      if (pos < MIN_PX || span - pos < MIN_PX) return;
-      setRatio(pos / span);
-    };
-    const settle = () => {
-      if (!dragging.current) return;
-      dragging.current = false;
-      document.body.style.cursor = "";
-      document.body.style.userSelect = "";
-      setRatio((r) => {
-        safeSetItem(ratioKey(location), String(r));
-        return r;
-      });
-      window.dispatchEvent(new Event("resize"));
-    };
-    const onMouseMove = (e: MouseEvent) => {
-      if (dragging.current) apply(vertical ? e.clientY : e.clientX);
-    };
-    document.addEventListener("mousemove", onMouseMove);
-    document.addEventListener("mouseup", settle);
-    return () => {
-      document.removeEventListener("mousemove", onMouseMove);
-      document.removeEventListener("mouseup", settle);
-      if (dragging.current) {
-        dragging.current = false;
-        document.body.style.cursor = "";
-        document.body.style.userSelect = "";
-      }
-    };
-  }, [vertical, location]);
-
-  const split = paneIds.length === 2;
-  const paneBox = (id: string, basis: number | null) => {
-    const desc = descriptorFor(id);
-    return (
-      <div
-        key={id}
-        style={basis === null ? undefined : { flexBasis: `${basis * 100}%` }}
-        className={`flex min-h-0 min-w-0 ${basis === null ? "flex-1" : ""} ${vertical ? "flex-col" : "flex-row"}`}
-      >
-        <PaneFrame
-          title={desc.title}
-          icon={desc.icon}
-          dock={location}
-          onMove={(dock) => onMove(id, dock)}
-          onClose={() => onClose(id)}
-        >
-          {renderBody(id)}
-        </PaneFrame>
-      </div>
-    );
-  };
+ *  ponytail: a single tab group per dock. Multiple split groups within a dock
+ *  arrive with the drag-and-drop follow-up; the layout storage is already
+ *  group-shaped for it. */
+export function Dock({
+  location,
+  tabs,
+  active,
+  descriptorFor,
+  renderBody,
+  onActivate,
+  onClose,
+  onMove,
+  onNewTerminal,
+}: Props) {
+  if (tabs.length === 0) return null;
+  const activeId = active && tabs.includes(active) ? active : tabs[0]!;
+  const target: DockLocation = location === "right" ? "bottom" : "right";
+  const MoveIcon = location === "right" ? PanelBottom : PanelRight;
+  const activeName = descriptorFor(activeId).title.toLowerCase();
 
   return (
-    <div ref={containerRef} className={`flex min-h-0 min-w-0 flex-1 ${vertical ? "flex-col" : "flex-row"}`}>
-      {split ? (
-        <>
-          {paneBox(paneIds[0]!, ratio)}
-          <div
-            data-testid={`dock-resize-${location}`}
-            onMouseDown={handleMouseDown}
-            className={`shrink-0 hover:bg-brand-600/50 transition-colors duration-75 ${
-              vertical ? "h-1 cursor-row-resize" : "w-1 cursor-col-resize"
-            }`}
-          />
-          {paneBox(paneIds[1]!, 1 - ratio)}
-        </>
-      ) : (
-        paneIds.map((id) => paneBox(id, null))
-      )}
-    </div>
+    <section className="flex flex-col min-h-0 flex-1 overflow-hidden" data-pane-dock={location}>
+      <div role="tablist" className="flex items-stretch h-7 shrink-0 bg-surface-900 border-b border-surface-700/20">
+        <div className="flex items-stretch min-w-0 overflow-x-auto">
+          {tabs.map((id) => {
+            const desc = descriptorFor(id);
+            const isActive = id === activeId;
+            const name = desc.title.toLowerCase();
+            return (
+              <div
+                key={id}
+                role="tab"
+                aria-selected={isActive}
+                data-testid={`pane-tab-${id}`}
+                onClick={() => onActivate(id)}
+                className={`group flex items-center gap-1 pl-2 pr-1 cursor-pointer border-r border-surface-700/20 transition-colors ${
+                  isActive
+                    ? "bg-surface-800 text-text-secondary"
+                    : "text-text-dim hover:text-text-secondary hover:bg-surface-800/40"
+                }`}
+              >
+                {createElement(desc.icon, { className: "size-3.5 shrink-0", "aria-hidden": true })}
+                <span className="text-[11px] font-medium truncate max-w-[10rem]">{desc.title}</span>
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onClose(id);
+                  }}
+                  className={btn}
+                  title={`Close ${name}`}
+                  aria-label={`Close ${name}`}
+                >
+                  <X className="size-3" aria-hidden />
+                </button>
+              </div>
+            );
+          })}
+        </div>
+        <div className="flex items-center ml-auto px-1 gap-0.5 shrink-0">
+          <button
+            onClick={() => onMove(activeId, target)}
+            className={btn}
+            title={`Move ${activeName} to ${target} dock`}
+            aria-label={`Move ${activeName} to ${target} dock`}
+          >
+            <MoveIcon className="size-3.5" aria-hidden />
+          </button>
+          <button onClick={onNewTerminal} className={btn} title="New terminal" aria-label="New terminal">
+            <Plus className="size-3.5" aria-hidden />
+          </button>
+        </div>
+      </div>
+      <div className="flex-1 flex flex-col min-h-0 overflow-hidden">{renderBody(activeId)}</div>
+    </section>
   );
 }

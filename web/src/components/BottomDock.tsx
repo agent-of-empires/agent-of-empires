@@ -20,17 +20,29 @@ function loadHeight(): number {
 }
 
 interface Props {
-  paneIds: string[];
+  tabs: string[];
+  active: string | null;
   descriptorFor: (id: string) => PaneDisplay;
   renderBody: (id: string) => ReactNode;
-  onMove: (id: string, dock: DockLocation) => void;
+  onActivate: (id: string) => void;
   onClose: (id: string) => void;
+  onMove: (id: string, dock: DockLocation) => void;
+  onNewTerminal: () => void;
 }
 
 /** Full-width bottom dock: a height-resizable strip below the main+right-dock
  *  row. Hidden by the parent when it has no open panes. Desktop only; mobile
  *  uses the single full-viewport view picker. */
-export function BottomDock({ paneIds, descriptorFor, renderBody, onMove, onClose }: Props) {
+export function BottomDock({
+  tabs,
+  active,
+  descriptorFor,
+  renderBody,
+  onActivate,
+  onClose,
+  onMove,
+  onNewTerminal,
+}: Props) {
   const [height, setHeight] = useState(loadHeight);
   const ref = useRef<HTMLDivElement>(null);
   const dragging = useRef(false);
@@ -83,11 +95,14 @@ export function BottomDock({ paneIds, descriptorFor, renderBody, onMove, onClose
       />
       <Dock
         location="bottom"
-        paneIds={paneIds}
+        tabs={tabs}
+        active={active}
         descriptorFor={descriptorFor}
         renderBody={renderBody}
-        onMove={onMove}
+        onActivate={onActivate}
         onClose={onClose}
+        onMove={onMove}
+        onNewTerminal={onNewTerminal}
       />
     </div>
   );
