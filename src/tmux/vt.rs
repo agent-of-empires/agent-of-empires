@@ -239,9 +239,26 @@ fn push_color_params(params: &mut Vec<String>, color: vt100::Color, bg: bool) {
     }
 }
 
+/// Whether a cell carries any non-default styling (intensity, italic,
+/// underline, inverse, or a non-default fg/bg colour). A blank-but-styled cell
+/// is still visible: a background fill that runs to the edge of a row (a status
+/// bar, a selection) has no glyph yet must be drawn.
+fn cell_has_style(cell: &vt100::Cell) -> bool {
+    cell.bold()
+        || cell.dim()
+        || cell.italic()
+        || cell.underline()
+        || cell.inverse()
+        || !matches!(cell.fgcolor(), vt100::Color::Default)
+        || !matches!(cell.bgcolor(), vt100::Color::Default)
+}
+
 /// The SGR escape that reproduces a cell's attributes, or an empty string for a
 /// default (unstyled) cell.
 fn cell_sgr(cell: &vt100::Cell) -> String {
+    if !cell_has_style(cell) {
+        return String::new();
+    }
     let mut params: Vec<String> = Vec::new();
     if cell.bold() {
         params.push("1".into());
@@ -276,11 +293,17 @@ fn cell_sgr(cell: &vt100::Cell) -> String {
 /// with their spaces stripped (#2433 regression). Emitting literal spaces keeps
 /// the column layout intact while preserving colour and intensity.
 fn row_to_ansi(screen: &vt100::Screen, row: u16, cols: u16) -> String {
-    // Trim trailing blank cells, mirroring `capture-pane`'s trailing-space trim,
-    // so a row never carries a full width of padding into ratatui's wrapper.
+    // Trim trailing *unstyled* blank cells, mirroring `capture-pane`'s
+    // trailing-space trim, so a row never carries a full width of padding into
+    // ratatui's wrapper. A trailing blank that carries styling (a background
+    // fill running to the edge) is kept: it is drawn as a coloured space below,
+    // exactly as a mid-row styled blank already is.
     let mut last = 0u16;
     for col in 0..cols {
-        if screen.cell(row, col).is_some_and(vt100::Cell::has_contents) {
+        if screen
+            .cell(row, col)
+            .is_some_and(|cell| cell.has_contents() || cell_has_style(cell))
+        {
             last = col + 1;
         }
     }
@@ -730,6 +753,26 @@ mod tests {
         assert!(
             content.contains("\x1b[31m") || content.contains("31m"),
             "red foreground lost:\n{content:?}"
+        );
+    }
+
+    #[test]
+    fn grid_content_keeps_trailing_styled_fill() {
+        // "Hi" then a blue background erased to the end of the line (`ESC[K`
+        // with a bg set): cols 2..10 carry a bgcolor but no glyph, like a status
+        // bar or selection that runs to the right edge. They must survive as
+        // coloured spaces, not be trimmed as if blank.
+        let mut p = vt100::Parser::new(2, 10, 0);
+        p.process(b"Hi\x1b[44m\x1b[K");
+        let (content, _) = grid_content(&mut p, 2, 10, 2);
+        let first = content.split('\n').next().unwrap_or("");
+        assert!(
+            first.contains("44m"),
+            "trailing background fill dropped:\n{content:?}"
+        );
+        assert!(
+            first.matches(' ').count() >= 8,
+            "trailing fill should keep its eight cells as spaces:\n{content:?}"
         );
     }
 
