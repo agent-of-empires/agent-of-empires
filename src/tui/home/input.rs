@@ -697,42 +697,68 @@ impl HomeView {
             self.preview_autoscroll_at = None;
             return false;
         }
-        // Pace the scroll to a steady cadence regardless of how often the
-        // loop woke this iteration, so the speed is even instead of racing
-        // with capture-worker activity.
+        // Pace the scroll to a steady cadence regardless of how often the loop
+        // woke this iteration, so the speed is even instead of racing with
+        // capture-worker activity. The aoe-side line scroll and the wheel
+        // forward to a mouse agent are both fine-grained (one line / one wheel
+        // notch), so they run at the fast cadence and read as smooth, like the
+        // native wheel forward when the live pane is active. The no-mouse
+        // page-key fallback stays slow: each press scrolls a WHOLE page, so a
+        // held edge at the fast cadence would rocket through the transcript.
         const AUTOSCROLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(40);
+        const PAGE_FORWARD_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
         let now = std::time::Instant::now();
-        if let Some(prev) = self.preview_autoscroll_at {
-            if now.duration_since(prev) < AUTOSCROLL_INTERVAL {
-                return false;
+        let forward_interval = if self.preview_forwards_mouse().is_some() {
+            AUTOSCROLL_INTERVAL
+        } else {
+            PAGE_FORWARD_INTERVAL
+        };
+        let line_ready = self
+            .preview_autoscroll_at
+            .is_none_or(|prev| now.duration_since(prev) >= AUTOSCROLL_INTERVAL);
+        let forward_ready = self
+            .preview_autoscroll_at
+            .is_none_or(|prev| now.duration_since(prev) >= forward_interval);
+        // First try the aoe-side capture-window scroll (normal-buffer panes
+        // with real scrollback).
+        if line_ready {
+            let scrolled = if at_top {
+                self.scroll_preview_offset(1)
+            } else {
+                self.scroll_preview_offset(-1)
+            };
+            if scrolled {
+                self.preview_autoscroll_at = Some(now);
+                let col_off = col.clamp(pane.x, pane.right().saturating_sub(1)) - pane.x;
+                // Pin the extent to the now-revealed edge line in `from_bottom`
+                // terms, which the new scroll offset gives directly: the bottom
+                // visible line sits `offset` lines up from the newest line, the
+                // top visible line `offset + height - 1`. Deriving it from the
+                // offset (not the stale pre-scroll `total_lines`) keeps it
+                // correct even before the next frame re-captures.
+                let offset = self.preview_scroll_offset as usize;
+                let from_bottom = if at_top {
+                    offset + (pane.height as usize).saturating_sub(1)
+                } else {
+                    offset
+                };
+                if let Some(sel) = self.preview_selection.as_mut() {
+                    sel.extent = (col_off, from_bottom);
+                }
+                return true;
             }
         }
-        let scrolled = if at_top {
-            self.scroll_preview_offset(1)
-        } else {
-            self.scroll_preview_offset(-1)
-        };
-        if !scrolled {
-            return false;
+        // The capture-window scroll is inert: a full-screen (alternate-screen)
+        // agent has no aoe-side scrollback, so forward the same scroll input a
+        // wheel notch would to the agent instead, scrolling its OWN transcript
+        // the way the wheel forward does (#2421). The extent stays pinned to the
+        // screen edge; the agent's redraw is what reveals more text under the
+        // held selection.
+        if forward_ready && self.forward_scroll_to_preview(at_top, col, row) {
+            self.preview_autoscroll_at = Some(now);
+            return true;
         }
-        self.preview_autoscroll_at = Some(now);
-        let col_off = col.clamp(pane.x, pane.right().saturating_sub(1)) - pane.x;
-        // Pin the extent to the now-revealed edge line in `from_bottom`
-        // terms, which the new scroll offset gives directly: the bottom
-        // visible line sits `offset` lines up from the newest line, the top
-        // visible line `offset + height - 1`. Deriving it from the offset
-        // (not the stale pre-scroll `total_lines`) keeps it correct even
-        // before the next frame re-captures.
-        let offset = self.preview_scroll_offset as usize;
-        let from_bottom = if at_top {
-            offset + (pane.height as usize).saturating_sub(1)
-        } else {
-            offset
-        };
-        if let Some(sel) = self.preview_selection.as_mut() {
-            sel.extent = (col_off, from_bottom);
-        }
-        true
+        false
     }
 
     /// Shift the preview scroll offset by `delta` lines (positive scrolls
@@ -741,9 +767,18 @@ impl HomeView {
     /// handlers so the edge auto-scroll can move the pane without dragging
     /// the whole `handle_scroll_*` routing along with it.
     fn scroll_preview_offset(&mut self, delta: i32) -> bool {
-        let cache = self.active_preview_cache();
-        let visible_height = cache.dimensions.1.saturating_sub(1) as usize;
-        let real_max = cache.captured_lines.saturating_sub(visible_height) as i32;
+        // Use the same rendered output-body height the per-frame clamp uses
+        // (`clamp_scroll_to_capture`), NOT `dimensions.1 - 1`. The raw-height
+        // `- 1` over-counts the max offset by a row, so on an alternate-screen
+        // agent with no scrollback this would grant a phantom 1-row offset that
+        // render erases every frame: the offset oscillates 0->1->0, the view
+        // never moves, and because it returns `true` the caller never falls
+        // through to the agent scroll-forward fallback.
+        let visible_height = self.preview_visible_rows;
+        let real_max = self
+            .active_preview_cache()
+            .captured_lines
+            .saturating_sub(visible_height) as i32;
         let new = (self.preview_scroll_offset as i32 + delta).clamp(0, real_max) as u16;
         if new == self.preview_scroll_offset {
             return false;
@@ -3406,6 +3441,34 @@ impl HomeView {
         self.send_to_preview_pane(key)
     }
 
+    /// During an edge-held preview selection over a full-screen
+    /// (alternate-screen) agent, the aoe capture-window scroll is inert (the
+    /// alternate screen has no scrollback, so `scroll_preview_offset` can't
+    /// move), so forward the SAME scroll input one wheel notch would, scrolling
+    /// the agent's OWN transcript. Mirrors `forward_wheel_to_preview` by reusing
+    /// `wheel_forward_key`: a mouse-tracking app gets a wheel-up/down mouse
+    /// report at the held cell (PageUp does nothing while it owns the mouse), a
+    /// no-mouse app gets `PageUp`/`PageDown`. `wheel_forward_key` also enforces
+    /// the alternate-screen gate, so a normal-buffer pane that has merely
+    /// bottomed out its scrollback never gets scroll input injected into its
+    /// shell. `up` selects the top-edge (scroll back) vs bottom-edge (scroll
+    /// forward) direction; `col`/`row` is the held pointer cell, mapped into the
+    /// pane for the mouse-byte encoding. Returns true when something was sent.
+    fn forward_scroll_to_preview(&self, up: bool, col: u16, row: u16) -> bool {
+        let Some(cursor) = self
+            .preview_capture_worker
+            .as_ref()
+            .and_then(|w| w.current_cursor())
+        else {
+            return false;
+        };
+        let Some(key) = wheel_forward_key(&cursor, up, self.preview_text_view.pane, col, row)
+        else {
+            return false;
+        };
+        self.send_to_preview_pane(key)
+    }
+
     /// Send a forwarded key/mouse-byte payload to the pane the preview is
     /// showing (`preview_capture_target`). The cursor and mapped coordinates
     /// describe THAT pane, so the bytes must go there. Route through the
@@ -3429,13 +3492,16 @@ impl HomeView {
     }
 
     /// The previewed agent's cursor when a mouse button event over the preview
-    /// should be forwarded to it instead of driving aoe's own UI: live-send
-    /// only, and the pane must be a full-screen app with mouse tracking on (the
-    /// same gate as the wheel's mouse-byte branch). `None` means let the event
-    /// fall through to aoe's handlers (selection, etc.). Returns the cursor so
-    /// the caller can read `mouse_sgr` for the encoding.
+    /// should be forwarded to it instead of driving aoe's own UI: the pane must
+    /// be a full-screen app with mouse tracking on (the same gate as the wheel's
+    /// mouse-byte branch). Works in passive preview too, not just live-send,
+    /// mirroring `forward_wheel_to_preview`: hovering a mouse agent and dragging
+    /// drives its native selection/scroll, and `send_to_preview_pane` forks a
+    /// one-shot send when there's no live-send worker. `None` means let the
+    /// event fall through to aoe's handlers (selection, etc.); Shift is the
+    /// caller's escape hatch back to aoe-side selection / copy. Returns the
+    /// cursor so the caller can read `mouse_sgr` for the encoding.
     fn preview_forwards_mouse(&self) -> Option<crate::tmux::PaneCursor> {
-        self.live_send.as_ref()?;
         let cursor = self
             .preview_capture_worker
             .as_ref()
@@ -4383,6 +4449,69 @@ impl HomeView {
                     self.start_live_send()
                 }
             }
+        }
+    }
+
+    /// A double-click on the preview pane opens/attaches the previewed session,
+    /// producing the SAME `Action` a sidebar double-click (or `Enter`) would, so
+    /// the two gestures match. Mirrors `handle_click`'s double-click detection
+    /// but keyed to the preview rect via its own `last_preview_click`, and gated
+    /// to a plain (no-Shift) left press over the preview with no overlay on top.
+    /// The previewed pane is always `selected_session`, so it activates the
+    /// right row without touching `cursor`. Returns the activation `Action` on
+    /// the second qualifying press on the SAME cell within
+    /// `DOUBLE_CLICK_THRESHOLD`, else `None` (a single press, whose timing it
+    /// records; the caller still forwards that press to a mouse-tracking
+    /// agent). Shift falls through so aoe's own preview selection runs, matching
+    /// the mouse-forward gate.
+    pub fn preview_double_click_action(
+        &mut self,
+        kind: crossterm::event::MouseEventKind,
+        modifiers: crossterm::event::KeyModifiers,
+        col: u16,
+        row: u16,
+    ) -> Option<Action> {
+        self.preview_double_click_action_at(std::time::Instant::now(), kind, modifiers, col, row)
+    }
+
+    /// Same as `preview_double_click_action`, but the caller supplies `now` so
+    /// unit tests can drive double-click detection deterministically.
+    pub(super) fn preview_double_click_action_at(
+        &mut self,
+        now: std::time::Instant,
+        kind: crossterm::event::MouseEventKind,
+        modifiers: crossterm::event::KeyModifiers,
+        col: u16,
+        row: u16,
+    ) -> Option<Action> {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        if !matches!(kind, MouseEventKind::Down(MouseButton::Left)) {
+            return None;
+        }
+        if modifiers.contains(crossterm::event::KeyModifiers::SHIFT) {
+            return None;
+        }
+        if self.has_non_live_send_overlay() || !self.hit_preview(col, row) {
+            return None;
+        }
+        // Match the SAME cell, not just the row: the sidebar can key by row
+        // because a row identifies an item, but a preview row is just a line of
+        // text, so two unrelated presses on the same line (different columns)
+        // must not count as a double-click.
+        let is_double = matches!(
+            self.last_preview_click,
+            Some((prev_time, prev_col, prev_row))
+                if prev_col == col
+                    && prev_row == row
+                    && now.duration_since(prev_time) <= DOUBLE_CLICK_THRESHOLD
+        );
+        if is_double {
+            // Reset so a triple-click doesn't immediately re-fire activation.
+            self.last_preview_click = None;
+            self.activate_selected_session()
+        } else {
+            self.last_preview_click = Some((now, col, row));
+            None
         }
     }
 

@@ -213,6 +213,134 @@ fn cursor_from_screen(screen: &vt100::Screen, rows: u16, cols: u16) -> PaneCurso
     }
 }
 
+/// Append the SGR parameters for one `vt100::Color` (foreground when `bg` is
+/// false, background when true) to `params`.
+fn push_color_params(params: &mut Vec<String>, color: vt100::Color, bg: bool) {
+    match color {
+        vt100::Color::Default => {}
+        vt100::Color::Idx(n) if n < 8 => {
+            params.push((u16::from(n) + if bg { 40 } else { 30 }).to_string());
+        }
+        vt100::Color::Idx(n) if n < 16 => {
+            params.push((u16::from(n - 8) + if bg { 100 } else { 90 }).to_string());
+        }
+        vt100::Color::Idx(n) => {
+            params.push(if bg { "48".into() } else { "38".into() });
+            params.push("5".into());
+            params.push(n.to_string());
+        }
+        vt100::Color::Rgb(r, g, b) => {
+            params.push(if bg { "48".into() } else { "38".into() });
+            params.push("2".into());
+            params.push(r.to_string());
+            params.push(g.to_string());
+            params.push(b.to_string());
+        }
+    }
+}
+
+/// Whether a cell carries any non-default styling (intensity, italic,
+/// underline, inverse, or a non-default fg/bg colour). A blank-but-styled cell
+/// is still visible: a background fill that runs to the edge of a row (a status
+/// bar, a selection) has no glyph yet must be drawn.
+fn cell_has_style(cell: &vt100::Cell) -> bool {
+    cell.bold()
+        || cell.dim()
+        || cell.italic()
+        || cell.underline()
+        || cell.inverse()
+        || !matches!(cell.fgcolor(), vt100::Color::Default)
+        || !matches!(cell.bgcolor(), vt100::Color::Default)
+}
+
+/// The SGR escape that reproduces a cell's attributes, or an empty string for a
+/// default (unstyled) cell.
+fn cell_sgr(cell: &vt100::Cell) -> String {
+    if !cell_has_style(cell) {
+        return String::new();
+    }
+    let mut params: Vec<String> = Vec::new();
+    if cell.bold() {
+        params.push("1".into());
+    }
+    if cell.dim() {
+        params.push("2".into());
+    }
+    if cell.italic() {
+        params.push("3".into());
+    }
+    if cell.underline() {
+        params.push("4".into());
+    }
+    if cell.inverse() {
+        params.push("7".into());
+    }
+    push_color_params(&mut params, cell.fgcolor(), false);
+    push_color_params(&mut params, cell.bgcolor(), true);
+    if params.is_empty() {
+        String::new()
+    } else {
+        format!("\x1b[{}m", params.join(";"))
+    }
+}
+
+/// Serialise one visible grid row to ANSI by walking its cells directly:
+/// explicit SGR plus a literal character (or a space for a blank cell). vt100's
+/// own `rows_formatted` encodes runs of blank cells as cursor-movement
+/// (`ESC [ n C`) and erase-char (`ESC [ n X`) sequences. `ansi_to_tui`, the
+/// downstream consumer that turns this string into a ratatui `Text`, ignores
+/// cursor movement, so every gap of padding collapsed and aligned TUIs rendered
+/// with their spaces stripped (#2433 regression). Emitting literal spaces keeps
+/// the column layout intact while preserving colour and intensity.
+fn row_to_ansi(screen: &vt100::Screen, row: u16, cols: u16) -> String {
+    // Trim trailing *unstyled* blank cells, mirroring `capture-pane`'s
+    // trailing-space trim, so a row never carries a full width of padding into
+    // ratatui's wrapper. A trailing blank that carries styling (a background
+    // fill running to the edge) is kept: it is drawn as a coloured space below,
+    // exactly as a mid-row styled blank already is.
+    let mut last = 0u16;
+    for col in 0..cols {
+        if screen
+            .cell(row, col)
+            .is_some_and(|cell| cell.has_contents() || cell_has_style(cell))
+        {
+            last = col + 1;
+        }
+    }
+
+    let mut out = String::new();
+    let mut cur_sgr: Option<String> = None;
+    let mut col = 0u16;
+    while col < last {
+        let Some(cell) = screen.cell(row, col) else {
+            out.push(' ');
+            col += 1;
+            continue;
+        };
+        // The trailing half of a wide character carries no contents of its own;
+        // the lead cell already emitted the glyph that spans both columns.
+        if cell.is_wide_continuation() {
+            col += 1;
+            continue;
+        }
+        let sgr = cell_sgr(cell);
+        if cur_sgr.as_deref() != Some(sgr.as_str()) {
+            // Reset first so a previous cell's attributes never bleed into this
+            // one, then apply this cell's own (possibly empty) escape.
+            out.push_str("\x1b[0m");
+            out.push_str(&sgr);
+            cur_sgr = Some(sgr);
+        }
+        if cell.has_contents() {
+            out.push_str(cell.contents());
+        } else {
+            out.push(' ');
+        }
+        col += if cell.is_wide() { 2 } else { 1 };
+    }
+    out
+}
+
 /// Assemble the last `max_lines` rows of (scrollback + visible screen) as
 /// per-row ANSI, and return that plus the full scrollback depth. vt100 only
 /// formats the *visible* window, so we read it at successive scrollback offsets
@@ -242,10 +370,11 @@ fn grid_content(
         let real = offset.min(total_sb);
         parser.screen_mut().set_scrollback(real);
         let base = total_sb - real; // absolute index of this window's top row
-        for (r, row) in parser.screen().rows_formatted(0, cols).enumerate() {
+        let screen = parser.screen();
+        for r in 0..h {
             let g = base + r;
             if g < total {
-                buf[g] = Some(String::from_utf8_lossy(&row).into_owned());
+                buf[g] = Some(row_to_ansi(screen, r as u16, cols));
             }
         }
         if real >= total_sb || base <= target_low {
@@ -589,6 +718,63 @@ impl Drop for VtChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grid_content_preserves_interior_padding() {
+        // A TUI lays a row out by positioning the cursor, not by writing runs of
+        // spaces: "A" at col 0, then jump the cursor to col 11 (`ESC[12G`) and
+        // write "B". The 10 cells in between are *default* (never written), so
+        // vt100's `rows_formatted` skips them with `ESC[10C` (cursor forward).
+        // `ansi_to_tui` ignores cursor movement, so the gap collapsed to "AB"
+        // and aligned UIs lost their spacing (#2433). The literal serialiser
+        // must emit those columns as real spaces.
+        let mut p = vt100::Parser::new(2, 20, 0);
+        p.process(b"A\x1b[12GB");
+        let (content, _) = grid_content(&mut p, 2, 20, 2);
+        assert!(
+            content.contains("A          B"),
+            "interior padding collapsed:\n{content:?}"
+        );
+        // No cursor-forward escape may leak into preview content.
+        assert!(
+            !content.contains("\x1b[10C") && !content.contains("\x1b[C"),
+            "cursor-forward escape leaked:\n{content:?}"
+        );
+    }
+
+    #[test]
+    fn grid_content_preserves_color() {
+        // SGR 31 (red fg) on "X" must round-trip as an SGR escape, not a bare
+        // cursor move, so colour survives into the preview.
+        let mut p = vt100::Parser::new(2, 20, 0);
+        p.process(b"\x1b[31mX\x1b[0m");
+        let (content, _) = grid_content(&mut p, 2, 20, 2);
+        assert!(content.contains('X'), "glyph missing:\n{content:?}");
+        assert!(
+            content.contains("\x1b[31m") || content.contains("31m"),
+            "red foreground lost:\n{content:?}"
+        );
+    }
+
+    #[test]
+    fn grid_content_keeps_trailing_styled_fill() {
+        // "Hi" then a blue background erased to the end of the line (`ESC[K`
+        // with a bg set): cols 2..10 carry a bgcolor but no glyph, like a status
+        // bar or selection that runs to the right edge. They must survive as
+        // coloured spaces, not be trimmed as if blank.
+        let mut p = vt100::Parser::new(2, 10, 0);
+        p.process(b"Hi\x1b[44m\x1b[K");
+        let (content, _) = grid_content(&mut p, 2, 10, 2);
+        let first = content.split('\n').next().unwrap_or("");
+        assert!(
+            first.contains("44m"),
+            "trailing background fill dropped:\n{content:?}"
+        );
+        assert!(
+            first.matches(' ').count() >= 8,
+            "trailing fill should keep its eight cells as spaces:\n{content:?}"
+        );
+    }
 
     #[test]
     fn grid_content_assembles_scrollback_and_screen() {

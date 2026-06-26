@@ -286,7 +286,13 @@ body {
 .acp-markdown pre {
   margin: 0.5rem 0;
   border-radius: 0.375rem;
-  overflow: hidden;
+  /* overflow-x: auto (not hidden) so a fenced code block wider than the
+     bubble scrolls horizontally instead of clipping its long lines. `hidden`
+     here outranked the `overflow-x-auto` utility on the plain <pre> and
+     clipped shiki's inner <pre> before its wrapper could scroll. The radius
+     still clips the corners; no fixed height means no vertical scrollbar.
+     See #2443. */
+  overflow-x: auto;
   border: 1px solid var(--color-surface-700);
   background: var(--color-surface-950);
 }

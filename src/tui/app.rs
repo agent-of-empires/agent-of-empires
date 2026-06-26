@@ -970,11 +970,44 @@ impl App {
                                     continue;
                                 }
                             }
-                            // Mouse-tracking agent in live-send: forward the
-                            // press / drag / release straight to it, exactly as
-                            // a direct attach would. Shift falls through to
-                            // aoe's own preview text-selection. Consumes the
-                            // event when it forwards.
+                            // A double-click on the preview pane opens/attaches
+                            // the previewed session, the same as a sidebar
+                            // double-click. Checked BEFORE forwarding so the
+                            // agent doesn't swallow the second press; a single
+                            // press records its timing here and falls through to
+                            // the forward path below.
+                            if let Some(action) = self.home.preview_double_click_action(
+                                mouse.kind,
+                                mouse.modifiers,
+                                mouse.column,
+                                mouse.row,
+                            ) {
+                                let _ = self.home.clear_preview_selection();
+                                self.execute_action(action, terminal)?;
+                                // Mirror the list double-click path: an acp
+                                // session only stashes its id, so drain and open
+                                // the structured view here too.
+                                #[cfg(feature = "serve")]
+                                if let Some(session_id) =
+                                    self.pending_structured_view_open.take()
+                                {
+                                    self.run_structured_view(&session_id, terminal).await?;
+                                }
+                                self.sync_mouse_capture(terminal)?;
+                                if self.should_quit {
+                                    break;
+                                }
+                                if !self.needs_redraw {
+                                    self.draw(terminal)?;
+                                }
+                                continue;
+                            }
+                            // Mouse-tracking agent under the preview (live-send
+                            // OR passive hover): forward the press / drag /
+                            // release straight to it, exactly as a direct attach
+                            // would, so its native selection / scroll works.
+                            // Shift falls through to aoe's own preview text-
+                            // selection. Consumes the event when it forwards.
                             if self.home.forward_mouse_to_preview(
                                 mouse.kind,
                                 mouse.modifiers,
