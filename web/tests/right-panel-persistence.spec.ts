@@ -1,15 +1,24 @@
 import { test, expect } from "./helpers/mockedTest";
 
-const LAYOUT_KEY = "aoe-pane-layout";
+const V1_KEY = "aoe-pane-layout"; // pre-#2437 per-pane {open, dock} shape
+const V2_KEY = "aoe-pane-layout-v2";
 const LEGACY_KEY = "aoe-right-collapsed";
+const SESSION = "pinch-test";
 
-// The stored layout is `{ diff: { open, dock }, ... }`; these tests only assert
-// the open flags, so flatten each pane to its boolean `open`.
+// The v2 layout is per-session tab groups. These tests assert only whether the
+// diff / terminal kinds are open for the active session, so flatten the active
+// session's tabs (falling back to the template before it is seeded) to booleans.
 async function getLayout(page: import("@playwright/test").Page) {
-  const raw = await page.evaluate((k) => localStorage.getItem(k), LAYOUT_KEY);
+  const raw = await page.evaluate((k) => localStorage.getItem(k), V2_KEY);
   if (!raw) return null;
-  const parsed = JSON.parse(raw) as Record<string, { open: boolean }>;
-  return Object.fromEntries(Object.entries(parsed).map(([k, v]) => [k, v.open]));
+  const store = JSON.parse(raw) as {
+    template?: { right?: { tabs: string[] }[]; bottom?: { tabs: string[] }[] };
+    sessions?: Record<string, { right?: { tabs: string[] }[]; bottom?: { tabs: string[] }[] }>;
+  };
+  const layout = store.sessions?.[SESSION] ?? store.template;
+  if (!layout) return null;
+  const tabs = [...(layout.right?.[0]?.tabs ?? []), ...(layout.bottom?.[0]?.tabs ?? [])];
+  return { diff: tabs.includes("diff"), terminal: tabs.some((t) => t.startsWith("terminal:")) };
 }
 
 test.describe("Right dock pane-layout persistence", () => {
@@ -37,10 +46,7 @@ test.describe("Right dock pane-layout persistence", () => {
 
   test("stored layout overrides the mobile viewport default", async ({ page }) => {
     await page.setViewportSize({ width: 375, height: 812 });
-    await page.addInitScript(
-      (k) => localStorage.setItem(k, JSON.stringify({ diff: true, terminal: true })),
-      LAYOUT_KEY,
-    );
+    await page.addInitScript((k) => localStorage.setItem(k, JSON.stringify({ diff: true, terminal: true })), V1_KEY);
     await page.goto("/");
     await expect(page.locator("header")).toBeVisible();
     expect(await getLayout(page)).toEqual({ diff: true, terminal: true });
@@ -48,7 +54,8 @@ test.describe("Right dock pane-layout persistence", () => {
 
   test("keyboard toggle flips the diff pane and survives reload", async ({ page }) => {
     await page.setViewportSize({ width: 1280, height: 720 });
-    await page.goto("/");
+    // Per-session layout: toggles need an active session, so open one directly.
+    await page.goto(`/session/${SESSION}`);
     await expect(page.locator("header")).toBeVisible();
     expect(await getLayout(page)).toEqual({ diff: true, terminal: true });
 

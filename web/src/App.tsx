@@ -1085,12 +1085,21 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       return;
     }
 
-    if (target === "paired" && !terminalOpen) {
-      // Terminal pane is closed, so the paired shell is unmounted. Set the
-      // pending intent so PairedTerminal grabs focus once it mounts and its
-      // PTY is ready, then open the terminal pane.
+    if (target === "paired") {
+      // The paired shell only mounts when a terminal tab is the active tab of
+      // its dock. Latch the focus intent, then ensure a terminal tab exists and
+      // is active so it mounts; PairedTerminal grabs focus once its PTY is ready.
       setPendingTerminalFocus("paired");
-      openTab(terminalTabId(0), "right");
+      const termTab =
+        (["right", "bottom"] as DockLocation[]).flatMap((d) => dockTabs(paneLayout, d)).find(isTerminalTabId) ??
+        terminalTabId(0);
+      const termDock = dockOf(paneLayout, termTab);
+      if (termDock) {
+        activateTab(termDock, termTab);
+        requestAnimationFrame(() => dispatchFocusTerminal("paired"));
+      } else {
+        openTab(termTab, "right");
+      }
       return;
     }
     if (target === "agent" && selectedFilePath) {
@@ -1102,7 +1111,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       return;
     }
     dispatchFocusTerminal(target);
-  }, [activeSessionId, singlePane, terminalOpen, openTab, selectedFilePath]);
+  }, [activeSessionId, singlePane, paneLayout, openTab, activateTab, selectedFilePath]);
 
   useKeyboardShortcuts(
     useCallback(

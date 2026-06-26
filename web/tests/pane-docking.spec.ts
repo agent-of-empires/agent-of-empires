@@ -1,8 +1,9 @@
-// The dockable pane system (JetBrains-style): an activity-bar strip toggles
-// each pane, panes move between the right and bottom docks, and a plugin's
-// `pane` slot renders as a first-class dockable tool-window with an action
-// button that round-trips to the worker. Mocked (no daemon); the plugin
-// UI-state poll is stubbed so the test owns the plugin entry it renders.
+// The dockable pane system (JetBrains-style): docks render their panes as a
+// tab strip, an activity-bar strip toggles each pane kind, panes move between
+// the right and bottom docks, terminals open as multiple tabs, and a plugin's
+// `pane` slot is a first-class tab with an action button that round-trips to
+// the worker. Mocked (no daemon); the plugin UI-state poll is stubbed so the
+// test owns the plugin entry it renders.
 
 import { test, expect } from "./helpers/mockedTest";
 import type { Page } from "@playwright/test";
@@ -88,13 +89,33 @@ test.describe("Dockable pane system", () => {
 
     await page.goto(`/session/${SESSION}`);
 
-    // The plugin pane gets its own activity-bar toggle and renders its body.
+    // The plugin pane gets its own activity-bar toggle and a dock tab.
     const paneId = "plugin:acme.demo:demo_pane";
     await expect(page.locator(`[data-testid="pane-toggle-${paneId}"]`)).toBeVisible();
+    // Only the active tab's body mounts, so activate the plugin tab first.
+    await page.getByTestId(`pane-tab-${paneId}`).click();
     await expect(page.locator('[data-testid="plugin-pane-body"][data-plugin-id="acme.demo"]')).toBeVisible();
 
     // Clicking the pane's action button forwards its method to the worker.
     await page.getByTestId("plugin-pane-action").click();
     await expect.poll(() => actionBody?.method).toBe("demo.reload");
+  });
+
+  test("the new-terminal button opens a second terminal tab that can be closed", async ({ page }) => {
+    await openSession(page);
+    await page.goto(`/session/${SESSION}`);
+
+    // Default right dock has the primary terminal tab.
+    await expect(page.getByTestId("pane-tab-terminal:0")).toBeVisible();
+    await expect(page.getByTestId("pane-tab-terminal:1")).toHaveCount(0);
+
+    // The "+" in the strip allocates a fresh terminal instance.
+    await page.getByLabel("New terminal").first().click();
+    await expect(page.getByTestId("pane-tab-terminal:1")).toBeVisible();
+
+    // Closing the extra terminal tab removes it; the primary one stays.
+    await page.getByLabel("Close terminal 2").click();
+    await expect(page.getByTestId("pane-tab-terminal:1")).toHaveCount(0);
+    await expect(page.getByTestId("pane-tab-terminal:0")).toBeVisible();
   });
 });

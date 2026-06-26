@@ -34,14 +34,15 @@ async function focusedKind(page: Page): Promise<"agent" | "paired" | null> {
 }
 
 async function focusKind(page: Page, kind: "agent" | "paired") {
-  const target = kind === "paired" ? "paired-visible" : "agent";
-  if (target === "agent") {
+  if (kind === "agent") {
     await page.locator('[data-term="agent"]').first().locator("textarea").focus();
     return;
   }
-  // The paired panel renders once (the inline desktop split copy); on
-  // mobile it is promoted into the single pane. Filter by visibility to
-  // hit whichever instance the user would actually use.
+  // Tabbed docks (#2437): the paired shell mounts only when its terminal tab is
+  // the active tab, so activate it first (desktop). On mobile the picker handles
+  // it and there is no tab strip.
+  const termTab = page.locator('[data-testid^="pane-tab-terminal:"]').first();
+  if (await termTab.count()) await termTab.click();
   const visiblePaired = page.locator('[data-term="paired"]:visible').first();
   await visiblePaired.locator("textarea").focus();
 }
@@ -65,7 +66,7 @@ test.describe("Cmd/Ctrl+` desktop", () => {
     await mockTerminalApis(page);
     await page.goto("/");
     await openSession(page);
-    await expect(page.locator('[data-term="paired"]')).toHaveCount(1);
+    // The paired shell mounts on demand once its tab is active (tabbed docks).
 
     await focusKind(page, "agent");
     await expect.poll(() => focusedKind(page)).toBe("agent");
@@ -145,7 +146,9 @@ test.describe("Cmd/Ctrl+` desktop", () => {
     await clickSidebarSession(page, "pinch-test");
 
     // Wait for paired to be ready (its ensureTerminal isn't delayed); use
-    // it as the focus source so target=agent.
+    // it as the focus source so target=agent. Activate its tab first so the
+    // paired shell mounts (tabbed docks #2437).
+    await page.locator('[data-testid^="pane-tab-terminal:"]').first().click();
     const paired = page.locator('[data-term="paired"]:visible').first();
     await expect(paired.locator("[data-live-terminal]")).toBeVisible();
     await paired.locator("textarea").focus();

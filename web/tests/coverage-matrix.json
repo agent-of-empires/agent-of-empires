@@ -14,7 +14,7 @@
       "kind": "vitest",
       "risk": "medium",
       "specs": ["src/components/__tests__/Dock.test.tsx"],
-      "components": ["web/src/components/Dock.tsx", "web/src/components/PaneFrame.tsx"]
+      "components": ["web/src/components/Dock.tsx"]
     },
     {
       "id": "app-shell.bottom-dock",
@@ -31,7 +31,7 @@
       "components": [
         "web/src/components/ActivityBar.tsx",
         "web/src/components/Dock.tsx",
-        "web/src/components/PaneFrame.tsx",
+        "web/src/components/BottomDock.tsx",
         "web/src/components/plugin/PluginSlots.tsx"
       ]
     },

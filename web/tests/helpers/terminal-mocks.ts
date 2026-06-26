@@ -86,7 +86,10 @@ export async function mockTerminalApis(page: Page, opts: { liveHistory?: number 
     });
   });
   await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));
-  await page.route("**/api/sessions/*/terminal", (r) => r.fulfill({ status: 200, body: "" }));
+  // Matches the bare path plus the `?index=N` query (#2437) for POST ensure and
+  // DELETE kill, and the container-terminal variant.
+  await page.route("**/api/sessions/*/terminal*", (r) => r.fulfill({ status: 200, body: "" }));
+  await page.route("**/api/sessions/*/container-terminal*", (r) => r.fulfill({ status: 200, body: "" }));
   await page.route("**/api/sessions/*/diff/files", (r) =>
     r.fulfill({ json: { files: [], per_repo_bases: [], warning: null } }),
   );
@@ -109,7 +112,7 @@ export async function mockTerminalApis(page: Page, opts: { liveHistory?: number 
   // Capture-snapshot live view (mobile). Replies to resize/window control
   // messages with a frame sized accordingly so the component always has
   // content to render, mirroring src/server/live_ws.rs.
-  await page.routeWebSocket(/\/sessions\/.*\/live-ws$/, (ws) => {
+  await page.routeWebSocket(/\/sessions\/.*\/live-ws(\?.*)?$/, (ws) => {
     liveSockets.push(ws);
     let rows = 24;
     let window = 24;
