@@ -127,10 +127,46 @@ export function setActive(layout: DockLayout, dock: DockLocation, tabId: TabId):
   return next;
 }
 
+function clampIndex(index: number, max: number): number {
+  return Math.max(0, Math.min(Math.floor(index), max));
+}
+
+/** Move `tabId` to position `toIndex` in `toDock`. Subsumes both within-dock
+ *  reorder (toDock equals the source dock) and cross-dock move. `toIndex` is the
+ *  index in the destination group *after* the tab is removed from its source.
+ *
+ *  Active-tab rule: a within-dock reorder keeps whatever was active (including
+ *  the dragged tab itself), so dragging a background tab never steals focus; a
+ *  cross-dock move activates the tab in its destination, since it would
+ *  otherwise land hidden behind the destination's active tab. Implemented
+ *  directly rather than via removeTab so a move never marks a plugin tab as
+ *  explicitly closed. */
+export function placeTab(layout: DockLayout, tabId: TabId, toDock: DockLocation, toIndex: number): DockLayout {
+  const fromDock = dockOf(layout, tabId);
+  if (!fromDock) return layout;
+  const next = clone(layout);
+  const source = next[fromDock][0]!;
+  const fromIndex = source.tabs.indexOf(tabId);
+  if (fromIndex < 0) return layout;
+  const wasActive = source.active === tabId;
+  source.tabs.splice(fromIndex, 1);
+  if (wasActive) {
+    // Source loses its active tab: prefer the tab that shifted into the slot,
+    // else the new last tab. (Overridden below for a within-dock reorder.)
+    source.active = source.tabs[fromIndex] ?? source.tabs[source.tabs.length - 1] ?? null;
+  }
+  pruneEmpty(next, fromDock);
+  const dest = ensureGroup(next, toDock);
+  dest.tabs.splice(clampIndex(toIndex, dest.tabs.length), 0, tabId);
+  if (fromDock !== toDock || wasActive || dest.active === null) dest.active = tabId;
+  next.closedPlugins = next.closedPlugins.filter((id) => id !== tabId);
+  return next;
+}
+
 export function moveTab(layout: DockLayout, tabId: TabId, toDock: DockLocation): DockLayout {
   const from = dockOf(layout, tabId);
   if (!from || from === toDock) return layout;
-  return addTab(removeTab(layout, tabId), toDock, tabId);
+  return placeTab(layout, tabId, toDock, dockTabs(layout, toDock).length);
 }
 
 /** Allocate a fresh terminal tab in `dock` and return its id + new layout. */
@@ -239,11 +275,26 @@ function normalizeGroups(v: unknown): PaneGroup[] {
   return [merged];
 }
 
+/** Drop from `group` any tab id already claimed by an earlier dock. A tab must
+ *  live in exactly one dock; a corrupted store with the same id in both would
+ *  hand dnd-kit duplicate sortable ids and break dragging. */
+function dropDuplicates(group: PaneGroup[], seen: Set<TabId>): PaneGroup[] {
+  return group
+    .map((g) => {
+      const tabs = g.tabs.filter((t) => !seen.has(t));
+      tabs.forEach((t) => seen.add(t));
+      const active = g.active && tabs.includes(g.active) ? g.active : (tabs[0] ?? null);
+      return { tabs, active };
+    })
+    .filter((g) => g.tabs.length > 0);
+}
+
 function normalizeDock(v: unknown): DockLayout {
   const o = (v && typeof v === "object" ? v : {}) as Record<string, unknown>;
+  const seen = new Set<TabId>();
   return {
-    right: normalizeGroups(o.right),
-    bottom: normalizeGroups(o.bottom),
+    right: dropDuplicates(normalizeGroups(o.right), seen),
+    bottom: dropDuplicates(normalizeGroups(o.bottom), seen),
     nextTerminalIndex:
       typeof o.nextTerminalIndex === "number" && o.nextTerminalIndex >= 1 ? Math.floor(o.nextTerminalIndex) : 1,
     closedPlugins: Array.isArray(o.closedPlugins)
@@ -281,6 +332,8 @@ export interface PaneLayoutApi {
   closeTab: (tabId: TabId) => void;
   activateTab: (dock: DockLocation, tabId: TabId) => void;
   moveTab: (tabId: TabId, toDock: DockLocation) => void;
+  /** Reorder within a dock or move across docks, landing at `toIndex`. */
+  placeTab: (tabId: TabId, toDock: DockLocation, toIndex: number) => void;
   /** Activity-bar toggle for a built-in kind ("diff" or "terminal"). */
   toggleKind: (kind: "diff" | "terminal", defaultDock: DockLocation) => void;
   /** Add/remove a plugin pane tab (activity-bar toggle). */
@@ -325,6 +378,10 @@ export function usePaneLayout(sessionId: string | null): PaneLayoutApi {
     (tabId: TabId, toDock: DockLocation) => mutate((l) => moveTab(l, tabId, toDock)),
     [mutate],
   );
+  const placeTabCb = useCallback(
+    (tabId: TabId, toDock: DockLocation, toIndex: number) => mutate((l) => placeTab(l, tabId, toDock, toIndex)),
+    [mutate],
+  );
   const toggleKind = useCallback(
     (kind: "diff" | "terminal", defaultDock: DockLocation) =>
       mutate((l) => {
@@ -353,6 +410,7 @@ export function usePaneLayout(sessionId: string | null): PaneLayoutApi {
     closeTab,
     activateTab,
     moveTab: moveTabCb,
+    placeTab: placeTabCb,
     toggleKind,
     togglePlugin,
     syncPlugins,

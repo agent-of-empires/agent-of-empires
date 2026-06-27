@@ -8,6 +8,7 @@ import {
   dockOf,
   dockTabs,
   moveTab,
+  placeTab,
   removeAllTerminals,
   removeTab,
   setActive,
@@ -56,6 +57,67 @@ describe("pane layout pure ops", () => {
     l = moveTab(l, "diff", "bottom");
     expect(dockOf(l, "diff")).toBe("bottom");
     expect(dockTabs(l, "right")).toEqual([]);
+  });
+
+  it("placeTab reorders within a dock without changing the active tab", () => {
+    let l = addTab(emptyLayout(), "right", "a");
+    l = addTab(l, "right", "b");
+    l = addTab(l, "right", "c");
+    l = setActive(l, "right", "a");
+    // Drag "a" to the end. toIndex is the post-removal index, so end == 2.
+    l = placeTab(l, "a", "right", 2);
+    expect(dockTabs(l, "right")).toEqual(["b", "c", "a"]);
+    // Reordering the active tab keeps it active.
+    expect(l.right[0]!.active).toBe("a");
+  });
+
+  it("placeTab reordering a background tab keeps the existing active tab", () => {
+    let l = addTab(emptyLayout(), "right", "a");
+    l = addTab(l, "right", "b");
+    l = addTab(l, "right", "c");
+    l = setActive(l, "right", "a");
+    l = placeTab(l, "c", "right", 0);
+    expect(dockTabs(l, "right")).toEqual(["c", "a", "b"]);
+    expect(l.right[0]!.active).toBe("a");
+  });
+
+  it("placeTab moves a tab across docks at an index and activates it there", () => {
+    let l = addTab(emptyLayout(), "right", "a");
+    l = addTab(l, "right", "b");
+    l = addTab(l, "bottom", "x");
+    l = addTab(l, "bottom", "y");
+    l = setActive(l, "right", "a");
+    l = setActive(l, "bottom", "x");
+    // Move right's active "a" between x and y.
+    l = placeTab(l, "a", "bottom", 1);
+    expect(dockTabs(l, "right")).toEqual(["b"]);
+    expect(dockTabs(l, "bottom")).toEqual(["x", "a", "y"]);
+    // Moved tab activates in its destination.
+    expect(l.bottom[0]!.active).toBe("a");
+    // Source falls back to a neighbor.
+    expect(l.right[0]!.active).toBe("b");
+  });
+
+  it("placeTab clamps an out-of-range index and prunes an emptied source dock", () => {
+    let l = addTab(emptyLayout(), "right", "only");
+    l = placeTab(l, "only", "bottom", 99);
+    expect(l.right).toEqual([]);
+    expect(dockTabs(l, "bottom")).toEqual(["only"]);
+  });
+
+  it("placeTab does not mark a moved plugin tab as closed", () => {
+    let l = addTab(emptyLayout(), "right", "plugin:p:a");
+    l = placeTab(l, "plugin:p:a", "bottom", 0);
+    expect(dockOf(l, "plugin:p:a")).toBe("bottom");
+    expect(l.closedPlugins).not.toContain("plugin:p:a");
+  });
+
+  it("moveTab appends to the destination and is a no-op within the same dock", () => {
+    let l = addTab(emptyLayout(), "bottom", "x");
+    l = addTab(l, "right", "a");
+    l = moveTab(l, "a", "bottom");
+    expect(dockTabs(l, "bottom")).toEqual(["x", "a"]);
+    expect(moveTab(l, "a", "bottom")).toBe(l);
   });
 
   it("removeAllTerminals clears every terminal tab but keeps others", () => {
@@ -110,6 +172,27 @@ describe("usePaneLayout migration + persistence", () => {
     // s1's addition round-trips through localStorage.
     const reloaded = renderHook(() => usePaneLayout("s1"));
     expect(dockTabs(reloaded.result.current.layout, "right")).toContain("terminal:1");
+  });
+
+  it("drops a tab id duplicated across docks on load (keeps the first dock)", () => {
+    localStorage.setItem(
+      "aoe-pane-layout-v2",
+      JSON.stringify({
+        version: 2,
+        template: { right: [], bottom: [], nextTerminalIndex: 1, closedPlugins: [] },
+        sessions: {
+          s1: {
+            right: [{ tabs: ["diff", "terminal:0"], active: "diff" }],
+            bottom: [{ tabs: ["diff"], active: "diff" }],
+            nextTerminalIndex: 1,
+            closedPlugins: [],
+          },
+        },
+      }),
+    );
+    const { result } = renderHook(() => usePaneLayout("s1"));
+    expect(dockTabs(result.current.layout, "right")).toEqual(["diff", "terminal:0"]);
+    expect(dockTabs(result.current.layout, "bottom")).toEqual([]);
   });
 
   it("toggleKind adds then removes the terminal tabs", () => {
