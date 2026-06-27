@@ -301,8 +301,9 @@ is unchanged, so an unvetted version of a reserved-namespace plugin is still
 refused (only a vetted release lifts that gate). A featured-verified install is
 the one case allowed to claim a reserved (`aoe.*` / `agent-of-empires.*`)
 namespace; a builtin-id collision is always rejected. To ship a new release, run
-`aoe plugin hash` against the new tag and add its `version = "sha256:..."` line
-to the entry. In debug builds `AOE_FEATURED_INDEX_PATH` overrides the embedded
+`aoe plugin hash` against the new tag and add a `"<version>" = "sha256:..."`
+entry inside the entry's `versions` map alongside the existing ones. In debug
+builds `AOE_FEATURED_INDEX_PATH` overrides the embedded
 index for tests; a release binary always uses the compiled-in index, since the
 curated set is a root of trust and must not be redefinable by the environment.
 
