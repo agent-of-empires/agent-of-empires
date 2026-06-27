@@ -1081,6 +1081,32 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         );
     }
 
+    // Trash retention sweep: auto-purge trashed sessions past their
+    // retention window. First tick fires immediately (startup sweep), then
+    // hourly. The daemon is the sole enforcer so there is no multi-process
+    // purge race; without a daemon, expired trash is purged on the next
+    // daemon start or by an explicit manual purge. See #2489.
+    {
+        let sweep_state = state.clone();
+        let shutdown = state.shutdown.clone();
+        crate::task_util::spawn_supervised(
+            "server.trash_retention_sweep",
+            crate::task_util::PanicPolicy::Log,
+            async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            crate::server::api::purge_expired_trash(&sweep_state).await;
+                        }
+                        _ = shutdown.cancelled() => break,
+                    }
+                }
+            },
+        );
+    }
+
     if let Some((lock, candidates)) = recovery_inputs {
         // Background mark-refresher (#1264). Re-stamps every still-pending
         // candidate in `recently_restarted` every RECENTLY_RESTARTED_TTL / 2
@@ -1447,6 +1473,8 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/api/sessions/{id}/snooze",
             patch(api::update_session_snooze),
         )
+        .route("/api/sessions/{id}/trash", post(api::trash_session))
+        .route("/api/sessions/{id}/restore", post(api::restore_session))
         .route(
             "/api/sessions/{id}/unread",
             patch(api::update_session_unread),
