@@ -870,11 +870,7 @@ mod tests {
         let mut staircased = vt100::Parser::new(6, 40, 0);
         staircased.process(raw);
         assert_eq!(
-            staircased
-                .screen()
-                .cell(1, 0)
-                .map(|c| c.contents())
-                .as_deref(),
+            staircased.screen().cell(1, 0).map(|c| c.contents()),
             Some(""),
             "control: bare LF should staircase (row 1 col 0 empty)"
         );
@@ -882,17 +878,17 @@ mod tests {
         let mut fixed = vt100::Parser::new(6, 40, 0);
         fixed.process(&lf_to_crlf(raw));
         assert_eq!(
-            fixed.screen().cell(0, 0).map(|c| c.contents()).as_deref(),
+            fixed.screen().cell(0, 0).map(|c| c.contents()),
             Some("l"),
             "row 0 starts at col 0"
         );
         assert_eq!(
-            fixed.screen().cell(1, 0).map(|c| c.contents()).as_deref(),
+            fixed.screen().cell(1, 0).map(|c| c.contents()),
             Some("l"),
             "row 1 must start at col 0, not staircase"
         );
         assert_eq!(
-            fixed.screen().cell(2, 0).map(|c| c.contents()).as_deref(),
+            fixed.screen().cell(2, 0).map(|c| c.contents()),
             Some("R"),
             "prompt row starts at col 0"
         );

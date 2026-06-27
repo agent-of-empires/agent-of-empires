@@ -5546,7 +5546,7 @@ mod tests {
         // (11,6). A release is the button-agnostic 3.
         assert_eq!(
             mouse_event_bytes(0, false, false, false, pane, 10, 5),
-            vec![0x1b, b'[', b'M', 0 + 32, 11 + 32, 6 + 32]
+            vec![0x1b, b'[', b'M', 32, 11 + 32, 6 + 32]
         ); // left press
         assert_eq!(
             mouse_event_bytes(0, true, false, false, pane, 10, 5),
@@ -5554,7 +5554,7 @@ mod tests {
         ); // release => button 3
         assert_eq!(
             mouse_event_bytes(0, false, true, false, pane, 10, 5),
-            vec![0x1b, b'[', b'M', 0 + 32 + 32, 11 + 32, 6 + 32]
+            vec![0x1b, b'[', b'M', 32 + 32, 11 + 32, 6 + 32]
         ); // left drag => button 0 + motion bit 32
     }
 
