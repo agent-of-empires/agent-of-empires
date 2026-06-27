@@ -3992,9 +3992,57 @@ fn map_update_to_events(
         SessionUpdate::SessionInfoUpdate(_) => Vec::new(),
         // Variants we don't have a typed mapping for yet pass through as
         // RawAgentUpdate so the UI can render best-effort and we can
-        // narrow these as we go.
-        other => vec![raw_event(&other)],
+        // narrow these as we go. One exception: the Claude SDK reports an
+        // async sub-agent launch through this catch-all (an unmapped
+        // update whose `_meta.claudeCode.toolName == "Agent"`); promote it
+        // to a typed BackgroundAgentLaunched so the daemon can tail the
+        // agent's transcript and the UI can show a background-agents panel.
+        other => {
+            let payload = serde_json::to_value(&other).unwrap_or(serde_json::Value::Null);
+            match background_agent_launched_from_value(&payload) {
+                Some(event) => vec![event],
+                None => vec![Event::RawAgentUpdate { payload }],
+            }
+        }
     }
+}
+
+/// Detect a Claude async sub-agent launch in an otherwise-unmapped ACP
+/// update and build a typed `BackgroundAgentLaunched`. The launch arrives
+/// as `{ _meta: { claudeCode: { toolName: "Agent", toolResponse: {
+/// agentId, description, prompt, resolvedModel, outputFile, status:
+/// "async_launched" } } }, toolCallId }`. Returns `None` for anything
+/// else (the caller falls back to `RawAgentUpdate`). Field extraction is
+/// fully defensive: a missing `agentId` is the only hard requirement.
+fn background_agent_launched_from_value(v: &serde_json::Value) -> Option<Event> {
+    let cc = v.get("_meta")?.get("claudeCode")?;
+    if cc.get("toolName").and_then(|t| t.as_str()) != Some("Agent") {
+        return None;
+    }
+    let tr = cc.get("toolResponse")?;
+    if tr.get("status").and_then(|s| s.as_str()) != Some("async_launched") {
+        return None;
+    }
+    let agent_id = tr.get("agentId").and_then(|s| s.as_str())?.to_string();
+    let str_field = |key: &str| {
+        tr.get(key)
+            .and_then(|s| s.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    Some(Event::BackgroundAgentLaunched {
+        agent_id,
+        tool_call_id: v
+            .get("toolCallId")
+            .and_then(|s| s.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        description: str_field("description"),
+        prompt: str_field("prompt"),
+        model: str_field("resolvedModel"),
+        output_file: str_field("outputFile"),
+        started_at: chrono::Utc::now(),
+    })
 }
 
 /// Build a `ConfigOptionsUpdated` event from a session response's
@@ -4903,6 +4951,28 @@ async fn run_connection_task<W, R>(
                         .await;
                     }
                     for event in mapped_events {
+                        // An async sub-agent launch: spawn a tailer that
+                        // follows the agent's on-disk transcript and emits
+                        // BackgroundAgent{Progress,Completed}. The tailer
+                        // owns its own lifecycle (self-terminates on
+                        // completion, hard-idle, or when event_tx closes),
+                        // so it can never outlive the session. Skipped on
+                        // replay (the agent already finished). See
+                        // src/acp/background_agent.rs.
+                        if let Event::BackgroundAgentLaunched {
+                            agent_id,
+                            output_file,
+                            ..
+                        } = &event
+                        {
+                            if !suppressing && !output_file.is_empty() {
+                                crate::acp::background_agent::spawn_tailer(
+                                    agent_id.clone(),
+                                    output_file.clone(),
+                                    event_tx.clone(),
+                                );
+                            }
+                        }
                         // During the post-load replay window, drop only
                         // events that would reproduce the prior turns'
                         // visible transcript (assistant chunks, tool
@@ -9405,6 +9475,58 @@ mod tests {
             }
             other => panic!("expected ToolStarted, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn background_agent_launched_parsed_from_agent_meta() {
+        let payload = serde_json::json!({
+            "_meta": { "claudeCode": {
+                "toolName": "Agent",
+                "toolResponse": {
+                    "agentId": "a3d5ae46a7a0414b1",
+                    "description": "grep tmux mentions repo-wide",
+                    "prompt": "Grep the repo for tmux.",
+                    "resolvedModel": "claude-opus-4-8[1m]",
+                    "outputFile": "/tmp/x/tasks/a3d5ae46a7a0414b1.output",
+                    "status": "async_launched"
+                }
+            }},
+            "toolCallId": "toolu_012yUZykQT2vqFXZTvqWev5e"
+        });
+        match background_agent_launched_from_value(&payload) {
+            Some(Event::BackgroundAgentLaunched {
+                agent_id,
+                tool_call_id,
+                description,
+                model,
+                output_file,
+                ..
+            }) => {
+                assert_eq!(agent_id, "a3d5ae46a7a0414b1");
+                assert_eq!(tool_call_id, "toolu_012yUZykQT2vqFXZTvqWev5e");
+                assert_eq!(description, "grep tmux mentions repo-wide");
+                assert_eq!(model, "claude-opus-4-8[1m]");
+                assert!(output_file.ends_with(".output"));
+            }
+            other => panic!("expected BackgroundAgentLaunched, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn background_agent_launched_ignores_non_agent_meta() {
+        // A normal tool-response RawAgentUpdate must not be promoted.
+        let bash = serde_json::json!({
+            "_meta": { "claudeCode": { "toolName": "Bash", "toolResponse": {} } }
+        });
+        assert!(background_agent_launched_from_value(&bash).is_none());
+        // An Agent update that is not an async launch (no status) stays raw.
+        let sync = serde_json::json!({
+            "_meta": { "claudeCode": { "toolName": "Agent", "toolResponse": {
+                "agentId": "x"
+            }}}
+        });
+        assert!(background_agent_launched_from_value(&sync).is_none());
+        assert!(background_agent_launched_from_value(&serde_json::json!({})).is_none());
     }
 
     #[test]

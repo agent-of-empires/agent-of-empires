@@ -583,6 +583,12 @@ impl AcpTranscript {
             | Event::RateLimit { .. }
             | Event::UsageUpdated { .. }
             | Event::RawAgentUpdate { .. }
+            // Background async sub-agents surface in the web panel; the
+            // native structured view has no panel yet, so these are
+            // ambient no-ops here (followup work).
+            | Event::BackgroundAgentLaunched { .. }
+            | Event::BackgroundAgentProgress { .. }
+            | Event::BackgroundAgentCompleted { .. }
             | Event::WakeupScheduled { .. }
             | Event::MonitorArmed { .. }
             | Event::CancelRequested { .. }
