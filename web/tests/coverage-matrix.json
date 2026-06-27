@@ -1377,6 +1377,17 @@
       ]
     },
     {
+      "id": "acp.attachment-drafts",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/acp-attachment-draft.spec.ts"],
+      "components": [
+        "web/src/components/acp/AcpRuntime.tsx",
+        "web/src/components/acp/Composer.tsx",
+        "web/src/lib/acpDrafts.ts"
+      ]
+    },
+    {
       "id": "acp.approval",
       "kind": "live-playwright",
       "risk": "high",
