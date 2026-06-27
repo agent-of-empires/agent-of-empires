@@ -2261,9 +2261,9 @@ const NEXT_AXIS: Record<SidebarAxis, SidebarAxis> = {
 };
 
 const AXIS_HEADING: Record<SidebarAxis, string> = {
-  repo: "Projects",
+  repo: "Sessions",
   group: "Groups",
-  "repo+group": "Projects",
+  "repo+group": "Sessions",
 };
 
 const AXIS_TOOLTIP: Record<SidebarAxis, string> = {
@@ -2765,7 +2765,9 @@ export function WorkspaceSidebar({
         }`}
       >
         <div className="px-3 pt-3 pb-1 flex items-center">
-          <span className="text-sm text-text-muted flex-1">{AXIS_HEADING[axis]}</span>
+          <span data-testid="sidebar-axis-heading" className="text-sm text-text-muted flex-1">
+            {AXIS_HEADING[axis]}
+          </span>
           <Tooltip text={AXIS_TOOLTIP[axis]}>
             <button
               onClick={() => onAxisChange(NEXT_AXIS[axis])}

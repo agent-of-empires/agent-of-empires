@@ -152,10 +152,15 @@ test.describe("sidebar user-group axis (#1234)", () => {
     await expect(headers).toHaveCount(1);
     await expect(page.locator(ROW)).toHaveCount(3);
 
+    // The control-row heading names the repo axis "Sessions", not "Projects".
+    const axisHeading = page.getByTestId("sidebar-axis-heading");
+    await expect(axisHeading).toHaveText("Sessions");
+
     const axisToggle = page.locator(AXIS_TOGGLE);
     await expect(axisToggle).toHaveAttribute("data-axis", "repo");
     await axisToggle.click();
     await expect(axisToggle).toHaveAttribute("data-axis", "group");
+    await expect(axisHeading).toHaveText("Groups");
 
     // Group axis: two headers, keyed by group_path. All three rows stay
     // visible, now nested under their group.
