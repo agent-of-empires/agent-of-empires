@@ -6,7 +6,7 @@
 // sort-key and filter-facet slots render as sidebar sort options and a facet
 // filter (the sidebar owns those; see SidebarSortPicker / WorkspaceSidebar, #2401).
 
-import { createElement, useState } from "react";
+import { createElement, useId, useState } from "react";
 import { ChevronRight } from "lucide-react";
 
 import { invokePluginAction } from "../../lib/api";
@@ -325,6 +325,7 @@ function BlockComment({ block }: { block: Record<string, unknown> }) {
   const resolved = block.resolved === true;
   const safe = safeHref(str(block, "href"));
   const [expanded, setExpanded] = useState(false);
+  const bodyId = useId();
   if (!author && !body) return null;
   const where = path ? `${path}${line ? `:${line}` : ""}` : undefined;
   // ponytail: cheap length/newline heuristic instead of measuring layout, so the
@@ -348,16 +349,19 @@ function BlockComment({ block }: { block: Record<string, unknown> }) {
       {body && (
         // Clamp only when there is a toggle to undo it, so a short body that
         // still wraps past three lines is not truncated with no way to expand.
-        <div className={`mt-0.5 whitespace-pre-wrap text-text-primary ${longBody && !expanded ? "line-clamp-3" : ""}`}>
+        <div
+          id={bodyId}
+          className={`mt-0.5 whitespace-pre-wrap text-text-primary ${longBody && !expanded ? "line-clamp-3" : ""}`}
+        >
           {body}
         </div>
       )}
     </>
   );
   return (
-    <div className="rounded bg-surface-700/30 p-2 text-xs">
+    <div className="rounded-md bg-surface-700/30 p-2 text-xs">
       {safe ? (
-        <a className="block rounded hover:bg-surface-700/50" href={safe} target="_blank" rel="noopener noreferrer">
+        <a className="block rounded-md hover:bg-surface-700/50" href={safe} target="_blank" rel="noopener noreferrer">
           {linkContent}
         </a>
       ) : (
@@ -367,6 +371,8 @@ function BlockComment({ block }: { block: Record<string, unknown> }) {
         <button
           type="button"
           data-testid="plugin-comment-toggle"
+          aria-expanded={expanded}
+          aria-controls={bodyId}
           onClick={() => setExpanded((v) => !v)}
           className="mt-0.5 text-[10px] text-text-dim hover:text-text-primary cursor-pointer"
         >

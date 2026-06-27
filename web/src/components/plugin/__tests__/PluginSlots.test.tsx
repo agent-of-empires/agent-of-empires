@@ -367,9 +367,14 @@ describe("plugin slot renderers", () => {
     expect(body.className).toContain("line-clamp-3");
     const toggle = screen.getByTestId("plugin-comment-toggle");
     expect(toggle.textContent).toBe("more");
+    // Toggle state and the controlled body are exposed to assistive tech.
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(toggle.getAttribute("aria-controls")).toBe(body.id);
+    expect(body.id).toBeTruthy();
     fireEvent.click(toggle);
     expect(body.className).not.toContain("line-clamp-3");
     expect(toggle.textContent).toBe("less");
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
     fireEvent.click(toggle);
     expect(body.className).toContain("line-clamp-3");
   });
