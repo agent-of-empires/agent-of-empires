@@ -267,6 +267,26 @@ describe("plugin slot renderers", () => {
     expect(container.querySelector("section")).toBeTruthy();
   });
 
+  it("a collapsible section keeps the user's fold across a re-push (uncontrolled)", () => {
+    const entry: PluginUiEntry = {
+      plugin_id: "acme.kit",
+      slot: "pane",
+      id: "gh",
+      session_id: "s1",
+      payload: {
+        blocks: [{ kind: "section", title: "Checks", collapsible: true, children: [{ kind: "note", text: "ci" }] }],
+      },
+    };
+    const { container, rerender } = render(<PluginPaneBody entry={entry} />);
+    const details = container.querySelector("details") as HTMLDetailsElement;
+    expect(details.open).toBe(true);
+    // User folds it shut. The worker re-pushes the same pane state (a new object
+    // each poll); a controlled `open` would snap it back open.
+    details.open = false;
+    rerender(<PluginPaneBody entry={{ ...entry, payload: { ...entry.payload } }} />);
+    expect((container.querySelector("details") as HTMLDetailsElement).open).toBe(false);
+  });
+
   it("a section title renders a tone-tinted icon for at-a-glance status", async () => {
     const entry: PluginUiEntry = {
       plugin_id: "acme.kit",
