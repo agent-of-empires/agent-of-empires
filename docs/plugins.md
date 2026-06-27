@@ -77,12 +77,19 @@ prompts you once to grant that exact set. Run non-interactively with `--yes` to
 grant without prompting. A capability this version of aoe does not recognize is
 rejected rather than granted; upgrade aoe.
 
-A grant is pinned to the installed manifest. If an update changes the
-capability set, the plugin is left installed but inactive and
-`aoe plugin update <id>` re-prompts you to approve the new set. `aoe plugin
+A grant is pinned to the installed manifest. If an update expands what the
+plugin can do (new capabilities, changed build steps or UI slots, a runtime or
+trust change), it must be approved before the new version becomes active. You
+can approve in a terminal with `aoe plugin update <id>`, or in-app: the web
+dashboard's plugin settings and the TUI plugin manager show an Update action
+that opens an approval popup describing exactly what changed. Declining keeps
+the current version active and stops the prompt from reappearing until the next
+version. The approval is pinned to the exact fetched content, so an update that
+changed since you reviewed it is refused rather than applied. `aoe plugin
 install` and `aoe plugin update` report the resolved trust level (`featured`,
 `community`, or `local`) in their success output, and `aoe plugin list` and
-`aoe plugin info <id>` show each plugin's trust level and whether it is granted. An external plugin cannot use the reserved `aoe.*` /
+`aoe plugin info <id>` show each plugin's trust level and whether it is granted.
+An external plugin cannot use the reserved `aoe.*` /
 `agent-of-empires.*` id namespace.
 
 Resolved versions live in `<app_dir>/plugins.lock` (the exact commit, manifest
