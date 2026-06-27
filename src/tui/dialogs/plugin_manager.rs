@@ -205,7 +205,13 @@ impl PluginManagerDialog {
                 if let Some(consent) = self.consent.take() {
                     match crate::plugin::install::dismiss_update(&consent.id, &consent.fingerprint)
                     {
-                        Ok(()) => self.info = Some(format!("Declined update for {}.", consent.id)),
+                        Ok(()) => {
+                            // dismiss_update wrote plugin config; flag it so an
+                            // embedding settings surface resyncs and a later save
+                            // does not clobber the dismissal.
+                            self.mutated = true;
+                            self.info = Some(format!("Declined update for {}.", consent.id));
+                        }
                         Err(e) => self.error = Some(format!("{e:#}")),
                     }
                 }
@@ -398,8 +404,17 @@ impl PluginManagerDialog {
                                 self.start_apply(id, Some(fingerprint));
                             }
                         }
-                        Ok(UpdatePreview::ConsentRequired { consent, .. }) => {
-                            self.consent = Some(*consent);
+                        // An already-dismissed version must not re-prompt; it
+                        // surfaces again only when a new version appears.
+                        Ok(UpdatePreview::ConsentRequired { consent, dismissed }) => {
+                            if dismissed {
+                                self.info = Some(format!(
+                                    "Update for {} was already declined.",
+                                    consent.id
+                                ));
+                            } else {
+                                self.consent = Some(*consent);
+                            }
                         }
                         Err(message) => self.error = Some(message),
                     }
@@ -570,8 +585,13 @@ impl PluginManagerDialog {
             Style::default().fg(theme.dimmed),
         )));
 
-        let width = area.width.clamp(40, 72);
-        let height = (lines.len() as u16 + 2).clamp(8, area.height);
+        // A tiny terminal can be narrower/shorter than our preferred size;
+        // never pass clamp/centered_rect a max below the min (it panics).
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let width = area.width.clamp(1, 72);
+        let height = (lines.len() as u16).saturating_add(2).clamp(1, area.height);
         let rect = centered_rect(area, width, height);
         f.render_widget(Clear, rect);
         let block = Block::default()
