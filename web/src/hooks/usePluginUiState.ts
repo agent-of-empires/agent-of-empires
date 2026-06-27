@@ -20,8 +20,15 @@ function toast(n: PluginUiNotification): void {
   }
 }
 
+// A poll faster than this shows no refresh indicator: a background fetch that
+// settles in tens of milliseconds would otherwise strobe the indicator on and
+// off every cadence. Only a poll slow enough to be worth surfacing (network
+// latency, a rate-limited GitHub refresh) crosses the threshold and shows.
+const REFRESH_INDICATOR_DELAY = 250;
+
 export function usePluginUiState() {
   const [entries, setEntries] = useState<PluginUiEntry[]>([]);
+  const [isRefreshing, setIsRefreshing] = useState(false);
   // Highest notification seq already toasted. Seeded from the first snapshot so
   // a page load does not replay the whole backlog as fresh toasts.
   const lastNotifySeqRef = useRef<number | null>(null);
@@ -29,6 +36,7 @@ export function usePluginUiState() {
   useEffect(() => {
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
+    let slowTimer: ReturnType<typeof setTimeout> | null = null;
 
     const apply = (notifications: PluginUiNotification[]) => {
       const maxSeq = notifications.reduce((m, n) => Math.max(m, n.seq), 0);
@@ -52,21 +60,32 @@ export function usePluginUiState() {
     // response cannot land after a newer one and roll the dashboard back to
     // stale plugin UI. A failed fetch (null) just skips this round.
     const tick = async () => {
+      // Flip the indicator on only once the poll outlasts the threshold, so a
+      // fast fetch never shows it. Cleared in finally whether the fetch
+      // succeeds, returns null, or the threshold never fires.
+      slowTimer = setTimeout(() => {
+        if (!cancelled) setIsRefreshing(true);
+      }, REFRESH_INDICATOR_DELAY);
       try {
         const state = await fetchPluginUiState();
         if (cancelled || state === null) return;
         setEntries(state.entries);
         apply(state.notifications);
       } finally {
-        if (!cancelled) timer = setTimeout(() => void tick(), POLL_INTERVAL);
+        if (slowTimer) clearTimeout(slowTimer);
+        if (!cancelled) {
+          setIsRefreshing(false);
+          timer = setTimeout(() => void tick(), POLL_INTERVAL);
+        }
       }
     };
     void tick();
     return () => {
       cancelled = true;
       if (timer) clearTimeout(timer);
+      if (slowTimer) clearTimeout(slowTimer);
     };
   }, []);
 
-  return entries;
+  return { entries, isRefreshing };
 }
