@@ -32,6 +32,10 @@ kinds:
     allow/deny mix, agent switches, plan-mode use, queued prompts),
   - for `aoe serve` only, coarse deployment enums: auth mode (`token` /
     `passphrase` / `none`) and exposure (`tunnel` / `tailscale` / `local`),
+  - a plugin census: installed count per source (`builtin` / `featured` /
+    `community` / `local`) and the active state of builtin and featured
+    plugins by id. Unfeatured GitHub and local installs are counted by source
+    but never named,
   - the version-health signals below.
 
 Model names are mapped to a coarse family vocabulary (`claude`, `openai`,

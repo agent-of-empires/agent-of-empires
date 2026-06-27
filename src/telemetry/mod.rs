@@ -22,6 +22,7 @@ pub mod aggregate;
 pub mod events;
 pub mod features;
 pub mod form_factor;
+pub mod plugins;
 pub mod sanitize;
 mod state;
 pub mod usage_signals;
@@ -415,6 +416,12 @@ pub fn build_usage_snapshot(
     snapshot.data_schema_version = crate::migrations::current_schema_version();
     snapshot.update_status = update_status;
     snapshot.update_releases_behind = update_releases_behind;
+    // Plugin census reads the loaded registry (disk-backed), so it is layered
+    // here rather than in the disk-free assembler, like the version-health
+    // fields above. Both the TUI and serve surfaces route through here.
+    let (plugins_by_source, plugins_active) = plugins::census(crate::plugin::registry().all());
+    snapshot.plugins_by_source = plugins_by_source;
+    snapshot.plugins_active = plugins_active;
     Some(snapshot)
 }
 
@@ -488,6 +495,10 @@ fn assemble_usage_snapshot(
         agent_switches: acp_counts.agent_switches,
         plan_mode_seen: acp_counts.plan_mode_seen,
         prompts_queued: acp_counts.prompts_queued,
+        // Plugin census reads the disk-backed registry; the disk-free assembler
+        // leaves these empty and `build_usage_snapshot` fills them.
+        plugins_by_source: BTreeMap::new(),
+        plugins_active: BTreeMap::new(),
     }
 }
 
@@ -792,6 +803,8 @@ mod tests {
             agent_switches: 0,
             plan_mode_seen: false,
             prompts_queued: 0,
+            plugins_by_source: BTreeMap::new(),
+            plugins_active: BTreeMap::new(),
         }
     }
 
