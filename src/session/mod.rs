@@ -27,6 +27,7 @@ pub mod smart_rename;
 pub mod stop;
 mod storage;
 pub(crate) mod sync;
+pub mod trash;
 pub mod worktree_edit;
 
 pub use crate::sound::SoundConfig;
@@ -49,8 +50,8 @@ pub use groups::{
 };
 pub(crate) use instance::{persist_session_to_storage, ResumeIntent, SidWrite};
 pub use instance::{
-    EnsureReadyError, EnsureReadyOutcome, Instance, LaunchSidOutcome, SandboxInfo, StartOutcome,
-    Status, TerminalInfo, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
+    EnsureReadyError, EnsureReadyOutcome, Instance, LaunchSidOutcome, SandboxInfo, SessionBucket,
+    StartOutcome, Status, TerminalInfo, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
     TMUX_SESSION_GONE_ERROR,
 };
 
