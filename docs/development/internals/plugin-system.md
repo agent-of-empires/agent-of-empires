@@ -603,7 +603,7 @@ above), the builtin worker self-exec path and worker SDK (with the first
 builtin worker that needs them), and the discovery / featured supply-chain
 layer with integrity hashing (issues 2364 and 2365). Rendering plugin slots in
 the standalone (non-daemon) home screen is still a follow-up (the
-structured-view TUI already renders them, #2402). Pinning a featured plugin's
+structured-view TUI already renders the terminal-applicable subset, #2402). Pinning a featured plugin's
 release-binary asset hash in `featured.toml` (so a featured worker is attested,
 not just its source) is a follow-up; today a release-binary plugin cannot be
 featured.
