@@ -1999,6 +1999,10 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
         status: e.status,
         toolCount: e.tool_count,
         tools: e.tools && e.tools.length > 0 ? e.tools : a.tools,
+        // Freeze the elapsed timer once stalled (the agent stopped
+        // writing; the SDK likely dropped it). Clear it if it resumes.
+        // The terminal Completed event sets the authoritative ended time.
+        endedAt: e.status === "stalled" ? (a.endedAt ?? e.at) : e.status === "running" ? null : a.endedAt,
         lastTool: e.last_tool ?? a.lastTool,
         lastText: e.last_text ?? a.lastText,
       };
