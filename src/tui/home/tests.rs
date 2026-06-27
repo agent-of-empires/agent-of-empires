@@ -6620,6 +6620,44 @@ fn toggle_archive_at_cursor_round_trip() {
     assert!(!env.view.instances[0].is_archived());
 }
 
+/// Trashing a session hides it from the active list and surfaces it under
+/// the synthetic Trash section; the shelve/unshelve key (`z`) restores it.
+#[test]
+#[serial]
+fn trash_then_restore_round_trip() {
+    let mut env = create_test_env_with_sessions(2);
+    // Keep the Trash section expanded so the trashed row stays reachable.
+    env.view.trashed_section_collapsed = false;
+    let id = env.view.instances[0].id.clone();
+    env.view.selected_session = Some(id.clone());
+    assert!(!env.view.instances[0].is_trashed());
+
+    env.view.trash_session_by_id(&id);
+    assert!(
+        env.view.get_instance(&id).unwrap().is_trashed(),
+        "session must be trashed"
+    );
+
+    // The Trash section header is present, and the trashed row is not in the
+    // active flow (it renders under that header).
+    let items = env.view.build_flat_items();
+    assert!(
+        items.iter().any(|it| matches!(
+            it,
+            Item::Group { path, .. } if crate::session::is_trash_section_path(path)
+        )),
+        "Trash section header must be present after trashing"
+    );
+
+    // Restore via the shelve/unshelve key.
+    env.view.select_session_by_id(&id);
+    env.view.toggle_archive_at_cursor().unwrap();
+    assert!(
+        !env.view.get_instance(&id).unwrap().is_trashed(),
+        "session must be restored out of trash"
+    );
+}
+
 /// When no session is selected, the toggle is a silent no-op.
 #[test]
 #[serial]

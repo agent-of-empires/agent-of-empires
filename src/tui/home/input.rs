@@ -2951,7 +2951,9 @@ impl HomeView {
                     // surface the sentinel path or invite Jump-to-group
                     // navigation that the rest of the codebase
                     // intentionally disarms.
-                    if crate::session::is_within_archived_section(path) {
+                    if crate::session::is_within_archived_section(path)
+                        || crate::session::is_within_trash_section(path)
+                    {
                         continue;
                     }
                     let label = if name == path {
@@ -3281,7 +3283,9 @@ impl HomeView {
                 }
                 Item::Group { path, .. } => {
                     self.selected_session = None;
-                    if crate::session::is_within_archived_section(path) {
+                    if crate::session::is_within_archived_section(path)
+                        || crate::session::is_within_trash_section(path)
+                    {
                         // The synthetic Archived section (and any
                         // project sub-folder rendered under it in
                         // Project mode) is not a real group: it can't
@@ -3375,6 +3379,10 @@ impl HomeView {
         // nonexistent group.
         if crate::session::is_archived_section_path(path) {
             self.toggle_archived_section();
+            return;
+        }
+        if crate::session::is_trash_section_path(path) {
+            self.toggle_trashed_section();
             return;
         }
         if self.group_by == GroupByMode::Project {
@@ -4245,6 +4253,22 @@ impl HomeView {
                         &message,
                         "force_remove_session",
                     ));
+                    return;
+                }
+
+                // Trash-first: when session.delete_to_trash is enabled (the
+                // default) and the session is not already trashed, move it to
+                // the trash instead of opening the permanent-delete dialog. A
+                // session already in the Trash section falls through so `D`
+                // there deletes it permanently. See #2489.
+                let already_trashed = inst.is_trashed();
+                let delete_to_trash =
+                    crate::session::resolve_config_or_warn(&self.config_profile())
+                        .session
+                        .delete_to_trash;
+                if delete_to_trash && !already_trashed {
+                    let sid = session_id.clone();
+                    self.trash_session_by_id(&sid);
                     return;
                 }
 
