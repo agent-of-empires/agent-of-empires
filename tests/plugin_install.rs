@@ -285,6 +285,11 @@ api_version = 2
     // --yes bypasses the unverified confirmation.
     let report = install::install("gh:acme/widget@main", true).await.unwrap();
     assert_eq!(report.id, "acme.widget");
+    assert_eq!(
+        report.validation.as_str(),
+        "community",
+        "the install report surfaces community trust for an unfeatured gh: install"
+    );
 
     let lock = Lockfile::load().unwrap();
     let locked = lock.get("acme.widget").expect("lock entry");
@@ -603,7 +608,12 @@ api_version = 2
         "sha256:0000000000000000000000000000000000000000000000000000000000000000",
     );
 
-    install::install(dir.to_str().unwrap(), true).await.unwrap();
+    let report = install::install(dir.to_str().unwrap(), true).await.unwrap();
+    assert_eq!(
+        report.validation.as_str(),
+        "local",
+        "the install report surfaces a local-directory install as local"
+    );
 
     // It installs (not refused) and is not featured. The non-featured label
     // ("local" here, since the install source is a local dir; "community" for a

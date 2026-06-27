@@ -174,12 +174,13 @@ fn run_set_enabled(id: &str, enabled: bool) -> Result<()> {
     Ok(())
 }
 
-fn print_report(report: &crate::plugin::install::InstallReport, verb: &str) {
-    println!("{verb} {} {}.", report.id, report.version);
+fn format_report(report: &crate::plugin::install::InstallReport, verb: &str) -> String {
+    let mut out = format!("{verb} {} {}.\n", report.id, report.version);
+    out.push_str(&format!("  validation: {}\n", report.validation.as_str()));
     if report.capabilities.is_empty() {
-        println!("  capabilities: none");
+        out.push_str("  capabilities: none");
     } else {
-        println!(
+        out.push_str(&format!(
             "  capabilities: {} ({})",
             report.capabilities.join(", "),
             if report.granted {
@@ -187,8 +188,13 @@ fn print_report(report: &crate::plugin::install::InstallReport, verb: &str) {
             } else {
                 "not granted, plugin inactive"
             }
-        );
+        ));
     }
+    out
+}
+
+fn print_report(report: &crate::plugin::install::InstallReport, verb: &str) {
+    println!("{}", format_report(report, verb));
 }
 
 async fn run_install(source: &str, yes: bool) -> Result<()> {
@@ -252,4 +258,43 @@ async fn run_outdated() -> Result<()> {
         println!("\nUpdate with:\n  aoe plugin update <id>");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_report;
+    use crate::plugin::install::InstallReport;
+    use crate::plugin::registry::ValidationState;
+
+    #[test]
+    fn report_shows_validation_line() {
+        let report = InstallReport {
+            id: "acme.foo".into(),
+            version: "1.2.3".into(),
+            capabilities: vec!["session.read".into(), "filesystem.read".into()],
+            granted: true,
+            validation: ValidationState::Community,
+        };
+        let out = format_report(&report, "Installed");
+        assert_eq!(
+            out,
+            "Installed acme.foo 1.2.3.\n  validation: community\n  capabilities: session.read, filesystem.read (granted)"
+        );
+    }
+
+    #[test]
+    fn local_install_validation_labelled_local() {
+        let report = InstallReport {
+            id: "acme.foo".into(),
+            version: "0.1.0".into(),
+            capabilities: vec![],
+            granted: true,
+            validation: ValidationState::Local,
+        };
+        let out = format_report(&report, "Installed");
+        assert!(
+            out.contains("\n  validation: local\n"),
+            "local install surfaces its validation: {out:?}"
+        );
+    }
 }

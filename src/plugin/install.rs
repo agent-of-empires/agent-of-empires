@@ -13,6 +13,7 @@ use crate::session::{save_config, CapabilityGrant, Config, PluginConfig};
 use super::featured::FeaturedIndex;
 use super::fetch::{self, FetchedPlugin};
 use super::lockfile::{LockedPlugin, Lockfile};
+use super::registry::ValidationState;
 use super::source::PluginSource;
 
 /// Set the enabled flag for a known plugin id in the global config, then reload
@@ -46,6 +47,23 @@ pub struct InstallReport {
     pub capabilities: Vec<String>,
     /// Whether the plugin is granted and live after the operation.
     pub granted: bool,
+    /// Resolved trust / validation provenance, for the success output.
+    pub validation: ValidationState,
+}
+
+/// Resolve the display validation for a just-installed plugin, mirroring
+/// `registry::validation_for`: a featured-verified source is `Featured`, any
+/// other `gh:` source is `Community`, and a local directory is `Local`. The
+/// content hash is already verified upstream (`featured_verified`), so this maps
+/// from that decision rather than re-hashing the tree.
+fn install_validation(featured_verified: bool, source: &str) -> ValidationState {
+    if featured_verified {
+        ValidationState::Featured
+    } else if source.starts_with("gh:") {
+        ValidationState::Community
+    } else {
+        ValidationState::Local
+    }
 }
 
 /// How an update treats a version that would need fresh consent (changed
@@ -113,12 +131,8 @@ pub async fn install(input: &str, assume_yes: bool) -> Result<InstallReport> {
     }
 
     let manifest_hash = PluginManifest::hash_bytes(&fetched.manifest_bytes);
-    persist_install(
-        &persisted_source(&resolved.source, input),
-        &id,
-        &capabilities,
-        &manifest_hash,
-    )?;
+    let persisted = persisted_source(&resolved.source, input);
+    persist_install(&persisted, &id, &capabilities, &manifest_hash)?;
     write_lock(&id, &fetched, &manifest_hash, featured_verified)?;
     super::reload_registry();
 
@@ -127,6 +141,7 @@ pub async fn install(input: &str, assume_yes: bool) -> Result<InstallReport> {
         version: fetched.manifest.version.clone(),
         capabilities,
         granted: true,
+        validation: install_validation(featured_verified, &persisted),
     })
 }
 
@@ -281,6 +296,7 @@ async fn update_with_consent(id: &str, mode: ConsentMode) -> Result<UpdateOutcom
         version: fetched.manifest.version.clone(),
         capabilities,
         granted,
+        validation: install_validation(featured_verified, &source_str),
     }))
 }
 
