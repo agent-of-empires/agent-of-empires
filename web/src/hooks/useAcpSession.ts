@@ -303,6 +303,12 @@ function cacheGet(sessionId: string): AcpState | undefined {
       if (oldest === undefined) break;
       stateCache.delete(oldest);
     }
+    // A `useBackgroundAgents` subscriber that already rendered an empty
+    // snapshot (panel open before this cache was primed) won't see the
+    // persisted agents until something else calls `cacheSet`. Wake it.
+    // Deferred so the notify never fires during a render that called
+    // `cacheGet` (e.g. the reducer initializer).
+    queueMicrotask(() => notifyStateListeners(sessionId));
     return persisted;
   }
   return undefined;
