@@ -203,6 +203,13 @@ export function syncPluginTabs(layout: DockLayout, available: { id: TabId; defau
 
 // --- persistence + migration ---
 
+// Built-in panes that open by default / on a v1 migration. The Sub agents
+// pane is intentionally excluded: it is opt-in, opened on demand via its
+// ActivityBar toggle or by clicking an inline sub-agent card, so it never
+// auto-opens as an empty tab. A v1 layout predates it, so it can never
+// have been "open" there either.
+const AUTO_OPEN_PANES = BUILTIN_PANES.filter((p) => p.id !== "agents");
+
 function defaultTemplate(): DockLayout {
   // Desktop opens diff + terminal in the right dock (matches the historical
   // expanded right column); narrow viewports start empty and drive the surface
@@ -211,7 +218,7 @@ function defaultTemplate(): DockLayout {
   const base = emptyDockLayout();
   if (!open) return base;
   let l: DockLayout = base;
-  for (const p of BUILTIN_PANES) {
+  for (const p of AUTO_OPEN_PANES) {
     const tabId = p.id === "terminal" ? terminalTabId(0) : p.id;
     l = addTab(l, p.defaultDock, tabId, false);
   }
@@ -224,7 +231,7 @@ function migrateTemplate(): DockLayout {
     try {
       const parsed = JSON.parse(v1) as Record<string, unknown>;
       let l = emptyDockLayout();
-      for (const p of BUILTIN_PANES) {
+      for (const p of AUTO_OPEN_PANES) {
         const v = parsed[p.id];
         let open = true;
         let dock: DockLocation = p.defaultDock;
@@ -249,7 +256,7 @@ function migrateTemplate(): DockLayout {
   if (collapsed === "1") return emptyDockLayout();
   if (collapsed === "0") {
     let l = emptyDockLayout();
-    for (const p of BUILTIN_PANES) {
+    for (const p of AUTO_OPEN_PANES) {
       const tabId = p.id === "terminal" ? terminalTabId(0) : p.id;
       l = addTab(l, p.defaultDock, tabId, false);
     }
