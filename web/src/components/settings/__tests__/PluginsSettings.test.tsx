@@ -413,8 +413,6 @@ describe("PluginsSettings", () => {
     await waitFor(() => expect(queryByTestId("plugin-detail-modal")).toBeNull());
   });
 
-  // --- In-app update flow ---
-
   // Surface the per-row Update button by reporting an available update.
   function markOutdated() {
     fetchPluginUpdates.mockResolvedValue({
