@@ -228,6 +228,12 @@ export function AcpRuntime({
       // Clear staged attachments only after the send resolves, so a
       // failed send keeps them staged for retry instead of dropping them.
       await acp.sendPrompt(text, attachments);
+      // Drop the persisted draft synchronously here, not only via the
+      // pendingAttachments effect: a send-then-immediately-navigate-away
+      // can unmount before the post-send render commits, which would
+      // otherwise leave an already-sent image behind to rehydrate later.
+      pendingAttachmentsRef.current = [];
+      setDraftAttachments(sessionId, []);
       setPendingAttachments([]);
     },
     onCancel,
