@@ -373,7 +373,18 @@ function DetailBlock({ block, pluginId }: { block: Record<string, unknown>; plug
       const title = str(block, "title");
       const children = Array.isArray(block.children) ? block.children.filter(isObject) : [];
       const body = children.map((c, i) => <DetailBlock key={i} block={c} pluginId={pluginId} />);
-      const titleClass = "text-[11px] font-semibold uppercase tracking-wide text-text-dim";
+      // An optional tone-tinted icon on the title gives an at-a-glance status
+      // even when the section is folded (e.g. a green check vs a red x).
+      const tone = validTone(block.tone);
+      const iconComp = lucideIcon(str(block, "icon"));
+      const titleColor = iconComp || tone ? toneTextClass(tone) : "text-text-dim";
+      const titleClass = `text-[11px] font-semibold uppercase tracking-wide ${titleColor}`;
+      const titleInner = (
+        <>
+          {iconComp && createElement(iconComp, { className: "size-3 shrink-0", "aria-hidden": true })}
+          {title}
+        </>
+      );
       // A `collapsible` section folds via a native <details>: keyboard-accessible
       // and stateless, no JS toggle to track. `collapsed` sets the initial state;
       // it stays open by default so existing panes look unchanged.
@@ -382,7 +393,7 @@ function DetailBlock({ block, pluginId }: { block: Record<string, unknown>; plug
           <details className="group flex flex-col gap-1" open={block.collapsed !== true}>
             <summary className={`flex cursor-pointer list-none items-center gap-1 select-none ${titleClass}`}>
               <ChevronRight className="size-3 shrink-0 transition-transform group-open:rotate-90" aria-hidden />
-              {title}
+              {titleInner}
             </summary>
             <div className="flex flex-col gap-1">{body}</div>
           </details>
@@ -390,7 +401,7 @@ function DetailBlock({ block, pluginId }: { block: Record<string, unknown>; plug
       }
       return (
         <section className="flex flex-col gap-1">
-          {title && <div className={titleClass}>{title}</div>}
+          {title && <div className={`flex items-center gap-1 ${titleClass}`}>{titleInner}</div>}
           {body}
         </section>
       );

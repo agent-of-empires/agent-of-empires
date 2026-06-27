@@ -267,6 +267,34 @@ describe("plugin slot renderers", () => {
     expect(container.querySelector("section")).toBeTruthy();
   });
 
+  it("a section title renders a tone-tinted icon for at-a-glance status", async () => {
+    const entry: PluginUiEntry = {
+      plugin_id: "acme.kit",
+      slot: "pane",
+      id: "gh",
+      session_id: "s1",
+      payload: {
+        blocks: [
+          {
+            kind: "section",
+            title: "Checks: passing",
+            collapsible: true,
+            collapsed: true,
+            icon: "circle-check",
+            tone: "success",
+            children: [{ kind: "note", text: "ci" }],
+          },
+        ],
+      },
+    };
+    const { container } = render(<PluginPaneBody entry={entry} />);
+    const summary = container.querySelector("summary")!;
+    // The success tone tints the title text, visible even when folded.
+    expect(summary.className).toContain("text-status-running");
+    // Both the chevron and the lazy-loaded status icon render as svgs.
+    await waitFor(() => expect(summary.querySelectorAll("svg")).toHaveLength(2));
+  });
+
   it("comment blocks render read-only with author, location and resolved state", () => {
     const entry: PluginUiEntry = {
       plugin_id: "acme.kit",
