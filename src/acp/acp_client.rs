@@ -3804,7 +3804,18 @@ fn map_update_to_events(
                     content: content_text,
                 });
             } else if events.is_empty() {
-                events.push(raw_event(&update));
+                // The async sub-agent launch rides a metadata-only
+                // ToolCallUpdate (`_meta.claudeCode.toolName == "Agent"`,
+                // status "async_launched", no status/content/title), so it
+                // lands here rather than the unknown-variant catch-all
+                // below. Promote it to a typed BackgroundAgentLaunched so
+                // the daemon tails the agent's transcript; otherwise pass
+                // the raw payload through unchanged.
+                let payload = serde_json::to_value(&update).unwrap_or(serde_json::Value::Null);
+                match background_agent_launched_from_value(&payload) {
+                    Some(event) => events.push(event),
+                    None => events.push(Event::RawAgentUpdate { payload }),
+                }
             }
             // claude-agent-acp emits the initial `tool_call` frame for
             // ScheduleWakeup with empty `raw_input`; the actual
@@ -3992,18 +4003,8 @@ fn map_update_to_events(
         SessionUpdate::SessionInfoUpdate(_) => Vec::new(),
         // Variants we don't have a typed mapping for yet pass through as
         // RawAgentUpdate so the UI can render best-effort and we can
-        // narrow these as we go. One exception: the Claude SDK reports an
-        // async sub-agent launch through this catch-all (an unmapped
-        // update whose `_meta.claudeCode.toolName == "Agent"`); promote it
-        // to a typed BackgroundAgentLaunched so the daemon can tail the
-        // agent's transcript and the UI can show a background-agents panel.
-        other => {
-            let payload = serde_json::to_value(&other).unwrap_or(serde_json::Value::Null);
-            match background_agent_launched_from_value(&payload) {
-                Some(event) => vec![event],
-                None => vec![Event::RawAgentUpdate { payload }],
-            }
-        }
+        // narrow these as we go.
+        other => vec![raw_event(&other)],
     }
 }
 
@@ -9510,6 +9511,60 @@ mod tests {
             }
             other => panic!("expected BackgroundAgentLaunched, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn map_tool_call_update_meta_emits_background_agent_launched() {
+        // The real path: the async launch arrives as a metadata-only
+        // ToolCallUpdate (no status/content/title), carrying the Agent
+        // payload under `_meta.claudeCode`. It must map to a typed
+        // BackgroundAgentLaunched, not a raw passthrough. This is the
+        // path the unit test on the helper alone did not cover.
+        use agent_client_protocol::schema::{SessionUpdate, ToolCallUpdate, ToolCallUpdateFields};
+        let mut meta = serde_json::Map::new();
+        meta.insert(
+            "claudeCode".to_string(),
+            serde_json::json!({
+                "toolName": "Agent",
+                "toolResponse": {
+                    "agentId": "a6654829ea0a19032",
+                    "description": "grep tmux mentions repo-wide",
+                    "prompt": "Grep the repo for tmux.",
+                    "resolvedModel": "claude-opus-4-8[1m]",
+                    "outputFile": "/tmp/x/tasks/a6654829ea0a19032.output",
+                    "status": "async_launched"
+                }
+            }),
+        );
+        let mut update = ToolCallUpdate::new("toolu_01HzYCZK", ToolCallUpdateFields::new());
+        update.meta = Some(meta);
+        let events = map_update_to_events(
+            SessionUpdate::ToolCallUpdate(update),
+            &agent_profiles::CLAUDE,
+        );
+        match events.iter().find_map(|e| match e {
+            Event::BackgroundAgentLaunched {
+                agent_id,
+                description,
+                output_file,
+                ..
+            } => Some((agent_id.clone(), description.clone(), output_file.clone())),
+            _ => None,
+        }) {
+            Some((id, desc, out)) => {
+                assert_eq!(id, "a6654829ea0a19032");
+                assert_eq!(desc, "grep tmux mentions repo-wide");
+                assert!(out.ends_with(".output"));
+            }
+            None => panic!("expected BackgroundAgentLaunched, got {events:?}"),
+        }
+        // It must NOT also leak a RawAgentUpdate for the same payload.
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::RawAgentUpdate { .. })),
+            "async launch should not also pass through as RawAgentUpdate"
+        );
     }
 
     #[test]
