@@ -103,11 +103,15 @@ export function clearDraft(sessionId: string): void {
   setDraft(sessionId, "");
 }
 
+function isPromptAttachmentKind(kind: unknown): kind is PromptAttachmentInput["kind"] {
+  return kind === "image" || kind === "audio" || kind === "resource";
+}
+
 function isPromptAttachmentInput(v: unknown): v is PromptAttachmentInput {
   if (!v || typeof v !== "object" || Array.isArray(v)) return false;
   const r = v as Record<string, unknown>;
   return (
-    typeof r.kind === "string" &&
+    isPromptAttachmentKind(r.kind) &&
     typeof r.mimeType === "string" &&
     typeof r.dataB64 === "string" &&
     (r.name === undefined || typeof r.name === "string")
@@ -158,11 +162,13 @@ export function clearDraftAttachments(sessionId: string): void {
 }
 
 // Cheap presence check for the sidebar "unsent draft" dot: a non-empty
-// stored array serializes to more than "[]" (2 chars), so we avoid parsing
-// (potentially megabytes of base64) on the sidebar re-render hot path.
+// stored array serializes to more than "[]" (2 chars) and starts with "[",
+// so we avoid parsing (potentially megabytes of base64) on the sidebar
+// re-render hot path while still rejecting obviously-corrupt non-array
+// values (which would otherwise leave the dot stuck on).
 export function hasDraftAttachments(sessionId: string): boolean {
   const v = safeGetItem(attachmentKey(sessionId));
-  return v !== null && v.length > 2;
+  return v !== null && v.length > 2 && v.startsWith("[");
 }
 
 // Remove every `acp:draft:<id>` key whose session id is not in the

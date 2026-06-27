@@ -392,6 +392,13 @@ describe("hasDraft with attachment-only drafts (#2493)", () => {
     expect(hasDraft("s-1")).toBe(true);
   });
 
+  it("treats corrupt attachment storage as no draft", () => {
+    localStorage.setItem("acp:draft-attachments:s-1", "{not json");
+    expect(getDraftAttachments("s-1")).toEqual([]);
+    expect(hasDraftAttachments("s-1")).toBe(false);
+    expect(hasDraft("s-1")).toBe(false);
+  });
+
   it("sweepOrphanDrafts removes orphaned attachment keys", () => {
     setDraftAttachments("s-keep", [img("keep")]);
     setDraftAttachments("s-orphan", [img("gone")]);
