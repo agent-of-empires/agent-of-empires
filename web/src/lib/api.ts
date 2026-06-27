@@ -1703,6 +1703,39 @@ export async function setSessionArchive(
   }
 }
 
+/** Move a session to the trash (#2489): stops the live session (ACP
+ *  shutdown, which preserves the transcript, plus optional tmux teardown)
+ *  and hides it from the normal list while keeping every durable artifact so
+ *  it can be restored. NOT a permanent delete; use `deleteSession` for that. */
+export async function trashSession(id: string, killPane = true): Promise<SessionResponse | null> {
+  try {
+    const res = await fetch(`/api/sessions/${id}/trash`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ kill_pane: killPane }),
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as SessionResponse;
+  } catch {
+    return null;
+  }
+}
+
+/** Restore a trashed session (#2489): clears `trashed_at`, returning it to
+ *  its prior bucket with its transcript and metadata intact. */
+export async function restoreSession(id: string): Promise<SessionResponse | null> {
+  try {
+    const res = await fetch(`/api/sessions/${id}/restore`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as SessionResponse;
+  } catch {
+    return null;
+  }
+}
+
 /** Stop a session, matching the TUI's `x` keybind: kills the tmux pane and
  *  stops (but does not remove) the Docker container for plain sessions, or
  *  shuts down the worker for structured-view sessions. The session record is

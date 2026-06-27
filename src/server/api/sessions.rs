@@ -239,6 +239,10 @@ pub struct CleanupDefaults {
     pub delete_worktree: bool,
     pub delete_branch: bool,
     pub delete_sandbox: bool,
+    /// Resolved `session.delete_to_trash`: when true, the web delete dialog
+    /// defaults to "Move to Trash" with a permanent-delete disclosure;
+    /// when false it goes straight to permanent delete. See #2489.
+    pub delete_to_trash: bool,
 }
 
 impl SessionResponse {
@@ -342,6 +346,7 @@ impl SessionResponse {
                 delete_worktree: true,
                 delete_branch: false,
                 delete_sandbox: true,
+                delete_to_trash: true,
             },
             remote_owner: None,
             notify_on_waiting: inst.notify_on_waiting,
@@ -576,6 +581,7 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
                     delete_worktree: cfg.worktree.auto_cleanup,
                     delete_branch: cfg.worktree.delete_branch_on_cleanup,
                     delete_sandbox: cfg.sandbox.auto_cleanup,
+                    delete_to_trash: cfg.session.delete_to_trash,
                 }
             });
         }
@@ -7549,6 +7555,7 @@ mod workspace_ordering_tests {
                 delete_worktree: false,
                 delete_branch: false,
                 delete_sandbox: false,
+                delete_to_trash: true,
             },
             remote_owner: None,
             notify_on_waiting: None,

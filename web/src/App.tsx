@@ -42,6 +42,8 @@ import {
   loginStatus,
   logout,
   deleteSession,
+  trashSession,
+  restoreSession,
   stopSession,
   startSession,
   fetchAbout,
@@ -856,6 +858,39 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     },
     [deletingSession, activeSessionId, setSessionStatus, navigate],
   );
+
+  // Move-to-trash path (#2489): the safe default. Unlike permanent delete it
+  // deliberately KEEPS the per-session acp cache, draft, and stored comments
+  // so a restore is faithful; only purge clears them.
+  const handleConfirmTrash = useCallback(async () => {
+    if (!deletingSession) return;
+    const sessionId = deletingSession.id;
+    const wasActive = sessionId === activeSessionId;
+
+    setDeletingWorkspaceId(null);
+    setSessionStatus(sessionId, "Stopped");
+    if (wasActive) {
+      navigate("/");
+    }
+
+    const res = await trashSession(sessionId);
+    if (!res) {
+      setSessionStatus(sessionId, "Error");
+      toastBus.handler?.error("Failed to move session to trash");
+      return;
+    }
+    toastBus.handler?.info("Moved to trash");
+  }, [deletingSession, activeSessionId, setSessionStatus, navigate]);
+
+  // Restore a trashed session from the sidebar Trash section (#2489).
+  const handleRestoreSession = useCallback(async (sessionId: string) => {
+    const res = await restoreSession(sessionId);
+    if (!res) {
+      toastBus.handler?.error("Failed to restore session");
+      return;
+    }
+    toastBus.handler?.info("Session restored");
+  }, []);
 
   const stoppingWorkspace = stoppingWorkspaceId ? workspaces.find((w) => w.id === stoppingWorkspaceId) : null;
   const stoppingSession = stoppingWorkspace?.sessions[0] ?? null;
@@ -1707,6 +1742,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
               onRemoveProject={handleRemoveProject}
               onSettings={handleOpenSettings}
               onDeleteSession={handleDeleteSession}
+              onRestoreSession={handleRestoreSession}
               onStopSession={handleStopSession}
               onStartSession={handleStartSession}
               readOnly={serverAbout?.read_only}
@@ -1777,7 +1813,9 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
             isSandboxed={deletingSession.is_sandboxed}
             isScratch={deletingSession.scratch}
             cleanupDefaults={deletingSession.cleanup_defaults}
+            defaultToTrash={!deletingSession.trashed_at && deletingSession.cleanup_defaults.delete_to_trash}
             onConfirm={handleConfirmDelete}
+            onTrash={handleConfirmTrash}
             onCancel={() => setDeletingWorkspaceId(null)}
           />
         )}

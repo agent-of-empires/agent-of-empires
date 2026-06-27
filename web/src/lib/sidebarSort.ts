@@ -63,7 +63,15 @@ export function workspaceIsPinned(ws: Workspace): boolean {
  *  a sibling session was archived. See #1581. */
 export function workspaceIsSunk(ws: Workspace): boolean {
   if (ws.sessions.length === 0) return false;
-  return ws.sessions.every((s) => s.archived_at != null || s.snoozed_until != null);
+  return ws.sessions.every((s) => s.archived_at != null || s.snoozed_until != null || s.trashed_at != null);
+}
+
+/** True when every one of the workspace's sessions is trashed. Trashed
+ *  workspaces are sunk (excluded from the live list) AND broken out of the
+ *  "Snoozed & archived" footer into a dedicated Trash section. See #2489. */
+export function workspaceIsTrashed(ws: Workspace): boolean {
+  if (ws.sessions.length === 0) return false;
+  return ws.sessions.every((s) => s.trashed_at != null);
 }
 
 /** True when a repo group still has at least one workspace that is
