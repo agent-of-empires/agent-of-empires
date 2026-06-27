@@ -18,14 +18,27 @@ use sha2::{Digest, Sha256};
 /// Domain-separation header. Bump the version when the hashed fields change.
 const HASH_PREFIX: &[u8] = b"aoe-plugin-tree-hash-v1\0";
 
+/// Reserved directory for a plugin's build output. A `command` runtime's build
+/// steps (a Python `.venv`, `node_modules`, compiled artifacts) must write here,
+/// never into the source tree. It is excluded from the hash at every level, like
+/// `.git`, so a build that mutates the install tree does not change the source
+/// hash: an author's `aoe plugin hash` of a clean checkout and the live load-path
+/// re-derivation over the built tree produce the same value, keeping a featured
+/// pin verifiable after the build runs. Build output is therefore not attested by
+/// the pin (build steps already run unsandboxed at the user's trust); a fixed
+/// reserved name keeps the exclusion out of attacker control, unlike a
+/// manifest-declared list which a tampered manifest could widen to hide source.
+pub const BUILD_OUTPUT_DIR: &str = ".aoe-build";
+
 /// Deterministic `sha256:<hex>` over the files in `dir`.
 ///
 /// Files are sorted by their forward-slash relative path; each contributes
 /// `file\0<path>\0<len><content>` to the digest, where `<len>` is the content
 /// length as 8 little-endian bytes so a path/content boundary is unambiguous.
-/// `.git` is skipped at every level (it is stripped from an installed tree). A
-/// symlink or a non-UTF-8 path is an error, not a silent skip, so nothing that
-/// would be installed escapes the hash. File mode is deliberately excluded for
+/// `.git` and the reserved [`BUILD_OUTPUT_DIR`] are skipped at every level (both
+/// are stripped from, or generated into, an installed tree). A symlink or a
+/// non-UTF-8 path is an error, not a silent skip, so nothing that would be
+/// installed escapes the hash. File mode is deliberately excluded for
 /// cross-platform determinism (Windows has no executable bit).
 pub fn tree_hash(dir: &Path) -> Result<String> {
     let mut files = Vec::new();
@@ -47,7 +60,11 @@ pub fn tree_hash(dir: &Path) -> Result<String> {
 fn collect(root: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) -> Result<()> {
     for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
         let entry = entry?;
-        if entry.file_name() == ".git" {
+        // Skip git history and the reserved build-output dir before inspecting
+        // the entry's type: a build output like a `.venv` holds symlinks, which
+        // the symlink check below would otherwise reject, and its contents are
+        // not part of the hashed source.
+        if entry.file_name() == ".git" || entry.file_name() == BUILD_OUTPUT_DIR {
             continue;
         }
         let file_type = entry.file_type()?;
@@ -140,6 +157,38 @@ mod tests {
             tree_hash(with_git.path()).unwrap(),
             tree_hash(without_git.path()).unwrap()
         );
+    }
+
+    #[test]
+    fn build_output_dir_is_skipped() {
+        let with_build = tempfile::tempdir().unwrap();
+        write(with_build.path(), "aoe-plugin.toml", b"x");
+        write(
+            with_build.path(),
+            &format!("{BUILD_OUTPUT_DIR}/venv/pyvenv.cfg"),
+            b"junk",
+        );
+        let without_build = tempfile::tempdir().unwrap();
+        write(without_build.path(), "aoe-plugin.toml", b"x");
+        assert_eq!(
+            tree_hash(with_build.path()).unwrap(),
+            tree_hash(without_build.path()).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_inside_build_output_is_not_rejected() {
+        // A build like a Python venv places a symlink under the build-output
+        // dir; the hash must skip it rather than hard-error, so a built tree
+        // still re-derives the source hash.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "aoe-plugin.toml", b"x");
+        let build = dir.path().join(BUILD_OUTPUT_DIR).join("bin");
+        std::fs::create_dir_all(&build).unwrap();
+        std::fs::write(build.join("real"), b"x").unwrap();
+        std::os::unix::fs::symlink("real", build.join("python3")).unwrap();
+        assert!(tree_hash(dir.path()).is_ok());
     }
 
     #[cfg(unix)]

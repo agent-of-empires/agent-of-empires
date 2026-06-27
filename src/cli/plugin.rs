@@ -24,9 +24,12 @@ pub enum PluginCommands {
         id: String,
     },
     /// Install an external plugin from a `gh:owner/repo[@ref]` slug or a local
-    /// directory. Community plugins run at your own risk.
+    /// directory. With no `@ref`, installs the repo's latest release; an
+    /// explicit `@ref` installs unverified, un-audited code. Community plugins
+    /// run at your own risk.
     Install {
-        /// `gh:owner/repo[@ref]` or a local directory path
+        /// `gh:owner/repo` (latest release) or `gh:owner/repo@ref` (unverified)
+        /// or a local directory path
         source: String,
         /// Grant all requested capabilities without prompting
         #[arg(long)]
