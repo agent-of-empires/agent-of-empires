@@ -114,15 +114,29 @@ declares: `capabilities`, `commands`, `keybinds`, `settings`, `ui`, and a
 declares; they are defined in `aoe-plugin-api` and parsed/validated by the
 host, but consumed by later issues (the settings registry in #2094, the runtime
 host in #2095, the command/keybind/UI surfaces in #2366). `api_version` is now
-3 (bumped to 2 for the contribution sections, then 3 when the `detail-panel`
-slot became the dockable `pane` slot); an older `api_version` manifest still
-loads as long as it targets no newer slot. Unknown top-level keys remain a hard
-parse error (`deny_unknown_fields`).
+4 (bumped to 2 for the contribution sections, 3 when the `detail-panel` slot
+became the dockable `pane` slot, then 4 for the `status` section and the
+`aoe_version` field); an older `api_version` manifest still loads as long as it
+targets no newer field. Unknown top-level keys remain a hard parse error
+(`deny_unknown_fields`).
 
-The `themes`, `status`, and `panes` sections are deferred until a consumer
-exists, so no schema lands in core ahead of one (#2386). With
-`deny_unknown_fields`, a manifest declaring `[[themes]]`, `[[status]]`, or
-`[[panes]]` is a hard parse error today.
+The `themes` section ships and is consumed by the theme registry (#2094); the
+`status` section (`id`, `label`) is parsed and validated here, its consumer is
+the status reference plugin (#2096). `panes` is not a manifest section: panes
+ship as a `ui` slot of kind `pane` (#2432), so `[[panes]]` stays a hard parse
+error. `status` and `aoe_version` (below) require `api_version >= 4`: under
+`deny_unknown_fields` a pre-4 host would otherwise report a bare "unknown
+field" instead of the "upgrade aoe" message, so the host gates them behind the
+bump.
+
+`aoe_version` is an optional semver requirement (`">=0.10, <0.12"`) naming
+which aoe (host app) versions this plugin version supports. It is distinct from
+`api_version`: `api_version` gates the manifest schema shape, `aoe_version`
+gates the host's app behaviour. The host refuses to install or update a plugin
+whose range excludes the running aoe, and skips loading one (into the
+registry's load errors) rather than bailing, so an aoe upgrade cannot brick
+startup. Builtins are exempt (they ship with aoe). An absent range means no
+constraint.
 
 The `runtime` section is one of two kinds: `command` (an argv launched from the
 plugin directory) or `release-binary` (a compiled worker shipped as a GitHub
