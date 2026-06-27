@@ -106,10 +106,10 @@ function SortableTab({ id, location, groupIndex, isActive, desc, onActivate, onC
 }
 
 /** A half of a group body that, while a tab is dragged, lifts the drop into a
- *  fresh group before or after this one. Right docks split side-by-side (left /
- *  right halves), bottom docks stack (top / bottom halves). Mounted only during
- *  a drag, so it never intercepts ordinary clicks on the pane body (terminals,
- *  iframes). */
+ *  fresh group before or after this one. The tall right column stacks groups
+ *  (top / bottom halves), the wide bottom strip splits side by side (left /
+ *  right halves). Mounted only during a drag, so it never intercepts ordinary
+ *  clicks on the pane body (terminals, iframes). */
 function SplitDropZone({
   location,
   groupIndex,
@@ -126,11 +126,11 @@ function SplitDropZone({
   const half =
     location === "right"
       ? side === "before"
-        ? "top-0 left-0 h-full w-1/2"
-        : "top-0 right-0 h-full w-1/2"
-      : side === "before"
         ? "top-0 left-0 w-full h-1/2"
-        : "bottom-0 left-0 w-full h-1/2";
+        : "bottom-0 left-0 w-full h-1/2"
+      : side === "before"
+        ? "top-0 left-0 h-full w-1/2"
+        : "top-0 right-0 h-full w-1/2";
   return (
     <div
       ref={setNodeRef}

@@ -23,9 +23,10 @@ interface Props {
   onNewTerminal?: () => void;
 }
 
-/** Lays a dock's groups out along its split axis: the right dock splits into
- *  side-by-side columns (flex row), the bottom dock into stacked strips (flex
- *  column). Groups share space equally; a thin divider separates them.
+/** Lays a dock's groups out along its split axis: the tall right column stacks
+ *  groups top to bottom (flex column), the wide bottom strip places groups
+ *  side by side (flex row). Groups share space equally; a thin divider
+ *  separates them.
  *  ponytail: equal flex, no per-group resize handles yet (#2486 follow-up). */
 export function DockGroups({
   location,
@@ -38,8 +39,8 @@ export function DockGroups({
   onNewTerminal,
 }: Props) {
   if (groups.length === 0) return null;
-  const axis = location === "right" ? "flex-row" : "flex-col";
-  const divider = location === "right" ? "border-l" : "border-t";
+  const axis = location === "right" ? "flex-col" : "flex-row";
+  const divider = location === "right" ? "border-t" : "border-l";
   return (
     <div className={`flex ${axis} min-h-0 min-w-0 flex-1 overflow-hidden`}>
       {groups.map((g, i) => (
