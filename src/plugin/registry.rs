@@ -216,7 +216,7 @@ fn validation_for(
     source: Option<&str>,
 ) -> ValidationState {
     if let Some(entry) = featured.get(id) {
-        if integrity::tree_hash(dir).is_ok_and(|h| h == entry.tree_hash) {
+        if integrity::tree_hash(dir).is_ok_and(|h| entry.verifies(&h)) {
             return ValidationState::Featured;
         }
     }

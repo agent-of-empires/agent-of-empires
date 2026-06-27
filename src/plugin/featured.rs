@@ -1,12 +1,14 @@
 //! The curated / featured plugin index.
 //!
-//! `plugins/featured.toml` is compiled into the binary and pins a vetted plugin
-//! release to its source [`tree_hash`](super::integrity::tree_hash). A featured
-//! entry is the maintainer's attestation that this exact tree was reviewed: it
-//! is what makes "is this plugin safe" answerable, and it is the only thing
-//! that lets a community install claim a reserved (`aoe.*` /
-//! `agent-of-empires.*`) namespace. Install and update refuse on a mismatch
-//! against the pin.
+//! `plugins/featured.toml` is compiled into the binary and pins one or more
+//! vetted plugin releases to their source
+//! [`tree_hash`](super::integrity::tree_hash). A featured entry is the
+//! maintainer's attestation that each listed tree was reviewed: it is what makes
+//! "is this plugin safe" answerable, and it is the only thing that lets a
+//! community install claim a reserved (`aoe.*` / `agent-of-empires.*`)
+//! namespace. An entry holds a `version -> tree_hash` map so a new release can
+//! be vetted alongside older ones; an install whose fetched tree hashes to any
+//! vetted value is featured-verified.
 
 use std::collections::BTreeMap;
 
@@ -17,14 +19,23 @@ use serde::Deserialize;
 /// vet plugin releases.
 const EMBEDDED: &str = include_str!("../../plugins/featured.toml");
 
-/// One vetted pin, keyed by plugin id in the index.
+/// One featured plugin's vetted releases, keyed by plugin id in the index.
 #[derive(Debug, Clone, Deserialize)]
 pub struct FeaturedEntry {
     /// The canonical source slug the plugin must be installed from
     /// (`gh:owner/repo`).
     pub source: String,
-    /// `sha256:<hex>` of the vetted source tree.
-    pub tree_hash: String,
+    /// Vetted releases as `version -> sha256:<hex>` of the source tree. The
+    /// version label is informational (it documents which release each hash
+    /// belongs to); the verified decision is membership in the set of values.
+    pub versions: BTreeMap<String, String>,
+}
+
+impl FeaturedEntry {
+    /// Whether `tree_hash` is one of this entry's vetted release hashes.
+    pub fn verifies(&self, tree_hash: &str) -> bool {
+        self.versions.values().any(|v| v == tree_hash)
+    }
 }
 
 /// The parsed featured index.
@@ -89,18 +100,37 @@ mod tests {
             r#"
 [plugins."agent-of-empires.example"]
 source = "gh:agent-of-empires/example"
-tree_hash = "sha256:abc"
+versions = { "1.0" = "sha256:abc" }
 "#,
         )
         .unwrap();
         let entry = index.get("agent-of-empires.example").expect("present");
         assert_eq!(entry.source, "gh:agent-of-empires/example");
-        assert_eq!(entry.tree_hash, "sha256:abc");
+        assert_eq!(
+            entry.versions.get("1.0").map(String::as_str),
+            Some("sha256:abc")
+        );
         assert!(index.get("acme.absent").is_none());
 
         // Source-slug match is case-insensitive and ignores the keying id.
         assert!(index.is_featured_source("gh:agent-of-empires/example"));
         assert!(index.is_featured_source("gh:Agent-Of-Empires/Example"));
         assert!(!index.is_featured_source("gh:someone/else"));
+    }
+
+    #[test]
+    fn verifies_any_vetted_hash() {
+        let index = FeaturedIndex::from_toml_str(
+            r#"
+[plugins."agent-of-empires.example"]
+source = "gh:agent-of-empires/example"
+versions = { "1.0" = "sha256:aaa", "1.1" = "sha256:bbb" }
+"#,
+        )
+        .unwrap();
+        let entry = index.get("agent-of-empires.example").expect("present");
+        assert!(entry.verifies("sha256:aaa"));
+        assert!(entry.verifies("sha256:bbb"));
+        assert!(!entry.verifies("sha256:ccc"));
     }
 }

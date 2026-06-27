@@ -2,21 +2,29 @@
 #
 # This file is compiled into the aoe binary. Each entry is a maintainer's
 # attestation that an exact plugin source tree was reviewed: install and update
-# refuse unless the plugin's fetched source slug and tree hash match the pin,
-# and a featured entry is the only thing that lets a community install claim a
-# reserved (`aoe.*` / `agent-of-empires.*`) namespace.
+# refuse unless the plugin's fetched source slug matches, and a featured entry
+# is the only thing that lets a community install claim a reserved (`aoe.*` /
+# `agent-of-empires.*`) namespace.
 #
-# An entry's `tree_hash` is produced by `aoe plugin hash <plugin-dir>` on a
-# clean checkout. Generate it on a canonical platform with LF line endings; the
-# hash covers source files only (a release-binary worker is not pinned here, so
-# release-binary plugins cannot be featured yet).
+# Each entry lists one or more vetted releases as `version -> tree_hash`. An
+# install whose fetched source tree hashes to any listed value is
+# featured-verified; an install of the same id at an unlisted hash is treated as
+# an unvetted version (community), not a tamper-refuse (the reserved-namespace
+# gate still blocks an unvetted version of a reserved-namespace plugin).
 #
-# Schema (one vetted pin per plugin id):
+# A `tree_hash` is produced by `aoe plugin hash <plugin-dir>` on a clean
+# checkout. Generate it on a canonical platform with LF line endings; the hash
+# covers source files only (a release-binary worker is not pinned here, so
+# release-binary plugins cannot be featured yet). To ship a new release, run
+# `aoe plugin hash` against the new tag and add its `version = "sha256:..."`
+# line alongside the existing ones.
+#
+# Schema (one or more vetted releases per plugin id):
 #
 #   [plugins."agent-of-empires.example"]
 #   source = "gh:agent-of-empires/example"
-#   tree_hash = "sha256:<hex>"
+#   versions = { "1.0" = "sha256:<hex>", "1.1" = "sha256:<hex>" }
 
 [plugins."agent-of-empires.github"]
 source = "gh:agent-of-empires/plugin-github"
-tree_hash = "sha256:6b506512d4efbc8a70c4d989188e701e547f5c35bd690c28276df435ced940fc"
+versions = { "0.1.0" = "sha256:6b506512d4efbc8a70c4d989188e701e547f5c35bd690c28276df435ced940fc" }

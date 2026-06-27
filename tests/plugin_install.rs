@@ -266,16 +266,32 @@ api_version = 2
 }
 
 /// Write a featured index file and point `AOE_FEATURED_INDEX_PATH` at it (debug
-/// builds only; tests run in debug).
-fn write_featured(dir: &Path, id: &str, source: &str, tree_hash: &str) -> PathBuf {
+/// builds only; tests run in debug). `versions` is a list of `(label, hash)`
+/// vetted releases for the single entry.
+fn write_featured_versions(
+    dir: &Path,
+    id: &str,
+    source: &str,
+    versions: &[(&str, &str)],
+) -> PathBuf {
+    let body: String = versions
+        .iter()
+        .map(|(label, hash)| format!("\"{label}\" = \"{hash}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
     let path = dir.join("featured.toml");
     std::fs::write(
         &path,
-        format!("[plugins.\"{id}\"]\nsource = \"{source}\"\ntree_hash = \"{tree_hash}\"\n"),
+        format!("[plugins.\"{id}\"]\nsource = \"{source}\"\nversions = {{ {body} }}\n"),
     )
     .unwrap();
     std::env::set_var("AOE_FEATURED_INDEX_PATH", &path);
     path
+}
+
+/// Convenience: a single vetted release at `tree_hash`.
+fn write_featured(dir: &Path, id: &str, source: &str, tree_hash: &str) -> PathBuf {
+    write_featured_versions(dir, id, source, &[("1.0.0", tree_hash)])
 }
 
 #[tokio::test]
@@ -317,7 +333,7 @@ api_version = 2
 
 #[tokio::test]
 #[serial]
-async fn featured_hash_mismatch_is_refused() {
+async fn featured_unvetted_version_installs_as_community() {
     let _home = isolate();
     let src = tempfile::tempdir().unwrap();
     let dir = write_plugin_dir(
@@ -329,10 +345,87 @@ version = "1.0.0"
 api_version = 2
 "#,
     );
-    // Pin a hash that does not match the actual tree.
+    // The id is featured but pinned to a different (unvetted) hash. For a
+    // non-reserved id this is not tamper-refuse: it installs as an unvetted
+    // version (community).
     write_featured(
         src.path(),
         "acme.featured",
+        dir.to_str().unwrap(),
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    );
+
+    install::install(dir.to_str().unwrap(), true).await.unwrap();
+
+    // It installs (not refused) and is not featured. The non-featured label
+    // ("local" here, since the install source is a local dir; "community" for a
+    // gh: install) is derived from the source, not the hash mismatch.
+    let reg = load_registry();
+    let plugin = reg.get("acme.featured").expect("installed");
+    assert_ne!(plugin.validation.as_str(), "featured");
+    assert_eq!(plugin.validation.as_str(), "local");
+
+    std::env::remove_var("AOE_FEATURED_INDEX_PATH");
+}
+
+#[tokio::test]
+#[serial]
+async fn featured_second_vetted_version_verifies() {
+    let _home = isolate();
+    let src = tempfile::tempdir().unwrap();
+    let dir = write_plugin_dir(
+        src.path(),
+        r#"
+id = "agent-of-empires.official"
+name = "Official"
+version = "1.1.0"
+api_version = 2
+"#,
+    );
+    let tree_hash = agent_of_empires::plugin::integrity::tree_hash(&dir).unwrap();
+    // The actual tree is the second vetted release; an earlier release is also
+    // listed and must not un-verify this one.
+    write_featured_versions(
+        src.path(),
+        "agent-of-empires.official",
+        dir.to_str().unwrap(),
+        &[
+            (
+                "1.0.0",
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            ),
+            ("1.1.0", &tree_hash),
+        ],
+    );
+
+    install::install(dir.to_str().unwrap(), true).await.unwrap();
+
+    let reg = load_registry();
+    let plugin = reg.get("agent-of-empires.official").expect("installed");
+    assert_eq!(plugin.validation.as_str(), "featured");
+
+    std::env::remove_var("AOE_FEATURED_INDEX_PATH");
+}
+
+#[tokio::test]
+#[serial]
+async fn featured_reserved_namespace_unvetted_is_refused() {
+    let _home = isolate();
+    let src = tempfile::tempdir().unwrap();
+    // A reserved-namespace id at an unvetted hash is still refused: only a
+    // vetted release lifts the reserved-namespace gate.
+    let dir = write_plugin_dir(
+        src.path(),
+        r#"
+id = "agent-of-empires.official"
+name = "Official"
+version = "1.0.0"
+api_version = 2
+"#,
+    );
+    write_featured(
+        src.path(),
+        "agent-of-empires.official",
         dir.to_str().unwrap(),
         "sha256:0000000000000000000000000000000000000000000000000000000000000000",
     );
@@ -341,8 +434,8 @@ api_version = 2
         .await
         .unwrap_err()
         .to_string();
-    assert!(err.contains("featured pin"), "got: {err}");
-    assert!(load_registry().get("acme.featured").is_none());
+    assert!(err.contains("reserved"), "got: {err}");
+    assert!(load_registry().get("agent-of-empires.official").is_none());
 
     std::env::remove_var("AOE_FEATURED_INDEX_PATH");
 }

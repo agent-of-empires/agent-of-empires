@@ -350,12 +350,15 @@ fn reject_incompatible_host(manifest: &PluginManifest) -> Result<()> {
 /// Check a fetched plugin against the curated index. Returns whether it is a
 /// verified featured plugin.
 ///
-/// If the id is in the index, the install MUST match the pin: the source slug
-/// (case-insensitively, GitHub slugs are not case-sensitive) and the source
-/// tree hash both have to match, and a release-binary worker is refused (its
-/// bytes are not covered by the tree hash yet, so a featured pin cannot vouch
-/// for them). Any mismatch is a hard error, not a silent demotion: a featured
-/// id is only ever installed at its vetted tree.
+/// If the id is in the index, the install must come from the pinned source slug
+/// (case-insensitively, GitHub slugs are not case-sensitive) and must not ship a
+/// release-binary worker (its bytes are not covered by the tree hash yet, so a
+/// featured pin cannot vouch for them); both are hard errors. The tree hash is
+/// checked against the entry's set of vetted release hashes: a match is
+/// featured-verified, while an id-in-index but hash-not-vetted install is simply
+/// an unvetted version (returns `false`, treated as community) rather than a
+/// tamper-refuse. The reserved-namespace gate downstream still blocks an
+/// unvetted version of a reserved-namespace plugin.
 fn verify_featured(featured: &FeaturedIndex, fetched: &FetchedPlugin) -> Result<bool> {
     let id = fetched.manifest.id.as_str();
     let Some(entry) = featured.get(id) else {
@@ -374,10 +377,7 @@ fn verify_featured(featured: &FeaturedIndex, fetched: &FetchedPlugin) -> Result<
             entry.source
         );
     }
-    if fetched.tree_hash != entry.tree_hash {
-        bail!("{id} does not match its featured pin (source tree hash mismatch); refusing install");
-    }
-    Ok(true)
+    Ok(entry.verifies(&fetched.tree_hash))
 }
 
 /// The manifest's capabilities as strings, rejecting any this host does not

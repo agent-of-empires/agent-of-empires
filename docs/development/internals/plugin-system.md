@@ -287,16 +287,24 @@ install-time value; the downloaded worker stays pinned separately by the lock's
 `asset_sha256`.
 
 `plugins/featured.toml` is the curated index, compiled into the binary. Each
-entry pins one vetted release per plugin id to its `{source, tree_hash}`: a
-maintainer's attestation that this exact tree was reviewed. When a plugin id
-appears in the index, install and update **refuse** unless the fetched source
-slug (case-insensitive) and tree hash both match the pin, and a release-binary
-manifest is refused outright (its worker bytes are not covered by the tree hash
-yet). A featured-verified install is the one case allowed to claim a reserved
-(`aoe.*` / `agent-of-empires.*`) namespace; a builtin-id collision is always
-rejected. In debug builds `AOE_FEATURED_INDEX_PATH` overrides the embedded index
-for tests; a release binary always uses the compiled-in index, since the curated
-set is a root of trust and must not be redefinable by the environment.
+entry holds a plugin's `source` slug and a `version -> tree_hash` map of vetted
+releases: a maintainer's attestation that each listed tree was reviewed. When a
+plugin id appears in the index, install and update **refuse** if the fetched
+source slug (case-insensitive) does not match, or if the manifest ships a
+release-binary worker (its bytes are not covered by the tree hash yet). The tree
+hash is then checked against the entry's set of vetted hashes: a match is
+featured-verified. An id-in-index install at a hash that is **not** in the set is
+an unvetted version, not a tamper-refuse: it installs as a non-featured plugin
+(community for a GitHub install), so a maintainer can vet a new release by
+appending its hash without un-verifying older ones. The reserved-namespace gate
+is unchanged, so an unvetted version of a reserved-namespace plugin is still
+refused (only a vetted release lifts that gate). A featured-verified install is
+the one case allowed to claim a reserved (`aoe.*` / `agent-of-empires.*`)
+namespace; a builtin-id collision is always rejected. To ship a new release, run
+`aoe plugin hash` against the new tag and add its `version = "sha256:..."` line
+to the entry. In debug builds `AOE_FEATURED_INDEX_PATH` overrides the embedded
+index for tests; a release binary always uses the compiled-in index, since the
+curated set is a root of trust and must not be redefinable by the environment.
 
 Every surface (CLI `aoe plugin list` / `info`, the TUI plugin manager, the web
 Plugins panel) shows a `ValidationState`: `builtin`, `featured`, `community` (an
