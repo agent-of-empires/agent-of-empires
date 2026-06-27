@@ -1015,6 +1015,32 @@ pub struct SessionConfig {
     )]
     pub snooze_duration_minutes: u32,
 
+    /// Move deleted sessions to the trash instead of purging them
+    /// immediately. When enabled (default), `delete`/`rm` and the TUI/web
+    /// delete actions stop the session and hide it in a recoverable trash
+    /// bucket; durable state (transcript, worktree, branch, container) is
+    /// kept until the session is purged or its retention window expires.
+    /// When disabled, delete performs the historical irreversible purge.
+    /// An explicit purge (`aoe rm --purge`, the web "Delete permanently"
+    /// action) always purges regardless of this setting.
+    #[serde(default = "default_true")]
+    #[setting(label = "Delete to Trash", widget = "toggle")]
+    pub delete_to_trash: bool,
+
+    /// Days a session stays in the trash before it is automatically purged,
+    /// measured from when it was trashed. `0` keeps trashed sessions
+    /// forever (manual purge only). The sweep runs on app/daemon startup
+    /// and, for the serve daemon, hourly thereafter.
+    #[serde(default = "default_trash_retention_days")]
+    #[setting(
+        label = "Trash Retention (days)",
+        widget = "number",
+        min = 0,
+        max = 3650,
+        validate = "range:0:3650"
+    )]
+    pub trash_retention_days: u32,
+
     /// Seconds of inactivity after which a plain TUI/tmux session that has
     /// been `Idle` this long is auto-stopped (its tmux session and any
     /// sandbox container are killed and the row becomes a restartable
@@ -1299,6 +1325,8 @@ impl Default for SessionConfig {
             acp_defaults: HashMap::new(),
             strict_hotkeys: false,
             snooze_duration_minutes: 30,
+            delete_to_trash: true,
+            trash_retention_days: default_trash_retention_days(),
             auto_stop_idle_secs: default_auto_stop_idle_secs(),
             restart_wake_message: default_restart_wake_message(),
             row_tag: RowTagMode::default(),
@@ -1317,6 +1345,10 @@ impl Default for SessionConfig {
 }
 
 fn default_snooze_duration_minutes() -> u32 {
+    30
+}
+
+fn default_trash_retention_days() -> u32 {
     30
 }
 
