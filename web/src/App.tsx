@@ -84,6 +84,7 @@ const StructuredView = lazy(() =>
 import { Dock, type PaneDisplay } from "./components/Dock";
 import { BottomDock } from "./components/BottomDock";
 import { PaneDndController } from "./components/PaneDndController";
+import { visibleToFullIndex } from "./components/paneDnd";
 import { DiffPane } from "./components/DiffPane";
 import { PairedShellPane } from "./components/PairedTerminal";
 import { BUILTIN_PANES, isTerminalTabId, terminalIndexOf, terminalTabId, type DockLocation } from "./lib/panes";
@@ -471,6 +472,16 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     [closeTab, activeSessionId],
   );
   const movePaneAny = useCallback((id: string, dock: DockLocation) => moveTab(id, dock), [moveTab]);
+  // The dnd controller works in visible-tab space; map its drop index back to
+  // the full persisted dock list, since a hidden (unloaded) plugin tab still
+  // holds a slot the visible index does not count.
+  const placeVisibleTab = useCallback(
+    (id: string, toDock: DockLocation, visibleIndex: number) => {
+      const fullBase = dockTabs(paneLayout, toDock).filter((tab) => tab !== id);
+      placeTab(id, toDock, visibleToFullIndex(fullBase, visibleIndex, tabAvailable));
+    },
+    [paneLayout, placeTab, tabAvailable],
+  );
   // Layout topology is width-driven so it stays aligned with the `md:`
   // Tailwind classes the rest of the layout uses. At md and up the
   // side-by-side ContentSplit renders; below md a single full-viewport
@@ -1337,7 +1348,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     };
     return (
       <div className="flex-1 flex flex-col min-h-0">
-        <PaneDndController tabsByDock={tabsByDock} descriptorFor={paneDescriptor} onPlaceTab={placeTab}>
+        <PaneDndController tabsByDock={tabsByDock} descriptorFor={paneDescriptor} onPlaceTab={placeVisibleTab}>
           <ContentSplit
             collapsed={rightDockCollapsed}
             onToggleCollapse={toggleDiff}
