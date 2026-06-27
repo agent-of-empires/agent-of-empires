@@ -104,6 +104,21 @@ impl HostApiState {
     pub fn ui_snapshot(&self) -> UiSnapshot {
         self.ui.snapshot()
     }
+
+    /// Push a host-originated notification onto the ring. Unlike the `ui.notify`
+    /// RPC this is the host itself speaking (e.g. the auto-update sweep telling
+    /// the user an update needs approval), so it bypasses the per-worker
+    /// capability check. Errors (an empty or over-long title) are swallowed: a
+    /// notification is best-effort and must never fail a caller.
+    pub fn notify_host(
+        &self,
+        plugin_id: &str,
+        tone: crate::plugin::ui_state::Tone,
+        title: String,
+        body: Option<String>,
+    ) {
+        let _ = self.ui.notify(plugin_id, tone, title, body, None);
+    }
 }
 
 /// Per-worker call context: who is calling and what they were granted. Built

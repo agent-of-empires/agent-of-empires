@@ -1188,8 +1188,17 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
 
     // Opt-in clean-only plugin auto-update sweep (off by default). Spawned
     // non-blocking so daemon startup never waits on git/network; freshly applied
-    // updates are picked up on the next daemon restart.
-    crate::plugin::auto_update::spawn_if_enabled(&crate::session::Config::load_or_warn());
+    // updates are picked up on the next daemon restart. The plugin host (when
+    // running) is passed as the notifier so a consent-needed skip surfaces as a
+    // dashboard notification, not just a log line.
+    let update_notifier = state
+        .plugin_host
+        .clone()
+        .map(|h| h as std::sync::Arc<dyn crate::plugin::auto_update::UpdateNotifier>);
+    crate::plugin::auto_update::spawn_if_enabled(
+        &crate::session::Config::load_or_warn(),
+        update_notifier,
+    );
 
     rate_limiter.spawn_cleanup_task(state.shutdown.clone());
     login_manager.spawn_cleanup_task(state.shutdown.clone());

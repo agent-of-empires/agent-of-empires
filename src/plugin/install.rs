@@ -7,6 +7,7 @@ use std::process::Stdio;
 
 use anyhow::{anyhow, bail, Context, Result};
 use aoe_plugin_api::{BuildStep, PluginManifest, RuntimeSpec, UiContribution};
+use serde::Serialize;
 
 use crate::session::{save_config, CapabilityGrant, Config, PluginConfig};
 
@@ -84,8 +85,76 @@ pub enum UpdateOutcome {
     /// The update was applied (the tree was replaced and the lockfile rewritten).
     Applied(InstallReport),
     /// A `CleanOnlyNonInteractive` update was skipped because it needs consent;
-    /// the prior version stays installed and active.
-    Skipped { id: String, reason: String },
+    /// the prior version stays installed and active. `fingerprint` identifies the
+    /// skipped version so a caller (the auto-update sweep) can compare it to the
+    /// user's recorded dismissal and avoid re-nagging.
+    Skipped {
+        id: String,
+        reason: String,
+        fingerprint: String,
+    },
+}
+
+/// One dashboard UI slot a plugin contributes to, in a consent disclosure.
+#[derive(Debug, Clone, Serialize)]
+pub struct UiView {
+    pub slot: String,
+    pub id: String,
+}
+
+/// The structured disclosure an in-app (web / TUI) update approval renders. The
+/// same payload the terminal prompt describes, so every surface consents to the
+/// identical change. `fingerprint` pins the exact content the user is approving
+/// (the source tree plus any release-binary asset and the trust class), so
+/// `apply_update` can refuse if the remote moved since this was shown.
+#[derive(Debug, Clone, Serialize)]
+pub struct UpdateConsent {
+    pub id: String,
+    pub from_version: String,
+    pub to_version: String,
+    /// Capabilities currently granted (the prior approval).
+    pub prior_capabilities: Vec<String>,
+    /// Capabilities the new manifest declares.
+    pub new_capabilities: Vec<String>,
+    /// Capabilities present in the new set but not the prior one.
+    pub added_capabilities: Vec<String>,
+    /// Capabilities present in the prior set but not the new one.
+    pub removed_capabilities: Vec<String>,
+    /// The dashboard UI slots the new version contributes to.
+    pub ui: Vec<UiView>,
+    /// Build commands the new version will run, unsandboxed, at apply time.
+    pub build_steps: Vec<String>,
+    /// A human description when the worker runtime kind changes (e.g. a script
+    /// becomes a downloaded release binary), else `None`.
+    pub runtime_change: Option<String>,
+    /// The plugin was a verified featured plugin and the update no longer is.
+    pub trust_downgrade: bool,
+    /// Content fingerprint of the version being approved.
+    pub fingerprint: String,
+    /// Whether declining keeps the current version active (always true for the
+    /// in-app path, which never touches the tree on decline).
+    pub stays_active_if_declined: bool,
+}
+
+/// What a non-interactive update preview found for one installed plugin.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UpdatePreview {
+    /// The remote matches the installed content; nothing to do.
+    NoUpdate,
+    /// A newer version that needs no fresh consent; safe to apply directly.
+    SafeUpdate {
+        to_version: String,
+        fingerprint: String,
+    },
+    /// A newer version that expands access (capabilities, build steps, UI,
+    /// runtime, or trust) and must be explicitly approved. `dismissed` is set
+    /// when the user already declined this exact fingerprint. Boxed because the
+    /// consent payload dwarfs the other variants.
+    ConsentRequired {
+        consent: Box<UpdateConsent>,
+        dismissed: bool,
+    },
 }
 
 /// Install an external plugin from `input` (`gh:owner/repo[@ref]` or a local
@@ -154,7 +223,7 @@ pub async fn update(id: &str) -> Result<InstallReport> {
         UpdateOutcome::Applied(report) => Ok(report),
         // Interactive mode prompts rather than skipping, so this is unreachable;
         // map it to an error rather than panicking if that ever changes.
-        UpdateOutcome::Skipped { id, reason } => {
+        UpdateOutcome::Skipped { id, reason, .. } => {
             bail!("update for {id} was skipped unexpectedly: {reason}")
         }
     }
@@ -167,7 +236,48 @@ pub async fn update_clean(id: &str) -> Result<UpdateOutcome> {
     update_with_consent(id, ConsentMode::CleanOnlyNonInteractive).await
 }
 
-async fn update_with_consent(id: &str, mode: ConsentMode) -> Result<UpdateOutcome> {
+/// Everything an update needs after fetching and diffing, before any decision
+/// about whether to apply it. Computing the consent decision in exactly one
+/// place is what lets the CLI prompt, the in-app preview/apply flow, and the
+/// auto-update sweep stay in lockstep instead of drifting apart.
+struct Prepared {
+    id: String,
+    source_str: String,
+    fetched: FetchedPlugin,
+    featured_verified: bool,
+    prior_grant: Option<CapabilityGrant>,
+    capabilities: Vec<String>,
+    manifest_hash: String,
+    /// Content fingerprint of the fetched version (tree + release asset + trust).
+    fingerprint: String,
+    /// Content fingerprint of the currently installed version, from the
+    /// lockfile; `None` when no lock entry exists.
+    prior_fingerprint: Option<String>,
+    from_version: String,
+    caps_changed: bool,
+    added_capabilities: Vec<String>,
+    removed_capabilities: Vec<String>,
+    build_changed: bool,
+    ui_changed: bool,
+    runtime_change: Option<String>,
+    trust_downgrade: bool,
+    needs_consent: bool,
+}
+
+/// A content fingerprint of an installed or fetched version: the source tree
+/// hash, the release-binary asset hash (whose bytes the tree hash does not
+/// cover), and the trust class. This pins exactly what a consent approval
+/// covers, so a preview cannot be applied if the remote moved underneath it: a
+/// manifest hash alone would miss a `build.sh` or worker script changing under
+/// an unchanged `aoe-plugin.toml`, which run unsandboxed at apply time.
+fn fingerprint(tree_hash: &str, asset_sha256: Option<&str>, trust: &str) -> String {
+    format!("{tree_hash}|{}|{trust}", asset_sha256.unwrap_or(""))
+}
+
+/// Fetch an installed plugin's recorded source and diff it against what is on
+/// disk, classifying whether the update needs fresh consent. Network-only: it
+/// never touches the installed tree.
+async fn prepare_update(id: &str) -> Result<Prepared> {
     let config = Config::load()?;
     let plugin_config = config
         .plugins
@@ -200,117 +310,318 @@ async fn update_with_consent(id: &str, mode: ConsentMode) -> Result<UpdateOutcom
     let capabilities = capability_strings(&fetched)?;
     let manifest_hash = PluginManifest::hash_bytes(&fetched.manifest_bytes);
 
+    // The lockfile is the source of truth for what is installed on disk.
+    let lock = Lockfile::load()?;
+    let prior_locked = lock.get(id);
+    let prior_tree_hash = prior_locked
+        .map(|l| l.tree_hash.clone())
+        .unwrap_or_default();
+    let prior_was_release_binary = prior_locked.is_some_and(|l| l.asset_sha256.is_some());
+    let prior_trust = prior_locked.map(|l| l.trust.clone()).unwrap_or_default();
+    let from_version = prior_locked
+        .map(|l| l.version.clone())
+        .unwrap_or_else(|| "?".to_string());
+
+    let trust = if featured_verified {
+        "featured"
+    } else {
+        "community"
+    };
+    let prior_fingerprint =
+        prior_locked.map(|l| fingerprint(&l.tree_hash, l.asset_sha256.as_deref(), &l.trust));
+    let fingerprint = fingerprint(&fetched.tree_hash, fetched.asset_sha256.as_deref(), trust);
+
     let prior_caps: BTreeSet<&str> = prior_grant
         .as_ref()
         .map(|g| g.capabilities.iter().map(String::as_str).collect())
         .unwrap_or_default();
     let new_caps: BTreeSet<&str> = capabilities.iter().map(String::as_str).collect();
     let caps_changed = prior_caps != new_caps;
+    let added_capabilities: Vec<String> = new_caps
+        .difference(&prior_caps)
+        .map(|s| s.to_string())
+        .collect();
+    let removed_capabilities: Vec<String> = prior_caps
+        .difference(&new_caps)
+        .map(|s| s.to_string())
+        .collect();
 
-    // Build steps run unsandboxed at update time, so a changed build recipe
-    // must re-prompt even when the capability set is unchanged; a static
-    // capability list must not let modified build commands run unattended. The
-    // manifest hash covers the build steps, so a hash change with build steps
-    // present means the recipe could have changed.
+    // Build steps run unsandboxed at apply time, so a changed recipe must
+    // re-prompt. A manifest hash misses a build script changing under an
+    // unchanged `aoe-plugin.toml`, so key this on the source tree hash: if the
+    // tree moved and the new version declares build steps, the recipe could have
+    // changed. Fall back to the manifest-hash heuristic only when no prior tree
+    // hash is recorded (a pre-v2 lock).
     let manifest_changed =
         prior_grant.as_ref().map(|g| g.manifest_hash.as_str()) != Some(manifest_hash.as_str());
-    let build_changed = manifest_changed && !build_steps(&fetched.manifest).is_empty();
+    let tree_changed = if prior_tree_hash.is_empty() {
+        manifest_changed
+    } else {
+        prior_tree_hash != fetched.tree_hash
+    };
+    let build_changed = tree_changed && !build_steps(&fetched.manifest).is_empty();
     // UI contributions are disclosed at install, so an update that changes the
     // manifest while declaring UI slots must re-disclose them: otherwise an
-    // update could add new dashboard slots the user never saw. The manifest
-    // hash covers the `[[ui]]` section, so a hash change with UI present means
-    // the slots could have changed.
+    // update could add dashboard slots the user never saw.
     let ui_changed = manifest_changed && !fetched.manifest.ui.is_empty();
-    // Prompt when there is something to consent to or disclose: capabilities
-    // that changed, build steps that could have changed, or UI slots on a
-    // changed manifest. Dropping all capabilities with no build/UI has nothing
-    // to grant, so it still (re)grants silently.
-    let needs_prompt = (!capabilities.is_empty() && caps_changed) || build_changed || ui_changed;
+    // A worker that switches between an in-tree command and a downloaded release
+    // binary is a meaningful change in auditability, even when capabilities are
+    // unchanged; disclose and re-prompt for it.
+    let new_is_release_binary = matches!(
+        fetched.manifest.runtime,
+        Some(RuntimeSpec::ReleaseBinary { .. })
+    );
+    let runtime_change = if new_is_release_binary && !prior_was_release_binary {
+        Some(
+            "the worker is now a downloaded release binary (opaque, not source-auditable)"
+                .to_string(),
+        )
+    } else if prior_was_release_binary && !new_is_release_binary {
+        Some("the worker is now an in-tree command (was a downloaded release binary)".to_string())
+    } else {
+        None
+    };
+    // A plugin that was a verified featured plugin and no longer is has lost the
+    // curated-index vouch; treat the downgrade as consent-worthy.
+    let trust_downgrade = prior_trust == "featured" && !featured_verified;
+
+    // Re-prompt when there is something to consent to or disclose: capabilities
+    // that changed, a build recipe that could have changed, UI slots on a
+    // changed manifest, a runtime-kind switch, or a trust downgrade. Dropping
+    // all capabilities with no other trigger has nothing to grant, so it still
+    // (re)grants silently.
+    let needs_consent = (!capabilities.is_empty() && caps_changed)
+        || build_changed
+        || ui_changed
+        || runtime_change.is_some()
+        || trust_downgrade;
+
+    Ok(Prepared {
+        id: id.to_string(),
+        source_str,
+        fetched,
+        featured_verified,
+        prior_grant,
+        capabilities,
+        manifest_hash,
+        fingerprint,
+        prior_fingerprint,
+        from_version,
+        caps_changed,
+        added_capabilities,
+        removed_capabilities,
+        build_changed,
+        ui_changed,
+        runtime_change,
+        trust_downgrade,
+        needs_consent,
+    })
+}
+
+/// Apply a prepared update with an already-decided grant: replace the tree, run
+/// the build, persist the grant and lockfile, and reload the registry. A `None`
+/// grant on a build-bearing, consent-needing update aborts (the user declined
+/// arbitrary code); a capabilities-only decline keeps the prior behavior (tree
+/// updated, left inactive until re-approved).
+fn apply_prepared(prepared: &Prepared, grant: Option<CapabilityGrant>) -> Result<InstallReport> {
+    let id = prepared.id.as_str();
+    let final_dir = super::plugins_dir()?.join(id);
+    if prepared.needs_consent
+        && grant.is_none()
+        && !build_steps(&prepared.fetched.manifest).is_empty()
+    {
+        bail!("update cancelled for {id}; build steps were not approved, prior version kept");
+    }
+    replace_and_build(id, &prepared.fetched, &final_dir)?;
+
+    let granted = grant.is_some();
+    persist_update(id, &prepared.source_str, grant)?;
+    write_lock(
+        id,
+        &prepared.fetched,
+        &prepared.manifest_hash,
+        prepared.featured_verified,
+    )?;
+    super::reload_registry();
+
+    if prepared.caps_changed && !granted {
+        eprintln!(
+            "{id} updated but its capability set changed; it stays inactive until you re-approve with `aoe plugin update {id}`."
+        );
+    }
+
+    Ok(InstallReport {
+        id: id.to_string(),
+        version: prepared.fetched.manifest.version.clone(),
+        capabilities: prepared.capabilities.clone(),
+        granted,
+        validation: install_validation(prepared.featured_verified, &prepared.source_str),
+    })
+}
+
+async fn update_with_consent(id: &str, mode: ConsentMode) -> Result<UpdateOutcome> {
+    let prepared = prepare_update(id).await?;
 
     // Decide the grant BEFORE touching the installed tree, so a declined or
     // non-interactive prompt bails while the old install, config, and lockfile
     // are still consistent.
-    let grant = if needs_prompt {
+    let grant = if prepared.needs_consent {
         // The auto-update sweep declines anything needing consent: skip without
         // touching the tree, leaving the working version active.
         if mode == ConsentMode::CleanOnlyNonInteractive {
             return Ok(UpdateOutcome::Skipped {
                 id: id.to_string(),
-                reason: skip_reason(caps_changed, build_changed, ui_changed),
+                reason: skip_reason(&prepared),
+                fingerprint: prepared.fingerprint.clone(),
             });
         }
         if confirm_capabilities(
             id,
-            &capabilities,
-            &fetched.manifest.ui,
-            build_steps(&fetched.manifest),
+            &prepared.capabilities,
+            &prepared.fetched.manifest.ui,
+            build_steps(&prepared.fetched.manifest),
         )? {
             Some(CapabilityGrant {
-                manifest_hash: manifest_hash.clone(),
-                capabilities: capabilities.clone(),
+                manifest_hash: prepared.manifest_hash.clone(),
+                capabilities: prepared.capabilities.clone(),
                 granted_at: chrono::Utc::now(),
             })
         } else {
             None
         }
-    } else if capabilities.is_empty() {
+    } else if prepared.capabilities.is_empty() {
         // Nothing to grant; an empty capability set keeps the plugin active.
         Some(CapabilityGrant {
-            manifest_hash: manifest_hash.clone(),
+            manifest_hash: prepared.manifest_hash.clone(),
             capabilities: vec![],
             granted_at: chrono::Utc::now(),
         })
     } else {
         // Capabilities unchanged and the build recipe (if any) unchanged: carry
         // the prior grant forward, refreshed to the new manifest hash.
-        prior_grant.map(|g| CapabilityGrant {
-            manifest_hash: manifest_hash.clone(),
+        prepared.prior_grant.clone().map(|g| CapabilityGrant {
+            manifest_hash: prepared.manifest_hash.clone(),
             capabilities: g.capabilities,
             granted_at: g.granted_at,
         })
     };
 
-    let final_dir = super::plugins_dir()?.join(id);
-    // A declined prompt must not run the plugin's build steps (arbitrary code
-    // the user just refused): abort and keep the prior version. A capabilities
-    // decline with no build steps keeps the prior behavior (tree updated, left
-    // inactive until re-approved).
-    if needs_prompt && grant.is_none() && !build_steps(&fetched.manifest).is_empty() {
-        bail!("update cancelled for {id}; build steps were not approved, prior version kept");
-    }
-    replace_and_build(id, &fetched, &final_dir)?;
-
-    let granted = grant.is_some();
-    persist_update(id, &source_str, grant)?;
-    write_lock(id, &fetched, &manifest_hash, featured_verified)?;
-    super::reload_registry();
-
-    if caps_changed && !granted {
-        eprintln!(
-            "{id} updated but its capability set changed; it stays inactive until you re-approve with `aoe plugin update {id}`."
-        );
-    }
-
-    Ok(UpdateOutcome::Applied(InstallReport {
-        id: id.to_string(),
-        version: fetched.manifest.version.clone(),
-        capabilities,
-        granted,
-        validation: install_validation(featured_verified, &source_str),
-    }))
+    Ok(UpdateOutcome::Applied(apply_prepared(&prepared, grant)?))
 }
 
-/// Human-readable reason an auto-update was skipped, for the sweep log.
-fn skip_reason(caps_changed: bool, build_changed: bool, ui_changed: bool) -> String {
+/// Build the structured consent disclosure from a prepared update.
+fn consent_of(p: &Prepared) -> UpdateConsent {
+    UpdateConsent {
+        id: p.id.clone(),
+        from_version: p.from_version.clone(),
+        to_version: p.fetched.manifest.version.clone(),
+        prior_capabilities: p
+            .prior_grant
+            .as_ref()
+            .map(|g| g.capabilities.clone())
+            .unwrap_or_default(),
+        new_capabilities: p.capabilities.clone(),
+        added_capabilities: p.added_capabilities.clone(),
+        removed_capabilities: p.removed_capabilities.clone(),
+        ui: p
+            .fetched
+            .manifest
+            .ui
+            .iter()
+            .map(|u| UiView {
+                slot: u.slot.as_str().to_string(),
+                id: u.id.clone(),
+            })
+            .collect(),
+        build_steps: build_steps(&p.fetched.manifest)
+            .iter()
+            .map(|s| s.command.join(" "))
+            .collect(),
+        runtime_change: p.runtime_change.clone(),
+        trust_downgrade: p.trust_downgrade,
+        fingerprint: p.fingerprint.clone(),
+        stays_active_if_declined: true,
+    }
+}
+
+/// Classify an available update for one installed plugin without applying it:
+/// the in-app (web / TUI) "what would this update do" probe. Network-only.
+pub async fn preview_update(id: &str) -> Result<UpdatePreview> {
+    let prepared = prepare_update(id).await?;
+    if prepared.prior_fingerprint.as_ref() == Some(&prepared.fingerprint) {
+        return Ok(UpdatePreview::NoUpdate);
+    }
+    if !prepared.needs_consent {
+        return Ok(UpdatePreview::SafeUpdate {
+            to_version: prepared.fetched.manifest.version.clone(),
+            fingerprint: prepared.fingerprint.clone(),
+        });
+    }
+    let dismissed = Config::load()
+        .ok()
+        .and_then(|c| c.plugins.get(id).and_then(|p| p.dismissed_update.clone()))
+        == Some(prepared.fingerprint.clone());
+    Ok(UpdatePreview::ConsentRequired {
+        consent: Box::new(consent_of(&prepared)),
+        dismissed,
+    })
+}
+
+/// Apply an update that was previewed in-app, granting whatever the fetched
+/// manifest declares. `expected_fingerprint` pins the exact content the user
+/// approved: if the remote moved since the preview, this refuses rather than
+/// silently granting something the user never saw. Clears any recorded
+/// dismissal for the plugin on success (via `persist_update`).
+pub async fn apply_update(id: &str, expected_fingerprint: Option<String>) -> Result<InstallReport> {
+    let prepared = prepare_update(id).await?;
+    if let Some(expected) = expected_fingerprint {
+        if expected != prepared.fingerprint {
+            bail!(
+                "the available update for {id} changed since it was shown; review it again before approving"
+            );
+        }
+    }
+    let grant = Some(CapabilityGrant {
+        manifest_hash: prepared.manifest_hash.clone(),
+        capabilities: prepared.capabilities.clone(),
+        granted_at: chrono::Utc::now(),
+    });
+    apply_prepared(&prepared, grant)
+}
+
+/// Record that the user declined an available update by its fingerprint, so the
+/// popup and the auto-update notification stop nagging until the next version.
+pub fn dismiss_update(id: &str, fingerprint: &str) -> Result<()> {
+    let mut config = Config::load()?;
+    let entry = config
+        .plugins
+        .entry(id.to_string())
+        .or_insert_with(PluginConfig::default);
+    if entry.source.is_none() {
+        bail!("{id} is not an installed external plugin");
+    }
+    entry.dismissed_update = Some(fingerprint.to_string());
+    save_config(&config)
+}
+
+/// Human-readable reason an auto-update was skipped, for the sweep log and the
+/// in-app notification.
+fn skip_reason(prepared: &Prepared) -> String {
     let mut parts = Vec::new();
-    if caps_changed {
+    if prepared.caps_changed {
         parts.push("capability change");
     }
-    if build_changed {
+    if prepared.build_changed {
         parts.push("build-step change");
     }
-    if ui_changed {
+    if prepared.ui_changed {
         parts.push("UI change");
+    }
+    if prepared.runtime_change.is_some() {
+        parts.push("runtime change");
+    }
+    if prepared.trust_downgrade {
+        parts.push("trust downgrade");
     }
     if parts.is_empty() {
         "needs approval".to_string()
@@ -793,6 +1104,9 @@ fn persist_update(id: &str, source: &str, grant: Option<CapabilityGrant>) -> Res
         .or_insert_with(PluginConfig::default);
     entry.source = Some(source.to_string());
     entry.grant = grant;
+    // The applied version is no longer "the update the user declined"; clear any
+    // stale dismissal so a later update is surfaced normally.
+    entry.dismissed_update = None;
     save_config(&config)
 }
 

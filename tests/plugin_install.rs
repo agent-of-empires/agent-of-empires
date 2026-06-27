@@ -1169,7 +1169,7 @@ async fn auto_update_applies_clean_github_update() {
 
     // A clean (no consent change) newer version on the remote.
     push_new_commit(base.path(), "acme", "upd", &[("aoe-plugin.toml", &v2)]);
-    let summary = auto_update::sweep().await;
+    let summary = auto_update::sweep(None).await;
     assert_eq!(summary.applied, vec!["acme.upd".to_string()], "{summary:?}");
     assert_eq!(
         Lockfile::load().unwrap().get("acme.upd").unwrap().version,

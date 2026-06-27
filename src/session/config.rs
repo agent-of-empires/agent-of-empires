@@ -125,6 +125,13 @@ pub struct PluginConfig {
     /// builtins are auto-granted and never store one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grant: Option<CapabilityGrant>,
+
+    /// An available update the user declined in-app, recorded by its content
+    /// fingerprint so the popup and auto-update notification stop nagging until
+    /// the next version. Cleared on any successful apply or uninstall. Absent
+    /// when no update has been dismissed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dismissed_update: Option<String>,
 }
 
 /// A user's approval of an external plugin's requested capabilities, pinned to
@@ -154,6 +161,7 @@ impl Default for PluginConfig {
             source: None,
             settings: toml::Table::new(),
             grant: None,
+            dismissed_update: None,
         }
     }
 }
