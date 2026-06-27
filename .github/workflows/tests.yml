@@ -81,7 +81,7 @@ jobs:
         if: runner.os == 'macOS'
         run: cargo test --features serve --lib --bins
       # With every bundled plugin compiled out, core must still build and pass
-      # its unit/integration suite. `--no-default-features` also drops `serve`,
+      # its lib/bin unit tests. `--no-default-features` also drops `serve`,
       # so this doubles as the TUI-only compile gate, keeping the ~27
       # cfg(feature = "serve") sites from rotting.
       - name: Cargo test (bare core, no default features)
