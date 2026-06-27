@@ -348,6 +348,107 @@ export async function fetchPluginDetails(source: string): Promise<PluginDetailRe
   }
 }
 
+/** One UI slot disclosed in an update consent (mirrors the engine `UiView`). */
+export interface PluginUpdateUiView {
+  slot: string;
+  id: string;
+}
+
+/** Structured disclosure for a capability-expanding plugin update, mirroring the
+ *  Rust `UpdateConsent`. Drives the consent modal. */
+export interface PluginUpdateConsent {
+  id: string;
+  from_version: string;
+  to_version: string;
+  prior_capabilities: string[];
+  new_capabilities: string[];
+  added_capabilities: string[];
+  removed_capabilities: string[];
+  ui: PluginUpdateUiView[];
+  build_steps: string[];
+  runtime_change: string | null;
+  trust_downgrade: boolean;
+  fingerprint: string;
+  stays_active_if_declined: boolean;
+}
+
+/** Result of `GET /api/plugins/{id}/update/preview`: a tagged union mirroring the
+ *  Rust `UpdatePreview`. */
+export type PluginUpdatePreview =
+  | { kind: "no_update" }
+  | { kind: "safe_update"; to_version: string; fingerprint: string }
+  | { kind: "consent_required"; consent: PluginUpdateConsent; dismissed: boolean };
+
+export type PluginUpdatePreviewResult =
+  | { kind: "ok"; preview: PluginUpdatePreview }
+  | { kind: "error"; message: string };
+
+/** Classify the available update for one installed plugin (no install happens).
+ *  When consent is required the payload carries the full disclosure. */
+export async function previewPluginUpdate(id: string): Promise<PluginUpdatePreviewResult> {
+  try {
+    const res = await fetch(`/api/plugins/${encodeURIComponent(id)}/update/preview`, {
+      headers: { Accept: "application/json" },
+    });
+    const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+    if (res.ok && payload && typeof payload.kind === "string") {
+      return { kind: "ok", preview: payload as unknown as PluginUpdatePreview };
+    }
+    const message =
+      typeof payload?.message === "string"
+        ? (payload.message as string)
+        : `Update preview failed (HTTP ${res.status}).`;
+    return { kind: "error", message };
+  } catch {
+    return { kind: "error", message: "Network error." };
+  }
+}
+
+/** Apply an approved update, pinned to the fingerprint the user saw. On success
+ *  the server returns the refreshed plugin list. A 409 means the remote moved
+ *  since the preview, so the caller should re-preview before re-approving. */
+export async function applyPluginUpdate(id: string, expectedFingerprint: string | null): Promise<PluginToggleResult> {
+  try {
+    const res = await fetch(`/api/plugins/${encodeURIComponent(id)}/update/apply`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ expected_fingerprint: expectedFingerprint }),
+    });
+    const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+    if (res.ok && payload && isValidPluginListResponse(payload)) {
+      return { kind: "ok", data: payload };
+    }
+    const message =
+      typeof payload?.message === "string" ? (payload.message as string) : `Update failed (HTTP ${res.status}).`;
+    return { kind: "error", message };
+  } catch {
+    return { kind: "error", message: "Network error." };
+  }
+}
+
+export type PluginDismissResult = { kind: "ok" } | { kind: "error"; message: string };
+
+/** Record an in-app decline of an available update so it stops nagging until the
+ *  next version. */
+export async function dismissPluginUpdate(id: string, fingerprint: string): Promise<PluginDismissResult> {
+  try {
+    const res = await fetch(`/api/plugins/${encodeURIComponent(id)}/update/dismiss`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fingerprint }),
+    });
+    if (res.ok) {
+      return { kind: "ok" };
+    }
+    const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+    const message =
+      typeof payload?.message === "string" ? (payload.message as string) : `Dismiss failed (HTTP ${res.status}).`;
+    return { kind: "error", message };
+  } catch {
+    return { kind: "error", message: "Network error." };
+  }
+}
+
 // Plugin UI extension points (#2366).
 
 /** Display tone a plugin attaches to a slot entry or notification. The host

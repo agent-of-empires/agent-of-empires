@@ -1,17 +1,22 @@
 import { useCallback, useEffect, useState } from "react";
 
 import {
+  applyPluginUpdate,
+  dismissPluginUpdate,
   discoverPlugins,
   fetchPluginUpdates,
   fetchPlugins,
+  previewPluginUpdate,
   setPluginEnabled,
   type PluginDiscoveryResult,
   type PluginListResponse,
+  type PluginUpdateConsent,
   type PluginUpdateStatus,
   type PluginView,
 } from "../../lib/api";
 import { reportInfo } from "../../lib/toastBus";
 import { PluginDetailModal } from "./PluginDetailModal";
+import { PluginUpdateConsentModal } from "./PluginUpdateConsentModal";
 
 interface DetailTarget {
   source: string;
@@ -51,6 +56,20 @@ export function PluginsSettings() {
 
   // The plugin whose detail modal is open (null = closed).
   const [detail, setDetail] = useState<DetailTarget | null>(null);
+
+  // The in-app update flow: which plugin's Update button is previewing, and the
+  // consent modal when a fetched update needs explicit approval.
+  const [updatingId, setUpdatingId] = useState<string | null>(null);
+  const [consentModal, setConsentModal] = useState<{ plugin: PluginView; consent: PluginUpdateConsent } | null>(null);
+  const [consentBusy, setConsentBusy] = useState(false);
+  const [consentError, setConsentError] = useState<string | null>(null);
+
+  const clearUpdateBadge = (id: string) =>
+    setUpdates((u) => {
+      const next = { ...u };
+      delete next[id];
+      return next;
+    });
 
   // Two tabs, JetBrains-style: manage installed plugins vs browse the
   // marketplace (GitHub discovery).
@@ -117,6 +136,74 @@ export function PluginsSettings() {
       }
     } finally {
       setCheckingUpdates(false);
+    }
+  };
+
+  // Drive an in-app update: preview first, then apply a safe update directly or
+  // open the consent modal when the fetched version expands access.
+  const onUpdate = async (plugin: PluginView) => {
+    setUpdatingId(plugin.id);
+    setError(null);
+    try {
+      const res = await previewPluginUpdate(plugin.id);
+      if (res.kind !== "ok") {
+        setError(res.message);
+        return;
+      }
+      const preview = res.preview;
+      if (preview.kind === "no_update") {
+        reportInfo(`${plugin.name} is already up to date.`);
+        clearUpdateBadge(plugin.id);
+      } else if (preview.kind === "safe_update") {
+        const applied = await applyPluginUpdate(plugin.id, preview.fingerprint);
+        if (applied.kind === "ok") {
+          setData(applied.data);
+          clearUpdateBadge(plugin.id);
+          reportInfo(`${plugin.name} updated.`);
+        } else {
+          setError(applied.message);
+        }
+      } else {
+        setConsentError(null);
+        setConsentModal({ plugin, consent: preview.consent });
+      }
+    } finally {
+      setUpdatingId(null);
+    }
+  };
+
+  const onApproveUpdate = async () => {
+    if (!consentModal) return;
+    setConsentBusy(true);
+    setConsentError(null);
+    try {
+      const res = await applyPluginUpdate(consentModal.plugin.id, consentModal.consent.fingerprint);
+      if (res.kind === "ok") {
+        setData(res.data);
+        clearUpdateBadge(consentModal.plugin.id);
+        reportInfo(`${consentModal.plugin.name} updated.`);
+        setConsentModal(null);
+      } else {
+        // A moved-remote 409 (or any failure) keeps the modal open with the
+        // message; the user can close and re-Update to re-preview.
+        setConsentError(res.message);
+      }
+    } finally {
+      setConsentBusy(false);
+    }
+  };
+
+  const onDeclineUpdate = async () => {
+    if (!consentModal) return;
+    setConsentBusy(true);
+    try {
+      // Either way the current version stays active; record the decline so it
+      // stops nagging, then close.
+      await dismissPluginUpdate(consentModal.plugin.id, consentModal.consent.fingerprint);
+      clearUpdateBadge(consentModal.plugin.id);
+      setConsentModal(null);
+    } finally {
+      setConsentBusy(false);
     }
   };
 
@@ -328,10 +415,20 @@ export function PluginsSettings() {
                       </p>
                     )}
                     {update?.needs_update && (
-                      <p className="mt-1 text-[11px] text-text-dim">
-                        Update available ({update.current} → {update.available ?? "modified"}). Update with{" "}
-                        <code>aoe plugin update {plugin.id}</code>.
-                      </p>
+                      <div className="mt-1 flex flex-wrap items-center gap-2">
+                        <span className="text-[11px] text-text-dim">
+                          Update available ({update.current} → {update.available ?? "modified"}).
+                        </span>
+                        <button
+                          type="button"
+                          className="rounded border border-surface-700 px-2 py-0.5 text-[11px] hover:bg-surface-800 disabled:opacity-50"
+                          disabled={updatingId === plugin.id}
+                          onClick={() => void onUpdate(plugin)}
+                          data-testid={`plugin-update-${plugin.id}`}
+                        >
+                          {updatingId === plugin.id ? "Checking…" : "Update"}
+                        </button>
+                      </div>
                     )}
                     {update?.error && (
                       <p className="mt-1 text-[11px] text-status-error">Update check failed: {update.error}</p>
@@ -363,6 +460,19 @@ export function PluginsSettings() {
           fallback={detail.fallback}
           installCommand={detail.installCommand}
           onClose={() => setDetail(null)}
+        />
+      )}
+
+      {consentModal && (
+        <PluginUpdateConsentModal
+          key={consentModal.plugin.id}
+          consent={consentModal.consent}
+          name={consentModal.plugin.name}
+          busy={consentBusy}
+          error={consentError}
+          onApprove={() => void onApproveUpdate()}
+          onDecline={() => void onDeclineUpdate()}
+          onClose={() => setConsentModal(null)}
         />
       )}
     </div>

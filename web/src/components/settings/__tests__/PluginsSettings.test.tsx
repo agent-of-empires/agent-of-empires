@@ -12,8 +12,10 @@ import { fireEvent, render, waitFor } from "@testing-library/react";
 import type {
   DiscoverResult,
   PluginDetailResult,
+  PluginDismissResult,
   PluginListResponse,
   PluginToggleResult,
+  PluginUpdatePreviewResult,
   PluginUpdatesResult,
 } from "../../../lib/api";
 
@@ -22,6 +24,9 @@ const setPluginEnabled = vi.fn<[string, boolean], Promise<PluginToggleResult>>()
 const fetchPluginUpdates = vi.fn<[], Promise<PluginUpdatesResult>>();
 const discoverPlugins = vi.fn<[string], Promise<DiscoverResult>>();
 const fetchPluginDetails = vi.fn<[string], Promise<PluginDetailResult>>();
+const previewPluginUpdate = vi.fn<[string], Promise<PluginUpdatePreviewResult>>();
+const applyPluginUpdate = vi.fn<[string, string | null], Promise<PluginToggleResult>>();
+const dismissPluginUpdate = vi.fn<[string, string], Promise<PluginDismissResult>>();
 const reportInfo = vi.fn<[string], void>();
 
 vi.mock("../../../lib/api", () => ({
@@ -30,6 +35,9 @@ vi.mock("../../../lib/api", () => ({
   fetchPluginUpdates: () => fetchPluginUpdates(),
   discoverPlugins: (q: string) => discoverPlugins(q),
   fetchPluginDetails: (source: string) => fetchPluginDetails(source),
+  previewPluginUpdate: (id: string) => previewPluginUpdate(id),
+  applyPluginUpdate: (id: string, fp: string | null) => applyPluginUpdate(id, fp),
+  dismissPluginUpdate: (id: string, fp: string) => dismissPluginUpdate(id, fp),
 }));
 
 vi.mock("../../../lib/toastBus", () => ({
@@ -85,6 +93,9 @@ beforeEach(() => {
   fetchPluginUpdates.mockReset();
   discoverPlugins.mockReset();
   fetchPluginDetails.mockReset();
+  previewPluginUpdate.mockReset();
+  applyPluginUpdate.mockReset();
+  dismissPluginUpdate.mockReset();
   reportInfo.mockReset();
   fetchPlugins.mockResolvedValue(listResponse());
   fetchPluginUpdates.mockResolvedValue({ kind: "ok", updates: [] });
@@ -400,5 +411,113 @@ describe("PluginsSettings", () => {
     expect(modal.textContent).toContain("v0.1.0");
     fireEvent.click(await findByTestId("plugin-detail-close"));
     await waitFor(() => expect(queryByTestId("plugin-detail-modal")).toBeNull());
+  });
+
+  // --- In-app update flow ---
+
+  // Surface the per-row Update button by reporting an available update.
+  function markOutdated() {
+    fetchPluginUpdates.mockResolvedValue({
+      kind: "ok",
+      updates: [
+        {
+          id: "example.plugin",
+          source: "gh:example/plugin",
+          current: "abc1234",
+          available: "def5678",
+          needs_update: true,
+          error: null,
+        },
+      ],
+    });
+  }
+
+  const consentPreview: PluginUpdatePreviewResult = {
+    kind: "ok",
+    preview: {
+      kind: "consent_required",
+      dismissed: false,
+      consent: {
+        id: "example.plugin",
+        from_version: "0.1.0",
+        to_version: "0.2.0",
+        prior_capabilities: ["net"],
+        new_capabilities: ["net", "fs.read"],
+        added_capabilities: ["fs.read"],
+        removed_capabilities: [],
+        ui: [],
+        build_steps: ["sh build.sh"],
+        runtime_change: null,
+        trust_downgrade: false,
+        fingerprint: "treeB||community",
+        stays_active_if_declined: true,
+      },
+    },
+  };
+
+  it("Update on a consent-required version opens the consent modal with the new access", async () => {
+    markOutdated();
+    previewPluginUpdate.mockResolvedValue(consentPreview);
+    const { findByTestId } = render(<PluginsSettings />);
+    fireEvent.click(await findByTestId("plugins-check-updates"));
+    fireEvent.click(await findByTestId("plugin-update-example.plugin"));
+    await waitFor(() => expect(previewPluginUpdate).toHaveBeenCalledWith("example.plugin"));
+    await findByTestId("plugin-update-consent-modal");
+    expect((await findByTestId("plugin-update-added-caps")).textContent).toContain("fs.read");
+    expect((await findByTestId("plugin-update-build-steps")).textContent).toContain("sh build.sh");
+  });
+
+  it("Approving applies the update pinned to the previewed fingerprint and closes the modal", async () => {
+    markOutdated();
+    previewPluginUpdate.mockResolvedValue(consentPreview);
+    applyPluginUpdate.mockResolvedValue({ kind: "ok", data: listResponse() });
+    const { findByTestId, queryByTestId } = render(<PluginsSettings />);
+    fireEvent.click(await findByTestId("plugins-check-updates"));
+    fireEvent.click(await findByTestId("plugin-update-example.plugin"));
+    fireEvent.click(await findByTestId("plugin-update-approve"));
+    await waitFor(() => expect(applyPluginUpdate).toHaveBeenCalledWith("example.plugin", "treeB||community"));
+    await waitFor(() => expect(queryByTestId("plugin-update-consent-modal")).toBeNull());
+  });
+
+  it("Declining records the dismissal and never applies (the version stays active)", async () => {
+    markOutdated();
+    previewPluginUpdate.mockResolvedValue(consentPreview);
+    dismissPluginUpdate.mockResolvedValue({ kind: "ok" });
+    const { findByTestId, queryByTestId } = render(<PluginsSettings />);
+    fireEvent.click(await findByTestId("plugins-check-updates"));
+    fireEvent.click(await findByTestId("plugin-update-example.plugin"));
+    fireEvent.click(await findByTestId("plugin-update-decline"));
+    await waitFor(() => expect(dismissPluginUpdate).toHaveBeenCalledWith("example.plugin", "treeB||community"));
+    expect(applyPluginUpdate).not.toHaveBeenCalled();
+    await waitFor(() => expect(queryByTestId("plugin-update-consent-modal")).toBeNull());
+  });
+
+  it("a safe update applies directly without a consent modal", async () => {
+    markOutdated();
+    previewPluginUpdate.mockResolvedValue({
+      kind: "ok",
+      preview: { kind: "safe_update", to_version: "0.2.0", fingerprint: "treeC||community" },
+    });
+    applyPluginUpdate.mockResolvedValue({ kind: "ok", data: listResponse() });
+    const { findByTestId, queryByTestId } = render(<PluginsSettings />);
+    fireEvent.click(await findByTestId("plugins-check-updates"));
+    fireEvent.click(await findByTestId("plugin-update-example.plugin"));
+    await waitFor(() => expect(applyPluginUpdate).toHaveBeenCalledWith("example.plugin", "treeC||community"));
+    expect(queryByTestId("plugin-update-consent-modal")).toBeNull();
+  });
+
+  it("surfaces an apply error in the consent modal and keeps it open", async () => {
+    markOutdated();
+    previewPluginUpdate.mockResolvedValue(consentPreview);
+    applyPluginUpdate.mockResolvedValue({
+      kind: "error",
+      message: "the available update changed since it was shown; review it again before approving",
+    });
+    const { findByTestId } = render(<PluginsSettings />);
+    fireEvent.click(await findByTestId("plugins-check-updates"));
+    fireEvent.click(await findByTestId("plugin-update-example.plugin"));
+    fireEvent.click(await findByTestId("plugin-update-approve"));
+    const err = await findByTestId("plugin-update-consent-error");
+    expect(err.textContent).toContain("changed since it was shown");
   });
 });
