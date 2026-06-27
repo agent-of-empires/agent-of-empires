@@ -690,6 +690,7 @@ mod tests {
     use serial_test::serial;
     use std::io::Read;
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(target_os = "macos")]
     use tempfile::TempDir;
 
     #[test]
