@@ -226,51 +226,6 @@ pub fn sanitize_title(raw: &str, user_message: &str) -> Option<String> {
     best
 }
 
-/// Cap for a native `session_info_update` title. Higher than `MAX_TITLE_CHARS`
-/// (the one-shot path's 3-to-5 word budget) because a native title can be a
-/// deliberate user `/rename`, not just a generated summary; render layers
-/// truncate further for display.
-#[cfg(feature = "serve")]
-const MAX_NATIVE_TITLE_CHARS: usize = 120;
-
-/// Normalize a claude-agent-acp native title for storage: strip ANSI, take the
-/// first non-empty cleaned line, and cap the length. Returns `None` when the
-/// result is empty or is itself a default civ name (which would re-arm the
-/// auto-overwrite gate and churn the title). Unlike `sanitize_title` this does
-/// not scan for refusals or enforce a word budget: the agent already produced a
-/// real title (possibly a user-set one), it just needs to be safe to persist.
-#[cfg(feature = "serve")]
-pub(crate) fn normalize_native_title(raw: &str) -> Option<String> {
-    let capped = clean_capped_native_title(raw)?;
-    if capped.is_empty() || is_default_civ_name(&capped) {
-        return None;
-    }
-    Some(capped)
-}
-
-#[cfg(feature = "serve")]
-fn clean_capped_native_title(raw: &str) -> Option<String> {
-    let cleaned = strip_ansi(raw);
-    let line = cleaned.lines().map(clean_line).find(|l| !l.is_empty())?;
-    let capped = line
-        .chars()
-        .take(MAX_NATIVE_TITLE_CHARS)
-        .collect::<String>();
-    let capped = capped.trim().to_string();
-    (!capped.is_empty()).then_some(capped)
-}
-
-#[cfg(feature = "serve")]
-fn native_title_echoes_first_prompt(title: &str, first_prompt: &str) -> bool {
-    let Some(title_key) = clean_capped_native_title(title).map(|s| s.to_lowercase()) else {
-        return false;
-    };
-    let Some(prompt_key) = clean_capped_native_title(first_prompt).map(|s| s.to_lowercase()) else {
-        return false;
-    };
-    title_key == prompt_key
-}
-
 /// Strip leading markdown markers / list numbering, wrapping quotes and
 /// backticks, trailing sentence punctuation, and collapse inner whitespace.
 fn clean_line(line: &str) -> String {
@@ -341,8 +296,6 @@ fn truncate_bytes(s: &str, max: usize) -> &str {
     &s[..end]
 }
 
-#[cfg(feature = "serve")]
-pub(crate) use serve::apply_native_title_suggestion;
 #[cfg(feature = "serve")]
 pub use serve::try_smart_rename;
 
@@ -533,14 +486,10 @@ mod serve {
     /// storage and mirroring the in-memory instance list so connected clients
     /// see it without a reload. The write happens only while the current title
     /// is still a default civ name or still equals the last auto title we wrote
-    /// (`title_is_auto_overwritable`), so a manual rename is never clobbered
-    /// while successive native pushes keep tracking the agent's title across
-    /// turns. Serializes against manual renames / worktree edits on this session
-    /// via the per-session instance lock, and mirrors memory only when the
-    /// storage write actually happened so the two never diverge.
-    ///
-    /// Used by both the `smart_rename` one-shot and the claude-agent-acp native
-    /// `session_info_update` push (via the daemon's `acp_event_listener`).
+    /// (`title_is_auto_overwritable`), so a manual rename is never clobbered.
+    /// Serializes against manual renames / worktree edits on this session via
+    /// the per-session instance lock, and mirrors memory only when the storage
+    /// write actually happened so the two never diverge.
     pub(crate) async fn apply_auto_title(
         state: &Arc<AppState>,
         id: &str,
@@ -597,29 +546,11 @@ mod serve {
         }
     }
 
-    pub(crate) async fn apply_native_title_suggestion(
-        state: &Arc<AppState>,
-        id: &str,
-        profile: &str,
-        title: &str,
-    ) {
-        let Some(new_title) = normalize_native_title(title) else {
-            return;
-        };
-        if let Some(first_prompt) = state.acp_event_store.first_user_prompt(id) {
-            if native_title_echoes_first_prompt(&new_title, &first_prompt) {
-                tracing::debug!(target: "smart_rename", session = %id, "skip: native title echoes first prompt");
-                return;
-            }
-        }
-        apply_auto_title(state, id, profile, &new_title).await;
-    }
-
     /// Whether an automatic renamer may overwrite this session's title: either
     /// it is still a default civ name (never explicitly set), or it still
-    /// matches the last title an auto renamer wrote (so native pushes keep
-    /// tracking the agent's evolving title). A manual rename leaves `title`
-    /// diverged from `last_auto_title`, which freezes it against auto writes.
+    /// matches the last title an auto renamer wrote. A manual rename leaves
+    /// `title` diverged from `last_auto_title`, which freezes it against auto
+    /// writes.
     pub(crate) fn title_is_auto_overwritable(inst: &crate::session::instance::Instance) -> bool {
         is_default_civ_name(&inst.title)
             || inst.last_auto_title.as_deref() == Some(inst.title.as_str())
@@ -648,8 +579,8 @@ mod serve {
             // A still-default civ name is overwritable.
             let mut inst = Instance::new("Britons", "/tmp");
             assert!(title_is_auto_overwritable(&inst));
-            // After an auto write, title == last_auto_title, so successive
-            // native pushes keep tracking the agent's title across turns.
+            // After an auto write, title == last_auto_title, so a forced
+            // retry can still replace an automatic title.
             inst.title = "Fix login redirect".to_string();
             inst.last_auto_title = Some("Fix login redirect".to_string());
             assert!(title_is_auto_overwritable(&inst));
@@ -662,44 +593,6 @@ mod serve {
             legacy.title = "Hand-picked name".to_string();
             legacy.last_auto_title = None;
             assert!(!title_is_auto_overwritable(&legacy));
-        }
-
-        #[test]
-        fn normalize_native_title_cleans_and_rejects() {
-            // Strips ANSI, takes the first non-empty line, drops markdown.
-            assert_eq!(
-                normalize_native_title("\x1b[1m# Fix the flaky test\x1b[0m\nsecond line")
-                    .as_deref(),
-                Some("Fix the flaky test"),
-            );
-            // Empty / whitespace yields nothing.
-            assert!(normalize_native_title("   \n  ").is_none());
-            // A civ-name candidate is rejected so it cannot re-arm the gate.
-            assert!(normalize_native_title("Romans").is_none());
-            // Overlong titles are capped.
-            let long = "word ".repeat(80);
-            let out = normalize_native_title(&long).expect("non-empty");
-            assert!(out.chars().count() <= 120);
-        }
-
-        #[test]
-        fn native_title_echo_compare_uses_capped_normalized_equality() {
-            let prompt = format!(
-                "Please refactor the authentication middleware to fix login redirects. {}",
-                "extra detail ".repeat(30)
-            );
-            let echoed = normalize_native_title(&prompt).expect("echo normalizes");
-            assert!(native_title_echoes_first_prompt(&echoed, &prompt));
-
-            assert!(!native_title_echoes_first_prompt(
-                "Fix login redirects",
-                "Fix login redirects and update the auth middleware"
-            ));
-
-            assert!(native_title_echoes_first_prompt(
-                "# FIX LOGIN REDIRECT.",
-                "fix login redirect"
-            ));
         }
     }
 }

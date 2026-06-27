@@ -413,36 +413,6 @@ pub fn validate(expected: ExpectedAgent, init: &InitializeResponse) -> Result<()
     Ok(())
 }
 
-/// Minimum claude-agent-acp version that pushes the session title natively
-/// via `session_info_update` at turn-end (PR #812, released in v0.52.0). At or
-/// above this aoe applies the agent's pushed titles and skips its own
-/// `smart_rename` one-shot for the session.
-fn claude_agent_acp_native_title_version() -> semver::Version {
-    semver::Version::new(0, 52, 0)
-}
-
-/// Whether the connected adapter pushes session titles natively via
-/// `session_info_update` at turn-end. True only for the claude-agent-acp
-/// adapter at >= 0.52.0. Fail-closed: any other adapter, a name mismatch, or a
-/// missing/unparseable version returns false, so the `smart_rename` one-shot
-/// fallback keeps running for everything else (including claude < 0.52, which
-/// is still above the 0.49 floor and otherwise valid).
-pub fn pushes_native_session_title(expected: ExpectedAgent, init: &InitializeResponse) -> bool {
-    if !matches!(expected, ExpectedAgent::ClaudeAgentAcp) {
-        return false;
-    }
-    let Some(info) = init.agent_info.as_ref() else {
-        return false;
-    };
-    if info.name != "@agentclientprotocol/claude-agent-acp" {
-        return false;
-    }
-    match semver::Version::parse(info.version.trim()) {
-        Ok(v) => v >= claude_agent_acp_native_title_version(),
-        Err(_) => false,
-    }
-}
-
 /// The ACP binary name aoe expects for this agent, or `None` for agents
 /// with no fixed binary (`AoeAgent`, `Other`).
 fn binary_for(expected: ExpectedAgent) -> Option<&'static str> {
@@ -505,41 +475,6 @@ mod tests {
         // claude-agent-acp is npm-installable, so the web can offer
         // "Update & restart". See #2109.
         assert!(auto_install);
-    }
-
-    #[test]
-    fn native_session_title_gate() {
-        // claude >= 0.52 pushes titles natively.
-        assert!(pushes_native_session_title(
-            ExpectedAgent::ClaudeAgentAcp,
-            &make_init("@agentclientprotocol/claude-agent-acp", "0.52.0"),
-        ));
-        assert!(pushes_native_session_title(
-            ExpectedAgent::ClaudeAgentAcp,
-            &make_init("@agentclientprotocol/claude-agent-acp", "0.60.1"),
-        ));
-        // claude below 0.52 (but above the 0.49 floor): no native push, one-shot fallback.
-        assert!(!pushes_native_session_title(
-            ExpectedAgent::ClaudeAgentAcp,
-            &make_init("@agentclientprotocol/claude-agent-acp", "0.49.0"),
-        ));
-        // Fail-closed: name mismatch, unparseable version, missing agent_info, non-claude.
-        assert!(!pushes_native_session_title(
-            ExpectedAgent::ClaudeAgentAcp,
-            &make_init("some-wrapper", "9.9.9"),
-        ));
-        assert!(!pushes_native_session_title(
-            ExpectedAgent::ClaudeAgentAcp,
-            &make_init("@agentclientprotocol/claude-agent-acp", "not-semver"),
-        ));
-        assert!(!pushes_native_session_title(
-            ExpectedAgent::ClaudeAgentAcp,
-            &make_init_no_info(),
-        ));
-        assert!(!pushes_native_session_title(
-            ExpectedAgent::CodexAcp,
-            &make_init("codex", "1.0.0"),
-        ));
     }
 
     #[test]

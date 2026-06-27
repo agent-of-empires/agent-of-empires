@@ -534,10 +534,10 @@ pub enum Event {
     TodoListUpdated {
         todos: Vec<Todo>,
     },
-    /// The agent pushed a session title via ACP `session_info_update`
-    /// (claude-agent-acp >=0.52 emits this at every turn-end). The title is
-    /// already normalized. Not part of `AcpState`; the daemon's
-    /// `acp_event_listener` applies it to the session's `Instance.title`.
+    /// Legacy event for agent-pushed ACP `session_info_update` titles. Kept so
+    /// persisted event logs from versions that emitted it still deserialize.
+    /// New Claude ACP title pushes are ignored; AoE owns automatic renaming via
+    /// `session::smart_rename`.
     SessionTitleSuggested {
         title: String,
     },

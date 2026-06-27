@@ -364,12 +364,11 @@ impl ResumeIntent {
 pub struct Instance {
     pub id: String,
     pub title: String,
-    /// The last title written by an automatic renamer (the `smart_rename`
-    /// one-shot or a claude-agent-acp native `session_info_update` push).
+    /// The last title written by the `smart_rename` automatic renamer.
     /// An auto-rename overwrites `title` only while `title` is still a
-    /// default civ name or still equals this value, so successive native
-    /// pushes keep tracking the agent's title across turns while a manual
-    /// rename (which changes `title` but not this) is left untouched.
+    /// default civ name or still equals this value, so a forced retry can
+    /// replace an automatic title while a manual rename (which changes `title`
+    /// but not this) is left untouched.
     /// `None` on legacy records and freshly created sessions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_auto_title: Option<String>,
