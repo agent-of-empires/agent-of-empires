@@ -6,7 +6,10 @@ import {
   SIDEBAR_SORT_MODE_KEY,
   compareWorkspacesByAttention,
   compareWorkspacesByLastActivityDesc,
+  compareWorkspacesByPluginSort,
   compareWorkspacesForComputedSortMode,
+  repoGroupPluginSortValue,
+  workspacePluginSortValue,
   loadSidebarSortMode,
   repoGroupAttentionRank,
   repoGroupHasLiveWorkspace,
@@ -731,5 +734,60 @@ describe("loadSidebarSortMode accepts attention (#1640)", () => {
   it("falls back to manual for an unknown stored value", () => {
     window.localStorage.setItem(SIDEBAR_SORT_MODE_KEY, "bogus");
     expect(loadSidebarSortMode()).toBe("manual");
+  });
+});
+
+describe("plugin sort comparators (#2401)", () => {
+  const wsA = workspace("a", [session({ id: "a1" }), session({ id: "a2" })]);
+  const wsB = workspace("b", [session({ id: "b1" })]);
+
+  it("workspacePluginSortValue picks the min for asc and the max for desc", () => {
+    const values = new Map([
+      ["a1", 30],
+      ["a2", 10],
+    ]);
+    expect(workspacePluginSortValue(wsA, { direction: "asc", values })).toBe(10);
+    expect(workspacePluginSortValue(wsA, { direction: "desc", values })).toBe(30);
+  });
+
+  it("workspacePluginSortValue is undefined when no session carries a value", () => {
+    expect(workspacePluginSortValue(wsA, { direction: "asc", values: new Map() })).toBeUndefined();
+  });
+
+  it("compareWorkspacesByPluginSort orders by the workspace's best value and sinks unvalued", () => {
+    const values = new Map([
+      ["a1", 5],
+      ["b1", 1],
+    ]);
+    const ascList = [wsA, wsB].slice().sort(compareWorkspacesByPluginSort({ direction: "asc", values }));
+    expect(ascList.map((w) => w.id)).toEqual(["b", "a"]);
+    const descList = [wsA, wsB].slice().sort(compareWorkspacesByPluginSort({ direction: "desc", values }));
+    expect(descList.map((w) => w.id)).toEqual(["a", "b"]);
+    // An unvalued workspace sinks to the bottom in both directions.
+    const wsC = workspace("c", [session({ id: "c1" })]);
+    const sunk = [wsC, wsA, wsB].slice().sort(compareWorkspacesByPluginSort({ direction: "desc", values }));
+    expect(sunk[sunk.length - 1]!.id).toBe("c");
+  });
+
+  it("compareWorkspacesByPluginSort keeps triage tier ahead of the plugin scalar", () => {
+    // wsB is sunk (its only session archived) but has the best asc value; tier
+    // still pushes it below the live wsA.
+    const archivedB = workspace("b", [session({ id: "b1", archived_at: "2025-01-01T00:00:00Z" })]);
+    const values = new Map([
+      ["a1", 99],
+      ["b1", 1],
+    ]);
+    const list = [archivedB, wsA].slice().sort(compareWorkspacesByPluginSort({ direction: "asc", values }));
+    expect(list.map((w) => w.id)).toEqual(["a", "b"]);
+  });
+
+  it("repoGroupPluginSortValue takes the best across the group's workspaces", () => {
+    const values = new Map([
+      ["a1", 30],
+      ["a2", 10],
+      ["b1", 50],
+    ]);
+    expect(repoGroupPluginSortValue([wsA, wsB], { direction: "asc", values })).toBe(10);
+    expect(repoGroupPluginSortValue([wsA, wsB], { direction: "desc", values })).toBe(50);
   });
 });
