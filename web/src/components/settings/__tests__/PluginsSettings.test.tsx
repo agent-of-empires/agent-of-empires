@@ -310,6 +310,7 @@ describe("PluginsSettings", () => {
       ],
     });
     const { findByTestId } = render(<PluginsSettings />);
+    fireEvent.click(await findByTestId("plugins-tab-marketplace"));
     fireEvent.click(await findByTestId("plugins-discover"));
     await waitFor(() => expect(discoverPlugins).toHaveBeenCalled());
     const result = await findByTestId("plugins-discover-result-gh:acme/widget");
@@ -320,6 +321,7 @@ describe("PluginsSettings", () => {
   it("Search GitHub surfaces a discovery error (e.g. rate limit)", async () => {
     discoverPlugins.mockResolvedValue({ kind: "error", message: "Rate limited by GitHub." });
     const { findByTestId } = render(<PluginsSettings />);
+    fireEvent.click(await findByTestId("plugins-tab-marketplace"));
     fireEvent.click(await findByTestId("plugins-discover"));
     const err = await findByTestId("plugins-discover-error");
     expect(err.textContent).toContain("Rate limited by GitHub.");
@@ -357,6 +359,7 @@ describe("PluginsSettings", () => {
       },
     });
     const { findByTestId } = render(<PluginsSettings />);
+    fireEvent.click(await findByTestId("plugins-tab-marketplace"));
     fireEvent.click(await findByTestId("plugins-discover"));
     fireEvent.click(await findByTestId("plugins-discover-open-gh:acme/widget"));
     await waitFor(() => expect(fetchPluginDetails).toHaveBeenCalledWith("gh:acme/widget"));
@@ -365,6 +368,17 @@ describe("PluginsSettings", () => {
     expect(modal.textContent).toContain("net");
     const versions = await findByTestId("plugin-detail-versions");
     expect(versions.textContent).toContain("v2.2.0");
+  });
+
+  it("separates installed management from the marketplace into tabs", async () => {
+    const { findByTestId, getByTestId, queryByTestId } = render(<PluginsSettings />);
+    // Installed tab is the default: update controls present, search hidden.
+    await findByTestId("plugins-check-updates");
+    expect(queryByTestId("plugins-discover")).toBeNull();
+    // Switch to the marketplace: search present, update controls hidden.
+    fireEvent.click(getByTestId("plugins-tab-marketplace"));
+    await findByTestId("plugins-discover");
+    expect(queryByTestId("plugins-check-updates")).toBeNull();
   });
 
   it("clicking an installed plugin opens the detail modal and closes it", async () => {
