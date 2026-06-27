@@ -34,7 +34,7 @@ import { useEdgeSwipe } from "./hooks/useEdgeSwipe";
 import { useIsCoarsePointer } from "./hooks/useIsCoarsePointer";
 import { useIsWideViewport } from "./hooks/useIsWideViewport";
 import type { RightPanelView } from "./lib/rightPanelView";
-import { usePaneLayout, dockTabs, dockActive, dockOf } from "./lib/paneLayout";
+import { usePaneLayout, dockTabs, dockGroups, dockOf, isActiveTab } from "./lib/paneLayout";
 import { isPluginPaneId, usePluginPanes, type PluginPane } from "./lib/pluginPanes";
 import { PluginPaneBody } from "./components/plugin/PluginSlots";
 import { TOUR_ANCHORS, tourAnchor } from "./lib/tourSteps";
@@ -83,10 +83,11 @@ const StructuredView = lazy(() =>
     default: m.StructuredView,
   })),
 );
-import { Dock, type PaneDisplay } from "./components/Dock";
+import { type PaneDisplay } from "./components/Dock";
+import { DockGroups, type DockGroupView } from "./components/DockGroups";
 import { BottomDock } from "./components/BottomDock";
 import { PaneDndController } from "./components/PaneDndController";
-import { visibleToFullIndex } from "./components/paneDnd";
+import { visibleToFullIndex, type DropTarget } from "./components/paneDnd";
 import { BackgroundAgentsPanel } from "./components/acp/BackgroundAgentsPanel";
 import { DiffPane } from "./components/DiffPane";
 import { PairedShellPane } from "./components/PairedTerminal";
@@ -452,23 +453,31 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     (id: string) => !id.startsWith("plugin:") || pluginPaneById.has(id),
     [pluginPaneById],
   );
-  const visibleTabs = useCallback(
-    (dock: DockLocation) => dockTabs(paneLayout, dock).filter(tabAvailable),
+  // A dock's groups reduced to what's actually shown: each surviving group keeps
+  // its persisted index (so a drop addresses the right group) and a valid active
+  // tab. Groups with no visible tab (only unloaded plugins) are not rendered.
+  const renderGroups = useCallback(
+    (dock: DockLocation): DockGroupView[] =>
+      dockGroups(paneLayout, dock)
+        .map((g, group) => {
+          const tabs = g.tabs.filter(tabAvailable);
+          const active = g.active && tabs.includes(g.active) ? g.active : (tabs[0] ?? null);
+          return { group, tabs, active };
+        })
+        .filter((g) => g.tabs.length > 0),
     [paneLayout, tabAvailable],
   );
-  const visibleActive = useCallback(
-    (dock: DockLocation): string | null => {
-      const vis = visibleTabs(dock);
-      const a = dockActive(paneLayout, dock);
-      return a && vis.includes(a) ? a : (vis[0] ?? null);
-    },
-    [paneLayout, visibleTabs],
-  );
 
-  const rightTabs = visibleTabs("right");
-  const bottomTabs = visibleTabs("bottom");
-  const tabsByDock = useMemo(() => ({ right: rightTabs, bottom: bottomTabs }), [rightTabs, bottomTabs]);
-  const rightDockCollapsed = rightTabs.length === 0;
+  const rightGroups = renderGroups("right");
+  const bottomGroups = renderGroups("bottom");
+  const groupsByDock = useMemo(
+    () => ({
+      right: rightGroups.map((g) => ({ group: g.group, tabs: g.tabs })),
+      bottom: bottomGroups.map((g) => ({ group: g.group, tabs: g.tabs })),
+    }),
+    [rightGroups, bottomGroups],
+  );
+  const rightDockCollapsed = rightGroups.length === 0;
   const terminalOpen = (["right", "bottom"] as DockLocation[]).some((d) =>
     dockTabs(paneLayout, d).some(isTerminalTabId),
   );
@@ -519,13 +528,19 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     [closeTab, activeSessionId],
   );
   const movePaneAny = useCallback((id: string, dock: DockLocation) => moveTab(id, dock), [moveTab]);
-  // The dnd controller works in visible-tab space; map its drop index back to
-  // the full persisted dock list, since a hidden (unloaded) plugin tab still
-  // holds a slot the visible index does not count.
+  // The dnd controller works in visible-tab space; map a drop index back to the
+  // target group's full persisted tab list, since a hidden (unloaded) plugin tab
+  // still holds a slot the visible index does not count. A split target carries
+  // no index (the new group starts with just the dragged tab).
   const placeVisibleTab = useCallback(
-    (id: string, toDock: DockLocation, visibleIndex: number) => {
-      const fullBase = dockTabs(paneLayout, toDock).filter((tab) => tab !== id);
-      placeTab(id, toDock, visibleToFullIndex(fullBase, visibleIndex, tabAvailable));
+    (id: string, target: DropTarget) => {
+      if (target.newGroup) {
+        placeTab(id, { dock: target.dock, group: target.group, newGroup: true });
+        return;
+      }
+      const fullBase = (dockGroups(paneLayout, target.dock)[target.group]?.tabs ?? []).filter((tab) => tab !== id);
+      const index = visibleToFullIndex(fullBase, target.index ?? fullBase.length, tabAvailable);
+      placeTab(id, { dock: target.dock, group: target.group, index });
     },
     [paneLayout, placeTab, tabAvailable],
   );
@@ -1174,7 +1189,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
         (["right", "bottom"] as DockLocation[]).flatMap((d) => dockTabs(paneLayout, d)).find(isTerminalTabId) ??
         terminalTabId(0);
       const termDock = dockOf(paneLayout, termTab);
-      if (termDock && dockActive(paneLayout, termDock) === termTab) {
+      if (termDock && isActiveTab(paneLayout, termTab)) {
         // Already the active tab (mounted): move focus synchronously so rapid
         // agent<->paired toggles stay deterministic.
         dispatchFocusTerminal("paired");
@@ -1406,7 +1421,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     };
     return (
       <div className="flex-1 flex flex-col min-h-0">
-        <PaneDndController tabsByDock={tabsByDock} descriptorFor={paneDescriptor} onPlaceTab={placeVisibleTab}>
+        <PaneDndController groupsByDock={groupsByDock} descriptorFor={paneDescriptor} onPlaceTab={placeVisibleTab}>
           <ContentSplit
             collapsed={rightDockCollapsed}
             onToggleCollapse={toggleDiff}
@@ -1453,10 +1468,9 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
             }
             right={
               <div {...tourAnchor(TOUR_ANCHORS.rightPanel)} className="flex min-h-0 min-w-0 flex-1">
-                <Dock
+                <DockGroups
                   location="right"
-                  tabs={rightTabs}
-                  active={visibleActive("right")}
+                  groups={rightGroups}
                   descriptorFor={paneDescriptor}
                   renderBody={renderPaneBody}
                   onActivate={(id) => activateTab("right", id)}
@@ -1467,10 +1481,9 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
               </div>
             }
           />
-          {bottomTabs.length > 0 && (
+          {bottomGroups.length > 0 && (
             <BottomDock
-              tabs={bottomTabs}
-              active={visibleActive("bottom")}
+              groups={bottomGroups}
               descriptorFor={paneDescriptor}
               renderBody={renderPaneBody}
               onActivate={(id) => activateTab("bottom", id)}

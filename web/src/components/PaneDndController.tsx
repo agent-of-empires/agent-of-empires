@@ -23,33 +23,40 @@ import {
   resolvePlacement,
   shouldApplyPlacement,
   type DockDropData,
+  type DragSource,
   type DropTarget,
+  type EmptyDockDropData,
   type PaneDndState,
   type PaneTabData,
+  type RenderGroup,
 } from "./paneDnd";
 
 // Prefer the droppable the pointer is actually inside, and only among pane
-// droppables, so a drag in the right column never magnetically snaps to a tab
-// in the distant bottom strip the way a global closestCenter would. A tab hit
-// wins over a dock-body hit so dropping onto a sibling tab reorders rather than
-// appends. Mirrors the filtered-collision approach in WorkspaceSidebar (#1644).
+// droppables, so a drag in the right column never magnetically snaps to a
+// distant bottom target the way a global closestCenter would. A tab hit wins
+// over everything (reorder), then a split-half hit (split into a new group),
+// then group/empty-dock bodies. Mirrors the filtered-collision approach in
+// WorkspaceSidebar (#1644).
 const panesCollision: CollisionDetection = (args) => {
   const paneContainers = args.droppableContainers.filter((c) => {
     const t = c.data.current?.type;
-    return t === "pane-tab" || t === "pane-dock" || t === "pane-empty-dock";
+    return t === "pane-tab" || t === "pane-group" || t === "pane-split" || t === "pane-empty-dock";
   });
   const hits = pointerWithin({ ...args, droppableContainers: paneContainers });
-  const tabHits = hits.filter((h) => h.data?.droppableContainer?.data.current?.type === "pane-tab");
-  return tabHits.length > 0 ? tabHits : hits;
+  const typeOf = (h: (typeof hits)[number]) => h.data?.droppableContainer?.data.current?.type;
+  const tabHits = hits.filter((h) => typeOf(h) === "pane-tab");
+  if (tabHits.length > 0) return tabHits;
+  const splitHits = hits.filter((h) => typeOf(h) === "pane-split");
+  return splitHits.length > 0 ? splitHits : hits;
 };
 
 interface Props {
-  /** The rendered tab order per dock (already availability-filtered), so drop
-   *  indices line up with what the docks actually show. */
-  tabsByDock: Record<DockLocation, string[]>;
+  /** The rendered groups per dock (visible tabs, persisted group index), so
+   *  drop targets line up with what the docks actually show. */
+  groupsByDock: Record<DockLocation, RenderGroup[]>;
   descriptorFor: (id: string) => PaneDisplay;
-  /** Reorder within a dock or move across docks, landing at `toIndex`. */
-  onPlaceTab: (tabId: string, toDock: DockLocation, toIndex: number) => void;
+  /** Reorder, move across docks/groups, or split into a new group. */
+  onPlaceTab: (tabId: string, target: DropTarget) => void;
   children: ReactNode;
 }
 
@@ -57,9 +64,9 @@ interface Props {
  *  collision policy, the live drop target, a DragOverlay replica that follows
  *  the cursor across the distant docks, and the empty-dock landing zones. Docks
  *  stay presentational and read the drop state through usePaneDnd. */
-export function PaneDndController({ tabsByDock, descriptorFor, onPlaceTab, children }: Props) {
+export function PaneDndController({ groupsByDock, descriptorFor, onPlaceTab, children }: Props) {
   const [activeTab, setActiveTab] = useState<string | null>(null);
-  const [sourceDock, setSourceDock] = useState<DockLocation | null>(null);
+  const [source, setSource] = useState<DragSource | null>(null);
   const [dropTarget, setDropTarget] = useState<DropTarget | null>(null);
 
   const sensors = useSensors(
@@ -67,30 +74,34 @@ export function PaneDndController({ tabsByDock, descriptorFor, onPlaceTab, child
     useSensor(TouchSensor, { activationConstraint: { delay: 150, tolerance: 8 } }),
   );
 
-  // Resolve the destination dock + post-removal insertion index from the
-  // hovered droppable. Returns null when the pointer is not over a pane target.
+  // Resolve the destination dock + group + insertion index from the hovered
+  // droppable. Returns null when the pointer is not over a pane target.
   const resolveTarget = useCallback(
     (e: DragOverEvent | DragEndEvent): DropTarget | null => {
-      const overData = e.over?.data.current as PaneTabData | DockDropData | undefined;
-      if (!overData) return null;
+      const data = e.over?.data.current as PaneTabData | DockDropData | undefined;
+      if (!data) return null;
+      const group = "group" in data ? data.group : 0;
+      const side = data.type === "pane-split" ? data.side : undefined;
       return resolvePlacement(
         {
-          type: overData.type,
-          dock: overData.dock,
+          type: data.type,
+          dock: data.dock,
+          group,
+          side,
           tabId: String(e.over!.id),
           after: pointerInsertsAfter(e.active.rect.current.translated, e.over!.rect),
         },
         String(e.active.id),
-        tabsByDock,
+        groupsByDock,
       );
     },
-    [tabsByDock],
+    [groupsByDock],
   );
 
   const onDragStart = useCallback((e: DragStartEvent) => {
     const data = e.active.data.current as PaneTabData | undefined;
     setActiveTab(String(e.active.id));
-    setSourceDock(data?.dock ?? null);
+    setSource(data ? { dock: data.dock, group: data.group } : null);
     setDropTarget(null);
   }, []);
 
@@ -98,7 +109,7 @@ export function PaneDndController({ tabsByDock, descriptorFor, onPlaceTab, child
 
   const reset = useCallback(() => {
     setActiveTab(null);
-    setSourceDock(null);
+    setSource(null);
     setDropTarget(null);
   }, []);
 
@@ -106,21 +117,15 @@ export function PaneDndController({ tabsByDock, descriptorFor, onPlaceTab, child
     (e: DragEndEvent) => {
       const tabId = String(e.active.id);
       const target = resolveTarget(e);
-      // resolveTarget already gives the post-removal insertion index for both
-      // cases (before/after the hovered tab, or append on a dock-body drop);
-      // shouldApplyPlacement skips a within-dock drop onto the tab's own slot.
-      if (target && shouldApplyPlacement(tabsByDock, tabId, target, sourceDock)) {
-        onPlaceTab(tabId, target.dock, target.index);
+      if (target && shouldApplyPlacement(groupsByDock, tabId, target, source)) {
+        onPlaceTab(tabId, target);
       }
       reset();
     },
-    [resolveTarget, sourceDock, tabsByDock, onPlaceTab, reset],
+    [resolveTarget, source, groupsByDock, onPlaceTab, reset],
   );
 
-  const state = useMemo<PaneDndState>(
-    () => ({ activeTab, sourceDock, dropTarget }),
-    [activeTab, sourceDock, dropTarget],
-  );
+  const state = useMemo<PaneDndState>(() => ({ activeTab, source, dropTarget }), [activeTab, source, dropTarget]);
 
   const overlayDesc = activeTab ? descriptorFor(activeTab) : null;
 
@@ -139,7 +144,7 @@ export function PaneDndController({ tabsByDock, descriptorFor, onPlaceTab, child
           {children}
           {activeTab &&
             (["right", "bottom"] as DockLocation[])
-              .filter((d) => tabsByDock[d].length === 0)
+              .filter((d) => groupsByDock[d].length === 0)
               .map((d) => <EmptyDockDropZone key={d} location={d} />)}
         </div>
         <DragOverlay dropAnimation={null}>
@@ -155,14 +160,14 @@ export function PaneDndController({ tabsByDock, descriptorFor, onPlaceTab, child
   );
 }
 
-/** A landing zone for a dock that currently has no tabs (so its Dock is not in
- *  the DOM to drop onto). Pinned to the dock's screen edge, shown only while a
- *  pane tab is dragged. MeasuringStrategy.Always on the context measures it
- *  even though it mounts on drag start. */
+/** A landing zone for a dock that currently has no groups (so no Dock is in the
+ *  DOM to drop onto). Pinned to the dock's screen edge, shown only while a pane
+ *  tab is dragged. MeasuringStrategy.Always on the context measures it even
+ *  though it mounts on drag start. */
 function EmptyDockDropZone({ location }: { location: DockLocation }) {
   const { setNodeRef, isOver } = useDroppable({
     id: `empty-dock:${location}`,
-    data: { type: "pane-empty-dock", dock: location } satisfies DockDropData,
+    data: { type: "pane-empty-dock", dock: location } satisfies EmptyDockDropData,
   });
   const edge = location === "right" ? "top-0 right-0 h-full w-24 border-l" : "bottom-0 left-0 w-full h-24 border-t";
   return (

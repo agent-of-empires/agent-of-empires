@@ -49,25 +49,45 @@ function emptyDockLayout(): DockLayout {
   return { right: [], bottom: [], nextTerminalIndex: 1, closedPlugins: [] };
 }
 
-/** First (and currently only) group of a dock, or undefined when empty. */
-function firstGroup(layout: DockLayout, dock: DockLocation): PaneGroup | undefined {
-  return layout[dock][0];
+/** All groups in a dock, in render order. */
+export function dockGroups(layout: DockLayout, dock: DockLocation): PaneGroup[] {
+  return layout[dock];
 }
 
+/** Every tab in a dock, flattened across its groups. Callers asking "is this
+ *  open / which dock holds it / close everything here" want the whole dock, not
+ *  a single group. */
 export function dockTabs(layout: DockLayout, dock: DockLocation): TabId[] {
-  return firstGroup(layout, dock)?.tabs ?? [];
+  return layout[dock].flatMap((g) => g.tabs);
 }
 
-export function dockActive(layout: DockLayout, dock: DockLocation): TabId | null {
-  return firstGroup(layout, dock)?.active ?? null;
+/** Address of a tab: its dock, its group's index, and its index in that group. */
+export interface TabAddress {
+  dock: DockLocation;
+  group: number;
+  index: number;
+}
+
+export function findTab(layout: DockLayout, tabId: TabId): TabAddress | null {
+  for (const dock of DOCKS) {
+    const groups = layout[dock];
+    for (let group = 0; group < groups.length; group++) {
+      const index = groups[group]!.tabs.indexOf(tabId);
+      if (index >= 0) return { dock, group, index };
+    }
+  }
+  return null;
+}
+
+/** True when `tabId` is the active tab of whichever group holds it. */
+export function isActiveTab(layout: DockLayout, tabId: TabId): boolean {
+  const at = findTab(layout, tabId);
+  return at ? layout[at.dock][at.group]!.active === tabId : false;
 }
 
 /** Which dock a tab currently lives in, or null if it is closed. */
 export function dockOf(layout: DockLayout, tabId: TabId): DockLocation | null {
-  for (const dock of DOCKS) {
-    if (dockTabs(layout, dock).includes(tabId)) return dock;
-  }
-  return null;
+  return findTab(layout, tabId)?.dock ?? null;
 }
 
 function clone(layout: DockLayout): DockLayout {
@@ -84,11 +104,12 @@ function ensureGroup(layout: DockLayout, dock: DockLocation): PaneGroup {
   return layout[dock][0]!;
 }
 
-/** Drop the dock's group entirely once its last tab closes, so the parent can
- *  hide an empty dock (it keys off a zero-length groups array). */
+/** Drop any group whose last tab just closed, leaving sibling groups intact. A
+ *  dock with no groups renders nothing (the parent keys off a zero-length
+ *  array). Prunes on real tab count, so a group holding only an unloaded plugin
+ *  tab survives. */
 function pruneEmpty(layout: DockLayout, dock: DockLocation): void {
-  const g = layout[dock][0];
-  if (g && g.tabs.length === 0) layout[dock] = [];
+  layout[dock] = layout[dock].filter((g) => g.tabs.length > 0);
 }
 
 export function addTab(layout: DockLayout, dock: DockLocation, tabId: TabId, activate = true): DockLayout {
@@ -102,28 +123,27 @@ export function addTab(layout: DockLayout, dock: DockLocation, tabId: TabId, act
 }
 
 export function removeTab(layout: DockLayout, tabId: TabId): DockLayout {
-  const dock = dockOf(layout, tabId);
-  if (!dock) return layout;
+  const at = findTab(layout, tabId);
+  if (!at) return layout;
   const next = clone(layout);
-  const group = next[dock][0]!;
-  const idx = group.tabs.indexOf(tabId);
-  group.tabs.splice(idx, 1);
+  const group = next[at.dock][at.group]!;
+  group.tabs.splice(at.index, 1);
   if (group.active === tabId) {
     // Prefer the tab that shifted into this slot, else the new last tab.
-    group.active = group.tabs[idx] ?? group.tabs[group.tabs.length - 1] ?? null;
+    group.active = group.tabs[at.index] ?? group.tabs[group.tabs.length - 1] ?? null;
   }
   if (tabId.startsWith("plugin:") && !next.closedPlugins.includes(tabId)) {
     next.closedPlugins.push(tabId);
   }
-  pruneEmpty(next, dock);
+  pruneEmpty(next, at.dock);
   return next;
 }
 
 export function setActive(layout: DockLayout, dock: DockLocation, tabId: TabId): DockLayout {
-  const group = firstGroup(layout, dock);
-  if (!group || !group.tabs.includes(tabId) || group.active === tabId) return layout;
+  const gi = layout[dock].findIndex((g) => g.tabs.includes(tabId));
+  if (gi < 0 || layout[dock][gi]!.active === tabId) return layout;
   const next = clone(layout);
-  next[dock][0]!.active = tabId;
+  next[dock][gi]!.active = tabId;
   return next;
 }
 
@@ -131,34 +151,57 @@ function clampIndex(index: number, max: number): number {
   return Math.max(0, Math.min(Math.floor(index), max));
 }
 
-/** Move `tabId` to position `toIndex` in `toDock`. Subsumes both within-dock
- *  reorder (toDock equals the source dock) and cross-dock move. `toIndex` is the
- *  index in the destination group *after* the tab is removed from its source.
+/** Where a tab should land: an existing group (`group` + `index`) or a fresh
+ *  group spliced into the dock at position `group` (when `newGroup`). */
+export interface PlaceTarget {
+  dock: DockLocation;
+  group: number;
+  index?: number;
+  newGroup?: boolean;
+}
+
+/** Move `tabId` to `target`. The single placement primitive: subsumes
+ *  within-group reorder, cross-group and cross-dock moves, and splitting a tab
+ *  into a new group. `index` is the position in the destination group *after*
+ *  the tab is removed from its source.
  *
- *  Active-tab rule: a within-dock reorder keeps whatever was active (including
- *  the dragged tab itself), so dragging a background tab never steals focus; a
- *  cross-dock move activates the tab in its destination, since it would
- *  otherwise land hidden behind the destination's active tab. Implemented
- *  directly rather than via removeTab so a move never marks a plugin tab as
- *  explicitly closed. */
-export function placeTab(layout: DockLayout, tabId: TabId, toDock: DockLocation, toIndex: number): DockLayout {
-  const fromDock = dockOf(layout, tabId);
-  if (!fromDock) return layout;
+ *  Active-tab rule: a within-group reorder keeps whatever was active (so
+ *  dragging a background tab never steals focus and dragging the active tab
+ *  keeps it active); any move into a different group activates the tab there,
+ *  since it would otherwise land hidden behind that group's active tab.
+ *  Implemented directly rather than via removeTab so a move never marks a plugin
+ *  tab as explicitly closed. */
+export function placeTab(layout: DockLayout, tabId: TabId, target: PlaceTarget): DockLayout {
+  const src = findTab(layout, tabId);
+  if (!src) return layout;
   const next = clone(layout);
-  const source = next[fromDock][0]!;
-  const fromIndex = source.tabs.indexOf(tabId);
-  if (fromIndex < 0) return layout;
-  const wasActive = source.active === tabId;
-  source.tabs.splice(fromIndex, 1);
-  if (wasActive) {
+  const srcGroup = next[src.dock][src.group]!;
+  const srcActive = srcGroup.active;
+  srcGroup.tabs.splice(src.index, 1);
+  if (srcActive === tabId) {
     // Source loses its active tab: prefer the tab that shifted into the slot,
-    // else the new last tab. (Overridden below for a within-dock reorder.)
-    source.active = source.tabs[fromIndex] ?? source.tabs[source.tabs.length - 1] ?? null;
+    // else the new last tab. (Restored below for a within-group reorder.)
+    srcGroup.active = srcGroup.tabs[src.index] ?? srcGroup.tabs[srcGroup.tabs.length - 1] ?? null;
   }
-  pruneEmpty(next, fromDock);
-  const dest = ensureGroup(next, toDock);
-  dest.tabs.splice(clampIndex(toIndex, dest.tabs.length), 0, tabId);
-  if (fromDock !== toDock || wasActive || dest.active === null) dest.active = tabId;
+  let srcPruned = false;
+  if (srcGroup.tabs.length === 0) {
+    next[src.dock].splice(src.group, 1);
+    srcPruned = true;
+  }
+  // Removing the source group renumbers later groups in the same dock; the
+  // caller's `target.group` was computed against the pre-removal layout.
+  let groupIdx = target.group;
+  if (srcPruned && src.dock === target.dock && src.group < groupIdx) groupIdx--;
+  const destGroups = next[target.dock];
+  if (target.newGroup) {
+    destGroups.splice(clampIndex(groupIdx, destGroups.length), 0, { tabs: [tabId], active: tabId });
+  } else {
+    const dest = destGroups[groupIdx];
+    if (!dest) return layout;
+    dest.tabs.splice(clampIndex(target.index ?? dest.tabs.length, dest.tabs.length), 0, tabId);
+    const sameGroup = !srcPruned && src.dock === target.dock && src.group === groupIdx;
+    dest.active = sameGroup ? srcActive : tabId;
+  }
   next.closedPlugins = next.closedPlugins.filter((id) => id !== tabId);
   return next;
 }
@@ -166,7 +209,10 @@ export function placeTab(layout: DockLayout, tabId: TabId, toDock: DockLocation,
 export function moveTab(layout: DockLayout, tabId: TabId, toDock: DockLocation): DockLayout {
   const from = dockOf(layout, tabId);
   if (!from || from === toDock) return layout;
-  return placeTab(layout, tabId, toDock, dockTabs(layout, toDock).length);
+  const groups = layout[toDock];
+  if (groups.length === 0) return placeTab(layout, tabId, { dock: toDock, group: 0, newGroup: true });
+  const last = groups.length - 1;
+  return placeTab(layout, tabId, { dock: toDock, group: last, index: groups[last]!.tabs.length });
 }
 
 /** Allocate a fresh terminal tab in `dock` and return its id + new layout. */
@@ -276,10 +322,7 @@ function normalizeGroups(v: unknown): PaneGroup[] {
     const active = typeof o.active === "string" && tabs.includes(o.active) ? o.active : tabs[0]!;
     groups.push({ tabs, active });
   }
-  // Collapse to a single group for now; DnD will lift this cap.
-  if (groups.length <= 1) return groups;
-  const merged: PaneGroup = { tabs: groups.flatMap((g) => g.tabs), active: groups[0]!.active };
-  return [merged];
+  return groups;
 }
 
 /** Drop from `group` any tab id already claimed by an earlier dock. A tab must
@@ -342,8 +385,8 @@ export interface PaneLayoutApi {
   closeTab: (tabId: TabId) => void;
   activateTab: (dock: DockLocation, tabId: TabId) => void;
   moveTab: (tabId: TabId, toDock: DockLocation) => void;
-  /** Reorder within a dock or move across docks, landing at `toIndex`. */
-  placeTab: (tabId: TabId, toDock: DockLocation, toIndex: number) => void;
+  /** Reorder, move across docks/groups, or split into a new group. */
+  placeTab: (tabId: TabId, target: PlaceTarget) => void;
   /** Activity-bar toggle for a built-in kind ("diff" or "terminal"). */
   toggleKind: (kind: "diff" | "terminal" | "agents", defaultDock: DockLocation) => void;
   /** Add/remove a plugin pane tab (activity-bar toggle). */
@@ -389,7 +432,7 @@ export function usePaneLayout(sessionId: string | null): PaneLayoutApi {
     [mutate],
   );
   const placeTabCb = useCallback(
-    (tabId: TabId, toDock: DockLocation, toIndex: number) => mutate((l) => placeTab(l, tabId, toDock, toIndex)),
+    (tabId: TabId, target: PlaceTarget) => mutate((l) => placeTab(l, tabId, target)),
     [mutate],
   );
   const toggleKind = useCallback(

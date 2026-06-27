@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 
 import { safeGetItem, safeSetItem } from "../lib/safeStorage";
-import { Dock, type PaneDisplay } from "./Dock";
+import { DockGroups, type DockGroupView } from "./DockGroups";
+import type { PaneDisplay } from "./Dock";
 import type { DockLocation } from "../lib/panes";
 
 const HEIGHT_KEY = "aoe-bottom-dock-height";
@@ -20,8 +21,7 @@ function loadHeight(): number {
 }
 
 interface Props {
-  tabs: string[];
-  active: string | null;
+  groups: DockGroupView[];
   descriptorFor: (id: string) => PaneDisplay;
   renderBody: (id: string) => ReactNode;
   onActivate: (id: string) => void;
@@ -31,18 +31,10 @@ interface Props {
 }
 
 /** Full-width bottom dock: a height-resizable strip below the main+right-dock
- *  row. Hidden by the parent when it has no open panes. Desktop only; mobile
- *  uses the single full-viewport view picker. */
-export function BottomDock({
-  tabs,
-  active,
-  descriptorFor,
-  renderBody,
-  onActivate,
-  onClose,
-  onMove,
-  onNewTerminal,
-}: Props) {
+ *  row. Hidden by the parent when it has no open panes. Holds one or more
+ *  stacked groups. Desktop only; mobile uses the single full-viewport view
+ *  picker. */
+export function BottomDock({ groups, descriptorFor, renderBody, onActivate, onClose, onMove, onNewTerminal }: Props) {
   const [height, setHeight] = useState(loadHeight);
   const ref = useRef<HTMLDivElement>(null);
   const dragging = useRef(false);
@@ -93,10 +85,9 @@ export function BottomDock({
         onMouseDown={handleMouseDown}
         className="h-1 cursor-row-resize shrink-0 hover:bg-brand-600/50 transition-colors duration-75"
       />
-      <Dock
+      <DockGroups
         location="bottom"
-        tabs={tabs}
-        active={active}
+        groups={groups}
         descriptorFor={descriptorFor}
         renderBody={renderBody}
         onActivate={onActivate}
