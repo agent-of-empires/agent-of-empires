@@ -1020,6 +1020,17 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/SidebarSortPicker.tsx"]
     },
     {
+      "id": "sidebar.plugin-sort-filter",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/plugin-sort-filter.spec.ts"],
+      "components": [
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/SidebarSortPicker.tsx",
+        "web/src/components/plugin/PluginSlots.tsx"
+      ]
+    },
+    {
       "id": "sidebar.group-axis-pure",
       "kind": "vitest",
       "risk": "high",
