@@ -420,17 +420,15 @@ async fn prepare_update(id: &str) -> Result<Prepared> {
 
 /// Apply a prepared update with an already-decided grant: replace the tree, run
 /// the build, persist the grant and lockfile, and reload the registry. A `None`
-/// grant on a build-bearing, consent-needing update aborts (the user declined
-/// arbitrary code); a capabilities-only decline keeps the prior behavior (tree
-/// updated, left inactive until re-approved).
+/// grant declines a consent-required update: it leaves the previously trusted
+/// version active without rewriting the tree or lockfile, matching the in-app
+/// decline. (Arbitrary build steps the user just refused must never run, and a
+/// declined capability expansion must not silently replace the install.)
 fn apply_prepared(prepared: &Prepared, grant: Option<CapabilityGrant>) -> Result<InstallReport> {
     let id = prepared.id.as_str();
     let final_dir = super::plugins_dir()?.join(id);
-    if prepared.needs_consent
-        && grant.is_none()
-        && !build_steps(&prepared.fetched.manifest).is_empty()
-    {
-        bail!("update cancelled for {id}; build steps were not approved, prior version kept");
+    if prepared.needs_consent && grant.is_none() {
+        bail!("update cancelled for {id}; the previously trusted version was kept");
     }
     replace_and_build(id, &prepared.fetched, &final_dir)?;
 
@@ -570,16 +568,24 @@ pub async fn preview_update(id: &str) -> Result<UpdatePreview> {
 /// Apply an update that was previewed in-app, granting whatever the fetched
 /// manifest declares. `expected_fingerprint` pins the exact content the user
 /// approved: if the remote moved since the preview, this refuses rather than
-/// silently granting something the user never saw. Clears any recorded
-/// dismissal for the plugin on success (via `persist_update`).
+/// silently granting something the user never saw. A capability-expanding update
+/// MUST carry a fingerprint, so approval cannot bypass the stale-preview guard;
+/// a safe update may omit it. Clears any recorded dismissal on success (via
+/// `persist_update`).
 pub async fn apply_update(id: &str, expected_fingerprint: Option<String>) -> Result<InstallReport> {
     let prepared = prepare_update(id).await?;
-    if let Some(expected) = expected_fingerprint {
-        if expected != prepared.fingerprint {
+    match &expected_fingerprint {
+        Some(expected) if *expected != prepared.fingerprint => {
             bail!(
                 "the available update for {id} changed since it was shown; review it again before approving"
             );
         }
+        // A consent-needing update must be pinned to what the user reviewed;
+        // refuse an unpinned approval rather than grant blind.
+        None if prepared.needs_consent => {
+            bail!("approving the update for {id} requires the fingerprint it was previewed with");
+        }
+        _ => {}
     }
     let grant = Some(CapabilityGrant {
         manifest_hash: prepared.manifest_hash.clone(),
