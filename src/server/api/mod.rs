@@ -239,6 +239,11 @@ mod tests {
                     "post_telemetry_structured_interaction",
                 ],
             ),
+            (
+                "api/plugins.rs",
+                include_str!("plugins.rs"),
+                &["invoke_plugin_action"],
+            ),
         ];
 
         let guard_patterns: &[&str] = &[
@@ -286,6 +291,39 @@ mod tests {
             "Read-only audit failed:\n{}",
             missing.join("\n")
         );
+    }
+
+    /// A plugin pane action is forwarded to the worker (the trust boundary)
+    /// and mutates no host-managed state, so it is gated on read-write mode
+    /// only, never on passphrase elevation (#2454). This static check guards
+    /// against a refactor re-introducing the elevation gate on the action
+    /// path and re-breaking the refresh button under login. Same body-boundary
+    /// walk as `every_mutating_handler_has_read_only_guard`.
+    #[test]
+    fn plugin_action_does_not_require_elevation() {
+        let source = include_str!("plugins.rs");
+        let needle = "fn invoke_plugin_action(";
+        let start = source
+            .find(needle)
+            .expect("handler `invoke_plugin_action` not found (rename/refactor?)");
+        let rest = &source[start + needle.len()..];
+        let body_terminators: &[&str] = &["\npub async fn ", "\npub fn ", "\nasync fn ", "\nfn "];
+        let end = body_terminators
+            .iter()
+            .filter_map(|t| rest.find(t))
+            .min()
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+        // `mutation_gate` bundles the elevation check; `is_elevated` /
+        // `elevation_required` would mean elevation was reintroduced inline.
+        for marker in ["mutation_gate", "is_elevated", "elevation_required"] {
+            assert!(
+                !body.contains(marker),
+                "invoke_plugin_action must not elevation-gate (found `{marker}`). \
+                 A pane action mutates no host state; keep the read-only gate only. \
+                 If an action ever needs elevation, make it opt-in per action (#2454)."
+            );
+        }
     }
 
     /// Companion to `every_mutating_handler_has_read_only_guard`: enforce

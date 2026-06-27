@@ -538,8 +538,12 @@ no reply) via `PluginHost::notify_worker`. The worker runs the method (e.g.
 `github.refresh`) and re-pushes its UI state, which the next `ui-state` poll
 renders. The plugin names the `method` in its own block, and the worker is the
 trust boundary: it acts only on methods it implements and ignores the rest (the
-honest-plugin model). The endpoint is gated like other mutations (read-write
-mode plus an elevated session when login is on).
+honest-plugin model). The endpoint is gated on read-write mode only, not on
+passphrase elevation: a pane action mutates no host-managed state (config,
+registry, grants, lockfile) and grants no new host capability, so it does not
+warrant the step-up the way enable/disable does (the worker's own behavior may
+still have plugin-defined side effects). If an action ever needs elevation,
+make it opt-in per action rather than blanket-gating every action.
 
 ### Store and lifecycle (`src/plugin/ui_state.rs`)
 

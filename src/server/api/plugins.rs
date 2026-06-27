@@ -91,14 +91,23 @@ pub struct PluginActionBody {
 /// button) to the plugin's worker as a fire-and-forget JSON-RPC notification.
 /// The worker is the trust boundary: it acts only on methods it implements and
 /// ignores the rest, so this never waits for or returns a worker result.
+///
+/// Gated on read-write mode only, not elevation. Unlike enable/disable, a pane
+/// action does not mutate host-managed state (config, registry, grants,
+/// lockfile) and grants no new host capability, so it does not warrant the
+/// passphrase step-up, the same reasoning as `update_theme` in `system.rs`.
+/// A routine `github.refresh` should not prompt for the passphrase.
 pub async fn invoke_plugin_action(
     State(state): State<std::sync::Arc<AppState>>,
-    session: Option<axum::Extension<AuthenticatedSession>>,
     Path(id): Path<String>,
     Json(body): Json<PluginActionBody>,
 ) -> Response {
-    if let Err(resp) = mutation_gate(&state, session.as_deref()).await {
-        return resp;
+    if state.read_only {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "read_only",
+            "Server is in read-only mode".into(),
+        );
     }
     let Some(host) = state.plugin_host.as_ref() else {
         return error_response(
