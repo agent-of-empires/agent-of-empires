@@ -16,6 +16,38 @@ async function openSession(page: Page) {
   await page.setViewportSize({ width: 1280, height: 720 });
 }
 
+/** Tab ids in a dock, in rendered (left-to-right) order. */
+async function dockTabOrder(page: Page, dock: "right" | "bottom"): Promise<string[]> {
+  return page.$$eval(`[data-pane-dock="${dock}"] [data-testid^="pane-tab-"]`, (els) =>
+    els.map((el) => (el.getAttribute("data-testid") ?? "").replace("pane-tab-", "")),
+  );
+}
+
+/** Press on a tab's activation button (where the drag listeners live), move past
+ *  the 8px MouseSensor threshold, run `mid` while held, then drop on `target`.
+ *  Playwright's mouse maps to dnd-kit's MouseSensor, so no press-hold delay. */
+async function dragTab(
+  page: Page,
+  fromId: string,
+  target: { x: number; y: number },
+  mid?: () => Promise<void>,
+) {
+  const from = await page.getByTestId(`pane-tab-${fromId}`).boundingBox();
+  if (!from) throw new Error(`missing tab ${fromId}`);
+  await page.mouse.move(from.x + from.width / 2, from.y + from.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(from.x + from.width / 2 + 12, from.y + from.height / 2, { steps: 4 });
+  await page.mouse.move(target.x, target.y, { steps: 12 });
+  if (mid) await mid();
+  await page.mouse.up();
+}
+
+async function tabCenter(page: Page, id: string): Promise<{ x: number; y: number }> {
+  const b = await page.getByTestId(`pane-tab-${id}`).boundingBox();
+  if (!b) throw new Error(`missing tab ${id}`);
+  return { x: b.x + b.width / 2, y: b.y + b.height / 2 };
+}
+
 test.describe("Dockable pane system", () => {
   test("the activity bar toggles the built-in diff and terminal panes", async ({ page }) => {
     await openSession(page);
@@ -99,6 +131,65 @@ test.describe("Dockable pane system", () => {
     // Clicking the pane's action button forwards its method to the worker.
     await page.getByTestId("plugin-pane-action").click();
     await expect.poll(() => actionBody?.method).toBe("demo.reload");
+  });
+
+  test("dragging a tab reorders it within a dock and the order persists across reload", async ({ page }) => {
+    await openSession(page);
+    await page.goto(`/session/${SESSION}`);
+
+    await expect(page.getByTestId("pane-tab-diff")).toBeVisible();
+    await expect(page.getByTestId("pane-tab-terminal:0")).toBeVisible();
+    expect(await dockTabOrder(page, "right")).toEqual(["diff", "terminal:0"]);
+
+    // Drag the terminal tab onto diff's left half so it lands first.
+    const diff = await page.getByTestId("pane-tab-diff").boundingBox();
+    if (!diff) throw new Error("missing diff tab");
+    await dragTab(page, "terminal:0", { x: diff.x + 4, y: diff.y + diff.height / 2 });
+    await expect.poll(() => dockTabOrder(page, "right")).toEqual(["terminal:0", "diff"]);
+
+    // The reordered layout round-trips through localStorage.
+    await page.reload();
+    await expect(page.getByTestId("pane-tab-diff")).toBeVisible();
+    await expect.poll(() => dockTabOrder(page, "right")).toEqual(["terminal:0", "diff"]);
+  });
+
+  test("dragging a tab onto the empty bottom dock opens it there", async ({ page }) => {
+    await openSession(page);
+    await page.goto(`/session/${SESSION}`);
+    await expect(page.getByTestId("bottom-dock-resize")).toHaveCount(0);
+
+    // The empty-dock landing zone exists only while a pane tab is dragged.
+    await dragTab(page, "diff", { x: 640, y: 715 }, async () => {
+      const zone = page.getByTestId("empty-dock-dropzone-bottom");
+      await expect(zone).toBeVisible();
+      const box = await zone.boundingBox();
+      if (box) await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 4 });
+    });
+
+    await expect(page.getByTestId("bottom-dock-resize")).toBeVisible();
+    await expect.poll(() => dockTabOrder(page, "bottom")).toEqual(["diff"]);
+    expect(await dockTabOrder(page, "right")).toEqual(["terminal:0"]);
+  });
+
+  test("a cross-dock drag shows an insertion marker and moves the pane", async ({ page }) => {
+    await openSession(page);
+    await page.goto(`/session/${SESSION}`);
+
+    // Split the docks: the active diff tab moves to the bottom, terminal stays.
+    await page.getByLabel("Move diff to bottom dock").click();
+    await expect(page.getByTestId("bottom-dock-resize")).toBeVisible();
+    expect(await dockTabOrder(page, "right")).toEqual(["terminal:0"]);
+    expect(await dockTabOrder(page, "bottom")).toEqual(["diff"]);
+
+    // Drag terminal onto the bottom dock's diff tab; the marker appears because
+    // the destination strip does not shift to preview a cross-dock insert.
+    const diff = await tabCenter(page, "diff");
+    await dragTab(page, "terminal:0", diff, async () => {
+      await expect(page.getByTestId("pane-insertion-marker")).toBeVisible();
+    });
+
+    await expect.poll(() => dockTabOrder(page, "right")).toEqual([]);
+    await expect.poll(() => dockTabOrder(page, "bottom")).toContain("terminal:0");
   });
 
   test("the new-terminal button opens a second terminal tab that can be closed", async ({ page }) => {

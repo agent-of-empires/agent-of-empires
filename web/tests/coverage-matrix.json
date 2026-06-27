@@ -32,6 +32,8 @@
         "web/src/components/ActivityBar.tsx",
         "web/src/components/Dock.tsx",
         "web/src/components/BottomDock.tsx",
+        "web/src/components/PaneDndController.tsx",
+        "web/src/components/paneDnd.ts",
         "web/src/components/plugin/PluginSlots.tsx"
       ]
     },
