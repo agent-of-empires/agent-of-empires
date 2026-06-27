@@ -32,6 +32,14 @@ pub struct RemoveArgs {
     /// sessions.
     #[arg(long = "keep-scratch")]
     keep_scratch: bool,
+
+    /// Permanently delete instead of moving to trash. By default `rm` moves
+    /// the session to the trash (when `session.delete_to_trash` is enabled,
+    /// the default) so it can be restored; `--purge` forces the irreversible
+    /// teardown (worktree/branch/container cleanup per the other flags, plus
+    /// transcript removal).
+    #[arg(long)]
+    purge: bool,
 }
 
 fn needs_worktree_cleanup(inst: &Instance, args: &RemoveArgs) -> bool {
@@ -58,6 +66,41 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
         profile,
         std::path::Path::new(&inst.project_path),
     );
+
+    // Trash-first: unless --purge is given (or delete_to_trash is disabled),
+    // stop the live session and mark it trashed, keeping every durable
+    // artifact so it can be restored. Mirrors the archive CLI's tmux
+    // teardown. See #2489.
+    if config.session.delete_to_trash && !args.purge {
+        if let Err(e) = inst.kill() {
+            eprintln!("Warning: failed to kill agent tmux session: {}", e);
+        }
+        inst.kill_ancillary_tmux_sessions();
+
+        let landed = storage.update(|all_instances, _groups| {
+            if let Some(stored) = all_instances.iter_mut().find(|i| i.id == removed_id) {
+                stored.trash();
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        })?;
+        if !landed {
+            anyhow::bail!(
+                "Session {} was removed by another process before it could be trashed",
+                removed_title
+            );
+        }
+        println!(
+            "  Moved session to trash: {} (from profile '{}')",
+            removed_title,
+            storage.profile()
+        );
+        println!(
+            "  Restore with `aoe session restore {removed_id}`, or delete permanently with `aoe rm --purge {removed_id}`."
+        );
+        return Ok(());
+    }
 
     let delete_worktree = needs_worktree_cleanup(&inst, &args);
     let delete_branch = inst
@@ -159,6 +202,7 @@ mod tests {
             force: false,
             keep_container: false,
             keep_scratch: false,
+            purge: false,
         }
     }
 
