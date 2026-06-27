@@ -9,13 +9,17 @@ import {
   type RepoAppearanceUpdate,
 } from "../lib/repoAppearance";
 import { loadRepoGroupOrder, persistRepoGroupOrder } from "../lib/repoGroupOrder";
+import { compareSortValues, type PluginSortValue } from "../lib/pluginUi";
 import {
   compareWorkspacesByAttention,
   compareWorkspacesByLastActivityDesc,
+  compareWorkspacesByPluginSort,
+  type PluginSortContext,
   repoGroupAttentionRank,
   repoGroupIsFavorited,
   repoGroupIsUrgent,
   repoGroupLastActivityMs,
+  repoGroupPluginSortValue,
   workspaceTriageTier,
   type SidebarSortMode,
 } from "../lib/sidebarSort";
@@ -61,6 +65,12 @@ export function useRepoGroups(
   workspaceOrdering: readonly string[] = [],
   sortMode: SidebarSortMode = "manual",
   projects: readonly ProjectInfo[] = [],
+  // When set, an active plugin sort (#2401) overrides the built-in `sortMode`
+  // for both within-group workspace order and group order. It is a computed
+  // mode like `lastActivity`, so manual drag order does not apply; synthetic
+  // and registered-empty groups stay pinned to the bottom as in every computed
+  // mode.
+  pluginSort?: PluginSortContext,
 ): {
   groups: RepoGroup[];
   /** Saved (registered) projects that are not pinned and have no live
@@ -105,7 +115,11 @@ export function useRepoGroups(
         if (ar > br) return 1;
         return a.id.localeCompare(b.id);
       });
+    const pluginCompare = pluginSort ? compareWorkspacesByPluginSort(pluginSort) : null;
     const sortWorkspaces = (list: Workspace[]) => {
+      if (pluginCompare) {
+        return [...list].sort(pluginCompare);
+      }
       if (sortMode === "attention") {
         return [...list].sort(compareWorkspacesByAttention);
       }
@@ -231,6 +245,29 @@ export function useRepoGroups(
     const isRegisteredEmpty = (g: RepoGroup) => g.workspaces.length === 0 && g.registeredProjects.length > 0;
 
     merged.sort((a, b) => {
+      if (pluginSort) {
+        // Computed order like lastActivity: manual group drag does not apply,
+        // synthetic groups stay pinned to the bottom (real repos, then
+        // multi-repo, then scratch), and registered-empty groups sink below
+        // populated real repos. Among real groups: best plugin scalar in the
+        // chosen direction (unvalued groups sink), then most-recent activity,
+        // then a deterministic repoPath tie-break. See #2401.
+        if (a.id === SCRATCH_GROUP_ID) return 1;
+        if (b.id === SCRATCH_GROUP_ID) return -1;
+        if (a.id === MULTI_REPO_GROUP_ID) return 1;
+        if (b.id === MULTI_REPO_GROUP_ID) return -1;
+        const ae = isRegisteredEmpty(a);
+        const be = isRegisteredEmpty(b);
+        if (ae !== be) return ae ? 1 : -1;
+        const av: PluginSortValue | undefined = repoGroupPluginSortValue(a.workspaces, pluginSort);
+        const bv: PluginSortValue | undefined = repoGroupPluginSortValue(b.workspaces, pluginSort);
+        const cmp = compareSortValues(av, bv, pluginSort.direction);
+        if (cmp !== 0) return cmp;
+        const ak = repoGroupLastActivityMs(a.workspaces);
+        const bk = repoGroupLastActivityMs(b.workspaces);
+        if (ak !== bk) return bk - ak;
+        return a.repoPath.localeCompare(b.repoPath);
+      }
       if (sortMode === "attention") {
         // Computed order, like lastActivity: manual group drag does not
         // apply and synthetic groups stay pinned to the bottom in a stable
@@ -320,7 +357,7 @@ export function useRepoGroups(
     });
 
     return { groups: merged, savedProjects };
-  }, [workspaces, workspaceOrdering, sortMode, projects, collapsedMap, appearanceMap, groupOrder]);
+  }, [workspaces, workspaceOrdering, sortMode, pluginSort, projects, collapsedMap, appearanceMap, groupOrder]);
 
   const toggleRepoCollapsed = useCallback((repoId: string) => {
     setCollapsedMap((prev) => {

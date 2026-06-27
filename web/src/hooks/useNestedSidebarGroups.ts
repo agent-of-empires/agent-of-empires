@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import type { RepoGroup } from "../lib/types";
 import { safeGetItem, safeRemoveItem, safeSetItem } from "../lib/safeStorage";
 import { buildNestedSidebarGroups, type NestedSidebarGroup } from "../lib/sidebarGroups";
-import type { SidebarSortMode } from "../lib/sidebarSort";
+import type { PluginSortContext, SidebarSortMode } from "../lib/sidebarSort";
 import { useIdleDecayWindowMs } from "../lib/idleDecay";
 
 // Distinct from both the repo prefix (`aoe-repo-collapsed-`) and the flat
@@ -26,6 +26,7 @@ function loadCollapsed(key: string): boolean {
 export function useNestedSidebarGroups(
   repoGroups: RepoGroup[],
   sortMode: SidebarSortMode,
+  pluginSort?: PluginSortContext,
 ): {
   groups: NestedSidebarGroup[];
   toggleSubgroupCollapsed: (repoId: string, groupPath: string) => void;
@@ -38,12 +39,13 @@ export function useNestedSidebarGroups(
       buildNestedSidebarGroups(repoGroups, {
         idleDecayWindowMs,
         sortMode,
+        pluginSort,
         isSubgroupCollapsed: (repoId, groupPath) => {
           const key = subgroupKey(repoId, groupPath);
           return collapsedMap[key] ?? loadCollapsed(key);
         },
       }),
-    [repoGroups, idleDecayWindowMs, sortMode, collapsedMap],
+    [repoGroups, idleDecayWindowMs, sortMode, pluginSort, collapsedMap],
   );
 
   // The updater stays pure and persistence runs in an effect, for the same

@@ -1,7 +1,13 @@
 import type { RepoColor } from "./repoAppearance";
 import type { ProjectInfo, RepoGroup, SessionResponse, Workspace, WorkspaceStatus } from "./types";
 import { isSessionActive } from "./session";
-import { compareWorkspacesForComputedSortMode, type SidebarSortMode, workspaceIsSunk } from "./sidebarSort";
+import {
+  compareWorkspacesByPluginSort,
+  compareWorkspacesForComputedSortMode,
+  type PluginSortContext,
+  type SidebarSortMode,
+  workspaceIsSunk,
+} from "./sidebarSort";
 import { MULTI_REPO_GROUP_ID, SCRATCH_GROUP_ID } from "../hooks/useRepoGroups";
 
 // Synthetic id for the bucket that collects sessions with no user-assigned
@@ -134,6 +140,9 @@ export function buildSessionGroups(
     // last-activity here (this axis has no manual drag order), while
     // `lastActivity` and `attention` are honored. See #1640.
     sortMode: SidebarSortMode;
+    // When set, an active plugin sort overrides the built-in `sortMode`
+    // comparator for the within-group rows. See #2401.
+    pluginSort?: PluginSortContext;
     // `groupPath` is the normalized path ("" for Ungrouped), passed
     // alongside the synthetic id so nested callers can key collapse state
     // on the path and dodge the `UNGROUPED_GROUP_ID` sentinel. Flat callers
@@ -141,7 +150,9 @@ export function buildSessionGroups(
     isCollapsed: (groupId: string, groupPath: string) => boolean;
   },
 ): SidebarGroup[] {
-  const compareWorkspace = compareWorkspacesForComputedSortMode(opts.sortMode);
+  const compareWorkspace = opts.pluginSort
+    ? compareWorkspacesByPluginSort(opts.pluginSort)
+    : compareWorkspacesForComputedSortMode(opts.sortMode);
   const byGroup = new Map<string, SidebarWorkspaceView[]>();
   const order: string[] = [];
 
@@ -264,6 +275,8 @@ export function buildNestedSidebarGroups(
     // selected sort mode. Top-level repo order is inherited from the repo
     // axis (already sorted by `useRepoGroups`), so it is not re-sorted here.
     sortMode: SidebarSortMode;
+    // Forwarded so subgroup rows honor an active plugin sort. See #2401.
+    pluginSort?: PluginSortContext;
     isSubgroupCollapsed: (repoId: string, groupPath: string) => boolean;
   },
 ): NestedSidebarGroup[] {
@@ -272,6 +285,7 @@ export function buildNestedSidebarGroups(
     const subgroups = buildSessionGroups(repoGroup.workspaces, {
       idleDecayWindowMs: opts.idleDecayWindowMs,
       sortMode: opts.sortMode,
+      pluginSort: opts.pluginSort,
       isCollapsed: (_groupId, groupPath) => opts.isSubgroupCollapsed(repo.id, groupPath),
     });
     return {
