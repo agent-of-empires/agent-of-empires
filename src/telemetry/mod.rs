@@ -592,7 +592,7 @@ pub fn build_cli_usage() -> Option<CliUsage> {
 /// Record one CLI subcommand invocation and flush the accumulated `cli_usage`
 /// event if a send is due. Called once per `aoe <subcommand>` run.
 ///
-/// Side-effect-free unless the install is opted in: the [`app_dir_exists`] gate
+/// Side-effect-free unless the install is opted in: the [`crate::session::app_dir_exists`] gate
 /// is a non-creating check, so app-data-free commands (`aoe completion`,
 /// `aoe init`, ...) on a not-opted-in install never materialize the app dir and
 /// keep working in read-only / sandboxed environments. The daily slot is claimed

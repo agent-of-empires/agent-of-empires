@@ -1129,7 +1129,7 @@ pub fn execute_hooks_in_container(
 
 /// Resolve `host_hooks.before_start` from global + profile config only.
 ///
-/// Deliberately resolved without repo overrides ([`resolve_config_or_warn`]
+/// Deliberately resolved without repo overrides ([`super::profile_config::resolve_config_or_warn`]
 /// rather than [`resolve_config_with_repo_or_warn`]) so a repo can never
 /// contribute host commands; this is belt-and-suspenders on top of
 /// `host_hooks` being excluded from [`REPO_OVERRIDABLE_SECTIONS`].

@@ -94,7 +94,18 @@ async fn check_one(target: &Target, lock: Result<&Lockfile, &anyhow::Error>) -> 
             let Some(current_commit) = locked.resolved_commit.clone() else {
                 return err("lockfile has no resolved commit".to_string());
             };
-            let reference = source.reference().map(String::from);
+            // A no-`@ref` install tracks the latest-release channel, so compare
+            // against the latest release tag rather than the moving default
+            // branch HEAD. An explicit `@ref` is compared as-is. A no-`@ref`
+            // source whose repo has no release has nothing to update to.
+            let reference = match source.reference() {
+                Some(r) => Some(r.to_string()),
+                None => match resolve_latest_release(&source).await {
+                    Ok(Some(tag)) => Some(tag),
+                    Ok(None) => return status(short(&current_commit), None, None),
+                    Err(e) => return err(format!("{e:#}")),
+                },
+            };
             let remote = tokio::task::spawn_blocking(move || {
                 super::fetch::ls_remote(&url, reference.as_deref())
             })
@@ -131,6 +142,17 @@ async fn check_one(target: &Target, lock: Result<&Lockfile, &anyhow::Error>) -> 
             }
         }
         Err(e) => err(format!("unparseable source {:?}: {e:#}", target.source)),
+    }
+}
+
+/// The latest stable release tag for a GitHub source, or `None` when the repo
+/// has none. Non-GitHub sources never reach this.
+async fn resolve_latest_release(source: &PluginSource) -> anyhow::Result<Option<String>> {
+    match source {
+        PluginSource::Github { owner, repo, .. } => {
+            super::fetch::latest_release_tag(owner, repo).await
+        }
+        PluginSource::Local(_) => Ok(None),
     }
 }
 

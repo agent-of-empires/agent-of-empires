@@ -20,7 +20,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use aoe_plugin_api::{PluginManifest, RuntimeSpec};
 
-use crate::github::{GitHubClient, GitHubClientConfig, DEFAULT_USER_AGENT};
+use crate::github::{GitHubClient, GitHubClientConfig, GitHubError, DEFAULT_USER_AGENT};
 
 use super::source::PluginSource;
 
@@ -80,6 +80,16 @@ pub async fn fetch(source: &PluginSource) -> Result<FetchedPlugin> {
     };
 
     let (manifest, manifest_bytes) = read_manifest(&tree)?;
+
+    // The reserved build-output dir is excluded from the tree hash, so a source
+    // that ships it could hide files from the pin. It must only ever be created
+    // by build steps, never committed; refuse a source tree that contains it.
+    if tree.join(super::integrity::BUILD_OUTPUT_DIR).exists() {
+        bail!(
+            "plugin source ships the reserved build-output directory {:?}; it must only be produced by build steps, not committed",
+            super::integrity::BUILD_OUTPUT_DIR
+        );
+    }
 
     // Hash the source tree before any release-binary is injected below, so the
     // value matches `aoe plugin hash` run on the author's checkout (which has
@@ -178,6 +188,24 @@ pub fn ls_remote(url: &str, reference: Option<&str>) -> Result<String> {
     let target = reference.unwrap_or("HEAD");
     let out = run_git(&["ls-remote", url, target], None)?;
     parse_ls_remote(&out, target)
+}
+
+/// The tag of the repo's latest stable GitHub release, or `None` when the repo
+/// has published no release. `GET /releases/latest` already excludes prereleases
+/// and drafts, so this is the stable channel; a 404 (no releases) maps to `None`
+/// while any other API error propagates. Used by the default install path
+/// (no `@ref`) and the rolling update check.
+pub async fn latest_release_tag(owner: &str, repo: &str) -> Result<Option<String>> {
+    let client = GitHubClient::unauthenticated(GitHubClientConfig {
+        api_base: github_api_base(),
+        user_agent: DEFAULT_USER_AGENT.to_string(),
+        timeout: Duration::from_secs(60),
+    })?;
+    match client.latest_release(owner, repo).await {
+        Ok(release) => Ok(Some(release.tag_name)),
+        Err(GitHubError::NotFound { .. }) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 fn is_full_commit_sha(s: &str) -> bool {

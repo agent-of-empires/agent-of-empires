@@ -262,12 +262,11 @@ impl TipsDialog {
             .position(|r| r.width > 0 && r.contains(pos));
         if let Some(vis_idx) = hit {
             match self.visible_rows().get(vis_idx) {
-                Some(Row::Tip(_)) => {
-                    if vis_idx != self.cursor {
-                        self.cursor = vis_idx;
-                        self.mark_current_seen();
-                    }
+                Some(Row::Tip(_)) if vis_idx != self.cursor => {
+                    self.cursor = vis_idx;
+                    self.mark_current_seen();
                 }
+                Some(Row::Tip(_)) => {}
                 Some(Row::SeenHeader) => {
                     self.cursor = vis_idx;
                     self.set_seen_collapsed(!self.seen_collapsed);

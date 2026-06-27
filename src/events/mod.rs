@@ -7,13 +7,13 @@
 //! storage, and topic deletion. Events are opaque JSON strings keyed by an
 //! arbitrary `topic` (the partition key), with a caller-assigned monotonic
 //! `seq`. The consumer owns its payload type, its replay semantics, and any
-//! payload-aware queries; it holds the [`Connection`] and threads it plus a
-//! [`Schema`] into these free functions. The dependency arrow runs consumer
+//! payload-aware queries; it holds the [`rusqlite::Connection`] and threads it plus a
+//! [`crate::events::Schema`] into these free functions. The dependency arrow runs consumer
 //! -> here, never the reverse.
 //!
 //! ## On-disk shape
 //!
-//! Two tables per [`Schema`], named `<prefix>_events` and
+//! Two tables per [`crate::events::Schema`], named `<prefix>_events` and
 //! `<prefix>_attachments`. The partition key is physically the `session_id`
 //! column (kept under that name so an existing ACP database loads without a
 //! migration) even though the API speaks of "topics". The payload column is

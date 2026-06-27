@@ -392,21 +392,29 @@ impl Storage {
         Ok(instances)
     }
 
-    /// Write corrupt session rows to a sibling `sessions.corrupt.jsonl`
-    /// quarantine file (one JSON object per line) for later inspection and
-    /// manual recovery. Best-effort: a failure to write the sidecar is
-    /// logged but never fails the load, since the whole point is to keep the
-    /// surviving sessions reachable.
-    ///
-    /// Truncates rather than appends: `load()` runs on read-only refresh
-    /// paths (TUI reconcile, web list, CLI) that never rewrite
-    /// `sessions.json`, so a persistently corrupt row would otherwise be
-    /// re-appended on every load and grow the sidecar without bound. Each
-    /// load sees the full current corrupt set, so an overwrite is a
-    /// complete, deduplicated snapshot.
     fn quarantine_corrupt_rows(&self, rows: &[serde_json::Value]) {
         let path = self.sessions_path.with_file_name("sessions.corrupt.jsonl");
+        Self::write_corrupt_rows_quarantine(&path, rows, "session");
+    }
 
+    fn quarantine_corrupt_group_rows(&self, rows: &[serde_json::Value]) {
+        let path = self.sessions_path.with_file_name("groups.corrupt.jsonl");
+        Self::write_corrupt_rows_quarantine(&path, rows, "group");
+    }
+
+    /// Write corrupt rows to a sibling quarantine sidecar for later inspection
+    /// and manual recovery. Each line preserves one original JSON value; rows
+    /// are not limited to objects because a malformed element can be any JSON
+    /// value. Best-effort: a failure to write the sidecar is logged but never
+    /// fails the load, since the whole point is to keep surviving sessions and
+    /// groups reachable.
+    ///
+    /// Truncates rather than appends: load paths can run on read-only refresh
+    /// flows (TUI reconcile, web list, CLI) that never rewrite the source JSON,
+    /// so a persistently corrupt row would otherwise be re-appended on every
+    /// load and grow the sidecar without bound. Each load sees the full current
+    /// corrupt set, so an overwrite is a complete, deduplicated snapshot.
+    fn write_corrupt_rows_quarantine(path: &Path, rows: &[serde_json::Value], row_kind: &str) {
         let mut buf = String::new();
         for row in rows {
             match serde_json::to_string(row) {
@@ -416,7 +424,8 @@ impl Storage {
                 }
                 Err(e) => tracing::warn!(
                     error = %e,
-                    "failed to serialise corrupt session row for quarantine"
+                    row_kind = %row_kind,
+                    "failed to serialise corrupt row for quarantine"
                 ),
             }
         }
@@ -425,17 +434,17 @@ impl Storage {
         }
 
         // `atomic_write` (not `fs::write`) so the sidecar matches the
-        // durability and privacy guarantees of `sessions.json`: a crash
-        // mid-write cannot tear the only surviving copy of the lost row,
-        // the file lands at 0o600 (it can echo tokens from
-        // `Instance.command`) instead of umask-default 0o644, and the
-        // unlocked, concurrently-reachable `load()` callers collapse to a
-        // benign last-writer-wins instead of interleaving bytes.
-        if let Err(e) = atomic_write(&path, buf.as_bytes()) {
+        // durability and privacy guarantees of the source JSON file: a crash
+        // mid-write cannot tear the only surviving copy of the lost row, fresh
+        // sidecars land at 0o600 while existing permissions are preserved, and
+        // concurrently-reachable read callers collapse to a benign
+        // last-writer-wins instead of interleaving bytes.
+        if let Err(e) = atomic_write(path, buf.as_bytes()) {
             tracing::warn!(
                 error = %e,
                 path = %path.display(),
-                "failed to write session quarantine file"
+                row_kind = %row_kind,
+                "failed to write quarantine file"
             );
         }
     }
@@ -449,7 +458,30 @@ impl Storage {
             if content.trim().is_empty() {
                 Vec::new()
             } else {
-                serde_json::from_str(&content)?
+                let rows: Vec<serde_json::Value> = serde_json::from_str(&content)?;
+                let mut groups = Vec::with_capacity(rows.len());
+                let mut corrupt: Vec<serde_json::Value> = Vec::new();
+                for (idx, row) in rows.into_iter().enumerate() {
+                    match <Group as serde::Deserialize>::deserialize(&row) {
+                        Ok(group) => groups.push(group),
+                        Err(e) => {
+                            tracing::warn!(
+                                profile = %self.profile,
+                                row = idx,
+                                error = %e,
+                                path = %groups_path.display(),
+                                "skipping corrupt group row"
+                            );
+                            corrupt.push(row);
+                        }
+                    }
+                }
+
+                if !corrupt.is_empty() {
+                    self.quarantine_corrupt_group_rows(&corrupt);
+                }
+
+                groups
             }
         } else {
             Vec::new()
@@ -1115,6 +1147,119 @@ mod tests {
         assert_eq!(loaded_instances.len(), 1);
         assert_eq!(loaded_instances[0].group_path, "work/projects");
         assert!(!loaded_groups.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn test_load_with_groups_skips_corrupt_row_and_quarantines() -> Result<()> {
+        let temp = tempdir()?;
+        setup_test_home(temp.path());
+
+        let storage = Storage::new_unwatched("test-groups-corrupt-row")?;
+        fs::create_dir_all(storage.sessions_path.parent().unwrap())?;
+        let expected_instances = [Instance::new("session", "/tmp/session")];
+        fs::write(
+            &storage.sessions_path,
+            serde_json::to_vec_pretty(&expected_instances)?,
+        )?;
+
+        let groups_path = storage.sessions_path.with_file_name("groups.json");
+        let valid = [
+            Group::new("alpha", "work/alpha"),
+            Group::new("beta", "work/beta"),
+        ];
+        let mut rows: Vec<serde_json::Value> = valid
+            .iter()
+            .map(|group| serde_json::to_value(group).unwrap())
+            .collect();
+        rows.insert(1, serde_json::json!({ "name": "corrupt-no-path" }));
+        fs::write(&groups_path, serde_json::to_vec_pretty(&rows)?)?;
+
+        let (instances, groups) = storage.load_with_groups()?;
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0].title, "session");
+        assert_eq!(instances[0].project_path, "/tmp/session");
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].name, "alpha");
+        assert_eq!(groups[0].path, "work/alpha");
+        assert_eq!(groups[1].name, "beta");
+        assert_eq!(groups[1].path, "work/beta");
+
+        let quarantine = storage.sessions_path.with_file_name("groups.corrupt.jsonl");
+        assert!(quarantine.exists(), "quarantine sidecar should be created");
+        let q = fs::read_to_string(&quarantine)?;
+        assert_eq!(q.lines().count(), 1, "exactly one row quarantined");
+        assert!(q.contains("corrupt-no-path"), "malformed row is preserved");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&quarantine)?.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "quarantine sidecar must be owner-only");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn test_load_with_groups_repeated_read_overwrites_quarantine() -> Result<()> {
+        let temp = tempdir()?;
+        setup_test_home(temp.path());
+
+        let storage = Storage::new_unwatched("test-groups-corrupt-row-repeat")?;
+        fs::create_dir_all(storage.sessions_path.parent().unwrap())?;
+        fs::write(&storage.sessions_path, "[]")?;
+
+        let groups_path = storage.sessions_path.with_file_name("groups.json");
+        let rows = serde_json::json!([
+            Group::new("alpha", "work/alpha"),
+            { "name": "corrupt-no-path" },
+            Group::new("beta", "work/beta")
+        ]);
+        fs::write(&groups_path, serde_json::to_vec_pretty(&rows)?)?;
+
+        assert_eq!(storage.load_with_groups()?.1.len(), 2);
+        let quarantine = storage.sessions_path.with_file_name("groups.corrupt.jsonl");
+        let first = fs::read_to_string(&quarantine)?;
+
+        assert_eq!(storage.load_with_groups()?.1.len(), 2);
+        let second = fs::read_to_string(&quarantine)?;
+        assert_eq!(second, first);
+        assert_eq!(
+            second.lines().count(),
+            1,
+            "repeated load must not duplicate"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn test_load_with_groups_top_level_corruption_still_errors() -> Result<()> {
+        let temp = tempdir()?;
+        setup_test_home(temp.path());
+
+        let storage = Storage::new_unwatched("test-groups-top-level-corrupt")?;
+        fs::create_dir_all(storage.sessions_path.parent().unwrap())?;
+        fs::write(&storage.sessions_path, "[]")?;
+
+        let groups_path = storage.sessions_path.with_file_name("groups.json");
+        let quarantine = storage.sessions_path.with_file_name("groups.corrupt.jsonl");
+        for bad in [&b"{}"[..], &b"{ this is not valid json ]"[..]] {
+            fs::write(&groups_path, bad)?;
+            assert!(
+                storage.load_with_groups().is_err(),
+                "top-level corruption should still surface as Err"
+            );
+            assert!(
+                !quarantine.exists(),
+                "no quarantine file for top-level corruption"
+            );
+        }
+
         Ok(())
     }
 

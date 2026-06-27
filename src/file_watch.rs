@@ -314,7 +314,7 @@ impl FileWatchService {
     /// Per-process single-instance rule: each process constructs exactly
     /// one live service at bootstrap and threads `Arc<Self>` through every
     /// consumer rather than building its own. Integration tests outside
-    /// the crate go through [`test_support::new_filewatch`] for clarity.
+    /// the crate go through `test_support::new_filewatch` for clarity.
     pub fn new() -> Result<Arc<Self>, WatchError> {
         if std::env::var("AOE_FILE_WATCH").as_deref() == Ok("off") {
             tracing::info!(
@@ -412,10 +412,10 @@ impl FileWatchService {
     /// return). [`Self::notify_local_change`] is silently a no-op: the
     /// dispatcher channel's receiver is dropped at construction so any
     /// `send` Errs, and `dispatcher_dead` is pre-set so the error log path
-    /// short-circuits. Used by [`Storage::new_unwatched`] and as the
+    /// short-circuits. Used by `Storage::new_unwatched` and as the
     /// graceful-degradation fallback when the live constructor fails.
     /// Integration tests outside the crate construct via
-    /// [`Storage::new_unwatched`] or [`test_support::noop_filewatch`].
+    /// `Storage::new_unwatched` or `test_support::noop_filewatch`.
     pub fn noop() -> Arc<Self> {
         let (tokio_tx, tokio_rx) = mpsc::unbounded_channel::<DispatchMsg>();
         // Drop the receiver before returning so any future `tokio_tx.send`

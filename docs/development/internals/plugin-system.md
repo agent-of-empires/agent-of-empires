@@ -152,19 +152,27 @@ registered. This is how an interpreted worker sets itself up (create a venv,
 ```toml
 [runtime]
 kind = "command"
-command = [".venv/bin/aoe-github-worker"]   # plugin-relative: PATH-independent
+command = [".aoe-build/venv/bin/aoe-github-worker"]   # plugin-relative
 
 [[runtime.build]]
-command = ["python3", "-m", "venv", ".venv"]
+command = ["python3", "-m", "venv", ".aoe-build/venv"]
 
 [[runtime.build]]
-command = [".venv/bin/pip", "install", "."]
+command = [".aoe-build/venv/bin/pip", "install", "."]
 platforms = ["linux", "macos"]              # optional; omitted runs everywhere
 ```
 
+Build output must go under the reserved `.aoe-build/` directory, never directly
+into the source tree. That directory is excluded from `tree_hash` (see below), so
+a build that mutates the install tree (a venv, `node_modules`, compiled
+artifacts) does not change the source hash and a featured plugin still
+re-derives `Featured` at load. A source tree that ships `.aoe-build` is refused
+at install.
+
 Each step's argv resolves through the host's argv resolver (bare name on PATH,
 separator path relative to the plugin dir, absolute rejected), evaluated just
-before the step runs so `.venv/bin/pip` resolves once the prior step created it.
+before the step runs so `.aoe-build/venv/bin/pip` resolves once the prior step
+created it.
 Build steps are free to name bare PATH programs (`python3`, `node`, `uv`): they
 run in the user's interactive shell where PATH is reliable, which is exactly why
 the worker entrypoint, launched later by the daemon, is not. A step's optional `platforms` (`linux` / `macos` / `windows`)
@@ -277,8 +285,16 @@ reads (the field defaults) and is repopulated on the next install/update.
 `plugin::integrity::tree_hash` is a deterministic `sha256:<hex>` over a plugin's
 source tree. Files are sorted by their forward-slash relative path and hashed
 under a versioned header (`aoe-plugin-tree-hash-v1`) as `file\0<path>\0<len>
-<content>`. `.git` is skipped (it is stripped from an installed tree); a symlink
-or non-UTF-8 path is a hard error so nothing installed escapes the hash. File
+<content>`. `.git` and the reserved `.aoe-build/` build-output directory are skipped
+(the first is stripped from an installed tree, the second is generated into it by
+build steps and is not part of the source); a symlink or non-UTF-8 path outside
+those is a hard error so nothing installed escapes the hash. Skipping
+`.aoe-build` is what lets a build-mutating plugin (a venv holds ~thousands of
+files and a `python3` symlink) re-derive the same hash at load that the author's
+`aoe plugin hash` of a clean checkout produced; a fixed reserved name keeps the
+exclusion out of attacker control, where a manifest-declared list a tampered
+manifest could widen would not. A source that ships `.aoe-build` is refused at
+fetch, so the excluded subtree can never hide vetted source. File
 mode is excluded for cross-platform determinism, and `git clone` runs with
 `core.autocrlf=false` so line endings never differ by platform. The hash is
 computed over the staged source **before** any release-binary worker is
@@ -316,8 +332,10 @@ gates the reserved-namespace lift and the lockfile is user-writable; `community`
 vs `local` is derived from the install source. The lockfile records the tree
 hash and the install-time `trust` as a resolved record, but the load path does
 not depend on them for validation. The recompute is cheap (only ids the index
-names, and a featured plugin ships no release-binary, so its installed tree
-equals its source tree) and is done live on every load from the on-disk tree,
+names, and a featured plugin ships no release-binary, so its installed source
+equals its pinned source; build output under `.aoe-build` is excluded, so a
+build-mutating plugin re-derives the same hash) and is done live on every load
+from the on-disk tree,
 never from a cache: a metadata-keyed cache could be forged to return a stale
 vetted hash for a tampered tree, so the verified decision always re-hashes
 content. The manifest-hash grant check still catches a community plugin tampered

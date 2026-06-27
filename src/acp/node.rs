@@ -11,7 +11,7 @@
 //! For 5 we have a real `download` function, but it is opt-in: the
 //! caller must explicitly invoke it. Resolving at session-spawn time
 //! returns a typed error if no Node is present, and the CLI surfaces
-//! the doctor's "[!! ] Node runtime missing" message.
+//! the doctor's `[!! ] Node runtime missing` message.
 
 use std::path::{Path, PathBuf};
 

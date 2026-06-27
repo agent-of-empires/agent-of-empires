@@ -170,7 +170,7 @@ impl IntroDialog {
     /// True on every page of the wizard so xterm mouse tracking stays
     /// off and the terminal can do native drag-to-select on the docs /
     /// YouTube / Discord URLs (and any other text). The trade is that
-    /// the footer [Skip] / [Back] / [Next →] / [Finish] buttons aren't
+    /// the footer `[Skip]` / `[Back]` / `[Next →]` / `[Finish]` buttons aren't
     /// clickable; navigation is keyboard-only (Enter / ← / Esc), which
     /// the hint on each page advertises.
     pub fn wants_text_selection(&self) -> bool {

@@ -74,7 +74,12 @@ pub enum UpdateOutcome {
 /// dir). Prompts once for the manifest's capabilities unless `assume_yes`.
 pub async fn install(input: &str, assume_yes: bool) -> Result<InstallReport> {
     let source = PluginSource::parse(input)?;
-    let fetched = fetch::fetch(&source).await?;
+    let resolved = resolve_source(source, true).await?;
+    eprintln!("{}", resolved.notice);
+    if resolved.unverified && !assume_yes && !confirm_unverified()? {
+        bail!("install cancelled; the unverified source was not approved");
+    }
+    let fetched = fetch::fetch(&resolved.source).await?;
 
     let id = fetched.manifest.id.as_str().to_string();
     let featured_verified = verify_featured(&FeaturedIndex::load()?, &fetched)?;
@@ -109,7 +114,7 @@ pub async fn install(input: &str, assume_yes: bool) -> Result<InstallReport> {
 
     let manifest_hash = PluginManifest::hash_bytes(&fetched.manifest_bytes);
     persist_install(
-        &persisted_source(&source, input),
+        &persisted_source(&resolved.source, input),
         &id,
         &capabilities,
         &manifest_hash,
@@ -160,7 +165,13 @@ async fn update_with_consent(id: &str, mode: ConsentMode) -> Result<UpdateOutcom
     let prior_grant = plugin_config.grant.clone();
 
     let source = PluginSource::parse(&source_str)?;
-    let fetched = fetch::fetch(&source).await?;
+    // A no-`@ref` install tracks the release channel: re-resolve the latest
+    // release each update (rolling). Disallow the default-branch fallback here
+    // so an update never silently switches a release-tracking install onto the
+    // moving default branch; an explicit `@ref` install keeps following its ref.
+    let resolved = resolve_source(source, false).await?;
+    eprintln!("{}", resolved.notice);
+    let fetched = fetch::fetch(&resolved.source).await?;
     if fetched.manifest.id.as_str() != id {
         bail!(
             "source {source_str:?} now resolves to plugin {:?}, not {id}",
@@ -345,6 +356,104 @@ fn reject_incompatible_host(manifest: &PluginManifest) -> Result<()> {
     manifest
         .host_compat(env!("CARGO_PKG_VERSION"))
         .map_err(|msg| anyhow!("{}: {msg}", manifest.id.as_str()))
+}
+
+/// What [`resolve_source`] decided to fetch.
+struct ResolvedSource {
+    /// The source to actually fetch. A no-`@ref` GitHub source is rewritten to
+    /// the resolved release tag; everything else is passed through unchanged.
+    source: PluginSource,
+    /// The install is off the audited-release default path: an explicit `@ref`,
+    /// or the no-release default-branch fallback. The install path confirms
+    /// before proceeding; update ignores it (it has its own consent flow).
+    unverified: bool,
+    /// One line stating what is being installed, printed by the caller.
+    notice: String,
+}
+
+/// Resolve what to fetch for an install or update.
+///
+/// A no-`@ref` GitHub source installs the latest stable release, the audited
+/// default path. With no published release, `allow_branch_fallback` (install)
+/// falls back to the default branch as an unverified install; without it
+/// (update) that is an error, so a release-tracking install never silently
+/// switches onto the moving default branch. An explicit `@ref` is an unverified
+/// opt-in fetched as-is; a local source is unchanged.
+async fn resolve_source(
+    source: PluginSource,
+    allow_branch_fallback: bool,
+) -> Result<ResolvedSource> {
+    match &source {
+        PluginSource::Local(_) => Ok(ResolvedSource {
+            unverified: false,
+            notice: "installing from a local directory".to_string(),
+            source,
+        }),
+        PluginSource::Github {
+            reference: Some(reference),
+            ..
+        } => {
+            let notice =
+                format!("installing the explicit ref {reference:?} (not an audited release)");
+            Ok(ResolvedSource {
+                unverified: true,
+                notice,
+                source,
+            })
+        }
+        PluginSource::Github {
+            owner,
+            repo,
+            reference: None,
+        } => match fetch::latest_release_tag(owner, repo).await? {
+            Some(tag) => {
+                let notice = format!("installing the latest release {tag}");
+                let source = PluginSource::Github {
+                    owner: owner.clone(),
+                    repo: repo.clone(),
+                    reference: Some(tag),
+                };
+                Ok(ResolvedSource {
+                    unverified: false,
+                    notice,
+                    source,
+                })
+            }
+            None if allow_branch_fallback => Ok(ResolvedSource {
+                unverified: true,
+                notice: format!(
+                    "{owner}/{repo} has no published release; falling back to the unverified default branch"
+                ),
+                source,
+            }),
+            None => bail!(
+                "{owner}/{repo} has no published release to update to; the prior version is kept"
+            ),
+        },
+    }
+}
+
+/// Confirm an install that is off the audited-release default path (an explicit
+/// ref, or the no-release default-branch fallback). Mirrors
+/// [`confirm_capabilities`]: a non-interactive stdin without `--yes` is an
+/// error, not a silent yes. The caller has already printed what is being
+/// installed, so this only states the trust caveat and prompts.
+fn confirm_unverified() -> Result<bool> {
+    if !io::stdin().is_terminal() {
+        bail!("this is unverified, un-audited code; re-run with --yes to install it");
+    }
+    println!(
+        "This is unverified, un-audited code: it does not come from a vetted release and is\n\
+         not covered by the featured index. Install it only if you trust the source."
+    );
+    print!("Continue? [y/N] ");
+    io::stdout().flush()?;
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    Ok(matches!(
+        line.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
 }
 
 /// Check a fetched plugin against the curated index. Returns whether it is a

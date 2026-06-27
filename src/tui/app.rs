@@ -1449,7 +1449,7 @@ impl App {
             // the block reads. Same `live_idle` gate; recomputing
             // `tool_hotkey_cache` mid live-send disrupts input.
             let live_idle = self.home.live_send.is_none();
-            let config_kick = take_config_refresh_kick(live_idle, &self.home.config_dirty);
+            let config_kick = take_config_refresh_kick(live_idle, &self.home.config_watch.dirty);
             if config_kick {
                 let result = self.home.try_refresh_from_config_watcher();
                 handle_tick_reload_config(result, &mut self.home.reload_failure_state);
@@ -1467,7 +1467,8 @@ impl App {
             // arrived during live-send is not silently lost.
             let dirty = if live_idle {
                 self.home
-                    .disk_dirty
+                    .disk_watch
+                    .dirty
                     .swap(false, std::sync::atomic::Ordering::Acquire)
             } else {
                 false

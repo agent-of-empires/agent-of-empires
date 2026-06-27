@@ -91,6 +91,54 @@ fn push_new_commit(base: &Path, owner: &str, repo: &str, files: &[(&str, &str)])
     git(&["push", "-q", bare.to_str().unwrap(), "main"], &work);
 }
 
+/// Tag the work tree behind a bare repo at its current HEAD and push the tag,
+/// so a clone of `tag` resolves. `force` moves an existing tag to a new HEAD.
+fn tag_bare_repo(base: &Path, owner: &str, repo: &str, tag: &str, force: bool) {
+    let work = base.join("work");
+    let mut args = vec!["tag"];
+    if force {
+        args.push("-f");
+    }
+    args.push(tag);
+    git(&args, &work);
+    let bare = base.join(owner).join(format!("{repo}.git"));
+    let refspec = format!("refs/tags/{tag}:refs/tags/{tag}");
+    git(
+        &["push", "-q", "-f", bare.to_str().unwrap(), &refspec],
+        &work,
+    );
+}
+
+/// Spawn a fake GitHub releases API serving `tag` as the latest stable release
+/// (and at `releases/tags/{tag}`), point `AOE_UPDATE_API_BASE` at it, and return
+/// the server handle so the caller can abort it. Assets are empty (source-only
+/// plugins); a release-binary test serves its own assets.
+async fn spawn_latest_release(owner: &str, repo: &str, tag: &str) -> tokio::task::JoinHandle<()> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let body = format!(r#"{{"tag_name":"{tag}","assets":[]}}"#);
+    let json = move || {
+        let body = body.clone();
+        async move {
+            (
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                body,
+            )
+        }
+    };
+    let app = axum::Router::new()
+        .route(
+            &format!("/repos/{owner}/{repo}/releases/latest"),
+            axum::routing::get(json.clone()),
+        )
+        .route(
+            &format!("/repos/{owner}/{repo}/releases/tags/{tag}"),
+            axum::routing::get(json),
+        );
+    std::env::set_var("AOE_UPDATE_API_BASE", &base_url);
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() })
+}
+
 #[tokio::test]
 #[serial]
 async fn local_install_lists_and_uninstalls() {
@@ -233,12 +281,15 @@ api_version = 2
         )],
     );
 
-    let report = install::install("gh:acme/widget", true).await.unwrap();
+    // An explicit `@ref` installs that ref directly (no release resolution);
+    // --yes bypasses the unverified confirmation.
+    let report = install::install("gh:acme/widget@main", true).await.unwrap();
     assert_eq!(report.id, "acme.widget");
 
     let lock = Lockfile::load().unwrap();
     let locked = lock.get("acme.widget").expect("lock entry");
     assert_eq!(locked.source, "gh:acme/widget");
+    assert_eq!(locked.requested_ref.as_deref(), Some("main"));
     assert!(
         locked
             .resolved_commit
@@ -263,6 +314,203 @@ api_version = 2
     );
 
     std::env::remove_var("AOE_GITHUB_CLONE_BASE");
+}
+
+#[tokio::test]
+#[serial]
+async fn github_no_ref_installs_latest_release() {
+    let _home = isolate();
+    let base = tempfile::tempdir().unwrap();
+    make_bare_repo(
+        base.path(),
+        "acme",
+        "rel",
+        &[(
+            "aoe-plugin.toml",
+            r#"
+id = "acme.rel"
+name = "Rel"
+version = "1.0.0"
+api_version = 2
+"#,
+        )],
+    );
+    tag_bare_repo(base.path(), "acme", "rel", "v1.0.0", false);
+    let server = spawn_latest_release("acme", "rel", "v1.0.0").await;
+
+    // No `@ref`: resolves and installs the latest release tag. `false` (no
+    // --yes) proves the resolved-release path is not treated as unverified, so
+    // it installs without an interactive confirmation.
+    install::install("gh:acme/rel", false).await.unwrap();
+
+    let lock = Lockfile::load().unwrap();
+    let locked = lock.get("acme.rel").expect("lock entry");
+    // The resolved release tag is recorded, but the config source stays ref-less
+    // so `update` keeps tracking the latest-release channel (rolling).
+    assert_eq!(locked.requested_ref.as_deref(), Some("v1.0.0"));
+    assert_eq!(
+        Config::load()
+            .unwrap()
+            .plugins
+            .get("acme.rel")
+            .and_then(|p| p.source.clone())
+            .as_deref(),
+        Some("gh:acme/rel"),
+    );
+
+    server.abort();
+    std::env::remove_var("AOE_GITHUB_CLONE_BASE");
+    std::env::remove_var("AOE_UPDATE_API_BASE");
+}
+
+#[tokio::test]
+#[serial]
+async fn github_no_ref_no_release_bails_without_yes() {
+    let _home = isolate();
+    let base = tempfile::tempdir().unwrap();
+    make_bare_repo(
+        base.path(),
+        "acme",
+        "norel",
+        &[(
+            "aoe-plugin.toml",
+            r#"
+id = "acme.norel"
+name = "NoRel"
+version = "1.0.0"
+api_version = 2
+"#,
+        )],
+    );
+    // A releases API with no matching route returns 404 -> no release found ->
+    // default-branch fallback, which is unverified and (non-interactively,
+    // without --yes) must bail rather than silently install.
+    let server = spawn_latest_release("other", "repo", "v9").await;
+
+    let err = install::install("gh:acme/norel", false)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("unverified"), "got: {err}");
+    assert!(load_registry().get("acme.norel").is_none());
+
+    server.abort();
+    std::env::remove_var("AOE_GITHUB_CLONE_BASE");
+    std::env::remove_var("AOE_UPDATE_API_BASE");
+}
+
+#[tokio::test]
+#[serial]
+async fn explicit_ref_requires_confirmation_without_yes() {
+    let _home = isolate();
+    let base = tempfile::tempdir().unwrap();
+    make_bare_repo(
+        base.path(),
+        "acme",
+        "widget",
+        &[(
+            "aoe-plugin.toml",
+            r#"
+id = "acme.widget"
+name = "Widget"
+version = "1.0.0"
+api_version = 2
+"#,
+        )],
+    );
+
+    // An explicit `@ref` is unverified; without --yes on a non-terminal stdin it
+    // bails rather than installing un-audited code.
+    let err = install::install("gh:acme/widget@main", false)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("unverified"), "got: {err}");
+    assert!(load_registry().get("acme.widget").is_none());
+
+    std::env::remove_var("AOE_GITHUB_CLONE_BASE");
+}
+
+#[tokio::test]
+#[serial]
+async fn outdated_tracks_release_not_default_branch() {
+    let _home = isolate();
+    let base = tempfile::tempdir().unwrap();
+    make_bare_repo(
+        base.path(),
+        "acme",
+        "rel",
+        &[(
+            "aoe-plugin.toml",
+            PLAIN_MANIFEST.replace("acme.upd", "acme.rel").as_str(),
+        )],
+    );
+    tag_bare_repo(base.path(), "acme", "rel", "v1.0.0", false);
+    let server = spawn_latest_release("acme", "rel", "v1.0.0").await;
+    install::install("gh:acme/rel", true).await.unwrap();
+
+    // Advance the default branch but leave the release tag at v1.0.0. A
+    // release-tracking install must NOT report this as an update.
+    push_new_commit(base.path(), "acme", "rel", &[("extra.txt", "new")]);
+    let after = update_check::outdated().await;
+    let s = after.iter().find(|s| s.id == "acme.rel").expect("present");
+    assert!(
+        !s.needs_update,
+        "tracks the release tag, not default-branch HEAD: {s:?}"
+    );
+    assert!(s.error.is_none(), "no check error: {s:?}");
+
+    server.abort();
+    std::env::remove_var("AOE_GITHUB_CLONE_BASE");
+    std::env::remove_var("AOE_UPDATE_API_BASE");
+}
+
+#[tokio::test]
+#[serial]
+async fn featured_reserved_namespace_loads_after_tree_mutating_build() {
+    // Regression for #2475: a featured plugin whose build mutates the install
+    // tree (a `.venv`-style dir with a symlink) must still re-derive Featured at
+    // load. Before the reserved-build-output skip, tree_hash hard-errored on the
+    // symlink, so the plugin was not Featured and the reserved-namespace gate
+    // skipped it.
+    let _home = isolate();
+    let src = tempfile::tempdir().unwrap();
+    let dir = write_plugin_dir(
+        src.path(),
+        r#"
+id = "agent-of-empires.official"
+name = "Official"
+version = "1.0.0"
+api_version = 2
+"#,
+    );
+    let tree_hash = agent_of_empires::plugin::integrity::tree_hash(&dir).unwrap();
+    write_featured(
+        src.path(),
+        "agent-of-empires.official",
+        dir.to_str().unwrap(),
+        &tree_hash,
+    );
+    install::install(dir.to_str().unwrap(), true).await.unwrap();
+
+    // Simulate a build that creates the reserved build-output dir with a symlink
+    // inside the installed plugin, the way plugin-github's venv build would.
+    let installed = agent_of_empires::plugin::plugins_dir()
+        .unwrap()
+        .join("agent-of-empires.official");
+    let build = installed.join(".aoe-build").join("bin");
+    std::fs::create_dir_all(&build).unwrap();
+    std::fs::write(build.join("real"), b"x").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("real", build.join("python3")).unwrap();
+
+    let reg = load_registry();
+    let plugin = reg
+        .get("agent-of-empires.official")
+        .expect("featured plugin still loads after a tree-mutating build");
+    assert_eq!(plugin.validation.as_str(), "featured");
+
+    std::env::remove_var("AOE_FEATURED_INDEX_PATH");
 }
 
 /// Write a featured index file and point `AOE_FEATURED_INDEX_PATH` at it (debug
@@ -454,18 +702,25 @@ async fn release_binary_is_downloaded_and_placed() {
     let release_json = format!(
         r#"{{"tag_name":"v1.0.0","assets":[{{"name":"{asset_name}","browser_download_url":"{base_url}/dl"}}]}}"#
     );
+    let json_handler = move || {
+        let body = release_json.clone();
+        async move {
+            (
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                body,
+            )
+        }
+    };
     let app = axum::Router::new()
+        // No `@ref` resolves the latest release tag, then pins source + asset to
+        // it, so both the latest and the by-tag endpoints are hit.
         .route(
             "/repos/acme/bin/releases/latest",
-            axum::routing::get(move || {
-                let body = release_json.clone();
-                async move {
-                    (
-                        [(axum::http::header::CONTENT_TYPE, "application/json")],
-                        body,
-                    )
-                }
-            }),
+            axum::routing::get(json_handler.clone()),
+        )
+        .route(
+            "/repos/acme/bin/releases/tags/v1.0.0",
+            axum::routing::get(json_handler),
         )
         .route(
             "/dl",
@@ -493,6 +748,7 @@ asset = "bin-${os}-${arch}"
 "#,
         )],
     );
+    tag_bare_repo(base.path(), "acme", "bin", "v1.0.0", false);
 
     install::install("gh:acme/bin", true).await.unwrap();
 
@@ -843,7 +1099,9 @@ async fn outdated_detects_new_github_commit() {
         "upd",
         &[("aoe-plugin.toml", PLAIN_MANIFEST)],
     );
-    install::install("gh:acme/upd", true).await.unwrap();
+    // Branch tracking is now an explicit-ref opt-in: `@main` follows the default
+    // branch (no release resolution), which these update-mechanics tests need.
+    install::install("gh:acme/upd@main", true).await.unwrap();
 
     let before = update_check::outdated().await;
     let s = before.iter().find(|s| s.id == "acme.upd").expect("present");
@@ -895,7 +1153,9 @@ async fn auto_update_applies_clean_github_update() {
         "upd",
         &[("aoe-plugin.toml", PLAIN_MANIFEST)],
     );
-    install::install("gh:acme/upd", true).await.unwrap();
+    // Branch tracking is now an explicit-ref opt-in: `@main` follows the default
+    // branch (no release resolution), which these update-mechanics tests need.
+    install::install("gh:acme/upd@main", true).await.unwrap();
 
     // A clean (no consent change) newer version on the remote.
     push_new_commit(base.path(), "acme", "upd", &[("aoe-plugin.toml", &v2)]);
@@ -926,7 +1186,9 @@ async fn clean_update_skips_capability_change() {
         "upd",
         &[("aoe-plugin.toml", PLAIN_MANIFEST)],
     );
-    install::install("gh:acme/upd", true).await.unwrap();
+    // Branch tracking is now an explicit-ref opt-in: `@main` follows the default
+    // branch (no release resolution), which these update-mechanics tests need.
+    install::install("gh:acme/upd@main", true).await.unwrap();
 
     // The new version adds a capability, so a non-interactive clean update must
     // skip it and leave the prior version installed.

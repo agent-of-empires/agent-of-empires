@@ -93,16 +93,19 @@ fn rewire_disk_subscriptions_is_noop_without_tokio_runtime() {
     let current = vec!["test".to_string()];
 
     assert!(
-        view.disk_watch_handles.is_empty(),
+        view.disk_watch.handles.is_empty(),
         "construction outside a tokio runtime must not prewire subscriptions"
     );
     view.rewire_disk_subscriptions(&current);
     assert!(
-        view.disk_watch_handles.is_empty(),
+        view.disk_watch.handles.is_empty(),
         "rewire outside a tokio runtime must stay a no-op for lib tests"
     );
     assert!(
-        !view.disk_dirty.load(std::sync::atomic::Ordering::Acquire),
+        !view
+            .disk_watch
+            .dirty
+            .load(std::sync::atomic::Ordering::Acquire),
         "the noop branch must leave disk_dirty clear outside a runtime"
     );
 }
@@ -122,12 +125,14 @@ async fn config_watch_keys_distinguish_global_from_profile_named_global() {
     )
     .unwrap();
 
-    assert_eq!(view.config_watch_handles.len(), 2);
+    assert_eq!(view.config_watch.handles.len(), 2);
     assert!(view
-        .config_watch_handles
+        .config_watch
+        .handles
         .contains_key(&ConfigWatchKey::Global));
     assert!(view
-        .config_watch_handles
+        .config_watch
+        .handles
         .contains_key(&ConfigWatchKey::profile(profile_name)));
 }
 
