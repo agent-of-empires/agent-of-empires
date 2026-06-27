@@ -27,4 +27,9 @@
 
 [plugins."agent-of-empires.github"]
 source = "gh:agent-of-empires/plugin-github"
-versions = { "0.1.0" = "sha256:6b506512d4efbc8a70c4d989188e701e547f5c35bd690c28276df435ced940fc", "1.0.0" = "sha256:b2f293d77244b03ddd98deb4426e96a09184a9454e2424bdd00a8e9d93ff4388", "1.1.0" = "sha256:2a13a901314e4061616ad68e5923a807c0841387ec065036eb972acc8c3703e0" }
+# 1.1.0 is intentionally unpinned: its `.venv`-in-source-root build bricked at
+# load (load-time tree_hash trips over the venv symlink, so the reserved
+# namespace gate skips it). Dropping the pin downgrades it to community so the
+# reserved-namespace install gate blocks it outright. Fixed in 1.2.0, which
+# builds under `.aoe-build/`.
+versions = { "0.1.0" = "sha256:6b506512d4efbc8a70c4d989188e701e547f5c35bd690c28276df435ced940fc", "1.0.0" = "sha256:b2f293d77244b03ddd98deb4426e96a09184a9454e2424bdd00a8e9d93ff4388", "1.2.0" = "sha256:e5fe509a3e7d39030350d7ee7efcd94623e9ec8ce7707a121804ec95212aba8a" }
