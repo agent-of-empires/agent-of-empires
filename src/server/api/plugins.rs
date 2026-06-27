@@ -174,6 +174,96 @@ pub async fn invoke_plugin_action(
     }
 }
 
+/// `GET /api/plugins/{id}/update/preview`: classify the available update for one
+/// installed external plugin (no_update / safe_update / consent_required) and,
+/// when consent is required, return the structured disclosure the dashboard and
+/// TUI render. Gated on read-write mode: it does a full source fetch, which a
+/// read-only dashboard has no business driving, but it needs no elevation
+/// because it mutates no host state. Network failures (no release, dead remote)
+/// surface as a 502 for the UI to show.
+pub async fn plugin_update_preview(
+    State(state): State<std::sync::Arc<AppState>>,
+    session: Option<axum::Extension<AuthenticatedSession>>,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(resp) = mutation_gate(&state, session.as_deref()).await {
+        return resp;
+    }
+    match plugin::install::preview_update(&id).await {
+        Ok(preview) => Json(preview).into_response(),
+        Err(e) => error_response(StatusCode::BAD_GATEWAY, "preview_failed", format!("{e:#}")),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct ApplyUpdateBody {
+    /// The fingerprint the user approved, from the preview. Pins the apply to
+    /// exactly what was shown: if the remote moved since, the apply is refused.
+    #[serde(default)]
+    pub expected_fingerprint: Option<String>,
+}
+
+/// `POST /api/plugins/{id}/update/apply`: apply an update the user approved in
+/// the dashboard, granting whatever the fetched manifest declares. A privileged
+/// host mutation (it can expand the capability set and run build steps), so it
+/// is gated on read-write mode AND elevation, like enable/disable. Returns the
+/// refreshed plugin list on success. A fingerprint mismatch (the remote moved
+/// since the preview) is a 409 so the dashboard re-previews before re-approving.
+pub async fn apply_plugin_update(
+    State(state): State<std::sync::Arc<AppState>>,
+    session: Option<axum::Extension<AuthenticatedSession>>,
+    Path(id): Path<String>,
+    Json(body): Json<ApplyUpdateBody>,
+) -> Response {
+    if let Err(resp) = mutation_gate(&state, session.as_deref()).await {
+        return resp;
+    }
+    match plugin::install::apply_update(&id, body.expected_fingerprint).await {
+        Ok(_) => list_plugins().await.into_response(),
+        Err(e) => {
+            let message = format!("{e:#}");
+            // The TOCTOU guard's "changed since it was shown" is a conflict the
+            // client recovers from by re-previewing, not a bad request.
+            let status = if message.contains("changed since it was shown") {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            error_response(status, "apply_failed", message)
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct DismissUpdateBody {
+    /// The fingerprint of the update the user declined, from the preview.
+    pub fingerprint: String,
+}
+
+/// `POST /api/plugins/{id}/update/dismiss`: record that the user declined an
+/// available update, so the popup and the auto-update notification stop nagging
+/// until the next version. Mutates host config and suppresses a security
+/// signal, so it is gated like apply (read-write + elevation).
+pub async fn dismiss_plugin_update(
+    State(state): State<std::sync::Arc<AppState>>,
+    session: Option<axum::Extension<AuthenticatedSession>>,
+    Path(id): Path<String>,
+    Json(body): Json<DismissUpdateBody>,
+) -> Response {
+    if let Err(resp) = mutation_gate(&state, session.as_deref()).await {
+        return resp;
+    }
+    let result = tokio::task::spawn_blocking(move || {
+        plugin::install::dismiss_update(&id, &body.fingerprint)
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => (StatusCode::OK, Json(json!({ "ok": true }))).into_response(),
+        Ok(Err(e)) => error_response(StatusCode::BAD_REQUEST, "plugin_error", format!("{e:#}")),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
+    }
+}
+
 #[derive(Deserialize)]
 pub struct SetEnabledBody {
     pub enabled: bool,
