@@ -718,14 +718,18 @@ impl SettingsView {
     /// toast was cleared so the caller can request a redraw. Errors are sticky
     /// (no expiry) and clear only on the next keypress.
     pub fn tick_status(&mut self) -> bool {
-        match self.success_message_expires_at {
+        // Poll the embedded plugin manager's in-flight discovery / update-check
+        // task so its results land without waiting for the next keypress.
+        let plugin_changed = self.plugin_manager.tick();
+        let toast_changed = match self.success_message_expires_at {
             Some(expires_at) if std::time::Instant::now() >= expires_at => {
                 self.success_message = None;
                 self.success_message_expires_at = None;
                 true
             }
             _ => false,
-        }
+        };
+        plugin_changed || toast_changed
     }
 
     /// Check if currently in an editing state (text field, list, dialog, etc.)
