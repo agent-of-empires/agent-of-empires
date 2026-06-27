@@ -125,6 +125,21 @@ describe("service worker push handler (#2491)", () => {
     expect(getNotifications).not.toHaveBeenCalledWith({ tag: QUESTION_TAG });
   });
 
+  it("drops an older notify delivered after a newer clear for the same tag", async () => {
+    // Out-of-order delivery: the clear arrives first, so getNotifications sees
+    // nothing to close, then the stale notify lands. Without a high-water mark
+    // it would resurrect a handled request's notification. See #2491.
+    const { handlers, showNotification } = loadSw();
+    await dispatchPush(handlers, { kind: "clear", tag: APPROVAL_TAG, seq: 10 });
+    await dispatchPush(handlers, {
+      kind: "notify",
+      title: "stale",
+      tag: APPROVAL_TAG,
+      seq: 5,
+    });
+    expect(showNotification).not.toHaveBeenCalled();
+  });
+
   it("ignores a clear with no tag without throwing or showing", async () => {
     const { handlers, showNotification, getNotifications } = loadSw();
     await dispatchPush(handlers, { kind: "clear", seq: 1 });
