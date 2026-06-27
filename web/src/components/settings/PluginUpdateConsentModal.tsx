@@ -149,7 +149,7 @@ export function PluginUpdateConsentModal({
           </button>
           <button
             type="button"
-            className="rounded bg-accent-500 px-3 py-1 text-xs font-medium text-surface-950 hover:bg-accent-400 disabled:opacity-50"
+            className="rounded bg-brand-600 px-3 py-1 text-xs font-medium text-white hover:bg-brand-500 disabled:opacity-50"
             disabled={busy}
             onClick={onApprove}
             data-testid="plugin-update-approve"
