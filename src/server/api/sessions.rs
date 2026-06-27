@@ -7557,6 +7557,7 @@ mod workspace_ordering_tests {
                 delete_sandbox: false,
                 delete_to_trash: true,
             },
+            trashed_at: None,
             remote_owner: None,
             notify_on_waiting: None,
             notify_on_idle: None,
