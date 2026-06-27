@@ -40,3 +40,43 @@ export const PaneDndStateContext = createContext<PaneDndState>({
 export function usePaneDnd(): PaneDndState {
   return useContext(PaneDndStateContext);
 }
+
+/** The droppable the pointer is over, reduced to the bits placement needs. */
+export interface PlacementOver {
+  type: "pane-tab" | "pane-dock" | "pane-empty-dock";
+  dock: DockLocation;
+  /** The hovered tab id (only meaningful when `type` is "pane-tab"). */
+  tabId: string;
+  /** Pointer is past the hovered tab's center, so insert after it. */
+  after: boolean;
+}
+
+/** Where a dragged tab lands: the destination dock and the index in that dock's
+ *  visible tab list *after* the dragged tab is removed. Dropping on a tab
+ *  inserts before or after it; dropping on a dock body or empty-dock zone
+ *  appends. Pure so the drag handler stays a thin adapter over the event. */
+export function resolvePlacement(
+  over: PlacementOver,
+  draggedId: string,
+  tabsByDock: Record<DockLocation, string[]>,
+): DropTarget {
+  const base = tabsByDock[over.dock].filter((id) => id !== draggedId);
+  if (over.type !== "pane-tab") return { dock: over.dock, index: base.length };
+  const overIndex = base.indexOf(over.tabId);
+  if (overIndex < 0) return { dock: over.dock, index: base.length };
+  return { dock: over.dock, index: overIndex + (over.after ? 1 : 0) };
+}
+
+/** Translate an insertion index in a dock's *visible* tab list to the index in
+ *  its *full* persisted list. They differ when the dock holds a tab that is
+ *  currently hidden (an unloaded plugin pane), which still occupies a persisted
+ *  slot. `fullBase` is the full dock list with the dragged tab already removed.
+ *  An index at or past the visible end appends to the full list. */
+export function visibleToFullIndex(
+  fullBase: string[],
+  visibleIndex: number,
+  isVisible: (id: string) => boolean,
+): number {
+  const visibleSlots = fullBase.map((id, index) => ({ id, index })).filter(({ id }) => isVisible(id));
+  return visibleIndex >= visibleSlots.length ? fullBase.length : visibleSlots[visibleIndex]!.index;
+}

@@ -14,12 +14,12 @@ import {
   type DragOverEvent,
   type DragStartEvent,
 } from "@dnd-kit/core";
-import { arrayMove } from "@dnd-kit/sortable";
 
 import type { DockLocation } from "../lib/panes";
 import type { PaneDisplay } from "./Dock";
 import {
   PaneDndStateContext,
+  resolvePlacement,
   type DockDropData,
   type DropTarget,
   type PaneDndState,
@@ -75,18 +75,18 @@ export function PaneDndController({ tabsByDock, descriptorFor, onPlaceTab, child
     (e: DragOverEvent | DragEndEvent): DropTarget | null => {
       const overData = e.over?.data.current as PaneTabData | DockDropData | undefined;
       if (!overData) return null;
-      const draggedId = String(e.active.id);
-      const dock = overData.dock;
-      // The destination's tabs without the dragged one: this is the index
-      // space placeTab inserts into, and (cross-dock) it has no gap to map.
-      const base = tabsByDock[dock].filter((id) => id !== draggedId);
-      if (overData.type !== "pane-tab") return { dock, index: base.length };
-      const overIndex = base.indexOf(String(e.over!.id));
-      if (overIndex < 0) return { dock, index: base.length };
       const activeC = centerX(e.active.rect.current.translated);
       const overC = centerX(e.over!.rect);
-      const after = activeC !== null && overC !== null && activeC > overC;
-      return { dock, index: overIndex + (after ? 1 : 0) };
+      return resolvePlacement(
+        {
+          type: overData.type,
+          dock: overData.dock,
+          tabId: String(e.over!.id),
+          after: activeC !== null && overC !== null && activeC > overC,
+        },
+        String(e.active.id),
+        tabsByDock,
+      );
     },
     [tabsByDock],
   );
@@ -111,17 +111,11 @@ export function PaneDndController({ tabsByDock, descriptorFor, onPlaceTab, child
       const tabId = String(e.active.id);
       const target = resolveTarget(e);
       if (target) {
-        if (target.dock === sourceDock) {
-          // Within-dock reorder: arrayMove gives the final order, and the
-          // dragged tab's index in it is exactly placeTab's post-removal index.
-          const arr = tabsByDock[target.dock];
-          const from = arr.indexOf(tabId);
-          const over = e.over ? arr.indexOf(String(e.over.id)) : -1;
-          if (from >= 0 && over >= 0 && from !== over) {
-            const finalIndex = arrayMove(arr, from, over).indexOf(tabId);
-            onPlaceTab(tabId, target.dock, finalIndex);
-          }
-        } else {
+        // resolveTarget already gives the post-removal insertion index for both
+        // cases (before/after the hovered tab, or append on a dock-body drop), so
+        // a within-dock reorder only needs a no-op guard against its own slot.
+        const from = tabsByDock[target.dock].indexOf(tabId);
+        if (target.dock !== sourceDock || (from >= 0 && from !== target.index)) {
           onPlaceTab(tabId, target.dock, target.index);
         }
       }
