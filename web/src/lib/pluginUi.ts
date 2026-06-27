@@ -139,9 +139,8 @@ export function toneTextClass(tone: PluginUiTone | undefined): string {
   );
 }
 
-// --- sort-key / filter-facet support (#2401) ---------------------------------
-// `sort-key` and `filter-facet` are global entries that reference a per-session
-// `row-column` entry by its `id` (the payload `column` field). The dashboard
+// `sort-key` and `filter-facet` (#2401) are global entries that reference a
+// per-session `row-column` entry by its `id` (the payload `column` field). The dashboard
 // orders/filters session rows client-side over the already-fetched scalars; no
 // plugin code runs and the render path never awaits a worker. Lookups are
 // scoped to the referencing plugin's own `plugin_id`, since a `column` id is
