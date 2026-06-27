@@ -42,9 +42,11 @@ first-party plugins land as each piece is verified.
 
 ## Installing external plugins
 
-External plugins are community code that you install at your own risk. Install,
-update, and uninstall are CLI-only (`aoe plugin` is reserved for management);
-the TUI and web surfaces show the result but do not install.
+External plugins are community code that you install at your own risk. Install
+and uninstall are CLI-only (`aoe plugin` is reserved for management); the TUI
+and web surfaces show the result but do not install. Updating an already
+installed plugin can be done from the CLI or approved in-app (see Trust and
+capabilities below).
 
 ```sh
 aoe plugin install gh:owner/repo          # latest release (the audited default)
