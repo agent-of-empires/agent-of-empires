@@ -247,30 +247,156 @@ default = "turbo"
 }
 
 #[test]
-fn deferred_sections_are_rejected() {
-    // status / panes are still deferred until a consumer exists (#2386); with
-    // deny_unknown_fields a manifest declaring one must fail to parse. themes
-    // is now consumed (#2094) and parses, asserted above.
-    for section in ["status", "panes"] {
-        let toml = format!(
-            r#"
+fn panes_section_is_rejected() {
+    // panes is not a manifest section: it ships as a `ui` slot kind (#2432).
+    // deny_unknown_fields makes a `[[panes]]` block a hard parse error. status
+    // is now a real section (#2386), asserted separately below.
+    let toml = r#"
 id = "acme.thing"
 name = "Thing"
 version = "0.1.0"
-api_version = 2
+api_version = 4
 
-[[{section}]]
+[[panes]]
 id = "x"
-name = "x"
-path = "x"
-"#
-        );
-        let err = PluginManifest::from_toml_str(&toml).unwrap_err();
-        assert!(
-            matches!(err, ManifestError::Parse(_)),
-            "[[{section}]] should be a hard parse error, got {err:?}"
-        );
-    }
+title = "x"
+"#;
+    let err = PluginManifest::from_toml_str(toml).unwrap_err();
+    assert!(
+        matches!(err, ManifestError::Parse(_)),
+        "[[panes]] should be a hard parse error, got {err:?}"
+    );
+}
+
+#[test]
+fn status_section_parses() {
+    let toml = r#"
+id = "acme.thing"
+name = "Thing"
+version = "0.1.0"
+api_version = 4
+
+[[status]]
+id = "queue"
+label = "Queue depth"
+
+[[status]]
+id = "nolabel"
+"#;
+    let m = PluginManifest::from_toml_str(toml).expect("status section parses");
+    assert_eq!(m.status[0].id, "queue");
+    assert_eq!(m.status[0].label, "Queue depth");
+    assert_eq!(m.status[1].id, "nolabel");
+    assert_eq!(m.status[1].label, "", "label defaults to empty");
+}
+
+#[test]
+fn invalid_status_collects_problem() {
+    let toml = r#"
+id = "acme.thing"
+name = "Thing"
+version = "0.1.0"
+api_version = 4
+
+[[status]]
+id = ""
+label = "x"
+"#;
+    let messages = match PluginManifest::from_toml_str(toml).unwrap_err() {
+        ManifestError::Invalid(m) => m,
+        other => panic!("expected Invalid, got {other:?}"),
+    };
+    assert!(
+        messages.iter().any(|m| m.contains("status[0].id")),
+        "{messages:?}"
+    );
+}
+
+#[test]
+fn aoe_version_parses_and_validates() {
+    let toml = r#"
+id = "acme.thing"
+name = "Thing"
+version = "0.1.0"
+api_version = 4
+aoe_version = ">=0.10, <0.12"
+"#;
+    let m = PluginManifest::from_toml_str(toml).expect("valid aoe_version parses");
+    assert_eq!(m.aoe_version.as_deref(), Some(">=0.10, <0.12"));
+
+    let bad = r#"
+id = "acme.thing"
+name = "Thing"
+version = "0.1.0"
+api_version = 4
+aoe_version = "not a range"
+"#;
+    let messages = match PluginManifest::from_toml_str(bad).unwrap_err() {
+        ManifestError::Invalid(m) => m,
+        other => panic!("expected Invalid, got {other:?}"),
+    };
+    assert!(
+        messages.iter().any(|m| m.contains("aoe_version")),
+        "{messages:?}"
+    );
+}
+
+#[test]
+fn host_compat_in_and_out_of_range() {
+    let toml = r#"
+id = "acme.thing"
+name = "Thing"
+version = "0.1.0"
+api_version = 4
+aoe_version = ">=0.10, <0.12"
+"#;
+    let m = PluginManifest::from_toml_str(toml).unwrap();
+    assert!(m.host_compat("0.11.0").is_ok());
+    let err = m.host_compat("0.13.0").unwrap_err();
+    assert!(err.contains("plugin requires aoe"), "{err}");
+    assert!(err.contains("0.13.0"), "{err}");
+
+    // A manifest with no declared range is always compatible.
+    let unbounded = r#"
+id = "acme.thing"
+name = "Thing"
+version = "0.1.0"
+api_version = 4
+"#;
+    let m = PluginManifest::from_toml_str(unbounded).unwrap();
+    assert!(m.host_compat("99.0.0").is_ok());
+}
+
+#[test]
+fn api_version_4_fields_require_bump() {
+    // Using a v4 field at an older api_version is rejected, so an author bumps
+    // to 4 and pre-4 hosts route to "upgrade aoe" instead of "unknown field".
+    let toml = r#"
+id = "acme.thing"
+name = "Thing"
+version = "0.1.0"
+api_version = 3
+aoe_version = ">=0.10"
+
+[[status]]
+id = "queue"
+"#;
+    let messages = match PluginManifest::from_toml_str(toml).unwrap_err() {
+        ManifestError::Invalid(m) => m,
+        other => panic!("expected Invalid, got {other:?}"),
+    };
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("status contributions require api_version >= 4")),
+        "{messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("aoe_version requires api_version >= 4")),
+        "{messages:?}"
+    );
 }
 
 #[test]
