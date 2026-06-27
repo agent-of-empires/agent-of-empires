@@ -357,15 +357,20 @@ impl AcpTranscript {
                 is_error,
                 content,
                 output,
+                async_subagent,
                 ..
             } => {
                 self.flush_pending_chunk();
                 if let Some(&idx) = self.tool_idx.get(tool_call_id) {
                     if let Some(ActivityRow::ToolCall(row)) = self.rows.get_mut(idx) {
-                        // The terminal can't render images/audio inline, so a
-                        // media completion shows a textual placeholder instead
-                        // of collapsing to the status word. See #1818.
-                        let text = if output.is_empty() {
+                        // An async sub-agent launch completes immediately but
+                        // the work runs off-protocol. Suppress the SDK marker
+                        // body (it carries an internal agent id we must not
+                        // surface) and label the row as a background dispatch
+                        // instead of a finished tool call.
+                        let text = if *async_subagent {
+                            "runs in background".to_string()
+                        } else if output.is_empty() {
                             content.clone()
                         } else {
                             summarize_output_blocks(output)
@@ -747,6 +752,7 @@ mod tests {
                 content: "ok".into(),
                 output: Vec::new(),
                 completed_at: Utc::now(),
+                async_subagent: false,
             },
         ));
         assert_eq!(t.rows.len(), 1);
@@ -755,6 +761,40 @@ mod tests {
                 let c = row.completed.as_ref().expect("completed");
                 assert!(c.ok);
                 assert_eq!(c.content, "ok");
+            }
+            _ => panic!("expected ToolCall"),
+        }
+    }
+
+    #[test]
+    fn async_subagent_completion_hides_marker_body() {
+        // An async sub-agent launch must not surface the SDK marker (it
+        // carries an internal agent id); the row reads as a background
+        // dispatch instead.
+        let mut t = AcpTranscript::new("s-1");
+        t.apply(&frame(
+            1,
+            Event::ToolCallStarted {
+                tool_call: tool("t-1", "Task"),
+            },
+        ));
+        t.apply(&frame(
+            2,
+            Event::ToolCallCompleted {
+                tool_call_id: "t-1".into(),
+                is_error: false,
+                content: "Async agent launched successfully\nagentId: secret (internal ID)".into(),
+                output: Vec::new(),
+                completed_at: Utc::now(),
+                async_subagent: true,
+            },
+        ));
+        match &t.rows[0] {
+            ActivityRow::ToolCall(row) => {
+                let c = row.completed.as_ref().expect("completed");
+                assert_eq!(c.content, "runs in background");
+                assert!(!c.content.contains("agentId"));
+                assert!(!c.content.contains("Async agent launched"));
             }
             _ => panic!("expected ToolCall"),
         }
