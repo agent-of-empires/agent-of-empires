@@ -6,11 +6,11 @@
 // sort-key and filter-facet slots render as sidebar sort options and a facet
 // filter (the sidebar owns those; see SidebarSortPicker / WorkspaceSidebar, #2401).
 
-import { createElement, useId, useState } from "react";
+import { createElement, useId, useRef, useState } from "react";
 import { ChevronRight } from "lucide-react";
 
 import { invokePluginAction } from "../../lib/api";
-import { usePluginUiEntries } from "../../lib/pluginUiContext";
+import { usePluginUiEntries, usePluginUiRefreshing } from "../../lib/pluginUiContext";
 import {
   accentStyle,
   entryText,
@@ -279,22 +279,42 @@ function BlockRow({ block }: { block: Record<string, unknown> }) {
   );
 }
 
+/** The repo's inline spinner glyph (same shape as the dialog buttons), sized to
+ *  fit alongside slot text. `currentColor` so it inherits the surrounding tone. */
+function Spinner({ className }: { className: string }) {
+  return (
+    <svg className={`animate-spin ${className}`} viewBox="0 0 24 24" aria-hidden>
+      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+    </svg>
+  );
+}
+
 /** An `action` pane block: a button that forwards a worker method (named by the
  *  plugin) to that plugin's worker. Fire-and-forget; the worker re-pushes its
- *  UI state, which the next poll renders. Disabled briefly so a double-click
- *  does not double-fire. An icon is optional. */
+ *  UI state, which the next poll renders. While the POST is in flight the button
+ *  disables and swaps its icon for a spinner, so a refresh shows it is underway;
+ *  `invokePluginAction` never rejects (it returns false on failure), so the
+ *  `finally` always restores the button to an actionable state. An icon is
+ *  optional. */
 function BlockAction({ block, pluginId }: { block: Record<string, unknown>; pluginId: string }) {
   const label = str(block, "label");
   const method = str(block, "method");
   const iconComp = lucideIcon(str(block, "icon"));
   const [busy, setBusy] = useState(false);
+  // A ref guard, not just `busy`: two clicks in the same tick both see the old
+  // `busy` state before React commits the update, so the boolean alone would
+  // double-fire. The ref flips synchronously.
+  const busyRef = useRef(false);
   if (!label || !method) return null;
   const onClick = async () => {
-    if (busy) return;
+    if (busyRef.current) return;
+    busyRef.current = true;
     setBusy(true);
     try {
       await invokePluginAction(pluginId, method);
     } finally {
+      busyRef.current = false;
       setBusy(false);
     }
   };
@@ -303,10 +323,15 @@ function BlockAction({ block, pluginId }: { block: Record<string, unknown>; plug
       type="button"
       onClick={onClick}
       disabled={busy}
+      aria-busy={busy || undefined}
       data-testid="plugin-pane-action"
       className="self-start inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-xs cursor-pointer bg-surface-700/50 text-text-secondary hover:text-text-primary hover:bg-surface-700 disabled:opacity-50 disabled:cursor-default transition-colors"
     >
-      {iconComp && createElement(iconComp, { className: "size-3.5", "aria-hidden": true })}
+      {busy ? (
+        <Spinner className="size-3.5" />
+      ) : (
+        iconComp && createElement(iconComp, { className: "size-3.5", "aria-hidden": true })
+      )}
       {label}
     </button>
   );
@@ -456,8 +481,20 @@ export function PluginPaneBody({ entry }: { entry: PluginUiEntry }) {
   const blocks = objectList(entry.payload, "blocks");
   const title = payloadStr(entry, "title");
   const body = payloadStr(entry, "body");
+  // A background poll only flips this once it outlasts the indicator delay, so
+  // this surfaces a slow auto-refresh without strobing on every 3s cadence.
+  const refreshing = usePluginUiRefreshing();
   return (
     <div className="flex-1 min-h-0 overflow-auto p-3" data-testid="plugin-pane-body" data-plugin-id={entry.plugin_id}>
+      {refreshing && (
+        <div
+          className="sticky top-0 z-10 mb-1.5 flex items-center justify-end gap-1 text-[10px] text-text-dim"
+          data-testid="plugin-pane-refreshing"
+        >
+          <Spinner className="size-3" />
+          Refreshing…
+        </div>
+      )}
       {blocks ? (
         <div className="flex flex-col gap-1.5">
           {blocks.map((b, i) => (

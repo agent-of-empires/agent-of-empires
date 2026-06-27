@@ -80,13 +80,23 @@ jobs:
       - name: Cargo test (macOS, lib + bins only)
         if: runner.os == 'macOS'
         run: cargo test --features serve --lib --bins
-      # Acceptance criterion 1 of #268: with every bundled plugin compiled out,
-      # core must still build and pass its suite. `--no-default-features` also
-      # drops `serve`, so this doubles as the TUI-only compile gate, keeping the
-      # ~27 cfg(feature = "serve") sites from rotting.
+      # With every bundled plugin compiled out, core must still build and pass
+      # its lib/bin unit tests. `--no-default-features` also drops `serve`,
+      # so this doubles as the TUI-only compile gate, keeping the ~27
+      # cfg(feature = "serve") sites from rotting.
       - name: Cargo test (bare core, no default features)
         if: runner.os == 'Linux'
         run: cargo test --no-default-features --lib --bins
+      # Acceptance criterion 1 of #268 (issue #2097): with all default plugins
+      # disabled, aoe still creates, attaches to, and destroys a tmux + worktree
+      # session from CLI and TUI. The --lib --bins leg above never spawns the
+      # binary under tmux, so the e2e crate is what actually proves the
+      # invariant; the serve-gated e2e modules self-gate to empty here. This is
+      # the forcing function that makes "default plugin" mean something: a
+      # default plugin that grows an undeclared core dependency turns this red.
+      - name: Cargo test (bare core e2e, no default features)
+        if: runner.os == 'Linux'
+        run: cargo test --no-default-features --test e2e
       # The third feature corner: default-plugins on, serve off. Compile gate
       # (including test/e2e targets, which plain check skips) so plugin
       # registration code can't grow a hidden dependency on serve types.

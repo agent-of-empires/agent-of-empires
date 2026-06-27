@@ -31,7 +31,12 @@ schema/host version this crate understands.
   TOML via `include_str!`. The `aoe.web` marker is gated on the `serve` cargo
   feature, so it is present in every dashboard/release build and absent from a
   TUI-only build. `default-plugins` (on by default) reserves the on-by-default
-  slot for bundled plugins that do not require the dashboard.
+  slot for bundled plugins that do not require the dashboard. CI runs a
+  `--no-default-features` leg (`.github/workflows/tests.yml`) that builds with
+  every default plugin compiled out and runs the e2e suite, so a default plugin
+  cannot silently grow an undeclared core dependency: core must still create,
+  attach to, and destroy a tmux + worktree session from CLI and TUI with all
+  default plugins disabled (invariant 1 of #268).
 - `PluginRegistry::load(config)` parses every builtin manifest, resolves each
   plugin's enabled flag from `[plugins."<id>"]` in `config.toml` (default
   enabled), and collects any parse errors as non-fatal `load_errors`.
