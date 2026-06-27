@@ -247,10 +247,10 @@ base("structured view surfaces", async ({ page }, testInfo) => {
     await waitForStructuredView(page);
     // The mobile drawer mounts open; tap the content area to the right of
     // it (the backdrop) so it slides away and the structured view is clear.
-    const projects = page.getByText("Projects", { exact: true });
-    if (await projects.isVisible().catch(() => false)) {
+    const sidebarHeading = page.getByText("Sessions", { exact: true });
+    if (await sidebarHeading.isVisible().catch(() => false)) {
       await page.mouse.click(340, 450);
-      await projects.waitFor({ state: "hidden", timeout: 5_000 }).catch(() => {});
+      await sidebarHeading.waitFor({ state: "hidden", timeout: 5_000 }).catch(() => {});
     }
     await page.waitForTimeout(600);
     await shot(page, "structured view/interface.png");
