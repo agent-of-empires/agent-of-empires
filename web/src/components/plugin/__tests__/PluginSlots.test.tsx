@@ -1,15 +1,19 @@
 // @vitest-environment jsdom
 
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import type { PluginUiEntry } from "../../../lib/api";
 import { PluginCards, PluginPaneBody, PluginRowBadges, PluginStatusBarSegments } from "../PluginSlots";
 
-// The slot components read entries from context; mock that hook so each test
-// drives a fixed snapshot.
-const { entriesRef } = vi.hoisted(() => ({ entriesRef: { current: [] as PluginUiEntry[] } }));
+// The slot components read entries (and the refresh flag) from context; mock
+// those hooks so each test drives a fixed snapshot.
+const { entriesRef, refreshingRef } = vi.hoisted(() => ({
+  entriesRef: { current: [] as PluginUiEntry[] },
+  refreshingRef: { current: false },
+}));
 vi.mock("../../../lib/pluginUiContext", () => ({
   usePluginUiEntries: () => entriesRef.current,
+  usePluginUiRefreshing: () => refreshingRef.current,
 }));
 
 // The action block forwards to the worker via this; stub it.
@@ -99,6 +103,68 @@ describe("plugin slot renderers", () => {
     expect(btn.textContent).toContain("Refresh");
     fireEvent.click(btn);
     await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("acme.kit", "github.refresh"));
+  });
+
+  it("pane action shows a spinner while the request is in flight, then clears it", async () => {
+    // Defer the action so the in-flight state is observable.
+    let resolve!: (v: boolean) => void;
+    invokeMock.mockImplementationOnce(() => new Promise<boolean>((r) => (resolve = r)));
+    const entry: PluginUiEntry = {
+      plugin_id: "acme.kit",
+      slot: "pane",
+      id: "p",
+      session_id: "s1",
+      payload: { blocks: [{ kind: "action", label: "Refresh", method: "github.refresh" }] },
+    };
+    const { container } = render(<PluginPaneBody entry={entry} />);
+    const btn = screen.getByTestId("plugin-pane-action") as HTMLButtonElement;
+    expect(container.querySelector("svg.animate-spin")).toBeNull();
+
+    fireEvent.click(btn);
+    await waitFor(() => expect(container.querySelector("svg.animate-spin")).toBeTruthy());
+    expect(btn.getAttribute("aria-busy")).toBe("true");
+    expect(btn.disabled).toBe(true);
+
+    await act(async () => resolve(true));
+    await waitFor(() => expect(container.querySelector("svg.animate-spin")).toBeNull());
+    expect(btn.getAttribute("aria-busy")).toBeNull();
+    expect(btn.disabled).toBe(false);
+  });
+
+  it("pane action stops the spinner and stays actionable when the request fails", async () => {
+    invokeMock.mockImplementationOnce(async () => false);
+    const entry: PluginUiEntry = {
+      plugin_id: "acme.kit",
+      slot: "pane",
+      id: "p",
+      session_id: "s1",
+      payload: { blocks: [{ kind: "action", label: "Refresh", method: "github.refresh" }] },
+    };
+    const { container } = render(<PluginPaneBody entry={entry} />);
+    const btn = screen.getByTestId("plugin-pane-action") as HTMLButtonElement;
+    fireEvent.click(btn);
+    await waitFor(() => expect(invokeMock).toHaveBeenCalled());
+    await waitFor(() => {
+      expect(container.querySelector("svg.animate-spin")).toBeNull();
+      expect(btn.disabled).toBe(false);
+    });
+  });
+
+  it("pane shows a background-refresh indicator only while a poll is in flight", () => {
+    const entry: PluginUiEntry = {
+      plugin_id: "acme.kit",
+      slot: "pane",
+      id: "p",
+      session_id: "s1",
+      payload: { title: "GitHub", body: "ok" },
+    };
+    refreshingRef.current = true;
+    const { rerender } = render(<PluginPaneBody entry={entry} />);
+    expect(screen.getByTestId("plugin-pane-refreshing")).toBeTruthy();
+
+    refreshingRef.current = false;
+    rerender(<PluginPaneBody entry={{ ...entry, payload: { ...entry.payload } }} />);
+    expect(screen.queryByTestId("plugin-pane-refreshing")).toBeNull();
   });
 
   it("pane action block without a method renders nothing", () => {

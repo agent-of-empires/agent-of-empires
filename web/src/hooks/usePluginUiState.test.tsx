@@ -108,3 +108,64 @@ describe("usePluginUiState notifications", () => {
     expect(reportInfo).toHaveBeenCalledWith("fresh");
   });
 });
+
+describe("usePluginUiState refresh indicator", () => {
+  it("does not flip isRefreshing for a poll that settles before the delay", async () => {
+    fetchMock.mockResolvedValue(snapshot([]));
+    const { result } = renderHook(() => usePluginUiState());
+
+    // Mount poll resolves on a microtask, before the threshold timer fires.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(result.current.isRefreshing).toBe(false);
+
+    // Past where the threshold would have fired: still false (timer was cleared).
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(300);
+    });
+    expect(result.current.isRefreshing).toBe(false);
+  });
+
+  it("flips isRefreshing on once a poll outlasts the delay, off when it settles", async () => {
+    let resolve!: (v: PluginUiState | null) => void;
+    fetchMock.mockReturnValueOnce(new Promise((r) => (resolve = r)));
+    fetchMock.mockResolvedValue(snapshot([]));
+    const { result } = renderHook(() => usePluginUiState());
+
+    // Still in flight, before the threshold.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(100);
+    });
+    expect(result.current.isRefreshing).toBe(false);
+
+    // Crossing the threshold while the poll is still pending shows the indicator.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(200);
+    });
+    expect(result.current.isRefreshing).toBe(true);
+
+    // Settling clears it.
+    await act(async () => {
+      resolve(snapshot([]));
+    });
+    expect(result.current.isRefreshing).toBe(false);
+  });
+
+  it("clears isRefreshing even when a slow poll fails (returns null)", async () => {
+    let resolve!: (v: PluginUiState | null) => void;
+    fetchMock.mockReturnValueOnce(new Promise((r) => (resolve = r)));
+    fetchMock.mockResolvedValue(snapshot([]));
+    const { result } = renderHook(() => usePluginUiState());
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(300);
+    });
+    expect(result.current.isRefreshing).toBe(true);
+
+    await act(async () => {
+      resolve(null);
+    });
+    expect(result.current.isRefreshing).toBe(false);
+  });
+});
