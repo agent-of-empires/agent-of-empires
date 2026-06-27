@@ -22,6 +22,7 @@ import {
   Brain,
   Calendar,
   CalendarPlus,
+  ArrowUpRight,
   CalendarX,
   ChevronDown,
   Clock,
@@ -453,6 +454,10 @@ interface CardChromeProps {
    *  stays on the per-child cards inside the expanded body. See
    *  #1102. */
   neutralOnDone?: boolean;
+  /** When the header click navigates somewhere (e.g. opens a pane)
+   *  rather than expanding the card, show an up-right arrow instead of
+   *  the disclosure chevron so the row doesn't read as collapsible. */
+  navigate?: boolean;
   /** ISO-8601 start timestamp for the underlying tool call. When set
    *  with `endedAt` (completed call) or alone (in-flight call), the
    *  header shows a duration label next to the status badge (#1060).
@@ -498,6 +503,7 @@ function CardChrome({
   startedAt,
   endedAt,
   neutralOnDone,
+  navigate,
 }: CardChromeProps) {
   const { showToolDurations } = useAcpPrefs();
   const Header = onToggle ? "button" : "div";
@@ -520,7 +526,8 @@ function CardChrome({
         {meta}
         {showToolDurations && startedAt && <DurationLabel startedAt={startedAt} endedAt={endedAt} />}
         {!showNeutral && <StatusBadge status={status} />}
-        {onToggle && (
+        {onToggle && navigate && <ArrowUpRight className="h-3.5 w-3.5 text-text-dim" />}
+        {onToggle && !navigate && (
           <ChevronDown
             className={["h-3.5 w-3.5 text-text-dim transition-transform", expanded ? "rotate-180" : ""].join(" ")}
           />
@@ -1503,6 +1510,7 @@ export function AsyncSubagentCard({ tool }: { tool: ToolCall }) {
       meta={<span className="text-[11px] text-text-dim">{metaText}</span>}
       expanded={false}
       onToggle={openPane}
+      navigate={openPane !== undefined}
     />
   );
 }
