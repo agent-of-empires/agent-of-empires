@@ -6,9 +6,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use agent_of_empires::plugin::install;
+use agent_of_empires::plugin::install::{self, UpdateOutcome};
 use agent_of_empires::plugin::lockfile::Lockfile;
 use agent_of_empires::plugin::registry::PluginRegistry;
+use agent_of_empires::plugin::{auto_update, update_check};
 use agent_of_empires::session::Config;
 use serial_test::serial;
 use tempfile::TempDir;
@@ -75,6 +76,19 @@ fn make_bare_repo(base: &Path, owner: &str, repo: &str, files: &[(&str, &str)]) 
         base,
     );
     std::env::set_var("AOE_GITHUB_CLONE_BASE", base);
+}
+
+/// Add a commit to the working tree behind a bare repo and push it, advancing
+/// the remote `main` so an `ls-remote` check sees a newer commit.
+fn push_new_commit(base: &Path, owner: &str, repo: &str, files: &[(&str, &str)]) {
+    let work = base.join("work");
+    for (name, contents) in files {
+        std::fs::write(work.join(name), contents).unwrap();
+    }
+    git(&["add", "."], &work);
+    git(&["commit", "-q", "-m", "update"], &work);
+    let bare = base.join(owner).join(format!("{repo}.git"));
+    git(&["push", "-q", bare.to_str().unwrap(), "main"], &work);
 }
 
 #[tokio::test]
@@ -716,4 +730,126 @@ command = ["cp", "aoe-plugin.toml", "marker-v2"]
             .version,
         "0.1.0"
     );
+}
+
+const PLAIN_MANIFEST: &str = r#"
+id = "acme.upd"
+name = "Upd"
+version = "1.0.0"
+api_version = 2
+"#;
+
+#[tokio::test]
+#[serial]
+async fn outdated_detects_new_github_commit() {
+    let _home = isolate();
+    let base = tempfile::tempdir().unwrap();
+    make_bare_repo(
+        base.path(),
+        "acme",
+        "upd",
+        &[("aoe-plugin.toml", PLAIN_MANIFEST)],
+    );
+    install::install("gh:acme/upd", true).await.unwrap();
+
+    let before = update_check::outdated().await;
+    let s = before.iter().find(|s| s.id == "acme.upd").expect("present");
+    assert!(!s.needs_update, "fresh install is current: {s:?}");
+    assert!(s.error.is_none(), "no check error: {s:?}");
+
+    // Advance the remote; the same manifest stays so it is a clean update.
+    push_new_commit(base.path(), "acme", "upd", &[("extra.txt", "new")]);
+    let after = update_check::outdated().await;
+    let s = after.iter().find(|s| s.id == "acme.upd").expect("present");
+    assert!(s.needs_update, "new commit detected: {s:?}");
+
+    std::env::remove_var("AOE_GITHUB_CLONE_BASE");
+}
+
+#[tokio::test]
+#[serial]
+async fn outdated_detects_changed_local_tree() {
+    let _home = isolate();
+    let src = tempfile::tempdir().unwrap();
+    let dir = write_plugin_dir(src.path(), PLAIN_MANIFEST);
+    install::install(dir.to_str().unwrap(), true).await.unwrap();
+
+    let before = update_check::outdated().await;
+    assert!(
+        !before
+            .iter()
+            .find(|s| s.id == "acme.upd")
+            .unwrap()
+            .needs_update
+    );
+
+    // Edit the local source tree; the re-hash should diverge from the lock.
+    std::fs::write(dir.join("added.txt"), "changed").unwrap();
+    let after = update_check::outdated().await;
+    let s = after.iter().find(|s| s.id == "acme.upd").expect("present");
+    assert!(s.needs_update, "local tree change detected: {s:?}");
+}
+
+#[tokio::test]
+#[serial]
+async fn auto_update_applies_clean_github_update() {
+    let _home = isolate();
+    let base = tempfile::tempdir().unwrap();
+    let v2 = PLAIN_MANIFEST.replace("1.0.0", "2.0.0");
+    make_bare_repo(
+        base.path(),
+        "acme",
+        "upd",
+        &[("aoe-plugin.toml", PLAIN_MANIFEST)],
+    );
+    install::install("gh:acme/upd", true).await.unwrap();
+
+    // A clean (no consent change) newer version on the remote.
+    push_new_commit(base.path(), "acme", "upd", &[("aoe-plugin.toml", &v2)]);
+    let summary = auto_update::sweep().await;
+    assert_eq!(summary.applied, vec!["acme.upd".to_string()], "{summary:?}");
+    assert_eq!(
+        Lockfile::load().unwrap().get("acme.upd").unwrap().version,
+        "2.0.0",
+    );
+
+    std::env::remove_var("AOE_GITHUB_CLONE_BASE");
+}
+
+#[tokio::test]
+#[serial]
+async fn clean_update_skips_capability_change() {
+    let _home = isolate();
+    let base = tempfile::tempdir().unwrap();
+    let with_cap = PLAIN_MANIFEST.replace(
+        "api_version = 2",
+        "api_version = 2\ncapabilities = [\"net\"]",
+    );
+    make_bare_repo(
+        base.path(),
+        "acme",
+        "upd",
+        &[("aoe-plugin.toml", PLAIN_MANIFEST)],
+    );
+    install::install("gh:acme/upd", true).await.unwrap();
+
+    // The new version adds a capability, so a non-interactive clean update must
+    // skip it and leave the prior version installed.
+    push_new_commit(
+        base.path(),
+        "acme",
+        "upd",
+        &[("aoe-plugin.toml", &with_cap)],
+    );
+    match install::update_clean("acme.upd").await.unwrap() {
+        UpdateOutcome::Skipped { id, .. } => assert_eq!(id, "acme.upd"),
+        other => panic!("expected skip on capability change, got {other:?}"),
+    }
+    assert_eq!(
+        Lockfile::load().unwrap().get("acme.upd").unwrap().version,
+        "1.0.0",
+        "prior version kept",
+    );
+
+    std::env::remove_var("AOE_GITHUB_CLONE_BASE");
 }
