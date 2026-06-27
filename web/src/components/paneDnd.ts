@@ -67,6 +67,39 @@ export function resolvePlacement(
   return { dock: over.dock, index: overIndex + (over.after ? 1 : 0) };
 }
 
+interface Rect {
+  left: number;
+  width: number;
+}
+
+/** Horizontal center of a rect, or null when the rect is missing (dnd-kit hands
+ *  a null translated rect before the first move). */
+export function centerX(rect: Rect | null | undefined): number | null {
+  return rect ? rect.left + rect.width / 2 : null;
+}
+
+/** True when the dragged tab's center has passed the hovered tab's center, so
+ *  the drop should insert after it rather than before. False if either rect is
+ *  unknown, biasing toward inserting before. */
+export function pointerInsertsAfter(activeRect: Rect | null | undefined, overRect: Rect | null | undefined): boolean {
+  const a = centerX(activeRect);
+  const o = centerX(overRect);
+  return a !== null && o !== null && a > o;
+}
+
+/** Whether a resolved drop is worth persisting: a cross-dock move always is, but
+ *  a within-dock reorder onto the tab's own slot is a no-op to skip. */
+export function shouldApplyPlacement(
+  tabsByDock: Record<DockLocation, string[]>,
+  tabId: string,
+  target: DropTarget,
+  sourceDock: DockLocation | null,
+): boolean {
+  if (target.dock !== sourceDock) return true;
+  const from = tabsByDock[target.dock].indexOf(tabId);
+  return from >= 0 && from !== target.index;
+}
+
 /** Translate an insertion index in a dock's *visible* tab list to the index in
  *  its *full* persisted list. They differ when the dock holds a tab that is
  *  currently hidden (an unloaded plugin pane), which still occupies a persisted

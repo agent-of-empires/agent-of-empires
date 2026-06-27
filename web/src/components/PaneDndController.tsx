@@ -19,7 +19,9 @@ import type { DockLocation } from "../lib/panes";
 import type { PaneDisplay } from "./Dock";
 import {
   PaneDndStateContext,
+  pointerInsertsAfter,
   resolvePlacement,
+  shouldApplyPlacement,
   type DockDropData,
   type DropTarget,
   type PaneDndState,
@@ -40,10 +42,6 @@ const panesCollision: CollisionDetection = (args) => {
   const tabHits = hits.filter((h) => h.data?.droppableContainer?.data.current?.type === "pane-tab");
   return tabHits.length > 0 ? tabHits : hits;
 };
-
-function centerX(rect: { left: number; width: number } | null | undefined): number | null {
-  return rect ? rect.left + rect.width / 2 : null;
-}
 
 interface Props {
   /** The rendered tab order per dock (already availability-filtered), so drop
@@ -75,14 +73,12 @@ export function PaneDndController({ tabsByDock, descriptorFor, onPlaceTab, child
     (e: DragOverEvent | DragEndEvent): DropTarget | null => {
       const overData = e.over?.data.current as PaneTabData | DockDropData | undefined;
       if (!overData) return null;
-      const activeC = centerX(e.active.rect.current.translated);
-      const overC = centerX(e.over!.rect);
       return resolvePlacement(
         {
           type: overData.type,
           dock: overData.dock,
           tabId: String(e.over!.id),
-          after: activeC !== null && overC !== null && activeC > overC,
+          after: pointerInsertsAfter(e.active.rect.current.translated, e.over!.rect),
         },
         String(e.active.id),
         tabsByDock,
@@ -110,14 +106,11 @@ export function PaneDndController({ tabsByDock, descriptorFor, onPlaceTab, child
     (e: DragEndEvent) => {
       const tabId = String(e.active.id);
       const target = resolveTarget(e);
-      if (target) {
-        // resolveTarget already gives the post-removal insertion index for both
-        // cases (before/after the hovered tab, or append on a dock-body drop), so
-        // a within-dock reorder only needs a no-op guard against its own slot.
-        const from = tabsByDock[target.dock].indexOf(tabId);
-        if (target.dock !== sourceDock || (from >= 0 && from !== target.index)) {
-          onPlaceTab(tabId, target.dock, target.index);
-        }
+      // resolveTarget already gives the post-removal insertion index for both
+      // cases (before/after the hovered tab, or append on a dock-body drop);
+      // shouldApplyPlacement skips a within-dock drop onto the tab's own slot.
+      if (target && shouldApplyPlacement(tabsByDock, tabId, target, sourceDock)) {
+        onPlaceTab(tabId, target.dock, target.index);
       }
       reset();
     },

@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 
-import { resolvePlacement, visibleToFullIndex, type PlacementOver } from "../paneDnd";
+import {
+  centerX,
+  pointerInsertsAfter,
+  resolvePlacement,
+  shouldApplyPlacement,
+  visibleToFullIndex,
+  type PlacementOver,
+} from "../paneDnd";
 
 const tabsByDock = { right: ["diff", "terminal:0", "terminal:1"], bottom: ["plugin:p:a"] };
 
@@ -45,6 +52,44 @@ describe("resolvePlacement", () => {
       dock: "bottom",
       index: 1,
     });
+  });
+});
+
+describe("centerX", () => {
+  it("returns the horizontal center", () => {
+    expect(centerX({ left: 10, width: 40 })).toBe(30);
+  });
+  it("returns null for a missing rect", () => {
+    expect(centerX(null)).toBeNull();
+    expect(centerX(undefined)).toBeNull();
+  });
+});
+
+describe("pointerInsertsAfter", () => {
+  it("is true when the dragged center is past the hovered center", () => {
+    expect(pointerInsertsAfter({ left: 50, width: 20 }, { left: 0, width: 20 })).toBe(true);
+  });
+  it("is false on the leading half", () => {
+    expect(pointerInsertsAfter({ left: 0, width: 20 }, { left: 50, width: 20 })).toBe(false);
+  });
+  it("is false when a rect is unknown", () => {
+    expect(pointerInsertsAfter(null, { left: 0, width: 20 })).toBe(false);
+  });
+});
+
+describe("shouldApplyPlacement", () => {
+  it("applies a cross-dock move", () => {
+    expect(shouldApplyPlacement(tabsByDock, "diff", { dock: "bottom", index: 0 }, "right")).toBe(true);
+  });
+  it("applies a within-dock move to a different slot", () => {
+    expect(shouldApplyPlacement(tabsByDock, "diff", { dock: "right", index: 2 }, "right")).toBe(true);
+  });
+  it("skips a within-dock drop onto the tab's own slot", () => {
+    // diff is at index 0; a post-removal target index of 0 is a no-op.
+    expect(shouldApplyPlacement(tabsByDock, "diff", { dock: "right", index: 0 }, "right")).toBe(false);
+  });
+  it("skips when the tab is not in the target dock", () => {
+    expect(shouldApplyPlacement(tabsByDock, "ghost", { dock: "right", index: 0 }, "right")).toBe(false);
   });
 });
 
