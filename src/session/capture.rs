@@ -743,6 +743,61 @@ pub(crate) fn compose_exclusion(
     set
 }
 
+/// Extend [`compose_exclusion`] with the sids of stopped, archived, or
+/// pane-less Claude peers in the same `project_path`, read from
+/// `sessions.json` via `Storage` for the caller's effective profile.
+///
+/// Used only by the Claude branch of `Instance::try_retroactive_capture`
+/// when the per-instance sidecar is absent or stale: the mtime fallback
+/// over `~/.claude/projects/<encoded-cwd>/` otherwise picks a co-located
+/// stopped peer's jsonl, since [`build_exclusion_set`] only sees live
+/// tmux peers, and the resume binds to the peer's conversation (#2355).
+///
+/// `claude_poll_fn` keeps the live-only exclusion via [`compose_exclusion`]:
+/// it runs on a hot polling path, and live peers already surface in the
+/// tmux env scan.
+///
+/// Scope: `~/.claude/projects/` is keyed by `$HOME`, not by AoE profile,
+/// but this helper only inspects `sessions.json` for the caller's effective
+/// profile. A stopped peer in a different profile against the same host
+/// `$HOME` will not be excluded; the residual gap is narrower than #2355's
+/// trigger and is left for a follow-up.
+pub(crate) fn compose_exclusion_with_stopped_peers(
+    current_instance_id: &str,
+    current_project_path: &str,
+    profile: &str,
+    retroactive_capture_excludes: &HashSet<String>,
+) -> HashSet<String> {
+    let mut set = compose_exclusion(current_instance_id, retroactive_capture_excludes);
+    let Ok(storage) = crate::session::storage::Storage::new_unwatched(profile) else {
+        return set;
+    };
+    let Ok(instances) = storage.load() else {
+        return set;
+    };
+    for inst in instances {
+        if inst.id == current_instance_id {
+            continue;
+        }
+        if inst.tool != "claude" {
+            continue;
+        }
+        if inst.project_path != current_project_path {
+            continue;
+        }
+        let should_exclude = matches!(inst.status, crate::session::Status::Stopped)
+            || inst.is_archived()
+            || !inst.has_live_tmux_pane();
+        if !should_exclude {
+            continue;
+        }
+        if let Some(sid) = inst.agent_session_id.as_deref().filter(|s| !s.is_empty()) {
+            set.insert(sid.to_string());
+        }
+    }
+    set
+}
+
 /// Build the set of session IDs already claimed by other live AoE instances.
 ///
 /// Reads every other live AoE tmux session's hidden env to find which session

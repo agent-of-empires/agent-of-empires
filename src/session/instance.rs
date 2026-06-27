@@ -1584,9 +1584,20 @@ impl Instance {
     }
 
     pub(crate) fn try_retroactive_capture(&self) -> Option<String> {
-        let exclusion = self.retroactive_capture_exclusion_set();
         let result: Option<String> = match self.tool.as_str() {
             "claude" => {
+                // Claude-only: extend the live-tmux exclusion with stopped,
+                // archived, or pane-less peer sids read from sessions.json so
+                // the mtime fallback skips peers whose jsonl outlived their
+                // tmux session (#2355). Other tool arms call
+                // `retroactive_capture_exclusion_set()` directly for the
+                // live-only set.
+                let exclusion = super::capture::compose_exclusion_with_stopped_peers(
+                    &self.id,
+                    &self.project_path,
+                    &self.effective_profile(),
+                    &self.retroactive_capture_excludes,
+                );
                 if self.is_sandboxed() {
                     let container_name = self.sandbox_info.as_ref()?.container_name.clone();
                     capture_claude_session_id_in_container(
@@ -1601,6 +1612,7 @@ impl Instance {
                 }
             }
             "opencode" => {
+                let exclusion = self.retroactive_capture_exclusion_set();
                 if self.is_sandboxed() {
                     let container_name = self.sandbox_info.as_ref()?.container_name.clone();
                     try_capture_opencode_session_id_in_container(
@@ -1615,6 +1627,7 @@ impl Instance {
                 }
             }
             "vibe" => {
+                let exclusion = self.retroactive_capture_exclusion_set();
                 if self.is_sandboxed() {
                     let container_name = self.sandbox_info.as_ref()?.container_name.clone();
                     try_capture_vibe_session_id_in_container(
@@ -1628,6 +1641,7 @@ impl Instance {
                 }
             }
             "pi" => {
+                let exclusion = self.retroactive_capture_exclusion_set();
                 if self.is_sandboxed() {
                     let container_name = self.sandbox_info.as_ref()?.container_name.clone();
                     try_capture_pi_session_id_in_container(
@@ -1641,6 +1655,7 @@ impl Instance {
                 }
             }
             "codex" => {
+                let exclusion = self.retroactive_capture_exclusion_set();
                 if self.is_sandboxed() {
                     let container_name = self.sandbox_info.as_ref()?.container_name.clone();
                     try_capture_codex_session_id_in_container(
@@ -1654,6 +1669,7 @@ impl Instance {
                 }
             }
             "gemini" => {
+                let exclusion = self.retroactive_capture_exclusion_set();
                 if self.is_sandboxed() {
                     let container_name = self.sandbox_info.as_ref()?.container_name.clone();
                     try_capture_gemini_session_id_in_container(
@@ -1667,6 +1683,7 @@ impl Instance {
                 }
             }
             "hermes" => {
+                let exclusion = self.retroactive_capture_exclusion_set();
                 if self.is_sandboxed() {
                     let container_name = self.sandbox_info.as_ref()?.container_name.clone();
                     try_capture_hermes_session_id_in_container(
@@ -7657,6 +7674,106 @@ mod tests {
                 let (sid, _is_existing) = inst.acquire_session_id();
                 assert_eq!(sid.as_deref(), Some(fresh));
                 assert_eq!(inst.agent_session_id.as_deref(), Some(fresh));
+            }
+
+            // #2355: when a co-located stopped peer leaves a fresher jsonl in
+            // the shared `~/.claude/projects/<encoded-cwd>/` dir, the mtime
+            // fallback must skip the peer's sid. `build_exclusion_set` only
+            // sees live tmux peers; `compose_exclusion_with_stopped_peers`
+            // adds the stopped peer's sid from `sessions.json` so this
+            // instance's own (older) jsonl wins.
+            #[test]
+            #[serial]
+            fn mtime_fallback_skips_stopped_peer_sid() {
+                let temp = tempdir().unwrap();
+                let _guard = ClaudeHomeGuard::set(&temp);
+
+                let project_path = "/tmp/aoe-test-2355-stopped-peer";
+                let claude_dir = temp
+                    .path()
+                    .join(".claude")
+                    .join("projects")
+                    .join(encode_claude_project_path(project_path));
+                fs::create_dir_all(&claude_dir).unwrap();
+
+                let mine = "11111111-1111-4111-8111-111111111111";
+                let peer = "22222222-2222-4222-8222-222222222222";
+                let now = SystemTime::now();
+                write_jsonl_with_mtime(
+                    &claude_dir.join(format!("{mine}.jsonl")),
+                    now - Duration::from_secs(120),
+                );
+                write_jsonl_with_mtime(
+                    &claude_dir.join(format!("{peer}.jsonl")),
+                    now - Duration::from_secs(5),
+                );
+
+                let profile = "verify-2355-stopped-peer";
+                let mut peer_inst = Instance::new("stopped-peer-id", project_path);
+                peer_inst.source_profile = profile.to_string();
+                peer_inst.tool = "claude".to_string();
+                peer_inst.agent_session_id = Some(peer.to_string());
+                peer_inst.status = Status::Stopped;
+                super::seed_disk_for_sidecar_test(profile, &peer_inst);
+
+                let mut inst = Instance::new("verify-2355", project_path);
+                inst.source_profile = profile.to_string();
+                inst.tool = "claude".to_string();
+                inst.agent_session_id = Some(mine.to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                let (sid, _is_existing) = inst.acquire_session_id();
+                assert_eq!(sid.as_deref(), Some(mine));
+                assert_eq!(inst.agent_session_id.as_deref(), Some(mine));
+            }
+
+            // Companion to the above: same setup but the peer is archived
+            // instead of stopped, exercising the `is_archived()` branch of
+            // `compose_exclusion_with_stopped_peers`.
+            #[test]
+            #[serial]
+            fn mtime_fallback_skips_archived_peer_sid() {
+                let temp = tempdir().unwrap();
+                let _guard = ClaudeHomeGuard::set(&temp);
+
+                let project_path = "/tmp/aoe-test-2355-archived-peer";
+                let claude_dir = temp
+                    .path()
+                    .join(".claude")
+                    .join("projects")
+                    .join(encode_claude_project_path(project_path));
+                fs::create_dir_all(&claude_dir).unwrap();
+
+                let mine = "33333333-3333-4333-8333-333333333333";
+                let peer = "44444444-4444-4444-8444-444444444444";
+                let now = SystemTime::now();
+                write_jsonl_with_mtime(
+                    &claude_dir.join(format!("{mine}.jsonl")),
+                    now - Duration::from_secs(120),
+                );
+                write_jsonl_with_mtime(
+                    &claude_dir.join(format!("{peer}.jsonl")),
+                    now - Duration::from_secs(5),
+                );
+
+                let profile = "verify-2355-archived-peer";
+                let mut peer_inst = Instance::new("archived-peer-id", project_path);
+                peer_inst.source_profile = profile.to_string();
+                peer_inst.tool = "claude".to_string();
+                peer_inst.agent_session_id = Some(peer.to_string());
+                peer_inst.archive();
+
+                super::seed_disk_for_sidecar_test(profile, &peer_inst);
+
+                let mut inst = Instance::new("verify-2355-archived", project_path);
+                inst.source_profile = profile.to_string();
+                inst.tool = "claude".to_string();
+                inst.agent_session_id = Some(mine.to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                let (sid, _is_existing) = inst.acquire_session_id();
+                assert_eq!(sid.as_deref(), Some(mine));
+                assert_eq!(inst.agent_session_id.as_deref(), Some(mine));
             }
         }
 
