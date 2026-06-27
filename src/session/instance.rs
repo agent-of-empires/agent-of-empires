@@ -7775,6 +7775,59 @@ mod tests {
                 assert_eq!(sid.as_deref(), Some(mine));
                 assert_eq!(inst.agent_session_id.as_deref(), Some(mine));
             }
+
+            // Companion to the above: same setup but the peer carries the
+            // default `Status::Idle` and is not archived, exercising the
+            // `!inst.has_live_tmux_pane()` branch on its own. The peer has
+            // never spawned a tmux pane in the test, so it counts as
+            // pane-less even though its Status field does not flag it.
+            #[test]
+            #[serial]
+            fn mtime_fallback_skips_pane_less_peer_sid() {
+                let temp = tempdir().unwrap();
+                let _guard = ClaudeHomeGuard::set(&temp);
+
+                let project_path = "/tmp/aoe-test-2355-paneless-peer";
+                let claude_dir = temp
+                    .path()
+                    .join(".claude")
+                    .join("projects")
+                    .join(encode_claude_project_path(project_path));
+                fs::create_dir_all(&claude_dir).unwrap();
+
+                let mine = "55555555-5555-4555-8555-555555555555";
+                let peer = "66666666-6666-4666-8666-666666666666";
+                let now = SystemTime::now();
+                write_jsonl_with_mtime(
+                    &claude_dir.join(format!("{mine}.jsonl")),
+                    now - Duration::from_secs(120),
+                );
+                write_jsonl_with_mtime(
+                    &claude_dir.join(format!("{peer}.jsonl")),
+                    now - Duration::from_secs(5),
+                );
+
+                let profile = "verify-2355-paneless-peer";
+                let mut peer_inst = Instance::new("paneless-peer-id", project_path);
+                peer_inst.source_profile = profile.to_string();
+                peer_inst.tool = "claude".to_string();
+                peer_inst.agent_session_id = Some(peer.to_string());
+                assert!(!peer_inst.is_archived());
+                assert!(matches!(peer_inst.status, Status::Idle));
+                assert!(!peer_inst.has_live_tmux_pane());
+
+                super::seed_disk_for_sidecar_test(profile, &peer_inst);
+
+                let mut inst = Instance::new("verify-2355-paneless", project_path);
+                inst.source_profile = profile.to_string();
+                inst.tool = "claude".to_string();
+                inst.agent_session_id = Some(mine.to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                let (sid, _is_existing) = inst.acquire_session_id();
+                assert_eq!(sid.as_deref(), Some(mine));
+                assert_eq!(inst.agent_session_id.as_deref(), Some(mine));
+            }
         }
 
         #[test]
