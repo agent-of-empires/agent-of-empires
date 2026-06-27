@@ -609,15 +609,78 @@ surface. The standalone home screen reads local session storage and has no
 daemon link, so it renders no plugin slots; rendering there is a follow-up
 (#2402).
 
+## Discovery and update checks (#2365)
+
+Discovery and update checks are **explicit actions, never background work** (the
+one exception is the opt-in auto-update sweep below). Both are repo/source level
+and reuse the existing install trust model rather than weakening it.
+
+### Discovery
+
+`plugin::discover::discover(query)` runs one GitHub search over the `aoe-plugin`
+topic (`topic:aoe-plugin fork:false archived:false`, plus an optional free-text
+term) and badges each result by matching the repo slug against the featured
+index source slugs and the installed plugins' sources (case-insensitive). It does
+**not** fetch each repo's `aoe-plugin.toml`: cloning N search results to read a
+manifest would be an N+1 blowup against the unauthenticated search rate limit. So
+a result is "a GitHub repository tagged `aoe-plugin`", and a `featured` badge
+means "a curated source slug", not "the current tree matches the pin". Results
+rank featured-first then by stars (#2105 will add popularity ranking). Install
+stays the trust boundary: `aoe plugin install` fetches the manifest, prompts for
+capabilities, and enforces the featured pin.
+
+Surfaces: `aoe plugin discover [query]`, the TUI plugin manager `d` key, and the
+dashboard "Search GitHub" button (`GET /api/plugins/discover?q=`). The dashboard
+has no install path (capability approval needs a terminal), so each result shows
+a copyable `aoe plugin install gh:owner/repo` command instead of an install
+button.
+
+Unauthenticated GitHub search is rate limited (about 10 requests/minute/IP); the
+client maps a 403/429 to a `RateLimited` error so each surface reports it plainly
+rather than as a generic failure.
+
+### Update checks
+
+`plugin::update_check::outdated()` checks every installed external plugin against
+its `plugins.lock` entry. A GitHub source compares the locked `resolved_commit`
+to `git ls-remote <clone_url> <ref|HEAD>` (no clone, no REST rate limit; honors
+`AOE_GITHUB_CLONE_BASE`, and an annotated tag's peeled `^{}` target wins). A local
+source re-hashes its source directory with `integrity::tree_hash` and compares to
+the locked `tree_hash`. Builtins are skipped; a missing lock entry, absent `git`,
+or dead remote is reported per-plugin, never silently treated as up to date. A
+commit-pinned install is never "outdated". Limitation: a `release-binary` plugin
+whose release asset is replaced without a source-commit change is not detected
+(ls-remote only sees the source tree).
+
+Surfaces: `aoe plugin outdated`, the TUI plugin manager `c` key, and
+`GET /api/plugins/updates`. The web endpoint is separate from the always-on
+`GET /api/plugins` list so a settings render never blocks on git or the network;
+the dashboard paints update-available badges only after the user clicks "Check
+for updates".
+
+### Auto-update sweep
+
+The opt-in `updates.auto_update_plugins` setting (off by default) runs a sweep at
+TUI and `aoe serve` startup (`plugin::auto_update::spawn_if_enabled`), spawned
+non-blocking so a slow remote never delays startup. It applies only **clean**
+updates, those that need no new consent; any version that changes the capability
+set, build steps, or UI slots is skipped and left for a manual `aoe plugin
+update` so the new grant is reviewed (`install::ConsentMode::CleanOnlyNonInteractive`).
+A background sweep therefore never grants new capabilities, runs a changed build
+step unattended, or deactivates a working plugin. Applied updates take effect on
+the next launch / daemon restart.
+
 ## What comes next
 
 Each deferred piece returns as its own PR once the core is proven: the Tier 0
 contribution registries (issue 2094), the UI extension points (issue 2366,
 above), the builtin worker self-exec path and worker SDK (with the first
-builtin worker that needs them), and the discovery / featured supply-chain
-layer with integrity hashing (issues 2364 and 2365). Rendering plugin slots in
-the standalone (non-daemon) home screen is still a follow-up (the
-structured-view TUI already renders the terminal-applicable subset, #2402). Pinning a featured plugin's
+builtin worker that needs them); the integrity-hashing / featured supply-chain
+layer landed in #2364 and the discovery / update-check layer in #2365 (both
+above). Rendering plugin slots in the standalone (non-daemon) home screen is
+still a follow-up (the structured-view TUI already renders the
+terminal-applicable subset, #2402). Pinning a featured plugin's
 release-binary asset hash in `featured.toml` (so a featured worker is attested,
 not just its source) is a follow-up; today a release-binary plugin cannot be
-featured.
+featured. Popularity-based discovery ranking and a `release-binary` asset-drift
+update check are tracked in #2105 and remain out of scope here.
