@@ -21,6 +21,7 @@ import {
   Folder,
   Hourglass,
   Layers,
+  ListFilter,
   Moon,
   Pencil,
   Pin,
@@ -28,6 +29,14 @@ import {
   Plus,
   Sparkles,
 } from "lucide-react";
+import { usePluginUiEntries } from "../lib/pluginUiContext";
+import {
+  type ActiveFacet,
+  pluginFacetSpecs,
+  pluginSortSpecs,
+  sessionMatchesFacets,
+  toneTextClass,
+} from "../lib/pluginUi";
 import {
   DndContext,
   MouseSensor,
@@ -50,6 +59,7 @@ import {
   sidebarGroupShouldRender,
   type NestedSidebarGroup,
   type SidebarGroup,
+  type SidebarWorkspaceView,
 } from "../lib/sidebarGroups";
 import { safeGetItem, safeSetItem } from "../lib/safeStorage";
 import { menuBus, closeOtherContextMenus } from "../lib/menuBus";
@@ -289,6 +299,8 @@ interface Props {
   readOnly?: boolean;
   sortMode: SidebarSortMode;
   onSortModeChange: (mode: SidebarSortMode) => void;
+  pluginSortRef: { pluginId: string; entryId: string } | null;
+  onPluginSortChange: (ref: { pluginId: string; entryId: string }) => void;
   axis: SidebarAxis;
   onAxisChange: (axis: SidebarAxis) => void;
 }
@@ -2305,10 +2317,53 @@ export function WorkspaceSidebar({
   readOnly,
   sortMode,
   onSortModeChange,
+  pluginSortRef,
+  onPluginSortChange,
   axis,
   onAxisChange,
 }: Props) {
-  const dragDisabled = !!readOnly || sortMode === "lastActivity";
+  // Plugin sort/filter slots (#2401). Read the live snapshot here so the facet
+  // control and the sort-picker options stay local to the sidebar; the active
+  // plugin sort comparator itself is built and threaded by AppContent.
+  const pluginUiEntries = usePluginUiEntries();
+  const pluginSorts = useMemo(() => pluginSortSpecs(pluginUiEntries), [pluginUiEntries]);
+  const facetSpecs = useMemo(() => pluginFacetSpecs(pluginUiEntries), [pluginUiEntries]);
+  const pluginSortActive =
+    pluginSortRef != null &&
+    pluginSorts.some((s) => s.pluginId === pluginSortRef.pluginId && s.entryId === pluginSortRef.entryId);
+  // Selected facet values keyed by `${pluginId}\0${entryId}`; ephemeral, like
+  // the plugin entries themselves. A selection for a facet that vanishes from
+  // the snapshot is simply ignored: `activeFacets` below only reads live
+  // `facetSpecs`, so a stale entry never filters and resumes if the facet
+  // reappears on a later poll.
+  const [facetSelection, setFacetSelection] = useState<Map<string, Set<string>>>(new Map());
+  const toggleFacetValue = useCallback((pluginId: string, entryId: string, value: string) => {
+    const key = `${pluginId}\u0000${entryId}`;
+    setFacetSelection((prev) => {
+      const next = new Map(prev);
+      const values = new Set(next.get(key));
+      if (values.has(value)) values.delete(value);
+      else values.add(value);
+      if (values.size === 0) next.delete(key);
+      else next.set(key, values);
+      return next;
+    });
+  }, []);
+  const activeFacets = useMemo<ActiveFacet[]>(() => {
+    const out: ActiveFacet[] = [];
+    for (const f of facetSpecs) {
+      const values = facetSelection.get(`${f.pluginId}\u0000${f.entryId}`);
+      if (values && values.size > 0) out.push({ pluginId: f.pluginId, column: f.column, values });
+    }
+    return out;
+  }, [facetSpecs, facetSelection]);
+  const workspaceMatchesFacets = useCallback(
+    (ws: Workspace) =>
+      activeFacets.length === 0 || ws.sessions.some((s) => sessionMatchesFacets(pluginUiEntries, s.id, activeFacets)),
+    [activeFacets, pluginUiEntries],
+  );
+
+  const dragDisabled = !!readOnly || sortMode === "lastActivity" || pluginSortActive;
   // Reorder (group drag + row drag) is also off whenever any visible group
   // forbids it, which is the whole user-group axis: groups have no manual
   // order in v1. Gating here keeps the shared DndContext from firing a
@@ -2326,6 +2381,7 @@ export function WorkspaceSidebar({
   }, [width]);
   const [filterOpen, setFilterOpen] = useState(false);
   const [filterQuery, setFilterQuery] = useState("");
+  const [facetOpen, setFacetOpen] = useState(false);
   const [sunkExpanded, setSunkExpanded] = useState<boolean>(loadSunkExpanded);
   const toggleSunkExpanded = useCallback(() => {
     setSunkExpanded((prev) => {
@@ -2437,13 +2493,19 @@ export function WorkspaceSidebar({
 
   const isNested = axis === "repo+group";
 
-  const filteredGroups = q
+  // A row survives the text query when there is none, or it matches the
+  // workspace/group name; a plugin facet filter (#2401) is ANDed on top, so an
+  // active facet narrows rows even with an empty text query. `hasFilter` gates
+  // whether the list is filtered at all.
+  const hasFilter = !!q || activeFacets.length > 0;
+  const textMatches = (v: SidebarWorkspaceView, ...groupNames: string[]) =>
+    !q || workspaceMatchesFilter(v.workspace, q) || groupNames.some((n) => n.toLowerCase().includes(q));
+
+  const filteredGroups = hasFilter
     ? groups
         .map((g) => ({
           ...g,
-          workspaces: g.workspaces.filter(
-            (v) => workspaceMatchesFilter(v.workspace, q) || g.displayName.toLowerCase().includes(q),
-          ),
+          workspaces: g.workspaces.filter((v) => textMatches(v, g.displayName) && workspaceMatchesFacets(v.workspace)),
         }))
         .filter((g) => g.workspaces.length > 0)
     : groups;
@@ -2451,7 +2513,7 @@ export function WorkspaceSidebar({
   // Filter the nested model the same way the flat list is filtered: a row
   // survives if it matches, or if its subgroup or repo header name matches;
   // empty subgroups and then empty repos drop out. See #1720.
-  const filteredNested: NestedSidebarGroup[] = q
+  const filteredNested: NestedSidebarGroup[] = hasFilter
     ? nestedGroups
         .map((ng) => ({
           repo: ng.repo,
@@ -2459,10 +2521,7 @@ export function WorkspaceSidebar({
             .map((sg) => ({
               ...sg,
               workspaces: sg.workspaces.filter(
-                (v) =>
-                  workspaceMatchesFilter(v.workspace, q) ||
-                  sg.displayName.toLowerCase().includes(q) ||
-                  ng.repo.displayName.toLowerCase().includes(q),
+                (v) => textMatches(v, sg.displayName, ng.repo.displayName) && workspaceMatchesFacets(v.workspace),
               ),
             }))
             .filter((sg) => sg.workspaces.length > 0),
@@ -2499,7 +2558,7 @@ export function WorkspaceSidebar({
     };
     for (const g of filteredGroups) {
       if (!sidebarGroupHasLiveWorkspace(g)) continue;
-      const expanded = q ? true : !g.collapsed;
+      const expanded = hasFilter ? true : !g.collapsed;
       if (!expanded) continue;
       for (const v of g.workspaces) {
         if (!workspaceIsSunk(v.workspace)) push(v.workspace.id);
@@ -2513,7 +2572,7 @@ export function WorkspaceSidebar({
       }
     }
     return ids;
-  }, [filteredGroups, q, sunkExpanded]);
+  }, [filteredGroups, hasFilter, sunkExpanded]);
 
   // Drop selected ids for workspaces that no longer exist (a session was
   // deleted or moved). Existence-based, not visibility-based: collapsing a
@@ -2782,7 +2841,32 @@ export function WorkspaceSidebar({
               <Layers className="h-3.5 w-3.5" />
             </button>
           </Tooltip>
-          <SidebarSortPicker sortMode={sortMode} onSortModeChange={onSortModeChange} />
+          <SidebarSortPicker
+            sortMode={sortMode}
+            onSortModeChange={onSortModeChange}
+            pluginSorts={pluginSorts}
+            pluginSortRef={pluginSortRef}
+            onPluginSortChange={onPluginSortChange}
+          />
+          {facetSpecs.length > 0 && (
+            <Tooltip text="Plugin facets">
+              <button
+                onClick={() => setFacetOpen((o) => !o)}
+                aria-haspopup="true"
+                aria-expanded={facetOpen}
+                aria-label="Plugin facet filters"
+                data-testid="sidebar-facet-toggle"
+                className={`relative w-8 h-8 flex items-center justify-center cursor-pointer rounded-md transition-colors ${
+                  activeFacets.length > 0 || facetOpen ? "text-brand-500" : "text-text-dim hover:text-text-secondary"
+                }`}
+              >
+                <ListFilter className="h-3.5 w-3.5" />
+                {activeFacets.length > 0 && (
+                  <span className="absolute -right-0.5 -top-0.5 h-2 w-2 rounded-full bg-brand-500" aria-hidden />
+                )}
+              </button>
+            </Tooltip>
+          )}
           <Tooltip text="Filter">
             <button
               onClick={toggleFilter}
@@ -2853,6 +2937,42 @@ export function WorkspaceSidebar({
           </div>
         )}
 
+        {facetOpen && facetSpecs.length > 0 && (
+          <div className="px-3 pb-2 flex flex-col gap-2" data-testid="sidebar-facet-panel">
+            {facetSpecs.map((facet) => {
+              const selected = facetSelection.get(`${facet.pluginId}\u0000${facet.entryId}`);
+              return (
+                <div key={`${facet.pluginId}:${facet.entryId}`} data-plugin-id={facet.pluginId}>
+                  <div className="text-[11px] font-semibold uppercase tracking-wide text-text-dim mb-1">
+                    {facet.label}
+                  </div>
+                  <div className="flex flex-wrap gap-1">
+                    {facet.options.map((opt) => {
+                      const on = selected?.has(opt.value) ?? false;
+                      return (
+                        <button
+                          key={opt.value}
+                          type="button"
+                          aria-pressed={on}
+                          data-testid={`sidebar-facet-option-${facet.entryId}-${opt.value}`}
+                          onClick={() => toggleFacetValue(facet.pluginId, facet.entryId, opt.value)}
+                          className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-mono cursor-pointer transition-colors ${
+                            on
+                              ? "bg-brand-500/15 text-brand-500 ring-1 ring-brand-500/40"
+                              : `bg-surface-700/40 hover:bg-surface-700/70 ${toneTextClass(opt.tone)}`
+                          }`}
+                        >
+                          {opt.label}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
         <div className="flex-1 overflow-y-auto overflow-x-hidden border-t border-surface-700/60">
           {!isNested && (
             <DragSuppressContext.Provider value={dragSuppressRef}>
@@ -2874,7 +2994,7 @@ export function WorkspaceSidebar({
                   const groupDragDisabled = reorderDisabled || q.length > 0;
 
                   const renderGroupBody = (group: SidebarGroup, dragHandle?: DragHandleProps) => {
-                    const showExpanded = q ? true : !group.collapsed;
+                    const showExpanded = hasFilter ? true : !group.collapsed;
                     const hasActiveChild = group.workspaces.some((v) => v.workspace.id === displayedActiveId);
                     // Header archive count + action operate on the full group,
                     // not the filter-sliced one, so "Archive all" never silently
@@ -2970,7 +3090,7 @@ export function WorkspaceSidebar({
           {isNested &&
             filteredNested.filter(nestedSidebarGroupShouldRender).map((ng) => {
               const repo = ng.repo;
-              const repoExpanded = q ? true : !repo.collapsed;
+              const repoExpanded = hasFilter ? true : !repo.collapsed;
               const repoHasActiveChild = ng.subgroups.some((sg) =>
                 sg.workspaces.some((v) => v.workspace.id === displayedActiveId),
               );
@@ -2992,7 +3112,7 @@ export function WorkspaceSidebar({
                   {repoExpanded &&
                     ng.subgroups.filter(sidebarGroupHasLiveWorkspace).map((sg) => {
                       const groupPath = sg.groupPath ?? "";
-                      const subExpanded = q ? true : !sg.collapsed;
+                      const subExpanded = hasFilter ? true : !sg.collapsed;
                       const subHasActiveChild = sg.workspaces.some((v) => v.workspace.id === displayedActiveId);
                       // Sunk rows are pulled into the single global
                       // footer below, exactly like the flat axes, so
