@@ -348,7 +348,29 @@ describe("plugin slot renderers", () => {
     expect(screen.getByText("unresolved")).toBeTruthy();
     const link = screen.getByRole("link");
     expect(link.getAttribute("href")).toBe("https://github.com/o/r/pull/1#c1");
-    // Read-only: no reply/resolve controls.
+    // Read-only: no reply/resolve controls, and a short body needs no toggle.
     expect(screen.queryByRole("button")).toBeNull();
+    expect(screen.queryByTestId("plugin-comment-toggle")).toBeNull();
+  });
+
+  it("a long comment body is clamped with a more/less toggle", () => {
+    const longBody = "x".repeat(250);
+    const entry: PluginUiEntry = {
+      plugin_id: "acme.kit",
+      slot: "pane",
+      id: "gh",
+      session_id: "s1",
+      payload: { blocks: [{ kind: "comment", author: "bob", body: longBody }] },
+    };
+    render(<PluginPaneBody entry={entry} />);
+    const body = screen.getByText(longBody);
+    expect(body.className).toContain("line-clamp-3");
+    const toggle = screen.getByTestId("plugin-comment-toggle");
+    expect(toggle.textContent).toBe("more");
+    fireEvent.click(toggle);
+    expect(body.className).not.toContain("line-clamp-3");
+    expect(toggle.textContent).toBe("less");
+    fireEvent.click(toggle);
+    expect(body.className).toContain("line-clamp-3");
   });
 });

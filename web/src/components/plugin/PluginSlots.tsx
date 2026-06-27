@@ -312,10 +312,11 @@ function BlockAction({ block, pluginId }: { block: Record<string, unknown>; plug
   );
 }
 
-/** A read-only PR review comment: author, optional file:line, a wrapped body
- *  excerpt, and an unresolved/resolved marker. Wrapped in a link when `href` is
- *  a safe http(s) URL. There are no reply/resolve controls; this only surfaces
- *  what is already on the PR. */
+/** A read-only PR review comment: author, optional file:line, a wrapped body,
+ *  and an unresolved/resolved marker. Wrapped in a link when `href` is a safe
+ *  http(s) URL. A long body is clamped to 3 lines with a "more"/"less" toggle so
+ *  the full text is reachable without leaving the pane. There are no
+ *  reply/resolve controls; this only surfaces what is already on the PR. */
 function BlockComment({ block }: { block: Record<string, unknown> }) {
   const author = str(block, "author");
   const body = str(block, "body");
@@ -323,8 +324,14 @@ function BlockComment({ block }: { block: Record<string, unknown> }) {
   const line = typeof block.line === "number" ? block.line : undefined;
   const resolved = block.resolved === true;
   const safe = safeHref(str(block, "href"));
+  const [expanded, setExpanded] = useState(false);
   if (!author && !body) return null;
   const where = path ? `${path}${line ? `:${line}` : ""}` : undefined;
+  // ponytail: cheap length/newline heuristic instead of measuring layout, so the
+  // toggle works in jsdom and needs no ref/effect. Ceiling: a short-but-wide body
+  // that wraps past 3 lines under 200 chars misses the toggle; raise the bound if
+  // that bites.
+  const longBody = !!body && (body.length > 200 || (body.match(/\n/g)?.length ?? 0) >= 3);
   const inner = (
     <>
       <div className="flex items-center justify-between gap-2 text-text-secondary">
@@ -336,7 +343,24 @@ function BlockComment({ block }: { block: Record<string, unknown> }) {
           </span>
         </span>
       </div>
-      {body && <div className="mt-0.5 line-clamp-3 whitespace-pre-wrap text-text-primary">{body}</div>}
+      {body && (
+        <div className={`mt-0.5 whitespace-pre-wrap text-text-primary ${expanded ? "" : "line-clamp-3"}`}>{body}</div>
+      )}
+      {longBody && (
+        <button
+          type="button"
+          data-testid="plugin-comment-toggle"
+          onClick={(e) => {
+            // Don't let the click follow the card's PR link.
+            e.preventDefault();
+            e.stopPropagation();
+            setExpanded((v) => !v);
+          }}
+          className="mt-0.5 text-[10px] text-text-dim hover:text-text-primary cursor-pointer"
+        >
+          {expanded ? "less" : "more"}
+        </button>
+      )}
     </>
   );
   const className = "block rounded bg-surface-700/30 p-2 text-xs";
