@@ -444,6 +444,13 @@
       "components": ["web/src/components/NotificationSettings.tsx"]
     },
     {
+      "id": "notifications.service-worker-clear",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/__tests__/sw.test.ts"],
+      "components": ["web/public/sw.js"]
+    },
+    {
       "id": "settings.security-readonly",
       "kind": "vitest",
       "risk": "low",

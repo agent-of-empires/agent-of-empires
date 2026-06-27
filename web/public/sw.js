@@ -46,12 +46,41 @@ self.addEventListener("push", (event) => {
       payload = { title: "Agent of Empires", body: event.data.text() };
     }
   }
+  // Retract path: a "clear" push closes a previously shown approval or
+  // question notification once that request was handled on another device,
+  // so a backgrounded phone or second computer stops showing a stale alert.
+  // It shows nothing (the request is gone) and is NOT focus-gated. The seq
+  // guard skips closing a NEWER notification when a clear for an earlier
+  // request in the same session is delivered out of order. See #2491.
+  if (payload.kind === "clear") {
+    event.waitUntil(
+      (async () => {
+        const tag = payload.tag;
+        if (!tag || !self.registration.getNotifications) return;
+        try {
+          const existing = await self.registration.getNotifications({ tag });
+          for (const n of existing) {
+            const nseq = n.data && n.data.seq;
+            if (nseq == null || payload.seq == null || nseq <= payload.seq) {
+              n.close();
+            }
+          }
+        } catch {
+          /* getNotifications may be unsupported or throw; never fail the push */
+        }
+      })(),
+    );
+    return;
+  }
+
   const title = payload.title || "Agent of Empires";
   const options = {
     body: payload.body || "",
     tag: payload.tag || "aoe",
     renotify: true,
-    data: { url: payload.url || "/" },
+    // Store tag + seq so a later "clear" push can match this notification
+    // and the seq guard can avoid closing it if a newer one supersedes it.
+    data: { url: payload.url || "/", tag: payload.tag, seq: payload.seq },
     icon: "/icon-192.png",
     badge: "/icon-192.png",
   };
