@@ -177,18 +177,19 @@ fn run_set_enabled(id: &str, enabled: bool) -> Result<()> {
 fn format_report(report: &crate::plugin::install::InstallReport, verb: &str) -> String {
     let mut out = format!("{verb} {} {}.\n", report.id, report.version);
     out.push_str(&format!("  validation: {}\n", report.validation.as_str()));
+    out.push_str("  capabilities: ");
     if report.capabilities.is_empty() {
-        out.push_str("  capabilities: none");
+        out.push_str("none");
     } else {
-        out.push_str(&format!(
-            "  capabilities: {} ({})",
-            report.capabilities.join(", "),
-            if report.granted {
-                "granted"
-            } else {
-                "not granted, plugin inactive"
-            }
-        ));
+        out.push_str(&report.capabilities.join(", "));
+    }
+    // Surface inactivity whenever the grant did not cover the install, including
+    // the empty-capabilities case (declining a UI-only manifest change leaves a
+    // plugin ungranted with no capabilities to list).
+    if !report.granted {
+        out.push_str(" (not granted, plugin inactive)");
+    } else if !report.capabilities.is_empty() {
+        out.push_str(" (granted)");
     }
     out
 }
@@ -295,6 +296,24 @@ mod tests {
         assert!(
             out.contains("\n  validation: local\n"),
             "local install surfaces its validation: {out:?}"
+        );
+    }
+
+    #[test]
+    fn inactive_with_no_capabilities_still_warns() {
+        // An ungranted update with no capabilities (e.g. a declined UI-only
+        // manifest change) must still flag that the plugin is inactive.
+        let report = InstallReport {
+            id: "acme.foo".into(),
+            version: "0.1.0".into(),
+            capabilities: vec![],
+            granted: false,
+            validation: ValidationState::Community,
+        };
+        let out = format_report(&report, "Updated");
+        assert!(
+            out.ends_with("  capabilities: none (not granted, plugin inactive)"),
+            "inactivity is surfaced with no capabilities: {out:?}"
         );
     }
 }
