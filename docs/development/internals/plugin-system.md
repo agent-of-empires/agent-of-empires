@@ -317,12 +317,11 @@ vs `local` is derived from the install source. The lockfile records the tree
 hash and the install-time `trust` as a resolved record, but the load path does
 not depend on them for validation. The recompute is cheap (only ids the index
 names, and a featured plugin ships no release-binary, so its installed tree
-equals its source tree) and memoized in process by `integrity::cached_tree_hash`
-behind a `(path, len, mtime)` signature, so a registry rebuild skips re-hashing
-an unchanged tree; the memo is in-memory only and falls back to a full re-hash on
-any signature miss, never gating the verified decision on a cache. The
-manifest-hash grant check still catches a community plugin tampered after
-install.
+equals its source tree) and is done live on every load from the on-disk tree,
+never from a cache: a metadata-keyed cache could be forged to return a stale
+vetted hash for a tampered tree, so the verified decision always re-hashes
+content. The manifest-hash grant check still catches a community plugin tampered
+after install.
 
 `aoe plugin hash <dir>` prints the tree hash for a plugin directory so an author
 can produce the value a maintainer pins. Run it on a clean checkout.
