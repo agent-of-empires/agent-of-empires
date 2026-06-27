@@ -21,6 +21,7 @@ import {
   type AcpAttachment,
   type AcpFrame,
   type AcpState,
+  type BackgroundAgent,
   type ElicitationResolution,
   type PromptAttachmentInput,
   type QueuedPrompt,
@@ -316,6 +317,59 @@ function cacheSet(sessionId: string, value: AcpState): void {
     stateCache.delete(oldest);
   }
   persistState(sessionId, value);
+  notifyStateListeners(sessionId);
+}
+
+// Lightweight per-session subscription over `stateCache` so a component
+// that is NOT a child of <StructuredView> (the Background agents panel
+// lives in a sibling Dock) can read derived ACP state without opening a
+// second WebSocket. Notified on every `cacheSet`; consumers diff by
+// reference in their `getSnapshot`, so a no-op change costs nothing.
+const stateListeners = new Map<string, Set<() => void>>();
+
+function notifyStateListeners(sessionId: string): void {
+  const set = stateListeners.get(sessionId);
+  if (!set) return;
+  for (const cb of set) cb();
+}
+
+/** Subscribe to ACP-state changes for `sessionId`. Returns an unsubscribe. */
+function subscribeAcpState(sessionId: string, cb: () => void): () => void {
+  let set = stateListeners.get(sessionId);
+  if (!set) {
+    set = new Set();
+    stateListeners.set(sessionId, set);
+  }
+  set.add(cb);
+  return () => {
+    const s = stateListeners.get(sessionId);
+    if (!s) return;
+    s.delete(cb);
+    if (s.size === 0) stateListeners.delete(sessionId);
+  };
+}
+
+/** Non-mutating peek at cached state (no LRU touch; safe in getSnapshot). */
+function peekAcpState(sessionId: string): AcpState | undefined {
+  return stateCache.get(sessionId);
+}
+
+const EMPTY_BACKGROUND_AGENTS: BackgroundAgent[] = [];
+
+/** Read the live background-agents list for a session. Sibling-safe (no
+ *  extra WebSocket); reuses the single subscription <StructuredView>
+ *  already holds. Re-renders only when the list reference changes. */
+export function useBackgroundAgents(sessionId: string | null): BackgroundAgent[] {
+  const subscribe = useCallback(
+    (cb: () => void) => (sessionId ? subscribeAcpState(sessionId, cb) : () => {}),
+    [sessionId],
+  );
+  const getSnapshot = useCallback(
+    () =>
+      sessionId ? (peekAcpState(sessionId)?.backgroundAgents ?? EMPTY_BACKGROUND_AGENTS) : EMPTY_BACKGROUND_AGENTS,
+    [sessionId],
+  );
+  return useSyncExternalStore(subscribe, getSnapshot);
 }
 
 /** Drop a session's cached state (or the entire cache when called

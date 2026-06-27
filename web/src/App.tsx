@@ -85,6 +85,7 @@ import { Dock, type PaneDisplay } from "./components/Dock";
 import { BottomDock } from "./components/BottomDock";
 import { PaneDndController } from "./components/PaneDndController";
 import { visibleToFullIndex } from "./components/paneDnd";
+import { BackgroundAgentsPanel } from "./components/acp/BackgroundAgentsPanel";
 import { DiffPane } from "./components/DiffPane";
 import { PairedShellPane } from "./components/PairedTerminal";
 import { BUILTIN_PANES, isTerminalTabId, terminalIndexOf, terminalTabId, type DockLocation } from "./lib/panes";
@@ -434,7 +435,6 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
 
   // Activity-bar entries are pane KINDS (diff, terminal, each plugin), not
   // individual tabs; the strip's +/x manage terminal instances.
-  const allPaneIds: string[] = ["diff", "terminal", ...pluginPanes.map((p) => p.id)];
   const isPaneOpen = (kind: string): boolean => {
     if (kind === "terminal") return terminalOpen;
     return dockOf(paneLayout, kind) !== null;
@@ -444,7 +444,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       const defaultDock: DockLocation =
         pluginPaneById.get(kind)?.defaultDock ?? BUILTIN_PANES.find((p) => p.id === kind)?.defaultDock ?? "right";
       if (isPluginPaneId(kind)) togglePlugin(kind, defaultDock);
-      else toggleKind(kind as "diff" | "terminal", defaultDock);
+      else toggleKind(kind as "diff" | "terminal" | "agents", defaultDock);
     },
     [toggleKind, togglePlugin, pluginPaneById],
   );
@@ -522,6 +522,14 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     return workspaces.find((w) => w.sessions.some((s) => s.id === activeSessionId));
   }, [workspaces, activeSessionId]);
   const activeSession = activeWorkspace?.sessions.find((s) => s.id === activeSessionId);
+  const allPaneIds: string[] = [
+    "diff",
+    "terminal",
+    // The background-agents panel only applies to structured-view (ACP)
+    // sessions; a plain terminal session never launches sub-agents.
+    ...(activeSession?.view === "structured" ? ["agents"] : []),
+    ...pluginPanes.map((p) => p.id),
+  ];
 
   // Fetch the diff when the panel is actually showing: on desktop when the
   // split is expanded, on mobile when the diff view is the active pane.
@@ -1316,6 +1324,9 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     const renderPaneBody = (id: string): ReactNode => {
       const plugin = pluginPaneById.get(id);
       if (plugin) return <PluginPaneBody entry={plugin.entry} />;
+      if (id === "agents") {
+        return <BackgroundAgentsPanel sessionId={activeSessionId} />;
+      }
       if (id === "diff") {
         return (
           <DiffPane

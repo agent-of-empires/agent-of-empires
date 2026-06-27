@@ -33,7 +33,8 @@ import { Markdown } from "./Markdown";
 import { isQueuedPromptLong, queuedStripLayout } from "./queuedPromptsLayout";
 import { StartupErrorScreen } from "./StartupErrorScreen";
 import { pickWorkerStoppedVariant } from "./workerStoppedBanner";
-import { SubagentCard, ToolCard, ToolGroupCard, TodoGroupCard } from "./ToolCards";
+import { BackgroundAgentsContext } from "./backgroundAgentsContext";
+import { AsyncSubagentCard, SubagentCard, ToolCard, ToolGroupCard, TodoGroupCard } from "./ToolCards";
 import { DiffCommentsUserCard } from "../diff/comments/DiffCommentsUserCard";
 import { isDiffCommentsCardPayload, parseDiffCommentsSentinel } from "../diff/comments/buildPrompt";
 import { ElicitationAnswerCard } from "./ElicitationAnswerCard";
@@ -127,17 +128,19 @@ export function StructuredView(props: Props) {
             showClearedTurns={showClearedTurns}
           >
             {(ctx) => (
-              <AcpChrome
-                sessionId={sessionId}
-                acpWorkerState={acpWorkerState}
-                showClearedTurns={showClearedTurns}
-                onToggleClearedTurns={() => setShowClearedTurns((v) => !v)}
-                toolDensity={toolDensity}
-                onToggleToolDensity={toggleToolDensity}
-                archivedAt={archivedAt}
-                snoozedUntil={snoozedUntil}
-                {...ctx}
-              />
+              <BackgroundAgentsContext.Provider value={ctx.state.backgroundAgents}>
+                <AcpChrome
+                  sessionId={sessionId}
+                  acpWorkerState={acpWorkerState}
+                  showClearedTurns={showClearedTurns}
+                  onToggleClearedTurns={() => setShowClearedTurns((v) => !v)}
+                  toolDensity={toolDensity}
+                  onToggleToolDensity={toggleToolDensity}
+                  archivedAt={archivedAt}
+                  snoozedUntil={snoozedUntil}
+                  {...ctx}
+                />
+              </BackgroundAgentsContext.Provider>
             )}
           </AcpRuntime>
         </ToolDisplayModeProvider>
@@ -988,8 +991,13 @@ function AssistantSubagentTask({ argsText }: { argsText?: string }) {
   };
 
   const parent = reconstruct(payload.parent);
+  // An async launch has no inline children; it links to its live entry in
+  // the Background agents panel by the launching tool-call id.
+  if (payload.async) {
+    return <AsyncSubagentCard tool={parent.tool} />;
+  }
   const children = payload.children.map(reconstruct);
-  return <SubagentCard tool={parent.tool} result={parent.result} children={children} async={payload.async} />;
+  return <SubagentCard tool={parent.tool} result={parent.result} children={children} />;
 }
 
 function prettifyToolName(kind: string, args?: Record<string, unknown>): string {

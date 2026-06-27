@@ -338,7 +338,7 @@ export interface PaneLayoutApi {
   /** Reorder within a dock or move across docks, landing at `toIndex`. */
   placeTab: (tabId: TabId, toDock: DockLocation, toIndex: number) => void;
   /** Activity-bar toggle for a built-in kind ("diff" or "terminal"). */
-  toggleKind: (kind: "diff" | "terminal", defaultDock: DockLocation) => void;
+  toggleKind: (kind: "diff" | "terminal" | "agents", defaultDock: DockLocation) => void;
   /** Add/remove a plugin pane tab (activity-bar toggle). */
   togglePlugin: (id: TabId, defaultDock: DockLocation) => void;
   syncPlugins: (available: { id: TabId; defaultDock: DockLocation }[]) => void;
@@ -386,10 +386,12 @@ export function usePaneLayout(sessionId: string | null): PaneLayoutApi {
     [mutate],
   );
   const toggleKind = useCallback(
-    (kind: "diff" | "terminal", defaultDock: DockLocation) =>
+    (kind: "diff" | "terminal" | "agents", defaultDock: DockLocation) =>
       mutate((l) => {
-        if (kind === "diff") {
-          return dockOf(l, "diff") ? removeTab(l, "diff") : addTab(l, defaultDock, "diff");
+        // Single-instance panes (diff, agents) toggle their one tab; the
+        // terminal kind is multi-instance and toggles the whole group.
+        if (kind === "diff" || kind === "agents") {
+          return dockOf(l, kind) ? removeTab(l, kind) : addTab(l, defaultDock, kind);
         }
         const hasTerminal = DOCKS.some((d) => dockTabs(l, d).some(isTerminalTabId));
         return hasTerminal ? removeAllTerminals(l) : addTab(l, defaultDock, terminalTabId(0));

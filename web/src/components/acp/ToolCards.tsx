@@ -59,6 +59,7 @@ import { marked } from "marked";
 import { reclassifyBash } from "../../lib/toolReclassify";
 import { useAgentProfile } from "../../lib/agentProfileContext";
 import { useAcpFileRef } from "./AcpFileRefContext";
+import { useBackgroundAgentFor } from "./backgroundAgentsContext";
 import { relativeDisplayPath } from "../../lib/fileRef";
 import { useToolDisplayMode, type ToolDensity } from "./ToolDisplayMode";
 import type { AgentProfile, CardKind } from "../../lib/agentProfiles";
@@ -1444,41 +1445,71 @@ interface SubagentProps {
   tool: ToolCall;
   result?: ActivityRow;
   children: SubagentChildItem[];
-  /** True for an async sub-agent launch (Claude `Task` with isAsync):
-   *  the launch completed but the work runs off-protocol and never
-   *  reports back, so the card shows a neutral "runs in background"
-   *  state (no spinner, no done check, no child list). */
-  async?: boolean;
 }
 
 /** Card for a Claude sub-agent (Task) and its child tool calls. The
  *  parent Task shows in the header; the body lists the children using
  *  the same ToolCard dispatch as top-level calls (with `nested=true`
  *  so the indented "↳ subagent" wrap doesn't double up). See #1041. */
-export function SubagentCard({ tool, result, children, async }: SubagentProps) {
+/** Inline card for an async sub-agent launch (Claude `Task` with isAsync).
+ *  The sub-agent runs off-protocol; the daemon tails its transcript and
+ *  publishes a `BackgroundAgent` record, which we look up by the launching
+ *  tool-call id to show live status, elapsed time, and activity, linking
+ *  this card to its entry in the Background agents panel. Before the first
+ *  tailer event arrives (or if the record is gone), it degrades to a
+ *  neutral "runs in background" card. The SDK launch-marker body (which
+ *  carries an internal agent id) is never rendered. */
+export function AsyncSubagentCard({ tool }: { tool: ToolCall }) {
+  const args = useMemo(() => parseJsonObject(tool.args_preview), [tool.args_preview]);
+  const description = pickStr(args, "description", "_aoe_title") ?? tool.name ?? "Subagent task";
+  const agent = useBackgroundAgentFor(tool.id);
+
+  const status: Status = !agent
+    ? "ok"
+    : agent.status === "running"
+      ? "running"
+      : agent.status === "completed"
+        ? "ok"
+        : agent.status === "error"
+          ? "err"
+          : "stopped"; // stalled / detached
+
+  let metaText = "runs in background";
+  if (agent) {
+    if (agent.status === "running") {
+      const tools = agent.toolCount > 0 ? `${agent.toolCount} ${agent.toolCount === 1 ? "tool" : "tools"}` : null;
+      metaText = [tools, agent.lastTool].filter(Boolean).join(" · ") || "running in background";
+    } else if (agent.status === "stalled") {
+      metaText = "stalled in background";
+    } else if (agent.status === "detached") {
+      metaText = "detached";
+    } else if (agent.status === "completed") {
+      metaText = "finished in background";
+    } else {
+      metaText = agent.warning ?? "background agent error";
+    }
+  }
+
+  return (
+    <CardChrome
+      status={status}
+      neutralOnDone={!agent || agent.status === "stalled" || agent.status === "detached"}
+      icon={<Sparkles className="h-3.5 w-3.5" />}
+      label="subagent"
+      startedAt={agent?.startedAt ?? tool.started_at}
+      endedAt={agent?.endedAt ?? undefined}
+      primary={<span className="truncate">{description}</span>}
+      meta={<span className="text-[11px] text-text-dim">{metaText}</span>}
+      expanded={false}
+    />
+  );
+}
+
+export function SubagentCard({ tool, result, children }: SubagentProps) {
   const [open, setOpen] = useState(false);
 
   const args = useMemo(() => parseJsonObject(tool.args_preview), [tool.args_preview]);
   const description = pickStr(args, "description", "_aoe_title") ?? tool.name ?? "Subagent task";
-
-  // Async sub-agent launch: the work runs off-protocol and never reports
-  // back on this stream. Render a neutral "runs in background" card (no
-  // spinner, no done check, no child list, no duration) and never show
-  // the parent result body, which carries the SDK launch marker plus an
-  // internal agent id the SDK tells us not to surface.
-  if (async) {
-    return (
-      <CardChrome
-        status="ok"
-        neutralOnDone
-        icon={<Sparkles className="h-3.5 w-3.5" />}
-        label="subagent"
-        primary={<span className="truncate">{description}</span>}
-        meta={<span className="text-[11px] text-text-dim">runs in background</span>}
-        expanded={false}
-      />
-    );
-  }
 
   const runningChildren = children.filter((c) => !c.result).length;
   const parentDone = result !== undefined;

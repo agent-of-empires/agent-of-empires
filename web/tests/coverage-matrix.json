@@ -1318,6 +1318,23 @@
       ]
     },
     {
+      "id": "acp.background-agents",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/acp/__tests__/BackgroundAgentsPanel.test.tsx",
+        "src/components/acp/__tests__/ToolCards.test.tsx",
+        "src/lib/acpTypes.reducer.test.ts"
+      ],
+      "components": [
+        "web/src/components/acp/BackgroundAgentsPanel.tsx",
+        "web/src/components/acp/backgroundAgentsContext.ts",
+        "web/src/components/acp/ToolCards.tsx",
+        "web/src/lib/acpTypes.ts",
+        "web/src/hooks/useAcpSession.ts"
+      ]
+    },
+    {
       "id": "acp.memory-recall",
       "kind": "live-playwright",
       "risk": "medium",

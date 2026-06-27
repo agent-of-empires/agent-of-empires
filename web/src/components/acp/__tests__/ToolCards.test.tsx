@@ -11,9 +11,17 @@
 import type { ReactNode } from "react";
 import { describe, expect, it } from "vitest";
 import { fireEvent, render, within } from "@testing-library/react";
-import { ToolCard, TodoGroupCard, ToolGroupCard, SubagentCard, formatDurationMs } from "../ToolCards";
+import {
+  ToolCard,
+  TodoGroupCard,
+  ToolGroupCard,
+  SubagentCard,
+  AsyncSubagentCard,
+  formatDurationMs,
+} from "../ToolCards";
+import { BackgroundAgentsContext } from "../backgroundAgentsContext";
 import { AgentProfileProvider } from "../../../lib/agentProfileContext";
-import type { ActivityRow, ToolCall, ToolOutputBlock } from "../../../lib/acpTypes";
+import type { ActivityRow, BackgroundAgent, ToolCall, ToolOutputBlock } from "../../../lib/acpTypes";
 
 function toolWith(overrides: Partial<ToolCall> = {}): ToolCall {
   return {
@@ -510,37 +518,56 @@ describe("SubagentCard", () => {
     expect(container.textContent).toContain("No tool calls recorded yet.");
   });
 
-  it("renders an async launch as a neutral background card and hides the marker body", () => {
+  it("renders an async launch as a neutral background card before any tailer event", () => {
     const tool = toolWith({
       id: "task-async",
       name: "Map backend lifecycle",
       kind: "think",
       args_preview: JSON.stringify({ description: "Map backend lifecycle" }),
     });
-    const { container, queryByRole } = render(
-      <SubagentCard
-        tool={tool}
-        result={completeRow({
-          id: "done-task-async",
-          toolCallId: "task-async",
-          text: "Async agent launched successfully\nagentId: ae6f0567246843e25 (internal ID)",
-        })}
-        children={[]}
-        async
-      />,
-    );
+    // No BackgroundAgentsContext provider: the launch event hasn't been
+    // reduced yet, so the card degrades to the neutral fallback.
+    const { container } = render(<AsyncSubagentCard tool={tool} />);
     expect(container.textContent).toContain("subagent");
     expect(container.textContent).toContain("Map backend lifecycle");
     expect(container.textContent).toContain("runs in background");
-    // The internal agent id and the SDK marker must never reach the user.
+    // The SDK launch marker / internal agent id must never reach the user.
     expect(container.textContent).not.toContain("agentId");
     expect(container.textContent).not.toContain("Async agent launched");
     expect(container.textContent).not.toContain("internal ID");
-    // Neutral: no done badge, no spinner, no expand toggle, no child list.
-    expect(container.textContent).not.toContain("done");
-    expect(container.textContent).not.toContain("running");
-    expect(container.textContent).not.toContain("No tool calls recorded yet.");
-    expect(queryByRole("button")).toBeNull();
+  });
+
+  it("reflects the live background-agent record (status, tools) when present", () => {
+    const tool = toolWith({
+      id: "task-live",
+      name: "Map backend lifecycle",
+      kind: "think",
+      args_preview: JSON.stringify({ description: "Map backend lifecycle" }),
+    });
+    const agent: BackgroundAgent = {
+      agentId: "a1",
+      toolCallId: "task-live",
+      description: "Map backend lifecycle",
+      prompt: "do it",
+      model: "claude-opus-4-8",
+      status: "running",
+      startedAt: new Date().toISOString(),
+      endedAt: null,
+      toolCount: 3,
+      lastTool: "Read",
+      lastText: "scanning files",
+      result: null,
+      warning: null,
+    };
+    const { container } = render(
+      <BackgroundAgentsContext.Provider value={[agent]}>
+        <AsyncSubagentCard tool={tool} />
+      </BackgroundAgentsContext.Provider>,
+    );
+    expect(container.textContent).toContain("Map backend lifecycle");
+    expect(container.textContent).toContain("3 tools");
+    expect(container.textContent).toContain("Read");
+    expect(container.textContent).not.toContain("agentId");
   });
 });
 

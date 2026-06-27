@@ -474,6 +474,35 @@ export type AcpEvent =
       };
     }
   | { RawAgentUpdate: { payload: unknown } }
+  | {
+      BackgroundAgentLaunched: {
+        agent_id: string;
+        tool_call_id: string;
+        description: string;
+        prompt: string;
+        model: string;
+        started_at: string;
+      };
+    }
+  | {
+      BackgroundAgentProgress: {
+        agent_id: string;
+        status: BackgroundAgentStatus;
+        tool_count: number;
+        last_tool?: string | null;
+        last_text?: string | null;
+        at: string;
+      };
+    }
+  | {
+      BackgroundAgentCompleted: {
+        agent_id: string;
+        status: BackgroundAgentStatus;
+        result?: string | null;
+        warning?: string | null;
+        ended_at: string;
+      };
+    }
   | { AgentMessageChunk: { text: string } }
   | { CancelRequested: { escalates_at: string } }
   | { Stopped: { reason: string } }
@@ -820,6 +849,38 @@ export interface AcpState {
    *  or finished without notifying the daemon (`agentOrphaned`).
    *  Cleared on `AcpSessionAssigned` or `UserPromptSent`. See #1240. */
   agentOrphaned: boolean;
+  /** Async sub-agents (Claude `Task` with isAsync) launched this session.
+   *  The parent stream only carries each launch; the daemon tails each
+   *  agent's transcript and emits `BackgroundAgent*` events that build
+   *  this list. Drives the Background agents panel and the inline Task
+   *  card linkage. Insertion order (oldest first). */
+  backgroundAgents: BackgroundAgent[];
+}
+
+/** Lifecycle status of an async background sub-agent. Mirrors the Rust
+ *  `BackgroundAgentStatus`. `completed` is the only clean-finish state. */
+export type BackgroundAgentStatus = "running" | "stalled" | "completed" | "detached" | "error";
+
+/** One async background sub-agent, built up from `BackgroundAgent*`
+ *  events. Mirrors the Rust `BackgroundAgentRecord`. */
+export interface BackgroundAgent {
+  agentId: string;
+  /** The parent `Task` tool call that launched this agent; links the
+   *  inline tool card to this panel entry. */
+  toolCallId: string;
+  description: string;
+  prompt: string;
+  model: string;
+  status: BackgroundAgentStatus;
+  /** ISO-8601 launch time. */
+  startedAt: string;
+  /** ISO-8601 terminal time, set on completion/stall/error. */
+  endedAt: string | null;
+  toolCount: number;
+  lastTool: string | null;
+  lastText: string | null;
+  result: string | null;
+  warning: string | null;
 }
 
 export interface RejectedPrompt {
@@ -964,6 +1025,7 @@ export function emptyAcpState(): AcpState {
     rejectedPrompts: [],
     agentUnresponsive: false,
     agentOrphaned: false,
+    backgroundAgents: [],
     modeSwitchFailed: null,
     lastAgentSwitch: null,
     configOptions: [],
@@ -1886,6 +1948,60 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // for the cap rationale.
     next.lastStoppedSeq = Math.min(next.lastStoppedSeq + 1, next.pendingUserPromptSeq);
     next.turnActive = isTurnActive(next);
+    return next;
+  }
+  if ("BackgroundAgentLaunched" in event) {
+    const e = event.BackgroundAgentLaunched;
+    const record: BackgroundAgent = {
+      agentId: e.agent_id,
+      toolCallId: e.tool_call_id,
+      description: e.description,
+      prompt: e.prompt,
+      model: e.model,
+      status: "running",
+      startedAt: e.started_at,
+      endedAt: null,
+      toolCount: 0,
+      lastTool: null,
+      lastText: null,
+      result: null,
+      warning: null,
+    };
+    // Idempotent on replay: replace any existing record for this agent.
+    const i = next.backgroundAgents.findIndex((a) => a.agentId === e.agent_id);
+    next.backgroundAgents =
+      i >= 0 ? next.backgroundAgents.map((a, idx) => (idx === i ? record : a)) : [...next.backgroundAgents, record];
+    return next;
+  }
+  if ("BackgroundAgentProgress" in event) {
+    const e = event.BackgroundAgentProgress;
+    next.backgroundAgents = next.backgroundAgents.map((a) => {
+      if (a.agentId !== e.agent_id) return a;
+      // A terminal record never reopens to running.
+      if (a.status === "completed" || a.status === "detached" || a.status === "error") return a;
+      return {
+        ...a,
+        status: e.status,
+        toolCount: e.tool_count,
+        lastTool: e.last_tool ?? a.lastTool,
+        lastText: e.last_text ?? a.lastText,
+      };
+    });
+    return next;
+  }
+  if ("BackgroundAgentCompleted" in event) {
+    const e = event.BackgroundAgentCompleted;
+    next.backgroundAgents = next.backgroundAgents.map((a) =>
+      a.agentId === e.agent_id
+        ? {
+            ...a,
+            status: e.status,
+            endedAt: e.ended_at,
+            result: e.result ?? a.result,
+            warning: e.warning ?? a.warning,
+          }
+        : a,
+    );
     return next;
   }
   // RawAgentUpdate, TodoListUpdated, anything else: pass through with
