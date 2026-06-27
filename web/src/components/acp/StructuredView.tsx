@@ -98,6 +98,9 @@ interface Props {
   /** Repo roots for this session, forwarded to the tool cards so file
    *  paths render repo-relative instead of absolute. See #2143. */
   fileRefSession?: FileRefSession | null;
+  /** Open (or focus) the Sub agents dock pane. Lets an inline async
+   *  sub-agent card jump to its panel entry. */
+  onOpenAgentsPane?: () => void;
 }
 
 const STARTER_PROMPTS = [
@@ -107,7 +110,8 @@ const STARTER_PROMPTS = [
 ];
 
 export function StructuredView(props: Props) {
-  const { sessionId, acpWorkerState, tool, archivedAt, snoozedUntil, onOpenFileRef, fileRefSession } = props;
+  const { sessionId, acpWorkerState, tool, archivedAt, snoozedUntil, onOpenFileRef, fileRefSession, onOpenAgentsPane } =
+    props;
   // Folds rows above the most recent `/clear` divider out of the
   // thread by default; the disclosure banner toggles this. Lives on
   // the view (not the reducer) because it's a UI preference, not
@@ -128,7 +132,9 @@ export function StructuredView(props: Props) {
             showClearedTurns={showClearedTurns}
           >
             {(ctx) => (
-              <BackgroundAgentsContext.Provider value={ctx.state.backgroundAgents}>
+              <BackgroundAgentsContext.Provider
+                value={{ agents: ctx.state.backgroundAgents, openPane: onOpenAgentsPane }}
+              >
                 <AcpChrome
                   sessionId={sessionId}
                   acpWorkerState={acpWorkerState}

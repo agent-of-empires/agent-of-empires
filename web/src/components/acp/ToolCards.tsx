@@ -59,7 +59,7 @@ import { marked } from "marked";
 import { reclassifyBash } from "../../lib/toolReclassify";
 import { useAgentProfile } from "../../lib/agentProfileContext";
 import { useAcpFileRef } from "./AcpFileRefContext";
-import { useBackgroundAgentFor } from "./backgroundAgentsContext";
+import { useBackgroundAgentFor, useOpenBackgroundAgentsPane } from "./backgroundAgentsContext";
 import { relativeDisplayPath } from "../../lib/fileRef";
 import { useToolDisplayMode, type ToolDensity } from "./ToolDisplayMode";
 import type { AgentProfile, CardKind } from "../../lib/agentProfiles";
@@ -1463,6 +1463,7 @@ export function AsyncSubagentCard({ tool }: { tool: ToolCall }) {
   const args = useMemo(() => parseJsonObject(tool.args_preview), [tool.args_preview]);
   const description = pickStr(args, "description", "_aoe_title") ?? tool.name ?? "Subagent task";
   const agent = useBackgroundAgentFor(tool.id);
+  const openPane = useOpenBackgroundAgentsPane();
 
   const status: Status = !agent
     ? "ok"
@@ -1501,6 +1502,7 @@ export function AsyncSubagentCard({ tool }: { tool: ToolCall }) {
       primary={<span className="truncate">{description}</span>}
       meta={<span className="text-[11px] text-text-dim">{metaText}</span>}
       expanded={false}
+      onToggle={openPane}
     />
   );
 }

@@ -9,7 +9,7 @@
 // AgentProfileProvider keyed to a profile that enables it.
 
 import type { ReactNode } from "react";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { fireEvent, render, within } from "@testing-library/react";
 import {
   ToolCard,
@@ -561,7 +561,7 @@ describe("SubagentCard", () => {
       warning: null,
     };
     const { container } = render(
-      <BackgroundAgentsContext.Provider value={[agent]}>
+      <BackgroundAgentsContext.Provider value={{ agents: [agent] }}>
         <AsyncSubagentCard tool={tool} />
       </BackgroundAgentsContext.Provider>,
     );
@@ -569,6 +569,23 @@ describe("SubagentCard", () => {
     expect(container.textContent).toContain("3 tools");
     expect(container.textContent).toContain("Read");
     expect(container.textContent).not.toContain("agentId");
+  });
+
+  it("clicking the async card opens the Sub agents pane", () => {
+    const tool = toolWith({
+      id: "task-open",
+      name: "Map backend lifecycle",
+      kind: "think",
+      args_preview: JSON.stringify({ description: "Map backend lifecycle" }),
+    });
+    const openPane = vi.fn();
+    const { getByRole } = render(
+      <BackgroundAgentsContext.Provider value={{ agents: [], openPane }}>
+        <AsyncSubagentCard tool={tool} />
+      </BackgroundAgentsContext.Provider>,
+    );
+    fireEvent.click(getByRole("button"));
+    expect(openPane).toHaveBeenCalledTimes(1);
   });
 });
 

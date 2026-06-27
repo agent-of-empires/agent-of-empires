@@ -9,7 +9,7 @@
 // backend tailer that produces the events.
 
 import { useEffect, useState } from "react";
-import { Bot, ChevronDown, Square } from "lucide-react";
+import { Bot, ChevronDown, Maximize2, Square, X } from "lucide-react";
 
 import { useBackgroundAgents } from "../../hooks/useAcpSession";
 import type { BackgroundAgent, BackgroundAgentStatus, BackgroundAgentTool } from "../../lib/acpTypes";
@@ -90,22 +90,36 @@ function StopButton({ sessionId }: { sessionId: string }) {
 
 function AgentRow({ agent }: { agent: BackgroundAgent }) {
   const [open, setOpen] = useState(false);
+  const [modal, setModal] = useState(false);
   return (
     <div className="border-b border-surface-800">
-      <button
-        type="button"
-        onClick={() => setOpen((v) => !v)}
-        className="flex w-full items-center gap-2 px-3 py-2 text-left hover:bg-surface-800"
-      >
-        <StatusDot status={agent.status} />
-        <Bot className="h-3.5 w-3.5 shrink-0 text-text-dim" />
-        <span className="min-w-0 flex-1 truncate text-xs text-text-secondary">{agent.description || "Sub-agent"}</span>
-        <Elapsed startedAt={agent.startedAt} endedAt={agent.endedAt} active={isActive(agent.status)} />
-        <StatusLabel status={agent.status} toolCount={agent.toolCount} />
-        <ChevronDown
-          className={`h-3.5 w-3.5 shrink-0 text-text-dim transition-transform ${open ? "rotate-180" : ""}`}
-        />
-      </button>
+      <div className="flex items-center hover:bg-surface-800">
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          className="flex min-w-0 flex-1 items-center gap-2 px-3 py-2 text-left"
+        >
+          <StatusDot status={agent.status} />
+          <Bot className="h-3.5 w-3.5 shrink-0 text-text-dim" />
+          <span className="min-w-0 flex-1 truncate text-xs text-text-secondary">
+            {agent.description || "Sub-agent"}
+          </span>
+          <Elapsed startedAt={agent.startedAt} endedAt={agent.endedAt} active={isActive(agent.status)} />
+          <StatusLabel status={agent.status} toolCount={agent.toolCount} />
+          <ChevronDown
+            className={`h-3.5 w-3.5 shrink-0 text-text-dim transition-transform ${open ? "rotate-180" : ""}`}
+          />
+        </button>
+        <button
+          type="button"
+          onClick={() => setModal(true)}
+          title="Open full details"
+          aria-label="Open full details"
+          className="shrink-0 px-2 py-2 text-text-dim hover:text-text-secondary"
+        >
+          <Maximize2 className="h-3.5 w-3.5" />
+        </button>
+      </div>
       {!open && agent.lastText && (
         <div className="truncate px-3 pb-1.5 pl-9 text-[11px] text-text-dim">{agent.lastText}</div>
       )}
@@ -114,10 +128,59 @@ function AgentRow({ agent }: { agent: BackgroundAgent }) {
           {agent.warning && <Field label="warning" value={agent.warning} tone="warn" />}
           <Field label="model" value={agent.model || "unknown"} mono />
           {agent.tools.length > 0 && <ToolList tools={agent.tools} />}
+          <Field label="prompt" value={agent.prompt || "(none)"} clamp />
+          {agent.result && <Field label="result" value={agent.result} clamp />}
+        </div>
+      )}
+      {modal && <AgentDetailModal agent={agent} onClose={() => setModal(false)} />}
+    </div>
+  );
+}
+
+/** Full-detail modal for one sub-agent: the prompt, result, and every
+ *  tool call shown in full (the panel is narrow and clamps long text). */
+function AgentDetailModal({ agent, onClose }: { agent: BackgroundAgent; onClose: () => void }) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 animate-fade-in"
+      onClick={onClose}
+      role="dialog"
+      aria-modal="true"
+    >
+      <div
+        className="flex max-h-[85vh] w-[680px] max-w-[92vw] flex-col rounded-lg border border-surface-700/50 bg-surface-800 shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center gap-2 border-b border-surface-700 px-4 py-3">
+          <Bot className="h-4 w-4 shrink-0 text-text-dim" />
+          <span className="min-w-0 flex-1 truncate text-sm font-semibold text-text-bright">
+            {agent.description || "Sub-agent"}
+          </span>
+          <StatusLabel status={agent.status} toolCount={agent.toolCount} />
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Close"
+            className="text-text-muted hover:text-text-secondary"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+        <div className="space-y-3 overflow-y-auto px-4 py-3 text-[12px]">
+          {agent.warning && <Field label="warning" value={agent.warning} tone="warn" />}
+          <Field label="model" value={agent.model || "unknown"} mono />
+          {agent.tools.length > 0 && <ToolList tools={agent.tools} />}
           <Field label="prompt" value={agent.prompt || "(none)"} />
           {agent.result && <Field label="result" value={agent.result} />}
         </div>
-      )}
+      </div>
     </div>
   );
 }
@@ -130,10 +193,12 @@ function ToolList({ tools }: { tools: BackgroundAgentTool[] }) {
       <span className="text-[10px] uppercase tracking-wider text-text-dim">tools · {tools.length}</span>
       <div className="flex flex-col gap-0.5">
         {tools.map((t, i) => (
-          <div key={i} className="flex items-center gap-1.5">
-            <ToolDot ok={t.ok} />
+          <div key={i} className="flex items-start gap-1.5" title={t.title ? `${t.name} ${t.title}` : t.name}>
+            <span className="mt-1">
+              <ToolDot ok={t.ok} />
+            </span>
             <span className="shrink-0 font-mono text-text-secondary">{t.name}</span>
-            {t.title && <span className="min-w-0 truncate font-mono text-text-dim">{t.title}</span>}
+            {t.title && <span className="min-w-0 break-all font-mono text-text-dim">{t.title}</span>}
           </div>
         ))}
       </div>
@@ -147,13 +212,28 @@ function ToolDot({ ok }: { ok?: boolean | null }) {
   return <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${cls}`} />;
 }
 
-function Field({ label, value, mono, tone }: { label: string; value: string; mono?: boolean; tone?: "warn" }) {
+function Field({
+  label,
+  value,
+  mono,
+  tone,
+  clamp,
+}: {
+  label: string;
+  value: string;
+  mono?: boolean;
+  tone?: "warn";
+  /** In the narrow inline row, cap long text to a few lines; the details
+   *  modal renders without this so prompt/result show in full. */
+  clamp?: boolean;
+}) {
   return (
     <div className="flex flex-col gap-0.5">
       <span className="text-[10px] uppercase tracking-wider text-text-dim">{label}</span>
       <span
         className={[
           "whitespace-pre-wrap break-words",
+          clamp ? "line-clamp-4" : "",
           mono ? "font-mono" : "",
           tone === "warn" ? "text-status-error" : "text-text-secondary",
         ].join(" ")}

@@ -448,6 +448,13 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     },
     [toggleKind, togglePlugin, pluginPaneById],
   );
+  // Open (or focus) the Sub agents pane. Used by an inline async
+  // sub-agent card to jump to its panel entry.
+  const openAgentsPane = useCallback(() => {
+    const dock = dockOf(paneLayout, "agents");
+    if (dock) activateTab(dock, "agents");
+    else toggleKind("agents", "right");
+  }, [paneLayout, activateTab, toggleKind]);
   const closePaneAny = useCallback(
     (id: string) => {
       // Closing an extra terminal tab kills its tmux shell so it does not leak;
@@ -1377,6 +1384,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
                         snoozedUntil={activeSession.snoozed_until ?? null}
                         onOpenFileRef={handleOpenFileRef}
                         fileRefSession={activeSession}
+                        onOpenAgentsPane={openAgentsPane}
                       />
                     </Suspense>
                   ) : (

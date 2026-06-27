@@ -60,9 +60,9 @@ describe("BackgroundAgentsPanel", () => {
         result: "found 12 files",
       }),
     ]);
-    const { container, getByRole } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+    const { container, getAllByRole } = render(<BackgroundAgentsPanel sessionId="s-1" />);
     expect(container.textContent).toContain("done");
-    fireEvent.click(getByRole("button"));
+    fireEvent.click(getAllByRole("button")[0]!); // row toggle (not the details button)
     expect(container.textContent).toContain("do the thing");
     expect(container.textContent).toContain("claude-opus-4-8");
     expect(container.textContent).toContain("found 12 files");
@@ -93,8 +93,9 @@ describe("BackgroundAgentsPanel", () => {
         ],
       }),
     ]);
-    const { container, getByRole } = render(<BackgroundAgentsPanel sessionId="s-1" />);
-    fireEvent.click(getByRole("button"));
+    const { container, getAllByRole } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+    // First button is the row toggle; second is the details (modal) button.
+    fireEvent.click(getAllByRole("button")[0]!);
     expect(container.textContent).toContain("tools · 3");
     expect(container.textContent).toContain("Bash");
     expect(container.textContent).toContain("ls -la");
@@ -118,5 +119,26 @@ describe("BackgroundAgentsPanel", () => {
     agentsMock.mockReturnValue([agent({ status: "completed", endedAt: new Date().toISOString() })]);
     const { queryByRole } = render(<BackgroundAgentsPanel sessionId="s-1" />);
     expect(queryByRole("button", { name: /stop/i })).toBeNull();
+  });
+
+  it("opens a details modal showing the full prompt, result, and tools", () => {
+    agentsMock.mockReturnValue([
+      agent({
+        status: "completed",
+        endedAt: new Date().toISOString(),
+        prompt: "a very long prompt that the narrow panel would clamp",
+        result: "the complete final result text",
+        tools: [{ name: "Bash", title: "ls -la", ok: true }],
+      }),
+    ]);
+    const { getByRole, getByText } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+    fireEvent.click(getByRole("button", { name: /open full details/i }));
+    const dialog = getByRole("dialog");
+    expect(dialog.textContent).toContain("a very long prompt that the narrow panel would clamp");
+    expect(dialog.textContent).toContain("the complete final result text");
+    expect(dialog.textContent).toContain("ls -la");
+    // Closes on the X button.
+    fireEvent.click(getByRole("button", { name: /close/i }));
+    expect(() => getByText("the complete final result text")).toThrow();
   });
 });
