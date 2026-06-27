@@ -293,7 +293,7 @@ mod tests {
 
     fn featured(slug: &str) -> FeaturedIndex {
         FeaturedIndex::from_toml_str(&format!(
-            "[plugins.\"x.y\"]\nsource = \"{slug}\"\ntree_hash = \"sha256:abc\"\n"
+            "[plugins.\"x.y\"]\nsource = \"{slug}\"\nversions = {{ \"1.0\" = \"sha256:abc\" }}\n"
         ))
         .unwrap()
     }
