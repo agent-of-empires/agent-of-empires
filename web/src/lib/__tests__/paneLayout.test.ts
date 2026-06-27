@@ -195,6 +195,26 @@ describe("usePaneLayout migration + persistence", () => {
     expect(dockTabs(result.current.layout, "bottom")).toEqual([]);
   });
 
+  it("drops a tab id duplicated within one group on load", () => {
+    localStorage.setItem(
+      "aoe-pane-layout-v2",
+      JSON.stringify({
+        version: 2,
+        template: { right: [], bottom: [], nextTerminalIndex: 1, closedPlugins: [] },
+        sessions: {
+          s1: {
+            right: [{ tabs: ["diff", "diff", "terminal:0"], active: "diff" }],
+            bottom: [],
+            nextTerminalIndex: 1,
+            closedPlugins: [],
+          },
+        },
+      }),
+    );
+    const { result } = renderHook(() => usePaneLayout("s1"));
+    expect(dockTabs(result.current.layout, "right")).toEqual(["diff", "terminal:0"]);
+  });
+
   it("toggleKind adds then removes the terminal tabs", () => {
     localStorage.setItem("aoe-right-collapsed", "1"); // start empty
     const { result } = renderHook(() => usePaneLayout("s1"));

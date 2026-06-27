@@ -281,8 +281,11 @@ function normalizeGroups(v: unknown): PaneGroup[] {
 function dropDuplicates(group: PaneGroup[], seen: Set<TabId>): PaneGroup[] {
   return group
     .map((g) => {
-      const tabs = g.tabs.filter((t) => !seen.has(t));
-      tabs.forEach((t) => seen.add(t));
+      const tabs = g.tabs.filter((t) => {
+        if (seen.has(t)) return false;
+        seen.add(t);
+        return true;
+      });
       const active = g.active && tabs.includes(g.active) ? g.active : (tabs[0] ?? null);
       return { tabs, active };
     })
