@@ -47,6 +47,8 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe plugin update`↴](#aoe-plugin-update)
 * [`aoe plugin uninstall`↴](#aoe-plugin-uninstall)
 * [`aoe plugin hash`↴](#aoe-plugin-hash)
+* [`aoe plugin discover`↴](#aoe-plugin-discover)
+* [`aoe plugin outdated`↴](#aoe-plugin-outdated)
 * [`aoe profile`↴](#aoe-profile)
 * [`aoe profile list`↴](#aoe-profile-list)
 * [`aoe profile create`↴](#aoe-profile-create)
@@ -684,6 +686,8 @@ Manage plugins (list, info, enable, disable, install, update, uninstall)
 * `update` — Update an installed external plugin from its recorded source. Prompts to re-approve capabilities if the update changes the capability set
 * `uninstall` — Uninstall an external plugin, removing its files and capability grant
 * `hash` — Print the deterministic source tree hash for a plugin directory, the value a maintainer pins in the featured index
+* `discover` — Search GitHub's `aoe-plugin` topic for installable plugins
+* `outdated` — List installed external plugins that have an update available
 
 
 
@@ -780,6 +784,26 @@ Print the deterministic source tree hash for a plugin directory, the value a mai
 ###### **Arguments:**
 
 * `<PATH>` — Path to the plugin directory
+
+
+
+## `aoe plugin discover`
+
+Search GitHub's `aoe-plugin` topic for installable plugins
+
+**Usage:** `aoe plugin discover [QUERY]`
+
+###### **Arguments:**
+
+* `<QUERY>` — Optional free-text term to narrow the search
+
+
+
+## `aoe plugin outdated`
+
+List installed external plugins that have an update available
+
+**Usage:** `aoe plugin outdated`
 
 
 

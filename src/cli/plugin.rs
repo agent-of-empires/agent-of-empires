@@ -49,6 +49,13 @@ pub enum PluginCommands {
         /// Path to the plugin directory
         path: String,
     },
+    /// Search GitHub's `aoe-plugin` topic for installable plugins
+    Discover {
+        /// Optional free-text term to narrow the search
+        query: Option<String>,
+    },
+    /// List installed external plugins that have an update available
+    Outdated,
 }
 
 pub async fn run(command: PluginCommands) -> Result<()> {
@@ -61,6 +68,8 @@ pub async fn run(command: PluginCommands) -> Result<()> {
         PluginCommands::Update { id } => run_update(&id).await,
         PluginCommands::Uninstall { id } => run_uninstall(&id),
         PluginCommands::Hash { path } => run_hash(&path),
+        PluginCommands::Discover { query } => run_discover(query.as_deref()).await,
+        PluginCommands::Outdated => run_outdated().await,
     }
 }
 
@@ -194,5 +203,50 @@ async fn run_update(id: &str) -> Result<()> {
 fn run_uninstall(id: &str) -> Result<()> {
     crate::plugin::install::uninstall(id)?;
     println!("Uninstalled {id}.");
+    Ok(())
+}
+
+async fn run_discover(query: Option<&str>) -> Result<()> {
+    let results = crate::plugin::discover::discover(query).await?;
+    if results.is_empty() {
+        println!("No plugins found on the `aoe-plugin` topic.");
+        return Ok(());
+    }
+    println!("{:<11} {:<6} {:<32} ABOUT", "BADGE", "STARS", "SOURCE");
+    for r in &results {
+        let about = r.description.as_deref().unwrap_or("");
+        println!(
+            "{:<11} {:<6} {:<32} {}",
+            r.badge.as_str(),
+            r.stars,
+            r.slug,
+            about
+        );
+    }
+    println!("\nInstall with:\n  aoe plugin install <source>");
+    Ok(())
+}
+
+async fn run_outdated() -> Result<()> {
+    let statuses = crate::plugin::update_check::outdated().await;
+    if statuses.is_empty() {
+        println!("No external plugins installed.");
+        return Ok(());
+    }
+    let mut any_outdated = false;
+    for s in &statuses {
+        if let Some(err) = &s.error {
+            println!("error         {:<20} {}", s.id, err);
+        } else if s.needs_update {
+            any_outdated = true;
+            let available = s.available.as_deref().unwrap_or("modified");
+            println!("needs update  {:<20} {} -> {}", s.id, s.current, available);
+        } else {
+            println!("up to date    {:<20} {}", s.id, s.current);
+        }
+    }
+    if any_outdated {
+        println!("\nUpdate with:\n  aoe plugin update <id>");
+    }
     Ok(())
 }
