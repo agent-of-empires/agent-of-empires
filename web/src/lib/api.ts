@@ -383,6 +383,23 @@ export type PluginUpdatePreviewResult =
   | { kind: "ok"; preview: PluginUpdatePreview }
   | { kind: "error"; message: string };
 
+/** Validate a preview payload against the discriminated union, so a drifted
+ *  server response is rejected rather than passed on: a safe_update must carry a
+ *  string fingerprint (else the apply would send no pin) and a consent_required
+ *  must carry a consent object (else the modal path would blow up). */
+function isValidPreview(payload: Record<string, unknown>): payload is PluginUpdatePreview {
+  switch (payload.kind) {
+    case "no_update":
+      return true;
+    case "safe_update":
+      return typeof payload.fingerprint === "string";
+    case "consent_required":
+      return typeof payload.consent === "object" && payload.consent !== null;
+    default:
+      return false;
+  }
+}
+
 /** Classify the available update for one installed plugin (no install happens).
  *  When consent is required the payload carries the full disclosure. */
 export async function previewPluginUpdate(id: string): Promise<PluginUpdatePreviewResult> {
@@ -391,8 +408,8 @@ export async function previewPluginUpdate(id: string): Promise<PluginUpdatePrevi
       headers: { Accept: "application/json" },
     });
     const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null;
-    if (res.ok && payload && typeof payload.kind === "string") {
-      return { kind: "ok", preview: payload as unknown as PluginUpdatePreview };
+    if (res.ok && payload && isValidPreview(payload)) {
+      return { kind: "ok", preview: payload };
     }
     const message =
       typeof payload?.message === "string"

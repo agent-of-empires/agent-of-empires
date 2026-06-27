@@ -130,6 +130,19 @@ describe("previewPluginUpdate", () => {
     fetchSpy.mockRejectedValue(new Error("offline"));
     expect(await previewPluginUpdate("acme.plugin")).toEqual({ kind: "error", message: "Network error." });
   });
+
+  it("rejects a malformed OK payload that drops the per-kind required fields", async () => {
+    // safe_update without a fingerprint, consent_required without a consent
+    // object, and an unknown kind must all be treated as errors, not passed on.
+    for (const bad of [
+      { kind: "safe_update", to_version: "2.0.0" },
+      { kind: "consent_required", dismissed: false },
+      { kind: "bogus" },
+    ]) {
+      fetchSpy.mockResolvedValue(new Response(JSON.stringify(bad), { status: 200 }));
+      expect((await previewPluginUpdate("acme.plugin")).kind).toBe("error");
+    }
+  });
 });
 
 describe("applyPluginUpdate", () => {
