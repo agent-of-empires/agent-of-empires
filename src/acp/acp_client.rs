@@ -3214,6 +3214,10 @@ fn is_transcript_event(event: &Event) -> bool {
             | Event::ApprovalRequested { .. }
             | Event::ApprovalResolved { .. }
             | Event::RawAgentUpdate { .. }
+            // A replayed launch must be dropped too: the tailer spawn is
+            // skipped during suppression, so letting it through would
+            // create a running record with nothing to ever complete it.
+            | Event::BackgroundAgentLaunched { .. }
             | Event::PromptRuntimeError { .. }
     )
 }
