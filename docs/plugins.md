@@ -80,9 +80,9 @@ rejected rather than granted; upgrade aoe.
 A grant is pinned to the installed manifest. If an update changes the
 capability set, the plugin is left installed but inactive and
 `aoe plugin update <id>` re-prompts you to approve the new set. `aoe plugin
-install` reports the resolved trust level (`featured`, `community`, or `local`)
-in its success output, and `aoe plugin list` and `aoe plugin info <id>` show
-each plugin's trust level and whether it is granted. An external plugin cannot use the reserved `aoe.*` /
+install` and `aoe plugin update` report the resolved trust level (`featured`,
+`community`, or `local`) in their success output, and `aoe plugin list` and
+`aoe plugin info <id>` show each plugin's trust level and whether it is granted. An external plugin cannot use the reserved `aoe.*` /
 `agent-of-empires.*` id namespace.
 
 Resolved versions live in `<app_dir>/plugins.lock` (the exact commit, manifest
