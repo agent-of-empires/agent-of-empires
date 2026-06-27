@@ -332,7 +332,9 @@ function BlockComment({ block }: { block: Record<string, unknown> }) {
   // that wraps past 3 lines under 200 chars misses the toggle; raise the bound if
   // that bites.
   const longBody = !!body && (body.length > 200 || (body.match(/\n/g)?.length ?? 0) >= 3);
-  const inner = (
+  // The linkable content (header + body); the toggle stays a sibling so it is
+  // never an interactive child of the <a> (invalid nesting, odd keyboard focus).
+  const linkContent = (
     <>
       <div className="flex items-center justify-between gap-2 text-text-secondary">
         <span className="min-w-0 truncate font-medium">{author}</span>
@@ -344,32 +346,34 @@ function BlockComment({ block }: { block: Record<string, unknown> }) {
         </span>
       </div>
       {body && (
-        <div className={`mt-0.5 whitespace-pre-wrap text-text-primary ${expanded ? "" : "line-clamp-3"}`}>{body}</div>
+        // Clamp only when there is a toggle to undo it, so a short body that
+        // still wraps past three lines is not truncated with no way to expand.
+        <div className={`mt-0.5 whitespace-pre-wrap text-text-primary ${longBody && !expanded ? "line-clamp-3" : ""}`}>
+          {body}
+        </div>
+      )}
+    </>
+  );
+  return (
+    <div className="rounded bg-surface-700/30 p-2 text-xs">
+      {safe ? (
+        <a className="block rounded hover:bg-surface-700/50" href={safe} target="_blank" rel="noopener noreferrer">
+          {linkContent}
+        </a>
+      ) : (
+        linkContent
       )}
       {longBody && (
         <button
           type="button"
           data-testid="plugin-comment-toggle"
-          onClick={(e) => {
-            // Don't let the click follow the card's PR link.
-            e.preventDefault();
-            e.stopPropagation();
-            setExpanded((v) => !v);
-          }}
+          onClick={() => setExpanded((v) => !v)}
           className="mt-0.5 text-[10px] text-text-dim hover:text-text-primary cursor-pointer"
         >
           {expanded ? "less" : "more"}
         </button>
       )}
-    </>
-  );
-  const className = "block rounded bg-surface-700/30 p-2 text-xs";
-  return safe ? (
-    <a className={`${className} hover:bg-surface-700/50`} href={safe} target="_blank" rel="noopener noreferrer">
-      {inner}
-    </a>
-  ) : (
-    <div className={className}>{inner}</div>
+    </div>
   );
 }
 
