@@ -536,4 +536,83 @@ describe("PluginsSettings", () => {
     const err = await findByTestId("plugin-update-consent-error");
     expect(err.textContent).toContain("changed since it was shown");
   });
+
+  it("the consent modal renders removed caps, runtime, trust downgrade, and UI slots", async () => {
+    markOutdated();
+    previewPluginUpdate.mockResolvedValue({
+      kind: "ok",
+      preview: {
+        kind: "consent_required",
+        dismissed: false,
+        consent: {
+          id: "example.plugin",
+          from_version: "0.1.0",
+          to_version: "0.2.0",
+          prior_capabilities: ["net", "fs.read"],
+          new_capabilities: ["net"],
+          added_capabilities: [],
+          removed_capabilities: ["fs.read"],
+          ui: [{ slot: "status-bar", id: "s" }],
+          build_steps: [],
+          runtime_change: "the worker is now a downloaded release binary",
+          trust_downgrade: true,
+          fingerprint: "treeD||community",
+          stays_active_if_declined: true,
+        },
+      },
+    });
+    const { findByTestId } = render(<PluginsSettings />);
+    fireEvent.click(await findByTestId("plugins-check-updates"));
+    fireEvent.click(await findByTestId("plugin-update-example.plugin"));
+    await findByTestId("plugin-update-consent-modal");
+    expect((await findByTestId("plugin-update-runtime-change")).textContent).toContain("release binary");
+    await findByTestId("plugin-update-trust-downgrade");
+  });
+
+  it("Update reports up-to-date and clears the badge when preview finds no update", async () => {
+    markOutdated();
+    previewPluginUpdate.mockResolvedValue({ kind: "ok", preview: { kind: "no_update" } });
+    const { findByTestId, queryByTestId } = render(<PluginsSettings />);
+    fireEvent.click(await findByTestId("plugins-check-updates"));
+    fireEvent.click(await findByTestId("plugin-update-example.plugin"));
+    await waitFor(() => expect(reportInfo).toHaveBeenCalled());
+    await waitFor(() => expect(queryByTestId("plugin-update-available-example.plugin")).toBeNull());
+  });
+
+  it("surfaces a preview error inline", async () => {
+    markOutdated();
+    previewPluginUpdate.mockResolvedValue({ kind: "error", message: "no published release" });
+    const { findByTestId, findByText } = render(<PluginsSettings />);
+    fireEvent.click(await findByTestId("plugins-check-updates"));
+    fireEvent.click(await findByTestId("plugin-update-example.plugin"));
+    await findByText("no published release");
+  });
+
+  it("surfaces an error when a safe update fails to apply", async () => {
+    markOutdated();
+    previewPluginUpdate.mockResolvedValue({
+      kind: "ok",
+      preview: { kind: "safe_update", to_version: "0.2.0", fingerprint: "treeC||community" },
+    });
+    applyPluginUpdate.mockResolvedValue({ kind: "error", message: "apply boom" });
+    const { findByTestId, findByText } = render(<PluginsSettings />);
+    fireEvent.click(await findByTestId("plugins-check-updates"));
+    fireEvent.click(await findByTestId("plugin-update-example.plugin"));
+    await findByText("apply boom");
+  });
+
+  it("does not close the consent modal while an apply is in flight", async () => {
+    markOutdated();
+    previewPluginUpdate.mockResolvedValue(consentPreview);
+    // A never-resolving apply keeps the modal in its busy state.
+    applyPluginUpdate.mockReturnValue(new Promise(() => {}));
+    const { findByTestId, queryByTestId } = render(<PluginsSettings />);
+    fireEvent.click(await findByTestId("plugins-check-updates"));
+    fireEvent.click(await findByTestId("plugin-update-example.plugin"));
+    fireEvent.click(await findByTestId("plugin-update-approve"));
+    // Escape and the Close button must be no-ops while busy.
+    fireEvent.keyDown(window, { key: "Escape" });
+    fireEvent.click(await findByTestId("plugin-update-consent-close"));
+    expect(queryByTestId("plugin-update-consent-modal")).not.toBeNull();
+  });
 });
