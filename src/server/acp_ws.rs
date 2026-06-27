@@ -22,7 +22,7 @@ use axum::extract::{
     Path, Query, State,
 };
 use axum::response::IntoResponse;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::select;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::time::Instant;
@@ -329,6 +329,7 @@ pub async fn trigger_approval_push(
     session_id: &str,
     approval_title: &str,
     destructive: bool,
+    seq: u64,
 ) {
     let badge = if destructive {
         "DESTRUCTIVE"
@@ -341,8 +342,45 @@ pub async fn trigger_approval_push(
     } else {
         approval_title.to_string()
     };
-    let tag = format!("acp-approval-{session_id}");
-    send_acp_attention_push(state, session_id, title, body, tag).await;
+    let tag = approval_tag(session_id);
+    send_acp_push(state, session_id, |url| AcpNotifyPayload {
+        kind: "notify",
+        title: title.clone(),
+        body: body.clone(),
+        url,
+        tag: tag.clone(),
+        session_id: session_id.to_string(),
+        seq,
+    })
+    .await;
+}
+
+/// Retract a previously shown approval notification on every device once
+/// the approval is handled. Mirrors `trigger_approval_push`'s tag so the
+/// service worker can match and close the live notification. See #2491.
+pub async fn trigger_approval_clear_push(state: &AppState, session_id: &str, seq: u64) {
+    let tag = approval_tag(session_id);
+    send_acp_push(state, session_id, |url| AcpClearPayload {
+        kind: "clear",
+        title: "Resolved",
+        body: "Handled on another device",
+        url,
+        tag: tag.clone(),
+        session_id: session_id.to_string(),
+        seq,
+    })
+    .await;
+}
+
+/// Tag shared by the approval show and clear pushes for a session.
+/// Single-sourced so the clear path can never drift from the show path.
+fn approval_tag(session_id: &str) -> String {
+    format!("acp-approval-{session_id}")
+}
+
+/// Tag shared by the question show and clear pushes for a session.
+fn question_tag(session_id: &str) -> String {
+    format!("acp-question-{session_id}")
 }
 
 /// Push-notification trigger for "agent asked you a question." Called by
@@ -351,10 +389,68 @@ pub async fn trigger_approval_push(
 /// on the user exactly like an approval, so it gets the same dedicated,
 /// suppression-bypassing push rather than only the generic Waiting one.
 /// See #2146.
-pub async fn trigger_question_push(state: &AppState, session_id: &str, question: &str) {
+pub async fn trigger_question_push(state: &AppState, session_id: &str, question: &str, seq: u64) {
     let title = format!("{} has a question", session_id);
-    let tag = format!("acp-question-{session_id}");
-    send_acp_attention_push(state, session_id, title, push_body_snippet(question), tag).await;
+    let body = push_body_snippet(question);
+    let tag = question_tag(session_id);
+    send_acp_push(state, session_id, |url| AcpNotifyPayload {
+        kind: "notify",
+        title: title.clone(),
+        body: body.clone(),
+        url,
+        tag: tag.clone(),
+        session_id: session_id.to_string(),
+        seq,
+    })
+    .await;
+}
+
+/// Retract a previously shown question notification once the question is
+/// answered. Mirrors `trigger_question_push`'s tag. See #2491.
+pub async fn trigger_question_clear_push(state: &AppState, session_id: &str, seq: u64) {
+    let tag = question_tag(session_id);
+    send_acp_push(state, session_id, |url| AcpClearPayload {
+        kind: "clear",
+        title: "Resolved",
+        body: "Handled on another device",
+        url,
+        tag: tag.clone(),
+        session_id: session_id.to_string(),
+        seq,
+    })
+    .await;
+}
+
+/// Payload for a dedicated ACP attention push (approval / question).
+/// `kind: "notify"` lets the service worker tell a show from a clear; an
+/// old service worker ignores the unknown field and falls back to showing
+/// `title`/`body`. `seq` is the originating event seq, stored in the
+/// notification so a later clear can avoid closing a newer notification.
+#[derive(Serialize)]
+struct AcpNotifyPayload {
+    kind: &'static str,
+    title: String,
+    body: String,
+    url: String,
+    tag: String,
+    session_id: String,
+    seq: u64,
+}
+
+/// Payload telling the service worker to retract a shown ACP attention
+/// notification once the request is handled. Carries `title`/`body` so a
+/// not-yet-updated service worker degrades to a benign "Resolved"
+/// notification (replacing the stale one via `tag`) rather than a blank
+/// one. `seq` lets the worker skip closing a newer notification. See #2491.
+#[derive(Serialize)]
+struct AcpClearPayload {
+    kind: &'static str,
+    title: &'static str,
+    body: &'static str,
+    url: String,
+    tag: String,
+    session_id: String,
+    seq: u64,
 }
 
 /// Question text can be long and lands on a lock screen, so collapse
@@ -370,17 +466,18 @@ fn push_body_snippet(s: &str) -> String {
 }
 
 /// Shared sender for the dedicated ACP "needs your attention" pushes
-/// (approval and question). Snapshots subscribers and sends one encrypted
-/// payload each, deep-linking to the session's structured view. Bypasses
-/// the status-push active-session suppression on purpose: these are
-/// precise, turn-blocking events, not the coarse Waiting heuristic.
-async fn send_acp_attention_push(
-    state: &AppState,
-    session_id: &str,
-    title: String,
-    body: String,
-    tag: String,
-) {
+/// (approval and question) and their matching clear pushes. Snapshots
+/// subscribers and sends one encrypted payload each, deep-linking to the
+/// session's structured view. `make_payload` builds the per-subscriber
+/// payload from that subscriber's push URL, so a show path and a clear
+/// path share the same fan-out. Bypasses the status-push active-session
+/// suppression on purpose: these are precise, turn-blocking events, not
+/// the coarse Waiting heuristic.
+async fn send_acp_push<T, F>(state: &AppState, session_id: &str, make_payload: F)
+where
+    T: Serialize,
+    F: Fn(String) -> T,
+{
     let Some(push) = state.push.as_ref() else {
         return;
     };
@@ -403,13 +500,7 @@ async fn send_acp_attention_push(
         let Some(url) = super::push::build_push_url(&sub, &path) else {
             continue;
         };
-        let payload = super::push_send::PushPayload {
-            title: title.clone(),
-            body: body.clone(),
-            url,
-            tag: tag.clone(),
-            session_id: session_id.to_string(),
-        };
+        let payload = make_payload(url);
         let body_bytes = match serde_json::to_vec(&payload) {
             Ok(b) => b,
             Err(e) => {
@@ -460,6 +551,51 @@ mod tests {
         let snippet = push_body_snippet(&long);
         assert!(snippet.ends_with('…'));
         assert_eq!(snippet.chars().count(), 120 + 1);
+    }
+
+    #[test]
+    fn attention_tags_are_session_scoped_and_kind_distinct() {
+        // The clear path reuses these helpers, so a drift here would
+        // silently fail to close the matching notification (#2491).
+        assert_eq!(approval_tag("s1"), "acp-approval-s1");
+        assert_eq!(question_tag("s1"), "acp-question-s1");
+        assert_ne!(approval_tag("s1"), question_tag("s1"));
+    }
+
+    #[test]
+    fn clear_payload_carries_kind_and_seq() {
+        let json = serde_json::to_value(AcpClearPayload {
+            kind: "clear",
+            title: "Resolved",
+            body: "Handled on another device",
+            url: "/sessions/s1/acp".into(),
+            tag: approval_tag("s1"),
+            session_id: "s1".into(),
+            seq: 7,
+        })
+        .unwrap();
+        assert_eq!(json["kind"], "clear");
+        assert_eq!(json["tag"], "acp-approval-s1");
+        assert_eq!(json["seq"], 7);
+        // title/body are present so a not-yet-updated service worker
+        // degrades to a benign notification rather than a blank one.
+        assert_eq!(json["title"], "Resolved");
+    }
+
+    #[test]
+    fn notify_payload_tags_kind_notify() {
+        let json = serde_json::to_value(AcpNotifyPayload {
+            kind: "notify",
+            title: "t".into(),
+            body: "b".into(),
+            url: "/sessions/s1/acp".into(),
+            tag: question_tag("s1"),
+            session_id: "s1".into(),
+            seq: 3,
+        })
+        .unwrap();
+        assert_eq!(json["kind"], "notify");
+        assert_eq!(json["seq"], 3);
     }
 
     #[tokio::test]

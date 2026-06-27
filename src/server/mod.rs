@@ -3632,14 +3632,32 @@ async fn acp_event_listener(state: Arc<AppState>) {
             let session_id = frame.session_id.clone();
             let approval_title = approval.tool_call.name.clone();
             let destructive = approval.destructive;
+            let seq = frame.seq;
             tokio::spawn(async move {
                 acp_ws::trigger_approval_push(
                     &state_for_push,
                     &session_id,
                     &approval_title,
                     destructive,
+                    seq,
                 )
                 .await;
+            });
+        }
+
+        // Clear push: when the approval is handled (on any device), retract
+        // the "needs approval" notification that the request push raised, so
+        // a backgrounded phone or second computer does not keep showing a
+        // stale alert for an already-resolved request. See #2491.
+        if matches!(
+            frame.event.as_ref(),
+            crate::acp::state::Event::ApprovalResolved { .. }
+        ) {
+            let state_for_push = state.clone();
+            let session_id = frame.session_id.clone();
+            let seq = frame.seq;
+            tokio::spawn(async move {
+                acp_ws::trigger_approval_clear_push(&state_for_push, &session_id, seq).await;
             });
         }
 
@@ -3653,8 +3671,23 @@ async fn acp_event_listener(state: Arc<AppState>) {
             let state_for_push = state.clone();
             let session_id = frame.session_id.clone();
             let question = elicitation.message.clone();
+            let seq = frame.seq;
             tokio::spawn(async move {
-                acp_ws::trigger_question_push(&state_for_push, &session_id, &question).await;
+                acp_ws::trigger_question_push(&state_for_push, &session_id, &question, seq).await;
+            });
+        }
+
+        // Clear push for an answered question, mirroring the approval clear
+        // above. See #2491.
+        if matches!(
+            frame.event.as_ref(),
+            crate::acp::state::Event::ElicitationResolved { .. }
+        ) {
+            let state_for_push = state.clone();
+            let session_id = frame.session_id.clone();
+            let seq = frame.seq;
+            tokio::spawn(async move {
+                acp_ws::trigger_question_clear_push(&state_for_push, &session_id, seq).await;
             });
         }
 
