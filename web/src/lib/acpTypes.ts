@@ -396,6 +396,14 @@ export type AcpEvent =
          *  backward compatibility with events persisted before this
          *  field landed. */
         completed_at?: string;
+        /** True when this completion is the synchronous launch of an
+         *  async sub-agent (Claude `Task` with isAsync): the call
+         *  completes immediately while the real work runs off-protocol
+         *  and never reports back on this stream. Renderers draw a
+         *  neutral "runs in background" sub-agent card and drop the
+         *  marker body (it carries an internal agent id). Absent for
+         *  events persisted before this field landed. */
+        async_subagent?: boolean;
       };
     }
   | {
@@ -885,6 +893,10 @@ export interface ActivityRow {
    *  reply to an AskUserQuestion / elicitation form). `text` holds a flat
    *  fallback; the card renders the structured pairs. See #2209. */
   elicitationAnswers?: ElicitationAnswer[];
+  /** True on a `tool_complete` row that is the synchronous launch of an
+   *  async sub-agent (Claude `Task` with isAsync). The runtime routes it
+   *  to a neutral background sub-agent card and drops the marker body. */
+  asyncSubagent?: boolean;
   at: string; // ISO-8601
 }
 
@@ -1162,7 +1174,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     return next;
   }
   if ("ToolCallCompleted" in event) {
-    const { tool_call_id, is_error, content, output, completed_at } = event.ToolCallCompleted;
+    const { tool_call_id, is_error, content, output, completed_at, async_subagent } = event.ToolCallCompleted;
     // The AskUserQuestion tool's completion is owned by its elicitation
     // card; drop it so no transcript tool card materializes. Clear the
     // in-flight pointer if it still points at this suppressed tool.
@@ -1206,6 +1218,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       text,
       toolCallId: tool_call_id,
       output: output && output.length > 0 ? output : undefined,
+      asyncSubagent: async_subagent || undefined,
       at: completed_at ?? new Date().toISOString(),
     });
     return next;

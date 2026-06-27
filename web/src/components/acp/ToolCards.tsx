@@ -1444,17 +1444,41 @@ interface SubagentProps {
   tool: ToolCall;
   result?: ActivityRow;
   children: SubagentChildItem[];
+  /** True for an async sub-agent launch (Claude `Task` with isAsync):
+   *  the launch completed but the work runs off-protocol and never
+   *  reports back, so the card shows a neutral "runs in background"
+   *  state (no spinner, no done check, no child list). */
+  async?: boolean;
 }
 
 /** Card for a Claude sub-agent (Task) and its child tool calls. The
  *  parent Task shows in the header; the body lists the children using
  *  the same ToolCard dispatch as top-level calls (with `nested=true`
  *  so the indented "↳ subagent" wrap doesn't double up). See #1041. */
-export function SubagentCard({ tool, result, children }: SubagentProps) {
+export function SubagentCard({ tool, result, children, async }: SubagentProps) {
   const [open, setOpen] = useState(false);
 
   const args = useMemo(() => parseJsonObject(tool.args_preview), [tool.args_preview]);
   const description = pickStr(args, "description", "_aoe_title") ?? tool.name ?? "Subagent task";
+
+  // Async sub-agent launch: the work runs off-protocol and never reports
+  // back on this stream. Render a neutral "runs in background" card (no
+  // spinner, no done check, no child list, no duration) and never show
+  // the parent result body, which carries the SDK launch marker plus an
+  // internal agent id the SDK tells us not to surface.
+  if (async) {
+    return (
+      <CardChrome
+        status="ok"
+        neutralOnDone
+        icon={<Sparkles className="h-3.5 w-3.5" />}
+        label="subagent"
+        primary={<span className="truncate">{description}</span>}
+        meta={<span className="text-[11px] text-text-dim">runs in background</span>}
+        expanded={false}
+      />
+    );
+  }
 
   const runningChildren = children.filter((c) => !c.result).length;
   const parentDone = result !== undefined;

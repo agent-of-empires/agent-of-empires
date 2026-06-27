@@ -930,6 +930,10 @@ function AssistantTodoGroup({ argsText }: { argsText?: string }) {
 interface SubagentPayload {
   parent: GroupChild;
   children: GroupChild[];
+  /** True for an async sub-agent launch: the `Task` completed at launch
+   *  and the work runs off-protocol, so there are no children and the
+   *  card renders a neutral "runs in background" state. */
+  async?: boolean;
 }
 
 /** Reconstructs the parent Task tool plus its sub-agent children from
@@ -985,7 +989,7 @@ function AssistantSubagentTask({ argsText }: { argsText?: string }) {
 
   const parent = reconstruct(payload.parent);
   const children = payload.children.map(reconstruct);
-  return <SubagentCard tool={parent.tool} result={parent.result} children={children} />;
+  return <SubagentCard tool={parent.tool} result={parent.result} children={children} async={payload.async} />;
 }
 
 function prettifyToolName(kind: string, args?: Record<string, unknown>): string {

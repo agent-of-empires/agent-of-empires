@@ -425,6 +425,7 @@ export function activityToThreadMessages(
         row.kind === "tool_stopped",
         row.text,
         row.at,
+        row.asyncSubagent ?? false,
       );
     } else if (row.kind === "thinking") {
       // Thinking is rendered by the global rattle spinner, not the
@@ -479,7 +480,7 @@ type DraftPart =
       toolCallId: string;
       toolName: string;
       argsText: string;
-      result?: { content: string; endedAt?: string; stopped?: boolean };
+      result?: { content: string; endedAt?: string; stopped?: boolean; async?: boolean };
       isError?: boolean;
     };
 
@@ -545,13 +546,21 @@ class AssistantBuilder {
     });
   }
 
-  completeToolCall(toolCallId: string, isError: boolean, stopped: boolean, resultText: string, endedAt: string) {
+  completeToolCall(
+    toolCallId: string,
+    isError: boolean,
+    stopped: boolean,
+    resultText: string,
+    endedAt: string,
+    async: boolean,
+  ) {
     for (const part of this.parts) {
       if (part.type === "tool-call" && part.toolCallId === toolCallId) {
         part.result = {
           content: resultText,
           endedAt,
           stopped: stopped || undefined,
+          async: async || undefined,
         };
         part.isError = isError || undefined;
         return;
@@ -623,7 +632,18 @@ function collapseSubagents(parts: DraftPart[]): DraftPart[] {
     const parentId = parentIdFromArgsText(p.argsText);
     if (parentId) childToParent.set(i, parentId);
   }
-  if (childToParent.size === 0) return parts;
+  // Async sub-agent launches (Claude `Task` with isAsync) complete
+  // immediately and emit NO inline children: the real work runs
+  // off-protocol and never reports back on this stream. They carry
+  // `result.async` (forwarded from the backend `async_subagent` flag).
+  // Render them as a childless sub-agent card so they don't fall
+  // through to a generic tool card that leaks the launch marker body.
+  const asyncParents = new Set<number>();
+  for (let i = 0; i < parts.length; i++) {
+    const p = parts[i];
+    if (p && p.type === "tool-call" && p.result?.async) asyncParents.add(i);
+  }
+  if (childToParent.size === 0 && asyncParents.size === 0) return parts;
 
   // Map each parentId to its part index (only when the parent is in
   // this same message; orphans skip the collapse).
@@ -646,14 +666,35 @@ function collapseSubagents(parts: DraftPart[]): DraftPart[] {
     childrenByParent.set(parentId, arr);
     childIndicesToDrop.add(idx);
   }
-  if (childrenByParent.size === 0) return parts;
+  if (childrenByParent.size === 0 && asyncParents.size === 0) return parts;
 
   const out: DraftPart[] = [];
   for (let i = 0; i < parts.length; i++) {
     if (childIndicesToDrop.has(i)) continue;
     const p = parts[i];
     if (!p) continue;
-    if (p.type === "tool-call" && parentIndex.has(p.toolCallId)) {
+    // Async sub-agent: a childless `Task` launch. Emit the synthetic
+    // subagent part with no children and async:true so SubagentCard
+    // renders a neutral "runs in background" card. Checked before the
+    // children branch since an async launch never has inline children.
+    if (p.type === "tool-call" && asyncParents.has(i)) {
+      out.push({
+        type: "tool-call",
+        toolCallId: `subagent-${p.toolCallId}`,
+        toolName: SUBAGENT_TASK_NAME,
+        argsText: JSON.stringify({
+          parent: {
+            toolCallId: p.toolCallId,
+            toolName: p.toolName,
+            argsText: p.argsText,
+            result: p.result,
+            isError: p.isError,
+          },
+          children: [],
+          async: true,
+        }),
+      });
+    } else if (p.type === "tool-call" && parentIndex.has(p.toolCallId)) {
       const childParts = childrenByParent.get(p.toolCallId) ?? [];
       const children = childParts
         .map((c) =>

@@ -509,6 +509,39 @@ describe("SubagentCard", () => {
     fireEvent.click(getByRole("button"));
     expect(container.textContent).toContain("No tool calls recorded yet.");
   });
+
+  it("renders an async launch as a neutral background card and hides the marker body", () => {
+    const tool = toolWith({
+      id: "task-async",
+      name: "Map backend lifecycle",
+      kind: "think",
+      args_preview: JSON.stringify({ description: "Map backend lifecycle" }),
+    });
+    const { container, queryByRole } = render(
+      <SubagentCard
+        tool={tool}
+        result={completeRow({
+          id: "done-task-async",
+          toolCallId: "task-async",
+          text: "Async agent launched successfully\nagentId: ae6f0567246843e25 (internal ID)",
+        })}
+        children={[]}
+        async
+      />,
+    );
+    expect(container.textContent).toContain("subagent");
+    expect(container.textContent).toContain("Map backend lifecycle");
+    expect(container.textContent).toContain("runs in background");
+    // The internal agent id and the SDK marker must never reach the user.
+    expect(container.textContent).not.toContain("agentId");
+    expect(container.textContent).not.toContain("Async agent launched");
+    expect(container.textContent).not.toContain("internal ID");
+    // Neutral: no done badge, no spinner, no expand toggle, no child list.
+    expect(container.textContent).not.toContain("done");
+    expect(container.textContent).not.toContain("running");
+    expect(container.textContent).not.toContain("No tool calls recorded yet.");
+    expect(queryByRole("button")).toBeNull();
+  });
 });
 
 function renderClaude(node: ReactNode) {

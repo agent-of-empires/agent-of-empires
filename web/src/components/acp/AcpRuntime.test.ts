@@ -405,6 +405,56 @@ describe("activityToThreadMessages; tool-call grouping (#1057)", () => {
     expect(directChild).toBeUndefined();
   });
 
+  it("collapses a childless async Task launch into an async _aoe_subagent_task part", () => {
+    // The async sub-agent model emits the Task with zero inline children
+    // and a completion carrying async_subagent (forwarded to the
+    // tool_complete row as asyncSubagent). It must still render as a
+    // subagent card, not fall through to a generic tool card that leaks
+    // the launch marker body.
+    const parent: ToolCall = {
+      id: "task-async",
+      name: "Map backend lifecycle",
+      kind: "think",
+      args_preview: JSON.stringify({
+        description: "Map backend lifecycle",
+        _aoe_title: "Map backend lifecycle",
+      }),
+      started_at: "2026-05-12T00:00:00Z",
+    };
+    const parentRow: ActivityRow = {
+      id: "start-task-async",
+      kind: "tool_start",
+      text: "Task",
+      toolCallId: "task-async",
+      tool: parent,
+      at: "2026-05-12T00:00:00Z",
+    };
+    const doneRow: ActivityRow = {
+      id: "done-task-async",
+      kind: "tool_complete",
+      text: "Async agent launched successfully\nagentId: secret (internal ID)",
+      toolCallId: "task-async",
+      asyncSubagent: true,
+      at: "2026-05-12T00:00:01Z",
+    };
+    const messages = activityToThreadMessages([userRow("go"), parentRow, doneRow], false);
+    const assistant = messages.find((m) => m.role === "assistant")!;
+    const parts = assistant.content as Array<{
+      type: string;
+      toolName?: string;
+      argsText?: string;
+    }>;
+    const subagentParts = parts.filter((p) => p.type === "tool-call" && p.toolName === SUBAGENT_TASK_NAME);
+    expect(subagentParts).toHaveLength(1);
+    const payload = JSON.parse(subagentParts[0]!.argsText!);
+    expect(payload.async).toBe(true);
+    expect(payload.children).toHaveLength(0);
+    expect(payload.parent.toolCallId).toBe("task-async");
+    // No generic tool-call part should survive for the async Task.
+    const directTask = parts.find((p) => p.type === "tool-call" && p.toolName !== SUBAGENT_TASK_NAME);
+    expect(directTask).toBeUndefined();
+  });
+
   it("leaves orphan children in place when their parent is absent", () => {
     const orphanChild: ToolCall = {
       id: "ch-1",
