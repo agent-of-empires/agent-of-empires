@@ -49,7 +49,7 @@ import { useAcpPrefs } from "../../lib/acpPrefs";
 import { AgentProfileProvider, useAgentProfile } from "../../lib/agentProfileContext";
 import { isClearAlias } from "../../lib/agentProfiles";
 import { AttentionChime } from "./AttentionChime";
-import { useRespawnSession } from "../../hooks/useRespawnSession";
+import { useRespawnSession, type RespawnState } from "../../hooks/useRespawnSession";
 import { useIsCoarsePointer } from "../../hooks/useIsCoarsePointer";
 import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
 import { dispatchFocusTerminal } from "../../lib/terminalFocus";
@@ -262,6 +262,11 @@ function AcpChrome({
       id: `rate-limit-recovery-${Date.now()}`,
       text,
     });
+  const {
+    state: rateLimitResumeState,
+    error: rateLimitResumeError,
+    respawn: resumeRateLimitedSession,
+  } = useRespawnSession(sessionId);
 
   // Re-pin the chat viewport to the bottom when the composer (or any
   // sibling below it: queued strip, primer banner) grows. assistant-ui's
@@ -436,6 +441,9 @@ function AcpChrome({
               maxRetries={maxRetries}
               manualReconnect={manualReconnect}
               onSwitchAgent={onSwitchAgent}
+              onResumeRateLimit={() => void resumeRateLimitedSession()}
+              rateLimitResumeState={rateLimitResumeState}
+              rateLimitResumeError={rateLimitResumeError}
             />
           ) : null
         }
@@ -1368,6 +1376,9 @@ export function SystemNotices({
   maxRetries,
   manualReconnect,
   onSwitchAgent,
+  onResumeRateLimit,
+  rateLimitResumeState = "idle",
+  rateLimitResumeError = null,
 }: {
   status: AcpContext["status"];
   lagged: boolean;
@@ -1379,6 +1390,9 @@ export function SystemNotices({
   maxRetries: number;
   manualReconnect: () => void;
   onSwitchAgent?: () => void;
+  onResumeRateLimit?: () => void;
+  rateLimitResumeState?: RespawnState;
+  rateLimitResumeError?: string | null;
 }) {
   const messages: { kind: string; text: string }[] = [];
   // Retry envelope exhausted: the auto-reconnect chain stopped after
@@ -1428,6 +1442,7 @@ export function SystemNotices({
       text: `Rate-limited (${rateLimit.kind}); resets at ${reset}.`,
     });
   }
+  const resumePending = rateLimitResumeState === "retrying" || rateLimitResumeState === "ok";
   if (messages.length === 0 && !retriesExhausted) return null;
   return (
     <div className="border-b border-surface-800 px-4 py-2 space-y-1">
@@ -1436,16 +1451,38 @@ export function SystemNotices({
           {m.text}
         </div>
       ))}
-      {rateLimit && onSwitchAgent && (
-        <div className="flex items-center justify-end pt-1">
-          <button
-            type="button"
-            onClick={onSwitchAgent}
-            className="shrink-0 rounded-md border border-brand-700 bg-brand-900/40 px-2 py-1 text-[10px] font-mono uppercase tracking-wide text-brand-100 hover:bg-brand-900/60"
-          >
-            Continue in another agent
-          </button>
+      {rateLimit && (onResumeRateLimit || onSwitchAgent) && (
+        <div className="flex flex-wrap items-center justify-end gap-2 pt-1">
+          {onResumeRateLimit && (
+            <button
+              type="button"
+              onClick={onResumeRateLimit}
+              disabled={resumePending}
+              className="shrink-0 rounded-md border border-brand-700 bg-brand-900/40 px-2 py-1 text-[10px] font-mono uppercase tracking-wide text-brand-100 hover:bg-brand-900/60 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {rateLimitResumeState === "retrying"
+                ? "Resuming…"
+                : rateLimitResumeState === "ok"
+                  ? "Resume requested"
+                  : "Resume now"}
+            </button>
+          )}
+          {onSwitchAgent && (
+            <button
+              type="button"
+              onClick={onSwitchAgent}
+              className="shrink-0 rounded-md border border-brand-700 bg-brand-900/40 px-2 py-1 text-[10px] font-mono uppercase tracking-wide text-brand-100 hover:bg-brand-900/60"
+            >
+              Continue in another agent
+            </button>
+          )}
         </div>
+      )}
+      {rateLimit && rateLimitResumeState === "ok" && (
+        <div className="pt-1 text-xs text-text-muted">Resume requested. New events should start streaming shortly.</div>
+      )}
+      {rateLimit && rateLimitResumeState === "failed" && rateLimitResumeError && (
+        <div className="pt-1 text-xs text-brand-400">Resume failed: {rateLimitResumeError}</div>
       )}
       {retriesExhausted && (
         <div className="flex items-center justify-between gap-3 text-xs text-brand-400">

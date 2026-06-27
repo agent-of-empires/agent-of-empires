@@ -10,6 +10,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::acp::approvals::Nonce;
@@ -20,7 +21,7 @@ use crate::acp::protocol::{
     FilesResponse, PromptAttachmentUpload, PromptRequest, ReplayQuery, ReplayResponse,
     ResolveApprovalRequest, SwitchAgentRequest, SwitchAgentResponse,
 };
-use crate::acp::state::PromptAttachmentKind;
+use crate::acp::state::{Event, PromptAttachmentKind, RateLimitInfo};
 use crate::acp::supervisor::SupervisorError;
 use crate::server::AppState;
 
@@ -201,6 +202,21 @@ fn validate_attachments(
     Ok(blobs)
 }
 
+fn rate_limit_resume_marker_resets_at(
+    latest_status: Option<&Event>,
+    latest_rate_limit: Option<&RateLimitInfo>,
+    fallback_resets_at: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    match latest_status {
+        Some(Event::Stopped { reason }) if reason == "rate_limited" => Some(
+            latest_rate_limit
+                .map(|info| info.resets_at.clone())
+                .unwrap_or(fallback_resets_at),
+        ),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SpawnAcpRequest {
     /// Optional override; falls back to the acp_default_agent
@@ -321,7 +337,29 @@ pub async fn spawn_acp(
     // profile for non-sandbox sessions too.
     let source_profile = Some(instance.source_profile.clone());
     let agent_for_response = agent.clone();
-    match state
+
+    let rate_limit_resume_resets_at = {
+        let store = Arc::clone(&state.acp_event_store);
+        let id_for_probe = id.clone();
+        tokio::task::spawn_blocking(move || {
+            let latest_status = store.latest_status_event(&id_for_probe);
+            let latest_rate_limit = store
+                .latest_rate_limit_event(&id_for_probe)
+                .map(|(info, _created_at)| info);
+            rate_limit_resume_marker_resets_at(
+                latest_status.as_ref(),
+                latest_rate_limit.as_ref(),
+                Utc::now(),
+            )
+        })
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(target: "http.api.acp", session = %id, "rate-limit resume probe failed: {e}");
+            None
+        })
+    };
+
+    let spawn_result = state
         .acp_supervisor
         .spawn(crate::acp::supervisor::SpawnRequest {
             session_id: id.clone(),
@@ -341,14 +379,35 @@ pub async fn spawn_acp(
             ),
             seed_history_replay,
         })
-        .await
-    {
-        Ok(()) => Json(SpawnAcpResponse {
-            session_id: id,
-            agent: agent_for_response,
-            status: "running",
-        })
-        .into_response(),
+        .await;
+
+    match spawn_result {
+        Ok(()) => {
+            if let Some(resets_at) = rate_limit_resume_resets_at {
+                state
+                    .acp_supervisor
+                    .publish_rate_limit_auto_resumed(&id, resets_at);
+            }
+            Json(SpawnAcpResponse {
+                session_id: id,
+                agent: agent_for_response,
+                status: "running",
+            })
+            .into_response()
+        }
+        Err(SupervisorError::AlreadyRunning(_)) if rate_limit_resume_resets_at.is_some() => {
+            if let Some(resets_at) = rate_limit_resume_resets_at {
+                state
+                    .acp_supervisor
+                    .publish_rate_limit_auto_resumed(&id, resets_at);
+            }
+            Json(SpawnAcpResponse {
+                session_id: id,
+                agent: agent_for_response,
+                status: "running",
+            })
+            .into_response()
+        }
         Err(SupervisorError::AlreadyRunning(_)) => (
             StatusCode::CONFLICT,
             "structured view already running for session",
@@ -2196,6 +2255,12 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    fn utc_ts(raw: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(raw)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
     #[test]
     fn mime_allowlist_gates_by_kind() {
         assert!(mime_allowed(PromptAttachmentKind::Image, "image/png"));
@@ -2225,6 +2290,55 @@ mod tests {
         assert!(!is_plan_mode_value("yolo"));
         assert!(!is_plan_mode_value("Plan"));
         assert!(!is_plan_mode_value(""));
+    }
+
+    #[test]
+    fn rate_limit_resume_marker_requires_latest_rate_limit_park() {
+        let fallback = utc_ts("2099-01-01T00:00:00Z");
+        assert_eq!(
+            rate_limit_resume_marker_resets_at(None, None, fallback),
+            None
+        );
+
+        let stopped = Event::Stopped {
+            reason: "user_stopped".to_string(),
+        };
+        assert_eq!(
+            rate_limit_resume_marker_resets_at(Some(&stopped), None, fallback),
+            None
+        );
+    }
+
+    #[test]
+    fn rate_limit_resume_marker_uses_latest_rate_limit_reset() {
+        let stopped = Event::Stopped {
+            reason: "rate_limited".to_string(),
+        };
+        let resets_at = utc_ts("2099-02-03T04:05:06Z");
+        let fallback = utc_ts("2099-01-01T00:00:00Z");
+        let info = RateLimitInfo {
+            status: "limited".to_string(),
+            resets_at: resets_at.clone(),
+            kind: "rate_limit".to_string(),
+        };
+
+        assert_eq!(
+            rate_limit_resume_marker_resets_at(Some(&stopped), Some(&info), fallback),
+            Some(resets_at)
+        );
+    }
+
+    #[test]
+    fn rate_limit_resume_marker_falls_back_when_rate_limit_event_missing() {
+        let stopped = Event::Stopped {
+            reason: "rate_limited".to_string(),
+        };
+        let fallback = utc_ts("2099-01-01T00:00:00Z");
+
+        assert_eq!(
+            rate_limit_resume_marker_resets_at(Some(&stopped), None, fallback.clone()),
+            Some(fallback)
+        );
     }
 
     #[test]
