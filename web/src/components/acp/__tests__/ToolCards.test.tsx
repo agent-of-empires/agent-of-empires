@@ -554,6 +554,7 @@ describe("SubagentCard", () => {
       startedAt: new Date().toISOString(),
       endedAt: null,
       toolCount: 3,
+      tools: [],
       lastTool: "Read",
       lastText: "scanning files",
       result: null,

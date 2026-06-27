@@ -489,6 +489,7 @@ export type AcpEvent =
         agent_id: string;
         status: BackgroundAgentStatus;
         tool_count: number;
+        tools?: BackgroundAgentTool[];
         last_tool?: string | null;
         last_text?: string | null;
         at: string;
@@ -498,6 +499,7 @@ export type AcpEvent =
       BackgroundAgentCompleted: {
         agent_id: string;
         status: BackgroundAgentStatus;
+        tools?: BackgroundAgentTool[];
         result?: string | null;
         warning?: string | null;
         ended_at: string;
@@ -861,6 +863,16 @@ export interface AcpState {
  *  `BackgroundAgentStatus`. `completed` is the only clean-finish state. */
 export type BackgroundAgentStatus = "running" | "stalled" | "completed" | "detached" | "error";
 
+/** One tool call a background sub-agent made, for the per-agent tool list.
+ *  Mirrors the Rust `BackgroundAgentTool`. */
+export interface BackgroundAgentTool {
+  name: string;
+  /** Short label from the tool input (command / file path / pattern). */
+  title?: string | null;
+  /** Outcome: undefined while running, true succeeded, false errored. */
+  ok?: boolean | null;
+}
+
 /** One async background sub-agent, built up from `BackgroundAgent*`
  *  events. Mirrors the Rust `BackgroundAgentRecord`. */
 export interface BackgroundAgent {
@@ -877,6 +889,8 @@ export interface BackgroundAgent {
   /** ISO-8601 terminal time, set on completion/stall/error. */
   endedAt: string | null;
   toolCount: number;
+  /** Individual tool calls in order, like the main output. */
+  tools: BackgroundAgentTool[];
   lastTool: string | null;
   lastText: string | null;
   result: string | null;
@@ -1962,6 +1976,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       startedAt: e.started_at,
       endedAt: null,
       toolCount: 0,
+      tools: [],
       lastTool: null,
       lastText: null,
       result: null,
@@ -1983,6 +1998,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
         ...a,
         status: e.status,
         toolCount: e.tool_count,
+        tools: e.tools && e.tools.length > 0 ? e.tools : a.tools,
         lastTool: e.last_tool ?? a.lastTool,
         lastText: e.last_text ?? a.lastText,
       };
@@ -1997,6 +2013,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
             ...a,
             status: e.status,
             endedAt: e.ended_at,
+            tools: e.tools && e.tools.length > 0 ? e.tools : a.tools,
             result: e.result ?? a.result,
             warning: e.warning ?? a.warning,
           }

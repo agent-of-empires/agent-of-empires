@@ -9,10 +9,10 @@
 // backend tailer that produces the events.
 
 import { useEffect, useState } from "react";
-import { Bot, ChevronDown } from "lucide-react";
+import { Bot, ChevronDown, Square } from "lucide-react";
 
 import { useBackgroundAgents } from "../../hooks/useAcpSession";
-import type { BackgroundAgent, BackgroundAgentStatus } from "../../lib/acpTypes";
+import type { BackgroundAgent, BackgroundAgentStatus, BackgroundAgentTool } from "../../lib/acpTypes";
 
 export function BackgroundAgentsPanel({ sessionId }: { sessionId: string | null }) {
   const agents = useBackgroundAgents(sessionId);
@@ -33,11 +33,13 @@ export function BackgroundAgentsPanel({ sessionId }: { sessionId: string | null 
     if (ra !== rb) return ra - rb;
     return b.startedAt.localeCompare(a.startedAt);
   });
+  const anyActive = agents.some((a) => isActive(a.status));
 
   return (
     <div className="flex h-full flex-col overflow-y-auto">
-      <div className="border-b border-surface-700 px-3 py-1.5 text-[11px] uppercase tracking-wider text-text-dim">
-        Sub agents · {agents.length}
+      <div className="flex items-center gap-2 border-b border-surface-700 px-3 py-1.5">
+        <span className="flex-1 text-[11px] uppercase tracking-wider text-text-dim">Sub agents · {agents.length}</span>
+        {anyActive && sessionId && <StopButton sessionId={sessionId} />}
       </div>
       <div className="flex flex-col">
         {sorted.map((a) => (
@@ -50,6 +52,40 @@ export function BackgroundAgentsPanel({ sessionId }: { sessionId: string | null 
 
 function isActive(status: BackgroundAgentStatus): boolean {
   return status === "running" || status === "stalled";
+}
+
+/** Interrupt the session, which stops the SDK's in-flight async sub-agents.
+ *  ACP has no per-agent cancel, so this is the same `/acp/cancel` the
+ *  composer Stop uses, reachable here because the panel sits in a sibling
+ *  dock with no composer turn of its own. */
+function StopButton({ sessionId }: { sessionId: string }) {
+  const [busy, setBusy] = useState(false);
+  return (
+    <button
+      type="button"
+      disabled={busy}
+      title="Interrupt the session and stop running sub-agents"
+      onClick={async () => {
+        setBusy(true);
+        try {
+          await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/acp/cancel`, { method: "POST" });
+        } catch {
+          // best-effort; the tailer marks idle agents stalled regardless
+        } finally {
+          setBusy(false);
+        }
+      }}
+      className={[
+        "inline-flex items-center gap-1 rounded-md border border-surface-600 bg-surface-800 px-2 py-0.5",
+        "text-[11px] text-text-secondary transition-colors",
+        "hover:border-rose-700/60 hover:bg-rose-950/30 hover:text-rose-300",
+        busy ? "opacity-50" : "",
+      ].join(" ")}
+    >
+      <Square className="h-3 w-3 fill-current" strokeWidth={0} />
+      Stop
+    </button>
+  );
 }
 
 function AgentRow({ agent }: { agent: BackgroundAgent }) {
@@ -77,13 +113,38 @@ function AgentRow({ agent }: { agent: BackgroundAgent }) {
         <div className="space-y-2 border-t border-surface-800 bg-surface-900/30 px-3 py-2 pl-9 text-[11px]">
           {agent.warning && <Field label="warning" value={agent.warning} tone="warn" />}
           <Field label="model" value={agent.model || "unknown"} mono />
-          {agent.lastTool && <Field label="last tool" value={agent.lastTool} mono />}
+          {agent.tools.length > 0 && <ToolList tools={agent.tools} />}
           <Field label="prompt" value={agent.prompt || "(none)"} />
           {agent.result && <Field label="result" value={agent.result} />}
         </div>
       )}
     </div>
   );
+}
+
+/** The sub-agent's individual tool calls, like the main output: one row
+ *  per read / bash / grep with its target and outcome. */
+function ToolList({ tools }: { tools: BackgroundAgentTool[] }) {
+  return (
+    <div className="flex flex-col gap-0.5">
+      <span className="text-[10px] uppercase tracking-wider text-text-dim">tools · {tools.length}</span>
+      <div className="flex flex-col gap-0.5">
+        {tools.map((t, i) => (
+          <div key={i} className="flex items-center gap-1.5">
+            <ToolDot ok={t.ok} />
+            <span className="shrink-0 font-mono text-text-secondary">{t.name}</span>
+            {t.title && <span className="min-w-0 truncate font-mono text-text-dim">{t.title}</span>}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ToolDot({ ok }: { ok?: boolean | null }) {
+  const cls =
+    ok === undefined || ok === null ? "bg-brand-400 animate-pulse" : ok ? "bg-status-running" : "bg-status-error";
+  return <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${cls}`} />;
 }
 
 function Field({ label, value, mono, tone }: { label: string; value: string; mono?: boolean; tone?: "warn" }) {

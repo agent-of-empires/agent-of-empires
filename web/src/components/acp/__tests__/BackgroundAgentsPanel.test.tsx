@@ -24,6 +24,7 @@ function agent(over: Partial<BackgroundAgent> = {}): BackgroundAgent {
     startedAt: new Date(Date.now() - 5000).toISOString(),
     endedAt: null,
     toolCount: 3,
+    tools: [],
     lastTool: "Read",
     lastText: "scanning files",
     result: null,
@@ -77,5 +78,45 @@ describe("BackgroundAgentsPanel", () => {
     const doneIdx = container.textContent!.indexOf("Done one");
     expect(runIdx).toBeGreaterThanOrEqual(0);
     expect(runIdx).toBeLessThan(doneIdx);
+  });
+
+  it("lists the sub-agent's individual tool calls when expanded", () => {
+    // Use a finished agent so the only button is the row toggle (no Stop).
+    agentsMock.mockReturnValue([
+      agent({
+        status: "completed",
+        endedAt: new Date().toISOString(),
+        tools: [
+          { name: "Bash", title: "ls -la", ok: true },
+          { name: "Read", title: "src/main.rs", ok: false },
+          { name: "Grep", title: "tmux", ok: undefined },
+        ],
+      }),
+    ]);
+    const { container, getByRole } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+    fireEvent.click(getByRole("button"));
+    expect(container.textContent).toContain("tools · 3");
+    expect(container.textContent).toContain("Bash");
+    expect(container.textContent).toContain("ls -la");
+    expect(container.textContent).toContain("Read");
+    expect(container.textContent).toContain("src/main.rs");
+    expect(container.textContent).toContain("Grep");
+  });
+
+  it("shows a Stop button for active agents that POSTs the session cancel", async () => {
+    const fetchMock = vi.fn(() => Promise.resolve({ ok: true } as Response));
+    vi.stubGlobal("fetch", fetchMock);
+    agentsMock.mockReturnValue([agent({ status: "running" })]);
+    const { getByRole } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+    const stop = getByRole("button", { name: /stop/i });
+    fireEvent.click(stop);
+    expect(fetchMock).toHaveBeenCalledWith("/api/sessions/s-1/acp/cancel", { method: "POST" });
+    vi.unstubAllGlobals();
+  });
+
+  it("hides the Stop button when no agent is active", () => {
+    agentsMock.mockReturnValue([agent({ status: "completed", endedAt: new Date().toISOString() })]);
+    const { queryByRole } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+    expect(queryByRole("button", { name: /stop/i })).toBeNull();
   });
 });
