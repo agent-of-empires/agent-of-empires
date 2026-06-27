@@ -138,3 +138,154 @@ export function toneTextClass(tone: PluginUiTone | undefined): string {
       .find((c) => c.startsWith("text-")) ?? "text-text-dim"
   );
 }
+
+// --- sort-key / filter-facet support (#2401) ---------------------------------
+// `sort-key` and `filter-facet` are global entries that reference a per-session
+// `row-column` entry by its `id` (the payload `column` field). The dashboard
+// orders/filters session rows client-side over the already-fetched scalars; no
+// plugin code runs and the render path never awaits a worker. Lookups are
+// scoped to the referencing plugin's own `plugin_id`, since a `column` id is
+// only unique within one plugin.
+
+/** A comparable scalar a `row-column` exposes for client-side sorting, matching
+ *  the host's untagged `SortValue` (number | string). */
+export type PluginSortValue = number | string;
+
+/** A `row-column`'s `sort_value`, validated to a finite number or a string;
+ *  undefined when absent or not a comparable scalar. */
+export function entrySortValue(entry: PluginUiEntry): PluginSortValue | undefined {
+  const v = entry.payload.sort_value;
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  if (typeof v === "string") return v;
+  return undefined;
+}
+
+/** A `row-column`'s `filter_values`, as the string tokens it matches. */
+export function entryFilterValues(entry: PluginUiEntry): string[] {
+  const v = entry.payload.filter_values;
+  return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
+}
+
+/** Compare two scalar sort values for a direction. Missing values (undefined)
+ *  always sort to the bottom regardless of direction, so an unvalued row sinks.
+ *  Numbers compare numerically, strings via `localeCompare`; when the two are
+ *  mixed a number sorts before a string, so the order stays deterministic.
+ *  Returns a negative number when `a` should rank before `b`. */
+export function compareSortValues(
+  a: PluginSortValue | undefined,
+  b: PluginSortValue | undefined,
+  direction: "asc" | "desc",
+): number {
+  if (a === undefined && b === undefined) return 0;
+  if (a === undefined) return 1;
+  if (b === undefined) return -1;
+  let cmp: number;
+  if (typeof a === "number" && typeof b === "number") cmp = a < b ? -1 : a > b ? 1 : 0;
+  else if (typeof a === "string" && typeof b === "string") cmp = a.localeCompare(b);
+  else cmp = typeof a === "number" ? -1 : 1;
+  return direction === "desc" ? -cmp : cmp;
+}
+
+/** A renderable plugin sort option, resolved from a global `sort-key` entry. */
+export interface PluginSortSpec {
+  pluginId: string;
+  entryId: string;
+  label: string;
+  /** The `row-column` id whose `sort_value` this orders by. */
+  column: string;
+  direction: "asc" | "desc";
+}
+
+/** Global `sort-key` entries as renderable sort options, in snapshot order.
+ *  Entries missing a label or column are skipped; an omitted direction defaults
+ *  to ascending. */
+export function pluginSortSpecs(entries: PluginUiEntry[]): PluginSortSpec[] {
+  const out: PluginSortSpec[] = [];
+  for (const e of entries) {
+    if (e.slot !== "sort-key" || e.session_id != null) continue;
+    const label = payloadStr(e, "label");
+    const column = payloadStr(e, "column");
+    if (!label || !column) continue;
+    out.push({
+      pluginId: e.plugin_id,
+      entryId: e.id,
+      label,
+      column,
+      direction: e.payload.direction === "desc" ? "desc" : "asc",
+    });
+  }
+  return out;
+}
+
+/** A renderable facet control, resolved from a global `filter-facet` entry. */
+export interface PluginFacetSpec {
+  pluginId: string;
+  entryId: string;
+  label: string;
+  /** The `row-column` id whose `filter_values` this filters over. */
+  column: string;
+  options: { value: string; label: string; tone: PluginUiTone | undefined }[];
+}
+
+/** Global `filter-facet` entries as renderable facet controls, in snapshot
+ *  order. Entries missing a label or column, and options missing a value, are
+ *  skipped. */
+export function pluginFacetSpecs(entries: PluginUiEntry[]): PluginFacetSpec[] {
+  const out: PluginFacetSpec[] = [];
+  for (const e of entries) {
+    if (e.slot !== "filter-facet" || e.session_id != null) continue;
+    const label = payloadStr(e, "label");
+    const column = payloadStr(e, "column");
+    if (!label || !column) continue;
+    const raw = Array.isArray(e.payload.options) ? e.payload.options : [];
+    const options = raw
+      .filter((o): o is Record<string, unknown> => typeof o === "object" && o !== null && !Array.isArray(o))
+      .map((o) => ({
+        value: typeof o.value === "string" ? o.value : "",
+        label: typeof o.label === "string" && o.label ? o.label : typeof o.value === "string" ? o.value : "",
+        tone: validTone(o.tone),
+      }))
+      .filter((o) => o.value !== "");
+    out.push({ pluginId: e.plugin_id, entryId: e.id, label, column, options });
+  }
+  return out;
+}
+
+/** Map of `session_id` -> `sort_value` for one plugin's `row-column` id, for
+ *  the active sort. Sessions whose entry carries no comparable scalar are
+ *  omitted (they sink to the bottom at compare time). */
+export function buildSortValueMap(
+  entries: PluginUiEntry[],
+  pluginId: string,
+  column: string,
+): Map<string, PluginSortValue> {
+  const map = new Map<string, PluginSortValue>();
+  for (const e of entries) {
+    if (e.slot !== "row-column" || e.plugin_id !== pluginId || e.id !== column || e.session_id == null) continue;
+    const v = entrySortValue(e);
+    if (v !== undefined) map.set(e.session_id, v);
+  }
+  return map;
+}
+
+/** One active facet selection: the referencing plugin/column plus the chosen
+ *  values (OR within this set). */
+export interface ActiveFacet {
+  pluginId: string;
+  column: string;
+  values: Set<string>;
+}
+
+/** Whether a session satisfies every active facet: for each facet the
+ *  session's matching `row-column` entry shares at least one `filter_value`
+ *  with the facet's selected set. AND across facets, OR within one facet. A
+ *  session with no matching row-column for an active facet fails that facet. */
+export function sessionMatchesFacets(entries: PluginUiEntry[], sessionId: string, active: ActiveFacet[]): boolean {
+  return active.every((f) => {
+    const rc = entries.find(
+      (e) => e.slot === "row-column" && e.plugin_id === f.pluginId && e.id === f.column && e.session_id === sessionId,
+    );
+    if (!rc) return false;
+    return entryFilterValues(rc).some((v) => f.values.has(v));
+  });
+}

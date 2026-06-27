@@ -1,5 +1,6 @@
 import type { RepoGroup, SessionResponse, Workspace } from "./types";
 import { safeGetItem, safeSetItem } from "./safeStorage";
+import { compareSortValues, type PluginSortValue } from "./pluginUi";
 
 export type SidebarSortMode = "manual" | "lastActivity" | "attention";
 
@@ -354,4 +355,62 @@ export function repoGroupIsUrgent(workspaces: readonly Workspace[]): boolean {
 /** True when any workspace in the group is favorited. */
 export function repoGroupIsFavorited(workspaces: readonly Workspace[]): boolean {
   return workspaces.some(workspaceIsFavorited);
+}
+
+/** An active plugin sort: the chosen direction plus a `session_id -> sort_value`
+ *  map for the referenced `row-column` column. Built at the component boundary
+ *  from the live snapshot and threaded into the sidebar builders so the pure
+ *  grouping code never reads plugin context directly. See #2401. */
+export interface PluginSortContext {
+  direction: "asc" | "desc";
+  values: Map<string, PluginSortValue>;
+}
+
+/** Best plugin sort value across a workspace's sessions: the value that ranks
+ *  first for the direction (the min for asc, the max for desc), so a
+ *  workspace's strongest row pulls it toward the top, mirroring how the
+ *  attention sort keys on a workspace's most-urgent session. `undefined` when
+ *  no session carries a value, so the workspace sinks. */
+export function workspacePluginSortValue(ws: Workspace, ctx: PluginSortContext): PluginSortValue | undefined {
+  let best: PluginSortValue | undefined;
+  for (const s of ws.sessions) {
+    const v = ctx.values.get(s.id);
+    if (v === undefined) continue;
+    if (best === undefined || compareSortValues(v, best, ctx.direction) < 0) best = v;
+  }
+  return best;
+}
+
+/** Best plugin sort value across a repo group's workspaces, so a group holding
+ *  the top-ranked row floats above one whose best row ranks lower. */
+export function repoGroupPluginSortValue(
+  workspaces: readonly Workspace[],
+  ctx: PluginSortContext,
+): PluginSortValue | undefined {
+  let best: PluginSortValue | undefined;
+  for (const ws of workspaces) {
+    const v = workspacePluginSortValue(ws, ctx);
+    if (v === undefined) continue;
+    if (best === undefined || compareSortValues(v, best, ctx.direction) < 0) best = v;
+  }
+  return best;
+}
+
+/** Plugin-sort comparator. Triage tier wins first (pinned floats, sunk sinks,
+ *  the same invariant as every built-in mode), then the workspace's best plugin
+ *  scalar in the chosen direction (unvalued workspaces sink), then last activity
+ *  descending and an id tie-break so equal keys never flake the render order. */
+export function compareWorkspacesByPluginSort(ctx: PluginSortContext): (a: Workspace, b: Workspace) => number {
+  return (a, b) => {
+    const aTier = workspaceTriageTier(a);
+    const bTier = workspaceTriageTier(b);
+    if (aTier !== bTier) return aTier - bTier;
+    const cmp = compareSortValues(workspacePluginSortValue(a, ctx), workspacePluginSortValue(b, ctx), ctx.direction);
+    if (cmp !== 0) return cmp;
+    const aMs = workspaceLastActivityMs(a);
+    const bMs = workspaceLastActivityMs(b);
+    if (aMs < bMs) return 1;
+    if (aMs > bMs) return -1;
+    return a.id.localeCompare(b.id);
+  };
 }
