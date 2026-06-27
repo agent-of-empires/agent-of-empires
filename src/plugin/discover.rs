@@ -13,6 +13,7 @@
 use std::time::Duration;
 
 use anyhow::Result;
+use serde::Serialize;
 
 use crate::github::{GitHubClient, GitHubClientConfig, GitHubRepo, DEFAULT_USER_AGENT};
 
@@ -23,7 +24,8 @@ use super::source::PluginSource;
 const PLUGIN_TOPIC: &str = "aoe-plugin";
 
 /// How a discovered repository relates to what the host already knows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum DiscoveryBadge {
     /// This source slug is already installed.
     Installed,
@@ -45,7 +47,7 @@ impl DiscoveryBadge {
 }
 
 /// One discovery result, repo-level and ready to render on any surface.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DiscoveryResult {
     /// `gh:owner/repo`, the slug `aoe plugin install` accepts.
     pub slug: String,
