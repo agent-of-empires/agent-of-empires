@@ -10,7 +10,11 @@
 //! later (for example folding in the executable bit once #2095 launches
 //! workers) without a new value silently colliding with an old pin.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
+use std::sync::{OnceLock, RwLock};
+use std::time::UNIX_EPOCH;
 
 use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
@@ -42,6 +46,96 @@ pub fn tree_hash(dir: &Path) -> Result<String> {
         hasher.update(contents);
     }
     Ok(format_digest(&hasher.finalize()))
+}
+
+/// [`tree_hash`] memoized for the registry load path, where validation re-hashes
+/// every featured-and-installed plugin on each rebuild. The result is keyed by
+/// plugin dir and guarded by a cheap `(path, len, mtime)` signature: a hit
+/// returns the previously computed hash only when the on-disk tree is unchanged,
+/// otherwise it falls back to a full re-hash.
+///
+/// This is an in-memory optimization, not a root of trust. The cache lives only
+/// for the process, is never persisted, and is never read by anything but this
+/// function; the value it returns is always either a fresh `tree_hash` or the
+/// exact hash a fresh `tree_hash` produced for the same tree. A signature is
+/// content-independent and therefore forgeable (mtime can be reset), which is
+/// why a persisted cache could not gate the verified decision; keeping it
+/// in-process sidesteps that, since an attacker who can write the tree and forge
+/// mtimes mid-process could equally just install a vetted tree.
+//
+// ponytail: in-process memo only. A persistent cross-launch cache would need a
+// tamper-evident key the content-integrity decision cannot safely trust, so it
+// is deliberately not built; revisit only if a benchmark on a large featured set
+// shows the per-load re-hash actually hurts.
+pub fn cached_tree_hash(dir: &Path) -> Result<String> {
+    let Some(sig) = tree_signature(dir) else {
+        return tree_hash(dir);
+    };
+    let key = dir.to_path_buf();
+    if let Some((cached_sig, hash)) = cache().read().ok().and_then(|c| c.get(&key).cloned()) {
+        if cached_sig == sig {
+            return Ok(hash);
+        }
+    }
+    let hash = tree_hash(dir)?;
+    if let Ok(mut c) = cache().write() {
+        c.insert(key, (sig, hash.clone()));
+    }
+    Ok(hash)
+}
+
+fn cache() -> &'static RwLock<HashMap<PathBuf, (u64, String)>> {
+    static CACHE: OnceLock<RwLock<HashMap<PathBuf, (u64, String)>>> = OnceLock::new();
+    CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// A cheap, content-independent signature of `dir`: every file's relative path,
+/// length, and mtime folded together. Returns `None` on any IO error, a
+/// symlink, or a non-UTF-8 path so the caller re-hashes directly (those are the
+/// cases [`tree_hash`] treats as hard errors anyway).
+fn tree_signature(dir: &Path) -> Option<u64> {
+    let mut files: Vec<(String, u64, u128)> = Vec::new();
+    sig_collect(dir, dir, &mut files).ok()?;
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for (rel, len, mtime) in &files {
+        rel.hash(&mut hasher);
+        len.hash(&mut hasher);
+        mtime.hash(&mut hasher);
+    }
+    Some(hasher.finish())
+}
+
+fn sig_collect(root: &Path, dir: &Path, out: &mut Vec<(String, u64, u128)>) -> Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_name() == ".git" {
+            continue;
+        }
+        let file_type = entry.file_type()?;
+        let path = entry.path();
+        if file_type.is_symlink() {
+            bail!("symlink in plugin tree; cannot signature, will re-hash");
+        }
+        if file_type.is_dir() {
+            sig_collect(root, &path, out)?;
+        } else {
+            let metadata = entry.metadata()?;
+            let mtime = metadata
+                .modified()?
+                .duration_since(UNIX_EPOCH)
+                .map_err(|e| anyhow!("mtime before unix epoch: {e}"))?
+                .as_nanos();
+            let rel = path
+                .strip_prefix(root)
+                .expect("entry path is under root")
+                .to_str()
+                .ok_or_else(|| anyhow!("non-UTF-8 path in plugin tree: {}", path.display()))?
+                .replace('\\', "/");
+            out.push((rel, metadata.len(), mtime));
+        }
+    }
+    Ok(())
 }
 
 fn collect(root: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) -> Result<()> {
@@ -140,6 +234,30 @@ mod tests {
             tree_hash(with_git.path()).unwrap(),
             tree_hash(without_git.path()).unwrap()
         );
+    }
+
+    #[test]
+    fn cached_matches_tree_hash_and_refreshes() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "f.txt", b"one");
+        let cached = cached_tree_hash(dir.path()).unwrap();
+        assert_eq!(cached, tree_hash(dir.path()).unwrap());
+
+        // A content change of a different length flips the signature, so the
+        // memo recomputes rather than returning the stale hash.
+        write(dir.path(), "f.txt", b"a much longer body");
+        let after = cached_tree_hash(dir.path()).unwrap();
+        assert_ne!(cached, after);
+        assert_eq!(after, tree_hash(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn signature_tracks_content_length() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "f.txt", b"one");
+        let before = tree_signature(dir.path()).unwrap();
+        write(dir.path(), "f.txt", b"two longer");
+        assert_ne!(before, tree_signature(dir.path()).unwrap());
     }
 
     #[cfg(unix)]
