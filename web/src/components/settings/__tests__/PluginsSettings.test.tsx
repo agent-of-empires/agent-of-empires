@@ -9,15 +9,19 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { fireEvent, render, waitFor } from "@testing-library/react";
 
-import type { PluginListResponse, PluginToggleResult } from "../../../lib/api";
+import type { DiscoverResult, PluginListResponse, PluginToggleResult, PluginUpdateStatus } from "../../../lib/api";
 
 const fetchPlugins = vi.fn<[], Promise<PluginListResponse | null>>();
 const setPluginEnabled = vi.fn<[string, boolean], Promise<PluginToggleResult>>();
+const fetchPluginUpdates = vi.fn<[], Promise<{ updates: PluginUpdateStatus[] } | null>>();
+const discoverPlugins = vi.fn<[string], Promise<DiscoverResult>>();
 const reportInfo = vi.fn<[string], void>();
 
 vi.mock("../../../lib/api", () => ({
   fetchPlugins: () => fetchPlugins(),
   setPluginEnabled: (id: string, enabled: boolean) => setPluginEnabled(id, enabled),
+  fetchPluginUpdates: () => fetchPluginUpdates(),
+  discoverPlugins: (q: string) => discoverPlugins(q),
 }));
 
 vi.mock("../../../lib/toastBus", () => ({
@@ -70,8 +74,12 @@ function listResponse(overrides: Partial<PluginListResponse> = {}): PluginListRe
 beforeEach(() => {
   fetchPlugins.mockReset();
   setPluginEnabled.mockReset();
+  fetchPluginUpdates.mockReset();
+  discoverPlugins.mockReset();
   reportInfo.mockReset();
   fetchPlugins.mockResolvedValue(listResponse());
+  fetchPluginUpdates.mockResolvedValue({ updates: [] });
+  discoverPlugins.mockResolvedValue({ kind: "ok", results: [] });
 });
 
 describe("PluginsSettings", () => {
@@ -225,5 +233,73 @@ describe("PluginsSettings", () => {
     fetchPlugins.mockResolvedValue(null);
     const { findByText } = render(<PluginsSettings />);
     await findByText("Failed to load plugins.");
+  });
+
+  it("Check for updates calls the endpoint and badges an outdated plugin", async () => {
+    fetchPluginUpdates.mockResolvedValue({
+      updates: [
+        {
+          id: "example.plugin",
+          source: "gh:example/plugin",
+          current: "abc1234",
+          available: "def5678",
+          needs_update: true,
+          error: null,
+        },
+      ],
+    });
+    const { findByTestId, getByTestId } = render(<PluginsSettings />);
+    fireEvent.click(await findByTestId("plugins-check-updates"));
+    await waitFor(() => expect(fetchPluginUpdates).toHaveBeenCalled());
+    await findByTestId("plugin-update-available-example.plugin");
+    expect(getByTestId("plugin-example.plugin").textContent).toContain("abc1234 → def5678");
+  });
+
+  it("Check for updates surfaces a per-plugin check error", async () => {
+    fetchPluginUpdates.mockResolvedValue({
+      updates: [
+        {
+          id: "example.plugin",
+          source: "gh:example/plugin",
+          current: "",
+          available: null,
+          needs_update: false,
+          error: "git not found",
+        },
+      ],
+    });
+    const { findByTestId, findByText } = render(<PluginsSettings />);
+    fireEvent.click(await findByTestId("plugins-check-updates"));
+    await findByText(/Update check failed: git not found/);
+  });
+
+  it("Search GitHub renders badged results with a copyable install command", async () => {
+    discoverPlugins.mockResolvedValue({
+      kind: "ok",
+      results: [
+        {
+          slug: "gh:acme/widget",
+          html_url: "https://github.com/acme/widget",
+          description: "A widget plugin.",
+          stars: 42,
+          badge: "unvetted",
+          install_command: "aoe plugin install gh:acme/widget",
+        },
+      ],
+    });
+    const { findByTestId } = render(<PluginsSettings />);
+    fireEvent.click(await findByTestId("plugins-discover"));
+    await waitFor(() => expect(discoverPlugins).toHaveBeenCalled());
+    const result = await findByTestId("plugins-discover-result-gh:acme/widget");
+    expect(result.textContent).toContain("aoe plugin install gh:acme/widget");
+    expect(result.textContent).toContain("unvetted");
+  });
+
+  it("Search GitHub surfaces a discovery error (e.g. rate limit)", async () => {
+    discoverPlugins.mockResolvedValue({ kind: "error", message: "Rate limited by GitHub." });
+    const { findByTestId } = render(<PluginsSettings />);
+    fireEvent.click(await findByTestId("plugins-discover"));
+    const err = await findByTestId("plugins-discover-error");
+    expect(err.textContent).toContain("Rate limited by GitHub.");
   });
 });
