@@ -82,12 +82,18 @@ export function PluginsSettings() {
 
   const onCheckUpdates = async () => {
     setCheckingUpdates(true);
+    setError(null);
     try {
       const res = await fetchPluginUpdates();
-      if (res) {
+      if (res.kind === "ok") {
         const next: Record<string, PluginUpdateStatus> = {};
         for (const s of res.updates) next[s.id] = s;
         setUpdates(next);
+      } else {
+        // Clear stale badges and surface the failure, so the button is not a
+        // silent no-op.
+        setUpdates({});
+        setError(res.message);
       }
     } finally {
       setCheckingUpdates(false);

@@ -252,8 +252,24 @@ export interface PluginUpdateStatus {
   error: string | null;
 }
 
-export function fetchPluginUpdates(): Promise<{ updates: PluginUpdateStatus[] } | null> {
-  return fetchJson<{ updates: PluginUpdateStatus[] }>("/api/plugins/updates");
+export type PluginUpdatesResult = { kind: "ok"; updates: PluginUpdateStatus[] } | { kind: "error"; message: string };
+
+/** Check installed plugins for updates. Returns a discriminated result (like
+ *  discoverPlugins) so this explicit action can report why it failed instead of
+ *  silently doing nothing on an HTTP/network/JSON error. */
+export async function fetchPluginUpdates(): Promise<PluginUpdatesResult> {
+  try {
+    const res = await fetch("/api/plugins/updates", { headers: { Accept: "application/json" } });
+    const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+    if (res.ok && payload && Array.isArray(payload.updates)) {
+      return { kind: "ok", updates: payload.updates as PluginUpdateStatus[] };
+    }
+    const message =
+      typeof payload?.message === "string" ? (payload.message as string) : `Update check failed (HTTP ${res.status}).`;
+    return { kind: "error", message };
+  } catch {
+    return { kind: "error", message: "Network error." };
+  }
 }
 
 /** One discovery result (`GET /api/plugins/discover`). Repo-level: the dashboard

@@ -9,11 +9,11 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { fireEvent, render, waitFor } from "@testing-library/react";
 
-import type { DiscoverResult, PluginListResponse, PluginToggleResult, PluginUpdateStatus } from "../../../lib/api";
+import type { DiscoverResult, PluginListResponse, PluginToggleResult, PluginUpdatesResult } from "../../../lib/api";
 
 const fetchPlugins = vi.fn<[], Promise<PluginListResponse | null>>();
 const setPluginEnabled = vi.fn<[string, boolean], Promise<PluginToggleResult>>();
-const fetchPluginUpdates = vi.fn<[], Promise<{ updates: PluginUpdateStatus[] } | null>>();
+const fetchPluginUpdates = vi.fn<[], Promise<PluginUpdatesResult>>();
 const discoverPlugins = vi.fn<[string], Promise<DiscoverResult>>();
 const reportInfo = vi.fn<[string], void>();
 
@@ -78,7 +78,7 @@ beforeEach(() => {
   discoverPlugins.mockReset();
   reportInfo.mockReset();
   fetchPlugins.mockResolvedValue(listResponse());
-  fetchPluginUpdates.mockResolvedValue({ updates: [] });
+  fetchPluginUpdates.mockResolvedValue({ kind: "ok", updates: [] });
   discoverPlugins.mockResolvedValue({ kind: "ok", results: [] });
 });
 
@@ -237,6 +237,7 @@ describe("PluginsSettings", () => {
 
   it("Check for updates calls the endpoint and badges an outdated plugin", async () => {
     fetchPluginUpdates.mockResolvedValue({
+      kind: "ok",
       updates: [
         {
           id: "example.plugin",
@@ -257,6 +258,7 @@ describe("PluginsSettings", () => {
 
   it("Check for updates surfaces a per-plugin check error", async () => {
     fetchPluginUpdates.mockResolvedValue({
+      kind: "ok",
       updates: [
         {
           id: "example.plugin",
@@ -271,6 +273,13 @@ describe("PluginsSettings", () => {
     const { findByTestId, findByText } = render(<PluginsSettings />);
     fireEvent.click(await findByTestId("plugins-check-updates"));
     await findByText(/Update check failed: git not found/);
+  });
+
+  it("Check for updates surfaces an endpoint failure and clears stale badges", async () => {
+    fetchPluginUpdates.mockResolvedValue({ kind: "error", message: "Update check failed (HTTP 502)." });
+    const { findByTestId, findByText } = render(<PluginsSettings />);
+    fireEvent.click(await findByTestId("plugins-check-updates"));
+    await findByText("Update check failed (HTTP 502).");
   });
 
   it("Search GitHub renders badged results with a copyable install command", async () => {
