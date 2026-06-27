@@ -682,7 +682,7 @@ Manage plugins (list, info, enable, disable, install, update, uninstall)
 * `info` — Show one plugin's manifest details
 * `enable` — Enable a plugin's contributions
 * `disable` — Disable a plugin; its settings stay on disk for re-enabling
-* `install` — Install an external plugin from a `gh:owner/repo[@ref]` slug or a local directory. Community plugins run at your own risk
+* `install` — Install an external plugin from a `gh:owner/repo[@ref]` slug or a local directory. With no `@ref`, installs the repo's latest release; an explicit `@ref` installs unverified, un-audited code. Community plugins run at your own risk
 * `update` — Update an installed external plugin from its recorded source. Prompts to re-approve capabilities if the update changes the capability set
 * `uninstall` — Uninstall an external plugin, removing its files and capability grant
 * `hash` — Print the deterministic source tree hash for a plugin directory, the value a maintainer pins in the featured index
@@ -737,13 +737,13 @@ Disable a plugin; its settings stay on disk for re-enabling
 
 ## `aoe plugin install`
 
-Install an external plugin from a `gh:owner/repo[@ref]` slug or a local directory. Community plugins run at your own risk
+Install an external plugin from a `gh:owner/repo[@ref]` slug or a local directory. With no `@ref`, installs the repo's latest release; an explicit `@ref` installs unverified, un-audited code. Community plugins run at your own risk
 
 **Usage:** `aoe plugin install [OPTIONS] <SOURCE>`
 
 ###### **Arguments:**
 
-* `<SOURCE>` — `gh:owner/repo[@ref]` or a local directory path
+* `<SOURCE>` — `gh:owner/repo` (latest release) or `gh:owner/repo@ref` (unverified) or a local directory path
 
 ###### **Options:**
 

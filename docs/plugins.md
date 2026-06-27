@@ -47,12 +47,20 @@ update, and uninstall are CLI-only (`aoe plugin` is reserved for management);
 the TUI and web surfaces show the result but do not install.
 
 ```sh
-aoe plugin install gh:owner/repo          # latest default branch
-aoe plugin install gh:owner/repo@v1.2.3   # a tag, branch, or commit
+aoe plugin install gh:owner/repo          # latest release (the audited default)
+aoe plugin install gh:owner/repo@v1.2.3   # an explicit tag, branch, or commit
 aoe plugin install ./path/to/plugin       # a local directory
 aoe plugin update <id>
 aoe plugin uninstall <id>
 ```
+
+With no `@ref`, install resolves the repo's latest stable GitHub release (the
+audited default path) and installs that tag. An explicit `@ref` installs
+unverified, un-audited code and asks you to confirm first (`--yes` skips the
+prompt). If the repo has published no release, install warns and falls back to
+the default branch behind the same confirmation. The recorded source stays
+ref-less, so `aoe plugin update` keeps tracking the latest release; an `@ref`
+install keeps following that ref.
 
 A plugin lands under `<app_dir>/plugins/<id>/`. A GitHub source is cloned and
 pinned to the exact commit; if the plugin ships a compiled worker as a release
