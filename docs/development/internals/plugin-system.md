@@ -546,7 +546,13 @@ Two slots carry more than a single value, so one entry (one declared
   optional `icon` (any lucide icon name, kebab-case) for its activity-bar
   button, falling back to a generic plugin icon. The host renders each `pane` as
   a dockable tool-window (activity-bar toggle, move, close) alongside the
-  built-in diff and terminal panes.
+  built-in diff and terminal panes. Each pane's body scrolls, and a long
+  `comment` body is clamped with a "more"/"less" toggle, so a full PR comment
+  list stays browsable.
+
+  A pane entry gets a larger payload budget than the other slots: its normalized
+  JSON may be up to 64KB, against 8KB for the small badge/column slots, so a
+  plugin can push a full comment list in one entry without truncating to fit.
 
 **Block parsing is forward-compatible by design.** The host stores `blocks` as
 opaque JSON (`Vec<Value>`); it validates only that the payload envelope is

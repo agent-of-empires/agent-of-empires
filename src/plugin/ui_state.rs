@@ -27,8 +27,11 @@ use serde_json::Value;
 /// bound (the model is honest, not adversarial), enough to keep a buggy plugin
 /// from growing host memory without limit.
 const MAX_ENTRIES_PER_PLUGIN: usize = 256;
-/// Largest normalized payload accepted for one entry, in bytes of JSON.
+/// Largest normalized payload accepted for one entry, in bytes of JSON. The
+/// pane slot gets a much larger budget than the small badge/column slots: a
+/// pane can carry a full PR comment list, where a badge is a few words.
 const MAX_PAYLOAD_BYTES: usize = 8 * 1024;
+const MAX_PANE_PAYLOAD_BYTES: usize = 64 * 1024;
 /// Notifications kept on the shared ring before the oldest are dropped.
 const NOTIFICATION_RING: usize = 200;
 /// Caps on notification text, so one notify cannot post an unbounded blob.
@@ -344,7 +347,7 @@ impl UiStore {
     ) -> Result<(), UiError> {
         check_scope(slot, session_id)?;
         let normalized = validate_payload(slot, payload).map_err(UiError::BadRequest)?;
-        if normalized.to_string().len() > MAX_PAYLOAD_BYTES {
+        if normalized.to_string().len() > max_payload_bytes(slot) {
             return Err(UiError::BadRequest("payload too large".into()));
         }
         let key = EntryKey {
@@ -487,6 +490,15 @@ impl UiStore {
     }
     fn write(&self) -> std::sync::RwLockWriteGuard<'_, Inner> {
         self.inner.write().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
+/// Per-slot payload ceiling. The pane carries lists (a full PR comment set), so
+/// it gets a larger budget than the small single-value slots.
+fn max_payload_bytes(slot: UiSlot) -> usize {
+    match slot {
+        UiSlot::Pane => MAX_PANE_PAYLOAD_BYTES,
+        _ => MAX_PAYLOAD_BYTES,
     }
 }
 
@@ -835,6 +847,50 @@ mod tests {
                 "gh",
                 Some("s1"),
                 &json!({"default_location": "sideways"})
+            ),
+            Err(UiError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn pane_payload_cap_is_larger_than_other_slots() {
+        let s = store();
+        let g = s.begin_generation("acme.kit");
+        // A pane body that would blow the 8KB badge cap but fits the 64KB pane
+        // cap: a long comment list. ~40KB of note text well over MAX_PAYLOAD_BYTES.
+        let big = "x".repeat(40 * 1024);
+        s.set(
+            "acme.kit",
+            g,
+            UiSlot::Pane,
+            "gh",
+            Some("s1"),
+            &json!({"blocks": [{"kind": "note", "text": big}]}),
+        )
+        .unwrap();
+        // Past the pane cap is still rejected.
+        let too_big = "x".repeat(64 * 1024);
+        assert!(matches!(
+            s.set(
+                "acme.kit",
+                g,
+                UiSlot::Pane,
+                "gh",
+                Some("s1"),
+                &json!({"blocks": [{"kind": "note", "text": too_big}]})
+            ),
+            Err(UiError::BadRequest(_))
+        ));
+        // A non-pane slot keeps the small 8KB cap.
+        let over_badge = "x".repeat(9 * 1024);
+        assert!(matches!(
+            s.set(
+                "acme.kit",
+                g,
+                UiSlot::RowBadge,
+                "b",
+                Some("s1"),
+                &json!({"text": over_badge})
             ),
             Err(UiError::BadRequest(_))
         ));
