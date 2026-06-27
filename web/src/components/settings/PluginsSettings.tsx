@@ -178,7 +178,7 @@ export function PluginsSettings() {
                     href={r.html_url}
                     target="_blank"
                     rel="noreferrer"
-                    className="font-medium text-accent-400 hover:underline"
+                    className="font-medium text-accent-500 hover:underline"
                   >
                     {r.slug}
                   </a>
