@@ -372,6 +372,22 @@ pub enum BackgroundAgentStatus {
     Error,
 }
 
+/// One tool call a background sub-agent made, parsed from its transcript
+/// so the panel can list individual reads / bashes / greps like the main
+/// output. Mirrors the web wire type in `web/src/lib/acpTypes.ts`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackgroundAgentTool {
+    /// Tool name, e.g. "Read", "Bash", "Grep".
+    pub name: String,
+    /// Short label from the tool input (command / file path / pattern).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Outcome from the matching tool_result: `None` while running,
+    /// `Some(true)` succeeded, `Some(false)` errored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ok: Option<bool>,
+}
+
 /// One async background sub-agent, built up from `BackgroundAgent*`
 /// events. Mirrors the web wire type in `web/src/lib/acpTypes.ts`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -390,6 +406,10 @@ pub struct BackgroundAgentRecord {
     /// Number of tool calls the agent has made so far (from its transcript).
     #[serde(default)]
     pub tool_count: u32,
+    /// The agent's individual tool calls, in order, so the panel can show
+    /// each read / bash / grep like the main output.
+    #[serde(default)]
+    pub tools: Vec<BackgroundAgentTool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_tool: Option<String>,
     /// Short preview of the agent's most recent assistant text.
@@ -829,6 +849,10 @@ pub enum Event {
         agent_id: String,
         status: BackgroundAgentStatus,
         tool_count: u32,
+        /// Full ordered tool list so far (coalesced into the snapshot, not
+        /// one event per tool). Replaces the record's list wholesale.
+        #[serde(default)]
+        tools: Vec<BackgroundAgentTool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         last_tool: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -840,6 +864,9 @@ pub enum Event {
     BackgroundAgentCompleted {
         agent_id: String,
         status: BackgroundAgentStatus,
+        /// Final ordered tool list. Replaces the record's list.
+        #[serde(default)]
+        tools: Vec<BackgroundAgentTool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         result: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1286,6 +1313,7 @@ impl AcpState {
                     started_at,
                     ended_at: None,
                     tool_count: 0,
+                    tools: Vec::new(),
                     last_tool: None,
                     last_text: None,
                     result: None,
@@ -1307,6 +1335,7 @@ impl AcpState {
                 agent_id,
                 status,
                 tool_count,
+                tools,
                 last_tool,
                 last_text,
                 ..
@@ -1325,6 +1354,9 @@ impl AcpState {
                     ) {
                         a.status = status;
                         a.tool_count = tool_count;
+                        if !tools.is_empty() {
+                            a.tools = tools;
+                        }
                         if last_tool.is_some() {
                             a.last_tool = last_tool;
                         }
@@ -1337,6 +1369,7 @@ impl AcpState {
             Event::BackgroundAgentCompleted {
                 agent_id,
                 status,
+                tools,
                 result,
                 warning,
                 ended_at,
@@ -1348,6 +1381,9 @@ impl AcpState {
                 {
                     a.status = status;
                     a.ended_at = Some(ended_at);
+                    if !tools.is_empty() {
+                        a.tools = tools;
+                    }
                     if result.is_some() {
                         a.result = result;
                     }
@@ -1399,6 +1435,11 @@ mod tests {
             agent_id: "a1".into(),
             status: BackgroundAgentStatus::Running,
             tool_count: 3,
+            tools: vec![BackgroundAgentTool {
+                name: "Read".into(),
+                title: Some("x.rs".into()),
+                ok: Some(true),
+            }],
             last_tool: Some("Read".into()),
             last_text: Some("scanning".into()),
             at: Utc::now(),
@@ -1406,10 +1447,13 @@ mod tests {
         .unwrap();
         assert_eq!(s.background_agents[0].tool_count, 3);
         assert_eq!(s.background_agents[0].last_tool.as_deref(), Some("Read"));
+        assert_eq!(s.background_agents[0].tools.len(), 1);
+        assert_eq!(s.background_agents[0].tools[0].name, "Read");
 
         s.apply_event(Event::BackgroundAgentCompleted {
             agent_id: "a1".into(),
             status: BackgroundAgentStatus::Completed,
+            tools: vec![],
             result: Some("done".into()),
             warning: None,
             ended_at: Utc::now(),
@@ -1426,6 +1470,7 @@ mod tests {
             agent_id: "a1".into(),
             status: BackgroundAgentStatus::Running,
             tool_count: 9,
+            tools: vec![],
             last_tool: None,
             last_text: None,
             at: Utc::now(),

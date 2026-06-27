@@ -58,6 +58,7 @@ pub fn spawn_tailer(agent_id: String, output_file: String, event_tx: Sender<Even
                 .send(completed(
                     agent_id,
                     BackgroundAgentStatus::Error,
+                    Vec::new(),
                     None,
                     Some("no transcript path reported for this sub-agent".into()),
                 ))
@@ -70,10 +71,27 @@ pub fn spawn_tailer(agent_id: String, output_file: String, event_tx: Sender<Even
     });
 }
 
+/// One tool call parsed from the transcript, tracked by its tool_use id
+/// so a later `tool_result` can fill in the outcome.
+struct ToolEntry {
+    id: String,
+    name: String,
+    title: Option<String>,
+    ok: Option<bool>,
+}
+
+/// Hard cap on per-agent tool entries carried in events, so a runaway
+/// sub-agent can't bloat the snapshot payload. Excess keeps the count
+/// accurate (`tool_count`) but stops growing the detailed list.
+const MAX_TOOLS: usize = 250;
+
 /// Running accumulator for one agent's parsed transcript state.
 #[derive(Default)]
 struct Snapshot {
     tool_count: u32,
+    /// Individual tool calls in order, with outcomes filled in from
+    /// matching tool_result records. Capped at `MAX_TOOLS`.
+    tools: Vec<ToolEntry>,
     last_tool: Option<String>,
     last_text: Option<String>,
     /// Final assistant text seen alongside an `end_turn` stop reason.
@@ -94,6 +112,7 @@ async fn run_tailer(agent_id: String, output_file: String, event_tx: Sender<Even
                 .send(completed(
                     agent_id,
                     BackgroundAgentStatus::Error,
+                    Vec::new(),
                     None,
                     Some("sub-agent transcript never appeared".into()),
                 ))
@@ -128,6 +147,7 @@ async fn run_tailer(agent_id: String, output_file: String, event_tx: Sender<Even
                 .send(completed(
                     agent_id,
                     BackgroundAgentStatus::Completed,
+                    snapshot_tools(&snap),
                     snap.result.clone(),
                     warning,
                 ))
@@ -142,6 +162,7 @@ async fn run_tailer(agent_id: String, output_file: String, event_tx: Sender<Even
                 .send(completed(
                     agent_id,
                     BackgroundAgentStatus::Stalled,
+                    snapshot_tools(&snap),
                     snap.result.clone(),
                     Some("no transcript activity; stopped tracking".into()),
                 ))
@@ -218,47 +239,130 @@ async fn read_new_lines(
 
 /// Parse one JSONL transcript line and fold it into the snapshot. Fully
 /// defensive: any shape we don't recognize is ignored, not fatal.
+/// Assistant lines carry `tool_use` (a tool call) and `text`; user lines
+/// carry `tool_result` (the outcome), matched back by `tool_use_id`.
 fn fold_line(line: &str, snap: &mut Snapshot) {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
         snap.parse_errors += 1;
         return;
     };
-    // `attachment` / system bookkeeping lines carry no message.
-    if v.get("type").and_then(|t| t.as_str()) != Some("assistant") {
-        return;
-    }
+    let kind = v.get("type").and_then(|t| t.as_str());
     let Some(msg) = v.get("message") else {
         return;
     };
-    snap.parsed_any = true;
-    let end_turn = msg.get("stop_reason").and_then(|s| s.as_str()) == Some("end_turn");
-    if let Some(blocks) = msg.get("content").and_then(|c| c.as_array()) {
-        for block in blocks {
-            match block.get("type").and_then(|t| t.as_str()) {
-                Some("tool_use") => {
-                    snap.tool_count += 1;
-                    if let Some(name) = block.get("name").and_then(|n| n.as_str()) {
-                        snap.last_tool = Some(name.to_string());
-                    }
-                }
-                Some("text") => {
-                    if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                        let preview = preview(text);
-                        if !preview.is_empty() {
-                            snap.last_text = Some(preview.clone());
-                            if end_turn {
-                                snap.result = Some(preview);
+    let Some(blocks) = msg.get("content").and_then(|c| c.as_array()) else {
+        return;
+    };
+    match kind {
+        Some("assistant") => {
+            snap.parsed_any = true;
+            let end_turn = msg.get("stop_reason").and_then(|s| s.as_str()) == Some("end_turn");
+            for block in blocks {
+                match block.get("type").and_then(|t| t.as_str()) {
+                    Some("tool_use") => fold_tool_use(block, snap),
+                    Some("text") => {
+                        if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                            let preview = preview(text);
+                            if !preview.is_empty() {
+                                snap.last_text = Some(preview.clone());
+                                if end_turn {
+                                    snap.result = Some(preview);
+                                }
                             }
                         }
                     }
+                    _ => {}
                 }
-                _ => {}
+            }
+            if end_turn {
+                snap.done = true;
+            }
+        }
+        Some("user") => {
+            for block in blocks {
+                if block.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
+                    fold_tool_result(block, snap);
+                }
+            }
+        }
+        // attachment / system bookkeeping lines: ignore.
+        _ => {}
+    }
+}
+
+/// Record a tool call. Bumps the count always; appends a detailed entry
+/// until the cap so a huge sub-agent can't bloat the event payload.
+fn fold_tool_use(block: &serde_json::Value, snap: &mut Snapshot) {
+    snap.tool_count += 1;
+    let name = block
+        .get("name")
+        .and_then(|n| n.as_str())
+        .unwrap_or("tool")
+        .to_string();
+    snap.last_tool = Some(name.clone());
+    if snap.tools.len() >= MAX_TOOLS {
+        return;
+    }
+    let title = block.get("input").and_then(tool_title);
+    let id = block
+        .get("id")
+        .and_then(|i| i.as_str())
+        .unwrap_or_default()
+        .to_string();
+    snap.tools.push(ToolEntry {
+        id,
+        name,
+        title,
+        ok: None,
+    });
+}
+
+/// Fill in a tool's outcome from its `tool_result`, matched by id.
+fn fold_tool_result(block: &serde_json::Value, snap: &mut Snapshot) {
+    let Some(id) = block.get("tool_use_id").and_then(|i| i.as_str()) else {
+        return;
+    };
+    let is_error = block
+        .get("is_error")
+        .and_then(|e| e.as_bool())
+        .unwrap_or(false);
+    if let Some(entry) = snap.tools.iter_mut().find(|t| t.id == id) {
+        entry.ok = Some(!is_error);
+    }
+}
+
+/// Pick a short label from a tool's input: the command, file path,
+/// pattern, url, or description, whichever is present first.
+fn tool_title(input: &serde_json::Value) -> Option<String> {
+    for key in [
+        "command",
+        "file_path",
+        "path",
+        "pattern",
+        "url",
+        "query",
+        "description",
+    ] {
+        if let Some(s) = input.get(key).and_then(|v| v.as_str()) {
+            if !s.is_empty() {
+                return Some(preview(s));
             }
         }
     }
-    if end_turn {
-        snap.done = true;
-    }
+    None
+}
+
+/// Convert the tracked tool entries into the wire shape (drops the
+/// internal id used only for result matching).
+fn snapshot_tools(snap: &Snapshot) -> Vec<crate::acp::state::BackgroundAgentTool> {
+    snap.tools
+        .iter()
+        .map(|t| crate::acp::state::BackgroundAgentTool {
+            name: t.name.clone(),
+            title: t.title.clone(),
+            ok: t.ok,
+        })
+        .collect()
 }
 
 /// First `TEXT_PREVIEW_CHARS` characters of `text`, trimmed, with an
@@ -287,6 +391,7 @@ fn progress(agent_id: String, status: BackgroundAgentStatus, snap: &Snapshot) ->
         agent_id,
         status,
         tool_count: snap.tool_count,
+        tools: snapshot_tools(snap),
         last_tool: snap.last_tool.clone(),
         last_text: snap.last_text.clone(),
         at: Utc::now(),
@@ -296,12 +401,14 @@ fn progress(agent_id: String, status: BackgroundAgentStatus, snap: &Snapshot) ->
 fn completed(
     agent_id: String,
     status: BackgroundAgentStatus,
+    tools: Vec<crate::acp::state::BackgroundAgentTool>,
     result: Option<String>,
     warning: Option<String>,
 ) -> Event {
     Event::BackgroundAgentCompleted {
         agent_id,
         status,
+        tools,
         result,
         warning,
         ended_at: Utc::now(),
@@ -327,6 +434,37 @@ mod tests {
         assert_eq!(snap.last_tool.as_deref(), Some("Bash"));
         assert_eq!(snap.last_text.as_deref(), Some("working on it"));
         assert!(!snap.done);
+    }
+
+    #[test]
+    fn fold_captures_tool_entries_with_titles_and_results() {
+        let mut snap = Snapshot::default();
+        fold_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls -la","description":"list"}}]}}"#,
+            &mut snap,
+        );
+        fold_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"Read","input":{"file_path":"src/main.rs"}}]}}"#,
+            &mut snap,
+        );
+        // tool_result for t1 (success) and t2 (error) arrive on user lines.
+        fold_line(
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":false}]}}"#,
+            &mut snap,
+        );
+        fold_line(
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2","is_error":true}]}}"#,
+            &mut snap,
+        );
+        let tools = snapshot_tools(&snap);
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].name, "Bash");
+        assert_eq!(tools[0].title.as_deref(), Some("ls -la"));
+        assert_eq!(tools[0].ok, Some(true));
+        assert_eq!(tools[1].name, "Read");
+        assert_eq!(tools[1].title.as_deref(), Some("src/main.rs"));
+        assert_eq!(tools[1].ok, Some(false));
+        assert_eq!(snap.tool_count, 2);
     }
 
     #[test]
