@@ -1708,8 +1708,11 @@ pub struct UpdatesConfig {
     /// Off by default. The sweep applies only updates that need no new consent;
     /// any version that changes capabilities, build steps, or UI slots is left
     /// for a manual `aoe plugin update` so its new grant is reviewed.
+    // global_only: the startup sweep reads the global config
+    // (`Config::load_or_warn`), so a profile/repo override would be silently
+    // ignored; show it but do not offer non-global scopes.
     #[serde(default)]
-    #[setting(label = "Auto-update plugins", widget = "toggle")]
+    #[setting(label = "Auto-update plugins", widget = "toggle", global_only)]
     pub auto_update_plugins: bool,
 }
 

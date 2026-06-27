@@ -56,13 +56,13 @@ pub async fn outdated() -> Vec<UpdateStatus> {
     let lock = Lockfile::load();
     let mut out = Vec::with_capacity(targets.len());
     for target in targets {
-        out.push(check_one(&target, lock.as_ref().ok()).await);
+        out.push(check_one(&target, lock.as_ref()).await);
     }
     out.sort_by(|a, b| a.id.cmp(&b.id));
     out
 }
 
-async fn check_one(target: &Target, lock: Option<&Lockfile>) -> UpdateStatus {
+async fn check_one(target: &Target, lock: Result<&Lockfile, &anyhow::Error>) -> UpdateStatus {
     let status = |current: String, available: Option<String>, error: Option<String>| UpdateStatus {
         id: target.id.clone(),
         source: target.source.clone(),
@@ -73,7 +73,13 @@ async fn check_one(target: &Target, lock: Option<&Lockfile>) -> UpdateStatus {
     };
     let err = |msg: String| status(String::new(), None, Some(msg));
 
-    let Some(locked) = lock.and_then(|l| l.get(&target.id)) else {
+    let lock = match lock {
+        Ok(lock) => lock,
+        // A corrupt or unreadable plugins.lock must surface as itself, not be
+        // misreported as a missing entry across every plugin.
+        Err(e) => return err(format!("reading plugins.lock: {e:#}")),
+    };
+    let Some(locked) = lock.get(&target.id) else {
         return err(format!(
             "no lockfile entry for {}; reinstall to record one",
             target.id

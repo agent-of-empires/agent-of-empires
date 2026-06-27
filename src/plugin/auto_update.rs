@@ -37,6 +37,7 @@ pub async fn sweep() -> SweepSummary {
                 %error,
                 "could not check plugin for updates",
             );
+            summary.errors.push((status.id.clone(), error.clone()));
             continue;
         }
         if !status.needs_update {

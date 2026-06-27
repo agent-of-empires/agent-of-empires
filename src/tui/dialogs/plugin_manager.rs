@@ -238,11 +238,20 @@ impl PluginManagerDialog {
                 Ok(statuses) => {
                     let outdated = statuses.iter().filter(|s| s.needs_update).count();
                     let errors = statuses.iter().filter(|s| s.error.is_some()).count();
+                    // outdated() skips builtins, so an empty result means there
+                    // are no external plugins; the dialog still lists builtin
+                    // rows, so "all up to date" would read as if they were
+                    // checked. Match the CLI's wording instead.
+                    let empty = statuses.is_empty();
                     self.updates = statuses.into_iter().map(|s| (s.id.clone(), s)).collect();
-                    self.info = Some(match (outdated, errors) {
-                        (0, 0) => "All plugins up to date.".to_string(),
-                        (n, 0) => format!("{n} plugin(s) have updates available."),
-                        (n, e) => format!("{n} update(s) available, {e} check error(s)."),
+                    self.info = Some(if empty {
+                        "No external plugins installed.".to_string()
+                    } else {
+                        match (outdated, errors) {
+                            (0, 0) => "All plugins up to date.".to_string(),
+                            (n, 0) => format!("{n} plugin(s) have updates available."),
+                            (n, e) => format!("{n} update(s) available, {e} check error(s)."),
+                        }
                     });
                     self.pending = None;
                     self.loading = None;

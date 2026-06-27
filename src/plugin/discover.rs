@@ -55,6 +55,10 @@ pub struct DiscoveryResult {
     pub description: Option<String>,
     pub stars: u64,
     pub badge: DiscoveryBadge,
+    /// Whether this source is in the featured index, tracked independently of
+    /// `badge`: an installed-and-featured repo shows the `Installed` badge but
+    /// must still rank as featured (the badge is one-of, ranking is not).
+    pub featured: bool,
     /// The exact command to install this plugin (web has no install path, so it
     /// shows this for the user to copy into a terminal).
     pub install_command: String,
@@ -76,7 +80,11 @@ pub async fn discover(query: Option<&str>) -> Result<Vec<DiscoveryResult>> {
     }
     let repos = client.search_repositories(&q, 30).await?;
 
-    let featured = FeaturedIndex::load().unwrap_or_default();
+    // Treat a featured-index load failure as fatal, matching install-time
+    // `verify_featured`: silently defaulting to an empty index would re-badge
+    // every curated plugin as unvetted and drop featured-first ordering, so
+    // discovery and install would disagree about the same trust signal.
+    let featured = FeaturedIndex::load()?;
     let installed = installed_slugs();
     Ok(rank(badge_repos(repos, &featured, &installed)))
 }
@@ -110,9 +118,13 @@ fn badge_repos(
             }
             let slug = format!("gh:{}", repo.full_name);
             let normalized = slug.to_ascii_lowercase();
-            let badge = if installed.contains(&normalized) {
+            let is_installed = installed.contains(&normalized);
+            let is_featured = featured.is_featured_source(&slug);
+            // Installed wins the one-of display badge, but `featured` is kept
+            // separately so an installed-and-featured repo still ranks featured.
+            let badge = if is_installed {
                 DiscoveryBadge::Installed
-            } else if featured.is_featured_source(&slug) {
+            } else if is_featured {
                 DiscoveryBadge::Featured
             } else {
                 DiscoveryBadge::Unvetted
@@ -121,6 +133,7 @@ fn badge_repos(
                 install_command: format!("aoe plugin install {slug}"),
                 slug,
                 html_url: repo.html_url,
+                featured: is_featured,
                 description: repo.description.filter(|d| !d.is_empty()),
                 stars: repo.stargazers_count,
                 badge,
@@ -133,9 +146,8 @@ fn badge_repos(
 /// popularity ranking; until then this is the issue's "featured status + stars").
 fn rank(mut results: Vec<DiscoveryResult>) -> Vec<DiscoveryResult> {
     results.sort_by(|a, b| {
-        let featured = |r: &DiscoveryResult| r.badge == DiscoveryBadge::Featured;
-        featured(b)
-            .cmp(&featured(a))
+        b.featured
+            .cmp(&a.featured)
             .then(b.stars.cmp(&a.stars))
             .then(a.slug.cmp(&b.slug))
     });
@@ -200,6 +212,19 @@ mod tests {
         let out = rank(badge_repos(repos, &index, &[]));
         assert_eq!(out[0].slug, "gh:acme/vetted");
         assert_eq!(out[1].slug, "gh:acme/popular");
+    }
+
+    #[test]
+    fn installed_and_featured_still_ranks_featured() {
+        // A repo that is both installed and featured shows the Installed badge
+        // but must still outrank a high-star unvetted repo (#2473 review).
+        let repos = vec![repo("acme/popular", 999), repo("acme/vetted", 1)];
+        let index = featured("gh:acme/vetted");
+        let installed = vec!["gh:acme/vetted".to_string()];
+        let out = rank(badge_repos(repos, &index, &installed));
+        assert_eq!(out[0].slug, "gh:acme/vetted");
+        assert_eq!(out[0].badge, DiscoveryBadge::Installed);
+        assert!(out[0].featured);
     }
 
     #[test]
