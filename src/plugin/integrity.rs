@@ -60,11 +60,16 @@ pub fn tree_hash(dir: &Path) -> Result<String> {
 fn collect(root: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) -> Result<()> {
     for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
         let entry = entry?;
-        // Skip git history and the reserved build-output dir before inspecting
-        // the entry's type: a build output like a `.venv` holds symlinks, which
-        // the symlink check below would otherwise reject, and its contents are
-        // not part of the hashed source.
-        if entry.file_name() == ".git" || entry.file_name() == BUILD_OUTPUT_DIR {
+        // Skip git history at every level. Skip the reserved build-output dir
+        // before inspecting the entry's type (a build output like a `.venv`
+        // holds symlinks the check below would reject, and is not hashed
+        // source), but ONLY at the root: it is a single top-level dir, so a
+        // nested `<sub>/.aoe-build` is ordinary source, hashed and
+        // symlink-checked like anything else rather than silently dropped.
+        if entry.file_name() == ".git" {
+            continue;
+        }
+        if dir == root && entry.file_name() == BUILD_OUTPUT_DIR {
             continue;
         }
         let file_type = entry.file_type()?;
@@ -174,6 +179,37 @@ mod tests {
             tree_hash(with_build.path()).unwrap(),
             tree_hash(without_build.path()).unwrap()
         );
+    }
+
+    #[test]
+    fn nested_build_output_dir_is_hashed_not_skipped() {
+        // The reserved dir is excluded only at the root. A nested
+        // `sub/.aoe-build` is ordinary source: it must change the hash, so it
+        // cannot be used to hide files from the pin.
+        let without = tempfile::tempdir().unwrap();
+        write(without.path(), "aoe-plugin.toml", b"x");
+        let with_nested = tempfile::tempdir().unwrap();
+        write(with_nested.path(), "aoe-plugin.toml", b"x");
+        write(with_nested.path(), "sub/.aoe-build/hidden", b"payload");
+        assert_ne!(
+            tree_hash(without.path()).unwrap(),
+            tree_hash(with_nested.path()).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nested_build_output_symlink_is_rejected() {
+        // A symlink under a nested (non-root) `.aoe-build` is still rejected:
+        // only the root build-output dir escapes the symlink check.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "aoe-plugin.toml", b"x");
+        let nested = dir.path().join("sub").join(".aoe-build");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("real"), b"x").unwrap();
+        std::os::unix::fs::symlink("real", nested.join("link")).unwrap();
+        let err = tree_hash(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("symlink"), "got: {err}");
     }
 
     #[cfg(unix)]

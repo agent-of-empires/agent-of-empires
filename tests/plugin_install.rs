@@ -338,8 +338,10 @@ api_version = 2
     tag_bare_repo(base.path(), "acme", "rel", "v1.0.0", false);
     let server = spawn_latest_release("acme", "rel", "v1.0.0").await;
 
-    // No `@ref`: resolves and installs the latest release tag.
-    install::install("gh:acme/rel", true).await.unwrap();
+    // No `@ref`: resolves and installs the latest release tag. `false` (no
+    // --yes) proves the resolved-release path is not treated as unverified, so
+    // it installs without an interactive confirmation.
+    install::install("gh:acme/rel", false).await.unwrap();
 
     let lock = Lockfile::load().unwrap();
     let locked = lock.get("acme.rel").expect("lock entry");
