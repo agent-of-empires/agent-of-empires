@@ -21,7 +21,7 @@ export interface PaneDescriptor {
 export const BUILTIN_PANES: PaneDescriptor[] = [
   { id: "diff", title: "Diff", icon: FileDiff, defaultDock: "right" },
   { id: "terminal", title: "Terminal", icon: SquareTerminal, defaultDock: "right" },
-  { id: "agents", title: "Agents", icon: Bot, defaultDock: "right" },
+  { id: "agents", title: "Sub agents", icon: Bot, defaultDock: "right" },
 ];
 
 // Terminal panes are the one kind that supports multiple instances as tabs

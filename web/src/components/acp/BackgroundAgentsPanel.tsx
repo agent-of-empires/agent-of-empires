@@ -37,7 +37,7 @@ export function BackgroundAgentsPanel({ sessionId }: { sessionId: string | null 
   return (
     <div className="flex h-full flex-col overflow-y-auto">
       <div className="border-b border-surface-700 px-3 py-1.5 text-[11px] uppercase tracking-wider text-text-dim">
-        Background agents · {agents.length}
+        Sub agents · {agents.length}
       </div>
       <div className="flex flex-col">
         {sorted.map((a) => (

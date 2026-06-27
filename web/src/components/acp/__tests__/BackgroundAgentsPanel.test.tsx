@@ -42,7 +42,7 @@ describe("BackgroundAgentsPanel", () => {
   it("lists a running agent with description, tool count, and last activity", () => {
     agentsMock.mockReturnValue([agent()]);
     const { container } = render(<BackgroundAgentsPanel sessionId="s-1" />);
-    expect(container.textContent).toContain("Background agents · 1");
+    expect(container.textContent).toContain("Sub agents · 1");
     expect(container.textContent).toContain("Map backend lifecycle");
     expect(container.textContent).toContain("running");
     expect(container.textContent).toContain("3 tools");
