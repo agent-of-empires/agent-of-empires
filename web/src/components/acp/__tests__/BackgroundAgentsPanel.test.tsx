@@ -121,6 +121,12 @@ describe("BackgroundAgentsPanel", () => {
     expect(queryByRole("button", { name: /stop/i })).toBeNull();
   });
 
+  it("hides the Stop button for a stalled agent (cancel would be a no-op)", () => {
+    agentsMock.mockReturnValue([agent({ status: "stalled" })]);
+    const { queryByRole } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+    expect(queryByRole("button", { name: /stop/i })).toBeNull();
+  });
+
   it("opens a details modal showing the full prompt, result, and tools", () => {
     agentsMock.mockReturnValue([
       agent({

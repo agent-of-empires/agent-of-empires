@@ -33,13 +33,15 @@ export function BackgroundAgentsPanel({ sessionId }: { sessionId: string | null 
     if (ra !== rb) return ra - rb;
     return b.startedAt.localeCompare(a.startedAt);
   });
-  const anyActive = agents.some((a) => isActive(a.status));
+  // Stop only when something is genuinely running; a stalled agent has
+  // stopped writing, so /acp/cancel would be a confusing no-op.
+  const anyRunning = agents.some((a) => a.status === "running");
 
   return (
     <div className="flex h-full flex-col overflow-y-auto">
       <div className="flex items-center gap-2 border-b border-surface-700 px-3 py-1.5">
         <span className="flex-1 text-[11px] uppercase tracking-wider text-text-dim">Sub agents · {agents.length}</span>
-        {anyActive && sessionId && <StopButton sessionId={sessionId} />}
+        {anyRunning && sessionId && <StopButton sessionId={sessionId} />}
       </div>
       <div className="flex flex-col">
         {sorted.map((a) => (
@@ -208,7 +210,7 @@ function ToolList({ tools }: { tools: BackgroundAgentTool[] }) {
 
 function ToolDot({ ok }: { ok?: boolean | null }) {
   const cls =
-    ok === undefined || ok === null ? "bg-brand-400 animate-pulse" : ok ? "bg-status-running" : "bg-status-error";
+    ok === undefined || ok === null ? "bg-status-waiting animate-pulse" : ok ? "bg-status-running" : "bg-status-error";
   return <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${cls}`} />;
 }
 
@@ -247,7 +249,7 @@ function Field({
 function StatusDot({ status }: { status: BackgroundAgentStatus }) {
   const cls =
     status === "running"
-      ? "bg-brand-400 animate-pulse"
+      ? "bg-status-waiting animate-pulse"
       : status === "completed"
         ? "bg-status-running"
         : status === "error"
