@@ -12,6 +12,7 @@ This opens the dashboard. You'll see an empty session list on first run.
 |-----|--------|
 | `n` | New session |
 | `b` | New session from saved project |
+| `p` | Manage saved projects (add/remove) |
 | `Enter` | Attach to session |
 | `d` | Delete session |
 | `t` | Toggle Agent/Terminal view |
