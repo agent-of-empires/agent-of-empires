@@ -177,17 +177,20 @@ pub async fn invoke_plugin_action(
 /// `GET /api/plugins/{id}/update/preview`: classify the available update for one
 /// installed external plugin (no_update / safe_update / consent_required) and,
 /// when consent is required, return the structured disclosure the dashboard and
-/// TUI render. Gated on read-write mode: it does a full source fetch, which a
-/// read-only dashboard has no business driving, but it needs no elevation
-/// because it mutates no host state. Network failures (no release, dead remote)
-/// surface as a 502 for the UI to show.
+/// TUI render. Gated on read-write mode only, NOT elevation: it mutates no host
+/// state and it powers the approval UI, so a non-elevated session must be able
+/// to fetch the capability diff before deciding (elevation is required on the
+/// actual apply). Network failures (no release, dead remote) surface as a 502.
 pub async fn plugin_update_preview(
     State(state): State<std::sync::Arc<AppState>>,
-    session: Option<axum::Extension<AuthenticatedSession>>,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(resp) = mutation_gate(&state, session.as_deref()).await {
-        return resp;
+    if state.read_only {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "read_only",
+            "Server is in read-only mode".into(),
+        );
     }
     match plugin::install::preview_update(&id).await {
         Ok(preview) => Json(preview).into_response(),
