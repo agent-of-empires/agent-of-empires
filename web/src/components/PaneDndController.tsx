@@ -177,7 +177,7 @@ function EmptyDockDropZone({ location }: { location: DockLocation }) {
     id: `empty-dock:${location}`,
     data: { type: "pane-empty-dock", dock: location } satisfies DockDropData,
   });
-  const edge = location === "right" ? "top-0 right-0 h-full w-12 border-l" : "bottom-0 left-0 w-full h-12 border-t";
+  const edge = location === "right" ? "top-0 right-0 h-full w-24 border-l" : "bottom-0 left-0 w-full h-24 border-t";
   return (
     <div
       ref={setNodeRef}
@@ -186,7 +186,7 @@ function EmptyDockDropZone({ location }: { location: DockLocation }) {
         isOver ? "border-brand-500 bg-brand-600/20" : "border-brand-600/40 bg-surface-900/40"
       }`}
     >
-      <span className="text-[10px] font-medium text-text-dim uppercase tracking-wide">Dock here</span>
+      <span className="text-xs font-medium text-text-dim uppercase tracking-wide">Dock here</span>
     </div>
   );
 }
