@@ -57,6 +57,7 @@ pub async fn install(input: &str, assume_yes: bool) -> Result<InstallReport> {
     let id = fetched.manifest.id.as_str().to_string();
     let featured_verified = verify_featured(&FeaturedIndex::load()?, &fetched)?;
     reject_reserved_or_builtin(&fetched.manifest, featured_verified)?;
+    reject_incompatible_host(&fetched.manifest)?;
 
     let final_dir = super::plugins_dir()?.join(&id);
     if final_dir.exists() {
@@ -127,6 +128,7 @@ pub async fn update(id: &str) -> Result<InstallReport> {
     }
     let featured_verified = verify_featured(&FeaturedIndex::load()?, &fetched)?;
     reject_reserved_or_builtin(&fetched.manifest, featured_verified)?;
+    reject_incompatible_host(&fetched.manifest)?;
 
     let capabilities = capability_strings(&fetched)?;
     let manifest_hash = PluginManifest::hash_bytes(&fetched.manifest_bytes);
@@ -263,6 +265,18 @@ fn reject_reserved_or_builtin(manifest: &PluginManifest, featured_verified: bool
         bail!("plugin id {id:?} uses a reserved namespace (aoe.* / agent-of-empires.*); only a featured-verified plugin may claim one");
     }
     Ok(())
+}
+
+/// Refuse a plugin whose declared `aoe_version` range excludes this host. A
+/// plugin author states which aoe versions a plugin version was tested against;
+/// installing outside that range invites runtime failure, so block it at
+/// install/update with the manifest's own actionable message. The load-time
+/// twin in the registry scan skips rather than bails so an aoe upgrade cannot
+/// brick startup.
+fn reject_incompatible_host(manifest: &PluginManifest) -> Result<()> {
+    manifest
+        .host_compat(env!("CARGO_PKG_VERSION"))
+        .map_err(|msg| anyhow!("{}: {msg}", manifest.id.as_str()))
 }
 
 /// Check a fetched plugin against the curated index. Returns whether it is a
@@ -629,6 +643,34 @@ mod tests {
             slot,
             id: id.to_string(),
         }
+    }
+
+    fn manifest_with_aoe_version(range: Option<&str>) -> PluginManifest {
+        let aoe = range
+            .map(|r| format!("aoe_version = \"{r}\"\n"))
+            .unwrap_or_default();
+        PluginManifest::from_toml_str(&format!(
+            "id = \"acme.thing\"\nname = \"Thing\"\nversion = \"1.0.0\"\napi_version = 4\n{aoe}"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn reject_incompatible_host_blocks_out_of_range_and_allows_in_range() {
+        // The host is this crate's CARGO_PKG_VERSION (a 1.x release); a range
+        // bracketing 1.x installs, a future-major-only range is refused with an
+        // id-prefixed message. Keep the literals semver-free so this compiles in
+        // a TUI-only build, where the host crate's semver dep is serve-gated.
+        let in_range = manifest_with_aoe_version(Some(">=1.0.0, <2.0.0"));
+        assert!(reject_incompatible_host(&in_range).is_ok());
+
+        let out = manifest_with_aoe_version(Some(">=2.0.0"));
+        let err = reject_incompatible_host(&out).unwrap_err().to_string();
+        assert!(err.contains("acme.thing"), "{err}");
+        assert!(err.contains("plugin requires aoe"), "{err}");
+
+        // No declared range installs everywhere.
+        assert!(reject_incompatible_host(&manifest_with_aoe_version(None)).is_ok());
     }
 
     #[test]

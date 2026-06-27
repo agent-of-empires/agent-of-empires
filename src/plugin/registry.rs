@@ -287,6 +287,16 @@ fn load_external(
         };
         let id = manifest.id.as_str().to_string();
 
+        // Skip a plugin the running aoe is too old/new for. Unlike install, a
+        // load-time mismatch must not be fatal: an aoe upgrade can move the host
+        // outside a still-installed plugin's range, and bailing would brick
+        // startup. Report it and carry on. Builtins never reach here (they load
+        // from the embedded BUILTINS set, not this directory scan).
+        if let Err(msg) = manifest.host_compat(env!("CARGO_PKG_VERSION")) {
+            load_errors.push(format!("plugin {id:?} at {}: {msg}", dir.display()));
+            continue;
+        }
+
         let plugin_config = config.plugins.get(&id);
         let source = plugin_config.and_then(|p| p.source.clone());
         let validation = validation_for(featured, &id, &dir, source.as_deref());
