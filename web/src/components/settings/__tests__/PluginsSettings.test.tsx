@@ -492,6 +492,22 @@ describe("PluginsSettings", () => {
     await waitFor(() => expect(queryByTestId("plugin-update-consent-modal")).toBeNull());
   });
 
+  it("a failed decline keeps the consent modal open and surfaces the error", async () => {
+    markOutdated();
+    previewPluginUpdate.mockResolvedValue(consentPreview);
+    dismissPluginUpdate.mockResolvedValue({ kind: "error", message: "Dashboard is read-only." });
+    const { findByTestId, queryByTestId } = render(<PluginsSettings />);
+    fireEvent.click(await findByTestId("plugins-check-updates"));
+    fireEvent.click(await findByTestId("plugin-update-example.plugin"));
+    fireEvent.click(await findByTestId("plugin-update-decline"));
+    const err = await findByTestId("plugin-update-consent-error");
+    expect(err.textContent).toContain("Dashboard is read-only.");
+    // The modal stays open and the update badge is not cleared, so the failed
+    // decline is not mistaken for a persisted one.
+    expect(queryByTestId("plugin-update-consent-modal")).not.toBeNull();
+    await findByTestId("plugin-update-available-example.plugin");
+  });
+
   it("a safe update applies directly without a consent modal", async () => {
     markOutdated();
     previewPluginUpdate.mockResolvedValue({

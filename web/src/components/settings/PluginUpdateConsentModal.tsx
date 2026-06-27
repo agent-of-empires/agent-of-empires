@@ -33,13 +33,19 @@ export function PluginUpdateConsentModal({
   onDecline,
   onClose,
 }: PluginUpdateConsentModalProps) {
+  // While an apply/dismiss is in flight, the modal must not close: dropping it
+  // would re-expose the Update button and let the same flow start concurrently.
+  const closeIfIdle = () => {
+    if (!busy) onClose();
+  };
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (!busy && e.key === "Escape") onClose();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  }, [busy, onClose]);
 
   return (
     <div
@@ -47,7 +53,7 @@ export function PluginUpdateConsentModal({
       role="dialog"
       aria-modal="true"
       aria-label={`Approve update for ${name}`}
-      onClick={onClose}
+      onClick={closeIfIdle}
       data-testid="plugin-update-consent-modal"
     >
       <div
@@ -63,8 +69,9 @@ export function PluginUpdateConsentModal({
           </div>
           <button
             type="button"
-            className="rounded border border-surface-700 px-2 py-0.5 text-xs hover:bg-surface-800"
-            onClick={onClose}
+            className="rounded border border-surface-700 px-2 py-0.5 text-xs hover:bg-surface-800 disabled:opacity-50"
+            disabled={busy}
+            onClick={closeIfIdle}
             data-testid="plugin-update-consent-close"
           >
             Close

@@ -196,12 +196,18 @@ export function PluginsSettings() {
   const onDeclineUpdate = async () => {
     if (!consentModal) return;
     setConsentBusy(true);
+    setConsentError(null);
     try {
-      // Either way the current version stays active; record the decline so it
-      // stops nagging, then close.
-      await dismissPluginUpdate(consentModal.plugin.id, consentModal.consent.fingerprint);
-      clearUpdateBadge(consentModal.plugin.id);
-      setConsentModal(null);
+      // The current version stays active either way, but only clear local state
+      // once the backend actually recorded the decline; otherwise a failed
+      // dismiss would look persisted and the prompt would return on reload.
+      const res = await dismissPluginUpdate(consentModal.plugin.id, consentModal.consent.fingerprint);
+      if (res.kind === "ok") {
+        clearUpdateBadge(consentModal.plugin.id);
+        setConsentModal(null);
+      } else {
+        setConsentError(res.message);
+      }
     } finally {
       setConsentBusy(false);
     }
