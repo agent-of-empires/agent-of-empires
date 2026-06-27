@@ -5,7 +5,7 @@
 //! typed [`GitHubError`] taxonomy. Only unauthenticated public reads (such as
 //! the update check) are wired up today via [`GitHubClient::unauthenticated`].
 
-use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
+use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS, NON_ALPHANUMERIC};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT};
 use reqwest::StatusCode;
 
@@ -20,6 +20,11 @@ const TAG_SEGMENT: &AsciiSet = &CONTROLS
     .add(b'%')
     .add(b'&')
     .add(b'+');
+/// Encode a search `q` value: encode everything non-alphanumeric (spaces,
+/// `:`, etc.) so the qualifier syntax (`topic:aoe-plugin fork:false`) survives
+/// into the query string intact.
+const QUERY_VALUE: &AsciiSet = NON_ALPHANUMERIC;
+
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use std::time::Duration;
@@ -59,6 +64,27 @@ pub struct GitHubRelease {
 pub struct GitHubAsset {
     pub name: String,
     pub browser_download_url: String,
+}
+
+/// A repository returned by the search API (the subset plugin discovery shows).
+#[derive(Debug, Clone, Deserialize)]
+pub struct GitHubRepo {
+    /// `owner/repo`.
+    pub full_name: String,
+    #[serde(default)]
+    pub html_url: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub stargazers_count: u64,
+    #[serde(default)]
+    pub topics: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct SearchReposResponse {
+    #[serde(default)]
+    items: Vec<GitHubRepo>,
 }
 
 #[derive(Deserialize)]
@@ -127,6 +153,21 @@ impl GitHubClient {
             self.api_base, owner, repo, tag
         );
         self.send_json(self.http.get(url)).await
+    }
+
+    /// `GET /search/repositories?q={query}&sort=stars&order=desc`
+    ///
+    /// Unauthenticated search is heavily rate limited (about 10 requests per
+    /// minute per IP); a 403/429 surfaces as [`GitHubError::RateLimited`] so the
+    /// caller can say so plainly rather than reporting a generic API error.
+    pub async fn search_repositories(&self, query: &str, per_page: u8) -> Result<Vec<GitHubRepo>> {
+        let q = utf8_percent_encode(query, QUERY_VALUE);
+        let url = format!(
+            "{}/search/repositories?q={q}&sort=stars&order=desc&per_page={per_page}",
+            self.api_base
+        );
+        let response: SearchReposResponse = self.send_json(self.http.get(url)).await?;
+        Ok(response.items)
     }
 
     async fn send_json<T: DeserializeOwned>(&self, request: reqwest::RequestBuilder) -> Result<T> {

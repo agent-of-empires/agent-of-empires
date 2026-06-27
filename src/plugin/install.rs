@@ -48,6 +48,28 @@ pub struct InstallReport {
     pub granted: bool,
 }
 
+/// How an update treats a version that would need fresh consent (changed
+/// capabilities, build recipe, or UI slots).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsentMode {
+    /// Prompt the user (the manual `aoe plugin update` path).
+    Interactive,
+    /// Apply only a "clean" update that needs no new consent; skip anything that
+    /// would (the opt-in startup auto-update sweep). Never prompts, never runs a
+    /// changed build step or installs a changed capability/UI set unattended.
+    CleanOnlyNonInteractive,
+}
+
+/// The result of an update attempt.
+#[derive(Debug)]
+pub enum UpdateOutcome {
+    /// The update was applied (the tree was replaced and the lockfile rewritten).
+    Applied(InstallReport),
+    /// A `CleanOnlyNonInteractive` update was skipped because it needs consent;
+    /// the prior version stays installed and active.
+    Skipped { id: String, reason: String },
+}
+
 /// Install an external plugin from `input` (`gh:owner/repo[@ref]` or a local
 /// dir). Prompts once for the manifest's capabilities unless `assume_yes`.
 pub async fn install(input: &str, assume_yes: bool) -> Result<InstallReport> {
@@ -103,10 +125,29 @@ pub async fn install(input: &str, assume_yes: bool) -> Result<InstallReport> {
     })
 }
 
-/// Re-fetch an installed external plugin from its recorded source. A changed
+/// Re-fetch an installed external plugin from its recorded source, prompting on
+/// a changed capability set (the manual `aoe plugin update` path). A changed
 /// capability set re-prompts; until re-approved the plugin's contributions stay
 /// inactive (the grant no longer covers the installed manifest).
 pub async fn update(id: &str) -> Result<InstallReport> {
+    match update_with_consent(id, ConsentMode::Interactive).await? {
+        UpdateOutcome::Applied(report) => Ok(report),
+        // Interactive mode prompts rather than skipping, so this is unreachable;
+        // map it to an error rather than panicking if that ever changes.
+        UpdateOutcome::Skipped { id, reason } => {
+            bail!("update for {id} was skipped unexpectedly: {reason}")
+        }
+    }
+}
+
+/// Re-fetch an installed external plugin and apply it only if it needs no new
+/// consent (the opt-in startup auto-update sweep). Returns whether it was
+/// applied or skipped; never prompts.
+pub async fn update_clean(id: &str) -> Result<UpdateOutcome> {
+    update_with_consent(id, ConsentMode::CleanOnlyNonInteractive).await
+}
+
+async fn update_with_consent(id: &str, mode: ConsentMode) -> Result<UpdateOutcome> {
     let config = Config::load()?;
     let plugin_config = config
         .plugins
@@ -164,6 +205,14 @@ pub async fn update(id: &str) -> Result<InstallReport> {
     // non-interactive prompt bails while the old install, config, and lockfile
     // are still consistent.
     let grant = if needs_prompt {
+        // The auto-update sweep declines anything needing consent: skip without
+        // touching the tree, leaving the working version active.
+        if mode == ConsentMode::CleanOnlyNonInteractive {
+            return Ok(UpdateOutcome::Skipped {
+                id: id.to_string(),
+                reason: skip_reason(caps_changed, build_changed, ui_changed),
+            });
+        }
         if confirm_capabilities(
             id,
             &capabilities,
@@ -216,12 +265,31 @@ pub async fn update(id: &str) -> Result<InstallReport> {
         );
     }
 
-    Ok(InstallReport {
+    Ok(UpdateOutcome::Applied(InstallReport {
         id: id.to_string(),
         version: fetched.manifest.version.clone(),
         capabilities,
         granted,
-    })
+    }))
+}
+
+/// Human-readable reason an auto-update was skipped, for the sweep log.
+fn skip_reason(caps_changed: bool, build_changed: bool, ui_changed: bool) -> String {
+    let mut parts = Vec::new();
+    if caps_changed {
+        parts.push("capability change");
+    }
+    if build_changed {
+        parts.push("build-step change");
+    }
+    if ui_changed {
+        parts.push("UI change");
+    }
+    if parts.is_empty() {
+        "needs approval".to_string()
+    } else {
+        format!("{} needs approval", parts.join(" + "))
+    }
 }
 
 /// Remove an installed external plugin: its tree, its config entry, and its

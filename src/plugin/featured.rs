@@ -60,6 +60,17 @@ impl FeaturedIndex {
     pub fn get(&self, id: &str) -> Option<&FeaturedEntry> {
         self.plugins.get(id)
     }
+
+    /// Whether any featured entry is pinned to this source slug (case-insensitive,
+    /// GitHub slugs are not case-sensitive). Discovery uses this to badge a search
+    /// result as a featured *source*, without fetching its manifest; it is not a
+    /// claim that the repo's current tree matches the pinned `tree_hash`, which
+    /// only install-time `verify_featured` enforces.
+    pub fn is_featured_source(&self, slug: &str) -> bool {
+        self.plugins
+            .values()
+            .any(|e| e.source.eq_ignore_ascii_case(slug))
+    }
 }
 
 #[cfg(test)]
@@ -86,5 +97,10 @@ tree_hash = "sha256:abc"
         assert_eq!(entry.source, "gh:agent-of-empires/example");
         assert_eq!(entry.tree_hash, "sha256:abc");
         assert!(index.get("acme.absent").is_none());
+
+        // Source-slug match is case-insensitive and ignores the keying id.
+        assert!(index.is_featured_source("gh:agent-of-empires/example"));
+        assert!(index.is_featured_source("gh:Agent-Of-Empires/Example"));
+        assert!(!index.is_featured_source("gh:someone/else"));
     }
 }

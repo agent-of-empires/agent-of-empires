@@ -6,7 +6,9 @@
 //! installs, capability grants, and the Tier 0 / Tier 1 contribution surface
 //! return in follow-up PRs.
 
+pub mod auto_update;
 pub mod contributions;
+pub mod discover;
 pub mod featured;
 pub mod fetch;
 pub mod install;
@@ -14,6 +16,7 @@ pub mod integrity;
 pub mod lockfile;
 pub mod registry;
 pub mod source;
+pub mod update_check;
 pub mod view;
 
 // The Tier 1 worker host runs only in the `aoe serve` daemon, where the event

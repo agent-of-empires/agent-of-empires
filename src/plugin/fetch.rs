@@ -161,6 +161,45 @@ fn run_git(args: &[&str], cwd: Option<&Path>) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Resolve the commit a GitHub source's ref currently points at, without
+/// cloning, via `git ls-remote`. `reference` of `None` means the remote `HEAD`.
+/// Used by the update check to tell whether a newer commit exists.
+///
+/// A `reference` that is already a full commit sha is returned as-is: `ls-remote`
+/// cannot resolve a bare sha, and a commit-pinned install can never be outdated.
+/// For a branch or tag, an annotated tag's peeled (`^{}`) target is preferred so
+/// the result is the commit the install would actually check out.
+pub fn ls_remote(url: &str, reference: Option<&str>) -> Result<String> {
+    if let Some(r) = reference {
+        if is_full_commit_sha(r) {
+            return Ok(r.to_ascii_lowercase());
+        }
+    }
+    let target = reference.unwrap_or("HEAD");
+    let out = run_git(&["ls-remote", url, target], None)?;
+    parse_ls_remote(&out, target)
+}
+
+fn is_full_commit_sha(s: &str) -> bool {
+    s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Pick the resolved commit from `git ls-remote` output (`<sha>\t<ref>` lines),
+/// preferring an annotated tag's peeled `^{}` target over the tag object itself.
+fn parse_ls_remote(out: &str, target: &str) -> Result<String> {
+    let mut first = None;
+    for line in out.lines() {
+        let Some((sha, name)) = line.split_once('\t') else {
+            continue;
+        };
+        if name.ends_with("^{}") {
+            return Ok(sha.trim().to_string());
+        }
+        first.get_or_insert_with(|| sha.trim().to_string());
+    }
+    first.ok_or_else(|| anyhow!("ref {target:?} not found on the remote"))
+}
+
 fn path_arg(path: &Path) -> Result<&str> {
     path.to_str()
         .ok_or_else(|| anyhow!("non-UTF-8 path: {}", path.display()))
@@ -435,6 +474,36 @@ fn ensure_executable(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_ls_remote_prefers_peeled_tag() {
+        let out = "1111111111111111111111111111111111111111\trefs/tags/v1\n\
+                   2222222222222222222222222222222222222222\trefs/tags/v1^{}";
+        assert_eq!(
+            parse_ls_remote(out, "v1").unwrap(),
+            "2222222222222222222222222222222222222222"
+        );
+    }
+
+    #[test]
+    fn parse_ls_remote_takes_first_when_unpeeled() {
+        let out = "3333333333333333333333333333333333333333\tHEAD";
+        assert_eq!(
+            parse_ls_remote(out, "HEAD").unwrap(),
+            "3333333333333333333333333333333333333333"
+        );
+    }
+
+    #[test]
+    fn parse_ls_remote_errors_when_empty() {
+        assert!(parse_ls_remote("", "nope").is_err());
+    }
+
+    #[test]
+    fn ls_remote_returns_pinned_sha_as_is() {
+        let sha = "abcdef0123456789abcdef0123456789abcdef01";
+        assert_eq!(ls_remote("unused://", Some(sha)).unwrap(), sha);
+    }
 
     #[test]
     fn renders_platform_tokens() {
