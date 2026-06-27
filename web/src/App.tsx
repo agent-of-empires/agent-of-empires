@@ -14,7 +14,9 @@ import { useLastSessionRestore } from "./hooks/useLastSessionRestore";
 import { useRepoGroups } from "./hooks/useRepoGroups";
 import { useSessionGroups } from "./hooks/useSessionGroups";
 import { useNestedSidebarGroups } from "./hooks/useNestedSidebarGroups";
-import { PluginUiProvider } from "./lib/pluginUiContext";
+import { PluginUiProvider, usePluginUiEntries } from "./lib/pluginUiContext";
+import { buildSortValueMap, pluginSortSpecs } from "./lib/pluginUi";
+import type { PluginSortContext, SidebarSortMode } from "./lib/sidebarSort";
 import { useSidebarSortMode } from "./hooks/useSidebarSortMode";
 import { useSidebarAxis } from "./hooks/useSidebarAxis";
 import { repoGroupToSidebarGroup, type SidebarGroup } from "./lib/sidebarGroups";
@@ -303,6 +305,40 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   const [sidebarSortMode, setSidebarSortMode] = useSidebarSortMode();
   const [sidebarAxis, setSidebarAxis] = useSidebarAxis();
 
+  // Active plugin sort (#2401): an ephemeral selection of a live `sort-key`
+  // entry. Not persisted (plugin entries die with the daemon). The ref is only
+  // ever read by resolving it against the live snapshot, so a stale ref (entry
+  // gone after a daemon restart) is inert and the sidebar falls back to the
+  // built-in sort; if the entry reappears on a later poll the selection
+  // resumes. Selecting a built-in mode clears it via `selectSidebarSortMode`.
+  const pluginUiEntries = usePluginUiEntries();
+  const [pluginSortRef, setPluginSortRef] = useState<{ pluginId: string; entryId: string } | null>(null);
+  const activePluginSort = useMemo(() => {
+    if (!pluginSortRef) return null;
+    return (
+      pluginSortSpecs(pluginUiEntries).find(
+        (s) => s.pluginId === pluginSortRef.pluginId && s.entryId === pluginSortRef.entryId,
+      ) ?? null
+    );
+  }, [pluginUiEntries, pluginSortRef]);
+  const pluginSort = useMemo<PluginSortContext | undefined>(
+    () =>
+      activePluginSort
+        ? {
+            direction: activePluginSort.direction,
+            values: buildSortValueMap(pluginUiEntries, activePluginSort.pluginId, activePluginSort.column),
+          }
+        : undefined,
+    [activePluginSort, pluginUiEntries],
+  );
+  const selectSidebarSortMode = useCallback(
+    (mode: SidebarSortMode) => {
+      setPluginSortRef(null);
+      setSidebarSortMode(mode);
+    },
+    [setSidebarSortMode],
+  );
+
   const { projects, refresh: refreshProjects } = useProjects();
   const {
     groups: repoGroups,
@@ -310,13 +346,17 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     toggleRepoCollapsed,
     updateRepoAppearance,
     reorderRepoGroups,
-  } = useRepoGroups(workspaces, workspaceOrdering, sidebarSortMode, projects);
-  const { groups: sessionGroups, toggleGroupCollapsed } = useSessionGroups(workspaces, sidebarSortMode);
+  } = useRepoGroups(workspaces, workspaceOrdering, sidebarSortMode, projects, pluginSort);
+  const { groups: sessionGroups, toggleGroupCollapsed } = useSessionGroups(workspaces, sidebarSortMode, pluginSort);
   // The nested `repo+group` axis reuses the already-built repo groups for
   // its top level (so repo collapse, appearance, and ordering are shared
   // with the repo axis) and splits each repo by `group_path` underneath.
   // See #1720.
-  const { groups: nestedGroups, toggleSubgroupCollapsed } = useNestedSidebarGroups(repoGroups, sidebarSortMode);
+  const { groups: nestedGroups, toggleSubgroupCollapsed } = useNestedSidebarGroups(
+    repoGroups,
+    sidebarSortMode,
+    pluginSort,
+  );
 
   // The sidebar render path consumes one honest model (SidebarGroup): the
   // repo axis maps in via an adapter, the user-group axis is already in
@@ -1671,7 +1711,9 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
               onStartSession={handleStartSession}
               readOnly={serverAbout?.read_only}
               sortMode={sidebarSortMode}
-              onSortModeChange={setSidebarSortMode}
+              onSortModeChange={selectSidebarSortMode}
+              pluginSortRef={pluginSortRef}
+              onPluginSortChange={setPluginSortRef}
               axis={sidebarAxis}
               onAxisChange={setSidebarAxis}
             />
