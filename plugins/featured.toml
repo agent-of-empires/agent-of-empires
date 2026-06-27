@@ -19,4 +19,4 @@
 
 [plugins."agent-of-empires.github"]
 source = "gh:agent-of-empires/plugin-github"
-tree_hash = "sha256:f5f204416197c99c47f46d1e0d5c7f16cbc95150bf6a8b7ad2420851886d974b"
+tree_hash = "sha256:6b506512d4efbc8a70c4d989188e701e547f5c35bd690c28276df435ced940fc"
