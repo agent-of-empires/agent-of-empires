@@ -13,6 +13,11 @@
 //! keepalive the runner supplies the stdin byte automatically and the
 //! second line is forwarded to the attached daemon; without it the fake
 //! agent blocks forever and the second line never arrives.
+//!
+//! Unix-only: the harness drives the runner's unix socket directly, so the
+//! whole file is gated rather than guarded at runtime (the `UnixStream`
+//! import alone would otherwise break non-Unix compilation).
+#![cfg(unix)]
 
 use std::io::{BufRead, BufReader, Read};
 use std::os::unix::net::UnixStream;
@@ -62,10 +67,6 @@ impl Drop for KillOnDrop {
 
 #[test]
 fn keepalive_unsticks_agent_blocked_on_stdin() {
-    if cfg!(not(unix)) {
-        return;
-    }
-
     let scratch = Scratch::new("k2455");
     let (home, xdg) = (scratch.0.clone(), scratch.0.clone());
     let workers = app_dir(&home, &xdg).join("acp-workers");
