@@ -266,7 +266,7 @@ function AcpChrome({
     state: rateLimitResumeState,
     error: rateLimitResumeError,
     respawn: resumeRateLimitedSession,
-  } = useRespawnSession(sessionId);
+  } = useRespawnSession(sessionId, state.rateLimit?.resets_at ?? null);
 
   // Re-pin the chat viewport to the bottom when the composer (or any
   // sibling below it: queued strip, primer banner) grows. assistant-ui's

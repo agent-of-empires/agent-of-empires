@@ -1525,6 +1525,7 @@
       "specs": [
         "src/lib/acpTypes.test.ts",
         "src/hooks/useAcpSession.queue.test.ts",
+        "src/hooks/useRespawnSession.test.tsx",
         "src/components/acp/SystemNotices.test.tsx",
         "src/components/acp/RateLimitRecoverySection.test.tsx",
         "src/components/acp/SwitchAgentModal.test.tsx"
