@@ -514,7 +514,9 @@ Two slots carry more than a single value, so one entry (one declared
   blocks. The web renderer knows these kinds: `heading { text }`,
   `row { label, value?, sublabel?, icon?, tone?, color?, href? }`,
   `note { text, tone? }`, `divider {}`,
-  `section { title?, children: Block[] }` (nested blocks),
+  `section { title?, children: Block[], collapsible?, collapsed? }` (nested
+  blocks; `collapsible` wraps the section in a native `<details>` the user can
+  fold, and `collapsed` starts it folded, default open),
   `comment { author, body, path?, line?, resolved?, href? }` (a read-only PR
   review comment: author, optional file:line, a wrapped body excerpt, and an
   unresolved/resolved marker), and

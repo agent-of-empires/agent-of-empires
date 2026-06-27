@@ -6,6 +6,7 @@
 // sort-key and filter-facet are deferred (see #2366 follow-ups).
 
 import { createElement, useState } from "react";
+import { ChevronRight } from "lucide-react";
 
 import { invokePluginAction } from "../../lib/api";
 import { usePluginUiEntries } from "../../lib/pluginUiContext";
@@ -371,12 +372,26 @@ function DetailBlock({ block, pluginId }: { block: Record<string, unknown>; plug
     case "section": {
       const title = str(block, "title");
       const children = Array.isArray(block.children) ? block.children.filter(isObject) : [];
+      const body = children.map((c, i) => <DetailBlock key={i} block={c} pluginId={pluginId} />);
+      const titleClass = "text-[11px] font-semibold uppercase tracking-wide text-text-dim";
+      // A `collapsible` section folds via a native <details>: keyboard-accessible
+      // and stateless, no JS toggle to track. `collapsed` sets the initial state;
+      // it stays open by default so existing panes look unchanged.
+      if (block.collapsible === true) {
+        return (
+          <details className="group flex flex-col gap-1" open={block.collapsed !== true}>
+            <summary className={`flex cursor-pointer list-none items-center gap-1 select-none ${titleClass}`}>
+              <ChevronRight className="size-3 shrink-0 transition-transform group-open:rotate-90" aria-hidden />
+              {title}
+            </summary>
+            <div className="flex flex-col gap-1">{body}</div>
+          </details>
+        );
+      }
       return (
         <section className="flex flex-col gap-1">
-          {title && <div className="text-[11px] font-semibold uppercase tracking-wide text-text-dim">{title}</div>}
-          {children.map((c, i) => (
-            <DetailBlock key={i} block={c} pluginId={pluginId} />
-          ))}
+          {title && <div className={titleClass}>{title}</div>}
+          {body}
         </section>
       );
     }

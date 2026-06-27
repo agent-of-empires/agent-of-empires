@@ -234,6 +234,39 @@ describe("plugin slot renderers", () => {
     expect(other.style.color).toBe("");
   });
 
+  it("a collapsible section renders a foldable details; collapsed sets the initial state", () => {
+    const entry: PluginUiEntry = {
+      plugin_id: "acme.kit",
+      slot: "pane",
+      id: "gh",
+      session_id: "s1",
+      payload: {
+        blocks: [
+          { kind: "section", title: "Checks: passing", collapsible: true, children: [{ kind: "note", text: "ci" }] },
+          {
+            kind: "section",
+            title: "Unresolved comments: 2",
+            collapsible: true,
+            collapsed: true,
+            children: [{ kind: "note", text: "cmt" }],
+          },
+          { kind: "section", title: "Plain", children: [{ kind: "note", text: "x" }] },
+        ],
+      },
+    };
+    const { container } = render(<PluginPaneBody entry={entry} />);
+    const details = container.querySelectorAll("details");
+    expect(details).toHaveLength(2);
+    // First (no `collapsed`) starts open; second (collapsed:true) starts closed.
+    expect((details[0] as HTMLDetailsElement).open).toBe(true);
+    expect((details[1] as HTMLDetailsElement).open).toBe(false);
+    // The title and children live inside the disclosure.
+    expect(screen.getByText("Checks: passing")).toBeTruthy();
+    expect(screen.getByText("cmt")).toBeTruthy();
+    // A section without the flag stays a plain <section>, not a <details>.
+    expect(container.querySelector("section")).toBeTruthy();
+  });
+
   it("comment blocks render read-only with author, location and resolved state", () => {
     const entry: PluginUiEntry = {
       plugin_id: "acme.kit",
