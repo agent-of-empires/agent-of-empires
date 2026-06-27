@@ -60,6 +60,12 @@ pub struct PluginManifest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub themes: Vec<ThemeContribution>,
 
+    /// Status segments the plugin contributes. Each is a labelled id the host
+    /// renders in a status surface; consumed by the status reference plugin
+    /// (#2096). Requires `api_version >= 4`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub status: Vec<StatusContribution>,
+
     /// UI slots the plugin renders into. Consumed by #2366.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ui: Vec<UiContribution>,
@@ -68,6 +74,16 @@ pub struct PluginManifest {
     /// release-binary worker; actually launching it is #2095.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<RuntimeSpec>,
+
+    /// Optional range of aoe (host app) versions this plugin version supports,
+    /// as a semver requirement like `">=0.10, <0.12"`. Distinct from
+    /// `api_version` (the manifest schema version): `api_version` gates the
+    /// manifest shape, `aoe_version` gates the host's app behaviour. The host
+    /// refuses to install and skips loading a plugin when its running version
+    /// is outside this range. Absent means no constraint. Requires
+    /// `api_version >= 4`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aoe_version: Option<String>,
 }
 
 /// A command the plugin contributes. The host namespaces it as
@@ -145,6 +161,17 @@ pub struct ThemeContribution {
     pub name: String,
     /// Theme TOML path, relative to the plugin directory.
     pub path: String,
+}
+
+/// A status segment the plugin contributes. The host namespaces it by plugin
+/// id and renders `label` in a status surface; consumed by #2096.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatusContribution {
+    /// Stable identifier the host addresses this segment by.
+    pub id: String,
+    /// Human-readable text shown in the status surface.
+    #[serde(default)]
+    pub label: String,
 }
 
 /// A host-rendered UI slot a plugin may push state into (#2366). A closed set,
@@ -355,6 +382,30 @@ impl PluginManifest {
         out
     }
 
+    /// Check the running host (aoe app) version against the manifest's declared
+    /// `aoe_version` range. `host` is a semver version string (the host's
+    /// `CARGO_PKG_VERSION`). No declared range means no constraint. Returns an
+    /// actionable message when the host is outside the range, so install can
+    /// refuse and load can skip with a reason. The range is re-parsed here
+    /// rather than cached because [`validate`] already gated its syntax, so a
+    /// loaded manifest's range is known-valid.
+    pub fn host_compat(&self, host: &str) -> Result<(), String> {
+        let Some(req) = &self.aoe_version else {
+            return Ok(());
+        };
+        let req = semver::VersionReq::parse(req)
+            .map_err(|e| format!("aoe_version {req:?} is not a valid semver requirement: {e}"))?;
+        let host_version = semver::Version::parse(host)
+            .map_err(|e| format!("host aoe version {host:?} is not valid semver: {e}"))?;
+        if req.matches(&host_version) {
+            Ok(())
+        } else {
+            Err(format!(
+                "plugin requires aoe {req}; this host is {host_version}"
+            ))
+        }
+    }
+
     /// Structural validation; collects every problem instead of stopping at
     /// the first so a plugin author sees the full list in one pass.
     ///
@@ -537,6 +588,36 @@ impl PluginManifest {
             check(
                 !t.path.is_empty(),
                 format!("themes[{i}].path must not be empty"),
+            );
+        }
+        for (i, s) in self.status.iter().enumerate() {
+            check(
+                !s.id.is_empty(),
+                format!("status[{i}].id must not be empty"),
+            );
+        }
+        // `aoe_version` is the host-app compatibility range, gated by the host
+        // at install and load; reject a malformed requirement at parse so the
+        // author learns of it before publishing rather than at a user's install.
+        if let Some(req) = &self.aoe_version {
+            check(
+                semver::VersionReq::parse(req).is_ok(),
+                format!("aoe_version {req:?} is not a valid semver requirement"),
+            );
+        }
+        // `status` and `aoe_version` are api_version 4 fields. A manifest using
+        // them while declaring an older api_version would parse fine on this
+        // host but fail with a confusing "unknown field" on a pre-4 host (which
+        // never reaches the "upgrade aoe" path because the declared version is
+        // not newer). Force the bump so older hosts emit the right message.
+        if self.api_version < 4 {
+            check(
+                self.status.is_empty(),
+                "status contributions require api_version >= 4".into(),
+            );
+            check(
+                self.aoe_version.is_none(),
+                "aoe_version requires api_version >= 4".into(),
             );
         }
         for key in self.setting_defaults.keys() {
