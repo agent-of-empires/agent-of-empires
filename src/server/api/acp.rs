@@ -210,7 +210,7 @@ fn rate_limit_resume_marker_resets_at(
     match latest_status {
         Some(Event::Stopped { reason }) if reason == "rate_limited" => Some(
             latest_rate_limit
-                .map(|info| info.resets_at.clone())
+                .map(|info| info.resets_at)
                 .unwrap_or(fallback_resets_at),
         ),
         _ => None,
@@ -2318,7 +2318,7 @@ mod tests {
         let fallback = utc_ts("2099-01-01T00:00:00Z");
         let info = RateLimitInfo {
             status: "limited".to_string(),
-            resets_at: resets_at.clone(),
+            resets_at,
             kind: "rate_limit".to_string(),
         };
 
@@ -2336,7 +2336,7 @@ mod tests {
         let fallback = utc_ts("2099-01-01T00:00:00Z");
 
         assert_eq!(
-            rate_limit_resume_marker_resets_at(Some(&stopped), None, fallback.clone()),
+            rate_limit_resume_marker_resets_at(Some(&stopped), None, fallback),
             Some(fallback)
         );
     }
