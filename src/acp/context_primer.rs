@@ -765,6 +765,7 @@ mod tests {
                 content: String::new(),
                 output: Vec::new(),
                 completed_at: Utc::now(),
+                async_subagent: false,
             },
         )
     }

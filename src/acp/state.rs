@@ -574,6 +574,18 @@ pub enum Event {
         /// events stay imprecise; new events are accurate end-to-end.
         #[serde(default = "chrono::Utc::now")]
         completed_at: DateTime<Utc>,
+        /// True when this completion is the synchronous launch of an
+        /// asynchronous sub-agent (Claude's `Task` tool with
+        /// `isAsync: true`): the visible tool call completes immediately
+        /// with the SDK marker `Async agent launched successfully` while
+        /// the real sub-agent runs off-protocol and never reports back on
+        /// this stream. Renderers use this to draw a neutral "runs in
+        /// background" sub-agent card instead of a finished tool card, and
+        /// to suppress the marker body (which carries an internal agent id
+        /// the SDK tells us not to surface). Defaults false for events
+        /// persisted before this field landed. See `OffProtocolWorkKind`.
+        #[serde(default)]
+        async_subagent: bool,
     },
     /// Streaming tool output. Some agents emit `ToolCallUpdate` notifications
     /// with `status != Completed` but populated `fields.content` to stream
@@ -1250,6 +1262,7 @@ mod tests {
             content: String::new(),
             output: Vec::new(),
             completed_at: Utc::now(),
+            async_subagent: false,
         })
         .unwrap();
         assert!(s.in_flight_tool.is_none());

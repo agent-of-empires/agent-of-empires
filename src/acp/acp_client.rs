@@ -3778,12 +3778,25 @@ fn map_update_to_events(
                 });
             }
             if completed {
+                // An async sub-agent launch (Claude `Task` with isAsync)
+                // completes immediately with the `Async agent launched
+                // successfully` marker while the real work runs
+                // off-protocol. Flag it so renderers draw a neutral
+                // background-sub-agent card and drop the marker body
+                // (which leaks an internal agent id). Same detector the
+                // silent-orphan watchdog uses; this just forwards it to
+                // the UI event stream.
+                let async_subagent = matches!(
+                    detect_off_protocol_work_completed(&update.fields.content),
+                    Some(OffProtocolWorkKind::AsyncAgent)
+                );
                 events.push(Event::ToolCallCompleted {
                     tool_call_id: id,
                     is_error,
                     content: content_text,
                     output: output_blocks,
                     completed_at: chrono::Utc::now(),
+                    async_subagent,
                 });
             } else if !content_text.is_empty() {
                 events.push(Event::ToolCallContent {
@@ -3900,6 +3913,7 @@ fn map_update_to_events(
                     content: String::new(),
                     output: Vec::new(),
                     completed_at: now,
+                    async_subagent: false,
                 },
             ]
         }
@@ -4237,6 +4251,7 @@ async fn emit_permission_denied(event_tx: &mpsc::Sender<Event>, tool_call_id: &s
             content: content.to_string(),
             output: Vec::new(),
             completed_at: chrono::Utc::now(),
+            async_subagent: false,
         })
         .await;
 }
@@ -9434,6 +9449,56 @@ mod tests {
                 assert_eq!(content, "abc1234 first commit");
             }
             other => panic!("expected ToolCallCompleted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_tool_call_update_flags_async_subagent_launch() {
+        // Claude's async `Task` tool completes immediately with the SDK
+        // marker while the sub-agent runs off-protocol. The completion
+        // event must carry async_subagent so renderers draw a background
+        // card and drop the marker body (it leaks an internal agent id).
+        use agent_client_protocol::schema::{
+            Content, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+        };
+        let fields = ToolCallUpdateFields::new()
+            .status(ToolCallStatus::Completed)
+            .content(vec![ToolCallContent::Content(Content::new(
+                "Async agent launched successfully\nagentId: ae6f0567246843e25 (internal ID)",
+            ))]);
+        let update = ToolCallUpdate::new("tc-async", fields);
+        let events = map_update_to_events(
+            SessionUpdate::ToolCallUpdate(update),
+            &agent_profiles::CLAUDE,
+        );
+        match events.iter().find_map(|e| match e {
+            Event::ToolCallCompleted { async_subagent, .. } => Some(*async_subagent),
+            _ => None,
+        }) {
+            Some(flag) => assert!(flag, "async sub-agent launch must set async_subagent"),
+            None => panic!("expected a ToolCallCompleted event, got {events:?}"),
+        }
+    }
+
+    #[test]
+    fn map_tool_call_update_normal_completion_is_not_async_subagent() {
+        use agent_client_protocol::schema::{
+            Content, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+        };
+        let fields = ToolCallUpdateFields::new()
+            .status(ToolCallStatus::Completed)
+            .content(vec![ToolCallContent::Content(Content::new("done"))]);
+        let update = ToolCallUpdate::new("tc-normal", fields);
+        let events = map_update_to_events(
+            SessionUpdate::ToolCallUpdate(update),
+            &agent_profiles::CLAUDE,
+        );
+        match events.iter().find_map(|e| match e {
+            Event::ToolCallCompleted { async_subagent, .. } => Some(*async_subagent),
+            _ => None,
+        }) {
+            Some(flag) => assert!(!flag, "normal completion must not set async_subagent"),
+            None => panic!("expected a ToolCallCompleted event, got {events:?}"),
         }
     }
 
