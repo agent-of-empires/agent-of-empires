@@ -381,6 +381,17 @@ describe("PluginsSettings", () => {
     expect(queryByTestId("plugins-check-updates")).toBeNull();
   });
 
+  it("a failed details fetch shows the error, not a false 'no releases'", async () => {
+    fetchPluginDetails.mockResolvedValue({ kind: "error", message: "Rate limited by GitHub." });
+    const { findByTestId } = render(<PluginsSettings />);
+    // example.plugin has a gh source, so opening it triggers a details fetch.
+    fireEvent.click(await findByTestId("plugin-open-example.plugin"));
+    const err = await findByTestId("plugin-detail-error");
+    expect(err.textContent).toContain("Rate limited by GitHub.");
+    const modal = await findByTestId("plugin-detail-modal");
+    expect(modal.textContent).not.toContain("No published releases.");
+  });
+
   it("clicking an installed plugin opens the detail modal and closes it", async () => {
     const { findByTestId, queryByTestId } = render(<PluginsSettings />);
     fireEvent.click(await findByTestId("plugin-open-example.plugin"));

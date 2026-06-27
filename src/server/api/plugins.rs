@@ -117,7 +117,11 @@ pub struct DetailsQuery {
 pub async fn plugin_details(Query(query): Query<DetailsQuery>) -> Response {
     match plugin::discover::details(&query.source).await {
         Ok(detail) => Json(detail).into_response(),
-        Err(e) => error_response(StatusCode::BAD_GATEWAY, "details_failed", format!("{e:#}")),
+        // `details()` only hard-errors on an invalid / unsupported `source`; a
+        // GitHub fetch failure is reported in-band (manifest_error / empty
+        // release tags), so a hard error here is bad client input, not an
+        // upstream outage.
+        Err(e) => error_response(StatusCode::BAD_REQUEST, "invalid_source", format!("{e:#}")),
     }
 }
 

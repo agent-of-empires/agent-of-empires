@@ -170,15 +170,26 @@ impl GitHubClient {
         Ok(response.items)
     }
 
-    /// Fetch a single file's raw contents from a repo's default branch via the
-    /// contents API (`Accept: application/vnd.github.raw`). Used to read a
-    /// plugin's `aoe-plugin.toml` for the details view without cloning.
-    pub async fn get_repo_file(&self, owner: &str, repo: &str, path: &str) -> Result<String> {
+    /// Fetch a single file's raw contents via the contents API (`Accept:
+    /// application/vnd.github.raw`). Used to read a plugin's `aoe-plugin.toml`
+    /// for the details view without cloning. `reference` pins the branch, tag,
+    /// or commit (`?ref=`); `None` reads the repo's default branch.
+    pub async fn get_repo_file(
+        &self,
+        owner: &str,
+        repo: &str,
+        path: &str,
+        reference: Option<&str>,
+    ) -> Result<String> {
         let path = utf8_percent_encode(path, TAG_SEGMENT);
-        let url = format!(
+        let mut url = format!(
             "{}/repos/{}/{}/contents/{}",
             self.api_base, owner, repo, path
         );
+        if let Some(reference) = reference {
+            url.push_str("?ref=");
+            url.extend(utf8_percent_encode(reference, TAG_SEGMENT));
+        }
         self.send_text(self.http.get(url).header(
             ACCEPT,
             HeaderValue::from_static("application/vnd.github.raw"),

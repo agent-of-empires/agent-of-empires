@@ -138,7 +138,9 @@ export function PluginDetailModal({ source, title, fallback, installCommand, onC
                 ))}
               </ul>
             ) : (
-              !loading && <p className="text-xs text-text-dim">No published releases.</p>
+              // Only claim "no releases" after a successful fetch; a transport
+              // error already shows above and must not read as zero releases.
+              !loading && !error && <p className="text-xs text-text-dim">No published releases.</p>
             )}
           </div>
         )}

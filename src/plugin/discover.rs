@@ -227,9 +227,15 @@ pub async fn details(source: &str) -> Result<PluginDetail> {
     let PluginSource::Github { owner, repo, .. } = &parsed else {
         bail!("details are only available for a gh:owner/repo source");
     };
+    // Honor a pinned tag/commit so a ref-pinned installed plugin's modal shows
+    // the installed version, not whatever is on HEAD today.
+    let reference = parsed.reference();
     let client = client()?;
 
-    let manifest = match client.get_repo_file(owner, repo, "aoe-plugin.toml").await {
+    let manifest = match client
+        .get_repo_file(owner, repo, "aoe-plugin.toml", reference)
+        .await
+    {
         Ok(text) => toml::from_str::<RawManifest>(&text)
             .map(|m| DetailManifest {
                 id: m.id,
