@@ -551,8 +551,9 @@ Two slots carry more than a single value, so one entry (one declared
   list stays browsable.
 
   A pane entry gets a larger payload budget than the other slots: its normalized
-  JSON may be up to 64KB, against 8KB for the small badge/column slots, so a
-  plugin can push a full comment list in one entry without truncating to fit.
+  JSON may be up to 64KB, against 8KB for every other slot (`status-bar`,
+  `row-badge`, `row-column`, `card`, `detail-badge`), so a plugin can push a full
+  comment list in one pane entry without truncating to fit.
 
 **Block parsing is forward-compatible by design.** The host stores `blocks` as
 opaque JSON (`Vec<Value>`); it validates only that the payload envelope is
