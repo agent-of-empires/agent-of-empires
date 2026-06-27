@@ -214,8 +214,7 @@ fn stdout_nudge_config(args: &AcpRunnerArgs) -> Option<StdoutNudgeConfig> {
 }
 
 fn stdout_nudge_default_for_agent(args: &AcpRunnerArgs) -> bool {
-    args.agent_key == "claude"
-        || args.agent_name.contains("claude-agent-acp")
+    args.agent_name.contains("claude-agent-acp")
         || args
             .agent_argv
             .first()
@@ -1317,6 +1316,11 @@ mod tests {
             "",
             "claude-agent-acp",
             "/usr/bin/claude-agent-acp"
+        )));
+        // A bare `claude` key without the claude-agent-acp binary is not
+        // enough: the keepalive defaults on only for the verified adapter.
+        assert!(!stdout_nudge_default_for_agent(&args_with_agent(
+            "claude", "claude", "claude"
         )));
         // Other adapters are off by default.
         assert!(!stdout_nudge_default_for_agent(&args_with_agent(
