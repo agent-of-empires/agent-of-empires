@@ -821,7 +821,9 @@ async fn auto_update_applies_clean_github_update() {
 async fn clean_update_skips_capability_change() {
     let _home = isolate();
     let base = tempfile::tempdir().unwrap();
-    let with_cap = PLAIN_MANIFEST.replace(
+    // Bump the version too, so the "prior version kept" assertion actually
+    // proves nothing was rewritten (a same-version skip could pass vacuously).
+    let with_cap = PLAIN_MANIFEST.replace("1.0.0", "2.0.0").replace(
         "api_version = 2",
         "api_version = 2\ncapabilities = [\"net\"]",
     );
