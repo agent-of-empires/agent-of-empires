@@ -574,9 +574,15 @@ incremental cursor. The dashboard polls it on the same cadence as
 `/api/sessions` and renders per-session entries only for sessions present in
 the live list. Notifications surface as toasts, deduped by `seq`.
 
-`sort-key` and `filter-facet` are accepted and stored by the host but their
-dashboard rendering (which needs changes to the sidebar's sort/filter core) is
-deferred to a follow-up.
+`sort-key` and `filter-facet` render in the dashboard sidebar (#2401): each
+global `sort-key` is an extra option in the sort picker that orders rows by the
+referenced `row-column`'s `sort_value` (best value per direction at the
+workspace and group level, unvalued rows sink), and each `filter-facet` is a
+facet control that filters rows by the referenced `row-column`'s
+`filter_values` (AND across facets, OR within one). Both selections are
+client-side and ephemeral: they read the already-fetched scalars, run no plugin
+code, and are not persisted, so a daemon restart falls back to the built-in
+sort.
 
 The native **structured-view** TUI (`aoe acp attach`, the remote-home picker)
 polls the same endpoint on a 3-second cadence and renders the slots a terminal
@@ -595,9 +601,8 @@ Each deferred piece returns as its own PR once the core is proven: the Tier 0
 contribution registries (issue 2094), the UI extension points (issue 2366,
 above), the builtin worker self-exec path and worker SDK (with the first
 builtin worker that needs them), and the discovery / featured supply-chain
-layer with integrity hashing (issues 2364 and 2365). Within #2366, dashboard
-rendering of the `sort-key` and `filter-facet` slots is itself a follow-up, as
-is rendering plugin slots in the standalone (non-daemon) home screen (the
+layer with integrity hashing (issues 2364 and 2365). Rendering plugin slots in
+the standalone (non-daemon) home screen is still a follow-up (the
 structured-view TUI already renders them, #2402). Pinning a featured plugin's
 release-binary asset hash in `featured.toml` (so a featured worker is attested,
 not just its source) is a follow-up; today a release-binary plugin cannot be

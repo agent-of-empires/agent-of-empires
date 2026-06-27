@@ -2,8 +2,9 @@
 // typed display state; these components draw it. No plugin code runs here.
 // Each reads the shared snapshot via context and the pure selectors in
 // `pluginUi.ts`. Slots shipped here: status-bar, row-badge, row-column, card,
-// pane, detail-badge. Notifications surface as toasts via the hook;
-// sort-key and filter-facet are deferred (see #2366 follow-ups).
+// pane, detail-badge. Notifications surface as toasts via the hook; the
+// sort-key and filter-facet slots render as sidebar sort options and a facet
+// filter (the sidebar owns those; see SidebarSortPicker / WorkspaceSidebar, #2401).
 
 import { createElement, useState } from "react";
 import { ChevronRight } from "lucide-react";
@@ -158,8 +159,9 @@ export function PluginRowBadges({ sessionId }: { sessionId: string }) {
 }
 
 /** row-column: per-session text column, right-aligned on a session row. The
- *  payload may also carry sort/filter scalars; rendering those as interactive
- *  controls is the deferred sort-key/filter-facet work. */
+ *  payload may also carry `sort_value` / `filter_values` scalars, which the
+ *  sidebar's sort-key and filter-facet controls consume (#2401); this renders
+ *  only the visible text. */
 export function PluginRowColumn({ sessionId }: { sessionId: string }) {
   const entries = sessionEntries(usePluginUiEntries(), "row-column", sessionId);
   if (entries.length === 0) return null;
