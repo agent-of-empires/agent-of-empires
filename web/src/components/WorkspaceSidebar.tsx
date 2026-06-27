@@ -2363,7 +2363,11 @@ export function WorkspaceSidebar({
     [activeFacets, pluginUiEntries],
   );
 
-  const dragDisabled = !!readOnly || sortMode === "lastActivity" || pluginSortActive;
+  // A facet filter narrows the visible rows, but handleDragEnd rebuilds order
+  // from the full group list, so a drag inside a filtered subset could move
+  // hidden rows and persist an order the user never saw. Gate reorder off while
+  // facets are active, like the computed sort modes. See #2401.
+  const dragDisabled = !!readOnly || sortMode === "lastActivity" || pluginSortActive || activeFacets.length > 0;
   // Reorder (group drag + row drag) is also off whenever any visible group
   // forbids it, which is the whole user-group axis: groups have no manual
   // order in v1. Gating here keeps the shared DndContext from firing a
@@ -3005,7 +3009,7 @@ export function WorkspaceSidebar({
                         <SidebarGroupHeader
                           group={{ ...fullGroup, collapsed: !showExpanded }}
                           hasActiveChild={!showExpanded && hasActiveChild}
-                          onClick={() => !q && onToggleGroup(group.id)}
+                          onClick={() => !hasFilter && onToggleGroup(group.id)}
                           onUpdateAppearance={onUpdateRepoAppearance}
                           onArchiveAll={readOnly || offline ? undefined : () => onArchiveGroup(fullGroup)}
                           onPin={readOnly || offline ? undefined : onPinProject}
@@ -3099,7 +3103,7 @@ export function WorkspaceSidebar({
                   <SidebarGroupHeader
                     group={{ ...repo, collapsed: !repoExpanded }}
                     hasActiveChild={!repoExpanded && repoHasActiveChild}
-                    onClick={() => !q && onToggleGroup(repo.id)}
+                    onClick={() => !hasFilter && onToggleGroup(repo.id)}
                     onUpdateAppearance={onUpdateRepoAppearance}
                     onArchiveAll={readOnly || offline ? undefined : () => onArchiveGroup(repo)}
                     onPin={readOnly || offline ? undefined : onPinProject}
@@ -3134,7 +3138,7 @@ export function WorkspaceSidebar({
                           <SidebarGroupHeader
                             group={{ ...fullSubgroup, collapsed: !subExpanded }}
                             hasActiveChild={!subExpanded && subHasActiveChild}
-                            onClick={() => !q && onToggleSubgroup(repo.id, groupPath)}
+                            onClick={() => !hasFilter && onToggleSubgroup(repo.id, groupPath)}
                             onUpdateAppearance={onUpdateRepoAppearance}
                             onArchiveAll={readOnly || offline ? undefined : () => onArchiveGroup(fullSubgroup)}
                             onNewSession={onNew}
@@ -3245,13 +3249,13 @@ export function WorkspaceSidebar({
             );
           })()}
 
-          {!hasResults && filterQuery && (
+          {!hasResults && hasFilter && (
             <div className="px-4 py-8 text-center">
               <p className="text-sm text-text-muted">No matches for &ldquo;{filterQuery}&rdquo;</p>
             </div>
           )}
 
-          {!hasResults && !filterQuery && (
+          {!hasResults && !hasFilter && (
             <div className="px-4 py-10 text-center" data-testid="sidebar-empty-state">
               <p className="text-sm font-medium text-text-secondary">No sessions yet</p>
               <p className="mt-1 text-[13px] text-text-muted">Create a session to start working in a repo.</p>
