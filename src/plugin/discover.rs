@@ -12,8 +12,8 @@
 
 use std::time::Duration;
 
-use anyhow::Result;
-use serde::Serialize;
+use anyhow::{bail, Result};
+use serde::{Deserialize, Serialize};
 
 use crate::github::{GitHubClient, GitHubClientConfig, GitHubRepo, DEFAULT_USER_AGENT};
 
@@ -67,11 +67,7 @@ pub struct DiscoveryResult {
 /// Search the `aoe-plugin` topic and badge each result. `query` is an optional
 /// free-text term ANDed with the topic filter.
 pub async fn discover(query: Option<&str>) -> Result<Vec<DiscoveryResult>> {
-    let client = GitHubClient::unauthenticated(GitHubClientConfig {
-        api_base: api_base(),
-        user_agent: DEFAULT_USER_AGENT.to_string(),
-        timeout: Duration::from_secs(30),
-    })?;
+    let client = client()?;
 
     let mut q = format!("topic:{PLUGIN_TOPIC} fork:false archived:false");
     if let Some(term) = query.map(str::trim).filter(|t| !t.is_empty()) {
@@ -154,9 +150,125 @@ fn rank(mut results: Vec<DiscoveryResult>) -> Vec<DiscoveryResult> {
     results
 }
 
+fn client() -> Result<GitHubClient> {
+    Ok(GitHubClient::unauthenticated(GitHubClientConfig {
+        api_base: api_base(),
+        user_agent: DEFAULT_USER_AGENT.to_string(),
+        timeout: Duration::from_secs(30),
+    })?)
+}
+
 fn api_base() -> String {
     std::env::var("AOE_UPDATE_API_BASE")
         .unwrap_or_else(|_| crate::github::DEFAULT_GITHUB_API_BASE.to_string())
+}
+
+/// The manifest fields a detail view shows, parsed leniently (unknown and
+/// future keys are ignored) so a plugin targeting a newer `api_version` than
+/// this host can install still renders in the modal.
+#[derive(Debug, Clone, Serialize)]
+pub struct DetailManifest {
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    pub api_version: u32,
+    pub capabilities: Vec<String>,
+    pub ui_contributions: Vec<UiSlotView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UiSlotView {
+    pub slot: String,
+    pub id: String,
+}
+
+/// The on-demand detail for one plugin source: its manifest fields plus the
+/// repo's published release tags (the available versions).
+#[derive(Debug, Clone, Serialize)]
+pub struct PluginDetail {
+    pub source: String,
+    pub manifest: Option<DetailManifest>,
+    /// Why the manifest could not be read/parsed, if it could not.
+    pub manifest_error: Option<String>,
+    /// Published GitHub release tags, newest first (the available versions).
+    pub release_tags: Vec<String>,
+}
+
+/// Lenient `aoe-plugin.toml` shape for the detail view. Unlike the strict host
+/// parser it ignores unknown fields and does not range-check `api_version`, so a
+/// not-yet-installable plugin still shows its version/description/capabilities.
+#[derive(Deserialize)]
+struct RawManifest {
+    id: String,
+    name: String,
+    version: String,
+    #[serde(default)]
+    description: String,
+    api_version: u32,
+    #[serde(default)]
+    capabilities: Vec<String>,
+    #[serde(default)]
+    ui: Vec<RawUi>,
+}
+
+#[derive(Deserialize)]
+struct RawUi {
+    slot: String,
+    id: String,
+}
+
+/// Fetch the detail for a `gh:owner/repo` source: its `aoe-plugin.toml` (read
+/// via the contents API, no clone) and the repo's release tags. A manifest that
+/// is missing or unparseable is reported in `manifest_error` while the release
+/// tags still load, so the modal degrades gracefully.
+pub async fn details(source: &str) -> Result<PluginDetail> {
+    let parsed = PluginSource::parse(source)?;
+    let PluginSource::Github { owner, repo, .. } = &parsed else {
+        bail!("details are only available for a gh:owner/repo source");
+    };
+    let client = client()?;
+
+    let manifest = match client.get_repo_file(owner, repo, "aoe-plugin.toml").await {
+        Ok(text) => toml::from_str::<RawManifest>(&text)
+            .map(|m| DetailManifest {
+                id: m.id,
+                name: m.name,
+                version: m.version,
+                description: m.description,
+                api_version: m.api_version,
+                capabilities: m.capabilities,
+                ui_contributions: m
+                    .ui
+                    .into_iter()
+                    .map(|u| UiSlotView {
+                        slot: u.slot,
+                        id: u.id,
+                    })
+                    .collect(),
+            })
+            .map_err(|e| format!("aoe-plugin.toml is invalid: {e}")),
+        Err(e) => Err(format!("{e}")),
+    };
+
+    // Release tags are best-effort: a repo with no releases is normal, so a
+    // failure here just yields an empty list rather than failing the request.
+    let release_tags = client
+        .list_releases(owner, repo, 30)
+        .await
+        .map(|rs| rs.into_iter().map(|r| r.tag_name).collect())
+        .unwrap_or_default();
+
+    let (manifest, manifest_error) = match manifest {
+        Ok(m) => (Some(m), None),
+        Err(e) => (None, Some(e)),
+    };
+    Ok(PluginDetail {
+        source: parsed.slug(),
+        manifest,
+        manifest_error,
+        release_tags,
+    })
 }
 
 #[cfg(test)]
@@ -232,6 +344,31 @@ mod tests {
         let repos = vec![repo("not-a-slug", 1), repo("a/b/c", 1)];
         let out = badge_repos(repos, &FeaturedIndex::default(), &[]);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn detail_manifest_parse_tolerates_newer_api_version_and_unknown_keys() {
+        // A plugin targeting an api_version this host cannot install must still
+        // render in the detail modal, and unknown/future keys are ignored.
+        let toml = r#"
+id = "acme.future"
+name = "Future"
+version = "9.9.9"
+api_version = 99
+description = "from the future"
+capabilities = ["net"]
+some_unknown_future_key = true
+
+[[ui]]
+slot = "status-bar"
+id = "s"
+"#;
+        let m: RawManifest = toml::from_str(toml).expect("lenient parse");
+        assert_eq!(m.version, "9.9.9");
+        assert_eq!(m.api_version, 99);
+        assert_eq!(m.capabilities, vec!["net"]);
+        assert_eq!(m.ui.len(), 1);
+        assert_eq!(m.ui[0].slot, "status-bar");
     }
 
     #[test]

@@ -639,6 +639,15 @@ Unauthenticated GitHub search is rate limited (about 10 requests/minute/IP); the
 client maps a 403/429 to a `RateLimited` error so each surface reports it plainly
 rather than as a generic failure.
 
+`GET /api/plugins/details?source=gh:owner/repo` backs the dashboard's detail
+modal (opened from a discovery result or an installed-plugin row). It reads the
+plugin's `aoe-plugin.toml` via the GitHub contents API (no clone) and lists the
+repo's release tags as the available versions. The manifest is parsed leniently
+(unknown and future keys ignored, `api_version` not range-checked), so a plugin
+targeting a newer host than the one installed still renders; a missing or
+unparseable manifest is reported in `manifest_error` while the release tags still
+load.
+
 ### Update checks
 
 `plugin::update_check::outdated()` checks every installed external plugin against

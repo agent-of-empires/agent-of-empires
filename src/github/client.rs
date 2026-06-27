@@ -170,11 +170,38 @@ impl GitHubClient {
         Ok(response.items)
     }
 
+    /// Fetch a single file's raw contents from a repo's default branch via the
+    /// contents API (`Accept: application/vnd.github.raw`). Used to read a
+    /// plugin's `aoe-plugin.toml` for the details view without cloning.
+    pub async fn get_repo_file(&self, owner: &str, repo: &str, path: &str) -> Result<String> {
+        let path = utf8_percent_encode(path, TAG_SEGMENT);
+        let url = format!(
+            "{}/repos/{}/{}/contents/{}",
+            self.api_base, owner, repo, path
+        );
+        self.send_text(self.http.get(url).header(
+            ACCEPT,
+            HeaderValue::from_static("application/vnd.github.raw"),
+        ))
+        .await
+    }
+
     async fn send_json<T: DeserializeOwned>(&self, request: reqwest::RequestBuilder) -> Result<T> {
         let response = request.send().await.map_err(classify_transport_error)?;
         let status = response.status();
         if status.is_success() {
             return response.json::<T>().await.map_err(GitHubError::Decode);
+        }
+        let headers = response.headers().clone();
+        let body = response.text().await.unwrap_or_default();
+        Err(classify_status(status, &headers, &body))
+    }
+
+    async fn send_text(&self, request: reqwest::RequestBuilder) -> Result<String> {
+        let response = request.send().await.map_err(classify_transport_error)?;
+        let status = response.status();
+        if status.is_success() {
+            return response.text().await.map_err(GitHubError::Http);
         }
         let headers = response.headers().clone();
         let body = response.text().await.unwrap_or_default();

@@ -9,12 +9,19 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { fireEvent, render, waitFor } from "@testing-library/react";
 
-import type { DiscoverResult, PluginListResponse, PluginToggleResult, PluginUpdatesResult } from "../../../lib/api";
+import type {
+  DiscoverResult,
+  PluginDetailResult,
+  PluginListResponse,
+  PluginToggleResult,
+  PluginUpdatesResult,
+} from "../../../lib/api";
 
 const fetchPlugins = vi.fn<[], Promise<PluginListResponse | null>>();
 const setPluginEnabled = vi.fn<[string, boolean], Promise<PluginToggleResult>>();
 const fetchPluginUpdates = vi.fn<[], Promise<PluginUpdatesResult>>();
 const discoverPlugins = vi.fn<[string], Promise<DiscoverResult>>();
+const fetchPluginDetails = vi.fn<[string], Promise<PluginDetailResult>>();
 const reportInfo = vi.fn<[string], void>();
 
 vi.mock("../../../lib/api", () => ({
@@ -22,6 +29,7 @@ vi.mock("../../../lib/api", () => ({
   setPluginEnabled: (id: string, enabled: boolean) => setPluginEnabled(id, enabled),
   fetchPluginUpdates: () => fetchPluginUpdates(),
   discoverPlugins: (q: string) => discoverPlugins(q),
+  fetchPluginDetails: (source: string) => fetchPluginDetails(source),
 }));
 
 vi.mock("../../../lib/toastBus", () => ({
@@ -76,10 +84,15 @@ beforeEach(() => {
   setPluginEnabled.mockReset();
   fetchPluginUpdates.mockReset();
   discoverPlugins.mockReset();
+  fetchPluginDetails.mockReset();
   reportInfo.mockReset();
   fetchPlugins.mockResolvedValue(listResponse());
   fetchPluginUpdates.mockResolvedValue({ kind: "ok", updates: [] });
   discoverPlugins.mockResolvedValue({ kind: "ok", results: [] });
+  fetchPluginDetails.mockResolvedValue({
+    kind: "ok",
+    detail: { source: "gh:example/plugin", manifest: null, manifest_error: null, release_tags: [] },
+  });
 });
 
 describe("PluginsSettings", () => {
@@ -310,5 +323,57 @@ describe("PluginsSettings", () => {
     fireEvent.click(await findByTestId("plugins-discover"));
     const err = await findByTestId("plugins-discover-error");
     expect(err.textContent).toContain("Rate limited by GitHub.");
+  });
+
+  it("clicking a discovery result opens the detail modal with version and release tags", async () => {
+    discoverPlugins.mockResolvedValue({
+      kind: "ok",
+      results: [
+        {
+          slug: "gh:acme/widget",
+          html_url: "https://github.com/acme/widget",
+          description: "A widget plugin.",
+          stars: 42,
+          badge: "unvetted",
+          install_command: "aoe plugin install gh:acme/widget",
+        },
+      ],
+    });
+    fetchPluginDetails.mockResolvedValue({
+      kind: "ok",
+      detail: {
+        source: "gh:acme/widget",
+        manifest: {
+          id: "acme.widget",
+          name: "Widget",
+          version: "2.3.0",
+          description: "A widget plugin.",
+          api_version: 4,
+          capabilities: ["net"],
+          ui_contributions: [{ slot: "status-bar", id: "s" }],
+        },
+        manifest_error: null,
+        release_tags: ["v2.3.0", "v2.2.0"],
+      },
+    });
+    const { findByTestId } = render(<PluginsSettings />);
+    fireEvent.click(await findByTestId("plugins-discover"));
+    fireEvent.click(await findByTestId("plugins-discover-open-gh:acme/widget"));
+    await waitFor(() => expect(fetchPluginDetails).toHaveBeenCalledWith("gh:acme/widget"));
+    const modal = await findByTestId("plugin-detail-modal");
+    expect(modal.textContent).toContain("v2.3.0");
+    expect(modal.textContent).toContain("net");
+    const versions = await findByTestId("plugin-detail-versions");
+    expect(versions.textContent).toContain("v2.2.0");
+  });
+
+  it("clicking an installed plugin opens the detail modal and closes it", async () => {
+    const { findByTestId, queryByTestId } = render(<PluginsSettings />);
+    fireEvent.click(await findByTestId("plugin-open-example.plugin"));
+    const modal = await findByTestId("plugin-detail-modal");
+    // Falls back to the installed view's fields immediately.
+    expect(modal.textContent).toContain("v0.1.0");
+    fireEvent.click(await findByTestId("plugin-detail-close"));
+    await waitFor(() => expect(queryByTestId("plugin-detail-modal")).toBeNull());
   });
 });

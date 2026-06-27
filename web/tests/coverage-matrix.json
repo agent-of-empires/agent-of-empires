@@ -2777,7 +2777,10 @@
       "kind": "vitest",
       "risk": "high",
       "specs": ["src/components/settings/__tests__/PluginsSettings.test.tsx"],
-      "components": ["web/src/components/settings/PluginsSettings.tsx"]
+      "components": [
+        "web/src/components/settings/PluginsSettings.tsx",
+        "web/src/components/settings/PluginDetailModal.tsx"
+      ]
     },
     {
       "id": "settings.plugins-live-toggle",

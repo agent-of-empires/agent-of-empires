@@ -306,6 +306,48 @@ export async function discoverPlugins(query: string): Promise<DiscoverResult> {
   }
 }
 
+/** A plugin's manifest fields as shown in the detail modal (parsed leniently
+ *  server-side, so a plugin targeting a newer api_version still renders). */
+export interface PluginDetailManifest {
+  id: string;
+  name: string;
+  version: string;
+  description: string;
+  api_version: number;
+  capabilities: string[];
+  ui_contributions: { slot: string; id: string }[];
+}
+
+/** On-demand detail for one plugin source (`GET /api/plugins/details`): manifest
+ *  fields plus the repo's published release tags (the available versions). */
+export interface PluginDetail {
+  source: string;
+  manifest: PluginDetailManifest | null;
+  manifest_error: string | null;
+  release_tags: string[];
+}
+
+export type PluginDetailResult = { kind: "ok"; detail: PluginDetail } | { kind: "error"; message: string };
+
+/** Fetch a plugin source's detail (manifest + release tags) for the modal.
+ *  Only gh:owner/repo sources are supported server-side. */
+export async function fetchPluginDetails(source: string): Promise<PluginDetailResult> {
+  try {
+    const res = await fetch(`/api/plugins/details?source=${encodeURIComponent(source)}`, {
+      headers: { Accept: "application/json" },
+    });
+    const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+    if (res.ok && payload && typeof payload.source === "string") {
+      return { kind: "ok", detail: payload as unknown as PluginDetail };
+    }
+    const message =
+      typeof payload?.message === "string" ? (payload.message as string) : `Details failed (HTTP ${res.status}).`;
+    return { kind: "error", message };
+  } catch {
+    return { kind: "error", message: "Network error." };
+  }
+}
+
 // Plugin UI extension points (#2366).
 
 /** Display tone a plugin attaches to a slot entry or notification. The host

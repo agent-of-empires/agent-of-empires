@@ -107,6 +107,21 @@ pub async fn plugin_discover(Query(query): Query<DiscoverQuery>) -> Response {
 }
 
 #[derive(Deserialize)]
+pub struct DetailsQuery {
+    pub source: String,
+}
+
+/// `GET /api/plugins/details?source=gh:owner/repo`: the on-demand detail for one
+/// plugin source (manifest fields + release tags) backing the dashboard detail
+/// modal. Allowed in read-only mode; reads remote state and mutates nothing.
+pub async fn plugin_details(Query(query): Query<DetailsQuery>) -> Response {
+    match plugin::discover::details(&query.source).await {
+        Ok(detail) => Json(detail).into_response(),
+        Err(e) => error_response(StatusCode::BAD_GATEWAY, "details_failed", format!("{e:#}")),
+    }
+}
+
+#[derive(Deserialize)]
 pub struct PluginActionBody {
     /// The worker method to invoke (the plugin names it in its pane's action
     /// block, e.g. `github.refresh`).

@@ -11,6 +11,19 @@ import {
   type PluginView,
 } from "../../lib/api";
 import { reportInfo } from "../../lib/toastBus";
+import { PluginDetailModal } from "./PluginDetailModal";
+
+interface DetailTarget {
+  source: string;
+  title: string;
+  fallback?: {
+    version?: string;
+    description?: string;
+    capabilities?: string[];
+    ui_contributions?: { slot: string; id: string }[];
+  };
+  installCommand?: string;
+}
 
 /// Plugin management: list every known plugin (name, version, description,
 /// validation provenance, capabilities, and enabled / approval state) and
@@ -35,6 +48,9 @@ export function PluginsSettings() {
   const [discoverResults, setDiscoverResults] = useState<PluginDiscoveryResult[] | null>(null);
   const [discoverError, setDiscoverError] = useState<string | null>(null);
   const [discovering, setDiscovering] = useState(false);
+
+  // The plugin whose detail modal is open (null = closed).
+  const [detail, setDetail] = useState<DetailTarget | null>(null);
 
   const reload = useCallback(async () => {
     const next = await fetchPlugins();
@@ -180,18 +196,21 @@ export function PluginsSettings() {
                 data-testid={`plugins-discover-result-${r.slug}`}
               >
                 <div className="flex flex-wrap items-center gap-2">
-                  <a
-                    href={r.html_url}
-                    target="_blank"
-                    rel="noreferrer"
+                  <button
+                    type="button"
                     className="font-medium text-accent-500 hover:underline"
+                    onClick={() => setDetail({ source: r.slug, title: r.slug, installCommand: r.install_command })}
+                    data-testid={`plugins-discover-open-${r.slug}`}
                   >
                     {r.slug}
-                  </a>
+                  </button>
                   <span className="rounded bg-accent-500/20 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-accent-500">
                     {r.badge}
                   </span>
                   <span className="text-text-dim">★ {r.stars}</span>
+                  <a href={r.html_url} target="_blank" rel="noreferrer" className="text-text-dim hover:underline">
+                    GitHub ↗
+                  </a>
                 </div>
                 {r.description && <p className="mt-1 text-text-dim">{r.description}</p>}
                 <p className="mt-1 text-text-dim">
@@ -220,7 +239,25 @@ export function PluginsSettings() {
               <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0">
                   <div className="flex flex-wrap items-center gap-2">
-                    <span className="font-medium">{plugin.name}</span>
+                    <button
+                      type="button"
+                      className="font-medium hover:underline"
+                      onClick={() =>
+                        setDetail({
+                          source: plugin.source ?? "",
+                          title: plugin.name,
+                          fallback: {
+                            version: plugin.version,
+                            description: plugin.description,
+                            capabilities: plugin.capabilities,
+                            ui_contributions: plugin.ui_contributions,
+                          },
+                        })
+                      }
+                      data-testid={`plugin-open-${plugin.id}`}
+                    >
+                      {plugin.name}
+                    </button>
                     <span className="text-xs text-text-dim">v{plugin.version}</span>
                     <span
                       className="rounded bg-accent-500/20 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-accent-500"
@@ -288,6 +325,17 @@ export function PluginsSettings() {
           );
         })}
       </div>
+
+      {detail && (
+        <PluginDetailModal
+          key={detail.source}
+          source={detail.source}
+          title={detail.title}
+          fallback={detail.fallback}
+          installCommand={detail.installCommand}
+          onClose={() => setDetail(null)}
+        />
+      )}
     </div>
   );
 }
