@@ -26,12 +26,7 @@ async function dockTabOrder(page: Page, dock: "right" | "bottom"): Promise<strin
 /** Press on a tab's activation button (where the drag listeners live), move past
  *  the 8px MouseSensor threshold, run `mid` while held, then drop on `target`.
  *  Playwright's mouse maps to dnd-kit's MouseSensor, so no press-hold delay. */
-async function dragTab(
-  page: Page,
-  fromId: string,
-  target: { x: number; y: number },
-  mid?: () => Promise<void>,
-) {
+async function dragTab(page: Page, fromId: string, target: { x: number; y: number }, mid?: () => Promise<void>) {
   const from = await page.getByTestId(`pane-tab-${fromId}`).boundingBox();
   if (!from) throw new Error(`missing tab ${fromId}`);
   await page.mouse.move(from.x + from.width / 2, from.y + from.height / 2);
