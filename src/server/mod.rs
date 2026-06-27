@@ -1186,6 +1186,11 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         host.start(&crate::plugin::registry()).await;
     }
 
+    // Opt-in clean-only plugin auto-update sweep (off by default). Spawned
+    // non-blocking so daemon startup never waits on git/network; freshly applied
+    // updates are picked up on the next daemon restart.
+    crate::plugin::auto_update::spawn_if_enabled(&crate::session::Config::load_or_warn());
+
     rate_limiter.spawn_cleanup_task(state.shutdown.clone());
     login_manager.spawn_cleanup_task(state.shutdown.clone());
 
@@ -1502,6 +1507,8 @@ fn build_router(state: Arc<AppState>) -> Router {
         // elevation inside the handler.
         .route("/api/plugins", get(api::list_plugins))
         .route("/api/plugins/ui-state", get(api::plugin_ui_state))
+        .route("/api/plugins/updates", get(api::plugin_updates))
+        .route("/api/plugins/discover", get(api::plugin_discover))
         .route("/api/plugins/{id}/enabled", post(api::set_plugin_enabled))
         .route("/api/plugins/{id}/action", post(api::invoke_plugin_action))
         .route(

@@ -5,7 +5,7 @@
 //! requires read-write mode AND an elevated session when login is enabled,
 //! mirroring the requires-elevation settings fields.
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -75,6 +75,34 @@ pub async fn plugin_ui_state(
             empty()
         })),
         None => Json(empty()),
+    }
+}
+
+/// `GET /api/plugins/updates`: which installed external plugins have an update
+/// available. An explicit, on-demand network check (the dashboard "Check for
+/// updates" button), kept off the always-on `GET /api/plugins` list path so a
+/// settings render never blocks on git/network. Allowed in read-only mode: it
+/// reads remote state and mutates nothing.
+pub async fn plugin_updates() -> Json<serde_json::Value> {
+    Json(json!({ "updates": plugin::update_check::outdated().await }))
+}
+
+#[derive(Deserialize)]
+pub struct DiscoverQuery {
+    #[serde(default)]
+    pub q: Option<String>,
+}
+
+/// `GET /api/plugins/discover?q=`: search the `aoe-plugin` GitHub topic. The
+/// dashboard "Search GitHub" button. Browse-only: the dashboard has no install
+/// path (capability approval needs a terminal), so each result carries an
+/// `install_command` the user copies. On a GitHub failure (notably the
+/// unauthenticated search rate limit) the message is returned for the UI to
+/// show, rather than a generic 500.
+pub async fn plugin_discover(Query(query): Query<DiscoverQuery>) -> Response {
+    match plugin::discover::discover(query.q.as_deref()).await {
+        Ok(results) => Json(json!({ "results": results })).into_response(),
+        Err(e) => error_response(StatusCode::BAD_GATEWAY, "discover_failed", format!("{e:#}")),
     }
 }
 

@@ -1,6 +1,15 @@
 import { useCallback, useEffect, useState } from "react";
 
-import { fetchPlugins, setPluginEnabled, type PluginListResponse, type PluginView } from "../../lib/api";
+import {
+  discoverPlugins,
+  fetchPluginUpdates,
+  fetchPlugins,
+  setPluginEnabled,
+  type PluginDiscoveryResult,
+  type PluginListResponse,
+  type PluginUpdateStatus,
+  type PluginView,
+} from "../../lib/api";
 import { reportInfo } from "../../lib/toastBus";
 
 /// Plugin management: list every known plugin (name, version, description,
@@ -16,6 +25,16 @@ export function PluginsSettings() {
   const [data, setData] = useState<PluginListResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+
+  // Update checks (on-demand, never auto). Keyed by plugin id.
+  const [updates, setUpdates] = useState<Record<string, PluginUpdateStatus>>({});
+  const [checkingUpdates, setCheckingUpdates] = useState(false);
+
+  // GitHub discovery (browse-only; install is CLI).
+  const [discoverQuery, setDiscoverQuery] = useState("");
+  const [discoverResults, setDiscoverResults] = useState<PluginDiscoveryResult[] | null>(null);
+  const [discoverError, setDiscoverError] = useState<string | null>(null);
+  const [discovering, setDiscovering] = useState(false);
 
   const reload = useCallback(async () => {
     const next = await fetchPlugins();
@@ -61,6 +80,33 @@ export function PluginsSettings() {
     }
   };
 
+  const onCheckUpdates = async () => {
+    setCheckingUpdates(true);
+    try {
+      const res = await fetchPluginUpdates();
+      if (res) {
+        const next: Record<string, PluginUpdateStatus> = {};
+        for (const s of res.updates) next[s.id] = s;
+        setUpdates(next);
+      }
+    } finally {
+      setCheckingUpdates(false);
+    }
+  };
+
+  const onDiscover = async () => {
+    setDiscovering(true);
+    setDiscoverError(null);
+    const res = await discoverPlugins(discoverQuery);
+    if (res.kind === "ok") {
+      setDiscoverResults(res.results);
+    } else {
+      setDiscoverResults(null);
+      setDiscoverError(res.message);
+    }
+    setDiscovering(false);
+  };
+
   if (!data && !error) {
     return <p className="text-sm text-text-dim">Loading plugins…</p>;
   }
@@ -78,70 +124,163 @@ export function PluginsSettings() {
         </div>
       )}
 
+      <div className="flex flex-wrap items-center gap-2">
+        <button
+          type="button"
+          className="rounded border border-surface-700 px-2 py-1 text-xs hover:bg-surface-800 disabled:opacity-50"
+          disabled={checkingUpdates}
+          onClick={() => void onCheckUpdates()}
+          data-testid="plugins-check-updates"
+        >
+          {checkingUpdates ? "Checking…" : "Check for updates"}
+        </button>
+        <input
+          type="search"
+          value={discoverQuery}
+          onChange={(e) => setDiscoverQuery(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") void onDiscover();
+          }}
+          placeholder="Search GitHub (aoe-plugin topic)…"
+          className="min-w-0 flex-1 rounded border border-surface-700 bg-surface-850 px-2 py-1 text-xs"
+          data-testid="plugins-discover-query"
+        />
+        <button
+          type="button"
+          className="rounded border border-surface-700 px-2 py-1 text-xs hover:bg-surface-800 disabled:opacity-50"
+          disabled={discovering}
+          onClick={() => void onDiscover()}
+          data-testid="plugins-discover"
+        >
+          {discovering ? "Searching…" : "Search GitHub"}
+        </button>
+      </div>
+
+      {discoverError && (
+        <p className="text-xs text-status-error" data-testid="plugins-discover-error">
+          {discoverError}
+        </p>
+      )}
+
+      {discoverResults && (
+        <div className="space-y-2" data-testid="plugins-discover-results">
+          {discoverResults.length === 0 ? (
+            <p className="text-xs text-text-dim">No plugins found on the aoe-plugin topic.</p>
+          ) : (
+            discoverResults.map((r) => (
+              <div
+                key={r.slug}
+                className="rounded border border-surface-700 bg-surface-850 p-2 text-xs"
+                data-testid={`plugins-discover-result-${r.slug}`}
+              >
+                <div className="flex flex-wrap items-center gap-2">
+                  <a
+                    href={r.html_url}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="font-medium text-accent-400 hover:underline"
+                  >
+                    {r.slug}
+                  </a>
+                  <span className="rounded bg-accent-500/20 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-accent-500">
+                    {r.badge}
+                  </span>
+                  <span className="text-text-dim">★ {r.stars}</span>
+                </div>
+                {r.description && <p className="mt-1 text-text-dim">{r.description}</p>}
+                <p className="mt-1 text-text-dim">
+                  Install in a terminal: <code>{r.install_command}</code>
+                </p>
+              </div>
+            ))
+          )}
+        </div>
+      )}
+
       <div className="space-y-3">
         {data && data.plugins.length === 0 && (
           <p className="text-xs text-text-dim" data-testid="plugins-empty">
             No plugins detected.
           </p>
         )}
-        {data?.plugins.map((plugin) => (
-          <div
-            key={plugin.id}
-            className="rounded border border-surface-700 bg-surface-850 p-3"
-            data-testid={`plugin-${plugin.id}`}
-          >
-            <div className="flex items-start justify-between gap-3">
-              <div className="min-w-0">
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="font-medium">{plugin.name}</span>
-                  <span className="text-xs text-text-dim">v{plugin.version}</span>
-                  <span
-                    className="rounded bg-accent-500/20 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-accent-500"
-                    data-testid={`plugin-validation-${plugin.id}`}
-                  >
-                    {plugin.validation}
-                  </span>
-                  {plugin.needs_reapproval && (
+        {data?.plugins.map((plugin) => {
+          const update = updates[plugin.id];
+          return (
+            <div
+              key={plugin.id}
+              className="rounded border border-surface-700 bg-surface-850 p-3"
+              data-testid={`plugin-${plugin.id}`}
+            >
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-medium">{plugin.name}</span>
+                    <span className="text-xs text-text-dim">v{plugin.version}</span>
                     <span
-                      className="rounded bg-status-warning/20 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-status-warning"
-                      data-testid={`plugin-needs-approval-${plugin.id}`}
+                      className="rounded bg-accent-500/20 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-accent-500"
+                      data-testid={`plugin-validation-${plugin.id}`}
                     >
-                      needs approval
+                      {plugin.validation}
                     </span>
+                    {plugin.needs_reapproval && (
+                      <span
+                        className="rounded bg-status-warning/20 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-status-warning"
+                        data-testid={`plugin-needs-approval-${plugin.id}`}
+                      >
+                        needs approval
+                      </span>
+                    )}
+                    {update?.needs_update && (
+                      <span
+                        className="rounded bg-accent-500/20 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-accent-500"
+                        data-testid={`plugin-update-available-${plugin.id}`}
+                      >
+                        update available
+                      </span>
+                    )}
+                  </div>
+                  <p className="mt-1 text-xs text-text-dim">{plugin.description}</p>
+                  {plugin.capabilities.length > 0 && (
+                    <p className="mt-1 text-[11px] text-text-dim">
+                      Capabilities: {plugin.capabilities.join(", ")}
+                      {plugin.granted ? "" : " (not granted)"}
+                    </p>
+                  )}
+                  {(plugin.ui_contributions ?? []).length > 0 && (
+                    <p className="mt-1 text-[11px] text-text-dim">
+                      UI: {[...new Set((plugin.ui_contributions ?? []).map((u) => u.slot))].join(", ")}
+                    </p>
+                  )}
+                  {plugin.needs_reapproval && (
+                    <p className="mt-1 text-[11px] text-status-warning">
+                      Installed but inactive. Re-approve with <code>aoe plugin update {plugin.id}</code>.
+                    </p>
+                  )}
+                  {update?.needs_update && (
+                    <p className="mt-1 text-[11px] text-text-dim">
+                      Update available ({update.current} → {update.available ?? "modified"}). Update with{" "}
+                      <code>aoe plugin update {plugin.id}</code>.
+                    </p>
+                  )}
+                  {update?.error && (
+                    <p className="mt-1 text-[11px] text-status-error">Update check failed: {update.error}</p>
                   )}
                 </div>
-                <p className="mt-1 text-xs text-text-dim">{plugin.description}</p>
-                {plugin.capabilities.length > 0 && (
-                  <p className="mt-1 text-[11px] text-text-dim">
-                    Capabilities: {plugin.capabilities.join(", ")}
-                    {plugin.granted ? "" : " (not granted)"}
-                  </p>
-                )}
-                {(plugin.ui_contributions ?? []).length > 0 && (
-                  <p className="mt-1 text-[11px] text-text-dim">
-                    UI: {[...new Set((plugin.ui_contributions ?? []).map((u) => u.slot))].join(", ")}
-                  </p>
-                )}
-                {plugin.needs_reapproval && (
-                  <p className="mt-1 text-[11px] text-status-warning">
-                    Installed but inactive. Re-approve with <code>aoe plugin update {plugin.id}</code>.
-                  </p>
-                )}
+                <label className="flex shrink-0 items-center gap-1 text-xs">
+                  <input
+                    type="checkbox"
+                    role="switch"
+                    aria-label={`Enable ${plugin.name}`}
+                    checked={plugin.enabled}
+                    disabled={busy}
+                    onChange={(e) => void onToggle(plugin, e.target.checked)}
+                  />
+                  Enabled
+                </label>
               </div>
-              <label className="flex shrink-0 items-center gap-1 text-xs">
-                <input
-                  type="checkbox"
-                  role="switch"
-                  aria-label={`Enable ${plugin.name}`}
-                  checked={plugin.enabled}
-                  disabled={busy}
-                  onChange={(e) => void onToggle(plugin, e.target.checked)}
-                />
-                Enabled
-              </label>
             </div>
-          </div>
-        ))}
+          );
+        })}
       </div>
     </div>
   );

@@ -239,6 +239,57 @@ function isValidPluginListResponse(payload: unknown): payload is PluginListRespo
   );
 }
 
+/** One plugin's update status (`GET /api/plugins/updates`). An on-demand
+ *  network check, kept off the always-on plugin list. `available` is a short
+ *  commit for an outdated GitHub source, "modified" for a changed local tree,
+ *  or null when current. `error` is set when the check could not run. */
+export interface PluginUpdateStatus {
+  id: string;
+  source: string;
+  current: string;
+  available: string | null;
+  needs_update: boolean;
+  error: string | null;
+}
+
+export function fetchPluginUpdates(): Promise<{ updates: PluginUpdateStatus[] } | null> {
+  return fetchJson<{ updates: PluginUpdateStatus[] }>("/api/plugins/updates");
+}
+
+/** One discovery result (`GET /api/plugins/discover`). Repo-level: the dashboard
+ *  has no install path, so it shows `install_command` for the user to copy. */
+export interface PluginDiscoveryResult {
+  slug: string;
+  html_url: string;
+  description: string | null;
+  stars: number;
+  badge: "installed" | "featured" | "unvetted";
+  install_command: string;
+}
+
+export type DiscoverResult = { kind: "ok"; results: PluginDiscoveryResult[] } | { kind: "error"; message: string };
+
+/** Search the `aoe-plugin` GitHub topic. Returns the error message (notably the
+ *  unauthenticated rate limit) so the UI can show it rather than failing
+ *  silently. */
+export async function discoverPlugins(query: string): Promise<DiscoverResult> {
+  const qs = query.trim() ? `?q=${encodeURIComponent(query.trim())}` : "";
+  try {
+    const res = await fetch(`/api/plugins/discover${qs}`, {
+      headers: { Accept: "application/json" },
+    });
+    const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+    if (res.ok && payload && Array.isArray(payload.results)) {
+      return { kind: "ok", results: payload.results as PluginDiscoveryResult[] };
+    }
+    const message =
+      typeof payload?.message === "string" ? (payload.message as string) : `Discovery failed (HTTP ${res.status}).`;
+    return { kind: "error", message };
+  } catch {
+    return { kind: "error", message: "Network error." };
+  }
+}
+
 // Plugin UI extension points (#2366).
 
 /** Display tone a plugin attaches to a slot entry or notification. The host
