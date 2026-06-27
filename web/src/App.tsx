@@ -83,6 +83,7 @@ const StructuredView = lazy(() =>
 );
 import { Dock, type PaneDisplay } from "./components/Dock";
 import { BottomDock } from "./components/BottomDock";
+import { PaneDndController } from "./components/PaneDndController";
 import { DiffPane } from "./components/DiffPane";
 import { PairedShellPane } from "./components/PairedTerminal";
 import { BUILTIN_PANES, isTerminalTabId, terminalIndexOf, terminalTabId, type DockLocation } from "./lib/panes";
@@ -370,6 +371,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     closeTab,
     activateTab,
     moveTab,
+    placeTab,
     toggleKind,
     togglePlugin,
     syncPlugins,
@@ -387,17 +389,20 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     syncPlugins(pluginPanes.map((p) => ({ id: p.id, defaultDock: p.defaultDock })));
   }, [pluginPanes, syncPlugins]);
 
-  const paneDescriptor = (id: string): PaneDisplay => {
-    const plugin = pluginPaneById.get(id);
-    if (plugin) return { title: plugin.title, icon: plugin.icon ?? Puzzle };
-    if (isTerminalTabId(id)) {
-      const idx = terminalIndexOf(id);
-      const term = BUILTIN_PANES.find((p) => p.id === "terminal")!;
-      return { title: idx === 0 ? term.title : `${term.title} ${idx + 1}`, icon: term.icon };
-    }
-    const d = BUILTIN_PANES.find((p) => p.id === id)!;
-    return { title: d.title, icon: d.icon };
-  };
+  const paneDescriptor = useCallback(
+    (id: string): PaneDisplay => {
+      const plugin = pluginPaneById.get(id);
+      if (plugin) return { title: plugin.title, icon: plugin.icon ?? Puzzle };
+      if (isTerminalTabId(id)) {
+        const idx = terminalIndexOf(id);
+        const term = BUILTIN_PANES.find((p) => p.id === "terminal")!;
+        return { title: idx === 0 ? term.title : `${term.title} ${idx + 1}`, icon: term.icon };
+      }
+      const d = BUILTIN_PANES.find((p) => p.id === id)!;
+      return { title: d.title, icon: d.icon };
+    },
+    [pluginPaneById],
+  );
 
   // A persisted tab is visible only if its backing pane currently exists: diff
   // and terminals always do; a plugin tab does only while its plugin is loaded.
@@ -420,6 +425,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
 
   const rightTabs = visibleTabs("right");
   const bottomTabs = visibleTabs("bottom");
+  const tabsByDock = useMemo(() => ({ right: rightTabs, bottom: bottomTabs }), [rightTabs, bottomTabs]);
   const rightDockCollapsed = rightTabs.length === 0;
   const terminalOpen = (["right", "bottom"] as DockLocation[]).some((d) =>
     dockTabs(paneLayout, d).some(isTerminalTabId),
@@ -1331,77 +1337,79 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     };
     return (
       <div className="flex-1 flex flex-col min-h-0">
-        <ContentSplit
-          collapsed={rightDockCollapsed}
-          onToggleCollapse={toggleDiff}
-          left={
-            <div className="flex-1 flex flex-col min-h-0 overflow-hidden relative">
-              <div className={selectedFilePath ? "hidden" : "flex-1 flex flex-col min-h-0 overflow-hidden"}>
-                {activeSession?.view === "structured" ? (
-                  <Suspense fallback={<AcpLoadingFallback />}>
-                    <StructuredView
-                      key={activeSessionId}
-                      sessionId={activeSessionId!}
-                      acpWorkerState={activeSession.acp_worker_state ?? "absent"}
-                      tool={activeSession.tool}
-                      archivedAt={activeSession.archived_at ?? null}
-                      snoozedUntil={activeSession.snoozed_until ?? null}
-                      onOpenFileRef={handleOpenFileRef}
-                      fileRefSession={activeSession}
+        <PaneDndController tabsByDock={tabsByDock} descriptorFor={paneDescriptor} onPlaceTab={placeTab}>
+          <ContentSplit
+            collapsed={rightDockCollapsed}
+            onToggleCollapse={toggleDiff}
+            left={
+              <div className="flex-1 flex flex-col min-h-0 overflow-hidden relative">
+                <div className={selectedFilePath ? "hidden" : "flex-1 flex flex-col min-h-0 overflow-hidden"}>
+                  {activeSession?.view === "structured" ? (
+                    <Suspense fallback={<AcpLoadingFallback />}>
+                      <StructuredView
+                        key={activeSessionId}
+                        sessionId={activeSessionId!}
+                        acpWorkerState={activeSession.acp_worker_state ?? "absent"}
+                        tool={activeSession.tool}
+                        archivedAt={activeSession.archived_at ?? null}
+                        snoozedUntil={activeSession.snoozed_until ?? null}
+                        onOpenFileRef={handleOpenFileRef}
+                        fileRefSession={activeSession}
+                      />
+                    </Suspense>
+                  ) : (
+                    <TerminalSessionStack
+                      activeSessionId={activeSessionId!}
+                      sessions={sessions.filter((session) => session.view !== "structured")}
+                      persistent={webSettings.persistentTerminals}
+                      maxPersistentTerminals={webSettings.maxPersistentTerminals}
                     />
-                  </Suspense>
-                ) : (
-                  <TerminalSessionStack
-                    activeSessionId={activeSessionId!}
-                    sessions={sessions.filter((session) => session.view !== "structured")}
-                    persistent={webSettings.persistentTerminals}
-                    maxPersistentTerminals={webSettings.maxPersistentTerminals}
+                  )}
+                </div>
+
+                {selectedFilePath && activeSessionId && (
+                  <DiffFileViewer
+                    sessionId={activeSessionId}
+                    filePath={selectedFilePath}
+                    repoName={selectedRepoName}
+                    targetLine={selectedFileLine}
+                    revision={revision}
+                    onClose={handleCloseFile}
+                    commentsEnabled={commentsEnabled}
+                    commentsStore={diffComments}
                   />
                 )}
               </div>
-
-              {selectedFilePath && activeSessionId && (
-                <DiffFileViewer
-                  sessionId={activeSessionId}
-                  filePath={selectedFilePath}
-                  repoName={selectedRepoName}
-                  targetLine={selectedFileLine}
-                  revision={revision}
-                  onClose={handleCloseFile}
-                  commentsEnabled={commentsEnabled}
-                  commentsStore={diffComments}
+            }
+            right={
+              <div {...tourAnchor(TOUR_ANCHORS.rightPanel)} className="flex min-h-0 min-w-0 flex-1">
+                <Dock
+                  location="right"
+                  tabs={rightTabs}
+                  active={visibleActive("right")}
+                  descriptorFor={paneDescriptor}
+                  renderBody={renderPaneBody}
+                  onActivate={(id) => activateTab("right", id)}
+                  onMove={movePaneAny}
+                  onClose={closePaneAny}
+                  onNewTerminal={serverAbout?.read_only ? undefined : () => addTerminal("right")}
                 />
-              )}
-            </div>
-          }
-          right={
-            <div {...tourAnchor(TOUR_ANCHORS.rightPanel)} className="flex min-h-0 min-w-0 flex-1">
-              <Dock
-                location="right"
-                tabs={rightTabs}
-                active={visibleActive("right")}
-                descriptorFor={paneDescriptor}
-                renderBody={renderPaneBody}
-                onActivate={(id) => activateTab("right", id)}
-                onMove={movePaneAny}
-                onClose={closePaneAny}
-                onNewTerminal={serverAbout?.read_only ? undefined : () => addTerminal("right")}
-              />
-            </div>
-          }
-        />
-        {bottomTabs.length > 0 && (
-          <BottomDock
-            tabs={bottomTabs}
-            active={visibleActive("bottom")}
-            descriptorFor={paneDescriptor}
-            renderBody={renderPaneBody}
-            onActivate={(id) => activateTab("bottom", id)}
-            onMove={movePaneAny}
-            onClose={closePaneAny}
-            onNewTerminal={serverAbout?.read_only ? undefined : () => addTerminal("bottom")}
+              </div>
+            }
           />
-        )}
+          {bottomTabs.length > 0 && (
+            <BottomDock
+              tabs={bottomTabs}
+              active={visibleActive("bottom")}
+              descriptorFor={paneDescriptor}
+              renderBody={renderPaneBody}
+              onActivate={(id) => activateTab("bottom", id)}
+              onMove={movePaneAny}
+              onClose={closePaneAny}
+              onNewTerminal={serverAbout?.read_only ? undefined : () => addTerminal("bottom")}
+            />
+          )}
+        </PaneDndController>
         {sendDialogOpen && commentsEnabled && activeSessionId && (
           <SendCommentsDialog
             sessionId={activeSessionId}
