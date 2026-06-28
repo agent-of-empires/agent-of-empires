@@ -100,8 +100,14 @@ pub(crate) fn purge_acp_transcript(inst: &Instance) -> Result<()> {
         return Ok(());
     }
     // The durable transcript only exists under the `serve` feature (the `acp`
-    // module is gated on it), and structured-view sessions can only have been
-    // created by a serve-capable build, so this is a no-op otherwise.
+    // module is gated on it). A default build cannot reach the event store, so
+    // it must NOT report success: callers (`rm --purge`, `empty-trash`) read
+    // `Ok(())` as "safe to drop the session row", which would delete the row
+    // while orphaning its transcript in `acp_events.db`. Bail instead.
+    #[cfg(not(feature = "serve"))]
+    {
+        anyhow::bail!("acp transcript purge requires a build with the `serve` feature")
+    }
     #[cfg(feature = "serve")]
     {
         let app_dir = crate::session::get_app_dir()
@@ -113,8 +119,8 @@ pub(crate) fn purge_acp_transcript(inst: &Instance) -> Result<()> {
         let store = crate::acp::event_store::EventStore::open(&db_path, 100)
             .map_err(|e| anyhow::anyhow!("acp transcript purge: open event store: {e}"))?;
         store.delete_session(&inst.id);
+        Ok(())
     }
-    Ok(())
 }
 
 pub fn truncate(s: &str, max: usize) -> String {
