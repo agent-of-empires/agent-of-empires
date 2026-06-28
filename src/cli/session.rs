@@ -454,12 +454,17 @@ async fn empty_trash(profile: &str) -> Result<()> {
         // transcript (the daemon does this via the supervisor; the CLI opens
         // the event store directly since it has no live worker) and drop the
         // session row. Doing the irreversible transcript delete last keeps a
-        // failed purge fully restorable, and keeping the row on failure lets
-        // the orphaned worktree/container be retried instead of abandoned.
-        // See #2489.
+        // failed purge fully restorable, and keeping the row on failure (here
+        // or in perform_deletion) lets the orphaned worktree/container/
+        // transcript be retried instead of abandoned. See #2489.
         if result.success {
-            super::purge_acp_transcript(inst);
-            purged_ids.push(inst.id.clone());
+            match super::purge_acp_transcript(inst) {
+                Ok(()) => purged_ids.push(inst.id.clone()),
+                Err(e) => eprintln!(
+                    "Warning ({}): transcript not purged, keeping session in trash: {}",
+                    inst.title, e
+                ),
+            }
         }
     }
 

@@ -95,25 +95,26 @@ pub fn resolve_session<'a>(identifier: &str, instances: &'a [Instance]) -> Resul
 /// RPC the daemon sends (that needs a running worker), but deleting the local
 /// UI transcript stops purged rows from orphaning. No-op for non-structured
 /// sessions or when the store does not exist. See #2489.
-pub(crate) fn purge_acp_transcript(inst: &Instance) {
+pub(crate) fn purge_acp_transcript(inst: &Instance) -> Result<()> {
     if !inst.is_structured() {
-        return;
+        return Ok(());
     }
-    let Ok(app_dir) = crate::session::get_app_dir() else {
-        return;
-    };
-    let db_path = app_dir.join("acp_events.db");
-    if !db_path.exists() {
-        return;
+    // The durable transcript only exists under the `serve` feature (the `acp`
+    // module is gated on it), and structured-view sessions can only have been
+    // created by a serve-capable build, so this is a no-op otherwise.
+    #[cfg(feature = "serve")]
+    {
+        let app_dir = crate::session::get_app_dir()
+            .map_err(|e| anyhow::anyhow!("acp transcript purge: resolve app dir: {e}"))?;
+        let db_path = app_dir.join("acp_events.db");
+        if !db_path.exists() {
+            return Ok(());
+        }
+        let store = crate::acp::event_store::EventStore::open(&db_path, 100)
+            .map_err(|e| anyhow::anyhow!("acp transcript purge: open event store: {e}"))?;
+        store.delete_session(&inst.id);
     }
-    match crate::acp::event_store::EventStore::open(&db_path, 100) {
-        Ok(store) => store.delete_session(&inst.id),
-        Err(e) => tracing::warn!(
-            target: "cli.session",
-            session = %inst.id,
-            "acp transcript purge: failed to open event store: {e}"
-        ),
-    }
+    Ok(())
 }
 
 pub fn truncate(s: &str, max: usize) -> String {

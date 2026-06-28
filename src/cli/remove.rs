@@ -134,9 +134,16 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
     // Permanent purge of a structured-view session must also drop its durable
     // transcript so it does not orphan in the event store; the CLI opens the
     // store directly since it has no live worker. Only after a successful
-    // teardown so a failed purge stays restorable. See #2489.
+    // teardown so a failed purge stays restorable. If the transcript can't be
+    // dropped, keep the session row (skip the removal below) rather than
+    // orphan the transcript. See #2489.
     if result.success {
-        super::purge_acp_transcript(&inst);
+        if let Err(e) = super::purge_acp_transcript(&inst) {
+            anyhow::bail!(
+                "Session teardown succeeded but its transcript could not be purged, so the session \
+                 record was kept (retry, or remove it once the event store is reachable): {e}"
+            );
+        }
     }
 
     if !delete_worktree {
