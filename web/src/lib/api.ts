@@ -533,10 +533,12 @@ export interface PluginJob {
   };
 }
 
-export type PluginJobResult = { kind: "ok"; job: PluginJob } | { kind: "error"; message: string };
+export type PluginJobResult = { kind: "ok"; job: PluginJob } | { kind: "error"; status: number; message: string };
 
 /** Fetch a lifecycle job's status plus a tail of its log. Polled by the
- *  progress modal until the job reaches a terminal state. */
+ *  progress modal until the job reaches a terminal state. The HTTP `status` is
+ *  preserved so the caller can tell a terminal 404 (the job is gone, e.g. after
+ *  a daemon restart) from a transient failure worth retrying. */
 export async function fetchPluginJob(jobId: string, tail = 200): Promise<PluginJobResult> {
   try {
     const res = await fetch(`/api/plugins/jobs/${encodeURIComponent(jobId)}?tail=${tail}`, {
@@ -548,9 +550,9 @@ export async function fetchPluginJob(jobId: string, tail = 200): Promise<PluginJ
     }
     const message =
       typeof payload?.message === "string" ? (payload.message as string) : `Job status failed (HTTP ${res.status}).`;
-    return { kind: "error", message };
+    return { kind: "error", status: res.status, message };
   } catch {
-    return { kind: "error", message: "Network error." };
+    return { kind: "error", status: 0, message: "Network error." };
   }
 }
 

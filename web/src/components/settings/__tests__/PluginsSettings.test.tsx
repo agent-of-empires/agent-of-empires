@@ -825,6 +825,20 @@ describe("PluginsSettings", () => {
     expect(err.textContent).toContain("removing tree failed");
   });
 
+  it("the job modal treats a 404 (job gone) as terminal, not an endless reconnect", async () => {
+    startPluginUninstall.mockResolvedValue({ kind: "ok", jobId: "job1" });
+    // The daemon restarted mid-run: the job entry is gone. The modal must stop
+    // polling and let the user close, not spin forever with Close disabled.
+    fetchPluginJob.mockResolvedValue({ kind: "error", status: 404, message: "No plugin job job1" });
+    const { findByTestId } = render(<PluginsSettings />);
+    fireEvent.click(await findByTestId("plugin-uninstall-example.plugin"));
+    fireEvent.click(await findByTestId("plugin-uninstall-confirm-button"));
+    const status = await findByTestId("plugin-job-status");
+    await waitFor(() => expect(status.textContent).toContain("no longer available"));
+    const close = (await findByTestId("plugin-job-close")) as HTMLButtonElement;
+    expect(close.disabled).toBe(false);
+  });
+
   it("a rejected install start (e.g. another job active) surfaces the error in the consent modal", async () => {
     discoverWidget();
     previewPluginInstall.mockResolvedValue(installConsent);

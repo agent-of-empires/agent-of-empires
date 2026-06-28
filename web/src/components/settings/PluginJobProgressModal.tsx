@@ -20,6 +20,9 @@ interface PluginJobProgressModalProps {
 export function PluginJobProgressModal({ jobId, title, onClose }: PluginJobProgressModalProps) {
   const [job, setJob] = useState<PluginJob | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // The job is gone (404), e.g. the daemon restarted mid-run. Terminal: stop
+  // polling and let the user close, rather than spinning forever.
+  const [gone, setGone] = useState(false);
   const logRef = useRef<HTMLPreElement>(null);
 
   useEffect(() => {
@@ -34,6 +37,10 @@ export function PluginJobProgressModal({ jobId, title, onClose }: PluginJobProgr
         if (res.job.job.status.state === "running") {
           timer = setTimeout(() => void poll(), 1000);
         }
+      } else if (res.status === 404) {
+        // The job no longer exists; treat it as terminal instead of retrying.
+        setGone(true);
+        setError(res.message);
       } else {
         // A transient read failure should not kill the follow; retry slower.
         setError(res.message);
@@ -54,7 +61,7 @@ export function PluginJobProgressModal({ jobId, title, onClose }: PluginJobProgr
   }, [job?.log.tail]);
 
   const state = job?.job.status.state ?? "running";
-  const done = state === "succeeded" || state === "failed";
+  const done = state === "succeeded" || state === "failed" || gone;
   const failedError = job?.job.status.state === "failed" ? job.job.status.error : null;
 
   return (
@@ -70,9 +77,9 @@ export function PluginJobProgressModal({ jobId, title, onClose }: PluginJobProgr
           <div>
             <h2 className="font-semibold">{title}</h2>
             <p className="text-xs text-text-dim" data-testid="plugin-job-status">
-              {state === "running" && "Running…"}
-              {state === "succeeded" && "Done."}
-              {state === "failed" && "Failed."}
+              {gone ? "Job no longer available." : state === "running" && "Running…"}
+              {!gone && state === "succeeded" && "Done."}
+              {!gone && state === "failed" && "Failed."}
             </p>
           </div>
           <button
