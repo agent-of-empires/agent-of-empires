@@ -28,7 +28,7 @@ import { useDiffFiles } from "./hooks/useDiffFiles";
 import { useDiffComments } from "./hooks/useDiffComments";
 import { clearStoredComments, sweepOrphanComments } from "./components/diff/comments/storage";
 import { SendCommentsDialog } from "./components/diff/comments/SendCommentsDialog";
-import { useCommandActions } from "./hooks/useCommandActions";
+import { useCommandActions, buildConversationActions } from "./hooks/useCommandActions";
 import { useSettingsCommands } from "./hooks/useSettingsCommands";
 import { useEdgeSwipe } from "./hooks/useEdgeSwipe";
 import { useIsCoarsePointer } from "./hooks/useIsCoarsePointer";
@@ -116,7 +116,6 @@ import { TipsModal } from "./components/TipsModal";
 import { useTips, shouldAutoPopTips } from "./hooks/useTips";
 import { CommandPalette } from "./components/command-palette/CommandPalette";
 import { useConversationSearch } from "./hooks/useConversationSearch";
-import type { CommandAction } from "./components/command-palette/types";
 import { DisconnectBanner } from "./components/DisconnectBanner";
 import { ElevationPrompt } from "./components/ElevationPrompt";
 import { UpdateBanner } from "./components/UpdateBanner";
@@ -1344,32 +1343,14 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   // declared above (near showPalette) so the keyboard handlers can clear it
   // on close/toggle; consumed here.
   const { results: conversationHits, loading: conversationSearching } = useConversationSearch(paletteQuery);
-  const conversationActions = useMemo<CommandAction[]>(() => {
-    return conversationHits.flatMap((hit) => {
-      const session = sessions.find((s) => s.id === hit.session_id);
-      if (!session || session.id === activeSessionId) return [];
-      const state = session.trashed_at
-        ? "trashed"
-        : session.archived_at
-          ? "archived"
-          : session.snoozed_until
-            ? "snoozed"
-            : null;
-      const title = session.title || session.branch || "(untitled)";
-      const count = hit.match_count > 1 ? ` (${hit.match_count} matches)` : "";
-      return [
-        {
-          id: `conversation:${session.id}`,
-          title: state ? `${title} · ${state}` : title,
-          subtitle: `${hit.snippet}${count}`,
-          group: "Conversations" as const,
-          status: session.status,
-          statusCreatedAt: session.created_at,
-          perform: () => handleSelectSession(session.id),
-        },
-      ];
-    });
-  }, [conversationHits, sessions, activeSessionId, handleSelectSession]);
+  const conversationActions = useMemo(
+    () =>
+      buildConversationActions(conversationHits, sessions, activeSessionId).map(({ sessionId, ...rest }) => ({
+        ...rest,
+        perform: () => handleSelectSession(sessionId),
+      })),
+    [conversationHits, sessions, activeSessionId, handleSelectSession],
+  );
 
   const renderContent = () => {
     if (showSettings) {

@@ -8,7 +8,7 @@
 
 import { describe, expect, it, vi } from "vitest";
 import { renderHook } from "@testing-library/react";
-import { useCommandActions } from "../useCommandActions";
+import { useCommandActions, buildConversationActions } from "../useCommandActions";
 import type { SessionResponse } from "../../lib/types";
 
 type Args = Parameters<typeof useCommandActions>[0];
@@ -67,5 +67,47 @@ describe("useCommandActions: scratch command", () => {
     const ids = result.current.map((a) => a.id);
     expect(ids).not.toContain("action:new-session");
     expect(ids).not.toContain("action:new-scratch-session");
+  });
+});
+
+describe("buildConversationActions", () => {
+  const hit = (over: Partial<import("../../lib/api").ConversationSearchHit> = {}) => ({
+    session_id: "s1",
+    seq: 1,
+    kind: "agent",
+    snippet: "matched text",
+    match_count: 1,
+    ...over,
+  });
+  const session = (over: Partial<SessionResponse> = {}) =>
+    ({ id: "s1", title: "My Session", status: "idle", created_at: "2026-01-01T00:00:00Z", ...over }) as SessionResponse;
+
+  it("maps a hit to Conversations row data carrying its session id", () => {
+    const actions = buildConversationActions([hit()], [session()], null);
+    expect(actions).toHaveLength(1);
+    expect(actions[0]).toMatchObject({
+      id: "conversation:s1",
+      sessionId: "s1",
+      title: "My Session",
+      group: "Conversations",
+      subtitle: "matched text",
+    });
+  });
+
+  it("skips the active session and hits whose session is gone", () => {
+    expect(buildConversationActions([hit()], [session()], "s1")).toHaveLength(0);
+    expect(buildConversationActions([hit({ session_id: "ghost" })], [session()], null)).toHaveLength(0);
+  });
+
+  it("labels sunk state and a multi-match count", () => {
+    const trashed = buildConversationActions(
+      [hit({ match_count: 3 })],
+      [session({ trashed_at: "2026-01-02T00:00:00Z" })],
+      null,
+    );
+    expect(trashed[0]!.title).toBe("My Session · trashed");
+    expect(trashed[0]!.subtitle).toBe("matched text (3 matches)");
+    const snoozed = buildConversationActions([hit()], [session({ snoozed_until: "2099-01-01T00:00:00Z" })], null);
+    expect(snoozed[0]!.title).toBe("My Session · snoozed");
   });
 });

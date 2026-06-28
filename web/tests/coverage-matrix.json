@@ -823,12 +823,11 @@
       "specs": [
         "tests/live/palette-content-search.spec.ts",
         "src/components/command-palette/__tests__/CommandPalette.test.tsx",
-        "src/hooks/useConversationSearch.test.ts"
+        "src/hooks/useConversationSearch.test.ts",
+        "src/hooks/__tests__/useCommandActions.test.tsx",
+        "src/lib/__tests__/searchConversationsApi.test.ts"
       ],
-      "components": [
-        "web/src/App.tsx",
-        "web/src/components/command-palette/CommandPalette.tsx"
-      ]
+      "components": ["web/src/App.tsx", "web/src/components/command-palette/CommandPalette.tsx"]
     },
     {
       "id": "sidebar.scratch-group",

@@ -2,7 +2,51 @@ import { useMemo } from "react";
 
 const IS_MAC = typeof navigator !== "undefined" && /Mac|iPhone|iPad|iPod/.test(navigator.platform);
 import type { SessionResponse } from "../lib/types";
+import type { ConversationSearchHit } from "../lib/api";
 import type { CommandAction } from "../components/command-palette/types";
+
+// A conversation-search palette row minus its `perform` handler. The caller
+// attaches `perform` in a closure (so the select callback is never passed
+// into this render-time builder, which the react-hooks lint reads as a
+// possible ref access during render).
+export type ConversationActionData = Omit<CommandAction, "perform"> & { sessionId: string };
+
+// Map conversation-content search hits (#2515) to palette row data. The hit
+// carries only the session id; title and state come from the client's
+// session list. Skips the active session (already in view) and any hit whose
+// session is no longer in the list. A sunk-state label and a match-count
+// suffix annotate the row so an archived/trashed hit is not mistaken for a
+// live one.
+export function buildConversationActions(
+  hits: ConversationSearchHit[],
+  sessions: SessionResponse[],
+  activeSessionId: string | null,
+): ConversationActionData[] {
+  return hits.flatMap((hit) => {
+    const session = sessions.find((s) => s.id === hit.session_id);
+    if (!session || session.id === activeSessionId) return [];
+    const state = session.trashed_at
+      ? "trashed"
+      : session.archived_at
+        ? "archived"
+        : session.snoozed_until
+          ? "snoozed"
+          : null;
+    const title = session.title || session.branch || "(untitled)";
+    const count = hit.match_count > 1 ? ` (${hit.match_count} matches)` : "";
+    return [
+      {
+        id: `conversation:${session.id}`,
+        sessionId: session.id,
+        title: state ? `${title} · ${state}` : title,
+        subtitle: `${hit.snippet}${count}`,
+        group: "Conversations" as const,
+        status: session.status,
+        statusCreatedAt: session.created_at,
+      },
+    ];
+  });
+}
 
 interface Args {
   sessions: SessionResponse[];
