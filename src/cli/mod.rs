@@ -119,15 +119,24 @@ pub(crate) fn purge_acp_transcript(inst: &Instance) -> Result<()> {
 /// A missing table means the store predates it: nothing to purge. Kept
 /// feature-independent so non-`serve` CLI builds can clean transcripts too.
 fn purge_acp_transcript_rows(db_path: &std::path::Path, session_id: &str) -> Result<()> {
-    let conn = rusqlite::Connection::open(db_path)
+    let mut conn = rusqlite::Connection::open(db_path)
         .map_err(|e| anyhow::anyhow!("acp transcript purge: open event store: {e}"))?;
     // A running daemon may hold the store open; wait briefly rather than fail.
     conn.busy_timeout(std::time::Duration::from_secs(5))
         .map_err(|e| anyhow::anyhow!("acp transcript purge: set busy_timeout: {e}"))?;
+    // Both deletes run in one transaction so the purge is all-or-nothing: if the
+    // attachments delete fails after the events delete, the dropped `tx` rolls
+    // both back and the caller keeps the session row for retry rather than
+    // leaving the transcript half removed.
+    let tx = conn
+        .transaction()
+        .map_err(|e| anyhow::anyhow!("acp transcript purge: begin transaction: {e}"))?;
     // The source of truth for these names is `crate::events::Schema` (prefix
-    // "acp"), which is serve-gated and so cannot be referenced from here.
+    // "acp"), which is serve-gated and so cannot be referenced from here. They
+    // are fixed literals, not user input, and `session_id` is bound, so the
+    // `format!` only interpolates a constant.
     for table in ["acp_events", "acp_attachments"] {
-        match conn.execute(
+        match tx.execute(
             &format!("DELETE FROM {table} WHERE session_id = ?1"),
             rusqlite::params![session_id],
         ) {
@@ -140,6 +149,8 @@ fn purge_acp_transcript_rows(db_path: &std::path::Path, session_id: &str) -> Res
             }
         }
     }
+    tx.commit()
+        .map_err(|e| anyhow::anyhow!("acp transcript purge: commit: {e}"))?;
     Ok(())
 }
 
