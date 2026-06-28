@@ -38,12 +38,11 @@ import { usePaneLayout, dockTabs, dockActive, dockOf } from "./lib/paneLayout";
 import { isPluginPaneId, usePluginPanes, type PluginPane } from "./lib/pluginPanes";
 import { PluginPaneBody } from "./components/plugin/PluginSlots";
 import { TOUR_ANCHORS, tourAnchor } from "./lib/tourSteps";
+import { restoreSessions, trashSessions } from "./lib/trashActions";
 import {
   loginStatus,
   logout,
   deleteSession,
-  trashSession,
-  restoreSession,
   stopSession,
   startSession,
   fetchAbout,
@@ -876,45 +875,20 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       navigate("/");
     }
 
-    let anyFailed = false;
-    for (const id of ids) {
-      const res = await trashSession(id);
-      if (res) {
-        // Apply the returned snapshot so the row re-buckets into Trash now,
-        // not on the next poll.
-        applySession(res);
-      } else {
-        anyFailed = true;
-        setSessionStatus(id, "Error");
-      }
-    }
-    if (anyFailed) {
-      toastBus.handler?.error("Failed to move session to trash");
-    } else {
-      toastBus.handler?.info("Moved to trash");
-    }
+    // The returned snapshot re-buckets each row into Trash immediately
+    // instead of on the next poll. See trashSessions.
+    await trashSessions(ids, {
+      applySession,
+      onError: (id) => setSessionStatus(id, "Error"),
+      notify: toastBus.handler,
+    });
   }, [deletingWorkspace, activeSessionId, setSessionStatus, applySession, navigate]);
 
   // Restore a trashed workspace from the sidebar Trash section (#2489).
   // Restores every session in the workspace (a workspace only lands in Trash
   // when all of its sessions are trashed), not just the first.
   const handleRestoreSession = useCallback(
-    async (sessionIds: string[]) => {
-      let anyFailed = false;
-      for (const id of sessionIds) {
-        const res = await restoreSession(id);
-        if (res) {
-          applySession(res);
-        } else {
-          anyFailed = true;
-        }
-      }
-      if (anyFailed) {
-        toastBus.handler?.error("Failed to restore session");
-      } else {
-        toastBus.handler?.info("Session restored");
-      }
-    },
+    (sessionIds: string[]) => restoreSessions(sessionIds, { applySession, notify: toastBus.handler }),
     [applySession],
   );
 
