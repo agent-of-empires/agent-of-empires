@@ -105,6 +105,11 @@ impl HostApiState {
         self.ui.snapshot()
     }
 
+    /// The plugin's current UI mutation counter (0 if none yet).
+    pub fn ui_revision(&self, plugin_id: &str) -> u64 {
+        self.ui.revision(plugin_id)
+    }
+
     /// Push a host-originated notification onto the ring. Unlike the `ui.notify`
     /// RPC this is the host itself speaking (e.g. the auto-update sweep telling
     /// the user an update needs approval), so it bypasses the per-worker

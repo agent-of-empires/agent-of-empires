@@ -96,6 +96,13 @@ impl PluginHost {
         self.api.ui_snapshot()
     }
 
+    /// The plugin's current UI mutation counter. The action endpoint reads this
+    /// before forwarding an action so the dashboard can hold a spinner until the
+    /// worker's re-pushed state moves the counter off this baseline.
+    pub fn ui_revision(&self, plugin_id: &str) -> u64 {
+        self.api.ui_revision(plugin_id)
+    }
+
     /// Push a host-originated notification onto the ring (e.g. the auto-update
     /// sweep telling the user an update needs approval). Best-effort.
     pub fn notify_host(

@@ -184,6 +184,7 @@ impl StructuredViewState {
             plugin_ui: UiSnapshot {
                 entries: Vec::new(),
                 notifications: Vec::new(),
+                revisions: Default::default(),
             },
             plugin_notify: PluginNotifyState::default(),
         }

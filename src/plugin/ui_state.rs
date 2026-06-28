@@ -15,7 +15,7 @@
 //! and immediately crashes should still reach the browser) and the client
 //! toasts each one once by tracking the monotonic `seq`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
@@ -282,6 +282,14 @@ pub struct UiEntry {
 pub struct UiSnapshot {
     pub entries: Vec<UiEntry>,
     pub notifications: Vec<Notification>,
+    /// Per-plugin monotonic mutation counter. The dashboard reads a baseline
+    /// from the action POST and holds a manual-action spinner until the
+    /// plugin's counter moves off it, so the spinner tracks the worker's
+    /// re-pushed state instead of the fire-and-forget POST. `BTreeMap` for a
+    /// deterministic serialized order; `serde(default)` so an older daemon's
+    /// snapshot still decodes.
+    #[serde(default)]
+    pub revisions: BTreeMap<String, u64>,
 }
 
 #[derive(Default)]
@@ -293,6 +301,18 @@ struct Inner {
     active: HashMap<String, u64>,
     notifications: VecDeque<Notification>,
     notify_seq: u64,
+    /// Per-plugin mutation counter, bumped on every accepted entry change.
+    /// Daemon-local: it resets when the daemon restarts, so the client treats
+    /// any change off its baseline (including a reset to a lower value) as
+    /// "state moved".
+    revisions: HashMap<String, u64>,
+}
+
+impl Inner {
+    fn bump_revision(&mut self, plugin_id: &str) {
+        let rev = self.revisions.entry(plugin_id.to_string()).or_insert(0);
+        *rev = rev.saturating_add(1);
+    }
 }
 
 /// The shared store. A `std::sync::RwLock` (not `tokio::Mutex`): writes happen
@@ -329,9 +349,20 @@ impl UiStore {
         // fast respawn (begin running before the exited worker's clear_plugin),
         // where clearing by the old generation would otherwise no-op and leave
         // its entries visible until the new worker happened to overwrite them.
+        let before = inner.entries.len();
         inner.entries.retain(|k, _| k.plugin_id != plugin_id);
+        if before != inner.entries.len() {
+            inner.bump_revision(plugin_id);
+        }
         inner.active.insert(plugin_id.to_string(), gen);
         gen
+    }
+
+    /// The plugin's current mutation counter, or 0 if it has none yet. The
+    /// action endpoint reads this before forwarding an action so the client can
+    /// wait for the worker's re-pushed state to move it.
+    pub fn revision(&self, plugin_id: &str) -> u64 {
+        self.read().revisions.get(plugin_id).copied().unwrap_or(0)
     }
 
     /// Validate and store one entry. Rejects a stale generation, a payload that
@@ -371,6 +402,7 @@ impl UiStore {
             return Err(UiError::QuotaExceeded);
         }
         inner.entries.insert(key, normalized);
+        inner.bump_revision(plugin_id);
         Ok(())
     }
 
@@ -397,7 +429,9 @@ impl UiStore {
         if inner.active.get(plugin_id) != Some(&generation) {
             return Err(UiError::StaleWorker);
         }
-        inner.entries.remove(&key);
+        if inner.entries.remove(&key).is_some() {
+            inner.bump_revision(plugin_id);
+        }
         Ok(())
     }
 
@@ -450,7 +484,11 @@ impl UiStore {
         inner.active.remove(plugin_id);
         let before = inner.entries.len();
         inner.entries.retain(|k, _| k.plugin_id != plugin_id);
-        before != inner.entries.len()
+        let changed = before != inner.entries.len();
+        if changed {
+            inner.bump_revision(plugin_id);
+        }
+        changed
     }
 
     /// Clone the full state for the web to render.
@@ -482,6 +520,11 @@ impl UiStore {
         UiSnapshot {
             entries,
             notifications: inner.notifications.iter().cloned().collect(),
+            revisions: inner
+                .revisions
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect(),
         }
     }
 
@@ -932,5 +975,48 @@ mod tests {
             &json!({"title": "y"}),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn revision_bumps_on_mutation_and_surfaces_in_snapshot() {
+        let s = store();
+        // Absent until the plugin first mutates state.
+        assert_eq!(s.revision("acme.kit"), 0);
+        let g = s.begin_generation("acme.kit");
+
+        s.set(
+            "acme.kit",
+            g,
+            UiSlot::Card,
+            "c0",
+            None,
+            &json!({"title": "x"}),
+        )
+        .unwrap();
+        assert_eq!(s.revision("acme.kit"), 1);
+
+        // An identical re-push still bumps: a refresh that returns unchanged
+        // data must still move the counter, or a waiting spinner would hang.
+        s.set(
+            "acme.kit",
+            g,
+            UiSlot::Card,
+            "c0",
+            None,
+            &json!({"title": "x"}),
+        )
+        .unwrap();
+        assert_eq!(s.revision("acme.kit"), 2);
+
+        // Removing a present entry bumps; removing an absent one does not.
+        s.remove("acme.kit", g, UiSlot::Card, "c0", None).unwrap();
+        assert_eq!(s.revision("acme.kit"), 3);
+        s.remove("acme.kit", g, UiSlot::Card, "gone", None).unwrap();
+        assert_eq!(s.revision("acme.kit"), 3);
+
+        // The counter is exposed in the polled snapshot, scoped per plugin.
+        let snap = s.snapshot();
+        assert_eq!(snap.revisions.get("acme.kit"), Some(&3));
+        assert_eq!(snap.revisions.get("other.kit"), None);
     }
 }

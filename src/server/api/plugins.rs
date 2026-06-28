@@ -168,8 +168,18 @@ pub async fn invoke_plugin_action(
             "Plugin host is not running".into(),
         );
     };
+    // Read the plugin's UI revision before forwarding, not the value the
+    // dashboard last polled: that one is stale, so an unrelated push between
+    // the last poll and this click would already exceed it and clear the
+    // spinner before the worker has done anything. The dashboard holds the
+    // spinner until the plugin's revision moves off this baseline.
+    let baseline_revision = host.ui_revision(&id);
     if host.notify_worker(&id, &body.method, body.params).await {
-        (StatusCode::ACCEPTED, Json(json!({ "ok": true }))).into_response()
+        (
+            StatusCode::ACCEPTED,
+            Json(json!({ "ok": true, "baseline_revision": baseline_revision })),
+        )
+            .into_response()
     } else {
         error_response(
             StatusCode::NOT_FOUND,
