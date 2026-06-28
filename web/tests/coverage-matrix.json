@@ -817,6 +817,20 @@
       ]
     },
     {
+      "id": "palette.content-search",
+      "kind": "live-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/live/palette-content-search.spec.ts",
+        "src/components/command-palette/__tests__/CommandPalette.test.tsx",
+        "src/hooks/useConversationSearch.test.ts"
+      ],
+      "components": [
+        "web/src/App.tsx",
+        "web/src/components/command-palette/CommandPalette.tsx"
+      ]
+    },
+    {
       "id": "sidebar.scratch-group",
       "kind": "mocked-playwright",
       "risk": "medium",
