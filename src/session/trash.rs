@@ -556,4 +556,65 @@ mod tests {
             Some(original.as_str())
         );
     }
+
+    #[test]
+    fn relocated_worktree_is_a_working_checkout() {
+        // The structured-view preview and diff read the worktree at
+        // project_path; after relocation that must still be a live git
+        // worktree, not a detached directory.
+        if !git_available() {
+            return;
+        }
+        let (_tmp, mut inst) = real_worktree_instance();
+        inst.trash();
+        assert!(matches!(
+            relocate_worktree_to_trash(&mut inst),
+            RelocateOutcome::Relocated { .. }
+        ));
+        let status = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&inst.project_path)
+            .output()
+            .unwrap();
+        assert!(
+            status.status.success(),
+            "git status must work in the relocated worktree: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+    }
+
+    #[test]
+    fn purge_removes_relocated_worktree() {
+        // Acceptance criterion: purging a trashed session deletes the worktree
+        // at its relocated holding path, leaving nothing behind.
+        if !git_available() {
+            return;
+        }
+        let (_tmp, mut inst) = real_worktree_instance();
+        inst.trash();
+        assert!(matches!(
+            relocate_worktree_to_trash(&mut inst),
+            RelocateOutcome::Relocated { .. }
+        ));
+        let holding = PathBuf::from(&inst.project_path);
+        assert!(holding.exists());
+
+        let result = crate::session::deletion::perform_deletion(
+            &crate::session::deletion::DeletionRequest {
+                session_id: inst.id.clone(),
+                instance: inst.clone(),
+                delete_worktree: true,
+                delete_branch: true,
+                delete_sandbox: false,
+                force_delete: true,
+                detach_hooks: true,
+                keep_scratch: false,
+            },
+        );
+        assert!(result.success, "purge failed: {:?}", result.errors);
+        assert!(
+            !holding.exists(),
+            "relocated worktree should be gone after purge"
+        );
+    }
 }

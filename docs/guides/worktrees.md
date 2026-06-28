@@ -124,6 +124,10 @@ init_submodules = true
 
 On the delete side, aoe runs `git submodule deinit -f --all` before `git worktree remove` for any worktree with `.gitmodules`, so the panic-button `Force` checkbox is not required just because the worktree has submodules. If git still refuses (e.g. a partially-broken submodule), aoe falls back to clearing `<main>/.git/worktrees/<name>/modules/` and pruning the stale entry manually.
 
+### Trashing relocates the worktree
+
+Moving a worktree session to the trash (rather than purging it) relocates its worktree out of the active worktree dir into a sibling `.aoe-trash/<session-id>` holding directory via `git worktree move`, so trashed sessions stop cluttering the active checkouts. The worktree stays a live checkout, so previewing a trashed session still works. Restoring the session moves the worktree back to its original path; if that path is now occupied, the restore is refused so nothing is overwritten. Purging a trashed session removes the worktree from the holding dir. Sessions trashed before this behavior existed are relocated the next time the daemon starts or the TUI loads.
+
 ### Template Variables
 
 | Variable | Description |
