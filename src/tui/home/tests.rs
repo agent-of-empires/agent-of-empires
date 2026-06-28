@@ -6674,6 +6674,35 @@ fn trash_then_restore_round_trip() {
     );
 }
 
+#[test]
+#[serial]
+fn d_on_session_with_default_trash_persists_trash_marker() {
+    let mut env = create_test_env_with_sessions(2);
+    let id = env.view.selected_session.clone().unwrap();
+
+    env.view.handle_key(key(KeyCode::Char('d')), None);
+
+    assert!(
+        env.view.get_instance(&id).unwrap().is_trashed(),
+        "pressing d with default trash-first config must mark the row trashed in memory"
+    );
+    assert!(
+        env.view.unified_delete_dialog.is_none(),
+        "trash-first d must not open the permanent-delete dialog"
+    );
+    let disk_row = Storage::new_unwatched("test")
+        .unwrap()
+        .load()
+        .unwrap()
+        .into_iter()
+        .find(|inst| inst.id == id)
+        .expect("disk row present");
+    assert!(
+        disk_row.is_trashed(),
+        "pressing d must persist trashed_at so a storage refresh cannot resurrect a killed session"
+    );
+}
+
 /// When no session is selected, the toggle is a silent no-op.
 #[test]
 #[serial]

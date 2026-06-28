@@ -1448,12 +1448,12 @@ impl HomeView {
     /// restored. The Trash section is revealed so the user sees where the row
     /// went. See #2489.
     pub(super) fn trash_session_by_id(&mut self, id: &str) {
-        if let Some(inst) = self.instances.iter().find(|i| i.id == id) {
-            inst.kill_all_tmux_sessions();
-        }
         if let Err(e) = self.apply_user_action(id, |inst| inst.trash()) {
             tracing::warn!(target: "tui.session", session = %id, "trash failed: {e}");
             return;
+        }
+        if let Some(inst) = self.instances.iter().find(|i| i.id == id) {
+            inst.kill_all_tmux_sessions();
         }
         self.reveal_trashed_section();
         self.flat_items = self.build_flat_items();
