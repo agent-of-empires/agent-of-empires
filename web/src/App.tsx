@@ -29,6 +29,7 @@ import { useDiffComments } from "./hooks/useDiffComments";
 import { clearStoredComments, sweepOrphanComments } from "./components/diff/comments/storage";
 import { SendCommentsDialog } from "./components/diff/comments/SendCommentsDialog";
 import { useCommandActions, buildConversationActions } from "./hooks/useCommandActions";
+import { usePluginCommands } from "./hooks/usePluginCommands";
 import { useSettingsCommands } from "./hooks/useSettingsCommands";
 import { useEdgeSwipe } from "./hooks/useEdgeSwipe";
 import { useIsCoarsePointer } from "./hooks/useIsCoarsePointer";
@@ -1346,6 +1347,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     readOnly: !!serverAbout?.read_only,
     onOpenSettingsTab: openSettingsTab,
   });
+  const pluginCommandActions = usePluginCommands(pluginUiEntries, activeSessionId);
 
   // Conversation-content search for the palette (#2515). paletteQuery is
   // declared above (near showPalette) so the keyboard handlers can clear it
@@ -1882,7 +1884,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
             setShowPalette(false);
             setPaletteQuery("");
           }}
-          actions={[...commandActions, ...conversationActions, ...settingsCommands]}
+          actions={[...commandActions, ...conversationActions, ...settingsCommands, ...pluginCommandActions]}
           onSearchChange={setPaletteQuery}
           searching={conversationSearching}
         />

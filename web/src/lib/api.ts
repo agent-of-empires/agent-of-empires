@@ -252,6 +252,30 @@ export function fetchPlugins(): Promise<PluginListResponse | null> {
   return fetchJson<PluginListResponse>("/api/plugins");
 }
 
+/** A command's client-executed action (`api_version >= 6`). `open-ui-link` opens
+ *  the `href` from the plugin's own per-session UI-state entry at `(slot, id)`. */
+export type PluginClientAction = { kind: "open-ui-link"; slot: PluginUiSlot; id: string };
+
+/** One active plugin command (`GET /api/plugins/commands`), normalized for the
+ *  command palette and keymap. */
+export interface PluginCommand {
+  fqid: string;
+  plugin_id: string;
+  id: string;
+  title: string;
+  description: string;
+  keybinds: string[];
+  action: PluginClientAction | null;
+}
+
+export interface PluginCommandsResponse {
+  commands: PluginCommand[];
+}
+
+export function fetchPluginCommands(): Promise<PluginCommandsResponse | null> {
+  return fetchJson<PluginCommandsResponse>("/api/plugins/commands");
+}
+
 function isValidPluginListResponse(payload: unknown): payload is PluginListResponse {
   return (
     typeof payload === "object" &&
