@@ -1124,7 +1124,19 @@
       "kind": "mocked-playwright",
       "risk": "high",
       "specs": ["tests/session-trash-flow.spec.ts"],
-      "components": ["web/src/App.tsx", "web/src/components/WorkspaceSidebar.tsx", "web/src/hooks/useSessions.ts"]
+      "components": [
+        "web/src/App.tsx",
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/DeleteSessionDialog.tsx",
+        "web/src/hooks/useSessions.ts"
+      ]
+    },
+    {
+      "id": "session.trash.read-only-composer",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/acp-trashed-composer.spec.ts"],
+      "components": ["web/src/components/acp/StructuredView.tsx"]
     },
     {
       "id": "session.group-edit",

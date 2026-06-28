@@ -604,67 +604,74 @@ function AcpChrome({
           </div>
         </ThreadPrimitive.Viewport>
 
-        <div ref={belowViewportRef}>
-          <QueuedPromptsStrip
-            queued={state.queuedPrompts}
-            onRemove={removeQueuedPrompt}
-            onEdit={editQueuedPrompt}
-            onClear={clearQueue}
-            pendingResume={
-              status !== "open" || acpWorkerState !== "running" || state.workerStopped || state.workerRestarting
-            }
-          />
+        {/* A trashed session is read-only until restored: the reconciler will
+            never resume it, so the queue strips and composer (which would only
+            stash input into a queue that never drains) are not rendered. The
+            transcript above stays visible. Archived / snoozed sessions are
+            resumable, so they keep their composer. See #2529. */}
+        {!trashedAt && (
+          <div ref={belowViewportRef}>
+            <QueuedPromptsStrip
+              queued={state.queuedPrompts}
+              onRemove={removeQueuedPrompt}
+              onEdit={editQueuedPrompt}
+              onClear={clearQueue}
+              pendingResume={
+                status !== "open" || acpWorkerState !== "running" || state.workerStopped || state.workerRestarting
+              }
+            />
 
-          <RejectedPromptsStrip
-            rejected={state.rejectedPrompts}
-            onRetry={sendPrompt}
-            onDismiss={dismissRejectedPrompt}
-            disabled={state.workerRestarting || state.workerStopped || Boolean(state.startupError)}
-          />
+            <RejectedPromptsStrip
+              rejected={state.rejectedPrompts}
+              onRetry={sendPrompt}
+              onDismiss={dismissRejectedPrompt}
+              disabled={state.workerRestarting || state.workerStopped || Boolean(state.startupError)}
+            />
 
-          <ModeSwitchFailedNotice failure={state.modeSwitchFailed} onDismiss={dismissModeSwitchFailed} />
+            <ModeSwitchFailedNotice failure={state.modeSwitchFailed} onDismiss={dismissModeSwitchFailed} />
 
-          <ConfigOptionSwitchFailedNotice
-            failure={state.configOptionSwitchFailed}
-            configOptions={state.configOptions}
-            onDismiss={dismissConfigOptionSwitchFailed}
-          />
+            <ConfigOptionSwitchFailedNotice
+              failure={state.configOptionSwitchFailed}
+              configOptions={state.configOptions}
+              onDismiss={dismissConfigOptionSwitchFailed}
+            />
 
-          <ContextPrimerBanner
-            sessionId={sessionId}
-            available={state.contextPrimerAvailable}
-            onInsertPrimer={(text) =>
-              setPrimerPrefill({
-                id: `primer-${state.contextPrimerAvailable?.resetSeq ?? 0}-${Date.now()}`,
-                text,
-              })
-            }
-            onDismiss={dismissPrimer}
-          />
+            <ContextPrimerBanner
+              sessionId={sessionId}
+              available={state.contextPrimerAvailable}
+              onInsertPrimer={(text) =>
+                setPrimerPrefill({
+                  id: `primer-${state.contextPrimerAvailable?.resetSeq ?? 0}-${Date.now()}`,
+                  text,
+                })
+              }
+              onDismiss={dismissPrimer}
+            />
 
-          <Composer
-            sessionId={sessionId}
-            currentAgent={state.agent}
-            availableModes={state.availableModes}
-            currentModeId={state.currentModeId}
-            legacyMode={state.mode}
-            configOptions={state.configOptions}
-            pendingConfigOption={state.pendingConfigOption}
-            setConfigOption={setConfigOption}
-            sessionUsage={state.sessionUsage}
-            availableCommands={state.availableCommands}
-            connected={status === "open" && !state.workerStopped && !state.workerRestarting}
-            turnActive={state.turnActive}
-            queuedCount={state.queuedPrompts.length}
-            enqueuePrompt={sendPrompt}
-            promptCapabilities={state.promptCapabilities}
-            pendingAttachments={pendingAttachments}
-            setPendingAttachments={setPendingAttachments}
-            primerPrefill={primerPrefill}
-            queuedPrompts={state.queuedPrompts}
-            editQueuedPrompt={editQueuedPrompt}
-          />
-        </div>
+            <Composer
+              sessionId={sessionId}
+              currentAgent={state.agent}
+              availableModes={state.availableModes}
+              currentModeId={state.currentModeId}
+              legacyMode={state.mode}
+              configOptions={state.configOptions}
+              pendingConfigOption={state.pendingConfigOption}
+              setConfigOption={setConfigOption}
+              sessionUsage={state.sessionUsage}
+              availableCommands={state.availableCommands}
+              connected={status === "open" && !state.workerStopped && !state.workerRestarting}
+              turnActive={state.turnActive}
+              queuedCount={state.queuedPrompts.length}
+              enqueuePrompt={sendPrompt}
+              promptCapabilities={state.promptCapabilities}
+              pendingAttachments={pendingAttachments}
+              setPendingAttachments={setPendingAttachments}
+              primerPrefill={primerPrefill}
+              queuedPrompts={state.queuedPrompts}
+              editQueuedPrompt={editQueuedPrompt}
+            />
+          </div>
+        )}
       </ThreadPrimitive.Root>
     </StructuredViewRoot>
   );

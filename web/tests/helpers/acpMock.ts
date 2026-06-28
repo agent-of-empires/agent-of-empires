@@ -27,6 +27,9 @@ export interface AcpSessionMockOptions {
   onConfigOption?: (body: { config_id: string; value: string }) => unknown[];
   /** Override the `/api/about` payload (e.g. `{ read_only: true }`). */
   about?: Record<string, unknown>;
+  /** When set, the session is reported trashed (`trashed_at`) with a stopped
+   *  worker, so the trashed read-only banner shows. See #2529. */
+  trashedAt?: string;
 }
 
 export interface AcpSessionMock {
@@ -107,7 +110,7 @@ export async function mockAcpSession(page: Page, opts: AcpSessionMockOptions = {
             project_path: `/tmp/${title}`,
             group_path: "/tmp",
             tool: "claude",
-            status: "Running",
+            status: opts.trashedAt ? "Stopped" : "Running",
             yolo_mode: false,
             created_at: new Date().toISOString(),
             last_accessed_at: null,
@@ -117,9 +120,10 @@ export async function mockAcpSession(page: Page, opts: AcpSessionMockOptions = {
             is_sandboxed: false,
             has_terminal: true,
             profile: "default",
+            trashed_at: opts.trashedAt ?? null,
             workspace_repos: [],
             view: "structured",
-            acp_worker_state: "running",
+            acp_worker_state: opts.trashedAt ? "stopped" : "running",
             claude_fullscreen: false,
           },
         ],
