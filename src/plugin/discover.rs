@@ -219,6 +219,33 @@ pub struct ScreenshotView {
     pub caption: String,
 }
 
+/// Resolve a manifest's raw screenshots into browser-fetchable views. Gated on
+/// `api_version >= 5` to mirror [`aoe_plugin_api::PluginManifest::validate`], so
+/// the detail modal never shows media for a manifest the install path would
+/// reject; entries that fail [`screenshot_path_ok`] or have empty alt text are
+/// dropped (one bad entry never poisons the whole detail), capped at
+/// [`MAX_SCREENSHOTS`].
+fn resolve_screenshots(
+    api_version: u32,
+    raws: Vec<RawScreenshot>,
+    owner: &str,
+    repo: &str,
+    reference: Option<&str>,
+) -> Vec<ScreenshotView> {
+    if api_version < 5 {
+        return Vec::new();
+    }
+    raws.into_iter()
+        .filter(|s| screenshot_path_ok(&s.path) && !s.alt.trim().is_empty())
+        .take(MAX_SCREENSHOTS)
+        .map(|s| ScreenshotView {
+            src: raw_url(owner, repo, reference, &s.path),
+            alt: s.alt,
+            caption: s.caption,
+        })
+        .collect()
+}
+
 /// Build the `raw.githubusercontent.com` URL for a repository-relative path.
 /// `reference` defaults to `HEAD` (the repo's default branch) when the source
 /// is unpinned. The path is already validated by [`screenshot_path_ok`]; this
@@ -315,20 +342,13 @@ pub async fn details(source: &str) -> Result<PluginDetail> {
                         id: u.id,
                     })
                     .collect(),
-                screenshots: m
-                    .screenshots
-                    .into_iter()
-                    // Drop entries the strict schema would reject (URLs,
-                    // traversing/absolute paths, empty alt) so one bad entry
-                    // never poisons the whole detail; cap at the manifest bound.
-                    .filter(|s| screenshot_path_ok(&s.path) && !s.alt.trim().is_empty())
-                    .take(MAX_SCREENSHOTS)
-                    .map(|s| ScreenshotView {
-                        src: raw_url(owner, repo, reference, &s.path),
-                        alt: s.alt,
-                        caption: s.caption,
-                    })
-                    .collect(),
+                screenshots: resolve_screenshots(
+                    m.api_version,
+                    m.screenshots,
+                    owner,
+                    repo,
+                    reference,
+                ),
             })
             .map_err(|e| format!("aoe-plugin.toml is invalid: {e}")),
         Err(e) => Err(format!("{e}")),
@@ -489,16 +509,32 @@ path = "docs/b.png"
 alt = "   "
 "#;
         let m: RawManifest = toml::from_str(toml).expect("lenient parse");
-        let kept: Vec<_> = m
-            .screenshots
-            .into_iter()
-            .filter(|s| screenshot_path_ok(&s.path) && !s.alt.trim().is_empty())
-            .map(|s| raw_url("acme", "widget", None, &s.path))
-            .collect();
+        let kept = resolve_screenshots(m.api_version, m.screenshots, "acme", "widget", None);
+        assert_eq!(kept.len(), 1);
         assert_eq!(
-            kept,
-            vec!["https://raw.githubusercontent.com/acme/widget/HEAD/docs/a.png".to_string()]
+            kept[0].src,
+            "https://raw.githubusercontent.com/acme/widget/HEAD/docs/a.png"
         );
+    }
+
+    #[test]
+    fn screenshots_gated_out_below_api_version_5() {
+        // A v4 manifest must not surface screenshots in the detail modal, since
+        // the strict install validator rejects them; the lenient detail path
+        // mirrors that gate.
+        let toml = r#"
+id = "acme.widget"
+name = "Widget"
+version = "1.0.0"
+api_version = 4
+
+[[screenshots]]
+path = "docs/a.png"
+alt = "good"
+"#;
+        let m: RawManifest = toml::from_str(toml).expect("lenient parse");
+        let kept = resolve_screenshots(m.api_version, m.screenshots, "acme", "widget", None);
+        assert!(kept.is_empty(), "v4 must not expose screenshots");
     }
 
     #[test]
