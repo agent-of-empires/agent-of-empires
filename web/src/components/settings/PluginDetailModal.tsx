@@ -23,11 +23,12 @@ interface PluginDetailModalProps {
   onClose: () => void;
 }
 
-/// A modal showing one plugin's detail: version, description, capabilities, UI
-/// slots, and the available release versions. Opened from a discovery result or
-/// an installed-plugin row. For a gh source it fetches the live manifest +
-/// release tags; for a local source it renders the passed-in fallback fields.
-/// Screenshots and richer metadata are a future addition.
+/// A modal showing one plugin's detail: screenshots, version, description,
+/// capabilities, UI slots, and the available release versions. Opened from a
+/// discovery result or an installed-plugin row. For a gh source it fetches the
+/// live manifest + release tags; for a local source it renders the passed-in
+/// fallback fields. Screenshots come only from the fetched gh manifest (the
+/// server resolves their paths to raw.githubusercontent.com URLs).
 export function PluginDetailModal({ source, title, fallback, installCommand, onClose }: PluginDetailModalProps) {
   const isGithub = source.startsWith("gh:");
   const [detail, setDetail] = useState<PluginDetail | null>(null);
@@ -65,6 +66,9 @@ export function PluginDetailModal({ source, title, fallback, installCommand, onC
   const description = manifest?.description ?? fallback?.description ?? null;
   const capabilities = manifest?.capabilities ?? fallback?.capabilities ?? [];
   const ui = manifest?.ui_contributions ?? fallback?.ui_contributions ?? [];
+  // Screenshots come only from the fetched gh manifest; a no-media plugin
+  // yields an empty list and renders no gallery chrome.
+  const screenshots = manifest?.screenshots ?? [];
 
   return (
     <div
@@ -100,6 +104,30 @@ export function PluginDetailModal({ source, title, fallback, installCommand, onC
           <p className="text-xs text-status-error" data-testid="plugin-detail-error">
             {error}
           </p>
+        )}
+
+        {screenshots.length > 0 && (
+          <div className="mb-3 grid gap-3" data-testid="plugin-detail-screenshots">
+            {screenshots.map((shot) => (
+              <figure key={shot.src} className="overflow-hidden rounded border border-surface-700 bg-surface-950">
+                <img
+                  src={shot.src}
+                  alt={shot.alt}
+                  loading="lazy"
+                  decoding="async"
+                  className="max-h-72 w-full object-contain"
+                  // A moved branch/tag or deleted asset 404s; hide the figure
+                  // rather than leave a broken-image icon.
+                  onError={(e) => {
+                    e.currentTarget.closest("figure")?.classList.add("hidden");
+                  }}
+                />
+                {shot.caption && (
+                  <figcaption className="px-2 py-1 text-[11px] text-text-dim">{shot.caption}</figcaption>
+                )}
+              </figure>
+            ))}
+          </div>
         )}
 
         {description && <p className="mb-3 text-text-dim">{description}</p>}

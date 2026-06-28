@@ -364,6 +364,7 @@ describe("PluginsSettings", () => {
           api_version: 4,
           capabilities: ["net"],
           ui_contributions: [{ slot: "status-bar", id: "s" }],
+          screenshots: [],
         },
         manifest_error: null,
         release_tags: ["v2.3.0", "v2.2.0"],
@@ -379,6 +380,45 @@ describe("PluginsSettings", () => {
     expect(modal.textContent).toContain("net");
     const versions = await findByTestId("plugin-detail-versions");
     expect(versions.textContent).toContain("v2.2.0");
+    // No screenshots in the manifest: no gallery chrome.
+    expect(modal.querySelector("[data-testid='plugin-detail-screenshots']")).toBeNull();
+  });
+
+  it("renders a screenshot gallery when the manifest declares screenshots", async () => {
+    fetchPluginDetails.mockResolvedValue({
+      kind: "ok",
+      detail: {
+        source: "gh:acme/widget",
+        manifest: {
+          id: "acme.widget",
+          name: "Widget",
+          version: "2.3.0",
+          description: "A widget plugin.",
+          api_version: 5,
+          capabilities: [],
+          ui_contributions: [],
+          screenshots: [
+            {
+              src: "https://raw.githubusercontent.com/acme/widget/HEAD/a.png",
+              alt: "Dashboard card",
+              caption: "Live card.",
+            },
+            { src: "https://raw.githubusercontent.com/acme/widget/HEAD/b.gif", alt: "Demo", caption: "" },
+          ],
+        },
+        manifest_error: null,
+        release_tags: [],
+      },
+    });
+    const { findByTestId } = render(<PluginsSettings />);
+    fireEvent.click(await findByTestId("plugin-open-example.plugin"));
+    const gallery = await findByTestId("plugin-detail-screenshots");
+    const imgs = gallery.querySelectorAll("img");
+    expect(imgs).toHaveLength(2);
+    expect(imgs[0].getAttribute("src")).toBe("https://raw.githubusercontent.com/acme/widget/HEAD/a.png");
+    expect(imgs[0].getAttribute("alt")).toBe("Dashboard card");
+    expect(imgs[0].getAttribute("loading")).toBe("lazy");
+    expect(gallery.textContent).toContain("Live card.");
   });
 
   it("separates installed management from the marketplace into tabs", async () => {

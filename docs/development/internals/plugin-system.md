@@ -23,6 +23,26 @@ contribution section from a future schema is a hard error today) and validates
 (`api_version` in range, non-empty `name`/`version`). `API_VERSION` is the
 schema/host version this crate understands.
 
+### Screenshots
+
+A plugin may declare up to eight `[[screenshots]]` to illustrate itself in the
+dashboard marketplace and detail modal (requires `api_version >= 5`):
+
+```toml
+[[screenshots]]
+path = "docs/screenshots/dashboard.png"  # repository-relative; not a URL
+alt = "Dashboard card the plugin contributes"  # required, for accessibility
+caption = "Live status card."  # optional, shown beneath the image
+```
+
+`path` must be a repository-relative image (`png`/`jpg`/`jpeg`/`gif`/`webp`):
+absolute URLs, absolute or `..`-traversing paths, and other extensions are
+rejected. The plugin detail endpoint resolves each path against the source
+repo's `raw.githubusercontent.com` (honoring the installed ref, else `HEAD`),
+so the browser fetches the asset directly; AoE never proxies image bytes. The
+assets must be committed and pushed to the source repo before they render; a
+local plugin's screenshots are not served (a follow-up, see #2484).
+
 ## Registry
 
 `src/plugin/registry.rs` owns the in-process registry.

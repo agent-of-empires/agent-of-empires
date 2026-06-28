@@ -316,6 +316,8 @@ export interface PluginDetailManifest {
   api_version: number;
   capabilities: string[];
   ui_contributions: { slot: string; id: string }[];
+  /** Screenshot/GIF previews, each resolved server-side to a raw.githubusercontent.com URL. */
+  screenshots: { src: string; alt: string; caption: string }[];
 }
 
 /** On-demand detail for one plugin source (`GET /api/plugins/details`): manifest
