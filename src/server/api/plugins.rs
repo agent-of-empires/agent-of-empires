@@ -181,7 +181,21 @@ pub async fn invoke_plugin_action(
     // session's activity cannot move it. The dashboard holds the spinner until
     // this scope's revision moves off the baseline.
     let baseline_revision = host.ui_revision(&id, body.session_id.as_deref());
-    if host.notify_worker(&id, &body.method, body.params).await {
+    // Forward the firing pane's session to the worker so a per-session action
+    // (e.g. github.refresh) can scope its work to that session instead of every
+    // one. Merged into the params object; a worker that does not use it ignores
+    // it (the honest-plugin model).
+    let mut params = body.params;
+    if let Some(sid) = &body.session_id {
+        match &mut params {
+            serde_json::Value::Object(map) => {
+                map.insert("session_id".into(), serde_json::Value::String(sid.clone()));
+            }
+            serde_json::Value::Null => params = json!({ "session_id": sid }),
+            _ => {}
+        }
+    }
+    if host.notify_worker(&id, &body.method, params).await {
         (
             StatusCode::ACCEPTED,
             Json(json!({ "ok": true, "baseline_revision": baseline_revision })),
