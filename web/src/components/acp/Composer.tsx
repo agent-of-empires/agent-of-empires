@@ -16,7 +16,7 @@ import {
   type Unstable_TriggerItem,
 } from "@assistant-ui/core";
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
-import { AtSign, ChevronUp, Paperclip, Pencil, Slash, Square, X } from "lucide-react";
+import { AtSign, ChevronUp, Mic, Paperclip, Pencil, Slash, Square, X } from "lucide-react";
 
 import { useFilesIndex, fuzzyFilter } from "./useFilesIndex";
 import { SessionConfigControls } from "./SessionConfigControls";
@@ -40,6 +40,7 @@ import { useAgentProfile } from "../../lib/agentProfileContext";
 import { resolveModeChannel } from "../../lib/modeChannel";
 import { useFocusTerminalTarget } from "../../hooks/useFocusTerminalTarget";
 import { useDictationBurstGuard } from "./useDictationBurstGuard";
+import { useVoiceDictation } from "./useVoiceDictation";
 import { nextRecallTarget, recallBannerInfo, type RecallCursor, type RecallNav } from "./recallNav";
 
 export {
@@ -465,6 +466,8 @@ export function Composer({
   );
 
   const composerRuntime = useComposerRuntime();
+  const [composerText, setComposerText] = useState(() => composerRuntime.getState().text);
+  const voiceDictationRangeRef = useRef<{ start: number; end: number } | null>(null);
 
   // ArrowUp/ArrowDown queue recall (shell-history style). recallRef holds
   // the id of the queued prompt currently loaded into the composer plus
@@ -609,6 +612,26 @@ export function Composer({
   const dictationGuard = useDictationBurstGuard((text) => {
     composerRuntime.setText(text);
   });
+  const voiceDictation = useVoiceDictation((text) => {
+    replaceVoiceDictationTextAtCaret(taRef, voiceDictationRangeRef, text);
+  });
+  const showVoiceDictation = isMobile && voiceDictation.supported;
+  const hasSubmittableDraft = composerText.trim().length > 0 || supportedPendingAttachments.length > 0;
+  const showVoiceAction = showVoiceDictation && (voiceDictation.listening || !hasSubmittableDraft);
+  const startVoiceDictation = useCallback(() => {
+    const ta = taRef.current;
+    if (ta) {
+      const start = ta.selectionStart ?? ta.value.length;
+      const end = ta.selectionEnd ?? start;
+      voiceDictationRangeRef.current = { start, end };
+    } else {
+      voiceDictationRangeRef.current = null;
+    }
+    voiceDictation.start();
+  }, [voiceDictation]);
+  const stopVoiceDictation = useCallback(() => {
+    voiceDictation.stop();
+  }, [voiceDictation]);
 
   // Context-primer prefill: when the parent passes a `primerPrefill`
   // payload (after the user clicked "Resume with prior context" on the
@@ -686,6 +709,7 @@ export function Composer({
       setDraft(sessionId, composerRuntime.getState().text);
     };
     const unsub = composerRuntime.subscribe(() => {
+      setComposerText(composerRuntime.getState().text);
       if (writeTimer !== null) window.clearTimeout(writeTimer);
       writeTimer = window.setTimeout(flush, 250);
     });
@@ -1088,14 +1112,22 @@ export function Composer({
 
               <div data-testid="composer-actions" className="flex shrink-0 items-center gap-2">
                 <UsageHint usage={sessionUsage} />
-                {turnActive ? (
+                {showVoiceAction ? (
+                  <VoiceDictationButton
+                    listening={voiceDictation.listening}
+                    error={voiceDictation.error}
+                    onStart={startVoiceDictation}
+                    onStop={stopVoiceDictation}
+                  />
+                ) : turnActive ? (
                   <>
                     <StopButton />
                     <QueueSendButton connected={connected} queuedCount={queuedCount} onSend={submitComposer} />
                   </>
-                ) : (
+                ) : hasSubmittableDraft || !isMobile ? (
                   <SendButton connected={connected} onSend={submitComposer} />
-                )}
+                ) : null}
+                {showVoiceAction && turnActive && <StopButton />}
               </div>
             </div>
           </ComposerPrimitive.Root>
@@ -1247,6 +1279,66 @@ export function insertAtCaret(ref: React.RefObject<HTMLTextAreaElement | null>, 
   ta.setSelectionRange(pos, pos);
 }
 
+export function insertPlainTextAtCaret(ref: React.RefObject<HTMLTextAreaElement | null>, text: string) {
+  const ta = ref.current;
+  if (!ta) return;
+  const start = ta.selectionStart ?? ta.value.length;
+  const end = ta.selectionEnd ?? start;
+  const before = ta.value.slice(0, start);
+  const after = ta.value.slice(end);
+  const needsLeadingSpace = text.length > 0 && before.length > 0 && !/\s$/.test(before) && !/^[\s.,!?;:)]/.test(text);
+  const insertion = `${needsLeadingSpace ? " " : ""}${text}`;
+  const next = before + insertion + after;
+  const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+  setter?.call(ta, next);
+  ta.dispatchEvent(
+    new InputEvent("input", {
+      bubbles: true,
+      inputType: "insertText",
+      data: insertion,
+    }),
+  );
+  const pos = before.length + insertion.length;
+  ta.focus();
+  ta.setSelectionRange(pos, pos);
+  ta.style.height = "auto";
+  ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`;
+}
+
+export function replaceVoiceDictationTextAtCaret(
+  ref: React.RefObject<HTMLTextAreaElement | null>,
+  rangeRef: React.MutableRefObject<{ start: number; end: number } | null>,
+  text: string,
+) {
+  const ta = ref.current;
+  if (!ta) return;
+  const range = rangeRef.current ?? {
+    start: ta.selectionStart ?? ta.value.length,
+    end: ta.selectionEnd ?? ta.selectionStart ?? ta.value.length,
+  };
+  const before = ta.value.slice(0, range.start);
+  const after = ta.value.slice(range.end);
+  const needsLeadingSpace = text.length > 0 && before.length > 0 && !/\s$/.test(before) && !/^[\s.,!?;:)]/.test(text);
+  const insertion = `${needsLeadingSpace ? " " : ""}${text}`;
+  const next = before + insertion + after;
+  const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+  setter?.call(ta, next);
+  ta.dispatchEvent(
+    new InputEvent("input", {
+      bubbles: true,
+      inputType: "insertText",
+      data: insertion,
+    }),
+  );
+  const start = range.start;
+  const end = start + insertion.length;
+  rangeRef.current = { start, end };
+  ta.focus();
+  ta.setSelectionRange(end, end);
+  ta.style.height = "auto";
+  ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`;
+}
+
 function extDescription(path: string): string | undefined {
   const m = path.match(/\.([a-z0-9]+)$/i);
   return m?.[1]?.toLowerCase();
@@ -1283,6 +1375,42 @@ function ToolbarButton({
     >
       {icon}
       {hint && <span className="font-mono">{hint}</span>}
+    </button>
+  );
+}
+
+function VoiceDictationButton({
+  listening,
+  error,
+  onStart,
+  onStop,
+}: {
+  listening: boolean;
+  error: string | null;
+  onStart: () => void;
+  onStop: () => void;
+}) {
+  const label = listening ? "Stop voice dictation" : "Start voice dictation";
+  const title = error ? "Voice dictation unavailable" : listening ? "Stop voice dictation" : "Start voice dictation";
+  return (
+    <button
+      type="button"
+      aria-label={label}
+      aria-pressed={listening}
+      title={title}
+      onClick={() => {
+        if (listening) onStop();
+        else onStart();
+      }}
+      className={[
+        "inline-flex items-center justify-center gap-1 rounded-lg px-2.5 py-1.5 text-[12px]",
+        listening
+          ? "bg-rose-600 text-white shadow-sm hover:bg-rose-500"
+          : "border border-surface-600 bg-surface-800 text-text-secondary hover:border-surface-500 hover:bg-surface-700",
+        "active:scale-[0.98] transition-all duration-100",
+      ].join(" ")}
+    >
+      <Mic className="h-3.5 w-3.5" />
     </button>
   );
 }

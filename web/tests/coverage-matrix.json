@@ -2374,6 +2374,13 @@
       "components": ["web/src/components/acp/Composer.tsx"]
     },
     {
+      "id": "acp.story.composer-mobile-voice-dictation",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/acp/Composer.voiceDictation.test.tsx", "src/components/acp/useVoiceDictation.test.ts"],
+      "components": ["web/src/components/acp/Composer.tsx", "web/src/components/acp/useVoiceDictation.ts"]
+    },
+    {
       "id": "acp.composer-ios-dictation-state-machine",
       "kind": "vitest",
       "risk": "medium",
