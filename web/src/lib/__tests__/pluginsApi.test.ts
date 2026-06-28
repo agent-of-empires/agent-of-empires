@@ -146,10 +146,10 @@ describe("previewPluginUpdate", () => {
 });
 
 describe("applyPluginUpdate", () => {
-  it("POSTs the fingerprint and returns the refreshed list on success", async () => {
-    fetchSpy.mockResolvedValue(new Response(JSON.stringify(listPayload), { status: 200 }));
+  it("POSTs the fingerprint and returns a job id on success", async () => {
+    fetchSpy.mockResolvedValue(new Response(JSON.stringify({ job_id: "job1" }), { status: 202 }));
     const res = await applyPluginUpdate("acme.plugin", "treeB||community");
-    expect(res).toEqual({ kind: "ok", data: listPayload });
+    expect(res).toEqual({ kind: "ok", jobId: "job1" });
     const [url, init] = fetchSpy.mock.calls[0];
     expect(url).toBe("/api/plugins/acme.plugin/update/apply");
     expect(init?.method).toBe("POST");
@@ -161,7 +161,7 @@ describe("applyPluginUpdate", () => {
     expect(await applyPluginUpdate("acme.plugin", "x")).toEqual({ kind: "error", message: "changed since shown" });
   });
 
-  it("reports an error when an OK response has a malformed shape", async () => {
+  it("reports an error when an OK response carries no job id", async () => {
     fetchSpy.mockResolvedValue(new Response(JSON.stringify({ nope: true }), { status: 200 }));
     expect((await applyPluginUpdate("acme.plugin", null)).kind).toBe("error");
   });
