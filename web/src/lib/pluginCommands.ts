@@ -56,6 +56,9 @@ export function resolveCommandLinks(
   const items = entry.payload.items;
   if (Array.isArray(items)) {
     for (const raw of items) {
+      // payload is untyped plugin JSON; a primitive or null item must not crash
+      // resolution for the whole session.
+      if (!raw || typeof raw !== "object") continue;
       const item = raw as Record<string, unknown>;
       push(item.href, item.tooltip ?? item.text);
     }

@@ -146,6 +146,12 @@ describe("multi-repo workspaces", () => {
     expect(resolveCommandLinks(badge, [badgeEntry(dup)], "s1")).toHaveLength(1);
   });
 
+  it("skips malformed (null/primitive) item entries without throwing", () => {
+    const mixed = [null, "nope", 42, items[0]];
+    const links = resolveCommandLinks(badge, [badgeEntry(mixed)], "s1");
+    expect(links).toEqual([{ href: "https://github.com/o/a/pull/1", label: "a: PR #1" }]);
+  });
+
   it("falls back to the top-level href when there are no item hrefs", () => {
     const links = resolveCommandLinks(badge, [badgeEntry([], "https://github.com/o/a/pull/9")], "s1");
     expect(links).toEqual([{ href: "https://github.com/o/a/pull/9", label: "https://github.com/o/a/pull/9" }]);
