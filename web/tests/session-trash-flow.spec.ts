@@ -323,6 +323,35 @@ test.describe("Multi-session workspace trash", () => {
     expect(handle.deleteOptions[siblingId]).toMatchObject({ delete_worktree: false, delete_branch: false });
   });
 
+  test("a sibling delete failure leaves that session in Trash and reports it (#2530)", async ({ page }) => {
+    // Primary (sess-a) and one sibling (sess-b) purge, but sess-c fails. The
+    // workspace stays in Trash holding the surviving session, surfacing the
+    // partial-failure path of the delete loop.
+    const handle = await mockMultiApis(
+      page,
+      [
+        { id: "sess-a", groupPath: "alpha", trashed: true },
+        { id: "sess-b", groupPath: "beta", trashed: true },
+        { id: "sess-c", groupPath: "gamma", trashed: true },
+      ],
+      { failDeleteIds: ["sess-c"] },
+    );
+    await page.setViewportSize({ width: 1280, height: 720 });
+
+    await page.goto("/");
+    const toggle = page.locator('[data-testid="sidebar-trash-toggle"]');
+    await toggle.click();
+    await page.locator('[data-testid="sidebar-trash-purge"]').first().click();
+    const dialog = page.locator('[data-testid="delete-session-dialog"]');
+    await expect(dialog).toBeVisible({ timeout: 5_000 });
+    await dialog.getByRole("button", { name: /^Delete$/ }).click();
+
+    // The two that succeeded are gone; the failed one is still attempted.
+    await expect.poll(() => [...handle.deletedIds].sort(), { timeout: 10_000 }).toEqual(["sess-a", "sess-b"]);
+    // The workspace remains in Trash because sess-c is still trashed.
+    await expect(toggle).toBeVisible({ timeout: 10_000 });
+  });
+
   test("a failed primary delete does not redirect away from an open sibling (#2539 review)", async ({ page }) => {
     // Open session is the sibling (sess-b); the primary (sess-a) delete fails,
     // so nothing is removed. The user must stay on the still-live session
