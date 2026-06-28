@@ -17,6 +17,61 @@ use super::lockfile::{LockedPlugin, Lockfile};
 use super::registry::ValidationState;
 use super::source::PluginSource;
 
+/// Where install / update / uninstall progress and child build output are
+/// written. The CLI uses `Inherit` so the user watches build output on their
+/// terminal; the dashboard's host-side job path uses `File`, so a dashboard
+/// user with no terminal attached can tail the same output.
+pub enum OperationLog {
+    Inherit,
+    File(std::fs::File),
+}
+
+impl OperationLog {
+    /// Open a job log file in append mode, owner-only (0600 on Unix). Build
+    /// output is not secret, but the log lives beside other 0600 daemon state,
+    /// so keep the convention.
+    pub fn file(path: &Path) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating plugin job log dir {}", parent.display()))?;
+        }
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let file = opts
+            .open(path)
+            .with_context(|| format!("opening plugin job log {}", path.display()))?;
+        Ok(OperationLog::File(file))
+    }
+
+    /// Write one host-side progress line.
+    fn line(&self, msg: &str) {
+        match self {
+            OperationLog::Inherit => eprintln!("{msg}"),
+            OperationLog::File(file) => {
+                let _ = writeln!(&mut &*file, "{msg}");
+            }
+        }
+    }
+
+    /// stdout and stderr for a child build step: inherited for the CLI, or two
+    /// clones of the job log handle so the child's output lands in the tail.
+    fn child_stdio(&self) -> Result<(Stdio, Stdio)> {
+        match self {
+            OperationLog::Inherit => Ok((Stdio::inherit(), Stdio::inherit())),
+            OperationLog::File(file) => {
+                let out = file.try_clone().context("cloning plugin job log handle")?;
+                let err = file.try_clone().context("cloning plugin job log handle")?;
+                Ok((Stdio::from(out), Stdio::from(err)))
+            }
+        }
+    }
+}
+
 /// Set the enabled flag for a known plugin id in the global config, then reload
 /// the registry so the change takes effect.
 pub fn set_enabled(plugin_id: &str, enabled: bool) -> Result<()> {
@@ -157,15 +212,61 @@ pub enum UpdatePreview {
     },
 }
 
-/// Install an external plugin from `input` (`gh:owner/repo[@ref]` or a local
-/// dir). Prompts once for the manifest's capabilities unless `assume_yes`.
-pub async fn install(input: &str, assume_yes: bool) -> Result<InstallReport> {
+/// Everything an install needs after fetching and validating, before any
+/// consent decision or filesystem mutation. Computing this in one place is what
+/// lets the CLI prompt and the in-app preview/apply flow stay in lockstep, the
+/// same split `Prepared` gives the update path.
+struct PreparedInstall {
+    /// Persisted source string for a later `update`.
+    persisted_source: String,
+    /// The install is off the audited-release default path (an explicit `@ref`
+    /// or a no-release default-branch fallback).
+    unverified: bool,
+    /// One line stating what is being installed.
+    notice: String,
+    fetched: FetchedPlugin,
+    featured_verified: bool,
+    id: String,
+    capabilities: Vec<String>,
+    manifest_hash: String,
+    /// Content fingerprint of the fetched version (tree + release asset + trust).
+    fingerprint: String,
+    validation: ValidationState,
+}
+
+/// The structured disclosure an in-app (web / TUI) install approval renders, the
+/// same data the terminal prompt prints. `fingerprint` pins the exact content
+/// being approved so `apply_install` refuses if the remote moved since this was
+/// shown.
+#[derive(Debug, Clone, Serialize)]
+pub struct InstallConsent {
+    pub id: String,
+    pub version: String,
+    /// Persisted source slug (`gh:owner/repo[@ref]`).
+    pub source: String,
+    /// One line stating what is being installed (resolved release, ref, etc).
+    pub notice: String,
+    /// The source is off the audited-release default path (explicit ref or a
+    /// no-release default-branch fallback); the dashboard warns on it.
+    pub unverified: bool,
+    /// Resolved trust class (featured / community / local).
+    pub validation: String,
+    /// Capabilities the manifest declares (each needs a grant).
+    pub capabilities: Vec<String>,
+    /// Dashboard UI slots the plugin contributes to.
+    pub ui: Vec<UiView>,
+    /// Build commands the plugin will run, unsandboxed, at install time.
+    pub build_steps: Vec<String>,
+    /// Content fingerprint of the version being approved.
+    pub fingerprint: String,
+}
+
+/// Resolve, fetch, and validate an install candidate without touching the
+/// installed tree. Network-only. The caller decides consent (CLI prompt or web
+/// preview/apply) and then calls [`apply_prepared_install`].
+async fn prepare_install(input: &str) -> Result<PreparedInstall> {
     let source = PluginSource::parse(input)?;
     let resolved = resolve_source(source, true).await?;
-    eprintln!("{}", resolved.notice);
-    if resolved.unverified && !assume_yes && !confirm_unverified()? {
-        bail!("install cancelled; the unverified source was not approved");
-    }
     let fetched = fetch::fetch(&resolved.source).await?;
 
     let id = fetched.manifest.id.as_str().to_string();
@@ -173,25 +274,54 @@ pub async fn install(input: &str, assume_yes: bool) -> Result<InstallReport> {
     reject_reserved_or_builtin(&fetched.manifest, featured_verified)?;
     reject_incompatible_host(&fetched.manifest)?;
 
-    let final_dir = super::plugins_dir()?.join(&id);
-    if final_dir.exists() {
+    if super::plugins_dir()?.join(&id).exists() {
         bail!("{id} is already installed; run `aoe plugin update {id}` or uninstall it first");
     }
 
     let capabilities = capability_strings(&fetched)?;
-    let build = build_steps(&fetched.manifest);
-    let granted =
-        if assume_yes || !install_needs_consent(&capabilities, build, &fetched.manifest.ui) {
-            true
-        } else {
-            confirm_capabilities(&id, &capabilities, &fetched.manifest.ui, build)?
-        };
-    if !granted {
-        bail!("install cancelled; no capabilities were granted");
+    let manifest_hash = PluginManifest::hash_bytes(&fetched.manifest_bytes);
+    let trust = if featured_verified {
+        "featured"
+    } else {
+        "community"
+    };
+    let fingerprint = fingerprint(&fetched.tree_hash, fetched.asset_sha256.as_deref(), trust);
+    let persisted_source = persisted_source(&resolved.source, input);
+    let validation = install_validation(featured_verified, &persisted_source);
+
+    Ok(PreparedInstall {
+        persisted_source,
+        unverified: resolved.unverified,
+        notice: resolved.notice,
+        fetched,
+        featured_verified,
+        id,
+        capabilities,
+        manifest_hash,
+        fingerprint,
+        validation,
+    })
+}
+
+/// Move the fetched tree into place, build it, and persist the grant, config,
+/// and lockfile. Consent is already decided by the caller; build output goes to
+/// `log`. A failed build leaves nothing behind.
+fn apply_prepared_install(p: &PreparedInstall, log: &OperationLog) -> Result<InstallReport> {
+    let final_dir = super::plugins_dir()?.join(&p.id);
+    if final_dir.exists() {
+        bail!(
+            "{} is already installed; run `aoe plugin update {}` or uninstall it first",
+            p.id,
+            p.id
+        );
     }
 
-    move_into_place(&fetched, &final_dir)?;
-    if let Err(e) = build_in_place(&id, &final_dir, &fetched.manifest) {
+    log.line(&format!(
+        "installing {} {}",
+        p.id, p.fetched.manifest.version
+    ));
+    move_into_place(&p.fetched, &final_dir)?;
+    if let Err(e) = build_in_place(&p.id, &final_dir, &p.fetched.manifest, log) {
         // A failed build must not leave a half-installed tree behind; nothing
         // is persisted to config or the lockfile, so removing the directory
         // returns the host to its pre-install state.
@@ -199,19 +329,110 @@ pub async fn install(input: &str, assume_yes: bool) -> Result<InstallReport> {
         return Err(e);
     }
 
-    let manifest_hash = PluginManifest::hash_bytes(&fetched.manifest_bytes);
-    let persisted = persisted_source(&resolved.source, input);
-    persist_install(&persisted, &id, &capabilities, &manifest_hash)?;
-    write_lock(&id, &fetched, &manifest_hash, featured_verified)?;
+    persist_install(
+        &p.persisted_source,
+        &p.id,
+        &p.capabilities,
+        &p.manifest_hash,
+    )?;
+    write_lock(&p.id, &p.fetched, &p.manifest_hash, p.featured_verified)?;
     super::reload_registry();
+    log.line(&format!(
+        "installed {} {}",
+        p.id, p.fetched.manifest.version
+    ));
 
     Ok(InstallReport {
-        id,
-        version: fetched.manifest.version.clone(),
-        capabilities,
+        id: p.id.clone(),
+        version: p.fetched.manifest.version.clone(),
+        capabilities: p.capabilities.clone(),
         granted: true,
-        validation: install_validation(featured_verified, &persisted),
+        validation: p.validation.clone(),
     })
+}
+
+/// Install an external plugin from `input` (`gh:owner/repo[@ref]` or a local
+/// dir). Prompts once for the manifest's capabilities unless `assume_yes`.
+pub async fn install(input: &str, assume_yes: bool) -> Result<InstallReport> {
+    let prepared = prepare_install(input).await?;
+    eprintln!("{}", prepared.notice);
+    if prepared.unverified && !assume_yes && !confirm_unverified()? {
+        bail!("install cancelled; the unverified source was not approved");
+    }
+    let build = build_steps(&prepared.fetched.manifest);
+    let granted = if assume_yes
+        || !install_needs_consent(&prepared.capabilities, build, &prepared.fetched.manifest.ui)
+    {
+        true
+    } else {
+        confirm_capabilities(
+            &prepared.id,
+            &prepared.capabilities,
+            &prepared.fetched.manifest.ui,
+            build,
+        )?
+    };
+    if !granted {
+        bail!("install cancelled; no capabilities were granted");
+    }
+    apply_prepared_install(&prepared, &OperationLog::Inherit)
+}
+
+/// Classify an install candidate for an in-app approval without installing it:
+/// the dashboard "what would this install do" probe. Network-only. Restricted
+/// to `gh:` sources so a browser request never makes the daemon read an
+/// arbitrary local path; local installs stay on the CLI.
+pub async fn preview_install(input: &str) -> Result<InstallConsent> {
+    if !input.starts_with("gh:") {
+        bail!("web install supports gh: sources only; use `aoe plugin install` for a local path");
+    }
+    let p = prepare_install(input).await?;
+    Ok(InstallConsent {
+        id: p.id.clone(),
+        version: p.fetched.manifest.version.clone(),
+        source: p.persisted_source.clone(),
+        notice: p.notice.clone(),
+        unverified: p.unverified,
+        validation: p.validation.as_str().to_string(),
+        capabilities: p.capabilities.clone(),
+        ui: p
+            .fetched
+            .manifest
+            .ui
+            .iter()
+            .map(|u| UiView {
+                slot: u.slot.as_str().to_string(),
+                id: u.id.clone(),
+            })
+            .collect(),
+        build_steps: build_steps(&p.fetched.manifest)
+            .iter()
+            .map(|s| s.command.join(" "))
+            .collect(),
+        fingerprint: p.fingerprint.clone(),
+    })
+}
+
+/// Apply an install previewed in-app, granting whatever the fetched manifest
+/// declares. `expected_fingerprint` pins the exact content the user approved: if
+/// the remote moved since the preview, this refuses rather than installing
+/// something the user never saw. Build output goes to `log`. `gh:` only, like
+/// [`preview_install`].
+pub async fn apply_install(
+    input: &str,
+    expected_fingerprint: &str,
+    log: &OperationLog,
+) -> Result<InstallReport> {
+    if !input.starts_with("gh:") {
+        bail!("web install supports gh: sources only; use `aoe plugin install` for a local path");
+    }
+    let prepared = prepare_install(input).await?;
+    if prepared.fingerprint != expected_fingerprint {
+        bail!(
+            "the plugin at {input} changed since it was shown; review it again before installing"
+        );
+    }
+    apply_prepared_install(&prepared, log)
 }
 
 /// Re-fetch an installed external plugin from its recorded source, prompting on
@@ -424,13 +645,21 @@ async fn prepare_update(id: &str) -> Result<Prepared> {
 /// version active without rewriting the tree or lockfile, matching the in-app
 /// decline. (Arbitrary build steps the user just refused must never run, and a
 /// declined capability expansion must not silently replace the install.)
-fn apply_prepared(prepared: &Prepared, grant: Option<CapabilityGrant>) -> Result<InstallReport> {
+fn apply_prepared(
+    prepared: &Prepared,
+    grant: Option<CapabilityGrant>,
+    log: &OperationLog,
+) -> Result<InstallReport> {
     let id = prepared.id.as_str();
     let final_dir = super::plugins_dir()?.join(id);
     if prepared.needs_consent && grant.is_none() {
         bail!("update cancelled for {id}; the previously trusted version was kept");
     }
-    replace_and_build(id, &prepared.fetched, &final_dir)?;
+    log.line(&format!(
+        "updating {id} to {}",
+        prepared.fetched.manifest.version
+    ));
+    replace_and_build(id, &prepared.fetched, &final_dir, log)?;
 
     let granted = grant.is_some();
     persist_update(id, &prepared.source_str, grant)?;
@@ -504,7 +733,11 @@ async fn update_with_consent(id: &str, mode: ConsentMode) -> Result<UpdateOutcom
         })
     };
 
-    Ok(UpdateOutcome::Applied(apply_prepared(&prepared, grant)?))
+    Ok(UpdateOutcome::Applied(apply_prepared(
+        &prepared,
+        grant,
+        &OperationLog::Inherit,
+    )?))
 }
 
 /// Build the structured consent disclosure from a prepared update.
@@ -572,7 +805,11 @@ pub async fn preview_update(id: &str) -> Result<UpdatePreview> {
 /// MUST carry a fingerprint, so approval cannot bypass the stale-preview guard;
 /// a safe update may omit it. Clears any recorded dismissal on success (via
 /// `persist_update`).
-pub async fn apply_update(id: &str, expected_fingerprint: Option<String>) -> Result<InstallReport> {
+pub async fn apply_update(
+    id: &str,
+    expected_fingerprint: Option<String>,
+    log: &OperationLog,
+) -> Result<InstallReport> {
     let prepared = prepare_update(id).await?;
     match &expected_fingerprint {
         Some(expected) if *expected != prepared.fingerprint => {
@@ -592,7 +829,7 @@ pub async fn apply_update(id: &str, expected_fingerprint: Option<String>) -> Res
         capabilities: prepared.capabilities.clone(),
         granted_at: chrono::Utc::now(),
     });
-    apply_prepared(&prepared, grant)
+    apply_prepared(&prepared, grant, log)
 }
 
 /// Record that the user declined an available update by its fingerprint, so the
@@ -661,6 +898,15 @@ pub fn uninstall(id: &str) -> Result<()> {
         lock.save()?;
     }
     super::reload_registry();
+    Ok(())
+}
+
+/// [`uninstall`] with progress written to `log`, for the dashboard job path so a
+/// terminal-less user gets a readable tail that ends in success or failure.
+pub fn uninstall_logged(id: &str, log: &OperationLog) -> Result<()> {
+    log.line(&format!("uninstalling {id}"));
+    uninstall(id)?;
+    log.line(&format!("uninstalled {id}"));
     Ok(())
 }
 
@@ -949,8 +1195,13 @@ fn build_steps(manifest: &PluginManifest) -> &[BuildStep] {
 /// worker entrypoint is runnable. Builds run in the final directory (not the
 /// staging tree) because tools like Python venvs embed absolute paths and are
 /// not relocatable, so a build followed by a rename would break the worker.
-fn build_in_place(plugin_id: &str, dir: &Path, manifest: &PluginManifest) -> Result<()> {
-    run_build(plugin_id, dir, build_steps(manifest))?;
+fn build_in_place(
+    plugin_id: &str,
+    dir: &Path,
+    manifest: &PluginManifest,
+    log: &OperationLog,
+) -> Result<()> {
+    run_build(plugin_id, dir, build_steps(manifest), log)?;
     // A build can succeed by exit code yet not produce the entrypoint (every
     // step skipped on this platform, or a no-op build against a broken
     // project). Resolve the launch command now, while the user is watching, so
@@ -983,8 +1234,9 @@ fn build_in_place(plugin_id: &str, dir: &Path, manifest: &PluginManifest) -> Res
 /// the same policy as the launch command, immediately before it runs, so a step
 /// like `.venv/bin/pip` resolves once the prior step created it. Build stdin is
 /// `/dev/null` so an interactive prompt cannot hang a `--yes` install; stdout
-/// and stderr inherit the terminal so the user sees build progress.
-fn run_build(plugin_id: &str, dir: &Path, steps: &[BuildStep]) -> Result<()> {
+/// and stderr go to `log` (the terminal for the CLI, or the job log file for a
+/// dashboard install) so the user sees build progress either way.
+fn run_build(plugin_id: &str, dir: &Path, steps: &[BuildStep], log: &OperationLog) -> Result<()> {
     let os = std::env::consts::OS;
     for (i, step) in steps.iter().enumerate() {
         if !step.platforms.is_empty() && !step.platforms.iter().any(|p| p == os) {
@@ -998,12 +1250,15 @@ fn run_build(plugin_id: &str, dir: &Path, steps: &[BuildStep]) -> Result<()> {
             &super::launch::OsLaunchResolver,
         )
         .with_context(|| format!("resolving build step {} ({pretty})", i + 1))?;
-        eprintln!("  building {plugin_id}: {pretty}");
+        log.line(&format!("  building {plugin_id}: {pretty}"));
+        let (stdout, stderr) = log.child_stdio()?;
         let status = std::process::Command::new(&program)
             .args(&args)
             .current_dir(dir)
             .env("AOE_PLUGIN_ID", plugin_id)
             .stdin(Stdio::null())
+            .stdout(stdout)
+            .stderr(stderr)
             .status()
             .with_context(|| format!("spawning build step {} ({pretty})", i + 1))?;
         if !status.success() {
@@ -1022,7 +1277,12 @@ fn run_build(plugin_id: &str, dir: &Path, steps: &[BuildStep]) -> Result<()> {
 /// Then move the current install aside, place the new tree, and build: on
 /// success drop the backup, on failure restore it so the user is never left
 /// worse off than before the update.
-fn replace_and_build(plugin_id: &str, fetched: &FetchedPlugin, final_dir: &Path) -> Result<()> {
+fn replace_and_build(
+    plugin_id: &str,
+    fetched: &FetchedPlugin,
+    final_dir: &Path,
+    log: &OperationLog,
+) -> Result<()> {
     // `with_file_name`, not `with_extension`: a plugin id like `acme.worker`
     // has a dot, and `with_extension("bak")` would replace `.worker`, yielding
     // `acme.bak` and colliding with every other `acme.*` plugin's backup.
@@ -1049,7 +1309,7 @@ fn replace_and_build(plugin_id: &str, fetched: &FetchedPlugin, final_dir: &Path)
                 final_dir.display()
             )
         })?;
-        build_in_place(plugin_id, final_dir, &fetched.manifest)
+        build_in_place(plugin_id, final_dir, &fetched.manifest, log)
     })();
 
     match place_and_build {

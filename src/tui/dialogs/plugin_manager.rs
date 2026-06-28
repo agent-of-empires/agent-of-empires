@@ -300,10 +300,14 @@ impl PluginManagerDialog {
         let apply_id = id.clone();
         tokio::spawn(async move {
             let _ = tx.send(
-                crate::plugin::install::apply_update(&apply_id, fingerprint)
-                    .await
-                    .map(|_| ())
-                    .map_err(|e| format!("{e:#}")),
+                crate::plugin::install::apply_update(
+                    &apply_id,
+                    fingerprint,
+                    &crate::plugin::install::OperationLog::Inherit,
+                )
+                .await
+                .map(|_| ())
+                .map_err(|e| format!("{e:#}")),
             );
         });
         self.pending_plugin = Some(id);
