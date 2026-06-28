@@ -82,6 +82,10 @@ pub const KNOWN_CAPABILITIES: &[&str] = &[
     "clipboard.write",
     // Posting desktop / TUI notifications.
     "notifications",
+    // Opening an external URL in the user's browser, driven by a command's
+    // `action` (or a future host RPC). Distinct from a rendered `href` anchor
+    // the user clicks, which needs no grant.
+    "browser_open",
 ];
 
 /// How far a plugin is trusted. Host-assigned at load time, never declared in

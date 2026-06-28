@@ -101,6 +101,26 @@ pub struct CommandContribution {
     pub title: String,
     #[serde(default)]
     pub description: String,
+    /// How invoking the command behaves. Absent means a fire-and-forget worker
+    /// notification (deferred). When present, the host surface executes the
+    /// action directly, synchronously inside the user's gesture, so it works on
+    /// a remote web dashboard where an async round-trip would be popup-blocked.
+    /// Requires `api_version >= 6` and the `browser_open` capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<ClientAction>,
+}
+
+/// A client-executed command action: the host surface (web dashboard, TUI) runs
+/// it directly rather than forwarding to the worker. Tagged by `kind` so future
+/// action shapes extend the set without breaking existing manifests.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum ClientAction {
+    /// Open the `href` carried by this plugin's own `(slot, id)` UI-state entry
+    /// for the active session, in the user's browser. The href is read from the
+    /// snapshot the surface already holds, so no worker call is made; the slot
+    /// must be per-session.
+    OpenUiLink { slot: UiSlot, id: String },
 }
 
 /// A keybind the plugin contributes, binding a key chord to a command.
@@ -572,11 +592,36 @@ impl PluginManifest {
         // Contribution sections declare required identifiers; an empty one would
         // install and persist a malformed manifest, so reject it here rather
         // than push the cleanup onto the later consumers (#2094 / #2095 / #2366).
+        let has_browser_open = self
+            .capabilities
+            .iter()
+            .any(|c| c.as_str() == "browser_open");
         for (i, c) in self.commands.iter().enumerate() {
             check(
                 !c.id.is_empty(),
                 format!("commands[{i}].id must not be empty"),
             );
+            if let Some(ClientAction::OpenUiLink { slot, id }) = &c.action {
+                check(
+                    self.api_version >= 6,
+                    format!("commands[{i}].action requires api_version >= 6"),
+                );
+                check(
+                    has_browser_open,
+                    format!("commands[{i}].action needs the `browser_open` capability"),
+                );
+                check(
+                    slot.is_per_session(),
+                    format!("commands[{i}].action open-ui-link slot must be per-session"),
+                );
+                check(
+                    self.ui.iter().any(|u| u.slot == *slot && &u.id == id),
+                    format!(
+                        "commands[{i}].action references undeclared ui slot ({}, {id})",
+                        slot.as_str()
+                    ),
+                );
+            }
         }
         for (i, k) in self.keybinds.iter().enumerate() {
             check(
@@ -743,6 +788,78 @@ impl PluginManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn open_ui_link_toml(api_version: u32, caps: &str, ui_slot: &str, action_slot: &str) -> String {
+        format!(
+            "id = \"acme.thing\"\nname = \"Thing\"\nversion = \"1.0.0\"\napi_version = {api_version}\ncapabilities = [{caps}]\n\n\
+             [[ui]]\nslot = \"{ui_slot}\"\nid = \"link\"\n\n\
+             [[commands]]\nid = \"open\"\ntitle = \"Open\"\n[commands.action]\nkind = \"open-ui-link\"\nslot = \"{action_slot}\"\nid = \"link\"\n"
+        )
+    }
+
+    #[test]
+    fn open_ui_link_action_valid() {
+        let m = PluginManifest::from_toml_str(&open_ui_link_toml(
+            6,
+            "\"browser_open\"",
+            "row-column",
+            "row-column",
+        ))
+        .expect("manifest parses");
+        assert!(matches!(
+            m.commands[0].action,
+            Some(ClientAction::OpenUiLink { .. })
+        ));
+    }
+
+    #[test]
+    fn open_ui_link_requires_capability() {
+        let err =
+            PluginManifest::from_toml_str(&open_ui_link_toml(6, "", "row-column", "row-column"))
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("browser_open"), "{err}");
+    }
+
+    #[test]
+    fn open_ui_link_requires_api_version_6() {
+        let err = PluginManifest::from_toml_str(&open_ui_link_toml(
+            5,
+            "\"browser_open\"",
+            "row-column",
+            "row-column",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("api_version"), "{err}");
+    }
+
+    #[test]
+    fn open_ui_link_rejects_global_slot() {
+        let err = PluginManifest::from_toml_str(&open_ui_link_toml(
+            6,
+            "\"browser_open\"",
+            "status-bar",
+            "status-bar",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("per-session"), "{err}");
+    }
+
+    #[test]
+    fn open_ui_link_requires_declared_slot() {
+        // Declares a row-badge ui slot but the action points at row-column.
+        let err = PluginManifest::from_toml_str(&open_ui_link_toml(
+            6,
+            "\"browser_open\"",
+            "row-badge",
+            "row-column",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("undeclared ui slot"), "{err}");
+    }
 
     #[test]
     fn setting_type_accepts_boolean_and_bool() {
