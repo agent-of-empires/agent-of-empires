@@ -35,6 +35,19 @@ pub fn trash_holding_path(original: &Path, session_id: &str) -> Option<PathBuf> 
     Some(original.parent()?.join(TRASH_DIR_NAME).join(session_id))
 }
 
+/// True when `path` is already a holding path for this session, i.e. its leaf
+/// is the session id sitting directly under a `.aoe-trash` dir. Guards the
+/// backfill branch of reconciliation from nesting an already-relocated (but
+/// markerless) worktree under `.aoe-trash/.aoe-trash/<id>`.
+fn is_holding_path(path: &Path, session_id: &str) -> bool {
+    path.file_name()
+        .is_some_and(|leaf| leaf == std::ffi::OsStr::new(session_id))
+        && path
+            .parent()
+            .and_then(|p| p.file_name())
+            .is_some_and(|name| name == std::ffi::OsStr::new(TRASH_DIR_NAME))
+}
+
 /// Result of attempting to relocate a trashed session's worktree.
 #[derive(Debug)]
 pub enum RelocateOutcome {
@@ -248,12 +261,25 @@ pub fn reconcile_trashed_location(inst: &mut Instance) -> bool {
     if current.exists() {
         // Legacy backfill: a trashed managed worktree still sitting in the
         // active dir with no marker gets relocated now. An already-relocated
-        // row (marker set, current == holding) is left alone.
-        if inst.pre_trash_project_path.is_none() && current != target {
-            return matches!(
-                relocate_worktree_to_trash(inst),
-                RelocateOutcome::Relocated { .. }
-            );
+        // row (marker set, current == holding) is left alone, as is a
+        // markerless row that already sits in the holding area (relocating it
+        // again would nest it under .aoe-trash/.aoe-trash/<id>).
+        if inst.pre_trash_project_path.is_none()
+            && current != target
+            && !is_holding_path(&current, &inst.id)
+        {
+            return match relocate_worktree_to_trash(inst) {
+                RelocateOutcome::Relocated { .. } => true,
+                RelocateOutcome::Failed { reason } => {
+                    tracing::warn!(
+                        target: "session.trash",
+                        session = %inst.id,
+                        "trash worktree reconcile relocation failed: {reason}"
+                    );
+                    false
+                }
+                RelocateOutcome::Skipped => false,
+            };
         }
         return false;
     }
@@ -451,8 +477,9 @@ mod tests {
             "expected relocation, got {out:?}"
         );
         // Worktree moved into the holding area, original dir gone.
-        assert!(inst.project_path.contains("/.aoe-trash/"));
-        assert!(PathBuf::from(&inst.project_path).exists());
+        let holding = trash_holding_path(Path::new(&original), &inst.id).unwrap();
+        assert_eq!(PathBuf::from(&inst.project_path), holding);
+        assert!(holding.exists());
         assert!(!PathBuf::from(&original).exists());
         assert_eq!(
             inst.pre_trash_project_path.as_deref(),
@@ -516,7 +543,8 @@ mod tests {
             reconcile_trashed_location(&mut inst),
             "reconcile should relocate a legacy trashed worktree"
         );
-        assert!(inst.project_path.contains("/.aoe-trash/"));
+        let holding = trash_holding_path(Path::new(&original), &inst.id).unwrap();
+        assert_eq!(PathBuf::from(&inst.project_path), holding);
         assert_eq!(
             inst.pre_trash_project_path.as_deref(),
             Some(original.as_str())
@@ -525,6 +553,32 @@ mod tests {
 
         // Second pass changes nothing.
         assert!(!reconcile_trashed_location(&mut inst));
+    }
+
+    #[test]
+    fn reconcile_skips_markerless_row_already_in_holding() {
+        // A trashed worktree that already lives in the holding area but lost
+        // its marker must not be relocated again (which would nest it under
+        // .aoe-trash/.aoe-trash/<id>).
+        if !git_available() {
+            return;
+        }
+        let (_tmp, mut inst) = real_worktree_instance();
+        inst.trash();
+        assert!(matches!(
+            relocate_worktree_to_trash(&mut inst),
+            RelocateOutcome::Relocated { .. }
+        ));
+        let holding = inst.project_path.clone();
+        // Drop the marker: the row now points at the holding path with no record.
+        inst.pre_trash_project_path = None;
+
+        assert!(
+            !reconcile_trashed_location(&mut inst),
+            "a markerless row already in holding must be left alone"
+        );
+        assert_eq!(inst.project_path, holding);
+        assert!(!PathBuf::from(&holding).join(".aoe-trash").exists());
     }
 
     #[test]
