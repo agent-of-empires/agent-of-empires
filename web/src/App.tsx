@@ -859,15 +859,12 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       const primary = sessions[0];
       if (!primary) return;
       const ids = sessions.map((s) => s.id);
-      const wasActive = activeSessionId != null && ids.includes(activeSessionId);
+      const activeWorkspaceSessionId =
+        activeSessionId != null && ids.includes(activeSessionId) ? activeSessionId : null;
 
       // Close dialog and show "Deleting" status for every session immediately.
       setDeletingWorkspaceId(null);
       for (const id of ids) setSessionStatus(id, "Deleting");
-
-      if (wasActive) {
-        navigate("/");
-      }
 
       // Per-id local cleanup, run only after that id's server delete succeeds so
       // a failed delete never strands a stale acp cache (#1358), composer draft
@@ -884,12 +881,14 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       // If the primary delete fails (dirty worktree, server error) the shared
       // worktree is still present, so abort before destroying any sibling
       // record and leaving an orphaned workspace. See #2530.
+      let activeDeleted = false;
       const primaryResult = await deleteSession(primary.id, options);
       if (!primaryResult.ok) {
         for (const id of ids) setSessionStatus(id, "Error");
         toastBus.handler?.error(primaryResult.error || "Failed to delete session");
         return;
       }
+      if (activeWorkspaceSessionId === primary.id) activeDeleted = true;
       purgeLocal(primary.id);
 
       // Siblings keep the per-session cleanup (sandbox container, force) but
@@ -900,12 +899,19 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       for (const sibling of sessions.slice(1)) {
         const res = await deleteSession(sibling.id, siblingOptions);
         if (res.ok) {
+          if (activeWorkspaceSessionId === sibling.id) activeDeleted = true;
           purgeLocal(sibling.id);
         } else {
           anyFailed = true;
           setSessionStatus(sibling.id, "Error");
         }
       }
+
+      // Redirect only once the open session has actually been deleted, not
+      // merely because it belonged to the workspace: a failed primary (above)
+      // returns early with nothing removed, so navigating earlier would strand
+      // the user on `/` with the session still live. See #2539 review.
+      if (activeDeleted) navigate("/");
 
       if (anyFailed) {
         toastBus.handler?.error("Some sessions could not be deleted");

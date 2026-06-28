@@ -211,9 +211,11 @@ function multiPayload(id: string, groupPath: string, trashed: boolean) {
 async function mockMultiApis(
   page: Page,
   sessions: Array<{ id: string; groupPath: string; trashed: boolean }>,
+  opts: { failDeleteIds?: string[] } = {},
 ): Promise<MultiHandle> {
   const handle: MultiHandle = { deletedIds: [], deleteOptions: {}, restoredIds: [] };
   const trashedState = new Map(sessions.map((s) => [s.id, s.trashed]));
+  const failDelete = new Set(opts.failDeleteIds ?? []);
 
   // Force the user-group axis so `buildSessionGroups` actually slices the
   // workspace by `group_path`. The slicing bug (#2533) cannot reproduce on the
@@ -244,6 +246,7 @@ async function mockMultiApis(
     });
     await page.route(`**/api/sessions/${s.id}`, (r) => {
       if (r.request().method() !== "DELETE") return r.fulfill({ status: 400 });
+      if (failDelete.has(s.id)) return r.fulfill({ status: 500, json: { message: "boom" } });
       handle.deletedIds.push(s.id);
       const body = r.request().postData();
       handle.deleteOptions[s.id] = body ? (JSON.parse(body) as Record<string, unknown>) : {};
@@ -318,5 +321,35 @@ test.describe("Multi-session workspace trash", () => {
     // shared worktree/branch removal.
     const siblingId = handle.deletedIds[1]!;
     expect(handle.deleteOptions[siblingId]).toMatchObject({ delete_worktree: false, delete_branch: false });
+  });
+
+  test("a failed primary delete does not redirect away from an open sibling (#2539 review)", async ({ page }) => {
+    // Open session is the sibling (sess-b); the primary (sess-a) delete fails,
+    // so nothing is removed. The user must stay on the still-live session
+    // instead of being kicked back to "/".
+    const handle = await mockMultiApis(
+      page,
+      [
+        { id: "sess-a", groupPath: "alpha", trashed: true },
+        { id: "sess-b", groupPath: "beta", trashed: true },
+      ],
+      { failDeleteIds: ["sess-a"] },
+    );
+    await page.setViewportSize({ width: 1280, height: 720 });
+
+    await page.goto("/session/sess-b");
+    await page.locator('[data-testid="sidebar-trash-toggle"]').click();
+    const trashRow = page.locator('[data-testid="sidebar-trash-row"]').first();
+    await expect(trashRow).toBeVisible({ timeout: 10_000 });
+    await trashRow.locator('[data-testid="sidebar-trash-purge"]').click();
+    const dialog = page.locator('[data-testid="delete-session-dialog"]');
+    await expect(dialog).toBeVisible({ timeout: 5_000 });
+    await dialog.getByRole("button", { name: /^Delete$/ }).click();
+
+    // Dialog closes (the handler ran), the primary delete failed so no session
+    // was removed, and the route still points at the open sibling.
+    await expect(dialog).toHaveCount(0, { timeout: 10_000 });
+    await expect.poll(() => handle.deletedIds, { timeout: 5_000 }).toEqual([]);
+    await expect(page).toHaveURL(/\/session\/sess-b/);
   });
 });
