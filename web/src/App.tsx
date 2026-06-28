@@ -40,11 +40,10 @@ import { usePaneLayout, dockTabs, dockGroups, dockOf, isActiveTab } from "./lib/
 import { isPluginPaneId, usePluginPanes, type PluginPane } from "./lib/pluginPanes";
 import { PluginPaneBody } from "./components/plugin/PluginSlots";
 import { TOUR_ANCHORS, tourAnchor } from "./lib/tourSteps";
-import { restoreSessions, trashSessions } from "./lib/trashActions";
+import { deleteWorkspaceSessions, restoreSessions, trashSessions } from "./lib/trashActions";
 import {
   loginStatus,
   logout,
-  deleteSession,
   stopSession,
   startSession,
   fetchAbout,
@@ -856,73 +855,22 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     async (options: DeleteSessionOptions) => {
       if (!deletingWorkspace) return;
       const sessions = deletingWorkspace.sessions;
-      const primary = sessions[0];
-      if (!primary) return;
-      const ids = sessions.map((s) => s.id);
-      const activeWorkspaceSessionId =
-        activeSessionId != null && ids.includes(activeSessionId) ? activeSessionId : null;
-
-      // Close dialog and show "Deleting" status for every session immediately.
+      // Close the dialog immediately; the loop, ordering, and toast logic live
+      // in deleteWorkspaceSessions so they are unit-testable without the bundle.
       setDeletingWorkspaceId(null);
-      for (const id of ids) setSessionStatus(id, "Deleting");
-
-      // Per-id local cleanup, run only after that id's server delete succeeds so
-      // a failed delete never strands a stale acp cache (#1358), composer draft
-      // (#1358), or diff-comments storage (#1842). Cross-tab / cross-device
-      // deletes still fall to the startup sweep.
-      const purgeLocal = (id: string) => {
-        clearAcpCache(id);
-        clearDraft(id);
-        clearStoredComments(id);
-      };
-
-      // Every session in a workspace shares one git worktree and branch, so the
-      // user-chosen worktree/branch cleanup runs exactly once, on the primary.
-      // If the primary delete fails (dirty worktree, server error) the shared
-      // worktree is still present, so abort before destroying any sibling
-      // record and leaving an orphaned workspace. See #2530.
-      let activeDeleted = false;
-      const primaryResult = await deleteSession(primary.id, options);
-      if (!primaryResult.ok) {
-        for (const id of ids) setSessionStatus(id, "Error");
-        toastBus.handler?.error(primaryResult.error || "Failed to delete session");
-        return;
-      }
-      if (activeWorkspaceSessionId === primary.id) activeDeleted = true;
-      purgeLocal(primary.id);
-
-      // Siblings keep the per-session cleanup (sandbox container, force) but
-      // never re-run the shared worktree/branch removal: it is already done, and
-      // remove_managed_worktree is not idempotent.
-      const siblingOptions: DeleteSessionOptions = { ...options, delete_worktree: false, delete_branch: false };
-      let anyFailed = false;
-      for (const sibling of sessions.slice(1)) {
-        const res = await deleteSession(sibling.id, siblingOptions);
-        if (res.ok) {
-          if (activeWorkspaceSessionId === sibling.id) activeDeleted = true;
-          purgeLocal(sibling.id);
-        } else {
-          anyFailed = true;
-          setSessionStatus(sibling.id, "Error");
-        }
-      }
-
-      // Redirect only once the open session has actually been deleted, not
-      // merely because it belonged to the workspace: a failed primary (above)
-      // returns early with nothing removed, so navigating earlier would strand
-      // the user on `/` with the session still live. See #2539 review.
-      if (activeDeleted) navigate("/");
-
-      if (anyFailed) {
-        toastBus.handler?.error("Some sessions could not be deleted");
-        return;
-      }
-
-      // Server returns `messages` from `perform_deletion` when there's something
-      // user-facing to report (e.g. "Scratch directory kept at: <path>" when
-      // `keep_scratch` is set). Surface the first one so the kept-path is visible.
-      const toast = primaryResult.messages?.[0] ?? (ids.length > 1 ? "Sessions deleted" : "Session deleted");
-      toastBus.handler?.info(toast);
+      await deleteWorkspaceSessions(sessions, options, activeSessionId, {
+        setStatus: setSessionStatus,
+        // Drop a deleted session's local-only state (#1358 acp cache + draft,
+        // #1842 diff comments). Cross-tab / cross-device deletes fall to the
+        // startup sweep.
+        purgeLocal: (id) => {
+          clearAcpCache(id);
+          clearDraft(id);
+          clearStoredComments(id);
+        },
+        navigateHome: () => navigate("/"),
+        notify: toastBus.handler,
+      });
     },
     [deletingWorkspace, activeSessionId, setSessionStatus, navigate],
   );

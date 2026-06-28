@@ -7,19 +7,22 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("../api", () => ({
   trashSession: vi.fn(),
   restoreSession: vi.fn(),
+  deleteSession: vi.fn(),
 }));
 
-import { restoreSession, trashSession } from "../api";
-import { restoreSessions, trashSessions } from "../trashActions";
+import { deleteSession, restoreSession, trashSession } from "../api";
+import { deleteWorkspaceSessions, restoreSessions, trashSessions } from "../trashActions";
 import type { SessionResponse } from "../types";
 
 const snap = (id: string) => ({ id, title: id }) as unknown as SessionResponse;
 const trashMock = vi.mocked(trashSession);
 const restoreMock = vi.mocked(restoreSession);
+const deleteMock = vi.mocked(deleteSession);
 
 beforeEach(() => {
   trashMock.mockReset();
   restoreMock.mockReset();
+  deleteMock.mockReset();
 });
 
 afterEach(() => vi.clearAllMocks());
@@ -86,5 +89,91 @@ describe("restoreSessions (#2489)", () => {
   it("tolerates a null notifier", async () => {
     restoreMock.mockResolvedValue(snap("a"));
     await expect(restoreSessions(["a"], { applySession: vi.fn(), notify: null })).resolves.toBe(true);
+  });
+});
+
+describe("deleteWorkspaceSessions (#2530, #2539)", () => {
+  const ok = (messages?: string[]) => ({ ok: true as const, messages });
+  const sessions = (...ids: string[]) => ids.map((id) => ({ id }) as unknown as SessionResponse);
+  const deps = () => ({
+    setStatus: vi.fn(),
+    purgeLocal: vi.fn(),
+    navigateHome: vi.fn(),
+    notify: { info: vi.fn(), error: vi.fn() },
+  });
+
+  it("deletes every session; the primary carries the chosen cleanup, siblings strip worktree/branch", async () => {
+    deleteMock.mockResolvedValue(ok());
+    const d = deps();
+
+    await deleteWorkspaceSessions(sessions("a", "b", "c"), { delete_worktree: true, delete_branch: true }, null, d);
+
+    expect(deleteMock).toHaveBeenCalledTimes(3);
+    expect(deleteMock).toHaveBeenNthCalledWith(1, "a", { delete_worktree: true, delete_branch: true });
+    expect(deleteMock).toHaveBeenNthCalledWith(2, "b", { delete_worktree: false, delete_branch: false });
+    expect(deleteMock).toHaveBeenNthCalledWith(3, "c", { delete_worktree: false, delete_branch: false });
+    expect(d.purgeLocal).toHaveBeenCalledTimes(3);
+    expect(d.notify.info).toHaveBeenCalledWith("Sessions deleted");
+    expect(d.navigateHome).not.toHaveBeenCalled();
+  });
+
+  it("aborts the siblings and does not navigate when the primary delete fails", async () => {
+    deleteMock.mockResolvedValueOnce({ ok: false, error: "dirty" });
+    const d = deps();
+
+    await deleteWorkspaceSessions(sessions("a", "b"), {}, "b", d);
+
+    expect(deleteMock).toHaveBeenCalledTimes(1);
+    expect(d.purgeLocal).not.toHaveBeenCalled();
+    expect(d.navigateHome).not.toHaveBeenCalled();
+    expect(d.setStatus).toHaveBeenCalledWith("a", "Error");
+    expect(d.setStatus).toHaveBeenCalledWith("b", "Error");
+    expect(d.notify.error).toHaveBeenCalledWith("dirty");
+  });
+
+  it("navigates home only after the open session is actually deleted (primary)", async () => {
+    deleteMock.mockResolvedValue(ok());
+    const d = deps();
+
+    await deleteWorkspaceSessions(sessions("a", "b"), {}, "a", d);
+
+    expect(d.navigateHome).toHaveBeenCalledTimes(1);
+  });
+
+  it("navigates home when the open session is a deleted sibling", async () => {
+    deleteMock.mockResolvedValue(ok());
+    const d = deps();
+
+    await deleteWorkspaceSessions(sessions("a", "b"), {}, "b", d);
+
+    expect(d.navigateHome).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports a partial failure and skips purge for the failed sibling", async () => {
+    deleteMock.mockResolvedValueOnce(ok()).mockResolvedValueOnce({ ok: false, error: "boom" });
+    const d = deps();
+
+    await deleteWorkspaceSessions(sessions("a", "b"), {}, null, d);
+
+    expect(d.purgeLocal).toHaveBeenCalledTimes(1);
+    expect(d.purgeLocal).toHaveBeenCalledWith("a");
+    expect(d.setStatus).toHaveBeenCalledWith("b", "Error");
+    expect(d.notify.error).toHaveBeenCalledWith("Some sessions could not be deleted");
+  });
+
+  it("surfaces a server message and handles a single-session workspace", async () => {
+    deleteMock.mockResolvedValue(ok(["Scratch directory kept at: /tmp/x"]));
+    const d = deps();
+
+    await deleteWorkspaceSessions(sessions("solo"), {}, null, d);
+
+    expect(deleteMock).toHaveBeenCalledTimes(1);
+    expect(d.notify.info).toHaveBeenCalledWith("Scratch directory kept at: /tmp/x");
+  });
+
+  it("no-ops on an empty workspace", async () => {
+    const d = deps();
+    await deleteWorkspaceSessions([], {}, null, d);
+    expect(deleteMock).not.toHaveBeenCalled();
   });
 });
