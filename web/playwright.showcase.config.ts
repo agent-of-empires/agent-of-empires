@@ -64,10 +64,7 @@ export default defineConfig({
     reuseExistingServer: true,
   },
 
-  reporter: [
-    ["html", { open: "never", outputFolder: "playwright-showcase-report" }],
-    ["list"],
-  ],
+  reporter: [["html", { open: "never", outputFolder: "playwright-showcase-report" }], ["list"]],
 
   projects: [
     {
