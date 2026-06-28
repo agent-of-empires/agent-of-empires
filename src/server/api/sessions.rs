@@ -579,7 +579,11 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
                 let cfg = crate::session::profile_config::resolve_config_or_warn(&session.profile);
                 CleanupDefaults {
                     delete_worktree: cfg.worktree.auto_cleanup,
-                    delete_branch: cfg.worktree.delete_branch_on_cleanup,
+                    // Branch deletion only makes sense when the worktree is
+                    // also removed; keeping the worktree keeps its branch
+                    // checked out, so a `git branch -d` would fail (#2532).
+                    delete_branch: cfg.worktree.auto_cleanup
+                        && cfg.worktree.delete_branch_on_cleanup,
                     delete_sandbox: cfg.sandbox.auto_cleanup,
                     delete_to_trash: cfg.session.delete_to_trash,
                 }
@@ -1899,13 +1903,24 @@ fn default_kill_pane() -> bool {
     true
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Deserialize)]
 pub struct TrashSessionBody {
     /// On trash, tear down every tmux session this instance owns. `false`
     /// keeps tmux state alive; structured-view supervisor shutdown (which
     /// preserves the transcript) is unconditional. Defaults to `true`.
     #[serde(default = "default_kill_pane")]
     pub kill_pane: bool,
+}
+
+// A no-body trash request resolves through `unwrap_or_default()`, so `Default`
+// must match the serde field default (`true`). The derived `Default` would use
+// `bool::default()` (`false`) and silently leave the pane running (#2523).
+impl Default for TrashSessionBody {
+    fn default() -> Self {
+        Self {
+            kill_pane: default_kill_pane(),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -3436,7 +3451,10 @@ pub(crate) async fn purge_expired_trash(state: &Arc<AppState>) {
         let cfg = crate::session::profile_config::resolve_config_or_warn(&instance.source_profile);
         let body = DeleteSessionBody {
             delete_worktree: cfg.worktree.auto_cleanup,
-            delete_branch: cfg.worktree.delete_branch_on_cleanup,
+            // Tie branch cleanup to worktree cleanup: a preserved worktree
+            // keeps its branch checked out, so branch deletion would fail
+            // (#2532).
+            delete_branch: cfg.worktree.auto_cleanup && cfg.worktree.delete_branch_on_cleanup,
             delete_sandbox: cfg.sandbox.auto_cleanup,
             force_delete: true,
             keep_scratch: false,
@@ -5778,6 +5796,24 @@ mod tests {
         inst.status = Status::Running;
         inst.group_path = "work/projects".to_string();
         inst
+    }
+
+    #[test]
+    fn trash_body_default_keeps_kill_pane_true() {
+        // #2523: a no-body trash request resolves through
+        // `unwrap_or_default()`. The derived `Default` would yield
+        // `kill_pane = false` and leave the pane running; the hand impl must
+        // match the serde field default.
+        assert!(TrashSessionBody::default().kill_pane);
+
+        // An empty JSON object goes through serde, which honors the field
+        // default helper.
+        let from_empty: TrashSessionBody = serde_json::from_str("{}").unwrap();
+        assert!(from_empty.kill_pane);
+
+        // An explicit `false` is still respected.
+        let explicit: TrashSessionBody = serde_json::from_str(r#"{"kill_pane": false}"#).unwrap();
+        assert!(!explicit.kill_pane);
     }
 
     #[test]
