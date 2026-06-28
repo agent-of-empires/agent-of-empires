@@ -2661,20 +2661,23 @@ export function WorkspaceSidebar({
 
   // Trashed workspaces, flattened across the active axis and deduped by id (the
   // same workspace can appear under more than one group). Feeds the footer
-  // Trash menu next to Settings (#2512), no longer an inline section.
+  // Trash menu next to Settings (#2512), no longer an inline section. Built
+  // from the unfiltered groups, not the filtered ones: trash is a global
+  // recovery affordance, so an active search or facet must not hide the footer
+  // icon and strand trashed sessions until the filter is cleared.
   const trashedWorkspaces = useMemo(() => {
     const raw = isNested
-      ? filteredNested.flatMap((ng) =>
+      ? nestedGroups.flatMap((ng) =>
           ng.subgroups.flatMap((sg) => sg.workspaces.filter((v) => workspaceIsTrashed(v.workspace))),
         )
-      : filteredGroups.flatMap((g) => g.workspaces.filter((v) => workspaceIsTrashed(v.workspace)));
+      : groups.flatMap((g) => g.workspaces.filter((v) => workspaceIsTrashed(v.workspace)));
     const seen = new Set<string>();
     return raw.filter((v) => {
       if (seen.has(v.workspace.id)) return false;
       seen.add(v.workspace.id);
       return true;
     });
-  }, [isNested, filteredNested, filteredGroups]);
+  }, [isNested, nestedGroups, groups]);
 
   // Sidebar multi-select. Selection is ephemeral sidebar UI state (not routed
   // or persisted); the anchor pivots Shift+click ranges. See #1724.

@@ -138,6 +138,25 @@ describe("WorkspaceSidebar Trash control (#2489, #2512)", () => {
     expect(screen.queryByTestId("sidebar-trash-menu")).toBeNull();
   });
 
+  it("closes the Trash popover on outside click", () => {
+    renderSidebar({ groups: trashedGroups() });
+    fireEvent.click(screen.getByTestId("sidebar-trash-toggle"));
+    expect(screen.getByTestId("sidebar-trash-menu")).toBeTruthy();
+    fireEvent.mouseDown(document.body);
+    expect(screen.queryByTestId("sidebar-trash-menu")).toBeNull();
+  });
+
+  it("keeps the Trash icon reachable while a filter hides every live row (#2512)", () => {
+    // Trash is a global recovery affordance: an active filter that matches no
+    // workspace must not strand trashed sessions by hiding the footer icon.
+    renderSidebar({ groups: trashedGroups() });
+    fireEvent.click(screen.getByLabelText("Filter sessions"));
+    fireEvent.change(screen.getByTestId("sidebar-filter-input"), { target: { value: "zzz-no-match" } });
+    expect(screen.getByTestId("sidebar-trash-toggle")).toBeTruthy();
+    fireEvent.click(screen.getByTestId("sidebar-trash-toggle"));
+    expect(screen.getByTestId("sidebar-trash-row")).toBeTruthy();
+  });
+
   it("hides Restore/Delete actions in read-only mode", () => {
     renderSidebar({ groups: trashedGroups(), readOnly: true });
     fireEvent.click(screen.getByTestId("sidebar-trash-toggle"));
