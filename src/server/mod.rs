@@ -372,6 +372,10 @@ pub struct AppState {
     /// stand up a host; `Some` in a live daemon.
     #[cfg(feature = "serve")]
     pub plugin_host: Option<Arc<crate::plugin::host::PluginHost>>,
+    /// Tracks in-flight web plugin install / update / uninstall jobs so the
+    /// dashboard can tail their host-side log. In-memory; see
+    /// `api::plugins::PluginJobRegistry`.
+    pub plugin_jobs: Arc<crate::server::api::plugins::PluginJobRegistry>,
     /// Epoch-millis timestamp of the most recent authenticated API request.
     /// Updated by auth middleware on every successful auth. The push consumer
     /// checks this to suppress notifications when someone is actively using
@@ -1008,6 +1012,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         acp_supervisor: acp_supervisor.clone(),
         #[cfg(feature = "serve")]
         plugin_host: plugin_host.clone(),
+        plugin_jobs: Arc::new(api::plugins::PluginJobRegistry::new()),
         push: push_state,
         push_enabled,
         web_config: config.web.clone(),
@@ -1552,6 +1557,16 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/plugins/details", get(api::plugin_details))
         .route("/api/plugins/{id}/enabled", post(api::set_plugin_enabled))
         .route("/api/plugins/{id}/action", post(api::invoke_plugin_action))
+        .route(
+            "/api/plugins/install/preview",
+            post(api::preview_plugin_install),
+        )
+        .route("/api/plugins/install", post(api::start_plugin_install))
+        .route(
+            "/api/plugins/{id}/uninstall",
+            post(api::start_plugin_uninstall),
+        )
+        .route("/api/plugins/jobs/{job_id}", get(api::plugin_job_status))
         .route(
             "/api/plugins/{id}/update/preview",
             get(api::plugin_update_preview),
@@ -4121,6 +4136,7 @@ pub mod test_support {
             acp_event_store: event_store,
             acp_supervisor: supervisor,
             plugin_host: None,
+            plugin_jobs: Arc::new(api::plugins::PluginJobRegistry::new()),
             push: None,
             push_enabled: false,
             web_config: crate::session::config::WebConfig::default(),
