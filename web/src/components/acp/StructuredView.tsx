@@ -1541,15 +1541,15 @@ export function SystemNotices({
 
 function InteractionErrorBanner({ message, onDismiss }: { message: string; onDismiss: () => void }) {
   return (
-    <div className="flex items-start justify-between gap-3 border-b border-amber-900/60 bg-amber-950/40 px-4 py-2 text-amber-200">
+    <div className="flex items-start justify-between gap-3 border-b border-status-warning/30 bg-status-warning/10 px-4 py-2 text-status-warning">
       <div className="flex-1 min-w-0">
         <div className="text-xs font-medium">Action did not complete</div>
-        <div className="mt-0.5 text-xs text-amber-100/90 break-words">{message}</div>
+        <div className="mt-0.5 text-xs text-status-warning/90 break-words">{message}</div>
       </div>
       <button
         type="button"
         onClick={onDismiss}
-        className="shrink-0 rounded-md border border-amber-800/60 bg-amber-900/40 px-2 py-1 text-[10px] font-mono uppercase tracking-wide text-amber-100 hover:bg-amber-900/60"
+        className="shrink-0 rounded-md border border-status-warning/40 bg-status-warning/20 px-2 py-1 text-[10px] font-mono uppercase tracking-wide text-status-warning hover:bg-status-warning/30"
       >
         Dismiss
       </button>
@@ -1595,8 +1595,8 @@ export function WorkerRestartingBanner({
  *  nothing to be still-available. See #1106. */
 function SpawningBanner() {
   return (
-    <div className="flex items-center gap-2 border-b border-amber-900/60 bg-amber-950/40 px-4 py-2 text-xs text-amber-200">
-      <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-amber-400" aria-hidden />
+    <div className="flex items-center gap-2 border-b border-status-warning/30 bg-status-warning/10 px-4 py-2 text-xs text-status-warning">
+      <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-status-warning" aria-hidden />
       <span>Starting structured view worker for new session… this can take a few seconds.</span>
     </div>
   );
@@ -1610,8 +1610,8 @@ function WorkerResumingBanner() {
   // `running` state (typically within a few hundred ms of completion).
   // See #1088.
   return (
-    <div className="flex items-center gap-2 border-b border-amber-900/60 bg-amber-950/40 px-4 py-2 text-xs text-amber-200">
-      <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-amber-400" aria-hidden />
+    <div className="flex items-center gap-2 border-b border-status-warning/30 bg-status-warning/10 px-4 py-2 text-xs text-status-warning">
+      <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-status-warning" aria-hidden />
       <span>
         Resuming structured view worker… cached transcript still available. Queued prompts will send once the agent is
         back online.
@@ -1717,12 +1717,12 @@ function WorkerStoppedBanner({ sessionId }: { sessionId: string }) {
   const { state: retryState, error: retryError, respawn: handleReconnect } = useRespawnSession(sessionId);
 
   return (
-    <div className="border-b border-amber-900/60 bg-amber-950/40 px-4 py-3 text-amber-200">
+    <div className="border-b border-status-warning/30 bg-status-warning/10 px-4 py-3 text-status-warning">
       <div className="flex items-start justify-between gap-3">
         <div className="flex-1 min-w-0">
           <div className="text-sm font-medium">Structured view worker stopped</div>
-          <div className="mt-1 text-xs text-amber-100/90">
-            The agent was terminated via <code className="rounded bg-amber-900/60 px-1">aoe acp stop</code> or an
+          <div className="mt-1 text-xs text-status-warning/90">
+            The agent was terminated via <code className="rounded bg-status-warning/30 px-1">aoe acp stop</code> or an
             equivalent external teardown. New prompts are disabled until you reconnect.
           </div>
         </div>
@@ -1730,7 +1730,7 @@ function WorkerStoppedBanner({ sessionId }: { sessionId: string }) {
           type="button"
           onClick={handleReconnect}
           disabled={retryState === "retrying"}
-          className="shrink-0 rounded-md border border-amber-800/60 bg-amber-900/40 px-3 py-1 text-xs font-medium text-amber-100 hover:bg-amber-900/60 disabled:cursor-not-allowed disabled:opacity-60"
+          className="shrink-0 rounded-md border border-status-warning/40 bg-status-warning/20 px-3 py-1 text-xs font-medium text-status-warning hover:bg-status-warning/30 disabled:cursor-not-allowed disabled:opacity-60"
         >
           {retryState === "retrying" ? "Reconnecting…" : "Reconnect"}
         </button>
@@ -1741,7 +1741,7 @@ function WorkerStoppedBanner({ sessionId }: { sessionId: string }) {
         </div>
       )}
       {retryState === "failed" && retryError && (
-        <div className="mt-2 text-xs text-amber-100/90">Reconnect failed: {retryError}</div>
+        <div className="mt-2 text-xs text-status-warning/90">Reconnect failed: {retryError}</div>
       )}
     </div>
   );
@@ -1761,11 +1761,11 @@ function WorkerStoppedBanner({ sessionId }: { sessionId: string }) {
 export function TrashedWorkerStoppedBanner({ sessionId }: { sessionId: string }) {
   return (
     <div
-      className="border-b border-amber-900/60 bg-amber-950/40 px-4 py-3 text-amber-200"
+      className="border-b border-status-warning/30 bg-status-warning/10 px-4 py-3 text-status-warning"
       data-testid={`acp-trashed-banner-${sessionId}`}
     >
       <div className="text-sm font-medium">Session in trash</div>
-      <div className="mt-1 text-xs text-amber-100/90">
+      <div className="mt-1 text-xs text-status-warning/90">
         This session is in the trash. Its transcript and workspace are kept and shown here read-only, but the worker is
         stopped and will not respawn. Restore it from the Trash section in the sidebar to resume, or delete it
         permanently from there.
@@ -1777,11 +1777,11 @@ export function TrashedWorkerStoppedBanner({ sessionId }: { sessionId: string })
 export function ArchivedWorkerStoppedBanner({ sessionId }: { sessionId: string }) {
   return (
     <div
-      className="border-b border-amber-900/60 bg-amber-950/40 px-4 py-3 text-amber-200"
+      className="border-b border-status-warning/30 bg-status-warning/10 px-4 py-3 text-status-warning"
       data-testid={`acp-archived-banner-${sessionId}`}
     >
       <div className="text-sm font-medium">Session archived</div>
-      <div className="mt-1 text-xs text-amber-100/90">
+      <div className="mt-1 text-xs text-status-warning/90">
         This session is parked. The structured view worker was shut down and the reconciler will not respawn it.
         Unarchive from the sidebar (right-click the row, then Unarchive) to bring it back.
       </div>
@@ -1799,11 +1799,11 @@ export function SnoozedWorkerStoppedBanner({ sessionId, snoozedUntil }: { sessio
   const wallClock = Number.isFinite(target.getTime()) ? target.toLocaleString() : snoozedUntil;
   return (
     <div
-      className="border-b border-amber-900/60 bg-amber-950/40 px-4 py-3 text-amber-200"
+      className="border-b border-status-warning/30 bg-status-warning/10 px-4 py-3 text-status-warning"
       data-testid={`acp-snoozed-banner-${sessionId}`}
     >
       <div className="text-sm font-medium">Session snoozed</div>
-      <div className="mt-1 text-xs text-amber-100/90">
+      <div className="mt-1 text-xs text-status-warning/90">
         The structured view worker was shut down until <span className="font-mono">{wallClock}</span>. The reconciler
         will respawn it automatically once the snooze expires, or you can Unsnooze from the sidebar (right-click the
         row) to wake it sooner.
