@@ -419,14 +419,22 @@ describe("PluginsSettings", () => {
     expect(imgs[0].getAttribute("alt")).toBe("Dashboard card");
     expect(imgs[0].getAttribute("loading")).toBe("lazy");
     expect(gallery.textContent).toContain("Live card.");
-    // Clicking a screenshot opens the full-size lightbox; clicking it closes.
+    // Clicking a screenshot opens the full-size lightbox.
     const { findByTestId: findInModal, queryByTestId } = within(document.body);
     fireEvent.click(imgs[0]!);
     const lightbox = await findInModal("plugin-detail-lightbox");
-    expect(lightbox.querySelector("img")?.getAttribute("src")).toBe(
-      "https://raw.githubusercontent.com/acme/widget/HEAD/a.png",
-    );
-    fireEvent.click(lightbox);
+    const bigImg = lightbox.querySelector("img")!;
+    expect(bigImg.getAttribute("src")).toBe("https://raw.githubusercontent.com/acme/widget/HEAD/a.png");
+    // Clicking the image itself does not dismiss; only the backdrop does.
+    fireEvent.click(bigImg);
+    expect(queryByTestId("plugin-detail-lightbox")).not.toBeNull();
+    // Escape closes the lightbox first, leaving the detail modal open.
+    fireEvent.keyDown(window, { key: "Escape" });
+    await waitFor(() => expect(queryByTestId("plugin-detail-lightbox")).toBeNull());
+    expect(queryByTestId("plugin-detail-modal")).not.toBeNull();
+    // Backdrop click also dismisses.
+    fireEvent.click(imgs[0]!);
+    fireEvent.click(await findInModal("plugin-detail-lightbox"));
     await waitFor(() => expect(queryByTestId("plugin-detail-lightbox")).toBeNull());
     // A 404 (moved ref / deleted asset) hides the figure rather than leaving a
     // broken-image icon.
@@ -463,6 +471,14 @@ describe("PluginsSettings", () => {
     // Falls back to the installed view's fields immediately.
     expect(modal.textContent).toContain("v0.1.0");
     fireEvent.click(await findByTestId("plugin-detail-close"));
+    await waitFor(() => expect(queryByTestId("plugin-detail-modal")).toBeNull());
+  });
+
+  it("Escape closes the detail modal when no lightbox is open", async () => {
+    const { findByTestId, queryByTestId } = render(<PluginsSettings />);
+    fireEvent.click(await findByTestId("plugin-open-example.plugin"));
+    await findByTestId("plugin-detail-modal");
+    fireEvent.keyDown(window, { key: "Escape" });
     await waitFor(() => expect(queryByTestId("plugin-detail-modal")).toBeNull());
   });
 

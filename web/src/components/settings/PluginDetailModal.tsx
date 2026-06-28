@@ -200,9 +200,11 @@ export function PluginDetailModal({ source, title, fallback, installCommand, onC
           aria-label={`${zoomed.alt || "Screenshot"} full size`}
           onClick={(e) => {
             // Don't bubble to the modal backdrop (which would close the whole
-            // modal); the lightbox owns this click.
+            // modal); the lightbox owns this click. Dismiss only on a backdrop
+            // click, not when the image itself is clicked, so inspecting the
+            // full-size image does not make it vanish.
             e.stopPropagation();
-            setZoomed(null);
+            if (e.target === e.currentTarget) setZoomed(null);
           }}
           data-testid="plugin-detail-lightbox"
         >
