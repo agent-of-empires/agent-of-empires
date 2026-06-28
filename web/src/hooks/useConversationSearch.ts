@@ -5,6 +5,14 @@ const DEBOUNCE_MS = 200;
 const MIN_CHARS = 2;
 
 interface SearchState {
+  // The query these results belong to, so a result that resolves after the
+  // query changed is suppressed rather than shown under the new query.
+  query: string;
+  results: ConversationSearchHit[];
+  loading: boolean;
+}
+
+interface SearchResult {
   results: ConversationSearchHit[];
   loading: boolean;
 }
@@ -14,8 +22,8 @@ interface SearchState {
 // spinner instead of a premature "No matches". An AbortController drops a
 // stale response when the query changes, so out-of-order resolution never
 // shows results for an old query.
-export function useConversationSearch(query: string): SearchState {
-  const [state, setState] = useState<SearchState>({ results: [], loading: false });
+export function useConversationSearch(query: string): SearchResult {
+  const [state, setState] = useState<SearchState>({ query: "", results: [], loading: false });
   const normalized = query.trim();
   const enabled = normalized.length >= MIN_CHARS;
 
@@ -28,10 +36,10 @@ export function useConversationSearch(query: string): SearchState {
     if (!enabled) return;
     const controller = new AbortController();
     const timer = setTimeout(() => {
-      setState((prev) => ({ ...prev, loading: true }));
+      setState({ query: normalized, results: [], loading: true });
       void searchConversations(normalized, controller.signal).then((results) => {
         if (controller.signal.aborted) return;
-        setState({ results, loading: false });
+        setState({ query: normalized, results, loading: false });
       });
     }, DEBOUNCE_MS);
 
@@ -41,5 +49,10 @@ export function useConversationSearch(query: string): SearchState {
     };
   }, [normalized, enabled]);
 
-  return enabled ? state : { results: [], loading: false };
+  // Suppress results that belong to a previous query (the new query's fetch
+  // has not settled yet), so stale hits never stay selectable in the palette.
+  if (!enabled) return { results: [], loading: false };
+  return state.query === normalized
+    ? { results: state.results, loading: state.loading }
+    : { results: [], loading: state.loading };
 }
