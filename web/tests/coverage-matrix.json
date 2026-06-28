@@ -1039,6 +1039,13 @@
       ]
     },
     {
+      "id": "sidebar.plugin-row-slots",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/plugin-row-slots-mobile.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/plugin/PluginSlots.tsx"]
+    },
+    {
       "id": "sidebar.group-axis-pure",
       "kind": "vitest",
       "risk": "high",
