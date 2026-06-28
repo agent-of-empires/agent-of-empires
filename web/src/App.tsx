@@ -671,6 +671,14 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     setPairedMounted(true);
   }
 
+  // A plugin pane promoted into the mobile main pane can vanish (plugin
+  // unloaded, or the new session has no such pane). Fall back to the agent
+  // view so the user is never stranded on a blank pane. Mirrors the diff /
+  // paired guards above; render-phase derivation per the block at the top.
+  if (isPluginPaneId(rightPanelView) && !pluginPanes.some((p) => p.id === rightPanelView)) {
+    setRightPanelView("agent");
+  }
+
   // Refit the newly active terminal after a single-pane view switch: the
   // layers keep their geometry while hidden (visibility, not display:none),
   // but a resize nudge re-runs the xterm fit so the grid matches exactly.
@@ -1387,6 +1395,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       return (
         <MobileMainPane
           view={rightPanelView}
+          pluginPanes={pluginPanes}
           onBackToAgent={() => setRightPanelView("agent")}
           pairedMounted={pairedMounted}
           activeSession={activeSession ?? null}
@@ -1855,6 +1864,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
           <MobileRightPanelPicker
             open={pickerOpen && singlePane}
             active={rightPanelView}
+            pluginPanes={pluginPanes}
             onSelect={handlePickView}
             onClose={() => setPickerOpen(false)}
           />

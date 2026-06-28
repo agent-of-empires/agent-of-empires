@@ -6,7 +6,9 @@ import { DiffFileList } from "./diff/DiffFileList";
 import { DiffFileViewer } from "./diff/DiffFileViewer";
 import { CommentsBanner } from "./diff/comments/CommentsBanner";
 import { SendCommentsDialog } from "./diff/comments/SendCommentsDialog";
+import { PluginPaneBody } from "./plugin/PluginSlots";
 import type { RightPanelView } from "../lib/rightPanelView";
+import { isPluginPaneId, type PluginPane } from "../lib/pluginPanes";
 import type { RepoBase, RichDiffFile, SessionResponse } from "../lib/types";
 import type { useDiffComments } from "../hooks/useDiffComments";
 import type { FileRef } from "../lib/fileRef";
@@ -15,6 +17,7 @@ const StructuredView = lazy(() => import("./acp/StructuredView").then((m) => ({ 
 
 interface Props {
   view: RightPanelView;
+  pluginPanes: PluginPane[];
   onBackToAgent: () => void;
   pairedMounted: boolean;
   activeSession: SessionResponse | null;
@@ -56,6 +59,7 @@ function layerClass(active: boolean): string {
  *  view switches; `display:none` would collapse xterm geometry to zero. */
 export function MobileMainPane({
   view,
+  pluginPanes,
   onBackToAgent,
   pairedMounted,
   activeSession,
@@ -84,7 +88,9 @@ export function MobileMainPane({
   onCloseSendDialog,
   onClearSelectedFile,
 }: Props) {
-  const viewLabel = view === "diff" ? "Diff" : "Paired terminal";
+  const activePluginPane = isPluginPaneId(view) ? (pluginPanes.find((p) => p.id === view) ?? null) : null;
+  const viewLabel =
+    view === "diff" ? "Diff" : view === "paired" ? "Paired terminal" : (activePluginPane?.title ?? "Plugin");
 
   return (
     <div className="flex-1 flex flex-col min-h-0">
@@ -171,6 +177,12 @@ export function MobileMainPane({
                 />
               </div>
             )}
+          </div>
+        )}
+
+        {activePluginPane && (
+          <div className="absolute inset-0 z-10 flex flex-col min-h-0 overflow-hidden bg-surface-900">
+            <PluginPaneBody entry={activePluginPane.entry} />
           </div>
         )}
       </div>

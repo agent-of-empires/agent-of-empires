@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import type { RightPanelView } from "../lib/rightPanelView";
+import type { PluginPane } from "../lib/pluginPanes";
 
 interface Entry {
   view: RightPanelView;
@@ -16,6 +17,7 @@ const ENTRIES: Entry[] = [
 interface Props {
   open: boolean;
   active: RightPanelView;
+  pluginPanes: PluginPane[];
   onSelect: (view: RightPanelView) => void;
   onClose: () => void;
 }
@@ -24,7 +26,7 @@ interface Props {
  *  full-viewport main pane (#1452). Replaces the old slide-in right-panel
  *  overlay, which collapsed the paired terminal to zero height under the
  *  soft keyboard. */
-export function MobileRightPanelPicker({ open, active, onSelect, onClose }: Props) {
+export function MobileRightPanelPicker({ open, active, pluginPanes, onSelect, onClose }: Props) {
   // Close on Escape, matching the other dismissible overlays.
   useEffect(() => {
     if (!open) return;
@@ -68,6 +70,24 @@ export function MobileRightPanelPicker({ open, active, onSelect, onClose }: Prop
                 >
                   <span className="text-sm font-medium">{entry.label}</span>
                   <span className="text-xs text-text-dim">{entry.hint}</span>
+                </button>
+              </li>
+            );
+          })}
+          {pluginPanes.map((pane) => {
+            const isActive = pane.id === active;
+            return (
+              <li key={pane.id}>
+                <button
+                  onClick={() => onSelect(pane.id as RightPanelView)}
+                  aria-current={isActive ? "true" : undefined}
+                  data-testid={`mobile-right-panel-pick-${pane.id}`}
+                  className={`w-full flex flex-col items-start gap-0.5 px-3 py-2 rounded-lg text-left cursor-pointer transition-colors ${
+                    isActive ? "bg-brand-600/10 text-brand-500" : "text-text-secondary hover:bg-surface-800"
+                  }`}
+                >
+                  <span className="text-sm font-medium">{pane.title}</span>
+                  <span className="text-xs text-text-dim">Plugin</span>
                 </button>
               </li>
             );

@@ -1263,6 +1263,18 @@
       ]
     },
     {
+      "id": "right-panel.mobile-plugin-pane",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/mobile-plugin-pane.spec.ts"],
+      "components": [
+        "web/src/components/MobileRightPanelPicker.tsx",
+        "web/src/components/MobileMainPane.tsx",
+        "web/src/components/plugin/PluginSlots.tsx",
+        "web/src/lib/rightPanelView.ts"
+      ]
+    },
+    {
       "id": "right-panel.mobile-picker-units",
       "kind": "vitest",
       "risk": "high",

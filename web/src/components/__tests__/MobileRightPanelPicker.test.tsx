@@ -8,14 +8,23 @@ import { MobileRightPanelPicker } from "../MobileRightPanelPicker";
 function setup(overrides: Partial<Parameters<typeof MobileRightPanelPicker>[0]> = {}) {
   const onSelect = vi.fn();
   const onClose = vi.fn();
-  render(<MobileRightPanelPicker open active="agent" onSelect={onSelect} onClose={onClose} {...overrides} />);
+  render(
+    <MobileRightPanelPicker
+      open
+      active="agent"
+      pluginPanes={[]}
+      onSelect={onSelect}
+      onClose={onClose}
+      {...overrides}
+    />,
+  );
   return { onSelect, onClose };
 }
 
 describe("MobileRightPanelPicker", () => {
   it("renders nothing when closed", () => {
     const { container } = render(
-      <MobileRightPanelPicker open={false} active="agent" onSelect={vi.fn()} onClose={vi.fn()} />,
+      <MobileRightPanelPicker open={false} active="agent" pluginPanes={[]} onSelect={vi.fn()} onClose={vi.fn()} />,
     );
     expect(container.firstChild).toBeNull();
   });
@@ -33,6 +42,22 @@ describe("MobileRightPanelPicker", () => {
     const { onSelect } = setup();
     fireEvent.click(screen.getByTestId("mobile-right-panel-pick-diff"));
     expect(onSelect).toHaveBeenCalledWith("diff");
+  });
+
+  it("lists plugin panes after the built-ins and selects them by id", () => {
+    const pane = {
+      id: "plugin:acme.kit:gh" as const,
+      title: "GitHub",
+      defaultDock: "right" as const,
+      icon: undefined,
+      entry: { plugin_id: "acme.kit", slot: "pane" as const, id: "gh", session_id: "s1", payload: {} },
+    };
+    const { onSelect } = setup({ pluginPanes: [pane], active: pane.id });
+    const option = screen.getByTestId("mobile-right-panel-pick-plugin:acme.kit:gh");
+    expect(option.textContent).toContain("GitHub");
+    expect(option.getAttribute("aria-current")).toBe("true");
+    fireEvent.click(option);
+    expect(onSelect).toHaveBeenCalledWith("plugin:acme.kit:gh");
   });
 
   it("closes on backdrop click", () => {

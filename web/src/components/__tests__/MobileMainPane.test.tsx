@@ -83,6 +83,7 @@ function setup(overrides: Partial<Parameters<typeof MobileMainPane>[0]> = {}) {
   const onBackToAgent = vi.fn();
   const props: Parameters<typeof MobileMainPane>[0] = {
     view: "agent",
+    pluginPanes: [],
     onBackToAgent,
     pairedMounted: false,
     activeSession: session(),
@@ -148,6 +149,26 @@ describe("MobileMainPane", () => {
     setup({ view: "diff" });
     expect(screen.getByTestId("diff-list")).toBeDefined();
     expect(screen.getByText("Diff")).toBeDefined();
+  });
+
+  it("renders the plugin pane body and its title for a plugin view", () => {
+    const pane = {
+      id: "plugin:acme.kit:gh" as const,
+      title: "GitHub",
+      defaultDock: "right" as const,
+      icon: undefined,
+      entry: {
+        plugin_id: "acme.kit",
+        slot: "pane" as const,
+        id: "gh",
+        session_id: "s1",
+        payload: { title: "GitHub", body: "PR #1 open" },
+      },
+    };
+    setup({ view: pane.id, pluginPanes: [pane] });
+    expect(screen.getByTestId("plugin-pane-body")).toBeDefined();
+    expect(screen.getByText("PR #1 open")).toBeDefined();
+    expect(screen.getByTestId("mobile-back-to-agent")).toBeDefined();
   });
 
   it("shows the diff viewer when a file is selected", () => {
