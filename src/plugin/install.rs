@@ -1460,4 +1460,21 @@ mod tests {
             &[ui(UiSlot::StatusBar, "s")]
         ));
     }
+
+    #[tokio::test]
+    async fn web_install_rejects_non_gh_sources() {
+        // The web install path is gh: only, so a browser request can never make
+        // the daemon read an arbitrary local path. Both must bail before any
+        // network or filesystem work, with a message naming the gh: constraint.
+        let err = preview_install("/tmp/some/plugin")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("gh:"), "{err}");
+        let err = apply_install("./local/dir", "fp", &OperationLog::Inherit)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("gh:"), "{err}");
+    }
 }

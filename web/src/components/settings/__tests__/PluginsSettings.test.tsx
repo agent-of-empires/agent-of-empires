@@ -13,6 +13,9 @@ import type {
   DiscoverResult,
   PluginDetailResult,
   PluginDismissResult,
+  PluginInstallPreviewResult,
+  PluginJobResult,
+  PluginJobStartResult,
   PluginListResponse,
   PluginToggleResult,
   PluginUpdatePreviewResult,
@@ -25,8 +28,12 @@ const fetchPluginUpdates = vi.fn<[], Promise<PluginUpdatesResult>>();
 const discoverPlugins = vi.fn<[string], Promise<DiscoverResult>>();
 const fetchPluginDetails = vi.fn<[string], Promise<PluginDetailResult>>();
 const previewPluginUpdate = vi.fn<[string], Promise<PluginUpdatePreviewResult>>();
-const applyPluginUpdate = vi.fn<[string, string | null], Promise<PluginToggleResult>>();
+const applyPluginUpdate = vi.fn<[string, string | null], Promise<PluginJobStartResult>>();
 const dismissPluginUpdate = vi.fn<[string, string], Promise<PluginDismissResult>>();
+const previewPluginInstall = vi.fn<[string], Promise<PluginInstallPreviewResult>>();
+const startPluginInstall = vi.fn<[string, string], Promise<PluginJobStartResult>>();
+const startPluginUninstall = vi.fn<[string], Promise<PluginJobStartResult>>();
+const fetchPluginJob = vi.fn<[string, number?], Promise<PluginJobResult>>();
 const reportInfo = vi.fn<[string], void>();
 
 vi.mock("../../../lib/api", () => ({
@@ -38,6 +45,10 @@ vi.mock("../../../lib/api", () => ({
   previewPluginUpdate: (id: string) => previewPluginUpdate(id),
   applyPluginUpdate: (id: string, fp: string | null) => applyPluginUpdate(id, fp),
   dismissPluginUpdate: (id: string, fp: string) => dismissPluginUpdate(id, fp),
+  previewPluginInstall: (source: string) => previewPluginInstall(source),
+  startPluginInstall: (source: string, fp: string) => startPluginInstall(source, fp),
+  startPluginUninstall: (id: string) => startPluginUninstall(id),
+  fetchPluginJob: (jobId: string, tail?: number) => fetchPluginJob(jobId, tail),
 }));
 
 vi.mock("../../../lib/toastBus", () => ({
@@ -96,6 +107,10 @@ beforeEach(() => {
   previewPluginUpdate.mockReset();
   applyPluginUpdate.mockReset();
   dismissPluginUpdate.mockReset();
+  previewPluginInstall.mockReset();
+  startPluginInstall.mockReset();
+  startPluginUninstall.mockReset();
+  fetchPluginJob.mockReset();
   reportInfo.mockReset();
   fetchPlugins.mockResolvedValue(listResponse());
   fetchPluginUpdates.mockResolvedValue({ kind: "ok", updates: [] });
@@ -103,6 +118,25 @@ beforeEach(() => {
   fetchPluginDetails.mockResolvedValue({
     kind: "ok",
     detail: { source: "gh:example/plugin", manifest: null, manifest_error: null, release_tags: [] },
+  });
+  // Lifecycle jobs default to "started" + a terminal succeeded poll, so a
+  // progress modal that opens resolves to Done without hanging.
+  applyPluginUpdate.mockResolvedValue({ kind: "ok", jobId: "job1" });
+  startPluginInstall.mockResolvedValue({ kind: "ok", jobId: "job1" });
+  startPluginUninstall.mockResolvedValue({ kind: "ok", jobId: "job1" });
+  fetchPluginJob.mockResolvedValue({
+    kind: "ok",
+    job: {
+      job: {
+        id: "job1",
+        kind: "install",
+        target: "gh:acme/widget",
+        status: { state: "succeeded" },
+        started_at: 0,
+        finished_at: 1,
+      },
+      log: { exists: true, tail: "installed acme.widget 1.0.0", lines_returned: 1, truncated: false },
+    },
   });
 });
 
@@ -465,16 +499,18 @@ describe("PluginsSettings", () => {
     expect((await findByTestId("plugin-update-build-steps")).textContent).toContain("sh build.sh");
   });
 
-  it("Approving applies the update pinned to the previewed fingerprint and closes the modal", async () => {
+  it("Approving applies the update pinned to the previewed fingerprint and opens the job modal", async () => {
     markOutdated();
     previewPluginUpdate.mockResolvedValue(consentPreview);
-    applyPluginUpdate.mockResolvedValue({ kind: "ok", data: listResponse() });
+    applyPluginUpdate.mockResolvedValue({ kind: "ok", jobId: "job1" });
     const { findByTestId, queryByTestId } = render(<PluginsSettings />);
     fireEvent.click(await findByTestId("plugins-check-updates"));
     fireEvent.click(await findByTestId("plugin-update-example.plugin"));
     fireEvent.click(await findByTestId("plugin-update-approve"));
     await waitFor(() => expect(applyPluginUpdate).toHaveBeenCalledWith("example.plugin", "treeB||community"));
+    // The consent modal closes and the update runs as a job with a live log.
     await waitFor(() => expect(queryByTestId("plugin-update-consent-modal")).toBeNull());
+    await findByTestId("plugin-job-modal");
   });
 
   it("Declining records the dismissal and never applies (the version stays active)", async () => {
@@ -506,18 +542,19 @@ describe("PluginsSettings", () => {
     await findByTestId("plugin-update-available-example.plugin");
   });
 
-  it("a safe update applies directly without a consent modal", async () => {
+  it("a safe update applies directly without a consent modal and follows the job", async () => {
     markOutdated();
     previewPluginUpdate.mockResolvedValue({
       kind: "ok",
       preview: { kind: "safe_update", to_version: "0.2.0", fingerprint: "treeC||community" },
     });
-    applyPluginUpdate.mockResolvedValue({ kind: "ok", data: listResponse() });
+    applyPluginUpdate.mockResolvedValue({ kind: "ok", jobId: "job1" });
     const { findByTestId, queryByTestId } = render(<PluginsSettings />);
     fireEvent.click(await findByTestId("plugins-check-updates"));
     fireEvent.click(await findByTestId("plugin-update-example.plugin"));
     await waitFor(() => expect(applyPluginUpdate).toHaveBeenCalledWith("example.plugin", "treeC||community"));
     expect(queryByTestId("plugin-update-consent-modal")).toBeNull();
+    await findByTestId("plugin-job-modal");
   });
 
   it("surfaces an apply error in the consent modal and keeps it open", async () => {
@@ -612,5 +649,192 @@ describe("PluginsSettings", () => {
     fireEvent.keyDown(window, { key: "Escape" });
     fireEvent.click(await findByTestId("plugin-update-consent-close"));
     expect(queryByTestId("plugin-update-consent-modal")).not.toBeNull();
+  });
+
+  // --- Install (marketplace) ---
+
+  function discoverWidget() {
+    discoverPlugins.mockResolvedValue({
+      kind: "ok",
+      results: [
+        {
+          slug: "gh:acme/widget",
+          html_url: "https://github.com/acme/widget",
+          description: "A widget plugin.",
+          stars: 42,
+          badge: "unvetted",
+          install_command: "aoe plugin install gh:acme/widget",
+        },
+      ],
+    });
+  }
+
+  const installConsent: PluginInstallPreviewResult = {
+    kind: "ok",
+    consent: {
+      id: "acme.widget",
+      version: "1.0.0",
+      source: "gh:acme/widget",
+      notice: "installing the latest release v1.0.0",
+      unverified: false,
+      validation: "community",
+      capabilities: ["net"],
+      ui: [],
+      build_steps: ["sh build.sh"],
+      fingerprint: "treeA||community",
+    },
+  };
+
+  it("Install on a marketplace result previews the gh: source and shows the disclosure", async () => {
+    discoverWidget();
+    previewPluginInstall.mockResolvedValue(installConsent);
+    const { findByTestId } = render(<PluginsSettings />);
+    fireEvent.click(await findByTestId("plugins-tab-marketplace"));
+    fireEvent.click(await findByTestId("plugins-discover"));
+    fireEvent.click(await findByTestId("plugins-install-gh:acme/widget"));
+    // The gh: source is taken from the copy command, prefix intact.
+    await waitFor(() => expect(previewPluginInstall).toHaveBeenCalledWith("gh:acme/widget"));
+    await findByTestId("plugin-install-consent-modal");
+    expect((await findByTestId("plugin-install-caps")).textContent).toContain("net");
+    expect((await findByTestId("plugin-install-build-steps")).textContent).toContain("sh build.sh");
+  });
+
+  it("Approving an install starts the job pinned to the previewed fingerprint", async () => {
+    discoverWidget();
+    previewPluginInstall.mockResolvedValue(installConsent);
+    startPluginInstall.mockResolvedValue({ kind: "ok", jobId: "job1" });
+    const { findByTestId, queryByTestId } = render(<PluginsSettings />);
+    fireEvent.click(await findByTestId("plugins-tab-marketplace"));
+    fireEvent.click(await findByTestId("plugins-discover"));
+    fireEvent.click(await findByTestId("plugins-install-gh:acme/widget"));
+    fireEvent.click(await findByTestId("plugin-install-approve"));
+    await waitFor(() => expect(startPluginInstall).toHaveBeenCalledWith("gh:acme/widget", "treeA||community"));
+    await waitFor(() => expect(queryByTestId("plugin-install-consent-modal")).toBeNull());
+    await findByTestId("plugin-job-modal");
+  });
+
+  it("surfaces an install preview error without opening the consent modal", async () => {
+    discoverWidget();
+    previewPluginInstall.mockResolvedValue({ kind: "error", message: "no published release" });
+    const { findByTestId, queryByTestId } = render(<PluginsSettings />);
+    fireEvent.click(await findByTestId("plugins-tab-marketplace"));
+    fireEvent.click(await findByTestId("plugins-discover"));
+    fireEvent.click(await findByTestId("plugins-install-gh:acme/widget"));
+    const err = await findByTestId("plugins-discover-error");
+    expect(err.textContent).toContain("no published release");
+    expect(queryByTestId("plugin-install-consent-modal")).toBeNull();
+  });
+
+  it("an installed marketplace result shows no Install button", async () => {
+    discoverPlugins.mockResolvedValue({
+      kind: "ok",
+      results: [
+        {
+          slug: "gh:acme/widget",
+          html_url: "https://github.com/acme/widget",
+          description: "A widget plugin.",
+          stars: 42,
+          badge: "installed",
+          install_command: "aoe plugin install gh:acme/widget",
+        },
+      ],
+    });
+    const { findByTestId, queryByTestId } = render(<PluginsSettings />);
+    fireEvent.click(await findByTestId("plugins-tab-marketplace"));
+    fireEvent.click(await findByTestId("plugins-discover"));
+    await findByTestId("plugins-discover-result-gh:acme/widget");
+    expect(queryByTestId("plugins-install-gh:acme/widget")).toBeNull();
+  });
+
+  // --- Uninstall ---
+
+  it("Uninstall on an external plugin confirms, then starts the job", async () => {
+    startPluginUninstall.mockResolvedValue({ kind: "ok", jobId: "job1" });
+    const { findByTestId } = render(<PluginsSettings />);
+    fireEvent.click(await findByTestId("plugin-uninstall-example.plugin"));
+    await findByTestId("plugin-uninstall-confirm");
+    fireEvent.click(await findByTestId("plugin-uninstall-confirm-button"));
+    await waitFor(() => expect(startPluginUninstall).toHaveBeenCalledWith("example.plugin"));
+    await findByTestId("plugin-job-modal");
+  });
+
+  it("Cancelling the uninstall confirm starts no job", async () => {
+    const { findByTestId, queryByTestId } = render(<PluginsSettings />);
+    fireEvent.click(await findByTestId("plugin-uninstall-example.plugin"));
+    fireEvent.click(await findByTestId("plugin-uninstall-cancel"));
+    await waitFor(() => expect(queryByTestId("plugin-uninstall-confirm")).toBeNull());
+    expect(startPluginUninstall).not.toHaveBeenCalled();
+  });
+
+  it("a builtin plugin has no Uninstall button", async () => {
+    const { findByText, queryByTestId } = render(<PluginsSettings />);
+    await findByText("Agent Status Detection");
+    expect(queryByTestId("plugin-uninstall-aoe.status")).toBeNull();
+  });
+
+  // --- Job progress modal ---
+
+  it("the job modal renders the live log tail and closes to a refreshed list when done", async () => {
+    startPluginUninstall.mockResolvedValue({ kind: "ok", jobId: "job1" });
+    fetchPluginJob.mockResolvedValue({
+      kind: "ok",
+      job: {
+        job: {
+          id: "job1",
+          kind: "uninstall",
+          target: "example.plugin",
+          status: { state: "succeeded" },
+          started_at: 0,
+          finished_at: 1,
+        },
+        log: { exists: true, tail: "uninstalled example.plugin", lines_returned: 1, truncated: false },
+      },
+    });
+    const { findByTestId, queryByTestId } = render(<PluginsSettings />);
+    fireEvent.click(await findByTestId("plugin-uninstall-example.plugin"));
+    fireEvent.click(await findByTestId("plugin-uninstall-confirm-button"));
+    const log = await findByTestId("plugin-job-log");
+    await waitFor(() => expect(log.textContent).toContain("uninstalled example.plugin"));
+    const fetchCountBefore = fetchPlugins.mock.calls.length;
+    fireEvent.click(await findByTestId("plugin-job-close"));
+    await waitFor(() => expect(queryByTestId("plugin-job-modal")).toBeNull());
+    // Closing refreshes the list so the removed plugin disappears.
+    await waitFor(() => expect(fetchPlugins.mock.calls.length).toBeGreaterThan(fetchCountBefore));
+  });
+
+  it("the job modal shows the failure error from a failed job", async () => {
+    startPluginUninstall.mockResolvedValue({ kind: "ok", jobId: "job1" });
+    fetchPluginJob.mockResolvedValue({
+      kind: "ok",
+      job: {
+        job: {
+          id: "job1",
+          kind: "uninstall",
+          target: "example.plugin",
+          status: { state: "failed", error: "removing tree failed" },
+          started_at: 0,
+          finished_at: 1,
+        },
+        log: { exists: true, tail: "uninstalling example.plugin", lines_returned: 1, truncated: false },
+      },
+    });
+    const { findByTestId } = render(<PluginsSettings />);
+    fireEvent.click(await findByTestId("plugin-uninstall-example.plugin"));
+    fireEvent.click(await findByTestId("plugin-uninstall-confirm-button"));
+    const err = await findByTestId("plugin-job-error");
+    expect(err.textContent).toContain("removing tree failed");
+  });
+
+  it("a rejected install start (e.g. another job active) surfaces the error in the consent modal", async () => {
+    discoverWidget();
+    previewPluginInstall.mockResolvedValue(installConsent);
+    startPluginInstall.mockResolvedValue({ kind: "error", message: "Another plugin operation is already running" });
+    const { findByTestId } = render(<PluginsSettings />);
+    fireEvent.click(await findByTestId("plugins-tab-marketplace"));
+    fireEvent.click(await findByTestId("plugins-discover"));
+    fireEvent.click(await findByTestId("plugins-install-gh:acme/widget"));
+    fireEvent.click(await findByTestId("plugin-install-approve"));
+    const err = await findByTestId("plugin-install-consent-error");
+    expect(err.textContent).toContain("already running");
   });
 });

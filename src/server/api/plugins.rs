@@ -306,7 +306,7 @@ pub enum PluginJobKind {
     Uninstall,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum PluginJobStatus {
     Running,
@@ -594,5 +594,45 @@ pub async fn plugin_job_status(
             format!("{e}"),
         ),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registry_allows_one_active_job_then_releases_on_finish() {
+        let reg = PluginJobRegistry::new();
+        let (id1, _) = reg
+            .begin(PluginJobKind::Install, "gh:a/b".into())
+            .expect("first job begins");
+        // A second lifecycle mutation is rejected while one is active: config
+        // and lockfile writes are not concurrency-safe.
+        assert!(
+            reg.begin(PluginJobKind::Uninstall, "x".into()).is_none(),
+            "second job rejected while one is active"
+        );
+        assert!(matches!(
+            reg.get(&id1).unwrap().status,
+            PluginJobStatus::Running
+        ));
+
+        reg.finish(&id1, Ok(()));
+        assert!(matches!(
+            reg.get(&id1).unwrap().status,
+            PluginJobStatus::Succeeded
+        ));
+
+        // The guard is released, so a new job can begin and a failure records
+        // its message.
+        let (id2, _) = reg
+            .begin(PluginJobKind::Update, "gh:c/d".into())
+            .expect("job begins after the prior one finished");
+        reg.finish(&id2, Err(anyhow::anyhow!("boom")));
+        match reg.get(&id2).unwrap().status {
+            PluginJobStatus::Failed { error } => assert!(error.contains("boom"), "{error}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
     }
 }
