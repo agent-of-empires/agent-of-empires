@@ -1227,6 +1227,9 @@ impl Instance {
         if pre.pinned_at != post.pinned_at {
             self.pinned_at = post.pinned_at;
         }
+        if pre.trashed_at != post.trashed_at {
+            self.trashed_at = post.trashed_at;
+        }
         if pre.unread != post.unread {
             self.unread = post.unread;
         }
@@ -4622,6 +4625,27 @@ mod tests {
         let mut disk2 = pre2.clone();
         disk2.merge_user_action_diff(&pre2, &post2);
         assert!(!disk2.unread);
+    }
+
+    #[test]
+    fn test_merge_user_action_diff_propagates_trash_marker() {
+        let pre = Instance::new("t", "/tmp");
+        let mut post = pre.clone();
+        post.trash();
+        let mut disk = pre.clone();
+
+        disk.merge_user_action_diff(&pre, &post);
+
+        assert!(disk.is_trashed());
+
+        let pre2 = post.clone();
+        let mut post2 = pre2.clone();
+        post2.untrash();
+        let mut disk2 = pre2.clone();
+
+        disk2.merge_user_action_diff(&pre2, &post2);
+
+        assert!(!disk2.is_trashed());
     }
 
     #[test]
