@@ -119,6 +119,15 @@ fn is_user_turn_boundary(ev: &Event) -> bool {
 /// acp -> events.
 pub struct EventStore {
     conn: Mutex<Connection>,
+    /// Read-only connection used exclusively by `search_content`. A
+    /// content search scans many rows; routing it through the writer
+    /// `conn` would hold that mutex for the whole scan and stall the
+    /// live `record()` path (WAL gives no concurrency while one Rust
+    /// mutex serializes every access). A separate read-only connection
+    /// lets WAL serve the scan concurrently with writes. Searches still
+    /// serialize against each other behind this mutex, which is fine:
+    /// one in-flight search at a time is plenty for the palette.
+    search_conn: Mutex<Connection>,
     schema: events::Schema,
     /// Per-session retention cap. Older events are pruned on insert
     /// once the count exceeds this value. Bytes are not enforced here
@@ -137,6 +146,22 @@ impl EventStore {
         // tables, so an established database opens unchanged (no migration).
         let schema = events::Schema::new("acp")?;
         let conn = events::open(db_path, &schema)?;
+        // Separate read-only handle for content search; the writer above
+        // already created the file and tables, so opening read-only here
+        // always succeeds. query_only is belt-and-suspenders on top of the
+        // READ_ONLY flag; busy_timeout keeps a scan from erroring out if it
+        // briefly contends with a checkpoint.
+        let search_conn = Connection::open_with_flags(
+            db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )
+        .with_context(|| format!("open read-only search handle at {}", db_path.display()))?;
+        search_conn
+            .pragma_update(None, "query_only", "ON")
+            .context("set query_only=ON on search handle")?;
+        search_conn
+            .busy_timeout(std::time::Duration::from_millis(1000))
+            .context("set busy_timeout on search handle")?;
         debug!(
             target: "acp.event_store",
             path = %db_path.display(),
@@ -145,6 +170,7 @@ impl EventStore {
         );
         Ok(Self {
             conn: Mutex::new(conn),
+            search_conn: Mutex::new(search_conn),
             schema,
             max_events_per_session,
         })
@@ -454,6 +480,110 @@ impl EventStore {
         } else {
             None
         }
+    }
+
+    /// Full-text search over conversation content (agent messages, user
+    /// prompts, tool output) across every session, newest match first,
+    /// grouped to one hit per session. Backs the web command palette's
+    /// "Conversations" group (#2515).
+    ///
+    /// Runs on the dedicated read-only `search_conn` so a scan never
+    /// blocks the live `record()` path. Returns an empty vec for a query
+    /// below the minimum length or on any DB error: search is best-effort
+    /// chrome, not a correctness path.
+    ///
+    // ponytail: raw event_json LIKE prefilter, then decode + verify in
+    // Rust. No FTS5 and no plaintext sidecar table, so zero write-path
+    // cost and no migration. The SQL LIKE can over-match on JSON keys
+    // (e.g. "text"), but the post-decode check that the extracted prose
+    // actually contains the query drops those before they reach results.
+    // Ceiling: a full scan bounded by SEARCH_ROW_SCAN_CAP. Upgrade path
+    // if the corpus outgrows it: a plaintext sidecar table or an FTS5
+    // virtual table populated on record().
+    pub fn search_content(&self, query: &str, limit: usize) -> Vec<ContentHit> {
+        let trimmed = query.trim();
+        if trimmed.chars().count() < MIN_SEARCH_CHARS {
+            return Vec::new();
+        }
+        let needle: String = trimmed
+            .chars()
+            .take(MAX_SEARCH_CHARS)
+            .collect::<String>()
+            .to_lowercase();
+        let limit = limit.clamp(1, MAX_SEARCH_RESULTS);
+        let pattern = format!("%{}%", escape_like(&needle));
+
+        let conn = match self.search_conn.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let mut stmt = match conn.prepare(
+            "SELECT session_id, seq, event_json FROM acp_events
+             WHERE event_json LIKE ?1 ESCAPE '\\'
+             ORDER BY created_at DESC LIMIT ?2",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(target: "acp.event_store", "prepare search query: {e}");
+                return Vec::new();
+            }
+        };
+        let rows = match stmt.query_map(params![pattern, SEARCH_ROW_SCAN_CAP as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        }) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(target: "acp.event_store", "run search query: {e}");
+                return Vec::new();
+            }
+        };
+
+        // Preserve newest-first row order; the first row seen for a
+        // session is its representative (newest) hit, later rows only
+        // bump match_count.
+        let mut order: Vec<String> = Vec::new();
+        let mut hits: std::collections::HashMap<String, ContentHit> =
+            std::collections::HashMap::new();
+        for row in rows.flatten() {
+            let (session_id, seq, json) = row;
+            let Ok(event) = serde_json::from_str::<Event>(&json) else {
+                continue;
+            };
+            let Some((kind, text)) = event_search_text(&event) else {
+                continue;
+            };
+            // The SQL LIKE matched the raw JSON; confirm the query is in
+            // the extracted prose, not a field name or escape sequence.
+            if !text.to_lowercase().contains(&needle) {
+                continue;
+            }
+            match hits.get_mut(&session_id) {
+                Some(hit) => hit.match_count += 1,
+                None => {
+                    order.push(session_id.clone());
+                    hits.insert(
+                        session_id.clone(),
+                        ContentHit {
+                            session_id,
+                            seq: seq.max(0) as u64,
+                            kind,
+                            snippet: make_snippet(&text, &needle),
+                            match_count: 1,
+                        },
+                    );
+                }
+            }
+        }
+
+        order
+            .into_iter()
+            .take(limit)
+            .filter_map(|id| hits.remove(&id))
+            .collect()
     }
 
     /// Return the most recent `Event::RateLimit` stored for `session_id`
@@ -1238,6 +1368,100 @@ pub struct AttachmentBlob {
 /// full payload (assistant chunks can be a few KB each). Unknown
 /// variants fall back to "other"; `event_kind` only exists for log
 /// breadcrumbs and doesn't need to stay in lockstep with the enum.
+/// Shortest query `search_content` will run; below this every session
+/// matches and the result is noise.
+const MIN_SEARCH_CHARS: usize = 2;
+/// Cap on query length so a pathological input can't build a huge LIKE
+/// pattern.
+const MAX_SEARCH_CHARS: usize = 128;
+/// Most sessions returned from a single search.
+const MAX_SEARCH_RESULTS: usize = 20;
+/// Upper bound on rows the LIKE prefilter scans before grouping. Bounds
+/// the cost of a search on a large DB; older matches past this are not
+/// surfaced (newest-first), an acceptable MVP ceiling.
+const SEARCH_ROW_SCAN_CAP: usize = 300;
+/// Characters of context kept on each side of the match in a snippet.
+const SNIPPET_RADIUS_CHARS: usize = 60;
+
+/// One session's content-search hit: the newest matching event plus a
+/// count of how many of its events matched within the scanned window.
+#[derive(Debug, Clone)]
+pub struct ContentHit {
+    pub session_id: String,
+    pub seq: u64,
+    pub kind: &'static str,
+    pub snippet: String,
+    pub match_count: usize,
+}
+
+/// Escape the LIKE metacharacters so user input is matched literally
+/// rather than as wildcard syntax (a bare `%` would otherwise match
+/// every row). Paired with `ESCAPE '\'` in the query.
+fn escape_like(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Extract the user-facing prose from an event for content search, with
+/// a short kind label. Returns `None` for structural / metadata events
+/// that carry no conversation text. Only the high-signal prose sources
+/// are indexed; status and error strings are deliberately excluded so a
+/// search stays scoped to the conversation.
+fn event_search_text(event: &Event) -> Option<(&'static str, String)> {
+    let pick = |s: &str, kind: &'static str| {
+        let t = s.trim();
+        if t.is_empty() {
+            None
+        } else {
+            Some((kind, s.to_string()))
+        }
+    };
+    match event {
+        Event::AgentMessageChunk { text, .. } => pick(text, "agent"),
+        Event::UserPromptSent { text, .. } => pick(text, "user"),
+        Event::UserDiffCommentsPrompt {
+            assembled_markdown, ..
+        } => pick(assembled_markdown, "user"),
+        Event::ToolCallContent { content, .. } => pick(content, "tool"),
+        Event::ToolCallCompleted { content, .. } => pick(content, "tool"),
+        _ => None,
+    }
+}
+
+/// Build a display snippet: a window of `SNIPPET_RADIUS_CHARS` on each
+/// side of the first case-insensitive match of `needle` (already
+/// lowercased) in `text`, whitespace-collapsed, with ellipses where
+/// trimmed. Falls back to the head of the text when the needle is not
+/// found (callers only pass text that matched, so this is rare). UTF-8
+/// safe: windows on char boundaries, never byte offsets.
+fn make_snippet(text: &str, needle: &str) -> String {
+    let collapsed: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let chars: Vec<char> = collapsed.chars().collect();
+    let lower = collapsed.to_lowercase();
+    // Map the byte index of the match to a char index over `chars`.
+    let match_char = lower
+        .find(needle)
+        .map(|byte_idx| lower[..byte_idx].chars().count())
+        .unwrap_or(0);
+    let start = match_char.saturating_sub(SNIPPET_RADIUS_CHARS);
+    let end = (match_char + needle.chars().count() + SNIPPET_RADIUS_CHARS).min(chars.len());
+    let mut snippet = String::new();
+    if start > 0 {
+        snippet.push('…');
+    }
+    snippet.extend(&chars[start..end]);
+    if end < chars.len() {
+        snippet.push('…');
+    }
+    snippet
+}
+
 fn event_kind(event: &Event) -> &'static str {
     match event {
         Event::PlanUpdated { .. } => "plan_updated",
@@ -1298,6 +1522,85 @@ mod tests {
         let path = tmp.path().join("acp.db");
         let store = EventStore::open(&path, max).unwrap();
         (tmp, store)
+    }
+
+    fn agent_chunk(text: &str) -> Event {
+        Event::AgentMessageChunk { text: text.into() }
+    }
+
+    fn user_prompt(text: &str) -> Event {
+        Event::UserPromptSent {
+            text: text.into(),
+            attachments: vec![],
+        }
+    }
+
+    #[test]
+    fn search_content_finds_prompt_agent_and_tool_text() {
+        let (_tmp, store) = open_store(1000);
+        store
+            .record("s1", 1, &user_prompt("please refactor the reconciler"))
+            .unwrap();
+        store
+            .record("s2", 1, &agent_chunk("I updated the supervisor"))
+            .unwrap();
+        store
+            .record(
+                "s3",
+                1,
+                &Event::ToolCallContent {
+                    tool_call_id: "t1".into(),
+                    content: "grep matched reconciler in supervisor.rs".into(),
+                },
+            )
+            .unwrap();
+
+        let hits = store.search_content("reconciler", 10);
+        let ids: Vec<&str> = hits.iter().map(|h| h.session_id.as_str()).collect();
+        assert!(ids.contains(&"s1"), "prompt text should match");
+        assert!(ids.contains(&"s3"), "tool content should match");
+        assert!(!ids.contains(&"s2"), "non-matching session excluded");
+    }
+
+    #[test]
+    fn search_content_ignores_json_keys() {
+        let (_tmp, store) = open_store(1000);
+        // The substring "text" is a JSON key in every UserPromptSent row,
+        // so a raw LIKE would match; the decode-and-verify step must drop
+        // it because the prose does not contain "text".
+        store.record("s1", 1, &user_prompt("hello world")).unwrap();
+        let hits = store.search_content("text", 10);
+        assert!(hits.is_empty(), "JSON key 'text' must not match prose");
+    }
+
+    #[test]
+    fn search_content_is_case_insensitive_and_groups_by_session() {
+        let (_tmp, store) = open_store(1000);
+        store
+            .record("s1", 1, &agent_chunk("The Quick Brown Fox"))
+            .unwrap();
+        store.record("s1", 2, &agent_chunk("quick again")).unwrap();
+        let hits = store.search_content("QUICK", 10);
+        assert_eq!(hits.len(), 1, "two matching events collapse to one session");
+        assert_eq!(hits[0].session_id, "s1");
+        assert_eq!(hits[0].match_count, 2);
+    }
+
+    #[test]
+    fn search_content_escapes_like_wildcards() {
+        let (_tmp, store) = open_store(1000);
+        store
+            .record("s1", 1, &agent_chunk("plain message"))
+            .unwrap();
+        // Unescaped, "e%" becomes LIKE pattern %e%% which matches any text
+        // containing "e" (the prose has several). Escaped, it matches only
+        // the literal substring "e%", which the prose lacks, so the result
+        // is empty. This fails if wildcard escaping regresses.
+        let hits = store.search_content("e%", 10);
+        assert!(
+            hits.is_empty(),
+            "% must be matched literally, not as a wildcard"
+        );
     }
 
     fn img_blob(id: &str) -> AttachmentBlob {

@@ -5557,6 +5557,52 @@ pub async fn preview_volume_ignores_globs(
     }
 }
 
+#[derive(Deserialize)]
+pub struct SearchQuery {
+    pub q: String,
+    pub limit: Option<usize>,
+}
+
+#[derive(Serialize)]
+pub struct SearchHit {
+    pub session_id: String,
+    pub seq: u64,
+    pub kind: String,
+    pub snippet: String,
+    pub match_count: usize,
+}
+
+#[derive(Serialize)]
+pub struct SearchResponse {
+    pub results: Vec<SearchHit>,
+}
+
+/// Full-text search over session conversation content (#2515). Scans the
+/// structured-view event store on its read-only connection and returns
+/// one hit per matching session, newest first. The response carries only
+/// the session id; the web client already holds the session list and
+/// resolves the title and state from it. Read-only; allowed in
+/// `--read-only` mode.
+pub async fn search_sessions(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(q): axum::extract::Query<SearchQuery>,
+) -> Json<SearchResponse> {
+    let limit = q.limit.unwrap_or(10);
+    let results = state
+        .acp_event_store
+        .search_content(&q.q, limit)
+        .into_iter()
+        .map(|h| SearchHit {
+            session_id: h.session_id,
+            seq: h.seq,
+            kind: h.kind.to_string(),
+            snippet: h.snippet,
+            match_count: h.match_count,
+        })
+        .collect();
+    Json(SearchResponse { results })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
