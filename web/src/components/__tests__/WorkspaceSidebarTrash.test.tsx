@@ -102,13 +102,27 @@ function renderSidebar(over: Partial<React.ComponentProps<typeof WorkspaceSideba
 afterEach(cleanup);
 
 describe("WorkspaceSidebar Trash control (#2489, #2512)", () => {
+  // The Trash list is owned by the parent (App computes it from the full,
+  // unsliced workspace set) and passed in as `trashedWorkspaces`; the sidebar
+  // no longer derives it from `groups`. See #2533. Tests pass both: `groups`
+  // so the workspace exists for navigation, `trashedWorkspaces` to populate
+  // the footer popover.
+  function trashedWorkspace(): Workspace {
+    return workspace("trashed-ws", [session({ id: "s1", trashed_at: "2026-01-01T00:00:00Z" })]);
+  }
   function trashedGroups() {
-    const ws = workspace("trashed-ws", [session({ id: "s1", trashed_at: "2026-01-01T00:00:00Z" })]);
-    return buildSessionGroups([ws], { idleDecayWindowMs: 60_000, sortMode: "lastActivity", isCollapsed: () => false });
+    return buildSessionGroups([trashedWorkspace()], {
+      idleDecayWindowMs: 60_000,
+      sortMode: "lastActivity",
+      isCollapsed: () => false,
+    });
+  }
+  function renderWithTrash(over: Partial<React.ComponentProps<typeof WorkspaceSidebar>> = {}) {
+    return renderSidebar({ groups: trashedGroups(), trashedWorkspaces: [trashedWorkspace()], ...over });
   }
 
   it("reaches a trashed workspace via the footer Trash popover and exposes its actions", () => {
-    const props = renderSidebar({ groups: trashedGroups() });
+    const props = renderWithTrash();
 
     // No inline section in the scrolling list; only the footer toggle.
     expect(screen.queryByTestId("sidebar-trash-section")).toBeNull();
@@ -131,7 +145,7 @@ describe("WorkspaceSidebar Trash control (#2489, #2512)", () => {
   });
 
   it("closes the Trash popover on Escape", () => {
-    renderSidebar({ groups: trashedGroups() });
+    renderWithTrash();
     fireEvent.click(screen.getByTestId("sidebar-trash-toggle"));
     expect(screen.getByTestId("sidebar-trash-menu")).toBeTruthy();
     fireEvent.keyDown(document, { key: "Escape" });
@@ -139,7 +153,7 @@ describe("WorkspaceSidebar Trash control (#2489, #2512)", () => {
   });
 
   it("closes the Trash popover on outside click", () => {
-    renderSidebar({ groups: trashedGroups() });
+    renderWithTrash();
     fireEvent.click(screen.getByTestId("sidebar-trash-toggle"));
     expect(screen.getByTestId("sidebar-trash-menu")).toBeTruthy();
     fireEvent.mouseDown(document.body);
@@ -149,7 +163,7 @@ describe("WorkspaceSidebar Trash control (#2489, #2512)", () => {
   it("keeps the Trash icon reachable while a filter hides every live row (#2512)", () => {
     // Trash is a global recovery affordance: an active filter that matches no
     // workspace must not strand trashed sessions by hiding the footer icon.
-    renderSidebar({ groups: trashedGroups() });
+    renderWithTrash();
     fireEvent.click(screen.getByLabelText("Filter sessions"));
     fireEvent.change(screen.getByTestId("sidebar-filter-input"), { target: { value: "zzz-no-match" } });
     expect(screen.getByTestId("sidebar-trash-toggle")).toBeTruthy();
@@ -158,7 +172,7 @@ describe("WorkspaceSidebar Trash control (#2489, #2512)", () => {
   });
 
   it("hides Restore/Delete actions in read-only mode", () => {
-    renderSidebar({ groups: trashedGroups(), readOnly: true });
+    renderWithTrash({ readOnly: true });
     fireEvent.click(screen.getByTestId("sidebar-trash-toggle"));
     expect(screen.getByTestId("sidebar-trash-open")).toBeTruthy();
     expect(screen.queryByTestId("sidebar-trash-restore")).toBeNull();

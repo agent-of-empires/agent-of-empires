@@ -13,6 +13,11 @@ interface Props {
    *  Trash" with a "Delete permanently" disclosure; when false it goes
    *  straight to the permanent-delete options. See #2489. */
   defaultToTrash: boolean;
+  /** Number of sibling sessions in the workspace beyond the one named above.
+   *  A workspace shares one worktree across all its sessions, and delete acts
+   *  on the whole workspace, so when this is >0 the dialog discloses that more
+   *  than the named session will be removed. See #2530. */
+  extraSessionCount?: number;
   onConfirm: (options: DeleteSessionOptions) => Promise<void>;
   onTrash: () => Promise<void>;
   onCancel: () => void;
@@ -26,6 +31,7 @@ export function DeleteSessionDialog({
   isScratch,
   cleanupDefaults,
   defaultToTrash,
+  extraSessionCount = 0,
   onConfirm,
   onTrash,
   onCancel,
@@ -129,6 +135,12 @@ export function DeleteSessionDialog({
           <p className="text-[13px] text-text-secondary">
             Delete <span className="font-mono text-text-primary">{sessionTitle}</span>?
           </p>
+
+          {extraSessionCount > 0 && (
+            <p className="text-[12px] text-text-dim" data-testid="delete-session-extra-count">
+              This removes all {extraSessionCount + 1} sessions on this branch.
+            </p>
+          )}
 
           {/* When trash is the default, deleting moves the session to the
               Trash (restore later); this checkbox opts into erasing it now.

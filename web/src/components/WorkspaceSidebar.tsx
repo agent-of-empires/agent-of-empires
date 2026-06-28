@@ -272,6 +272,15 @@ interface Props {
   // The nested `repo+group` axis model (#1720). Only consumed when
   // `axis === "repo+group"`; the flat `groups` list drives the other axes.
   nestedGroups: NestedSidebarGroup[];
+  // Fully-trashed workspaces, computed by the parent from the authoritative
+  // unsliced workspace list (`workspaces.filter(workspaceIsTrashed)`), NOT from
+  // the per-`group_path` slice views in `groups`/`nestedGroups`. Trash
+  // membership and Restore scope are a whole-workspace concern: a workspace
+  // split across groups is in Trash only when every one of its sessions is
+  // trashed, and Restore must cover all of them. See #2533. Optional with an
+  // empty default so callers that never trash (and render-only tests) need not
+  // thread it.
+  trashedWorkspaces?: Workspace[];
   onToggleSubgroup: (repoId: string, groupPath: string) => void;
   onReorderWorkspaces: (newOrder: string[]) => void;
   onReorderGroups: (orderedGroupIds: string[]) => void;
@@ -506,7 +515,7 @@ function TrashMenu({
   onRestore,
   onDelete,
 }: {
-  trashedWorkspaces: SidebarWorkspaceView[];
+  trashedWorkspaces: Workspace[];
   readOnly?: boolean;
   onOpen: (workspaceId: string, e: { metaKey: boolean; ctrlKey: boolean; shiftKey: boolean }) => void;
   onRestore: (sessionIds: string[]) => void;
@@ -555,26 +564,26 @@ function TrashMenu({
           <div className="px-3 py-1.5 text-[11px] font-mono uppercase tracking-widest text-text-muted">
             Trash ({count})
           </div>
-          {trashedWorkspaces.map((v) => (
+          {trashedWorkspaces.map((ws) => (
             <div
-              key={v.key}
+              key={ws.id}
               data-testid="sidebar-trash-row"
               className="flex items-center gap-2 px-3 py-1.5 text-[13px] text-text-secondary"
             >
               <button
                 type="button"
-                onClick={(e) => onOpen(v.workspace.id, e)}
-                title={v.workspace.displayName}
+                onClick={(e) => onOpen(ws.id, e)}
+                title={ws.displayName}
                 data-testid="sidebar-trash-open"
                 className="flex-1 truncate text-left hover:text-text-primary cursor-pointer"
               >
-                {v.workspace.displayName}
+                {ws.displayName}
               </button>
               {!readOnly && (
                 <>
                   <button
                     onClick={() => {
-                      const ids = v.workspace.sessions.map((s) => s.id);
+                      const ids = ws.sessions.map((s) => s.id);
                       if (ids.length > 0) onRestore(ids);
                     }}
                     data-testid="sidebar-trash-restore"
@@ -585,7 +594,7 @@ function TrashMenu({
                     <RotateCcw className="h-3.5 w-3.5" />
                   </button>
                   <button
-                    onClick={() => onDelete(v.workspace.id)}
+                    onClick={() => onDelete(ws.id)}
                     data-testid="sidebar-trash-purge"
                     title="Delete permanently"
                     aria-label="Delete permanently"
@@ -2409,6 +2418,7 @@ const AXIS_ARIA: Record<SidebarAxis, string> = {
 export function WorkspaceSidebar({
   groups,
   nestedGroups,
+  trashedWorkspaces = [],
   onToggleSubgroup,
   onReorderWorkspaces,
   onReorderGroups,
@@ -2657,26 +2667,6 @@ export function WorkspaceSidebar({
   const savedProjectsMatchQuery =
     !!q && savedProjects.some((p) => p.displayName.toLowerCase().includes(q) || p.repoPath.toLowerCase().includes(q));
   const hasResults = (isNested ? filteredNested.length > 0 : filteredGroups.length > 0) || savedProjectsMatchQuery;
-
-  // Trashed workspaces, flattened across the active axis and deduped by id (the
-  // same workspace can appear under more than one group). Feeds the footer
-  // Trash menu next to Settings (#2512), no longer an inline section. Built
-  // from the unfiltered groups, not the filtered ones: trash is a global
-  // recovery affordance, so an active search or facet must not hide the footer
-  // icon and strand trashed sessions until the filter is cleared.
-  const trashedWorkspaces = useMemo(() => {
-    const raw = isNested
-      ? nestedGroups.flatMap((ng) =>
-          ng.subgroups.flatMap((sg) => sg.workspaces.filter((v) => workspaceIsTrashed(v.workspace))),
-        )
-      : groups.flatMap((g) => g.workspaces.filter((v) => workspaceIsTrashed(v.workspace)));
-    const seen = new Set<string>();
-    return raw.filter((v) => {
-      if (seen.has(v.workspace.id)) return false;
-      seen.add(v.workspace.id);
-      return true;
-    });
-  }, [isNested, nestedGroups, groups]);
 
   // Sidebar multi-select. Selection is ephemeral sidebar UI state (not routed
   // or persisted); the anchor pivots Shift+click ranges. See #1724.

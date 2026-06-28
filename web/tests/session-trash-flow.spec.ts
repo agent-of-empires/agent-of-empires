@@ -167,3 +167,144 @@ test.describe("Session trash flow", () => {
     await expect.poll(() => handle.deletes, { timeout: 10_000 }).toBe(1);
   });
 });
+
+// Multi-session workspace coverage (#2530, #2533). A "workspace" is keyed by
+// `repoPath::branch`, so two sessions on the same branch but different
+// `group_path` belong to ONE workspace that the sidebar splits into two
+// per-group slices. Trash membership, Restore, and permanent Delete must all
+// act on the whole workspace, not on whichever slice survives dedupe.
+
+interface MultiHandle {
+  /** Session ids that received a DELETE, in call order. */
+  deletedIds: string[];
+  /** Last DELETE option body keyed by session id. */
+  deleteOptions: Record<string, Record<string, unknown>>;
+  /** Session ids that received a restore POST, in call order. */
+  restoredIds: string[];
+}
+
+function multiPayload(id: string, groupPath: string, trashed: boolean) {
+  return {
+    id,
+    title: id,
+    project_path: "/tmp/repo",
+    group_path: groupPath,
+    tool: "claude",
+    status: trashed ? "Stopped" : "Running",
+    yolo_mode: false,
+    created_at: new Date().toISOString(),
+    last_accessed_at: null,
+    idle_entered_at: null,
+    last_error: null,
+    branch: "feat/x",
+    main_repo_path: "/tmp/repo",
+    is_sandboxed: false,
+    has_managed_worktree: false,
+    has_terminal: true,
+    profile: "default",
+    trashed_at: trashed ? new Date().toISOString() : null,
+    cleanup_defaults: { delete_to_trash: true },
+    workspace_repos: [],
+  };
+}
+
+async function mockMultiApis(
+  page: Page,
+  sessions: Array<{ id: string; groupPath: string; trashed: boolean }>,
+): Promise<MultiHandle> {
+  const handle: MultiHandle = { deletedIds: [], deleteOptions: {}, restoredIds: [] };
+  const trashedState = new Map(sessions.map((s) => [s.id, s.trashed]));
+
+  await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
+  await page.route("**/api/sessions", (r) => {
+    if (r.request().method() !== "GET") return r.fulfill({ status: 400 });
+    const live = sessions
+      .filter((s) => !handle.deletedIds.includes(s.id))
+      .map((s) => multiPayload(s.id, s.groupPath, trashedState.get(s.id) ?? false));
+    return r.fulfill({ json: { sessions: live, workspace_ordering: [] } });
+  });
+  for (const s of sessions) {
+    await page.route(`**/api/sessions/${s.id}/restore`, (r) => {
+      if (r.request().method() !== "POST") return r.fulfill({ status: 400 });
+      handle.restoredIds.push(s.id);
+      trashedState.set(s.id, false);
+      return r.fulfill({ json: multiPayload(s.id, s.groupPath, false) });
+    });
+    await page.route(`**/api/sessions/${s.id}`, (r) => {
+      if (r.request().method() !== "DELETE") return r.fulfill({ status: 400 });
+      handle.deletedIds.push(s.id);
+      const body = r.request().postData();
+      handle.deleteOptions[s.id] = body ? (JSON.parse(body) as Record<string, unknown>) : {};
+      return r.fulfill({ json: {} });
+    });
+  }
+  await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));
+  await page.route("**/api/sessions/*/terminal", (r) => r.fulfill({ status: 200, body: "" }));
+  await page.route("**/api/sessions/*/diff/files", (r) =>
+    r.fulfill({ json: { files: [], per_repo_bases: [], warning: null } }),
+  );
+  for (const path of ["settings", "themes", "agents", "profiles", "groups", "devices", "docker/status", "about"]) {
+    await page.route(`**/api/${path}`, (r) => r.fulfill({ json: path === "docker/status" ? {} : [] }));
+  }
+  await page.routeWebSocket(/\/sessions\/.*\/(ws|acp-ws|container-ws)$/, () => {});
+  return handle;
+}
+
+test.describe("Multi-session workspace trash", () => {
+  test("a workspace trashed in only one group slice does not appear in Trash (#2533)", async ({ page }) => {
+    await mockMultiApis(page, [
+      { id: "sess-a", groupPath: "alpha", trashed: true },
+      { id: "sess-b", groupPath: "beta", trashed: false },
+    ]);
+    await page.setViewportSize({ width: 1280, height: 720 });
+
+    await page.goto("/");
+    // The still-live sibling keeps the workspace out of Trash entirely: no
+    // Trash footer icon, even though the "alpha" slice is fully trashed.
+    await expect(page.locator('[data-testid="sidebar-session-row"]').first()).toBeVisible({ timeout: 10_000 });
+    await expect(page.locator('[data-testid="sidebar-trash-toggle"]')).toHaveCount(0, { timeout: 5_000 });
+  });
+
+  test("Restore from Trash restores every session of a split workspace (#2533)", async ({ page }) => {
+    const handle = await mockMultiApis(page, [
+      { id: "sess-a", groupPath: "alpha", trashed: true },
+      { id: "sess-b", groupPath: "beta", trashed: true },
+    ]);
+    await page.setViewportSize({ width: 1280, height: 720 });
+
+    await page.goto("/");
+    await page.locator('[data-testid="sidebar-trash-toggle"]').click();
+    // The two slices dedupe to a single Trash row for the workspace.
+    const trashRows = page.locator('[data-testid="sidebar-trash-row"]');
+    await expect(trashRows).toHaveCount(1, { timeout: 10_000 });
+
+    await trashRows.first().locator('[data-testid="sidebar-trash-restore"]').click();
+    await expect.poll(() => [...handle.restoredIds].sort(), { timeout: 10_000 }).toEqual(["sess-a", "sess-b"]);
+  });
+
+  test("permanent Delete purges every session of a trashed workspace (#2530)", async ({ page }) => {
+    const handle = await mockMultiApis(page, [
+      { id: "sess-a", groupPath: "alpha", trashed: true },
+      { id: "sess-b", groupPath: "beta", trashed: true },
+    ]);
+    await page.setViewportSize({ width: 1280, height: 720 });
+
+    await page.goto("/");
+    await page.locator('[data-testid="sidebar-trash-toggle"]').click();
+    const trashRow = page.locator('[data-testid="sidebar-trash-row"]').first();
+    await expect(trashRow).toBeVisible({ timeout: 10_000 });
+
+    await trashRow.locator('[data-testid="sidebar-trash-purge"]').click();
+    const dialog = page.locator('[data-testid="delete-session-dialog"]');
+    await expect(dialog).toBeVisible({ timeout: 5_000 });
+    // The dialog discloses the workspace-wide scope (#2530).
+    await expect(dialog.locator('[data-testid="delete-session-extra-count"]')).toContainText("all 2 sessions");
+    await dialog.getByRole("button", { name: /^Delete$/ }).click();
+
+    await expect.poll(() => [...handle.deletedIds].sort(), { timeout: 10_000 }).toEqual(["sess-a", "sess-b"]);
+    // Whichever id is the workspace primary, the sibling never re-runs the
+    // shared worktree/branch removal.
+    const siblingId = handle.deletedIds[1]!;
+    expect(handle.deleteOptions[siblingId]).toMatchObject({ delete_worktree: false, delete_branch: false });
+  });
+});
