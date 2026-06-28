@@ -38,6 +38,30 @@ export function fetchSessions(): Promise<SessionsEnvelope | null> {
   return fetchJson<SessionsEnvelope>("/api/sessions");
 }
 
+// --- Conversation content search (#2515) ---
+
+export interface ConversationSearchHit {
+  session_id: string;
+  seq: number;
+  kind: string;
+  snippet: string;
+  match_count: number;
+}
+
+interface ConversationSearchResponse {
+  results: ConversationSearchHit[];
+}
+
+// Full-text search over session conversation content. Returns one hit per
+// matching session, newest first. `signal` lets the caller abort a stale
+// in-flight search when the query changes.
+export async function searchConversations(query: string, signal?: AbortSignal): Promise<ConversationSearchHit[]> {
+  const res = await fetchJson<ConversationSearchResponse>(`/api/sessions/search?q=${encodeURIComponent(query)}`, {
+    signal,
+  });
+  return res?.results ?? [];
+}
+
 // --- Recent projects ---
 
 export interface RecentProjectEntry {

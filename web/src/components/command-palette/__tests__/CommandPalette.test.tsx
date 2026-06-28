@@ -61,4 +61,39 @@ describe("CommandPalette", () => {
     fireEvent.click(screen.getByTestId("command-palette-backdrop"));
     expect(onClose).toHaveBeenCalledOnce();
   });
+
+  it("shows a spinner row in Conversations while a content search runs", () => {
+    render(<CommandPalette open onClose={() => {}} actions={[action()]} searching />);
+    expect(screen.getByText("Searching conversations…")).toBeTruthy();
+  });
+
+  it("keeps conversation hits even when the query does not match their text", () => {
+    render(
+      <CommandPalette
+        open
+        onClose={() => {}}
+        actions={[
+          action({ id: "session:s1", title: "Some Title", group: "Sessions" }),
+          action({ id: "conversation:s2", title: "Hit session", group: "Conversations" }),
+        ]}
+      />,
+    );
+    // Type a query that matches neither title; the conversation hit is
+    // force-kept (server already matched it by content), the metadata
+    // session row is filtered out.
+    fireEvent.change(screen.getByPlaceholderText("Search actions, sessions, settings…"), {
+      target: { value: "zzzznomatch" },
+    });
+    expect(screen.getByText("Hit session")).toBeTruthy();
+    expect(screen.queryByText("Some Title")).toBeNull();
+  });
+
+  it("reports the typed query through onSearchChange", () => {
+    const onSearchChange = vi.fn();
+    render(<CommandPalette open onClose={() => {}} actions={[action()]} onSearchChange={onSearchChange} />);
+    fireEvent.change(screen.getByPlaceholderText("Search actions, sessions, settings…"), {
+      target: { value: "reconciler" },
+    });
+    expect(onSearchChange).toHaveBeenCalledWith("reconciler");
+  });
 });

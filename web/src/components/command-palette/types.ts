@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 import type { SessionStatus } from "../../lib/types";
 
-export type CommandActionGroup = "Actions" | "Sessions" | "Settings";
+export type CommandActionGroup = "Actions" | "Sessions" | "Conversations" | "Settings";
 
 export interface CommandAction {
   id: string;
