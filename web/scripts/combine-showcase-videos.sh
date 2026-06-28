@@ -1,38 +1,15 @@
 #!/usr/bin/env bash
-# Combine every Playwright showcase video.webm under test-results/ into a
-# single mp4 capped at MAX_SECONDS (default 120s). Speed-up is computed
-# so the final clip is always ~MAX_SECONDS regardless of input count.
+# Combine every Playwright showcase video.webm under test-results/ into one
+# mp4. Speed-up is computed so the result is always ~MAX_SECONDS regardless
+# of input count. Re-encode is unavoidable (we apply a setpts filter, which
+# stream-copy can't do). Usage and env knobs: docs/development/showcase-video.md.
 #
-# Two layouts:
-#
-#   - concat (default): videos play back-to-back. factor = max(1, sum / cap).
-#   - grid (GRID=COLSxROWS): videos play in parallel in a fixed grid.
-#     Shorter cells are tail-padded with their last frame so every cell
-#     ends at the same time. factor = max(1, longest / cap).
-#     If video count > COLS*ROWS, the extras are dropped (warn).
-#     If video count < COLS*ROWS, empty cells are filled with black.
-#
-# Optional per-cell / per-segment title overlay (SHOW_TITLES=1). Title
-# text is derived from the video's parent directory name (Playwright
-# names it after the spec + test title).
-#
-# Output is H.264 mp4 (libx264, crf 18, slow preset). Re-encode is
-# unavoidable because we apply a setpts filter; stream-copy is not
-# compatible with filter graphs.
-#
-# Usage:
-#   ./scripts/combine-showcase-videos.sh                                  # concat, 120s cap, no titles
-#   ./scripts/combine-showcase-videos.sh out.mp4                          # custom output
-#   MAX_SECONDS=60 ./scripts/combine-showcase-videos.sh
-#   GRID=2x2 ./scripts/combine-showcase-videos.sh                         # 2x2 grid
-#   GRID=3x3 SHOW_TITLES=1 ./scripts/combine-showcase-videos.sh           # 3x3 grid + per-cell titles
-#   SHOW_TITLES=1 ./scripts/combine-showcase-videos.sh                    # concat + per-segment titles
-#   CRF=23 PRESET=fast ./scripts/combine-showcase-videos.sh               # cheaper / lower-quality encode
-#   TARGET_W=1920 TARGET_H=1080 ./scripts/combine-showcase-videos.sh      # output canvas size
-#   FONT=/path/to/font.ttf ./scripts/combine-showcase-videos.sh           # override drawtext font
-#
-# Order is filesystem-sorted (Playwright's per-test dir prefix sorts
-# stably enough for a deterministic playback order across runs).
+# Two layouts, both deterministic (inputs are filesystem-sorted):
+#   - concat (default): videos play back-to-back; factor = max(1, sum / cap).
+#   - grid (GRID=COLSxROWS): videos stream into COLS*ROWS lanes round-robin,
+#     concatenated within each lane and played in parallel. Shorter lanes
+#     tail-pad with their last frame; empty lanes (fewer videos than cells)
+#     are black. factor = max(1, longest-lane / cap).
 
 set -euo pipefail
 
