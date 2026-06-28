@@ -1408,7 +1408,10 @@ fn test_cli_add_scratch_provisions_dir() {
     // Capture path before rm so we can assert cleanup.
     let captured = path.to_path_buf();
 
-    let rm_output = h.run_cli(&["rm", "QuickScratch"]);
+    // --purge: with trash-first delete (session.delete_to_trash default on,
+    // #2489) a bare `rm` moves the session to the trash and keeps the scratch
+    // dir; this test asserts the permanent cleanup path.
+    let rm_output = h.run_cli(&["rm", "--purge", "QuickScratch"]);
     assert!(
         rm_output.status.success(),
         "aoe rm failed:\nstdout: {}\nstderr: {}",
@@ -1462,7 +1465,10 @@ fn test_cli_rm_keep_scratch_leaves_dir_on_disk() {
     let path = Path::new(project_path).to_path_buf();
     assert!(path.exists(), "scratch dir must exist before rm");
 
-    let rm_output = h.run_cli(&["rm", "KeepMe", "--keep-scratch"]);
+    // --purge: keep-scratch is a permanent-delete option; with trash-first
+    // (#2489) a bare `rm` would trash instead of purging, so pass --purge to
+    // exercise the keep-scratch cleanup path.
+    let rm_output = h.run_cli(&["rm", "--purge", "KeepMe", "--keep-scratch"]);
     assert!(
         rm_output.status.success(),
         "aoe rm --keep-scratch failed:\nstdout: {}\nstderr: {}",
