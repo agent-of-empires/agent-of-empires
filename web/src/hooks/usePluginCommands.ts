@@ -2,13 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 import { fetchPluginCommands, type PluginCommand, type PluginUiEntry } from "../lib/api";
 import type { CommandAction } from "../components/command-palette/types";
-import {
-  buildPluginCommandActions,
-  matchPluginChord,
-  openExternal,
-  parsePluginChord,
-  resolveCommandHref,
-} from "../lib/pluginCommands";
+import { buildPluginCommandActions, openExternal, pickKeybindHref } from "../lib/pluginCommands";
 
 /** Surfaces active plugin commands as palette actions and binds their declared
  *  keybinds. `open-ui-link` commands open the active session's PR href from the
@@ -45,18 +39,10 @@ export function usePluginCommands(entries: PluginUiEntry[], activeSessionId: str
       const t = e.target as HTMLElement | null;
       if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
       const { commands, entries, activeSessionId } = live.current;
-      for (const cmd of commands) {
-        if (cmd.action?.kind !== "open-ui-link") continue;
-        for (const key of cmd.keybinds) {
-          const chord = parsePluginChord(key);
-          if (!chord || !matchPluginChord(chord, e)) continue;
-          const href = resolveCommandHref(cmd, entries, activeSessionId);
-          if (href) {
-            e.preventDefault();
-            openExternal(href);
-          }
-          return;
-        }
+      const href = pickKeybindHref(commands, entries, activeSessionId, e);
+      if (href) {
+        e.preventDefault();
+        openExternal(href);
       }
     };
     document.addEventListener("keydown", handler);

@@ -6,6 +6,7 @@ import {
   isExternalHttpUrl,
   matchPluginChord,
   parsePluginChord,
+  pickKeybindHref,
   resolveCommandHref,
   resolveCommandLinks,
 } from "../pluginCommands";
@@ -172,5 +173,43 @@ describe("multi-repo workspaces", () => {
     expect(resolveCommandHref(badge, [badgeEntry(items, "https://github.com/o/b/pull/2")], "s1")).toBe(
       "https://github.com/o/b/pull/2",
     );
+  });
+});
+
+describe("pickKeybindHref", () => {
+  const ev = { ctrlKey: true, shiftKey: true, altKey: false, metaKey: false, key: "g" } as KeyboardEvent;
+  const cmdA: PluginCommand = {
+    fqid: "plugin.acme.a.open",
+    plugin_id: "acme.a",
+    id: "open",
+    title: "A",
+    description: "",
+    keybinds: ["Ctrl+Shift+G"],
+    action: { kind: "open-ui-link", slot: "row-column", id: "pr" },
+  };
+  const cmdB: PluginCommand = { ...cmdA, fqid: "plugin.acme.b.open", plugin_id: "acme.b" };
+
+  function entryFor(pluginId: string, href: string): PluginUiEntry {
+    return { plugin_id: pluginId, slot: "row-column", id: "pr", session_id: "s1", payload: { href } };
+  }
+
+  it("opens the matching command's href", () => {
+    expect(pickKeybindHref([cmdA], [entryFor("acme.a", "https://x.test/1")], "s1", ev)).toBe("https://x.test/1");
+  });
+
+  it("falls through to a later command sharing the chord when the first is inactive", () => {
+    // cmdA matches the chord but has no entry (inactive for this session); cmdB
+    // shares the chord and resolves, so it must still fire.
+    const href = pickKeybindHref([cmdA, cmdB], [entryFor("acme.b", "https://x.test/2")], "s1", ev);
+    expect(href).toBe("https://x.test/2");
+  });
+
+  it("returns null when no matching command can execute", () => {
+    expect(pickKeybindHref([cmdA, cmdB], [], "s1", ev)).toBeNull();
+  });
+
+  it("ignores commands whose chord does not match", () => {
+    const other = { ctrlKey: false, shiftKey: false, altKey: false, metaKey: false, key: "x" } as KeyboardEvent;
+    expect(pickKeybindHref([cmdA], [entryFor("acme.a", "https://x.test/1")], "s1", other)).toBeNull();
   });
 });

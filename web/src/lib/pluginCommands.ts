@@ -168,3 +168,25 @@ export function matchPluginChord(chord: ParsedChord, e: KeyboardEvent): boolean 
     e.key.toLowerCase() === chord.base
   );
 }
+
+/** The href to open for a keydown event: the first command whose chord matches
+ *  AND whose primary href resolves. A chord match that can't execute (no PR for
+ *  this session) is skipped, so a second command sharing the chord still fires.
+ *  `null` when nothing matches or nothing resolves. */
+export function pickKeybindHref(
+  commands: PluginCommand[],
+  entries: PluginUiEntry[],
+  activeSessionId: string | null,
+  e: KeyboardEvent,
+): string | null {
+  for (const cmd of commands) {
+    if (cmd.action?.kind !== "open-ui-link") continue;
+    for (const key of cmd.keybinds) {
+      const chord = parsePluginChord(key);
+      if (!chord || !matchPluginChord(chord, e)) continue;
+      const href = resolveCommandHref(cmd, entries, activeSessionId);
+      if (href) return href;
+    }
+  }
+  return null;
+}
