@@ -210,6 +210,13 @@ const PAGES = [
       "Long-form reference for the web dashboard test pipeline: mocked vs live Playwright, Vitest contract tests, fake ACP agent, coverage matrix, coverage reports.",
   },
   {
+    source: "docs/development/showcase-video.md",
+    dest: "docs/development/showcase-video.md",
+    title: "Showcase video pipeline",
+    description:
+      "Record every Playwright spec as video and stitch the clips into one demo/highlight mp4: showcase config, the combine script, and its layout/speed/quality knobs.",
+  },
+  {
     source: "docs/development/releases.md",
     dest: "docs/development/releases.md",
     title: "Releases",
@@ -374,6 +381,7 @@ const URL_MAP = {
   "docs/development/adding-settings.md": "/docs/development/adding-settings/",
   "docs/development/logging.md": "/docs/development/logging/",
   "docs/development/playwright.md": "/docs/development/playwright/",
+  "docs/development/showcase-video.md": "/docs/development/showcase-video/",
   "docs/development/releases.md": "/docs/development/releases/",
   "docs/development/web-dashboard.md": "/docs/development/web-dashboard/",
   "docs/development/internals/structured-view.md": "/docs/development/internals/structured-view/",

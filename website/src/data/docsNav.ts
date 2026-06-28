@@ -81,6 +81,7 @@ export const docsNav: NavSection[] = [
       { title: "Adding a Setting", href: "/docs/development/adding-settings/" },
       { title: "Logging", href: "/docs/development/logging/" },
       { title: "Playwright + Vitest testing", href: "/docs/development/playwright/" },
+      { title: "Showcase video pipeline", href: "/docs/development/showcase-video/" },
       { title: "Releases", href: "/docs/development/releases/" },
       {
         title: "Web Dashboard Development",

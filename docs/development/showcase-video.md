@@ -187,8 +187,8 @@ Playwright will recreate both on the next showcase run.
 
 ## Files
 
-- `web/playwright.showcase.config.ts` -- config used by step 1.
-- `web/scripts/combine-showcase-videos.sh` -- combiner used by step 2.
-- `web/package.json` -- `test:showcase` script.
-- `web/test-results/` -- per-test recordings (gitignored).
-- `web/playwright-showcase-report/` -- HTML report (gitignored).
+- `web/playwright.showcase.config.ts`: config used by step 1.
+- `web/scripts/combine-showcase-videos.sh`: combiner used by step 2.
+- `web/package.json`: `test:showcase` script.
+- `web/test-results/`: per-test recordings (gitignored).
+- `web/playwright-showcase-report/`: HTML report (gitignored).
