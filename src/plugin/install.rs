@@ -329,13 +329,23 @@ fn apply_prepared_install(p: &PreparedInstall, log: &OperationLog) -> Result<Ins
         return Err(e);
     }
 
-    persist_install(
-        &p.persisted_source,
-        &p.id,
-        &p.capabilities,
-        &p.manifest_hash,
-    )?;
-    write_lock(&p.id, &p.fetched, &p.manifest_hash, p.featured_verified)?;
+    // Persist config and lockfile together; if either fails, roll the install
+    // back so a half-written config/lock and an untracked tree do not block
+    // retries with "already installed" or leave the two out of sync.
+    let persisted = (|| -> Result<()> {
+        persist_install(
+            &p.persisted_source,
+            &p.id,
+            &p.capabilities,
+            &p.manifest_hash,
+        )?;
+        write_lock(&p.id, &p.fetched, &p.manifest_hash, p.featured_verified)
+    })();
+    if let Err(e) = persisted {
+        let _ = uninstall(&p.id);
+        let _ = std::fs::remove_dir_all(&final_dir);
+        return Err(e);
+    }
     super::reload_registry();
     log.line(&format!(
         "installed {} {}",
