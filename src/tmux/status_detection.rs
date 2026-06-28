@@ -1001,8 +1001,15 @@ fn cursor_is_follow_up_prompt(line: &str) -> bool {
 }
 
 /// Copilot CLI status detection via tmux pane parsing.
-/// Copilot CLI is a full-screen TUI. It shows "Thinking" while the model is
-/// processing and displays tool approval prompts when actions need confirmation.
+///
+/// Copilot CLI (v1.0.65) is a full-screen TUI rendered inside a bordered input
+/// box. The bottom status line is the reliable signal:
+///   - `◎ Working ... esc cancel` while the model is generating (Running).
+///   - `/ commands · ? help · tab next tab` when parked at an empty prompt,
+///     ready for the next message (Waiting).
+///   - a numbered choice list with `enter to select` / `esc to cancel` for a
+///     tool/folder-trust approval (Waiting). `--yolo` (allow-all-paths +
+///     allow-all-tools) suppresses most of these.
 pub fn detect_copilot_status(raw_content: &str) -> Status {
     let content = raw_content.to_lowercase();
     let lines: Vec<&str> = content.lines().collect();
@@ -1030,6 +1037,9 @@ pub fn detect_copilot_status(raw_content: &str) -> Status {
         || last_lines_lower.contains("working")
         || last_lines_lower.contains("esc to interrupt")
         || last_lines_lower.contains("ctrl+c to interrupt")
+        // Copilot's live footer reads `◎ Working ... esc cancel`; key on the
+        // interrupt hint too so a verb change doesn't drop the Running signal.
+        || last_lines_lower.contains("esc cancel")
     {
         return Status::Running;
     }
@@ -1048,7 +1058,14 @@ pub fn detect_copilot_status(raw_content: &str) -> Status {
         return Status::Waiting;
     }
 
-    if matches_input_prompt(&non_empty_lines, 10, &["copilot>"]) {
+    // Empty ready prompt: Copilot's idle footer is `/ commands · ? help · tab
+    // next tab`. `tab next tab` and `? help` only render at the ready prompt
+    // (Working and approval footers differ), so they mark the turn as done and
+    // waiting for the user. `copilot>` is kept for custom wrappers/older builds.
+    if last_lines_lower.contains("tab next tab")
+        || last_lines_lower.contains("? help")
+        || matches_input_prompt(&non_empty_lines, 10, &["copilot>"])
+    {
         return Status::Waiting;
     }
 
@@ -2783,6 +2800,11 @@ run this command? (y/n)
         );
         assert_eq!(detect_copilot_status("working ⠋"), Status::Running);
         assert_eq!(detect_copilot_status("loading ⠹"), Status::Running);
+        // Real v1.0.65 working footer.
+        assert_eq!(
+            detect_copilot_status("┃\n◎ Working esc cancel    MAI-Code-1-Flash"),
+            Status::Running
+        );
     }
 
     #[test]
@@ -2798,6 +2820,11 @@ run this command? (y/n)
         );
         assert_eq!(detect_copilot_status("done\n>"), Status::Waiting);
         assert_eq!(detect_copilot_status("done\ncopilot>"), Status::Waiting);
+        // Real v1.0.65 idle/ready footer: turn done, waiting for the next message.
+        assert_eq!(
+            detect_copilot_status("answer text\n┃\n/ commands · ? help · tab next tab"),
+            Status::Waiting
+        );
     }
 
     #[test]

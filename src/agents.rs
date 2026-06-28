@@ -615,7 +615,7 @@ pub const AGENTS: &[AgentDef] = &[
     },
     AgentDef {
         name: "copilot",
-        oneshot_flag: None,
+        oneshot_flag: Some("-p"),
         binary: "copilot",
         launch_subcommand: None,
         aliases: &["github-copilot"],
@@ -627,7 +627,13 @@ pub const AGENTS: &[AgentDef] = &[
         container_env: &[("COPILOT_CONFIG_DIR", "/root/.copilot")],
         hook_config: None,
         sidecar_hooks: None,
-        resume_strategy: ResumeStrategy::Unsupported,
+        // Copilot records its live session id (a UUID) in the `sessions` table
+        // of `~/.copilot/session-store.db`; the poller captures it and resumes
+        // with `copilot --session-id <id>`. `--session-id` takes a required
+        // value, so the space-separated form `build_resume_flags` emits parses
+        // unambiguously; `--resume[=<id>]` takes an optional value and would
+        // read a space-separated id as a positional prompt instead.
+        resume_strategy: ResumeStrategy::Flag("--session-id"),
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
@@ -855,6 +861,22 @@ impl AgentDef {
         }
     }
 
+    /// Static argv tokens appended *after* the prompt for a one-shot
+    /// (smart-rename) title call. Only meaningful for flag-value one-shots
+    /// (`oneshot_flag` is a `-p`-style option whose value is the prompt): the
+    /// CLI binds the prompt to the flag, so these trailing flags cannot be read
+    /// as the prompt, and the prompt cannot be read as one of them. Copilot
+    /// needs `-s` (print only the final answer, no stats) plus
+    /// `--allow-all-tools --no-ask-user` so the non-interactive title call
+    /// never blocks on a permission or follow-up question. These are static,
+    /// never user input, so the no-injection contract holds.
+    pub fn oneshot_trailing_args(&self) -> &'static [&'static str] {
+        match self.name {
+            "copilot" => &["-s", "--allow-all-tools", "--no-ask-user"],
+            _ => &[],
+        }
+    }
+
     /// The base launch token(s) for the default (non-overridden) command:
     /// the binary, plus any `launch_subcommand` (e.g. `"kiro-cli chat"`). All
     /// subsequent flags (extra args, yolo, resume) are appended after this, so
@@ -1030,6 +1052,27 @@ mod tests {
                 "agent '{}' one-shot flag must not interpolate the prompt",
                 agent.name
             );
+            // The same single-token, no-interpolation contract applies to the
+            // static args inserted before and after the prompt.
+            for extra in agent
+                .oneshot_extra_args()
+                .iter()
+                .chain(agent.oneshot_trailing_args())
+            {
+                assert!(
+                    !extra.contains("{}"),
+                    "agent '{}' one-shot arg '{}' must not interpolate the prompt",
+                    agent.name,
+                    extra
+                );
+                assert_eq!(
+                    extra.split_whitespace().count(),
+                    1,
+                    "agent '{}' one-shot arg '{}' must be exactly one argv token",
+                    agent.name,
+                    extra
+                );
+            }
         }
     }
 
@@ -1071,6 +1114,31 @@ mod tests {
     #[test]
     fn test_get_agent_unknown() {
         assert!(get_agent("unknown").is_none());
+    }
+
+    #[test]
+    fn test_copilot_agent_definition() {
+        let copilot = get_agent("copilot").unwrap();
+        assert_eq!(copilot.binary, "copilot");
+        assert!(matches!(
+            &copilot.detection,
+            DetectionMethod::Which("copilot")
+        ));
+        assert!(matches!(&copilot.yolo, Some(YoloMode::CliFlag("--yolo"))));
+        // Copilot resumes a prior conversation with `copilot --session-id <id>`,
+        // where the id is captured from `~/.copilot/session-store.db`.
+        assert!(matches!(
+            &copilot.resume_strategy,
+            ResumeStrategy::Flag("--session-id")
+        ));
+        // One-shot title generation runs `copilot -p <prompt> -s
+        // --allow-all-tools --no-ask-user`.
+        assert_eq!(copilot.oneshot_flag, Some("-p"));
+        assert_eq!(
+            copilot.oneshot_trailing_args(),
+            &["-s", "--allow-all-tools", "--no-ask-user"]
+        );
+        assert!(!copilot.host_only);
     }
 
     #[test]

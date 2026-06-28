@@ -206,17 +206,24 @@ pub fn build_prompt(user_message: &str) -> String {
 }
 
 /// Build the argv for a one-shot title call, or `None` when the agent has no
-/// known one-shot mode. Always `[binary, oneshot_token, prompt]`: the prompt is
-/// a single argv element passed straight to the process, never interpolated
-/// into a shell string, so untrusted user text cannot inject arguments.
+/// known one-shot mode. Shape is `[binary, oneshot_token, extra.., prompt,
+/// trailing..]`: the prompt is a single argv element passed straight to the
+/// process, never interpolated into a shell string, so untrusted user text
+/// cannot inject arguments. `oneshot_trailing_args` is only populated for
+/// flag-value one-shots (e.g. copilot `-p`), where the CLI binds the prompt to
+/// the flag, so trailing flags after it stay unambiguous.
 pub fn build_oneshot_argv(agent: &agents::AgentDef, prompt: &str) -> Option<Vec<String>> {
     let token = agent.oneshot_flag?;
     let mut argv = vec![agent.binary.to_string(), token.to_string()];
     // Static per-agent flags (e.g. codex `--skip-git-repo-check`) go between the
-    // one-shot token and the prompt; the prompt stays the final argv element so
+    // one-shot token and the prompt; the prompt stays directly after them so
     // untrusted user text can never be read as an argument.
     argv.extend(agent.oneshot_extra_args().iter().map(|s| s.to_string()));
     argv.push(prompt.to_string());
+    // Static trailing flags (e.g. copilot `-s --allow-all-tools --no-ask-user`)
+    // follow the prompt for flag-value one-shots; the CLI has already bound the
+    // prompt to the one-shot flag, so these parse as options, not the prompt.
+    argv.extend(agent.oneshot_trailing_args().iter().map(|s| s.to_string()));
     Some(argv)
 }
 
@@ -709,6 +716,27 @@ mod tests {
         assert_eq!(
             build_oneshot_argv(claude(), "name this").unwrap(),
             vec!["claude", "-p", "name this"]
+        );
+    }
+
+    #[test]
+    fn argv_copilot_appends_silent_autoapprove_flags_after_prompt() {
+        // Copilot's `-p` binds the prompt as its value, so the auto-approve and
+        // silent flags follow the prompt. Without them a non-interactive title
+        // call can block on a permission prompt or print stats that pollute the
+        // title; with them stdout is just the final answer.
+        let argv = build_oneshot_argv(agents::get_agent("copilot").unwrap(), "name this")
+            .expect("copilot one-shot");
+        assert_eq!(
+            argv,
+            vec![
+                "copilot",
+                "-p",
+                "name this",
+                "-s",
+                "--allow-all-tools",
+                "--no-ask-user"
+            ]
         );
     }
 

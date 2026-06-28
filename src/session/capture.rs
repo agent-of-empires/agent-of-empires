@@ -1987,6 +1987,113 @@ fn extract_gemini_fields(path: &std::path::Path) -> Option<(Option<String>, Opti
     Some((session_id, project_hash))
 }
 
+// ─── Copilot CLI session capture ──────────────────────────────────────────────
+
+/// Resolve the path to Copilot's local SQLite session store.
+///
+/// Copilot records every session in the `sessions` table of `session-store.db`
+/// under its config dir (`$COPILOT_CONFIG_DIR`, default `~/.copilot`). Each row
+/// carries the session UUID (`id`), the working directory (`cwd`), and an ISO
+/// 8601 `updated_at` timestamp.
+fn copilot_db_path() -> Result<PathBuf> {
+    Ok(resolve_agent_home(Some("COPILOT_CONFIG_DIR"), ".copilot")?.join("session-store.db"))
+}
+
+/// Load Copilot's session rows from its SQLite store at `db_path`, newest
+/// first. Each row is `(id, cwd)`; rows without a `cwd` are skipped since they
+/// cannot be matched to a project. ISO 8601 `updated_at` strings sort
+/// chronologically as text, so `ORDER BY updated_at DESC` yields most-recent
+/// first.
+fn read_copilot_sessions_from_sqlite_at(db_path: &Path) -> Result<Vec<(String, String)>> {
+    use rusqlite::{Connection, OpenFlags};
+
+    if !db_path.exists() {
+        anyhow::bail!("Copilot session store not found at {}", db_path.display());
+    }
+
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| {
+        format!(
+            "Failed to open Copilot session store at {}",
+            db_path.display()
+        )
+    })?;
+    conn.busy_timeout(Duration::from_millis(100))
+        .context("Failed to set Copilot session store busy timeout")?;
+
+    let mut stmt = conn
+        .prepare("SELECT id, cwd FROM sessions WHERE cwd IS NOT NULL ORDER BY updated_at DESC")
+        .context("Copilot sessions table schema mismatch")?;
+
+    let rows = stmt
+        .query_map([], |row| {
+            let id: String = row.get(0)?;
+            let cwd: String = row.get(1)?;
+            Ok((id, cwd))
+        })
+        .context("Failed to query Copilot sessions table")?;
+
+    let mut entries: Vec<(String, String)> = Vec::new();
+    for row in rows {
+        entries.push(row.context("Failed to read Copilot session row")?);
+    }
+    Ok(entries)
+}
+
+/// Pick the newest unexcluded Copilot session whose `cwd` matches `match_path`.
+///
+/// `entries` are `(id, cwd)` pairs in newest-first order. Paths are compared
+/// after canonicalization so a symlinked or `/tmp` -> `/private/tmp` cwd still
+/// matches; a now-deleted cwd falls back to a raw string compare.
+fn select_copilot_session(
+    entries: &[(String, String)],
+    match_path: &str,
+    exclusion: &HashSet<String>,
+) -> Result<String> {
+    let canonical_match = canonicalize_or_raw(match_path);
+    entries
+        .iter()
+        .find(|(id, cwd)| !exclusion.contains(id) && canonicalize_or_raw(cwd) == canonical_match)
+        .map(|(id, _)| id.clone())
+        .ok_or_else(|| anyhow::anyhow!("No Copilot session found matching project path"))
+}
+
+/// Capture a Copilot session ID for `project_path`.
+///
+/// Reads the `sessions` table of `~/.copilot/session-store.db` (or
+/// `$COPILOT_CONFIG_DIR/session-store.db`) newest-first and returns the UUID of
+/// the most recently updated session whose recorded `cwd` matches
+/// `project_path`, skipping any IDs in `exclusion`. Copilot resumes that UUID
+/// with `copilot --session-id <id>`.
+pub(crate) fn capture_copilot_session_id(
+    project_path: &str,
+    exclusion: &HashSet<String>,
+) -> Result<String> {
+    let db_path = copilot_db_path()?;
+    let entries = read_copilot_sessions_from_sqlite_at(&db_path)?;
+    select_copilot_session(&entries, project_path, exclusion)
+}
+
+/// Polling closure for Copilot CLI session tracking.
+pub(crate) fn copilot_poll_fn(
+    project_path: String,
+    instance_id: String,
+    extra_excludes: HashSet<String>,
+) -> impl Fn() -> Option<String> + Send + 'static {
+    move || {
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
+        capture_copilot_session_id(&project_path, &exclusion)
+            .map_err(
+                |e| tracing::debug!(target: "session.capture", "Copilot poll capture failed: {}", e),
+            )
+            .ok()
+            .and_then(validated_session_id)
+    }
+}
+
 // ─── Hermes session capture ───────────────────────────────────────────────────
 
 const HERMES_COMMAND_TIMEOUT_SECS: u64 = 5;
@@ -3924,6 +4031,112 @@ mod tests {
     #[test]
     fn test_hermes_session_id_format_valid() {
         assert!(is_valid_session_id("20260429_193246_adcddd"));
+    }
+
+    fn create_copilot_test_db(rows: &[(&str, &str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("session-store.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                cwd TEXT,
+                updated_at TEXT
+            );",
+        )
+        .unwrap();
+        for (id, cwd, updated_at) in rows {
+            conn.execute(
+                "INSERT INTO sessions (id, cwd, updated_at) VALUES (?1, ?2, ?3)",
+                rusqlite::params![id, cwd, updated_at],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        dir
+    }
+
+    #[test]
+    fn test_select_copilot_session_matches_cwd_newest_first() {
+        let entries = vec![
+            ("newer".to_string(), "/work/proj".to_string()),
+            ("older".to_string(), "/work/proj".to_string()),
+            ("other".to_string(), "/work/elsewhere".to_string()),
+        ];
+        // ORDER BY updated_at DESC already put the newest match first.
+        let result = select_copilot_session(&entries, "/work/proj", &HashSet::new()).unwrap();
+        assert_eq!(result, "newer");
+    }
+
+    #[test]
+    fn test_select_copilot_session_skips_excluded() {
+        let entries = vec![
+            ("newer".to_string(), "/work/proj".to_string()),
+            ("older".to_string(), "/work/proj".to_string()),
+        ];
+        let exclusion: HashSet<String> = ["newer".to_string()].into_iter().collect();
+        let result = select_copilot_session(&entries, "/work/proj", &exclusion).unwrap();
+        assert_eq!(result, "older");
+    }
+
+    #[test]
+    fn test_select_copilot_session_no_cwd_match_errs() {
+        let entries = vec![("a".to_string(), "/work/elsewhere".to_string())];
+        let result = select_copilot_session(&entries, "/work/proj", &HashSet::new());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_copilot_basic() {
+        let tmp = create_copilot_test_db(&[
+            (
+                "11111111-1111-4111-8111-111111111111",
+                "/work/proj",
+                "2026-06-28T10:00:00.000Z",
+            ),
+            (
+                "22222222-2222-4222-8222-222222222222",
+                "/work/proj",
+                "2026-06-28T12:00:00.000Z",
+            ),
+        ]);
+        unsafe { std::env::set_var("COPILOT_CONFIG_DIR", tmp.path()) };
+        let result = capture_copilot_session_id("/work/proj", &HashSet::new()).unwrap();
+        unsafe { std::env::remove_var("COPILOT_CONFIG_DIR") };
+        // Newest updated_at wins.
+        assert_eq!(result, "22222222-2222-4222-8222-222222222222");
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_copilot_filters_by_project_path() {
+        let tmp = create_copilot_test_db(&[
+            (
+                "33333333-3333-4333-8333-333333333333",
+                "/work/other",
+                "2026-06-28T12:00:00.000Z",
+            ),
+            (
+                "44444444-4444-4444-8444-444444444444",
+                "/work/proj",
+                "2026-06-28T10:00:00.000Z",
+            ),
+        ]);
+        unsafe { std::env::set_var("COPILOT_CONFIG_DIR", tmp.path()) };
+        let result = capture_copilot_session_id("/work/proj", &HashSet::new()).unwrap();
+        unsafe { std::env::remove_var("COPILOT_CONFIG_DIR") };
+        assert_eq!(result, "44444444-4444-4444-8444-444444444444");
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_copilot_no_db() {
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("COPILOT_CONFIG_DIR", tmp.path()) };
+        let result = capture_copilot_session_id("/work/proj", &HashSet::new());
+        unsafe { std::env::remove_var("COPILOT_CONFIG_DIR") };
+        assert!(result.is_err());
     }
 
     fn create_opencode_test_db(rows: &[(&str, &str, i64)]) -> (tempfile::TempDir, PathBuf) {

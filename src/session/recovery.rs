@@ -2,8 +2,8 @@
 //!
 //! After a system reboot, tmux loses all its sessions. AoE sessions whose
 //! agent supports `--resume <sid>` (claude, opencode, codex, gemini, vibe,
-//! pi, hermes, kiro, qwen) can be transparently recreated by replaying the
-//! resume cascade in `start_with_resume_fallback`. This module centralises
+//! pi, hermes, kiro, qwen, copilot) can be transparently recreated by replaying
+//! the resume cascade in `start_with_resume_fallback`. This module centralises
 //! the candidate selection and the cross-process exclusion needed to make
 //! that safe when both the TUI (`aoe`) and the daemon (`aoe serve`) are
 //! running.
