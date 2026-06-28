@@ -93,34 +93,91 @@ pub fn resolve_session<'a>(identifier: &str, instances: &'a [Instance]) -> Resul
 /// daemon does this through its supervisor; the CLI has no live worker, so it
 /// opens the event store directly. It cannot send the adapter `session/delete`
 /// RPC the daemon sends (that needs a running worker), but deleting the local
-/// UI transcript stops purged rows from orphaning. No-op for non-structured
-/// sessions or when the store does not exist. See #2489.
+/// UI transcript stops purged rows from orphaning. No-op when the store does
+/// not exist; a failure to open or write it returns `Err` so callers keep the
+/// session row rather than orphan its transcript. See #2489, #2524.
+///
+/// The delete is idempotent and feature-independent: `rusqlite` is a
+/// non-optional dependency, so a default (non-`serve`) build can reach the
+/// store too. It deliberately does NOT gate on `Instance::is_structured()`,
+/// which always returns `false` in a non-`serve` build (the `view` field is
+/// serve-gated), so the old guard left the non-serve bail unreachable and
+/// orphaned transcripts. Deleting zero rows for a terminal session is harmless.
 pub(crate) fn purge_acp_transcript(inst: &Instance) -> Result<()> {
-    if !inst.is_structured() {
+    let app_dir = crate::session::get_app_dir()
+        .map_err(|e| anyhow::anyhow!("acp transcript purge: resolve app dir: {e}"))?;
+    let db_path = app_dir.join("acp_events.db");
+    if !db_path.exists() {
         return Ok(());
     }
-    // The durable transcript only exists under the `serve` feature (the `acp`
-    // module is gated on it). A default build cannot reach the event store, so
-    // it must NOT report success: callers (`rm --purge`, `empty-trash`) read
-    // `Ok(())` as "safe to drop the session row", which would delete the row
-    // while orphaning its transcript in `acp_events.db`. Bail instead.
-    #[cfg(not(feature = "serve"))]
-    {
-        anyhow::bail!("acp transcript purge requires a build with the `serve` feature")
-    }
-    #[cfg(feature = "serve")]
-    {
-        let app_dir = crate::session::get_app_dir()
-            .map_err(|e| anyhow::anyhow!("acp transcript purge: resolve app dir: {e}"))?;
-        let db_path = app_dir.join("acp_events.db");
-        if !db_path.exists() {
-            return Ok(());
+    purge_acp_transcript_rows(&db_path, &inst.id)
+}
+
+/// Delete a session's rows from the ACP event store at `db_path`, removing both
+/// the event rows and their attachment blobs (mirrors
+/// `crate::events::delete_topic`'s cascade so no orphaned bytes are left).
+/// A missing table means the store predates it: nothing to purge. Kept
+/// feature-independent so non-`serve` CLI builds can clean transcripts too.
+fn purge_acp_transcript_rows(db_path: &std::path::Path, session_id: &str) -> Result<()> {
+    let conn = rusqlite::Connection::open(db_path)
+        .map_err(|e| anyhow::anyhow!("acp transcript purge: open event store: {e}"))?;
+    // A running daemon may hold the store open; wait briefly rather than fail.
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|e| anyhow::anyhow!("acp transcript purge: set busy_timeout: {e}"))?;
+    // The source of truth for these names is `crate::events::Schema` (prefix
+    // "acp"), which is serve-gated and so cannot be referenced from here.
+    for table in ["acp_events", "acp_attachments"] {
+        match conn.execute(
+            &format!("DELETE FROM {table} WHERE session_id = ?1"),
+            rusqlite::params![session_id],
+        ) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(_, Some(msg))) if msg.contains("no such table") => {}
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "acp transcript purge: delete from {table}: {e}"
+                ))
+            }
         }
-        let store = crate::acp::event_store::EventStore::open(&db_path, 100)
-            .map_err(|e| anyhow::anyhow!("acp transcript purge: open event store: {e}"))?;
-        store.delete_session(&inst.id);
-        Ok(())
     }
+    Ok(())
+}
+
+/// Decides whether a CLI permanent purge must KEEP a row it had targeted,
+/// because the row was restored after the purge snapshot was taken. A purge
+/// runs its destructive teardown on an unlocked snapshot and only removes the
+/// row from storage under the lock; if it targeted a trashed session and a
+/// concurrent restore untrashed it in between, the restore wins and the row is
+/// kept rather than silently deleted. A purge of a row that was not trashed at
+/// snapshot time (a direct `rm --purge` of a live session) has no restore to
+/// lose to, so it is never kept on this basis. See #2534.
+pub(crate) fn purge_restored_row_must_be_kept(targeted_trashed: bool, still_trashed: bool) -> bool {
+    targeted_trashed && !still_trashed
+}
+
+/// Apply a completed `empty-trash` purge to the latest storage snapshot under
+/// the lock: drop every successfully-purged row that is still trashed, and keep
+/// any that a concurrent restore brought back (its teardown already ran, so the
+/// caller should warn). Returns `(removed, restored_kept)`. The `removed` count
+/// is what callers must report instead of the candidate count. See #2527, #2534.
+pub(crate) fn apply_empty_trash_purge(
+    instances: &mut Vec<Instance>,
+    purged: &std::collections::HashSet<String>,
+) -> (usize, usize) {
+    let before = instances.len();
+    let mut restored = 0usize;
+    instances.retain(|i| {
+        if !purged.contains(&i.id) {
+            return true;
+        }
+        if purge_restored_row_must_be_kept(true, i.is_trashed()) {
+            restored += 1;
+            true
+        } else {
+            false
+        }
+    });
+    (before - instances.len(), restored)
 }
 
 pub fn truncate(s: &str, max: usize) -> String {
@@ -235,5 +292,106 @@ mod tests {
         })
         .unwrap();
         assert_eq!(v[1].title, "renamed");
+    }
+
+    // #2534: a purge keeps a targeted row only when it was trashed at snapshot
+    // time but is no longer trashed (restored mid-purge); every other case
+    // drops it (still trashed, or a direct live purge with no restore to lose).
+    #[test]
+    fn purge_keeps_only_rows_restored_after_a_trashed_snapshot() {
+        assert!(purge_restored_row_must_be_kept(true, false));
+        assert!(!purge_restored_row_must_be_kept(true, true));
+        assert!(!purge_restored_row_must_be_kept(false, false));
+        assert!(!purge_restored_row_must_be_kept(false, true));
+    }
+
+    // #2527 + #2534: empty-trash must report the count actually removed (not
+    // the candidate count), drop only rows still trashed, and keep rows a
+    // concurrent restore brought back.
+    #[test]
+    fn apply_empty_trash_purge_counts_removed_and_keeps_restored() {
+        use std::collections::HashSet;
+
+        let mut still_trashed = Instance::new("gone", "/tmp/a");
+        still_trashed.trash();
+        let restored = Instance::new("restored", "/tmp/b"); // purged but no longer trashed
+        let mut untargeted = Instance::new("other", "/tmp/c");
+        untargeted.trash();
+
+        let purged: HashSet<String> = [still_trashed.id.clone(), restored.id.clone()]
+            .into_iter()
+            .collect();
+        let restored_id = restored.id.clone();
+        let untargeted_id = untargeted.id.clone();
+        let mut instances = vec![still_trashed, restored, untargeted];
+
+        let (removed, kept_restored) = apply_empty_trash_purge(&mut instances, &purged);
+
+        assert_eq!(removed, 1, "only the still-trashed candidate is removed");
+        assert_eq!(
+            kept_restored, 1,
+            "the restored candidate is kept and counted"
+        );
+        let surviving: Vec<&str> = instances.iter().map(|i| i.id.as_str()).collect();
+        assert!(surviving.contains(&restored_id.as_str()));
+        assert!(surviving.contains(&untargeted_id.as_str()));
+        assert_eq!(instances.len(), 2);
+    }
+
+    // #2524: the non-serve purge path used to be unreachable, orphaning
+    // transcripts. The feature-independent row delete must drop both the
+    // event rows and their attachment blobs for the target session only.
+    #[test]
+    fn purge_acp_transcript_rows_deletes_only_target_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("acp_events.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE acp_events (session_id TEXT, seq INTEGER, event_json TEXT);
+             CREATE TABLE acp_attachments (session_id TEXT, attachment_id TEXT, data BLOB);
+             INSERT INTO acp_events VALUES ('keep', 0, '{}'), ('drop', 0, '{}'), ('drop', 1, '{}');
+             INSERT INTO acp_attachments VALUES ('keep', 'a0', x'00'), ('drop', 'a1', x'01');",
+        )
+        .unwrap();
+        drop(conn);
+
+        purge_acp_transcript_rows(&db_path, "drop").unwrap();
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM acp_events WHERE session_id = 'drop'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let attachments: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM acp_attachments WHERE session_id = 'drop'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let kept_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM acp_events WHERE session_id = 'keep'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 0, "target event rows should be deleted");
+        assert_eq!(attachments, 0, "target attachment blobs should be deleted");
+        assert_eq!(kept_events, 1, "other session must be untouched");
+    }
+
+    // A store that predates a table (or any expected table missing) is not an
+    // error: there is simply nothing to purge.
+    #[test]
+    fn purge_acp_transcript_rows_tolerates_missing_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("acp_events.db");
+        // Open creates an empty db with neither acp_events nor acp_attachments.
+        rusqlite::Connection::open(&db_path).unwrap();
+        purge_acp_transcript_rows(&db_path, "whatever").unwrap();
     }
 }

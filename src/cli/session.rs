@@ -485,18 +485,36 @@ async fn empty_trash(profile: &str) -> Result<()> {
         }
     }
 
-    // Phase 2 (locked): drop every purged id from the latest disk state.
+    // Phase 2 (locked): drop every successfully-purged id from the latest disk
+    // state. #2534: revalidate under the lock; a candidate restored mid-purge
+    // (no longer trashed) must survive even though its teardown already ran on
+    // the snapshot. #2527: report the count actually removed, not the candidate
+    // count, plus how many were kept (teardown/transcript failed, or restored).
     let purged_set: HashSet<String> = purged_ids.into_iter().collect();
-    storage.update(|all_instances, _groups| {
-        all_instances.retain(|i| !purged_set.contains(&i.id));
-        Ok(())
+    let candidates = trashed.len();
+    let (removed, restored) = storage.update(|all_instances, _groups| {
+        Ok(super::apply_empty_trash_purge(all_instances, &purged_set))
     })?;
 
-    println!(
-        "Emptied trash: purged {} session(s) from profile '{}'.",
-        trashed.len(),
-        storage.profile()
-    );
+    let kept = candidates.saturating_sub(removed);
+    if restored > 0 {
+        eprintln!(
+            "Warning: {restored} session(s) were restored while the trash was being \
+             emptied; kept the restored records, but their worktree, branch, container, \
+             or transcript may already have been removed. Inspect and repair them."
+        );
+    }
+    if kept > 0 {
+        println!(
+            "Emptied trash: purged {removed} session(s), kept {kept} for retry, from profile '{}'.",
+            storage.profile()
+        );
+    } else {
+        println!(
+            "Emptied trash: purged {removed} session(s) from profile '{}'.",
+            storage.profile()
+        );
+    }
     Ok(())
 }
 

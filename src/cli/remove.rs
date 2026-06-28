@@ -46,6 +46,21 @@ fn needs_worktree_cleanup(inst: &Instance, args: &RemoveArgs) -> bool {
     args.delete_worktree && inst.has_managed_worktree_or_workspace()
 }
 
+/// Whether a `--purge` should delete the session's git branch(es). #2525: gated
+/// on the shape-agnostic predicate so it fires for multi-repo workspace sessions
+/// (only `workspace_info`, no `worktree_info`) as well as worktree sessions;
+/// `perform_deletion` keys both worktree and workspace-repo branch cleanup off
+/// this flag. The old `worktree_info`-only gate skipped workspace branches.
+fn should_delete_branch(
+    inst: &Instance,
+    args: &RemoveArgs,
+    delete_worktree: bool,
+    delete_branch_on_cleanup: bool,
+) -> bool {
+    inst.has_managed_worktree_or_workspace()
+        && (args.delete_branch || (delete_worktree && delete_branch_on_cleanup))
+}
+
 #[tracing::instrument(target = "cli.session", skip_all, fields(profile = %profile))]
 pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
     let storage = Storage::new_unwatched(profile)?;
@@ -128,11 +143,12 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
     }
 
     let delete_worktree = needs_worktree_cleanup(&inst, &args);
-    let delete_branch = inst
-        .worktree_info
-        .as_ref()
-        .is_some_and(|wt| wt.managed_by_aoe)
-        && (args.delete_branch || (delete_worktree && config.worktree.delete_branch_on_cleanup));
+    let delete_branch = should_delete_branch(
+        &inst,
+        &args,
+        delete_worktree,
+        config.worktree.delete_branch_on_cleanup,
+    );
     let delete_sandbox = inst.sandbox_info.as_ref().is_some_and(|s| s.enabled)
         && !args.keep_container
         && config.sandbox.auto_cleanup;
@@ -204,18 +220,50 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
     }
 
     // Phase 2 (locked): drop the entry by id from the latest disk state.
-    // No-op if a peer already removed it; that is the correct semantics.
-    storage.update(|all_instances, _groups| {
-        all_instances.retain(|i| i.id != removed_id);
-        Ok(())
+    // #2534: revalidate under the lock. The destructive teardown above ran on
+    // an unlocked snapshot; if this purge targeted a trashed session and a
+    // concurrent restore untrashed it in the meantime, the restore must win, so
+    // keep the row instead of deleting a session the user just brought back.
+    // A no-op when a peer already removed it; that is the correct semantics.
+    let was_trashed = inst.is_trashed();
+    let outcome = storage.update(|all_instances, _groups| {
+        Ok(
+            match all_instances.iter().position(|i| i.id == removed_id) {
+                None => RowRemoval::AlreadyGone,
+                Some(idx)
+                    if super::purge_restored_row_must_be_kept(
+                        was_trashed,
+                        all_instances[idx].is_trashed(),
+                    ) =>
+                {
+                    RowRemoval::KeptRestored
+                }
+                Some(idx) => {
+                    all_instances.remove(idx);
+                    RowRemoval::Removed
+                }
+            },
+        )
     })?;
+
+    if matches!(outcome, RowRemoval::KeptRestored) {
+        eprintln!(
+            "Warning: session {} was restored while its purge was running; kept the \
+             restored record, but its worktree, branch, container, or transcript may \
+             already have been removed by the purge. Inspect and repair it.",
+            removed_title
+        );
+        return Ok(());
+    }
 
     // Keep the project in the new-session wizard's Recent tab after its last
     // session is gone (#2141). Best-effort; a failure must not fail the remove.
-    if let Some(entry) = crate::session::recent_project_entry_for(&inst) {
-        if let Err(e) = crate::session::record_recent_project(entry) {
-            tracing::warn!(target: "session.delete",
-                "recording recent project after remove failed: {e}");
+    if matches!(outcome, RowRemoval::Removed) {
+        if let Some(entry) = crate::session::recent_project_entry_for(&inst) {
+            if let Err(e) = crate::session::record_recent_project(entry) {
+                tracing::warn!(target: "session.delete",
+                    "recording recent project after remove failed: {e}");
+            }
         }
     }
 
@@ -226,6 +274,16 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Outcome of the final locked row-removal step in a `--purge`. See #2534.
+enum RowRemoval {
+    /// The row was dropped from storage.
+    Removed,
+    /// A concurrent restore won; the (now untrashed) row was kept.
+    KeptRestored,
+    /// A peer already removed the row before this purge reached the lock.
+    AlreadyGone,
 }
 
 #[cfg(test)]
@@ -269,5 +327,38 @@ mod tests {
 
         assert!(needs_worktree_cleanup(&inst, &args(true)));
         assert!(!needs_worktree_cleanup(&inst, &args(false)));
+    }
+
+    // Regression for #2525: a multi-repo workspace session has no
+    // `worktree_info`, so the old `worktree_info`-only gate returned false and
+    // `--purge --delete-worktree --delete-branch` left the AoE-created branches
+    // behind. The shape-agnostic gate must enable branch deletion for it.
+    #[test]
+    fn should_delete_branch_true_for_workspace_session() {
+        let mut inst = Instance::new("WS", "/tmp/ws/repo-a");
+        inst.workspace_info = Some(WorkspaceInfo {
+            branch: "feature/abc".to_string(),
+            workspace_dir: "/tmp/ws".to_string(),
+            repos: vec![WorkspaceRepo {
+                name: "repo-a".to_string(),
+                source_path: "/tmp/src/repo-a".to_string(),
+                branch: "feature/abc".to_string(),
+                worktree_path: "/tmp/ws/repo-a".to_string(),
+                main_repo_path: "/tmp/src/repo-a".to_string(),
+                managed_by_aoe: true,
+            }],
+            created_at: Utc::now(),
+            cleanup_on_delete: true,
+        });
+
+        let mut with_flag = args(true);
+        with_flag.delete_branch = true;
+        // Explicit --delete-branch fires regardless of the config default.
+        assert!(should_delete_branch(&inst, &with_flag, true, false));
+        // And via the config default when deleting the worktree.
+        assert!(should_delete_branch(&inst, &args(true), true, true));
+        // Not without any managed worktree/workspace.
+        let plain = Instance::new("plain", "/tmp/plain");
+        assert!(!should_delete_branch(&plain, &with_flag, true, true));
     }
 }
