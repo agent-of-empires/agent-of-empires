@@ -215,6 +215,18 @@ async function mockMultiApis(
   const handle: MultiHandle = { deletedIds: [], deleteOptions: {}, restoredIds: [] };
   const trashedState = new Map(sessions.map((s) => [s.id, s.trashed]));
 
+  // Force the user-group axis so `buildSessionGroups` actually slices the
+  // workspace by `group_path`. The slicing bug (#2533) cannot reproduce on the
+  // default repo axis, where rows already carry the full unsliced workspace.
+  await page.addInitScript(() => {
+    try {
+      localStorage.setItem("aoe-sidebar-axis", "group");
+    } catch {
+      // jsdom-less / storage-disabled contexts fall back to the default axis.
+    }
+  });
+  await page.route("**/api/app-state/web-ui-state", (r) => r.fulfill({ json: { "aoe-sidebar-axis": "group" } }));
+
   await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
   await page.route("**/api/sessions", (r) => {
     if (r.request().method() !== "GET") return r.fulfill({ status: 400 });
