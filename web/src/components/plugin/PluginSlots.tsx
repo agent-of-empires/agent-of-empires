@@ -307,11 +307,19 @@ const ACTION_TIMEOUT_MS = 15000;
  *  worker's re-pushed state has landed), not merely until the POST is accepted,
  *  with a hard timeout fallback so it can never hang. A failed POST clears the
  *  spinner at once. An icon is optional. */
-function BlockAction({ block, pluginId }: { block: Record<string, unknown>; pluginId: string }) {
+function BlockAction({
+  block,
+  pluginId,
+  sessionId,
+}: {
+  block: Record<string, unknown>;
+  pluginId: string;
+  sessionId?: string;
+}) {
   const label = str(block, "label");
   const method = str(block, "method");
   const iconComp = lucideIcon(str(block, "icon"));
-  const revision = usePluginUiRevision(pluginId);
+  const revision = usePluginUiRevision(pluginId, sessionId);
   const poke = usePluginUiPoke();
   // `posting`: the POST is in flight. `waitBaseline`: the revision the host had
   // when it accepted the action; the button keeps spinning until the polled
@@ -345,11 +353,14 @@ function BlockAction({ block, pluginId }: { block: Record<string, unknown>; plug
     postingRef.current = true;
     setPosting(true);
     try {
-      const accepted = await invokePluginAction(pluginId, method);
+      const accepted = await invokePluginAction(pluginId, method, sessionId);
       if (!accepted) return; // 403/404/network: nothing re-pushes, stop spinning
+      poke();
+      // No baseline (older daemon): can't track completion, so degrade to
+      // clearing when the POST settles rather than spinning to the timeout.
+      if (accepted.baselineRevision === null) return;
       // Hold the spinner until the revision moves off this baseline (see above).
       setWaitBaseline(accepted.baselineRevision);
-      poke();
       if (timerRef.current) clearTimeout(timerRef.current);
       timerRef.current = setTimeout(() => {
         setWaitBaseline(null);
@@ -454,7 +465,15 @@ function BlockComment({ block }: { block: Record<string, unknown> }) {
  *  an unknown `kind` (or a known kind missing its required field) renders
  *  nothing rather than throwing, so a newer plugin can push kinds an older host
  *  has never heard of. */
-function DetailBlock({ block, pluginId }: { block: Record<string, unknown>; pluginId: string }) {
+function DetailBlock({
+  block,
+  pluginId,
+  sessionId,
+}: {
+  block: Record<string, unknown>;
+  pluginId: string;
+  sessionId?: string;
+}) {
   switch (str(block, "kind")) {
     case "heading": {
       const text = str(block, "text");
@@ -471,11 +490,11 @@ function DetailBlock({ block, pluginId }: { block: Record<string, unknown>; plug
     case "divider":
       return <hr className="border-surface-700/60" />;
     case "action":
-      return <BlockAction block={block} pluginId={pluginId} />;
+      return <BlockAction block={block} pluginId={pluginId} sessionId={sessionId} />;
     case "section": {
       const title = str(block, "title");
       const children = Array.isArray(block.children) ? block.children.filter(isObject) : [];
-      const body = children.map((c, i) => <DetailBlock key={i} block={c} pluginId={pluginId} />);
+      const body = children.map((c, i) => <DetailBlock key={i} block={c} pluginId={pluginId} sessionId={sessionId} />);
       // An optional tone-tinted icon on the title gives an at-a-glance status
       // even when the section is folded (e.g. a green check vs a red x).
       const tone = validTone(block.tone);
@@ -540,7 +559,7 @@ export function PluginPaneBody({ entry }: { entry: PluginUiEntry }) {
       {blocks ? (
         <div className="flex flex-col gap-1.5">
           {blocks.map((b, i) => (
-            <DetailBlock key={i} block={b} pluginId={entry.plugin_id} />
+            <DetailBlock key={i} block={b} pluginId={entry.plugin_id} sessionId={entry.session_id} />
           ))}
         </div>
       ) : (

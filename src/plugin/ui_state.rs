@@ -15,7 +15,7 @@
 //! and immediately crashes should still reach the browser) and the client
 //! toasts each one once by tracking the monotonic `seq`.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
@@ -282,14 +282,16 @@ pub struct UiEntry {
 pub struct UiSnapshot {
     pub entries: Vec<UiEntry>,
     pub notifications: Vec<Notification>,
-    /// Per-plugin monotonic mutation counter. The dashboard reads a baseline
-    /// from the action POST and holds a manual-action spinner until the
-    /// plugin's counter moves off it, so the spinner tracks the worker's
-    /// re-pushed state instead of the fire-and-forget POST. `BTreeMap` for a
-    /// deterministic serialized order; `serde(default)` so an older daemon's
-    /// snapshot still decodes.
+    /// Monotonic mutation counter per `(plugin_id, scope)`, where `scope` is a
+    /// session id, or `""` for a global (session-less) slot. The dashboard reads
+    /// a baseline from the action POST and holds a manual-action spinner until
+    /// the matching scope's counter moves off it, so the spinner tracks the
+    /// worker's re-pushed state for that pane instead of the fire-and-forget
+    /// POST, and an unrelated session's push never clears it. Outer key is the
+    /// plugin id, inner key the scope. `BTreeMap` for a deterministic serialized
+    /// order; `serde(default)` so an older daemon's snapshot still decodes.
     #[serde(default)]
-    pub revisions: BTreeMap<String, u64>,
+    pub revisions: BTreeMap<String, BTreeMap<String, u64>>,
 }
 
 #[derive(Default)]
@@ -301,17 +303,37 @@ struct Inner {
     active: HashMap<String, u64>,
     notifications: VecDeque<Notification>,
     notify_seq: u64,
-    /// Per-plugin mutation counter, bumped on every accepted entry change.
-    /// Daemon-local: it resets when the daemon restarts, so the client treats
-    /// any change off its baseline (including a reset to a lower value) as
-    /// "state moved".
-    revisions: HashMap<String, u64>,
+    /// Mutation counter keyed by `(plugin_id, scope)`, bumped on every accepted
+    /// entry change to that scope. `scope` is the entry's session id, or `""`
+    /// for a global slot. Daemon-local: it resets when the daemon restarts, so
+    /// the client treats any change off its baseline (including a reset to a
+    /// lower value) as "state moved".
+    revisions: HashMap<(String, String), u64>,
+}
+
+/// The revision scope an entry belongs to: its session id, or `""` for a global
+/// (session-less) slot. Shared by writes and the snapshot so they key alike.
+fn scope_of(session_id: Option<&str>) -> String {
+    session_id.unwrap_or("").to_string()
 }
 
 impl Inner {
-    fn bump_revision(&mut self, plugin_id: &str) {
-        let rev = self.revisions.entry(plugin_id.to_string()).or_insert(0);
+    fn bump_revision(&mut self, plugin_id: &str, scope: String) {
+        let rev = self
+            .revisions
+            .entry((plugin_id.to_string(), scope))
+            .or_insert(0);
         *rev = rev.saturating_add(1);
+    }
+
+    /// The distinct scopes a plugin currently has entries in. Used to bump every
+    /// affected pane's counter when a bulk clear drops a plugin's entries.
+    fn plugin_scopes(&self, plugin_id: &str) -> HashSet<String> {
+        self.entries
+            .keys()
+            .filter(|k| k.plugin_id == plugin_id)
+            .map(|k| scope_of(k.session_id.as_deref()))
+            .collect()
     }
 }
 
@@ -349,20 +371,25 @@ impl UiStore {
         // fast respawn (begin running before the exited worker's clear_plugin),
         // where clearing by the old generation would otherwise no-op and leave
         // its entries visible until the new worker happened to overwrite them.
-        let before = inner.entries.len();
+        let scopes = inner.plugin_scopes(plugin_id);
         inner.entries.retain(|k, _| k.plugin_id != plugin_id);
-        if before != inner.entries.len() {
-            inner.bump_revision(plugin_id);
+        for scope in scopes {
+            inner.bump_revision(plugin_id, scope);
         }
         inner.active.insert(plugin_id.to_string(), gen);
         gen
     }
 
-    /// The plugin's current mutation counter, or 0 if it has none yet. The
-    /// action endpoint reads this before forwarding an action so the client can
-    /// wait for the worker's re-pushed state to move it.
-    pub fn revision(&self, plugin_id: &str) -> u64 {
-        self.read().revisions.get(plugin_id).copied().unwrap_or(0)
+    /// The mutation counter for one `(plugin_id, session)` scope, or 0 if it has
+    /// none yet. The action endpoint reads this for the clicked pane's session
+    /// before forwarding, so the client waits only for that pane's re-pushed
+    /// state, not any update from the same plugin in another session.
+    pub fn revision(&self, plugin_id: &str, session_id: Option<&str>) -> u64 {
+        self.read()
+            .revisions
+            .get(&(plugin_id.to_string(), scope_of(session_id)))
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Validate and store one entry. Rejects a stale generation, a payload that
@@ -402,7 +429,7 @@ impl UiStore {
             return Err(UiError::QuotaExceeded);
         }
         inner.entries.insert(key, normalized);
-        inner.bump_revision(plugin_id);
+        inner.bump_revision(plugin_id, scope_of(session_id));
         Ok(())
     }
 
@@ -430,7 +457,7 @@ impl UiStore {
             return Err(UiError::StaleWorker);
         }
         if inner.entries.remove(&key).is_some() {
-            inner.bump_revision(plugin_id);
+            inner.bump_revision(plugin_id, scope_of(session_id));
         }
         Ok(())
     }
@@ -482,11 +509,11 @@ impl UiStore {
             return false;
         }
         inner.active.remove(plugin_id);
-        let before = inner.entries.len();
+        let scopes = inner.plugin_scopes(plugin_id);
         inner.entries.retain(|k, _| k.plugin_id != plugin_id);
-        let changed = before != inner.entries.len();
-        if changed {
-            inner.bump_revision(plugin_id);
+        let changed = !scopes.is_empty();
+        for scope in scopes {
+            inner.bump_revision(plugin_id, scope);
         }
         changed
     }
@@ -517,14 +544,17 @@ impl UiStore {
                 &b.session_id,
             ))
         });
+        let mut revisions: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
+        for ((plugin_id, scope), rev) in &inner.revisions {
+            revisions
+                .entry(plugin_id.clone())
+                .or_default()
+                .insert(scope.clone(), *rev);
+        }
         UiSnapshot {
             entries,
             notifications: inner.notifications.iter().cloned().collect(),
-            revisions: inner
-                .revisions
-                .iter()
-                .map(|(k, v)| (k.clone(), *v))
-                .collect(),
+            revisions,
         }
     }
 
@@ -980,8 +1010,8 @@ mod tests {
     #[test]
     fn revision_bumps_on_mutation_and_surfaces_in_snapshot() {
         let s = store();
-        // Absent until the plugin first mutates state.
-        assert_eq!(s.revision("acme.kit"), 0);
+        // Absent until the plugin first mutates state (global scope here).
+        assert_eq!(s.revision("acme.kit", None), 0);
         let g = s.begin_generation("acme.kit");
 
         s.set(
@@ -993,7 +1023,7 @@ mod tests {
             &json!({"title": "x"}),
         )
         .unwrap();
-        assert_eq!(s.revision("acme.kit"), 1);
+        assert_eq!(s.revision("acme.kit", None), 1);
 
         // An identical re-push still bumps: a refresh that returns unchanged
         // data must still move the counter, or a waiting spinner would hang.
@@ -1006,17 +1036,57 @@ mod tests {
             &json!({"title": "x"}),
         )
         .unwrap();
-        assert_eq!(s.revision("acme.kit"), 2);
+        assert_eq!(s.revision("acme.kit", None), 2);
 
         // Removing a present entry bumps; removing an absent one does not.
         s.remove("acme.kit", g, UiSlot::Card, "c0", None).unwrap();
-        assert_eq!(s.revision("acme.kit"), 3);
+        assert_eq!(s.revision("acme.kit", None), 3);
         s.remove("acme.kit", g, UiSlot::Card, "gone", None).unwrap();
-        assert_eq!(s.revision("acme.kit"), 3);
+        assert_eq!(s.revision("acme.kit", None), 3);
 
-        // The counter is exposed in the polled snapshot, scoped per plugin.
+        // The counter is exposed in the polled snapshot, keyed plugin -> scope.
         let snap = s.snapshot();
-        assert_eq!(snap.revisions.get("acme.kit"), Some(&3));
+        assert_eq!(
+            snap.revisions.get("acme.kit").and_then(|m| m.get("")),
+            Some(&3)
+        );
         assert_eq!(snap.revisions.get("other.kit"), None);
+    }
+
+    #[test]
+    fn revision_is_scoped_per_session() {
+        let s = store();
+        let g = s.begin_generation("acme.kit");
+        // A pane push for session s1 bumps only s1's scope.
+        s.set(
+            "acme.kit",
+            g,
+            UiSlot::Pane,
+            "p",
+            Some("s1"),
+            &json!({"title": "a"}),
+        )
+        .unwrap();
+        assert_eq!(s.revision("acme.kit", Some("s1")), 1);
+        assert_eq!(s.revision("acme.kit", Some("s2")), 0);
+
+        // A push for an unrelated session must not move s1's counter, so s1's
+        // refresh spinner cannot be cleared by s2's activity.
+        s.set(
+            "acme.kit",
+            g,
+            UiSlot::Pane,
+            "p",
+            Some("s2"),
+            &json!({"title": "b"}),
+        )
+        .unwrap();
+        assert_eq!(s.revision("acme.kit", Some("s1")), 1);
+        assert_eq!(s.revision("acme.kit", Some("s2")), 1);
+
+        // A bulk clear bumps every scope the plugin had entries in.
+        s.clear_plugin("acme.kit", g);
+        assert_eq!(s.revision("acme.kit", Some("s1")), 2);
+        assert_eq!(s.revision("acme.kit", Some("s2")), 2);
     }
 }

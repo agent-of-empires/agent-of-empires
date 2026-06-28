@@ -15,7 +15,7 @@ import type { PluginUiEntry } from "./api";
 // change even though they never read them.
 const PluginUiEntriesContext = createContext<PluginUiEntry[]>([]);
 const PluginUiRefreshingContext = createContext(false);
-const PluginUiRevisionsContext = createContext<Record<string, number>>({});
+const PluginUiRevisionsContext = createContext<Record<string, Record<string, number>>>({});
 const PluginUiPokeContext = createContext<() => void>(() => {});
 
 export function PluginUiProvider({ children }: { children: ReactNode }) {
@@ -42,10 +42,12 @@ export function usePluginUiRefreshing(): boolean {
   return useContext(PluginUiRefreshingContext);
 }
 
-/** The plugin's current UI mutation counter (0 if none seen yet). A pane action
- *  holds its spinner until this moves off the baseline the action POST returned. */
-export function usePluginUiRevision(pluginId: string): number {
-  return useContext(PluginUiRevisionsContext)[pluginId] ?? 0;
+/** The UI mutation counter for one plugin pane's scope (a session id, or the
+ *  global `""` scope), 0 if none seen yet. A pane action holds its spinner until
+ *  this moves off the baseline the action POST returned, so a different
+ *  session's push for the same plugin cannot clear it. */
+export function usePluginUiRevision(pluginId: string, sessionId?: string): number {
+  return useContext(PluginUiRevisionsContext)[pluginId]?.[sessionId ?? ""] ?? 0;
 }
 
 /** Run a ui-state poll now and briefly boost the cadence, so a just-fired pane

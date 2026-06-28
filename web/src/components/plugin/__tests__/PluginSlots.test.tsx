@@ -110,7 +110,7 @@ describe("plugin slot renderers", () => {
     const btn = screen.getByTestId("plugin-pane-action");
     expect(btn.textContent).toContain("Refresh");
     fireEvent.click(btn);
-    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("acme.kit", "github.refresh"));
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("acme.kit", "github.refresh", "s1"));
   });
 
   it("holds the spinner until the plugin revision advances, not just until the POST resolves", async () => {
@@ -174,6 +174,28 @@ describe("plugin slot renderers", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("skips the wait and clears on POST settle when the daemon omits a baseline", async () => {
+    // Older daemon: no baseline_revision, so the API returns null. The button
+    // must not spin to the 15s timeout; it clears once the POST settles.
+    revisionRef.current = 0;
+    invokeMock.mockImplementationOnce(async () => ({ baselineRevision: null }));
+    const entry: PluginUiEntry = {
+      plugin_id: "acme.kit",
+      slot: "pane",
+      id: "p",
+      session_id: "s1",
+      payload: { blocks: [{ kind: "action", label: "Refresh", method: "github.refresh" }] },
+    };
+    const { container } = render(<PluginPaneBody entry={entry} />);
+    const btn = screen.getByTestId("plugin-pane-action") as HTMLButtonElement;
+    fireEvent.click(btn);
+    await waitFor(() => expect(pokeMock).toHaveBeenCalled());
+    await waitFor(() => {
+      expect(container.querySelector("svg.animate-spin")).toBeNull();
+      expect(btn.disabled).toBe(false);
+    });
   });
 
   it("pane action stops the spinner and stays actionable when the POST fails", async () => {

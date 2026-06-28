@@ -36,7 +36,7 @@ const REFRESH_INDICATOR_DELAY = 250;
 
 export function usePluginUiState() {
   const [entries, setEntries] = useState<PluginUiEntry[]>([]);
-  const [revisions, setRevisions] = useState<Record<string, number>>({});
+  const [revisions, setRevisions] = useState<Record<string, Record<string, number>>>({});
   const [isRefreshing, setIsRefreshing] = useState(false);
   // Highest notification seq already toasted. Seeded from the first snapshot so
   // a page load does not replay the whole backlog as fresh toasts.

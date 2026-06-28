@@ -105,9 +105,9 @@ impl HostApiState {
         self.ui.snapshot()
     }
 
-    /// The plugin's current UI mutation counter (0 if none yet).
-    pub fn ui_revision(&self, plugin_id: &str) -> u64 {
-        self.ui.revision(plugin_id)
+    /// The UI mutation counter for one `(plugin, session)` scope (0 if none yet).
+    pub fn ui_revision(&self, plugin_id: &str, session_id: Option<&str>) -> u64 {
+        self.ui.revision(plugin_id, session_id)
     }
 
     /// Push a host-originated notification onto the ring. Unlike the `ui.notify`
