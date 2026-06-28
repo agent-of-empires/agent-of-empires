@@ -47,10 +47,15 @@ test.describe.serial("file-watch peer propagation", () => {
         })
         .toBe(true);
 
-      // Once the watcher has updated daemon state, the dashboard can take a
-      // little longer to repaint.
+      // Once the watcher has updated daemon state, the dashboard still has to
+      // pick the change up on its own client poll (useSessions POLL_INTERVAL,
+      // 3s) and repaint. The watcher-beats-poll guarantee is already proven by
+      // the 1.5s daemon-state assertion above; this only confirms the UI
+      // eventually reflects it, so the budget must comfortably exceed one poll
+      // cycle. A 3s ceiling equalled the poll interval and raced (a rename
+      // landing right after a poll missed the window). Allow several cycles.
       await expect(page.getByText("peer-target")).toBeVisible({
-        timeout: 3_000,
+        timeout: 10_000,
       });
     } finally {
       await serve.stop();
