@@ -501,6 +501,18 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trashed_at: Option<DateTime<Utc>>,
 
+    /// The `project_path` a managed-worktree session had before it was
+    /// trashed, captured when the trash flow relocates the worktree into the
+    /// `.aoe-trash` holding area (see `src/session/trash.rs`). `project_path`
+    /// is repointed to the trash location while trashed so the structured-view
+    /// preview, diff, and purge keep reading the worktree at its real spot;
+    /// restore moves the worktree back here and clears this field. `None` for
+    /// sessions that were never relocated (plain / non-managed worktrees, or
+    /// rows trashed before relocation existed). Additive: absent in older
+    /// `sessions.json` rows, so no migration is needed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_trash_project_path: Option<String>,
+
     /// Namespaced per-session plugin data, keyed by plugin id. Each plugin
     /// owns only its own slot (`plugin_meta["<id>"]`), an opaque JSON value it
     /// reads and writes through the host API that lands with the Tier 1 host
@@ -924,6 +936,7 @@ impl Instance {
             idle_dormant_since: None,
             pinned_at: None,
             trashed_at: None,
+            pre_trash_project_path: None,
             plugin_meta: std::collections::BTreeMap::new(),
             scratch: false,
             worktree_info: None,
@@ -1229,6 +1242,9 @@ impl Instance {
         }
         if pre.trashed_at != post.trashed_at {
             self.trashed_at = post.trashed_at;
+        }
+        if pre.pre_trash_project_path != post.pre_trash_project_path {
+            self.pre_trash_project_path = post.pre_trash_project_path.clone();
         }
         if pre.unread != post.unread {
             self.unread = post.unread;
