@@ -172,19 +172,28 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
         eprintln!("Warning: {}", err);
     }
 
+    // A failed teardown (worktree/branch/container cleanup) must keep the
+    // session row so the leftover artifacts can be retried, not abandoned by
+    // dropping the record below. Mirrors `empty-trash`, which only purges rows
+    // whose teardown succeeded. See #2489.
+    if !result.success {
+        anyhow::bail!(
+            "Session teardown failed, so the session record was kept (retry, or fix the \
+             underlying cause and remove it again)"
+        );
+    }
+
     // Permanent purge of a structured-view session must also drop its durable
     // transcript so it does not orphan in the event store; the CLI opens the
     // store directly since it has no live worker. Only after a successful
     // teardown so a failed purge stays restorable. If the transcript can't be
     // dropped, keep the session row (skip the removal below) rather than
     // orphan the transcript. See #2489.
-    if result.success {
-        if let Err(e) = super::purge_acp_transcript(&inst) {
-            anyhow::bail!(
-                "Session teardown succeeded but its transcript could not be purged, so the session \
-                 record was kept (retry, or remove it once the event store is reachable): {e}"
-            );
-        }
+    if let Err(e) = super::purge_acp_transcript(&inst) {
+        anyhow::bail!(
+            "Session teardown succeeded but its transcript could not be purged, so the session \
+             record was kept (retry, or remove it once the event store is reachable): {e}"
+        );
     }
 
     if !delete_worktree {
