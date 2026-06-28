@@ -18,8 +18,8 @@ mod manifest;
 pub use capability::{CapabilityId, TrustLevel, KNOWN_CAPABILITIES};
 pub use id::{InvalidPluginId, PluginId};
 pub use manifest::{
-    BuildStep, CommandContribution, KeybindContribution, ManifestError, PluginManifest,
-    RuntimeSpec, Screenshot, SettingContribution, SettingType, StatusContribution,
+    screenshot_path_ok, BuildStep, CommandContribution, KeybindContribution, ManifestError,
+    PluginManifest, RuntimeSpec, Screenshot, SettingContribution, SettingType, StatusContribution,
     ThemeContribution, UiContribution, UiSlot, MAX_SCREENSHOTS,
 };
 

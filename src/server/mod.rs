@@ -1789,10 +1789,12 @@ async fn http_request_span(
 ///   runtime (terminal font-size updates) and Tailwind v4 emits inline
 ///   `<style>` blocks in dev. Blocking inline styles breaks xterm.js's
 ///   rendered viewport.
-/// - `img-src 'self' data: https://github.com https://avatars.githubusercontent.com`:
+/// - `img-src 'self' data: https://github.com https://avatars.githubusercontent.com https://raw.githubusercontent.com`:
 ///   repo-owner avatars are loaded from `github.com/{user}.png` which 302s
 ///   to `avatars.githubusercontent.com`; CSP checks both URLs across the
 ///   redirect, so both hosts must be allowed. `data:` covers inline icons.
+///   `raw.githubusercontent.com` serves plugin screenshots resolved by the
+///   plugin detail endpoint (#2484).
 /// - `font-src 'self'`: Geist fonts are bundled under /fonts/.
 /// - `connect-src 'self' ws: wss:`: REST + PTY WebSocket to same origin.
 /// - `frame-ancestors 'none'`: CSP-native equivalent of X-Frame-Options.
@@ -1801,7 +1803,7 @@ async fn http_request_span(
 const CSP: &str = "default-src 'self'; \
     script-src 'self' 'wasm-unsafe-eval'; \
     style-src 'self' 'unsafe-inline'; \
-    img-src 'self' data: https://github.com https://avatars.githubusercontent.com; \
+    img-src 'self' data: https://github.com https://avatars.githubusercontent.com https://raw.githubusercontent.com; \
     font-src 'self'; \
     connect-src 'self' ws: wss:; \
     frame-ancestors 'none'; \
@@ -5151,7 +5153,7 @@ mod tests {
         for needle in [
             "default-src 'self'",
             "script-src 'self' 'wasm-unsafe-eval'",
-            "img-src 'self' data: https://github.com https://avatars.githubusercontent.com",
+            "img-src 'self' data: https://github.com https://avatars.githubusercontent.com https://raw.githubusercontent.com",
             "connect-src 'self' ws: wss:",
             "frame-ancestors 'none'",
         ] {

@@ -13,9 +13,32 @@
 use std::time::Duration;
 
 use anyhow::{bail, Result};
+use aoe_plugin_api::{screenshot_path_ok, MAX_SCREENSHOTS};
+use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use serde::{Deserialize, Serialize};
 
 use crate::github::{GitHubClient, GitHubClientConfig, GitHubRepo, DEFAULT_USER_AGENT};
+
+/// Characters to percent-encode in a `raw.githubusercontent.com` path while
+/// keeping `/` (segment separators) and the unreserved set intact. The path is
+/// already structurally validated by [`screenshot_path_ok`]; this guards the
+/// remaining URL-unsafe bytes (spaces, `?`, `#`, `%`, ...).
+const RAW_PATH: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'`')
+    .add(b'{')
+    .add(b'}')
+    .add(b'|')
+    .add(b'^')
+    .add(b'\\')
+    .add(b'[')
+    .add(b']');
 
 use super::featured::FeaturedIndex;
 use super::source::PluginSource;
@@ -175,12 +198,40 @@ pub struct DetailManifest {
     pub api_version: u32,
     pub capabilities: Vec<String>,
     pub ui_contributions: Vec<UiSlotView>,
+    /// Screenshot/GIF previews, each resolved to a browser-fetchable URL on
+    /// `raw.githubusercontent.com`. Author-declared paths that fail validation
+    /// are dropped here rather than failing the whole detail.
+    pub screenshots: Vec<ScreenshotView>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct UiSlotView {
     pub slot: String,
     pub id: String,
+}
+
+/// A screenshot resolved for the detail modal: `src` is a fully-qualified
+/// `raw.githubusercontent.com` URL the browser fetches directly.
+#[derive(Debug, Clone, Serialize)]
+pub struct ScreenshotView {
+    pub src: String,
+    pub alt: String,
+    pub caption: String,
+}
+
+/// Build the `raw.githubusercontent.com` URL for a repository-relative path.
+/// `reference` defaults to `HEAD` (the repo's default branch) when the source
+/// is unpinned. The path is already validated by [`screenshot_path_ok`]; this
+/// only percent-encodes the remaining URL-unsafe bytes per segment.
+fn raw_url(owner: &str, repo: &str, reference: Option<&str>, path: &str) -> String {
+    let reference = reference.unwrap_or("HEAD");
+    format!(
+        "https://raw.githubusercontent.com/{}/{}/{}/{}",
+        utf8_percent_encode(owner, RAW_PATH),
+        utf8_percent_encode(repo, RAW_PATH),
+        utf8_percent_encode(reference, RAW_PATH),
+        utf8_percent_encode(path, RAW_PATH),
+    )
 }
 
 /// The on-demand detail for one plugin source: its manifest fields plus the
@@ -210,12 +261,24 @@ struct RawManifest {
     capabilities: Vec<String>,
     #[serde(default)]
     ui: Vec<RawUi>,
+    #[serde(default)]
+    screenshots: Vec<RawScreenshot>,
 }
 
 #[derive(Deserialize)]
 struct RawUi {
     slot: String,
     id: String,
+}
+
+#[derive(Deserialize)]
+struct RawScreenshot {
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    alt: String,
+    #[serde(default)]
+    caption: String,
 }
 
 /// Fetch the detail for a `gh:owner/repo` source: its `aoe-plugin.toml` (read
@@ -250,6 +313,20 @@ pub async fn details(source: &str) -> Result<PluginDetail> {
                     .map(|u| UiSlotView {
                         slot: u.slot,
                         id: u.id,
+                    })
+                    .collect(),
+                screenshots: m
+                    .screenshots
+                    .into_iter()
+                    // Drop entries the strict schema would reject (URLs,
+                    // traversing/absolute paths, empty alt) so one bad entry
+                    // never poisons the whole detail; cap at the manifest bound.
+                    .filter(|s| screenshot_path_ok(&s.path) && !s.alt.trim().is_empty())
+                    .take(MAX_SCREENSHOTS)
+                    .map(|s| ScreenshotView {
+                        src: raw_url(owner, repo, reference, &s.path),
+                        alt: s.alt,
+                        caption: s.caption,
                     })
                     .collect(),
             })
@@ -375,6 +452,53 @@ id = "s"
         assert_eq!(m.capabilities, vec!["net"]);
         assert_eq!(m.ui.len(), 1);
         assert_eq!(m.ui[0].slot, "status-bar");
+    }
+
+    #[test]
+    fn raw_url_defaults_to_head_and_encodes_path() {
+        assert_eq!(
+            raw_url("acme", "widget", None, "docs/shots/a.png"),
+            "https://raw.githubusercontent.com/acme/widget/HEAD/docs/shots/a.png"
+        );
+        // A pinned ref is honored; spaces in a path are percent-encoded while
+        // the `/` separators survive.
+        assert_eq!(
+            raw_url("acme", "widget", Some("v1.2.0"), "media/cool demo.gif"),
+            "https://raw.githubusercontent.com/acme/widget/v1.2.0/media/cool%20demo.gif"
+        );
+    }
+
+    #[test]
+    fn detail_manifest_parses_screenshots_and_drops_bad_entries() {
+        let toml = r#"
+id = "acme.widget"
+name = "Widget"
+version = "1.0.0"
+api_version = 5
+
+[[screenshots]]
+path = "docs/a.png"
+alt = "good"
+
+[[screenshots]]
+path = "https://tracker.example.com/x.png"
+alt = "bad url"
+
+[[screenshots]]
+path = "docs/b.png"
+alt = "   "
+"#;
+        let m: RawManifest = toml::from_str(toml).expect("lenient parse");
+        let kept: Vec<_> = m
+            .screenshots
+            .into_iter()
+            .filter(|s| screenshot_path_ok(&s.path) && !s.alt.trim().is_empty())
+            .map(|s| raw_url("acme", "widget", None, &s.path))
+            .collect();
+        assert_eq!(
+            kept,
+            vec!["https://raw.githubusercontent.com/acme/widget/HEAD/docs/a.png".to_string()]
+        );
     }
 
     #[test]
