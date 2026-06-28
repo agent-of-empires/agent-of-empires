@@ -1085,8 +1085,11 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // retention window. First tick fires immediately (startup sweep), then
     // hourly. The daemon is the sole enforcer so there is no multi-process
     // purge race; without a daemon, expired trash is purged on the next
-    // daemon start or by an explicit manual purge. See #2489.
-    {
+    // daemon start or by an explicit manual purge. Skipped entirely in
+    // read-only mode: a read-only daemon must not permanently delete
+    // sessions in the background, since that bypasses every handler's
+    // read-only guard. See #2489.
+    if !state.read_only {
         let sweep_state = state.clone();
         let shutdown = state.shutdown.clone();
         crate::task_util::spawn_supervised(

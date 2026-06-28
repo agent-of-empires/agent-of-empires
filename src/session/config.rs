@@ -1029,8 +1029,10 @@ pub struct SessionConfig {
 
     /// Days a session stays in the trash before it is automatically purged,
     /// measured from when it was trashed. `0` keeps trashed sessions
-    /// forever (manual purge only). The sweep runs on app/daemon startup
-    /// and, for the serve daemon, hourly thereafter.
+    /// forever (manual purge only). Auto-purge is enforced by the `aoe serve`
+    /// daemon (a startup sweep plus an hourly tick); without a running daemon,
+    /// expired trash is purged on the next daemon start or by an explicit
+    /// manual purge (`aoe rm --purge`, `aoe session empty-trash`).
     #[serde(default = "default_trash_retention_days")]
     #[setting(
         label = "Trash Retention (days)",

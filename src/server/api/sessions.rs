@@ -3109,13 +3109,22 @@ async fn purge_session_artifacts(
 ) -> Result<Vec<String>, String> {
     let profile = instance.source_profile.clone();
 
+    // True once we have crossed the irreversible line (the structured-view
+    // transcript has been deleted). After that point a sidecar-cleanup
+    // failure must NOT leave the session row restorable, since the restore
+    // would resurrect a session whose transcript is already gone. See #2489.
+    #[cfg(feature = "serve")]
+    let transcript_purged = instance.is_structured();
+    #[cfg(not(feature = "serve"))]
+    let transcript_purged = false;
+
     // Tear down the structured view worker FIRST so the ACP subprocess + its
     // claude-agent-acp child don't leak past the session delete. Permanent
     // removal releases the agent's persisted transcript too (#1710); the
     // event store purge prevents a recreated same-id session from inheriting
     // the deleted transcript.
     #[cfg(feature = "serve")]
-    if instance.is_structured() {
+    if transcript_purged {
         match state.acp_supervisor.shutdown_and_delete(id).await {
             Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
             Err(e) => {
@@ -3153,14 +3162,32 @@ async fn purge_session_artifacts(
     .await
     .map_err(|e| format!("Deletion task failed: {e}"))?;
 
+    let mut messages = deletion_result.messages.clone();
     if !deletion_result.success {
-        return Err(if deletion_result.errors.is_empty() {
+        let errs = if deletion_result.errors.is_empty() {
             "Unknown error".to_string()
         } else {
             deletion_result.errors.join("; ")
-        });
+        };
+        if !transcript_purged {
+            // Nothing irreversible happened (no transcript to lose), so keep
+            // the row intact and let the caller surface the error; the user
+            // can retry, e.g. with force on a dirty worktree.
+            return Err(errs);
+        }
+        // The durable transcript is already gone; a kept row would only allow
+        // a broken restore. Commit the removal and surface the sidecar errors
+        // as warnings so the orphaned worktree/container can be cleaned up by
+        // hand. See #2489.
+        tracing::warn!(
+            target: "http.api.sessions",
+            session = %id,
+            "purge sidecar cleanup failed after the transcript was deleted; removing the session row anyway: {errs}"
+        );
+        messages.push(format!(
+            "Cleanup incomplete (session removed anyway): {errs}"
+        ));
     }
-    let messages = deletion_result.messages.clone();
 
     // Disk first: if persistence fails, in-memory state stays intact and the
     // poll loop will not re-add a half-deleted row.
