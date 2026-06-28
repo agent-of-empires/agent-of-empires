@@ -138,7 +138,9 @@ export function DeleteSessionDialog({
 
           {extraSessionCount > 0 && (
             <p className="text-[12px] text-text-dim" data-testid="delete-session-extra-count">
-              This removes all {extraSessionCount + 1} sessions on this branch.
+              {permanent
+                ? `This permanently deletes all ${extraSessionCount + 1} sessions in this workspace.`
+                : `This moves all ${extraSessionCount + 1} sessions in this workspace to Trash.`}
             </p>
           )}
 
