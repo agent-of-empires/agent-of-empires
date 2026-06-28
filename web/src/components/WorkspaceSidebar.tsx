@@ -295,8 +295,10 @@ interface Props {
   onRemoveProject: (group: RepoGroup) => void;
   onSettings: () => void;
   onDeleteSession?: (workspaceId: string) => void;
-  /** Restore a trashed session from the Trash section (#2489). */
-  onRestoreSession?: (sessionId: string) => void;
+  /** Restore a trashed workspace from the Trash section: receives every
+   *  session id in the workspace, since a workspace only lands in Trash when
+   *  all of its sessions are trashed (#2489). */
+  onRestoreSession?: (sessionIds: string[]) => void;
   onStopSession?: (workspaceId: string) => void;
   onStartSession?: (workspaceId: string) => void;
   readOnly?: boolean;
@@ -3264,11 +3266,20 @@ export function WorkspaceSidebar({
             // Global "Trash" section, sibling of "Snoozed & archived" and
             // pinned below it. Flat list of trashed workspaces with restore
             // and permanent-delete actions. See #2489.
-            const trashedWorkspaces = isNested
+            const trashedRaw = isNested
               ? filteredNested.flatMap((ng) =>
                   ng.subgroups.flatMap((sg) => sg.workspaces.filter((v) => workspaceIsTrashed(v.workspace))),
                 )
               : filteredGroups.flatMap((g) => g.workspaces.filter((v) => workspaceIsTrashed(v.workspace)));
+            // The same workspace can appear under more than one group on the
+            // group axis; dedupe by workspace id so Trash doesn't double-count
+            // or double-render it. See #2489.
+            const seenTrashIds = new Set<string>();
+            const trashedWorkspaces = trashedRaw.filter((v) => {
+              if (seenTrashIds.has(v.workspace.id)) return false;
+              seenTrashIds.add(v.workspace.id);
+              return true;
+            });
             if (trashedWorkspaces.length === 0) return null;
             return (
               <div data-testid="sidebar-trash-section">
@@ -3316,8 +3327,8 @@ export function WorkspaceSidebar({
                         <>
                           <button
                             onClick={() => {
-                              const sid = v.workspace.sessions[0]?.id;
-                              if (sid) onRestoreSession?.(sid);
+                              const ids = v.workspace.sessions.map((s) => s.id);
+                              if (ids.length > 0) onRestoreSession?.(ids);
                             }}
                             data-testid="sidebar-trash-restore"
                             className="text-[12px] text-accent-500 hover:text-accent-600 cursor-pointer"

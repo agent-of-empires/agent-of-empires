@@ -70,6 +70,14 @@ export function useSessions() {
     setSessions((prev) => prev.map((s) => (s.id === id ? { ...s, status } : s)));
   }, []);
 
+  // Replace a single session with a fresh server snapshot (e.g. the response
+  // from a trash/restore/archive PATCH) so the UI re-buckets immediately
+  // instead of waiting for the next poll. No-op if the id isn't present.
+  // See #2489.
+  const applySession = useCallback((session: SessionResponse) => {
+    setSessions((prev) => prev.map((s) => (s.id === session.id ? session : s)));
+  }, []);
+
   return {
     sessions,
     workspaceOrdering,
@@ -80,5 +88,6 @@ export function useSessions() {
     refresh,
     injectSession,
     setSessionStatus,
+    applySession,
   };
 }

@@ -270,6 +270,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     loaded: sessionsLoaded,
     injectSession,
     setSessionStatus,
+    applySession,
   } = useSessions();
   const workspaces = useWorkspaces(sessions);
 
@@ -861,36 +862,61 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
 
   // Move-to-trash path (#2489): the safe default. Unlike permanent delete it
   // deliberately KEEPS the per-session acp cache, draft, and stored comments
-  // so a restore is faithful; only purge clears them.
+  // so a restore is faithful; only purge clears them. Trashes every session
+  // in the workspace so a multi-session workspace sinks as a whole.
   const handleConfirmTrash = useCallback(async () => {
-    if (!deletingSession) return;
-    const sessionId = deletingSession.id;
-    const wasActive = sessionId === activeSessionId;
+    if (!deletingWorkspace) return;
+    const ids = deletingWorkspace.sessions.map((s) => s.id);
+    if (ids.length === 0) return;
+    const wasActive = activeSessionId != null && ids.includes(activeSessionId);
 
     setDeletingWorkspaceId(null);
-    setSessionStatus(sessionId, "Stopped");
+    for (const id of ids) setSessionStatus(id, "Stopped");
     if (wasActive) {
       navigate("/");
     }
 
-    const res = await trashSession(sessionId);
-    if (!res) {
-      setSessionStatus(sessionId, "Error");
+    let anyFailed = false;
+    for (const id of ids) {
+      const res = await trashSession(id);
+      if (res) {
+        // Apply the returned snapshot so the row re-buckets into Trash now,
+        // not on the next poll.
+        applySession(res);
+      } else {
+        anyFailed = true;
+        setSessionStatus(id, "Error");
+      }
+    }
+    if (anyFailed) {
       toastBus.handler?.error("Failed to move session to trash");
-      return;
+    } else {
+      toastBus.handler?.info("Moved to trash");
     }
-    toastBus.handler?.info("Moved to trash");
-  }, [deletingSession, activeSessionId, setSessionStatus, navigate]);
+  }, [deletingWorkspace, activeSessionId, setSessionStatus, applySession, navigate]);
 
-  // Restore a trashed session from the sidebar Trash section (#2489).
-  const handleRestoreSession = useCallback(async (sessionId: string) => {
-    const res = await restoreSession(sessionId);
-    if (!res) {
-      toastBus.handler?.error("Failed to restore session");
-      return;
-    }
-    toastBus.handler?.info("Session restored");
-  }, []);
+  // Restore a trashed workspace from the sidebar Trash section (#2489).
+  // Restores every session in the workspace (a workspace only lands in Trash
+  // when all of its sessions are trashed), not just the first.
+  const handleRestoreSession = useCallback(
+    async (sessionIds: string[]) => {
+      let anyFailed = false;
+      for (const id of sessionIds) {
+        const res = await restoreSession(id);
+        if (res) {
+          applySession(res);
+        } else {
+          anyFailed = true;
+        }
+      }
+      if (anyFailed) {
+        toastBus.handler?.error("Failed to restore session");
+      } else {
+        toastBus.handler?.info("Session restored");
+      }
+    },
+    [applySession],
+  );
 
   const stoppingWorkspace = stoppingWorkspaceId ? workspaces.find((w) => w.id === stoppingWorkspaceId) : null;
   const stoppingSession = stoppingWorkspace?.sessions[0] ?? null;
