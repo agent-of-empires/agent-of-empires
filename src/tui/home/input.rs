@@ -4262,10 +4262,14 @@ impl HomeView {
                 // session already in the Trash section falls through so `D`
                 // there deletes it permanently. See #2489.
                 let already_trashed = inst.is_trashed();
-                let delete_to_trash =
-                    crate::session::resolve_config_or_warn(&self.config_profile())
-                        .session
-                        .delete_to_trash;
+                // Resolve the policy from the SELECTED session's profile, not
+                // the active filter: in all-profiles view `config_profile()`
+                // can differ from the row's `source_profile`, which would
+                // trash/purge under the wrong profile's retention policy.
+                // See #2489.
+                let delete_to_trash = crate::session::resolve_config_or_warn(&inst.source_profile)
+                    .session
+                    .delete_to_trash;
                 if delete_to_trash && !already_trashed {
                     let sid = session_id.clone();
                     self.trash_session_by_id(&sid);

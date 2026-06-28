@@ -2660,6 +2660,28 @@ impl HomeView {
                 title
             )
         };
+        let restore_key = if self.strict_hotkeys { "Z" } else { "z" };
+        // The permanent-delete keybind is blocked in Terminal view (it routes
+        // to a "Cannot delete terminal" dialog), so only advertise it in
+        // Structured view. Restore works in either. See #2489.
+        let hint = if self.view_mode == ViewMode::Terminal {
+            Line::from(vec![
+                Span::styled("Press ", Style::default().fg(theme.dimmed)),
+                Span::styled(restore_key, Style::default().fg(theme.hint).bold()),
+                Span::styled(" to restore.", Style::default().fg(theme.dimmed)),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled("Press ", Style::default().fg(theme.dimmed)),
+                Span::styled(restore_key, Style::default().fg(theme.hint).bold()),
+                Span::styled(" to restore, or ", Style::default().fg(theme.dimmed)),
+                Span::styled(
+                    if self.strict_hotkeys { "D" } else { "d" },
+                    Style::default().fg(theme.hint).bold(),
+                ),
+                Span::styled(" to delete permanently.", Style::default().fg(theme.dimmed)),
+            ])
+        };
         let lines = vec![
             Line::from(""),
             Line::from(Span::styled(
@@ -2669,19 +2691,7 @@ impl HomeView {
             Line::from(""),
             Line::from(Span::styled(body, Style::default().fg(theme.dimmed))),
             Line::from(""),
-            Line::from(vec![
-                Span::styled("Press ", Style::default().fg(theme.dimmed)),
-                Span::styled(
-                    if self.strict_hotkeys { "Z" } else { "z" },
-                    Style::default().fg(theme.hint).bold(),
-                ),
-                Span::styled(" to restore, or ", Style::default().fg(theme.dimmed)),
-                Span::styled(
-                    if self.strict_hotkeys { "D" } else { "d" },
-                    Style::default().fg(theme.hint).bold(),
-                ),
-                Span::styled(" to delete permanently.", Style::default().fg(theme.dimmed)),
-            ]),
+            hint,
         ];
         let para = Paragraph::new(lines).alignment(Alignment::Center);
         frame.render_widget(para, area);

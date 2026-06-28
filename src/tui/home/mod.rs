@@ -4155,7 +4155,7 @@ impl HomeView {
         // automatic"), leaving the user no way to clear it.
         let tree_seed: Vec<Instance> = grouped
             .iter()
-            .filter(|i| !i.is_archived())
+            .filter(|i| !i.is_archived() && !i.is_trashed())
             .cloned()
             .collect();
 
