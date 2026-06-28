@@ -490,6 +490,13 @@ that loses returns the current value rather than clobbering it. Writes go
 through `Storage`'s cross-process lock, so the daemon picks them up on its next
 session reload (eventual consistency, not a live push).
 
+`sessions.list` returns one entry per session with `id`, `title`,
+`project_path`, `tool`, `status` (the run-state), and two inactivity flags:
+`archived` (the session is archived) and `snoozed` (it has a snooze deadline
+still in the future; a past deadline reports `false`). The call never filters
+server-side, so a worker that should ignore dormant sessions, for example to
+avoid spending API quota on them, checks these flags itself.
+
 `config.get { key }` returns the value at `plugins.<plugin-id>.settings.<key>`
 for the calling plugin's own id, so a worker reads back the settings the user
 edited on the TUI/web surfaces, falling back to its own default when the key is

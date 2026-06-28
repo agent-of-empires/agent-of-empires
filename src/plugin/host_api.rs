@@ -438,6 +438,8 @@ fn sessions_list(state: &HostApiState) -> Result<Value, DispatchError> {
                 "project_path": i.project_path,
                 "tool": i.tool,
                 "status": format!("{:?}", i.status),
+                "archived": i.is_archived(),
+                "snoozed": i.is_snoozed(),
             })
         })
         .collect();
@@ -766,10 +768,79 @@ mod tests {
         .unwrap();
         assert_eq!(other["value"], json!(null));
 
-        // sessions.list surfaces the seeded session.
+        // sessions.list surfaces the seeded session; an active session reports
+        // neither archived nor snoozed.
         let list = dispatch(&state, &a, "sessions.list", &json!({})).unwrap();
         let sessions = list["sessions"].as_array().unwrap();
-        assert!(sessions.iter().any(|s| s["id"] == json!(session_id)));
+        let seeded = sessions
+            .iter()
+            .find(|s| s["id"] == json!(session_id))
+            .unwrap();
+        assert_eq!(seeded["archived"], json!(false));
+        assert_eq!(seeded["snoozed"], json!(false));
+    }
+
+    /// `sessions.list` exposes the archive/snooze state per entry so a worker can
+    /// skip inactive sessions. A past snooze deadline reports `snoozed: false`
+    /// (snooze is deadline-based; only a future deadline counts as active).
+    #[test]
+    #[serial_test::serial]
+    fn sessions_list_exposes_archived_and_snoozed_flags() {
+        use crate::session::{Instance, Storage};
+
+        struct XdgGuard(Option<std::ffi::OsString>);
+        impl Drop for XdgGuard {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                    None => std::env::remove_var("XDG_CONFIG_HOME"),
+                }
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let _xdg = XdgGuard(std::env::var_os("XDG_CONFIG_HOME"));
+        std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+
+        let storage = Storage::new_unwatched("default").unwrap();
+        let (archived_id, future_id, past_id) = storage
+            .update(|instances, _groups| {
+                let mut archived = Instance::new("archived", "/tmp/plugin-host-test");
+                archived.archived_at = Some(chrono::Utc::now());
+                let archived_id = archived.id.clone();
+
+                let mut future = Instance::new("future-snooze", "/tmp/plugin-host-test");
+                future.snoozed_until = Some(chrono::Utc::now() + chrono::Duration::hours(1));
+                let future_id = future.id.clone();
+
+                let mut past = Instance::new("past-snooze", "/tmp/plugin-host-test");
+                past.snoozed_until = Some(chrono::Utc::now() - chrono::Duration::hours(1));
+                let past_id = past.id.clone();
+
+                instances.push(archived);
+                instances.push(future);
+                instances.push(past);
+                Ok((archived_id, future_id, past_id))
+            })
+            .unwrap();
+
+        let state =
+            HostApiState::open(&tmp.path().join("plugin_events.db"), "default", 100).unwrap();
+        let a = ctx(&[CAP_SESSION_READ]);
+
+        let list = dispatch(&state, &a, "sessions.list", &json!({})).unwrap();
+        let sessions = list["sessions"].as_array().unwrap();
+        let by_id = |id: &str| sessions.iter().find(|s| s["id"] == json!(id)).unwrap();
+
+        assert_eq!(by_id(&archived_id)["archived"], json!(true));
+        assert_eq!(by_id(&archived_id)["snoozed"], json!(false));
+
+        assert_eq!(by_id(&future_id)["snoozed"], json!(true));
+        assert_eq!(by_id(&future_id)["archived"], json!(false));
+
+        // A snooze deadline in the past is inactive.
+        assert_eq!(by_id(&past_id)["snoozed"], json!(false));
+        assert_eq!(by_id(&past_id)["archived"], json!(false));
     }
 
     /// `config.get` reads the calling plugin's own persisted settings, gated by
