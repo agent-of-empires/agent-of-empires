@@ -421,22 +421,133 @@ export async function previewPluginUpdate(id: string): Promise<PluginUpdatePrevi
   }
 }
 
-/** Apply an approved update, pinned to the fingerprint the user saw. On success
- *  the server returns the refreshed plugin list. A 409 means the remote moved
- *  since the preview, so the caller should re-preview before re-approving. */
-export async function applyPluginUpdate(id: string, expectedFingerprint: string | null): Promise<PluginToggleResult> {
+/** Start a host-side update job, pinned to the fingerprint the user saw. The
+ *  update runs as a job (like install/uninstall) so its build is observable;
+ *  poll the returned job id with `fetchPluginJob`. A fingerprint mismatch (the
+ *  remote moved since the preview) surfaces as a failed job, which the UI
+ *  recovers from by re-previewing. */
+export async function applyPluginUpdate(id: string, expectedFingerprint: string | null): Promise<PluginJobStartResult> {
+  return startPluginJob(`/api/plugins/${encodeURIComponent(id)}/update/apply`, {
+    expected_fingerprint: expectedFingerprint,
+  });
+}
+
+/** Structured install disclosure (`POST /api/plugins/install/preview`),
+ *  mirroring the Rust `InstallConsent`. Drives the install consent modal. */
+export interface PluginInstallConsent {
+  id: string;
+  version: string;
+  source: string;
+  /** One line stating what is being installed (resolved release, ref, etc). */
+  notice: string;
+  /** The source is off the audited-release default path; warn on it. */
+  unverified: boolean;
+  /** Trust class: "featured" | "community" | "local". */
+  validation: string;
+  capabilities: string[];
+  ui: PluginUpdateUiView[];
+  build_steps: string[];
+  fingerprint: string;
+}
+
+export type PluginInstallPreviewResult =
+  | { kind: "ok"; consent: PluginInstallConsent }
+  | { kind: "error"; message: string };
+
+/** Classify a gh: install candidate and return its disclosure, without
+ *  installing. Backs the install consent modal. */
+export async function previewPluginInstall(source: string): Promise<PluginInstallPreviewResult> {
   try {
-    const res = await fetch(`/api/plugins/${encodeURIComponent(id)}/update/apply`, {
+    const res = await fetch("/api/plugins/install/preview", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ expected_fingerprint: expectedFingerprint }),
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ source }),
     });
     const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null;
-    if (res.ok && payload && isValidPluginListResponse(payload)) {
-      return { kind: "ok", data: payload };
+    if (res.ok && payload && typeof payload.fingerprint === "string") {
+      return { kind: "ok", consent: payload as unknown as PluginInstallConsent };
     }
     const message =
-      typeof payload?.message === "string" ? (payload.message as string) : `Update failed (HTTP ${res.status}).`;
+      typeof payload?.message === "string"
+        ? (payload.message as string)
+        : `Install preview failed (HTTP ${res.status}).`;
+    return { kind: "error", message };
+  } catch {
+    return { kind: "error", message: "Network error." };
+  }
+}
+
+/** Outcome of starting a lifecycle job: a job id to poll, or an error (403
+ *  read_only / elevation_required is handled by the fetch interceptor). */
+export type PluginJobStartResult = { kind: "ok"; jobId: string } | { kind: "error"; message: string };
+
+async function startPluginJob(url: string, body: unknown): Promise<PluginJobStartResult> {
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify(body),
+    });
+    const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+    if (res.ok && payload && typeof payload.job_id === "string") {
+      return { kind: "ok", jobId: payload.job_id as string };
+    }
+    const message =
+      typeof payload?.message === "string" ? (payload.message as string) : `Request failed (HTTP ${res.status}).`;
+    return { kind: "error", message };
+  } catch {
+    return { kind: "error", message: "Network error." };
+  }
+}
+
+/** Start a host-side install job for an approved gh: source. Poll the returned
+ *  job id with `fetchPluginJob`. */
+export async function startPluginInstall(source: string, expectedFingerprint: string): Promise<PluginJobStartResult> {
+  return startPluginJob("/api/plugins/install", { source, expected_fingerprint: expectedFingerprint });
+}
+
+/** Start a host-side uninstall job for an installed external plugin. */
+export async function startPluginUninstall(id: string): Promise<PluginJobStartResult> {
+  return startPluginJob(`/api/plugins/${encodeURIComponent(id)}/uninstall`, {});
+}
+
+/** A lifecycle job's status, mirroring the Rust `PluginJobStatus` tag. */
+export type PluginJobState = { state: "running" } | { state: "succeeded" } | { state: "failed"; error: string };
+
+/** A lifecycle job plus a bounded tail of its host-side log
+ *  (`GET /api/plugins/jobs/{id}`). */
+export interface PluginJob {
+  job: {
+    id: string;
+    kind: "install" | "update" | "uninstall";
+    target: string;
+    status: PluginJobState;
+    started_at: number;
+    finished_at: number | null;
+  };
+  log: {
+    exists: boolean;
+    tail: string;
+    lines_returned: number;
+    truncated: boolean;
+  };
+}
+
+export type PluginJobResult = { kind: "ok"; job: PluginJob } | { kind: "error"; message: string };
+
+/** Fetch a lifecycle job's status plus a tail of its log. Polled by the
+ *  progress modal until the job reaches a terminal state. */
+export async function fetchPluginJob(jobId: string, tail = 200): Promise<PluginJobResult> {
+  try {
+    const res = await fetch(`/api/plugins/jobs/${encodeURIComponent(jobId)}?tail=${tail}`, {
+      headers: { Accept: "application/json" },
+    });
+    const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+    if (res.ok && payload && typeof payload.job === "object" && payload.job !== null) {
+      return { kind: "ok", job: payload as unknown as PluginJob };
+    }
+    const message =
+      typeof payload?.message === "string" ? (payload.message as string) : `Job status failed (HTTP ${res.status}).`;
     return { kind: "error", message };
   } catch {
     return { kind: "error", message: "Network error." };
