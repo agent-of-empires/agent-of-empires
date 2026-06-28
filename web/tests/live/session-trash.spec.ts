@@ -59,9 +59,9 @@ base.describe("session trash + restore via sidebar (#2489)", () => {
         .toBe(true);
       await expect(row).toHaveCount(0, { timeout: 10_000 });
 
-      // Expand the Trash section and restore.
+      // Open the footer Trash popover and restore.
       const trashToggle = page.locator("[data-testid='sidebar-trash-toggle']");
-      await expect(trashToggle).toContainText("Trash (1)");
+      await expect(trashToggle).toHaveAttribute("aria-label", "Trash (1)");
       await trashToggle.click();
 
       const restorePromise = page.waitForResponse(

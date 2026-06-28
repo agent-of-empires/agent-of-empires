@@ -1,8 +1,10 @@
 // @vitest-environment jsdom
 //
-// Coverage for the WorkspaceSidebar Trash section (#2489): a workspace whose
-// sessions are all trashed renders under a collapsible "Trash" group with
-// Open / Restore / Delete actions, separate from the live and sunk lists.
+// Coverage for the WorkspaceSidebar Trash control (#2489, reworked in #2512):
+// a workspace whose sessions are all trashed is reachable from a Trash icon in
+// the sidebar footer next to Settings, which opens a popover with Open /
+// Restore / Delete actions. Trash is no longer an inline scrolling section.
+// Also asserts the Projects section renders below "Snoozed & archived" (#2512).
 // Vitest (accurate per-file V8) rather than Playwright, whose bundle->source
 // remap is lossy for this large file.
 
@@ -99,21 +101,23 @@ function renderSidebar(over: Partial<React.ComponentProps<typeof WorkspaceSideba
 
 afterEach(cleanup);
 
-describe("WorkspaceSidebar Trash section (#2489)", () => {
+describe("WorkspaceSidebar Trash control (#2489, #2512)", () => {
   function trashedGroups() {
     const ws = workspace("trashed-ws", [session({ id: "s1", trashed_at: "2026-01-01T00:00:00Z" })]);
     return buildSessionGroups([ws], { idleDecayWindowMs: 60_000, sortMode: "lastActivity", isCollapsed: () => false });
   }
 
-  it("renders a trashed workspace under the Trash section and exposes its actions", () => {
+  it("reaches a trashed workspace via the footer Trash popover and exposes its actions", () => {
     const props = renderSidebar({ groups: trashedGroups() });
 
-    const section = screen.getByTestId("sidebar-trash-section");
-    expect(section).toBeTruthy();
-    // Collapsed by default: rows hidden until the toggle is clicked.
+    // No inline section in the scrolling list; only the footer toggle.
+    expect(screen.queryByTestId("sidebar-trash-section")).toBeNull();
+    // Closed by default: popover and rows hidden until the icon is clicked.
+    expect(screen.queryByTestId("sidebar-trash-menu")).toBeNull();
     expect(screen.queryByTestId("sidebar-trash-row")).toBeNull();
 
     fireEvent.click(screen.getByTestId("sidebar-trash-toggle"));
+    expect(screen.getByTestId("sidebar-trash-menu")).toBeTruthy();
     expect(screen.getByTestId("sidebar-trash-row")).toBeTruthy();
 
     fireEvent.click(screen.getByTestId("sidebar-trash-open"));
@@ -126,6 +130,14 @@ describe("WorkspaceSidebar Trash section (#2489)", () => {
     expect(props.onDeleteSession).toHaveBeenCalledWith("trashed-ws");
   });
 
+  it("closes the Trash popover on Escape", () => {
+    renderSidebar({ groups: trashedGroups() });
+    fireEvent.click(screen.getByTestId("sidebar-trash-toggle"));
+    expect(screen.getByTestId("sidebar-trash-menu")).toBeTruthy();
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.queryByTestId("sidebar-trash-menu")).toBeNull();
+  });
+
   it("hides Restore/Delete actions in read-only mode", () => {
     renderSidebar({ groups: trashedGroups(), readOnly: true });
     fireEvent.click(screen.getByTestId("sidebar-trash-toggle"));
@@ -134,7 +146,7 @@ describe("WorkspaceSidebar Trash section (#2489)", () => {
     expect(screen.queryByTestId("sidebar-trash-purge")).toBeNull();
   });
 
-  it("omits the Trash section when nothing is trashed", () => {
+  it("omits the Trash icon when nothing is trashed", () => {
     renderSidebar({
       groups: buildSessionGroups([workspace("live-ws", [session({ id: "live", status: "Running" })])], {
         idleDecayWindowMs: 60_000,
@@ -142,6 +154,22 @@ describe("WorkspaceSidebar Trash section (#2489)", () => {
         isCollapsed: () => false,
       }),
     });
-    expect(screen.queryByTestId("sidebar-trash-section")).toBeNull();
+    expect(screen.queryByTestId("sidebar-trash-toggle")).toBeNull();
+  });
+
+  it("renders the Projects section below 'Snoozed & archived' (#2512)", () => {
+    // An archived (sunk) workspace surfaces the sunk section; the Projects
+    // section header always renders when CRUD is available. Assert DOM order.
+    const archivedWs = workspace("archived-ws", [session({ id: "a1", archived_at: "2026-01-01T00:00:00Z" })]);
+    renderSidebar({
+      groups: buildSessionGroups([archivedWs], {
+        idleDecayWindowMs: 60_000,
+        sortMode: "lastActivity",
+        isCollapsed: () => false,
+      }),
+    });
+    const sunk = screen.getByTestId("sidebar-sunk-section");
+    const projects = screen.getByTestId("sidebar-projects-section");
+    expect(sunk.compareDocumentPosition(projects) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 });

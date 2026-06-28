@@ -111,17 +111,18 @@ test.describe("Session trash flow", () => {
 
     await expect.poll(() => handle.trashCalls, { timeout: 10_000 }).toBe(1);
 
-    // Row leaves the active list and surfaces under the Trash section.
-    const trashSection = page.locator('[data-testid="sidebar-trash-section"]');
-    await expect(trashSection).toBeVisible({ timeout: 10_000 });
-    await page.locator('[data-testid="sidebar-trash-toggle"]').click();
+    // Row leaves the active list; the footer Trash icon appears and its
+    // popover lists the trashed workspace.
+    const trashToggle = page.locator('[data-testid="sidebar-trash-toggle"]');
+    await expect(trashToggle).toBeVisible({ timeout: 10_000 });
+    await trashToggle.click();
     const trashRow = page.locator('[data-testid="sidebar-trash-row"]').filter({ hasText: "story-trash" });
     await expect(trashRow).toBeVisible({ timeout: 10_000 });
 
     // Restore brings it back to the active list.
     await trashRow.locator('[data-testid="sidebar-trash-restore"]').click();
     await expect.poll(() => handle.restoreCalls, { timeout: 10_000 }).toBe(1);
-    await expect(trashSection).toHaveCount(0, { timeout: 10_000 });
+    await expect(trashToggle).toHaveCount(0, { timeout: 10_000 });
     await expect(row).toBeVisible({ timeout: 10_000 });
   });
 
@@ -142,11 +143,11 @@ test.describe("Session trash flow", () => {
       .click();
 
     await expect.poll(() => handle.trashCalls, { timeout: 10_000 }).toBe(1);
-    // The trash failed: no Trash section appears and the row stays put.
-    await expect(page.locator('[data-testid="sidebar-trash-section"]')).toHaveCount(0, { timeout: 5_000 });
+    // The trash failed: no Trash icon appears and the row stays put.
+    await expect(page.locator('[data-testid="sidebar-trash-toggle"]')).toHaveCount(0, { timeout: 5_000 });
   });
 
-  test("Delete from the Trash section opens the permanent-delete dialog", async ({ page }) => {
+  test("Delete from the Trash popover opens the permanent-delete dialog", async ({ page }) => {
     const handle = await mockApis(page);
     handle.trashed = true; // start already trashed
     await page.setViewportSize({ width: 1280, height: 720 });
@@ -156,7 +157,7 @@ test.describe("Session trash flow", () => {
     const trashRow = page.locator('[data-testid="sidebar-trash-row"]').filter({ hasText: "story-trash" });
     await expect(trashRow).toBeVisible({ timeout: 10_000 });
 
-    // The Trash-section Delete re-opens the dialog; with the row already
+    // The Trash-popover Delete re-opens the dialog; with the row already
     // trashed it goes straight to permanent delete (no trash checkbox).
     await trashRow.locator('[data-testid="sidebar-trash-purge"]').click();
     const dialog = page.locator('[data-testid="delete-session-dialog"]');
