@@ -615,9 +615,13 @@ impl PluginManifest {
                     format!("commands[{i}].action open-ui-link slot must be per-session"),
                 );
                 check(
-                    self.ui.iter().any(|u| u.slot == *slot && &u.id == id),
+                    self.ui
+                        .iter()
+                        .filter(|u| u.slot == *slot && &u.id == id)
+                        .count()
+                        == 1,
                     format!(
-                        "commands[{i}].action references undeclared ui slot ({}, {id})",
+                        "commands[{i}].action must reference exactly one ui slot ({}, {id})",
                         slot.as_str()
                     ),
                 );
@@ -858,7 +862,21 @@ mod tests {
         ))
         .unwrap_err()
         .to_string();
-        assert!(err.contains("undeclared ui slot"), "{err}");
+        assert!(err.contains("exactly one ui slot"), "{err}");
+    }
+
+    #[test]
+    fn open_ui_link_rejects_duplicate_slot() {
+        // Two ui contributions declare the same per-session (slot, id), so the
+        // action's target is ambiguous and must be rejected.
+        let err = PluginManifest::from_toml_str(
+            "id = \"acme.thing\"\nname = \"Thing\"\nversion = \"1.0.0\"\napi_version = 6\ncapabilities = [\"browser_open\"]\n\n\
+             [[ui]]\nslot = \"row-column\"\nid = \"link\"\n\n[[ui]]\nslot = \"row-column\"\nid = \"link\"\n\n\
+             [[commands]]\nid = \"open\"\n[commands.action]\nkind = \"open-ui-link\"\nslot = \"row-column\"\nid = \"link\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("exactly one ui slot"), "{err}");
     }
 
     #[test]
