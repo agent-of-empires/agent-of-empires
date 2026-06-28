@@ -182,7 +182,8 @@ Build steps are free to name bare PATH programs (`python3`, `node`, `uv`): they
 run in the user's interactive shell where PATH is reliable, which is exactly why
 the worker entrypoint, launched later by the daemon, is not. A step's optional `platforms` (`linux` / `macos` / `windows`)
 restricts it to matching hosts. Builds run with cwd set to the plugin dir, with
-stdin closed and stdout/stderr inherited so the user sees progress.
+stdin closed and stdout/stderr going to the operation log: the user's terminal
+for a CLI install, or a per-job log file for a dashboard install (see below).
 
 Why install time and the final dir, not launch or staging: `aoe plugin
 install` runs in the user's interactive shell, where `python3` / `node` / `uv`
@@ -192,6 +193,19 @@ absolute paths), so the build runs in the final `<plugins_dir>/<id>`, never in
 a staging tree that is then renamed. A failed build aborts the install with no
 trace; a failed update restores the prior version from a backup, and a leftover
 backup from an interrupted update is recovered on the next install/update.
+
+Web lifecycle jobs: the dashboard (Settings -> Plugins) installs, updates, and
+uninstalls a `gh:` plugin without a terminal. The same disclosure the CLI
+prompts for (capabilities, build commands, UI slots, unverified-source warning)
+is returned as structured data and approved in a modal; the host then runs the
+operation as a job whose progress and build output stream to a per-job log file
+under `<plugins_dir>/jobs/<job_id>.log`, which the dashboard tails. One
+lifecycle mutation runs at a time (config and lockfile writes are not
+concurrency-safe; a second start is rejected). One PATH caveat: a dashboard
+build runs with the daemon's environment, not the user's interactive shell, so a
+build step that names a bare PATH program present only in the interactive shell
+can succeed from `aoe plugin install` yet fail from a dashboard install. Local
+(non-`gh:`) installs stay CLI-only.
 
 The worker entrypoint (`command`'s `argv[0]`) must be plugin-relative: a path
 containing a separator (`.venv/bin/worker`), resolved inside the install
