@@ -392,7 +392,8 @@ export function PluginsSettings() {
                     </div>
                     {r.description && <p className="mt-1 text-text-dim">{r.description}</p>}
                     <div className="mt-2 flex flex-wrap items-center gap-2">
-                      {r.badge === "installed" ? (
+                      {r.badge === "installed" ||
+                      data?.plugins.some((p) => p.source === sourceFromCommand(r.install_command)) ? (
                         <span className="text-text-dim">Installed.</span>
                       ) : (
                         <button
