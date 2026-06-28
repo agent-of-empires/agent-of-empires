@@ -83,8 +83,12 @@ describe("Dock", () => {
   });
 
   it("shows split drop zones only while a tab is being dragged", () => {
-    // No drag in progress (default context): no split zones mounted.
+    // Baseline Dock with no drag in progress: no split zones mounted (assert
+    // after mounting so this catches unconditional rendering, not an empty DOM).
+    const { unmount } = renderDock();
     expect(document.querySelector('[data-testid="pane-split-right-0-before"]')).toBeNull();
+    expect(document.querySelector('[data-testid="pane-split-right-0-after"]')).toBeNull();
+    unmount();
 
     render(
       <PaneDndStateContext.Provider
