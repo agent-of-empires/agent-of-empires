@@ -16,27 +16,74 @@ export function openExternal(url: string): void {
   window.open(url, "_blank", "noopener,noreferrer");
 }
 
-/** The href an `open-ui-link` command would open for the active session: the
- *  `href` on the plugin's own `(slot, id)` UI-state entry, validated. `null`
- *  when there is no active session, no matching entry, or no safe href (e.g. the
- *  session has no open PR). */
+/** One openable link an `open-ui-link` command exposes: a validated href plus a
+ *  human label (from the badge item's tooltip/text). */
+export interface CommandLink {
+  href: string;
+  label: string;
+}
+
+function entryFor(
+  cmd: PluginCommand,
+  entries: PluginUiEntry[],
+  activeSessionId: string | null,
+): PluginUiEntry | undefined {
+  if (!activeSessionId || cmd.action?.kind !== "open-ui-link") return undefined;
+  const { slot, id } = cmd.action;
+  return entries.find(
+    (e) => e.plugin_id === cmd.plugin_id && e.slot === slot && e.id === id && e.session_id === activeSessionId,
+  );
+}
+
+/** Every link an `open-ui-link` command can open for the active session, deduped
+ *  by href. A multi-repo workspace exposes one link per open PR via the entry's
+ *  `items`; a single-link slot falls back to the entry's top-level `href`. Empty
+ *  when there is no active session, no matching entry, or no safe href. */
+export function resolveCommandLinks(
+  cmd: PluginCommand,
+  entries: PluginUiEntry[],
+  activeSessionId: string | null,
+): CommandLink[] {
+  const entry = entryFor(cmd, entries, activeSessionId);
+  if (!entry) return [];
+  const links: CommandLink[] = [];
+  const seen = new Set<string>();
+  const push = (href: unknown, label: unknown) => {
+    if (!isExternalHttpUrl(href) || seen.has(href)) return;
+    seen.add(href);
+    links.push({ href, label: typeof label === "string" && label ? label : href });
+  };
+  const items = entry.payload.items;
+  if (Array.isArray(items)) {
+    for (const raw of items) {
+      const item = raw as Record<string, unknown>;
+      push(item.href, item.tooltip ?? item.text);
+    }
+  }
+  // Fall back to the entry's top-level href (e.g. a single-link slot, or a badge
+  // with no per-item hrefs).
+  if (links.length === 0) push(entry.payload.href, entry.payload.tooltip ?? entry.payload.text);
+  return links;
+}
+
+/** The primary href an `open-ui-link` command opens (for the keybind, which
+ *  cannot disambiguate): the entry's top-level `href` if valid, else the first
+ *  resolved link. `null` when nothing safe resolves. */
 export function resolveCommandHref(
   cmd: PluginCommand,
   entries: PluginUiEntry[],
   activeSessionId: string | null,
 ): string | null {
-  if (!activeSessionId || cmd.action?.kind !== "open-ui-link") return null;
-  const { slot, id } = cmd.action;
-  const entry = entries.find(
-    (e) => e.plugin_id === cmd.plugin_id && e.slot === slot && e.id === id && e.session_id === activeSessionId,
-  );
-  const href = entry?.payload.href;
-  return isExternalHttpUrl(href) ? href : null;
+  const entry = entryFor(cmd, entries, activeSessionId);
+  const top = entry?.payload.href;
+  if (isExternalHttpUrl(top)) return top;
+  return resolveCommandLinks(cmd, entries, activeSessionId)[0]?.href ?? null;
 }
 
 /** Palette entries for the active session's client-executable plugin commands.
- *  An `open-ui-link` command is shown only when its href resolves, so the
- *  palette never offers a dead "open" with nothing to open. */
+ *  A command with a single link becomes one entry; a multi-repo workspace with
+ *  several open PRs becomes one entry per PR so the palette is the picker. A
+ *  command whose links do not resolve is omitted, so no dead "open" is shown. */
 export function buildPluginCommandActions(
   commands: PluginCommand[],
   entries: PluginUiEntry[],
@@ -45,16 +92,18 @@ export function buildPluginCommandActions(
   const actions: CommandAction[] = [];
   for (const cmd of commands) {
     if (cmd.action?.kind !== "open-ui-link") continue;
-    const href = resolveCommandHref(cmd, entries, activeSessionId);
-    if (!href) continue;
-    actions.push({
-      id: `plugin:${cmd.fqid}`,
-      title: cmd.title || cmd.id,
-      subtitle: cmd.description || undefined,
-      group: "Actions",
-      keywords: ["plugin", cmd.plugin_id, cmd.id],
-      shortcut: cmd.keybinds[0],
-      perform: () => openExternal(href),
+    const links = resolveCommandLinks(cmd, entries, activeSessionId);
+    const multiple = links.length > 1;
+    links.forEach((link, i) => {
+      actions.push({
+        id: multiple ? `plugin:${cmd.fqid}:${i}` : `plugin:${cmd.fqid}`,
+        title: multiple ? `${cmd.title || cmd.id}: ${link.label}` : cmd.title || cmd.id,
+        subtitle: multiple ? undefined : cmd.description || undefined,
+        group: "Actions",
+        keywords: ["plugin", cmd.plugin_id, cmd.id],
+        shortcut: !multiple ? cmd.keybinds[0] : undefined,
+        perform: () => openExternal(link.href),
+      });
     });
   }
   return actions;

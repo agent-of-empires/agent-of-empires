@@ -7,7 +7,28 @@ import {
   matchPluginChord,
   parsePluginChord,
   resolveCommandHref,
+  resolveCommandLinks,
 } from "../pluginCommands";
+
+const badge: PluginCommand = {
+  fqid: "plugin.acme.github.open_pr",
+  plugin_id: "acme.github",
+  id: "open_pr",
+  title: "Open GitHub PR",
+  description: "",
+  keybinds: ["Ctrl+Shift+G"],
+  action: { kind: "open-ui-link", slot: "row-badge", id: "github_pr_badge" },
+};
+
+function badgeEntry(items: unknown[], href?: string): PluginUiEntry {
+  return {
+    plugin_id: "acme.github",
+    slot: "row-badge",
+    id: "github_pr_badge",
+    session_id: "s1",
+    payload: href ? { items, href } : { items },
+  };
+}
 
 const openPr: PluginCommand = {
   fqid: "plugin.acme.github.open_pr",
@@ -101,5 +122,55 @@ describe("matchPluginChord", () => {
   it("does not match when a modifier differs", () => {
     const e = { ctrlKey: true, shiftKey: false, altKey: false, metaKey: false, key: "g" } as KeyboardEvent;
     expect(matchPluginChord(chord, e)).toBe(false);
+  });
+});
+
+describe("multi-repo workspaces", () => {
+  const items = [
+    { href: "https://github.com/o/a/pull/1", tooltip: "a: PR #1" },
+    { href: "https://github.com/o/b/pull/2", tooltip: "b: PR #2" },
+    { tooltip: "c: no PR" }, // no href -> skipped
+  ];
+
+  it("resolveCommandLinks returns one link per open PR from items", () => {
+    const links = resolveCommandLinks(badge, [badgeEntry(items)], "s1");
+    expect(links).toEqual([
+      { href: "https://github.com/o/a/pull/1", label: "a: PR #1" },
+      { href: "https://github.com/o/b/pull/2", label: "b: PR #2" },
+    ]);
+  });
+
+  it("dedupes repeated hrefs", () => {
+    const dup = [items[0], items[0]];
+    expect(resolveCommandLinks(badge, [badgeEntry(dup)], "s1")).toHaveLength(1);
+  });
+
+  it("falls back to the top-level href when there are no item hrefs", () => {
+    const links = resolveCommandLinks(badge, [badgeEntry([], "https://github.com/o/a/pull/9")], "s1");
+    expect(links).toEqual([{ href: "https://github.com/o/a/pull/9", label: "https://github.com/o/a/pull/9" }]);
+  });
+
+  it("builds one palette entry per PR, titled by item label", () => {
+    const actions = buildPluginCommandActions([badge], [badgeEntry(items)], "s1");
+    expect(actions.map((a) => a.title)).toEqual(["Open GitHub PR: a: PR #1", "Open GitHub PR: b: PR #2"]);
+    expect(actions.map((a) => a.id)).toEqual([
+      "plugin:plugin.acme.github.open_pr:0",
+      "plugin:plugin.acme.github.open_pr:1",
+    ]);
+    // No single-entry shortcut hint when the command fans out.
+    expect(actions[0].shortcut).toBeUndefined();
+  });
+
+  it("builds a single titled entry when only one PR is open", () => {
+    const actions = buildPluginCommandActions([badge], [badgeEntry([items[0]])], "s1");
+    expect(actions).toHaveLength(1);
+    expect(actions[0]).toMatchObject({ id: "plugin:plugin.acme.github.open_pr", title: "Open GitHub PR" });
+    expect(actions[0].shortcut).toBe("Ctrl+Shift+G");
+  });
+
+  it("resolveCommandHref returns the top-level primary for the keybind", () => {
+    expect(resolveCommandHref(badge, [badgeEntry(items, "https://github.com/o/b/pull/2")], "s1")).toBe(
+      "https://github.com/o/b/pull/2",
+    );
   });
 });
