@@ -33,17 +33,22 @@ export function PluginDetailModal({ source, title, fallback, installCommand, onC
   const isGithub = source.startsWith("gh:");
   const [detail, setDetail] = useState<PluginDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // The screenshot opened full-size in the lightbox, or null when none is.
+  const [zoomed, setZoomed] = useState<{ src: string; alt: string } | null>(null);
   // Derived, not stored: avoids a synchronous setState in the effect. The modal
   // is remounted per source (keyed at the call site), so this resets each open.
   const loading = isGithub && !detail && !error;
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key !== "Escape") return;
+      // Escape closes the lightbox first if it is open, the modal otherwise.
+      if (zoomed) setZoomed(null);
+      else onClose();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  }, [onClose, zoomed]);
 
   useEffect(() => {
     if (!isGithub) return;
@@ -110,18 +115,25 @@ export function PluginDetailModal({ source, title, fallback, installCommand, onC
           <div className="mb-3 grid gap-3" data-testid="plugin-detail-screenshots">
             {screenshots.map((shot) => (
               <figure key={shot.src} className="overflow-hidden rounded border border-surface-700 bg-surface-950">
-                <img
-                  src={shot.src}
-                  alt={shot.alt}
-                  loading="lazy"
-                  decoding="async"
-                  className="max-h-72 w-full object-contain"
-                  // A moved branch/tag or deleted asset 404s; hide the figure
-                  // rather than leave a broken-image icon.
-                  onError={(e) => {
-                    e.currentTarget.closest("figure")?.classList.add("hidden");
-                  }}
-                />
+                <button
+                  type="button"
+                  className="block w-full cursor-zoom-in"
+                  onClick={() => setZoomed({ src: shot.src, alt: shot.alt })}
+                  aria-label={`View ${shot.alt || "screenshot"} full size`}
+                >
+                  <img
+                    src={shot.src}
+                    alt={shot.alt}
+                    loading="lazy"
+                    decoding="async"
+                    className="max-h-72 w-full object-contain"
+                    // A moved branch/tag or deleted asset 404s; hide the figure
+                    // rather than leave a broken-image icon.
+                    onError={(e) => {
+                      e.currentTarget.closest("figure")?.classList.add("hidden");
+                    }}
+                  />
+                </button>
                 {shot.caption && (
                   <figcaption className="px-2 py-1 text-[11px] text-text-dim">{shot.caption}</figcaption>
                 )}
@@ -179,6 +191,24 @@ export function PluginDetailModal({ source, title, fallback, installCommand, onC
           </p>
         )}
       </div>
+
+      {zoomed && (
+        <div
+          className="fixed inset-0 z-[60] flex items-center justify-center bg-black/80 p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-label={`${zoomed.alt || "Screenshot"} full size`}
+          onClick={(e) => {
+            // Don't bubble to the modal backdrop (which would close the whole
+            // modal); the lightbox owns this click.
+            e.stopPropagation();
+            setZoomed(null);
+          }}
+          data-testid="plugin-detail-lightbox"
+        >
+          <img src={zoomed.src} alt={zoomed.alt} className="max-h-full max-w-full object-contain" />
+        </div>
+      )}
     </div>
   );
 }

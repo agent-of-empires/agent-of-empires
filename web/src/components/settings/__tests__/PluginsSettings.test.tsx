@@ -7,7 +7,7 @@
 // shown rather than swallowed.
 
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { fireEvent, render, waitFor } from "@testing-library/react";
+import { fireEvent, render, waitFor, within } from "@testing-library/react";
 
 import type {
   DiscoverResult,
@@ -419,6 +419,15 @@ describe("PluginsSettings", () => {
     expect(imgs[0].getAttribute("alt")).toBe("Dashboard card");
     expect(imgs[0].getAttribute("loading")).toBe("lazy");
     expect(gallery.textContent).toContain("Live card.");
+    // Clicking a screenshot opens the full-size lightbox; clicking it closes.
+    const { findByTestId: findInModal, queryByTestId } = within(document.body);
+    fireEvent.click(imgs[0]!);
+    const lightbox = await findInModal("plugin-detail-lightbox");
+    expect(lightbox.querySelector("img")?.getAttribute("src")).toBe(
+      "https://raw.githubusercontent.com/acme/widget/HEAD/a.png",
+    );
+    fireEvent.click(lightbox);
+    await waitFor(() => expect(queryByTestId("plugin-detail-lightbox")).toBeNull());
     // A 404 (moved ref / deleted asset) hides the figure rather than leaving a
     // broken-image icon.
     fireEvent.error(imgs[0]!);
