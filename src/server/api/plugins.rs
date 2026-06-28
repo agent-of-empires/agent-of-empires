@@ -291,7 +291,7 @@ pub async fn set_plugin_enabled(
     }
 }
 
-// ---- Plugin lifecycle jobs (install / update / uninstall) -----------------
+// Plugin lifecycle jobs: install, update, and uninstall.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
