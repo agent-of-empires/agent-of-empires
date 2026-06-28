@@ -318,16 +318,19 @@ describe("DeleteSessionDialog keyboard affordances", () => {
     expect(onConfirm.mock.calls[0][0].keep_scratch).toBeUndefined();
   });
 
-  it("trash-first: defaults to Move to Trash and calls onTrash, not onConfirm", () => {
+  it("trash-first: a bare Delete calls onTrash, with the cleanup options hidden", () => {
     const onConfirm = vi.fn().mockResolvedValue(undefined);
     const onTrash = vi.fn().mockResolvedValue(undefined);
     const { container } = setup({ onConfirm, onTrash, defaultToTrash: true });
 
-    // Header + primary button reflect the trash-first default.
-    const title = container.querySelector("#delete-session-dialog-title");
-    expect(title?.textContent).toMatch(/Move to Trash/);
-    expect(container.querySelector('[data-testid="delete-session-trash-note"]')).toBeTruthy();
-    // Destructive cleanup options are hidden in trash mode.
+    // The modal looks the same as a normal delete: static "Delete Session"
+    // title, plus a "Delete permanently" opt-in checkbox (unchecked).
+    expect(container.querySelector("#delete-session-dialog-title")?.textContent).toMatch(/Delete Session/);
+    const permanentBox = container.querySelector<HTMLLabelElement>('[data-testid="delete-session-permanent"]');
+    expect(permanentBox).toBeTruthy();
+    expect(permanentBox!.dataset.checked).toBe("false");
+    // While "Delete permanently" is unchecked the cleanup options stay hidden
+    // (trash keeps the worktree/branch/container).
     expect(container.querySelectorAll('[data-testid^="delete-session-checkbox-"]')).toHaveLength(0);
 
     fireEvent.keyDown(document, { key: "Enter" });
@@ -335,16 +338,16 @@ describe("DeleteSessionDialog keyboard affordances", () => {
     expect(onConfirm).not.toHaveBeenCalled();
   });
 
-  it("trash-first: 'Delete permanently instead' reveals options and switches to onConfirm", () => {
+  it("trash-first: checking 'Delete permanently' reveals options and routes to onConfirm", () => {
     const onConfirm = vi.fn().mockResolvedValue(undefined);
     const onTrash = vi.fn().mockResolvedValue(undefined);
     const { container } = setup({ onConfirm, onTrash, defaultToTrash: true });
 
-    const toPermanent = container.querySelector<HTMLButtonElement>('[data-testid="delete-session-switch-permanent"]');
-    expect(toPermanent).toBeTruthy();
-    fireEvent.click(toPermanent!);
+    const permanentBox = container.querySelector<HTMLLabelElement>('[data-testid="delete-session-permanent"]');
+    fireEvent.click(permanentBox!.querySelector("span")!);
+    expect(permanentBox!.dataset.checked).toBe("true");
 
-    // Now in permanent mode: cleanup options appear and the title flips.
+    // Cleanup options now appear; the title and button are unchanged.
     expect(container.querySelector("#delete-session-dialog-title")?.textContent).toMatch(/Delete Session/);
     expect(container.querySelector('[data-testid="delete-session-checkbox-worktree"]')).toBeTruthy();
 
@@ -357,6 +360,21 @@ describe("DeleteSessionDialog keyboard affordances", () => {
       delete_sandbox: false,
       force_delete: false,
     });
+  });
+
+  it("already-trashed (defaultToTrash=false): no permanent checkbox, Delete purges directly", () => {
+    const onConfirm = vi.fn().mockResolvedValue(undefined);
+    const onTrash = vi.fn().mockResolvedValue(undefined);
+    const { container } = setup({ onConfirm, onTrash, defaultToTrash: false });
+
+    // No opt-in checkbox: this is the permanent path (e.g. deleting again
+    // from the Trash section). Cleanup options are shown immediately.
+    expect(container.querySelector('[data-testid="delete-session-permanent"]')).toBeNull();
+    expect(container.querySelector('[data-testid="delete-session-checkbox-worktree"]')).toBeTruthy();
+
+    fireEvent.keyDown(document, { key: "Enter" });
+    expect(onConfirm).toHaveBeenCalledTimes(1);
+    expect(onTrash).not.toHaveBeenCalled();
   });
 
   it("restores focus to the previously focused element when the dialog unmounts", () => {

@@ -38,14 +38,15 @@ base.describe("session trash + restore via sidebar (#2489)", () => {
 
       const dialog = page.locator("[data-testid='delete-session-dialog']");
       await expect(dialog).toBeVisible();
-      // Default config has delete_to_trash enabled, so the dialog opens in
-      // trash mode with a "Move to Trash" primary action.
-      await expect(dialog.locator("[data-testid='delete-session-trash-note']")).toBeVisible();
+      // Default config has delete_to_trash enabled, so the dialog offers a
+      // "Delete permanently" opt-in (left unchecked) and a bare Delete
+      // trashes the session.
+      await expect(dialog.locator("[data-testid='delete-session-permanent']")).toBeVisible();
 
       const trashPromise = page.waitForResponse(
         (res) => res.url().endsWith(`/api/sessions/${sessionId}/trash`) && res.request().method() === "POST",
       );
-      await dialog.getByRole("button", { name: /Move to Trash/ }).click();
+      await dialog.getByRole("button", { name: /^Delete$/ }).click();
       const trashRes = await trashPromise;
       expect(trashRes.ok()).toBe(true);
 

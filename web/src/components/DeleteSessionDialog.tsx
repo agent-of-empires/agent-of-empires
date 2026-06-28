@@ -119,26 +119,29 @@ export function DeleteSessionDialog({
       >
         {/* Header */}
         <div className="px-5 py-4 border-b border-surface-700">
-          <h2
-            id="delete-session-dialog-title"
-            className={`text-sm font-semibold ${permanent ? "text-status-error" : "text-text-primary"}`}
-          >
-            {permanent ? "Delete Session" : "Move to Trash"}
+          <h2 id="delete-session-dialog-title" className="text-sm font-semibold text-status-error">
+            Delete Session
           </h2>
         </div>
 
         {/* Body */}
         <div className="px-5 py-4 space-y-3">
           <p className="text-[13px] text-text-secondary">
-            {permanent ? "Delete" : "Move"} <span className="font-mono text-text-primary">{sessionTitle}</span>
-            {permanent ? "?" : " to the trash?"}
+            Delete <span className="font-mono text-text-primary">{sessionTitle}</span>?
           </p>
 
-          {!permanent && (
-            <p className="text-[12px] text-text-dim" data-testid="delete-session-trash-note">
-              The session is stopped and hidden, but its transcript and workspace are kept. Restore it anytime from the
-              Trash section.
-            </p>
+          {/* When trash is the default, deleting moves the session to the
+              Trash (restore later); this checkbox opts into erasing it now.
+              When trash-first is off (or the session is already trashed),
+              there is no checkbox and delete is always permanent. See #2489. */}
+          {defaultToTrash && (
+            <Checkbox
+              checked={permanent}
+              onChange={setPermanent}
+              label="Delete permanently"
+              detail="Skip the trash and erase now, including the transcript. Off: move to Trash, restore later."
+              testId="delete-session-permanent"
+            />
           )}
 
           {permanent && hasOptions && (
@@ -192,31 +195,6 @@ export function DeleteSessionDialog({
               )}
             </div>
           )}
-
-          {/* Mode toggle, only when trash-first is enabled so the user can
-              switch between the safe and permanent paths. */}
-          {defaultToTrash && !permanent && (
-            <button
-              type="button"
-              onClick={() => setPermanent(true)}
-              disabled={deleting}
-              data-testid="delete-session-switch-permanent"
-              className="text-[12px] text-status-error/80 hover:text-status-error underline cursor-pointer disabled:opacity-50"
-            >
-              Delete permanently instead
-            </button>
-          )}
-          {defaultToTrash && permanent && (
-            <button
-              type="button"
-              onClick={() => setPermanent(false)}
-              disabled={deleting}
-              data-testid="delete-session-switch-trash"
-              className="text-[12px] text-text-secondary hover:text-text-primary underline cursor-pointer disabled:opacity-50"
-            >
-              Move to trash instead
-            </button>
-          )}
         </div>
 
         {/* Footer */}
@@ -233,9 +211,7 @@ export function DeleteSessionDialog({
             onClick={handleConfirm}
             disabled={deleting}
             data-testid="delete-session-confirm"
-            className={`px-3 py-1.5 text-sm text-white rounded-md cursor-pointer transition-colors disabled:opacity-50 flex items-center gap-2 ${
-              permanent ? "bg-status-error/90 hover:bg-status-error" : "bg-accent-600/90 hover:bg-accent-600"
-            }`}
+            className="px-3 py-1.5 text-sm text-white rounded-md cursor-pointer transition-colors disabled:opacity-50 flex items-center gap-2 bg-status-error/90 hover:bg-status-error"
           >
             {deleting && (
               <svg className="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24">
@@ -251,7 +227,7 @@ export function DeleteSessionDialog({
                 <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
               </svg>
             )}
-            {deleting ? (permanent ? "Deleting..." : "Moving...") : permanent ? "Delete" : "Move to Trash"}
+            {deleting ? "Deleting..." : "Delete"}
           </button>
         </div>
       </div>
