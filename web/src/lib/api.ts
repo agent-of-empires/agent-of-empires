@@ -38,8 +38,6 @@ export function fetchSessions(): Promise<SessionsEnvelope | null> {
   return fetchJson<SessionsEnvelope>("/api/sessions");
 }
 
-// --- Conversation content search (#2515) ---
-
 export interface ConversationSearchHit {
   session_id: string;
   seq: number;
