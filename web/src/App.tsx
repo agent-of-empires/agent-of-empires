@@ -1184,10 +1184,13 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
 
     if (target === "paired") {
       // The paired shell only mounts when a terminal tab is the active tab of
-      // its dock.
-      const termTab =
-        (["right", "bottom"] as DockLocation[]).flatMap((d) => dockTabs(paneLayout, d)).find(isTerminalTabId) ??
-        terminalTabId(0);
+      // its group. Prefer a terminal that is already active (and thus mounted)
+      // over the first one, so multi-group layouts focus the live terminal
+      // instead of switching another group's tab.
+      const terminalTabs = (["right", "bottom"] as DockLocation[])
+        .flatMap((d) => dockTabs(paneLayout, d))
+        .filter(isTerminalTabId);
+      const termTab = terminalTabs.find((id) => isActiveTab(paneLayout, id)) ?? terminalTabs[0] ?? terminalTabId(0);
       const termDock = dockOf(paneLayout, termTab);
       if (termDock && isActiveTab(paneLayout, termTab)) {
         // Already the active tab (mounted): move focus synchronously so rapid
