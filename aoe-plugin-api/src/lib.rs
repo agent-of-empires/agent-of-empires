@@ -19,8 +19,8 @@ pub use capability::{CapabilityId, TrustLevel, KNOWN_CAPABILITIES};
 pub use id::{InvalidPluginId, PluginId};
 pub use manifest::{
     BuildStep, CommandContribution, KeybindContribution, ManifestError, PluginManifest,
-    RuntimeSpec, SettingContribution, SettingType, StatusContribution, ThemeContribution,
-    UiContribution, UiSlot,
+    RuntimeSpec, Screenshot, SettingContribution, SettingType, StatusContribution,
+    ThemeContribution, UiContribution, UiSlot, MAX_SCREENSHOTS,
 };
 
 /// Version of the manifest schema and host API this crate describes.
@@ -30,5 +30,6 @@ pub use manifest::{
 /// 2 when the contribution sections and capability taxonomy were added; 3 when
 /// the `detail-panel` slot became the dockable `pane` slot (with
 /// `default_location`); 4 when the `status` contribution section and the
-/// `aoe_version` host-compatibility field were added.
-pub const API_VERSION: u32 = 4;
+/// `aoe_version` host-compatibility field were added; 5 when the `screenshots`
+/// presentation metadata was added.
+pub const API_VERSION: u32 = 5;
