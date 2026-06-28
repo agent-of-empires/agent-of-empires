@@ -145,7 +145,9 @@ pub enum SettingType {
     /// Free text, rendered as a text input.
     #[default]
     String,
-    /// On/off, rendered as a toggle.
+    /// On/off, rendered as a toggle. Accepts `boolean` too: it is the natural
+    /// spelling next to `integer`, and shipped plugins use it.
+    #[serde(alias = "boolean")]
     Bool,
     /// Integer, rendered as a number input (bounded by `min`/`max`).
     Integer,
@@ -638,6 +640,28 @@ impl PluginManifest {
             Ok(())
         } else {
             Err(ManifestError::Invalid(errors))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn setting_type_accepts_boolean_and_bool() {
+        // `boolean` is the natural spelling next to `integer`, and shipped
+        // plugins (plugin-github) use it; both must parse to Bool.
+        for spelling in ["boolean", "bool"] {
+            let manifest = PluginManifest::from_toml_str(&format!(
+                "id = \"acme.thing\"\nname = \"Thing\"\nversion = \"1.0.0\"\napi_version = 4\n\n[[settings]]\nkey = \"flag\"\ntype = \"{spelling}\"\n"
+            ))
+            .expect("manifest parses");
+            assert_eq!(
+                manifest.settings[0].value_type,
+                SettingType::Bool,
+                "{spelling}"
+            );
         }
     }
 }
