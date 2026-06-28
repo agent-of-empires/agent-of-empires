@@ -3042,6 +3042,7 @@ impl HomeView {
                 self.tool_preview_cache = super::PreviewCache::default();
                 None
             }
+            PaletteAction::Cheat(message) => Some(Action::SetTransientStatus(message)),
         }
     }
 

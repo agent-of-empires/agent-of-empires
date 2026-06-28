@@ -68,6 +68,9 @@ pub enum PaletteAction {
     JumpToCursor(usize),
     /// Open a tool session by name (lazygit, yazi, etc.)
     ToolSession(String),
+    /// The query matched an Age of Empires cheat code; show its message as a
+    /// transient toast. The payload is the message to display.
+    Cheat(String),
 }
 
 /// One entry in the palette. `payload` is what gets returned when the user picks it.
@@ -249,6 +252,11 @@ impl CommandPaletteDialog {
             _ => {
                 self.input.handle_event(&crossterm::event::Event::Key(key));
                 self.recompute_matches();
+                // A full-string match on a known cheat code fires its toast and
+                // closes the palette, mirroring the web easter egg.
+                if let Some(message) = super::cheats::match_cheat(self.input.value()) {
+                    return DialogResult::Submit(PaletteAction::Cheat(message.to_string()));
+                }
                 DialogResult::Continue
             }
         }
@@ -672,6 +680,36 @@ mod tests {
         let attach_strict = strict.iter().find(|c| c.id == "attach").unwrap();
         assert_eq!(attach_normal.hotkey, "Enter");
         assert_eq!(attach_strict.hotkey, "Enter");
+    }
+
+    #[test]
+    fn typing_a_cheat_code_submits_a_cheat_payload() {
+        let mut dialog = make_dialog();
+        // Intermediate prefixes are not a full match and keep the palette open.
+        for c in "wolol".chars() {
+            assert!(matches!(
+                dialog.handle_key(ke(KeyCode::Char(c))),
+                DialogResult::Continue
+            ));
+        }
+        // Completing the code fires the cheat and closes the palette.
+        match dialog.handle_key(ke(KeyCode::Char('o'))) {
+            DialogResult::Submit(PaletteAction::Cheat(message)) => {
+                assert!(message.contains("converts to your cause"), "got: {message}");
+            }
+            _ => panic!("expected Submit(Cheat) after typing a full cheat code"),
+        }
+    }
+
+    #[test]
+    fn ordinary_query_does_not_trigger_a_cheat() {
+        let mut dialog = make_dialog();
+        for c in "settings".chars() {
+            assert!(matches!(
+                dialog.handle_key(ke(KeyCode::Char(c))),
+                DialogResult::Continue
+            ));
+        }
     }
 
     #[test]
