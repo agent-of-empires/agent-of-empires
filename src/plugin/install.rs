@@ -347,7 +347,7 @@ fn apply_prepared_install(p: &PreparedInstall, log: &OperationLog) -> Result<Ins
         version: p.fetched.manifest.version.clone(),
         capabilities: p.capabilities.clone(),
         granted: true,
-        validation: p.validation.clone(),
+        validation: p.validation,
     })
 }
 

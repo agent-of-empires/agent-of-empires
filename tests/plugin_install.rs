@@ -1282,9 +1282,13 @@ async fn apply_update_grants_the_new_capability_set() {
         other => panic!("expected consent_required, got {other:?}"),
     };
 
-    install::apply_update("acme.upd", Some(fingerprint))
-        .await
-        .unwrap();
+    install::apply_update(
+        "acme.upd",
+        Some(fingerprint),
+        &install::OperationLog::Inherit,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         Lockfile::load().unwrap().get("acme.upd").unwrap().version,
@@ -1305,10 +1309,14 @@ async fn apply_update_rejects_a_stale_fingerprint() {
 
     // The user approved a different (stale) fingerprint than what is now fetched:
     // the apply must refuse rather than grant something never disclosed.
-    let err = install::apply_update("acme.upd", Some("sha256:stale||community".to_string()))
-        .await
-        .unwrap_err()
-        .to_string();
+    let err = install::apply_update(
+        "acme.upd",
+        Some("sha256:stale||community".to_string()),
+        &install::OperationLog::Inherit,
+    )
+    .await
+    .unwrap_err()
+    .to_string();
     assert!(err.contains("changed since it was shown"), "got: {err}");
     assert_eq!(
         Lockfile::load().unwrap().get("acme.upd").unwrap().version,
