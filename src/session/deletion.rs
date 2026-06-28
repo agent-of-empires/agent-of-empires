@@ -181,7 +181,9 @@ pub fn perform_deletion(request: &DeletionRequest) -> DeletionResult {
     // outcomes here instead of inferring them from error-message prefixes
     // (#2532).
     let mut main_worktree_removed = false;
-    let mut removed_workspace_repos: std::collections::HashSet<String> =
+    // Keyed by worktree path, not repo name: two workspace repos can share a
+    // name, and the path is what uniquely identifies the removed worktree.
+    let mut removed_workspace_worktrees: std::collections::HashSet<PathBuf> =
         std::collections::HashSet::new();
 
     if request.delete_worktree {
@@ -247,7 +249,7 @@ pub fn perform_deletion(request: &DeletionRequest) -> DeletionResult {
                                         "Workspace ({}) worktree removed",
                                         repo.name
                                     ));
-                                    removed_workspace_repos.insert(repo.name.clone());
+                                    removed_workspace_worktrees.insert(worktree_path.clone());
                                 }
                             }
                             Err(e) => {
@@ -304,7 +306,6 @@ pub fn perform_deletion(request: &DeletionRequest) -> DeletionResult {
         }
     }
 
-    // Branch cleanup for workspace repos
     if request.delete_branch {
         if let Some(ws_info) = &request.instance.workspace_info {
             for repo in &ws_info.repos {
@@ -315,7 +316,7 @@ pub fn perform_deletion(request: &DeletionRequest) -> DeletionResult {
                 // worktree was actually removed. A repo whose worktree was
                 // preserved (or failed to remove) keeps its branch checked
                 // out (#2532).
-                if !removed_workspace_repos.contains(&repo.name) {
+                if !removed_workspace_worktrees.contains(&PathBuf::from(&repo.worktree_path)) {
                     messages.push(format!(
                         "Branch '{}' ({}) kept; its worktree was preserved",
                         repo.branch, repo.name
