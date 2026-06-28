@@ -1101,6 +1101,10 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
             "server.trash_retention_sweep",
             crate::task_util::PanicPolicy::Log,
             async move {
+                // One-shot startup backfill: relocate trashed worktrees still
+                // in the active dir (rows trashed before relocation existed)
+                // and heal any pointer a crash left stale. See #2522.
+                crate::server::api::reconcile_trashed_worktrees(&sweep_state).await;
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {

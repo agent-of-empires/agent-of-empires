@@ -357,27 +357,44 @@ async fn unarchive_session(profile: &str, args: SessionIdArgs) -> Result<()> {
 
 async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let storage = Storage::new_unwatched(profile)?;
+
+    // Resolve within the trashed subset only. The CLI advertises the argument
+    // as an id OR title, and a live or archived session can share a title/path
+    // with a trashed one; resolving against the full list would let that row
+    // win and make `untrash()` a silent no-op on an already-live session.
+    // See #2489.
+    let (instances, _groups) = storage.load_with_groups()?;
+    let trashed: Vec<_> = instances
+        .iter()
+        .filter(|i| i.is_trashed())
+        .cloned()
+        .collect();
+    let mut inst = super::resolve_session(&args.identifier, &trashed)
+        .map_err(|_| anyhow::anyhow!("No trashed session matching '{}'", args.identifier))?
+        .clone();
+    let restore_id = inst.id.clone();
+
+    // Move the worktree back to its pre-trash location before flipping the
+    // marker. Strict: if the original path is occupied or git refuses, leave
+    // the session trashed and surface the error rather than restoring it to
+    // the holding-area path.
+    if let crate::session::trash::RestoreOutcome::Failed { reason } =
+        crate::session::trash::restore_worktree_location(&mut inst)
+    {
+        anyhow::bail!("Cannot restore worktree: {reason}");
+    }
+    let restored_path = inst.project_path.clone();
+    let restored_pre = inst.pre_trash_project_path.clone();
+
     let title = storage.update(|instances, _groups| {
-        // Resolve within the trashed subset only. The CLI advertises the
-        // argument as an id OR title, and a live or archived session can share
-        // a title/path with a trashed one; resolving against the full list
-        // would let that row win and make `untrash()` a silent no-op on an
-        // already-live session. See #2489.
-        let trashed: Vec<_> = instances
-            .iter()
-            .filter(|i| i.is_trashed())
-            .cloned()
-            .collect();
-        let id = super::resolve_session(&args.identifier, &trashed)
-            .map_err(|_| anyhow::anyhow!("No trashed session matching '{}'", args.identifier))?
-            .id
-            .clone();
-        let inst = instances
+        let stored = instances
             .iter_mut()
-            .find(|i| i.id == id)
-            .expect("resolve_session returned an id that is no longer in instances");
-        inst.untrash();
-        Ok(inst.title.clone())
+            .find(|i| i.id == restore_id)
+            .ok_or_else(|| anyhow::anyhow!("No trashed session matching '{}'", args.identifier))?;
+        stored.project_path = restored_path.clone();
+        stored.pre_trash_project_path = restored_pre.clone();
+        stored.untrash();
+        Ok(stored.title.clone())
     })?;
     println!("Restored: {}", title);
     Ok(())

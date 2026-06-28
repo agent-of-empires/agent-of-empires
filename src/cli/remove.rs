@@ -91,6 +91,31 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
                 removed_title
             );
         }
+
+        // The session is durably trashed; now move its worktree out of the
+        // active dir into the holding area and persist the repointed
+        // project_path. A failure here never blocks the trash; the worktree
+        // just stays in place and a later reconcile pass can relocate it.
+        let mut inst = inst;
+        inst.trash();
+        match crate::session::trash::relocate_worktree_to_trash(&mut inst) {
+            crate::session::trash::RelocateOutcome::Relocated { .. } => {
+                let new_path = inst.project_path.clone();
+                let pre = inst.pre_trash_project_path.clone();
+                let _ = storage.update(|all_instances, _groups| {
+                    if let Some(stored) = all_instances.iter_mut().find(|i| i.id == removed_id) {
+                        stored.project_path = new_path.clone();
+                        stored.pre_trash_project_path = pre.clone();
+                    }
+                    Ok(())
+                });
+            }
+            crate::session::trash::RelocateOutcome::Failed { reason } => {
+                eprintln!("  Note: left worktree in place ({reason}).");
+            }
+            crate::session::trash::RelocateOutcome::Skipped => {}
+        }
+
         println!(
             "  Moved session to trash: {} (from profile '{}')",
             removed_title,

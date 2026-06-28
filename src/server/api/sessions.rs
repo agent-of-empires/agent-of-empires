@@ -2277,6 +2277,60 @@ pub async fn trash_session(
         }
     }
 
+    // The session is durably trashed and its agent stopped; relocate its
+    // managed worktree out of the active dir into the holding area, then
+    // persist the repointed project_path. The git move is blocking, so it runs
+    // on a blocking thread. Best-effort: a failure leaves the worktree in
+    // place and the daemon's reconcile pass can move it later. Never blocks the
+    // trash itself, which already landed above.
+    {
+        let profile = inst_clone.source_profile.clone();
+        match tokio::task::spawn_blocking(move || {
+            let mut inst = inst_clone;
+            let outcome = crate::session::trash::relocate_worktree_to_trash(&mut inst);
+            (outcome, inst)
+        })
+        .await
+        {
+            Ok((crate::session::trash::RelocateOutcome::Relocated { .. }, moved)) => {
+                let new_path = moved.project_path.clone();
+                let pre = moved.pre_trash_project_path.clone();
+                let persist_id = id.clone();
+                let (np, pp) = (new_path.clone(), pre.clone());
+                let _ = persist_session_update(
+                    profile,
+                    "trash-relocate",
+                    state.file_watch.clone(),
+                    move |instances| {
+                        if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+                            inst.project_path = np.clone();
+                            inst.pre_trash_project_path = pp.clone();
+                        }
+                    },
+                )
+                .await;
+                let mut instances = state.instances.write().await;
+                if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+                    inst.project_path = new_path;
+                    inst.pre_trash_project_path = pre;
+                }
+            }
+            Ok((crate::session::trash::RelocateOutcome::Failed { reason }, _)) => {
+                tracing::warn!(
+                    target: "http.api.sessions",
+                    session = %id,
+                    "trash worktree relocation skipped: {reason}"
+                );
+            }
+            Ok((crate::session::trash::RelocateOutcome::Skipped, _)) => {}
+            Err(e) => tracing::warn!(
+                target: "http.api.sessions",
+                session = %id,
+                "trash worktree relocation join failed: {e}"
+            ),
+        }
+    }
+
     let instances = state.instances.read().await;
     let response = match instances.iter().find(|i| i.id == id) {
         Some(inst) => {
@@ -2316,7 +2370,7 @@ pub async fn restore_session(
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
 
-    let profile = {
+    let (profile, snapshot) = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
             return (
@@ -2325,16 +2379,50 @@ pub async fn restore_session(
             )
                 .into_response();
         };
-        inst.source_profile.clone()
+        (inst.source_profile.clone(), inst.clone())
     };
 
+    // Move the worktree back to its pre-trash location before clearing the
+    // marker. Strict: if the original path is occupied or git refuses, keep
+    // the session trashed and surface a conflict, rather than restoring it to
+    // the holding-area path. The git move is blocking, so it runs off the
+    // async runtime.
+    let restored = match tokio::task::spawn_blocking(move || {
+        let mut inst = snapshot;
+        let outcome = crate::session::trash::restore_worktree_location(&mut inst);
+        (outcome, inst)
+    })
+    .await
+    {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::warn!(target: "http.api.sessions", session = %id, "restore relocation join failed: {e}");
+            return persist_failed_response();
+        }
+    };
+    if let crate::session::trash::RestoreOutcome::Failed { reason } = &restored.0 {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "worktree_restore_failed",
+                "message": format!("Could not restore the worktree: {reason}")
+            })),
+        )
+            .into_response();
+    }
+    let restored_path = restored.1.project_path.clone();
+    let restored_pre = restored.1.pre_trash_project_path.clone();
+
     let persist_id = id.clone();
+    let (rp, pre) = (restored_path.clone(), restored_pre.clone());
     if persist_session_update(
         profile,
         "restore",
         state.file_watch.clone(),
         move |instances| {
             if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+                inst.project_path = rp.clone();
+                inst.pre_trash_project_path = pre.clone();
                 inst.untrash();
             }
         },
@@ -2349,6 +2437,8 @@ pub async fn restore_session(
     let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
         return persist_failed_response();
     };
+    inst.project_path = restored_path;
+    inst.pre_trash_project_path = restored_pre;
     inst.untrash();
     let response =
         SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen());
@@ -3218,6 +3308,74 @@ async fn purge_session_artifacts(
         }
     }
     Ok(messages)
+}
+
+/// Relocate any trashed managed worktree still sitting in the active dir into
+/// the holding area, and heal a pointer left stale by a crash between the move
+/// and its persist. Backfills rows trashed before relocation existed. Runs
+/// once on daemon startup, best-effort and per-session locked; a failure on one
+/// session logs and moves on. The git move is blocking, so it runs off the
+/// async runtime.
+pub(crate) async fn reconcile_trashed_worktrees(state: &Arc<AppState>) {
+    let candidates: Vec<(String, String)> = {
+        let instances = state.instances.read().await;
+        instances
+            .iter()
+            .filter(|i| i.is_trashed())
+            .map(|i| (i.id.clone(), i.source_profile.clone()))
+            .collect()
+    };
+    for (id, profile) in candidates {
+        let lock = state.instance_lock(&id).await;
+        let _guard = lock.lock().await;
+
+        let snapshot = {
+            let instances = state.instances.read().await;
+            match instances.iter().find(|i| i.id == id) {
+                Some(i) if i.is_trashed() => i.clone(),
+                _ => continue,
+            }
+        };
+        let reconciled = match tokio::task::spawn_blocking(move || {
+            let mut inst = snapshot;
+            let changed = crate::session::trash::reconcile_trashed_location(&mut inst);
+            (changed, inst)
+        })
+        .await
+        {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::warn!(target: "http.api.sessions", session = %id, "trash reconcile join failed: {e}");
+                continue;
+            }
+        };
+        if !reconciled.0 {
+            continue;
+        }
+        let moved = reconciled.1;
+        let (np, pre) = (
+            moved.project_path.clone(),
+            moved.pre_trash_project_path.clone(),
+        );
+        let persist_id = id.clone();
+        let _ = persist_session_update(
+            profile,
+            "trash-reconcile",
+            state.file_watch.clone(),
+            move |instances| {
+                if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+                    inst.project_path = np.clone();
+                    inst.pre_trash_project_path = pre.clone();
+                }
+            },
+        )
+        .await;
+        let mut instances = state.instances.write().await;
+        if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+            inst.project_path = moved.project_path;
+            inst.pre_trash_project_path = moved.pre_trash_project_path;
+        }
+    }
 }
 
 /// Auto-purge trashed sessions whose retention window has elapsed

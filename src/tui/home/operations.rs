@@ -1455,6 +1455,21 @@ impl HomeView {
         if let Some(inst) = self.instances.iter().find(|i| i.id == id) {
             inst.kill_all_tmux_sessions();
         }
+        // The session is durably trashed and its agent stopped; relocate its
+        // worktree out of the active dir. The move + repointed project_path
+        // persist through the same diff path. Best-effort: a failure leaves the
+        // worktree in place and a later reconcile pass can move it.
+        let mut relocate_warning: Option<String> = None;
+        let _ = self.apply_user_action(id, |inst| {
+            if let crate::session::trash::RelocateOutcome::Failed { reason } =
+                crate::session::trash::relocate_worktree_to_trash(inst)
+            {
+                relocate_warning = Some(reason);
+            }
+        });
+        if let Some(reason) = relocate_warning {
+            tracing::warn!(target: "tui.session", session = %id, "trash worktree relocation skipped: {reason}");
+        }
         self.reveal_trashed_section();
         self.flat_items = self.build_flat_items();
         self.cursor = self.cursor.min(self.flat_items.len().saturating_sub(1));
@@ -1476,8 +1491,25 @@ impl HomeView {
         if !is_trashed {
             return;
         }
-        if let Err(e) = self.apply_user_action(&id, |inst| inst.untrash()) {
-            tracing::warn!(target: "tui.session", session = %id, "restore failed: {e}");
+        // Move the worktree back to its pre-trash location before clearing the
+        // marker. Strict: if the original path is occupied, keep the session
+        // trashed and tell the user, rather than restoring it to the holding
+        // path.
+        let mut restore_error: Option<String> = None;
+        let _ = self.apply_user_action(&id, |inst| {
+            if let crate::session::trash::RestoreOutcome::Failed { reason } =
+                crate::session::trash::restore_worktree_location(inst)
+            {
+                restore_error = Some(reason);
+            } else {
+                inst.untrash();
+            }
+        });
+        if let Some(reason) = restore_error {
+            self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
+                "Restore Failed",
+                &format!("Could not restore the worktree: {reason}"),
+            ));
             return;
         }
         self.flat_items = self.build_flat_items();

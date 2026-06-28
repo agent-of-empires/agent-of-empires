@@ -1850,6 +1850,24 @@ impl HomeView {
             for inst in &mut instances {
                 inst.source_profile = profile_name.clone();
             }
+            // Backfill / heal trashed worktrees: relocate any still sitting in
+            // the active dir (rows trashed before relocation existed) and fix a
+            // pointer a crash left stale. Best-effort and only touches trashed
+            // rows, which are typically few. See #2522.
+            for inst in &mut instances {
+                if crate::session::trash::reconcile_trashed_location(inst) {
+                    let new_path = inst.project_path.clone();
+                    let pre = inst.pre_trash_project_path.clone();
+                    let target_id = inst.id.clone();
+                    let _ = storage.update(|disk, _groups| {
+                        if let Some(d) = disk.iter_mut().find(|i| i.id == target_id) {
+                            d.project_path = new_path.clone();
+                            d.pre_trash_project_path = pre.clone();
+                        }
+                        Ok(())
+                    });
+                }
+            }
             let tree = GroupTree::new_with_groups(&instances, &groups);
             group_trees.insert(profile_name.clone(), tree);
             all_instances.extend(instances);

@@ -57,6 +57,9 @@ pub(crate) use sessions::persist_session_update;
 // Trash retention sweep, driven by the daemon's hourly loop; not a route handler.
 #[cfg(feature = "serve")]
 pub(crate) use sessions::purge_expired_trash;
+// Startup backfill that relocates trashed worktrees; not a route handler.
+#[cfg(feature = "serve")]
+pub(crate) use sessions::reconcile_trashed_worktrees;
 pub use system::{
     browse_filesystem, create_profile, default_profile, delete_profile, dismiss_update,
     docker_status, filesystem_home, get_about, get_current_theme, get_profile_settings,
