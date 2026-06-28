@@ -5588,18 +5588,26 @@ pub async fn search_sessions(
     axum::extract::Query(q): axum::extract::Query<SearchQuery>,
 ) -> Json<SearchResponse> {
     let limit = q.limit.unwrap_or(10);
-    let results = state
-        .acp_event_store
-        .search_content(&q.q, limit)
-        .into_iter()
-        .map(|h| SearchHit {
-            session_id: h.session_id,
-            seq: h.seq,
-            kind: h.kind.to_string(),
-            snippet: h.snippet,
-            match_count: h.match_count,
-        })
-        .collect();
+    // search_content does synchronous SQLite I/O plus JSON decoding; the
+    // palette fires it repeatedly as the user types, so run it on the
+    // blocking pool to keep slow scans off the Tokio worker threads.
+    let store = Arc::clone(&state.acp_event_store);
+    let query = q.q.clone();
+    let results = tokio::task::spawn_blocking(move || {
+        store
+            .search_content(&query, limit)
+            .into_iter()
+            .map(|h| SearchHit {
+                session_id: h.session_id,
+                seq: h.seq,
+                kind: h.kind.to_string(),
+                snippet: h.snippet,
+                match_count: h.match_count,
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_default();
     Json(SearchResponse { results })
 }
 

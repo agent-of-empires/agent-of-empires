@@ -564,6 +564,15 @@ impl EventStore {
             match hits.get_mut(&session_id) {
                 Some(hit) => hit.match_count += 1,
                 None => {
+                    // Stop once we have enough distinct sessions: rows are
+                    // newest-first, so any further new session ranks below
+                    // these and would be dropped anyway. Counting the cap on
+                    // distinct sessions (not raw rows) keeps one chatty
+                    // session from hiding others. match_count past this point
+                    // is left approximate on purpose.
+                    if order.len() >= limit {
+                        break;
+                    }
                     order.push(session_id.clone());
                     hits.insert(
                         session_id.clone(),
@@ -581,7 +590,6 @@ impl EventStore {
 
         order
             .into_iter()
-            .take(limit)
             .filter_map(|id| hits.remove(&id))
             .collect()
     }
@@ -1376,10 +1384,13 @@ const MIN_SEARCH_CHARS: usize = 2;
 const MAX_SEARCH_CHARS: usize = 128;
 /// Most sessions returned from a single search.
 const MAX_SEARCH_RESULTS: usize = 20;
-/// Upper bound on rows the LIKE prefilter scans before grouping. Bounds
-/// the cost of a search on a large DB; older matches past this are not
-/// surfaced (newest-first), an acceptable MVP ceiling.
-const SEARCH_ROW_SCAN_CAP: usize = 300;
+/// Hard ceiling on rows the LIKE prefilter scans, so a no-match query on a
+/// huge DB can't scan the whole table. The scan also stops early as soon as
+/// `limit` distinct sessions are collected, so the common case reads far
+/// fewer rows; this ceiling only bites when matches are sparse. Set well
+/// above `limit` so a single chatty session's run of newest events does not
+/// crowd other matching sessions out of the window.
+const SEARCH_ROW_SCAN_CAP: usize = 2000;
 /// Characters of context kept on each side of the match in a snippet.
 const SNIPPET_RADIUS_CHARS: usize = 60;
 
@@ -1601,6 +1612,32 @@ mod tests {
             hits.is_empty(),
             "% must be matched literally, not as a wildcard"
         );
+    }
+
+    #[test]
+    fn search_content_caps_distinct_sessions_not_raw_rows() {
+        let (_tmp, store) = open_store(1000);
+        // A chatty session (s_busy) with many matching events recorded first
+        // (older), then a single newer match in s_quiet. The cap is on
+        // distinct sessions, so s_busy must not crowd s_quiet out.
+        for seq in 1..=20 {
+            store
+                .record("s_busy", seq, &agent_chunk("needle again"))
+                .unwrap();
+        }
+        store.record("s_quiet", 1, &agent_chunk("needle")).unwrap();
+
+        let all = store.search_content("needle", 10);
+        let ids: Vec<&str> = all.iter().map(|h| h.session_id.as_str()).collect();
+        assert!(ids.contains(&"s_busy"), "chatty session present");
+        assert!(
+            ids.contains(&"s_quiet"),
+            "quiet session not hidden by chatty one"
+        );
+
+        // limit caps the number of distinct sessions, not raw matched rows.
+        let one = store.search_content("needle", 1);
+        assert_eq!(one.len(), 1, "limit bounds distinct sessions");
     }
 
     fn img_blob(id: &str) -> AttachmentBlob {
