@@ -180,7 +180,7 @@ CRF=12 PRESET=veryslow GRID=2x2 ./scripts/combine-showcase-videos.sh ~/Desktop/a
 ### Reset between runs
 
 ```bash
-rm -rf web/test-results web/playwright-showcase-report
+rm -rf test-results playwright-showcase-report
 ```
 
 Playwright will recreate both on the next showcase run.
