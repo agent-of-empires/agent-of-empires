@@ -200,21 +200,23 @@ if [[ -n "${GRID}" ]]; then
   # lane_count[k]: how many videos in lane k.
   # lane_total[k]: sum of their durations.
   lane_indices_lookup=""  # space-separated "lane_k:idx_in_videos" pairs, ordered.
+  lane_count=()
+  lane_total=()
   for (( k=0; k<cells; k++ )); do
-    eval "lane_count_${k}=0"
-    eval "lane_total_${k}=0"
+    lane_count[k]=0
+    lane_total[k]=0
   done
   for (( i=0; i<count; i++ )); do
     k=$(( i % cells ))
-    eval "lane_count_${k}=\$(( lane_count_${k} + 1 ))"
-    eval "lane_total_${k}=\$(awk -v a=\"\$lane_total_${k}\" -v b=\"${durations[$i]}\" 'BEGIN { printf \"%.6f\", a + b }')"
+    lane_count[k]=$(( lane_count[k] + 1 ))
+    lane_total[k]="$(awk -v a="${lane_total[k]}" -v b="${durations[$i]}" 'BEGIN { printf "%.6f", a + b }')"
   done
 
   # Lane max = max over lane totals. xstack needs every lane to reach
   # that timestamp, so shorter lanes tail-pad to lane_max.
   lane_max=0
   for (( k=0; k<cells; k++ )); do
-    eval "lt=\$lane_total_${k}"
+    lt="${lane_total[k]}"
     lane_max="$(awk -v a="${lane_max}" -v b="${lt}" 'BEGIN { print (b > a) ? b : a }')"
   done
 
@@ -233,8 +235,8 @@ if [[ -n "${GRID}" ]]; then
   filter=""
   stack_inputs=""
   for (( k=0; k<cells; k++ )); do
-    eval "lc=\$lane_count_${k}"
-    eval "lt=\$lane_total_${k}"
+    lc="${lane_count[k]}"
+    lt="${lane_total[k]}"
 
     # Per-video chain: scale+pad to cell dims, optional title overlay.
     # Emits labels [v_k_0], [v_k_1], ... that the concat filter ties together.
