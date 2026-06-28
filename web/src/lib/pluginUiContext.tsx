@@ -9,18 +9,24 @@ import { createContext, useContext, type ReactNode } from "react";
 import { usePluginUiState } from "../hooks/usePluginUiState";
 import type { PluginUiEntry } from "./api";
 
-// Entries and the refresh flag live in separate contexts: the flag toggles on
-// every slow poll, and folding it into the entries context would re-render all
-// entry consumers (rows, badges, cards, top bar) on each toggle even though
-// they never read it.
+// Entries, revisions, the refresh flag, and poke live in separate contexts: the
+// flag and revisions toggle on polls, and folding them into the entries context
+// would re-render all entry consumers (rows, badges, cards, top bar) on each
+// change even though they never read them.
 const PluginUiEntriesContext = createContext<PluginUiEntry[]>([]);
 const PluginUiRefreshingContext = createContext(false);
+const PluginUiRevisionsContext = createContext<Record<string, number>>({});
+const PluginUiPokeContext = createContext<() => void>(() => {});
 
 export function PluginUiProvider({ children }: { children: ReactNode }) {
-  const { entries, isRefreshing } = usePluginUiState();
+  const { entries, revisions, isRefreshing, poke } = usePluginUiState();
   return (
     <PluginUiEntriesContext.Provider value={entries}>
-      <PluginUiRefreshingContext.Provider value={isRefreshing}>{children}</PluginUiRefreshingContext.Provider>
+      <PluginUiRevisionsContext.Provider value={revisions}>
+        <PluginUiPokeContext.Provider value={poke}>
+          <PluginUiRefreshingContext.Provider value={isRefreshing}>{children}</PluginUiRefreshingContext.Provider>
+        </PluginUiPokeContext.Provider>
+      </PluginUiRevisionsContext.Provider>
     </PluginUiEntriesContext.Provider>
   );
 }
@@ -34,4 +40,16 @@ export function usePluginUiEntries(): PluginUiEntry[] {
  *  delay. Lets a pane renderer show a refresh-in-progress affordance. */
 export function usePluginUiRefreshing(): boolean {
   return useContext(PluginUiRefreshingContext);
+}
+
+/** The plugin's current UI mutation counter (0 if none seen yet). A pane action
+ *  holds its spinner until this moves off the baseline the action POST returned. */
+export function usePluginUiRevision(pluginId: string): number {
+  return useContext(PluginUiRevisionsContext)[pluginId] ?? 0;
+}
+
+/** Run a ui-state poll now and briefly boost the cadence, so a just-fired pane
+ *  action's result (and its revision bump) shows up without waiting a full tick. */
+export function usePluginUiPoke(): () => void {
+  return useContext(PluginUiPokeContext);
 }

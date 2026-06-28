@@ -6,11 +6,16 @@
 // sort-key and filter-facet slots render as sidebar sort options and a facet
 // filter (the sidebar owns those; see SidebarSortPicker / WorkspaceSidebar, #2401).
 
-import { createElement, useId, useRef, useState } from "react";
+import { createElement, useEffect, useId, useRef, useState } from "react";
 import { ChevronRight } from "lucide-react";
 
 import { invokePluginAction } from "../../lib/api";
-import { usePluginUiEntries, usePluginUiRefreshing } from "../../lib/pluginUiContext";
+import {
+  usePluginUiEntries,
+  usePluginUiPoke,
+  usePluginUiRefreshing,
+  usePluginUiRevision,
+} from "../../lib/pluginUiContext";
 import {
   accentStyle,
   entryText,
@@ -290,32 +295,69 @@ function Spinner({ className }: { className: string }) {
   );
 }
 
+// A pane action's spinner clears after this even if no fresh state arrives, so
+// a worker that processes the action without re-pushing (no sessions, ignored
+// method, mid-refresh crash) can never leave the button spinning forever.
+const ACTION_TIMEOUT_MS = 15000;
+
 /** An `action` pane block: a button that forwards a worker method (named by the
- *  plugin) to that plugin's worker. Fire-and-forget; the worker re-pushes its
- *  UI state, which the next poll renders. While the POST is in flight the button
- *  disables and swaps its icon for a spinner, so a refresh shows it is underway;
- *  `invokePluginAction` never rejects (it returns false on failure), so the
- *  `finally` always restores the button to an actionable state. An icon is
- *  optional. */
+ *  plugin) to that plugin's worker. The worker runs the method and re-pushes its
+ *  UI state, which a later poll renders. The button spins from the click until
+ *  the plugin's UI revision moves off the baseline the action POST returned (the
+ *  worker's re-pushed state has landed), not merely until the POST is accepted,
+ *  with a hard timeout fallback so it can never hang. A failed POST clears the
+ *  spinner at once. An icon is optional. */
 function BlockAction({ block, pluginId }: { block: Record<string, unknown>; pluginId: string }) {
   const label = str(block, "label");
   const method = str(block, "method");
   const iconComp = lucideIcon(str(block, "icon"));
-  const [busy, setBusy] = useState(false);
-  // A ref guard, not just `busy`: two clicks in the same tick both see the old
-  // `busy` state before React commits the update, so the boolean alone would
-  // double-fire. The ref flips synchronously.
-  const busyRef = useRef(false);
+  const revision = usePluginUiRevision(pluginId);
+  const poke = usePluginUiPoke();
+  // `posting`: the POST is in flight. `waitBaseline`: the revision the host had
+  // when it accepted the action; the button keeps spinning until the polled
+  // revision moves off it (the worker's re-pushed state landed) or the timeout
+  // fires. Stored as state so a polled revision change re-renders the button.
+  const [posting, setPosting] = useState(false);
+  const [waitBaseline, setWaitBaseline] = useState<number | null>(null);
+  // Guards a same-tick double-fire of the POST, before `posting` commits and
+  // `disabled` takes effect; the wait phase is guarded by `busy`/`disabled`.
+  const postingRef = useRef(false);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Derived in render, so nothing has to chase the revision in an effect: still
+  // waiting only while the polled revision has not moved off the baseline. `!==`
+  // so a daemon restart that resets the counter to a lower value also clears.
+  const waiting = waitBaseline !== null && revision === waitBaseline;
+  const busy = posting || waiting;
+
+  // Only an unmount guard: stop the fallback timer so it cannot fire setState on
+  // an unmounted block. No state writes here, so no effect-chases-event lint.
+  useEffect(
+    () => () => {
+      if (timerRef.current) clearTimeout(timerRef.current);
+    },
+    [],
+  );
+
   if (!label || !method) return null;
   const onClick = async () => {
-    if (busyRef.current) return;
-    busyRef.current = true;
-    setBusy(true);
+    if (postingRef.current || busy) return;
+    postingRef.current = true;
+    setPosting(true);
     try {
-      await invokePluginAction(pluginId, method);
+      const accepted = await invokePluginAction(pluginId, method);
+      if (!accepted) return; // 403/404/network: nothing re-pushes, stop spinning
+      // Hold the spinner until the revision moves off this baseline (see above).
+      setWaitBaseline(accepted.baselineRevision);
+      poke();
+      if (timerRef.current) clearTimeout(timerRef.current);
+      timerRef.current = setTimeout(() => {
+        setWaitBaseline(null);
+        timerRef.current = null;
+      }, ACTION_TIMEOUT_MS);
     } finally {
-      busyRef.current = false;
-      setBusy(false);
+      postingRef.current = false;
+      setPosting(false);
     }
   };
   return (

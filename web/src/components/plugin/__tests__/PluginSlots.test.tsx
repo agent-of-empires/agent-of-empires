@@ -5,19 +5,27 @@ import { describe, expect, it, vi } from "vitest";
 import type { PluginUiEntry } from "../../../lib/api";
 import { PluginCards, PluginPaneBody, PluginRowBadges, PluginStatusBarSegments } from "../PluginSlots";
 
-// The slot components read entries (and the refresh flag) from context; mock
-// those hooks so each test drives a fixed snapshot.
-const { entriesRef, refreshingRef } = vi.hoisted(() => ({
+// The slot components read entries, the refresh flag, the per-plugin revision,
+// and the poke fn from context; mock those hooks so each test drives a fixed
+// snapshot and can advance the revision to simulate the poll seeing fresh state.
+const { entriesRef, refreshingRef, revisionRef, pokeMock } = vi.hoisted(() => ({
   entriesRef: { current: [] as PluginUiEntry[] },
   refreshingRef: { current: false },
+  revisionRef: { current: 0 },
+  pokeMock: vi.fn(),
 }));
 vi.mock("../../../lib/pluginUiContext", () => ({
   usePluginUiEntries: () => entriesRef.current,
   usePluginUiRefreshing: () => refreshingRef.current,
+  usePluginUiRevision: () => revisionRef.current,
+  usePluginUiPoke: () => pokeMock,
 }));
 
-// The action block forwards to the worker via this; stub it.
-const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn(async () => true) }));
+// The action block forwards to the worker via this; stub it. The default
+// returns an accepted baseline of 0 (matching the initial revision).
+const { invokeMock } = vi.hoisted(() => ({
+  invokeMock: vi.fn(async () => ({ baselineRevision: 0 })),
+}));
 vi.mock("../../../lib/api", () => ({ invokePluginAction: invokeMock }));
 
 function set(entries: PluginUiEntry[]) {
@@ -105,10 +113,11 @@ describe("plugin slot renderers", () => {
     await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("acme.kit", "github.refresh"));
   });
 
-  it("pane action shows a spinner while the request is in flight, then clears it", async () => {
-    // Defer the action so the in-flight state is observable.
-    let resolve!: (v: boolean) => void;
-    invokeMock.mockImplementationOnce(() => new Promise<boolean>((r) => (resolve = r)));
+  it("holds the spinner until the plugin revision advances, not just until the POST resolves", async () => {
+    // The host had revision 7 when it accepted the action; the worker re-pushes
+    // its state asynchronously, bumping the revision to 8 on a later poll.
+    revisionRef.current = 7;
+    invokeMock.mockImplementationOnce(async () => ({ baselineRevision: 7 }));
     const entry: PluginUiEntry = {
       plugin_id: "acme.kit",
       slot: "pane",
@@ -116,23 +125,59 @@ describe("plugin slot renderers", () => {
       session_id: "s1",
       payload: { blocks: [{ kind: "action", label: "Refresh", method: "github.refresh" }] },
     };
-    const { container } = render(<PluginPaneBody entry={entry} />);
+    const { container, rerender } = render(<PluginPaneBody entry={entry} />);
     const btn = screen.getByTestId("plugin-pane-action") as HTMLButtonElement;
-    expect(container.querySelector("svg.animate-spin")).toBeNull();
 
     fireEvent.click(btn);
-    await waitFor(() => expect(container.querySelector("svg.animate-spin")).toBeTruthy());
+    // POST has resolved, but the revision has not moved yet: the spinner must
+    // stay (the old behavior cleared it here, which is the bug).
+    await waitFor(() => expect(pokeMock).toHaveBeenCalled());
+    expect(container.querySelector("svg.animate-spin")).toBeTruthy();
     expect(btn.getAttribute("aria-busy")).toBe("true");
     expect(btn.disabled).toBe(true);
 
-    await act(async () => resolve(true));
+    // The poll delivers the worker's re-pushed state: revision moves off the
+    // baseline and the spinner clears.
+    revisionRef.current = 8;
+    rerender(<PluginPaneBody entry={entry} />);
     await waitFor(() => expect(container.querySelector("svg.animate-spin")).toBeNull());
     expect(btn.getAttribute("aria-busy")).toBeNull();
     expect(btn.disabled).toBe(false);
   });
 
-  it("pane action stops the spinner and stays actionable when the request fails", async () => {
-    invokeMock.mockImplementationOnce(async () => false);
+  it("clears a stuck spinner after the timeout when no fresh state arrives", async () => {
+    vi.useFakeTimers();
+    try {
+      revisionRef.current = 3;
+      invokeMock.mockImplementationOnce(async () => ({ baselineRevision: 3 }));
+      const entry: PluginUiEntry = {
+        plugin_id: "acme.kit",
+        slot: "pane",
+        id: "p",
+        session_id: "s1",
+        payload: { blocks: [{ kind: "action", label: "Refresh", method: "github.refresh" }] },
+      };
+      const { container } = render(<PluginPaneBody entry={entry} />);
+      const btn = screen.getByTestId("plugin-pane-action") as HTMLButtonElement;
+
+      await act(async () => {
+        fireEvent.click(btn);
+      });
+      expect(container.querySelector("svg.animate-spin")).toBeTruthy();
+
+      // Revision never moves; the hard timeout restores the button.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(15000);
+      });
+      expect(container.querySelector("svg.animate-spin")).toBeNull();
+      expect(btn.disabled).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("pane action stops the spinner and stays actionable when the POST fails", async () => {
+    invokeMock.mockImplementationOnce(async () => null);
     const entry: PluginUiEntry = {
       plugin_id: "acme.kit",
       slot: "pane",

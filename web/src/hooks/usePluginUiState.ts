@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { fetchPluginUiState, type PluginUiEntry, type PluginUiNotification } from "../lib/api";
 import { reportError, reportInfo } from "../lib/toastBus";
 
@@ -7,6 +7,14 @@ import { reportError, reportInfo } from "../lib/toastBus";
 // (no separate, tearing-prone clock). Notifications are point-in-time: each
 // arrives once, tracked by its monotonic seq, and is pushed to the toast bus.
 const POLL_INTERVAL = 3000;
+// While a manual pane action is settling, `poke()` drops the cadence to this so
+// the worker's re-pushed state (and the revision bump that clears the action's
+// spinner) shows up in well under a second instead of waiting a full 3s tick.
+const BOOST_INTERVAL = 500;
+// How long a single `poke()` keeps the boosted cadence before reverting. Sized
+// to outlast a slow (network / rate-limited) GitHub refresh; the action spinner
+// has its own hard timeout, so an over-long boost is bounded regardless.
+const BOOST_MS = 15000;
 
 /** Map a plugin notification onto the toast bus. The bus only distinguishes
  *  error vs info, so danger/warn tones surface as errors and the rest as info;
@@ -28,15 +36,22 @@ const REFRESH_INDICATOR_DELAY = 250;
 
 export function usePluginUiState() {
   const [entries, setEntries] = useState<PluginUiEntry[]>([]);
+  const [revisions, setRevisions] = useState<Record<string, number>>({});
   const [isRefreshing, setIsRefreshing] = useState(false);
   // Highest notification seq already toasted. Seeded from the first snapshot so
   // a page load does not replay the whole backlog as fresh toasts.
   const lastNotifySeqRef = useRef<number | null>(null);
+  // `poke()` reaches into the running poll loop to run a tick now and boost the
+  // cadence. The loop publishes its trigger here; poke is otherwise a no-op
+  // (e.g. called before the effect mounts).
+  const pokeRef = useRef<() => void>(() => {});
 
   useEffect(() => {
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
     let slowTimer: ReturnType<typeof setTimeout> | null = null;
+    let inFlight = false;
+    let boostUntil = 0;
 
     const apply = (notifications: PluginUiNotification[]) => {
       const maxSeq = notifications.reduce((m, n) => Math.max(m, n.seq), 0);
@@ -55,11 +70,19 @@ export function usePluginUiState() {
       lastNotifySeqRef.current = Math.max(seen, maxSeq);
     };
 
+    const scheduleNext = () => {
+      if (cancelled) return;
+      const delay = Date.now() < boostUntil ? BOOST_INTERVAL : POLL_INTERVAL;
+      timer = setTimeout(() => void tick(), delay);
+    };
+
     // Recursive setTimeout, not setInterval: the next poll is scheduled only
     // after the current one settles, so requests never overlap and a slow
     // response cannot land after a newer one and roll the dashboard back to
     // stale plugin UI. A failed fetch (null) just skips this round.
     const tick = async () => {
+      if (inFlight) return; // a poke during an in-flight fetch; scheduleNext re-fires
+      inFlight = true;
       // Flip the indicator on only once the poll outlasts the threshold, so a
       // fast fetch never shows it. Cleared in finally whether the fetch
       // succeeds, returns null, or the threshold never fires.
@@ -70,22 +93,35 @@ export function usePluginUiState() {
         const state = await fetchPluginUiState();
         if (cancelled || state === null) return;
         setEntries(state.entries);
+        setRevisions(state.revisions ?? {});
         apply(state.notifications);
       } finally {
         if (slowTimer) clearTimeout(slowTimer);
+        inFlight = false;
         if (!cancelled) {
           setIsRefreshing(false);
-          timer = setTimeout(() => void tick(), POLL_INTERVAL);
+          scheduleNext();
         }
       }
     };
+
+    pokeRef.current = () => {
+      boostUntil = Date.now() + BOOST_MS;
+      if (inFlight) return; // the in-flight fetch's scheduleNext picks up the boost
+      if (timer) clearTimeout(timer);
+      void tick();
+    };
+
     void tick();
     return () => {
       cancelled = true;
+      pokeRef.current = () => {};
       if (timer) clearTimeout(timer);
       if (slowTimer) clearTimeout(slowTimer);
     };
   }, []);
 
-  return { entries, isRefreshing };
+  const poke = useCallback(() => pokeRef.current(), []);
+
+  return { entries, revisions, isRefreshing, poke };
 }
