@@ -268,6 +268,23 @@ pub fn reconcile_trashed_location(inst: &mut Instance) -> bool {
             && current != target
             && !is_holding_path(&current, &inst.id)
         {
+            // Crash case: the worktree was already moved to `target` but the
+            // marker/pointer persist was lost and something was recreated at
+            // the original path. Retrying the move would fail (target exists)
+            // and leave project_path on the wrong dir, so heal to the existing
+            // holding path and record the marker. Restore can then fail
+            // cleanly if the original stays occupied.
+            if target.exists() {
+                inst.project_path = target.to_string_lossy().into_owned();
+                inst.pre_trash_project_path = Some(original.to_string_lossy().into_owned());
+                tracing::info!(
+                    target: "session.trash",
+                    session = %inst.id,
+                    to = %target.display(),
+                    "reconciled trashed worktree pointer to existing holding area"
+                );
+                return true;
+            }
             return match relocate_worktree_to_trash(inst) {
                 RelocateOutcome::Relocated { .. } => true,
                 RelocateOutcome::Failed { reason } => {
@@ -579,6 +596,41 @@ mod tests {
         );
         assert_eq!(inst.project_path, holding);
         assert!(!PathBuf::from(&holding).join(".aoe-trash").exists());
+    }
+
+    #[test]
+    fn reconcile_heals_to_holding_when_original_recreated() {
+        // Crash case: worktree already moved to the holding path, but the
+        // marker was lost and the original path was recreated. Reconcile must
+        // point at the existing holding worktree and record the marker, not
+        // retry the (now-failing) move and leave project_path on the recreated
+        // original.
+        if !git_available() {
+            return;
+        }
+        let (_tmp, mut inst) = real_worktree_instance();
+        let original = inst.project_path.clone();
+        inst.trash();
+        assert!(matches!(
+            relocate_worktree_to_trash(&mut inst),
+            RelocateOutcome::Relocated { .. }
+        ));
+        let holding = inst.project_path.clone();
+
+        // Lost persist + recreated original.
+        inst.project_path = original.clone();
+        inst.pre_trash_project_path = None;
+        std::fs::create_dir_all(&original).unwrap();
+
+        assert!(
+            reconcile_trashed_location(&mut inst),
+            "reconcile should heal to the existing holding path"
+        );
+        assert_eq!(inst.project_path, holding);
+        assert_eq!(
+            inst.pre_trash_project_path.as_deref(),
+            Some(original.as_str())
+        );
     }
 
     #[test]
