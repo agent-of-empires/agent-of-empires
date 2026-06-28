@@ -3303,9 +3303,15 @@ export function WorkspaceSidebar({
                       data-testid="sidebar-trash-row"
                       className="flex items-center gap-2 pl-7 pr-3 py-1.5 text-[13px] text-text-muted"
                     >
-                      <span className="flex-1 truncate" title={v.workspace.displayName}>
+                      <button
+                        type="button"
+                        onClick={(e) => handleRowActivate(v.workspace.id, e)}
+                        title={v.workspace.displayName}
+                        data-testid="sidebar-trash-open"
+                        className="flex-1 truncate text-left hover:text-text-secondary cursor-pointer"
+                      >
                         {v.workspace.displayName}
-                      </span>
+                      </button>
                       {!readOnly && (
                         <>
                           <button

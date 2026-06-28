@@ -89,6 +89,11 @@ interface Props {
    *  timestamps come back as null and we fall through to the live
    *  variant. See #1581. */
   snoozedUntil: string | null;
+  /** RFC3339 trashed-at timestamp, or null. Drives the trash-specific
+   *  "worker stopped" banner: a trashed session is recoverable only by
+   *  restoring it, so the banner replaces the composer and points at the
+   *  Trash section. Takes precedence over archived/snoozed. See #2489. */
+  trashedAt: string | null;
   /** Open a local file reference cited in the transcript (Codex
    *  `path:line` markdown links). Provided to the markdown anchor
    *  override via context so a click opens the in-app file viewer
@@ -110,8 +115,17 @@ const STARTER_PROMPTS = [
 ];
 
 export function StructuredView(props: Props) {
-  const { sessionId, acpWorkerState, tool, archivedAt, snoozedUntil, onOpenFileRef, fileRefSession, onOpenAgentsPane } =
-    props;
+  const {
+    sessionId,
+    acpWorkerState,
+    tool,
+    archivedAt,
+    snoozedUntil,
+    trashedAt,
+    onOpenFileRef,
+    fileRefSession,
+    onOpenAgentsPane,
+  } = props;
   // Folds rows above the most recent `/clear` divider out of the
   // thread by default; the disclosure banner toggles this. Lives on
   // the view (not the reducer) because it's a UI preference, not
@@ -144,6 +158,7 @@ export function StructuredView(props: Props) {
                   onToggleToolDensity={toggleToolDensity}
                   archivedAt={archivedAt}
                   snoozedUntil={snoozedUntil}
+                  trashedAt={trashedAt}
                   {...ctx}
                 />
               </BackgroundAgentsContext.Provider>
@@ -200,6 +215,7 @@ function AcpChrome({
   onToggleToolDensity,
   archivedAt,
   snoozedUntil,
+  trashedAt,
   state,
   status,
   hasEverOpened,
@@ -236,6 +252,7 @@ function AcpChrome({
   onToggleToolDensity: () => void;
   archivedAt: string | null;
   snoozedUntil: string | null;
+  trashedAt: string | null;
 }) {
   // Count how many activity rows precede the latest `session_cleared`
   // divider so the banner can say "12 earlier turns hidden". The
@@ -463,9 +480,13 @@ function AcpChrome({
         const variant = pickWorkerStoppedVariant({
           workerStopped: state.workerStopped,
           startupError: state.startupError,
+          trashedAt,
           archivedAt,
           snoozedUntil,
         });
+        if (variant === "trashed") {
+          return <TrashedWorkerStoppedBanner sessionId={sessionId} />;
+        }
         if (variant === "archived") {
           return <ArchivedWorkerStoppedBanner sessionId={sessionId} />;
         }
@@ -1732,6 +1753,27 @@ function WorkerStoppedBanner({ sessionId }: { sessionId: string }) {
  *  startup recovery path both skip archived sessions, so a fresh
  *  spawn would not survive the next reconciliation tick. The user
  *  unblocks by unarchiving from the sidebar context menu. See #1581. */
+/** Replacement for `WorkerStoppedBanner` when the session is in the trash
+ *  (#2489). The transcript is still readable (the event store keeps it until
+ *  purge), but the worker is stopped and the reconciler will not respawn a
+ *  trashed session, so the composer is disabled and the banner points at the
+ *  sidebar Trash section to restore. */
+export function TrashedWorkerStoppedBanner({ sessionId }: { sessionId: string }) {
+  return (
+    <div
+      className="border-b border-amber-900/60 bg-amber-950/40 px-4 py-3 text-amber-200"
+      data-testid={`acp-trashed-banner-${sessionId}`}
+    >
+      <div className="text-sm font-medium">Session in trash</div>
+      <div className="mt-1 text-xs text-amber-100/90">
+        This session is in the trash. Its transcript and workspace are kept and shown here read-only, but the worker is
+        stopped and will not respawn. Restore it from the Trash section in the sidebar to resume, or delete it
+        permanently from there.
+      </div>
+    </div>
+  );
+}
+
 export function ArchivedWorkerStoppedBanner({ sessionId }: { sessionId: string }) {
   return (
     <div

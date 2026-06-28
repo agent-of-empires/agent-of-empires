@@ -1457,6 +1457,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
                         tool={activeSession.tool}
                         archivedAt={activeSession.archived_at ?? null}
                         snoozedUntil={activeSession.snoozed_until ?? null}
+                        trashedAt={activeSession.trashed_at ?? null}
                         onOpenFileRef={handleOpenFileRef}
                         fileRefSession={activeSession}
                         onOpenAgentsPane={openAgentsPane}

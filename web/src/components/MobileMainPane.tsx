@@ -111,6 +111,7 @@ export function MobileMainPane({
                 tool={activeSession.tool}
                 archivedAt={activeSession.archived_at ?? null}
                 snoozedUntil={activeSession.snoozed_until ?? null}
+                trashedAt={activeSession.trashed_at ?? null}
                 onOpenFileRef={onOpenFileRef}
                 fileRefSession={activeSession}
               />
