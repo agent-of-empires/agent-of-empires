@@ -55,7 +55,11 @@ export function PluginInstallConsentModal({
           <div>
             <h2 className="font-semibold">Install {consent.id}?</h2>
             <p className="text-xs text-text-dim">
-              v{consent.version} · {consent.validation} · {consent.source}
+              v{consent.version} ·{" "}
+              <span className={consent.validation === "featured" ? "font-medium text-accent-500" : undefined}>
+                {consent.validation}
+              </span>{" "}
+              · {consent.source}
             </p>
           </div>
           <button

@@ -107,6 +107,19 @@ export function PluginJobProgressModal({ jobId, title, onClose }: PluginJobProgr
         >
           {job?.log.tail || (state === "running" ? "Starting…" : "")}
         </pre>
+
+        {done && (
+          <div className="mt-3 flex justify-end">
+            <button
+              type="button"
+              className="rounded bg-brand-600 px-3 py-1 text-xs font-medium text-white hover:bg-brand-500"
+              onClick={onClose}
+              data-testid="plugin-job-done"
+            >
+              Close
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );
