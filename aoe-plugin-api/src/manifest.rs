@@ -25,6 +25,12 @@ pub struct PluginManifest {
     #[serde(default)]
     pub description: String,
 
+    /// Screenshots / animated GIFs the plugin ships to illustrate itself in the
+    /// marketplace and detail views. Each `path` is repository-relative;
+    /// presentation only, granting nothing. Requires `api_version >= 5`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub screenshots: Vec<Screenshot>,
+
     /// Resource/effect capabilities the plugin requests. Static contributions
     /// below are NOT listed here; only runtime resource access is. The user
     /// grants these once at install (community plugins); builtins are
@@ -145,7 +151,9 @@ pub enum SettingType {
     /// Free text, rendered as a text input.
     #[default]
     String,
-    /// On/off, rendered as a toggle.
+    /// On/off, rendered as a toggle. Accepts `boolean` too: it is the natural
+    /// spelling next to `integer`, and shipped plugins use it.
+    #[serde(alias = "boolean")]
     Bool,
     /// Integer, rendered as a number input (bounded by `min`/`max`).
     Integer,
@@ -172,6 +180,66 @@ pub struct StatusContribution {
     /// Human-readable text shown in the status surface.
     #[serde(default)]
     pub label: String,
+}
+
+/// Maximum screenshots a manifest may declare. A cap keeps the detail modal
+/// usable and the manifest from ballooning; the lenient detail parser truncates
+/// to the same bound.
+pub const MAX_SCREENSHOTS: usize = 8;
+
+/// Image extensions a screenshot `path` may use. The host renders each in an
+/// `<img>`, so this is the raster/animated set a browser shows inline; SVG is
+/// deliberately excluded (it can embed external references).
+const SCREENSHOT_EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];
+
+/// A screenshot or animated GIF a plugin ships to illustrate itself. `path` is
+/// repository-relative (resolved against the plugin's source repo by the detail
+/// endpoint); absolute URLs are rejected so opening a detail modal cannot issue
+/// author-chosen third-party requests.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Screenshot {
+    /// Repository-relative path to a PNG/JPEG/GIF/WebP asset in the plugin's
+    /// source repo. Not a URL: no scheme, no leading separator, no `..`.
+    pub path: String,
+    /// Accessible description of the image. Required; screenshots are content,
+    /// not decoration.
+    pub alt: String,
+    /// Optional human-visible caption shown beneath the image.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub caption: String,
+}
+
+/// Whether `path` is a clean repository-relative image path usable as a
+/// screenshot: relative (no URL scheme, no drive letter, no leading separator),
+/// no `..` traversal, no empty components, no control characters, bounded
+/// length, and an allowed image extension. Shared by the strict validator and
+/// the lenient detail parser so both agree on what resolves.
+pub fn screenshot_path_ok(path: &str) -> bool {
+    if path.is_empty() || path.len() > 512 {
+        return false;
+    }
+    // A colon rejects both URL schemes (`https:`) and Windows drive letters
+    // (`C:`); a leading slash rejects absolute paths. Screenshot paths are
+    // repository paths, so they must use `/`, never `\`: a backslash would
+    // survive into the resolved raw URL percent-encoded and 404, so reject it
+    // here to fail fast for the author rather than render a broken image.
+    if path.starts_with('/') || path.contains(':') || path.contains('\\') {
+        return false;
+    }
+    if path.chars().any(char::is_control) {
+        return false;
+    }
+    if path.split('/').any(|seg| seg == ".." || seg.is_empty()) {
+        return false;
+    }
+    match path.rsplit('.').next() {
+        Some(ext) if ext != path => {
+            SCREENSHOT_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str())
+        }
+        // No extension (or a leading-dot dotfile with no extension).
+        _ => false,
+    }
 }
 
 /// A host-rendered UI slot a plugin may push state into (#2366). A closed set,
@@ -596,6 +664,27 @@ impl PluginManifest {
                 format!("status[{i}].id must not be empty"),
             );
         }
+        check(
+            self.screenshots.len() <= MAX_SCREENSHOTS,
+            format!(
+                "at most {MAX_SCREENSHOTS} screenshots are allowed (got {})",
+                self.screenshots.len()
+            ),
+        );
+        for (i, s) in self.screenshots.iter().enumerate() {
+            check(
+                screenshot_path_ok(&s.path),
+                format!(
+                    "screenshots[{i}].path {:?} must be a repository-relative image path \
+                     (png/jpg/jpeg/gif/webp), not a URL or an absolute/traversing path",
+                    s.path
+                ),
+            );
+            check(
+                !s.alt.trim().is_empty(),
+                format!("screenshots[{i}].alt must not be empty"),
+            );
+        }
         // `aoe_version` is the host-app compatibility range, gated by the host
         // at install and load; reject a malformed requirement at parse so the
         // author learns of it before publishing rather than at a user's install.
@@ -620,6 +709,15 @@ impl PluginManifest {
                 "aoe_version requires api_version >= 4".into(),
             );
         }
+        // `screenshots` is an api_version 5 field; force the bump for the same
+        // reason as the api_version 4 fields above, so a pre-5 host emits the
+        // "upgrade aoe" path rather than a confusing "unknown field" error.
+        if self.api_version < 5 {
+            check(
+                self.screenshots.is_empty(),
+                "screenshots require api_version >= 5".into(),
+            );
+        }
         for key in self.setting_defaults.keys() {
             check(
                 key.contains('.') && !key.starts_with('.') && !key.ends_with('.'),
@@ -638,6 +736,28 @@ impl PluginManifest {
             Ok(())
         } else {
             Err(ManifestError::Invalid(errors))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn setting_type_accepts_boolean_and_bool() {
+        // `boolean` is the natural spelling next to `integer`, and shipped
+        // plugins (plugin-github) use it; both must parse to Bool.
+        for spelling in ["boolean", "bool"] {
+            let manifest = PluginManifest::from_toml_str(&format!(
+                "id = \"acme.thing\"\nname = \"Thing\"\nversion = \"1.0.0\"\napi_version = 4\n\n[[settings]]\nkey = \"flag\"\ntype = \"{spelling}\"\n"
+            ))
+            .expect("manifest parses");
+            assert_eq!(
+                manifest.settings[0].value_type,
+                SettingType::Bool,
+                "{spelling}"
+            );
         }
     }
 }

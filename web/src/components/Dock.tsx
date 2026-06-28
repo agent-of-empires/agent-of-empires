@@ -5,7 +5,7 @@ import { SortableContext, horizontalListSortingStrategy, useSortable } from "@dn
 import { CSS } from "@dnd-kit/utilities";
 
 import type { DockLocation } from "../lib/panes";
-import { usePaneDnd, type PaneTabData } from "./paneDnd";
+import { usePaneDnd, type PaneTabData, type SplitDropData } from "./paneDnd";
 
 export interface PaneDisplay {
   title: string;
@@ -14,6 +14,9 @@ export interface PaneDisplay {
 
 interface Props {
   location: DockLocation;
+  /** Persisted index of this group within its dock; carried on the drop
+   *  payloads so a drop addresses the right group. */
+  groupIndex: number;
   /** Visible tab ids in strip order (the parent pre-filters availability). */
   tabs: string[];
   /** Active tab id; falls back to the first tab if stale/missing. */
@@ -35,7 +38,7 @@ const btn =
   "w-5 h-5 flex items-center justify-center shrink-0 rounded text-text-dim hover:text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors";
 
 /** A vertical bar marking where a dragged tab would land. Rendered inline
- *  between tabs (cross-dock drops only, see Dock), so it costs 2px of strip
+ *  between tabs (cross-group drops only, see Dock), so it costs 2px of strip
  *  width and no reflow of the tab bodies. */
 function InsertionMarker() {
   return <div data-testid="pane-insertion-marker" className="w-0.5 self-stretch bg-brand-500 shrink-0" />;
@@ -44,6 +47,7 @@ function InsertionMarker() {
 interface SortableTabProps {
   id: string;
   location: DockLocation;
+  groupIndex: number;
   isActive: boolean;
   desc: PaneDisplay;
   onActivate: (id: string) => void;
@@ -55,10 +59,10 @@ interface SortableTabProps {
  *  still activates rather than starting a drag. Only `listeners` are spread,
  *  not dnd-kit's `attributes`, which would inject a conflicting role/aria onto
  *  the role="tab" button. */
-function SortableTab({ id, location, isActive, desc, onActivate, onClose }: SortableTabProps) {
+function SortableTab({ id, location, groupIndex, isActive, desc, onActivate, onClose }: SortableTabProps) {
   const { setNodeRef, listeners, transform, transition, isDragging } = useSortable({
     id,
-    data: { type: "pane-tab", dock: location } satisfies PaneTabData,
+    data: { type: "pane-tab", dock: location, group: groupIndex } satisfies PaneTabData,
   });
   const name = desc.title.toLowerCase();
   const style = { transform: CSS.Transform.toString(transform), transition };
@@ -101,20 +105,55 @@ function SortableTab({ id, location, isActive, desc, onActivate, onClose }: Sort
   );
 }
 
-/** Renders one dock location as a tabbed group: a tab strip plus the active
- *  tab's body. Each tab carries its pane's icon, title, and a close control;
- *  the strip also offers move-to-other-dock and a new-terminal button. Only the
- *  active body is mounted; the terminal/diff state it shows is server-side
- *  (tmux session, diff API), so re-mounting on a tab switch is cheap. The
- *  parent hides the dock entirely when it has no tabs.
+/** A half of a group body that, while a tab is dragged, lifts the drop into a
+ *  fresh group before or after this one. The tall right column stacks groups
+ *  (top / bottom halves), the wide bottom strip splits side by side (left /
+ *  right halves). Mounted only during a drag, so it never intercepts ordinary
+ *  clicks on the pane body (terminals, iframes). */
+function SplitDropZone({
+  location,
+  groupIndex,
+  side,
+}: {
+  location: DockLocation;
+  groupIndex: number;
+  side: "before" | "after";
+}) {
+  const { setNodeRef, isOver } = useDroppable({
+    id: `pane-split:${location}:${groupIndex}:${side}`,
+    data: { type: "pane-split", dock: location, group: groupIndex, side } satisfies SplitDropData,
+  });
+  const half =
+    location === "right"
+      ? side === "before"
+        ? "top-0 left-0 w-full h-1/2"
+        : "bottom-0 left-0 w-full h-1/2"
+      : side === "before"
+        ? "top-0 left-0 h-full w-1/2"
+        : "top-0 right-0 h-full w-1/2";
+  return (
+    <div
+      ref={setNodeRef}
+      data-testid={`pane-split-${location}-${groupIndex}-${side}`}
+      className={`absolute z-20 ${half} ${isOver ? "bg-brand-600/25 ring-2 ring-inset ring-brand-500/70" : ""}`}
+    />
+  );
+}
+
+/** Renders one dock group: a tab strip plus the active tab's body. Each tab
+ *  carries its pane's icon, title, and a close control; the strip also offers
+ *  move-to-other-dock and a new-terminal button. Only the active body is
+ *  mounted; the terminal/diff state it shows is server-side (tmux session, diff
+ *  API), so re-mounting on a tab switch is cheap. The parent maps a dock's
+ *  groups to one Dock each and hides a dock with no groups.
  *
- *  Tabs reorder within the dock and move across docks via drag-and-drop (the
- *  shared DndContext lives in PaneDndController); the move button stays as the
- *  keyboard/click affordance. A within-dock reorder is shown by the tabs
- *  sliding apart; a cross-dock drop adds a destination ring plus an insertion
- *  marker, since the destination strip does not shift to preview the insert. */
+ *  Tabs reorder within a group and move across groups/docks via drag-and-drop
+ *  (the shared DndContext lives in PaneDndController); the move button stays as
+ *  the keyboard/click affordance. Dropping on the strip joins this group;
+ *  dropping on a body half splits into a new sibling group. */
 export function Dock({
   location,
+  groupIndex,
   tabs,
   active,
   descriptorFor,
@@ -124,30 +163,41 @@ export function Dock({
   onMove,
   onNewTerminal,
 }: Props) {
-  const { sourceDock, dropTarget } = usePaneDnd();
-  const { setNodeRef: setDockRef } = useDroppable({
-    id: `dock-body:${location}`,
-    data: { type: "pane-dock", dock: location },
+  const { activeTab, source, dropTarget } = usePaneDnd();
+  const { setNodeRef: setGroupRef } = useDroppable({
+    id: `pane-group:${location}:${groupIndex}`,
+    data: { type: "pane-group", dock: location, group: groupIndex },
   });
   if (tabs.length === 0) return null;
   const activeId = active && tabs.includes(active) ? active : tabs[0]!;
   const target: DockLocation = location === "right" ? "bottom" : "right";
   const MoveIcon = location === "right" ? PanelBottom : PanelRight;
   const activeName = descriptorFor(activeId).title.toLowerCase();
-  // Highlight + mark only a cross-dock drop: a within-dock reorder reads from
-  // the tabs sliding apart, so a marker there would double up with the gap.
-  const isDropTarget = dropTarget?.dock === location && sourceDock !== location;
-  const markerIndex = isDropTarget ? dropTarget!.index : null;
+  // Highlight + mark only a drop into a *different* group; a within-group
+  // reorder reads from the tabs sliding apart, so a marker there would double
+  // up with the gap.
+  const isSourceGroup = source?.dock === location && source.group === groupIndex;
+  const isDropTarget =
+    !!dropTarget &&
+    !dropTarget.newGroup &&
+    dropTarget.dock === location &&
+    dropTarget.group === groupIndex &&
+    !isSourceGroup;
+  const markerIndex = isDropTarget ? (dropTarget!.index ?? tabs.length) : null;
 
   return (
     <section
-      ref={setDockRef}
-      className={`flex flex-col min-h-0 flex-1 overflow-hidden ${
+      className={`flex flex-col min-h-0 min-w-0 flex-1 overflow-hidden ${
         isDropTarget ? "ring-2 ring-inset ring-brand-500/70" : ""
       }`}
       data-pane-dock={location}
+      data-pane-group={groupIndex}
     >
-      <div role="tablist" className="flex items-stretch h-7 shrink-0 bg-surface-900 border-b border-surface-700/20">
+      <div
+        ref={setGroupRef}
+        role="tablist"
+        className="flex items-stretch h-7 shrink-0 bg-surface-900 border-b border-surface-700/20"
+      >
         <div className="flex items-stretch min-w-0 overflow-x-auto">
           <SortableContext items={tabs} strategy={horizontalListSortingStrategy}>
             {tabs.map((id, i) => (
@@ -156,6 +206,7 @@ export function Dock({
                 <SortableTab
                   id={id}
                   location={location}
+                  groupIndex={groupIndex}
                   isActive={id === activeId}
                   desc={descriptorFor(id)}
                   onActivate={onActivate}
@@ -182,7 +233,15 @@ export function Dock({
           )}
         </div>
       </div>
-      <div className="flex-1 flex flex-col min-h-0 overflow-hidden">{renderBody(activeId)}</div>
+      <div className="relative flex-1 flex flex-col min-h-0 overflow-hidden">
+        {renderBody(activeId)}
+        {activeTab && (
+          <>
+            <SplitDropZone location={location} groupIndex={groupIndex} side="before" />
+            <SplitDropZone location={location} groupIndex={groupIndex} side="after" />
+          </>
+        )}
+      </div>
     </section>
   );
 }

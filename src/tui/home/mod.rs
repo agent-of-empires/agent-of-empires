@@ -23,7 +23,7 @@ use ratatui::prelude::Rect;
 use tui_input::Input;
 
 use crate::session::{
-    append_archived_section, append_archived_section_by_project,
+    append_archived_section, append_archived_section_by_project, append_trash_section,
     config::{load_config, save_config, GroupByMode, SortOrder},
     flatten_sessions_by_attention, flatten_tree, flatten_tree_all_profiles, resolve_config_or_warn,
     DefaultTerminalMode, EnsureReadyOutcome, Group, GroupTree, Instance, Item, Storage,
@@ -887,6 +887,14 @@ pub struct HomeView {
     /// bottom until the user opts to see them. Persisted to
     /// `app_state.archived_section_collapsed`.
     pub(super) archived_section_collapsed: bool,
+
+    /// Collapsed state of the synthetic "Trash" sidebar section. Defaults to
+    /// `true` (collapsed): trash is a recovery shelf, kept out of the way
+    /// until the user opens it. In-memory only (not persisted): a fresh
+    /// session starts with trash collapsed, which is the right default for a
+    /// rarely-used shelf.
+    // ponytail: in-memory only; persist to app_state if users ask for it.
+    pub(super) trashed_section_collapsed: bool,
 
     /// Channel that startup-recovery workers send results back on. `None`
     /// when no recovery was attempted at construction (live tmux, daemon
@@ -2078,6 +2086,7 @@ impl HomeView {
                 .as_ref()
                 .and_then(|c| c.app_state.archived_section_collapsed)
                 .unwrap_or(true),
+            trashed_section_collapsed: true,
             recovery_rx: None,
             recovery_lock: None,
             recovery_in_flight: std::collections::HashSet::new(),
@@ -3963,6 +3972,21 @@ impl HomeView {
         });
     }
 
+    /// Expand the synthetic Trash section if collapsed. Used when trashing a
+    /// session so the user sees where the row went. No-op when already open.
+    pub(super) fn reveal_trashed_section(&mut self) {
+        self.trashed_section_collapsed = false;
+    }
+
+    pub fn toggle_trashed_section(&mut self) {
+        self.trashed_section_collapsed = !self.trashed_section_collapsed;
+        self.flat_items = self.build_flat_items();
+        if !self.flat_items.is_empty() && self.cursor >= self.flat_items.len() {
+            self.cursor = self.flat_items.len() - 1;
+        }
+        self.update_selected();
+    }
+
     pub fn toggle_archived_section(&mut self) {
         self.archived_section_collapsed = !self.archived_section_collapsed;
         let collapsed = self.archived_section_collapsed;
@@ -4063,6 +4087,7 @@ impl HomeView {
             };
             let mut items = flatten_sessions_by_attention(&filtered);
             append_archived_section(&mut items, &filtered, self.archived_section_collapsed);
+            append_trash_section(&mut items, &filtered, self.trashed_section_collapsed);
             return items;
         }
 
@@ -4094,6 +4119,8 @@ impl HomeView {
         // sort order. Archived rows were filtered out of the natural flow
         // inside `flatten_tree` / `flatten_tree_all_profiles`.
         append_archived_section(&mut items, &archive_pool, self.archived_section_collapsed);
+        // Trash sits below Archived, also pinned to the bottom.
+        append_trash_section(&mut items, &archive_pool, self.trashed_section_collapsed);
         items
     }
 
@@ -4128,7 +4155,7 @@ impl HomeView {
         // automatic"), leaving the user no way to clear it.
         let tree_seed: Vec<Instance> = grouped
             .iter()
-            .filter(|i| !i.is_archived())
+            .filter(|i| !i.is_archived() && !i.is_trashed())
             .cloned()
             .collect();
 
@@ -4165,6 +4192,9 @@ impl HomeView {
             &self.project_group_collapsed,
             self.sort_order,
         );
+        // Trash is a flat shelf even in project mode (recovery list, not a
+        // workspace), pinned below the Archived section.
+        append_trash_section(&mut items, &grouped, self.trashed_section_collapsed);
         items
     }
 
@@ -5546,7 +5576,9 @@ impl HomeView {
         }
         match self.flat_items.get(self.cursor) {
             Some(Item::Group { path, name, .. })
-                if !crate::session::is_within_archived_section(path) && name != "scratch" =>
+                if !crate::session::is_within_archived_section(path)
+                    && !crate::session::is_within_trash_section(path)
+                    && name != "scratch" =>
             {
                 Some(name.clone())
             }

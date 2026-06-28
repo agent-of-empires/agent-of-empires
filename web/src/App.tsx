@@ -34,10 +34,11 @@ import { useEdgeSwipe } from "./hooks/useEdgeSwipe";
 import { useIsCoarsePointer } from "./hooks/useIsCoarsePointer";
 import { useIsWideViewport } from "./hooks/useIsWideViewport";
 import type { RightPanelView } from "./lib/rightPanelView";
-import { usePaneLayout, dockTabs, dockActive, dockOf } from "./lib/paneLayout";
+import { usePaneLayout, dockTabs, dockGroups, dockOf, isActiveTab } from "./lib/paneLayout";
 import { isPluginPaneId, usePluginPanes, type PluginPane } from "./lib/pluginPanes";
 import { PluginPaneBody } from "./components/plugin/PluginSlots";
 import { TOUR_ANCHORS, tourAnchor } from "./lib/tourSteps";
+import { restoreSessions, trashSessions } from "./lib/trashActions";
 import {
   loginStatus,
   logout,
@@ -83,10 +84,11 @@ const StructuredView = lazy(() =>
     default: m.StructuredView,
   })),
 );
-import { Dock, type PaneDisplay } from "./components/Dock";
+import { type PaneDisplay } from "./components/Dock";
+import { DockGroups, type DockGroupView } from "./components/DockGroups";
 import { BottomDock } from "./components/BottomDock";
 import { PaneDndController } from "./components/PaneDndController";
-import { visibleToFullIndex } from "./components/paneDnd";
+import { visibleToFullIndex, type DropTarget } from "./components/paneDnd";
 import { BackgroundAgentsPanel } from "./components/acp/BackgroundAgentsPanel";
 import { DiffPane } from "./components/DiffPane";
 import { PairedShellPane } from "./components/PairedTerminal";
@@ -268,6 +270,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     loaded: sessionsLoaded,
     injectSession,
     setSessionStatus,
+    applySession,
   } = useSessions();
   const workspaces = useWorkspaces(sessions);
 
@@ -452,23 +455,31 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     (id: string) => !id.startsWith("plugin:") || pluginPaneById.has(id),
     [pluginPaneById],
   );
-  const visibleTabs = useCallback(
-    (dock: DockLocation) => dockTabs(paneLayout, dock).filter(tabAvailable),
+  // A dock's groups reduced to what's actually shown: each surviving group keeps
+  // its persisted index (so a drop addresses the right group) and a valid active
+  // tab. Groups with no visible tab (only unloaded plugins) are not rendered.
+  const renderGroups = useCallback(
+    (dock: DockLocation): DockGroupView[] =>
+      dockGroups(paneLayout, dock)
+        .map((g, group) => {
+          const tabs = g.tabs.filter(tabAvailable);
+          const active = g.active && tabs.includes(g.active) ? g.active : (tabs[0] ?? null);
+          return { group, tabs, active };
+        })
+        .filter((g) => g.tabs.length > 0),
     [paneLayout, tabAvailable],
   );
-  const visibleActive = useCallback(
-    (dock: DockLocation): string | null => {
-      const vis = visibleTabs(dock);
-      const a = dockActive(paneLayout, dock);
-      return a && vis.includes(a) ? a : (vis[0] ?? null);
-    },
-    [paneLayout, visibleTabs],
-  );
 
-  const rightTabs = visibleTabs("right");
-  const bottomTabs = visibleTabs("bottom");
-  const tabsByDock = useMemo(() => ({ right: rightTabs, bottom: bottomTabs }), [rightTabs, bottomTabs]);
-  const rightDockCollapsed = rightTabs.length === 0;
+  const rightGroups = renderGroups("right");
+  const bottomGroups = renderGroups("bottom");
+  const groupsByDock = useMemo(
+    () => ({
+      right: rightGroups.map((g) => ({ group: g.group, tabs: g.tabs })),
+      bottom: bottomGroups.map((g) => ({ group: g.group, tabs: g.tabs })),
+    }),
+    [rightGroups, bottomGroups],
+  );
+  const rightDockCollapsed = rightGroups.length === 0;
   const terminalOpen = (["right", "bottom"] as DockLocation[]).some((d) =>
     dockTabs(paneLayout, d).some(isTerminalTabId),
   );
@@ -519,13 +530,19 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     [closeTab, activeSessionId],
   );
   const movePaneAny = useCallback((id: string, dock: DockLocation) => moveTab(id, dock), [moveTab]);
-  // The dnd controller works in visible-tab space; map its drop index back to
-  // the full persisted dock list, since a hidden (unloaded) plugin tab still
-  // holds a slot the visible index does not count.
+  // The dnd controller works in visible-tab space; map a drop index back to the
+  // target group's full persisted tab list, since a hidden (unloaded) plugin tab
+  // still holds a slot the visible index does not count. A split target carries
+  // no index (the new group starts with just the dragged tab).
   const placeVisibleTab = useCallback(
-    (id: string, toDock: DockLocation, visibleIndex: number) => {
-      const fullBase = dockTabs(paneLayout, toDock).filter((tab) => tab !== id);
-      placeTab(id, toDock, visibleToFullIndex(fullBase, visibleIndex, tabAvailable));
+    (id: string, target: DropTarget) => {
+      if (target.newGroup) {
+        placeTab(id, { dock: target.dock, group: target.group, newGroup: true });
+        return;
+      }
+      const fullBase = (dockGroups(paneLayout, target.dock)[target.group]?.tabs ?? []).filter((tab) => tab !== id);
+      const index = visibleToFullIndex(fullBase, target.index ?? fullBase.length, tabAvailable);
+      placeTab(id, { dock: target.dock, group: target.group, index });
     },
     [paneLayout, placeTab, tabAvailable],
   );
@@ -857,6 +874,39 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     [deletingSession, activeSessionId, setSessionStatus, navigate],
   );
 
+  // Move-to-trash path (#2489): the safe default. Unlike permanent delete it
+  // deliberately KEEPS the per-session acp cache, draft, and stored comments
+  // so a restore is faithful; only purge clears them. Trashes every session
+  // in the workspace so a multi-session workspace sinks as a whole.
+  const handleConfirmTrash = useCallback(async () => {
+    if (!deletingWorkspace) return;
+    const ids = deletingWorkspace.sessions.map((s) => s.id);
+    if (ids.length === 0) return;
+    const wasActive = activeSessionId != null && ids.includes(activeSessionId);
+
+    setDeletingWorkspaceId(null);
+    for (const id of ids) setSessionStatus(id, "Stopped");
+    if (wasActive) {
+      navigate("/");
+    }
+
+    // The returned snapshot re-buckets each row into Trash immediately
+    // instead of on the next poll. See trashSessions.
+    await trashSessions(ids, {
+      applySession,
+      onError: (id) => setSessionStatus(id, "Error"),
+      notify: toastBus.handler,
+    });
+  }, [deletingWorkspace, activeSessionId, setSessionStatus, applySession, navigate]);
+
+  // Restore a trashed workspace from the sidebar Trash section (#2489).
+  // Restores every session in the workspace (a workspace only lands in Trash
+  // when all of its sessions are trashed), not just the first.
+  const handleRestoreSession = useCallback(
+    (sessionIds: string[]) => restoreSessions(sessionIds, { applySession, notify: toastBus.handler }),
+    [applySession],
+  );
+
   const stoppingWorkspace = stoppingWorkspaceId ? workspaces.find((w) => w.id === stoppingWorkspaceId) : null;
   const stoppingSession = stoppingWorkspace?.sessions[0] ?? null;
 
@@ -1169,12 +1219,15 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
 
     if (target === "paired") {
       // The paired shell only mounts when a terminal tab is the active tab of
-      // its dock.
-      const termTab =
-        (["right", "bottom"] as DockLocation[]).flatMap((d) => dockTabs(paneLayout, d)).find(isTerminalTabId) ??
-        terminalTabId(0);
+      // its group. Prefer a terminal that is already active (and thus mounted)
+      // over the first one, so multi-group layouts focus the live terminal
+      // instead of switching another group's tab.
+      const terminalTabs = (["right", "bottom"] as DockLocation[])
+        .flatMap((d) => dockTabs(paneLayout, d))
+        .filter(isTerminalTabId);
+      const termTab = terminalTabs.find((id) => isActiveTab(paneLayout, id)) ?? terminalTabs[0] ?? terminalTabId(0);
       const termDock = dockOf(paneLayout, termTab);
-      if (termDock && dockActive(paneLayout, termDock) === termTab) {
+      if (termDock && isActiveTab(paneLayout, termTab)) {
         // Already the active tab (mounted): move focus synchronously so rapid
         // agent<->paired toggles stay deterministic.
         dispatchFocusTerminal("paired");
@@ -1406,7 +1459,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     };
     return (
       <div className="flex-1 flex flex-col min-h-0">
-        <PaneDndController tabsByDock={tabsByDock} descriptorFor={paneDescriptor} onPlaceTab={placeVisibleTab}>
+        <PaneDndController groupsByDock={groupsByDock} descriptorFor={paneDescriptor} onPlaceTab={placeVisibleTab}>
           <ContentSplit
             collapsed={rightDockCollapsed}
             onToggleCollapse={toggleDiff}
@@ -1422,6 +1475,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
                         tool={activeSession.tool}
                         archivedAt={activeSession.archived_at ?? null}
                         snoozedUntil={activeSession.snoozed_until ?? null}
+                        trashedAt={activeSession.trashed_at ?? null}
                         onOpenFileRef={handleOpenFileRef}
                         fileRefSession={activeSession}
                         onOpenAgentsPane={openAgentsPane}
@@ -1453,10 +1507,9 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
             }
             right={
               <div {...tourAnchor(TOUR_ANCHORS.rightPanel)} className="flex min-h-0 min-w-0 flex-1">
-                <Dock
+                <DockGroups
                   location="right"
-                  tabs={rightTabs}
-                  active={visibleActive("right")}
+                  groups={rightGroups}
                   descriptorFor={paneDescriptor}
                   renderBody={renderPaneBody}
                   onActivate={(id) => activateTab("right", id)}
@@ -1467,10 +1520,9 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
               </div>
             }
           />
-          {bottomTabs.length > 0 && (
+          {bottomGroups.length > 0 && (
             <BottomDock
-              tabs={bottomTabs}
-              active={visibleActive("bottom")}
+              groups={bottomGroups}
               descriptorFor={paneDescriptor}
               renderBody={renderPaneBody}
               onActivate={(id) => activateTab("bottom", id)}
@@ -1707,6 +1759,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
               onRemoveProject={handleRemoveProject}
               onSettings={handleOpenSettings}
               onDeleteSession={handleDeleteSession}
+              onRestoreSession={handleRestoreSession}
               onStopSession={handleStopSession}
               onStartSession={handleStartSession}
               readOnly={serverAbout?.read_only}
@@ -1777,7 +1830,9 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
             isSandboxed={deletingSession.is_sandboxed}
             isScratch={deletingSession.scratch}
             cleanupDefaults={deletingSession.cleanup_defaults}
+            defaultToTrash={!deletingSession.trashed_at && deletingSession.cleanup_defaults.delete_to_trash}
             onConfirm={handleConfirmDelete}
+            onTrash={handleConfirmTrash}
             onCancel={() => setDeletingWorkspaceId(null)}
           />
         )}

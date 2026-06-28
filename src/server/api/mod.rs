@@ -17,7 +17,7 @@ mod client_log;
 mod git;
 mod log_level;
 mod mcp;
-mod plugins;
+pub mod plugins;
 mod projects;
 mod sessions;
 pub(crate) mod system;
@@ -37,21 +37,25 @@ pub use git::{clone_repo, list_branches};
 pub use log_level::{get_log_level, patch_log_level};
 pub use mcp::{drop_mcp_server, get_mcp_servers, keep_mcp_server, resolve_mcp_conflict};
 pub use plugins::{
-    invoke_plugin_action, list_plugins, plugin_details, plugin_discover, plugin_ui_state,
-    plugin_updates, set_plugin_enabled,
+    apply_plugin_update, dismiss_plugin_update, invoke_plugin_action, list_plugins, plugin_details,
+    plugin_discover, plugin_job_status, plugin_ui_state, plugin_update_preview, plugin_updates,
+    preview_plugin_install, set_plugin_enabled, start_plugin_install, start_plugin_uninstall,
 };
 pub use projects::{create_project, delete_project, list_projects, update_project};
 pub use sessions::{
     create_session, delete_session, ensure_container_terminal, ensure_session, ensure_terminal,
     force_smart_rename, get_recent_projects, kill_terminal, list_sessions,
-    preview_volume_ignores_globs, read_output, rename_session, send_message, session_diff_file,
-    session_diff_files, set_worktree_name, start_session, stop_session, update_session_archive,
-    update_session_diff_base, update_session_group, update_session_notifications,
-    update_session_pin, update_session_snooze, update_session_unread, update_workspace_ordering,
-    CleanupDefaults, OutputQuery, SendMessageRequest, SessionResponse,
+    preview_volume_ignores_globs, read_output, rename_session, restore_session, send_message,
+    session_diff_file, session_diff_files, set_worktree_name, start_session, stop_session,
+    trash_session, update_session_archive, update_session_diff_base, update_session_group,
+    update_session_notifications, update_session_pin, update_session_snooze, update_session_unread,
+    update_workspace_ordering, CleanupDefaults, OutputQuery, SendMessageRequest, SessionResponse,
 };
 // Shared by the status poll loop's auto-unread persistence; not a route handler.
 pub(crate) use sessions::persist_session_update;
+// Trash retention sweep, driven by the daemon's hourly loop; not a route handler.
+#[cfg(feature = "serve")]
+pub(crate) use sessions::purge_expired_trash;
 pub use system::{
     browse_filesystem, create_profile, default_profile, delete_profile, dismiss_update,
     docker_status, filesystem_home, get_about, get_current_theme, get_profile_settings,
@@ -169,6 +173,8 @@ mod tests {
                     "update_session_pin",
                     "update_session_archive",
                     "update_session_snooze",
+                    "trash_session",
+                    "restore_session",
                     "update_session_unread",
                     "stop_session",
                     "force_smart_rename",
@@ -364,6 +370,7 @@ mod tests {
                     "update_session_pin",
                     "update_session_archive",
                     "update_session_snooze",
+                    "trash_session",
                     "update_session_unread",
                     "stop_session",
                     "start_session",

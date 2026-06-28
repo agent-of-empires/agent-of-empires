@@ -7,6 +7,7 @@ import {
   addTerminal,
   dockOf,
   dockTabs,
+  isActiveTab,
   moveTab,
   placeTab,
   removeAllTerminals,
@@ -64,8 +65,8 @@ describe("pane layout pure ops", () => {
     l = addTab(l, "right", "b");
     l = addTab(l, "right", "c");
     l = setActive(l, "right", "a");
-    // Drag "a" to the end. toIndex is the post-removal index, so end == 2.
-    l = placeTab(l, "a", "right", 2);
+    // Drag "a" to the end. index is the post-removal index, so end == 2.
+    l = placeTab(l, "a", { dock: "right", group: 0, index: 2 });
     expect(dockTabs(l, "right")).toEqual(["b", "c", "a"]);
     // Reordering the active tab keeps it active.
     expect(l.right[0]!.active).toBe("a");
@@ -76,7 +77,7 @@ describe("pane layout pure ops", () => {
     l = addTab(l, "right", "b");
     l = addTab(l, "right", "c");
     l = setActive(l, "right", "a");
-    l = placeTab(l, "c", "right", 0);
+    l = placeTab(l, "c", { dock: "right", group: 0, index: 0 });
     expect(dockTabs(l, "right")).toEqual(["c", "a", "b"]);
     expect(l.right[0]!.active).toBe("a");
   });
@@ -89,7 +90,7 @@ describe("pane layout pure ops", () => {
     l = setActive(l, "right", "a");
     l = setActive(l, "bottom", "x");
     // Move right's active "a" between x and y.
-    l = placeTab(l, "a", "bottom", 1);
+    l = placeTab(l, "a", { dock: "bottom", group: 0, index: 1 });
     expect(dockTabs(l, "right")).toEqual(["b"]);
     expect(dockTabs(l, "bottom")).toEqual(["x", "a", "y"]);
     // Moved tab activates in its destination.
@@ -98,18 +99,60 @@ describe("pane layout pure ops", () => {
     expect(l.right[0]!.active).toBe("b");
   });
 
-  it("placeTab clamps an out-of-range index and prunes an emptied source dock", () => {
-    let l = addTab(emptyLayout(), "right", "only");
-    l = placeTab(l, "only", "bottom", 99);
-    expect(l.right).toEqual([]);
-    expect(dockTabs(l, "bottom")).toEqual(["only"]);
+  it("placeTab clamps an out-of-range index within a group", () => {
+    let l = addTab(emptyLayout(), "right", "a");
+    l = addTab(l, "right", "b");
+    l = placeTab(l, "a", { dock: "right", group: 0, index: 99 });
+    expect(dockTabs(l, "right")).toEqual(["b", "a"]);
   });
 
   it("placeTab does not mark a moved plugin tab as closed", () => {
     let l = addTab(emptyLayout(), "right", "plugin:p:a");
-    l = placeTab(l, "plugin:p:a", "bottom", 0);
+    l = placeTab(l, "plugin:p:a", { dock: "bottom", group: 0, newGroup: true });
     expect(dockOf(l, "plugin:p:a")).toBe("bottom");
     expect(l.closedPlugins).not.toContain("plugin:p:a");
+  });
+
+  it("placeTab split lifts a tab into a new sibling group in the same dock", () => {
+    let l = addTab(emptyLayout(), "right", "a");
+    l = addTab(l, "right", "b");
+    // Split "b" into a fresh group after group 0.
+    l = placeTab(l, "b", { dock: "right", group: 1, newGroup: true });
+    expect(l.right.length).toBe(2);
+    expect(l.right[0]!.tabs).toEqual(["a"]);
+    expect(l.right[0]!.active).toBe("a");
+    expect(l.right[1]!.tabs).toEqual(["b"]);
+    expect(l.right[1]!.active).toBe("b");
+  });
+
+  it("removeTab prunes only the emptied group, leaving siblings intact", () => {
+    let l = addTab(emptyLayout(), "right", "a");
+    l = addTab(l, "right", "b");
+    l = placeTab(l, "b", { dock: "right", group: 1, newGroup: true });
+    l = removeTab(l, "a"); // empties group 0 only
+    expect(l.right.length).toBe(1);
+    expect(l.right[0]!.tabs).toEqual(["b"]);
+  });
+
+  it("placeTab into another group activates it there and prunes the emptied source group", () => {
+    let l = addTab(emptyLayout(), "right", "a");
+    l = addTab(l, "right", "b");
+    l = placeTab(l, "b", { dock: "right", group: 1, newGroup: true }); // groups [a], [b]
+    l = setActive(l, "right", "a");
+    // Move "a" (its group's only tab) into group 1; group 0 prunes and the
+    // target-group index shifts down by one.
+    l = placeTab(l, "a", { dock: "right", group: 1, index: 1 });
+    expect(l.right.length).toBe(1);
+    expect(l.right[0]!.tabs).toEqual(["b", "a"]);
+    expect(l.right[0]!.active).toBe("a");
+  });
+
+  it("isActiveTab reports each group's active tab independently", () => {
+    let l = addTab(emptyLayout(), "right", "a");
+    l = addTab(l, "right", "b");
+    l = placeTab(l, "b", { dock: "right", group: 1, newGroup: true });
+    expect(isActiveTab(l, "a")).toBe(true);
+    expect(isActiveTab(l, "b")).toBe(true);
   });
 
   it("moveTab appends to the destination and is a no-op within the same dock", () => {
@@ -213,6 +256,31 @@ describe("usePaneLayout migration + persistence", () => {
     );
     const { result } = renderHook(() => usePaneLayout("s1"));
     expect(dockTabs(result.current.layout, "right")).toEqual(["diff", "terminal:0"]);
+  });
+
+  it("loads multiple persisted groups per dock without merging them", () => {
+    localStorage.setItem(
+      "aoe-pane-layout-v2",
+      JSON.stringify({
+        version: 2,
+        template: { right: [], bottom: [], nextTerminalIndex: 1, closedPlugins: [] },
+        sessions: {
+          s1: {
+            right: [
+              { tabs: ["diff"], active: "diff" },
+              { tabs: ["terminal:0"], active: "terminal:0" },
+            ],
+            bottom: [],
+            nextTerminalIndex: 1,
+            closedPlugins: [],
+          },
+        },
+      }),
+    );
+    const { result } = renderHook(() => usePaneLayout("s1"));
+    expect(result.current.layout.right.length).toBe(2);
+    expect(result.current.layout.right[0]!.tabs).toEqual(["diff"]);
+    expect(result.current.layout.right[1]!.tabs).toEqual(["terminal:0"]);
   });
 
   it("toggleKind adds then removes the terminal tabs", () => {

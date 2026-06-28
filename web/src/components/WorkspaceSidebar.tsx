@@ -88,6 +88,7 @@ import {
   triageStateOf,
   workspaceIsPinned,
   workspaceIsSunk,
+  workspaceIsTrashed,
   type SidebarSortMode,
 } from "../lib/sidebarSort";
 import {
@@ -294,6 +295,10 @@ interface Props {
   onRemoveProject: (group: RepoGroup) => void;
   onSettings: () => void;
   onDeleteSession?: (workspaceId: string) => void;
+  /** Restore a trashed workspace from the Trash section: receives every
+   *  session id in the workspace, since a workspace only lands in Trash when
+   *  all of its sessions are trashed (#2489). */
+  onRestoreSession?: (sessionIds: string[]) => void;
   onStopSession?: (workspaceId: string) => void;
   onStartSession?: (workspaceId: string) => void;
   readOnly?: boolean;
@@ -2312,6 +2317,7 @@ export function WorkspaceSidebar({
   onRemoveProject,
   onSettings,
   onDeleteSession,
+  onRestoreSession,
   onStopSession,
   onStartSession,
   readOnly,
@@ -2387,6 +2393,9 @@ export function WorkspaceSidebar({
   const [filterQuery, setFilterQuery] = useState("");
   const [facetOpen, setFacetOpen] = useState(false);
   const [sunkExpanded, setSunkExpanded] = useState<boolean>(loadSunkExpanded);
+  // Trash section expand state: in-memory only, collapsed by default
+  // (recovery shelf, kept out of the way). See #2489.
+  const [trashExpanded, setTrashExpanded] = useState<boolean>(false);
   const toggleSunkExpanded = useCallback(() => {
     setSunkExpanded((prev) => {
       const next = !prev;
@@ -3194,9 +3203,13 @@ export function WorkspaceSidebar({
             // #1720.
             const sunkWorkspaces = isNested
               ? filteredNested.flatMap((ng) =>
-                  ng.subgroups.flatMap((sg) => sg.workspaces.filter((v) => workspaceIsSunk(v.workspace))),
+                  ng.subgroups.flatMap((sg) =>
+                    sg.workspaces.filter((v) => workspaceIsSunk(v.workspace) && !workspaceIsTrashed(v.workspace)),
+                  ),
                 )
-              : filteredGroups.flatMap((g) => g.workspaces.filter((v) => workspaceIsSunk(v.workspace)));
+              : filteredGroups.flatMap((g) =>
+                  g.workspaces.filter((v) => workspaceIsSunk(v.workspace) && !workspaceIsTrashed(v.workspace)),
+                );
             if (sunkWorkspaces.length === 0) return null;
             return (
               <div data-testid="sidebar-sunk-section">
@@ -3244,6 +3257,94 @@ export function WorkspaceSidebar({
                       bulkApi={rowBulkApi}
                       indented
                     />
+                  ))}
+              </div>
+            );
+          })()}
+
+          {(() => {
+            // Global "Trash" section, sibling of "Snoozed & archived" and
+            // pinned below it. Flat list of trashed workspaces with restore
+            // and permanent-delete actions. See #2489.
+            const trashedRaw = isNested
+              ? filteredNested.flatMap((ng) =>
+                  ng.subgroups.flatMap((sg) => sg.workspaces.filter((v) => workspaceIsTrashed(v.workspace))),
+                )
+              : filteredGroups.flatMap((g) => g.workspaces.filter((v) => workspaceIsTrashed(v.workspace)));
+            // The same workspace can appear under more than one group on the
+            // group axis; dedupe by workspace id so Trash doesn't double-count
+            // or double-render it. See #2489.
+            const seenTrashIds = new Set<string>();
+            const trashedWorkspaces = trashedRaw.filter((v) => {
+              if (seenTrashIds.has(v.workspace.id)) return false;
+              seenTrashIds.add(v.workspace.id);
+              return true;
+            });
+            if (trashedWorkspaces.length === 0) return null;
+            return (
+              <div data-testid="sidebar-trash-section">
+                <button
+                  onClick={() => setTrashExpanded((v) => !v)}
+                  data-testid="sidebar-trash-toggle"
+                  aria-expanded={trashExpanded}
+                  className="w-full flex items-center gap-2 px-3 py-1.5 text-[11px] font-mono uppercase tracking-widest text-text-muted hover:text-text-secondary hover:bg-surface-800/40 cursor-pointer transition-colors border-t border-surface-800/60"
+                >
+                  <svg
+                    width="10"
+                    height="10"
+                    viewBox="0 0 10 10"
+                    fill="currentColor"
+                    className={`shrink-0 transition-transform duration-75 ${trashExpanded ? "" : "-rotate-90"}`}
+                  >
+                    <path
+                      d="M2 3 L5 6.5 L8 3"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.5"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    />
+                  </svg>
+                  <span>Trash ({trashedWorkspaces.length})</span>
+                </button>
+                {trashExpanded &&
+                  trashedWorkspaces.map((v) => (
+                    <div
+                      key={v.key}
+                      data-testid="sidebar-trash-row"
+                      className="flex items-center gap-2 pl-7 pr-3 py-1.5 text-[13px] text-text-muted"
+                    >
+                      <button
+                        type="button"
+                        onClick={(e) => handleRowActivate(v.workspace.id, e)}
+                        title={v.workspace.displayName}
+                        data-testid="sidebar-trash-open"
+                        className="flex-1 truncate text-left hover:text-text-secondary cursor-pointer"
+                      >
+                        {v.workspace.displayName}
+                      </button>
+                      {!readOnly && (
+                        <>
+                          <button
+                            onClick={() => {
+                              const ids = v.workspace.sessions.map((s) => s.id);
+                              if (ids.length > 0) onRestoreSession?.(ids);
+                            }}
+                            data-testid="sidebar-trash-restore"
+                            className="text-[12px] text-accent-500 hover:text-accent-600 cursor-pointer"
+                          >
+                            Restore
+                          </button>
+                          <button
+                            onClick={() => onDeleteSession?.(v.workspace.id)}
+                            data-testid="sidebar-trash-purge"
+                            className="text-[12px] text-status-error/80 hover:text-status-error cursor-pointer"
+                          >
+                            Delete
+                          </button>
+                        </>
+                      )}
+                    </div>
                   ))}
               </div>
             );

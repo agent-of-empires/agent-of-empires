@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use agent_of_empires::plugin::install::{self, UpdateOutcome};
+use agent_of_empires::plugin::install::{self, UpdateOutcome, UpdatePreview};
 use agent_of_empires::plugin::lockfile::Lockfile;
 use agent_of_empires::plugin::registry::PluginRegistry;
 use agent_of_empires::plugin::{auto_update, update_check};
@@ -285,6 +285,11 @@ api_version = 2
     // --yes bypasses the unverified confirmation.
     let report = install::install("gh:acme/widget@main", true).await.unwrap();
     assert_eq!(report.id, "acme.widget");
+    assert_eq!(
+        report.validation.as_str(),
+        "community",
+        "the install report surfaces community trust for an unfeatured gh: install"
+    );
 
     let lock = Lockfile::load().unwrap();
     let locked = lock.get("acme.widget").expect("lock entry");
@@ -603,7 +608,12 @@ api_version = 2
         "sha256:0000000000000000000000000000000000000000000000000000000000000000",
     );
 
-    install::install(dir.to_str().unwrap(), true).await.unwrap();
+    let report = install::install(dir.to_str().unwrap(), true).await.unwrap();
+    assert_eq!(
+        report.validation.as_str(),
+        "local",
+        "the install report surfaces a local-directory install as local"
+    );
 
     // It installs (not refused) and is not featured. The non-featured label
     // ("local" here, since the install source is a local dir; "community" for a
@@ -1159,7 +1169,7 @@ async fn auto_update_applies_clean_github_update() {
 
     // A clean (no consent change) newer version on the remote.
     push_new_commit(base.path(), "acme", "upd", &[("aoe-plugin.toml", &v2)]);
-    let summary = auto_update::sweep().await;
+    let summary = auto_update::sweep(None).await;
     assert_eq!(summary.applied, vec!["acme.upd".to_string()], "{summary:?}");
     assert_eq!(
         Lockfile::load().unwrap().get("acme.upd").unwrap().version,
@@ -1206,6 +1216,189 @@ async fn clean_update_skips_capability_change() {
         Lockfile::load().unwrap().get("acme.upd").unwrap().version,
         "1.0.0",
         "prior version kept",
+    );
+
+    std::env::remove_var("AOE_GITHUB_CLONE_BASE");
+}
+
+/// The manifest a capability-expanding update fetches.
+fn with_net_cap_v2() -> String {
+    PLAIN_MANIFEST.replace("1.0.0", "2.0.0").replace(
+        "api_version = 2",
+        "api_version = 2\ncapabilities = [\"net\"]",
+    )
+}
+
+/// Install plain acme.upd from a local bare repo tracking `@main`, then push a
+/// v2 that adds the `net` capability. Returns the temp base so the caller keeps
+/// the repo alive.
+async fn install_then_push_cap_update() -> TempDir {
+    let base = tempfile::tempdir().unwrap();
+    make_bare_repo(
+        base.path(),
+        "acme",
+        "upd",
+        &[("aoe-plugin.toml", PLAIN_MANIFEST)],
+    );
+    install::install("gh:acme/upd@main", true).await.unwrap();
+    push_new_commit(
+        base.path(),
+        "acme",
+        "upd",
+        &[("aoe-plugin.toml", &with_net_cap_v2())],
+    );
+    base
+}
+
+#[tokio::test]
+#[serial]
+async fn preview_reports_consent_required_for_capability_change() {
+    let _home = isolate();
+    let _base = install_then_push_cap_update().await;
+
+    match install::preview_update("acme.upd").await.unwrap() {
+        UpdatePreview::ConsentRequired { consent, dismissed } => {
+            assert_eq!(consent.from_version, "1.0.0");
+            assert_eq!(consent.to_version, "2.0.0");
+            assert_eq!(consent.added_capabilities, vec!["net".to_string()]);
+            assert!(consent.removed_capabilities.is_empty());
+            assert!(!dismissed, "a fresh update is not pre-dismissed");
+            assert!(!consent.fingerprint.is_empty());
+        }
+        other => panic!("expected consent_required, got {other:?}"),
+    }
+
+    std::env::remove_var("AOE_GITHUB_CLONE_BASE");
+}
+
+#[tokio::test]
+#[serial]
+async fn apply_update_grants_the_new_capability_set() {
+    let _home = isolate();
+    let _base = install_then_push_cap_update().await;
+
+    let fingerprint = match install::preview_update("acme.upd").await.unwrap() {
+        UpdatePreview::ConsentRequired { consent, .. } => consent.fingerprint,
+        other => panic!("expected consent_required, got {other:?}"),
+    };
+
+    install::apply_update(
+        "acme.upd",
+        Some(fingerprint),
+        &install::OperationLog::Inherit,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        Lockfile::load().unwrap().get("acme.upd").unwrap().version,
+        "2.0.0",
+    );
+    let reg = load_registry();
+    let plugin = reg.get("acme.upd").expect("present");
+    assert!(plugin.active(), "the approved update is granted and active");
+
+    std::env::remove_var("AOE_GITHUB_CLONE_BASE");
+}
+
+#[tokio::test]
+#[serial]
+async fn apply_update_rejects_a_stale_fingerprint() {
+    let _home = isolate();
+    let _base = install_then_push_cap_update().await;
+
+    // The user approved a different (stale) fingerprint than what is now fetched:
+    // the apply must refuse rather than grant something never disclosed.
+    let err = install::apply_update(
+        "acme.upd",
+        Some("sha256:stale||community".to_string()),
+        &install::OperationLog::Inherit,
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("changed since it was shown"), "got: {err}");
+    assert_eq!(
+        Lockfile::load().unwrap().get("acme.upd").unwrap().version,
+        "1.0.0",
+        "a rejected apply keeps the prior version",
+    );
+
+    std::env::remove_var("AOE_GITHUB_CLONE_BASE");
+}
+
+#[tokio::test]
+#[serial]
+async fn declining_keeps_the_prior_version_and_stops_nagging() {
+    let _home = isolate();
+    let _base = install_then_push_cap_update().await;
+
+    let fingerprint = match install::preview_update("acme.upd").await.unwrap() {
+        UpdatePreview::ConsentRequired { consent, .. } => consent.fingerprint,
+        other => panic!("expected consent_required, got {other:?}"),
+    };
+
+    // Decline: record the dismissal. The new version is never applied.
+    install::dismiss_update("acme.upd", &fingerprint).unwrap();
+    assert_eq!(
+        Lockfile::load().unwrap().get("acme.upd").unwrap().version,
+        "1.0.0",
+        "the previously trusted version stays installed",
+    );
+    assert!(
+        load_registry().get("acme.upd").unwrap().active(),
+        "the prior version stays active",
+    );
+
+    // A re-preview now flags the dismissal so the surfaces stop re-prompting.
+    match install::preview_update("acme.upd").await.unwrap() {
+        UpdatePreview::ConsentRequired { dismissed, .. } => {
+            assert!(dismissed, "the declined fingerprint is remembered");
+        }
+        other => panic!("expected consent_required, got {other:?}"),
+    }
+
+    std::env::remove_var("AOE_GITHUB_CLONE_BASE");
+}
+
+#[derive(Default)]
+struct RecordingNotifier(std::sync::Mutex<Vec<String>>);
+
+impl auto_update::UpdateNotifier for RecordingNotifier {
+    fn needs_approval(&self, plugin_id: &str, _reason: &str) {
+        self.0.lock().unwrap().push(plugin_id.to_string());
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn sweep_notifies_then_respects_a_dismissal() {
+    let _home = isolate();
+    let _base = install_then_push_cap_update().await;
+
+    let fingerprint = match install::preview_update("acme.upd").await.unwrap() {
+        UpdatePreview::ConsentRequired { consent, .. } => consent.fingerprint,
+        other => panic!("expected consent_required, got {other:?}"),
+    };
+
+    // First sweep: not dismissed, so the consent-needed skip notifies.
+    let rec = std::sync::Arc::new(RecordingNotifier::default());
+    let notifier: std::sync::Arc<dyn auto_update::UpdateNotifier> = rec.clone();
+    auto_update::sweep(Some(&notifier)).await;
+    assert_eq!(
+        rec.0.lock().unwrap().as_slice(),
+        ["acme.upd".to_string()],
+        "an undismissed consent-needed skip notifies",
+    );
+
+    // After dismissing this exact version, a later sweep stays silent.
+    install::dismiss_update("acme.upd", &fingerprint).unwrap();
+    let rec2 = std::sync::Arc::new(RecordingNotifier::default());
+    let notifier2: std::sync::Arc<dyn auto_update::UpdateNotifier> = rec2.clone();
+    auto_update::sweep(Some(&notifier2)).await;
+    assert!(
+        rec2.0.lock().unwrap().is_empty(),
+        "a dismissed version does not re-notify",
     );
 
     std::env::remove_var("AOE_GITHUB_CLONE_BASE");

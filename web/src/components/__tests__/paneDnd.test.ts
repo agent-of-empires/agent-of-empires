@@ -7,49 +7,89 @@ import {
   shouldApplyPlacement,
   visibleToFullIndex,
   type PlacementOver,
+  type RenderGroup,
 } from "../paneDnd";
 
-const tabsByDock = { right: ["diff", "terminal:0", "terminal:1"], bottom: ["plugin:p:a"] };
+const groupsByDock: Record<"right" | "bottom", RenderGroup[]> = {
+  right: [{ group: 0, tabs: ["diff", "terminal:0", "terminal:1"] }],
+  bottom: [{ group: 0, tabs: ["plugin:p:a"] }],
+};
 
 function over(partial: Partial<PlacementOver>): PlacementOver {
-  return { type: "pane-tab", dock: "right", tabId: "diff", after: false, ...partial };
+  return { type: "pane-tab", dock: "right", group: 0, tabId: "diff", after: false, ...partial };
 }
 
 describe("resolvePlacement", () => {
   it("inserts before the hovered tab when the pointer is on its leading half", () => {
     // Dragging terminal:1 onto diff's leading half; base (without the dragged
     // tab) is [diff, terminal:0], so before diff is index 0.
-    expect(resolvePlacement(over({ tabId: "diff", after: false }), "terminal:1", tabsByDock)).toEqual({
+    expect(resolvePlacement(over({ tabId: "diff", after: false }), "terminal:1", groupsByDock)).toEqual({
       dock: "right",
+      group: 0,
       index: 0,
     });
   });
 
   it("inserts after the hovered tab when the pointer is on its trailing half", () => {
-    expect(resolvePlacement(over({ tabId: "diff", after: true }), "terminal:1", tabsByDock)).toEqual({
+    expect(resolvePlacement(over({ tabId: "diff", after: true }), "terminal:1", groupsByDock)).toEqual({
       dock: "right",
+      group: 0,
       index: 1,
     });
   });
 
-  it("appends when dropping on a dock body rather than a tab", () => {
+  it("appends when dropping on a group strip rather than a tab", () => {
     // base without the dragged diff is [terminal:0, terminal:1], so append is 2.
-    expect(resolvePlacement(over({ type: "pane-dock", tabId: "" }), "diff", tabsByDock)).toEqual({
+    expect(resolvePlacement(over({ type: "pane-group", tabId: "" }), "diff", groupsByDock)).toEqual({
       dock: "right",
+      group: 0,
       index: 2,
     });
   });
 
-  it("appends to an empty-dock zone", () => {
-    expect(resolvePlacement(over({ type: "pane-empty-dock", dock: "bottom", tabId: "" }), "diff", tabsByDock)).toEqual({
+  it("splits into a new group before the hovered group", () => {
+    expect(
+      resolvePlacement(over({ type: "pane-split", side: "before", group: 0, tabId: "" }), "diff", groupsByDock),
+    ).toEqual({
+      dock: "right",
+      group: 0,
+      newGroup: true,
+    });
+  });
+
+  it("splits into a new group after the hovered group", () => {
+    expect(
+      resolvePlacement(over({ type: "pane-split", side: "after", group: 0, tabId: "" }), "diff", groupsByDock),
+    ).toEqual({
+      dock: "right",
+      group: 1,
+      newGroup: true,
+    });
+  });
+
+  it("seeds the first group on an empty-dock zone", () => {
+    expect(
+      resolvePlacement(over({ type: "pane-empty-dock", dock: "bottom", group: 0, tabId: "" }), "diff", groupsByDock),
+    ).toEqual({
       dock: "bottom",
+      group: 0,
+      newGroup: true,
+    });
+  });
+
+  it("treats a drop onto the dragged tab's own tab as a no-op, keeping its slot", () => {
+    // terminal:0 sits at index 1; dropping it on itself must not append it.
+    expect(resolvePlacement(over({ tabId: "terminal:0", after: true }), "terminal:0", groupsByDock)).toEqual({
+      dock: "right",
+      group: 0,
       index: 1,
     });
   });
 
-  it("appends when the hovered tab is not in the destination (cross-dock to a stale id)", () => {
-    expect(resolvePlacement(over({ dock: "bottom", tabId: "ghost" }), "diff", tabsByDock)).toEqual({
+  it("appends when the hovered tab is not in the destination group (stale id)", () => {
+    expect(resolvePlacement(over({ dock: "bottom", group: 0, tabId: "ghost" }), "diff", groupsByDock)).toEqual({
       dock: "bottom",
+      group: 0,
       index: 1,
     });
   });
@@ -78,18 +118,26 @@ describe("pointerInsertsAfter", () => {
 });
 
 describe("shouldApplyPlacement", () => {
+  const src = (group: number) => ({ dock: "right" as const, group });
+
   it("applies a cross-dock move", () => {
-    expect(shouldApplyPlacement(tabsByDock, "diff", { dock: "bottom", index: 0 }, "right")).toBe(true);
+    expect(shouldApplyPlacement(groupsByDock, "diff", { dock: "bottom", group: 0, index: 0 }, src(0))).toBe(true);
   });
-  it("applies a within-dock move to a different slot", () => {
-    expect(shouldApplyPlacement(tabsByDock, "diff", { dock: "right", index: 2 }, "right")).toBe(true);
+  it("applies a within-group move to a different slot", () => {
+    expect(shouldApplyPlacement(groupsByDock, "diff", { dock: "right", group: 0, index: 2 }, src(0))).toBe(true);
   });
-  it("skips a within-dock drop onto the tab's own slot", () => {
+  it("applies a cross-group move within the same dock", () => {
+    expect(shouldApplyPlacement(groupsByDock, "diff", { dock: "right", group: 1, index: 0 }, src(0))).toBe(true);
+  });
+  it("always applies a split into a new group", () => {
+    expect(shouldApplyPlacement(groupsByDock, "diff", { dock: "right", group: 0, newGroup: true }, src(0))).toBe(true);
+  });
+  it("skips a within-group drop onto the tab's own slot", () => {
     // diff is at index 0; a post-removal target index of 0 is a no-op.
-    expect(shouldApplyPlacement(tabsByDock, "diff", { dock: "right", index: 0 }, "right")).toBe(false);
+    expect(shouldApplyPlacement(groupsByDock, "diff", { dock: "right", group: 0, index: 0 }, src(0))).toBe(false);
   });
-  it("skips when the tab is not in the target dock", () => {
-    expect(shouldApplyPlacement(tabsByDock, "ghost", { dock: "right", index: 0 }, "right")).toBe(false);
+  it("skips when the tab is not in the target group", () => {
+    expect(shouldApplyPlacement(groupsByDock, "ghost", { dock: "right", group: 0, index: 0 }, src(0))).toBe(false);
   });
 });
 

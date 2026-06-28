@@ -1,8 +1,8 @@
 //! Plugin manager: list plugins (builtin and external) with their trust and
-//! enabled/approval state, and enable/disable them from the TUI. The TUI twin
-//! of `aoe plugin list` and the web Plugins tab. Installing, updating, and
-//! capability approval are CLI-driven (`aoe plugin install`); the TUI shows the
-//! resulting state but does not perform installs.
+//! enabled/approval state, enable/disable them, and update an external plugin
+//! with an in-TUI consent popup when the new version expands access. The TUI
+//! twin of `aoe plugin list` and the web Plugins tab. Installing a new plugin is
+//! still CLI-driven (`aoe plugin install`); the TUI shows the resulting state.
 
 use std::collections::HashMap;
 
@@ -13,6 +13,7 @@ use tokio::sync::oneshot;
 
 use super::{centered_rect, DialogResult};
 use crate::plugin::discover::DiscoveryResult;
+use crate::plugin::install::{UpdateConsent, UpdatePreview};
 use crate::plugin::update_check::UpdateStatus;
 use crate::tui::styles::Theme;
 
@@ -30,6 +31,10 @@ enum Mode {
 enum Pending {
     Updates(oneshot::Receiver<Vec<UpdateStatus>>),
     Discover(oneshot::Receiver<Result<Vec<DiscoveryResult>, String>>),
+    /// Classifying one plugin's available update (the `u` key).
+    Preview(oneshot::Receiver<Result<UpdatePreview, String>>),
+    /// Applying an approved update.
+    Apply(oneshot::Receiver<Result<(), String>>),
 }
 
 pub struct PluginManagerDialog {
@@ -59,6 +64,12 @@ pub struct PluginManagerDialog {
     /// Discovery results from the last `d` search, plus the cursor into them.
     discover_rows: Vec<DiscoveryResult>,
     discover_selected: usize,
+    /// The plugin id a preview/apply is running for, so `tick` knows which row
+    /// the result belongs to.
+    pending_plugin: Option<String>,
+    /// An open update-consent popup: the structured disclosure to render and
+    /// approve / decline.
+    consent: Option<UpdateConsent>,
 }
 
 impl Default for PluginManagerDialog {
@@ -83,6 +94,8 @@ impl PluginManagerDialog {
             updates: HashMap::new(),
             discover_rows: Vec::new(),
             discover_selected: 0,
+            pending_plugin: None,
+            consent: None,
         };
         dialog.reload();
         dialog.mutated = false; // Initial load is not a user mutation.
@@ -117,6 +130,10 @@ impl PluginManagerDialog {
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<()> {
         self.info = None;
+        // An open consent popup owns the keyboard until the user decides.
+        if self.consent.is_some() {
+            return self.handle_consent_key(key);
+        }
         if self.mode == Mode::Discover {
             return self.handle_discover_key(key);
         }
@@ -157,6 +174,52 @@ impl PluginManagerDialog {
             }
             KeyCode::Char('d') => {
                 self.start_discover();
+                DialogResult::Continue
+            }
+            // Update the selected plugin, but only when the last `c` check found
+            // one available (the preview re-fetches and classifies it).
+            KeyCode::Char('u') => {
+                if let Some(row) = self.rows.get(self.selected) {
+                    if self.updates.get(&row.id).is_some_and(|u| u.needs_update) {
+                        self.start_preview(row.id.clone());
+                    }
+                }
+                DialogResult::Continue
+            }
+            _ => DialogResult::Continue,
+        }
+    }
+
+    /// Keys while the update-consent popup is open: approve, decline, or close.
+    fn handle_consent_key(&mut self, key: KeyEvent) -> DialogResult<()> {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                if let Some(consent) = self.consent.take() {
+                    self.start_apply(consent.id, Some(consent.fingerprint));
+                }
+                DialogResult::Continue
+            }
+            // Decline: record the dismissal so it stops nagging, keep the active
+            // version. `dismiss_update` is a quick local config write.
+            KeyCode::Char('n') => {
+                if let Some(consent) = self.consent.take() {
+                    match crate::plugin::install::dismiss_update(&consent.id, &consent.fingerprint)
+                    {
+                        Ok(()) => {
+                            // dismiss_update wrote plugin config; flag it so an
+                            // embedding settings surface resyncs and a later save
+                            // does not clobber the dismissal.
+                            self.mutated = true;
+                            self.info = Some(format!("Declined update for {}.", consent.id));
+                        }
+                        Err(e) => self.error = Some(format!("{e:#}")),
+                    }
+                }
+                DialogResult::Continue
+            }
+            // Close without deciding.
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.consent = None;
                 DialogResult::Continue
             }
             _ => DialogResult::Continue,
@@ -207,6 +270,49 @@ impl PluginManagerDialog {
         });
         self.pending = Some(Pending::Updates(rx));
         self.loading = Some("Checking for updates…");
+        self.error = None;
+    }
+
+    fn start_preview(&mut self, id: String) {
+        if self.pending.is_some() {
+            return;
+        }
+        let (tx, rx) = oneshot::channel();
+        let preview_id = id.clone();
+        tokio::spawn(async move {
+            let _ = tx.send(
+                crate::plugin::install::preview_update(&preview_id)
+                    .await
+                    .map_err(|e| format!("{e:#}")),
+            );
+        });
+        self.pending_plugin = Some(id);
+        self.pending = Some(Pending::Preview(rx));
+        self.loading = Some("Checking update…");
+        self.error = None;
+    }
+
+    fn start_apply(&mut self, id: String, fingerprint: Option<String>) {
+        if self.pending.is_some() {
+            return;
+        }
+        let (tx, rx) = oneshot::channel();
+        let apply_id = id.clone();
+        tokio::spawn(async move {
+            let _ = tx.send(
+                crate::plugin::install::apply_update(
+                    &apply_id,
+                    fingerprint,
+                    &crate::plugin::install::OperationLog::Inherit,
+                )
+                .await
+                .map(|_| ())
+                .map_err(|e| format!("{e:#}")),
+            );
+        });
+        self.pending_plugin = Some(id);
+        self.pending = Some(Pending::Apply(rx));
+        self.loading = Some("Updating…");
         self.error = None;
     }
 
@@ -288,6 +394,68 @@ impl PluginManagerDialog {
                     true
                 }
             },
+            Pending::Preview(rx) => match rx.try_recv() {
+                Ok(result) => {
+                    self.pending = None;
+                    self.loading = None;
+                    match result {
+                        Ok(UpdatePreview::NoUpdate) => {
+                            self.info = Some("Already up to date.".to_string());
+                        }
+                        // A safe update needs no consent: apply it straight away.
+                        Ok(UpdatePreview::SafeUpdate { fingerprint, .. }) => {
+                            if let Some(id) = self.pending_plugin.clone() {
+                                self.start_apply(id, Some(fingerprint));
+                            }
+                        }
+                        // An already-dismissed version must not re-prompt; it
+                        // surfaces again only when a new version appears.
+                        Ok(UpdatePreview::ConsentRequired { consent, dismissed }) => {
+                            if dismissed {
+                                self.info = Some(format!(
+                                    "Update for {} was already declined.",
+                                    consent.id
+                                ));
+                            } else {
+                                self.consent = Some(*consent);
+                            }
+                        }
+                        Err(message) => self.error = Some(message),
+                    }
+                    true
+                }
+                Err(TryRecvError::Empty) => false,
+                Err(TryRecvError::Closed) => {
+                    self.error = Some("Update check failed.".to_string());
+                    self.pending = None;
+                    self.loading = None;
+                    true
+                }
+            },
+            Pending::Apply(rx) => match rx.try_recv() {
+                Ok(result) => {
+                    self.pending = None;
+                    self.loading = None;
+                    match result {
+                        Ok(()) => {
+                            if let Some(id) = self.pending_plugin.take() {
+                                self.updates.remove(&id);
+                                self.info = Some(format!("Updated {id}."));
+                            }
+                            self.reload();
+                        }
+                        Err(message) => self.error = Some(message),
+                    }
+                    true
+                }
+                Err(TryRecvError::Empty) => false,
+                Err(TryRecvError::Closed) => {
+                    self.error = Some("Update failed.".to_string());
+                    self.pending = None;
+                    self.loading = None;
+                    true
+                }
+            },
         }
     }
 
@@ -338,6 +506,107 @@ impl PluginManagerDialog {
         let inner = block.inner(rect);
         f.render_widget(block, rect);
         self.render_browse(f, inner, theme);
+        // The consent popup floats over the list, centered on the dialog rect.
+        if let Some(consent) = &self.consent {
+            self.render_consent(f, rect, theme, consent);
+        }
+    }
+
+    fn render_consent(&self, f: &mut Frame, area: Rect, theme: &Theme, consent: &UpdateConsent) {
+        let mut lines: Vec<Line> = vec![
+            Line::from(Span::styled(
+                format!(
+                    "Update {}? v{} -> v{}",
+                    consent.id, consent.from_version, consent.to_version
+                ),
+                Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                "This update expands what the plugin can do.",
+                Style::default().fg(theme.dimmed),
+            )),
+            Line::from(""),
+        ];
+        if !consent.added_capabilities.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "New capabilities: {}",
+                    consent.added_capabilities.join(", ")
+                ),
+                Style::default().fg(theme.waiting),
+            )));
+        }
+        if !consent.removed_capabilities.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!("Removed: {}", consent.removed_capabilities.join(", ")),
+                Style::default().fg(theme.dimmed),
+            )));
+        }
+        if let Some(change) = &consent.runtime_change {
+            lines.push(Line::from(Span::styled(
+                format!("Runtime: {change}"),
+                Style::default().fg(theme.waiting),
+            )));
+        }
+        if consent.trust_downgrade {
+            lines.push(Line::from(Span::styled(
+                "No longer a verified featured plugin (community trust).",
+                Style::default().fg(theme.waiting),
+            )));
+        }
+        if !consent.build_steps.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "Build commands (run as you, unsandboxed):",
+                Style::default().fg(theme.waiting),
+            )));
+            for step in &consent.build_steps {
+                lines.push(Line::from(Span::styled(
+                    format!("  $ {step}"),
+                    Style::default().fg(theme.dimmed),
+                )));
+            }
+        }
+        if !consent.ui.is_empty() {
+            let mut slots: Vec<&str> = Vec::new();
+            for u in &consent.ui {
+                if !slots.contains(&u.slot.as_str()) {
+                    slots.push(u.slot.as_str());
+                }
+            }
+            lines.push(Line::from(Span::styled(
+                format!("UI slots: {}", slots.join(", ")),
+                Style::default().fg(theme.dimmed),
+            )));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Approving trusts this plugin; a worker and build steps run without OS sandboxing.",
+            Style::default().fg(theme.dimmed),
+        )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "y approve · n decline · esc close",
+            Style::default().fg(theme.dimmed),
+        )));
+
+        // A tiny terminal can be narrower/shorter than our preferred size;
+        // never pass clamp/centered_rect a max below the min (it panics).
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let width = area.width.clamp(1, 72);
+        let height = (lines.len() as u16).saturating_add(2).clamp(1, area.height);
+        let rect = centered_rect(area, width, height);
+        f.render_widget(Clear, rect);
+        let block = Block::default()
+            .title(" Approve update ")
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme.accent));
+        let inner = block.inner(rect);
+        f.render_widget(block, rect);
+        let body = Paragraph::new(lines).wrap(Wrap { trim: true });
+        f.render_widget(body, inner);
     }
 
     fn render_browse(&self, f: &mut Frame, area: Rect, theme: &Theme) {
@@ -489,7 +758,7 @@ impl PluginManagerDialog {
                 "esc close"
             };
             (
-                format!("space toggle · c check updates · d discover · {back}"),
+                format!("space toggle · c check updates · u update · d discover · {back}"),
                 theme.dimmed,
             )
         };

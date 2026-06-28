@@ -425,6 +425,81 @@ body {
     animation: none;
   }
 }
+/* Cheat-code easter egg effects (command palette). One-off, non-blocking. */
+@keyframes cheat-fly-ltr {
+  from {
+    transform: translateX(-20vw) translateY(-50%) rotate(-8deg);
+  }
+  to {
+    transform: translateX(120vw) translateY(-50%) rotate(8deg);
+  }
+}
+@keyframes cheat-fly-rtl {
+  from {
+    transform: translateX(120vw) translateY(-50%) rotate(8deg);
+  }
+  to {
+    transform: translateX(-20vw) translateY(-50%) rotate(-8deg);
+  }
+}
+@keyframes cheat-confetti-fall {
+  from {
+    transform: translateY(-10vh) rotate(0deg);
+    opacity: 1;
+  }
+  to {
+    transform: translateY(110vh) rotate(540deg);
+    opacity: 0;
+  }
+}
+@keyframes cheat-flash {
+  0% {
+    opacity: 0;
+  }
+  35% {
+    opacity: 0.55;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+@keyframes cheat-pulse {
+  0% {
+    transform: translate(-50%, -50%) scale(0.4);
+    opacity: 0;
+  }
+  40% {
+    transform: translate(-50%, -50%) scale(1.1);
+    opacity: 1;
+  }
+  100% {
+    transform: translate(-50%, -50%) scale(2.2);
+    opacity: 0;
+  }
+}
+.animate-cheat-fly-ltr {
+  animation: cheat-fly-ltr 1.6s ease-in forwards;
+}
+.animate-cheat-fly-rtl {
+  animation: cheat-fly-rtl 1.6s ease-in forwards;
+}
+.animate-cheat-confetti-fall {
+  animation: cheat-confetti-fall 2s ease-in forwards;
+}
+.animate-cheat-flash {
+  animation: cheat-flash 0.6s ease-out forwards;
+}
+.animate-cheat-pulse {
+  animation: cheat-pulse 1s ease-out forwards;
+}
+/* Respect reduced-motion: drop the visual flourish entirely (the toast still
+   fires as the functional signal). Hiding the overlay avoids a static
+   full-screen flash that animation:none would otherwise leave behind. */
+@media (prefers-reduced-motion: reduce) {
+  [data-testid="cheat-overlay"] {
+    display: none;
+  }
+}
 
 /* Focus indicators for keyboard navigation */
 button:focus-visible,

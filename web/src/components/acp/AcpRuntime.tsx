@@ -40,6 +40,7 @@ import type {
   ToolCall,
 } from "../../lib/acpTypes";
 import { hasTodoArrayArgsText, parseJsonObject } from "../../lib/acpArgs";
+import { getDraftAttachments, setDraftAttachments } from "../../lib/acpDrafts";
 import { useHistoryWindow } from "../../hooks/useHistoryWindow";
 import { canOfferEarlier, earlierAction } from "../../lib/historyScroll";
 import { useAgentProfile } from "../../lib/agentProfileContext";
@@ -136,11 +137,31 @@ export function AcpRuntime({
   // Staged attachments for the next prompt. A ref mirror keeps `onNew`
   // (recreated each render by useExternalStoreRuntime) reading the
   // latest value without going stale. See #1000 / #965.
-  const [pendingAttachments, setPendingAttachments] = useState<PromptAttachmentInput[]>([]);
-  const pendingAttachmentsRef = useRef<PromptAttachmentInput[]>([]);
+  // Seed from the persisted draft so a staged image survives a session
+  // switch or reload like unsent text does. StructuredView remounts this
+  // runtime per session (`key={sessionId}`), so the initializer runs once
+  // with the right session's attachments and `sessionId` is stable for the
+  // instance lifetime, which keeps the persist effect below race-free.
+  const [pendingAttachments, setPendingAttachments] = useState<PromptAttachmentInput[]>(() =>
+    getDraftAttachments(sessionId),
+  );
+  const pendingAttachmentsRef = useRef<PromptAttachmentInput[]>(pendingAttachments);
   useEffect(() => {
     pendingAttachmentsRef.current = pendingAttachments;
   }, [pendingAttachments]);
+  // Mirror staged attachments into the per-session draft on every change.
+  // Skip the first run: the state was just initialized from storage, so
+  // re-serializing (potentially megabytes of base64) straight back would
+  // be wasted main-thread work on every session open. Post-send the
+  // composer clears pendingAttachments, which removes the key here.
+  const attachmentsHydratedRef = useRef(false);
+  useEffect(() => {
+    if (!attachmentsHydratedRef.current) {
+      attachmentsHydratedRef.current = true;
+      return;
+    }
+    setDraftAttachments(sessionId, pendingAttachments);
+  }, [sessionId, pendingAttachments]);
   // Stop-button escalation: a second press always force-ends, even when the
   // server never confirms the first cancel (no in-flight prompt on the
   // daemon). Owns its own reset-on-turn-end and reset-on-session-switch
@@ -207,6 +228,12 @@ export function AcpRuntime({
       // Clear staged attachments only after the send resolves, so a
       // failed send keeps them staged for retry instead of dropping them.
       await acp.sendPrompt(text, attachments);
+      // Drop the persisted draft synchronously here, not only via the
+      // pendingAttachments effect: a send-then-immediately-navigate-away
+      // can unmount before the post-send render commits, which would
+      // otherwise leave an already-sent image behind to rehydrate later.
+      pendingAttachmentsRef.current = [];
+      setDraftAttachments(sessionId, []);
       setPendingAttachments([]);
     },
     onCancel,

@@ -23,6 +23,29 @@ contribution section from a future schema is a hard error today) and validates
 (`api_version` in range, non-empty `name`/`version`). `API_VERSION` is the
 schema/host version this crate understands.
 
+### Screenshots
+
+A plugin may declare up to eight `[[screenshots]]` to illustrate itself in the
+dashboard marketplace and detail modal (requires `api_version >= 5`):
+
+```toml
+[[screenshots]]
+path = "docs/screenshots/dashboard.png"  # repository-relative; not a URL
+alt = "Dashboard card the plugin contributes"  # required, for accessibility
+caption = "Live status card."  # optional, shown beneath the image
+```
+
+`path` must be a repository-relative image (`png`/`jpg`/`jpeg`/`gif`/`webp`):
+absolute URLs, absolute or `..`-traversing paths, and other extensions are
+rejected. The plugin detail endpoint resolves each path against the source
+repo's `raw.githubusercontent.com` (honoring the installed ref, else `HEAD`),
+so the browser fetches the asset directly; AoE never proxies image bytes. The
+endpoint silently drops any screenshot whose path or alt text fails validation
+rather than failing the whole detail response, so one bad entry omits only that
+image. The assets must be committed and pushed to the source repo before they
+render; local plugins do not support screenshots yet (future work beyond
+#2484).
+
 ## Registry
 
 `src/plugin/registry.rs` owns the in-process registry.
@@ -182,7 +205,8 @@ Build steps are free to name bare PATH programs (`python3`, `node`, `uv`): they
 run in the user's interactive shell where PATH is reliable, which is exactly why
 the worker entrypoint, launched later by the daemon, is not. A step's optional `platforms` (`linux` / `macos` / `windows`)
 restricts it to matching hosts. Builds run with cwd set to the plugin dir, with
-stdin closed and stdout/stderr inherited so the user sees progress.
+stdin closed and stdout/stderr going to the operation log: the user's terminal
+for a CLI install, or a per-job log file for a dashboard install (see below).
 
 Why install time and the final dir, not launch or staging: `aoe plugin
 install` runs in the user's interactive shell, where `python3` / `node` / `uv`
@@ -192,6 +216,19 @@ absolute paths), so the build runs in the final `<plugins_dir>/<id>`, never in
 a staging tree that is then renamed. A failed build aborts the install with no
 trace; a failed update restores the prior version from a backup, and a leftover
 backup from an interrupted update is recovered on the next install/update.
+
+Web lifecycle jobs: the dashboard (Settings -> Plugins) installs, updates, and
+uninstalls a `gh:` plugin without a terminal. The same disclosure the CLI
+prompts for (capabilities, build commands, UI slots, unverified-source warning)
+is returned as structured data and approved in a modal; the host then runs the
+operation as a job whose progress and build output stream to a per-job log file
+under `<plugins_dir>/jobs/<job_id>.log`, which the dashboard tails. One
+lifecycle mutation runs at a time (config and lockfile writes are not
+concurrency-safe; a second start is rejected). One PATH caveat: a dashboard
+build runs with the daemon's environment, not the user's interactive shell, so a
+build step that names a bare PATH program present only in the interactive shell
+can succeed from `aoe plugin install` yet fail from a dashboard install. Local
+(non-`gh:`) installs stay CLI-only.
 
 The worker entrypoint (`command`'s `argv[0]`) must be plugin-relative: a path
 containing a separator (`.venv/bin/worker`), resolved inside the install
@@ -489,6 +526,13 @@ plugin's id, so one plugin cannot reach another's data. A `session.meta.cas`
 that loses returns the current value rather than clobbering it. Writes go
 through `Storage`'s cross-process lock, so the daemon picks them up on its next
 session reload (eventual consistency, not a live push).
+
+`sessions.list` returns one entry per session with `id`, `title`,
+`project_path`, `tool`, `status` (the run-state), and two inactivity flags:
+`archived` (the session is archived) and `snoozed` (it has a snooze deadline
+still in the future; a past deadline reports `false`). The call never filters
+server-side, so a worker that should ignore dormant sessions, for example to
+avoid spending API quota on them, checks these flags itself.
 
 `config.get { key }` returns the value at `plugins.<plugin-id>.settings.<key>`
 for the calling plugin's own id, so a worker reads back the settings the user

@@ -1,8 +1,11 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Command } from "cmdk";
 import { StatusGlyph } from "../StatusGlyph";
+import { CheatOverlay } from "./CheatOverlay";
 import { GROUP_ORDER } from "./groups";
 import type { CommandAction, CommandActionGroup } from "./types";
+import { matchCheat, type CheatEffect } from "../../lib/cheats";
+import { reportInfo } from "../../lib/toastBus";
 
 interface Props {
   open: boolean;
@@ -13,6 +16,23 @@ interface Props {
 export function CommandPalette({ open, onClose, actions }: Props) {
   const inputRef = useRef<HTMLInputElement>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
+  const [search, setSearch] = useState("");
+  // Active easter-egg effect plus a monotonic id so retyping the same cheat
+  // replays the animation (the id is the overlay's React key).
+  const [cheat, setCheat] = useState<{ effect: CheatEffect; id: number } | null>(null);
+
+  // A full-string match on a known Age of Empires cheat code fires a toast and
+  // a one-off visual, then clears the input. Anything else is a normal search.
+  const onSearchChange = (value: string) => {
+    const hit = matchCheat(value);
+    if (hit) {
+      reportInfo(hit.toast);
+      setCheat((prev) => ({ effect: hit.effect, id: (prev?.id ?? 0) + 1 }));
+      setSearch("");
+      return;
+    }
+    setSearch(value);
+  };
 
   // Capture the launcher before moving focus into the palette, then restore
   // it on close so Esc / backdrop-close return keyboard users to where they
@@ -28,6 +48,23 @@ export function CommandPalette({ open, onClose, actions }: Props) {
       if (prev?.isConnected) prev.focus();
     };
   }, [open]);
+
+  // Controlled input keeps its value across open/close, so reset it when the
+  // palette closes; also drop any in-flight cheat so reopening does not replay
+  // the last one. Adjusting during render on the open->closed edge is the
+  // React-recommended pattern, no effect needed.
+  const [wasOpen, setWasOpen] = useState(open);
+  if (open !== wasOpen) {
+    setWasOpen(open);
+    if (!open) {
+      setSearch("");
+      setCheat(null);
+    }
+  }
+
+  // Stable so the overlay's cleanup timer is not reset by unrelated re-renders
+  // (e.g. the user typing again while an effect is still on screen).
+  const clearCheat = useCallback(() => setCheat(null), []);
 
   const grouped = useMemo(() => {
     const map = new Map<CommandActionGroup, CommandAction[]>();
@@ -78,6 +115,8 @@ export function CommandPalette({ open, onClose, actions }: Props) {
           </svg>
           <Command.Input
             ref={inputRef}
+            value={search}
+            onValueChange={onSearchChange}
             placeholder="Search actions, sessions, settings…"
             className="flex-1 bg-transparent outline-none text-[15px] text-text-primary placeholder:text-text-muted"
           />
@@ -136,6 +175,7 @@ export function CommandPalette({ open, onClose, actions }: Props) {
           </span>
         </div>
       </Command>
+      {cheat && <CheatOverlay key={cheat.id} effect={cheat.effect} onDone={clearCheat} />}
     </div>
   );
 }

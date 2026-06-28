@@ -9,7 +9,12 @@ interface Props {
   isSandboxed: boolean;
   isScratch: boolean;
   cleanupDefaults: CleanupDefaults;
+  /** When true (session.delete_to_trash), the dialog defaults to "Move to
+   *  Trash" with a "Delete permanently" disclosure; when false it goes
+   *  straight to the permanent-delete options. See #2489. */
+  defaultToTrash: boolean;
   onConfirm: (options: DeleteSessionOptions) => Promise<void>;
+  onTrash: () => Promise<void>;
   onCancel: () => void;
 }
 
@@ -20,7 +25,9 @@ export function DeleteSessionDialog({
   isSandboxed,
   isScratch,
   cleanupDefaults,
+  defaultToTrash,
   onConfirm,
+  onTrash,
   onCancel,
 }: Props) {
   const [deleteWorktree, setDeleteWorktree] = useState(hasManagedWorktree && cleanupDefaults.delete_worktree);
@@ -31,6 +38,10 @@ export function DeleteSessionDialog({
   // realize mid-delete they want to rescue the files.
   const [keepScratch, setKeepScratch] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  // Permanent-delete mode. Off by default when trash-first is enabled; the
+  // user reveals the destructive options via "Delete permanently". When
+  // trash-first is disabled there is no trash step, so start permanent.
+  const [permanent, setPermanent] = useState(!defaultToTrash);
   const confirmButtonRef = useRef<HTMLButtonElement | null>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
 
@@ -39,17 +50,21 @@ export function DeleteSessionDialog({
   const handleConfirm = useCallback(async () => {
     setDeleting(true);
     try {
-      await onConfirm({
-        delete_worktree: deleteWorktree,
-        delete_branch: deleteBranch,
-        delete_sandbox: deleteSandbox,
-        force_delete: forceDelete,
-        keep_scratch: isScratch ? keepScratch : undefined,
-      });
+      if (permanent) {
+        await onConfirm({
+          delete_worktree: deleteWorktree,
+          delete_branch: deleteBranch,
+          delete_sandbox: deleteSandbox,
+          force_delete: forceDelete,
+          keep_scratch: isScratch ? keepScratch : undefined,
+        });
+      } else {
+        await onTrash();
+      }
     } catch {
       setDeleting(false);
     }
-  }, [onConfirm, deleteWorktree, deleteBranch, deleteSandbox, forceDelete, isScratch, keepScratch]);
+  }, [permanent, onConfirm, onTrash, deleteWorktree, deleteBranch, deleteSandbox, forceDelete, isScratch, keepScratch]);
 
   // Capture the previously focused element on mount and restore focus on
   // unmount so keyboard users return to the trigger (the sidebar row /
@@ -115,7 +130,21 @@ export function DeleteSessionDialog({
             Delete <span className="font-mono text-text-primary">{sessionTitle}</span>?
           </p>
 
-          {hasOptions && (
+          {/* When trash is the default, deleting moves the session to the
+              Trash (restore later); this checkbox opts into erasing it now.
+              When trash-first is off (or the session is already trashed),
+              there is no checkbox and delete is always permanent. See #2489. */}
+          {defaultToTrash && (
+            <Checkbox
+              checked={permanent}
+              onChange={setPermanent}
+              label="Delete permanently"
+              detail="Skip the trash and erase now, including the transcript. Off: move to Trash, restore later."
+              testId="delete-session-permanent"
+            />
+          )}
+
+          {permanent && hasOptions && (
             <div className="space-y-2 pt-1">
               {hasManagedWorktree && (
                 <>
@@ -181,7 +210,8 @@ export function DeleteSessionDialog({
             ref={confirmButtonRef}
             onClick={handleConfirm}
             disabled={deleting}
-            className="px-3 py-1.5 text-sm text-white bg-status-error/90 hover:bg-status-error rounded-md cursor-pointer transition-colors disabled:opacity-50 flex items-center gap-2"
+            data-testid="delete-session-confirm"
+            className="px-3 py-1.5 text-sm text-white rounded-md cursor-pointer transition-colors disabled:opacity-50 flex items-center gap-2 bg-status-error/90 hover:bg-status-error"
           >
             {deleting && (
               <svg className="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24">

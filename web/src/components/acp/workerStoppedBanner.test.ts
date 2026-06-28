@@ -7,6 +7,7 @@ describe("pickWorkerStoppedVariant", () => {
       pickWorkerStoppedVariant({
         workerStopped: false,
         startupError: null,
+        trashedAt: null,
         archivedAt: null,
         snoozedUntil: null,
       }),
@@ -18,10 +19,41 @@ describe("pickWorkerStoppedVariant", () => {
       pickWorkerStoppedVariant({
         workerStopped: true,
         startupError: "missing API key",
+        trashedAt: null,
         archivedAt: null,
         snoozedUntil: null,
       }),
     ).toBe("none");
+  });
+
+  it("returns 'trashed' when the session is in the trash", () => {
+    // A trashed structured view session is recoverable only by restoring
+    // it; reconnecting would race the reconciler (which skips trashed
+    // sessions) just like the archived case. See #2489.
+    expect(
+      pickWorkerStoppedVariant({
+        workerStopped: true,
+        startupError: null,
+        trashedAt: "2026-01-01T00:00:00Z",
+        archivedAt: null,
+        snoozedUntil: null,
+      }),
+    ).toBe("trashed");
+  });
+
+  it("prefers 'trashed' over 'archived' and 'snoozed'", () => {
+    // Trash supersedes the other sink states (Instance::trash leaves the
+    // sibling flags intact, and effective_bucket makes trash win), so the
+    // banner must too. See #2489.
+    expect(
+      pickWorkerStoppedVariant({
+        workerStopped: true,
+        startupError: null,
+        trashedAt: "2026-03-01T00:00:00Z",
+        archivedAt: "2026-01-01T00:00:00Z",
+        snoozedUntil: "2026-02-01T00:00:00Z",
+      }),
+    ).toBe("trashed");
   });
 
   it("returns 'archived' when the session is archived", () => {
@@ -34,6 +66,7 @@ describe("pickWorkerStoppedVariant", () => {
       pickWorkerStoppedVariant({
         workerStopped: true,
         startupError: null,
+        trashedAt: null,
         archivedAt: "2026-01-01T00:00:00Z",
         snoozedUntil: null,
       }),
@@ -49,6 +82,7 @@ describe("pickWorkerStoppedVariant", () => {
       pickWorkerStoppedVariant({
         workerStopped: true,
         startupError: null,
+        trashedAt: null,
         archivedAt: null,
         snoozedUntil: "2026-01-01T00:00:00Z",
       }),
@@ -64,6 +98,7 @@ describe("pickWorkerStoppedVariant", () => {
       pickWorkerStoppedVariant({
         workerStopped: true,
         startupError: null,
+        trashedAt: null,
         archivedAt: "2026-01-01T00:00:00Z",
         snoozedUntil: "2026-02-01T00:00:00Z",
       }),
@@ -75,6 +110,7 @@ describe("pickWorkerStoppedVariant", () => {
       pickWorkerStoppedVariant({
         workerStopped: true,
         startupError: null,
+        trashedAt: null,
         archivedAt: null,
         snoozedUntil: null,
       }),
@@ -82,14 +118,15 @@ describe("pickWorkerStoppedVariant", () => {
   });
 
   it("returns 'generic' when only snoozedUntil is null but archivedAt is null too (branch combo)", () => {
-    // Branch coverage: the snoozedUntil-falsy leg of the third `if`
-    // (after archivedAt also falsy). The "generic" test above hits
-    // this path with all-null; this case uses an empty string on
-    // startupError to confirm that branch's falsy side as well.
+    // Branch coverage: the snoozedUntil-falsy leg of the last `if`
+    // (after trashedAt and archivedAt also falsy). The "generic" test
+    // above hits this path with all-null; this case uses an empty string
+    // on startupError to confirm that branch's falsy side as well.
     expect(
       pickWorkerStoppedVariant({
         workerStopped: true,
         startupError: "",
+        trashedAt: null,
         archivedAt: null,
         snoozedUntil: null,
       }),
@@ -104,6 +141,7 @@ describe("pickWorkerStoppedVariant", () => {
       pickWorkerStoppedVariant({
         workerStopped: true,
         startupError: "",
+        trashedAt: null,
         archivedAt: "2026-01-01T00:00:00Z",
         snoozedUntil: null,
       }),
@@ -119,6 +157,7 @@ describe("pickWorkerStoppedVariant", () => {
       pickWorkerStoppedVariant({
         workerStopped: true,
         startupError: null,
+        trashedAt: null,
         archivedAt: null,
         snoozedUntil: "2099-01-01T00:00:00Z",
       }),

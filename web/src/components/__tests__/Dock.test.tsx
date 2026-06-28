@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render } from "@testing-library/react";
 
 import { Dock } from "../Dock";
+import { PaneDndStateContext } from "../paneDnd";
 import { BUILTIN_PANES } from "../../lib/panes";
 
 afterEach(() => cleanup());
@@ -24,6 +25,7 @@ function renderDock(props: Partial<React.ComponentProps<typeof Dock>> = {}) {
   return render(
     <Dock
       location="right"
+      groupIndex={0}
       tabs={["diff", "terminal:0"]}
       active="terminal:0"
       descriptorFor={descriptorFor}
@@ -78,5 +80,34 @@ describe("Dock", () => {
     const { getByLabelText } = renderDock({ onNewTerminal });
     fireEvent.click(getByLabelText("New terminal"));
     expect(onNewTerminal).toHaveBeenCalled();
+  });
+
+  it("shows split drop zones only while a tab is being dragged", () => {
+    // Baseline Dock with no drag in progress: no split zones mounted (assert
+    // after mounting so this catches unconditional rendering, not an empty DOM).
+    const { unmount } = renderDock();
+    expect(document.querySelector('[data-testid="pane-split-right-0-before"]')).toBeNull();
+    expect(document.querySelector('[data-testid="pane-split-right-0-after"]')).toBeNull();
+    unmount();
+
+    render(
+      <PaneDndStateContext.Provider
+        value={{ activeTab: "diff", source: { dock: "right", group: 0 }, dropTarget: null }}
+      >
+        <Dock
+          location="right"
+          groupIndex={0}
+          tabs={["diff", "terminal:0"]}
+          active="terminal:0"
+          descriptorFor={descriptorFor}
+          renderBody={body}
+          onActivate={vi.fn()}
+          onClose={vi.fn()}
+          onMove={vi.fn()}
+        />
+      </PaneDndStateContext.Provider>,
+    );
+    expect(document.querySelector('[data-testid="pane-split-right-0-before"]')).toBeTruthy();
+    expect(document.querySelector('[data-testid="pane-split-right-0-after"]')).toBeTruthy();
   });
 });

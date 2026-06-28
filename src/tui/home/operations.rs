@@ -367,6 +367,7 @@ impl HomeView {
                 let snoozed = inst.is_snoozed();
                 let skip = matches!(inst.status, Status::Creating | Status::Deleting)
                     || inst.is_archived()
+                    || inst.is_trashed()
                     || (snoozed && in_attention)
                     || inst.pane_dead_observed;
                 let wake_snooze = snoozed && !in_attention;
@@ -1306,7 +1307,7 @@ impl HomeView {
                 return None;
             }
             let inst = self.instances.iter().find(|i| &i.id == id)?;
-            (!inst.is_archived()).then(|| id.clone())
+            (!inst.is_archived() && !inst.is_trashed()).then(|| id.clone())
         };
         for item in self.flat_items.iter().skip(self.cursor + 1) {
             if let Some(id) = candidate(item) {
@@ -1360,6 +1361,13 @@ impl HomeView {
         let Some(id) = self.selected_session.clone() else {
             return Ok(());
         };
+        // The shelve/unshelve key doubles as restore for the Trash section: a
+        // trashed row can't be meaningfully archived, so `z` on it pulls the
+        // session back out of the trash instead. See #2489.
+        if matches!(self.instances.iter().find(|i| i.id == id), Some(i) if i.is_trashed()) {
+            self.restore_selected_from_trash();
+            return Ok(());
+        }
         let is_archived = match self.instances.iter().find(|i| i.id == id) {
             Some(i) => i.is_archived(),
             None => return Ok(()),
@@ -1434,6 +1442,48 @@ impl HomeView {
         Ok(())
     }
 
+    /// Move a session to the trash: stop its tmux sessions (a structured-view
+    /// worker is reaped by the daemon reconciler once the row reads trashed)
+    /// and set `trashed_at`. Durable artifacts are kept so it can be
+    /// restored. The Trash section is revealed so the user sees where the row
+    /// went. See #2489.
+    pub(super) fn trash_session_by_id(&mut self, id: &str) {
+        if let Some(inst) = self.instances.iter().find(|i| i.id == id) {
+            inst.kill_all_tmux_sessions();
+        }
+        if let Err(e) = self.apply_user_action(id, |inst| inst.trash()) {
+            tracing::warn!(target: "tui.session", session = %id, "trash failed: {e}");
+            return;
+        }
+        self.reveal_trashed_section();
+        self.flat_items = self.build_flat_items();
+        self.cursor = self.cursor.min(self.flat_items.len().saturating_sub(1));
+        self.update_selected();
+    }
+
+    /// Restore the selected trashed session, clearing `trashed_at` so it
+    /// returns to its prior bucket. No-op when the selection is not trashed.
+    /// The session stays stopped (trash killed its panes); the user restarts
+    /// it with `e` like any stopped session. See #2489.
+    pub(super) fn restore_selected_from_trash(&mut self) {
+        let Some(id) = self.selected_session.clone() else {
+            return;
+        };
+        let is_trashed = matches!(
+            self.instances.iter().find(|i| i.id == id),
+            Some(i) if i.is_trashed()
+        );
+        if !is_trashed {
+            return;
+        }
+        if let Err(e) = self.apply_user_action(&id, |inst| inst.untrash()) {
+            tracing::warn!(target: "tui.session", session = %id, "restore failed: {e}");
+            return;
+        }
+        self.flat_items = self.build_flat_items();
+        self.select_session_by_id(&id);
+    }
+
     /// Collect the active (non-archived) session ids under the currently
     /// selected group header, honoring the active group-by mode. Archived
     /// sessions are excluded: they already live under the synthetic Archived
@@ -1450,7 +1500,7 @@ impl HomeView {
             crate::session::config::GroupByMode::Project => self
                 .instances
                 .iter()
-                .filter(|i| !i.is_archived())
+                .filter(|i| !i.is_archived() && !i.is_trashed())
                 .filter(|i| {
                     self.active_profile
                         .as_ref()
@@ -1466,7 +1516,7 @@ impl HomeView {
                 let prefix = format!("{}/", group_path);
                 self.instances
                     .iter()
-                    .filter(|i| !i.is_archived())
+                    .filter(|i| !i.is_archived() && !i.is_trashed())
                     .filter(|i| i.group_path == group_path || i.group_path.starts_with(&prefix))
                     .filter(|i| {
                         self.selected_group_profile

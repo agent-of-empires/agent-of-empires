@@ -37,6 +37,26 @@ self.addEventListener("activate", (e) => {
 // focused tab is rare enough for pushes that revocation hasn't been
 // an issue. If it becomes one, fall back to showing the notification
 // anyway and let the client suppress its own toast.
+// Per-tag high-water mark of the latest seq we've shown or cleared. Lets an
+// out-of-order older notify (delivered AFTER a newer clear) be dropped instead
+// of resurrecting a handled request's notification: getNotifications only sees
+// what is open right now, so a clear cannot close a notify that has not arrived
+// yet. See #2491.
+// ponytail: in-memory only, lost if the browser terminates the worker between
+// pushes; reordering only matters when pushes are near-simultaneous (the worker
+// stays warm), so IndexedDB persistence would buy a moot window.
+const seqHighWater = new Map();
+function isStaleSeq(tag, seq) {
+  if (seq == null || !tag) return false;
+  const hw = seqHighWater.get(tag);
+  return hw != null && seq < hw;
+}
+function recordSeq(tag, seq) {
+  if (seq == null || !tag) return;
+  const hw = seqHighWater.get(tag);
+  if (hw == null || seq > hw) seqHighWater.set(tag, seq);
+}
+
 self.addEventListener("push", (event) => {
   let payload = {};
   if (event.data) {
@@ -46,12 +66,50 @@ self.addEventListener("push", (event) => {
       payload = { title: "Agent of Empires", body: event.data.text() };
     }
   }
+  // Retract path: a "clear" push closes a previously shown approval or
+  // question notification once that request was handled on another device,
+  // so a backgrounded phone or second computer stops showing a stale alert.
+  // It shows nothing (the request is gone) and is NOT focus-gated. The seq
+  // guard skips closing a NEWER notification when a clear for an earlier
+  // request in the same session is delivered out of order. See #2491.
+  if (payload.kind === "clear") {
+    const tag = payload.tag;
+    // Record the clear's seq even when getNotifications is unsupported, so a
+    // later older notify for this tag is dropped rather than shown.
+    recordSeq(tag, payload.seq);
+    event.waitUntil(
+      (async () => {
+        if (!tag || !self.registration.getNotifications) return;
+        try {
+          const existing = await self.registration.getNotifications({ tag });
+          for (const n of existing) {
+            const nseq = n.data && n.data.seq;
+            if (nseq == null || payload.seq == null || nseq <= payload.seq) {
+              n.close();
+            }
+          }
+        } catch {
+          /* getNotifications may be unsupported or throw; never fail the push */
+        }
+      })(),
+    );
+    return;
+  }
+
+  // Drop an out-of-order notify that is older than a clear (or newer notify)
+  // already seen for this tag: the request it announces was already handled.
+  const tag = payload.tag || "aoe";
+  if (isStaleSeq(tag, payload.seq)) return;
+  recordSeq(tag, payload.seq);
+
   const title = payload.title || "Agent of Empires";
   const options = {
     body: payload.body || "",
-    tag: payload.tag || "aoe",
+    tag,
     renotify: true,
-    data: { url: payload.url || "/" },
+    // Store tag + seq so a later "clear" push can match this notification
+    // and the seq guard can avoid closing it if a newer one supersedes it.
+    data: { url: payload.url || "/", tag: payload.tag, seq: payload.seq },
     icon: "/icon-192.png",
     badge: "/icon-192.png",
   };

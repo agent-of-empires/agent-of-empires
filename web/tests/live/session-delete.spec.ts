@@ -47,6 +47,10 @@ base.describe("session delete via sidebar context menu (#1220)", () => {
       const dialog = page.locator("[data-testid='delete-session-dialog']");
       await expect(dialog).toBeVisible();
 
+      // Trash-first is on by default (#2489), so a bare Delete trashes; tick
+      // "Delete permanently" to exercise the DELETE purge path.
+      await dialog.locator("[data-testid='delete-session-permanent']").click();
+
       const deletePromise = page.waitForResponse(
         (res) => res.url().endsWith(`/api/sessions/${sessionId}`) && res.request().method() === "DELETE",
       );

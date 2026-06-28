@@ -230,7 +230,8 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
     // Opt-in clean-only plugin auto-update sweep (off by default). Spawned
     // non-blocking so a slow remote or git never delays the TUI; applied updates
     // take effect on the next launch.
-    crate::plugin::auto_update::spawn_if_enabled(&crate::session::Config::load_or_warn());
+    // No notifier in the TUI: there is no plugin host / notification ring here.
+    crate::plugin::auto_update::spawn_if_enabled(&crate::session::Config::load_or_warn(), None);
 
     // Bail early if stdin is not a terminal. Running without a tty would
     // cause the event loop to busy-loop after the parent terminal dies.

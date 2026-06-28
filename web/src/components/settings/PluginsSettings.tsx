@@ -1,17 +1,28 @@
 import { useCallback, useEffect, useState } from "react";
 
 import {
+  applyPluginUpdate,
+  dismissPluginUpdate,
   discoverPlugins,
   fetchPluginUpdates,
   fetchPlugins,
+  previewPluginInstall,
+  previewPluginUpdate,
   setPluginEnabled,
+  startPluginInstall,
+  startPluginUninstall,
   type PluginDiscoveryResult,
+  type PluginInstallConsent,
   type PluginListResponse,
+  type PluginUpdateConsent,
   type PluginUpdateStatus,
   type PluginView,
 } from "../../lib/api";
 import { reportInfo } from "../../lib/toastBus";
 import { PluginDetailModal } from "./PluginDetailModal";
+import { PluginInstallConsentModal } from "./PluginInstallConsentModal";
+import { PluginJobProgressModal } from "./PluginJobProgressModal";
+import { PluginUpdateConsentModal } from "./PluginUpdateConsentModal";
 
 interface DetailTarget {
   source: string;
@@ -26,14 +37,15 @@ interface DetailTarget {
 }
 
 /// Plugin management: list every known plugin (name, version, description,
-/// validation provenance, capabilities, and enabled / approval state) and
-/// toggle it on or off. Installing and capability approval are CLI-driven (`aoe plugin
-/// install`); this panel shows the resulting state. The toggle POSTs to
-/// `/api/plugins/{id}/enabled`; it is a host mutation, so it needs read-write
-/// mode and (when login is enabled) an elevated session. A `403
-/// elevation_required` response pops the global passphrase prompt via the
-/// fetch interceptor, the same as any other elevated setting; other failures
-/// surface their message inline. `load_errors` are shown as a warning line.
+/// validation provenance, capabilities, and enabled / approval state), toggle
+/// it on or off, and run the lifecycle actions (install from the marketplace,
+/// update, uninstall) as host-side jobs with a live log tail. Install and
+/// uninstall still show the same capability disclosure the CLI prompts for. The
+/// mutations are host operations, so they need read-write mode and (when login
+/// is enabled) an elevated session. A `403 elevation_required` response pops the
+/// global passphrase prompt via the fetch interceptor, the same as any other
+/// elevated setting; other failures surface their message inline. `load_errors`
+/// are shown as a warning line.
 export function PluginsSettings() {
   const [data, setData] = useState<PluginListResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -43,7 +55,7 @@ export function PluginsSettings() {
   const [updates, setUpdates] = useState<Record<string, PluginUpdateStatus>>({});
   const [checkingUpdates, setCheckingUpdates] = useState(false);
 
-  // GitHub discovery (browse-only; install is CLI).
+  // GitHub discovery (the marketplace tab; each result can install in-app).
   const [discoverQuery, setDiscoverQuery] = useState("");
   const [discoverResults, setDiscoverResults] = useState<PluginDiscoveryResult[] | null>(null);
   const [discoverError, setDiscoverError] = useState<string | null>(null);
@@ -51,6 +63,35 @@ export function PluginsSettings() {
 
   // The plugin whose detail modal is open (null = closed).
   const [detail, setDetail] = useState<DetailTarget | null>(null);
+
+  // The in-app update flow: which plugin's Update button is previewing, and the
+  // consent modal when a fetched update needs explicit approval.
+  const [updatingId, setUpdatingId] = useState<string | null>(null);
+  const [consentModal, setConsentModal] = useState<{ plugin: PluginView; consent: PluginUpdateConsent } | null>(null);
+  const [consentBusy, setConsentBusy] = useState(false);
+  const [consentError, setConsentError] = useState<string | null>(null);
+
+  // The in-app install flow: which marketplace source is previewing, the
+  // consent modal once its disclosure is fetched, and busy/error while the
+  // install job is started.
+  const [previewingSource, setPreviewingSource] = useState<string | null>(null);
+  const [installConsent, setInstallConsent] = useState<PluginInstallConsent | null>(null);
+  const [installBusy, setInstallBusy] = useState(false);
+  const [installError, setInstallError] = useState<string | null>(null);
+
+  // An installed external plugin awaiting uninstall confirmation.
+  const [confirmUninstall, setConfirmUninstall] = useState<PluginView | null>(null);
+
+  // The active lifecycle job (install / update / uninstall) the progress modal
+  // is following; null when none is running.
+  const [job, setJob] = useState<{ id: string; title: string } | null>(null);
+
+  const clearUpdateBadge = (id: string) =>
+    setUpdates((u) => {
+      const next = { ...u };
+      delete next[id];
+      return next;
+    });
 
   // Two tabs, JetBrains-style: manage installed plugins vs browse the
   // marketplace (GitHub discovery).
@@ -118,6 +159,139 @@ export function PluginsSettings() {
     } finally {
       setCheckingUpdates(false);
     }
+  };
+
+  // Drive an in-app update: preview first, then apply a safe update directly or
+  // open the consent modal when the fetched version expands access.
+  const onUpdate = async (plugin: PluginView) => {
+    setUpdatingId(plugin.id);
+    setError(null);
+    try {
+      const res = await previewPluginUpdate(plugin.id);
+      if (res.kind !== "ok") {
+        setError(res.message);
+        return;
+      }
+      const preview = res.preview;
+      if (preview.kind === "no_update") {
+        reportInfo(`${plugin.name} is already up to date.`);
+        clearUpdateBadge(plugin.id);
+      } else if (preview.kind === "safe_update") {
+        const started = await applyPluginUpdate(plugin.id, preview.fingerprint);
+        if (started.kind === "ok") {
+          clearUpdateBadge(plugin.id);
+          setJob({ id: started.jobId, title: `Updating ${plugin.name}` });
+        } else {
+          setError(started.message);
+        }
+      } else {
+        setConsentError(null);
+        setConsentModal({ plugin, consent: preview.consent });
+      }
+    } finally {
+      setUpdatingId(null);
+    }
+  };
+
+  const onApproveUpdate = async () => {
+    if (!consentModal) return;
+    setConsentBusy(true);
+    setConsentError(null);
+    try {
+      const res = await applyPluginUpdate(consentModal.plugin.id, consentModal.consent.fingerprint);
+      if (res.kind === "ok") {
+        clearUpdateBadge(consentModal.plugin.id);
+        const name = consentModal.plugin.name;
+        setConsentModal(null);
+        setJob({ id: res.jobId, title: `Updating ${name}` });
+      } else {
+        // Any failure keeps the modal open with the message; the user can close
+        // and re-Update to re-preview.
+        setConsentError(res.message);
+      }
+    } finally {
+      setConsentBusy(false);
+    }
+  };
+
+  const onDeclineUpdate = async () => {
+    if (!consentModal) return;
+    setConsentBusy(true);
+    setConsentError(null);
+    try {
+      // The current version stays active either way, but only clear local state
+      // once the backend actually recorded the decline; otherwise a failed
+      // dismiss would look persisted and the prompt would return on reload.
+      const res = await dismissPluginUpdate(consentModal.plugin.id, consentModal.consent.fingerprint);
+      if (res.kind === "ok") {
+        clearUpdateBadge(consentModal.plugin.id);
+        setConsentModal(null);
+      } else {
+        setConsentError(res.message);
+      }
+    } finally {
+      setConsentBusy(false);
+    }
+  };
+
+  // The `gh:owner/repo` source to install, taken from the discovery row's copy
+  // command (`aoe plugin install gh:owner/repo`) so it always carries the `gh:`
+  // prefix the web install path requires.
+  const sourceFromCommand = (command: string) => command.replace(/^.*\binstall\s+/, "").trim();
+
+  // Marketplace install: preview the disclosure first, then open the consent
+  // modal. Nothing is installed until the user approves.
+  const onInstall = async (source: string) => {
+    setPreviewingSource(source);
+    setDiscoverError(null);
+    setInstallError(null);
+    try {
+      const res = await previewPluginInstall(source);
+      if (res.kind === "ok") {
+        setInstallConsent(res.consent);
+      } else {
+        setDiscoverError(res.message);
+      }
+    } finally {
+      setPreviewingSource(null);
+    }
+  };
+
+  const onApproveInstall = async () => {
+    if (!installConsent) return;
+    setInstallBusy(true);
+    setInstallError(null);
+    try {
+      const res = await startPluginInstall(installConsent.source, installConsent.fingerprint);
+      if (res.kind === "ok") {
+        const title = `Installing ${installConsent.id}`;
+        setInstallConsent(null);
+        setJob({ id: res.jobId, title });
+      } else {
+        setInstallError(res.message);
+      }
+    } finally {
+      setInstallBusy(false);
+    }
+  };
+
+  const onConfirmUninstall = async () => {
+    if (!confirmUninstall) return;
+    const plugin = confirmUninstall;
+    setConfirmUninstall(null);
+    const res = await startPluginUninstall(plugin.id);
+    if (res.kind === "ok") {
+      setJob({ id: res.jobId, title: `Uninstalling ${plugin.name}` });
+    } else {
+      setError(res.message);
+    }
+  };
+
+  // When a job modal closes (terminal state), refresh the list so the installed
+  // set, versions, and approval state reflect what the job did.
+  const onJobClose = async () => {
+    setJob(null);
+    await reload();
   };
 
   const onDiscover = async () => {
@@ -217,9 +391,25 @@ export function PluginsSettings() {
                       </a>
                     </div>
                     {r.description && <p className="mt-1 text-text-dim">{r.description}</p>}
-                    <p className="mt-1 text-text-dim">
-                      Install in a terminal: <code>{r.install_command}</code>
-                    </p>
+                    <div className="mt-2 flex flex-wrap items-center gap-2">
+                      {r.badge === "installed" ||
+                      data?.plugins.some((p) => p.source === sourceFromCommand(r.install_command)) ? (
+                        <span className="text-text-dim">Installed.</span>
+                      ) : (
+                        <button
+                          type="button"
+                          className="rounded bg-brand-600 px-2 py-0.5 text-[11px] font-medium text-white hover:bg-brand-500 disabled:opacity-50"
+                          disabled={previewingSource !== null}
+                          onClick={() => void onInstall(sourceFromCommand(r.install_command))}
+                          data-testid={`plugins-install-${r.slug}`}
+                        >
+                          {previewingSource === sourceFromCommand(r.install_command) ? "Checking…" : "Install"}
+                        </button>
+                      )}
+                      <span className="text-text-dim">
+                        or in a terminal: <code>{r.install_command}</code>
+                      </span>
+                    </div>
                   </div>
                 ))
               )}
@@ -328,26 +518,48 @@ export function PluginsSettings() {
                       </p>
                     )}
                     {update?.needs_update && (
-                      <p className="mt-1 text-[11px] text-text-dim">
-                        Update available ({update.current} → {update.available ?? "modified"}). Update with{" "}
-                        <code>aoe plugin update {plugin.id}</code>.
-                      </p>
+                      <div className="mt-1 flex flex-wrap items-center gap-2">
+                        <span className="text-[11px] text-text-dim">
+                          Update available ({update.current} → {update.available ?? "modified"}).
+                        </span>
+                        <button
+                          type="button"
+                          className="rounded border border-surface-700 px-2 py-0.5 text-[11px] hover:bg-surface-800 disabled:opacity-50"
+                          disabled={updatingId === plugin.id}
+                          onClick={() => void onUpdate(plugin)}
+                          data-testid={`plugin-update-${plugin.id}`}
+                        >
+                          {updatingId === plugin.id ? "Checking…" : "Update"}
+                        </button>
+                      </div>
                     )}
                     {update?.error && (
                       <p className="mt-1 text-[11px] text-status-error">Update check failed: {update.error}</p>
                     )}
                   </div>
-                  <label className="flex shrink-0 items-center gap-1 text-xs">
-                    <input
-                      type="checkbox"
-                      role="switch"
-                      aria-label={`Enable ${plugin.name}`}
-                      checked={plugin.enabled}
-                      disabled={busy}
-                      onChange={(e) => void onToggle(plugin, e.target.checked)}
-                    />
-                    Enabled
-                  </label>
+                  <div className="flex shrink-0 flex-col items-end gap-2">
+                    <label className="flex items-center gap-1 text-xs">
+                      <input
+                        type="checkbox"
+                        role="switch"
+                        aria-label={`Enable ${plugin.name}`}
+                        checked={plugin.enabled}
+                        disabled={busy}
+                        onChange={(e) => void onToggle(plugin, e.target.checked)}
+                      />
+                      Enabled
+                    </label>
+                    {!plugin.builtin && plugin.source && (
+                      <button
+                        type="button"
+                        className="rounded border border-status-error/50 px-2 py-0.5 text-[11px] text-status-error hover:bg-status-error/10 disabled:opacity-50"
+                        onClick={() => setConfirmUninstall(plugin)}
+                        data-testid={`plugin-uninstall-${plugin.id}`}
+                      >
+                        Uninstall
+                      </button>
+                    )}
+                  </div>
                 </div>
               </div>
             );
@@ -365,6 +577,72 @@ export function PluginsSettings() {
           onClose={() => setDetail(null)}
         />
       )}
+
+      {consentModal && (
+        <PluginUpdateConsentModal
+          key={consentModal.plugin.id}
+          consent={consentModal.consent}
+          name={consentModal.plugin.name}
+          busy={consentBusy}
+          error={consentError}
+          onApprove={() => void onApproveUpdate()}
+          onDecline={() => void onDeclineUpdate()}
+          onClose={() => setConsentModal(null)}
+        />
+      )}
+
+      {installConsent && (
+        <PluginInstallConsentModal
+          key={installConsent.fingerprint}
+          consent={installConsent}
+          busy={installBusy}
+          error={installError}
+          onApprove={() => void onApproveInstall()}
+          onClose={() => setInstallConsent(null)}
+        />
+      )}
+
+      {confirmUninstall && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-label={`Uninstall ${confirmUninstall.name}`}
+          onClick={() => setConfirmUninstall(null)}
+          data-testid="plugin-uninstall-confirm"
+        >
+          <div
+            className="w-full max-w-sm rounded border border-surface-700 bg-surface-900 p-4 text-sm"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h2 className="mb-2 font-semibold">Uninstall {confirmUninstall.name}?</h2>
+            <p className="mb-4 text-xs text-text-dim">
+              This removes the plugin's files, config entry, and lockfile entry from the host. You can reinstall it
+              later from the marketplace.
+            </p>
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                className="rounded border border-surface-700 px-3 py-1 text-xs hover:bg-surface-800"
+                onClick={() => setConfirmUninstall(null)}
+                data-testid="plugin-uninstall-cancel"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="rounded bg-status-error px-3 py-1 text-xs font-medium text-white hover:opacity-90"
+                onClick={() => void onConfirmUninstall()}
+                data-testid="plugin-uninstall-confirm-button"
+              >
+                Uninstall
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {job && <PluginJobProgressModal jobId={job.id} title={job.title} onClose={() => void onJobClose()} />}
     </div>
   );
 }

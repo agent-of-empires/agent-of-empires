@@ -770,3 +770,138 @@ fn manifest_hash_is_stable_and_prefixed() {
     assert!(a.starts_with("sha256:"));
     assert_ne!(a, PluginManifest::hash_bytes(b"different"));
 }
+
+#[test]
+fn screenshots_parse_and_round_trip() {
+    let toml = r#"
+id = "acme.widget"
+name = "Widget"
+version = "0.1.0"
+api_version = 5
+
+[[screenshots]]
+path = "docs/screenshots/dashboard.png"
+alt = "Dashboard card"
+caption = "The plugin's dashboard card."
+
+[[screenshots]]
+path = "media/demo.gif"
+alt = "Animated demo"
+"#;
+    let manifest = PluginManifest::from_toml_str(toml).expect("screenshots parse");
+    assert_eq!(manifest.screenshots.len(), 2);
+    assert_eq!(
+        manifest.screenshots[0].path,
+        "docs/screenshots/dashboard.png"
+    );
+    assert_eq!(
+        manifest.screenshots[0].caption,
+        "The plugin's dashboard card."
+    );
+    assert_eq!(manifest.screenshots[1].alt, "Animated demo");
+    assert_eq!(manifest.screenshots[1].caption, "");
+}
+
+#[test]
+fn screenshots_require_api_version_5() {
+    let toml = r#"
+id = "acme.widget"
+name = "Widget"
+version = "0.1.0"
+api_version = 4
+
+[[screenshots]]
+path = "a.png"
+alt = "a"
+"#;
+    let err = PluginManifest::from_toml_str(toml).unwrap_err();
+    assert!(
+        matches!(&err, ManifestError::Invalid(errs) if errs.iter().any(|e| e.contains("screenshots require api_version >= 5"))),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn screenshots_reject_absolute_url_and_traversal_paths() {
+    for bad in [
+        "https://tracker.example.com/x.png",
+        "/etc/passwd.png",
+        "../secrets.png",
+        "a/../../b.png",
+        "C:/Windows/x.png",
+        "no-extension",
+        "evil.svg",
+    ] {
+        let toml = format!(
+            r#"
+id = "acme.widget"
+name = "Widget"
+version = "0.1.0"
+api_version = 5
+
+[[screenshots]]
+path = "{bad}"
+alt = "x"
+"#
+        );
+        let err = PluginManifest::from_toml_str(&toml).unwrap_err();
+        assert!(
+            matches!(&err, ManifestError::Invalid(errs) if errs.iter().any(|e| e.contains("must be a repository-relative image path"))),
+            "path {bad:?} should be rejected, got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn screenshots_reject_empty_alt() {
+    let toml = r#"
+id = "acme.widget"
+name = "Widget"
+version = "0.1.0"
+api_version = 5
+
+[[screenshots]]
+path = "a.png"
+alt = "   "
+"#;
+    let err = PluginManifest::from_toml_str(toml).unwrap_err();
+    assert!(
+        matches!(&err, ManifestError::Invalid(errs) if errs.iter().any(|e| e.contains("alt must not be empty"))),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn screenshots_reject_too_many() {
+    let entries = (0..9)
+        .map(|i| format!("[[screenshots]]\npath = \"s{i}.png\"\nalt = \"s{i}\"\n"))
+        .collect::<String>();
+    let toml = format!(
+        "id = \"acme.widget\"\nname = \"Widget\"\nversion = \"0.1.0\"\napi_version = 5\n\n{entries}"
+    );
+    let err = PluginManifest::from_toml_str(&toml).unwrap_err();
+    assert!(
+        matches!(&err, ManifestError::Invalid(errs) if errs.iter().any(|e| e.contains("at most 8 screenshots"))),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn screenshot_path_ok_rejects_backslash_and_bad_shapes() {
+    use aoe_plugin_api::screenshot_path_ok;
+    assert!(screenshot_path_ok("docs/shot.png"));
+    assert!(screenshot_path_ok("a/b/c.gif"));
+    for bad in [
+        "docs\\shot.png",
+        "..\\x.png",
+        "C:\\x.png",
+        "/abs.png",
+        "https://x/y.png",
+        "a/../b.png",
+        "noext",
+        "evil.svg",
+        "",
+    ] {
+        assert!(!screenshot_path_ok(bad), "{bad:?} should be rejected");
+    }
+}

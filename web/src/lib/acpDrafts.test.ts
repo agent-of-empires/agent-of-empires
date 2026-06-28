@@ -18,13 +18,22 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   __resetDraftPersistFailureNotifications,
   clearDraft,
+  clearDraftAttachments,
   getDraft,
+  getDraftAttachments,
   hasDraft,
+  hasDraftAttachments,
   setDraft,
+  setDraftAttachments,
   subscribeDrafts,
   sweepOrphanDrafts,
 } from "./acpDrafts";
+import type { PromptAttachmentInput } from "./acpTypes";
 import { toastBus, type ToastApi } from "./toastBus";
+
+function img(dataB64 = "AAAA", name?: string): PromptAttachmentInput {
+  return { kind: "image", mimeType: "image/png", dataB64, ...(name ? { name } : {}) };
+}
 
 function makeQuotaError(): DOMException {
   return new DOMException("The quota has been exceeded.", "QuotaExceededError");
@@ -292,6 +301,120 @@ describe("sweepOrphanDrafts", () => {
     sweepOrphanDrafts(new Set());
     expect(hasDraft("s-a")).toBe(false);
     expect(hasDraft("s-b")).toBe(false);
+  });
+});
+
+describe("getDraftAttachments / setDraftAttachments (#2493)", () => {
+  it("returns an empty array when no attachment draft is persisted", () => {
+    expect(getDraftAttachments("s-1")).toEqual([]);
+  });
+
+  it("round-trips a staged attachment array", () => {
+    setDraftAttachments("s-1", [img("PNGBYTES", "shot.png")]);
+    const got = getDraftAttachments("s-1");
+    expect(got).toEqual([img("PNGBYTES", "shot.png")]);
+  });
+
+  it("scopes attachment drafts per session id", () => {
+    setDraftAttachments("s-1", [img("ONE")]);
+    setDraftAttachments("s-2", [img("TWO")]);
+    expect(getDraftAttachments("s-1")).toEqual([img("ONE")]);
+    expect(getDraftAttachments("s-2")).toEqual([img("TWO")]);
+  });
+
+  it("empty array removes the key entirely", () => {
+    setDraftAttachments("s-1", [img()]);
+    setDraftAttachments("s-1", []);
+    expect(getDraftAttachments("s-1")).toEqual([]);
+    expect(localStorage.getItem("acp:draft-attachments:s-1")).toBeNull();
+  });
+
+  it("clearDraftAttachments removes the key", () => {
+    setDraftAttachments("s-1", [img()]);
+    clearDraftAttachments("s-1");
+    expect(localStorage.getItem("acp:draft-attachments:s-1")).toBeNull();
+  });
+
+  it("drops malformed entries on read", () => {
+    localStorage.setItem("acp:draft-attachments:s-1", JSON.stringify([img("OK"), { kind: "image" }, "garbage", null]));
+    expect(getDraftAttachments("s-1")).toEqual([img("OK")]);
+  });
+
+  it("returns an empty array on corrupt JSON", () => {
+    localStorage.setItem("acp:draft-attachments:s-1", "{not json");
+    expect(getDraftAttachments("s-1")).toEqual([]);
+  });
+
+  it("removes the key on a failed write so a stale draft is never restored", () => {
+    setDraftAttachments("s-1", [img("OLD")]);
+    expect(getDraftAttachments("s-1")).toEqual([img("OLD")]);
+    const spy = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw makeQuotaError();
+    });
+    setDraftAttachments("s-1", [img("NEW-TOO-BIG")]);
+    spy.mockRestore();
+    expect(localStorage.getItem("acp:draft-attachments:s-1")).toBeNull();
+    expect(getDraftAttachments("s-1")).toEqual([]);
+  });
+
+  it("toasts once on a failed attachment write", () => {
+    const spy = attachToastSpy();
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw makeQuotaError();
+    });
+    setDraftAttachments("s-1", [img("BIG")]);
+    setDraftAttachments("s-1", [img("BIGGER")]);
+    expect(spy.errors).toHaveLength(1);
+    expect(spy.errors[0]).toMatch(/storage full/i);
+  });
+
+  it("notifies filtered subscribers on write", () => {
+    const cb = vi.fn();
+    const unsub = subscribeDrafts(cb, new Set(["s-1"]));
+    setDraftAttachments("s-1", [img()]);
+    expect(cb).toHaveBeenCalledTimes(1);
+    unsub();
+  });
+});
+
+describe("hasDraft with attachment-only drafts (#2493)", () => {
+  it("hasDraftAttachments is true for a non-empty staged array, false otherwise", () => {
+    expect(hasDraftAttachments("s-1")).toBe(false);
+    setDraftAttachments("s-1", [img()]);
+    expect(hasDraftAttachments("s-1")).toBe(true);
+    setDraftAttachments("s-1", []);
+    expect(hasDraftAttachments("s-1")).toBe(false);
+  });
+
+  it("hasDraft lights for an attachment-only draft (no text)", () => {
+    expect(hasDraft("s-1")).toBe(false);
+    setDraftAttachments("s-1", [img()]);
+    expect(hasDraft("s-1")).toBe(true);
+  });
+
+  it("treats corrupt attachment storage as no draft", () => {
+    localStorage.setItem("acp:draft-attachments:s-1", "{not json");
+    expect(getDraftAttachments("s-1")).toEqual([]);
+    expect(hasDraftAttachments("s-1")).toBe(false);
+    expect(hasDraft("s-1")).toBe(false);
+  });
+
+  it("sweepOrphanDrafts removes orphaned attachment keys", () => {
+    setDraftAttachments("s-keep", [img("keep")]);
+    setDraftAttachments("s-orphan", [img("gone")]);
+    setDraft("s-orphan", "text-too");
+    sweepOrphanDrafts(new Set(["s-keep"]));
+    expect(getDraftAttachments("s-keep")).toEqual([img("keep")]);
+    expect(localStorage.getItem("acp:draft-attachments:s-orphan")).toBeNull();
+    expect(localStorage.getItem("acp:draft:s-orphan")).toBeNull();
+  });
+
+  it("cross-tab storage event for an attachment key fires the listener", () => {
+    const cb = vi.fn();
+    const unsub = subscribeDrafts(cb, new Set(["s-1"]));
+    window.dispatchEvent(new StorageEvent("storage", { key: "acp:draft-attachments:s-1", newValue: "[]" }));
+    expect(cb).toHaveBeenCalledTimes(1);
+    unsub();
   });
 });
 

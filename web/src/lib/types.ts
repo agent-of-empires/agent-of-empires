@@ -64,6 +64,11 @@ export interface SessionResponse {
    *  comes back as null on the wire; the web therefore only needs to
    *  treat any non-null value as an active snooze. See #1581. */
   snoozed_until?: string | null;
+  /** RFC3339 timestamp at which the session was moved to trash, or null /
+   *  undefined when not trashed. Trashed sessions are bucketed into a
+   *  dedicated Trash section with restore and permanent-delete actions; they
+   *  are excluded from the active and archived buckets. See #2489. */
+  trashed_at?: string | null;
   /** Unread marker mirroring `Instance::unread`: `true` when the session
    *  needs attention (a finished turn the user hasn't engaged with, or a
    *  manual flag), false / undefined when read. The sidebar paints an unread
@@ -170,6 +175,9 @@ export interface CleanupDefaults {
   delete_worktree: boolean;
   delete_branch: boolean;
   delete_sandbox: boolean;
+  /** Resolved `session.delete_to_trash`: the delete dialog defaults to
+   *  "Move to Trash" when true, permanent delete when false. See #2489. */
+  delete_to_trash: boolean;
 }
 
 export type SessionStatus =

@@ -1,6 +1,7 @@
 //! TUI dialog components
 
 mod changelog;
+mod cheats;
 mod command_palette;
 mod confirm;
 mod context_menu;

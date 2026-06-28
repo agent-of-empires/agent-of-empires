@@ -316,6 +316,8 @@ export interface PluginDetailManifest {
   api_version: number;
   capabilities: string[];
   ui_contributions: { slot: string; id: string }[];
+  /** Screenshot/GIF previews, each resolved server-side to a raw.githubusercontent.com URL. */
+  screenshots: { src: string; alt: string; caption: string }[];
 }
 
 /** On-demand detail for one plugin source (`GET /api/plugins/details`): manifest
@@ -342,6 +344,237 @@ export async function fetchPluginDetails(source: string): Promise<PluginDetailRe
     }
     const message =
       typeof payload?.message === "string" ? (payload.message as string) : `Details failed (HTTP ${res.status}).`;
+    return { kind: "error", message };
+  } catch {
+    return { kind: "error", message: "Network error." };
+  }
+}
+
+/** One UI slot disclosed in an update consent (mirrors the engine `UiView`). */
+export interface PluginUpdateUiView {
+  slot: string;
+  id: string;
+}
+
+/** Structured disclosure for a capability-expanding plugin update, mirroring the
+ *  Rust `UpdateConsent`. Drives the consent modal. */
+export interface PluginUpdateConsent {
+  id: string;
+  from_version: string;
+  to_version: string;
+  prior_capabilities: string[];
+  new_capabilities: string[];
+  added_capabilities: string[];
+  removed_capabilities: string[];
+  ui: PluginUpdateUiView[];
+  build_steps: string[];
+  runtime_change: string | null;
+  trust_downgrade: boolean;
+  fingerprint: string;
+  stays_active_if_declined: boolean;
+}
+
+/** Result of `GET /api/plugins/{id}/update/preview`: a tagged union mirroring the
+ *  Rust `UpdatePreview`. */
+export type PluginUpdatePreview =
+  | { kind: "no_update" }
+  | { kind: "safe_update"; to_version: string; fingerprint: string }
+  | { kind: "consent_required"; consent: PluginUpdateConsent; dismissed: boolean };
+
+export type PluginUpdatePreviewResult =
+  | { kind: "ok"; preview: PluginUpdatePreview }
+  | { kind: "error"; message: string };
+
+/** Validate a preview payload against the discriminated union, so a drifted
+ *  server response is rejected rather than passed on: a safe_update must carry a
+ *  string fingerprint (else the apply would send no pin) and a consent_required
+ *  must carry a consent object (else the modal path would blow up). */
+function isValidPreview(payload: Record<string, unknown>): payload is PluginUpdatePreview {
+  switch (payload.kind) {
+    case "no_update":
+      return true;
+    case "safe_update":
+      return typeof payload.fingerprint === "string";
+    case "consent_required":
+      return typeof payload.consent === "object" && payload.consent !== null;
+    default:
+      return false;
+  }
+}
+
+/** Classify the available update for one installed plugin (no install happens).
+ *  When consent is required the payload carries the full disclosure. */
+export async function previewPluginUpdate(id: string): Promise<PluginUpdatePreviewResult> {
+  try {
+    const res = await fetch(`/api/plugins/${encodeURIComponent(id)}/update/preview`, {
+      headers: { Accept: "application/json" },
+    });
+    const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+    if (res.ok && payload && isValidPreview(payload)) {
+      return { kind: "ok", preview: payload };
+    }
+    const message =
+      typeof payload?.message === "string"
+        ? (payload.message as string)
+        : `Update preview failed (HTTP ${res.status}).`;
+    return { kind: "error", message };
+  } catch {
+    return { kind: "error", message: "Network error." };
+  }
+}
+
+/** Start a host-side update job, pinned to the fingerprint the user saw. The
+ *  update runs as a job (like install/uninstall) so its build is observable;
+ *  poll the returned job id with `fetchPluginJob`. A fingerprint mismatch (the
+ *  remote moved since the preview) surfaces as a failed job, which the UI
+ *  recovers from by re-previewing. */
+export async function applyPluginUpdate(id: string, expectedFingerprint: string | null): Promise<PluginJobStartResult> {
+  return startPluginJob(`/api/plugins/${encodeURIComponent(id)}/update/apply`, {
+    expected_fingerprint: expectedFingerprint,
+  });
+}
+
+/** Structured install disclosure (`POST /api/plugins/install/preview`),
+ *  mirroring the Rust `InstallConsent`. Drives the install consent modal. */
+export interface PluginInstallConsent {
+  id: string;
+  version: string;
+  source: string;
+  /** One line stating what is being installed (resolved release, ref, etc). */
+  notice: string;
+  /** The source is off the audited-release default path; warn on it. */
+  unverified: boolean;
+  /** Trust class: "featured" | "community" | "local". */
+  validation: string;
+  capabilities: string[];
+  ui: PluginUpdateUiView[];
+  build_steps: string[];
+  fingerprint: string;
+}
+
+export type PluginInstallPreviewResult =
+  | { kind: "ok"; consent: PluginInstallConsent }
+  | { kind: "error"; message: string };
+
+/** Classify a gh: install candidate and return its disclosure, without
+ *  installing. Backs the install consent modal. */
+export async function previewPluginInstall(source: string): Promise<PluginInstallPreviewResult> {
+  try {
+    const res = await fetch("/api/plugins/install/preview", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ source }),
+    });
+    const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+    if (res.ok && payload && typeof payload.fingerprint === "string") {
+      return { kind: "ok", consent: payload as unknown as PluginInstallConsent };
+    }
+    const message =
+      typeof payload?.message === "string"
+        ? (payload.message as string)
+        : `Install preview failed (HTTP ${res.status}).`;
+    return { kind: "error", message };
+  } catch {
+    return { kind: "error", message: "Network error." };
+  }
+}
+
+/** Outcome of starting a lifecycle job: a job id to poll, or an error (403
+ *  read_only / elevation_required is handled by the fetch interceptor). */
+export type PluginJobStartResult = { kind: "ok"; jobId: string } | { kind: "error"; message: string };
+
+async function startPluginJob(url: string, body: unknown): Promise<PluginJobStartResult> {
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify(body),
+    });
+    const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+    if (res.ok && payload && typeof payload.job_id === "string") {
+      return { kind: "ok", jobId: payload.job_id as string };
+    }
+    const message =
+      typeof payload?.message === "string" ? (payload.message as string) : `Request failed (HTTP ${res.status}).`;
+    return { kind: "error", message };
+  } catch {
+    return { kind: "error", message: "Network error." };
+  }
+}
+
+/** Start a host-side install job for an approved gh: source. Poll the returned
+ *  job id with `fetchPluginJob`. */
+export async function startPluginInstall(source: string, expectedFingerprint: string): Promise<PluginJobStartResult> {
+  return startPluginJob("/api/plugins/install", { source, expected_fingerprint: expectedFingerprint });
+}
+
+/** Start a host-side uninstall job for an installed external plugin. */
+export async function startPluginUninstall(id: string): Promise<PluginJobStartResult> {
+  return startPluginJob(`/api/plugins/${encodeURIComponent(id)}/uninstall`, {});
+}
+
+/** A lifecycle job's status, mirroring the Rust `PluginJobStatus` tag. */
+export type PluginJobState = { state: "running" } | { state: "succeeded" } | { state: "failed"; error: string };
+
+/** A lifecycle job plus a bounded tail of its host-side log
+ *  (`GET /api/plugins/jobs/{id}`). */
+export interface PluginJob {
+  job: {
+    id: string;
+    kind: "install" | "update" | "uninstall";
+    target: string;
+    status: PluginJobState;
+    started_at: number;
+    finished_at: number | null;
+  };
+  log: {
+    exists: boolean;
+    tail: string;
+    lines_returned: number;
+    truncated: boolean;
+  };
+}
+
+export type PluginJobResult = { kind: "ok"; job: PluginJob } | { kind: "error"; status: number; message: string };
+
+/** Fetch a lifecycle job's status plus a tail of its log. Polled by the
+ *  progress modal until the job reaches a terminal state. The HTTP `status` is
+ *  preserved so the caller can tell a terminal 404 (the job is gone, e.g. after
+ *  a daemon restart) from a transient failure worth retrying. */
+export async function fetchPluginJob(jobId: string, tail = 200): Promise<PluginJobResult> {
+  try {
+    const res = await fetch(`/api/plugins/jobs/${encodeURIComponent(jobId)}?tail=${tail}`, {
+      headers: { Accept: "application/json" },
+    });
+    const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+    if (res.ok && payload && typeof payload.job === "object" && payload.job !== null) {
+      return { kind: "ok", job: payload as unknown as PluginJob };
+    }
+    const message =
+      typeof payload?.message === "string" ? (payload.message as string) : `Job status failed (HTTP ${res.status}).`;
+    return { kind: "error", status: res.status, message };
+  } catch {
+    return { kind: "error", status: 0, message: "Network error." };
+  }
+}
+
+export type PluginDismissResult = { kind: "ok" } | { kind: "error"; message: string };
+
+/** Record an in-app decline of an available update so it stops nagging until the
+ *  next version. */
+export async function dismissPluginUpdate(id: string, fingerprint: string): Promise<PluginDismissResult> {
+  try {
+    const res = await fetch(`/api/plugins/${encodeURIComponent(id)}/update/dismiss`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fingerprint }),
+    });
+    if (res.ok) {
+      return { kind: "ok" };
+    }
+    const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+    const message =
+      typeof payload?.message === "string" ? (payload.message as string) : `Dismiss failed (HTTP ${res.status}).`;
     return { kind: "error", message };
   } catch {
     return { kind: "error", message: "Network error." };
@@ -1695,6 +1928,39 @@ export async function setSessionArchive(
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ archived, kill_pane: killPane }),
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as SessionResponse;
+  } catch {
+    return null;
+  }
+}
+
+/** Move a session to the trash (#2489): stops the live session (ACP
+ *  shutdown, which preserves the transcript, plus optional tmux teardown)
+ *  and hides it from the normal list while keeping every durable artifact so
+ *  it can be restored. NOT a permanent delete; use `deleteSession` for that. */
+export async function trashSession(id: string, killPane = true): Promise<SessionResponse | null> {
+  try {
+    const res = await fetch(`/api/sessions/${id}/trash`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ kill_pane: killPane }),
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as SessionResponse;
+  } catch {
+    return null;
+  }
+}
+
+/** Restore a trashed session (#2489): clears `trashed_at`, returning it to
+ *  its prior bucket with its transcript and metadata intact. */
+export async function restoreSession(id: string): Promise<SessionResponse | null> {
+  try {
+    const res = await fetch(`/api/sessions/${id}/restore`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
     });
     if (!res.ok) return null;
     return (await res.json()) as SessionResponse;

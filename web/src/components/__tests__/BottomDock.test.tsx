@@ -22,8 +22,7 @@ const descriptorFor = (id: string) => {
 function renderBottomDock(props = {}) {
   return render(
     <BottomDock
-      tabs={["terminal:0"]}
-      active="terminal:0"
+      groups={[{ group: 0, tabs: ["terminal:0"], active: "terminal:0" }]}
       descriptorFor={descriptorFor}
       renderBody={body}
       onActivate={vi.fn()}

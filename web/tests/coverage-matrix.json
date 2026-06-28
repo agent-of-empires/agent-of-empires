@@ -31,6 +31,7 @@
       "components": [
         "web/src/components/ActivityBar.tsx",
         "web/src/components/Dock.tsx",
+        "web/src/components/DockGroups.tsx",
         "web/src/components/BottomDock.tsx",
         "web/src/components/PaneDndController.tsx",
         "web/src/components/paneDnd.ts",
@@ -442,6 +443,13 @@
       "risk": "medium",
       "specs": ["src/components/__tests__/NotificationSettings.test.tsx"],
       "components": ["web/src/components/NotificationSettings.tsx"]
+    },
+    {
+      "id": "notifications.service-worker-clear",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/__tests__/sw.test.ts"],
+      "components": ["web/public/sw.js"]
     },
     {
       "id": "settings.security-readonly",
@@ -1081,6 +1089,24 @@
       "components": ["web/src/components/DeleteSessionDialog.tsx", "web/src/components/WorkspaceSidebar.tsx"]
     },
     {
+      "id": "session.trash",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/session-trash.spec.ts"],
+      "components": [
+        "web/src/components/DeleteSessionDialog.tsx",
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/lib/sidebarSort.ts"
+      ]
+    },
+    {
+      "id": "session.trash.flow",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/session-trash-flow.spec.ts"],
+      "components": ["web/src/App.tsx", "web/src/components/WorkspaceSidebar.tsx", "web/src/hooks/useSessions.ts"]
+    },
+    {
       "id": "session.group-edit",
       "kind": "live-playwright",
       "risk": "high",
@@ -1367,6 +1393,17 @@
         "web/src/components/acp/Composer.tsx",
         "web/src/components/acp/AcpRuntime.tsx",
         "web/src/components/acp/StructuredView.tsx"
+      ]
+    },
+    {
+      "id": "acp.attachment-drafts",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/acp-attachment-draft.spec.ts"],
+      "components": [
+        "web/src/components/acp/AcpRuntime.tsx",
+        "web/src/components/acp/Composer.tsx",
+        "web/src/lib/acpDrafts.ts"
       ]
     },
     {
@@ -1882,6 +1919,16 @@
       "risk": "medium",
       "specs": ["src/hooks/__tests__/useSettingsCommands.test.tsx"],
       "components": ["web/src/hooks/useSettingsCommands.ts", "web/src/App.tsx"]
+    },
+    {
+      "id": "story.cmdk-cheat-codes",
+      "kind": "mocked-playwright",
+      "risk": "low",
+      "specs": ["tests/command-palette.spec.ts"],
+      "components": [
+        "web/src/components/command-palette/CommandPalette.tsx",
+        "web/src/components/command-palette/CheatOverlay.tsx"
+      ]
     },
     {
       "id": "story.shortcut-toggle-sidebar",
@@ -2779,7 +2826,10 @@
       "specs": ["src/components/settings/__tests__/PluginsSettings.test.tsx"],
       "components": [
         "web/src/components/settings/PluginsSettings.tsx",
-        "web/src/components/settings/PluginDetailModal.tsx"
+        "web/src/components/settings/PluginDetailModal.tsx",
+        "web/src/components/settings/PluginUpdateConsentModal.tsx",
+        "web/src/components/settings/PluginInstallConsentModal.tsx",
+        "web/src/components/settings/PluginJobProgressModal.tsx"
       ]
     },
     {

@@ -373,6 +373,20 @@ fn create_test_env_with_sessions(count: usize) -> TestEnv {
     TestEnv { _temp: temp, view }
 }
 
+/// Disable trash-first delete for tests that assert the permanent-delete
+/// dialog opens on `d` / `Shift+D` / context-menu Delete. With the default
+/// (`delete_to_trash = true`) those keys move the session to the trash
+/// instead of opening the dialog; the trash-first path has its own coverage
+/// (`trash_then_restore_round_trip`). Must run after `setup_test_home` so it
+/// writes into the test HOME. See #2489.
+fn disable_delete_to_trash() {
+    let mut config = crate::session::config::load_config()
+        .unwrap()
+        .unwrap_or_default();
+    config.session.delete_to_trash = false;
+    crate::session::config::save_config(&config).unwrap();
+}
+
 fn create_test_env_with_groups() -> TestEnv {
     use crate::session::config::GroupByMode;
     let temp = TempDir::new().unwrap();
@@ -1301,6 +1315,7 @@ fn test_search_mode_enter_exits_and_clears_state() {
 #[serial]
 fn test_d_on_session_opens_delete_dialog() {
     let mut env = create_test_env_with_sessions(3);
+    disable_delete_to_trash();
     env.view.update_selected();
     assert!(env.view.unified_delete_dialog.is_none());
     env.view.handle_key(key(KeyCode::Char('d')), None);
@@ -3586,6 +3601,7 @@ fn test_strict_mode_ctrl_d_r_p_reach_secondary_actions() {
     // fire rename (not serve), and orphaned the diff/serve/projects arms. All
     // three Ctrl chords must keep CTRL so their secondary arms fire.
     let mut env = create_test_env_with_sessions(1);
+    disable_delete_to_trash();
     env.view.strict_hotkeys = true;
     env.view.cursor = 0;
     env.view.update_selected();
@@ -6618,6 +6634,44 @@ fn toggle_archive_at_cursor_round_trip() {
     env.view.select_session_by_id(&id);
     env.view.toggle_archive_at_cursor().unwrap();
     assert!(!env.view.instances[0].is_archived());
+}
+
+/// Trashing a session hides it from the active list and surfaces it under
+/// the synthetic Trash section; the shelve/unshelve key (`z`) restores it.
+#[test]
+#[serial]
+fn trash_then_restore_round_trip() {
+    let mut env = create_test_env_with_sessions(2);
+    // Keep the Trash section expanded so the trashed row stays reachable.
+    env.view.trashed_section_collapsed = false;
+    let id = env.view.instances[0].id.clone();
+    env.view.selected_session = Some(id.clone());
+    assert!(!env.view.instances[0].is_trashed());
+
+    env.view.trash_session_by_id(&id);
+    assert!(
+        env.view.get_instance(&id).unwrap().is_trashed(),
+        "session must be trashed"
+    );
+
+    // The Trash section header is present, and the trashed row is not in the
+    // active flow (it renders under that header).
+    let items = env.view.build_flat_items();
+    assert!(
+        items.iter().any(|it| matches!(
+            it,
+            Item::Group { path, .. } if crate::session::is_trash_section_path(path)
+        )),
+        "Trash section header must be present after trashing"
+    );
+
+    // Restore via the shelve/unshelve key.
+    env.view.select_session_by_id(&id);
+    env.view.toggle_archive_at_cursor().unwrap();
+    assert!(
+        !env.view.get_instance(&id).unwrap().is_trashed(),
+        "session must be restored out of trash"
+    );
 }
 
 /// When no session is selected, the toggle is a silent no-op.
@@ -13519,6 +13573,7 @@ mod right_click_context_menu {
     #[serial]
     fn down_then_enter_in_menu_opens_delete_dialog() {
         let mut env = create_test_env_with_sessions(2);
+        disable_delete_to_trash();
         setup_inner(&mut env);
         // Attention sort surfaces the full session menu (New Session / Rename
         // / Archive / Snooze / Mark unread / Delete), so Delete is five Downs

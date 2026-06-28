@@ -5,10 +5,19 @@
 
 import { useMemo, useSyncExternalStore } from "react";
 
+import type { PromptAttachmentInput } from "./acpTypes";
 import { safeGetItem, safeRemoveItem, safeSetItem } from "./safeStorage";
 import { toastBus } from "./toastBus";
 
 const DRAFT_KEY_PREFIX = "acp:draft:";
+// Staged composer attachments persist beside the text draft under their own
+// key (JSON array of PromptAttachmentInput) so an unsent multimodal prompt
+// survives session switches and reloads, matching the text-draft contract.
+// Kept parallel to the text key, not folded into one JSON blob: text writes
+// on a 250ms keystroke debounce while attachments write on stage/remove, and
+// a single blob would make the two write paths clobber each other. Parallel
+// keys also let text persist even when a large base64 image blows quota.
+const ATTACHMENT_KEY_PREFIX = "acp:draft-attachments:";
 
 // Sessions that have already surfaced a "storage full" toast this page
 // load. We dedupe so the composer does not toast on every keystroke once
@@ -32,9 +41,16 @@ function draftKey(sessionId: string): string {
   return `${DRAFT_KEY_PREFIX}${sessionId}`;
 }
 
+function attachmentKey(sessionId: string): string {
+  return `${ATTACHMENT_KEY_PREFIX}${sessionId}`;
+}
+
+// Recognizes both the text and attachment key prefixes so the orphan sweep
+// and the cross-tab storage listener cover attachment drafts for free.
 function sessionIdFromKey(key: string): string | null {
-  if (!key.startsWith(DRAFT_KEY_PREFIX)) return null;
-  return key.slice(DRAFT_KEY_PREFIX.length);
+  if (key.startsWith(DRAFT_KEY_PREFIX)) return key.slice(DRAFT_KEY_PREFIX.length);
+  if (key.startsWith(ATTACHMENT_KEY_PREFIX)) return key.slice(ATTACHMENT_KEY_PREFIX.length);
+  return null;
 }
 
 type Listener = () => void;
@@ -87,6 +103,74 @@ export function clearDraft(sessionId: string): void {
   setDraft(sessionId, "");
 }
 
+function isPromptAttachmentKind(kind: unknown): kind is PromptAttachmentInput["kind"] {
+  return kind === "image" || kind === "audio" || kind === "resource";
+}
+
+function isPromptAttachmentInput(v: unknown): v is PromptAttachmentInput {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return false;
+  const r = v as Record<string, unknown>;
+  return (
+    isPromptAttachmentKind(r.kind) &&
+    typeof r.mimeType === "string" &&
+    typeof r.dataB64 === "string" &&
+    (r.name === undefined || typeof r.name === "string")
+  );
+}
+
+export function getDraftAttachments(sessionId: string): PromptAttachmentInput[] {
+  const raw = safeGetItem(attachmentKey(sessionId));
+  if (!raw) return [];
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(isPromptAttachmentInput);
+  } catch {
+    return [];
+  }
+}
+
+export function setDraftAttachments(sessionId: string, attachments: readonly PromptAttachmentInput[]): void {
+  const key = attachmentKey(sessionId);
+  let ok = true;
+  if (attachments.length === 0) {
+    safeRemoveItem(key);
+  } else {
+    let json = "";
+    try {
+      json = JSON.stringify(attachments);
+    } catch {
+      ok = false;
+    }
+    if (ok) ok = safeSetItem(key, json);
+    // Exact-or-none: if the current set cannot be persisted (quota, serialize
+    // failure), drop the key so a stale older draft is never restored and
+    // silently re-sent. The in-memory staged attachments stay live for the
+    // current page lifetime; the user just loses them on reload.
+    if (!ok) safeRemoveItem(key);
+  }
+  if (!ok) {
+    notifyDraftPersistFailure(sessionId);
+  } else {
+    clearDraftPersistFailure(sessionId);
+  }
+  notify(sessionId);
+}
+
+export function clearDraftAttachments(sessionId: string): void {
+  setDraftAttachments(sessionId, []);
+}
+
+// Cheap presence check for the sidebar "unsent draft" dot: a non-empty
+// stored array serializes to more than "[]" (2 chars) and starts with "[",
+// so we avoid parsing (potentially megabytes of base64) on the sidebar
+// re-render hot path while still rejecting obviously-corrupt non-array
+// values (which would otherwise leave the dot stuck on).
+export function hasDraftAttachments(sessionId: string): boolean {
+  const v = safeGetItem(attachmentKey(sessionId));
+  return v !== null && v.length > 2 && v.startsWith("[");
+}
+
 // Remove every `acp:draft:<id>` key whose session id is not in the
 // given active set. Run once on app mount to catch drafts left behind
 // by session deletions that happened in another tab or on another
@@ -113,7 +197,10 @@ export function sweepOrphanDrafts(activeSessionIds: ReadonlySet<string>): void {
 
 export function hasDraft(sessionId: string): boolean {
   const v = safeGetItem(draftKey(sessionId));
-  return v !== null && v.length > 0;
+  if (v !== null && v.length > 0) return true;
+  // An attachment-only draft (no text) is still unsent work, so the sidebar
+  // dot must light for it too. useHasDraftForSessions reads through here.
+  return hasDraftAttachments(sessionId);
 }
 
 // Subscribe to draft changes. `filter` scopes the listener to a specific

@@ -70,6 +70,16 @@ pub enum SessionCommands {
 
     /// Unarchive a session (restores it to its tier in the Attention sort)
     Unarchive(SessionIdArgs),
+
+    /// Restore a trashed session, returning it to its prior bucket with its
+    /// transcript and metadata intact. See #2489.
+    Restore(SessionIdArgs),
+
+    /// List the sessions currently in the trash.
+    ListTrash,
+
+    /// Permanently purge every trashed session in the profile (irreversible).
+    EmptyTrash,
 }
 
 #[derive(Args)]
@@ -259,6 +269,9 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
         SessionCommands::Unfavorite(args) => unfavorite_session(profile, args).await,
         SessionCommands::Archive(args) => archive_session(profile, args).await,
         SessionCommands::Unarchive(args) => unarchive_session(profile, args).await,
+        SessionCommands::Restore(args) => restore_session(profile, args).await,
+        SessionCommands::ListTrash => list_trash(profile).await,
+        SessionCommands::EmptyTrash => empty_trash(profile).await,
     }
 }
 
@@ -339,6 +352,134 @@ async fn unarchive_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         Ok(inst.title.clone())
     })?;
     println!("Unarchived: {}", title);
+    Ok(())
+}
+
+async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
+    let storage = Storage::new_unwatched(profile)?;
+    let title = storage.update(|instances, _groups| {
+        // Resolve within the trashed subset only. The CLI advertises the
+        // argument as an id OR title, and a live or archived session can share
+        // a title/path with a trashed one; resolving against the full list
+        // would let that row win and make `untrash()` a silent no-op on an
+        // already-live session. See #2489.
+        let trashed: Vec<_> = instances
+            .iter()
+            .filter(|i| i.is_trashed())
+            .cloned()
+            .collect();
+        let id = super::resolve_session(&args.identifier, &trashed)
+            .map_err(|_| anyhow::anyhow!("No trashed session matching '{}'", args.identifier))?
+            .id
+            .clone();
+        let inst = instances
+            .iter_mut()
+            .find(|i| i.id == id)
+            .expect("resolve_session returned an id that is no longer in instances");
+        inst.untrash();
+        Ok(inst.title.clone())
+    })?;
+    println!("Restored: {}", title);
+    Ok(())
+}
+
+async fn list_trash(profile: &str) -> Result<()> {
+    let storage = Storage::new_unwatched(profile)?;
+    let (instances, _groups) = storage.load_with_groups()?;
+    let trashed: Vec<_> = instances.iter().filter(|i| i.is_trashed()).collect();
+    if trashed.is_empty() {
+        println!("Trash is empty.");
+        return Ok(());
+    }
+    println!("Trashed sessions in profile '{}':", storage.profile());
+    for inst in trashed {
+        let when = inst
+            .trashed_at
+            .map(|t| t.to_rfc3339())
+            .unwrap_or_else(|| "?".to_string());
+        println!("  {}  {}  (trashed {})", inst.id, inst.title, when);
+    }
+    Ok(())
+}
+
+async fn empty_trash(profile: &str) -> Result<()> {
+    let storage = Storage::new_unwatched(profile)?;
+
+    // Phase 1 (unlocked): snapshot the trashed sessions and run the slow
+    // teardown for each. Purge is permanent; force removal so a dirty
+    // worktree cannot keep an emptied session pinned in the trash.
+    let (instances, _groups) = storage.load_with_groups()?;
+    let trashed: Vec<_> = instances
+        .iter()
+        .filter(|i| i.is_trashed())
+        .cloned()
+        .collect();
+    if trashed.is_empty() {
+        println!("Trash is empty.");
+        return Ok(());
+    }
+
+    let mut purged_ids = Vec::new();
+    for inst in &trashed {
+        let config = crate::session::repo_config::resolve_config_with_repo_or_warn(
+            profile,
+            std::path::Path::new(&inst.project_path),
+        );
+        let delete_worktree =
+            config.worktree.auto_cleanup && inst.has_managed_worktree_or_workspace();
+        // Tie branch deletion to worktree deletion + config so it also fires
+        // for multi-repo workspace sessions (which have no `worktree_info`);
+        // `perform_deletion` keys the workspace-repo branch cleanup off this
+        // same flag. See #2489.
+        let delete_branch = delete_worktree && config.worktree.delete_branch_on_cleanup;
+        let delete_sandbox =
+            inst.sandbox_info.as_ref().is_some_and(|s| s.enabled) && config.sandbox.auto_cleanup;
+
+        let result = crate::session::deletion::perform_deletion(
+            &crate::session::deletion::DeletionRequest {
+                session_id: inst.id.clone(),
+                instance: inst.clone(),
+                delete_worktree,
+                delete_branch,
+                delete_sandbox,
+                force_delete: true,
+                detach_hooks: false,
+                keep_scratch: false,
+            },
+        );
+        for err in &result.errors {
+            eprintln!("Warning ({}): {}", inst.title, err);
+        }
+        // Only after teardown succeeded: purge the durable structured-view
+        // transcript (the daemon does this via the supervisor; the CLI opens
+        // the event store directly since it has no live worker) and drop the
+        // session row. Doing the irreversible transcript delete last keeps a
+        // failed purge fully restorable, and keeping the row on failure (here
+        // or in perform_deletion) lets the orphaned worktree/container/
+        // transcript be retried instead of abandoned. See #2489.
+        if result.success {
+            match super::purge_acp_transcript(inst) {
+                Ok(()) => purged_ids.push(inst.id.clone()),
+                Err(e) => eprintln!(
+                    "Warning ({}): transcript not purged, keeping session in trash: {}",
+                    inst.title, e
+                ),
+            }
+        }
+    }
+
+    // Phase 2 (locked): drop every purged id from the latest disk state.
+    let purged_set: HashSet<String> = purged_ids.into_iter().collect();
+    storage.update(|all_instances, _groups| {
+        all_instances.retain(|i| !purged_set.contains(&i.id));
+        Ok(())
+    })?;
+
+    println!(
+        "Emptied trash: purged {} session(s) from profile '{}'.",
+        trashed.len(),
+        storage.profile()
+    );
     Ok(())
 }
 

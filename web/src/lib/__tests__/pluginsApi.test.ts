@@ -5,7 +5,14 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { fetchPlugins, setPluginEnabled, updateSettings } from "../api";
+import {
+  applyPluginUpdate,
+  dismissPluginUpdate,
+  fetchPlugins,
+  previewPluginUpdate,
+  setPluginEnabled,
+  updateSettings,
+} from "../api";
 
 const fetchSpy = vi.fn<typeof fetch>();
 
@@ -83,6 +90,107 @@ describe("setPluginEnabled", () => {
     fetchSpy.mockRejectedValue(new Error("offline"));
     const result = await setPluginEnabled("aoe.web", true);
     expect(result).toEqual({ kind: "error", message: "Network error." });
+  });
+});
+
+const consentPreview = {
+  kind: "consent_required",
+  dismissed: false,
+  consent: {
+    id: "acme.plugin",
+    from_version: "1.0.0",
+    to_version: "2.0.0",
+    prior_capabilities: ["net"],
+    new_capabilities: ["net", "fs.read"],
+    added_capabilities: ["fs.read"],
+    removed_capabilities: [],
+    ui: [],
+    build_steps: [],
+    runtime_change: null,
+    trust_downgrade: false,
+    fingerprint: "treeB||community",
+    stays_active_if_declined: true,
+  },
+};
+
+describe("previewPluginUpdate", () => {
+  it("returns the parsed preview from GET .../update/preview", async () => {
+    fetchSpy.mockResolvedValue(new Response(JSON.stringify(consentPreview), { status: 200 }));
+    const res = await previewPluginUpdate("acme.plugin");
+    expect(res).toEqual({ kind: "ok", preview: consentPreview });
+    expect(fetchSpy.mock.calls[0][0]).toBe("/api/plugins/acme.plugin/update/preview");
+  });
+
+  it("surfaces the server message on a non-OK response", async () => {
+    fetchSpy.mockResolvedValue(new Response(JSON.stringify({ message: "no release" }), { status: 502 }));
+    expect(await previewPluginUpdate("acme.plugin")).toEqual({ kind: "error", message: "no release" });
+  });
+
+  it("returns a network error when the request throws", async () => {
+    fetchSpy.mockRejectedValue(new Error("offline"));
+    expect(await previewPluginUpdate("acme.plugin")).toEqual({ kind: "error", message: "Network error." });
+  });
+
+  it("rejects a malformed OK payload that drops the per-kind required fields", async () => {
+    // safe_update without a fingerprint, consent_required without a consent
+    // object, and an unknown kind must all be treated as errors, not passed on.
+    for (const bad of [
+      { kind: "safe_update", to_version: "2.0.0" },
+      { kind: "consent_required", dismissed: false },
+      { kind: "bogus" },
+    ]) {
+      fetchSpy.mockResolvedValue(new Response(JSON.stringify(bad), { status: 200 }));
+      expect((await previewPluginUpdate("acme.plugin")).kind).toBe("error");
+    }
+  });
+});
+
+describe("applyPluginUpdate", () => {
+  it("POSTs the fingerprint and returns a job id on success", async () => {
+    fetchSpy.mockResolvedValue(new Response(JSON.stringify({ job_id: "job1" }), { status: 202 }));
+    const res = await applyPluginUpdate("acme.plugin", "treeB||community");
+    expect(res).toEqual({ kind: "ok", jobId: "job1" });
+    const [url, init] = fetchSpy.mock.calls[0];
+    expect(url).toBe("/api/plugins/acme.plugin/update/apply");
+    expect(init?.method).toBe("POST");
+    expect(JSON.parse(String(init?.body))).toEqual({ expected_fingerprint: "treeB||community" });
+  });
+
+  it("surfaces a conflict message (moved remote)", async () => {
+    fetchSpy.mockResolvedValue(new Response(JSON.stringify({ message: "changed since shown" }), { status: 409 }));
+    expect(await applyPluginUpdate("acme.plugin", "x")).toEqual({ kind: "error", message: "changed since shown" });
+  });
+
+  it("reports an error when an OK response carries no job id", async () => {
+    fetchSpy.mockResolvedValue(new Response(JSON.stringify({ nope: true }), { status: 200 }));
+    expect((await applyPluginUpdate("acme.plugin", null)).kind).toBe("error");
+  });
+
+  it("returns a network error when the request throws", async () => {
+    fetchSpy.mockRejectedValue(new Error("offline"));
+    expect(await applyPluginUpdate("acme.plugin", null)).toEqual({ kind: "error", message: "Network error." });
+  });
+});
+
+describe("dismissPluginUpdate", () => {
+  it("POSTs the fingerprint and returns ok on success", async () => {
+    fetchSpy.mockResolvedValue(new Response("", { status: 200 }));
+    const res = await dismissPluginUpdate("acme.plugin", "treeB||community");
+    expect(res).toEqual({ kind: "ok" });
+    const [url, init] = fetchSpy.mock.calls[0];
+    expect(url).toBe("/api/plugins/acme.plugin/update/dismiss");
+    expect(init?.method).toBe("POST");
+    expect(JSON.parse(String(init?.body))).toEqual({ fingerprint: "treeB||community" });
+  });
+
+  it("surfaces the server message on a non-OK response", async () => {
+    fetchSpy.mockResolvedValue(new Response(JSON.stringify({ message: "read-only" }), { status: 403 }));
+    expect(await dismissPluginUpdate("acme.plugin", "x")).toEqual({ kind: "error", message: "read-only" });
+  });
+
+  it("returns a network error when the request throws", async () => {
+    fetchSpy.mockRejectedValue(new Error("offline"));
+    expect(await dismissPluginUpdate("acme.plugin", "x")).toEqual({ kind: "error", message: "Network error." });
   });
 });
 

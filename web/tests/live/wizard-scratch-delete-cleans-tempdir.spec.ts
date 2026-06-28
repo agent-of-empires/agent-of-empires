@@ -42,6 +42,10 @@ base("deleting a scratch session removes its scratch dir", async ({ page }, test
     const dialog = page.locator("[data-testid='delete-session-dialog']");
     await expect(dialog).toBeVisible();
 
+    // Trash-first is on by default (#2489); tick "Delete permanently" so the
+    // scratch dir is actually purged.
+    await dialog.locator("[data-testid='delete-session-permanent']").click();
+
     const deletePromise = page.waitForResponse(
       (res) => res.url().endsWith(`/api/sessions/${sessionId}`) && res.request().method() === "DELETE",
     );

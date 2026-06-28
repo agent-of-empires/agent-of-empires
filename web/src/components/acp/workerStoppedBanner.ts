@@ -7,6 +7,9 @@
  *
  *  Returns:
  *   - `"none"`     : worker is not stopped, no banner.
+ *   - `"trashed"`  : the session is in the trash (#2489); reconnect
+ *                    is not the right next step (the user must restore
+ *                    it first). Takes precedence over archived/snoozed.
  *   - `"archived"` : worker was torn down by the sidebar archive
  *                    action; reconnect is not the right next step
  *                    (the user must unarchive first).
@@ -21,16 +24,20 @@
  *  callers should bail before invoking this helper when a startup
  *  error is in flight, but we still defensively return `"none"` to
  *  stay safe under refactors. */
-export type WorkerStoppedVariant = "none" | "archived" | "snoozed" | "generic";
+export type WorkerStoppedVariant = "none" | "trashed" | "archived" | "snoozed" | "generic";
 
 export function pickWorkerStoppedVariant(args: {
   workerStopped: boolean;
   startupError: string | null;
+  trashedAt: string | null;
   archivedAt: string | null;
   snoozedUntil: string | null;
 }): WorkerStoppedVariant {
   if (!args.workerStopped) return "none";
   if (args.startupError) return "none";
+  // Trash supersedes archive/snooze: a trashed session is recoverable only
+  // by restoring it, so its banner must win even if archived_at is also set.
+  if (args.trashedAt) return "trashed";
   if (args.archivedAt) return "archived";
   if (args.snoozedUntil) return "snoozed";
   return "generic";

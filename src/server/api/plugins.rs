@@ -5,15 +5,20 @@
 //! requires read-write mode AND an elevated session when login is enabled,
 //! mirroring the requires-elevation settings fields.
 
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Mutex;
+
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::AppState;
 use crate::plugin;
+use crate::plugin::install::OperationLog;
 use crate::server::auth::AuthenticatedSession;
 
 fn error_response(status: StatusCode, code: &str, message: String) -> Response {
@@ -174,6 +179,94 @@ pub async fn invoke_plugin_action(
     }
 }
 
+/// `GET /api/plugins/{id}/update/preview`: classify the available update for one
+/// installed external plugin (no_update / safe_update / consent_required) and,
+/// when consent is required, return the structured disclosure the dashboard and
+/// TUI render. Gated on read-write mode only, NOT elevation: it mutates no host
+/// state and it powers the approval UI, so a non-elevated session must be able
+/// to fetch the capability diff before deciding (elevation is required on the
+/// actual apply). Network failures (no release, dead remote) surface as a 502.
+pub async fn plugin_update_preview(
+    State(state): State<std::sync::Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    if state.read_only {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "read_only",
+            "Server is in read-only mode".into(),
+        );
+    }
+    match plugin::install::preview_update(&id).await {
+        Ok(preview) => Json(preview).into_response(),
+        Err(e) => error_response(StatusCode::BAD_GATEWAY, "preview_failed", format!("{e:#}")),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct ApplyUpdateBody {
+    /// The fingerprint the user approved, from the preview. Pins the apply to
+    /// exactly what was shown: if the remote moved since, the apply is refused.
+    #[serde(default)]
+    pub expected_fingerprint: Option<String>,
+}
+
+/// `POST /api/plugins/{id}/update/apply`: apply an update the user approved in
+/// the dashboard, granting whatever the fetched manifest declares. A privileged
+/// host mutation (it can expand the capability set and run build steps), so it
+/// is gated on read-write mode AND elevation, like enable/disable. Runs as a
+/// host-side job so the build is observable; returns a `job_id` the dashboard
+/// polls for the live log. A fingerprint mismatch (the remote moved since the
+/// preview) surfaces as a failed job, which the UI recovers from by
+/// re-previewing.
+pub async fn apply_plugin_update(
+    State(state): State<std::sync::Arc<AppState>>,
+    session: Option<axum::Extension<AuthenticatedSession>>,
+    Path(id): Path<String>,
+    Json(body): Json<ApplyUpdateBody>,
+) -> Response {
+    if let Err(resp) = mutation_gate(&state, session.as_deref()).await {
+        return resp;
+    }
+    let plugin_id = id.clone();
+    let fingerprint = body.expected_fingerprint;
+    start_job(state, PluginJobKind::Update, id, move |log| async move {
+        plugin::install::apply_update(&plugin_id, fingerprint, &log)
+            .await
+            .map(|_| ())
+    })
+}
+
+#[derive(Deserialize)]
+pub struct DismissUpdateBody {
+    /// The fingerprint of the update the user declined, from the preview.
+    pub fingerprint: String,
+}
+
+/// `POST /api/plugins/{id}/update/dismiss`: record that the user declined an
+/// available update, so the popup and the auto-update notification stop nagging
+/// until the next version. Mutates host config and suppresses a security
+/// signal, so it is gated like apply (read-write + elevation).
+pub async fn dismiss_plugin_update(
+    State(state): State<std::sync::Arc<AppState>>,
+    session: Option<axum::Extension<AuthenticatedSession>>,
+    Path(id): Path<String>,
+    Json(body): Json<DismissUpdateBody>,
+) -> Response {
+    if let Err(resp) = mutation_gate(&state, session.as_deref()).await {
+        return resp;
+    }
+    let result = tokio::task::spawn_blocking(move || {
+        plugin::install::dismiss_update(&id, &body.fingerprint)
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => (StatusCode::OK, Json(json!({ "ok": true }))).into_response(),
+        Ok(Err(e)) => error_response(StatusCode::BAD_REQUEST, "plugin_error", format!("{e:#}")),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
+    }
+}
+
 #[derive(Deserialize)]
 pub struct SetEnabledBody {
     pub enabled: bool,
@@ -195,5 +288,351 @@ pub async fn set_plugin_enabled(
         Ok(Ok(())) => list_plugins().await.into_response(),
         Ok(Err(e)) => error_response(StatusCode::BAD_REQUEST, "plugin_error", format!("{e:#}")),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
+    }
+}
+
+// Plugin lifecycle jobs: install, update, and uninstall.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// A host-side plugin lifecycle operation the dashboard started and tails. The
+/// daemon owns the work; the browser polls `GET /api/plugins/jobs/{id}` for
+/// status plus the live log tail.
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginJobKind {
+    Install,
+    Update,
+    Uninstall,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum PluginJobStatus {
+    Running,
+    Succeeded,
+    Failed { error: String },
+}
+
+#[derive(Clone, Serialize)]
+pub struct PluginJob {
+    pub id: String,
+    pub kind: PluginJobKind,
+    /// What is being operated on: a source slug for install, a plugin id else.
+    pub target: String,
+    pub status: PluginJobStatus,
+    pub started_at: i64,
+    pub finished_at: Option<i64>,
+    /// On-disk log file; never serialized (read via the tail endpoint instead).
+    #[serde(skip)]
+    log_path: PathBuf,
+}
+
+/// Drop finished jobs and their log files older than this when a new job
+/// starts. A dashboard polls a job for seconds to minutes; an hour is a wide
+/// margin that bounds the in-memory map and the on-disk logs over a long-lived
+/// daemon.
+const FINISHED_JOB_TTL_SECS: i64 = 3600;
+
+/// In-memory registry of plugin lifecycle jobs. Dies with the daemon: a job
+/// running at shutdown is gone, but its on-disk log survives so a tail after a
+/// restart still shows what happened, just without live status.
+// ponytail: in-memory only; a persisted job table would need process
+// supervision and orphaned-build recovery to mean anything. Add that only if
+// restart-survival of in-flight jobs is ever required.
+pub struct PluginJobRegistry {
+    jobs: Mutex<HashMap<String, PluginJob>>,
+    /// At most one lifecycle mutation runs at a time. Config + lockfile writes
+    /// and in-place tree mutations are not concurrency-safe, so a second start
+    /// is rejected with 409 rather than queued (a queued mutation can go stale
+    /// before it runs).
+    active: AtomicBool,
+}
+
+impl Default for PluginJobRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PluginJobRegistry {
+    pub fn new() -> Self {
+        Self {
+            jobs: Mutex::new(HashMap::new()),
+            active: AtomicBool::new(false),
+        }
+    }
+
+    /// Begin a job if no other lifecycle mutation is active. Returns the job id
+    /// and its log path, or `None` if one is already running.
+    fn begin(&self, kind: PluginJobKind, target: String) -> Option<(String, PathBuf)> {
+        if self
+            .active
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return None;
+        }
+        let log_path = match plugin::plugins_dir() {
+            Ok(dir) => dir
+                .join("jobs")
+                .join(format!("{}.log", uuid::Uuid::new_v4())),
+            Err(_) => {
+                self.active.store(false, Ordering::SeqCst);
+                return None;
+            }
+        };
+        let id = uuid::Uuid::new_v4().to_string();
+        self.prune();
+        let job = PluginJob {
+            id: id.clone(),
+            kind,
+            target,
+            status: PluginJobStatus::Running,
+            started_at: chrono::Utc::now().timestamp(),
+            finished_at: None,
+            log_path: log_path.clone(),
+        };
+        self.jobs.lock().unwrap().insert(id.clone(), job);
+        Some((id, log_path))
+    }
+
+    /// Mark a job done and release the single-active guard.
+    fn finish(&self, id: &str, result: anyhow::Result<()>) {
+        if let Some(job) = self.jobs.lock().unwrap().get_mut(id) {
+            job.finished_at = Some(chrono::Utc::now().timestamp());
+            job.status = match result {
+                Ok(()) => PluginJobStatus::Succeeded,
+                Err(e) => PluginJobStatus::Failed {
+                    error: format!("{e:#}"),
+                },
+            };
+        }
+        self.active.store(false, Ordering::SeqCst);
+    }
+
+    pub fn get(&self, id: &str) -> Option<PluginJob> {
+        self.jobs.lock().unwrap().get(id).cloned()
+    }
+
+    /// Drop finished jobs older than the TTL and remove their log files.
+    fn prune(&self) {
+        let cutoff = chrono::Utc::now().timestamp() - FINISHED_JOB_TTL_SECS;
+        self.jobs.lock().unwrap().retain(|_, job| {
+            let stale = job.finished_at.is_some_and(|t| t < cutoff);
+            if stale {
+                let _ = std::fs::remove_file(&job.log_path);
+            }
+            !stale
+        });
+    }
+}
+
+/// Begin a lifecycle job, spawn its work, and return `202 { job_id }`. Returns
+/// `409` when another lifecycle mutation is already running. The work runs in a
+/// detached task; its build output and host-side progress lines land in the job
+/// log file, which the dashboard tails via `plugin_job_status`.
+// ponytail: install/update run their (synchronous) build inside this async
+// task, parking one runtime worker for the build's duration. The single-active
+// guard caps that at one parked worker; switch to a dedicated blocking thread
+// only if that ever matters.
+fn start_job<F, Fut>(
+    state: std::sync::Arc<AppState>,
+    kind: PluginJobKind,
+    target: String,
+    run: F,
+) -> Response
+where
+    F: FnOnce(OperationLog) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    let Some((job_id, log_path)) = state.plugin_jobs.begin(kind, target) else {
+        return error_response(
+            StatusCode::CONFLICT,
+            "plugin_job_active",
+            "Another plugin operation is already running".into(),
+        );
+    };
+    let jobs = state.plugin_jobs.clone();
+    let id = job_id.clone();
+    tokio::spawn(async move {
+        let result = match OperationLog::file(&log_path) {
+            Ok(log) => run(log).await,
+            Err(e) => Err(e),
+        };
+        jobs.finish(&id, result);
+    });
+    (StatusCode::ACCEPTED, Json(json!({ "job_id": job_id }))).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct InstallPreviewBody {
+    pub source: String,
+}
+
+/// `POST /api/plugins/install/preview`: classify a `gh:` install candidate and
+/// return the capability / build / UI disclosure the dashboard renders before
+/// the user approves. Read-write only, NOT elevation: it mutates nothing and
+/// powers the approval UI (elevation is required on the actual install).
+pub async fn preview_plugin_install(
+    State(state): State<std::sync::Arc<AppState>>,
+    Json(body): Json<InstallPreviewBody>,
+) -> Response {
+    if state.read_only {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "read_only",
+            "Server is in read-only mode".into(),
+        );
+    }
+    match plugin::install::preview_install(&body.source).await {
+        Ok(consent) => Json(consent).into_response(),
+        Err(e) => error_response(StatusCode::BAD_GATEWAY, "preview_failed", format!("{e:#}")),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct StartInstallBody {
+    pub source: String,
+    /// The fingerprint the user approved, from the preview. Pins the install to
+    /// exactly what was shown.
+    pub expected_fingerprint: String,
+}
+
+/// `POST /api/plugins/install`: start a host-side install job for a `gh:` source
+/// the user approved in the dashboard. Read-write + elevation, like update
+/// apply. Returns a `job_id` to poll; `409` if another lifecycle job is running.
+pub async fn start_plugin_install(
+    State(state): State<std::sync::Arc<AppState>>,
+    session: Option<axum::Extension<AuthenticatedSession>>,
+    Json(body): Json<StartInstallBody>,
+) -> Response {
+    if let Err(resp) = mutation_gate(&state, session.as_deref()).await {
+        return resp;
+    }
+    let source = body.source.clone();
+    let fingerprint = body.expected_fingerprint;
+    start_job(
+        state,
+        PluginJobKind::Install,
+        source.clone(),
+        move |log| async move {
+            plugin::install::apply_install(&source, &fingerprint, &log)
+                .await
+                .map(|_| ())
+        },
+    )
+}
+
+/// `POST /api/plugins/{id}/uninstall`: start a host-side uninstall job. Removes
+/// the plugin's tree, config entry, and lockfile entry. Read-write + elevation;
+/// returns a `job_id` to poll; `409` if another lifecycle job is running.
+pub async fn start_plugin_uninstall(
+    State(state): State<std::sync::Arc<AppState>>,
+    session: Option<axum::Extension<AuthenticatedSession>>,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(resp) = mutation_gate(&state, session.as_deref()).await {
+        return resp;
+    }
+    let plugin_id = id.clone();
+    start_job(state, PluginJobKind::Uninstall, id, move |log| async move {
+        // Uninstall is synchronous filesystem work; run it off the async task so
+        // it never parks a runtime worker.
+        match tokio::task::spawn_blocking(move || {
+            plugin::install::uninstall_logged(&plugin_id, &log)
+        })
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => Err(anyhow::anyhow!("uninstall task failed: {e}")),
+        }
+    })
+}
+
+#[derive(Deserialize)]
+pub struct JobLogQuery {
+    /// Trailing lines to return; clamped to [1, 2000], default 200.
+    pub tail: Option<usize>,
+}
+
+/// `GET /api/plugins/jobs/{job_id}`: a lifecycle job's status plus a bounded
+/// tail of its host-side log. Polled by the dashboard progress modal. Reads job
+/// state only, so no elevation; the global auth middleware still applies.
+pub async fn plugin_job_status(
+    State(state): State<std::sync::Arc<AppState>>,
+    Path(job_id): Path<String>,
+    Query(q): Query<JobLogQuery>,
+) -> Response {
+    let Some(job) = state.plugin_jobs.get(&job_id) else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "job_not_found",
+            format!("No plugin job {job_id}"),
+        );
+    };
+    let tail = q.tail.unwrap_or(200).clamp(1, 2000);
+    let log_path = job.log_path.clone();
+    let read = tokio::task::spawn_blocking(move || {
+        crate::server::api::acp::read_log_tail(&log_path, tail)
+    })
+    .await;
+    match read {
+        Ok(Ok((lines, truncated, exists))) => Json(json!({
+            "job": job,
+            "log": {
+                "exists": exists,
+                "tail": lines.join("\n"),
+                "lines_returned": lines.len(),
+                "truncated": truncated,
+            }
+        }))
+        .into_response(),
+        Ok(Err(e)) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "log_read_failed",
+            format!("{e}"),
+        ),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registry_allows_one_active_job_then_releases_on_finish() {
+        let reg = PluginJobRegistry::new();
+        let (id1, _) = reg
+            .begin(PluginJobKind::Install, "gh:a/b".into())
+            .expect("first job begins");
+        // A second lifecycle mutation is rejected while one is active: config
+        // and lockfile writes are not concurrency-safe.
+        assert!(
+            reg.begin(PluginJobKind::Uninstall, "x".into()).is_none(),
+            "second job rejected while one is active"
+        );
+        assert!(matches!(
+            reg.get(&id1).unwrap().status,
+            PluginJobStatus::Running
+        ));
+
+        reg.finish(&id1, Ok(()));
+        assert!(matches!(
+            reg.get(&id1).unwrap().status,
+            PluginJobStatus::Succeeded
+        ));
+
+        // The guard is released, so a new job can begin and a failure records
+        // its message.
+        let (id2, _) = reg
+            .begin(PluginJobKind::Update, "gh:c/d".into())
+            .expect("job begins after the prior one finished");
+        reg.finish(&id2, Err(anyhow::anyhow!("boom")));
+        match reg.get(&id2).unwrap().status {
+            PluginJobStatus::Failed { error } => assert!(error.contains("boom"), "{error}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
     }
 }

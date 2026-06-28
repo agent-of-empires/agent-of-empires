@@ -128,6 +128,7 @@ pub fn is_recovery_candidate(inst: &Instance) -> bool {
     !inst.is_structured()
         && !inst.is_archived()
         && !inst.is_snoozed()
+        && !inst.is_trashed()
         && inst.status != super::Status::Stopped
         && inst.agent_session_id != inst.resume_probe_failed_sid
         && should_attempt_resume(inst.agent_session_id.as_deref(), &inst.tool)

@@ -96,6 +96,18 @@ impl PluginHost {
         self.api.ui_snapshot()
     }
 
+    /// Push a host-originated notification onto the ring (e.g. the auto-update
+    /// sweep telling the user an update needs approval). Best-effort.
+    pub fn notify_host(
+        &self,
+        plugin_id: &str,
+        tone: crate::plugin::ui_state::Tone,
+        title: String,
+        body: Option<String>,
+    ) {
+        self.api.notify_host(plugin_id, tone, title, body);
+    }
+
     /// Push a fire-and-forget JSON-RPC notification (no id, so the worker sends
     /// no reply) to a running worker's stdin. Used to forward a dashboard UI
     /// action (e.g. a pane's "Refresh" button) to the worker method the plugin
