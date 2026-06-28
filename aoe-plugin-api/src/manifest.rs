@@ -218,17 +218,17 @@ pub fn screenshot_path_ok(path: &str) -> bool {
         return false;
     }
     // A colon rejects both URL schemes (`https:`) and Windows drive letters
-    // (`C:`); a leading separator rejects absolute paths.
-    if path.starts_with('/') || path.starts_with('\\') || path.contains(':') {
+    // (`C:`); a leading slash rejects absolute paths. Screenshot paths are
+    // repository paths, so they must use `/`, never `\`: a backslash would
+    // survive into the resolved raw URL percent-encoded and 404, so reject it
+    // here to fail fast for the author rather than render a broken image.
+    if path.starts_with('/') || path.contains(':') || path.contains('\\') {
         return false;
     }
     if path.chars().any(char::is_control) {
         return false;
     }
-    if path
-        .split(['/', '\\'])
-        .any(|seg| seg == ".." || seg.is_empty())
-    {
+    if path.split('/').any(|seg| seg == ".." || seg.is_empty()) {
         return false;
     }
     match path.rsplit('.').next() {

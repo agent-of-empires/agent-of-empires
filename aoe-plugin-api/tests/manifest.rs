@@ -885,3 +885,23 @@ fn screenshots_reject_too_many() {
         "got {err:?}"
     );
 }
+
+#[test]
+fn screenshot_path_ok_rejects_backslash_and_bad_shapes() {
+    use aoe_plugin_api::screenshot_path_ok;
+    assert!(screenshot_path_ok("docs/shot.png"));
+    assert!(screenshot_path_ok("a/b/c.gif"));
+    for bad in [
+        "docs\\shot.png",
+        "..\\x.png",
+        "C:\\x.png",
+        "/abs.png",
+        "https://x/y.png",
+        "a/../b.png",
+        "noext",
+        "evil.svg",
+        "",
+    ] {
+        assert!(!screenshot_path_ok(bad), "{bad:?} should be rejected");
+    }
+}
