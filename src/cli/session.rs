@@ -491,12 +491,19 @@ async fn empty_trash(profile: &str) -> Result<()> {
     // the snapshot. #2527: report the count actually removed, not the candidate
     // count, plus how many were kept (teardown/transcript failed, or restored).
     let purged_set: HashSet<String> = purged_ids.into_iter().collect();
-    let candidates = trashed.len();
-    let (removed, restored) = storage.update(|all_instances, _groups| {
-        Ok(super::apply_empty_trash_purge(all_instances, &purged_set))
+    let candidate_ids: HashSet<String> = trashed.iter().map(|i| i.id.clone()).collect();
+    // Compute `kept` from candidate rows that are STILL present after the purge,
+    // not `candidates - removed`: a candidate a peer already removed before this
+    // lock is neither removed by us nor still around, so subtracting would
+    // wrongly report it as kept for retry.
+    let (removed, restored, kept) = storage.update(|all_instances, _groups| {
+        let (removed, restored) = super::apply_empty_trash_purge(all_instances, &purged_set);
+        let kept = all_instances
+            .iter()
+            .filter(|i| candidate_ids.contains(&i.id))
+            .count();
+        Ok((removed, restored, kept))
     })?;
-
-    let kept = candidates.saturating_sub(removed);
     if restored > 0 {
         eprintln!(
             "Warning: {restored} session(s) were restored while the trash was being \
