@@ -40,8 +40,11 @@ absolute URLs, absolute or `..`-traversing paths, and other extensions are
 rejected. The plugin detail endpoint resolves each path against the source
 repo's `raw.githubusercontent.com` (honoring the installed ref, else `HEAD`),
 so the browser fetches the asset directly; AoE never proxies image bytes. The
-assets must be committed and pushed to the source repo before they render; a
-local plugin's screenshots are not served (a follow-up, see #2484).
+endpoint silently drops any screenshot whose path or alt text fails validation
+rather than failing the whole detail response, so one bad entry omits only that
+image. The assets must be committed and pushed to the source repo before they
+render; local plugins do not support screenshots yet (future work beyond
+#2484).
 
 ## Registry
 
