@@ -579,11 +579,7 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
                 let cfg = crate::session::profile_config::resolve_config_or_warn(&session.profile);
                 CleanupDefaults {
                     delete_worktree: cfg.worktree.auto_cleanup,
-                    // Branch deletion only makes sense when the worktree is
-                    // also removed; keeping the worktree keeps its branch
-                    // checked out, so a `git branch -d` would fail (#2532).
-                    delete_branch: cfg.worktree.auto_cleanup
-                        && cfg.worktree.delete_branch_on_cleanup,
+                    delete_branch: cfg.worktree.should_delete_branch_on_cleanup(),
                     delete_sandbox: cfg.sandbox.auto_cleanup,
                     delete_to_trash: cfg.session.delete_to_trash,
                 }
@@ -3451,10 +3447,7 @@ pub(crate) async fn purge_expired_trash(state: &Arc<AppState>) {
         let cfg = crate::session::profile_config::resolve_config_or_warn(&instance.source_profile);
         let body = DeleteSessionBody {
             delete_worktree: cfg.worktree.auto_cleanup,
-            // Tie branch cleanup to worktree cleanup: a preserved worktree
-            // keeps its branch checked out, so branch deletion would fail
-            // (#2532).
-            delete_branch: cfg.worktree.auto_cleanup && cfg.worktree.delete_branch_on_cleanup,
+            delete_branch: cfg.worktree.should_delete_branch_on_cleanup(),
             delete_sandbox: cfg.sandbox.auto_cleanup,
             force_delete: true,
             keep_scratch: false,

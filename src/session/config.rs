@@ -1894,6 +1894,16 @@ pub struct WorktreeConfig {
     pub default_base_branch: Option<String>,
 }
 
+impl WorktreeConfig {
+    /// Branch cleanup only makes sense when the worktree is also removed; a
+    /// preserved worktree keeps its branch checked out, so deleting it would
+    /// fail (#2532). Single source for that invariant across the cleanup
+    /// default and auto-purge call sites.
+    pub fn should_delete_branch_on_cleanup(&self) -> bool {
+        self.auto_cleanup && self.delete_branch_on_cleanup
+    }
+}
+
 impl Default for WorktreeConfig {
     fn default() -> Self {
         Self {
