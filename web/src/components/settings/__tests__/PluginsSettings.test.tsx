@@ -419,6 +419,10 @@ describe("PluginsSettings", () => {
     expect(imgs[0].getAttribute("alt")).toBe("Dashboard card");
     expect(imgs[0].getAttribute("loading")).toBe("lazy");
     expect(gallery.textContent).toContain("Live card.");
+    // A 404 (moved ref / deleted asset) hides the figure rather than leaving a
+    // broken-image icon.
+    fireEvent.error(imgs[0]!);
+    expect(imgs[0]!.closest("figure")!.className).toContain("hidden");
   });
 
   it("separates installed management from the marketplace into tabs", async () => {
