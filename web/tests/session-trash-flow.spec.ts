@@ -352,4 +352,26 @@ test.describe("Multi-session workspace trash", () => {
     await expect.poll(() => handle.deletedIds, { timeout: 5_000 }).toEqual([]);
     await expect(page).toHaveURL(/\/session\/sess-b/);
   });
+
+  for (const open of ["sess-a", "sess-b"] as const) {
+    test(`redirects to / after the open ${open === "sess-a" ? "primary" : "sibling"} is purged`, async ({ page }) => {
+      await mockMultiApis(page, [
+        { id: "sess-a", groupPath: "alpha", trashed: true },
+        { id: "sess-b", groupPath: "beta", trashed: true },
+      ]);
+      await page.setViewportSize({ width: 1280, height: 720 });
+
+      await page.goto(`/session/${open}`);
+      await page.locator('[data-testid="sidebar-trash-toggle"]').click();
+      const trashRow = page.locator('[data-testid="sidebar-trash-row"]').first();
+      await expect(trashRow).toBeVisible({ timeout: 10_000 });
+      await trashRow.locator('[data-testid="sidebar-trash-purge"]').click();
+      const dialog = page.locator('[data-testid="delete-session-dialog"]');
+      await expect(dialog).toBeVisible({ timeout: 5_000 });
+      await dialog.getByRole("button", { name: /^Delete$/ }).click();
+
+      // The open session was deleted, so the handler navigates home.
+      await expect(page).toHaveURL(/\/$/, { timeout: 10_000 });
+    });
+  }
 });
