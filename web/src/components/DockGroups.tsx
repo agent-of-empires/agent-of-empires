@@ -26,8 +26,8 @@ interface Props {
 /** Lays a dock's groups out along its split axis: the tall right column stacks
  *  groups top to bottom (flex column), the wide bottom strip places groups
  *  side by side (flex row). Groups share space equally; a thin divider
- *  separates them.
- *  ponytail: equal flex, no per-group resize handles yet (#2486 follow-up). */
+ *  separates them. Equal flex sizing is intentional until per-group resize
+ *  handles are added (`#2486` follow-up). */
 export function DockGroups({
   location,
   groups,
