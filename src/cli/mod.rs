@@ -87,6 +87,35 @@ pub fn resolve_session<'a>(identifier: &str, instances: &'a [Instance]) -> Resul
     bail!("Session not found: {}", identifier)
 }
 
+/// Best-effort deletion of a structured-view session's durable transcript
+/// (the ACP event-store rows under `<app_dir>/acp_events.db`) during a CLI
+/// permanent purge (`aoe rm --purge`, `aoe session empty-trash`). The serve
+/// daemon does this through its supervisor; the CLI has no live worker, so it
+/// opens the event store directly. It cannot send the adapter `session/delete`
+/// RPC the daemon sends (that needs a running worker), but deleting the local
+/// UI transcript stops purged rows from orphaning. No-op for non-structured
+/// sessions or when the store does not exist. See #2489.
+pub(crate) fn purge_acp_transcript(inst: &Instance) {
+    if !inst.is_structured() {
+        return;
+    }
+    let Ok(app_dir) = crate::session::get_app_dir() else {
+        return;
+    };
+    let db_path = app_dir.join("acp_events.db");
+    if !db_path.exists() {
+        return;
+    }
+    match crate::acp::event_store::EventStore::open(&db_path, 100) {
+        Ok(store) => store.delete_session(&inst.id),
+        Err(e) => tracing::warn!(
+            target: "cli.session",
+            session = %inst.id,
+            "acp transcript purge: failed to open event store: {e}"
+        ),
+    }
+}
+
 pub fn truncate(s: &str, max: usize) -> String {
     let char_count = s.chars().count();
     if char_count <= max {

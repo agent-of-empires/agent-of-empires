@@ -358,7 +358,18 @@ async fn unarchive_session(profile: &str, args: SessionIdArgs) -> Result<()> {
 async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let storage = Storage::new_unwatched(profile)?;
     let title = storage.update(|instances, _groups| {
-        let id = super::resolve_session(&args.identifier, instances)?
+        // Resolve within the trashed subset only. The CLI advertises the
+        // argument as an id OR title, and a live or archived session can share
+        // a title/path with a trashed one; resolving against the full list
+        // would let that row win and make `untrash()` a silent no-op on an
+        // already-live session. See #2489.
+        let trashed: Vec<_> = instances
+            .iter()
+            .filter(|i| i.is_trashed())
+            .cloned()
+            .collect();
+        let id = super::resolve_session(&args.identifier, &trashed)
+            .map_err(|_| anyhow::anyhow!("No trashed session matching '{}'", args.identifier))?
             .id
             .clone();
         let inst = instances
@@ -416,11 +427,11 @@ async fn empty_trash(profile: &str) -> Result<()> {
         );
         let delete_worktree =
             config.worktree.auto_cleanup && inst.has_managed_worktree_or_workspace();
-        let delete_branch = inst
-            .worktree_info
-            .as_ref()
-            .is_some_and(|wt| wt.managed_by_aoe)
-            && config.worktree.delete_branch_on_cleanup;
+        // Tie branch deletion to worktree deletion + config so it also fires
+        // for multi-repo workspace sessions (which have no `worktree_info`);
+        // `perform_deletion` keys the workspace-repo branch cleanup off this
+        // same flag. See #2489.
+        let delete_branch = delete_worktree && config.worktree.delete_branch_on_cleanup;
         let delete_sandbox =
             inst.sandbox_info.as_ref().is_some_and(|s| s.enabled) && config.sandbox.auto_cleanup;
 
@@ -439,7 +450,17 @@ async fn empty_trash(profile: &str) -> Result<()> {
         for err in &result.errors {
             eprintln!("Warning ({}): {}", inst.title, err);
         }
-        purged_ids.push(inst.id.clone());
+        // Only after teardown succeeded: purge the durable structured-view
+        // transcript (the daemon does this via the supervisor; the CLI opens
+        // the event store directly since it has no live worker) and drop the
+        // session row. Doing the irreversible transcript delete last keeps a
+        // failed purge fully restorable, and keeping the row on failure lets
+        // the orphaned worktree/container be retried instead of abandoned.
+        // See #2489.
+        if result.success {
+            super::purge_acp_transcript(inst);
+            purged_ids.push(inst.id.clone());
+        }
     }
 
     // Phase 2 (locked): drop every purged id from the latest disk state.

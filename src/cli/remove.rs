@@ -131,6 +131,14 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
         eprintln!("Warning: {}", err);
     }
 
+    // Permanent purge of a structured-view session must also drop its durable
+    // transcript so it does not orphan in the event store; the CLI opens the
+    // store directly since it has no live worker. Only after a successful
+    // teardown so a failed purge stays restorable. See #2489.
+    if result.success {
+        super::purge_acp_transcript(&inst);
+    }
+
     if !delete_worktree {
         if inst
             .worktree_info
