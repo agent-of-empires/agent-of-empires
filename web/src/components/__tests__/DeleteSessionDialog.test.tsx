@@ -340,9 +340,7 @@ describe("DeleteSessionDialog keyboard affordances", () => {
     const onTrash = vi.fn().mockResolvedValue(undefined);
     const { container } = setup({ onConfirm, onTrash, defaultToTrash: true });
 
-    const toPermanent = container.querySelector<HTMLButtonElement>(
-      '[data-testid="delete-session-switch-permanent"]',
-    );
+    const toPermanent = container.querySelector<HTMLButtonElement>('[data-testid="delete-session-switch-permanent"]');
     expect(toPermanent).toBeTruthy();
     fireEvent.click(toPermanent!);
 

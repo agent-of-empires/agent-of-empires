@@ -43,8 +43,7 @@ base.describe("session trash + restore via sidebar (#2489)", () => {
       await expect(dialog.locator("[data-testid='delete-session-trash-note']")).toBeVisible();
 
       const trashPromise = page.waitForResponse(
-        (res) =>
-          res.url().endsWith(`/api/sessions/${sessionId}/trash`) && res.request().method() === "POST",
+        (res) => res.url().endsWith(`/api/sessions/${sessionId}/trash`) && res.request().method() === "POST",
       );
       await dialog.getByRole("button", { name: /Move to Trash/ }).click();
       const trashRes = await trashPromise;
@@ -65,8 +64,7 @@ base.describe("session trash + restore via sidebar (#2489)", () => {
       await trashToggle.click();
 
       const restorePromise = page.waitForResponse(
-        (res) =>
-          res.url().endsWith(`/api/sessions/${sessionId}/restore`) && res.request().method() === "POST",
+        (res) => res.url().endsWith(`/api/sessions/${sessionId}/restore`) && res.request().method() === "POST",
       );
       await page.locator("[data-testid='sidebar-trash-restore']").click();
       const restoreRes = await restorePromise;
