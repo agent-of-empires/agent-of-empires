@@ -64,6 +64,52 @@ pub async fn list_plugins() -> Json<serde_json::Value> {
     }))
 }
 
+/// One active plugin command, normalized for the dashboard command palette and
+/// keymap: the namespaced `fqid`, its declared keybind chords, and its optional
+/// client-executed `action`. The web binds and renders these without parsing
+/// raw manifests.
+#[derive(Serialize)]
+struct PluginCommandView {
+    fqid: String,
+    plugin_id: String,
+    id: String,
+    title: String,
+    description: String,
+    keybinds: Vec<String>,
+    action: Option<aoe_plugin_api::ClientAction>,
+}
+
+/// `GET /api/plugins/commands`: active plugins' contributed commands, each with
+/// the chords bound to it and its client action. Reads the registry (manifests),
+/// not workers, so it is safe in read-only mode.
+pub async fn plugin_commands() -> Json<serde_json::Value> {
+    let registry = plugin::registry();
+    let mut commands = Vec::new();
+    for p in registry.active() {
+        let plugin_id = p.id().to_string();
+        for c in &p.manifest.commands {
+            let fqid = format!("plugin.{plugin_id}.{}", c.id);
+            let keybinds = p
+                .manifest
+                .keybinds
+                .iter()
+                .filter(|kb| kb.command == c.id || kb.command == fqid)
+                .map(|kb| kb.key.clone())
+                .collect();
+            commands.push(PluginCommandView {
+                fqid: fqid.clone(),
+                plugin_id: plugin_id.clone(),
+                id: c.id.clone(),
+                title: c.title.clone(),
+                description: c.description.clone(),
+                keybinds,
+                action: c.action.clone(),
+            });
+        }
+    }
+    Json(json!({ "commands": commands }))
+}
+
 /// `GET /api/plugins/ui-state`: the plugin host's aggregated UI-state snapshot
 /// (the slots workers have pushed, plus the notification ring). Empty when no
 /// host is running (read-only mode, or a TUI-only build with no daemon). The
