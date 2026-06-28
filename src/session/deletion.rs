@@ -175,6 +175,15 @@ pub fn perform_deletion(request: &DeletionRequest) -> DeletionResult {
         tracing::debug!(target: "session.delete", branch = %b, main_repo = %r.display(), "perform_deletion: branch_to_delete resolved");
     }
 
+    // Branch cleanup is gated on the worktree actually being removed, not on
+    // `request.delete_worktree`. A branch checked out in a preserved (or
+    // failed-to-remove) worktree cannot be deleted, so track real removal
+    // outcomes here instead of inferring them from error-message prefixes
+    // (#2532).
+    let mut main_worktree_removed = false;
+    let mut removed_workspace_repos: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+
     if request.delete_worktree {
         if let Some(wt_info) = &request.instance.worktree_info {
             if wt_info.managed_by_aoe {
@@ -195,6 +204,7 @@ pub fn perform_deletion(request: &DeletionRequest) -> DeletionResult {
                                 errors.extend(errs);
                             } else {
                                 messages.push("Worktree removed".to_string());
+                                main_worktree_removed = true;
                             }
                         }
                         Err(e) => {
@@ -237,6 +247,7 @@ pub fn perform_deletion(request: &DeletionRequest) -> DeletionResult {
                                         "Workspace ({}) worktree removed",
                                         repo.name
                                     ));
+                                    removed_workspace_repos.insert(repo.name.clone());
                                 }
                             }
                             Err(e) => {
@@ -266,10 +277,8 @@ pub fn perform_deletion(request: &DeletionRequest) -> DeletionResult {
     // was successfully removed).
     tracing::debug!(target: "session.delete", session_id = %request.session_id, stage = "branch_delete", "perform_deletion: stage");
     if let Some((branch, main_repo)) = branch_to_delete {
-        let worktree_ok =
-            !request.delete_worktree || !errors.iter().any(|e| e.starts_with("Worktree:"));
-        tracing::debug!(target: "session.delete", branch = %branch, main_repo = %main_repo.display(), worktree_ok, "perform_deletion: attempting branch deletion");
-        if worktree_ok {
+        tracing::debug!(target: "session.delete", branch = %branch, main_repo = %main_repo.display(), main_worktree_removed, "perform_deletion: attempting branch deletion");
+        if main_worktree_removed {
             match GitWorktree::new(main_repo.clone()) {
                 Ok(git_wt) => {
                     if let Err(e) = git_wt.delete_branch(&branch) {
@@ -286,30 +295,39 @@ pub fn perform_deletion(request: &DeletionRequest) -> DeletionResult {
             }
         } else {
             tracing::debug!(target: "session.delete",
-                "perform_deletion: skipping branch deletion (worktree removal had errors)"
+                "perform_deletion: skipping branch deletion (worktree preserved or not removed)"
             );
+            messages.push(format!(
+                "Branch '{}' kept; its worktree was preserved",
+                branch
+            ));
         }
     }
 
     // Branch cleanup for workspace repos
     if request.delete_branch {
         if let Some(ws_info) = &request.instance.workspace_info {
-            let worktree_ok =
-                !request.delete_worktree || !errors.iter().any(|e| e.starts_with("Workspace ("));
-            if worktree_ok {
-                for repo in &ws_info.repos {
-                    if repo.managed_by_aoe {
-                        let main_repo = PathBuf::from(&repo.main_repo_path);
-                        if let Ok(git_wt) = GitWorktree::new(main_repo) {
-                            if let Err(e) = git_wt.delete_branch(&repo.branch) {
-                                errors.push(format!("Branch ({}): {}", repo.name, e));
-                            } else {
-                                messages.push(format!(
-                                    "Branch '{}' ({}) deleted",
-                                    repo.branch, repo.name
-                                ));
-                            }
-                        }
+            for repo in &ws_info.repos {
+                if !repo.managed_by_aoe {
+                    continue;
+                }
+                // Per-repo gate: only delete a repo's branch when that repo's
+                // worktree was actually removed. A repo whose worktree was
+                // preserved (or failed to remove) keeps its branch checked
+                // out (#2532).
+                if !removed_workspace_repos.contains(&repo.name) {
+                    messages.push(format!(
+                        "Branch '{}' ({}) kept; its worktree was preserved",
+                        repo.branch, repo.name
+                    ));
+                    continue;
+                }
+                let main_repo = PathBuf::from(&repo.main_repo_path);
+                if let Ok(git_wt) = GitWorktree::new(main_repo) {
+                    if let Err(e) = git_wt.delete_branch(&repo.branch) {
+                        errors.push(format!("Branch ({}): {}", repo.name, e));
+                    } else {
+                        messages.push(format!("Branch '{}' ({}) deleted", repo.branch, repo.name));
                     }
                 }
             }
@@ -846,6 +864,105 @@ mod tests {
                     .trim()
                     .is_empty(),
                 "branch should be deleted: stdout={}",
+                String::from_utf8_lossy(&branches_out.stdout)
+            );
+        }
+
+        /// #2532 repro: requesting branch deletion while preserving the
+        /// worktree (`delete_worktree=false, delete_branch=true`) must NOT
+        /// attempt `git branch -d/-D` on the branch the preserved worktree
+        /// still has checked out. Pre-fix this pushed a `Branch:` error and
+        /// failed the deletion; post-fix the branch is kept with a message
+        /// and the worktree + branch survive intact.
+        #[test]
+        fn e2e_preserved_worktree_keeps_its_branch() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let main_repo = tmp.path().join("main");
+            let worktree_path = tmp.path().join("worktree");
+            std::fs::create_dir(&main_repo).unwrap();
+
+            let repo = git2::Repository::init(&main_repo).unwrap();
+            let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+            let tree_id = repo.index().unwrap().write_tree().unwrap();
+            let tree = repo.find_tree(tree_id).unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+                .unwrap();
+
+            let status = std::process::Command::new("git")
+                .args([
+                    "worktree",
+                    "add",
+                    "-b",
+                    "feature/keep-me",
+                    worktree_path.to_str().unwrap(),
+                ])
+                .current_dir(&main_repo)
+                .output()
+                .unwrap();
+            assert!(
+                status.status.success(),
+                "git worktree add failed: {}",
+                String::from_utf8_lossy(&status.stderr)
+            );
+
+            let mut instance = Instance::new("Test", worktree_path.to_str().unwrap());
+            instance.worktree_info = Some(crate::session::WorktreeInfo {
+                branch: "feature/keep-me".to_string(),
+                main_repo_path: main_repo.to_string_lossy().to_string(),
+                managed_by_aoe: true,
+                created_at: chrono::Utc::now(),
+                base_branch: None,
+            });
+
+            let request = DeletionRequest {
+                session_id: instance.id.clone(),
+                instance,
+                delete_worktree: false,
+                delete_branch: true,
+                delete_sandbox: false,
+                force_delete: false,
+                detach_hooks: true,
+                keep_scratch: false,
+            };
+
+            let result = perform_deletion(&request);
+            assert!(
+                result.success,
+                "preserving the worktree must not fail deletion: {:?}",
+                result.errors
+            );
+            assert!(
+                !result.errors.iter().any(|e| e.starts_with("Branch:")),
+                "no branch-cleanup error expected: {:?}",
+                result.errors
+            );
+            assert!(
+                result.messages.iter().any(|m| m.contains("kept")),
+                "a kept-branch message is expected: {:?}",
+                result.messages
+            );
+
+            // Worktree directory and admin entry must survive.
+            assert!(
+                worktree_path.exists(),
+                "preserved worktree dir must still exist"
+            );
+            assert!(
+                main_repo.join(".git/worktrees/worktree").exists(),
+                "preserved worktree admin dir must still exist"
+            );
+
+            // Branch must still be present.
+            let branches_out = std::process::Command::new("git")
+                .args(["branch", "--list", "feature/keep-me"])
+                .current_dir(&main_repo)
+                .output()
+                .unwrap();
+            assert!(
+                !String::from_utf8_lossy(&branches_out.stdout)
+                    .trim()
+                    .is_empty(),
+                "branch should be preserved: stdout={}",
                 String::from_utf8_lossy(&branches_out.stdout)
             );
         }
