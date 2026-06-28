@@ -77,6 +77,15 @@ describe("resolvePlacement", () => {
     });
   });
 
+  it("treats a drop onto the dragged tab's own tab as a no-op, keeping its slot", () => {
+    // terminal:0 sits at index 1; dropping it on itself must not append it.
+    expect(resolvePlacement(over({ tabId: "terminal:0", after: true }), "terminal:0", groupsByDock)).toEqual({
+      dock: "right",
+      group: 0,
+      index: 1,
+    });
+  });
+
   it("appends when the hovered tab is not in the destination group (stale id)", () => {
     expect(resolvePlacement(over({ dock: "bottom", group: 0, tabId: "ghost" }), "diff", groupsByDock)).toEqual({
       dock: "bottom",

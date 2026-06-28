@@ -105,8 +105,16 @@ export function resolvePlacement(
     return { dock: over.dock, group: 0, newGroup: true };
   }
   const grp = groupsByDock[over.dock].find((g) => g.group === over.group);
-  const base = (grp?.tabs ?? []).filter((id) => id !== draggedId);
+  const full = grp?.tabs ?? [];
+  const base = full.filter((id) => id !== draggedId);
   if (over.type !== "pane-tab") return { dock: over.dock, group: over.group, index: base.length };
+  // Dropping a tab onto its own tab is a no-op: keep its current slot rather
+  // than appending (base has the dragged tab filtered out, so its index would
+  // otherwise resolve to the end).
+  if (over.tabId === draggedId) {
+    const currentIndex = full.indexOf(draggedId);
+    return { dock: over.dock, group: over.group, index: currentIndex >= 0 ? currentIndex : base.length };
+  }
   const overIndex = base.indexOf(over.tabId);
   if (overIndex < 0) return { dock: over.dock, group: over.group, index: base.length };
   return { dock: over.dock, group: over.group, index: overIndex + (over.after ? 1 : 0) };
