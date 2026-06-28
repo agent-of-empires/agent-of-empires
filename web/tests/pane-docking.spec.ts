@@ -244,4 +244,39 @@ test.describe("Dockable pane system", () => {
     await expect.poll(() => dockGroupCount(page, "right")).toBe(1);
     await expect(page.getByTestId("pane-tab-diff")).toBeVisible();
   });
+
+  test("dragging a tab onto a pane body splits the bottom dock into two groups that persist", async ({ page }) => {
+    await openSession(page);
+    await page.goto(`/session/${SESSION}`);
+
+    // Gather both panes into a single bottom-dock group.
+    await page.getByLabel("Move diff to bottom dock").click();
+    await page.getByLabel("Move terminal to bottom dock").click();
+    await expect.poll(() => dockTabOrder(page, "bottom")).toEqual(["diff", "terminal:0"]);
+    expect(await dockGroupCount(page, "bottom")).toBe(1);
+
+    // Drag terminal:0 onto the group body's trailing split half: the wide bottom
+    // strip splits side by side, so this lifts it into a second group.
+    await dragTab(page, "terminal:0", { x: 640, y: 650 }, async () => {
+      const zone = page.getByTestId("pane-split-bottom-0-after");
+      await expect(zone).toBeVisible();
+      const box = await zone.boundingBox();
+      if (box) await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 6 });
+    });
+
+    await expect.poll(() => dockGroupCount(page, "bottom")).toBe(2);
+    await expect(page.getByTestId("pane-tab-diff")).toBeVisible();
+    await expect(page.getByTestId("pane-tab-terminal:0")).toBeVisible();
+
+    // The split layout round-trips through localStorage.
+    await page.reload();
+    await expect(page.getByTestId("pane-tab-diff")).toBeVisible();
+    await expect.poll(() => dockGroupCount(page, "bottom")).toBe(2);
+
+    // Closing one group's pane prunes only that group; the other stays valid.
+    await page.getByLabel("Close terminal").click();
+    await expect(page.getByTestId("pane-tab-terminal:0")).toHaveCount(0);
+    await expect.poll(() => dockGroupCount(page, "bottom")).toBe(1);
+    await expect(page.getByTestId("pane-tab-diff")).toBeVisible();
+  });
 });
