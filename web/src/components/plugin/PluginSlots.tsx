@@ -158,7 +158,8 @@ export function PluginRowBadges({ sessionId }: { sessionId: string }) {
   );
 }
 
-/** row-column: per-session text column, right-aligned on a session row. The
+/** row-column: per-session text column, anchored to the right of the plugin
+ *  row line (#2514) so it gives up no width to the badges beside it. The
  *  payload may also carry `sort_value` / `filter_values` scalars, which the
  *  sidebar's sort-key and filter-facet controls consume (#2401); this renders
  *  only the visible text. */
@@ -166,7 +167,7 @@ export function PluginRowColumn({ sessionId }: { sessionId: string }) {
   const entries = sessionEntries(usePluginUiEntries(), "row-column", sessionId);
   if (entries.length === 0) return null;
   return (
-    <span className="flex min-w-0 items-center gap-1.5">
+    <span className="ml-auto flex shrink-0 items-center gap-1.5">
       {entries.map((e) => {
         const text = entryText(e);
         if (!text) return null;
@@ -186,6 +187,27 @@ export function PluginRowColumn({ sessionId }: { sessionId: string }) {
           </span>
         );
       })}
+    </span>
+  );
+}
+
+/** The plugin row line: badges (wrapping, left) plus the right-anchored
+ *  status column, on their own line under the session name (#2514). Keeping
+ *  these off the name line stops the narrow mobile sidebar from squeezing the
+ *  column text to zero and pushing the badge icons past the drawer edge.
+ *  Renders nothing when the session has neither, so plugin-free rows keep their
+ *  original height. */
+export function PluginRowLine({ sessionId }: { sessionId: string }) {
+  const entries = usePluginUiEntries();
+  const hasBadges = sessionEntries(entries, "row-badge", sessionId).length > 0;
+  const hasColumn = sessionEntries(entries, "row-column", sessionId).length > 0;
+  if (!hasBadges && !hasColumn) return null;
+  return (
+    <span className="mt-0.5 flex items-center gap-1.5">
+      <span className="flex min-w-0 flex-wrap items-center gap-1.5">
+        <PluginRowBadges sessionId={sessionId} />
+      </span>
+      <PluginRowColumn sessionId={sessionId} />
     </span>
   );
 }
