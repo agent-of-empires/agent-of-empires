@@ -1,27 +1,9 @@
-// Showcase Playwright config.
+// Showcase Playwright config: records every mocked AND live spec in one run
+// for demo videos, trading throughput for cinematic footage (full-resolution
+// video, slow per-action delay, single worker so the encoder owns the CPU).
 //
-// Reuses the existing mocked specs (`tests/*.spec.ts`) AND live-backend
-// specs (`tests/live/**/*.spec.ts`) under a single run, trading throughput
-// for cinematic, deterministic video recordings. Each test gets a full
-// resolution video, a slow per-action delay, and a single worker so the
-// encoder never fights another browser for CPU.
-//
-// Run:
-//   cd web
-//   npx playwright test --config=playwright.showcase.config.ts
-//
-// Filter to a single project or spec:
-//   npx playwright test --config=playwright.showcase.config.ts --project=mocked
-//   npx playwright test --config=playwright.showcase.config.ts tests/live/golden-path.spec.ts
-//
-// The aoe binary is resolved the same way as the live config
-// (AOE_E2E_BINARY env or ../target/release/aoe). Build it first with
-// `cargo build --features serve --release` (globalSetup will do that
-// for you on first run too).
-//
-// Videos land under `test-results/**/video.webm`. The HTML report at
-// `playwright-showcase-report/` embeds them. Post-process with ffmpeg
-// (e.g. `-filter:v "setpts=0.4*PTS" -an`) to speed the final clip up.
+// Usage, build steps, and the ffmpeg post-processing live in
+// docs/development/showcase-video.md.
 
 import { defineConfig } from "@playwright/test";
 
@@ -56,8 +38,10 @@ export default defineConfig({
   // globalSetup and is a no-op when the binary is already on disk.
   globalSetup: "./tests/helpers/liveGlobalSetup.ts",
 
-  // Mocked specs need a vite preview server on 4173. Live specs ignore
-  // it (they spawn their own backend per test).
+  // webServer is config-wide, so it boots for every project: mocked specs
+  // hit it on 4173, and a live-only run (--project=live) still starts vite
+  // preview here and therefore needs a built bundle, even though live specs
+  // spawn their own backend per test.
   webServer: {
     command: "npx vite preview --port 4173",
     port: 4173,
