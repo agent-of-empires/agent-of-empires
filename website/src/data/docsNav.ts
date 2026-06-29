@@ -71,6 +71,7 @@ export const docsNav: NavSection[] = [
       { title: "GitHub Integration", href: "/docs/github-integration/" },
       { title: "Configuration", href: "/docs/guides/configuration/" },
       { title: "Plugins", href: "/docs/plugins/" },
+      { title: "Plugin API Reference", href: "/docs/plugin-api/" },
     ],
   },
   {
@@ -86,6 +87,7 @@ export const docsNav: NavSection[] = [
         title: "Web Dashboard Development",
         href: "/docs/development/web-dashboard/",
       },
+      { title: "Writing Plugins", href: "/docs/development/writing-plugins/" },
     ],
   },
   {

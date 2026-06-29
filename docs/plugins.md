@@ -8,6 +8,14 @@ directory. Per-plugin settings and plugin-contributed UI land in follow-up
 releases; running plugin code is not wired up yet, so an installed external
 plugin records its grant and files but does not execute until a later release.
 
+To build your own, start with [Writing Plugins](development/writing-plugins.md)
+and the [Plugin API Reference](plugin-api.md). The official starter scaffolds a
+working plugin in Python, Node, or Rust:
+
+```sh
+cookiecutter gh:agent-of-empires/plugin-template
+```
+
 ## Managing plugins
 
 Three equivalent surfaces:

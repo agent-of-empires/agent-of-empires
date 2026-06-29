@@ -245,6 +245,13 @@ const PAGES = [
       "Code-level design for the plugin system: subprocess JSON-RPC runtime, core event bus, contribution registries, capability model, and the phased rollout.",
   },
   {
+    source: "docs/development/writing-plugins.md",
+    dest: "docs/development/writing-plugins.md",
+    title: "Writing Plugins",
+    description:
+      "Build an Agent of Empires plugin end to end: scaffold from the template, declare the manifest, write the JSON-RPC worker, install locally, and publish.",
+  },
+  {
     source: "docs/development/internals/sessions.md",
     dest: "docs/development/internals/sessions.md",
     title: "Session & Worktree Internals",
@@ -350,6 +357,13 @@ const PAGES = [
       "REST endpoints for driving Agent of Empires sessions from external orchestrators.",
   },
   {
+    source: "docs/plugin-api.md",
+    dest: "docs/plugin-api.md",
+    title: "Plugin API Reference",
+    description:
+      "Field-by-field reference for the aoe-plugin.toml manifest: identity, capabilities, commands, settings, UI slots, status, screenshots, and runtime.",
+  },
+  {
     source: "docs/telemetry.md",
     dest: "docs/telemetry.md",
     title: "Telemetry",
@@ -379,6 +393,7 @@ const URL_MAP = {
   "docs/development/internals/structured-view.md": "/docs/development/internals/structured-view/",
   "docs/development/internals/sandbox.md": "/docs/development/internals/sandbox/",
   "docs/development/internals/plugin-system.md": "/docs/development/internals/plugin-system/",
+  "docs/development/writing-plugins.md": "/docs/development/writing-plugins/",
   "docs/development/internals/sessions.md": "/docs/development/internals/sessions/",
   "docs/guides/configuration.md": "/docs/guides/configuration/",
   "docs/cli/reference.md": "/docs/cli/reference/",
@@ -387,6 +402,7 @@ const URL_MAP = {
   "docs/structured-view/controls.md": "/docs/structured-view/controls/",
   "docs/structured-view/troubleshooting.md": "/docs/structured-view/troubleshooting/",
   "docs/api.md": "/docs/api/",
+  "docs/plugin-api.md": "/docs/plugin-api/",
   "docs/telemetry.md": "/docs/telemetry/",
   // Guides
   "docs/guides/shell-completions.md": "/guides/shell-completions/",
