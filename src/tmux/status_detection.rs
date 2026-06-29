@@ -1059,11 +1059,13 @@ pub fn detect_copilot_status(raw_content: &str) -> Status {
     }
 
     // Empty ready prompt: Copilot's idle footer is `/ commands · ? help · tab
-    // next tab`. `tab next tab` and `? help` only render at the ready prompt
-    // (Working and approval footers differ), so they mark the turn as done and
-    // waiting for the user. `copilot>` is kept for custom wrappers/older builds.
-    if last_lines_lower.contains("tab next tab")
-        || last_lines_lower.contains("? help")
+    // next tab`. Require all three tokens together so ordinary prose mentioning
+    // `? help` or `tab next tab` mid-turn does not falsely read as Waiting; the
+    // full footer only renders at the ready prompt (Working and approval footers
+    // differ). `copilot>` is kept for custom wrappers/older builds.
+    if (last_lines_lower.contains("/ commands")
+        && last_lines_lower.contains("? help")
+        && last_lines_lower.contains("tab next tab"))
         || matches_input_prompt(&non_empty_lines, 10, &["copilot>"])
     {
         return Status::Waiting;
@@ -2831,6 +2833,13 @@ run this command? (y/n)
     fn test_detect_copilot_status_idle() {
         assert_eq!(detect_copilot_status("file saved"), Status::Idle);
         assert_eq!(detect_copilot_status("random output text"), Status::Idle);
+        // Prose mentioning footer phrases without the full footer must not read
+        // as Waiting: only the complete `/ commands · ? help · tab next tab`
+        // shape (or `copilot>`) marks the turn done.
+        assert_eq!(
+            detect_copilot_status("need more? help is available; use tab next tab to switch"),
+            Status::Idle
+        );
     }
 
     #[test]

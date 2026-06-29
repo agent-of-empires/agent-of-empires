@@ -1973,7 +1973,14 @@ impl Instance {
             // A fork is a fresh session, not an in-place resume.
             return false;
         }
-        let (session_id, is_existing) = self.acquire_session_id();
+        let (mut session_id, is_existing) = self.acquire_session_id();
+        // Sandboxed Copilot starts fresh: the session db lives inside the
+        // container, so a host-captured or manually pinned sid would launch
+        // `--session-id <id>` against a UUID that does not resolve there.
+        // Capture is already host-only above; drop the sid to gate emission too.
+        if self.tool == "copilot" && self.is_sandboxed() {
+            session_id = None;
+        }
         let emitted =
             append_resume_flags(&self.tool, session_id.as_deref(), is_existing, cmd, context);
         is_existing && emitted

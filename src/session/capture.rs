@@ -1993,15 +1993,15 @@ fn extract_gemini_fields(path: &std::path::Path) -> Option<(Option<String>, Opti
 ///
 /// Copilot records every session in the `sessions` table of `session-store.db`
 /// under its config dir (`$COPILOT_CONFIG_DIR`, default `~/.copilot`). Each row
-/// carries the session UUID (`id`), the working directory (`cwd`), and an ISO
-/// 8601 `updated_at` timestamp.
+/// carries the session UUID (`id`), the working directory (`cwd`), and an RFC
+/// 3339 `updated_at` timestamp.
 fn copilot_db_path() -> Result<PathBuf> {
     Ok(resolve_agent_home(Some("COPILOT_CONFIG_DIR"), ".copilot")?.join("session-store.db"))
 }
 
 /// Load Copilot's session rows from its SQLite store at `db_path`, newest
 /// first. Each row is `(id, cwd)`; rows without a `cwd` are skipped since they
-/// cannot be matched to a project. ISO 8601 `updated_at` strings sort
+/// cannot be matched to a project. RFC 3339 `updated_at` strings sort
 /// chronologically as text, so `ORDER BY updated_at DESC` yields most-recent
 /// first.
 fn read_copilot_sessions_from_sqlite_at(db_path: &Path) -> Result<Vec<(String, String)>> {
@@ -4088,7 +4088,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_capture_copilot_basic() {
+    fn test_copilot_capture_basic() {
         let tmp = create_copilot_test_db(&[
             (
                 "11111111-1111-4111-8111-111111111111",
@@ -4110,7 +4110,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_capture_copilot_filters_by_project_path() {
+    fn test_copilot_capture_filters_by_project_path() {
         let tmp = create_copilot_test_db(&[
             (
                 "33333333-3333-4333-8333-333333333333",
@@ -4131,7 +4131,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_capture_copilot_no_db() {
+    fn test_copilot_capture_no_db() {
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("COPILOT_CONFIG_DIR", tmp.path()) };
         let result = capture_copilot_session_id("/work/proj", &HashSet::new());
