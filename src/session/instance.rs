@@ -1335,6 +1335,7 @@ impl Instance {
 
     pub fn unarchive(&mut self) {
         self.archived_at = None;
+        self.idle_dormant_since = None;
     }
 
     pub fn is_archived(&self) -> bool {
@@ -4550,6 +4551,23 @@ mod tests {
         assert!(inst.is_idle_dormant());
         inst.touch_last_accessed();
         assert!(!inst.is_idle_dormant());
+    }
+
+    #[test]
+    fn test_unarchive_clears_idle_dormant() {
+        let mut inst = Instance::new("test", "/tmp/test");
+        inst.archive();
+        inst.mark_idle_dormant();
+        assert!(inst.is_archived());
+        assert!(inst.is_idle_dormant());
+
+        inst.unarchive();
+
+        assert!(!inst.is_archived());
+        assert!(
+            !inst.is_idle_dormant(),
+            "unarchive should wake sessions blocked by idle auto-stop"
+        );
     }
 
     #[test]
