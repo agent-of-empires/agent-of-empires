@@ -1529,10 +1529,10 @@ impl<S: BroadcastSink> Supervisor<S> {
         // (see `apply_yolo_mode()` in `src/session/instance.rs`); structured view
         // can't pass CLI flags through the ACP adapter, so we set the
         // mode via `session/set_mode` instead. The mode id is adapter-specific
-        // (claude: `bypassPermissions`, codex: `full-access`, gemini: `yolo`),
+        // (claude: `bypassPermissions`, codex: `agent-full-access`, gemini: `yolo`),
         // so resolve it from the agent profile rather than hard-coding Claude's
-        // id; codex advertises `full-access`, not `bypassPermissions`, so a
-        // hard-coded `bypassPermissions` was silently dropped by the
+        // id; codex advertises `agent-full-access`, not `bypassPermissions`, so
+        // a hard-coded or stale id is silently dropped by the
         // not-advertised guard and left codex sessions in their default
         // (approval-prompting) preset. Best-effort: the call is
         // fire-and-forget through cmd_tx, the connection loop warns on

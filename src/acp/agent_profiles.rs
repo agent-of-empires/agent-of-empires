@@ -40,7 +40,7 @@ pub struct AgentProfile {
     /// ACP session-mode id that means "bypass all permission prompts"
     /// (the wizard's "Auto-approve" / profile `yolo_mode_default`). Each
     /// adapter names this differently: claude-agent-acp advertises
-    /// `bypassPermissions`, codex-acp advertises `full-access`, gemini-cli
+    /// `bypassPermissions`, codex-acp advertises `agent-full-access`, gemini-cli
     /// advertises `yolo`. The supervisor sends this id via
     /// `session/set_mode` immediately after spawn (see
     /// `supervisor::spawn_inner`). `None` for adapters with no known
@@ -118,7 +118,7 @@ pub const CLAUDE_CODE: AgentProfile = AgentProfile {
     ..CLAUDE
 };
 
-/// OpenAI Codex CLI via Zed's `codex-acp` adapter. `/new` is the Codex
+/// OpenAI Codex CLI via `@agentclientprotocol/codex-acp`. `/new` is the Codex
 /// CLI convention for starting a fresh conversation. No TodoWrite,
 /// Skill, plan mode, or ScheduleWakeup in Codex's tool surface.
 pub const CODEX: AgentProfile = AgentProfile {
@@ -127,9 +127,10 @@ pub const CODEX: AgentProfile = AgentProfile {
     clear_aliases: &["/new"],
     supports_exit_plan_mode: false,
     supports_wakeup_tools: false,
-    // codex-acp advertises its bypass preset as the `full-access` session
-    // mode (read-only / auto / full-access), not Claude's `bypassPermissions`.
-    yolo_mode_id: Some("full-access"),
+    // @agentclientprotocol/codex-acp advertises its bypass preset as the
+    // `agent-full-access` session mode (read-only / agent /
+    // agent-full-access), not Claude's `bypassPermissions`.
+    yolo_mode_id: Some("agent-full-access"),
 };
 
 /// SST OpenCode via native `opencode acp`. OpenCode's `task` tool can
@@ -252,11 +253,12 @@ mod tests {
             Some("bypassPermissions")
         );
         assert_eq!(resolve("aoe-agent").yolo_mode_id, Some("bypassPermissions"));
-        // Regression for #1142: codex's bypass preset is `full-access`, not
-        // Claude's `bypassPermissions`. A hard-coded `bypassPermissions` was
-        // dropped by the not-advertised guard, leaving codex prompting for
-        // approvals despite yolo_mode_default.
-        assert_eq!(resolve("codex").yolo_mode_id, Some("full-access"));
+        // Regression for #1142 and the @agentclientprotocol/codex-acp
+        // migration: codex's bypass preset is `agent-full-access`, not
+        // Claude's `bypassPermissions` or the old Zed adapter's `full-access`.
+        // A stale id is dropped by the not-advertised guard, leaving codex
+        // prompting for approvals despite yolo_mode_default.
+        assert_eq!(resolve("codex").yolo_mode_id, Some("agent-full-access"));
         assert_eq!(resolve("gemini").yolo_mode_id, Some("yolo"));
         // Adapters with no verified bypass mode keep YOLO a no-op.
         assert_eq!(resolve("opencode").yolo_mode_id, None);
