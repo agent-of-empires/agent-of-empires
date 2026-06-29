@@ -1654,6 +1654,12 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/api/telemetry/structured-interaction",
             post(api::post_telemetry_structured_interaction),
         )
+        .route("/api/transcription/status", get(api::transcription_status))
+        .route(
+            "/api/transcription",
+            post(api::transcribe_audio)
+                .layer(axum::extract::DefaultBodyLimit::max(28 * 1024 * 1024)),
+        )
         // Terminal WebSockets (capture-streaming live view; the agent pane and
         // the paired host/container shells). The xterm PTY relay was removed.
         .route("/sessions/{id}/live-ws", get(live_ws::live_terminal_ws))

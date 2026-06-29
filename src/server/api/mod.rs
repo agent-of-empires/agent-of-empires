@@ -22,6 +22,8 @@ mod projects;
 mod sessions;
 pub(crate) mod system;
 mod telemetry;
+#[cfg(feature = "serve")]
+mod transcription;
 
 #[cfg(feature = "serve")]
 pub use acp::{
@@ -74,6 +76,8 @@ pub use telemetry::{
     get_telemetry_status, post_telemetry_seen, post_telemetry_structured_interaction,
     set_telemetry_consent,
 };
+#[cfg(feature = "serve")]
+pub use transcription::{transcribe_audio, transcription_status};
 
 const SHELL_METACHARACTERS: &[char] = &[
     ';', '&', '|', '$', '`', '(', ')', '{', '}', '<', '>', '\n', '\r', '\\', '"', '\'', '!', '#',

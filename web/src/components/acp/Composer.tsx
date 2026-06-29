@@ -617,7 +617,8 @@ export function Composer({
   });
   const showVoiceDictation = isMobile && voiceDictation.supported;
   const hasSubmittableDraft = composerText.trim().length > 0 || supportedPendingAttachments.length > 0;
-  const showVoiceAction = showVoiceDictation && (voiceDictation.listening || !hasSubmittableDraft);
+  const showVoiceAction =
+    showVoiceDictation && (voiceDictation.listening || voiceDictation.processing || !hasSubmittableDraft);
   const startVoiceDictation = useCallback(() => {
     const ta = taRef.current;
     if (ta) {
@@ -1115,6 +1116,7 @@ export function Composer({
                 {showVoiceAction ? (
                   <VoiceDictationButton
                     listening={voiceDictation.listening}
+                    processing={voiceDictation.processing}
                     error={voiceDictation.error}
                     onStart={startVoiceDictation}
                     onStop={stopVoiceDictation}
@@ -1381,33 +1383,48 @@ function ToolbarButton({
 
 function VoiceDictationButton({
   listening,
+  processing,
   error,
   onStart,
   onStop,
 }: {
   listening: boolean;
+  processing: boolean;
   error: string | null;
   onStart: () => void;
   onStop: () => void;
 }) {
-  const label = listening ? "Stop voice dictation" : "Start voice dictation";
-  const title = error ? "Voice dictation unavailable" : listening ? "Stop voice dictation" : "Start voice dictation";
+  const label = processing
+    ? "Transcribing voice dictation"
+    : listening
+      ? "Stop voice dictation"
+      : "Start voice dictation";
+  const title = error
+    ? "Voice dictation unavailable"
+    : processing
+      ? "Transcribing voice dictation"
+      : listening
+        ? "Stop voice dictation"
+        : "Start voice dictation";
   return (
     <button
       type="button"
       aria-label={label}
       aria-pressed={listening}
       title={title}
+      disabled={processing}
       onClick={() => {
+        if (processing) return;
         if (listening) onStop();
         else onStart();
       }}
       className={[
         "inline-flex items-center justify-center gap-1 rounded-lg px-2.5 py-1.5 text-[12px]",
-        listening
+        listening || processing
           ? "bg-rose-600 text-white shadow-sm hover:bg-rose-500"
           : "border border-surface-600 bg-surface-800 text-text-secondary hover:border-surface-500 hover:bg-surface-700",
-        "active:scale-[0.98] transition-all duration-100",
+        processing ? "opacity-80" : "active:scale-[0.98]",
+        "transition-all duration-100",
       ].join(" ")}
     >
       <Mic className="h-3.5 w-3.5" />
