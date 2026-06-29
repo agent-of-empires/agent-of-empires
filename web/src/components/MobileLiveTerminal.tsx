@@ -987,7 +987,7 @@ export function MobileLiveTerminal({
           case "Backspace":
             return "\x7f";
           case "Tab":
-            return "\t";
+            return e.shiftKey ? "\x1b[Z" : "\t";
           case "Escape":
             return "\x1b";
           case "ArrowUp":

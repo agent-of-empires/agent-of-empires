@@ -106,6 +106,29 @@ test.describe("Desktop live terminal input", () => {
     expect(sentSigint).toBe(false);
   });
 
+  test("Shift+Tab sends backtab (CSI Z), not a plain Tab", async ({ page }) => {
+    // The keydown handler keyed only on e.key === "Tab" and always returned
+    // "\t", dropping the Shift. Shift+Tab must reach the agent as the backtab
+    // sequence \x1b[Z, which is what the TUI's live_send already emits for BTab.
+    // Without it, apps that read backtab (e.g. Claude Code's permission-mode
+    // cycle) never see Shift+Tab in the web terminal.
+    const handle = await mockTerminalApis(page);
+    await page.goto("/");
+    await clickSidebarSession(page, "pinch-test");
+    await page.locator("[data-live-terminal]").first().waitFor({ state: "visible", timeout: 10_000 });
+    await page.locator("[data-live-terminal]").first().click();
+    await expect(page.locator('textarea[aria-label="Live terminal input"]').first()).toBeFocused();
+
+    const before = handle.liveMessages.length;
+    await page.keyboard.press("Shift+Tab");
+
+    await expect
+      .poll(() => handle.liveMessages.slice(before).map((m) => m.toString("utf8")))
+      .toContainEqual("\x1b[Z");
+    const sentPlainTab = handle.liveMessages.slice(before).some((m) => m.toString("utf8") === "\t");
+    expect(sentPlainTab).toBe(false);
+  });
+
   test("renders at the desktop font size, not the small mobile default", async ({ page }) => {
     // The live view used to always read `mobileFontSize` (default 8px), so on
     // desktop it came up tiny and ignored the dashboard's terminal font-size
