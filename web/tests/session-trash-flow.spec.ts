@@ -178,7 +178,13 @@ test.describe("Session trash flow", () => {
     await page.setViewportSize({ width: 1280, height: 720 });
 
     await page.goto("/");
-    await page.locator('[data-testid="sidebar-trash-toggle"]').click();
+    const trashToggle = page.locator('[data-testid="sidebar-trash-toggle"]');
+    await trashToggle.click();
+    const panelBox = await page.locator('[data-testid="sidebar-trash-menu"]').boundingBox();
+    const toggleBox = await trashToggle.boundingBox();
+    expect(panelBox).not.toBeNull();
+    expect(toggleBox).not.toBeNull();
+    expect(panelBox!.x + panelBox!.width).toBeGreaterThan(toggleBox!.x + toggleBox!.width + 100);
     const trashRow = page.locator('[data-testid="sidebar-trash-row"]').filter({ hasText: longTitle });
     await expect(trashRow).toBeVisible({ timeout: 10_000 });
 
