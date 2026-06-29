@@ -122,9 +122,7 @@ test.describe("Desktop live terminal input", () => {
     const before = handle.liveMessages.length;
     await page.keyboard.press("Shift+Tab");
 
-    await expect
-      .poll(() => handle.liveMessages.slice(before).map((m) => m.toString("utf8")))
-      .toContainEqual("\x1b[Z");
+    await expect.poll(() => handle.liveMessages.slice(before).map((m) => m.toString("utf8"))).toContainEqual("\x1b[Z");
     const sentPlainTab = handle.liveMessages.slice(before).some((m) => m.toString("utf8") === "\t");
     expect(sentPlainTab).toBe(false);
   });
