@@ -182,7 +182,7 @@ describe("useVoiceDictation", () => {
       .fn()
       .mockResolvedValueOnce({
         ok: true,
-        json: async () => ({ available: true, provider: "openai", model: "gpt-4o-mini-transcribe" }),
+        json: async () => ({ available: true, provider: "openai", model: "gpt-4o-transcribe" }),
       })
       .mockResolvedValueOnce({
         ok: true,

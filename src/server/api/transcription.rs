@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use super::AppState;
 
-const DEFAULT_MODEL: &str = "gpt-4o-mini-transcribe";
+const DEFAULT_MODEL: &str = "gpt-4o-transcribe";
 const OPENAI_TRANSCRIPTIONS_URL: &str = "https://api.openai.com/v1/audio/transcriptions";
 const MAX_AUDIO_BYTES: usize = 28 * 1024 * 1024;
 
