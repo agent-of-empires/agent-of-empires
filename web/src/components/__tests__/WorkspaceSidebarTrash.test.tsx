@@ -1,9 +1,10 @@
 // @vitest-environment jsdom
 //
 // Coverage for the WorkspaceSidebar Trash control (#2489, reworked in #2512):
-// a workspace whose sessions are all trashed is reachable from a Trash icon in
-// the sidebar footer next to Settings, which opens a popover with Open /
-// Restore / Delete actions. Trash is no longer an inline scrolling section.
+// a workspace whose sessions are all trashed is reachable from a labeled Trash
+// control in the sidebar footer next to Settings, which opens a wider panel
+// with Open / Restore / Delete actions. Trash is no longer an inline scrolling
+// section.
 // Also asserts the Projects section renders below "Snoozed & archived" (#2512).
 // Vitest (accurate per-file V8) rather than Playwright, whose bundle->source
 // remap is lossy for this large file.
@@ -121,22 +122,28 @@ describe("WorkspaceSidebar Trash control (#2489, #2512)", () => {
     return renderSidebar({ groups: trashedGroups(), trashedWorkspaces: [trashedWorkspace()], ...over });
   }
 
-  it("reaches a trashed workspace via the footer Trash popover and exposes its actions", () => {
+  it("reaches a trashed workspace via the footer Trash panel and exposes its actions", () => {
     const props = renderWithTrash();
 
     // No inline section in the scrolling list; only the footer toggle.
     expect(screen.queryByTestId("sidebar-trash-section")).toBeNull();
-    // Closed by default: popover and rows hidden until the icon is clicked.
+    expect(screen.getByTestId("sidebar-trash-toggle").textContent).toContain("Trash");
+    // Closed by default: panel and rows hidden until the footer control is clicked.
     expect(screen.queryByTestId("sidebar-trash-menu")).toBeNull();
     expect(screen.queryByTestId("sidebar-trash-row")).toBeNull();
 
     fireEvent.click(screen.getByTestId("sidebar-trash-toggle"));
     expect(screen.getByTestId("sidebar-trash-menu")).toBeTruthy();
     expect(screen.getByTestId("sidebar-trash-row")).toBeTruthy();
+    expect(screen.getByTestId("sidebar-trash-open").textContent).toContain("Open");
+    expect(screen.getByTestId("sidebar-trash-restore").textContent).toContain("Restore");
+    expect(screen.getByTestId("sidebar-trash-purge").textContent).toContain("Delete");
 
     fireEvent.click(screen.getByTestId("sidebar-trash-open"));
     expect(props.onSelect).toHaveBeenCalledWith("trashed-ws");
+    expect(screen.queryByTestId("sidebar-trash-menu")).toBeNull();
 
+    fireEvent.click(screen.getByTestId("sidebar-trash-toggle"));
     fireEvent.click(screen.getByTestId("sidebar-trash-restore"));
     expect(props.onRestoreSession).toHaveBeenCalledWith(["s1"]);
 
@@ -166,7 +173,7 @@ describe("WorkspaceSidebar Trash control (#2489, #2512)", () => {
     renderWithTrash();
     fireEvent.click(screen.getByLabelText("Filter sessions"));
     fireEvent.change(screen.getByTestId("sidebar-filter-input"), { target: { value: "zzz-no-match" } });
-    expect(screen.getByTestId("sidebar-trash-toggle")).toBeTruthy();
+    expect(screen.getByTestId("sidebar-trash-toggle").textContent).toContain("Trash");
     fireEvent.click(screen.getByTestId("sidebar-trash-toggle"));
     expect(screen.getByTestId("sidebar-trash-row")).toBeTruthy();
   });

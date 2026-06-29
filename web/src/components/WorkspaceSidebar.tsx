@@ -503,11 +503,11 @@ export function formatSnoozeRemainingShort(snoozedUntilIso: string): string {
   return `${Math.floor(hours / 24)}d`;
 }
 
-/** Trash control in the sidebar footer, next to Settings (#2512). Trash is a
- *  terminal, rarely-touched state, so it lives as an icon with an upward
- *  popover rather than a full scrolling section. Outside click and Escape
- *  close it, mirroring SidebarSortPicker. Only rendered when something is
- *  trashed. */
+/** Trash control in the sidebar footer, next to Settings (#2512). Trash stays
+ *  outside the filtered session list so recovery remains reachable when search
+ *  hides every live row, but opens into a wider panel instead of a cramped
+ *  icon-only popover. Outside click and Escape close it, mirroring
+ *  SidebarSortPicker. Only rendered when something is trashed. */
 function TrashMenu({
   trashedWorkspaces,
   readOnly,
@@ -543,71 +543,128 @@ function TrashMenu({
   const count = trashedWorkspaces.length;
 
   return (
-    <div ref={ref} className="relative">
+    <div ref={ref} className="relative min-w-0 flex-1">
       <button
         onClick={() => setOpen((o) => !o)}
-        aria-haspopup="menu"
         aria-expanded={open}
+        aria-controls={open ? "sidebar-trash-panel" : undefined}
         data-testid="sidebar-trash-toggle"
-        className="w-8 h-8 flex items-center justify-center text-text-secondary hover:text-text-primary hover:bg-surface-800/50 cursor-pointer rounded-md transition-colors"
+        className="h-8 w-full min-w-0 flex items-center gap-2 rounded-md px-2.5 text-text-secondary hover:text-text-primary hover:bg-surface-800/50 cursor-pointer transition-colors"
         title={`Trash (${count})`}
         aria-label={`Trash (${count})`}
       >
-        <Trash2 className="h-4 w-4" />
+        <Trash2 className="h-4 w-4 shrink-0" />
+        <span className="min-w-0 flex-1 truncate text-left text-[13px] font-medium">Trash</span>
+        <span className="shrink-0 rounded-full bg-surface-900 px-1.5 py-0.5 text-[10px] font-mono tabular-nums text-text-dim leading-none">
+          {count}
+        </span>
       </button>
       {open && (
         <div
-          role="menu"
+          id="sidebar-trash-panel"
+          role="region"
+          aria-label="Trash"
           data-testid="sidebar-trash-menu"
-          className="absolute bottom-full mb-1 left-0 w-[220px] max-w-[calc(100vw-1rem)] max-h-[50vh] overflow-y-auto bg-surface-800 border border-surface-700/50 rounded-md shadow-xl py-1 z-50 animate-fade-in"
+          className="absolute bottom-full mb-2 left-0 z-40 flex max-h-[min(520px,calc(100vh-5rem))] w-[min(420px,calc(100vw-1rem))] flex-col overflow-hidden rounded-lg border border-surface-700/60 bg-surface-800 shadow-2xl animate-fade-in"
         >
-          <div className="px-3 py-1.5 text-[11px] font-mono uppercase tracking-widest text-text-muted">
-            Trash ({count})
-          </div>
-          {trashedWorkspaces.map((ws) => (
-            <div
-              key={ws.id}
-              data-testid="sidebar-trash-row"
-              className="flex items-center gap-2 px-3 py-1.5 text-[13px] text-text-secondary"
-            >
-              <div className="min-w-0 flex-1">
-                <button
-                  type="button"
-                  onClick={(e) => onOpen(ws.id, e)}
-                  title={ws.displayName}
-                  data-testid="sidebar-trash-open"
-                  className="block w-full truncate text-left hover:text-text-primary cursor-pointer"
-                >
-                  {ws.displayName}
-                </button>
+          <div className="flex items-start justify-between gap-3 border-b border-surface-700/60 px-4 py-3">
+            <div className="min-w-0">
+              <div className="flex items-center gap-2">
+                <Trash2 className="h-4 w-4 shrink-0 text-text-muted" />
+                <h2 className="text-sm font-semibold text-text-primary">Trash</h2>
+                <span className="rounded-full bg-surface-900 px-2 py-0.5 text-[11px] font-mono tabular-nums text-text-dim leading-none">
+                  {count}
+                </span>
               </div>
-              {!readOnly && (
-                <>
-                  <button
-                    onClick={() => {
-                      const ids = ws.sessions.map((s) => s.id);
-                      if (ids.length > 0) onRestore(ids);
-                    }}
-                    data-testid="sidebar-trash-restore"
-                    title="Restore"
-                    aria-label="Restore"
-                    className="shrink-0 text-accent-500 hover:text-accent-600 cursor-pointer"
-                  >
-                    <RotateCcw className="h-3.5 w-3.5" />
-                  </button>
-                  <button
-                    onClick={() => onDelete(ws.id)}
-                    data-testid="sidebar-trash-purge"
-                    title="Delete permanently"
-                    aria-label="Delete permanently"
-                    className="shrink-0 text-status-error/80 hover:text-status-error cursor-pointer"
-                  >
-                    <X className="h-3.5 w-3.5" />
-                  </button>
-                </>
-              )}
+              <p className="mt-1 text-[12px] text-text-dim">Restore sessions, or delete them permanently.</p>
             </div>
-          ))}
+            <button
+              type="button"
+              onClick={() => setOpen(false)}
+              aria-label="Close Trash"
+              className="-mr-1 rounded-md p-1 text-text-muted hover:bg-surface-700/50 hover:text-text-primary cursor-pointer transition-colors"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+
+          <div className="min-h-0 flex-1 overflow-y-auto p-2">
+            <div className="space-y-1">
+              {trashedWorkspaces.map((ws) => {
+                const sessionCount = ws.sessions.length;
+                const sessionLabel = sessionCount === 1 ? "1 session" : `${sessionCount} sessions`;
+                return (
+                  <div
+                    key={ws.id}
+                    data-testid="sidebar-trash-row"
+                    className="rounded-md border border-surface-700/30 bg-surface-900/20 px-3 py-2.5 text-[13px] text-text-secondary"
+                  >
+                    <div className="min-w-0">
+                      <div className="truncate font-medium text-text-primary" title={ws.displayName}>
+                        {ws.displayName}
+                      </div>
+                      <div className="mt-0.5 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-text-dim">
+                        <span className="max-w-full truncate font-mono" title={ws.projectPath}>
+                          {ws.projectPath}
+                        </span>
+                        {ws.branch && (
+                          <span className="max-w-full truncate font-mono text-accent-500" title={ws.branch}>
+                            {ws.branch}
+                          </span>
+                        )}
+                        <span>{sessionLabel}</span>
+                      </div>
+                    </div>
+                    <div className="mt-2 flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setOpen(false);
+                          onOpen(ws.id, { metaKey: false, ctrlKey: false, shiftKey: false });
+                        }}
+                        data-testid="sidebar-trash-open"
+                        className="inline-flex h-7 items-center rounded-md border border-surface-700/50 px-2.5 text-[12px] font-medium text-text-secondary hover:border-surface-600 hover:bg-surface-700/40 hover:text-text-primary cursor-pointer transition-colors"
+                      >
+                        Open
+                      </button>
+                      {!readOnly && (
+                        <>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const ids = ws.sessions.map((s) => s.id);
+                              if (ids.length > 0) onRestore(ids);
+                            }}
+                            data-testid="sidebar-trash-restore"
+                            title="Restore"
+                            aria-label="Restore"
+                            className="inline-flex h-7 items-center gap-1.5 rounded-md border border-accent-500/30 bg-accent-500/10 px-2.5 text-[12px] font-medium text-accent-500 hover:border-accent-500/50 hover:bg-accent-500/15 hover:text-accent-600 cursor-pointer transition-colors"
+                          >
+                            <RotateCcw className="h-3.5 w-3.5 shrink-0" />
+                            Restore
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setOpen(false);
+                              onDelete(ws.id);
+                            }}
+                            data-testid="sidebar-trash-purge"
+                            title="Delete permanently"
+                            aria-label="Delete permanently"
+                            className="inline-flex h-7 items-center gap-1.5 rounded-md border border-status-error/30 bg-status-error/10 px-2.5 text-[12px] font-medium text-status-error/85 hover:border-status-error/50 hover:bg-status-error/15 hover:text-status-error cursor-pointer transition-colors"
+                          >
+                            <X className="h-3.5 w-3.5 shrink-0" />
+                            Delete
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
         </div>
       )}
     </div>
@@ -3430,7 +3487,7 @@ export function WorkspaceSidebar({
           <button
             onClick={onSettings}
             {...tourAnchor(TOUR_ANCHORS.sidebarSettings)}
-            className="w-8 h-8 flex items-center justify-center text-text-secondary hover:text-text-primary hover:bg-surface-800/50 cursor-pointer rounded-md transition-colors"
+            className="w-8 h-8 shrink-0 flex items-center justify-center text-text-secondary hover:text-text-primary hover:bg-surface-800/50 cursor-pointer rounded-md transition-colors"
             title="Settings"
             aria-label="Settings"
           >
