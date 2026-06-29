@@ -139,7 +139,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: nixbuild/nix-quick-install-action@2c9db80fb984ceb1bcaa77cdda3fdf8cfba92035 # v34
+      - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
       - name: Evaluate flake outputs (all systems)
         run: |
           set -euo pipefail
@@ -230,7 +230,7 @@ jobs:
             echo "relevant=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: nixbuild/nix-quick-install-action@2c9db80fb984ceb1bcaa77cdda3fdf8cfba92035 # v34
+      - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
         if: steps.changes.outputs.relevant == 'true'
 
       - name: Build aoe-web-frontend
