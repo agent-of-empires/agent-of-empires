@@ -20,10 +20,10 @@ interface Handle {
   failRestore: boolean;
 }
 
-function sessionPayload(trashed: boolean) {
+function sessionPayload(trashed: boolean, title = "story-trash") {
   return {
     id: "sess-trash",
-    title: "story-trash",
+    title,
     project_path: "/tmp/story",
     group_path: "/tmp",
     tool: "claude",
@@ -45,7 +45,7 @@ function sessionPayload(trashed: boolean) {
   };
 }
 
-async function mockApis(page: Page): Promise<Handle> {
+async function mockApis(page: Page, options: { title?: string } = {}): Promise<Handle> {
   const handle: Handle = {
     trashed: false,
     trashCalls: 0,
@@ -58,7 +58,7 @@ async function mockApis(page: Page): Promise<Handle> {
   await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
   await page.route("**/api/sessions", (r) => {
     if (r.request().method() !== "GET") return r.fulfill({ status: 400 });
-    const sessions = handle.deletes > 0 ? [] : [sessionPayload(handle.trashed)];
+    const sessions = handle.deletes > 0 ? [] : [sessionPayload(handle.trashed, options.title)];
     return r.fulfill({ json: { sessions, workspace_ordering: [] } });
   });
   await page.route("**/api/sessions/sess-trash/trash", (r) => {
@@ -66,14 +66,14 @@ async function mockApis(page: Page): Promise<Handle> {
     handle.trashCalls += 1;
     if (handle.failTrash) return r.fulfill({ status: 500, body: "boom" });
     handle.trashed = true;
-    return r.fulfill({ json: sessionPayload(true) });
+    return r.fulfill({ json: sessionPayload(true, options.title) });
   });
   await page.route("**/api/sessions/sess-trash/restore", (r) => {
     if (r.request().method() !== "POST") return r.fulfill({ status: 400 });
     handle.restoreCalls += 1;
     if (handle.failRestore) return r.fulfill({ status: 500, body: "boom" });
     handle.trashed = false;
-    return r.fulfill({ json: sessionPayload(false) });
+    return r.fulfill({ json: sessionPayload(false, options.title) });
   });
   await page.route("**/api/sessions/sess-trash", (r) => {
     if (r.request().method() !== "DELETE") return r.fulfill({ status: 400 });
@@ -163,6 +163,35 @@ test.describe("Session trash flow", () => {
     const dialog = page.locator('[data-testid="delete-session-dialog"]');
     await expect(dialog).toBeVisible({ timeout: 5_000 });
     await expect(dialog.locator('[data-testid="delete-session-permanent"]')).toHaveCount(0);
+    await dialog.getByRole("button", { name: /^Delete$/ }).click();
+    await expect.poll(() => handle.deletes, { timeout: 10_000 }).toBe(1);
+  });
+
+  test("long trashed session names keep Trash actions and the delete dialog usable", async ({ page }) => {
+    const longTitle = `story-trash-${"x".repeat(240)}`;
+    const handle = await mockApis(page, { title: longTitle });
+    handle.trashed = true;
+    await page.setViewportSize({ width: 1280, height: 720 });
+
+    await page.goto("/");
+    await page.locator('[data-testid="sidebar-trash-toggle"]').click();
+    const trashRow = page.locator('[data-testid="sidebar-trash-row"]').filter({ hasText: longTitle });
+    await expect(trashRow).toBeVisible({ timeout: 10_000 });
+
+    await expect(trashRow.locator('[data-testid="sidebar-trash-restore"]')).toBeInViewport({ ratio: 1 });
+    const purge = trashRow.locator('[data-testid="sidebar-trash-purge"]');
+    await expect(purge).toBeInViewport({ ratio: 1 });
+
+    await purge.click();
+    const dialog = page.locator('[data-testid="delete-session-dialog"]');
+    await expect(dialog).toBeVisible({ timeout: 5_000 });
+    await expect(dialog).toContainText(longTitle);
+    await expect(dialog.getByRole("button", { name: /^Delete$/ })).toBeInViewport({ ratio: 1 });
+    const panelFits = await dialog.locator('[data-testid="delete-session-dialog-panel"]').evaluate((node) => {
+      return node.scrollWidth <= node.clientWidth;
+    });
+    expect(panelFits).toBe(true);
+
     await dialog.getByRole("button", { name: /^Delete$/ }).click();
     await expect.poll(() => handle.deletes, { timeout: 10_000 }).toBe(1);
   });

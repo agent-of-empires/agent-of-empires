@@ -120,6 +120,7 @@ export function DeleteSessionDialog({
       onClick={onCancel}
     >
       <div
+        data-testid="delete-session-dialog-panel"
         className="bg-surface-800 border border-surface-700/50 rounded-lg w-[420px] max-w-[90vw] shadow-2xl animate-slide-up"
         onClick={(e) => e.stopPropagation()}
       >
@@ -133,7 +134,7 @@ export function DeleteSessionDialog({
         {/* Body */}
         <div className="px-5 py-4 space-y-3">
           <p className="text-[13px] text-text-secondary">
-            Delete <span className="font-mono text-text-primary">{sessionTitle}</span>?
+            Delete <span className="font-mono text-text-primary break-all">{sessionTitle}</span>?
           </p>
 
           {extraSessionCount > 0 && (

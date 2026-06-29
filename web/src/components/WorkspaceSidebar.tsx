@@ -559,7 +559,7 @@ function TrashMenu({
         <div
           role="menu"
           data-testid="sidebar-trash-menu"
-          className="absolute bottom-full mb-1 left-0 min-w-[220px] max-h-[50vh] overflow-y-auto bg-surface-800 border border-surface-700/50 rounded-md shadow-xl py-1 z-50 animate-fade-in"
+          className="absolute bottom-full mb-1 left-0 w-[220px] max-w-[calc(100vw-1rem)] max-h-[50vh] overflow-y-auto bg-surface-800 border border-surface-700/50 rounded-md shadow-xl py-1 z-50 animate-fade-in"
         >
           <div className="px-3 py-1.5 text-[11px] font-mono uppercase tracking-widest text-text-muted">
             Trash ({count})
@@ -570,15 +570,17 @@ function TrashMenu({
               data-testid="sidebar-trash-row"
               className="flex items-center gap-2 px-3 py-1.5 text-[13px] text-text-secondary"
             >
-              <button
-                type="button"
-                onClick={(e) => onOpen(ws.id, e)}
-                title={ws.displayName}
-                data-testid="sidebar-trash-open"
-                className="flex-1 truncate text-left hover:text-text-primary cursor-pointer"
-              >
-                {ws.displayName}
-              </button>
+              <div className="min-w-0 flex-1">
+                <button
+                  type="button"
+                  onClick={(e) => onOpen(ws.id, e)}
+                  title={ws.displayName}
+                  data-testid="sidebar-trash-open"
+                  className="block w-full truncate text-left hover:text-text-primary cursor-pointer"
+                >
+                  {ws.displayName}
+                </button>
+              </div>
               {!readOnly && (
                 <>
                   <button
@@ -589,7 +591,7 @@ function TrashMenu({
                     data-testid="sidebar-trash-restore"
                     title="Restore"
                     aria-label="Restore"
-                    className="text-accent-500 hover:text-accent-600 cursor-pointer"
+                    className="shrink-0 text-accent-500 hover:text-accent-600 cursor-pointer"
                   >
                     <RotateCcw className="h-3.5 w-3.5" />
                   </button>
@@ -598,7 +600,7 @@ function TrashMenu({
                     data-testid="sidebar-trash-purge"
                     title="Delete permanently"
                     aria-label="Delete permanently"
-                    className="text-status-error/80 hover:text-status-error cursor-pointer"
+                    className="shrink-0 text-status-error/80 hover:text-status-error cursor-pointer"
                   >
                     <X className="h-3.5 w-3.5" />
                   </button>
