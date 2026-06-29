@@ -81,9 +81,11 @@ A request, and the response your `status` handler returns:
 {"jsonrpc": "2.0", "id": 1, "result": {"ok": true, "message": "running"}}
 ```
 
-The host maps a command id to a method, so dispatch on the trailing segment of
-`method`. Return a JSON-RPC error with code `-32601` for an unknown method. A
-message with no `id` is a notification; do not respond to it.
+The host maps a command id to a fully namespaced method, `plugin.<id>.<command-id>`,
+so the example above is abbreviated: a worker for `dev.example.my-plugin` actually
+receives `plugin.dev.example.my-plugin.status`. Dispatch on the trailing segment of
+`method` so either form works. Return a JSON-RPC error with code `-32601` for an
+unknown method. A message with no `id` is a notification; do not respond to it.
 
 ## Build and launch
 
