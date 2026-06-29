@@ -67,7 +67,7 @@ impl AgentRegistry {
     ///   claude   → claude-agent-acp     (Zed adapter for Claude SDK)
     ///   opencode → `opencode acp`       (native, SST)
     ///   gemini   → `gemini --acp`       (native, Google)
-    ///   codex    → codex-acp            (Zed adapter, OpenAI Codex CLI)
+    ///   codex    → codex-acp            (ACP adapter, OpenAI Codex CLI)
     ///   vibe     → vibe-acp             (native, Mistral)
     ///   pi       → pi-acp               (adapter, Pi coding agent)
     ///
@@ -127,7 +127,7 @@ impl AgentRegistry {
                 command: "codex-acp".into(),
                 args: vec![],
                 description:
-                    "OpenAI Codex CLI via Zed adapter (npm i -g @zed-industries/codex-acp)".into(),
+                    "OpenAI Codex CLI via ACP adapter (npm i -g @agentclientprotocol/codex-acp@latest)".into(),
                 env_allowlist: None,
             },
         );

@@ -611,7 +611,7 @@ mod tests {
 
     #[test]
     fn non_claude_permissive_on_old_version() {
-        let init = make_init("@zed-industries/codex-acp", "0.0.1");
+        let init = make_init("@agentclientprotocol/codex-acp", "0.0.1");
         validate(ExpectedAgent::CodexAcp, &init).unwrap();
     }
 

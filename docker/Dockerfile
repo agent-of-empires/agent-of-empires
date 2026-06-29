@@ -80,7 +80,7 @@ RUN npm install -g @qwen-code/qwen-code
 # CLIs above.
 RUN npm install -g \
     @agentclientprotocol/claude-agent-acp@^0.49.0 \
-    @zed-industries/codex-acp \
+    @agentclientprotocol/codex-acp@latest \
     pi-acp
 
 # Create directories for credential mounts

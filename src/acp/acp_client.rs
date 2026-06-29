@@ -8588,7 +8588,9 @@ mod tests {
             AcpError::Spawn(msg) => {
                 assert!(msg.contains("codex-acp"), "should echo the binary: {msg}");
                 assert!(
-                    msg.contains("Install with: npm install -g @zed-industries/codex-acp"),
+                    msg.contains(
+                        "Install with: npm install -g @agentclientprotocol/codex-acp@latest"
+                    ),
                     "should append the exact install command: {msg}"
                 );
             }

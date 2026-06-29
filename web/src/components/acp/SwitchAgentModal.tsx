@@ -190,7 +190,7 @@ export function SwitchAgentModal({ open, sessionId, currentAgent, onClose, onPre
         ) : agents.length === 0 ? (
           <div className="mt-4 text-xs text-status-error">
             No alternative structured view agents are registered. Install one (e.g. `npm i -g
-            @zed-industries/codex-acp`) and try again.
+            @agentclientprotocol/codex-acp@latest`) and try again.
           </div>
         ) : (
           <ul className="mt-4 max-h-64 space-y-1 overflow-y-auto">

@@ -129,7 +129,7 @@ describe("installAcpAgent", () => {
   it("POSTs to /api/sessions/:id/acp/install-agent and returns the parsed body", async () => {
     const body = {
       session_id: "s-1",
-      package: "@zed-industries/codex-acp",
+      package: "@agentclientprotocol/codex-acp@latest",
       success: true,
       exit_code: 0,
       stdout: "added 1 package",

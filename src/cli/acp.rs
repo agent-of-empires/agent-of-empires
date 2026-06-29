@@ -213,7 +213,7 @@ const NPM_INSTALLABLE_ACP: &[(&str, &str)] = &[
         "claude-agent-acp",
         "@agentclientprotocol/claude-agent-acp@latest",
     ),
-    ("codex-acp", "@zed-industries/codex-acp"),
+    ("codex-acp", "@agentclientprotocol/codex-acp@latest"),
     ("pi-acp", "pi-acp"),
 ];
 

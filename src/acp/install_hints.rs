@@ -9,7 +9,7 @@
 pub fn install_hint_for(binary: &str) -> Option<&'static str> {
     Some(match binary {
         "claude-agent-acp" => "npm install -g @agentclientprotocol/claude-agent-acp@latest",
-        "codex-acp" => "npm install -g @zed-industries/codex-acp",
+        "codex-acp" => "npm install -g @agentclientprotocol/codex-acp@latest",
         "pi-acp" => {
             "npm install -g pi-acp (also requires `npm install -g @earendil-works/pi-coding-agent`)"
         }
@@ -31,7 +31,7 @@ pub fn install_hint_for(binary: &str) -> Option<&'static str> {
 pub fn npm_package_for(binary: &str) -> Option<&'static str> {
     Some(match binary {
         "claude-agent-acp" => "@agentclientprotocol/claude-agent-acp@latest",
-        "codex-acp" => "@zed-industries/codex-acp",
+        "codex-acp" => "@agentclientprotocol/codex-acp@latest",
         "gemini" => "@google/gemini-cli",
         _ => return None,
     })
@@ -45,7 +45,7 @@ mod tests {
     fn npm_package_only_for_clean_npm_agents() {
         assert_eq!(
             npm_package_for("codex-acp"),
-            Some("@zed-industries/codex-acp")
+            Some("@agentclientprotocol/codex-acp@latest")
         );
         assert_eq!(
             npm_package_for("claude-agent-acp"),
