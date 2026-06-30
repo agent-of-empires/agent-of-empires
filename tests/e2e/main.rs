@@ -34,6 +34,7 @@ mod filewatch_tui_burst_reload;
 mod filewatch_tui_dynamic_profile;
 mod filewatch_tui_reload;
 mod fork_cli;
+mod fork_structured_e2e;
 mod intro;
 mod kiro_launch;
 mod logs;

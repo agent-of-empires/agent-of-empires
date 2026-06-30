@@ -334,6 +334,17 @@ const INITIALIZE_RESULT = {
   protocolVersion: 1,
   agentCapabilities: {
     loadSession: true,
+    // Advertise the unstable session lifecycle methods the real
+    // claude-agent-acp exposes. Only `fork` is consulted by aoe's structured
+    // fork gate (session_capabilities.fork.is_some()); the rest mirror the
+    // real shape so the fixture stays realistic.
+    sessionCapabilities: {
+      fork: {},
+      resume: {},
+      list: {},
+      close: {},
+      delete: {},
+    },
     promptCapabilities: {
       image: false,
       embeddedContext: false,
@@ -544,6 +555,50 @@ async function handleRequest(msg) {
           });
         });
       }
+      return;
+    }
+
+    case "session/fork": {
+      // Mirror claude-agent-acp's unstable_forkSession: mint a brand-new
+      // session id distinct from the parent (params.sessionId) rather than
+      // echoing it, and carry the same configOptions shape session/new ships
+      // so the structured view hydrates the forked session's selectors.
+      // Tag the forked id so the e2e can prove session/fork (not session/new)
+      // minted it: a plain new or structured session carries a "fake-acp-"
+      // id from makeSessionId(), so only a real session/fork yields the
+      // "fork-" marker.
+      const forkedId = `fake-acp-fork-${randomBytes(4).toString("hex")}`;
+      const includeForkConfigOptions = process.env.FAKE_ACP_EMIT_CONFIG_OPTIONS !== "0";
+      const result = { sessionId: forkedId };
+      if (includeForkConfigOptions) {
+        result.configOptions = [
+          {
+            id: "model",
+            name: "Model",
+            category: "model",
+            type: "select",
+            currentValue: "claude-opus-4-7",
+            options: [
+              { value: "claude-opus-4-7", name: "Claude Opus 4.7" },
+              { value: "claude-sonnet-4-6", name: "Claude Sonnet 4.6" },
+            ],
+          },
+          {
+            id: "effort",
+            name: "Reasoning Effort",
+            category: "thought_level",
+            type: "select",
+            currentValue: "default",
+            options: [
+              { value: "default", name: "Default" },
+              { value: "low", name: "Low" },
+              { value: "medium", name: "Medium" },
+              { value: "high", name: "High" },
+            ],
+          },
+        ];
+      }
+      sendResult(id, result);
       return;
     }
 

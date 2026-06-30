@@ -3655,6 +3655,30 @@ pub struct CreateSessionBody {
     pub fork_from: Option<String>,
 }
 
+/// Resolve the one-shot fork seed for a `fork_from` create request. A
+/// structured request (`structured == true`) forks through ACP `session/fork`
+/// against the parent's `acp_session_id`; a terminal request resumes the
+/// parent agent id with the agent's fork flag, generating a fresh child id.
+/// `Err` reports an unforkable terminal agent or missing parent id; structured
+/// forks defer that check to the live `session/fork` handshake.
+#[cfg(feature = "serve")]
+fn resolve_create_fork_seed(
+    tool: &str,
+    parent_id: &str,
+    structured: bool,
+) -> Result<crate::session::ForkSeed, crate::session::ForkDenied> {
+    if structured {
+        return Ok(crate::session::ForkSeed::Structured {
+            parent_acp_session_id: parent_id.to_string(),
+        });
+    }
+    crate::session::fork::terminal_fork_seed(
+        tool,
+        Some(parent_id),
+        crate::session::capture::generate_claude_session_id(),
+    )
+}
+
 fn validate_session_tool_identity(
     tool: &str,
     profile: &str,
@@ -4098,11 +4122,15 @@ pub async fn create_session(
         }
     }
 
-    // Forking an existing session (terminal): `fork_from` carries the source
-    // session's captured agent session id. Resolve eligibility here, ahead of
-    // the build, so an unforkable agent or a missing parent id returns a clean
-    // 400 rather than failing later. The seed is then applied by the builder,
-    // which pre-pins the child id and sets the one-shot Fork intent.
+    // Forking an existing session: `fork_from` carries the source session's
+    // captured session id. A structured request (`view == Structured`) forks
+    // through ACP `session/fork` against the parent's `acp_session_id`; a
+    // terminal request resumes the parent agent id with the agent's fork flag.
+    // The seed is resolved here, ahead of the build, so an unforkable terminal
+    // agent or a missing parent id returns a clean 400 rather than failing
+    // later. The builder applies the seed: a structured seed forces the
+    // structured view and sets the one-shot `fork_pending`/`import_pending`
+    // markers; a terminal seed pre-pins the child id and the Fork intent.
     #[cfg(feature = "serve")]
     let fork_seed = match body
         .fork_from
@@ -4110,23 +4138,22 @@ pub async fn create_session(
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        Some(parent_id) => match crate::session::fork::terminal_fork_seed(
-            &body.tool,
-            Some(parent_id),
-            crate::session::capture::generate_claude_session_id(),
-        ) {
-            Ok(seed) => Some(seed),
-            Err(_) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": "fork_unsupported",
-                        "message": "This agent or session cannot be forked",
-                    })),
-                )
-                    .into_response();
+        Some(parent_id) => {
+            let structured = body.view == crate::session::View::Structured;
+            match resolve_create_fork_seed(&body.tool, parent_id, structured) {
+                Ok(seed) => Some(seed),
+                Err(_) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": "fork_unsupported",
+                            "message": "This agent or session cannot be forked",
+                        })),
+                    )
+                        .into_response();
+                }
             }
-        },
+        }
         None => None,
     };
 
@@ -4290,11 +4317,18 @@ pub async fn create_session(
                     .is_some_and(|cmd| {
                         crate::acp::AgentSpec::from_acp_cmd(&instance.tool, cmd).is_ok()
                     });
-                instance.view = if capable {
-                    crate::session::View::Structured
+                if capable {
+                    instance.view = crate::session::View::Structured;
                 } else {
-                    crate::session::View::Terminal
-                };
+                    instance.view = crate::session::View::Terminal;
+                    // A non-ACP tool cannot run the structured session/fork
+                    // handshake. If a malformed request seeded a structured
+                    // fork (fork_pending/import_pending set by the builder),
+                    // drop those markers so a later switch-to-structured does
+                    // not fire an unexpected session/fork against the parent.
+                    instance.fork_pending = None;
+                    instance.import_pending = None;
+                }
             }
 
             if !instance.is_structured() {
@@ -6024,15 +6058,11 @@ mod tests {
 
     #[test]
     fn fork_from_builds_terminal_seed_for_claude() {
-        // The create handler resolves `fork_from` through the shared
+        // A non-structured (terminal) fork resolves through the shared
         // `terminal_fork_seed` helper; a claude parent id yields a Terminal
         // seed whose child id is a fresh, valid session id.
-        let seed = crate::session::fork::terminal_fork_seed(
-            "claude",
-            Some("parent-uuid"),
-            crate::session::capture::generate_claude_session_id(),
-        )
-        .expect("claude fork allowed");
+        let seed = resolve_create_fork_seed("claude", "parent-uuid", false)
+            .expect("claude terminal fork allowed");
         match seed {
             crate::session::ForkSeed::Terminal {
                 parent_agent_session_id,
@@ -6045,6 +6075,22 @@ mod tests {
             }
             _ => panic!("expected Terminal seed"),
         }
+    }
+
+    #[test]
+    fn fork_from_builds_structured_seed_when_view_is_structured() {
+        // A structured fork carries the parent's acp_session_id straight onto a
+        // Structured seed; the builder turns that into the one-shot
+        // fork_pending marker and the live session/fork handshake mints the
+        // child id. The terminal forkability check is intentionally skipped.
+        let seed = resolve_create_fork_seed("claude", "parent-acp-id", true)
+            .expect("structured fork seed is always allowed at create time");
+        assert_eq!(
+            seed,
+            crate::session::ForkSeed::Structured {
+                parent_acp_session_id: "parent-acp-id".into(),
+            }
+        );
     }
 
     #[test]
