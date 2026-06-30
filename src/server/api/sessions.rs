@@ -3655,12 +3655,15 @@ pub struct CreateSessionBody {
     #[cfg(feature = "serve")]
     #[serde(default)]
     pub import_acp_session_id: Option<String>,
-    /// Fork an existing session: the source session's captured agent session
-    /// id (terminal) to resume and diverge from. Pass the source session's
-    /// `agent_session_id`, not the AoE session id; the new session resumes
-    /// that conversation as an independent session (the original is left
-    /// untouched). Terminal fork only via this field; structured (ACP) fork is
-    /// requested separately.
+    /// Fork an existing session: the source session's captured session id to
+    /// resume and diverge from. The new session resumes that conversation as an
+    /// independent session (the original is left untouched). The kind of fork
+    /// follows `view`/the tool: when `view == Structured` and the tool is
+    /// ACP-capable, this drives a structured ACP `session/fork` against the
+    /// parent's `acp_session_id`; otherwise it drives a terminal fork that
+    /// resumes the parent `agent_session_id` with the agent's fork flag. A
+    /// structured fork requested for a non-ACP agent is rejected rather than
+    /// silently downgraded.
     #[cfg(feature = "serve")]
     #[serde(default)]
     pub fork_from: Option<String>,
@@ -3688,6 +3691,43 @@ fn resolve_create_fork_seed(
         Some(parent_id),
         crate::session::capture::generate_claude_session_id(),
     )
+}
+
+/// True when a create request asks to both import an existing session and fork
+/// a parent. The two seed the new session from different sources, so allowing
+/// both would produce a contradictory half-imported, half-forked session.
+/// Trailing whitespace is treated as unset, matching the per-field guards.
+#[cfg(feature = "serve")]
+fn both_import_and_fork_set(body: &CreateSessionBody) -> bool {
+    let set = |v: &Option<String>| v.as_deref().map(str::trim).is_some_and(|s| !s.is_empty());
+    set(&body.import_acp_session_id) && set(&body.fork_from)
+}
+
+/// Whether `tool`/`agent_name` can run the structured ACP `session/fork`
+/// handshake. A structured fork seeds an empty event store and replays history
+/// over a live ACP connection, which only an ACP-capable agent provides; a
+/// non-ACP agent would otherwise be silently downgraded to a non-forked
+/// terminal session. Mirrors the post-build capability re-resolution so the
+/// create path fails closed before any worktree is provisioned.
+#[cfg(feature = "serve")]
+fn agent_supports_structured_fork(
+    tool: &str,
+    agent_name: Option<&str>,
+    profile: &str,
+    project_path: &std::path::Path,
+) -> bool {
+    let resolved = agent_name.filter(|s| !s.is_empty()).unwrap_or(tool);
+    if crate::acp::AgentRegistry::with_defaults()
+        .get(resolved)
+        .is_some()
+    {
+        return true;
+    }
+    crate::session::repo_config::resolve_config_with_repo_or_warn(profile, project_path)
+        .session
+        .agent_acp_cmd
+        .get(tool)
+        .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(tool, cmd).is_ok())
 }
 
 fn validate_session_tool_identity(
@@ -4085,6 +4125,22 @@ pub async fn create_session(
             .into_response();
     }
 
+    // Import and fork are mutually exclusive: each seeds the new session from a
+    // different source (import adopts an on-disk session id; fork resumes a
+    // parent's captured id), and honoring both would leave the session in a
+    // contradictory half-imported, half-forked state. Reject up front.
+    #[cfg(feature = "serve")]
+    if both_import_and_fork_set(&body) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid_request",
+                "message": "Cannot set both import_acp_session_id and fork_from",
+            })),
+        )
+            .into_response();
+    }
+
     // Importing an existing Claude session (#2276) is tightly scoped: it
     // resumes a specific on-disk session id in its original cwd via the claude
     // structured agent. Reject any request that pairs the id with a different
@@ -4150,7 +4206,41 @@ pub async fn create_session(
         .filter(|s| !s.is_empty())
     {
         Some(parent_id) => {
+            // Reject a malformed parent id up front. `build_fork_flags` fails
+            // closed on an invalid id (no fork flags), which would otherwise
+            // start a fresh, non-forked session with no error to the caller.
+            if !crate::session::capture::is_valid_session_id(parent_id) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "fork_invalid",
+                        "message": "fork_from is not a valid session id",
+                    })),
+                )
+                    .into_response();
+            }
             let structured = body.view == crate::session::View::Structured;
+            // A structured fork only runs over a live ACP connection. Reject it
+            // here for a non-ACP agent rather than letting the post-build
+            // capability check silently downgrade it to a non-forked terminal
+            // session (the fork markers would be cleared, dropping the fork).
+            if structured
+                && !agent_supports_structured_fork(
+                    &body.tool,
+                    body.agent_name.as_deref(),
+                    validation_profile,
+                    std::path::Path::new(&body.path),
+                )
+            {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "fork_unsupported",
+                        "message": "A structured fork requires an ACP-capable agent",
+                    })),
+                )
+                    .into_response();
+            }
             match resolve_create_fork_seed(&body.tool, parent_id, structured) {
                 Ok(seed) => Some(seed),
                 Err(_) => {
@@ -6102,6 +6192,73 @@ mod tests {
                 parent_acp_session_id: "parent-acp-id".into(),
             }
         );
+    }
+
+    fn create_body_from_json(value: serde_json::Value) -> CreateSessionBody {
+        serde_json::from_value(value).expect("valid CreateSessionBody")
+    }
+
+    #[test]
+    fn both_import_and_fork_rejected() {
+        // A request that sets both seeds the session from two contradictory
+        // sources; the create handler rejects it before doing any work.
+        let body = create_body_from_json(serde_json::json!({
+            "path": "/tmp/p",
+            "tool": "claude",
+            "import_acp_session_id": "import-id",
+            "fork_from": "parent-id",
+        }));
+        assert!(both_import_and_fork_set(&body));
+
+        // Either alone is fine; trailing whitespace counts as unset.
+        let import_only = create_body_from_json(serde_json::json!({
+            "path": "/tmp/p", "tool": "claude", "import_acp_session_id": "import-id",
+        }));
+        assert!(!both_import_and_fork_set(&import_only));
+        let fork_only = create_body_from_json(serde_json::json!({
+            "path": "/tmp/p", "tool": "claude", "fork_from": "parent-id",
+        }));
+        assert!(!both_import_and_fork_set(&fork_only));
+        let blank_fork = create_body_from_json(serde_json::json!({
+            "path": "/tmp/p",
+            "tool": "claude",
+            "import_acp_session_id": "import-id",
+            "fork_from": "   ",
+        }));
+        assert!(!both_import_and_fork_set(&blank_fork));
+    }
+
+    #[test]
+    fn invalid_fork_id_is_rejected_by_create_guard() {
+        // The create path gates `fork_from` on `is_valid_session_id` so a
+        // malformed id can't slip through to `build_fork_flags`, which fails
+        // closed (no fork flags) and would silently start a fresh session.
+        use crate::session::capture::is_valid_session_id;
+        assert!(!is_valid_session_id("../etc/passwd"));
+        assert!(!is_valid_session_id("has spaces"));
+        assert!(!is_valid_session_id("slash/id"));
+        // A well-formed id still passes the same gate.
+        assert!(is_valid_session_id("parent-uuid_123.v2"));
+    }
+
+    #[test]
+    fn structured_fork_requires_acp_capable_agent() {
+        // claude is in the default ACP registry, so a structured fork is
+        // allowed. An unknown / non-ACP tool is not, so the create path rejects
+        // the structured fork rather than silently downgrading it to terminal.
+        let nonexistent = std::path::Path::new("/tmp/aoe-no-such-repo-for-test");
+        assert!(agent_supports_structured_fork(
+            "claude",
+            None,
+            "default",
+            nonexistent
+        ));
+        assert!(!agent_supports_structured_fork(
+            "definitely-not-an-acp-agent",
+            None,
+            "default",
+            nonexistent,
+        ));
     }
 
     #[test]
