@@ -272,6 +272,150 @@ fn refused_scratch_fork_leaves_no_orphaned_dir() {
     );
 }
 
+/// Forking from a session whose own fork has not launched yet is refused. Such
+/// a source still carries a one-shot `Fork` resume intent and a pre-pinned
+/// child `agent_session_id` that no agent has written, so forking from it would
+/// resume a conversation that does not exist. The gate keys off `resume_intent`,
+/// not the (synthetic) captured id.
+#[test]
+#[serial]
+fn fork_from_unlaunched_fork_is_refused() {
+    let h = TuiTestHarness::new("fork_cli_unlaunched_fork");
+    let project = h.project_path();
+
+    let parent = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "--cmd",
+        "claude",
+        "-t",
+        "PendingFork",
+    ]);
+    assert!(parent.status.success(), "aoe add parent failed");
+
+    // Make the source look like an unlaunched fork: a pre-pinned (synthetic)
+    // child id plus a one-shot Fork intent, exactly what a forked-but-not-yet-
+    // started session persists.
+    let mut sessions = read_sessions(&h);
+    let arr = sessions.as_array_mut().expect("sessions array");
+    let src = arr
+        .iter_mut()
+        .find(|s| s["title"].as_str() == Some("PendingFork"))
+        .expect("source session present");
+    src["agent_session_id"] =
+        serde_json::Value::String("99999999-8888-7777-6666-555555555555".to_string());
+    src["resume_intent"] = serde_json::json!({
+        "kind": "Fork",
+        "value": { "from": "11111111-2222-3333-4444-555555555555" }
+    });
+    std::fs::write(
+        sessions_path(&h),
+        serde_json::to_string_pretty(&sessions).unwrap(),
+    )
+    .expect("write seeded sessions.json");
+
+    let child = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "--cmd",
+        "claude",
+        "-t",
+        "WouldBeGrandchild",
+        "--fork-from",
+        "PendingFork",
+    ]);
+    assert!(
+        !child.status.success(),
+        "fork from an unlaunched fork must fail"
+    );
+    let stderr = String::from_utf8_lossy(&child.stderr);
+    assert!(
+        stderr.contains("its own fork has not launched yet"),
+        "expected an 'unlaunched fork' message, got: {stderr}"
+    );
+
+    let sessions = read_sessions(&h);
+    assert!(
+        sessions
+            .as_array()
+            .map(|arr| arr
+                .iter()
+                .all(|s| s["title"].as_str() != Some("WouldBeGrandchild")))
+            .unwrap_or(true),
+        "no child session should have been persisted on a refused fork"
+    );
+}
+
+/// `--fork-from` is a terminal-only fork; combining it with `--structured-view`
+/// would write terminal fork state onto a structured session. The CLI rejects
+/// the combination up front. This flag only exists in `--features serve`.
+#[cfg(feature = "serve")]
+#[test]
+#[serial]
+fn fork_from_with_structured_view_is_refused() {
+    let h = TuiTestHarness::new("fork_cli_structured_reject");
+    let project = h.project_path();
+
+    let parent = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "--cmd",
+        "claude",
+        "-t",
+        "StructForkParent",
+    ]);
+    assert!(parent.status.success(), "aoe add parent failed");
+
+    // Seed a captured id so the request would otherwise reach the seed apply
+    // step: the structured-view rejection must fire regardless.
+    let parent_agent_id = "abcdef00-1111-2222-3333-444444444444";
+    let mut sessions = read_sessions(&h);
+    sessions
+        .as_array_mut()
+        .expect("sessions array")
+        .iter_mut()
+        .find(|s| s["title"].as_str() == Some("StructForkParent"))
+        .expect("parent present")["agent_session_id"] =
+        serde_json::Value::String(parent_agent_id.to_string());
+    std::fs::write(
+        sessions_path(&h),
+        serde_json::to_string_pretty(&sessions).unwrap(),
+    )
+    .expect("write seeded sessions.json");
+
+    let child = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "--cmd",
+        "claude",
+        "-t",
+        "StructForkChild",
+        "--fork-from",
+        "StructForkParent",
+        "--structured-view",
+    ]);
+    assert!(
+        !child.status.success(),
+        "--fork-from --structured-view must fail"
+    );
+    let stderr = String::from_utf8_lossy(&child.stderr);
+    assert!(
+        stderr.contains("cannot be combined with"),
+        "expected an incompatible-flags message, got: {stderr}"
+    );
+
+    let sessions = read_sessions(&h);
+    assert!(
+        sessions
+            .as_array()
+            .map(|arr| arr
+                .iter()
+                .all(|s| s["title"].as_str() != Some("StructForkChild")))
+            .unwrap_or(true),
+        "no child session should have been persisted on a rejected combination"
+    );
+}
+
 /// Forking with an agent whose CLI has no fork capability is refused with a
 /// clear message naming the agent. `gemini` is resume-only (no fork flag); a
 /// PATH stub lets `aoe add --tool gemini` reach the fork gate without the real

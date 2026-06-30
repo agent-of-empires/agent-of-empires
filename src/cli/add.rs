@@ -253,6 +253,20 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     // static fork strategy), so it is safe to run before resource creation.
     let fork_seed: Option<crate::session::ForkSeed> = if let Some(fork_ref) = &args.fork_from {
         let source = super::resolve_session(fork_ref, &instances)?;
+        // A source that was itself created as a fork and has not launched yet
+        // still carries a one-shot Fork intent, and its `agent_session_id` is a
+        // pre-pinned child id that no agent has written to disk. Forking from it
+        // would resume a conversation that does not exist. Refuse until the
+        // child has run once and owns a real captured id.
+        if matches!(
+            source.resume_intent,
+            crate::session::ResumeIntent::Fork { .. }
+        ) {
+            bail!(
+                "Cannot fork from session '{}': its own fork has not launched yet. Start it once, then fork from the child conversation.",
+                source.title
+            );
+        }
         let parent_agent_session_id = source.agent_session_id.clone();
         let seed = crate::session::fork::terminal_fork_seed(
             &resolved_tool,
@@ -566,6 +580,17 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         // than a silent downgrade.
         let user_picked_agent = args.agent.is_some();
         let user_wants_structured = args.structured_view || user_picked_agent;
+        // `--fork-from` performs a TERMINAL fork (it seeds `agent_session_id` +
+        // a one-shot Fork resume intent). Pairing it with a structured-view
+        // request would write that terminal state onto a structured session,
+        // which is incoherent: structured fork is its own flow (ACP
+        // `session/fork`) and is offered from the web dashboard, not here.
+        if args.fork_from.is_some() && user_wants_structured {
+            bail!(
+                "`--fork-from` performs a terminal fork and cannot be combined with \
+                 --structured-view or --agent; structured fork is available from the web dashboard."
+            );
+        }
         instance.agent_name = args.agent.clone();
         instance.agent_model = args.model.clone();
 
