@@ -151,6 +151,23 @@ describe("WorkspaceSidebar Trash control (#2489, #2512)", () => {
     expect(props.onDeleteSession).toHaveBeenCalledWith("trashed-ws");
   });
 
+  it("renders the count badge next to the Trash icon, not against Settings (#2574)", () => {
+    // The badge must sit right after the Trash icon at the left of the control.
+    // A `flex-1` label that preceded the badge would shove the count to the
+    // button's right edge, where it reads as belonging to the Settings gear.
+    renderWithTrash();
+    const toggle = screen.getByTestId("sidebar-trash-toggle");
+    const badge = screen.getByTestId("sidebar-trash-count");
+    expect(badge.textContent).toBe("1");
+    // Badge is inside the Trash control, not the Settings button.
+    expect(toggle.contains(badge)).toBe(true);
+    // The "Trash" label follows the badge in DOM order; the badge is not the
+    // right-most child pushed up against Settings.
+    const label = Array.from(toggle.querySelectorAll("span")).find((s) => s.textContent === "Trash");
+    expect(label).toBeTruthy();
+    expect(badge.compareDocumentPosition(label!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
   it("closes the Trash popover on Escape", () => {
     renderWithTrash();
     fireEvent.click(screen.getByTestId("sidebar-trash-toggle"));

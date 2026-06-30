@@ -581,10 +581,13 @@ function TrashMenu({
         aria-label={`Trash (${count})`}
       >
         <Trash2 className="h-4 w-4 shrink-0" />
-        <span className="min-w-0 flex-1 truncate text-left text-[13px] font-medium">Trash</span>
-        <span className="shrink-0 rounded-full bg-surface-900 px-1.5 py-0.5 text-[10px] font-mono tabular-nums text-text-dim leading-none">
+        <span
+          data-testid="sidebar-trash-count"
+          className="shrink-0 rounded-full bg-surface-900 px-1.5 py-0.5 text-[10px] font-mono tabular-nums text-text-dim leading-none"
+        >
           {count}
         </span>
+        <span className="min-w-0 flex-1 truncate text-left text-[13px] font-medium">Trash</span>
       </button>
       {open &&
         panelPosition &&
