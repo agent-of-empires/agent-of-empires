@@ -868,6 +868,13 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
+      "id": "sessions.fork",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/components/__tests__/ForkSessionAction.test.tsx"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
       "id": "sidebar.repo-appearance",
       "kind": "mocked-playwright",
       "risk": "low",

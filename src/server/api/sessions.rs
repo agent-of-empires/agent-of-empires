@@ -172,6 +172,15 @@ pub struct SessionResponse {
     /// available, replacing the hardcoded client-side tool list.
     #[cfg(feature = "serve")]
     pub acp_capable: bool,
+    /// The session's captured ACP session id, present only once the
+    /// structured-view worker has minted one. The web dashboard passes this
+    /// as `fork_from` on a structured fork create, so the sidebar only offers
+    /// "Fork" on a structured row that has a captured id to diverge from.
+    /// Omitted when absent (terminal sessions, or structured ones whose worker
+    /// has not minted an id yet).
+    #[cfg(feature = "serve")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acp_session_id: Option<String>,
     /// True when the session is a Claude Code session AND the user has
     /// enabled Claude's fullscreen renderer (`tui: "fullscreen"` in
     /// `~/.claude/settings.json`). The web client uses this to skip
@@ -376,6 +385,8 @@ impl SessionResponse {
                     .unwrap_or(inst.tool.as_str());
                 builtin_acp_registry().get(resolved).is_some()
             },
+            #[cfg(feature = "serve")]
+            acp_session_id: inst.acp_session_id.clone(),
             claude_fullscreen: claude_fullscreen && inst.tool == "claude",
             workspace_repos: inst
                 .workspace_info
@@ -8139,6 +8150,8 @@ mod workspace_ordering_tests {
             acp_worker_state: crate::acp::supervisor::AcpWorkerState::Absent,
             #[cfg(feature = "serve")]
             acp_capable: false,
+            #[cfg(feature = "serve")]
+            acp_session_id: None,
             claude_fullscreen: false,
             workspace_repos: Vec::new(),
             warnings: Vec::new(),

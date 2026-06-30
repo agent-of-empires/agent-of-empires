@@ -19,6 +19,7 @@ import {
   CircleDot,
   CircleStop,
   Folder,
+  GitFork,
   Hourglass,
   Layers,
   ListFilter,
@@ -73,6 +74,7 @@ import { exceedsTouchSlop } from "../lib/longPress";
 import { useUnreadIndicatorEnabled } from "../lib/unreadIndicator";
 import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
 import {
+  createSession,
   renameSession,
   setSessionNotifications,
   setWorktreeName,
@@ -1078,6 +1080,28 @@ export const SessionRow = memo(function SessionRow({
     requestSwitchAgent(acpSession.id);
   };
 
+  // Fork a structured session: create a new structured session that resumes the
+  // source's ACP conversation and diverges from it. Gated on a captured
+  // `acp_session_id` (the value the server forks from); the original is left
+  // untouched. On success the new session opens; on failure the message
+  // surfaces as a toast.
+  const handleFork = async () => {
+    setContextMenu(null);
+    if (!acpSession?.acp_session_id) return;
+    const result = await createSession({
+      path: acpSession.project_path,
+      tool: acpSession.tool,
+      view: "structured",
+      profile: acpSession.profile || undefined,
+      fork_from: acpSession.acp_session_id,
+    });
+    if (result.ok && result.session) {
+      requestOpenSession(result.session.id);
+    } else {
+      reportError(result.error ?? "Could not fork this session. Please try again.");
+    }
+  };
+
   // Re-run smart rename ("Auto-name now") for a structured session whose
   // automatic rename never landed. Best-effort and async: a success just means
   // the one-shot was re-triggered; the title updates over the live session
@@ -1538,6 +1562,16 @@ export const SessionRow = memo(function SessionRow({
                   >
                     <ArrowLeftRight className="h-3.5 w-3.5 shrink-0" />
                     Switch agent
+                  </button>
+                )}
+                {!readOnly && acpSession?.acp_session_id && (
+                  <button
+                    onClick={() => void handleFork()}
+                    data-testid="sidebar-context-menu-fork"
+                    className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+                  >
+                    <GitFork className="h-3.5 w-3.5 shrink-0" />
+                    Fork session
                   </button>
                 )}
                 {!readOnly && acpSession?.default_name && (
