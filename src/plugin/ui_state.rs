@@ -232,6 +232,43 @@ struct PanePayload {
     icon: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ComposerActionPayload {
+    label: String,
+    method: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    icon: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tone: Option<Tone>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tooltip: Option<String>,
+    #[serde(default)]
+    disabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    draft_operation: Option<ComposerDraftOperation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+enum ComposerDraftOperation {
+    InsertText { id: String, text: String },
+    ReplaceSelection { id: String, text: String },
+    SetText { id: String, text: String },
+}
+
+impl ComposerDraftOperation {
+    fn valid(&self) -> bool {
+        match self {
+            ComposerDraftOperation::InsertText { id, text }
+            | ComposerDraftOperation::ReplaceSelection { id, text }
+            | ComposerDraftOperation::SetText { id, text } => {
+                !id.is_empty() && id.len() <= 128 && !text.is_empty() && text.len() <= 16 * 1024
+            }
+        }
+    }
+}
+
 /// Why a `ui.state.set`/`ui.state.remove` was rejected. The host API maps each
 /// to a JSON-RPC error code.
 #[derive(Debug, PartialEq, Eq)]
@@ -633,6 +670,26 @@ fn validate_payload(slot: UiSlot, raw: &Value) -> Result<Value, String> {
         UiSlot::FilterFacet => normalize::<FilterFacetPayload>(raw),
         UiSlot::Card => normalize::<CardPayload>(raw),
         UiSlot::Pane => normalize::<PanePayload>(raw),
+        UiSlot::ComposerAction => {
+            let parsed: ComposerActionPayload =
+                serde_json::from_value(raw.clone()).map_err(|e| e.to_string())?;
+            if parsed.label.is_empty() {
+                return Err("composer action label is required".into());
+            }
+            if parsed.method.is_empty() {
+                return Err("composer action method is required".into());
+            }
+            if parsed
+                .draft_operation
+                .as_ref()
+                .is_some_and(|op| !op.valid())
+            {
+                return Err(
+                    "composer draft operation requires a non-empty bounded id and text".into(),
+                );
+            }
+            serde_json::to_value(parsed).map_err(|e| e.to_string())
+        }
         UiSlot::Notification => Err("notification is pushed via ui.notify".into()),
     }
 }
@@ -697,6 +754,17 @@ mod tests {
             ),
             Err(UiError::BadRequest(_))
         ));
+        assert!(matches!(
+            s.set(
+                "acme.kit",
+                g,
+                UiSlot::ComposerAction,
+                "voice",
+                None,
+                &json!({"label": "Voice", "method": "voice.start"})
+            ),
+            Err(UiError::BadRequest(_))
+        ));
         // Notification is not a ui.state.set target.
         assert!(matches!(
             s.set(
@@ -757,6 +825,36 @@ mod tests {
             ),
             Err(UiError::BadRequest(_))
         ));
+        // Composer draft operations need a stable operation id and bounded text.
+        assert!(matches!(
+            s.set(
+                "acme.kit",
+                g,
+                UiSlot::ComposerAction,
+                "voice",
+                Some("s1"),
+                &json!({
+                    "label": "Voice",
+                    "method": "voice.start",
+                    "draft_operation": {"kind": "insert-text", "id": "", "text": "hello"}
+                })
+            ),
+            Err(UiError::BadRequest(_))
+        ));
+        s.set(
+            "acme.kit",
+            g,
+            UiSlot::ComposerAction,
+            "voice",
+            Some("s1"),
+            &json!({
+                "label": "Voice",
+                "method": "voice.start",
+                "icon": "mic",
+                "draft_operation": {"kind": "insert-text", "id": "op-1", "text": "hello"}
+            }),
+        )
+        .unwrap();
     }
 
     #[test]

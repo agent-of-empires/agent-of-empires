@@ -21,6 +21,8 @@ use crate::plugin;
 use crate::plugin::install::OperationLog;
 use crate::server::auth::{handler_elevated, AuthenticatedSession, LoopbackTrusted};
 
+const CAP_COMPOSER_READ: &str = "composer.read";
+
 fn error_response(status: StatusCode, code: &str, message: String) -> Response {
     (status, Json(json!({ "error": code, "message": message }))).into_response()
 }
@@ -246,25 +248,25 @@ pub async fn plugin_details(Query(query): Query<DetailsQuery>) -> Response {
 
 #[derive(Deserialize)]
 pub struct PluginActionBody {
-    /// The worker method to invoke (the plugin names it in its pane's action
-    /// block, e.g. `github.refresh`).
+    /// The worker method to invoke (the plugin names it in its UI action
+    /// payload, e.g. `github.refresh`).
     pub method: String,
     #[serde(default)]
     pub params: serde_json::Value,
-    /// The session whose pane fired the action, if any. The host reads the
+    /// The session whose UI fired the action, if any. The host reads the
     /// baseline revision for this `(plugin, session)` scope so the dashboard
-    /// waits only for that pane's re-pushed state; it is not forwarded to the
+    /// waits only for that scope's re-pushed state; it is not forwarded to the
     /// worker.
     #[serde(default)]
     pub session_id: Option<String>,
 }
 
-/// `POST /api/plugins/{id}/action`: forward a dashboard UI action (a pane
-/// button) to the plugin's worker as a fire-and-forget JSON-RPC notification.
+/// `POST /api/plugins/{id}/action`: forward a dashboard UI action to the
+/// plugin's worker as a fire-and-forget JSON-RPC notification.
 /// The worker is the trust boundary: it acts only on methods it implements and
 /// ignores the rest, so this never waits for or returns a worker result.
 ///
-/// Gated on read-write mode only, not elevation. Unlike enable/disable, a pane
+/// Gated on read-write mode only, not elevation. Unlike enable/disable, a UI
 /// action does not mutate host-managed state (config, registry, grants,
 /// lockfile) and grants no new host capability, so it does not warrant the
 /// passphrase step-up, the same reasoning as `update_theme` in `system.rs`.
@@ -288,18 +290,19 @@ pub async fn invoke_plugin_action(
             "Plugin host is not running".into(),
         );
     };
-    // Read the pane's UI revision before forwarding, not the value the dashboard
+    // Read the UI revision before forwarding, not the value the dashboard
     // last polled: that one is stale, so an unrelated push between the last poll
     // and this click would already exceed it and clear the spinner before the
-    // worker has done anything. Scoped to the firing pane's session so another
+    // worker has done anything. Scoped to the firing UI's session so another
     // session's activity cannot move it. The dashboard holds the spinner until
     // this scope's revision moves off the baseline.
     let baseline_revision = host.ui_revision(&id, body.session_id.as_deref());
-    // Forward the firing pane's session to the worker so a per-session action
+    // Forward the firing UI's session to the worker so a per-session action
     // (e.g. github.refresh) can scope its work to that session instead of every
     // one. Merged into the params object; a worker that does not use it ignores
     // it (the honest-plugin model).
     let mut params = body.params;
+    strip_composer_snapshot_without_capability(&id, &mut params);
     if let Some(sid) = &body.session_id {
         match &mut params {
             serde_json::Value::Object(map) => {
@@ -321,6 +324,24 @@ pub async fn invoke_plugin_action(
             "no_worker",
             format!("No running worker for plugin {id}"),
         )
+    }
+}
+
+fn strip_composer_snapshot_without_capability(plugin_id: &str, params: &mut serde_json::Value) {
+    let can_read = plugin::registry()
+        .get(plugin_id)
+        .filter(|p| p.active())
+        .is_some_and(|p| {
+            p.manifest
+                .capabilities
+                .iter()
+                .any(|cap| cap.as_str() == CAP_COMPOSER_READ)
+        });
+    if can_read {
+        return;
+    }
+    if let serde_json::Value::Object(map) = params {
+        map.remove("composer");
     }
 }
 

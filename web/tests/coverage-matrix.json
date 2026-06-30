@@ -3051,6 +3051,16 @@
         "src/hooks/usePluginUiState.test.tsx"
       ],
       "components": ["web/src/components/plugin/PluginSlots.tsx"]
+    },
+    {
+      "id": "plugins.composer-actions",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/plugin/__tests__/PluginSlots.test.tsx",
+        "src/components/acp/Composer.pluginComposerActions.test.tsx"
+      ],
+      "components": ["web/src/components/plugin/PluginSlots.tsx", "web/src/components/acp/Composer.tsx"]
     }
   ]
 }

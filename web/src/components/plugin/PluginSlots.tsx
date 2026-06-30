@@ -2,7 +2,7 @@
 // typed display state; these components draw it. No plugin code runs here.
 // Each reads the shared snapshot via context and the pure selectors in
 // `pluginUi.ts`. Slots shipped here: status-bar, row-badge, row-column, card,
-// pane, detail-badge. Notifications surface as toasts via the hook; the
+// pane, detail-badge, composer-action. Notifications surface as toasts via the hook; the
 // sort-key and filter-facet slots render as sidebar sort options and a facet
 // filter (the sidebar owns those; see SidebarSortPicker / WorkspaceSidebar, #2401).
 
@@ -29,6 +29,12 @@ import {
   validTone,
 } from "../../lib/pluginUi";
 import type { PluginUiEntry, PluginUiTone } from "../../lib/api";
+
+export interface ComposerActionSnapshot {
+  text: string;
+  selectionStart: number;
+  selectionEnd: number;
+}
 
 // Plugin strings are untrusted: only follow http/https hrefs, never
 // javascript:/data: and friends. Returns undefined for anything else, so the
@@ -254,6 +260,91 @@ export function PluginDetailBadges({ sessionId }: { sessionId: string }) {
         <Badge key={`${e.plugin_id}:${e.id}`} entry={e} />
       ))}
     </div>
+  );
+}
+
+export function PluginComposerActions({
+  sessionId,
+  getSnapshot,
+}: {
+  sessionId: string;
+  getSnapshot: () => ComposerActionSnapshot;
+}) {
+  const entries = sessionEntries(usePluginUiEntries(), "composer-action", sessionId);
+  if (entries.length === 0) return null;
+  return (
+    <>
+      {entries.map((entry) => (
+        <PluginComposerActionButton
+          key={`${entry.plugin_id}:${entry.id}`}
+          entry={entry}
+          sessionId={sessionId}
+          getSnapshot={getSnapshot}
+        />
+      ))}
+    </>
+  );
+}
+
+function PluginComposerActionButton({
+  entry,
+  sessionId,
+  getSnapshot,
+}: {
+  entry: PluginUiEntry;
+  sessionId: string;
+  getSnapshot: () => ComposerActionSnapshot;
+}) {
+  const label = payloadStr(entry, "label");
+  const method = payloadStr(entry, "method");
+  const tooltip = payloadStr(entry, "tooltip") || label;
+  const iconComp = lucideIcon(payloadStr(entry, "icon") || undefined);
+  const disabled = entry.payload.disabled === true || !method || !label;
+  const [posting, setPosting] = useState(false);
+  const postingRef = useRef(false);
+  const poke = usePluginUiPoke();
+  if (!label || !method) return null;
+  const onClick = async () => {
+    if (postingRef.current || disabled) return;
+    postingRef.current = true;
+    setPosting(true);
+    try {
+      const snapshot = getSnapshot();
+      const accepted = await invokePluginAction(entry.plugin_id, method, sessionId, {
+        composer: {
+          text: snapshot.text,
+          selection_start: snapshot.selectionStart,
+          selection_end: snapshot.selectionEnd,
+        },
+      });
+      if (accepted) poke();
+    } finally {
+      postingRef.current = false;
+      setPosting(false);
+    }
+  };
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled || posting}
+      title={tooltip}
+      aria-label={label}
+      aria-busy={posting || undefined}
+      data-testid="plugin-composer-action"
+      className={[
+        "inline-flex h-8 items-center justify-center gap-1 rounded-md border border-surface-700 bg-surface-800 px-2.5 text-[12px]",
+        toneClasses(entryTone(entry)),
+        "hover:bg-surface-700 disabled:cursor-not-allowed disabled:opacity-60 transition-colors duration-100",
+      ].join(" ")}
+    >
+      {posting ? (
+        <Spinner className="size-3.5" />
+      ) : (
+        iconComp && createElement(iconComp, { className: "size-3.5 shrink-0", "aria-hidden": true })
+      )}
+      <span className="max-w-24 truncate">{label}</span>
+    </button>
   );
 }
 

@@ -51,6 +51,7 @@ const CAP_SESSION_WRITE: &str = "session.write";
 /// capability. `ui.state.*` need no extra capability beyond `runtime.worker`:
 /// the gate is the manifest `ui` slot declaration (see [`PluginRpcContext`]).
 const CAP_NOTIFICATIONS: &str = "notifications";
+const CAP_COMPOSER_WRITE: &str = "composer.write";
 
 /// Shared, host-owned state behind the API: the plugin event bus and the
 /// profile whose session storage the API reads and writes. One per running
@@ -584,6 +585,9 @@ fn ui_state_set(
     let payload = params
         .get("payload")
         .ok_or_else(|| DispatchError::invalid_params("missing param \"payload\""))?;
+    if slot == UiSlot::ComposerAction && payload.get("draft_operation").is_some() {
+        ctx.require(CAP_COMPOSER_WRITE)?;
+    }
     state
         .ui
         .set(
@@ -1223,5 +1227,66 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.code, codes::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn composer_action_draft_operation_requires_composer_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state(tmp.path());
+        let c = ui_ctx(&state, &[CAP_WORKER], UiSlot::ComposerAction, "voice");
+
+        dispatch(
+            &state,
+            &c,
+            "ui.state.set",
+            &json!({
+                "slot": "composer-action",
+                "id": "voice",
+                "session_id": "s1",
+                "payload": {"label": "Voice", "method": "voice.start"}
+            }),
+        )
+        .unwrap();
+
+        let err = dispatch(
+            &state,
+            &c,
+            "ui.state.set",
+            &json!({
+                "slot": "composer-action",
+                "id": "voice",
+                "session_id": "s1",
+                "payload": {
+                    "label": "Voice",
+                    "method": "voice.start",
+                    "draft_operation": {"kind": "insert-text", "id": "op-1", "text": "hello"}
+                }
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, codes::FORBIDDEN);
+
+        let c = ui_ctx(
+            &state,
+            &[CAP_WORKER, CAP_COMPOSER_WRITE],
+            UiSlot::ComposerAction,
+            "voice",
+        );
+        dispatch(
+            &state,
+            &c,
+            "ui.state.set",
+            &json!({
+                "slot": "composer-action",
+                "id": "voice",
+                "session_id": "s1",
+                "payload": {
+                    "label": "Voice",
+                    "method": "voice.start",
+                    "draft_operation": {"kind": "insert-text", "id": "op-1", "text": "hello"}
+                }
+            }),
+        )
+        .unwrap();
     }
 }

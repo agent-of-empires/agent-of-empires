@@ -86,6 +86,11 @@ pub const KNOWN_CAPABILITIES: &[&str] = &[
     // `action` (or a future host RPC). Distinct from a rendered `href` anchor
     // the user clicks, which needs no grant.
     "browser_open",
+    // Reading and mutating the active ACP composer draft through a
+    // host-mediated composer action. The dashboard owns the actual draft state;
+    // plugins only receive a click-scoped snapshot or request a validated edit.
+    "composer.read",
+    "composer.write",
 ];
 
 /// How far a plugin is trusted. Host-assigned at load time, never declared in

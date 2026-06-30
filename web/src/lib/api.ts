@@ -703,7 +703,7 @@ export async function dismissPluginUpdate(id: string, fingerprint: string): Prom
  *  validates it to this closed set; each surface maps it to a color. */
 export type PluginUiTone = "neutral" | "info" | "success" | "warn" | "danger";
 
-/** The nine host-rendered slots, kebab-case as the host serializes them. */
+/** The host-rendered slots, kebab-case as the host serializes them. */
 export type PluginUiSlot =
   | "status-bar"
   | "row-badge"
@@ -712,6 +712,7 @@ export type PluginUiSlot =
   | "filter-facet"
   | "card"
   | "pane"
+  | "composer-action"
   | "detail-badge"
   | "notification";
 
@@ -774,19 +775,19 @@ export async function setPluginEnabled(id: string, enabled: boolean): Promise<Pl
 }
 
 /** A worker accepted an action. `baselineRevision` is the scope's UI mutation
- *  counter the host read before forwarding; the pane holds its spinner until
- *  the polled counter moves off this value. `null` means the daemon did not
- *  report a baseline (older daemon), so the caller skips the wait and just
+ *  counter the host read before forwarding; the UI action can hold its spinner
+ *  until the polled counter moves off this value. `null` means the daemon did
+ *  not report a baseline (older daemon), so the caller skips the wait and just
  *  clears when the POST settles. */
 export interface PluginActionAccepted {
   baselineRevision: number | null;
 }
 
 /**
- * Forward a plugin pane's UI action (e.g. a "Refresh" button) to the plugin's
- * worker. Fire-and-forget at the worker: the worker runs the named method and
- * re-pushes its UI state, which a later ui-state poll renders. `sessionId`
- * scopes the baseline revision to the firing pane's session. Returns the
+ * Forward a plugin UI action (e.g. a "Refresh" or composer button) to the
+ * plugin's worker. Fire-and-forget at the worker: the worker runs the named
+ * method and re-pushes its UI state, which a later ui-state poll renders.
+ * `sessionId` scopes the baseline revision to the firing UI's session. Returns the
  * accepted baseline (or null if the daemon omitted one), or null on read-only
  * (403), no running worker (404), or network failure.
  */
