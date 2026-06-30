@@ -198,6 +198,15 @@ test-support = []
 # Compile in the bundled first-party plugins. Build the bare core (acceptance
 # criterion 1 of #268) by opting out with `--no-default-features`.
 default-plugins = []
+# Gates the `e2e` test target (tests/e2e/main.rs). Off by default so CI can run
+# the serve suite as two parallel shards without enumerating every non-e2e test
+# binary: `cargo test --features serve` runs everything except e2e (the target
+# is skipped when the feature is off), and `cargo test --features serve,e2e-tests
+# --test e2e` runs e2e only. Run the full serve suite locally with
+# `cargo test --features serve,e2e-tests`. Naming the target explicitly
+# (`cargo test --test e2e`) without the feature errors loudly rather than
+# skipping silently.
+e2e-tests = []
 serve = [
     "axum",
     "tower-http",
@@ -259,6 +268,15 @@ codegen-units = 16
 # builds. Use the default `dev` profile when you want the isolated
 # `-dev` namespace.
 debug-assertions = false
+
+[[test]]
+# Explicit target so the `e2e-tests` feature gate applies. Without this entry
+# Cargo auto-discovers tests/e2e/main.rs unconditionally; the gate lets CI split
+# the serve suite into "everything except e2e" and "e2e only" shards. The other
+# 16 test binaries stay auto-discovered.
+name = "e2e"
+path = "tests/e2e/main.rs"
+required-features = ["e2e-tests"]
 
 [[bin]]
 name = "aoe"
