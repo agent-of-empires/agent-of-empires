@@ -1,6 +1,7 @@
 //! Plugin manager: list plugins (builtin and external) with their trust and
 //! enabled/approval state, enable/disable them, and update an external plugin
-//! with an in-TUI consent popup when the new version expands access. The TUI
+//! through an in-TUI review popup that shows the changelog (and the access
+//! disclosure when the new version expands what the plugin can do). The TUI
 //! twin of `aoe plugin list` and the web Plugins tab. Installing a new plugin is
 //! still CLI-driven (`aoe plugin install`); the TUI shows the resulting state.
 
