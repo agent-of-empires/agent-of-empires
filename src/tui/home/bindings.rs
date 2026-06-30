@@ -75,6 +75,9 @@ pub enum ActionId {
     /// global hotkey on purpose; reached from the command palette, the tips
     /// badge, and the `?` help screen, so it doesn't consume a scarce key.
     Tips,
+    /// Fork the selected session into a new independent session that resumes
+    /// its conversation context (palette + context menu only; no chord).
+    Fork,
 }
 
 /// A single chord. `ctrl` requires the Control modifier; Shift is implicit in
@@ -875,6 +878,22 @@ pub static BINDINGS: &[Binding] = &[
             serve_only: false,
         }),
     },
+    // Palette-only: Shift+F collides with strict-mode ToggleFavorite under
+    // Attention sort and the home keyspace is saturated, so fork is reached
+    // from the command palette and the context menu only.
+    Binding {
+        id: ActionId::Fork,
+        non_strict: &[],
+        strict: &[],
+        context: Context::Always,
+        help: None,
+        palette: Some(PaletteMeta {
+            title: "Fork session (resume context, diverge)",
+            keywords: &["fork", "branch", "duplicate", "clone", "context", "resume"],
+            group: PaletteGroup::Actions,
+            serve_only: false,
+        }),
+    },
 ];
 
 /// Stable palette/test id for an action (matches the legacy `builtin_commands`
@@ -916,6 +935,7 @@ pub fn palette_id(id: ActionId) -> &'static str {
         ActionId::ToggleProjectPin => "toggle-project-pin",
         ActionId::Tips => "tips",
         ActionId::Plugins => "plugins",
+        ActionId::Fork => "fork",
     }
 }
 
@@ -1173,6 +1193,18 @@ mod tests {
             resolve(&ctrl_key('o'), true, &c),
             Some(ActionId::SortPicker)
         );
+    }
+
+    #[test]
+    fn fork_is_palette_only_no_chord() {
+        let c = ctx();
+        // No chord resolves to Fork in either mode (palette-only, like Plugins).
+        for ch in ['f', 'F'] {
+            assert_ne!(resolve(&key(ch), false, &c), Some(ActionId::Fork));
+            assert_ne!(resolve(&key(ch), true, &c), Some(ActionId::Fork));
+        }
+        // Fork has a stable palette id.
+        assert_eq!(palette_id(ActionId::Fork), "fork");
     }
 
     #[test]

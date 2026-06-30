@@ -2581,6 +2581,8 @@ impl HomeView {
             ActionId::ToggleProjectPin => self.toggle_project_pin_at_cursor(),
             ActionId::NextWaiting => self.jump_to_next_waiting(),
             ActionId::Tips => self.open_tips_dialog(),
+            // dispatch wired in the fork-from-selection task
+            ActionId::Fork => {}
         }
         None
     }
