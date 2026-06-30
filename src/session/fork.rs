@@ -1,6 +1,9 @@
-//! Pure fork-eligibility logic and the one-shot fork seed a new session
-//! carries. No tmux, no daemon: this is the decision layer the TUI, CLI, and
-//! web all consult so "can I fork this?" is answered identically everywhere.
+//! Pure fork-eligibility logic for terminal sessions, plus the one-shot fork
+//! seed a new session carries. The TUI, CLI, and server share
+//! `terminal_fork_seed` so terminal fork eligibility is answered identically
+//! across those surfaces. Structured (ACP) fork eligibility is decided where
+//! the ACP session id is known (the create handler and the web sidebar), not
+//! here.
 
 use crate::agents::{get_agent, ForkStrategy};
 

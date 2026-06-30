@@ -779,6 +779,23 @@ fn build_fork_flags(tool: &str, parent_id: &str, child_id: &str) -> String {
     }
 }
 
+/// Splice `part` into `cmd`: insert it right after the binary (before other
+/// flags) when it is a subcommand, else append it. Shared by the resume and
+/// fork launch-flag builders.
+fn splice_subcommand_or_append(cmd: &mut String, part: &str, is_subcommand: bool) {
+    if is_subcommand {
+        if let Some(space_pos) = cmd.find(' ') {
+            let binary = &cmd[..space_pos];
+            let flags = &cmd[space_pos..];
+            *cmd = format!("{} {}{}", binary, part, flags);
+        } else {
+            *cmd = format!("{} {}", cmd, part);
+        }
+    } else {
+        *cmd = format!("{} {}", cmd, part);
+    }
+}
+
 fn append_resume_flags(
     tool: &str,
     session_id: Option<&str>,
@@ -797,17 +814,7 @@ fn append_resume_flags(
             get_agent(tool).map(|a| &a.resume_strategy),
             Some(ResumeStrategy::Subcommand(_))
         );
-        if is_subcommand {
-            if let Some(space_pos) = cmd.find(' ') {
-                let binary = &cmd[..space_pos];
-                let flags = &cmd[space_pos..];
-                *cmd = format!("{} {}{}", binary, resume_part, flags);
-            } else {
-                *cmd = format!("{} {}", cmd, resume_part);
-            }
-        } else {
-            *cmd = format!("{} {}", cmd, resume_part);
-        }
+        splice_subcommand_or_append(cmd, &resume_part, is_subcommand);
         tracing::debug!(target: "session.store", "Added resume flags to {} command: {}", context, resume_part);
         return true;
     }
@@ -1900,7 +1907,7 @@ impl Instance {
 
     fn apply_session_flags(&mut self, cmd: &mut String, context: &str) -> bool {
         if let ResumeIntent::Fork { from } = self.resume_intent.clone() {
-            let child = self.acquire_session_id().0;
+            let child = self.agent_session_id.clone();
             if let Some(child_id) = child.as_deref() {
                 let fork_part = build_fork_flags(&self.tool, &from, child_id);
                 if !fork_part.is_empty() {
@@ -1911,17 +1918,7 @@ impl Instance {
                         crate::agents::get_agent(&self.tool).map(|a| &a.fork_strategy),
                         Some(crate::agents::ForkStrategy::CodexFork)
                     );
-                    if is_subcommand {
-                        if let Some(space_pos) = cmd.find(' ') {
-                            let binary = &cmd[..space_pos];
-                            let flags = &cmd[space_pos..];
-                            *cmd = format!("{} {}{}", binary, fork_part, flags);
-                        } else {
-                            *cmd = format!("{} {}", cmd, fork_part);
-                        }
-                    } else {
-                        *cmd = format!("{cmd} {fork_part}");
-                    }
+                    splice_subcommand_or_append(cmd, &fork_part, is_subcommand);
                 }
             }
             // A fork is a fresh session, not an in-place resume.
