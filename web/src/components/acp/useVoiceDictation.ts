@@ -332,6 +332,7 @@ export function useVoiceDictation(onTranscript: (text: string) => void): VoiceDi
       mediaStreamRef.current = stream;
       if (discardRecordingRef.current) {
         stream.getTracks().forEach((track) => track.stop());
+        mediaStreamRef.current = null;
         serverRecordingStartingRef.current = false;
         setServerRecordingStarting(false);
         return;

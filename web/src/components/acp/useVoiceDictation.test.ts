@@ -348,7 +348,7 @@ describe("useVoiceDictation", () => {
         json: async () => ({ available: true, provider: "openai", model: "gpt-4o-transcribe" }),
       }),
     );
-    const { result } = renderHook(() => useVoiceDictation(vi.fn()));
+    const { result, unmount } = renderHook(() => useVoiceDictation(vi.fn()));
 
     await waitFor(() => expect(result.current.supported).toBe(true));
 
@@ -367,8 +367,11 @@ describe("useVoiceDictation", () => {
       await Promise.resolve();
     });
 
-    expect(stopTrack).toHaveBeenCalled();
+    expect(stopTrack).toHaveBeenCalledTimes(1);
     expect(MockMediaRecorder.instances).toHaveLength(0);
+
+    unmount();
+    expect(stopTrack).toHaveBeenCalledTimes(1);
   });
 
   it("stops acquired tracks when MediaRecorder construction fails", async () => {
