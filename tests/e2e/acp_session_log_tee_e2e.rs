@@ -11,7 +11,7 @@
 //! Compiled only with the default `serve` feature (excluded by `--no-default-features`). Run via:
 //!
 //! ```sh
-//! cargo test --test e2e -- acp_session_log_tee
+//! cargo test --features e2e-tests --test e2e -- acp_session_log_tee
 //! ```
 #![cfg(feature = "serve")]
 

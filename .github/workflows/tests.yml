@@ -13,33 +13,32 @@ permissions:
   contents: read
 
 jobs:
-  cargo:
-    # Job names use the stable `label`, not the runner, so the branch
-    # ruleset's required checks ("Cargo Test (linux)" / "Cargo Test
-    # (macos)") survive runner swaps. The runner itself comes from a
-    # repo Actions variable so Blacksmith can be dropped without a
-    # commit when the monthly credit pool runs dry: clearing
-    # RUNNER_CARGO_LINUX / RUNNER_CARGO_MACOS in Settings -> Actions ->
-    # Variables falls back to the free GitHub-hosted runners on the
-    # next run. Jobs already queued for Blacksmith sit "queued"
-    # forever (GitHub has no runner fallback primitive), so flip the
-    # variable, then re-run the stuck workflow.
-    name: Cargo Test (${{ matrix.label }})
-    runs-on: ${{ matrix.os }}
+  cargo-linux:
+    # Sharded Linux test matrix. Each leg runs on its own runner with its own
+    # rust-cache slot, so the feature-set switch that used to force a recompile
+    # between the sequential legs is gone and the legs run in parallel. The
+    # required-check context is the fan-in `cargo-linux-ok` job below (named
+    # "Cargo Test (linux)"), NOT these shard jobs; keep that in sync with the
+    # branch ruleset if the leg set changes. The runner comes from a repo
+    # Actions variable so Blacksmith can be dropped without a commit when the
+    # monthly credit pool runs dry: clearing RUNNER_CARGO_LINUX in Settings ->
+    # Actions -> Variables falls back to the free GitHub-hosted runner on the
+    # next run. Jobs already queued for Blacksmith sit "queued" forever (GitHub
+    # has no runner fallback primitive), so flip the variable, then re-run the
+    # stuck workflow.
+    name: Cargo Test (linux, ${{ matrix.leg }})
+    runs-on: ${{ vars.RUNNER_CARGO_LINUX || 'ubuntu-latest' }}
     strategy:
+      fail-fast: false
       matrix:
-        include:
-          - label: linux
-            os: ${{ vars.RUNNER_CARGO_LINUX || 'ubuntu-latest' }}
-          - label: macos
-            os: ${{ vars.RUNNER_CARGO_MACOS || 'macos-latest' }}
+        leg: [serve-e2e, serve-rest, bare-core]
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           # Cache compiled binaries too. Same-PR pushes that don't
-          # touch Rust deps get a warm `target/` and skip the 4-minute
+          # touch Rust deps get a warm `target/` and skip the cold
           # cargo build entirely; the first push still pays cold cost.
           cache-bin: "true"
           # Save on PRs too. Swatinem keys the cache on Cargo.lock +
@@ -47,62 +46,95 @@ jobs:
           # the slot rather than thrashing the 10GB repo cache budget.
           save-if: true
       - name: Install tmux
-        run: |
-          if [ "$RUNNER_OS" = "Linux" ]; then
-            sudo apt-get update && sudo apt-get install -y tmux
-          else
-            brew install tmux
-          fi
+        run: sudo apt-get update && sudo apt-get install -y tmux
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: '22'
       # tests/integration/acp_smoke.rs spawns the Node ACP shim under
       # acp-worker/test-shim/. The shim depends on @agentclientprotocol/sdk,
-      # so its deps must be installed before `cargo test --features serve`
-      # runs. The shim itself auto-skips if node is
-      # missing, but on a GitHub runner node is always present; without the
-      # install step the shim crashes before the ACP handshake completes.
-      # macOS only runs --lib --bins (no integration crates), so the shim
-      # isn't exercised there and we can skip the install.
+      # so its deps must be installed before the integration crate runs. Only
+      # the serve-rest leg runs the integration binary; the serve-e2e leg uses
+      # the fake ACP agent under web/tests/helpers/ instead, and bare-core does
+      # not exercise the shim.
       - name: Install ACP shim deps
-        if: runner.os == 'Linux'
+        if: matrix.leg == 'serve-rest'
         working-directory: acp-worker/test-shim
         run: npm ci
-      # `--features serve` is a strict superset of the default suite and pulls
-      # in the aoe.web plugin (serve-gated) that the e2e tests assert on, so a
-      # single run covers both feature gates. macOS-specific code lives in
-      # src/process/macos.rs plus one cfg in container_config.rs; the
-      # integration and e2e crates exercise OS-portable code that the Linux leg
-      # already covers, so macOS only runs --lib --bins.
-      - name: Cargo test (Linux, full suite incl. integration + e2e)
-        if: runner.os == 'Linux'
+      # serve-e2e: just the e2e binary (tmux-serial, the wall-clock long pole).
+      # The e2e target is gated behind the `e2e-tests` feature so the serve-rest
+      # leg below can skip it; this leg opts in.
+      - name: Cargo test (serve, e2e only)
+        if: matrix.leg == 'serve-e2e'
+        run: cargo test --features serve,e2e-tests --test e2e
+      # serve-rest: the full serve suite minus e2e (lib + bins + integration +
+      # the standalone test bins). `--features serve` leaves the e2e target
+      # gated off, so it is skipped here while every non-e2e test binary stays
+      # auto-discovered. `--features serve` is a strict superset of the default
+      # suite and pulls in the aoe.web plugin (serve-gated) the e2e tests assert
+      # on, so the two feature gates are both covered across this leg + serve-e2e.
+      - name: Cargo test (serve, everything except e2e)
+        if: matrix.leg == 'serve-rest'
         run: cargo test --features serve
-      - name: Cargo test (macOS, lib + bins only)
-        if: runner.os == 'macOS'
-        run: cargo test --features serve --lib --bins
-      # With every bundled plugin compiled out, core must still build and pass
-      # its lib/bin unit tests. `--no-default-features` also drops `serve`,
-      # so this doubles as the TUI-only compile gate, keeping the ~27
-      # cfg(feature = "serve") sites from rotting.
+      # bare-core: the three no-default-features feature corners.
+      #  - lib/bins: with every bundled plugin compiled out, core must still
+      #    build and pass its unit tests. `--no-default-features` also drops
+      #    `serve`, so this doubles as the TUI-only compile gate, keeping the
+      #    ~27 cfg(feature = "serve") sites from rotting.
+      #  - e2e: acceptance criterion 1 of #268 (issue #2097): with all default
+      #    plugins disabled, aoe still creates, attaches to, and destroys a
+      #    tmux + worktree session from CLI and TUI. The serve-gated e2e modules
+      #    self-gate to empty here. `e2e-tests` opts the gated target back in.
+      #  - check --all-targets: default-plugins on, serve off compile gate;
+      #    `e2e-tests` keeps the e2e target inside the --all-targets sweep, which
+      #    the gate would otherwise silently drop.
       - name: Cargo test (bare core, no default features)
-        if: runner.os == 'Linux'
-        run: cargo test --no-default-features --lib --bins
-      # Acceptance criterion 1 of #268 (issue #2097): with all default plugins
-      # disabled, aoe still creates, attaches to, and destroys a tmux + worktree
-      # session from CLI and TUI. The --lib --bins leg above never spawns the
-      # binary under tmux, so the e2e crate is what actually proves the
-      # invariant; the serve-gated e2e modules self-gate to empty here. This is
-      # the forcing function that makes "default plugin" mean something: a
-      # default plugin that grows an undeclared core dependency turns this red.
-      - name: Cargo test (bare core e2e, no default features)
-        if: runner.os == 'Linux'
-        run: cargo test --no-default-features --test e2e
-      # The third feature corner: default-plugins on, serve off. Compile gate
-      # (including test/e2e targets, which plain check skips) so plugin
-      # registration code can't grow a hidden dependency on serve types.
-      - name: Cargo check (default plugins, no serve)
-        if: runner.os == 'Linux'
-        run: cargo check --no-default-features --features default-plugins --all-targets
+        if: matrix.leg == 'bare-core'
+        run: |
+          cargo test --no-default-features --lib --bins
+          cargo test --no-default-features --features e2e-tests --test e2e
+          cargo check --no-default-features --features default-plugins,e2e-tests --all-targets
+
+  cargo-linux-ok:
+    # Fan-in for the branch ruleset: "Cargo Test (linux)" is a required status
+    # check, and matrix jobs report per-leg contexts the ruleset doesn't know
+    # about. This job carries the stable context name and fails unless every
+    # leg succeeded.
+    name: Cargo Test (linux)
+    needs: cargo-linux
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check leg results
+        run: |
+          if [ "${{ needs.cargo-linux.result }}" != "success" ]; then
+            echo "linux legs result: ${{ needs.cargo-linux.result }}"
+            exit 1
+          fi
+
+  cargo-macos:
+    # macOS-specific code lives in src/process/macos.rs plus one cfg in
+    # container_config.rs; the integration and e2e crates exercise OS-portable
+    # code the Linux legs already cover, so macOS only runs --lib --bins.
+    # `--features serve` is a strict superset of the default suite, so a single
+    # run covers both feature gates. The runner comes from a repo Actions
+    # variable (clear RUNNER_CARGO_MACOS to fall back to the GitHub-hosted
+    # runner on the next run).
+    name: Cargo Test (macos)
+    runs-on: ${{ vars.RUNNER_CARGO_MACOS || 'macos-latest' }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          cache-bin: "true"
+          save-if: true
+      - name: Install tmux
+        run: brew install tmux
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: '22'
+      - name: Cargo test (macOS, lib + bins only)
+        run: cargo test --features serve --lib --bins
 
   macos-acp-e2e:
     # The acp live-daemon e2e tests exercise the structured-view
@@ -131,7 +163,7 @@ jobs:
         with:
           node-version: '22'
       - name: Cargo test (macOS, acp live-daemon e2e)
-        run: cargo test --features serve --test e2e -- acp_ --test-threads=1 --nocapture
+        run: cargo test --features serve,e2e-tests --test e2e -- acp_ --test-threads=1 --nocapture
 
   vitest:
     name: Vitest

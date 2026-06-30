@@ -34,7 +34,7 @@
 //! Compiled only with `--features serve`. Run via:
 //!
 //! ```sh
-//! cargo test --test e2e --features serve -- archive_structured
+//! cargo test --features serve,e2e-tests --test e2e -- archive_structured
 //! ```
 #![cfg(feature = "serve")]
 

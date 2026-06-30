@@ -8,8 +8,8 @@
 //! # Running
 //!
 //! ```sh
-//! cargo test --test e2e              # run all e2e tests
-//! cargo test --test e2e -- --nocapture  # with screen dumps on failure
+//! cargo test --features e2e-tests --test e2e              # run all e2e tests
+//! cargo test --features e2e-tests --test e2e -- --nocapture  # with screen dumps on failure
 //! ```
 //!
 //! TUI tests require tmux and are skipped automatically if it is not installed.

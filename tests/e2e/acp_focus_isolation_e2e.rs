@@ -17,7 +17,7 @@
 //! don't exist otherwise). Run via:
 //!
 //! ```sh
-//! cargo test --test e2e -- acp_focus_isolation
+//! cargo test --features e2e-tests --test e2e -- acp_focus_isolation
 //! ```
 #![cfg(feature = "serve")]
 

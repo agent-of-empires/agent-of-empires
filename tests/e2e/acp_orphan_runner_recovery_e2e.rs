@@ -20,7 +20,7 @@
 //! Compiled only with the default `serve` feature (excluded by `--no-default-features`). Run via:
 //!
 //! ```sh
-//! cargo test --test e2e -- acp_orphan_runner_recovery
+//! cargo test --features e2e-tests --test e2e -- acp_orphan_runner_recovery
 //! ```
 #![cfg(feature = "serve")]
 

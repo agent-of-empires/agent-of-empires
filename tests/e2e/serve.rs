@@ -6,7 +6,7 @@
 //! under `--no-default-features`; run via:
 //!
 //! ```sh
-//! cargo test --test e2e -- tui_serve_dialog
+//! cargo test --features e2e-tests --test e2e -- tui_serve_dialog
 //! ```
 #![cfg(feature = "serve")]
 

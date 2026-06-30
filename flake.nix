@@ -130,7 +130,10 @@
 
             aoe-clippy = craneLib.cargoClippy (commonArgs // {
               inherit cargoArtifacts;
-              cargoClippyExtraArgs = "--package agent-of-empires --all-targets -- --deny warnings";
+              # e2e-tests keeps the gated e2e target inside the --all-targets
+              # sweep; without it the required-features gate would silently drop
+              # e2e from clippy's --deny warnings coverage.
+              cargoClippyExtraArgs = "--package agent-of-empires --all-targets --features e2e-tests -- --deny warnings";
             });
 
             aoe-fmt = craneLib.cargoFmt {

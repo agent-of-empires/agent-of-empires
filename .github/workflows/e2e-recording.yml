@@ -45,12 +45,12 @@ jobs:
           agg --version
 
       - name: Build tests
-        run: cargo test --test e2e --no-run
+        run: cargo test --features e2e-tests --test e2e --no-run
 
       - name: Run e2e tests with recording
         env:
           RECORD_E2E: "1"
-        run: cargo test --test e2e -- --nocapture
+        run: cargo test --features e2e-tests --test e2e -- --nocapture
 
       - name: Upload recordings as artifact
         if: always()
