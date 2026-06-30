@@ -352,6 +352,12 @@ pub(crate) enum ResumeIntent {
     /// after the launch completes (one-shot semantics).
     #[serde(rename = "Cleared")]
     Cleared,
+    /// One-shot fork seed: on the next (first) launch, resume `from` and fork
+    /// into a NEW session whose id was pre-pinned in `agent_session_id`.
+    /// Auto-promotes to `Default` after that launch, exactly like `Cleared`,
+    /// so later restarts resume the child's own id with a plain `--resume`.
+    #[serde(rename = "Fork")]
+    Fork { from: String },
 }
 
 impl ResumeIntent {
@@ -724,6 +730,33 @@ fn build_resume_flags(tool: &str, session_id: &str, is_existing_session: bool) -
         }
         ResumeStrategy::Subcommand(sub) => format!("{} {}", sub, session_id),
         ResumeStrategy::Unsupported => String::new(),
+    }
+}
+
+/// Build the launch flags for a one-shot terminal fork. Returns the empty
+/// string for an unforkable agent or an invalid id (mirroring
+/// `build_resume_flags`'s fail-closed contract). The child id is pre-pinned so
+/// the forked session is durable on disk before launch.
+fn build_fork_flags(tool: &str, parent_id: &str, child_id: &str) -> String {
+    use crate::agents::{get_agent, ForkStrategy};
+
+    if !is_valid_session_id(parent_id) || !is_valid_session_id(child_id) {
+        tracing::warn!(target: "session.store",
+            "Refusing to build fork flags: invalid id (parent={parent_id:?} child={child_id:?})");
+        return String::new();
+    }
+    let Some(agent) = get_agent(tool) else {
+        return String::new();
+    };
+    match agent.fork_strategy {
+        ForkStrategy::ClaudeFork => {
+            format!("--resume {parent_id} --fork-session --session-id {child_id}")
+        }
+        // Codex/opencode fork shapes are wired in a later task; not reachable in
+        // v1 because the TUI/CLI gate fork to claude until then.
+        ForkStrategy::CodexFork | ForkStrategy::Flag(_) | ForkStrategy::Unsupported => {
+            String::new()
+        }
     }
 }
 
@@ -1618,7 +1651,9 @@ impl Instance {
                 }
                 return (session_id, false);
             }
-            ResumeIntent::Default => {}
+            // Fork's launch wiring lands in a later task; until then it falls
+            // through to the Default path (resume the pre-pinned sid).
+            ResumeIntent::Default | ResumeIntent::Fork { .. } => {}
         }
 
         if let Some(stored) = self.agent_session_id.clone() {
@@ -6102,6 +6137,36 @@ mod tests {
 
         let flags = build_resume_flags("opencode", "id; echo pwned", false);
         assert_eq!(flags, "");
+    }
+
+    #[test]
+    fn fork_intent_emits_resume_fork_session_and_pins_child() {
+        let flags = build_fork_flags(
+            "claude",
+            "parent-1111-2222-3333-444444444444",
+            "child-5555-6666-7777-888888888888",
+        );
+        assert_eq!(
+            flags,
+            "--resume parent-1111-2222-3333-444444444444 --fork-session --session-id child-5555-6666-7777-888888888888"
+        );
+    }
+
+    #[test]
+    fn fork_flags_reject_invalid_ids() {
+        assert_eq!(
+            build_fork_flags("claude", "$(rm -rf /)", "child"),
+            String::new()
+        );
+        assert_eq!(
+            build_fork_flags("claude", "parent", "; echo pwned"),
+            String::new()
+        );
+    }
+
+    #[test]
+    fn fork_flags_empty_for_unsupported_agent() {
+        assert_eq!(build_fork_flags("cursor", "parent", "child"), String::new());
     }
 
     // Test: backwards compatibility - load old JSON without agent_session_id

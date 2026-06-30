@@ -1499,7 +1499,9 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
                 title
             );
         }
-        crate::session::ResumeIntent::Default => unreachable!(),
+        crate::session::ResumeIntent::Default | crate::session::ResumeIntent::Fork { .. } => {
+            unreachable!()
+        }
     }
     Ok(())
 }
