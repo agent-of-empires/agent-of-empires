@@ -117,6 +117,8 @@ describe("Composer voice dictation", () => {
     MockSpeechRecognition.instances[0]!.emitFinal("review the diff");
 
     expect(textarea.value).toBe("review the diff");
+    fireEvent.click(screen.getByRole("button", { name: "Stop voice dictation" }));
+    expect(screen.getByRole("button", { name: "Send message" })).toBeTruthy();
     expect(enqueuePrompt).not.toHaveBeenCalled();
   });
 

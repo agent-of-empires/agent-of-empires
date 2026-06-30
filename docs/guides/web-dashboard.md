@@ -186,19 +186,20 @@ On mobile structured-view sessions, the empty composer shows a microphone action
 
 AoE has two dictation paths:
 
-- **Enhanced transcription**: if `OPENAI_API_KEY` is present in the `aoe serve` environment, the PWA records audio in the browser and sends it to the local AoE server, which transcribes it with OpenAI. This is BYOK, so usage is billed to the server owner's OpenAI account.
-- **Browser fallback**: if enhanced transcription is unavailable or fails during the page session, AoE falls back to the browser speech-recognition API when the browser supports it.
+- **Enhanced transcription**: if `AOE_TRANSCRIPTION_ENABLED=1` and `OPENAI_API_KEY` are present in the `aoe serve` environment, and you grant the one-time enhanced dictation prompt, the PWA records audio in the browser and sends it to the local AoE server, which transcribes it with OpenAI. This is BYOK, so usage is billed to the server owner's OpenAI account.
+- **Browser fallback**: if enhanced transcription is unavailable, you decline the consent prompt, or transcription fails during the page session, AoE falls back to the browser speech-recognition API when the browser supports it.
 
 Enhanced transcription defaults to the higher-accuracy `gpt-4o-transcribe` model. Override it, add project vocabulary, or pin a language with environment variables:
 
 ```bash
 OPENAI_API_KEY=sk-...
+AOE_TRANSCRIPTION_ENABLED=1
 AOE_TRANSCRIPTION_MODEL=gpt-4o-transcribe
 AOE_TRANSCRIPTION_GLOSSARY="Supabase, Drizzle, TanStack Query, Turborepo"
 AOE_TRANSCRIPTION_LANGUAGE=en
 aoe serve
 ```
 
-You can replace the whole provider prompt with `AOE_TRANSCRIPTION_PROMPT`. Audio is sent only to the local AoE server and the configured OpenAI transcription endpoint; AoE does not store the audio.
+You can replace the whole provider prompt with `AOE_TRANSCRIPTION_PROMPT`. Audio is sent only after you grant the enhanced dictation prompt, and only to the local AoE server and the configured OpenAI transcription endpoint; AoE does not store the audio.
 
 For build, architecture, and frontend-development details, see [Web Dashboard Development](../development/web-dashboard.md).

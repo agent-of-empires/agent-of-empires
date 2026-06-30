@@ -29,6 +29,7 @@ SQLite, WebSocket, PWA, API, CLI, TUI, MCP, ACP, OpenAI, Whisper, Claude Code, a
 
 #[derive(Debug, Clone)]
 struct TranscriptionConfig {
+    enabled: bool,
     api_key: Option<String>,
     model: String,
     prompt: String,
@@ -56,8 +57,24 @@ pub struct TranscriptionResponse {
     corrected: bool,
 }
 
-pub async fn transcription_status() -> impl IntoResponse {
+pub async fn transcription_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let config = TranscriptionConfig::from_env();
+    if state.read_only {
+        return Json(TranscriptionStatusResponse {
+            available: false,
+            provider: None,
+            model: None,
+            reason: Some("read_only"),
+        });
+    }
+    if !config.enabled {
+        return Json(TranscriptionStatusResponse {
+            available: false,
+            provider: None,
+            model: None,
+            reason: Some("disabled"),
+        });
+    }
     if config.api_key.is_none() {
         return Json(TranscriptionStatusResponse {
             available: false,
@@ -81,9 +98,12 @@ pub async fn transcribe_audio(
     audio: Bytes,
 ) -> impl IntoResponse {
     let config = TranscriptionConfig::from_env();
-    if let Err((status, message)) =
-        validate_transcription_request(state.read_only, audio.len(), config.api_key.is_some())
-    {
+    if let Err((status, message)) = validate_transcription_request(
+        state.read_only,
+        audio.len(),
+        config.ready(),
+        request_content_type(&headers),
+    ) {
         return (status, message).into_response();
     }
     let api_key = config
@@ -122,6 +142,7 @@ fn validate_transcription_request(
     read_only: bool,
     audio_len: usize,
     configured: bool,
+    content_type: &str,
 ) -> Result<(), (StatusCode, &'static str)> {
     if read_only {
         return Err((StatusCode::FORBIDDEN, "server is in read-only mode"));
@@ -136,6 +157,12 @@ fn validate_transcription_request(
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             "server transcription is not configured",
+        ));
+    }
+    if !is_allowed_audio_content_type(content_type) {
+        return Err((
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported audio content type",
         ));
     }
     Ok(())
@@ -206,6 +233,7 @@ async fn transcribe_with_openai(
 
 impl TranscriptionConfig {
     fn from_env() -> Self {
+        let enabled = truthy_env("AOE_TRANSCRIPTION_ENABLED");
         let provider =
             env::var("AOE_TRANSCRIPTION_PROVIDER").unwrap_or_else(|_| "openai".to_string());
         let api_key = if provider.eq_ignore_ascii_case("openai") {
@@ -235,12 +263,31 @@ impl TranscriptionConfig {
             .filter(|value| !value.trim().is_empty());
 
         Self {
+            enabled,
             api_key,
             model,
             prompt,
             language,
         }
     }
+
+    fn ready(&self) -> bool {
+        self.enabled && self.api_key.is_some()
+    }
+}
+
+fn truthy_env(name: &str) -> bool {
+    env::var(name)
+        .ok()
+        .map(|value| parse_truthy(&value))
+        .unwrap_or(false)
+}
+
+fn parse_truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 fn request_content_type(headers: &HeaderMap) -> &str {
@@ -249,6 +296,28 @@ fn request_content_type(headers: &HeaderMap) -> &str {
         .and_then(|value| value.to_str().ok())
         .filter(|value| !value.trim().is_empty())
         .unwrap_or("audio/webm")
+}
+
+fn is_allowed_audio_content_type(content_type: &str) -> bool {
+    let base = content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        base.as_str(),
+        "audio/webm"
+            | "audio/ogg"
+            | "audio/mpeg"
+            | "audio/mp3"
+            | "audio/mp4"
+            | "audio/wav"
+            | "audio/x-wav"
+            | "audio/wave"
+            | "audio/flac"
+            | "audio/aac"
+    )
 }
 
 fn filename_for_content_type(content_type: &str) -> &'static str {
@@ -318,6 +387,23 @@ mod tests {
     }
 
     #[test]
+    fn allows_expected_audio_content_types() {
+        assert!(is_allowed_audio_content_type("audio/webm;codecs=opus"));
+        assert!(is_allowed_audio_content_type("audio/mp4"));
+        assert!(!is_allowed_audio_content_type("text/plain"));
+        assert!(!is_allowed_audio_content_type("application/json"));
+    }
+
+    #[test]
+    fn parses_explicit_transcription_enablement() {
+        assert!(parse_truthy("1"));
+        assert!(parse_truthy("true"));
+        assert!(parse_truthy("YES"));
+        assert!(!parse_truthy(""));
+        assert!(!parse_truthy("false"));
+    }
+
+    #[test]
     fn uses_audio_filename_extensions_for_uploads() {
         assert_eq!(filename_for_content_type("audio/mpeg"), "dictation.mp3");
         assert_eq!(
@@ -329,22 +415,29 @@ mod tests {
     #[test]
     fn rejects_unavailable_or_unsafe_requests_before_provider_call() {
         assert_eq!(
-            validate_transcription_request(true, 1024, true),
+            validate_transcription_request(true, 1024, true, "audio/webm"),
             Err((StatusCode::FORBIDDEN, "server is in read-only mode")),
         );
         assert_eq!(
-            validate_transcription_request(false, 0, true),
+            validate_transcription_request(false, 0, true, "audio/webm"),
             Err((StatusCode::BAD_REQUEST, "empty audio body")),
         );
         assert_eq!(
-            validate_transcription_request(false, MAX_AUDIO_BYTES + 1, true),
+            validate_transcription_request(false, MAX_AUDIO_BYTES + 1, true, "audio/webm"),
             Err((StatusCode::PAYLOAD_TOO_LARGE, "audio body too large")),
         );
         assert_eq!(
-            validate_transcription_request(false, 1024, false),
+            validate_transcription_request(false, 1024, false, "audio/webm"),
             Err((
                 StatusCode::SERVICE_UNAVAILABLE,
                 "server transcription is not configured"
+            )),
+        );
+        assert_eq!(
+            validate_transcription_request(false, 1024, true, "text/plain"),
+            Err((
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "unsupported audio content type"
             )),
         );
     }

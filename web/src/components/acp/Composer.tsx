@@ -686,6 +686,19 @@ export function Composer({
   // Keyed by sessionId; cleared when the text goes empty (user deleted
   // it, or the runtime cleared after a successful send).
   useEffect(() => {
+    let writeTimer: number | null = null;
+    const flush = () => {
+      if (writeTimer !== null) {
+        window.clearTimeout(writeTimer);
+        writeTimer = null;
+      }
+      setDraft(sessionId, composerRuntime.getState().text);
+    };
+    const unsub = composerRuntime.subscribe(() => {
+      setComposerText(composerRuntime.getState().text);
+      if (writeTimer !== null) window.clearTimeout(writeTimer);
+      writeTimer = window.setTimeout(flush, 250);
+    });
     const saved = getDraft(sessionId);
     if (saved && composerRuntime.getState().text === "") {
       composerRuntime.setText(saved);
@@ -700,20 +713,6 @@ export function Composer({
         }
       });
     }
-
-    let writeTimer: number | null = null;
-    const flush = () => {
-      if (writeTimer !== null) {
-        window.clearTimeout(writeTimer);
-        writeTimer = null;
-      }
-      setDraft(sessionId, composerRuntime.getState().text);
-    };
-    const unsub = composerRuntime.subscribe(() => {
-      setComposerText(composerRuntime.getState().text);
-      if (writeTimer !== null) window.clearTimeout(writeTimer);
-      writeTimer = window.setTimeout(flush, 250);
-    });
     // Page-unload flush. Effect cleanup runs on React unmount (sidebar
     // navigation) but not on a full reload, PWA cold start, or mobile
     // OS evicting the tab. Without these listeners, whatever sits in
@@ -1393,12 +1392,12 @@ function VoiceDictationButton({
         else onStart();
       }}
       className={[
-        "inline-flex items-center justify-center gap-1 rounded-lg px-2.5 py-1.5 text-[12px]",
+        "inline-flex h-8 items-center justify-center gap-1 rounded-md px-2.5 text-[12px]",
         listening || processing
-          ? "bg-rose-600 text-white shadow-sm hover:bg-rose-500"
+          ? "border border-status-error/50 bg-surface-800 text-status-error hover:bg-surface-700"
           : "border border-surface-600 bg-surface-800 text-text-secondary hover:border-surface-500 hover:bg-surface-700",
-        processing ? "opacity-80" : "active:scale-[0.98]",
-        "transition-all duration-100",
+        processing ? "opacity-80" : "",
+        "transition-colors duration-100",
       ].join(" ")}
     >
       <Mic className="h-3.5 w-3.5" />

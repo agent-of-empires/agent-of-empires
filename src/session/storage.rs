@@ -1768,9 +1768,35 @@ mod tests {
             )
             .expect("subscribe groups");
 
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        while sessions_rx.try_recv().is_ok() {}
-        while groups_rx.try_recv().is_ok() {}
+        let drain_deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+        loop {
+            let mut drained = false;
+            while sessions_rx.try_recv().is_ok() {
+                drained = true;
+            }
+            while groups_rx.try_recv().is_ok() {
+                drained = true;
+            }
+            if drained {
+                continue;
+            }
+
+            let remaining = drain_deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let wait_for = remaining.min(std::time::Duration::from_millis(50));
+            let received = tokio::time::timeout(wait_for, async {
+                tokio::select! {
+                    event = sessions_rx.recv() => event.is_some(),
+                    event = groups_rx.recv() => event.is_some(),
+                }
+            })
+            .await;
+            if !matches!(received, Ok(true)) {
+                break;
+            }
+        }
 
         let original_mode = fs::metadata(&profile_dir)?.permissions().mode();
         let mut readonly = fs::metadata(&profile_dir)?.permissions();

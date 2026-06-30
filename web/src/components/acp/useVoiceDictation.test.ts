@@ -253,6 +253,49 @@ describe("useVoiceDictation", () => {
     expect(result.current.error).toBe("enhanced-consent-declined");
   });
 
+  it("asks for enhanced recording consent only once", async () => {
+    vi.stubGlobal("webkitSpeechRecognition", undefined);
+    const { stopTrack } = stubMediaRecording();
+    const confirmMock = vi.fn(() => true);
+    vi.stubGlobal("confirm", confirmMock);
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({ available: true, provider: "openai", model: "gpt-4o-transcribe" }),
+        })
+        .mockResolvedValue({
+          ok: true,
+          json: async () => ({ text: "second pass" }),
+        }),
+    );
+    const { result } = renderHook(() => useVoiceDictation(vi.fn()));
+
+    await waitFor(() => expect(result.current.supported).toBe(true));
+
+    await act(async () => {
+      result.current.start();
+      await Promise.resolve();
+    });
+    await act(async () => {
+      result.current.stop();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      result.current.start();
+      await Promise.resolve();
+    });
+
+    expect(confirmMock).toHaveBeenCalledTimes(1);
+    expect(navigator.mediaDevices.getUserMedia).toHaveBeenCalledTimes(2);
+    expect(MockMediaRecorder.instances).toHaveLength(2);
+    expect(stopTrack).toHaveBeenCalled();
+  });
+
   it("coalesces rapid enhanced recording starts while microphone permission is pending", async () => {
     vi.stubGlobal("webkitSpeechRecognition", undefined);
     stubMediaRecording();
@@ -285,6 +328,47 @@ describe("useVoiceDictation", () => {
 
     expect(navigator.mediaDevices.getUserMedia).toHaveBeenCalledTimes(1);
     expect(MockMediaRecorder.instances).toHaveLength(1);
+  });
+
+  it("cancels enhanced recording while microphone permission is pending", async () => {
+    vi.stubGlobal("webkitSpeechRecognition", undefined);
+    stubMediaRecording();
+    const stopTrack = vi.fn();
+    let resolveStream!: (stream: MediaStream) => void;
+    const stream = { getTracks: () => [{ stop: stopTrack }] } as unknown as MediaStream;
+    vi.mocked(navigator.mediaDevices.getUserMedia).mockReturnValue(
+      new Promise<MediaStream>((resolve) => {
+        resolveStream = resolve;
+      }),
+    );
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ available: true, provider: "openai", model: "gpt-4o-transcribe" }),
+      }),
+    );
+    const { result } = renderHook(() => useVoiceDictation(vi.fn()));
+
+    await waitFor(() => expect(result.current.supported).toBe(true));
+
+    act(() => {
+      result.current.start();
+    });
+    expect(result.current.listening).toBe(true);
+
+    act(() => {
+      result.current.stop();
+    });
+    expect(result.current.listening).toBe(false);
+
+    await act(async () => {
+      resolveStream(stream);
+      await Promise.resolve();
+    });
+
+    expect(stopTrack).toHaveBeenCalled();
+    expect(MockMediaRecorder.instances).toHaveLength(0);
   });
 
   it("stops acquired tracks when MediaRecorder construction fails", async () => {

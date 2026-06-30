@@ -195,6 +195,7 @@ export function useVoiceDictation(onTranscript: (text: string) => void): VoiceDi
   const latestTranscriptRef = useRef<string | null>(null);
   const lastEmittedTranscriptRef = useRef<string | null>(null);
   const [browserListening, setBrowserListening] = useState(false);
+  const [serverRecordingStarting, setServerRecordingStarting] = useState(false);
   const [serverRecording, setServerRecording] = useState(false);
   const [processing, setProcessing] = useState(false);
   const [serverTranscriptionAvailable, setServerTranscriptionAvailable] = useState(false);
@@ -202,7 +203,7 @@ export function useVoiceDictation(onTranscript: (text: string) => void): VoiceDi
   const browserSupported = getSpeechRecognitionConstructor() !== null;
   const mediaSupported = getMediaRecordingSupported();
   const supported = serverTranscriptionAvailable || browserSupported;
-  const listening = browserListening || serverRecording;
+  const listening = browserListening || serverRecordingStarting || serverRecording;
 
   useEffect(() => {
     onTranscriptRef.current = onTranscript;
@@ -220,6 +221,13 @@ export function useVoiceDictation(onTranscript: (text: string) => void): VoiceDi
   }, [mediaSupported]);
 
   const stop = useCallback(() => {
+    if (serverRecordingStartingRef.current && !mediaRecorderRef.current) {
+      discardRecordingRef.current = true;
+      serverRecordingStartingRef.current = false;
+      setServerRecordingStarting(false);
+      setServerRecording(false);
+      return;
+    }
     const recorder = mediaRecorderRef.current;
     if (recorder && recorder.state === "recording") {
       discardRecordingRef.current = false;
@@ -250,6 +258,7 @@ export function useVoiceDictation(onTranscript: (text: string) => void): VoiceDi
     mediaRecorderRef.current = null;
     audioChunksRef.current = [];
     serverRecordingStartingRef.current = false;
+    setServerRecordingStarting(false);
     setServerRecording(false);
   }, []);
 
@@ -316,6 +325,7 @@ export function useVoiceDictation(onTranscript: (text: string) => void): VoiceDi
   const startServerRecording = useCallback(async () => {
     if (serverRecordingStartingRef.current || mediaRecorderRef.current || processing) return;
     serverRecordingStartingRef.current = true;
+    setServerRecordingStarting(true);
     discardRecordingRef.current = false;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -323,6 +333,7 @@ export function useVoiceDictation(onTranscript: (text: string) => void): VoiceDi
       if (discardRecordingRef.current) {
         stream.getTracks().forEach((track) => track.stop());
         serverRecordingStartingRef.current = false;
+        setServerRecordingStarting(false);
         return;
       }
       const recorder = new MediaRecorder(stream, mediaRecorderOptions());
@@ -366,6 +377,8 @@ export function useVoiceDictation(onTranscript: (text: string) => void): VoiceDi
 
       recorder.start();
       setError(null);
+      serverRecordingStartingRef.current = false;
+      setServerRecordingStarting(false);
       setServerRecording(true);
     } catch {
       cleanupMediaRecording(true);
