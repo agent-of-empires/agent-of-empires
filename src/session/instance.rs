@@ -2745,7 +2745,14 @@ impl Instance {
         expected_prior_intent: ResumeIntent,
     ) -> SidPersistOutcome {
         let new_sid = self.agent_session_id.clone();
-        let promote_cleared = matches!(expected_prior_intent, ResumeIntent::Cleared);
+        // Both Cleared and Fork are one-shot: after the launch they ran with
+        // completes, the session resumes its own id normally, so the intent
+        // must auto-promote to Default. A fork left as Fork on disk would
+        // re-fork the parent on the next restart (double-fork).
+        let promote_one_shot = matches!(
+            expected_prior_intent,
+            ResumeIntent::Cleared | ResumeIntent::Fork { .. }
+        );
 
         if let Some(ref sid) = new_sid {
             if !is_valid_session_id(sid) {
@@ -2791,7 +2798,7 @@ impl Instance {
             inst.agent_session_id = new_sid_for_closure.clone();
             inst.resume_probe_failed_sid = None;
 
-            if promote_cleared {
+            if promote_one_shot {
                 if inst.resume_intent == expected_prior_intent_for_closure {
                     inst.resume_intent = ResumeIntent::Default;
                 } else {
@@ -2810,7 +2817,7 @@ impl Instance {
         match outcome {
             Ok(SidWrite::Applied) => {
                 self.resume_probe_failed_sid = None;
-                if promote_cleared {
+                if promote_one_shot {
                     if let Ok(insts) = storage.load() {
                         if let Some(disk) = insts.into_iter().find(|i| i.id == self.id) {
                             self.resume_intent = disk.resume_intent;
@@ -8235,6 +8242,55 @@ mod tests {
                 "Cleared must auto-promote to Default in the same flock"
             );
             assert_eq!(inst.resume_intent, ResumeIntent::Default);
+        }
+
+        #[test]
+        #[serial]
+        fn fork_intent_promotes_to_default_after_launch() {
+            let temp = tempdir().unwrap();
+            std::env::set_var("HOME", temp.path());
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+
+            let profile = "fork-promote";
+            let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+            let mut inst = Instance::new("Forked", "/tmp/x");
+            inst.tool = "claude".into();
+            inst.source_profile = profile.into();
+            inst.agent_session_id = Some("019342ab-1234-7def-8901-abcdef012345".into());
+            inst.resume_intent = ResumeIntent::Fork {
+                from: "019342aa-2222-7eee-8fff-aaaabbbbcccc".into(),
+            };
+            let on_disk = inst.clone();
+            storage
+                .update(|i, g| {
+                    *i = vec![on_disk.clone()];
+                    *g = crate::session::GroupTree::new_with_groups(
+                        std::slice::from_ref(&on_disk),
+                        &[],
+                    )
+                    .get_all_groups();
+                    Ok(())
+                })
+                .unwrap();
+
+            // Simulate the post-launch persist: expected_prior_intent is the Fork
+            // we launched with; the child id is already pinned in agent_session_id.
+            let expected_prior = inst.resume_intent.clone();
+            let expected_sid = inst.agent_session_id.clone();
+            let _ = inst.persist_session_id(profile, expected_sid.as_deref(), expected_prior);
+
+            let reloaded = storage.load().unwrap();
+            let disk = reloaded.iter().find(|i| i.id == inst.id).unwrap();
+            assert_eq!(
+                disk.resume_intent,
+                ResumeIntent::Default,
+                "Fork must auto-promote to Default after the first launch so restarts resume the child plainly"
+            );
+            assert_eq!(
+                disk.agent_session_id.as_deref(),
+                Some("019342ab-1234-7def-8901-abcdef012345")
+            );
         }
 
         #[test]
