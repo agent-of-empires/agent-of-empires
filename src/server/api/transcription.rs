@@ -1,5 +1,6 @@
 use std::env;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use axum::body::Bytes;
@@ -9,12 +10,16 @@ use axum::response::IntoResponse;
 use axum::Json;
 use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
 
 use super::AppState;
 
 const DEFAULT_MODEL: &str = "gpt-4o-transcribe";
 const OPENAI_TRANSCRIPTIONS_URL: &str = "https://api.openai.com/v1/audio/transcriptions";
-const MAX_AUDIO_BYTES: usize = 28 * 1024 * 1024;
+const MAX_AUDIO_BYTES: usize = 24 * 1024 * 1024;
+const MAX_CONCURRENT_TRANSCRIPTIONS: usize = 2;
+static TRANSCRIPTION_IN_FLIGHT: LazyLock<Semaphore> =
+    LazyLock::new(|| Semaphore::new(MAX_CONCURRENT_TRANSCRIPTIONS));
 
 const DEFAULT_PROMPT: &str = "This is dictated text for a technical coding assistant. \
 Preserve developer terms, product names, acronyms, package names, and code-like words. \
@@ -71,22 +76,25 @@ pub async fn transcription_status() -> impl IntoResponse {
 }
 
 pub async fn transcribe_audio(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     audio: Bytes,
 ) -> impl IntoResponse {
-    if audio.is_empty() {
-        return (StatusCode::BAD_REQUEST, "empty audio body").into_response();
-    }
-    if audio.len() > MAX_AUDIO_BYTES {
-        return (StatusCode::PAYLOAD_TOO_LARGE, "audio body too large").into_response();
-    }
-
     let config = TranscriptionConfig::from_env();
-    let Some(api_key) = config.api_key.as_deref() else {
+    if let Err((status, message)) =
+        validate_transcription_request(state.read_only, audio.len(), config.api_key.is_some())
+    {
+        return (status, message).into_response();
+    }
+    let api_key = config
+        .api_key
+        .as_deref()
+        .expect("validated transcription config must include an API key");
+
+    let Ok(_permit) = TRANSCRIPTION_IN_FLIGHT.try_acquire() else {
         return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "server transcription is not configured",
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many transcription requests in flight",
         )
             .into_response();
     };
@@ -108,6 +116,29 @@ pub async fn transcribe_audio(
         }
         Err(message) => (StatusCode::BAD_GATEWAY, message).into_response(),
     }
+}
+
+fn validate_transcription_request(
+    read_only: bool,
+    audio_len: usize,
+    configured: bool,
+) -> Result<(), (StatusCode, &'static str)> {
+    if read_only {
+        return Err((StatusCode::FORBIDDEN, "server is in read-only mode"));
+    }
+    if audio_len == 0 {
+        return Err((StatusCode::BAD_REQUEST, "empty audio body"));
+    }
+    if audio_len > MAX_AUDIO_BYTES {
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, "audio body too large"));
+    }
+    if !configured {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server transcription is not configured",
+        ));
+    }
+    Ok(())
 }
 
 async fn transcribe_with_openai(
@@ -155,7 +186,13 @@ async fn transcribe_with_openai(
         .map_err(|e| format!("failed to read transcription response: {e}"))?;
 
     if !status.is_success() {
-        return Err(format!("transcription provider returned {status}: {body}"));
+        tracing::warn!(
+            target: "http.api.transcription",
+            %status,
+            response_bytes = body.len(),
+            "transcription provider returned an error"
+        );
+        return Err(format!("transcription provider returned {status}"));
     }
 
     let parsed: OpenAiTranscriptionResponse =
@@ -286,6 +323,29 @@ mod tests {
         assert_eq!(
             filename_for_content_type("audio/webm;codecs=opus"),
             "dictation.webm"
+        );
+    }
+
+    #[test]
+    fn rejects_unavailable_or_unsafe_requests_before_provider_call() {
+        assert_eq!(
+            validate_transcription_request(true, 1024, true),
+            Err((StatusCode::FORBIDDEN, "server is in read-only mode")),
+        );
+        assert_eq!(
+            validate_transcription_request(false, 0, true),
+            Err((StatusCode::BAD_REQUEST, "empty audio body")),
+        );
+        assert_eq!(
+            validate_transcription_request(false, MAX_AUDIO_BYTES + 1, true),
+            Err((StatusCode::PAYLOAD_TOO_LARGE, "audio body too large")),
+        );
+        assert_eq!(
+            validate_transcription_request(false, 1024, false),
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server transcription is not configured"
+            )),
         );
     }
 }

@@ -258,6 +258,11 @@ mod tests {
                 ],
             ),
             (
+                "api/transcription.rs",
+                include_str!("transcription.rs"),
+                &["transcribe_audio"],
+            ),
+            (
                 "api/plugins.rs",
                 include_str!("plugins.rs"),
                 &["invoke_plugin_action"],

@@ -80,6 +80,10 @@ function stubMediaRecording() {
     },
   });
   vi.stubGlobal("MediaRecorder", MockMediaRecorder);
+  vi.stubGlobal(
+    "confirm",
+    vi.fn(() => true),
+  );
   return { stopTrack };
 }
 
@@ -87,6 +91,7 @@ beforeEach(() => {
   MockSpeechRecognition.instances = [];
   MockMediaRecorder.instances = [];
   resetVoiceDictationServerStatusForTests();
+  window.localStorage.clear();
   vi.stubGlobal("webkitSpeechRecognition", MockSpeechRecognition);
 });
 
@@ -220,6 +225,134 @@ describe("useVoiceDictation", () => {
       }),
     );
     expect(onTranscript).toHaveBeenCalledWith("Supabase TypeScript project");
+  });
+
+  it("does not start enhanced recording when the user declines audio egress consent", async () => {
+    vi.stubGlobal("webkitSpeechRecognition", undefined);
+    stubMediaRecording();
+    vi.stubGlobal(
+      "confirm",
+      vi.fn(() => false),
+    );
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ available: true, provider: "openai", model: "gpt-4o-transcribe" }),
+      }),
+    );
+    const onTranscript = vi.fn();
+    const { result } = renderHook(() => useVoiceDictation(onTranscript));
+
+    await waitFor(() => expect(result.current.supported).toBe(true));
+
+    act(() => result.current.start());
+
+    expect(MockMediaRecorder.instances).toHaveLength(0);
+    expect(navigator.mediaDevices.getUserMedia).not.toHaveBeenCalled();
+    expect(result.current.error).toBe("enhanced-consent-declined");
+  });
+
+  it("coalesces rapid enhanced recording starts while microphone permission is pending", async () => {
+    vi.stubGlobal("webkitSpeechRecognition", undefined);
+    stubMediaRecording();
+    let resolveStream!: (stream: MediaStream) => void;
+    const stream = { getTracks: () => [{ stop: vi.fn() }] } as unknown as MediaStream;
+    vi.mocked(navigator.mediaDevices.getUserMedia).mockReturnValue(
+      new Promise<MediaStream>((resolve) => {
+        resolveStream = resolve;
+      }),
+    );
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ available: true, provider: "openai", model: "gpt-4o-transcribe" }),
+      }),
+    );
+    const { result } = renderHook(() => useVoiceDictation(vi.fn()));
+
+    await waitFor(() => expect(result.current.supported).toBe(true));
+
+    act(() => {
+      result.current.start();
+      result.current.start();
+    });
+    await act(async () => {
+      resolveStream(stream);
+      await Promise.resolve();
+    });
+
+    expect(navigator.mediaDevices.getUserMedia).toHaveBeenCalledTimes(1);
+    expect(MockMediaRecorder.instances).toHaveLength(1);
+  });
+
+  it("stops acquired tracks when MediaRecorder construction fails", async () => {
+    vi.stubGlobal("webkitSpeechRecognition", undefined);
+    const { stopTrack } = stubMediaRecording();
+    vi.stubGlobal(
+      "MediaRecorder",
+      class {
+        static isTypeSupported = vi.fn(() => true);
+        constructor() {
+          throw new Error("unsupported");
+        }
+      },
+    );
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ available: true, provider: "openai", model: "gpt-4o-transcribe" }),
+      }),
+    );
+    const { result } = renderHook(() => useVoiceDictation(vi.fn()));
+
+    await waitFor(() => expect(result.current.supported).toBe(true));
+
+    await act(async () => {
+      result.current.start();
+      await Promise.resolve();
+    });
+
+    expect(stopTrack).toHaveBeenCalled();
+    expect(result.current.error).toBe("microphone-unavailable");
+  });
+
+  it("falls back to browser speech after a server transcription failure", async () => {
+    stubMediaRecording();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ available: true, provider: "openai", model: "gpt-4o-transcribe" }),
+      })
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 502,
+        json: async () => ({}),
+      });
+    vi.stubGlobal("fetch", fetchMock);
+    const onTranscript = vi.fn();
+    const { result } = renderHook(() => useVoiceDictation(onTranscript));
+
+    await waitFor(() => expect(result.current.supported).toBe(true));
+
+    await act(async () => {
+      result.current.start();
+      await Promise.resolve();
+    });
+    await act(async () => {
+      result.current.stop();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(result.current.error).toBe("transcription-failed"));
+
+    act(() => result.current.start());
+
+    expect(MockSpeechRecognition.instances).toHaveLength(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });
 

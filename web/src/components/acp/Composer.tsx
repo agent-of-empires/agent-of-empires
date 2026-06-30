@@ -1281,32 +1281,6 @@ export function insertAtCaret(ref: React.RefObject<HTMLTextAreaElement | null>, 
   ta.setSelectionRange(pos, pos);
 }
 
-export function insertPlainTextAtCaret(ref: React.RefObject<HTMLTextAreaElement | null>, text: string) {
-  const ta = ref.current;
-  if (!ta) return;
-  const start = ta.selectionStart ?? ta.value.length;
-  const end = ta.selectionEnd ?? start;
-  const before = ta.value.slice(0, start);
-  const after = ta.value.slice(end);
-  const needsLeadingSpace = text.length > 0 && before.length > 0 && !/\s$/.test(before) && !/^[\s.,!?;:)]/.test(text);
-  const insertion = `${needsLeadingSpace ? " " : ""}${text}`;
-  const next = before + insertion + after;
-  const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
-  setter?.call(ta, next);
-  ta.dispatchEvent(
-    new InputEvent("input", {
-      bubbles: true,
-      inputType: "insertText",
-      data: insertion,
-    }),
-  );
-  const pos = before.length + insertion.length;
-  ta.focus();
-  ta.setSelectionRange(pos, pos);
-  ta.style.height = "auto";
-  ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`;
-}
-
 export function replaceVoiceDictationTextAtCaret(
   ref: React.RefObject<HTMLTextAreaElement | null>,
   rangeRef: React.MutableRefObject<{ start: number; end: number } | null>,

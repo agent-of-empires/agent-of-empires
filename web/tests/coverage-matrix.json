@@ -2378,11 +2378,7 @@
       "kind": "vitest",
       "risk": "medium",
       "specs": ["src/components/acp/Composer.voiceDictation.test.tsx", "src/components/acp/useVoiceDictation.test.ts"],
-      "components": [
-        "web/src/components/acp/Composer.tsx",
-        "web/src/components/acp/useVoiceDictation.ts",
-        "src/server/api/transcription.rs"
-      ]
+      "components": ["web/src/components/acp/Composer.tsx", "web/src/components/acp/useVoiceDictation.ts"]
     },
     {
       "id": "acp.composer-ios-dictation-state-machine",

@@ -1658,7 +1658,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/transcription",
             post(api::transcribe_audio)
-                .layer(axum::extract::DefaultBodyLimit::max(28 * 1024 * 1024)),
+                .layer(axum::extract::DefaultBodyLimit::max(24 * 1024 * 1024)),
         )
         // Terminal WebSockets (capture-streaming live view; the agent pane and
         // the paired host/container shells). The xterm PTY relay was removed.

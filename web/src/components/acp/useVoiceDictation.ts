@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { safeGetItem, safeSetItem } from "../../lib/safeStorage";
+
 type SpeechRecognitionAlternativeLike = { transcript: string };
 type SpeechRecognitionResultLike = {
   readonly isFinal: boolean;
@@ -44,6 +46,7 @@ interface TranscriptionResponse {
 }
 
 let serverTranscriptionStatusPromise: Promise<boolean> | null = null;
+const ENHANCED_DICTATION_CONSENT_KEY = "aoe.voiceDictation.enhancedConsent";
 
 export function getSpeechRecognitionConstructor(): SpeechRecognitionConstructorLike | null {
   if (typeof window === "undefined") return null;
@@ -62,6 +65,24 @@ export function getMediaRecordingSupported(): boolean {
 
 export function resetVoiceDictationServerStatusForTests(): void {
   serverTranscriptionStatusPromise = null;
+}
+
+function disableServerTranscriptionForSession(): void {
+  serverTranscriptionStatusPromise = Promise.resolve(false);
+}
+
+function hasEnhancedDictationConsent(): boolean {
+  return safeGetItem(ENHANCED_DICTATION_CONSENT_KEY) === "1";
+}
+
+function requestEnhancedDictationConsent(): boolean {
+  if (hasEnhancedDictationConsent()) return true;
+  const accepted = window.confirm(
+    "Enhanced voice dictation sends recorded audio to this AoE server for OpenAI transcription using the server owner's API key. Continue?",
+  );
+  if (!accepted) return false;
+  safeSetItem(ENHANCED_DICTATION_CONSENT_KEY, "1");
+  return true;
 }
 
 async function getServerTranscriptionAvailable(): Promise<boolean> {
@@ -168,6 +189,8 @@ export function useVoiceDictation(onTranscript: (text: string) => void): VoiceDi
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
+  const serverRecordingStartingRef = useRef(false);
+  const discardRecordingRef = useRef(false);
   const transcriptSegmentsRef = useRef<string[]>([]);
   const latestTranscriptRef = useRef<string | null>(null);
   const lastEmittedTranscriptRef = useRef<string | null>(null);
@@ -199,6 +222,7 @@ export function useVoiceDictation(onTranscript: (text: string) => void): VoiceDi
   const stop = useCallback(() => {
     const recorder = mediaRecorderRef.current;
     if (recorder && recorder.state === "recording") {
+      discardRecordingRef.current = false;
       recorder.stop();
       setServerRecording(false);
       return;
@@ -206,11 +230,26 @@ export function useVoiceDictation(onTranscript: (text: string) => void): VoiceDi
     recognitionRef.current?.stop();
   }, []);
 
-  const cleanupMediaRecording = useCallback(() => {
+  const cleanupMediaRecording = useCallback((discard = true) => {
+    const recorder = mediaRecorderRef.current;
+    if (discard) discardRecordingRef.current = true;
+    if (recorder) {
+      recorder.ondataavailable = null;
+      recorder.onerror = null;
+      recorder.onstop = null;
+      if (discard && recorder.state === "recording") {
+        try {
+          recorder.stop();
+        } catch {
+          // ignore: the browser may already be stopping the recorder
+        }
+      }
+    }
     mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
     mediaStreamRef.current = null;
     mediaRecorderRef.current = null;
     audioChunksRef.current = [];
+    serverRecordingStartingRef.current = false;
     setServerRecording(false);
   }, []);
 
@@ -275,11 +314,18 @@ export function useVoiceDictation(onTranscript: (text: string) => void): VoiceDi
   }, []);
 
   const startServerRecording = useCallback(async () => {
-    if (mediaRecorderRef.current || processing) return;
+    if (serverRecordingStartingRef.current || mediaRecorderRef.current || processing) return;
+    serverRecordingStartingRef.current = true;
+    discardRecordingRef.current = false;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const recorder = new MediaRecorder(stream, mediaRecorderOptions());
       mediaStreamRef.current = stream;
+      if (discardRecordingRef.current) {
+        stream.getTracks().forEach((track) => track.stop());
+        serverRecordingStartingRef.current = false;
+        return;
+      }
+      const recorder = new MediaRecorder(stream, mediaRecorderOptions());
       mediaRecorderRef.current = recorder;
       audioChunksRef.current = [];
 
@@ -288,12 +334,16 @@ export function useVoiceDictation(onTranscript: (text: string) => void): VoiceDi
       };
       recorder.onerror = () => {
         setError("recording-error");
-        cleanupMediaRecording();
+        cleanupMediaRecording(true);
       };
       recorder.onstop = () => {
+        if (discardRecordingRef.current) {
+          cleanupMediaRecording(true);
+          return;
+        }
         const mimeType = recorder.mimeType || audioChunksRef.current[0]?.type || "audio/webm";
         const audio = new Blob(audioChunksRef.current, { type: mimeType });
-        cleanupMediaRecording();
+        cleanupMediaRecording(false);
         if (audio.size === 0) {
           setError("empty-recording");
           return;
@@ -305,6 +355,8 @@ export function useVoiceDictation(onTranscript: (text: string) => void): VoiceDi
             onTranscriptRef.current(text);
           })
           .catch(() => {
+            disableServerTranscriptionForSession();
+            setServerTranscriptionAvailable(false);
             setError("transcription-failed");
           })
           .finally(() => {
@@ -316,13 +368,17 @@ export function useVoiceDictation(onTranscript: (text: string) => void): VoiceDi
       setError(null);
       setServerRecording(true);
     } catch {
-      cleanupMediaRecording();
+      cleanupMediaRecording(true);
       setError("microphone-unavailable");
     }
   }, [cleanupMediaRecording, processing]);
 
   const start = useCallback(() => {
     if (serverTranscriptionAvailable && mediaSupported) {
+      if (!requestEnhancedDictationConsent()) {
+        setError("enhanced-consent-declined");
+        return;
+      }
       void startServerRecording();
       return;
     }
@@ -333,7 +389,7 @@ export function useVoiceDictation(onTranscript: (text: string) => void): VoiceDi
     return () => {
       recognitionRef.current?.abort?.();
       recognitionRef.current = null;
-      cleanupMediaRecording();
+      cleanupMediaRecording(true);
       transcriptSegmentsRef.current = [];
       latestTranscriptRef.current = null;
       lastEmittedTranscriptRef.current = null;
