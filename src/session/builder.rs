@@ -730,10 +730,21 @@ pub fn build_instance(
                     from: parent_agent_session_id,
                 };
             }
-            crate::session::ForkSeed::Structured { .. } => {
-                // Structured fork (ACP) is wired in a later task once
-                // Instance.fork_pending exists.
-                unreachable!("structured fork lands in a later task");
+            #[cfg_attr(not(feature = "serve"), allow(unused_variables))]
+            crate::session::ForkSeed::Structured {
+                parent_acp_session_id,
+            } => {
+                // Structured fork: force the structured view, seed the parent
+                // for the ACP session/fork handshake, and replay history into
+                // the (empty) event store on first connect. The marker fields
+                // live behind the serve feature, so without it a structured
+                // fork is inapplicable and this arm is a no-op.
+                #[cfg(feature = "serve")]
+                {
+                    instance.view = crate::session::View::Structured;
+                    instance.fork_pending = Some(parent_acp_session_id);
+                    instance.import_pending = Some(true);
+                }
             }
         }
     }

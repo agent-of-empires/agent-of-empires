@@ -4004,6 +4004,10 @@ fn apply_acp_session_change(
                 "persisting agent-assigned ACP session id"
             );
             inst.acp_session_id = Some(new_id.clone());
+            // A structured fork's first session/fork assigns a brand-new id;
+            // consume the one-shot seed so a restart resumes the child via
+            // session/load instead of re-forking the parent.
+            inst.fork_pending = None;
         }
         AcpSessionChange::Reset(reason) => {
             tracing::info!(
@@ -4305,6 +4309,37 @@ mod tests {
         assert!(
             persist.is_some(),
             "clearing a stale marker must trigger a persist even on an unchanged id"
+        );
+    }
+
+    // A structured fork mints a brand-new child id on its first session/fork,
+    // so the assigned id differs from the (None) acp_session_id and we take the
+    // new-assignment path. That path must consume the one-shot fork_pending seed
+    // and persist, so a restart resumes the child via session/load rather than
+    // re-forking the parent.
+    #[cfg(feature = "serve")]
+    #[test]
+    fn assigning_forked_id_clears_fork_pending_and_persists() {
+        let mut inst = Instance::new("seed", "/tmp/seed");
+        inst.view = crate::session::View::Structured;
+        inst.acp_session_id = None;
+        inst.fork_pending = Some("parent-acp-id".into());
+        inst.import_pending = Some(true);
+
+        let profile = apply_acp_session_change(
+            &mut inst,
+            "sess-1",
+            Some(&AcpSessionChange::Assigned("forked-child-id".into())),
+        );
+
+        assert_eq!(inst.acp_session_id.as_deref(), Some("forked-child-id"));
+        assert_eq!(
+            inst.fork_pending, None,
+            "fork_pending cleared once the forked id is assigned"
+        );
+        assert!(
+            profile.is_some(),
+            "must persist so the forked id survives restart"
         );
     }
 

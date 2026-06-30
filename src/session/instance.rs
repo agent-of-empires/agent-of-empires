@@ -643,6 +643,14 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub import_pending: Option<bool>,
 
+    /// One-shot structured-fork seed: the parent ACP session id to fork from
+    /// on first connect. Set at creation, consumed when the adapter assigns
+    /// the forked child id (see `apply_acp_session_change`). `None` for
+    /// non-fork sessions. Skipped in serialization when absent.
+    #[cfg(feature = "serve")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_pending: Option<String>,
+
     // Runtime state (not serialized)
     #[serde(skip)]
     pub last_error_check: Option<std::time::Instant>,
@@ -994,6 +1002,8 @@ impl Instance {
             acp_session_id: None,
             #[cfg(feature = "serve")]
             import_pending: None,
+            #[cfg(feature = "serve")]
+            fork_pending: None,
             last_error_check: None,
             last_start_time: None,
             last_error: None,
@@ -5120,6 +5130,28 @@ mod tests {
         let json = serde_json::to_string(&inst).expect("serialize");
         let back: Instance = serde_json::from_str(&json).expect("round-trip");
         assert!(back.is_trashed());
+    }
+
+    // A non-fork session omits fork_pending on the wire (skip_serializing_if),
+    // so legacy sessions.json without the key deserializes to None and no
+    // migration is needed. A seeded fork id round-trips.
+    #[cfg(feature = "serve")]
+    #[test]
+    fn test_fork_pending_serde_roundtrip_and_default() {
+        let fresh = Instance::new("s", "/tmp/x");
+        let fresh_json = serde_json::to_string(&fresh).expect("serialize fresh");
+        assert!(
+            !fresh_json.contains("fork_pending"),
+            "None fork_pending must not be serialized"
+        );
+        let parsed: Instance = serde_json::from_str(&fresh_json).expect("parse fresh");
+        assert_eq!(parsed.fork_pending, None, "missing fork_pending => None");
+
+        let mut inst = Instance::new("s", "/tmp/x");
+        inst.fork_pending = Some("parent-acp-id".into());
+        let json = serde_json::to_string(&inst).expect("serialize");
+        let back: Instance = serde_json::from_str(&json).expect("round-trip");
+        assert_eq!(back.fork_pending.as_deref(), Some("parent-acp-id"));
     }
 
     #[test]
