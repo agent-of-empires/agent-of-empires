@@ -202,8 +202,8 @@ pub struct UpdateConsent {
 pub enum UpdatePreview {
     /// The remote matches the installed content; nothing to do.
     NoUpdate,
-    /// A newer version that needs no fresh consent; safe to apply directly. The
-    /// changelog is still surfaced so the user sees what they are pulling in.
+    /// A newer version that needs no fresh consent; still returned to the UI for
+    /// review so the user sees the changelog before applying.
     SafeUpdate {
         to_version: String,
         fingerprint: String,
