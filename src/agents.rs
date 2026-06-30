@@ -44,6 +44,24 @@ pub enum ResumeStrategy {
     Unsupported,
 }
 
+/// How an agent forks an existing session from the CLI: resume the parent's
+/// conversation but write the continuation to a NEW, independent session,
+/// leaving the original transcript untouched. Distinct from
+/// [`ResumeStrategy`], which continues the SAME session in place.
+pub enum ForkStrategy {
+    /// Claude Code: `--resume <parent> --fork-session --session-id <child>`.
+    /// AoE pre-pins `<child>` so the forked id is known and durable before
+    /// launch (no async capture window). Verified to compose live.
+    ClaudeFork,
+    /// Codex CLI: `codex fork <parent>` subcommand (mints a new id).
+    CodexFork,
+    /// A single flag appended when forking, used alongside the agent's normal
+    /// resume flag (e.g. opencode `--session <parent> --fork`).
+    Flag(&'static str),
+    /// Agent cannot fork a session.
+    Unsupported,
+}
+
 /// A single hook event that AoE registers in an agent's settings file.
 #[derive(Debug)]
 pub struct HookEvent {
@@ -224,6 +242,8 @@ pub struct AgentDef {
     pub sidecar_hooks: Option<SidecarHooks>,
     /// How this agent resumes a prior session.
     pub resume_strategy: ResumeStrategy,
+    /// How this agent forks a prior session into a new, independent one.
+    pub fork_strategy: ForkStrategy,
     /// If true, this agent can only run on the host (no sandbox/worktree support).
     /// The new-session dialog hides sandbox and worktree options for these agents.
     pub host_only: bool,
@@ -441,6 +461,7 @@ pub const AGENTS: &[AgentDef] = &[
             existing: "--resume",
             new_session: "--session-id",
         },
+        fork_strategy: ForkStrategy::ClaudeFork,
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint: "npm install -g @anthropic-ai/claude-code",
@@ -460,6 +481,7 @@ pub const AGENTS: &[AgentDef] = &[
         hook_config: None,
         sidecar_hooks: None,
         resume_strategy: ResumeStrategy::Flag("--session"),
+        fork_strategy: ForkStrategy::Flag("--fork"),
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint: "curl -fsSL https://opencode.ai/install | bash",
@@ -479,6 +501,7 @@ pub const AGENTS: &[AgentDef] = &[
         hook_config: None,
         sidecar_hooks: None,
         resume_strategy: ResumeStrategy::Flag("--resume"),
+        fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint: "pip install mistral-vibe",
@@ -507,6 +530,7 @@ pub const AGENTS: &[AgentDef] = &[
         }),
         sidecar_hooks: None,
         resume_strategy: ResumeStrategy::Subcommand("resume"),
+        fork_strategy: ForkStrategy::CodexFork,
         host_only: false,
         // Codex has paste-burst detection with a 120ms Enter-suppression window;
         // Enter keys arriving within that window after a character stream are
@@ -559,6 +583,7 @@ pub const AGENTS: &[AgentDef] = &[
         }),
         sidecar_hooks: None,
         resume_strategy: ResumeStrategy::Flag("--resume"),
+        fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint: "npm install -g @google/gemini-cli",
@@ -583,6 +608,7 @@ pub const AGENTS: &[AgentDef] = &[
         }),
         sidecar_hooks: None,
         resume_strategy: ResumeStrategy::Unsupported,
+        fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint: "see https://docs.cursor.com/cli",
@@ -602,6 +628,7 @@ pub const AGENTS: &[AgentDef] = &[
         hook_config: None,
         sidecar_hooks: None,
         resume_strategy: ResumeStrategy::Unsupported,
+        fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint: "see https://docs.github.com/en/copilot/github-copilot-in-the-cli",
@@ -622,6 +649,7 @@ pub const AGENTS: &[AgentDef] = &[
         hook_config: None,
         sidecar_hooks: None,
         resume_strategy: ResumeStrategy::Flag("--session"),
+        fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint: "npm install -g @earendil-works/pi-coding-agent",
@@ -641,6 +669,7 @@ pub const AGENTS: &[AgentDef] = &[
         hook_config: None,
         sidecar_hooks: None,
         resume_strategy: ResumeStrategy::Unsupported,
+        fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint: "npm install -g droid",
@@ -671,6 +700,7 @@ pub const AGENTS: &[AgentDef] = &[
             format: SidecarFormat::SettlToml,
         }),
         resume_strategy: ResumeStrategy::Unsupported,
+        fork_strategy: ForkStrategy::Unsupported,
         host_only: true,
         send_keys_enter_delay_ms: 0,
         install_hint: "brew install --cask mozilla-ai/tap/settl",
@@ -707,6 +737,7 @@ pub const AGENTS: &[AgentDef] = &[
             format: SidecarFormat::HermesYaml,
         }),
         resume_strategy: ResumeStrategy::Flag("--resume"),
+        fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint:
@@ -751,6 +782,7 @@ pub const AGENTS: &[AgentDef] = &[
             format: SidecarFormat::KiroJson,
         }),
         resume_strategy: ResumeStrategy::Flag("--resume-id"),
+        fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint: "curl -fsSL https://cli.kiro.dev/install | bash",
@@ -778,6 +810,7 @@ pub const AGENTS: &[AgentDef] = &[
             existing: "--resume",
             new_session: "--session-id",
         },
+        fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint: "npm install -g @qwen-code/qwen-code",
@@ -797,6 +830,7 @@ pub const AGENTS: &[AgentDef] = &[
         hook_config: None,
         sidecar_hooks: None,
         resume_strategy: ResumeStrategy::Unsupported,
+        fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint: "curl -fsSL https://antigravity.google/cli/install.sh | bash",
@@ -1406,6 +1440,35 @@ mod tests {
             declared, expected_names,
             "sidecar_hooks agent set drifted; update test_all_sidecar_hooks_declare_expected_format"
         );
+    }
+
+    #[test]
+    fn test_fork_strategy_is_set_for_fork_capable_agents() {
+        // Only claude, codex, and opencode can fork; every other agent is
+        // Unsupported. Iterating the full AGENTS slice makes a new agent with a
+        // stray fork_strategy fail loudly here.
+        assert!(matches!(
+            get_agent("claude").unwrap().fork_strategy,
+            ForkStrategy::ClaudeFork
+        ));
+        assert!(matches!(
+            get_agent("codex").unwrap().fork_strategy,
+            ForkStrategy::CodexFork
+        ));
+        assert!(matches!(
+            get_agent("opencode").unwrap().fork_strategy,
+            ForkStrategy::Flag("--fork")
+        ));
+        for agent in AGENTS {
+            let fork_capable = matches!(agent.name, "claude" | "codex" | "opencode");
+            assert_eq!(
+                matches!(agent.fork_strategy, ForkStrategy::Unsupported),
+                !fork_capable,
+                "agent '{}' fork_strategy drifted; when adding an agent, update \
+                 test_fork_strategy_is_set_for_fork_capable_agents and the agent's fork_strategy",
+                agent.name
+            );
+        }
     }
 
     #[test]
