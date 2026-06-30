@@ -3644,6 +3644,15 @@ pub struct CreateSessionBody {
     #[cfg(feature = "serve")]
     #[serde(default)]
     pub import_acp_session_id: Option<String>,
+    /// Fork an existing session: the source session's captured agent session
+    /// id (terminal) to resume and diverge from. Pass the source session's
+    /// `agent_session_id`, not the AoE session id; the new session resumes
+    /// that conversation as an independent session (the original is left
+    /// untouched). Terminal fork only via this field; structured (ACP) fork is
+    /// requested separately.
+    #[cfg(feature = "serve")]
+    #[serde(default)]
+    pub fork_from: Option<String>,
 }
 
 fn validate_session_tool_identity(
@@ -4089,6 +4098,38 @@ pub async fn create_session(
         }
     }
 
+    // Forking an existing session (terminal): `fork_from` carries the source
+    // session's captured agent session id. Resolve eligibility here, ahead of
+    // the build, so an unforkable agent or a missing parent id returns a clean
+    // 400 rather than failing later. The seed is then applied by the builder,
+    // which pre-pins the child id and sets the one-shot Fork intent.
+    #[cfg(feature = "serve")]
+    let fork_seed = match body
+        .fork_from
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(parent_id) => match crate::session::fork::terminal_fork_seed(
+            &body.tool,
+            Some(parent_id),
+            crate::session::capture::generate_claude_session_id(),
+        ) {
+            Ok(seed) => Some(seed),
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "fork_unsupported",
+                        "message": "This agent or session cannot be forked",
+                    })),
+                )
+                    .into_response();
+            }
+        },
+        None => None,
+    };
+
     let profile = body.profile.unwrap_or_else(|| state.profile.clone());
     let instances = state.instances.read().await;
     let existing_titles: Vec<String> = instances.iter().map(|i| i.title.clone()).collect();
@@ -4167,6 +4208,9 @@ pub async fn create_session(
             command_override: body.command_override,
             extra_repo_paths,
             scratch: body.scratch,
+            #[cfg(feature = "serve")]
+            fork_seed,
+            #[cfg(not(feature = "serve"))]
             fork_seed: None,
         };
 
@@ -5973,6 +6017,31 @@ mod tests {
         inst.status = Status::Running;
         inst.group_path = "work/projects".to_string();
         inst
+    }
+
+    #[test]
+    fn fork_from_builds_terminal_seed_for_claude() {
+        // The create handler resolves `fork_from` through the shared
+        // `terminal_fork_seed` helper; a claude parent id yields a Terminal
+        // seed whose child id is a fresh, valid session id.
+        let seed = crate::session::fork::terminal_fork_seed(
+            "claude",
+            Some("parent-uuid"),
+            crate::session::capture::generate_claude_session_id(),
+        )
+        .expect("claude fork allowed");
+        match seed {
+            crate::session::ForkSeed::Terminal {
+                parent_agent_session_id,
+                child_session_id,
+            } => {
+                assert_eq!(parent_agent_session_id, "parent-uuid");
+                assert!(crate::session::capture::is_valid_session_id(
+                    &child_session_id
+                ));
+            }
+            _ => panic!("expected Terminal seed"),
+        }
     }
 
     #[test]
