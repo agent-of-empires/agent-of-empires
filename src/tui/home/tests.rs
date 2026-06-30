@@ -646,6 +646,97 @@ fn unread_dot_yields_to_a_running_status() {
     );
 }
 
+/// Sunk rows never paint the unread dot. Archiving or snoozing an unread
+/// row dismisses it; surfacing it as unread contradicts that. The snooze
+/// case must hold in every sort mode, not just Attention (#2571).
+#[test]
+#[serial]
+fn unread_dot_suppressed_on_archived_and_snoozed() {
+    use crate::session::config::SortOrder;
+    use crate::tui::styles::load_theme;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    crate::session::set_unread_enabled(true);
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances()[0].id.clone();
+    let theme = load_theme("empire");
+
+    let render = |env: &mut TestEnv| -> String {
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| env.view.render(f, f.area(), &theme, None, None, None))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+        }
+        out
+    };
+
+    // Baseline: an idle unread row paints the dot.
+    env.view.mutate_instance(&id, |inst| {
+        inst.status = crate::session::Status::Idle;
+        inst.mark_unread();
+    });
+    env.view.flat_items = env.view.build_flat_items();
+    assert!(
+        render(&mut env).contains('●'),
+        "an idle unread row should paint the unread dot"
+    );
+
+    // Snoozed, in a non-Attention sort: the dot must be gone even though the
+    // snooze decoration itself is Attention-only.
+    env.view.sort_order = SortOrder::Newest;
+    env.view.mutate_instance(&id, |inst| inst.snooze(30));
+    env.view.flat_items = env.view.build_flat_items();
+    assert!(
+        !render(&mut env).contains('●'),
+        "a snoozed unread row must not paint the unread dot outside Attention sort"
+    );
+
+    // Snoozed in Attention sort: still no dot.
+    env.view.sort_order = SortOrder::Attention;
+    env.view.flat_items = env.view.build_flat_items();
+    assert!(
+        !render(&mut env).contains('●'),
+        "a snoozed unread row must not paint the unread dot in Attention sort"
+    );
+
+    // Archived: the archive override already mutes the glyph; guard it stays muted.
+    env.view.mutate_instance(&id, |inst| {
+        inst.unsnooze();
+        inst.archive();
+    });
+    env.view.flat_items = env.view.build_flat_items();
+    assert!(
+        !render(&mut env).contains('●'),
+        "an archived unread row must not paint the unread dot"
+    );
+}
+
+/// Render suppression is cosmetic: archive/snooze leave the `unread` flag on
+/// disk so unarchiving or unsnoozing brings the marker back (#2571).
+#[test]
+fn unread_flag_survives_sink_round_trip() {
+    let mut inst = crate::session::Instance::new("rt", "/tmp/rt");
+    inst.mark_unread();
+
+    inst.archive();
+    assert!(inst.is_unread(), "archive must not clear unread");
+    inst.unarchive();
+    assert!(inst.is_unread(), "unarchive must keep unread");
+
+    inst.snooze(30);
+    assert!(inst.is_unread(), "snooze must not clear unread");
+    inst.unsnooze();
+    assert!(inst.is_unread(), "unsnooze must keep unread");
+}
+
 /// Dwell-to-read: an unread row that stays selected past `UNREAD_DWELL`
 /// (with the list in the foreground) is cleared, distinguishing "stopped to
 /// read it" from "scrolled past."

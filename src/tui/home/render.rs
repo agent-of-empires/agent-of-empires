@@ -1117,8 +1117,18 @@ impl HomeView {
                             // on Idle; a manual flag on a live row defers to
                             // the live state. Archived/snoozed/urgent below
                             // still override on top.
+                            // Sunk rows (archived/snoozed) never paint unread:
+                            // the user dismissed the row, so surfacing it as
+                            // unread contradicts that. The flag stays on disk,
+                            // so unarchiving/unsnoozing restores it. Snooze is
+                            // checked in every sort mode here (unlike the
+                            // Attention-only snooze decoration below), so a
+                            // snoozed unread row outside Attention sort still
+                            // drops the dot (#2571).
                             let unread_resting = crate::session::unread_enabled()
                                 && inst.is_unread()
+                                && !inst.is_archived()
+                                && !inst.is_snoozed()
                                 && matches!(inst.status, Status::Idle | Status::Unknown);
                             let color = match inst.status {
                                 Status::Running => theme.running,
@@ -1220,8 +1230,12 @@ impl HomeView {
                                     .map(|s| s.exists())
                                     .unwrap_or(false),
                             };
-                            let unread_overlay =
-                                crate::session::unread_enabled() && inst.is_unread();
+                            // Sunk rows suppress the unread overlay in every
+                            // sort mode, same rule as the Agent-view path (#2571).
+                            let unread_overlay = crate::session::unread_enabled()
+                                && inst.is_unread()
+                                && !inst.is_archived()
+                                && !inst.is_snoozed();
                             let (mut icon, color) = if terminal_running {
                                 (spinner_running(&inst.created_at), theme.terminal_active)
                             } else if unread_overlay {
