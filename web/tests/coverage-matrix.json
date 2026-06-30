@@ -830,6 +830,16 @@
       "components": ["web/src/App.tsx", "web/src/components/command-palette/CommandPalette.tsx"]
     },
     {
+      "id": "palette.category-tabs",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/command-palette/__tests__/CommandPalette.test.tsx"],
+      "components": [
+        "web/src/components/command-palette/CommandPalette.tsx",
+        "web/src/components/command-palette/groups.ts"
+      ]
+    },
+    {
       "id": "sidebar.scratch-group",
       "kind": "mocked-playwright",
       "risk": "medium",

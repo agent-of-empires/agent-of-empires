@@ -96,4 +96,86 @@ describe("CommandPalette", () => {
     });
     expect(onSearchChange).toHaveBeenCalledWith("reconciler");
   });
+
+  describe("category tabs", () => {
+    const mixed = [
+      action({ id: "a1", title: "Run thing", group: "Actions" }),
+      action({ id: "s1", title: "Save setting", group: "Settings" }),
+      action({ id: "sess1", title: "Some session", group: "Sessions" }),
+    ];
+
+    it("defaults to All and shows every group's rows (no regression)", () => {
+      render(<CommandPalette open onClose={() => {}} actions={mixed} />);
+      expect(screen.getByRole("tab", { name: "All" }).getAttribute("aria-selected")).toBe("true");
+      expect(screen.getByText("Run thing")).toBeTruthy();
+      expect(screen.getByText("Save setting")).toBeTruthy();
+      expect(screen.getByText("Some session")).toBeTruthy();
+    });
+
+    it("scopes the list to one group when a category tab is clicked", () => {
+      render(<CommandPalette open onClose={() => {}} actions={mixed} />);
+      fireEvent.click(screen.getByRole("tab", { name: "Settings" }));
+      expect(screen.getByText("Save setting")).toBeTruthy();
+      expect(screen.queryByText("Run thing")).toBeNull();
+      expect(screen.queryByText("Some session")).toBeNull();
+    });
+
+    it("offers no tab for an empty category", () => {
+      render(<CommandPalette open onClose={() => {}} actions={mixed} />);
+      // No Conversations actions and not searching, so no Conversations tab.
+      expect(screen.queryByRole("tab", { name: "Conversations" })).toBeNull();
+      expect(screen.getByRole("tab", { name: "Settings" })).toBeTruthy();
+    });
+
+    it("offers the Conversations tab while a content search is in flight", () => {
+      render(<CommandPalette open onClose={() => {}} actions={mixed} searching />);
+      expect(screen.getByRole("tab", { name: "Conversations" })).toBeTruthy();
+    });
+
+    it("hides the tab strip when only one category has results", () => {
+      render(<CommandPalette open onClose={() => {}} actions={[action({ title: "Lonely", group: "Actions" })]} />);
+      expect(screen.queryByRole("tablist")).toBeNull();
+    });
+
+    it("reflects the active tab's count in the footer", () => {
+      render(
+        <CommandPalette
+          open
+          onClose={() => {}}
+          actions={[
+            action({ id: "a1", title: "One", group: "Actions" }),
+            action({ id: "a2", title: "Two", group: "Actions" }),
+            action({ id: "s1", title: "Setting", group: "Settings" }),
+          ]}
+        />,
+      );
+      expect(screen.getByText("3 actions")).toBeTruthy();
+      fireEvent.click(screen.getByRole("tab", { name: "Settings" }));
+      expect(screen.getByText("1 action")).toBeTruthy();
+    });
+
+    it("cycles tabs with Tab and Shift+Tab", () => {
+      render(<CommandPalette open onClose={() => {}} actions={mixed} />);
+      const dialog = screen.getByRole("dialog", { name: "Command palette" });
+      const selected = () =>
+        screen.getAllByRole("tab").find((t) => t.getAttribute("aria-selected") === "true")?.textContent;
+      expect(selected()).toBe("All");
+      // Tab order is All, Actions, Sessions, Settings (no Conversations here).
+      fireEvent.keyDown(dialog, { key: "Tab" });
+      expect(selected()).toBe("Actions");
+      fireEvent.keyDown(dialog, { key: "Tab", shiftKey: true });
+      expect(selected()).toBe("All");
+      fireEvent.keyDown(dialog, { key: "Tab", shiftKey: true });
+      expect(selected()).toBe("Settings");
+    });
+
+    it("resets to All when reopened", () => {
+      const { rerender } = render(<CommandPalette open onClose={() => {}} actions={mixed} />);
+      fireEvent.click(screen.getByRole("tab", { name: "Settings" }));
+      expect(screen.getByRole("tab", { name: "Settings" }).getAttribute("aria-selected")).toBe("true");
+      rerender(<CommandPalette open={false} onClose={() => {}} actions={mixed} />);
+      rerender(<CommandPalette open onClose={() => {}} actions={mixed} />);
+      expect(screen.getByRole("tab", { name: "All" }).getAttribute("aria-selected")).toBe("true");
+    });
+  });
 });

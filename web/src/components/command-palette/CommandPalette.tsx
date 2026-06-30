@@ -1,8 +1,8 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type KeyboardEvent as ReactKeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Command, defaultFilter } from "cmdk";
 import { StatusGlyph } from "../StatusGlyph";
 import { CheatOverlay } from "./CheatOverlay";
-import { GROUP_ORDER } from "./groups";
+import { GROUP_ORDER, TAB_ORDER, type PaletteTab } from "./groups";
 import type { CommandAction, CommandActionGroup } from "./types";
 import { matchCheat, type CheatEffect } from "../../lib/cheats";
 import { reportInfo } from "../../lib/toastBus";
@@ -23,6 +23,9 @@ export function CommandPalette({ open, onClose, actions, onSearchChange, searchi
   const inputRef = useRef<HTMLInputElement>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
   const [search, setSearch] = useState("");
+  // JetBrains "Search Everywhere"-style tabs: "All" shows every group (the
+  // default flat view), a category tab scopes the list to one group.
+  const [activeTab, setActiveTab] = useState<PaletteTab>("All");
   // Active easter-egg effect plus a monotonic id so retyping the same cheat
   // replays the animation (the id is the overlay's React key).
   const [cheat, setCheat] = useState<{ effect: CheatEffect; id: number } | null>(null);
@@ -67,6 +70,7 @@ export function CommandPalette({ open, onClose, actions, onSearchChange, searchi
     if (!open) {
       setSearch("");
       setCheat(null);
+      setActiveTab("All");
     }
   }
 
@@ -84,11 +88,44 @@ export function CommandPalette({ open, onClose, actions, onSearchChange, searchi
     return map;
   }, [actions]);
 
+  // Tabs to render: "All" always, plus any group that has rows for the current
+  // query. The Conversations tab also shows while a content search is in
+  // flight so it is reachable before the first hit lands.
+  const tabs = useMemo(
+    () =>
+      TAB_ORDER.filter(
+        (t) => t === "All" || (grouped.get(t)?.length ?? 0) > 0 || (t === "Conversations" && !!searching),
+      ),
+    [grouped, searching],
+  );
+
+  // The active tab can go stale when the query changes out from under it (its
+  // group emptied). Fall back to "All" rather than render an empty scope.
+  if (activeTab !== "All" && !tabs.includes(activeTab)) setActiveTab("All");
+
+  const visibleGroups = activeTab === "All" ? GROUP_ORDER : [activeTab];
+  const visibleCount = visibleGroups.reduce((n, g) => n + (grouped.get(g)?.length ?? 0), 0);
+
   if (!open) return null;
 
   const run = (action: CommandAction) => {
     onClose();
     queueMicrotask(() => action.perform());
+  };
+
+  // Tab / Shift+Tab cycle the scope tabs (JetBrains mirror). preventDefault so
+  // the key does not move focus out of the input or type into it.
+  const cycleTab = (dir: 1 | -1) => {
+    if (tabs.length < 3) return;
+    const i = tabs.indexOf(activeTab);
+    const next = tabs[(i + dir + tabs.length) % tabs.length];
+    if (next) setActiveTab(next);
+  };
+
+  const onKeyDown = (e: ReactKeyboardEvent) => {
+    if (e.key !== "Tab") return;
+    e.preventDefault();
+    cycleTab(e.shiftKey ? -1 : 1);
   };
 
   return (
@@ -98,6 +135,7 @@ export function CommandPalette({ open, onClose, actions, onSearchChange, searchi
       aria-label="Command palette"
       className="fixed inset-0 z-[60] flex items-start justify-center bg-black/80 backdrop-blur-sm animate-fade-in pt-[15vh] px-3"
       onClick={onClose}
+      onKeyDown={onKeyDown}
       data-testid="command-palette-backdrop"
     >
       <Command
@@ -139,10 +177,39 @@ export function CommandPalette({ open, onClose, actions, onSearchChange, searchi
           </kbd>
         </div>
 
+        {tabs.length > 2 && (
+          <div
+            role="tablist"
+            aria-label="Result categories"
+            className="flex items-center gap-1 px-2 h-9 border-b border-surface-700/50"
+          >
+            {tabs.map((tab) => (
+              <button
+                key={tab}
+                type="button"
+                role="tab"
+                aria-selected={activeTab === tab}
+                onClick={() => setActiveTab(tab)}
+                className={`px-2.5 py-1 rounded text-xs font-medium ${
+                  activeTab === tab
+                    ? "bg-surface-700 text-text-bright"
+                    : "text-text-muted hover:text-text-primary hover:bg-surface-700/50"
+                }`}
+              >
+                {tab}
+              </button>
+            ))}
+            <span className="flex-1" />
+            <kbd className="font-mono text-[10px] px-1.5 py-0.5 rounded bg-surface-900 border border-surface-700 text-text-muted">
+              tab
+            </kbd>
+          </div>
+        )}
+
         <Command.List className="max-h-[50vh] overflow-y-auto p-1">
           <Command.Empty className="px-4 py-8 text-center text-sm text-text-muted">No matches</Command.Empty>
 
-          {GROUP_ORDER.map((groupName) => {
+          {visibleGroups.map((groupName) => {
             const items = grouped.get(groupName) ?? [];
             // The Conversations group still renders while a content search
             // is in flight, so the spinner replaces a premature "No matches".
@@ -198,7 +265,7 @@ export function CommandPalette({ open, onClose, actions, onSearchChange, searchi
         <div className="flex items-center justify-between px-4 h-8 border-t border-surface-700/50 text-[11px] font-mono text-text-muted">
           <span>↑↓ navigate · ↵ select · esc close</span>
           <span>
-            {actions.length} action{actions.length === 1 ? "" : "s"}
+            {visibleCount} action{visibleCount === 1 ? "" : "s"}
           </span>
         </div>
       </Command>
