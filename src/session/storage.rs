@@ -1768,14 +1768,9 @@ mod tests {
             )
             .expect("subscribe groups");
 
-        while tokio::time::timeout(std::time::Duration::from_millis(400), sessions_rx.recv())
-            .await
-            .is_ok()
-        {}
-        while tokio::time::timeout(std::time::Duration::from_millis(50), groups_rx.recv())
-            .await
-            .is_ok()
-        {}
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        while sessions_rx.try_recv().is_ok() {}
+        while groups_rx.try_recv().is_ok() {}
 
         let original_mode = fs::metadata(&profile_dir)?.permissions().mode();
         let mut readonly = fs::metadata(&profile_dir)?.permissions();
