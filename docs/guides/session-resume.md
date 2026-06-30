@@ -4,6 +4,8 @@ Claude Code sessions launched through AoE resume their prior conversation automa
 
 This is automatic and on by default. Runtime conversation changes (via `/clear`, `--fork-session`, `--continue`, or starting fresh in the pane) are picked up too, in both host and sandboxed (Docker) modes.
 
+To branch a conversation into a new session instead of resuming it in place, see [Forking Sessions](./session-fork.md).
+
 ## Pinning or resetting a conversation
 
 Pin a session to a specific Claude conversation:

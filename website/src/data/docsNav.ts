@@ -37,6 +37,7 @@ export const docsNav: NavSection[] = [
       { title: "Tool Sessions", href: "/guides/tool-sessions/", description: "Run plain shell or tool sessions alongside your agents." },
       { title: "MCP Servers", href: "/guides/mcp-servers/", description: "Forward configured MCP servers to structured-view agents." },
       { title: "Session Resume (Claude)", href: "/guides/session-resume/", description: "Resume a previous Claude Code conversation in a session." },
+      { title: "Forking Sessions", href: "/guides/session-fork/", description: "Branch a session's conversation into a new, independent session." },
       { title: "Shell Completions", href: "/guides/shell-completions/", description: "Install and refresh tab-completion for the aoe CLI." },
       { title: "Sound Effects", href: "/docs/sounds/", description: "Play sounds when agents need input or finish work." },
       { title: "Push Notifications", href: "/docs/push-notifications/", description: "Get notified when a session needs your attention." },
