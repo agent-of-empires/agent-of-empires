@@ -4167,6 +4167,7 @@ pub async fn create_session(
             command_override: body.command_override,
             extra_repo_paths,
             scratch: body.scratch,
+            fork_seed: None,
         };
 
         let build_result = builder::build_instance(params, &title_refs, &branch_refs, &profile)?;

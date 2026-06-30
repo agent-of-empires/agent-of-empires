@@ -125,6 +125,7 @@ impl CreationPoller {
             command_override: data.command_override,
             extra_repo_paths: data.extra_repo_paths,
             scratch: data.scratch,
+            fork_seed: None,
         };
 
         let build_result =
