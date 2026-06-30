@@ -12,10 +12,24 @@ use ratatui::widgets::*;
 use tokio::sync::oneshot;
 
 use super::{centered_rect, DialogResult};
+use crate::plugin::changelog::{ChangelogEntry, UpdateChangelog};
 use crate::plugin::discover::DiscoveryResult;
 use crate::plugin::install::{UpdateConsent, UpdatePreview};
 use crate::plugin::update_check::UpdateStatus;
 use crate::tui::styles::Theme;
+
+/// An open update review popup. Every update (safe or consent-required) shows
+/// the changelog; `consent` is `Some` only when the update also expands access,
+/// adding the capability / build / UI / runtime / trust disclosures and the
+/// Decline (dismiss) action.
+struct Review {
+    id: String,
+    from_version: String,
+    to_version: String,
+    fingerprint: String,
+    changelog: UpdateChangelog,
+    consent: Option<UpdateConsent>,
+}
 
 /// Which view the manager is showing: the installed list or GitHub discovery
 /// results.
@@ -67,14 +81,69 @@ pub struct PluginManagerDialog {
     /// The plugin id a preview/apply is running for, so `tick` knows which row
     /// the result belongs to.
     pending_plugin: Option<String>,
-    /// An open update-consent popup: the structured disclosure to render and
-    /// approve / decline.
-    consent: Option<UpdateConsent>,
+    /// An open update review popup: the changelog plus, when access expands, the
+    /// consent disclosure to render and approve / decline.
+    review: Option<Review>,
 }
 
 impl Default for PluginManagerDialog {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Append the changelog to a review popup's lines: release notes or commit
+/// subjects, or a single "unavailable" / "none" line. Best-effort presentation;
+/// the entries are already capped by the backend.
+fn push_changelog_lines(lines: &mut Vec<Line>, changelog: &UpdateChangelog, theme: &Theme) {
+    if let Some(reason) = &changelog.unavailable_reason {
+        lines.push(Line::from(Span::styled(
+            reason.clone(),
+            Style::default().fg(theme.dimmed),
+        )));
+        return;
+    }
+    if changelog.entries.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No changelog available.",
+            Style::default().fg(theme.dimmed),
+        )));
+        return;
+    }
+    lines.push(Line::from(Span::styled(
+        "What's new:",
+        Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+    )));
+    for entry in &changelog.entries {
+        match entry {
+            ChangelogEntry::Release { tag, body, .. } => {
+                lines.push(Line::from(Span::styled(
+                    tag.clone(),
+                    Style::default().fg(theme.text),
+                )));
+                if let Some(body) = body {
+                    for line in body.lines() {
+                        lines.push(Line::from(Span::styled(
+                            format!("  {line}"),
+                            Style::default().fg(theme.dimmed),
+                        )));
+                    }
+                }
+            }
+            ChangelogEntry::Commit { sha, subject, .. } => {
+                let short: String = sha.chars().take(7).collect();
+                lines.push(Line::from(Span::styled(
+                    format!("  {short} {subject}"),
+                    Style::default().fg(theme.dimmed),
+                )));
+            }
+        }
+    }
+    if changelog.truncated {
+        lines.push(Line::from(Span::styled(
+            "  ... older history on GitHub",
+            Style::default().fg(theme.dimmed),
+        )));
     }
 }
 
@@ -95,7 +164,7 @@ impl PluginManagerDialog {
             discover_rows: Vec::new(),
             discover_selected: 0,
             pending_plugin: None,
-            consent: None,
+            review: None,
         };
         dialog.reload();
         dialog.mutated = false; // Initial load is not a user mutation.
@@ -130,9 +199,9 @@ impl PluginManagerDialog {
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<()> {
         self.info = None;
-        // An open consent popup owns the keyboard until the user decides.
-        if self.consent.is_some() {
-            return self.handle_consent_key(key);
+        // An open review popup owns the keyboard until the user decides.
+        if self.review.is_some() {
+            return self.handle_review_key(key);
         }
         if self.mode == Mode::Discover {
             return self.handle_discover_key(key);
@@ -190,36 +259,42 @@ impl PluginManagerDialog {
         }
     }
 
-    /// Keys while the update-consent popup is open: approve, decline, or close.
-    fn handle_consent_key(&mut self, key: KeyEvent) -> DialogResult<()> {
+    /// Keys while the update review popup is open: approve/update, decline (only
+    /// when access expands), or close.
+    fn handle_review_key(&mut self, key: KeyEvent) -> DialogResult<()> {
         match key.code {
             KeyCode::Char('y') | KeyCode::Enter => {
-                if let Some(consent) = self.consent.take() {
-                    self.start_apply(consent.id, Some(consent.fingerprint));
+                if let Some(review) = self.review.take() {
+                    self.start_apply(review.id, Some(review.fingerprint));
                 }
                 DialogResult::Continue
             }
-            // Decline: record the dismissal so it stops nagging, keep the active
-            // version. `dismiss_update` is a quick local config write.
+            // Decline only applies to a consent-expanding update: record the
+            // dismissal so it stops nagging, keep the active version. A safe
+            // update has nothing to dismiss, so `n` just closes it.
             KeyCode::Char('n') => {
-                if let Some(consent) = self.consent.take() {
-                    match crate::plugin::install::dismiss_update(&consent.id, &consent.fingerprint)
-                    {
-                        Ok(()) => {
-                            // dismiss_update wrote plugin config; flag it so an
-                            // embedding settings surface resyncs and a later save
-                            // does not clobber the dismissal.
-                            self.mutated = true;
-                            self.info = Some(format!("Declined update for {}.", consent.id));
+                if let Some(review) = self.review.take() {
+                    if review.consent.is_some() {
+                        match crate::plugin::install::dismiss_update(
+                            &review.id,
+                            &review.fingerprint,
+                        ) {
+                            Ok(()) => {
+                                // dismiss_update wrote plugin config; flag it so
+                                // an embedding settings surface resyncs and a
+                                // later save does not clobber the dismissal.
+                                self.mutated = true;
+                                self.info = Some(format!("Declined update for {}.", review.id));
+                            }
+                            Err(e) => self.error = Some(format!("{e:#}")),
                         }
-                        Err(e) => self.error = Some(format!("{e:#}")),
                     }
                 }
                 DialogResult::Continue
             }
             // Close without deciding.
             KeyCode::Esc | KeyCode::Char('q') => {
-                self.consent = None;
+                self.review = None;
                 DialogResult::Continue
             }
             _ => DialogResult::Continue,
@@ -402,10 +477,28 @@ impl PluginManagerDialog {
                         Ok(UpdatePreview::NoUpdate) => {
                             self.info = Some("Already up to date.".to_string());
                         }
-                        // A safe update needs no consent: apply it straight away.
-                        Ok(UpdatePreview::SafeUpdate { fingerprint, .. }) => {
+                        // A safe update needs no consent, but still shows its
+                        // changelog in a review popup before applying.
+                        Ok(UpdatePreview::SafeUpdate {
+                            to_version,
+                            fingerprint,
+                            changelog,
+                        }) => {
                             if let Some(id) = self.pending_plugin.clone() {
-                                self.start_apply(id, Some(fingerprint));
+                                let from_version = self
+                                    .rows
+                                    .iter()
+                                    .find(|r| r.id == id)
+                                    .map(|r| r.version.clone())
+                                    .unwrap_or_default();
+                                self.review = Some(Review {
+                                    id,
+                                    from_version,
+                                    to_version,
+                                    fingerprint,
+                                    changelog,
+                                    consent: None,
+                                });
                             }
                         }
                         // An already-dismissed version must not re-prompt; it
@@ -417,7 +510,14 @@ impl PluginManagerDialog {
                                     consent.id
                                 ));
                             } else {
-                                self.consent = Some(*consent);
+                                self.review = Some(Review {
+                                    id: consent.id.clone(),
+                                    from_version: consent.from_version.clone(),
+                                    to_version: consent.to_version.clone(),
+                                    fingerprint: consent.fingerprint.clone(),
+                                    changelog: consent.changelog.clone(),
+                                    consent: Some(*consent),
+                                });
                             }
                         }
                         Err(message) => self.error = Some(message),
@@ -506,27 +606,42 @@ impl PluginManagerDialog {
         let inner = block.inner(rect);
         f.render_widget(block, rect);
         self.render_browse(f, inner, theme);
-        // The consent popup floats over the list, centered on the dialog rect.
-        if let Some(consent) = &self.consent {
-            self.render_consent(f, rect, theme, consent);
+        // The review popup floats over the list, centered on the dialog rect.
+        if let Some(review) = &self.review {
+            self.render_review(f, rect, theme, review);
         }
     }
 
-    fn render_consent(&self, f: &mut Frame, area: Rect, theme: &Theme, consent: &UpdateConsent) {
-        let mut lines: Vec<Line> = vec![
-            Line::from(Span::styled(
-                format!(
-                    "Update {}? v{} -> v{}",
-                    consent.id, consent.from_version, consent.to_version
-                ),
-                Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
+    fn render_review(&self, f: &mut Frame, area: Rect, theme: &Theme, review: &Review) {
+        let mut lines: Vec<Line> = vec![Line::from(Span::styled(
+            format!(
+                "Update {}? v{} -> v{}",
+                review.id, review.from_version, review.to_version
+            ),
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+        ))];
+        if review.consent.is_some() {
+            lines.push(Line::from(Span::styled(
                 "This update expands what the plugin can do.",
                 Style::default().fg(theme.dimmed),
-            )),
-            Line::from(""),
-        ];
+            )));
+        }
+        lines.push(Line::from(""));
+
+        // Changelog, shown for every update.
+        push_changelog_lines(&mut lines, &review.changelog, theme);
+        lines.push(Line::from(""));
+
+        let Some(consent) = &review.consent else {
+            // Safe update: changelog only, with an update/cancel hint.
+            lines.push(Line::from(Span::styled(
+                "enter update · esc cancel",
+                Style::default().fg(theme.dimmed),
+            )));
+            self.draw_review_popup(f, area, theme, lines, " Update plugin ");
+            return;
+        };
+
         if !consent.added_capabilities.is_empty() {
             lines.push(Line::from(Span::styled(
                 format!(
@@ -588,7 +703,18 @@ impl PluginManagerDialog {
             "y approve · n decline · esc close",
             Style::default().fg(theme.dimmed),
         )));
+        self.draw_review_popup(f, area, theme, lines, " Approve update ");
+    }
 
+    /// Draw the review popup body into a clamped, centered sub-rect.
+    fn draw_review_popup(
+        &self,
+        f: &mut Frame,
+        area: Rect,
+        theme: &Theme,
+        lines: Vec<Line>,
+        title: &str,
+    ) {
         // A tiny terminal can be narrower/shorter than our preferred size;
         // never pass clamp/centered_rect a max below the min (it panics).
         if area.width == 0 || area.height == 0 {
@@ -599,7 +725,7 @@ impl PluginManagerDialog {
         let rect = centered_rect(area, width, height);
         f.render_widget(Clear, rect);
         let block = Block::default()
-            .title(" Approve update ")
+            .title(title.to_string())
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(theme.accent));
