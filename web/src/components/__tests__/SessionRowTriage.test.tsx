@@ -224,6 +224,49 @@ describe("SessionRow chips", () => {
   });
 });
 
+describe("SessionRow unread dot", () => {
+  // Positive control: an idle unread row that is not sunk paints the dot,
+  // so the absence assertions below mean suppression, not a broken probe.
+  it("renders the unread dot on a live idle unread row", () => {
+    const ws = workspace("w-unread", [session({ unread: true })]);
+    render(
+      <Wrap>
+        <UnreadIndicatorContext.Provider value={true}>
+          <Row ws={ws} />
+        </UnreadIndicatorContext.Provider>
+      </Wrap>,
+    );
+    expect(screen.queryByTestId("sidebar-unread-dot")).not.toBeNull();
+  });
+
+  it("suppresses the unread dot when the row is archived (#2571)", () => {
+    const ws = workspace("w-unread-archived", [
+      session({ unread: true, archived_at: "2026-01-01T00:00:00Z" }),
+    ]);
+    render(
+      <Wrap>
+        <UnreadIndicatorContext.Provider value={true}>
+          <Row ws={ws} />
+        </UnreadIndicatorContext.Provider>
+      </Wrap>,
+    );
+    expect(screen.queryByTestId("sidebar-unread-dot")).toBeNull();
+  });
+
+  it("suppresses the unread dot when the row is snoozed (#2571)", () => {
+    const future = new Date(Date.now() + 90 * 60 * 1000).toISOString();
+    const ws = workspace("w-unread-snoozed", [session({ unread: true, snoozed_until: future })]);
+    render(
+      <Wrap>
+        <UnreadIndicatorContext.Provider value={true}>
+          <Row ws={ws} />
+        </UnreadIndicatorContext.Provider>
+      </Wrap>,
+    );
+    expect(screen.queryByTestId("sidebar-unread-dot")).toBeNull();
+  });
+});
+
 describe("SessionRow smart-rename chip", () => {
   it("renders the Auto-name chip when smart_rename is pending", () => {
     const ws = workspace("w-pending", [session({ view: "structured", smart_rename: "pending" })]);

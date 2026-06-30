@@ -954,12 +954,21 @@ export const SessionRow = memo(function SessionRow({
   const isPinned = workspace.sessions.some((s) => s.pinned_at != null);
   const isArchived = workspace.sessions.some((s) => s.archived_at != null);
   const snoozedUntil = workspace.sessions.find((s) => s.snoozed_until)?.snoozed_until ?? null;
+  // Effective state for rendering: optimistic overrides win until the
+  // sidebar's overlay reconciler drops them once the prop catches up.
+  const effectivePinned = effectivePinnedOf(optimistic, isPinned);
+  const effectiveArchived = effectiveArchivedOf(optimistic, isArchived);
+  const effectiveSnoozedUntil = effectiveSnoozedUntilOf(optimistic, snoozedUntil);
+  const effectiveSnoozed = effectiveSnoozedUntil != null;
   // Unread marker for the row, server value plus optimistic overlay. The
   // active (open) row is always suppressed: opening reads it and the App
   // clears it a beat later, so hiding it avoids a flash in the poll window.
+  // Sunk rows (archived/snoozed) suppress it too: the user dismissed the
+  // row, so lighting it up as unread contradicts that. The `unread` flag
+  // stays on disk, so unarchiving or unsnoozing restores the marker (#2571).
   const serverUnread = workspace.sessions.some((s) => s.unread === true);
   const effectiveUnread = effectiveUnreadOf(optimistic, serverUnread);
-  const isUnread = unreadIndicatorEnabled && effectiveUnread && !isActive;
+  const isUnread = unreadIndicatorEnabled && effectiveUnread && !isActive && !effectiveArchived && !effectiveSnoozed;
   // Like the TUI, the unread marker *replaces* the resting status glyph with a
   // solid dot (rather than sitting beside the title). Only for resting states:
   // a live spinner (Running/Waiting/...) stays, since live status outranks it
@@ -1076,13 +1085,6 @@ export const SessionRow = memo(function SessionRow({
       reportError(result.message ?? "Could not start auto-name. Please try again.");
     }
   };
-
-  // Effective state for rendering: optimistic overrides win until the
-  // sidebar's overlay reconciler drops them once the prop catches up.
-  const effectivePinned = effectivePinnedOf(optimistic, isPinned);
-  const effectiveArchived = effectiveArchivedOf(optimistic, isArchived);
-  const effectiveSnoozedUntil = effectiveSnoozedUntilOf(optimistic, snoozedUntil);
-  const effectiveSnoozed = effectiveSnoozedUntil != null;
 
   const [contextMenu, setContextMenu] = useState<{
     x: number;
