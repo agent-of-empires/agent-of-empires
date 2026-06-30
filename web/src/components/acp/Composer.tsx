@@ -1116,6 +1116,7 @@ export function Composer({
                   <VoiceDictationButton
                     listening={voiceDictation.listening}
                     processing={voiceDictation.processing}
+                    audioLevel={voiceDictation.audioLevel}
                     error={voiceDictation.error}
                     onStart={startVoiceDictation}
                     onStop={stopVoiceDictation}
@@ -1357,12 +1358,14 @@ function ToolbarButton({
 function VoiceDictationButton({
   listening,
   processing,
+  audioLevel,
   error,
   onStart,
   onStop,
 }: {
   listening: boolean;
   processing: boolean;
+  audioLevel: number | null;
   error: string | null;
   onStart: () => void;
   onStop: () => void;
@@ -1400,8 +1403,43 @@ function VoiceDictationButton({
         "transition-colors duration-100",
       ].join(" ")}
     >
-      <Mic className="h-3.5 w-3.5" />
+      {processing ? (
+        <>
+          <span
+            className="h-3.5 w-3.5 rounded-full border-2 border-current border-r-transparent motion-safe:animate-spin"
+            aria-hidden="true"
+          />
+        </>
+      ) : (
+        <>
+          <Mic className="h-3.5 w-3.5" />
+          {listening && <VoiceWaveform level={audioLevel} />}
+        </>
+      )}
     </button>
+  );
+}
+
+function VoiceWaveform({ level }: { level: number | null }) {
+  const clamped = level == null ? null : Math.max(0, Math.min(1, level));
+  const bars =
+    clamped == null
+      ? [0.38, 0.72, 0.5, 0.85]
+      : [0.28 + clamped * 0.55, 0.42 + clamped * 0.58, 0.34 + clamped * 0.66, 0.24 + clamped * 0.5];
+
+  return (
+    <span className="flex h-4 w-5 items-center justify-center gap-[2px]" aria-hidden="true">
+      {bars.map((scale, index) => (
+        <span
+          key={index}
+          className="aoe-voice-wave-bar h-3.5 w-[2px] rounded-full bg-current opacity-90 transition-transform duration-75"
+          style={{
+            transform: `scaleY(${scale})`,
+            animation: clamped == null ? `aoe-voice-wave 720ms ease-in-out ${index * 90}ms infinite` : undefined,
+          }}
+        />
+      ))}
+    </span>
   );
 }
 

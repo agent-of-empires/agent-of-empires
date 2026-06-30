@@ -36,6 +36,10 @@ type SpeechRecognitionWindow = Window &
     SpeechRecognition?: SpeechRecognitionConstructorLike;
     webkitSpeechRecognition?: SpeechRecognitionConstructorLike;
   };
+type AudioContextWindow = Window &
+  typeof globalThis & {
+    webkitAudioContext?: typeof AudioContext;
+  };
 
 interface TranscriptionStatusResponse {
   available?: boolean;
@@ -178,6 +182,7 @@ export interface VoiceDictationState {
   supported: boolean;
   listening: boolean;
   processing: boolean;
+  audioLevel: number | null;
   error: string | null;
   start: () => void;
   stop: () => void;
@@ -188,9 +193,16 @@ export function useVoiceDictation(onTranscript: (text: string) => void): VoiceDi
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const audioLevelFrameRef = useRef<number | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const serverRecordingStartingRef = useRef(false);
   const discardRecordingRef = useRef(false);
+  const browserSessionActiveRef = useRef(false);
+  const browserRestartTimerRef = useRef<number | null>(null);
+  const startBrowserRecognitionInstanceRef = useRef<() => void>(() => {});
+  const browserCommittedTranscriptRef = useRef("");
+  const currentRecognitionTranscriptRef = useRef<string | null>(null);
   const transcriptSegmentsRef = useRef<string[]>([]);
   const latestTranscriptRef = useRef<string | null>(null);
   const lastEmittedTranscriptRef = useRef<string | null>(null);
@@ -198,6 +210,7 @@ export function useVoiceDictation(onTranscript: (text: string) => void): VoiceDi
   const [serverRecordingStarting, setServerRecordingStarting] = useState(false);
   const [serverRecording, setServerRecording] = useState(false);
   const [processing, setProcessing] = useState(false);
+  const [audioLevel, setAudioLevel] = useState<number | null>(null);
   const [serverTranscriptionAvailable, setServerTranscriptionAvailable] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const browserSupported = getSpeechRecognitionConstructor() !== null;
@@ -208,6 +221,77 @@ export function useVoiceDictation(onTranscript: (text: string) => void): VoiceDi
   useEffect(() => {
     onTranscriptRef.current = onTranscript;
   }, [onTranscript]);
+
+  const clearBrowserRestartTimer = useCallback(() => {
+    if (browserRestartTimerRef.current == null) return;
+    window.clearTimeout(browserRestartTimerRef.current);
+    browserRestartTimerRef.current = null;
+  }, []);
+
+  const emitBrowserTranscript = useCallback((currentRecognitionTranscript: string) => {
+    const cleaned = mergeSpeechRecognitionSegments([
+      browserCommittedTranscriptRef.current,
+      currentRecognitionTranscript,
+    ]);
+    latestTranscriptRef.current = cleaned || null;
+    if (cleaned && cleaned !== lastEmittedTranscriptRef.current) {
+      lastEmittedTranscriptRef.current = cleaned;
+      onTranscriptRef.current(cleaned);
+    }
+  }, []);
+
+  const cleanupAudioLevelMeter = useCallback(() => {
+    if (audioLevelFrameRef.current != null) {
+      window.cancelAnimationFrame(audioLevelFrameRef.current);
+      audioLevelFrameRef.current = null;
+    }
+    const context = audioContextRef.current;
+    audioContextRef.current = null;
+    if (context && context.state !== "closed") {
+      void context.close().catch(() => {});
+    }
+    setAudioLevel(null);
+  }, []);
+
+  const startAudioLevelMeter = useCallback(
+    (stream: MediaStream) => {
+      cleanupAudioLevelMeter();
+      const audioWindow = window as AudioContextWindow;
+      const AudioContextCtor = window.AudioContext ?? audioWindow.webkitAudioContext;
+      if (!AudioContextCtor) {
+        setAudioLevel(null);
+        return;
+      }
+
+      try {
+        const context = new AudioContextCtor();
+        const analyser = context.createAnalyser();
+        analyser.fftSize = 256;
+        const source = context.createMediaStreamSource(stream);
+        source.connect(analyser);
+        const samples = new Uint8Array(analyser.fftSize);
+        audioContextRef.current = context;
+
+        const tick = () => {
+          analyser.getByteTimeDomainData(samples);
+          let sum = 0;
+          for (const sample of samples) {
+            const centered = sample - 128;
+            sum += centered * centered;
+          }
+          const rms = Math.sqrt(sum / samples.length);
+          setAudioLevel(Math.min(1, rms / 42));
+          audioLevelFrameRef.current = window.requestAnimationFrame(tick);
+        };
+
+        void context.resume().catch(() => {});
+        tick();
+      } catch {
+        cleanupAudioLevelMeter();
+      }
+    },
+    [cleanupAudioLevelMeter],
+  );
 
   useEffect(() => {
     if (!mediaSupported) return;
@@ -231,41 +315,59 @@ export function useVoiceDictation(onTranscript: (text: string) => void): VoiceDi
     const recorder = mediaRecorderRef.current;
     if (recorder && recorder.state === "recording") {
       discardRecordingRef.current = false;
+      setProcessing(true);
       recorder.stop();
       setServerRecording(false);
       return;
     }
-    recognitionRef.current?.stop();
-  }, []);
+    browserSessionActiveRef.current = false;
+    clearBrowserRestartTimer();
+    const recognition = recognitionRef.current;
+    if (recognition) {
+      recognition.stop();
+      return;
+    }
+    setBrowserListening(false);
+    transcriptSegmentsRef.current = [];
+    currentRecognitionTranscriptRef.current = null;
+    latestTranscriptRef.current = null;
+    lastEmittedTranscriptRef.current = null;
+    browserCommittedTranscriptRef.current = "";
+  }, [clearBrowserRestartTimer]);
 
-  const cleanupMediaRecording = useCallback((discard = true) => {
-    const recorder = mediaRecorderRef.current;
-    if (discard) discardRecordingRef.current = true;
-    if (recorder) {
-      recorder.ondataavailable = null;
-      recorder.onerror = null;
-      recorder.onstop = null;
-      if (discard && recorder.state === "recording") {
-        try {
-          recorder.stop();
-        } catch {
-          // ignore: the browser may already be stopping the recorder
+  const cleanupMediaRecording = useCallback(
+    (discard = true) => {
+      const recorder = mediaRecorderRef.current;
+      if (discard) discardRecordingRef.current = true;
+      if (recorder) {
+        recorder.ondataavailable = null;
+        recorder.onerror = null;
+        recorder.onstop = null;
+        if (discard && recorder.state === "recording") {
+          try {
+            recorder.stop();
+          } catch {
+            // ignore: the browser may already be stopping the recorder
+          }
         }
       }
-    }
-    mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
-    mediaStreamRef.current = null;
-    mediaRecorderRef.current = null;
-    audioChunksRef.current = [];
-    serverRecordingStartingRef.current = false;
-    setServerRecordingStarting(false);
-    setServerRecording(false);
-  }, []);
+      mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+      mediaStreamRef.current = null;
+      mediaRecorderRef.current = null;
+      audioChunksRef.current = [];
+      cleanupAudioLevelMeter();
+      serverRecordingStartingRef.current = false;
+      setServerRecordingStarting(false);
+      setServerRecording(false);
+    },
+    [cleanupAudioLevelMeter],
+  );
 
-  const startBrowserRecognition = useCallback(() => {
+  const startBrowserRecognitionInstance = useCallback(() => {
     if (recognitionRef.current) return;
     const Recognition = getSpeechRecognitionConstructor();
     if (!Recognition) {
+      browserSessionActiveRef.current = false;
       setError("unsupported");
       return;
     }
@@ -276,8 +378,7 @@ export function useVoiceDictation(onTranscript: (text: string) => void): VoiceDi
     recognition.lang = navigator.language || "en-US";
     recognitionRef.current = recognition;
     transcriptSegmentsRef.current = [];
-    latestTranscriptRef.current = null;
-    lastEmittedTranscriptRef.current = null;
+    currentRecognitionTranscriptRef.current = null;
 
     recognition.onresult = (event) => {
       const segments = transcriptSegmentsRef.current;
@@ -290,25 +391,46 @@ export function useVoiceDictation(onTranscript: (text: string) => void): VoiceDi
       segments.length = event.results.length;
 
       const cleaned = mergeSpeechRecognitionSegments(segments);
-      latestTranscriptRef.current = cleaned || null;
-      if (cleaned && cleaned !== lastEmittedTranscriptRef.current) {
-        lastEmittedTranscriptRef.current = cleaned;
-        onTranscriptRef.current(cleaned);
-      }
+      currentRecognitionTranscriptRef.current = cleaned || null;
+      if (cleaned) emitBrowserTranscript(cleaned);
     };
     recognition.onerror = (event) => {
-      setError(event.error ?? "speech-recognition-error");
+      const reason = event.error ?? "speech-recognition-error";
+      if (["audio-capture", "language-not-supported", "not-allowed", "service-not-allowed"].includes(reason)) {
+        browserSessionActiveRef.current = false;
+        setError(reason);
+      } else if (!browserSessionActiveRef.current) {
+        setError(reason);
+      }
     };
     recognition.onend = () => {
-      const fallback = latestTranscriptRef.current;
+      const currentRecognitionTranscript = currentRecognitionTranscriptRef.current;
+      if (currentRecognitionTranscript) {
+        browserCommittedTranscriptRef.current = mergeSpeechRecognitionSegments([
+          browserCommittedTranscriptRef.current,
+          currentRecognitionTranscript,
+        ]);
+      }
       transcriptSegmentsRef.current = [];
-      latestTranscriptRef.current = null;
+      currentRecognitionTranscriptRef.current = null;
       recognitionRef.current = null;
-      setBrowserListening(false);
+      if (browserSessionActiveRef.current) {
+        setBrowserListening(true);
+        clearBrowserRestartTimer();
+        browserRestartTimerRef.current = window.setTimeout(() => {
+          browserRestartTimerRef.current = null;
+          startBrowserRecognitionInstanceRef.current();
+        }, 100);
+        return;
+      }
+      const fallback = browserCommittedTranscriptRef.current || latestTranscriptRef.current;
       if (fallback && fallback !== lastEmittedTranscriptRef.current) {
         lastEmittedTranscriptRef.current = fallback;
         onTranscriptRef.current(fallback);
       }
+      setBrowserListening(false);
+      latestTranscriptRef.current = null;
+      browserCommittedTranscriptRef.current = "";
     };
 
     try {
@@ -317,10 +439,27 @@ export function useVoiceDictation(onTranscript: (text: string) => void): VoiceDi
       setBrowserListening(true);
     } catch {
       recognitionRef.current = null;
+      browserSessionActiveRef.current = false;
       setBrowserListening(false);
       setError("start-failed");
     }
-  }, []);
+  }, [clearBrowserRestartTimer, emitBrowserTranscript]);
+
+  useEffect(() => {
+    startBrowserRecognitionInstanceRef.current = startBrowserRecognitionInstance;
+  }, [startBrowserRecognitionInstance]);
+
+  const startBrowserRecognition = useCallback(() => {
+    if (browserSessionActiveRef.current || recognitionRef.current) return;
+    browserSessionActiveRef.current = true;
+    clearBrowserRestartTimer();
+    browserCommittedTranscriptRef.current = "";
+    transcriptSegmentsRef.current = [];
+    currentRecognitionTranscriptRef.current = null;
+    latestTranscriptRef.current = null;
+    lastEmittedTranscriptRef.current = null;
+    startBrowserRecognitionInstance();
+  }, [clearBrowserRestartTimer, startBrowserRecognitionInstance]);
 
   const startServerRecording = useCallback(async () => {
     if (serverRecordingStartingRef.current || mediaRecorderRef.current || processing) return;
@@ -337,6 +476,7 @@ export function useVoiceDictation(onTranscript: (text: string) => void): VoiceDi
         setServerRecordingStarting(false);
         return;
       }
+      startAudioLevelMeter(stream);
       const recorder = new MediaRecorder(stream, mediaRecorderOptions());
       mediaRecorderRef.current = recorder;
       audioChunksRef.current = [];
@@ -346,6 +486,7 @@ export function useVoiceDictation(onTranscript: (text: string) => void): VoiceDi
       };
       recorder.onerror = () => {
         setError("recording-error");
+        setProcessing(false);
         cleanupMediaRecording(true);
       };
       recorder.onstop = () => {
@@ -358,9 +499,9 @@ export function useVoiceDictation(onTranscript: (text: string) => void): VoiceDi
         cleanupMediaRecording(false);
         if (audio.size === 0) {
           setError("empty-recording");
+          setProcessing(false);
           return;
         }
-        setProcessing(true);
         void transcribeAudio(audio)
           .then((text) => {
             setError(null);
@@ -387,9 +528,10 @@ export function useVoiceDictation(onTranscript: (text: string) => void): VoiceDi
       setServerRecording(true);
     } catch {
       cleanupMediaRecording(true);
+      setProcessing(false);
       setError("microphone-unavailable");
     }
-  }, [browserSupported, cleanupMediaRecording, processing, startBrowserRecognition]);
+  }, [browserSupported, cleanupMediaRecording, processing, startAudioLevelMeter, startBrowserRecognition]);
 
   const start = useCallback(() => {
     if (serverTranscriptionAvailable && mediaSupported) {
@@ -405,14 +547,18 @@ export function useVoiceDictation(onTranscript: (text: string) => void): VoiceDi
 
   useEffect(() => {
     return () => {
+      browserSessionActiveRef.current = false;
+      clearBrowserRestartTimer();
       recognitionRef.current?.abort?.();
       recognitionRef.current = null;
       cleanupMediaRecording(true);
       transcriptSegmentsRef.current = [];
+      currentRecognitionTranscriptRef.current = null;
       latestTranscriptRef.current = null;
       lastEmittedTranscriptRef.current = null;
+      browserCommittedTranscriptRef.current = "";
     };
-  }, [cleanupMediaRecording]);
+  }, [cleanupMediaRecording, clearBrowserRestartTimer]);
 
-  return { supported, listening, processing, error, start, stop };
+  return { supported, listening, processing, audioLevel, error, start, stop };
 }

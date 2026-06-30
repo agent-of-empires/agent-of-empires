@@ -39,6 +39,10 @@ class MockSpeechRecognition implements SpeechRecognitionLike {
       results: Object.assign(list, { length: list.length }),
     });
   }
+
+  emitEnd() {
+    this.onend?.();
+  }
 }
 
 class MockMediaRecorder {
@@ -167,6 +171,31 @@ describe("useVoiceDictation", () => {
     expect(result.current.listening).toBe(false);
   });
 
+  it("restarts browser recognition after a spontaneous end and keeps a cumulative transcript", async () => {
+    const onTranscript = vi.fn();
+    const { result } = renderHook(() => useVoiceDictation(onTranscript));
+    act(() => result.current.start());
+
+    act(() => {
+      MockSpeechRecognition.instances[0]!.emitResult([{ transcript: "review the", isFinal: false }]);
+      MockSpeechRecognition.instances[0]!.emitEnd();
+    });
+
+    expect(result.current.listening).toBe(true);
+    await waitFor(() => expect(MockSpeechRecognition.instances).toHaveLength(2));
+
+    act(() => {
+      MockSpeechRecognition.instances[1]!.emitResult([{ transcript: "diff please", isFinal: false }]);
+    });
+
+    expect(onTranscript).toHaveBeenNthCalledWith(1, "review the");
+    expect(onTranscript).toHaveBeenNthCalledWith(2, "review the diff please");
+    expect(result.current.listening).toBe(true);
+
+    act(() => result.current.stop());
+    expect(result.current.listening).toBe(false);
+  });
+
   it("reports unsupported browsers without calling the transcript sink", () => {
     vi.unstubAllGlobals();
     resetVoiceDictationServerStatusForTests();
@@ -225,6 +254,53 @@ describe("useVoiceDictation", () => {
       }),
     );
     expect(onTranscript).toHaveBeenCalledWith("Supabase TypeScript project");
+  });
+
+  it("enters processing state immediately after enhanced recording stops", async () => {
+    vi.stubGlobal("webkitSpeechRecognition", undefined);
+    stubMediaRecording();
+    let resolveTranscription!: (response: { ok: boolean; json: () => Promise<{ text: string }> }) => void;
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ available: true, provider: "openai", model: "gpt-4o-transcribe" }),
+      })
+      .mockReturnValueOnce(
+        new Promise((resolve) => {
+          resolveTranscription = resolve;
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    const onTranscript = vi.fn();
+    const { result } = renderHook(() => useVoiceDictation(onTranscript));
+
+    await waitFor(() => expect(result.current.supported).toBe(true));
+
+    await act(async () => {
+      result.current.start();
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      result.current.stop();
+      await Promise.resolve();
+    });
+
+    expect(result.current.processing).toBe(true);
+    expect(result.current.listening).toBe(false);
+
+    await act(async () => {
+      resolveTranscription({
+        ok: true,
+        json: async () => ({ text: "queued transcription" }),
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(result.current.processing).toBe(false);
+    expect(onTranscript).toHaveBeenCalledWith("queued transcription");
   });
 
   it("does not start enhanced recording when the user declines audio egress consent", async () => {
