@@ -125,7 +125,7 @@ impl CreationPoller {
             command_override: data.command_override,
             extra_repo_paths: data.extra_repo_paths,
             scratch: data.scratch,
-            fork_seed: None,
+            fork_seed: data.fork_seed,
         };
 
         let build_result =
@@ -313,5 +313,68 @@ impl CreationPoller {
 impl Default for CreationPoller {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::ForkSeed;
+
+    fn fork_data(seed: ForkSeed) -> NewSessionData {
+        NewSessionData {
+            profile: "default".into(),
+            title: "Forked".into(),
+            path: "/tmp".into(),
+            group: String::new(),
+            tool: "claude".into(),
+            worktree_enabled: false,
+            worktree_branch: None,
+            create_new_branch: false,
+            base_branch: None,
+            extra_repo_paths: Vec::new(),
+            sandbox: false,
+            sandbox_image: String::new(),
+            yolo_mode: false,
+            extra_env: Vec::new(),
+            extra_args: String::new(),
+            command_override: String::new(),
+            scratch: false,
+            fork_seed: Some(seed),
+        }
+    }
+
+    /// Regression for the async creation path dropping the fork seed: the
+    /// poller builds its own `InstanceParams` literal, which once hardcoded
+    /// `fork_seed: None`, so a TUI fork of a sandboxed/hooked/worktree session
+    /// silently produced a plain new session. Assert the seed is forwarded and
+    /// applied (child id pinned, one-shot Fork intent set).
+    #[test]
+    fn create_instance_forwards_fork_seed() {
+        let request = CreationRequest {
+            data: fork_data(ForkSeed::Terminal {
+                parent_agent_session_id: "parent-uuid".into(),
+                child_session_id: "child-uuid".into(),
+            }),
+            existing_instances: Vec::new(),
+            hooks: None,
+        };
+        let (progress_tx, _progress_rx) = mpsc::channel();
+
+        let result = CreationPoller::create_instance(request, &progress_tx);
+
+        let instance = match result {
+            CreationResult::Success { instance, .. } => *instance,
+            other => panic!("expected successful creation, got {other:?}"),
+        };
+        assert_eq!(instance.agent_session_id.as_deref(), Some("child-uuid"));
+        assert!(
+            matches!(
+                instance.resume_intent,
+                crate::session::ResumeIntent::Fork { ref from } if from == "parent-uuid"
+            ),
+            "fork intent must carry the parent id, got {:?}",
+            instance.resume_intent
+        );
     }
 }
