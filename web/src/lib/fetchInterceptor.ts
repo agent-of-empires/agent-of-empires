@@ -3,6 +3,8 @@ import { getOrCreateDeviceBindingSecret } from "./deviceBinding";
 import { reportError } from "./toastBus";
 import { clearToken, getToken, saveToken } from "./token";
 
+const LIFECYCLE_NETWORK_TOAST_SUPPRESS_MS = 2_000;
+
 /** Dispatched on `window` when the auth token is rejected or missing. App.tsx
  *  listens for this to show the token entry page instead of just a toast. */
 export const TOKEN_EXPIRED_EVENT = "aoe:token-expired";
@@ -68,6 +70,7 @@ export function installFetchErrorToasts(): void {
     return;
   }
   (window as unknown as { __aoeFetchPatched?: boolean }).__aoeFetchPatched = true;
+  installPageLifecycleTracking();
 
   const original = window.fetch.bind(window);
 
@@ -138,7 +141,7 @@ export function installFetchErrorToasts(): void {
       }
       // When the server is known to be down, suppress per-request toasts.
       // The DisconnectBanner handles the user-facing notification instead.
-      if (isApi && !isServerDown()) {
+      if (isApi && !isServerDown() && !isPageLifecycleNetworkGlitch()) {
         reportError(`Network error contacting ${path}. Check your connection.`);
       }
       throw err;
@@ -171,6 +174,27 @@ function handleLoginRequired(): void {
   if (loginRequiredDispatched) return;
   loginRequiredDispatched = true;
   window.dispatchEvent(new CustomEvent(LOGIN_REQUIRED_EVENT));
+}
+
+let lastPageLifecycleChangeAt = 0;
+let lifecycleTrackingInstalled = false;
+
+function installPageLifecycleTracking(): void {
+  if (lifecycleTrackingInstalled) return;
+  lifecycleTrackingInstalled = true;
+  const mark = () => {
+    lastPageLifecycleChangeAt = Date.now();
+  };
+  document.addEventListener("visibilitychange", mark);
+  window.addEventListener("pagehide", mark);
+  window.addEventListener("pageshow", mark);
+  window.addEventListener("blur", mark);
+  window.addEventListener("focus", mark);
+}
+
+function isPageLifecycleNetworkGlitch(): boolean {
+  if (document.visibilityState === "hidden") return true;
+  return lastPageLifecycleChangeAt > 0 && Date.now() - lastPageLifecycleChangeAt < LIFECYCLE_NETWORK_TOAST_SUPPRESS_MS;
 }
 
 /** Reset the dedup flags so a new 401 after re-authentication will be

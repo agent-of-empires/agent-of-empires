@@ -75,6 +75,11 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.useRealTimers();
+  Object.defineProperty(document, "visibilityState", {
+    value: "visible",
+    configurable: true,
+  });
 });
 
 describe("installFetchErrorToasts lifecycle", () => {
@@ -389,6 +394,37 @@ describe("network error handling", () => {
 
     await expect(window.fetch("/api/sessions")).rejects.toBe(timeout);
     expect(reportError).not.toHaveBeenCalled();
+  });
+
+  it("suppresses a lifecycle network toast while the document is hidden", async () => {
+    const { original } = await freshInstall();
+    const boom = new TypeError("Failed to fetch");
+    original.mockRejectedValue(boom);
+    Object.defineProperty(document, "visibilityState", {
+      value: "hidden",
+      configurable: true,
+    });
+    document.dispatchEvent(new Event("visibilitychange"));
+
+    await expect(window.fetch("/api/sessions")).rejects.toBe(boom);
+    expect(reportError).not.toHaveBeenCalled();
+  });
+
+  it("suppresses transient lifecycle network toasts only briefly after focus returns", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(10_000);
+    const { original } = await freshInstall();
+    const boom = new TypeError("Failed to fetch");
+    original.mockRejectedValue(boom);
+
+    window.dispatchEvent(new Event("focus"));
+
+    await expect(window.fetch("/api/sessions")).rejects.toBe(boom);
+    expect(reportError).not.toHaveBeenCalled();
+
+    vi.setSystemTime(13_000);
+    await expect(window.fetch("/api/sessions")).rejects.toBe(boom);
+    expect(reportError).toHaveBeenCalledWith("Network error contacting /api/sessions. Check your connection.");
   });
 
   it("does not toast a network error on a non-/api path but still rethrows", async () => {

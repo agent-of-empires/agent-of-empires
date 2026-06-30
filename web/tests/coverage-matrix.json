@@ -1378,6 +1378,13 @@
       "components": ["web/src/components/DisconnectBanner.tsx"]
     },
     {
+      "id": "connectivity.lifecycle-fetch-toasts",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/lib/fetchInterceptor.more.test.ts"],
+      "components": ["web/src/lib/fetchInterceptor.ts"]
+    },
+    {
       "id": "git-clone",
       "kind": "live-playwright",
       "risk": "medium",
