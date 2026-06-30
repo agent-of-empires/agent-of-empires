@@ -117,8 +117,8 @@ afterEach(() => {
 });
 
 describe("SessionRow Fork affordance gating", () => {
-  it("shows Fork on a structured row that has a captured acp_session_id", () => {
-    const ws = workspace("w-fork", [session({ view: "structured", acp_session_id: "acp-parent" })]);
+  it("shows Fork on a structured, fork-capable row with a captured acp_session_id", () => {
+    const ws = workspace("w-fork", [session({ view: "structured", acp_session_id: "acp-parent", acp_can_fork: true })]);
     render(
       <Wrap>
         <Row ws={ws} />
@@ -129,7 +129,23 @@ describe("SessionRow Fork affordance gating", () => {
   });
 
   it("hides Fork on a structured row with no captured acp_session_id", () => {
-    const ws = workspace("w-no-id", [session({ view: "structured" })]);
+    const ws = workspace("w-no-id", [session({ view: "structured", acp_can_fork: true })]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    expect(screen.queryByTestId("sidebar-context-menu-fork")).toBeNull();
+  });
+
+  it("hides Fork on a resume-only structured row (captured id but not fork-capable)", () => {
+    // e.g. the bundled aoe-agent: advertises loadSession and mints an
+    // acp_session_id, but does not advertise session/fork. Gating on the id
+    // alone would offer a dead-end button that fails at the handshake.
+    const ws = workspace("w-resume-only", [
+      session({ view: "structured", acp_session_id: "acp-parent", acp_can_fork: false }),
+    ]);
     render(
       <Wrap>
         <Row ws={ws} />
@@ -151,7 +167,7 @@ describe("SessionRow Fork affordance gating", () => {
   });
 
   it("hides Fork in read-only mode even for a forkable row", () => {
-    const ws = workspace("w-ro", [session({ view: "structured", acp_session_id: "acp-parent" })]);
+    const ws = workspace("w-ro", [session({ view: "structured", acp_session_id: "acp-parent", acp_can_fork: true })]);
     render(
       <Wrap>
         <Row ws={ws} readOnly />
@@ -172,6 +188,7 @@ describe("SessionRow Fork action payload", () => {
         project_path: "/repo",
         profile: "work",
         acp_session_id: "acp-parent-42",
+        acp_can_fork: true,
       }),
     ]);
     render(

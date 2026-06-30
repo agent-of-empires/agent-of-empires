@@ -5382,6 +5382,27 @@ async fn run_connection_task<W, R>(
                                 }) {
                                     has_config_option_mode = true;
                                 }
+                                // Surface agent-advertised modes (when carried in
+                                // the ACP `modes` field rather than the `mode`
+                                // config option), mirroring session/new so a fork
+                                // hydrates the mode picker too. See #1403.
+                                if let Some(modes) = resp.modes.as_ref() {
+                                    let infos: Vec<ModeInfo> = modes
+                                        .available_modes
+                                        .iter()
+                                        .map(|m| ModeInfo {
+                                            id: m.id.0.to_string(),
+                                            name: m.name.clone(),
+                                            description: m.description.clone(),
+                                        })
+                                        .collect();
+                                    let _ = event_tx_for_block
+                                        .send(Event::ModesAvailable {
+                                            current_mode_id: modes.current_mode_id.0.to_string(),
+                                            modes: infos,
+                                        })
+                                        .await;
+                                }
                                 let _ = event_tx_for_block
                                     .send(Event::AcpSessionAssigned {
                                         acp_session_id: new_id.0.to_string(),

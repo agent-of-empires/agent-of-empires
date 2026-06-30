@@ -181,6 +181,19 @@ pub struct SessionResponse {
     #[cfg(feature = "serve")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acp_session_id: Option<String>,
+    /// True when this session's agent can run a structured ACP `session/fork`:
+    /// it is ACP-capable AND declares a real fork strategy. Resume-only ACP
+    /// agents (e.g. the bundled `aoe-agent`, which advertises `loadSession` but
+    /// not `session/fork`) are ACP-capable yet not forkable, so gating the web
+    /// "Fork" action on `acp_session_id` alone would offer a dead-end button
+    /// that fails at the `session/fork` handshake. The true capability is only
+    /// advertised transiently during the handshake, so this projects the static
+    /// agent fork strategy instead, which is the set AoE treats as forkable.
+    /// Omitted (read as not-forkable) for terminal sessions and non-forkable
+    /// agents.
+    #[cfg(feature = "serve")]
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub acp_can_fork: bool,
     /// True when the session is a Claude Code session AND the user has
     /// enabled Claude's fullscreen renderer (`tui: "fullscreen"` in
     /// `~/.claude/settings.json`). The web client uses this to skip
@@ -387,6 +400,24 @@ impl SessionResponse {
             },
             #[cfg(feature = "serve")]
             acp_session_id: inst.acp_session_id.clone(),
+            // Forkable structured = ACP-capable AND a non-`Unsupported` fork
+            // strategy. The bundled `aoe-agent` and other resume-only agents are
+            // ACP-capable but declare no fork strategy, so they read false here.
+            // Custom agents are absent from `get_agent`, so they default to
+            // not-forkable; the list/create handlers do not overlay this because
+            // no custom agent currently exposes a structured fork.
+            #[cfg(feature = "serve")]
+            acp_can_fork: {
+                let resolved = inst
+                    .agent_name
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(inst.tool.as_str());
+                builtin_acp_registry().get(resolved).is_some()
+                    && crate::agents::get_agent(resolved).is_some_and(|a| {
+                        !matches!(a.fork_strategy, crate::agents::ForkStrategy::Unsupported)
+                    })
+            },
             claude_fullscreen: claude_fullscreen && inst.tool == "claude",
             workspace_repos: inst
                 .workspace_info
@@ -6261,6 +6292,29 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "serve")]
+    #[test]
+    fn acp_can_fork_tracks_acp_capable_and_fork_strategy() {
+        // claude is ACP-capable AND declares a real fork strategy, so the web
+        // gets a forkable signal.
+        let mut claude = make_test_instance();
+        claude.tool = "claude".to_string();
+        assert!(SessionResponse::from_instance(&claude, false).acp_can_fork);
+
+        // aoe-agent is ACP-capable (it is in the ACP registry) but declares no
+        // fork strategy, so it is NOT forkable. Gating the web Fork action on
+        // acp_session_id alone would offer a dead-end button for it; this is the
+        // signal that suppresses that.
+        let mut aoe_agent = make_test_instance();
+        aoe_agent.tool = "aoe-agent".to_string();
+        assert!(!SessionResponse::from_instance(&aoe_agent, false).acp_can_fork);
+
+        // A non-ACP agent is neither ACP-capable nor fork-capable.
+        let mut other = make_test_instance();
+        other.tool = "definitely-not-an-acp-agent".to_string();
+        assert!(!SessionResponse::from_instance(&other, false).acp_can_fork);
+    }
+
     #[test]
     fn trash_body_default_keeps_kill_pane_true() {
         // #2523: a no-body trash request resolves through
@@ -8309,6 +8363,8 @@ mod workspace_ordering_tests {
             acp_capable: false,
             #[cfg(feature = "serve")]
             acp_session_id: None,
+            #[cfg(feature = "serve")]
+            acp_can_fork: false,
             claude_fullscreen: false,
             workspace_repos: Vec::new(),
             warnings: Vec::new(),

@@ -245,6 +245,47 @@ function makeOpencodeModeOption(currentValue) {
   };
 }
 
+// The per-session selectors (model + effort, plus the synthetic OpenCode-shape
+// mode option when FAKE_ACP_MODE_VIA_CONFIG_OPTION is set) that ship in the
+// session/new, session/load, and session/fork *responses*. Shared so a forked
+// session hydrates the same selectors as a fresh one; returns undefined when
+// FAKE_ACP_EMIT_CONFIG_OPTIONS is "0" so the caller can omit the field.
+function buildSessionConfigOptions(sessionId) {
+  if (process.env.FAKE_ACP_EMIT_CONFIG_OPTIONS === "0") return undefined;
+  const configOptions = [
+    {
+      id: "model",
+      name: "Model",
+      category: "model",
+      type: "select",
+      currentValue: "claude-opus-4-7",
+      options: [
+        { value: "claude-opus-4-7", name: "Claude Opus 4.7" },
+        { value: "claude-sonnet-4-6", name: "Claude Sonnet 4.6" },
+      ],
+    },
+    {
+      id: "effort",
+      name: "Reasoning Effort",
+      category: "thought_level",
+      type: "select",
+      currentValue: "default",
+      options: [
+        { value: "default", name: "Default" },
+        { value: "low", name: "Low" },
+        { value: "medium", name: "Medium" },
+        { value: "high", name: "High" },
+      ],
+    },
+  ];
+  if (process.env.FAKE_ACP_MODE_VIA_CONFIG_OPTION) {
+    const current = opencodeModeBySession.get(sessionId) ?? "build";
+    opencodeModeBySession.set(sessionId, current);
+    configOptions.push(makeOpencodeModeOption(current));
+  }
+  return configOptions;
+}
+
 async function emitSessionUpdates(sessionId, updates) {
   for (const u of updates) {
     if (cancelFlags.get(sessionId)) return;
@@ -489,41 +530,9 @@ async function handleRequest(msg) {
       // session/new and session/load *response*, not as a subsequent
       // notification. The structured view's acp_client reads the response
       // field and emits Event::ConfigOptionsUpdated. See #1403.
-      const includeConfigOptions = process.env.FAKE_ACP_EMIT_CONFIG_OPTIONS !== "0";
       const result = { sessionId };
-      if (includeConfigOptions) {
-        result.configOptions = [
-          {
-            id: "model",
-            name: "Model",
-            category: "model",
-            type: "select",
-            currentValue: "claude-opus-4-7",
-            options: [
-              { value: "claude-opus-4-7", name: "Claude Opus 4.7" },
-              { value: "claude-sonnet-4-6", name: "Claude Sonnet 4.6" },
-            ],
-          },
-          {
-            id: "effort",
-            name: "Reasoning Effort",
-            category: "thought_level",
-            type: "select",
-            currentValue: "default",
-            options: [
-              { value: "default", name: "Default" },
-              { value: "low", name: "Low" },
-              { value: "medium", name: "Medium" },
-              { value: "high", name: "High" },
-            ],
-          },
-        ];
-      }
-      if (process.env.FAKE_ACP_MODE_VIA_CONFIG_OPTION) {
-        const current = opencodeModeBySession.get(sessionId) ?? "build";
-        opencodeModeBySession.set(sessionId, current);
-        result.configOptions = [...(result.configOptions ?? []), makeOpencodeModeOption(current)];
-      }
+      const configOptions = buildSessionConfigOptions(sessionId);
+      if (configOptions) result.configOptions = configOptions;
       sendResult(id, result);
       // Test hook for the import flow (#2276): on session/load, replay a
       // deterministic transcript chunk the way claude-agent-acp re-emits
@@ -568,36 +577,9 @@ async function handleRequest(msg) {
       // id from makeSessionId(), so only a real session/fork yields the
       // "fork-" marker.
       const forkedId = `fake-acp-fork-${randomBytes(4).toString("hex")}`;
-      const includeForkConfigOptions = process.env.FAKE_ACP_EMIT_CONFIG_OPTIONS !== "0";
       const result = { sessionId: forkedId };
-      if (includeForkConfigOptions) {
-        result.configOptions = [
-          {
-            id: "model",
-            name: "Model",
-            category: "model",
-            type: "select",
-            currentValue: "claude-opus-4-7",
-            options: [
-              { value: "claude-opus-4-7", name: "Claude Opus 4.7" },
-              { value: "claude-sonnet-4-6", name: "Claude Sonnet 4.6" },
-            ],
-          },
-          {
-            id: "effort",
-            name: "Reasoning Effort",
-            category: "thought_level",
-            type: "select",
-            currentValue: "default",
-            options: [
-              { value: "default", name: "Default" },
-              { value: "low", name: "Low" },
-              { value: "medium", name: "Medium" },
-              { value: "high", name: "High" },
-            ],
-          },
-        ];
-      }
+      const configOptions = buildSessionConfigOptions(forkedId);
+      if (configOptions) result.configOptions = configOptions;
       sendResult(id, result);
       return;
     }

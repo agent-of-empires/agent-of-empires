@@ -134,6 +134,14 @@ export interface SessionResponse {
    *  structured row with a captured id to diverge from). Absent for terminal
    *  sessions and structured ones whose worker has not minted an id yet. */
   acp_session_id?: string;
+  /** True when this session's agent can run a structured ACP `session/fork`:
+   *  it is ACP-capable AND declares a real fork strategy. Resume-only ACP
+   *  agents (e.g. the bundled `aoe-agent`, which advertises `loadSession` but
+   *  not `session/fork`) are ACP-capable yet not forkable. The sidebar gates the
+   *  "Fork" action on this together with `acp_session_id` so a resume-only row
+   *  never shows a dead-end fork button. Absent (read as not-forkable) for
+   *  terminal sessions and non-forkable agents. */
+  acp_can_fork?: boolean;
   /** True when this is a Claude Code session AND the user has enabled
    *  Claude's fullscreen renderer (`tui: "fullscreen"` in
    *  ~/.claude/settings.json). The mobile rendering path uses this to

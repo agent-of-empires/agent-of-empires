@@ -1082,12 +1082,13 @@ export const SessionRow = memo(function SessionRow({
 
   // Fork a structured session: create a new structured session that resumes the
   // source's ACP conversation and diverges from it. Gated on a captured
-  // `acp_session_id` (the value the server forks from); the original is left
-  // untouched. On success the new session opens; on failure the message
-  // surfaces as a toast.
+  // `acp_session_id` (the value the server forks from) AND `acp_can_fork`, so a
+  // resume-only agent that minted an id but cannot do `session/fork` never
+  // reaches the handshake; the original is left untouched. On success the new
+  // session opens; on failure the message surfaces as a toast.
   const handleFork = async () => {
     setContextMenu(null);
-    if (!acpSession?.acp_session_id) return;
+    if (!acpSession?.acp_session_id || !acpSession.acp_can_fork) return;
     const result = await createSession({
       path: acpSession.project_path,
       tool: acpSession.tool,
@@ -1564,7 +1565,7 @@ export const SessionRow = memo(function SessionRow({
                     Switch agent
                   </button>
                 )}
-                {!readOnly && acpSession?.acp_session_id && (
+                {!readOnly && acpSession?.acp_session_id && acpSession.acp_can_fork && (
                   <button
                     onClick={() => void handleFork()}
                     data-testid="sidebar-context-menu-fork"
