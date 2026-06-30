@@ -1651,9 +1651,17 @@ impl Instance {
                 }
                 return (session_id, false);
             }
-            // Fork's launch wiring lands in a later task; until then it falls
-            // through to the Default path (resume the pre-pinned sid).
-            ResumeIntent::Default | ResumeIntent::Fork { .. } => {}
+            ResumeIntent::Fork { .. } => {
+                // The child id was pre-generated and stored in
+                // agent_session_id at creation. acquire returns it as the
+                // session this instance owns; the actual fork flags
+                // (--resume <parent> --fork-session --session-id <child>) are
+                // emitted by apply_session_flags, which reads the parent off
+                // the Fork intent. Report `false` (not an in-place resume): a
+                // fork starts a new session.
+                return (self.agent_session_id.clone(), false);
+            }
+            ResumeIntent::Default => {}
         }
 
         if let Some(stored) = self.agent_session_id.clone() {
@@ -1870,6 +1878,17 @@ impl Instance {
     }
 
     fn apply_session_flags(&mut self, cmd: &mut String, context: &str) -> bool {
+        if let ResumeIntent::Fork { from } = self.resume_intent.clone() {
+            let child = self.acquire_session_id().0;
+            if let Some(child_id) = child.as_deref() {
+                let fork_part = build_fork_flags(&self.tool, &from, child_id);
+                if !fork_part.is_empty() {
+                    *cmd = format!("{cmd} {fork_part}");
+                }
+            }
+            // A fork is a fresh session, not an in-place resume.
+            return false;
+        }
         let (session_id, is_existing) = self.acquire_session_id();
         let emitted =
             append_resume_flags(&self.tool, session_id.as_deref(), is_existing, cmd, context);
@@ -6169,6 +6188,31 @@ mod tests {
         assert_eq!(build_fork_flags("cursor", "parent", "child"), String::new());
     }
 
+    #[test]
+    fn acquire_session_id_fork_pins_child_and_reports_fresh() {
+        let mut inst = Instance::new("Forked", "/tmp/x");
+        inst.tool = "claude".to_string();
+        // The child id was pre-generated and stored in agent_session_id at
+        // creation; the Fork intent carries the parent to resume from.
+        inst.agent_session_id = Some("child-5555-6666-7777-888888888888".to_string());
+        inst.resume_intent = ResumeIntent::Fork {
+            from: "parent-1111-2222-3333-444444444444".to_string(),
+        };
+        let mut cmd = "claude".to_string();
+        let is_existing = inst.apply_session_flags(&mut cmd, "test");
+        assert_eq!(
+            cmd,
+            "claude --resume parent-1111-2222-3333-444444444444 --fork-session --session-id child-5555-6666-7777-888888888888"
+        );
+        // A fork is a NEW session (not a resume-in-place), so report not-existing.
+        assert!(!is_existing);
+        // The child id we will resume from here on stays pinned in agent_session_id.
+        assert_eq!(
+            inst.agent_session_id.as_deref(),
+            Some("child-5555-6666-7777-888888888888")
+        );
+    }
+
     // Test: backwards compatibility - load old JSON without agent_session_id
     #[test]
     fn test_backwards_compatibility() {
@@ -7266,6 +7310,9 @@ mod tests {
                 ResumeIntent::Default,
                 ResumeIntent::Use("abc".to_string()),
                 ResumeIntent::Cleared,
+                ResumeIntent::Fork {
+                    from: "some-parent-id".to_string(),
+                },
             ] {
                 let json = serde_json::to_string(&intent).unwrap();
                 let back: ResumeIntent = serde_json::from_str(&json).unwrap();
@@ -7286,6 +7333,17 @@ mod tests {
             assert_eq!(
                 serde_json::to_string(&ResumeIntent::Cleared).unwrap(),
                 r#"{"kind":"Cleared"}"#
+            );
+            // `Fork` is a struct variant, so its `value` is a nested object
+            // (`{"from":...}`), not a bare string like `Use`. This shape is
+            // persisted to `sessions.json`; pin it so a refactor cannot break
+            // deserialisation of saved fork seeds.
+            assert_eq!(
+                serde_json::to_string(&ResumeIntent::Fork {
+                    from: "some-parent-id".to_string()
+                })
+                .unwrap(),
+                r#"{"kind":"Fork","value":{"from":"some-parent-id"}}"#
             );
         }
 
