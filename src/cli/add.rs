@@ -1119,16 +1119,14 @@ fn cleanup_partial_session(
     // an error. `Some` only when the session is sandboxed.
     if let Some(session_id) = container_session_id {
         let container = crate::containers::DockerContainer::from_session_id(session_id);
-        match container.remove(true) {
-            Ok(()) | Err(crate::containers::error::DockerError::ContainerNotFound(_)) => {}
-            Err(e) => tracing::warn!(
+        if let crate::containers::Teardown::Failed(e) = container.teardown(session_id) {
+            tracing::warn!(
                 target: "cli.add",
                 "failed to remove sandbox container during partial cleanup for {}: {}",
                 session_id,
                 e
-            ),
+            );
         }
-        container.remove_named_ignore_volumes(session_id);
     }
     if let Some(wt) = worktree_info {
         if wt.managed_by_aoe {

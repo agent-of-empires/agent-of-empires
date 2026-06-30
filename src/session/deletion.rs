@@ -144,10 +144,11 @@ pub fn perform_deletion(request: &DeletionRequest) -> DeletionResult {
     if request.delete_sandbox && is_sandboxed {
         tracing::debug!(target: "session.delete", session_id = %request.session_id, stage = "container_remove", "perform_deletion: stage");
         let container = DockerContainer::from_session_id(&request.instance.id);
-        record_container_removal(|force| container.remove(force), &mut messages, &mut errors);
-        // Remove named ignore volumes even if the container is already gone — volumes created
-        // with volume_ignores_strategy = "named" outlive the container and need explicit cleanup.
-        container.remove_named_ignore_volumes(&request.instance.id);
+        deletion_messages_for(
+            container.teardown(&request.instance.id),
+            &mut messages,
+            &mut errors,
+        );
     }
 
     // Stage 4: worktree cleanup. Container is gone, agent is gone, no
@@ -431,24 +432,22 @@ pub fn perform_deletion(request: &DeletionRequest) -> DeletionResult {
     }
 }
 
-/// Attempt to remove a session's sandbox container, recording the outcome.
+/// Map a container [`Teardown`](crate::containers::Teardown) outcome onto a
+/// deletion's user-facing messages and errors.
 ///
-/// Removal forces stop+remove in one shot and is idempotent: a
-/// `ContainerNotFound` result means there was nothing to remove and is not
-/// surfaced. Any other failure is pushed to `errors` so the caller keeps the
-/// session record rather than silently orphaning a live container.
-///
-/// NOTE: callers must invoke this unconditionally, never gating it behind a
-/// separate existence probe; a transient probe failure must not skip removal.
-fn record_container_removal(
-    remove: impl FnOnce(bool) -> crate::containers::error::Result<()>,
+/// A `Failed` outcome is recorded as an error so the caller keeps the session
+/// record rather than dropping it and orphaning a live container; `AlreadyGone`
+/// is a silent no-op (there was nothing to remove).
+fn deletion_messages_for(
+    outcome: crate::containers::Teardown,
     messages: &mut Vec<String>,
     errors: &mut Vec<String>,
 ) {
-    match remove(true) {
-        Ok(()) => messages.push("Container removed".to_string()),
-        Err(crate::containers::error::DockerError::ContainerNotFound(_)) => {}
-        Err(e) => errors.push(format!("Container: {}", e)),
+    use crate::containers::Teardown;
+    match outcome {
+        Teardown::Removed => messages.push("Container removed".to_string()),
+        Teardown::AlreadyGone => {}
+        Teardown::Failed(e) => errors.push(format!("Container: {}", e)),
     }
 }
 
@@ -582,14 +581,14 @@ mod tests {
     mod container_removal {
         use super::*;
         use crate::containers::error::DockerError;
-        use std::cell::Cell;
+        use crate::containers::Teardown;
 
         #[test]
-        fn removal_failure_is_recorded_as_error() {
+        fn failure_is_recorded_as_error() {
             let mut messages = Vec::new();
             let mut errors = Vec::new();
-            record_container_removal(
-                |_force| Err(DockerError::RemoveFailed("daemon busy".into())),
+            deletion_messages_for(
+                Teardown::Failed(DockerError::RemoveFailed("daemon busy".into())),
                 &mut messages,
                 &mut errors,
             );
@@ -603,23 +602,19 @@ mod tests {
         }
 
         #[test]
-        fn successful_removal_records_message() {
+        fn removed_records_message() {
             let mut messages = Vec::new();
             let mut errors = Vec::new();
-            record_container_removal(|_force| Ok(()), &mut messages, &mut errors);
+            deletion_messages_for(Teardown::Removed, &mut messages, &mut errors);
             assert_eq!(messages, vec!["Container removed".to_string()]);
             assert!(errors.is_empty());
         }
 
         #[test]
-        fn absent_container_is_not_an_error() {
+        fn already_gone_is_silent() {
             let mut messages = Vec::new();
             let mut errors = Vec::new();
-            record_container_removal(
-                |_force| Err(DockerError::ContainerNotFound("aoe-sandbox-x".into())),
-                &mut messages,
-                &mut errors,
-            );
+            deletion_messages_for(Teardown::AlreadyGone, &mut messages, &mut errors);
             assert!(
                 errors.is_empty(),
                 "an already-gone container is idempotent, not a failure"
@@ -627,27 +622,6 @@ mod tests {
             assert!(
                 messages.is_empty(),
                 "no spurious 'removed' message when nothing was removed"
-            );
-        }
-
-        #[test]
-        fn removal_is_always_attempted() {
-            let calls = Cell::new(0);
-            let mut messages = Vec::new();
-            let mut errors = Vec::new();
-            record_container_removal(
-                |force| {
-                    calls.set(calls.get() + 1);
-                    assert!(force, "deletion forces stop+remove in one shot");
-                    Ok(())
-                },
-                &mut messages,
-                &mut errors,
-            );
-            assert_eq!(
-                calls.get(),
-                1,
-                "removal must not be gated behind a swallowed existence probe"
             );
         }
     }

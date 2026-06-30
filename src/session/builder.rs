@@ -775,14 +775,13 @@ pub fn cleanup_instance(
 
     if let Some(sandbox) = &instance.sandbox_info {
         if sandbox.enabled {
+            // Direct idempotent teardown, never gated on a separate existence
+            // probe: a transient `inspect` failure must not skip removal and
+            // orphan a live container. Volumes are swept inside `teardown`.
             let container = containers::DockerContainer::from_session_id(&instance.id);
-            if container.exists().unwrap_or(false) {
-                if let Err(e) = container.remove(true) {
-                    tracing::warn!(target: "session.create", "Failed to clean up container: {}", e);
-                }
+            if let containers::Teardown::Failed(e) = container.teardown(&instance.id) {
+                tracing::warn!(target: "session.create", "Failed to clean up container: {}", e);
             }
-            // Remove named ignore volumes even if the container is already gone.
-            container.remove_named_ignore_volumes(&instance.id);
         }
     }
 

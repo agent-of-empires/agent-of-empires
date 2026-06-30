@@ -692,17 +692,14 @@ impl HomeView {
                 }
                 if inst.sandbox_info.as_ref().is_some_and(|s| s.enabled) {
                     let container = crate::containers::DockerContainer::from_session_id(&inst.id);
-                    match container.remove(true) {
-                        Ok(())
-                        | Err(crate::containers::error::DockerError::ContainerNotFound(_)) => {}
-                        Err(e) => tracing::warn!(
+                    if let crate::containers::Teardown::Failed(e) = container.teardown(&inst.id) {
+                        tracing::warn!(
                             target: "session.delete",
                             session_id = %inst.id,
                             "force_remove container teardown failed: {}",
                             e
-                        ),
+                        );
                     }
-                    container.remove_named_ignore_volumes(&inst.id);
                 }
             });
         }

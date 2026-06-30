@@ -51,6 +51,31 @@ pub fn batch_container_health() -> HashMap<String, bool> {
     map
 }
 
+/// Outcome of an idempotent container teardown.
+#[derive(Debug)]
+pub enum Teardown {
+    /// The container was force-removed.
+    Removed,
+    /// No container existed to remove; the teardown was a no-op.
+    AlreadyGone,
+    /// Removal failed for a reason other than the container being absent.
+    Failed(error::DockerError),
+}
+
+/// Classify a force-remove result into an idempotent teardown outcome.
+///
+/// A `ContainerNotFound` error means there was nothing to remove and maps to
+/// `AlreadyGone`; every other error is a genuine `Failed`. Keeping this
+/// classification separate from I/O lets it be reasoned about and tested
+/// without a live runtime.
+fn classify_removal(result: Result<()>) -> Teardown {
+    match result {
+        Ok(()) => Teardown::Removed,
+        Err(error::DockerError::ContainerNotFound(_)) => Teardown::AlreadyGone,
+        Err(e) => Teardown::Failed(e),
+    }
+}
+
 pub struct DockerContainer {
     pub name: String,
     pub image: String,
@@ -159,6 +184,21 @@ impl DockerContainer {
         }
     }
 
+    /// Force-remove this container, then sweep its named ignore volumes.
+    ///
+    /// Idempotent: a container that is already gone yields
+    /// [`Teardown::AlreadyGone`], not a failure. Named ignore volumes outlive
+    /// the container, so they are swept regardless of the removal outcome.
+    ///
+    /// NOTE: callers must invoke this unconditionally and act on the returned
+    /// outcome; it must never be gated behind a separate existence probe, whose
+    /// transient failure would skip removal and orphan a live container.
+    pub fn teardown(&self, session_id: &str) -> Teardown {
+        let outcome = classify_removal(self.remove(true));
+        self.remove_named_ignore_volumes(session_id);
+        outcome
+    }
+
     pub fn exec_command(&self, options: Option<&str>, cmd: &str) -> String {
         self.runtime.exec_command(&self.name, options, cmd)
     }
@@ -183,6 +223,25 @@ impl DockerContainer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classify_ok_is_removed() {
+        assert!(matches!(classify_removal(Ok(())), Teardown::Removed));
+    }
+
+    #[test]
+    fn classify_not_found_is_already_gone() {
+        let r = Err(error::DockerError::ContainerNotFound(
+            "aoe-sandbox-x".into(),
+        ));
+        assert!(matches!(classify_removal(r), Teardown::AlreadyGone));
+    }
+
+    #[test]
+    fn classify_other_error_is_failed() {
+        let r = Err(error::DockerError::RemoveFailed("daemon busy".into()));
+        assert!(matches!(classify_removal(r), Teardown::Failed(_)));
+    }
 
     #[test]
     fn test_container_generate_name_short_id() {
