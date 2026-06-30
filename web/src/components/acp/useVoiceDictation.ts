@@ -369,7 +369,11 @@ export function useVoiceDictation(onTranscript: (text: string) => void): VoiceDi
           .catch(() => {
             disableServerTranscriptionForSession();
             setServerTranscriptionAvailable(false);
-            setError("transcription-failed");
+            if (browserSupported) {
+              startBrowserRecognition();
+            } else {
+              setError("transcription-failed");
+            }
           })
           .finally(() => {
             setProcessing(false);
@@ -385,7 +389,7 @@ export function useVoiceDictation(onTranscript: (text: string) => void): VoiceDi
       cleanupMediaRecording(true);
       setError("microphone-unavailable");
     }
-  }, [cleanupMediaRecording, processing]);
+  }, [browserSupported, cleanupMediaRecording, processing, startBrowserRecognition]);
 
   const start = useCallback(() => {
     if (serverTranscriptionAvailable && mediaSupported) {

@@ -1395,7 +1395,7 @@ function VoiceDictationButton({
         "inline-flex h-8 items-center justify-center gap-1 rounded-md px-2.5 text-[12px]",
         listening || processing
           ? "border border-status-error/50 bg-surface-800 text-status-error hover:bg-surface-700"
-          : "border border-surface-600 bg-surface-800 text-text-secondary hover:border-surface-500 hover:bg-surface-700",
+          : "border border-surface-700 bg-surface-800 text-text-secondary hover:border-surface-700 hover:bg-surface-700",
         processing ? "opacity-80" : "",
         "transition-colors duration-100",
       ].join(" ")}

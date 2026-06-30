@@ -434,11 +434,8 @@ describe("useVoiceDictation", () => {
       await Promise.resolve();
       await Promise.resolve();
     });
-    await waitFor(() => expect(result.current.error).toBe("transcription-failed"));
-
-    act(() => result.current.start());
-
-    expect(MockSpeechRecognition.instances).toHaveLength(1);
+    await waitFor(() => expect(MockSpeechRecognition.instances).toHaveLength(1));
+    expect(result.current.error).toBeNull();
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });
