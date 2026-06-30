@@ -7,6 +7,23 @@ import type { CommandAction, CommandActionGroup } from "./types";
 import { matchCheat, type CheatEffect } from "../../lib/cheats";
 import { reportInfo } from "../../lib/toastBus";
 
+// The cmdk item value: id plus the searchable text. Kept in one place so the
+// pre-filter that drives tab/count visibility and the <Command.Item value=...>
+// that cmdk actually scores stay in sync.
+function actionValue(a: CommandAction): string {
+  return `${a.id} ${[a.title, a.subtitle ?? "", ...(a.keywords ?? [])].join(" ")}`;
+}
+
+// Does this row survive the current query? Mirrors the <Command> filter:
+// conversation hits are server-matched (force-kept), everything else uses
+// cmdk's default fuzzy scoring. An empty query keeps everything.
+function matches(a: CommandAction, search: string): boolean {
+  if (!search) return true;
+  const value = actionValue(a);
+  if (value.startsWith("conversation:")) return true;
+  return (defaultFilter!(value, search) ?? 0) > 0;
+}
+
 interface Props {
   open: boolean;
   onClose: () => void;
@@ -78,15 +95,19 @@ export function CommandPalette({ open, onClose, actions, onSearchChange, searchi
   // (e.g. the user typing again while an effect is still on screen).
   const clearCheat = useCallback(() => setCheat(null), []);
 
+  // Group only the rows that survive cmdk's search filter, so tab visibility
+  // and the footer count reflect what actually renders for the current query
+  // (not the raw group sizes). Mirrors the same value string and force-keep
+  // rule the <Command> filter uses below.
   const grouped = useMemo(() => {
     const map = new Map<CommandActionGroup, CommandAction[]>();
     for (const g of GROUP_ORDER) map.set(g, []);
     for (const a of actions) {
       const arr = map.get(a.group);
-      if (arr) arr.push(a);
+      if (arr && matches(a, search)) arr.push(a);
     }
     return map;
-  }, [actions]);
+  }, [actions, search]);
 
   // Tabs to render: "All" always, plus any group that has rows for the current
   // query. The Conversations tab also shows while a content search is in
@@ -232,11 +253,10 @@ export function CommandPalette({ open, onClose, actions, onSearchChange, searchi
                   </Command.Item>
                 )}
                 {items.map((action) => {
-                  const searchValue = [action.title, action.subtitle ?? "", ...(action.keywords ?? [])].join(" ");
                   return (
                     <Command.Item
                       key={action.id}
-                      value={`${action.id} ${searchValue}`}
+                      value={actionValue(action)}
                       onSelect={() => run(action)}
                       className="flex items-center gap-2 px-3 h-9 rounded-md cursor-pointer text-sm text-text-primary data-[selected=true]:bg-surface-700 data-[selected=true]:text-text-bright"
                     >

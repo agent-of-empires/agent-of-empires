@@ -169,6 +169,52 @@ describe("CommandPalette", () => {
       expect(selected()).toBe("Settings");
     });
 
+    it("drops a tab and trims the footer count when a query filters a group out", () => {
+      render(
+        <CommandPalette
+          open
+          onClose={() => {}}
+          actions={[
+            action({ id: "a1", title: "alpha run", group: "Actions" }),
+            action({ id: "s1", title: "alpha save", group: "Settings" }),
+            action({ id: "sess1", title: "beta sit", group: "Sessions" }),
+          ]}
+        />,
+      );
+      expect(screen.getByText("3 actions")).toBeTruthy();
+      // "alpha" matches the Actions + Settings rows but not the Sessions row.
+      fireEvent.change(screen.getByPlaceholderText("Search actions, sessions, settings…"), {
+        target: { value: "alpha" },
+      });
+      expect(screen.getByText("2 actions")).toBeTruthy();
+      expect(screen.queryByRole("tab", { name: "Sessions" })).toBeNull();
+      expect(screen.getByRole("tab", { name: "Actions" })).toBeTruthy();
+      expect(screen.getByRole("tab", { name: "Settings" })).toBeTruthy();
+    });
+
+    it("hides the strip and counts only matches when a query leaves one group", () => {
+      render(
+        <CommandPalette
+          open
+          onClose={() => {}}
+          actions={[
+            action({ id: "a1", title: "Run thing", group: "Actions" }),
+            action({ id: "s1", title: "Save setting", group: "Settings" }),
+            action({ id: "sess1", title: "Some session", group: "Sessions" }),
+          ]}
+        />,
+      );
+      // "setting" only matches the Settings row; the strip collapses (one real
+      // category) and the footer reflects the single surviving row.
+      fireEvent.change(screen.getByPlaceholderText("Search actions, sessions, settings…"), {
+        target: { value: "setting" },
+      });
+      expect(screen.queryByRole("tablist")).toBeNull();
+      expect(screen.getByText("1 action")).toBeTruthy();
+      expect(screen.queryByText("Run thing")).toBeNull();
+      expect(screen.queryByText("Some session")).toBeNull();
+    });
+
     it("resets to All when reopened", () => {
       const { rerender } = render(<CommandPalette open onClose={() => {}} actions={mixed} />);
       fireEvent.click(screen.getByRole("tab", { name: "Settings" }));
