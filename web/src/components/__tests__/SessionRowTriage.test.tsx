@@ -240,9 +240,7 @@ describe("SessionRow unread dot", () => {
   });
 
   it("suppresses the unread dot when the row is archived (#2571)", () => {
-    const ws = workspace("w-unread-archived", [
-      session({ unread: true, archived_at: "2026-01-01T00:00:00Z" }),
-    ]);
+    const ws = workspace("w-unread-archived", [session({ unread: true, archived_at: "2026-01-01T00:00:00Z" })]);
     render(
       <Wrap>
         <UnreadIndicatorContext.Provider value={true}>
