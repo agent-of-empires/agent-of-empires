@@ -8,6 +8,7 @@ pub mod config;
 pub(crate) mod container_config;
 pub mod deletion;
 pub(crate) mod environment;
+pub mod fork;
 mod groups;
 pub mod idle_reap;
 mod instance;
@@ -43,6 +44,7 @@ pub use config::{
 };
 pub(crate) use environment::user_shell;
 pub use environment::{validate_env_entries, validate_env_entry};
+pub use fork::{ForkDenied, ForkSeed};
 pub use groups::{
     append_archived_section, append_archived_section_by_project, append_trash_section,
     archived_project_sub_path, flatten_sessions_by_attention, flatten_tree,
