@@ -80,6 +80,23 @@ test.describe("Desktop live terminal input", () => {
     await clickSidebarSession(page, "pinch-test");
     await page.locator("[data-live-content]").first().waitFor({ state: "visible", timeout: 10_000 });
 
+    // The component requests a wider scrollback window after mount, so a second
+    // frame arrives with history rows. Wait for the content to stop changing
+    // before selecting; otherwise the captured Range drifts onto a row that
+    // renders in the later frame and the clipboard no longer matches `selected`.
+    let prevContent = "";
+    await expect
+      .poll(
+        async () => {
+          const cur = await page.evaluate(() => document.querySelector("[data-live-content]")?.textContent ?? "");
+          const stable = cur !== "" && cur === prevContent;
+          prevContent = cur;
+          return stable;
+        },
+        { timeout: 10_000, intervals: [200] },
+      )
+      .toBe(true);
+
     // Focus the input the way a user does (click the pane), then select a
     // rendered terminal row. The selection lives in the DOM while the hidden
     // input keeps focus, which is exactly the state Ctrl+Shift+C must read.
