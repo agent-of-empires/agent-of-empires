@@ -1164,7 +1164,12 @@ async fn build_spawn_request(
     // still seed the transcript from the replay. The supervisor clears any
     // partial events from the interrupted attempt after it reserves the slot.
     // See #2276.
-    let (cwd, seed_history_replay) = {
+    //
+    // fork_pending is read the same way: if the daemon restarted before the
+    // structured fork's first connect captured the child id, the handshake
+    // must still send session/fork. It is cleared once the forked id lands
+    // (Task 11), so a later reattach reads None and resumes normally.
+    let (cwd, seed_history_replay, fork_from) = {
         let _guard = inst_lock.lock().await;
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == target.id) else {
@@ -1173,6 +1178,7 @@ async fn build_spawn_request(
         (
             PathBuf::from(&inst.project_path),
             inst.import_pending == Some(true),
+            inst.fork_pending.clone(),
         )
     };
     let agent = supervisor
@@ -1217,6 +1223,7 @@ async fn build_spawn_request(
         model: target.model.clone(),
         effort: None,
         stored_acp_session_id: target.stored_acp_session_id.clone(),
+        fork_from,
         sandbox_info,
         source_profile: Some(target.source_profile.clone()),
         yolo_mode: target.yolo_mode,

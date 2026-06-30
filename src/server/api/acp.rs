@@ -313,6 +313,9 @@ pub async fn spawn_acp(
     // supervisor clears any partial replay from a prior attempt after it
     // reserves the worker slot, so we only pass the flag here.
     let seed_history_replay = instance.import_pending == Some(true);
+    // Structured fork: when set, the handshake sends session/fork against this
+    // parent id instead of session/new. Cleared once the forked id lands.
+    let fork_from = instance.fork_pending.clone();
 
     let inst_lock = state.instance_lock(&id).await;
     let sandbox_info = match crate::acp::sandbox::ensure_container_for_session(
@@ -370,6 +373,7 @@ pub async fn spawn_acp(
             model,
             effort: None,
             stored_acp_session_id,
+            fork_from,
             sandbox_info,
             source_profile,
             yolo_mode,
@@ -818,6 +822,8 @@ pub async fn switch_acp_agent(
             // Different ACP backend; the cached Claude session id would
             // be rejected by codex / opencode.
             stored_acp_session_id: None,
+            // Switching ACP backend starts a fresh session, never a fork.
+            fork_from: None,
             sandbox_info,
             source_profile,
             yolo_mode: instance.yolo_mode,
@@ -1677,6 +1683,8 @@ pub async fn acp_enable(
     // #2276: seed the transcript from the session/load replay when enabling
     // the structured view on an imported session (import_pending, empty store).
     let seed_history_replay = instance.import_pending == Some(true);
+    // Structured fork: send session/fork against the parent id on first connect.
+    let fork_from = instance.fork_pending.clone();
     let profile_for_spawn = profile.clone();
     let command_override = crate::server::acp_reconciler::command_override_for_spawn(
         &instance.tool,
@@ -1715,6 +1723,7 @@ pub async fn acp_enable(
                 model,
                 effort: None,
                 stored_acp_session_id,
+                fork_from,
                 sandbox_info,
                 source_profile,
                 yolo_mode,

@@ -23,9 +23,9 @@ use agent_client_protocol::schema::{
     CreateElicitationRequest, CreateElicitationResponse, CreateTerminalRequest,
     CreateTerminalResponse, ElicitationAction, ElicitationCapabilities,
     ElicitationFormCapabilities, EmbeddedResource, EmbeddedResourceResource,
-    FileSystemCapabilities, ImageContent, InitializeRequest, KillTerminalRequest,
-    KillTerminalResponse, LoadSessionRequest, McpServer, MessageId, NewSessionRequest,
-    PermissionOptionKind, PromptRequest, ProtocolVersion, ReadTextFileRequest,
+    FileSystemCapabilities, ForkSessionRequest, ImageContent, InitializeRequest,
+    KillTerminalRequest, KillTerminalResponse, LoadSessionRequest, McpServer, MessageId,
+    NewSessionRequest, PermissionOptionKind, PromptRequest, ProtocolVersion, ReadTextFileRequest,
     ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome, SessionConfigId, SessionConfigValueId, SessionId,
@@ -306,6 +306,13 @@ pub struct SpawnConfig {
     /// load failure the task falls back to `session/new` and emits a
     /// `SessionContextReset` event.
     pub stored_acp_session_id: Option<String>,
+    /// When `Some`, this spawn is a structured fork: instead of `session/new`
+    /// or `session/load`, the connection task sends `session/fork` with this
+    /// parent ACP session id (provided the agent advertises the fork
+    /// capability). The adapter mints a new child id, captured via
+    /// `AcpSessionAssigned` and persisted on `Instance.acp_session_id`.
+    /// Sourced from `Instance.fork_pending`.
+    pub fork_from: Option<String>,
     /// When `Some`, the agent runs inside the named Docker container.
     /// Daemon-side spawn wraps the argv in `docker exec` and the
     /// fs/terminal handlers route across the container boundary using
@@ -393,6 +400,10 @@ enum ConnectMode {
         /// instead of suppressing it (imported session, empty store). See
         /// #2276.
         seed_history_replay: bool,
+        /// Parent ACP session id to fork from. When set and the agent
+        /// advertises the fork capability, the handshake sends
+        /// `session/fork` instead of `session/new` / `session/load`.
+        fork_from: Option<String>,
     },
     Resume {
         acp_session_id: String,
@@ -1825,6 +1836,7 @@ impl AcpClient {
         let mode = ConnectMode::Fresh {
             stored_acp_session_id: config.stored_acp_session_id.clone(),
             seed_history_replay: config.seed_history_replay,
+            fork_from: config.fork_from.clone(),
         };
         let sandbox_pair = if let Some(info) = &config.sandbox_info {
             // `from_info` resolves the container workdir, which touches git2 and
@@ -4155,6 +4167,15 @@ fn thought_level_config_id(
     })
 }
 
+/// Whether to issue ACP `session/fork` on this connect: only when a fork was
+/// requested AND the agent advertised the (unstable) fork capability. Falls
+/// back to the normal new/load handshake otherwise (which, for a fork that
+/// can't run, surfaces as an empty new session rather than corrupting the
+/// parent).
+pub(crate) fn should_fork(fork_from: Option<&str>, agent_advertises_fork: bool) -> bool {
+    fork_from.is_some_and(|s| !s.is_empty()) && agent_advertises_fork
+}
+
 /// Build a structured view `ConfigOptionDescriptor` from an ACP
 /// `SessionConfigOption`. Returns `None` when the option has a kind
 /// the structured view does not yet render (today everything except `Select`).
@@ -5297,6 +5318,7 @@ async fn run_connection_task<W, R>(
                 ConnectMode::Fresh {
                     stored_acp_session_id,
                     seed_history_replay,
+                    fork_from,
                 } => {
                     // Decide whether to resume the prior agent session or create
                     // a fresh one. session/load is only attempted when the agent
@@ -5305,7 +5327,84 @@ async fn run_connection_task<W, R>(
                     // through to session/new and emit SessionContextReset so the
                     // UI can show a notice and clear stale token-usage hints.
                     let mut acp_session_id: Option<SessionId> = None;
-                    if load_session_capable {
+
+                    // Structured fork (when fork_pending is set and the agent
+                    // advertises the capability): send session/fork against the
+                    // parent id; the adapter mints a new child id we capture and
+                    // persist via AcpSessionAssigned. Tried before the load/new
+                    // decision so a fork never falls through to session/new
+                    // (which would hand the user an empty session they believe
+                    // is a fork). On fork failure we return Err and leave
+                    // fork_pending set for a retry rather than masking it.
+                    let fork_capable = init.agent_capabilities.session_capabilities.fork.is_some();
+                    if should_fork(fork_from.as_deref(), fork_capable) {
+                        let parent = fork_from.clone().unwrap();
+                        info!(
+                            target: "acp.protocol",
+                            session = %session_label,
+                            parent_acp_id = %parent,
+                            "structured fork via session/fork"
+                        );
+                        let req = ForkSessionRequest::new(parent.clone(), cwd.clone())
+                            .mcp_servers(mcp_servers.clone());
+                        match connection.send_request(req).block_task().await {
+                            Ok(resp) => {
+                                let new_id = resp.session_id.clone();
+                                info!(
+                                    target: "acp.protocol",
+                                    session = %session_label,
+                                    parent_acp_id = %parent,
+                                    new_id = %new_id.0,
+                                    "session/fork succeeded, captured forked acp_session_id"
+                                );
+                                // Capture available mode info and config-option
+                                // mode category from the fork response (it carries
+                                // the same modes/config_options as session/new), so
+                                // the SetMode handlers below skip modes the agent
+                                // has not advertised and the pickers hydrate.
+                                if let Some(modes) = resp.modes.as_ref() {
+                                    available_mode_ids = Some(
+                                        modes
+                                            .available_modes
+                                            .iter()
+                                            .map(|m| m.id.0.to_string())
+                                            .collect(),
+                                    );
+                                }
+                                if resp.config_options.as_ref().is_some_and(|opts| {
+                                    opts.iter().any(|o| {
+                                        o.category
+                                            == Some(
+                                                agent_client_protocol::schema::
+                                                    SessionConfigOptionCategory::Mode,
+                                            )
+                                    })
+                                }) {
+                                    has_config_option_mode = true;
+                                }
+                                let _ = event_tx_for_block
+                                    .send(Event::AcpSessionAssigned {
+                                        acp_session_id: new_id.0.to_string(),
+                                    })
+                                    .await;
+                                if let Some(event) = config_options_event(resp.config_options) {
+                                    let _ = event_tx_for_block.send(event).await;
+                                }
+                                acp_session_id = Some(new_id);
+                            }
+                            Err(e) => {
+                                warn!(
+                                    target: "acp.protocol",
+                                    session = %session_label,
+                                    parent_acp_id = %parent,
+                                    "session/fork failed; failing spawn (no session/new fallback): {e}"
+                                );
+                                return Err(e);
+                            }
+                        }
+                    }
+
+                    if acp_session_id.is_none() && load_session_capable {
                         if let Some(stored) = stored_acp_session_id.clone() {
                             info!(
                                 target: "acp.protocol",
@@ -7209,6 +7308,14 @@ mod tests {
         assert!(matches!(event, Event::ThinkingStarted));
     }
 
+    #[test]
+    fn should_fork_requires_capability_and_parent() {
+        assert!(should_fork(Some("parent"), true));
+        assert!(!should_fork(Some("parent"), false)); // adapter can't fork (e.g. aoe-agent)
+        assert!(!should_fork(None, true));
+        assert!(!should_fork(Some(""), true));
+    }
+
     // truncate_for_log is the adapter-error sanitizer in the
     // session/delete path: it caps a third-party-controlled string so
     // a chatty adapter can't bloat debug.log, and must never panic on
@@ -8333,6 +8440,7 @@ mod tests {
             default_effort: None,
             socket_path: None,
             stored_acp_session_id: None,
+            fork_from: None,
             seed_history_replay: false,
             artifact_dir: None,
             sandbox_info: Some(sandbox.clone()),
@@ -8404,6 +8512,7 @@ mod tests {
             default_effort: None,
             socket_path: None,
             stored_acp_session_id: None,
+            fork_from: None,
             seed_history_replay: false,
             artifact_dir: None,
             sandbox_info: Some(sandbox.clone()),
@@ -8477,6 +8586,7 @@ mod tests {
             default_effort: None,
             socket_path: None,
             stored_acp_session_id: None,
+            fork_from: None,
             seed_history_replay: false,
             artifact_dir: None,
             sandbox_info: Some(sandbox.clone()),
@@ -8525,6 +8635,7 @@ mod tests {
             default_effort: None,
             socket_path: None,
             stored_acp_session_id: None,
+            fork_from: None,
             seed_history_replay: false,
             artifact_dir: None,
             sandbox_info: None,
@@ -8559,6 +8670,7 @@ mod tests {
             default_effort: None,
             socket_path: None,
             stored_acp_session_id: None,
+            fork_from: None,
             seed_history_replay: false,
             artifact_dir: None,
             sandbox_info: None,

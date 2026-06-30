@@ -4004,10 +4004,19 @@ fn apply_acp_session_change(
                 "persisting agent-assigned ACP session id"
             );
             inst.acp_session_id = Some(new_id.clone());
-            // A structured fork's first session/fork assigns a brand-new id;
-            // consume the one-shot seed so a restart resumes the child via
-            // session/load instead of re-forking the parent.
-            inst.fork_pending = None;
+            // A structured fork sets fork_pending + import_pending together at
+            // creation and does not pre-pin acp_session_id, so the adapter's
+            // new forked id arrives on THIS different-id path. Consume both
+            // one-shot markers together: a restart resumes the child via
+            // session/load instead of re-forking the parent, and leaving
+            // import_pending set would make that resume re-seed the transcript
+            // into an already-populated store (duplicate-key corruption, the
+            // #2276 class). Gate the import clear on fork_pending having been
+            // set, so a non-fork different-id assignment leaves import_pending
+            // alone for its own retry.
+            if inst.fork_pending.take().is_some() {
+                inst.import_pending = None;
+            }
         }
         AcpSessionChange::Reset(reason) => {
             tracing::info!(
@@ -4337,9 +4346,43 @@ mod tests {
             inst.fork_pending, None,
             "fork_pending cleared once the forked id is assigned"
         );
+        assert_eq!(
+            inst.import_pending, None,
+            "import_pending consumed alongside fork_pending so a restart does not re-seed the transcript into the forked store"
+        );
         assert!(
             profile.is_some(),
             "must persist so the forked id survives restart"
+        );
+    }
+
+    // A different-id assignment that is NOT consuming a fork (fork_pending is
+    // None) must leave import_pending alone: that marker belongs to the import
+    // flow, which lands on the same-id path, and clearing it here would block a
+    // legitimate import retry from re-seeding the transcript.
+    #[cfg(feature = "serve")]
+    #[test]
+    fn non_fork_assignment_preserves_import_pending() {
+        let mut inst = Instance::new("seed", "/tmp/seed");
+        inst.acp_session_id = None;
+        inst.fork_pending = None;
+        inst.import_pending = Some(true);
+
+        let profile = apply_acp_session_change(
+            &mut inst,
+            "sess-1",
+            Some(&AcpSessionChange::Assigned("some-new-id".into())),
+        );
+
+        assert_eq!(inst.acp_session_id.as_deref(), Some("some-new-id"));
+        assert_eq!(
+            inst.import_pending,
+            Some(true),
+            "a non-fork different-id assignment must not consume import_pending"
+        );
+        assert!(
+            profile.is_some(),
+            "a new id assignment must persist regardless of markers"
         );
     }
 

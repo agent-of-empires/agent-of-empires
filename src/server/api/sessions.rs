@@ -4424,6 +4424,7 @@ pub async fn create_session(
                     instance.yolo_mode,
                     instance.command.clone(),
                     instance.import_pending == Some(true),
+                    instance.fork_pending.clone(),
                 ))
             } else {
                 None
@@ -4451,6 +4452,7 @@ pub async fn create_session(
                 yolo_mode,
                 command,
                 seed_history_replay,
+                fork_from,
             )) = acp_spawn_target
             {
                 let agent = state
@@ -4500,6 +4502,7 @@ pub async fn create_session(
                             model,
                             effort,
                             stored_acp_session_id,
+                            fork_from,
                             sandbox_info,
                             source_profile: source_profile_for_spawn,
                             yolo_mode,
