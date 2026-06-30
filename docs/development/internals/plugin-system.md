@@ -222,7 +222,13 @@ uninstalls a `gh:` plugin without a terminal. The same disclosure the CLI
 prompts for (capabilities, build commands, UI slots, unverified-source warning)
 is returned as structured data and approved in a modal; the host then runs the
 operation as a job whose progress and build output stream to a per-job log file
-under `<plugins_dir>/jobs/<job_id>.log`, which the dashboard tails. One
+under `<plugins_dir>/jobs/<job_id>.log`, which the dashboard tails. Every update
+(in the web modal and the TUI plugin manager) first shows a changelog between
+the installed and target version, release notes when the refs bracket release
+tags, otherwise commit subjects from the GitHub compare endpoint
+(`plugin::changelog`, assembled best-effort in `preview_update` only). A safe
+version bump no longer auto-applies: it opens the same review surface so the
+changelog is seen before the update runs. One
 lifecycle mutation runs at a time (config and lockfile writes are not
 concurrency-safe; a second start is rejected). One PATH caveat: a dashboard
 build runs with the daemon's environment, not the user's interactive shell, so a
