@@ -1131,6 +1131,12 @@ mod tests {
                 "-y",
                 "24",
                 "bash -c 'i=0; while true; do echo line-$((i++)); done'",
+                ";",
+                "set-option",
+                "-t",
+                guard.name(),
+                "pane-base-index",
+                "0",
             ])
             .output()
             .expect("tmux new-session");
@@ -1248,6 +1254,20 @@ mod tests {
                 "-y",
                 "10",
                 "sh -c 'printf hello; sleep 60'",
+                ";",
+                "set-option",
+                "-t",
+                &name,
+                "pane-base-index",
+                "0",
+                ";",
+                "resize-window",
+                "-t",
+                &name,
+                "-x",
+                "40",
+                "-y",
+                "10",
             ])
             .status()
             .expect("tmux new-session");

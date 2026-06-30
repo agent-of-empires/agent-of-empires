@@ -8939,6 +8939,12 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
                 "-y",
                 "40",
                 &launch,
+                ";",
+                "set-option",
+                "-t",
+                &session_name,
+                "pane-base-index",
+                "0",
             ])
             .output()
             .expect("spawn tmux");
