@@ -529,6 +529,30 @@ impl NewSessionDialog {
         self.fork_seed = Some(seed);
     }
 
+    /// Preselect a specific tool by name (e.g. so a fork opens on the parent's
+    /// agent rather than the configured default, matching the fork seed). No-op
+    /// when the tool isn't in the available list. Applies the same per-tool side
+    /// effects as cycling the tool field: always-yolo agents force the toggle,
+    /// host-only agents clear sandbox and worktree, and the per-tool extra
+    /// args / command override are re-resolved.
+    pub fn set_tool(&mut self, tool: &str) {
+        let Some(index) = self.available_tools.iter().position(|t| t == tool) else {
+            return;
+        };
+        self.tool_index = index;
+        if self.selected_tool_always_yolo() {
+            self.yolo_mode = true;
+        } else {
+            self.yolo_mode = self.yolo_mode_default;
+        }
+        if self.selected_tool_host_only() {
+            self.sandbox_enabled = false;
+            self.worktree_enabled = false;
+            self.worktree_branch.reset();
+        }
+        self.reload_tool_config();
+    }
+
     /// Move focus to the title field. Used by "new from selection", where the
     /// path is pre-filled so the user lands directly on naming the session.
     pub fn focus_title(&mut self) {
@@ -548,6 +572,14 @@ impl NewSessionDialog {
     #[cfg(test)]
     pub fn fork_seed(&self) -> Option<&crate::session::ForkSeed> {
         self.fork_seed.as_ref()
+    }
+
+    #[cfg(test)]
+    pub fn selected_tool(&self) -> &str {
+        self.available_tools
+            .get(self.tool_index)
+            .map(|s| s.as_str())
+            .unwrap_or("")
     }
 
     /// Push a hook progress message into the dialog state
