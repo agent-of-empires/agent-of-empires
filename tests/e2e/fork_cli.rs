@@ -348,7 +348,11 @@ fn fork_from_unlaunched_fork_is_refused() {
 
 /// `--fork-from` is a terminal-only fork; combining it with `--structured-view`
 /// would write terminal fork state onto a structured session. The CLI rejects
-/// the combination up front. This flag only exists in `--features serve`.
+/// the combination up front, BEFORE provisioning a scratch directory, so the
+/// refusal leaks nothing. Using `--scratch` here makes that leak observable:
+/// were the rejection still buried in the post-creation view block, a scratch
+/// dir would already exist by the time it fired. This flag only exists in
+/// `--features serve`.
 #[cfg(feature = "serve")]
 #[test]
 #[serial]
@@ -383,9 +387,21 @@ fn fork_from_with_structured_view_is_refused() {
     )
     .expect("write seeded sessions.json");
 
+    // The parent is a project session, so nothing has touched the scratch root
+    // yet. A scratch fork that got past the rejection would create
+    // <app_dir>/scratch/<id>/.
+    let scratch_root = scratch_root(&h);
+    assert!(
+        !scratch_root.exists()
+            || std::fs::read_dir(&scratch_root)
+                .map(|mut d| d.next().is_none())
+                .unwrap_or(true),
+        "scratch root should be empty before the fork attempt"
+    );
+
     let child = h.run_cli(&[
         "add",
-        project.to_str().unwrap(),
+        "--scratch",
         "--cmd",
         "claude",
         "-t",
@@ -402,6 +418,17 @@ fn fork_from_with_structured_view_is_refused() {
     assert!(
         stderr.contains("cannot be combined with"),
         "expected an incompatible-flags message, got: {stderr}"
+    );
+
+    // Leak check: the rejection fires before scratch provisioning, so no
+    // scratch directory was created.
+    assert!(
+        !scratch_root.exists()
+            || std::fs::read_dir(&scratch_root)
+                .map(|mut d| d.next().is_none())
+                .unwrap_or(true),
+        "refused structured fork must not leave an orphaned scratch dir under {}",
+        scratch_root.display()
     );
 
     let sessions = read_sessions(&h);

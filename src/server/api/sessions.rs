@@ -400,24 +400,11 @@ impl SessionResponse {
             },
             #[cfg(feature = "serve")]
             acp_session_id: inst.acp_session_id.clone(),
-            // Forkable structured = ACP-capable AND a non-`Unsupported` fork
-            // strategy. The bundled `aoe-agent` and other resume-only agents are
-            // ACP-capable but declare no fork strategy, so they read false here.
-            // Custom agents are absent from `get_agent`, so they default to
-            // not-forkable; the list/create handlers do not overlay this because
-            // no custom agent currently exposes a structured fork.
+            // Shares `agent_is_structured_fork_capable` with the create-time
+            // guard so the web "Fork" affordance and server-side acceptance
+            // cannot drift: forkable = ACP-capable AND a real fork strategy.
             #[cfg(feature = "serve")]
-            acp_can_fork: {
-                let resolved = inst
-                    .agent_name
-                    .as_deref()
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(inst.tool.as_str());
-                builtin_acp_registry().get(resolved).is_some()
-                    && crate::agents::get_agent(resolved).is_some_and(|a| {
-                        !matches!(a.fork_strategy, crate::agents::ForkStrategy::Unsupported)
-                    })
-            },
+            acp_can_fork: agent_is_structured_fork_capable(&inst.tool, inst.agent_name.as_deref()),
             claude_fullscreen: claude_fullscreen && inst.tool == "claude",
             workspace_repos: inst
                 .workspace_info
@@ -3734,31 +3721,25 @@ fn both_import_and_fork_set(body: &CreateSessionBody) -> bool {
     set(&body.import_acp_session_id) && set(&body.fork_from)
 }
 
-/// Whether `tool`/`agent_name` can run the structured ACP `session/fork`
-/// handshake. A structured fork seeds an empty event store and replays history
-/// over a live ACP connection, which only an ACP-capable agent provides; a
-/// non-ACP agent would otherwise be silently downgraded to a non-forked
-/// terminal session. Mirrors the post-build capability re-resolution so the
-/// create path fails closed before any worktree is provisioned.
+/// True when `tool`/`agent_name` can run the structured ACP `session/fork`
+/// handshake: ACP-capable AND declaring a real (non-`Unsupported`) fork
+/// strategy. This is the single source of truth shared by the
+/// `SessionResponse.acp_can_fork` projection (the web "Fork" affordance) and the
+/// create-time guard, so the two cannot drift. A resume-only ACP agent such as
+/// the bundled `aoe-agent` is ACP-capable yet declares no fork strategy, so it
+/// reads false here; gating only on ACP-capability would accept a structured
+/// fork that can only fail later at the live handshake.
+///
+/// Custom agents are absent from `get_agent`, so they default to not forkable,
+/// matching `acp_can_fork` (no custom agent currently exposes a structured
+/// fork). Treating an unknown custom agent as forkable here would diverge from
+/// the web signal and accept a create that the handshake then rejects.
 #[cfg(feature = "serve")]
-fn agent_supports_structured_fork(
-    tool: &str,
-    agent_name: Option<&str>,
-    profile: &str,
-    project_path: &std::path::Path,
-) -> bool {
+fn agent_is_structured_fork_capable(tool: &str, agent_name: Option<&str>) -> bool {
     let resolved = agent_name.filter(|s| !s.is_empty()).unwrap_or(tool);
-    if crate::acp::AgentRegistry::with_defaults()
-        .get(resolved)
-        .is_some()
-    {
-        return true;
-    }
-    crate::session::repo_config::resolve_config_with_repo_or_warn(profile, project_path)
-        .session
-        .agent_acp_cmd
-        .get(tool)
-        .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(tool, cmd).is_ok())
+    builtin_acp_registry().get(resolved).is_some()
+        && crate::agents::get_agent(resolved)
+            .is_some_and(|a| !matches!(a.fork_strategy, crate::agents::ForkStrategy::Unsupported))
 }
 
 fn validate_session_tool_identity(
@@ -4256,12 +4237,7 @@ pub async fn create_session(
             // capability check silently downgrade it to a non-forked terminal
             // session (the fork markers would be cleared, dropping the fork).
             if structured
-                && !agent_supports_structured_fork(
-                    &body.tool,
-                    body.agent_name.as_deref(),
-                    validation_profile,
-                    std::path::Path::new(&body.path),
-                )
+                && !agent_is_structured_fork_capable(&body.tool, body.agent_name.as_deref())
             {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -6273,23 +6249,33 @@ mod tests {
     }
 
     #[test]
-    fn structured_fork_requires_acp_capable_agent() {
-        // claude is in the default ACP registry, so a structured fork is
-        // allowed. An unknown / non-ACP tool is not, so the create path rejects
-        // the structured fork rather than silently downgrading it to terminal.
-        let nonexistent = std::path::Path::new("/tmp/aoe-no-such-repo-for-test");
-        assert!(agent_supports_structured_fork(
-            "claude",
-            None,
-            "default",
-            nonexistent
-        ));
-        assert!(!agent_supports_structured_fork(
+    fn structured_fork_create_guard_matches_acp_can_fork() {
+        // The create-time guard and the web `acp_can_fork` projection share
+        // `agent_is_structured_fork_capable`, so they must agree per agent.
+        // claude is ACP-capable with a real fork strategy: forkable.
+        assert!(agent_is_structured_fork_capable("claude", None));
+        // aoe-agent is ACP-capable but resume-only (no fork strategy), so the
+        // create guard must reject a structured fork for it just as the web
+        // suppresses the Fork affordance; gating on ACP-capability alone would
+        // accept a create that can only fail later at the `session/fork`
+        // handshake.
+        assert!(!agent_is_structured_fork_capable("aoe-agent", None));
+        // A non-ACP tool is neither ACP-capable nor fork-capable.
+        assert!(!agent_is_structured_fork_capable(
             "definitely-not-an-acp-agent",
-            None,
-            "default",
-            nonexistent,
+            None
         ));
+
+        // The two surfaces must report the same capability for each agent.
+        for tool in ["claude", "aoe-agent", "definitely-not-an-acp-agent"] {
+            let mut inst = make_test_instance();
+            inst.tool = tool.to_string();
+            assert_eq!(
+                SessionResponse::from_instance(&inst, false).acp_can_fork,
+                agent_is_structured_fork_capable(tool, None),
+                "acp_can_fork and the create guard disagree for '{tool}'"
+            );
+        }
     }
 
     #[cfg(feature = "serve")]

@@ -247,6 +247,25 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     // and applied once the instance is built.
     let resolved_tool = resolve_tool_for_add(&args, &config)?;
 
+    // `--fork-from` performs a TERMINAL fork (it seeds `agent_session_id` + a
+    // one-shot Fork resume intent). Pairing it with a structured-view request
+    // would write that terminal state onto a structured session, which is
+    // incoherent: structured fork is its own flow (ACP `session/fork`) and is
+    // offered from the web dashboard, not here. Reject it here, before any
+    // worktree or scratch directory is created, so the refusal leaks nothing.
+    // The structured-view flags are serve-gated, so `wants_structured` is
+    // always false on bare-core.
+    #[cfg(feature = "serve")]
+    let wants_structured = args.structured_view || args.agent.is_some();
+    #[cfg(not(feature = "serve"))]
+    let wants_structured = false;
+    if args.fork_from.is_some() && wants_structured {
+        bail!(
+            "`--fork-from` performs a terminal fork and cannot be combined with \
+             --structured-view or --agent; structured fork is available from the web dashboard."
+        );
+    }
+
     // Validate fork eligibility eagerly and produce the one-shot seed. This is
     // a pure decision (source-session lookup over the already-loaded
     // `instances`, plus `terminal_fork_seed`, which only consults the agent's
@@ -580,17 +599,9 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         // than a silent downgrade.
         let user_picked_agent = args.agent.is_some();
         let user_wants_structured = args.structured_view || user_picked_agent;
-        // `--fork-from` performs a TERMINAL fork (it seeds `agent_session_id` +
-        // a one-shot Fork resume intent). Pairing it with a structured-view
-        // request would write that terminal state onto a structured session,
-        // which is incoherent: structured fork is its own flow (ACP
-        // `session/fork`) and is offered from the web dashboard, not here.
-        if args.fork_from.is_some() && user_wants_structured {
-            bail!(
-                "`--fork-from` performs a terminal fork and cannot be combined with \
-                 --structured-view or --agent; structured fork is available from the web dashboard."
-            );
-        }
+        // The `--fork-from` + structured-view refusal is hoisted above
+        // worktree/scratch creation (see the early fork-validation block) so it
+        // leaks no resources; nothing to re-check here.
         instance.agent_name = args.agent.clone();
         instance.agent_model = args.model.clone();
 
