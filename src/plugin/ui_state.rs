@@ -42,6 +42,8 @@ const MAX_ENTRIES_PER_PLUGIN: usize = 1024;
 /// pane can carry a full PR comment list, where a badge is a few words.
 const MAX_PAYLOAD_BYTES: usize = 8 * 1024;
 const MAX_PANE_PAYLOAD_BYTES: usize = 64 * 1024;
+const MAX_COMPOSER_DRAFT_TEXT_BYTES: usize = 16 * 1024;
+const MAX_COMPOSER_ACTION_PAYLOAD_BYTES: usize = 20 * 1024;
 /// Notifications kept on the shared ring before the oldest are dropped.
 const NOTIFICATION_RING: usize = 200;
 /// Caps on notification text, so one notify cannot post an unbounded blob.
@@ -263,7 +265,7 @@ impl ComposerDraftOperation {
             ComposerDraftOperation::InsertText { id, text }
             | ComposerDraftOperation::ReplaceSelection { id, text }
             | ComposerDraftOperation::SetText { id, text } => {
-                !id.is_empty() && id.len() <= 128 && !text.is_empty() && text.len() <= 16 * 1024
+                !id.is_empty() && id.len() <= 128 && text.len() <= MAX_COMPOSER_DRAFT_TEXT_BYTES
             }
         }
     }
@@ -631,6 +633,7 @@ impl UiStore {
 fn max_payload_bytes(slot: UiSlot) -> usize {
     match slot {
         UiSlot::Pane => MAX_PANE_PAYLOAD_BYTES,
+        UiSlot::ComposerAction => MAX_COMPOSER_ACTION_PAYLOAD_BYTES,
         _ => MAX_PAYLOAD_BYTES,
     }
 }
@@ -684,9 +687,7 @@ fn validate_payload(slot: UiSlot, raw: &Value) -> Result<Value, String> {
                 .as_ref()
                 .is_some_and(|op| !op.valid())
             {
-                return Err(
-                    "composer draft operation requires a non-empty bounded id and text".into(),
-                );
+                return Err("composer draft operation requires a bounded id and text".into());
             }
             serde_json::to_value(parsed).map_err(|e| e.to_string())
         }
@@ -855,6 +856,55 @@ mod tests {
             }),
         )
         .unwrap();
+        s.set(
+            "acme.kit",
+            g,
+            UiSlot::ComposerAction,
+            "voice",
+            Some("s1"),
+            &json!({
+                "label": "Voice",
+                "method": "voice.start",
+                "draft_operation": {"kind": "set-text", "id": "op-2", "text": ""}
+            }),
+        )
+        .unwrap();
+        s.set(
+            "acme.kit",
+            g,
+            UiSlot::ComposerAction,
+            "voice",
+            Some("s1"),
+            &json!({
+                "label": "Voice",
+                "method": "voice.start",
+                "draft_operation": {
+                    "kind": "insert-text",
+                    "id": "op-3",
+                    "text": "x".repeat(MAX_PAYLOAD_BYTES + 512)
+                }
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            s.set(
+                "acme.kit",
+                g,
+                UiSlot::ComposerAction,
+                "voice",
+                Some("s1"),
+                &json!({
+                    "label": "Voice",
+                    "method": "voice.start",
+                    "draft_operation": {
+                        "kind": "insert-text",
+                        "id": "op-4",
+                        "text": "x".repeat(MAX_COMPOSER_DRAFT_TEXT_BYTES + 1)
+                    }
+                })
+            ),
+            Err(UiError::BadRequest(_))
+        ));
     }
 
     #[test]

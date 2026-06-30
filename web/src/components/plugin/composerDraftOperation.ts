@@ -20,7 +20,7 @@ export function composerDraftOperation(entry: PluginUiEntry): { id: string; oper
   const id = str(raw, "id");
   const text = str(raw, "text");
   const kind = str(raw, "kind");
-  if (!id || !text) return null;
+  if (!id || text === undefined) return null;
   if (kind === "insert-text" || kind === "replace-selection" || kind === "set-text") {
     return { id, operation: { kind, text } };
   }

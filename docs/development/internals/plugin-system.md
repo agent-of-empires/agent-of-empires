@@ -182,11 +182,12 @@ declares: `capabilities`, `commands`, `keybinds`, `settings`, `ui`, and a
 declares; they are defined in `aoe-plugin-api` and parsed/validated by the
 host, but consumed by later issues (the settings registry in #2094, the runtime
 host in #2095, the command/keybind/UI surfaces in #2366). `api_version` is now
-7 (bumped to 2 for the contribution sections, 3 when the `detail-panel` slot
+8 (bumped to 2 for the contribution sections, 3 when the `detail-panel` slot
 became the dockable `pane` slot, 4 for the `status` section and the
-`aoe_version` field, 5 for screenshots, 6 for command actions, and 7 for the
-`composer-action` slot); an older `api_version` manifest still loads as long as
-it targets no newer field. Unknown top-level keys remain a hard parse error
+`aoe_version` field, 5 for screenshots, 6 for command actions, 7 for identity
+icons, and 8 for the `composer-action` slot); an older `api_version` manifest
+still loads as long as it targets no newer field. Unknown top-level keys remain
+a hard parse error
 (`deny_unknown_fields`).
 
 The `themes` section ships and is consumed by the theme registry (#2094); the

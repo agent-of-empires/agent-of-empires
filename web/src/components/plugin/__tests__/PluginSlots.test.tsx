@@ -171,6 +171,15 @@ describe("plugin slot renderers", () => {
     expect(
       composerDraftOperation({
         ...entry,
+        payload: { ...entry.payload, draft_operation: { kind: "set-text", id: "op-2", text: "" } },
+      }),
+    ).toEqual({
+      id: "op-2",
+      operation: { kind: "set-text", text: "" },
+    });
+    expect(
+      composerDraftOperation({
+        ...entry,
         payload: { ...entry.payload, draft_operation: { kind: "bad", id: "op-2", text: "hello" } },
       }),
     ).toBeNull();
