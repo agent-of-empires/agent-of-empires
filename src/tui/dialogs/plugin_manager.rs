@@ -93,9 +93,16 @@ impl Default for PluginManagerDialog {
     }
 }
 
+/// Most changelog lines the non-scrollable popup renders before linking out to
+/// GitHub for the rest, so a long release body can never push the consent
+/// disclosure and the approve/decline hint off screen.
+const MAX_CHANGELOG_LINES: usize = 12;
+
 /// Append the changelog to a review popup's lines: release notes or commit
-/// subjects, or a single "unavailable" / "none" line. Best-effort presentation;
-/// the entries are already capped by the backend.
+/// subjects, or a single "unavailable" / "none" line. The popup `Paragraph` is
+/// not scrollable, so the rendered body is hard-capped at [`MAX_CHANGELOG_LINES`]
+/// and the full history is linked via `more_url`; the entry counts are already
+/// capped by the backend, this bounds multi-line release bodies too.
 fn push_changelog_lines(lines: &mut Vec<Line>, changelog: &UpdateChangelog, theme: &Theme) {
     if let Some(reason) = &changelog.unavailable_reason {
         lines.push(Line::from(Span::styled(
@@ -115,34 +122,57 @@ fn push_changelog_lines(lines: &mut Vec<Line>, changelog: &UpdateChangelog, them
         "What's new:",
         Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
     )));
-    for entry in &changelog.entries {
+    let mut remaining = MAX_CHANGELOG_LINES;
+    let mut clipped = false;
+    'entries: for entry in &changelog.entries {
         match entry {
             ChangelogEntry::Release { tag, body, .. } => {
+                if remaining == 0 {
+                    clipped = true;
+                    break;
+                }
                 lines.push(Line::from(Span::styled(
                     tag.clone(),
                     Style::default().fg(theme.text),
                 )));
+                remaining -= 1;
                 if let Some(body) = body {
                     for line in body.lines() {
+                        if remaining == 0 {
+                            clipped = true;
+                            break 'entries;
+                        }
                         lines.push(Line::from(Span::styled(
                             format!("  {line}"),
                             Style::default().fg(theme.dimmed),
                         )));
+                        remaining -= 1;
                     }
                 }
             }
             ChangelogEntry::Commit { sha, subject, .. } => {
+                if remaining == 0 {
+                    clipped = true;
+                    break;
+                }
                 let short: String = sha.chars().take(7).collect();
                 lines.push(Line::from(Span::styled(
                     format!("  {short} {subject}"),
                     Style::default().fg(theme.dimmed),
                 )));
+                remaining -= 1;
             }
         }
     }
-    if changelog.truncated {
+    // Link to the full history when the changelog was clipped here or already
+    // truncated upstream. Fall back to a plain marker if there is no URL.
+    if clipped || changelog.truncated {
+        let marker = match &changelog.more_url {
+            Some(url) => format!("  ... full changelog: {url}"),
+            None => "  ... older history on GitHub".to_string(),
+        };
         lines.push(Line::from(Span::styled(
-            "  ... older history on GitHub",
+            marker,
             Style::default().fg(theme.dimmed),
         )));
     }

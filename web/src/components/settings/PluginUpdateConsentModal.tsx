@@ -227,7 +227,18 @@ function PluginChangelogSection({ changelog }: { changelog: PluginUpdateChangelo
       </ul>
       {changelog.truncated && (
         <p className="mt-1 text-[11px] text-text-dim" data-testid="plugin-update-changelog-truncated">
-          Showing the most recent entries; older history is on GitHub.
+          Showing the most recent entries.{" "}
+          {changelog.more_url && (
+            <a
+              href={changelog.more_url}
+              target="_blank"
+              rel="noreferrer"
+              className="text-brand-400 underline hover:text-brand-300"
+              data-testid="plugin-update-changelog-more"
+            >
+              View the full changelog on GitHub
+            </a>
+          )}
         </p>
       )}
     </div>

@@ -416,6 +416,9 @@ export interface PluginUpdateChangelog {
   entries: PluginChangelogEntry[];
   truncated: boolean;
   unavailable_reason: string | null;
+  /** GitHub URL for the full history (releases page or compare view), shown when
+   *  the changelog is truncated. */
+  more_url: string | null;
 }
 
 /** Structured disclosure for a capability-expanding plugin update, mirroring the

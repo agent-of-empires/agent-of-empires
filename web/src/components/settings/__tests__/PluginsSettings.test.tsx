@@ -23,16 +23,23 @@ import type {
   PluginUpdatesResult,
 } from "../../../lib/api";
 
-const emptyChangelog: PluginUpdateChangelog = { entries: [], truncated: false, unavailable_reason: null };
+const emptyChangelog: PluginUpdateChangelog = {
+  entries: [],
+  truncated: false,
+  unavailable_reason: null,
+  more_url: null,
+};
 const releaseChangelog: PluginUpdateChangelog = {
   entries: [{ kind: "release", tag: "v0.2.0", body: "Added a thing.", published_at: null }],
   truncated: false,
   unavailable_reason: null,
+  more_url: null,
 };
 const commitChangelog: PluginUpdateChangelog = {
   entries: [{ kind: "commit", sha: "abcdef1234", subject: "fix: a bug", url: null }],
   truncated: true,
   unavailable_reason: null,
+  more_url: "https://github.com/example/plugin/compare/aaa...bbb",
 };
 
 const fetchPlugins = vi.fn<[], Promise<PluginListResponse | null>>();
@@ -646,6 +653,9 @@ describe("PluginsSettings", () => {
     // changelog, and has no access disclosure.
     await findByTestId("plugin-update-consent-modal");
     expect((await findByTestId("plugin-update-changelog")).textContent).toContain("fix: a bug");
+    // A truncated changelog links out to the full history on GitHub.
+    const more = await findByTestId("plugin-update-changelog-more");
+    expect(more.getAttribute("href")).toBe("https://github.com/example/plugin/compare/aaa...bbb");
     expect(queryByTestId("plugin-update-added-caps")).toBeNull();
     expect(applyPluginUpdate).not.toHaveBeenCalled();
     fireEvent.click(await findByTestId("plugin-update-approve"));
@@ -665,6 +675,7 @@ describe("PluginsSettings", () => {
           entries: [],
           truncated: false,
           unavailable_reason: "GitHub rate limit reached; changelog unavailable.",
+          more_url: null,
         },
       },
     });

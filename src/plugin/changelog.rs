@@ -41,6 +41,10 @@ pub struct UpdateChangelog {
     pub entries: Vec<ChangelogEntry>,
     pub truncated: bool,
     pub unavailable_reason: Option<String>,
+    /// A GitHub URL for the full history when the changelog is capped or a
+    /// surface cannot show it all (the releases page, or the compare view). The
+    /// non-scrollable TUI popup links to it; the web modal shows it on truncation.
+    pub more_url: Option<String>,
 }
 
 /// One changelog item: a published release's notes, or a single commit subject.
@@ -65,6 +69,7 @@ impl UpdateChangelog {
             entries: Vec::new(),
             truncated: false,
             unavailable_reason: None,
+            more_url: None,
         }
     }
 
@@ -73,8 +78,14 @@ impl UpdateChangelog {
             entries: Vec::new(),
             truncated: false,
             unavailable_reason: Some(reason.into()),
+            more_url: None,
         }
     }
+}
+
+/// The human GitHub base URL for a source, `https://github.com/{owner}/{repo}`.
+fn github_web_base(owner: &str, repo: &str) -> String {
+    format!("https://github.com/{owner}/{repo}")
 }
 
 /// Map a GitHub error to a short, user-facing "unavailable" reason. A rate limit
@@ -176,6 +187,7 @@ async fn release_changelog(
         entries,
         truncated,
         unavailable_reason: None,
+        more_url: Some(format!("{}/releases", github_web_base(owner, repo))),
     })
 }
 
@@ -255,6 +267,10 @@ async fn commit_changelog(
         entries,
         truncated,
         unavailable_reason: None,
+        more_url: Some(format!(
+            "{}/compare/{base}...{head}",
+            github_web_base(owner, repo)
+        )),
     }
 }
 
