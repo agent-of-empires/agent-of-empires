@@ -2581,8 +2581,7 @@ impl HomeView {
             ActionId::ToggleProjectPin => self.toggle_project_pin_at_cursor(),
             ActionId::NextWaiting => self.jump_to_next_waiting(),
             ActionId::Tips => self.open_tips_dialog(),
-            // dispatch wired in the fork-from-selection task
-            ActionId::Fork => {}
+            ActionId::Fork => self.open_fork_from_selection(),
         }
         None
     }
@@ -2663,6 +2662,93 @@ impl HomeView {
             // that teaches it.
             self.record_used_new_from_selection();
         }
+    }
+
+    /// Open the new-session dialog seeded as a fork of the selected session.
+    /// The forked session resumes the parent's captured conversation in a fresh
+    /// independent session id, so it can diverge without disturbing the parent.
+    /// Inherits the parent's repo path and group like "new from selection";
+    /// refuses (with an explanatory info dialog) when the agent can't fork or
+    /// the parent has no captured conversation yet.
+    pub(super) fn open_fork_from_selection(&mut self) {
+        if self.creating_stub_id.is_some() {
+            self.info_dialog = Some(InfoDialog::new(
+                "Please Wait",
+                "A session is already being created. Wait for it to finish or press Ctrl+C to cancel.",
+            ));
+            return;
+        }
+        if !self.available_tools.any_available() {
+            self.show_no_agents();
+            return;
+        }
+
+        // Pull the few parent fields we need into owned locals so the
+        // immutable borrow of `self` is dropped before the mutable `self.`
+        // calls below (dialog construction, info_dialog assignment).
+        let Some((tool, parent_agent_session_id, repo_path, group_path, title)) = self
+            .selected_session
+            .as_ref()
+            .and_then(|id| self.get_instance(id))
+            .map(|inst| {
+                (
+                    inst.tool.clone(),
+                    inst.agent_session_id.clone(),
+                    inst.repo_path().to_string(),
+                    inst.group_path.clone(),
+                    inst.title.clone(),
+                )
+            })
+        else {
+            return;
+        };
+
+        let child_id = crate::session::capture::generate_claude_session_id();
+        let seed = match crate::session::fork::terminal_fork_seed(
+            &tool,
+            parent_agent_session_id.as_deref(),
+            child_id,
+        ) {
+            Ok(s) => s,
+            Err(crate::session::ForkDenied::AgentCannotFork) => {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Fork not supported",
+                    &format!(
+                        "The '{}' agent cannot fork a session. Fork is available for Claude (and, later, Codex and OpenCode).",
+                        tool
+                    ),
+                ));
+                return;
+            }
+            Err(crate::session::ForkDenied::NoParentSession) => {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Nothing to fork yet",
+                    "This session has no captured conversation to fork from. Send it at least one message first.",
+                ));
+                return;
+            }
+        };
+
+        let existing_groups: Vec<String> =
+            self.all_groups().iter().map(|g| g.path.clone()).collect();
+        let current_profile = self
+            .profile_for_cursor(self.cursor)
+            .unwrap_or_else(|| self.config_profile());
+        let profiles = list_profiles().unwrap_or_else(|_| vec![current_profile.clone()]);
+        let mut dialog = NewSessionDialog::new(
+            self.available_tools.clone(),
+            existing_groups,
+            &current_profile,
+            profiles,
+        );
+        dialog.set_path(repo_path);
+        if !group_path.is_empty() {
+            dialog.set_group(group_path);
+        }
+        dialog.set_title(format!("{} (fork)", title));
+        dialog.set_fork_from(seed);
+        dialog.focus_title();
+        self.new_dialog = Some(dialog);
     }
 
     /// Pick a representative repo path for a selected group so "New Session"
@@ -3880,6 +3966,7 @@ impl HomeView {
             // path and group, a group/project row borrows a member's path, the
             // same way `'N'` does.
             ContextMenuAction::NewFromSelection => self.open_new_from_selection(),
+            ContextMenuAction::Fork => self.open_fork_from_selection(),
             ContextMenuAction::OpenSortPicker => self.show_sort_picker(),
             ContextMenuAction::OpenGroupPicker => self.show_group_picker(),
             ContextMenuAction::TogglePin => {
@@ -5936,6 +6023,7 @@ mod tests {
             extra_args: String::new(),
             command_override: String::new(),
             scratch: false,
+            fork_seed: None,
         }
     }
 

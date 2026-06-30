@@ -4605,6 +4605,7 @@ fn test_create_session_in_all_mode_is_findable() {
         extra_args: String::new(),
         command_override: String::new(),
         scratch: false,
+        fork_seed: None,
     };
 
     let session_id = view.create_session(data).unwrap();
@@ -5134,6 +5135,67 @@ fn test_session_context_menu_new_session_prefills_from_session() {
         .expect("NewFromSelection should open the new-session dialog");
     assert_eq!(dialog.path_value(), "/tmp/work");
     assert_eq!(dialog.group_value(), "work");
+}
+
+#[test]
+#[serial]
+fn fork_from_selection_seeds_terminal_fork_and_inherits_parent_context() {
+    let mut env = create_test_env_empty();
+    let mut inst = Instance::new("parent", "/tmp/repo");
+    inst.source_profile = "test".to_string();
+    inst.tool = "claude".into();
+    inst.agent_session_id = Some("parent-1111-2222-3333-444444444444".into());
+    let id = inst.id.clone();
+    env.view.add_instance(inst);
+    env.view.selected_session = Some(id);
+
+    env.view.open_fork_from_selection();
+
+    let dialog = env
+        .view
+        .new_dialog
+        .as_ref()
+        .expect("fork opens the new-session dialog");
+    let seed = dialog.fork_seed().cloned().expect("fork seed present");
+    match seed {
+        crate::session::ForkSeed::Terminal {
+            parent_agent_session_id,
+            child_session_id,
+        } => {
+            assert_eq!(
+                parent_agent_session_id,
+                "parent-1111-2222-3333-444444444444"
+            );
+            assert_ne!(child_session_id, "parent-1111-2222-3333-444444444444");
+            assert!(!child_session_id.is_empty());
+        }
+        other => panic!("expected Terminal fork seed, got {other:?}"),
+    }
+    assert_eq!(dialog.path_value(), "/tmp/repo");
+}
+
+#[test]
+#[serial]
+fn fork_denied_for_resume_only_agent_shows_info() {
+    let mut env = create_test_env_empty();
+    let mut inst = Instance::new("parent", "/tmp/repo");
+    inst.source_profile = "test".to_string();
+    inst.tool = "gemini".into();
+    inst.agent_session_id = Some("parent-uuid".into());
+    let id = inst.id.clone();
+    env.view.add_instance(inst);
+    env.view.selected_session = Some(id);
+
+    env.view.open_fork_from_selection();
+
+    assert!(
+        env.view.new_dialog.is_none(),
+        "no dialog for an unforkable agent"
+    );
+    assert!(
+        env.view.info_dialog.is_some(),
+        "an explanatory info dialog is shown instead"
+    );
 }
 
 #[test]
@@ -5736,6 +5798,7 @@ fn test_apply_creation_results_returns_session_id() {
         extra_args: String::new(),
         command_override: String::new(),
         scratch: false,
+        fork_seed: None,
     };
 
     // Use the async CreationPoller path (pass None hooks, non-sandbox,
@@ -12799,6 +12862,7 @@ mod new_session_attach_mode {
             extra_args: String::new(),
             command_override: String::new(),
             scratch: false,
+            fork_seed: None,
         }
     }
 
@@ -13865,7 +13929,7 @@ mod right_click_context_menu {
             .collect();
         // Default sort here is Newest, where Snooze is gated out. The unread
         // toggle is always-on (any sort) and defaults on, so the archived-row
-        // menu is New Session / Rename / Unarchive / Mark unread / Delete.
+        // menu is New Session / Rename / Unarchive / Mark unread / Delete / Fork.
         assert_eq!(
             labels,
             vec![
@@ -13873,7 +13937,8 @@ mod right_click_context_menu {
                 "Rename",
                 "Unarchive",
                 "Mark unread",
-                "Delete"
+                "Delete",
+                "Fork session"
             ]
         );
 

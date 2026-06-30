@@ -30,6 +30,9 @@ pub enum ContextMenuAction {
     /// repo path and group, a project/group row borrows a member's path,
     /// so the mouse path matches the web sidebar's per-project "+".
     NewFromSelection,
+    /// Fork the right-clicked session into a new independent session that
+    /// resumes its captured conversation (mirrors the palette "Fork session").
+    Fork,
     /// Open the sort-order picker (mirrors `'o'`).
     OpenSortPicker,
     /// Open the group-by mode picker (mirrors `'g'`).
@@ -117,6 +120,7 @@ impl ContextMenuDialog {
             items.push((ContextMenuAction::ToggleUnread, unread_label));
         }
         items.push((ContextMenuAction::Delete, "Delete"));
+        items.push((ContextMenuAction::Fork, "Fork session"));
         Self::new(anchor, items)
     }
 
@@ -504,7 +508,14 @@ mod tests {
         let labels: Vec<&str> = menu.items_for_test().iter().map(|(_, l)| *l).collect();
         assert_eq!(
             labels,
-            vec!["New Session", "Rename", "Unarchive", "Snooze", "Delete"]
+            vec![
+                "New Session",
+                "Rename",
+                "Unarchive",
+                "Snooze",
+                "Delete",
+                "Fork session"
+            ]
         );
     }
 
@@ -514,12 +525,19 @@ mod tests {
         let labels: Vec<&str> = menu.items_for_test().iter().map(|(_, l)| *l).collect();
         assert_eq!(
             labels,
-            vec!["New Session", "Rename", "Archive", "Unsnooze", "Delete"]
+            vec![
+                "New Session",
+                "Rename",
+                "Archive",
+                "Unsnooze",
+                "Delete",
+                "Fork session"
+            ]
         );
     }
 
     #[test]
-    fn active_session_menu_lists_all_five_actions() {
+    fn active_session_menu_lists_all_actions() {
         let menu = ContextMenuDialog::for_session((0, 0), false, Some(false), None);
         let items: Vec<ContextMenuAction> = menu.items_for_test().iter().map(|(a, _)| *a).collect();
         assert_eq!(
@@ -530,6 +548,7 @@ mod tests {
                 ContextMenuAction::ToggleArchive,
                 ContextMenuAction::ToggleSnooze,
                 ContextMenuAction::Delete,
+                ContextMenuAction::Fork,
             ]
         );
     }
@@ -540,7 +559,7 @@ mod tests {
         // resolve to NewFromSelection, matching the `'N'` keybinding's
         // new-from-selection behavior on a session.
         let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false), None);
-        // Pre-select Delete to prove the hotkey wins over the cursor.
+        // Pre-select Fork (Up wraps to the last item) to prove the hotkey wins over the cursor.
         menu.handle_key(key(KeyCode::Up));
         let result = menu.handle_key(key(KeyCode::Char('n')));
         assert!(matches!(
@@ -556,20 +575,37 @@ mod tests {
         let labels: Vec<&str> = read.items_for_test().iter().map(|(_, l)| *l).collect();
         assert_eq!(
             labels,
-            vec!["New Session", "Rename", "Archive", "Mark unread", "Delete"]
+            vec![
+                "New Session",
+                "Rename",
+                "Archive",
+                "Mark unread",
+                "Delete",
+                "Fork session"
+            ]
         );
 
         let unread = ContextMenuDialog::for_session((0, 0), false, None, Some(true));
         let labels: Vec<&str> = unread.items_for_test().iter().map(|(_, l)| *l).collect();
         assert_eq!(
             labels,
-            vec!["New Session", "Rename", "Archive", "Mark read", "Delete"]
+            vec![
+                "New Session",
+                "Rename",
+                "Archive",
+                "Mark read",
+                "Delete",
+                "Fork session"
+            ]
         );
 
         // Feature off (None) -> no unread row.
         let off = ContextMenuDialog::for_session((0, 0), false, None, None);
         let labels: Vec<&str> = off.items_for_test().iter().map(|(_, l)| *l).collect();
-        assert_eq!(labels, vec!["New Session", "Rename", "Archive", "Delete"]);
+        assert_eq!(
+            labels,
+            vec!["New Session", "Rename", "Archive", "Delete", "Fork session"]
+        );
     }
 
     #[test]
@@ -607,7 +643,10 @@ mod tests {
         // Snooze item to resolve to), matching the Attention-gated keybinding.
         let mut menu = ContextMenuDialog::for_session((0, 0), false, None, None);
         let labels: Vec<&str> = menu.items_for_test().iter().map(|(_, l)| *l).collect();
-        assert_eq!(labels, vec!["New Session", "Rename", "Archive", "Delete"]);
+        assert_eq!(
+            labels,
+            vec!["New Session", "Rename", "Archive", "Delete", "Fork session"]
+        );
         assert!(matches!(
             menu.handle_key(key(KeyCode::Char('h'))),
             DialogResult::Continue
@@ -648,15 +687,16 @@ mod tests {
         let result = menu.handle_key(key(KeyCode::Enter));
         assert!(matches!(
             result,
-            DialogResult::Submit(ContextMenuAction::Delete)
+            DialogResult::Submit(ContextMenuAction::Fork)
         ));
     }
 
     #[test]
     fn down_wraps_from_last_to_first() {
         let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false), None);
-        // 5 items: Down x5 walks NewSession -> Rename -> Archive -> Snooze ->
-        // Delete -> back to NewSession.
+        // 6 items: Down x6 walks NewSession -> Rename -> Archive -> Snooze ->
+        // Delete -> Fork -> back to NewSession.
+        menu.handle_key(key(KeyCode::Down));
         menu.handle_key(key(KeyCode::Down));
         menu.handle_key(key(KeyCode::Down));
         menu.handle_key(key(KeyCode::Down));
@@ -672,7 +712,7 @@ mod tests {
     #[test]
     fn r_hotkey_submits_rename() {
         let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false), None);
-        // Pre-select Delete (Up wraps to the last item) to prove the hotkey
+        // Pre-select Fork (Up wraps to the last item) to prove the hotkey
         // wins over the cursor.
         menu.handle_key(key(KeyCode::Up));
         let result = menu.handle_key(key(KeyCode::Char('r')));
@@ -853,7 +893,7 @@ mod tests {
     fn hover_off_menu_clears_the_highlight() {
         let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false), None);
         stub_render(&mut menu, 10, 10, 14, 7);
-        menu.handle_hover(12, 15); // Delete (fifth/last row)
+        menu.handle_hover(12, 15); // Delete (fifth row, index 4)
         assert_eq!(menu.highlight_for_test(), Some(4));
         // Moving the cursor off every item must drop the highlight so no
         // row stays lit once the pointer is no longer over any of them.
@@ -909,6 +949,6 @@ mod tests {
         stub_render(&mut menu, 10, 10, 14, 7);
         menu.handle_hover(40, 40); // off every item -> None
         menu.handle_key(key(KeyCode::Up));
-        assert_eq!(menu.selected_action(), ContextMenuAction::Delete);
+        assert_eq!(menu.selected_action(), ContextMenuAction::Fork);
     }
 }

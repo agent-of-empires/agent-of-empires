@@ -111,6 +111,9 @@ pub struct NewSessionData {
     /// `<app_dir>/scratch/<id>/` and persist `instance.scratch = true`.
     /// Mutually exclusive with worktree mode.
     pub scratch: bool,
+    /// One-shot fork seed carried when this session was opened as a fork of
+    /// another. `None` for an ordinary new session.
+    pub fork_seed: Option<crate::session::ForkSeed>,
 }
 
 pub struct NewSessionDialog {
@@ -220,6 +223,10 @@ pub struct NewSessionDialog {
     /// provisions a fresh scratch directory. Toggled with Ctrl+T from
     /// anywhere in the form. Mutually exclusive with worktree mode.
     pub(super) scratch: bool,
+    /// One-shot fork seed when this dialog was opened as a fork. Carried
+    /// verbatim into the resulting `NewSessionData` on submit; `None` for an
+    /// ordinary new session.
+    pub(super) fork_seed: Option<crate::session::ForkSeed>,
     /// Per-field hit rect captured by the renderer of the main form
     /// so a mouse click / hover can target the same cells the user
     /// sees. Each entry is `(focused_field_index, rect)`. Cleared and
@@ -491,6 +498,7 @@ impl NewSessionDialog {
             group_ghost: None,
             confirm_create_dir: None,
             scratch: false,
+            fork_seed: None,
             focusable_rects: Vec::new(),
             sandbox_config_rects: Vec::new(),
             tool_config_rects: Vec::new(),
@@ -511,6 +519,16 @@ impl NewSessionDialog {
         self.group = Input::new(group);
     }
 
+    /// Pre-fill the title field (e.g. a "(fork)" suffix when forking).
+    pub fn set_title(&mut self, title: String) {
+        self.title = Input::new(title);
+    }
+
+    /// Seed this dialog as a fork (carried into the resulting NewSessionData).
+    pub fn set_fork_from(&mut self, seed: crate::session::ForkSeed) {
+        self.fork_seed = Some(seed);
+    }
+
     /// Move focus to the title field. Used by "new from selection", where the
     /// path is pre-filled so the user lands directly on naming the session.
     pub fn focus_title(&mut self) {
@@ -525,6 +543,11 @@ impl NewSessionDialog {
     #[cfg(test)]
     pub fn group_value(&self) -> &str {
         self.group.value()
+    }
+
+    #[cfg(test)]
+    pub fn fork_seed(&self) -> Option<&crate::session::ForkSeed> {
+        self.fork_seed.as_ref()
     }
 
     /// Push a hook progress message into the dialog state
@@ -784,6 +807,7 @@ impl NewSessionDialog {
             group_ghost: None,
             confirm_create_dir: None,
             scratch: false,
+            fork_seed: None,
             focusable_rects: Vec::new(),
             sandbox_config_rects: Vec::new(),
             tool_config_rects: Vec::new(),
@@ -854,6 +878,7 @@ impl NewSessionDialog {
             group_ghost: None,
             confirm_create_dir: None,
             scratch: false,
+            fork_seed: None,
             focusable_rects: Vec::new(),
             sandbox_config_rects: Vec::new(),
             tool_config_rects: Vec::new(),
@@ -1973,6 +1998,7 @@ impl NewSessionDialog {
             extra_args: self.extra_args.value().trim().to_string(),
             command_override: self.command_override.value().trim().to_string(),
             scratch: self.scratch,
+            fork_seed: self.fork_seed.clone(),
         })
     }
 

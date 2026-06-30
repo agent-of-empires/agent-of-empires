@@ -258,7 +258,7 @@ impl HomeView {
             command_override: data.command_override,
             extra_repo_paths: data.extra_repo_paths,
             scratch: data.scratch,
-            fork_seed: None,
+            fork_seed: data.fork_seed,
         };
 
         let build_result = builder::build_instance(
