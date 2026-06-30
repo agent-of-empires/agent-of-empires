@@ -144,13 +144,7 @@ pub fn perform_deletion(request: &DeletionRequest) -> DeletionResult {
     if request.delete_sandbox && is_sandboxed {
         tracing::debug!(target: "session.delete", session_id = %request.session_id, stage = "container_remove", "perform_deletion: stage");
         let container = DockerContainer::from_session_id(&request.instance.id);
-        if container.exists().unwrap_or(false) {
-            if let Err(e) = container.remove(true) {
-                errors.push(format!("Container: {}", e));
-            } else {
-                messages.push("Container removed".to_string());
-            }
-        }
+        record_container_removal(|force| container.remove(force), &mut messages, &mut errors);
         // Remove named ignore volumes even if the container is already gone — volumes created
         // with volume_ignores_strategy = "named" outlive the container and need explicit cleanup.
         container.remove_named_ignore_volumes(&request.instance.id);
@@ -437,6 +431,27 @@ pub fn perform_deletion(request: &DeletionRequest) -> DeletionResult {
     }
 }
 
+/// Attempt to remove a session's sandbox container, recording the outcome.
+///
+/// Removal forces stop+remove in one shot and is idempotent: a
+/// `ContainerNotFound` result means there was nothing to remove and is not
+/// surfaced. Any other failure is pushed to `errors` so the caller keeps the
+/// session record rather than silently orphaning a live container.
+///
+/// NOTE: callers must invoke this unconditionally, never gating it behind a
+/// separate existence probe; a transient probe failure must not skip removal.
+fn record_container_removal(
+    remove: impl FnOnce(bool) -> crate::containers::error::Result<()>,
+    messages: &mut Vec<String>,
+    errors: &mut Vec<String>,
+) {
+    match remove(true) {
+        Ok(()) => messages.push("Container removed".to_string()),
+        Err(crate::containers::error::DockerError::ContainerNotFound(_)) => {}
+        Err(e) => errors.push(format!("Container: {}", e)),
+    }
+}
+
 /// Run on_destroy hooks for an instance. Uses best-effort execution so all
 /// hooks are attempted even if some fail. Failures are logged as warnings
 /// and never prevent deletion.
@@ -562,6 +577,79 @@ mod tests {
 
         assert!(result.success);
         assert!(result.errors.is_empty());
+    }
+
+    mod container_removal {
+        use super::*;
+        use crate::containers::error::DockerError;
+        use std::cell::Cell;
+
+        #[test]
+        fn removal_failure_is_recorded_as_error() {
+            let mut messages = Vec::new();
+            let mut errors = Vec::new();
+            record_container_removal(
+                |_force| Err(DockerError::RemoveFailed("daemon busy".into())),
+                &mut messages,
+                &mut errors,
+            );
+            assert_eq!(
+                errors.len(),
+                1,
+                "a removal failure must be surfaced so the caller keeps the session record"
+            );
+            assert!(errors[0].contains("Container"));
+            assert!(messages.is_empty());
+        }
+
+        #[test]
+        fn successful_removal_records_message() {
+            let mut messages = Vec::new();
+            let mut errors = Vec::new();
+            record_container_removal(|_force| Ok(()), &mut messages, &mut errors);
+            assert_eq!(messages, vec!["Container removed".to_string()]);
+            assert!(errors.is_empty());
+        }
+
+        #[test]
+        fn absent_container_is_not_an_error() {
+            let mut messages = Vec::new();
+            let mut errors = Vec::new();
+            record_container_removal(
+                |_force| Err(DockerError::ContainerNotFound("aoe-sandbox-x".into())),
+                &mut messages,
+                &mut errors,
+            );
+            assert!(
+                errors.is_empty(),
+                "an already-gone container is idempotent, not a failure"
+            );
+            assert!(
+                messages.is_empty(),
+                "no spurious 'removed' message when nothing was removed"
+            );
+        }
+
+        #[test]
+        fn removal_is_always_attempted() {
+            let calls = Cell::new(0);
+            let mut messages = Vec::new();
+            let mut errors = Vec::new();
+            record_container_removal(
+                |force| {
+                    calls.set(calls.get() + 1);
+                    assert!(force, "deletion forces stop+remove in one shot");
+                    Ok(())
+                },
+                &mut messages,
+                &mut errors,
+            );
+            assert_eq!(
+                calls.get(),
+                1,
+                "removal must not be gated behind a swallowed existence probe"
+            );
+        }
     }
 
     #[test]

@@ -4245,7 +4245,7 @@ impl HomeView {
                 if inst.status == Status::Deleting {
                     let message = format!(
                         "'{}' is stuck deleting. Force remove it from the session list? \
-                         (worktrees, branches, and containers will not be cleaned up)",
+                         (the sandbox container is torn down; worktrees and branches will not be cleaned up)",
                         inst.title
                     );
                     self.pending_force_remove_session = Some(session_id.clone());

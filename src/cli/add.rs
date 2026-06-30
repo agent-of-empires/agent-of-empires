@@ -429,6 +429,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             workspace_info_opt.as_ref(),
             args.create_branch,
             None,
+            None,
         );
         return Ok(());
     }
@@ -887,6 +888,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             } else {
                 None
             },
+            instance.sandbox_info.as_ref().map(|_| instance.id.as_str()),
         );
         return Err(e);
     }
@@ -924,6 +926,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 } else {
                     None
                 },
+                instance.sandbox_info.as_ref().map(|_| instance.id.as_str()),
             );
             return Ok(());
         }
@@ -938,6 +941,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 } else {
                     None
                 },
+                instance.sandbox_info.as_ref().map(|_| instance.id.as_str()),
             );
             return Err(e);
         }
@@ -1107,7 +1111,25 @@ fn cleanup_partial_session(
     workspace_info: Option<&crate::session::WorkspaceInfo>,
     created_branch: bool,
     scratch_dir: Option<&std::path::Path>,
+    container_session_id: Option<&str>,
 ) {
+    // Tear down the sandbox container first so its bind mount releases the
+    // worktree before the git removal below. Best-effort and idempotent: a
+    // container that was never started yields ContainerNotFound, which is not
+    // an error. `Some` only when the session is sandboxed.
+    if let Some(session_id) = container_session_id {
+        let container = crate::containers::DockerContainer::from_session_id(session_id);
+        match container.remove(true) {
+            Ok(()) | Err(crate::containers::error::DockerError::ContainerNotFound(_)) => {}
+            Err(e) => tracing::warn!(
+                target: "cli.add",
+                "failed to remove sandbox container during partial cleanup for {}: {}",
+                session_id,
+                e
+            ),
+        }
+        container.remove_named_ignore_volumes(session_id);
+    }
     if let Some(wt) = worktree_info {
         if wt.managed_by_aoe {
             if let Ok(git_wt) = crate::git::GitWorktree::new(PathBuf::from(&wt.main_repo_path)) {

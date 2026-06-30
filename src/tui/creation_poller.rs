@@ -175,6 +175,11 @@ impl CreationPoller {
                         &hook_env,
                     ) {
                         tracing::warn!(target: "session.create", "on_create hook failed in container: {:#}", e);
+                        builder::cleanup_instance(
+                            &instance,
+                            created_worktree.as_ref(),
+                            &created_workspace_worktrees,
+                        );
                         return CreationResult::Error(format!("on_create hook failed: {:#}", e));
                     }
                 }
