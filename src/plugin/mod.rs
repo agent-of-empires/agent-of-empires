@@ -7,6 +7,7 @@
 //! return in follow-up PRs.
 
 pub mod auto_update;
+pub mod changelog;
 pub mod contributions;
 pub mod discover;
 pub mod featured;

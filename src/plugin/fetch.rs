@@ -336,7 +336,7 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-fn github_api_base() -> String {
+pub(super) fn github_api_base() -> String {
     std::env::var("AOE_UPDATE_API_BASE")
         .unwrap_or_else(|_| crate::github::DEFAULT_GITHUB_API_BASE.to_string())
 }

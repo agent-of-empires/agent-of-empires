@@ -11,6 +11,7 @@ use serde::Serialize;
 
 use crate::session::{save_config, CapabilityGrant, Config, PluginConfig};
 
+use super::changelog::UpdateChangelog;
 use super::featured::FeaturedIndex;
 use super::fetch::{self, FetchedPlugin};
 use super::lockfile::{LockedPlugin, Lockfile};
@@ -189,6 +190,10 @@ pub struct UpdateConsent {
     /// Whether declining keeps the current version active (always true for the
     /// in-app path, which never touches the tree on decline).
     pub stays_active_if_declined: bool,
+    /// What changed between the installed version and this one, for the user to
+    /// review before approving. Best-effort; empty or unavailable on any fetch
+    /// failure.
+    pub changelog: UpdateChangelog,
 }
 
 /// What a non-interactive update preview found for one installed plugin.
@@ -197,10 +202,12 @@ pub struct UpdateConsent {
 pub enum UpdatePreview {
     /// The remote matches the installed content; nothing to do.
     NoUpdate,
-    /// A newer version that needs no fresh consent; safe to apply directly.
+    /// A newer version that needs no fresh consent; safe to apply directly. The
+    /// changelog is still surfaced so the user sees what they are pulling in.
     SafeUpdate {
         to_version: String,
         fingerprint: String,
+        changelog: UpdateChangelog,
     },
     /// A newer version that expands access (capabilities, build steps, UI,
     /// runtime, or trust) and must be explicitly approved. `dismissed` is set
@@ -484,6 +491,15 @@ struct Prepared {
     /// Content fingerprint of the currently installed version, from the
     /// lockfile; `None` when no lock entry exists.
     prior_fingerprint: Option<String>,
+    /// The installed source ref and resolved commit (from the lockfile), and the
+    /// fetched target ref and commit. Drive the changelog assembly in
+    /// `preview_update`. `requested_ref` is the source tag/branch (a no-`@ref`
+    /// release install resolves to the release tag here); `release_tag` is NOT
+    /// used (it is release-binary asset provenance only).
+    prior_requested_ref: Option<String>,
+    prior_resolved_commit: Option<String>,
+    target_requested_ref: Option<String>,
+    target_resolved_commit: Option<String>,
     from_version: String,
     caps_changed: bool,
     added_capabilities: Vec<String>,
@@ -552,6 +568,13 @@ async fn prepare_update(id: &str) -> Result<Prepared> {
     let from_version = prior_locked
         .map(|l| l.version.clone())
         .unwrap_or_else(|| "?".to_string());
+    // Captured before `fetched` is moved into the returned struct. The source
+    // ref is `requested_ref` (a no-`@ref` release install resolved its tag into
+    // this field), never `release_tag`.
+    let prior_requested_ref = prior_locked.and_then(|l| l.requested_ref.clone());
+    let prior_resolved_commit = prior_locked.and_then(|l| l.resolved_commit.clone());
+    let target_requested_ref = fetched.requested_ref.clone();
+    let target_resolved_commit = fetched.resolved_commit.clone();
 
     let trust = if featured_verified {
         "featured"
@@ -637,6 +660,10 @@ async fn prepare_update(id: &str) -> Result<Prepared> {
         manifest_hash,
         fingerprint,
         prior_fingerprint,
+        prior_requested_ref,
+        prior_resolved_commit,
+        target_requested_ref,
+        target_resolved_commit,
         from_version,
         caps_changed,
         added_capabilities,
@@ -750,8 +777,10 @@ async fn update_with_consent(id: &str, mode: ConsentMode) -> Result<UpdateOutcom
     )?))
 }
 
-/// Build the structured consent disclosure from a prepared update.
-fn consent_of(p: &Prepared) -> UpdateConsent {
+/// Build the structured consent disclosure from a prepared update. The
+/// changelog is assembled by the caller (`preview_update`) and passed in, so the
+/// disclosure stays free of network work.
+fn consent_of(p: &Prepared, changelog: UpdateChangelog) -> UpdateConsent {
     UpdateConsent {
         id: p.id.clone(),
         from_version: p.from_version.clone(),
@@ -782,7 +811,25 @@ fn consent_of(p: &Prepared) -> UpdateConsent {
         trust_downgrade: p.trust_downgrade,
         fingerprint: p.fingerprint.clone(),
         stays_active_if_declined: true,
+        changelog,
     }
+}
+
+/// Assemble the changelog for a prepared update from its prior/target refs and
+/// commits. Best-effort and network-bound; only called from `preview_update`.
+async fn changelog_of(p: &Prepared) -> UpdateChangelog {
+    let source = match PluginSource::parse(&p.source_str) {
+        Ok(s) => s,
+        Err(_) => return UpdateChangelog::unavailable("Changelog unavailable."),
+    };
+    super::changelog::build(
+        &source,
+        p.prior_requested_ref.as_deref(),
+        p.prior_resolved_commit.as_deref(),
+        p.target_requested_ref.as_deref(),
+        p.target_resolved_commit.as_deref(),
+    )
+    .await
 }
 
 /// Classify an available update for one installed plugin without applying it:
@@ -792,10 +839,13 @@ pub async fn preview_update(id: &str) -> Result<UpdatePreview> {
     if prepared.prior_fingerprint.as_ref() == Some(&prepared.fingerprint) {
         return Ok(UpdatePreview::NoUpdate);
     }
+    // One best-effort changelog fetch, behind this explicit user-driven preview.
+    let changelog = changelog_of(&prepared).await;
     if !prepared.needs_consent {
         return Ok(UpdatePreview::SafeUpdate {
             to_version: prepared.fetched.manifest.version.clone(),
             fingerprint: prepared.fingerprint.clone(),
+            changelog,
         });
     }
     let dismissed = Config::load()
@@ -803,7 +853,7 @@ pub async fn preview_update(id: &str) -> Result<UpdatePreview> {
         .and_then(|c| c.plugins.get(id).and_then(|p| p.dismissed_update.clone()))
         == Some(prepared.fingerprint.clone());
     Ok(UpdatePreview::ConsentRequired {
-        consent: Box::new(consent_of(&prepared)),
+        consent: Box::new(consent_of(&prepared, changelog)),
         dismissed,
     })
 }

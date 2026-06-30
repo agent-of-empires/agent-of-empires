@@ -53,10 +53,49 @@ pub struct GitHubRelease {
     #[serde(default)]
     pub body: Option<String>,
     pub published_at: Option<String>,
+    /// A draft (unpublished) release. Excluded from a public list, but kept here
+    /// so the changelog can filter defensively.
+    #[serde(default)]
+    pub draft: bool,
+    /// A prerelease (alpha/beta/rc). `releases/latest` excludes these; the list
+    /// endpoint does not, so the changelog filters them to match the stable
+    /// channel the update path tracks.
+    #[serde(default)]
+    pub prerelease: bool,
     /// Release assets (downloadable binaries). Empty for the update check; used
     /// by plugin install to fetch a release-binary worker.
     #[serde(default)]
     pub assets: Vec<GitHubAsset>,
+}
+
+/// The result of comparing two commits (`/compare/{base}...{head}`). Only the
+/// fields the changelog needs are deserialized.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GitHubCompare {
+    /// `ahead`, `behind`, `diverged`, or `identical`.
+    pub status: String,
+    /// Total commits between base and head. May exceed `commits.len()` because
+    /// the compare endpoint caps the returned list at 250.
+    #[serde(default)]
+    pub total_commits: u64,
+    #[serde(default)]
+    pub commits: Vec<GitHubCompareCommit>,
+}
+
+/// One commit in a compare result.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GitHubCompareCommit {
+    pub sha: String,
+    #[serde(default)]
+    pub html_url: String,
+    pub commit: GitHubCommitInner,
+}
+
+/// The commit metadata nested under a compare commit.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GitHubCommitInner {
+    #[serde(default)]
+    pub message: String,
 }
 
 /// A single downloadable asset attached to a release.
@@ -128,6 +167,29 @@ impl GitHubClient {
         let url = format!(
             "{}/repos/{}/{}/releases?per_page={}",
             self.api_base, owner, repo, per_page
+        );
+        self.send_json(self.http.get(url)).await
+    }
+
+    /// `GET /repos/{owner}/{repo}/compare/{base}...{head}`
+    ///
+    /// Returns the commits on `head` that are not on `base`, base-exclusive and
+    /// head-inclusive. The endpoint caps the returned list at 250 commits, so
+    /// `total_commits` may exceed `commits.len()`; callers mark truncation off
+    /// that gap. A ref containing `/` (a branch like `release/1.x`) is encoded so
+    /// it stays one path segment.
+    pub async fn compare_commits(
+        &self,
+        owner: &str,
+        repo: &str,
+        base: &str,
+        head: &str,
+    ) -> Result<GitHubCompare> {
+        let base = utf8_percent_encode(base, TAG_SEGMENT);
+        let head = utf8_percent_encode(head, TAG_SEGMENT);
+        let url = format!(
+            "{}/repos/{}/{}/compare/{}...{}",
+            self.api_base, owner, repo, base, head
         );
         self.send_json(self.http.get(url)).await
     }
