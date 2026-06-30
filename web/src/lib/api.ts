@@ -402,6 +402,22 @@ export interface PluginUpdateUiView {
   id: string;
 }
 
+/** One changelog item between the installed and target version: a release's
+ *  notes, or a single commit subject. Mirrors Rust `ChangelogEntry`. */
+export type PluginChangelogEntry =
+  | { kind: "release"; tag: string; body: string | null; published_at: string | null }
+  | { kind: "commit"; sha: string; subject: string; url: string | null };
+
+/** What changed between the installed version and the update target, mirroring
+ *  Rust `UpdateChangelog`. `unavailable_reason` distinguishes "could not load"
+ *  from "no entries" (both leave `entries` empty); `truncated` flags that more
+ *  existed than are shown. */
+export interface PluginUpdateChangelog {
+  entries: PluginChangelogEntry[];
+  truncated: boolean;
+  unavailable_reason: string | null;
+}
+
 /** Structured disclosure for a capability-expanding plugin update, mirroring the
  *  Rust `UpdateConsent`. Drives the consent modal. */
 export interface PluginUpdateConsent {
@@ -418,13 +434,14 @@ export interface PluginUpdateConsent {
   trust_downgrade: boolean;
   fingerprint: string;
   stays_active_if_declined: boolean;
+  changelog: PluginUpdateChangelog;
 }
 
 /** Result of `GET /api/plugins/{id}/update/preview`: a tagged union mirroring the
  *  Rust `UpdatePreview`. */
 export type PluginUpdatePreview =
   | { kind: "no_update" }
-  | { kind: "safe_update"; to_version: string; fingerprint: string }
+  | { kind: "safe_update"; to_version: string; fingerprint: string; changelog: PluginUpdateChangelog }
   | { kind: "consent_required"; consent: PluginUpdateConsent; dismissed: boolean };
 
 export type PluginUpdatePreviewResult =

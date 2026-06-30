@@ -18,9 +18,22 @@ import type {
   PluginJobStartResult,
   PluginListResponse,
   PluginToggleResult,
+  PluginUpdateChangelog,
   PluginUpdatePreviewResult,
   PluginUpdatesResult,
 } from "../../../lib/api";
+
+const emptyChangelog: PluginUpdateChangelog = { entries: [], truncated: false, unavailable_reason: null };
+const releaseChangelog: PluginUpdateChangelog = {
+  entries: [{ kind: "release", tag: "v0.2.0", body: "Added a thing.", published_at: null }],
+  truncated: false,
+  unavailable_reason: null,
+};
+const commitChangelog: PluginUpdateChangelog = {
+  entries: [{ kind: "commit", sha: "abcdef1234", subject: "fix: a bug", url: null }],
+  truncated: true,
+  unavailable_reason: null,
+};
 
 const fetchPlugins = vi.fn<[], Promise<PluginListResponse | null>>();
 const setPluginEnabled = vi.fn<[string, boolean], Promise<PluginToggleResult>>();
@@ -552,6 +565,7 @@ describe("PluginsSettings", () => {
         trust_downgrade: false,
         fingerprint: "treeB||community",
         stays_active_if_declined: true,
+        changelog: releaseChangelog,
       },
     },
   };
@@ -566,6 +580,8 @@ describe("PluginsSettings", () => {
     await findByTestId("plugin-update-consent-modal");
     expect((await findByTestId("plugin-update-added-caps")).textContent).toContain("fs.read");
     expect((await findByTestId("plugin-update-build-steps")).textContent).toContain("sh build.sh");
+    // The changelog is shown alongside the access disclosure.
+    expect((await findByTestId("plugin-update-changelog")).textContent).toContain("v0.2.0");
   });
 
   it("Approving applies the update pinned to the previewed fingerprint and opens the job modal", async () => {
@@ -611,19 +627,56 @@ describe("PluginsSettings", () => {
     await findByTestId("plugin-update-available-example.plugin");
   });
 
-  it("a safe update applies directly without a consent modal and follows the job", async () => {
+  it("a safe update shows the changelog in a review modal, then applies on Update", async () => {
     markOutdated();
     previewPluginUpdate.mockResolvedValue({
       kind: "ok",
-      preview: { kind: "safe_update", to_version: "0.2.0", fingerprint: "treeC||community" },
+      preview: {
+        kind: "safe_update",
+        to_version: "0.2.0",
+        fingerprint: "treeC||community",
+        changelog: commitChangelog,
+      },
     });
     applyPluginUpdate.mockResolvedValue({ kind: "ok", jobId: "job1" });
     const { findByTestId, queryByTestId } = render(<PluginsSettings />);
     fireEvent.click(await findByTestId("plugins-check-updates"));
     fireEvent.click(await findByTestId("plugin-update-example.plugin"));
+    // Safe updates no longer auto-apply: the review modal opens first, shows the
+    // changelog, and has no access disclosure.
+    await findByTestId("plugin-update-consent-modal");
+    expect((await findByTestId("plugin-update-changelog")).textContent).toContain("fix: a bug");
+    expect(queryByTestId("plugin-update-added-caps")).toBeNull();
+    expect(applyPluginUpdate).not.toHaveBeenCalled();
+    fireEvent.click(await findByTestId("plugin-update-approve"));
     await waitFor(() => expect(applyPluginUpdate).toHaveBeenCalledWith("example.plugin", "treeC||community"));
-    expect(queryByTestId("plugin-update-consent-modal")).toBeNull();
     await findByTestId("plugin-job-modal");
+  });
+
+  it("an unavailable changelog says so and still lets the update proceed", async () => {
+    markOutdated();
+    previewPluginUpdate.mockResolvedValue({
+      kind: "ok",
+      preview: {
+        kind: "safe_update",
+        to_version: "0.2.0",
+        fingerprint: "treeC||community",
+        changelog: {
+          entries: [],
+          truncated: false,
+          unavailable_reason: "GitHub rate limit reached; changelog unavailable.",
+        },
+      },
+    });
+    applyPluginUpdate.mockResolvedValue({ kind: "ok", jobId: "job1" });
+    const { findByTestId } = render(<PluginsSettings />);
+    fireEvent.click(await findByTestId("plugins-check-updates"));
+    fireEvent.click(await findByTestId("plugin-update-example.plugin"));
+    const note = await findByTestId("plugin-update-changelog-unavailable");
+    expect(note.textContent).toContain("rate limit");
+    // The update is still offered: approving applies it.
+    fireEvent.click(await findByTestId("plugin-update-approve"));
+    await waitFor(() => expect(applyPluginUpdate).toHaveBeenCalledWith("example.plugin", "treeC||community"));
   });
 
   it("surfaces an apply error in the consent modal and keeps it open", async () => {
@@ -662,6 +715,7 @@ describe("PluginsSettings", () => {
           trust_downgrade: true,
           fingerprint: "treeD||community",
           stays_active_if_declined: true,
+          changelog: emptyChangelog,
         },
       },
     });
@@ -671,6 +725,8 @@ describe("PluginsSettings", () => {
     await findByTestId("plugin-update-consent-modal");
     expect((await findByTestId("plugin-update-runtime-change")).textContent).toContain("release binary");
     await findByTestId("plugin-update-trust-downgrade");
+    // An empty (but available) changelog reads as "No changelog available".
+    await findByTestId("plugin-update-changelog-empty");
   });
 
   it("Update reports up-to-date and clears the badge when preview finds no update", async () => {
@@ -696,12 +752,13 @@ describe("PluginsSettings", () => {
     markOutdated();
     previewPluginUpdate.mockResolvedValue({
       kind: "ok",
-      preview: { kind: "safe_update", to_version: "0.2.0", fingerprint: "treeC||community" },
+      preview: { kind: "safe_update", to_version: "0.2.0", fingerprint: "treeC||community", changelog: emptyChangelog },
     });
     applyPluginUpdate.mockResolvedValue({ kind: "error", message: "apply boom" });
     const { findByTestId, findByText } = render(<PluginsSettings />);
     fireEvent.click(await findByTestId("plugins-check-updates"));
     fireEvent.click(await findByTestId("plugin-update-example.plugin"));
+    fireEvent.click(await findByTestId("plugin-update-approve"));
     await findByText("apply boom");
   });
 

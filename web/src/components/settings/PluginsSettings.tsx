@@ -14,6 +14,7 @@ import {
   type PluginDiscoveryResult,
   type PluginInstallConsent,
   type PluginListResponse,
+  type PluginUpdateChangelog,
   type PluginUpdateConsent,
   type PluginUpdateStatus,
   type PluginView,
@@ -65,9 +66,18 @@ export function PluginsSettings() {
   const [detail, setDetail] = useState<DetailTarget | null>(null);
 
   // The in-app update flow: which plugin's Update button is previewing, and the
-  // consent modal when a fetched update needs explicit approval.
+  // review modal once the preview lands. Every update (safe or consent-required)
+  // goes through the one review modal, which always shows the changelog;
+  // `consent` is non-null only when the update also expands access.
   const [updatingId, setUpdatingId] = useState<string | null>(null);
-  const [consentModal, setConsentModal] = useState<{ plugin: PluginView; consent: PluginUpdateConsent } | null>(null);
+  const [reviewModal, setReviewModal] = useState<{
+    plugin: PluginView;
+    fromVersion: string;
+    toVersion: string;
+    changelog: PluginUpdateChangelog;
+    consent: PluginUpdateConsent | null;
+    fingerprint: string;
+  } | null>(null);
   const [consentBusy, setConsentBusy] = useState(false);
   const [consentError, setConsentError] = useState<string | null>(null);
 
@@ -173,20 +183,30 @@ export function PluginsSettings() {
         return;
       }
       const preview = res.preview;
+      setConsentError(null);
       if (preview.kind === "no_update") {
         reportInfo(`${plugin.name} is already up to date.`);
         clearUpdateBadge(plugin.id);
       } else if (preview.kind === "safe_update") {
-        const started = await applyPluginUpdate(plugin.id, preview.fingerprint);
-        if (started.kind === "ok") {
-          clearUpdateBadge(plugin.id);
-          setJob({ id: started.jobId, title: `Updating ${plugin.name}` });
-        } else {
-          setError(started.message);
-        }
+        // A safe version bump no longer auto-applies: show the changelog first
+        // so the user sees what they are pulling in, then confirm.
+        setReviewModal({
+          plugin,
+          fromVersion: plugin.version,
+          toVersion: preview.to_version,
+          changelog: preview.changelog,
+          consent: null,
+          fingerprint: preview.fingerprint,
+        });
       } else {
-        setConsentError(null);
-        setConsentModal({ plugin, consent: preview.consent });
+        setReviewModal({
+          plugin,
+          fromVersion: preview.consent.from_version,
+          toVersion: preview.consent.to_version,
+          changelog: preview.consent.changelog,
+          consent: preview.consent,
+          fingerprint: preview.consent.fingerprint,
+        });
       }
     } finally {
       setUpdatingId(null);
@@ -194,15 +214,15 @@ export function PluginsSettings() {
   };
 
   const onApproveUpdate = async () => {
-    if (!consentModal) return;
+    if (!reviewModal) return;
     setConsentBusy(true);
     setConsentError(null);
     try {
-      const res = await applyPluginUpdate(consentModal.plugin.id, consentModal.consent.fingerprint);
+      const res = await applyPluginUpdate(reviewModal.plugin.id, reviewModal.fingerprint);
       if (res.kind === "ok") {
-        clearUpdateBadge(consentModal.plugin.id);
-        const name = consentModal.plugin.name;
-        setConsentModal(null);
+        clearUpdateBadge(reviewModal.plugin.id);
+        const name = reviewModal.plugin.name;
+        setReviewModal(null);
         setJob({ id: res.jobId, title: `Updating ${name}` });
       } else {
         // Any failure keeps the modal open with the message; the user can close
@@ -214,18 +234,20 @@ export function PluginsSettings() {
     }
   };
 
+  // Consent mode only (the modal's Decline button). A safe update has nothing to
+  // dismiss; its Cancel button just closes the modal.
   const onDeclineUpdate = async () => {
-    if (!consentModal) return;
+    if (!reviewModal?.consent) return;
     setConsentBusy(true);
     setConsentError(null);
     try {
       // The current version stays active either way, but only clear local state
       // once the backend actually recorded the decline; otherwise a failed
       // dismiss would look persisted and the prompt would return on reload.
-      const res = await dismissPluginUpdate(consentModal.plugin.id, consentModal.consent.fingerprint);
+      const res = await dismissPluginUpdate(reviewModal.plugin.id, reviewModal.consent.fingerprint);
       if (res.kind === "ok") {
-        clearUpdateBadge(consentModal.plugin.id);
-        setConsentModal(null);
+        clearUpdateBadge(reviewModal.plugin.id);
+        setReviewModal(null);
       } else {
         setConsentError(res.message);
       }
@@ -578,16 +600,19 @@ export function PluginsSettings() {
         />
       )}
 
-      {consentModal && (
+      {reviewModal && (
         <PluginUpdateConsentModal
-          key={consentModal.plugin.id}
-          consent={consentModal.consent}
-          name={consentModal.plugin.name}
+          key={reviewModal.plugin.id}
+          consent={reviewModal.consent}
+          name={reviewModal.plugin.name}
+          fromVersion={reviewModal.fromVersion}
+          toVersion={reviewModal.toVersion}
+          changelog={reviewModal.changelog}
           busy={consentBusy}
           error={consentError}
           onApprove={() => void onApproveUpdate()}
-          onDecline={() => void onDeclineUpdate()}
-          onClose={() => setConsentModal(null)}
+          onDecline={reviewModal.consent ? () => void onDeclineUpdate() : undefined}
+          onClose={() => setReviewModal(null)}
         />
       )}
 
