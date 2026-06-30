@@ -4243,7 +4243,7 @@ pub async fn create_session(
                     StatusCode::BAD_REQUEST,
                     Json(serde_json::json!({
                         "error": "fork_unsupported",
-                        "message": "A structured fork requires an ACP-capable agent",
+                        "message": "A structured fork requires an ACP agent that supports forking",
                     })),
                 )
                     .into_response();
