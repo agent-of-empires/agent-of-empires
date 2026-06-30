@@ -746,7 +746,7 @@ fn build_resume_flags(tool: &str, session_id: &str, is_existing_session: bool) -
 /// `build_resume_flags`'s fail-closed contract). The child id is pre-pinned so
 /// the forked session is durable on disk before launch.
 fn build_fork_flags(tool: &str, parent_id: &str, child_id: &str) -> String {
-    use crate::agents::{get_agent, ForkStrategy};
+    use crate::agents::{get_agent, ForkStrategy, ResumeStrategy};
 
     if !is_valid_session_id(parent_id) || !is_valid_session_id(child_id) {
         tracing::warn!(target: "session.store",
@@ -760,11 +760,22 @@ fn build_fork_flags(tool: &str, parent_id: &str, child_id: &str) -> String {
         ForkStrategy::ClaudeFork => {
             format!("--resume {parent_id} --fork-session --session-id {child_id}")
         }
-        // Codex/opencode fork shapes are wired in a later task; not reachable in
-        // v1 because the TUI/CLI gate fork to claude until then.
-        ForkStrategy::CodexFork | ForkStrategy::Flag(_) | ForkStrategy::Unsupported => {
-            String::new()
+        ForkStrategy::CodexFork => {
+            // Codex mints its own forked id; child_id is unused. The subcommand
+            // is inserted after the binary by apply_session_flags.
+            format!("fork {parent_id}")
         }
+        ForkStrategy::Flag(fork_flag) => {
+            // Resume the parent session (using the agent's own resume flag),
+            // then add the fork flag; the agent mints the new id.
+            match agent.resume_strategy {
+                ResumeStrategy::Flag(resume_flag) => {
+                    format!("{resume_flag} {parent_id} {fork_flag}")
+                }
+                _ => String::new(),
+            }
+        }
+        ForkStrategy::Unsupported => String::new(),
     }
 }
 
@@ -1893,7 +1904,24 @@ impl Instance {
             if let Some(child_id) = child.as_deref() {
                 let fork_part = build_fork_flags(&self.tool, &from, child_id);
                 if !fork_part.is_empty() {
-                    *cmd = format!("{cmd} {fork_part}");
+                    // Codex's fork is a subcommand and must sit right after the
+                    // binary (before other flags), like its resume subcommand.
+                    // Flag-shaped forks (claude, opencode) append.
+                    let is_subcommand = matches!(
+                        crate::agents::get_agent(&self.tool).map(|a| &a.fork_strategy),
+                        Some(crate::agents::ForkStrategy::CodexFork)
+                    );
+                    if is_subcommand {
+                        if let Some(space_pos) = cmd.find(' ') {
+                            let binary = &cmd[..space_pos];
+                            let flags = &cmd[space_pos..];
+                            *cmd = format!("{} {}{}", binary, fork_part, flags);
+                        } else {
+                            *cmd = format!("{} {}", cmd, fork_part);
+                        }
+                    } else {
+                        *cmd = format!("{cmd} {fork_part}");
+                    }
                 }
             }
             // A fork is a fresh session, not an in-place resume.
@@ -6250,6 +6278,44 @@ mod tests {
             inst.agent_session_id.as_deref(),
             Some("child-5555-6666-7777-888888888888")
         );
+    }
+
+    #[test]
+    fn fork_flags_for_codex_and_opencode() {
+        // Codex: `fork <parent>` subcommand. child_id unused (codex mints its own).
+        let codex = build_fork_flags("codex", "parent-id", "ignored-child");
+        assert_eq!(codex, "fork parent-id");
+        // OpenCode: resume the parent session and add --fork. agent mints new id.
+        let oc = build_fork_flags("opencode", "parent-id", "ignored-child");
+        assert_eq!(oc, "--session parent-id --fork");
+    }
+
+    #[test]
+    fn fork_command_inserts_codex_subcommand_after_binary() {
+        // codex fork must sit right after the binary, before other flags,
+        // mirroring how codex `resume` is inserted as a subcommand.
+        let mut inst = Instance::new("Forked", "/tmp/x");
+        inst.tool = "codex".to_string();
+        inst.agent_session_id = Some("child-ignored-by-codex".to_string());
+        inst.resume_intent = ResumeIntent::Fork {
+            from: "parent-1234".to_string(),
+        };
+        let mut cmd = "codex --some-flag".to_string();
+        inst.apply_session_flags(&mut cmd, "test");
+        assert_eq!(cmd, "codex fork parent-1234 --some-flag");
+    }
+
+    #[test]
+    fn fork_command_appends_opencode_flags() {
+        let mut inst = Instance::new("Forked", "/tmp/x");
+        inst.tool = "opencode".to_string();
+        inst.agent_session_id = Some("child-ignored".to_string());
+        inst.resume_intent = ResumeIntent::Fork {
+            from: "parent-9999".to_string(),
+        };
+        let mut cmd = "opencode".to_string();
+        inst.apply_session_flags(&mut cmd, "test");
+        assert_eq!(cmd, "opencode --session parent-9999 --fork");
     }
 
     // Test: backwards compatibility - load old JSON without agent_session_id
