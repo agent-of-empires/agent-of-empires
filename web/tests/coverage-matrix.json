@@ -1762,7 +1762,11 @@
       "id": "acp.markdown",
       "kind": "vitest",
       "risk": "high",
-      "specs": ["src/components/acp/Markdown.test.tsx", "src/components/acp/Markdown.breaks.test.tsx"],
+      "specs": [
+        "src/components/acp/Markdown.test.tsx",
+        "src/components/acp/Markdown.breaks.test.tsx",
+        "src/components/acp/__tests__/artifactMedia.test.tsx"
+      ],
       "components": ["web/src/components/acp/Markdown.tsx", "web/src/components/acp/artifactMedia.tsx"]
     },
     {
