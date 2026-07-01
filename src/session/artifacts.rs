@@ -80,6 +80,21 @@ pub fn resolve_artifact_path(instance_id: &str, rel: &str) -> Option<PathBuf> {
     }
 }
 
+/// Path to a session's artifact dir WITHOUT creating it. For read-only
+/// surfaces (e.g. the session API response) that must not provision anything.
+/// Returns `None` when the id is unsafe or the app dir cannot be resolved.
+pub fn artifact_dir_path(instance_id: &str) -> Option<PathBuf> {
+    if super::validate_instance_id(instance_id).is_err() {
+        return None;
+    }
+    Some(
+        super::get_app_dir()
+            .ok()?
+            .join(ARTIFACTS_SUBDIR)
+            .join(instance_id),
+    )
+}
+
 fn is_regular_file(path: &Path) -> bool {
     fs::metadata(path).map(|m| m.is_file()).unwrap_or(false)
 }

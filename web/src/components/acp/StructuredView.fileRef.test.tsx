@@ -28,6 +28,7 @@ import { StructuredView } from "./StructuredView";
 describe("StructuredView fileRef plumbing (#2143)", () => {
   it("provides the session repo roots through AcpFileRefContext", () => {
     const fileRefSession: FileRefSession = {
+      id: "s1",
       project_path: "/Users/me/wt",
       main_repo_path: null,
       workspace_repos: [],

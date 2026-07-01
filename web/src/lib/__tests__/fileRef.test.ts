@@ -1,5 +1,46 @@
 import { describe, expect, it } from "vitest";
-import { parseFileRef, relativeDisplayPath, resolveToRepoRelative, type FileRefSession } from "../fileRef";
+import {
+  parseFileRef,
+  relativeDisplayPath,
+  resolveArtifactUrl,
+  resolveToRepoRelative,
+  type FileRefSession,
+} from "../fileRef";
+
+describe("resolveArtifactUrl (#2587)", () => {
+  const session: FileRefSession = {
+    id: "sess-1",
+    project_path: "/Users/me/repo",
+    main_repo_path: null,
+    workspace_repos: [],
+    artifact_dir: "/Users/me/.aoe/artifacts/sess-1",
+  };
+
+  it("maps the fixed sandbox mount to the artifact route", () => {
+    expect(resolveArtifactUrl("/aoe/artifacts/shot.png", session)).toBe("/api/sessions/sess-1/artifacts/shot.png");
+  });
+
+  it("maps a nested path under the host artifact dir", () => {
+    expect(resolveArtifactUrl("/Users/me/.aoe/artifacts/sess-1/sub/x.png", session)).toBe(
+      "/api/sessions/sess-1/artifacts/sub/x.png",
+    );
+  });
+
+  it("percent-encodes path segments", () => {
+    expect(resolveArtifactUrl("/aoe/artifacts/a b/c#d.png", session)).toBe(
+      "/api/sessions/sess-1/artifacts/a%20b/c%23d.png",
+    );
+  });
+
+  it("returns null for a path outside every artifact root", () => {
+    expect(resolveArtifactUrl("/tmp/elsewhere/x.png", session)).toBeNull();
+    expect(resolveArtifactUrl("/Users/me/repo/src/app.ts", session)).toBeNull();
+  });
+
+  it("returns null for the artifact root itself (no file)", () => {
+    expect(resolveArtifactUrl("/aoe/artifacts", session)).toBeNull();
+  });
+});
 
 describe("parseFileRef", () => {
   it("parses an absolute path with a line suffix", () => {
@@ -97,6 +138,7 @@ describe("parseFileRef", () => {
 
 describe("resolveToRepoRelative", () => {
   const single: FileRefSession = {
+    id: "s1",
     project_path: "/Users/me/.aoe/worktrees/feat",
     main_repo_path: "/Users/me/repo",
     workspace_repos: [],
@@ -137,6 +179,7 @@ describe("resolveToRepoRelative", () => {
 
   it("matches a Windows drive root case-insensitively", () => {
     const win: FileRefSession = {
+      id: "s1",
       project_path: "C:\\Users\\me\\repo",
       main_repo_path: null,
       workspace_repos: [],
@@ -146,6 +189,7 @@ describe("resolveToRepoRelative", () => {
 
   it("resolves against a workspace repo root and returns its name", () => {
     const workspace: FileRefSession = {
+      id: "s1",
       project_path: "/Users/me/.aoe/worktrees/ws",
       main_repo_path: null,
       workspace_repos: [
@@ -162,6 +206,7 @@ describe("resolveToRepoRelative", () => {
 
 describe("relativeDisplayPath", () => {
   const single: FileRefSession = {
+    id: "s1",
     project_path: "/Users/me/.aoe/worktrees/feat",
     main_repo_path: "/Users/me/repo",
     workspace_repos: [],
@@ -173,6 +218,7 @@ describe("relativeDisplayPath", () => {
 
   it("prefixes the repo name in a multi-repo workspace", () => {
     const workspace: FileRefSession = {
+      id: "s1",
       project_path: "/Users/me/.aoe/worktrees/ws",
       main_repo_path: null,
       workspace_repos: [{ name: "api", source_path: "/Users/me/api" }],

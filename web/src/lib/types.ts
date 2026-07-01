@@ -5,6 +5,10 @@ export interface SessionResponse {
   id: string;
   title: string;
   project_path: string;
+  /** Absolute host path of the session's managed artifact directory; the
+   *  transcript maps agent-emitted artifact paths under it (or the fixed
+   *  sandbox mount) to the authenticated artifact route. See #2587. */
+  artifact_dir: string;
   group_path: string;
   tool: string;
   status: SessionStatus;

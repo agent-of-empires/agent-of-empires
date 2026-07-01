@@ -21,6 +21,10 @@ pub struct SessionResponse {
     pub id: String,
     pub title: String,
     pub project_path: String,
+    /// Absolute host path of the session's managed artifact directory. The
+    /// web transcript maps agent-emitted artifact paths under this root (or
+    /// the fixed sandbox mount) to the authenticated artifact route. See #2587.
+    pub artifact_dir: String,
     pub group_path: String,
     pub tool: String,
     pub status: String,
@@ -289,6 +293,9 @@ impl SessionResponse {
             id: inst.id.clone(),
             title: inst.title.clone(),
             project_path: inst.project_path.clone(),
+            artifact_dir: crate::session::artifacts::artifact_dir_path(&inst.id)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default(),
             group_path: inst.group_path.clone(),
             tool: inst.tool.clone(),
             status: format!("{:?}", inst.status),
@@ -7945,6 +7952,7 @@ mod workspace_ordering_tests {
             id: id.to_string(),
             title: id.to_string(),
             project_path: project_path.to_string(),
+            artifact_dir: String::new(),
             group_path: String::new(),
             tool: "claude".to_string(),
             status: "Idle".to_string(),

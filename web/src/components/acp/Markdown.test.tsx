@@ -260,6 +260,7 @@ describe("anchor inert-path for unresolvable local paths (#2587)", () => {
   }
 
   const session = {
+    id: "s1",
     project_path: "/Users/me/repo",
     main_repo_path: null,
     workspace_repos: [],
@@ -308,6 +309,95 @@ describe("anchor inert-path for unresolvable local paths (#2587)", () => {
     expect(a).not.toBeNull();
     expect(a?.getAttribute("target")).toBe("_blank");
     expect(onOpenFileRef).not.toHaveBeenCalled();
+  });
+});
+
+// #2587: paths under a session artifact root map to the authenticated
+// artifact route instead of rendering inert or dead.
+describe("anchor artifact-route mapping (#2587)", () => {
+  function getAnchor(): React.ComponentType<React.ComponentPropsWithoutRef<"a">> {
+    render(<Markdown text="x" />);
+    return primitiveCalls.at(-1)!.components.a as React.ComponentType<React.ComponentPropsWithoutRef<"a">>;
+  }
+
+  const artSession = {
+    id: "sess-1",
+    project_path: "/repo",
+    main_repo_path: null,
+    workspace_repos: [],
+    artifact_dir: "/home/u/.aoe/artifacts/sess-1",
+  };
+
+  it("renders a sandbox-mount artifact path as an artifact-route link", () => {
+    const Anchor = getAnchor();
+    const { container } = render(
+      <AcpFileRefContext.Provider value={{ onOpenFileRef: vi.fn(), fileRefSession: artSession }}>
+        <Anchor href="/aoe/artifacts/shot.png">shot</Anchor>
+      </AcpFileRefContext.Provider>,
+    );
+    const a = container.querySelector("a.acp-artifact-link");
+    expect(a).not.toBeNull();
+    expect(a?.getAttribute("href")).toBe("/api/sessions/sess-1/artifacts/shot.png");
+  });
+
+  it("renders a host artifact-dir path as an artifact-route link", () => {
+    const Anchor = getAnchor();
+    const { container } = render(
+      <AcpFileRefContext.Provider value={{ onOpenFileRef: vi.fn(), fileRefSession: artSession }}>
+        <Anchor href="/home/u/.aoe/artifacts/sess-1/sub/x.png">x</Anchor>
+      </AcpFileRefContext.Provider>,
+    );
+    expect(container.querySelector("a.acp-artifact-link")?.getAttribute("href")).toBe(
+      "/api/sessions/sess-1/artifacts/sub/x.png",
+    );
+  });
+});
+
+describe("img artifact/local override (#2587)", () => {
+  function getImg(): React.ComponentType<React.ComponentPropsWithoutRef<"img">> {
+    render(<Markdown text="x" />);
+    return primitiveCalls.at(-1)!.components.img as React.ComponentType<React.ComponentPropsWithoutRef<"img">>;
+  }
+
+  const artSession = {
+    id: "sess-1",
+    project_path: "/repo",
+    main_repo_path: null,
+    workspace_repos: [],
+    artifact_dir: "/home/u/.aoe/artifacts/sess-1",
+  };
+
+  it("does not emit a raw <img> pointing at the local artifact path", () => {
+    const Img = getImg();
+    const { container } = render(
+      <AcpFileRefContext.Provider value={{ fileRefSession: artSession }}>
+        <Img src="/aoe/artifacts/shot.png" alt="a shot" />
+      </AcpFileRefContext.Provider>,
+    );
+    // Routed through ArtifactImage (authed blob fetch); the raw /aoe path
+    // must never appear as an <img src>.
+    expect(container.querySelector('img[src="/aoe/artifacts/shot.png"]')).toBeNull();
+  });
+
+  it("renders an unresolvable local image path as inert text, not a broken img", () => {
+    const Img = getImg();
+    const { container } = render(
+      <AcpFileRefContext.Provider value={{ fileRefSession: artSession }}>
+        <Img src="/tmp/other/x.png" alt="alt text" />
+      </AcpFileRefContext.Provider>,
+    );
+    expect(container.querySelector("img")).toBeNull();
+    expect(container.querySelector("span.acp-inert-path")?.textContent).toBe("alt text");
+  });
+
+  it("leaves an external image src as a normal <img>", () => {
+    const Img = getImg();
+    const { container } = render(
+      <AcpFileRefContext.Provider value={{ fileRefSession: artSession }}>
+        <Img src="https://example.com/x.png" alt="ext" />
+      </AcpFileRefContext.Provider>,
+    );
+    expect(container.querySelector('img[src="https://example.com/x.png"]')).not.toBeNull();
   });
 });
 

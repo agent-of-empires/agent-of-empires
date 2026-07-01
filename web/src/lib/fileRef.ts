@@ -21,9 +21,44 @@ export interface FileRef {
  *  `SessionResponse`; kept structural so the pure resolver stays
  *  testable without constructing a full session object. */
 export interface FileRefSession {
+  id: string;
   project_path: string;
   main_repo_path: string | null;
   workspace_repos: { name: string; source_path: string }[];
+  /** Absolute host path of the session's managed artifact dir. Agent paths
+   *  under this root (or the fixed sandbox mount) map to the artifact route. */
+  artifact_dir?: string | null;
+}
+
+// Fixed mount point for the session artifact dir inside a sandbox container.
+// Mirrors CONTAINER_ARTIFACT_DIR in src/session/artifacts.rs: a sandboxed
+// agent writes here, a local agent writes to `session.artifact_dir`.
+const CONTAINER_ARTIFACT_DIR = "/aoe/artifacts";
+
+/**
+ * Map an agent-emitted artifact path to the authenticated artifact route
+ * (`/api/sessions/<id>/artifacts/<rel>`), or null when the path is not under
+ * a known artifact root. The two roots are the fixed sandbox mount and the
+ * session's host artifact dir; a path under either belongs to this session's
+ * served artifacts. See #2587.
+ */
+export function resolveArtifactUrl(rawPath: string, session: FileRefSession): string | null {
+  const target = rawPath.replace(/\\/g, "/");
+  const roots = [CONTAINER_ARTIFACT_DIR];
+  if (session.artifact_dir) roots.push(session.artifact_dir.replace(/\\/g, "/"));
+  for (const root of roots) {
+    const base = root.replace(/\/+$/, "");
+    if (base && target.startsWith(`${base}/`)) {
+      const rel = target.slice(base.length + 1);
+      if (!rel) return null;
+      const encoded = rel
+        .split("/")
+        .map((seg) => encodeURIComponent(seg))
+        .join("/");
+      return `/api/sessions/${encodeURIComponent(session.id)}/artifacts/${encoded}`;
+    }
+  }
+  return null;
 }
 
 // Web/app URL schemes that are never local file references. Anything

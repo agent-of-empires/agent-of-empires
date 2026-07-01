@@ -259,6 +259,12 @@ body {
 .acp-markdown blockquote.acp-callout-warn strong {
   color: var(--color-text-bright);
 }
+.acp-markdown .acp-artifact-image {
+  max-width: 100%;
+  height: auto;
+  border-radius: 0.375rem;
+  border: 1px solid var(--color-surface-700);
+}
 .acp-markdown .acp-inert-path {
   font-family: var(--font-mono, monospace);
   color: var(--color-text-muted);

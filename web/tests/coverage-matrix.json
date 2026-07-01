@@ -1763,7 +1763,7 @@
       "kind": "vitest",
       "risk": "high",
       "specs": ["src/components/acp/Markdown.test.tsx", "src/components/acp/Markdown.breaks.test.tsx"],
-      "components": ["web/src/components/acp/Markdown.tsx"]
+      "components": ["web/src/components/acp/Markdown.tsx", "web/src/components/acp/artifactMedia.tsx"]
     },
     {
       "id": "acp.file-links",

@@ -22,8 +22,10 @@ import remarkGfm from "remark-gfm";
 
 import { ensureThemeLoaded, getHighlighter, langKeyForExt, loadLanguage } from "../../lib/highlighter";
 import { useShikiTheme } from "../../hooks/useShikiTheme";
-import { parseFileRef, resolveToRepoRelative } from "../../lib/fileRef";
+import { parseFileRef, resolveArtifactUrl, resolveToRepoRelative } from "../../lib/fileRef";
 import { useAcpFileRef } from "./AcpFileRefContext";
+import { openArtifactInNewTab } from "../../lib/artifacts";
+import { ArtifactImage } from "./artifactMedia";
 
 interface Props {
   text: string;
@@ -73,6 +75,7 @@ export function Markdown({ text, smooth = false, breaks = false }: Props) {
         table: TableWithScroll,
         blockquote: Blockquote,
         a: TranscriptLink,
+        img: TranscriptImage,
       }}
     />
   );
@@ -104,16 +107,36 @@ export function Markdown({ text, smooth = false, breaks = false }: Props) {
  */
 function TranscriptLink({ href, onClick, children, ...rest }: React.ComponentPropsWithoutRef<"a">) {
   const { onOpenFileRef, fileRefSession } = useAcpFileRef();
-  const ref = href && onOpenFileRef ? parseFileRef(href) : null;
+  const ref = href ? parseFileRef(href) : null;
+  const artifactUrl = ref && fileRefSession ? resolveArtifactUrl(ref.path, fileRefSession) : null;
 
-  if (ref && fileRefSession && !resolveToRepoRelative(ref.path, fileRefSession)) {
+  // A managed session artifact: openable via the authenticated route. Fetch
+  // it through the authed global fetch and open the blob so it works in
+  // token-auth mode where a bare new-tab navigation would miss the header.
+  if (artifactUrl) {
+    return (
+      <a
+        {...rest}
+        href={artifactUrl}
+        className="acp-artifact-link"
+        onClick={(e) => {
+          e.preventDefault();
+          void openArtifactInNewTab(artifactUrl);
+        }}
+      >
+        {children}
+      </a>
+    );
+  }
+
+  if (ref && onOpenFileRef && fileRefSession && !resolveToRepoRelative(ref.path, fileRefSession)) {
     return <span className="acp-inert-path">{children}</span>;
   }
 
   function handleClick(e: React.MouseEvent<HTMLAnchorElement>) {
-    if (ref) {
+    if (ref && onOpenFileRef) {
       e.preventDefault();
-      onOpenFileRef?.(ref);
+      onOpenFileRef(ref);
       return;
     }
     onClick?.(e);
@@ -124,6 +147,27 @@ function TranscriptLink({ href, onClick, children, ...rest }: React.ComponentPro
       {children}
     </a>
   );
+}
+
+/**
+ * Transcript image. An agent may embed a screenshot with markdown image
+ * syntax (`![alt](/aoe/artifacts/shot.png)`); map a path under a session
+ * artifact root to the authenticated route and render the fetched bytes
+ * inline. A local path we cannot serve renders as inert text rather than a
+ * broken image icon. Everything else keeps default <img> behavior. See #2587.
+ */
+function TranscriptImage({ src, alt, ...rest }: React.ComponentPropsWithoutRef<"img">) {
+  const { fileRefSession } = useAcpFileRef();
+  const ref = typeof src === "string" ? parseFileRef(src) : null;
+  const artifactUrl = ref && fileRefSession ? resolveArtifactUrl(ref.path, fileRefSession) : null;
+
+  if (artifactUrl) {
+    return <ArtifactImage url={artifactUrl} alt={typeof alt === "string" ? alt : undefined} />;
+  }
+  if (ref && fileRefSession && !resolveToRepoRelative(ref.path, fileRefSession)) {
+    return <span className="acp-inert-path">{alt || src}</span>;
+  }
+  return <img {...rest} src={src} alt={alt} />;
 }
 
 /**
