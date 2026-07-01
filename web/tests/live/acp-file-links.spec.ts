@@ -43,7 +43,7 @@ function tallFile(): { baseline: string; modified: string } {
 }
 
 base(
-  "structured view transcript file links open in-app, scroll to cited line, and toast on miss",
+  "structured view transcript file links open in-app, scroll to cited line, and render out-of-repo paths as inert text",
   async ({ page }, testInfo) => {
     const scriptDir = mkdtempSync(join(tmpdir(), "aoe-acp-filelink-"));
     const scriptPath = join(scriptDir, "script.json");
@@ -123,11 +123,11 @@ base(
 
       const sessionUrl = new RegExp(`/session/${sessionId}`);
 
-      // Out-of-repo link: clicking surfaces a toast and does not navigate.
-      const missingLink = page.getByRole("link", { name: "missing" });
-      await expect(missingLink).toBeVisible({ timeout: 15_000 });
-      await missingLink.click();
-      await expect(page.locator('[role="alert"]')).toContainText(/Could not open/i, { timeout: 10_000 });
+      // Out-of-repo path: rendered as inert, non-clickable text rather than a
+      // link that would dead-end in a toast or route to the SPA. See #2587.
+      const inertMissing = page.locator("span.acp-inert-path", { hasText: "missing" });
+      await expect(inertMissing).toBeVisible({ timeout: 15_000 });
+      await expect(page.getByRole("link", { name: "missing" })).toHaveCount(0);
       await expect(page).toHaveURL(sessionUrl);
 
       // In-repo link: clicking opens the file in the in-app diff viewer,
