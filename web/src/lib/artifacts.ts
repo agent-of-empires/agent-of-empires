@@ -7,12 +7,29 @@
 // ponytail: the object URL is not revoked; the new tab owns its lifetime and
 // leaking one blob URL per user click is not worth tracking cross-tab.
 export async function openArtifactInNewTab(url: string): Promise<void> {
+  // Open the tab synchronously, while the click's user activation is still
+  // live, then point it at the blob once the bytes arrive. Opening after the
+  // await would count as a programmatic popup and get blocked (Safari is
+  // strictest). No `noopener` here: it makes window.open return null, losing
+  // the reference we need to set location, and the artifact is same-origin
+  // content we fetched ourselves, not a cross-origin tabnabbing vector.
+  const tab = window.open("about:blank", "_blank");
   try {
     const r = await fetch(url);
-    if (!r.ok) return;
+    if (!r.ok) {
+      tab?.close();
+      return;
+    }
     const blob = await r.blob();
-    window.open(URL.createObjectURL(blob), "_blank", "noopener,noreferrer");
+    const objectUrl = URL.createObjectURL(blob);
+    if (tab) {
+      tab.location.href = objectUrl;
+    } else {
+      // Popup blocked despite the sync open; last-resort direct open.
+      window.open(objectUrl, "_blank", "noopener,noreferrer");
+    }
   } catch {
     // Swallow: a failed artifact open is non-destructive; nothing to recover.
+    tab?.close();
   }
 }

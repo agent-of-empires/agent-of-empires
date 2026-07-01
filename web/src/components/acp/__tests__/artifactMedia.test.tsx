@@ -51,20 +51,26 @@ describe("ArtifactImage", () => {
 });
 
 describe("openArtifactInNewTab", () => {
-  it("fetches the blob and opens it in a new tab", async () => {
+  it("opens the tab synchronously, then points it at the blob URL", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, blob: async () => new Blob(["x"]) }));
-    const open = vi.fn();
+    const tab = { location: { href: "" }, close: vi.fn() };
+    const open = vi.fn(() => tab);
     vi.stubGlobal("open", open);
     await openArtifactInNewTab(URL_ANY);
+    // Tab opened synchronously (before the fetch) to keep the user gesture.
+    expect(open).toHaveBeenCalledWith("about:blank", "_blank");
     expect(fetch).toHaveBeenCalledWith(URL_ANY);
-    expect(open).toHaveBeenCalledWith("blob:mock-url", "_blank", "noopener,noreferrer");
+    expect(tab.location.href).toBe("blob:mock-url");
+    expect(tab.close).not.toHaveBeenCalled();
   });
 
-  it("does not open a tab when the fetch fails", async () => {
+  it("closes the pre-opened tab when the fetch fails", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 500 }));
-    const open = vi.fn();
+    const tab = { location: { href: "" }, close: vi.fn() };
+    const open = vi.fn(() => tab);
     vi.stubGlobal("open", open);
     await openArtifactInNewTab(URL_ANY);
-    expect(open).not.toHaveBeenCalled();
+    expect(tab.close).toHaveBeenCalled();
+    expect(tab.location.href).toBe("");
   });
 });
