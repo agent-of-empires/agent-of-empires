@@ -39,6 +39,7 @@ fn base_config(cwd: std::path::PathBuf, record_path: &std::path::Path) -> SpawnC
         socket_path: None,
         stored_acp_session_id: None,
         seed_history_replay: false,
+        artifact_dir: None,
         sandbox_info: None,
         source_profile: None,
         mcp_servers: Vec::new(),

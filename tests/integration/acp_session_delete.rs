@@ -37,6 +37,7 @@ fn spawn_config_with_shim_env(shim: PathBuf, env: Vec<(String, String)>) -> Spaw
         socket_path: None,
         stored_acp_session_id: None,
         seed_history_replay: false,
+        artifact_dir: None,
         sandbox_info: None,
         source_profile: None,
         mcp_servers: Vec::new(),
