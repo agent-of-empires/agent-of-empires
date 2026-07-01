@@ -73,4 +73,17 @@ describe("openArtifactInNewTab", () => {
     expect(tab.close).toHaveBeenCalled();
     expect(tab.location.href).toBe("");
   });
+
+  it("falls back to a direct blob open when the sync tab is popup-blocked", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, blob: async () => new Blob(["x"]) }));
+    // Popup blocked: the initial about:blank open returns null.
+    const open = vi
+      .fn()
+      .mockReturnValueOnce(null)
+      .mockReturnValue({ location: { href: "" }, close: vi.fn() });
+    vi.stubGlobal("open", open);
+    await openArtifactInNewTab(URL_ANY);
+    expect(open).toHaveBeenNthCalledWith(1, "about:blank", "_blank");
+    expect(open).toHaveBeenNthCalledWith(2, "blob:mock-url", "_blank", "noopener,noreferrer");
+  });
 });
