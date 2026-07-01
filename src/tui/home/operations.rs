@@ -684,7 +684,7 @@ impl HomeView {
                     inst.kill_all_tmux_sessions()
                 })) {
                     tracing::error!(
-                        target: "session.tmux_cleanup",
+                        target: "session.delete",
                         session_id = %inst.id,
                         "force_remove tmux teardown panicked: {:?}",
                         panic

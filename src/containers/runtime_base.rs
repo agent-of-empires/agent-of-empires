@@ -89,6 +89,11 @@ pub(crate) struct RuntimeBase {
     /// Whether this runtime supports the `:z`/`:Z` SELinux relabel volume flag
     /// (Docker and Podman do; Apple Container does not).
     pub supports_selinux_relabel: bool,
+    /// Case-insensitive stderr substrings that identify a "container does not
+    /// exist" error for this runtime. Each runtime words it differently (Docker
+    /// "No such container", Apple Container "notFound … not found"), so the
+    /// markers are per-runtime rather than a single shared string.
+    pub not_found_markers: &'static [&'static str],
 }
 
 impl RuntimeBase {
@@ -102,6 +107,7 @@ impl RuntimeBase {
         supports_remove_volumes: true,
         supports_named_volumes: true,
         supports_selinux_relabel: true,
+        not_found_markers: &["no such container"],
     };
 
     pub const APPLE_CONTAINER: Self = Self {
@@ -114,6 +120,9 @@ impl RuntimeBase {
         supports_remove_volumes: false,
         supports_named_volumes: false,
         supports_selinux_relabel: false,
+        // Apple Container reports a missing container as
+        // `notFound: "container with ID <id> not found"`.
+        not_found_markers: &["not found"],
     };
 
     pub const PODMAN: Self = Self {
@@ -129,7 +138,15 @@ impl RuntimeBase {
         supports_remove_volumes: true,
         supports_named_volumes: true,
         supports_selinux_relabel: true,
+        not_found_markers: &["no such container"],
     };
+
+    /// Whether `stderr` from a remove/stop indicates the container did not
+    /// exist. Case-insensitive; matches this runtime's own not-found wording.
+    pub fn is_not_found(&self, stderr: &str) -> bool {
+        let lower = stderr.to_lowercase();
+        self.not_found_markers.iter().any(|m| lower.contains(m))
+    }
 
     pub fn command(&self) -> Command {
         Command::new(self.binary)
@@ -385,7 +402,7 @@ impl RuntimeBase {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            if stderr.contains("No such container") {
+            if self.is_not_found(&stderr) {
                 return Err(DockerError::ContainerNotFound(name.to_string()));
             }
             return Err(DockerError::StopFailed(stderr.to_string()));
@@ -411,7 +428,7 @@ impl RuntimeBase {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            if stderr.contains("No such container") {
+            if self.is_not_found(&stderr) {
                 return Err(DockerError::ContainerNotFound(name.to_string()));
             }
             return Err(DockerError::RemoveFailed(stderr.to_string()));
@@ -497,6 +514,42 @@ impl RuntimeBase {
 mod tests {
     use super::*;
     use crate::containers::container_interface::{EnvEntry, VolumeMount};
+
+    // Real stderr captured from `<runtime> rm/delete <missing>` on 2026-07-01.
+    // These pin the per-runtime not-found classification that `remove()` and
+    // `stop_container()` rely on to stay idempotent.
+    const DOCKER_MISSING: &str =
+        "Error response from daemon: No such container: aoe-sandbox-abc123";
+    const APPLE_MISSING: &str = "Error: internalError: \"failed to delete container\" (cause: \"notFound: \"container with ID aoe-sandbox-abc123 not found\"\")";
+    // Podman not installed locally; representative of its documented output.
+    const PODMAN_MISSING: &str =
+        "Error: no container with name or ID \"aoe-sandbox-abc123\" found: no such container";
+
+    #[test]
+    fn docker_not_found_stderr_classifies() {
+        assert!(RuntimeBase::DOCKER.is_not_found(DOCKER_MISSING));
+    }
+
+    #[test]
+    fn apple_not_found_stderr_classifies() {
+        assert!(RuntimeBase::APPLE_CONTAINER.is_not_found(APPLE_MISSING));
+    }
+
+    #[test]
+    fn podman_not_found_stderr_classifies() {
+        assert!(RuntimeBase::PODMAN.is_not_found(PODMAN_MISSING));
+    }
+
+    #[test]
+    fn genuine_failure_is_not_classified_as_not_found() {
+        // A real removal failure must NOT be mistaken for "already gone",
+        // which would re-introduce the silent-orphan bug.
+        let busy = "Error response from daemon: container is running: stop it first";
+        assert!(!RuntimeBase::DOCKER.is_not_found(busy));
+        assert!(!RuntimeBase::APPLE_CONTAINER.is_not_found(
+            "Error: internalError: \"failed to delete container\" (cause: \"resource busy\")"
+        ));
+    }
 
     #[test]
     fn test_build_create_args_read_only_supported() {

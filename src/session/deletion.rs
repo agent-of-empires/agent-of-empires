@@ -35,6 +35,23 @@ pub struct DeletionResult {
 }
 
 pub fn perform_deletion(request: &DeletionRequest) -> DeletionResult {
+    perform_deletion_with(request, |session_id| {
+        DockerContainer::from_session_id(session_id).teardown(session_id)
+    })
+}
+
+/// Core deletion routine, parameterized over how the sandbox container is torn
+/// down so the container-removal contract can be exercised without a live
+/// runtime.
+///
+/// NOTE: when the session is sandboxed and `delete_sandbox` is set, `teardown`
+/// must be invoked unconditionally; it must not be gated behind a separate
+/// existence probe, whose transient failure would skip removal and orphan a
+/// live container.
+fn perform_deletion_with(
+    request: &DeletionRequest,
+    teardown: impl FnOnce(&str) -> crate::containers::Teardown,
+) -> DeletionResult {
     let mut errors = Vec::new();
     let mut messages = Vec::new();
 
@@ -143,12 +160,7 @@ pub fn perform_deletion(request: &DeletionRequest) -> DeletionResult {
     // container processes.
     if request.delete_sandbox && is_sandboxed {
         tracing::debug!(target: "session.delete", session_id = %request.session_id, stage = "container_remove", "perform_deletion: stage");
-        let container = DockerContainer::from_session_id(&request.instance.id);
-        deletion_messages_for(
-            container.teardown(&request.instance.id),
-            &mut messages,
-            &mut errors,
-        );
+        deletion_messages_for(teardown(&request.instance.id), &mut messages, &mut errors);
     }
 
     // Stage 4: worktree cleanup. Container is gone, agent is gone, no
@@ -623,6 +635,63 @@ mod tests {
                 messages.is_empty(),
                 "no spurious 'removed' message when nothing was removed"
             );
+        }
+
+        fn sandboxed_request() -> DeletionRequest {
+            use crate::session::SandboxInfo;
+            let mut instance = create_test_instance();
+            instance.sandbox_info = Some(SandboxInfo {
+                enabled: true,
+                container_id: None,
+                image: "alpine".to_string(),
+                container_name: "aoe-sandbox-calltest".to_string(),
+                extra_env: None,
+                custom_instruction: None,
+                before_start_env: Vec::new(),
+                container_workdir: None,
+            });
+            DeletionRequest {
+                session_id: instance.id.clone(),
+                instance,
+                delete_worktree: false,
+                delete_branch: false,
+                delete_sandbox: true,
+                force_delete: false,
+                detach_hooks: true,
+                keep_scratch: false,
+            }
+        }
+
+        #[test]
+        fn call_site_surfaces_teardown_failure() {
+            // A failed container teardown must surface as an error so the
+            // caller keeps the session record, not silently succeed. Pins the
+            // `perform_deletion` call site, not just the mapping helper.
+            let request = sandboxed_request();
+            let result = perform_deletion_with(&request, |_id| {
+                Teardown::Failed(DockerError::RemoveFailed("daemon busy".into()))
+            });
+            assert!(!result.success, "a teardown failure must fail the deletion");
+            assert!(result.errors.iter().any(|e| e.contains("Container")));
+        }
+
+        #[test]
+        fn call_site_invokes_teardown_unconditionally() {
+            // Guards against re-introducing an existence-probe gate around the
+            // teardown: it must run whenever the session is sandboxed and
+            // delete_sandbox is set.
+            use std::cell::Cell;
+            let request = sandboxed_request();
+            let called = Cell::new(false);
+            let result = perform_deletion_with(&request, |_id| {
+                called.set(true);
+                Teardown::Removed
+            });
+            assert!(
+                called.get(),
+                "teardown must be invoked unconditionally, never gated behind a probe"
+            );
+            assert!(result.success);
         }
     }
 
