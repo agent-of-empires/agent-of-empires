@@ -1473,6 +1473,10 @@ fn build_router(state: Arc<AppState>) -> Router {
             get(api::session_diff_files),
         )
         .route("/api/sessions/{id}/diff/file", get(api::session_diff_file))
+        .route(
+            "/api/sessions/{id}/artifacts/{*path}",
+            get(api::serve_session_artifact),
+        )
         .route("/api/sessions/{id}/ensure", post(api::ensure_session))
         .route("/api/sessions/{id}/send", post(api::send_message))
         .route("/api/sessions/{id}/output", get(api::read_output))

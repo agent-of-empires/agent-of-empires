@@ -5780,9 +5780,156 @@ pub async fn search_sessions(
     Json(SearchResponse { results })
 }
 
+/// Largest artifact the dashboard will serve inline. Generated screenshots
+/// and status pages are small; the cap just bounds a pathological read.
+const MAX_ARTIFACT_BYTES: u64 = 50 * 1024 * 1024;
+
+/// Serve a file from a session's managed artifact directory
+/// (`GET /api/sessions/{id}/artifacts/{*path}`). Auth is enforced by the
+/// global middleware; `resolve_artifact_path` canonicalizes and confines the
+/// request to the session's artifact root, so neither `..` nor a symlink can
+/// escape it and arbitrary host paths are never served. HTML is sent as an
+/// attachment (never inline) so a generated page cannot execute script in the
+/// dashboard's authenticated origin. See #2587.
+pub async fn serve_session_artifact(Path((id, path)): Path<(String, String)>) -> impl IntoResponse {
+    let resolved = tokio::task::spawn_blocking(move || {
+        crate::session::artifacts::resolve_artifact_path(&id, &path)
+    })
+    .await;
+
+    let file_path = match resolved {
+        Ok(Some(p)) => p,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+
+    match tokio::fs::metadata(&file_path).await {
+        Ok(m) if m.len() > MAX_ARTIFACT_BYTES => {
+            return StatusCode::PAYLOAD_TOO_LARGE.into_response()
+        }
+        Ok(_) => {}
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    }
+
+    let bytes = match tokio::fs::read(&file_path).await {
+        Ok(b) => b,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+
+    use axum::http::{header, HeaderMap, HeaderValue};
+    let mime = mime_guess::from_path(&file_path).first_or_octet_stream();
+    let essence = mime.essence_str();
+    let is_html = essence == "text/html" || essence == "application/xhtml+xml";
+    // Serve HTML as a download, not inline, to keep it out of the dashboard's
+    // same-origin script context.
+    let content_type = if is_html {
+        "application/octet-stream"
+    } else {
+        essence
+    };
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(content_type)
+            .unwrap_or(HeaderValue::from_static("application/octet-stream")),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, max-age=60"),
+    );
+    if is_html {
+        headers.insert(
+            header::CONTENT_DISPOSITION,
+            HeaderValue::from_static("attachment"),
+        );
+    }
+
+    (StatusCode::OK, headers, bytes).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #2587: the artifact route serves only canonicalized files confined to
+    // the session's artifact dir, sets nosniff, and never serves HTML inline.
+    mod artifact_route {
+        use super::*;
+        use axum::body::to_bytes;
+        use axum::extract::Path as AxumPath;
+        use axum::http::header;
+        use serial_test::serial;
+
+        fn isolate_app_dir() -> tempfile::TempDir {
+            let tmp = tempfile::tempdir().expect("temp home");
+            std::env::set_var("HOME", tmp.path());
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+            tmp
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn serves_image_with_nosniff() {
+            let _tmp = isolate_app_dir();
+            let id = format!("art-{}", uuid::Uuid::new_v4());
+            let dir = crate::session::artifacts::session_artifact_dir(&id).unwrap();
+            std::fs::write(dir.join("shot.png"), b"\x89PNG\r\n").unwrap();
+            let resp = serve_session_artifact(AxumPath((id, "shot.png".to_string())))
+                .await
+                .into_response();
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers().get(header::X_CONTENT_TYPE_OPTIONS).unwrap(),
+                "nosniff"
+            );
+            assert_eq!(
+                resp.headers().get(header::CONTENT_TYPE).unwrap(),
+                "image/png"
+            );
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn rejects_traversal_with_empty_body() {
+            let _tmp = isolate_app_dir();
+            let id = format!("art-{}", uuid::Uuid::new_v4());
+            crate::session::artifacts::session_artifact_dir(&id).unwrap();
+            let resp = serve_session_artifact(AxumPath((id, "../../../../etc/hosts".to_string())))
+                .await
+                .into_response();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+            let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+            assert!(body.is_empty(), "unexpected body: {body:?}");
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn serves_html_as_attachment() {
+            let _tmp = isolate_app_dir();
+            let id = format!("art-{}", uuid::Uuid::new_v4());
+            let dir = crate::session::artifacts::session_artifact_dir(&id).unwrap();
+            std::fs::write(dir.join("status.html"), b"<h1>hi</h1>").unwrap();
+            let resp = serve_session_artifact(AxumPath((id, "status.html".to_string())))
+                .await
+                .into_response();
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers().get(header::CONTENT_TYPE).unwrap(),
+                "application/octet-stream"
+            );
+            assert_eq!(
+                resp.headers().get(header::CONTENT_DISPOSITION).unwrap(),
+                "attachment"
+            );
+        }
+    }
+
     fn make_test_instance() -> Instance {
         let mut inst = Instance::new("test-session", "/tmp/test-project");
         inst.tool = "claude".to_string();
