@@ -86,11 +86,6 @@ export function workspaceTrashedAtMs(ws: Workspace): number {
   return max;
 }
 
-/** The trashed workspaces for the sidebar Trash section, newest-trashed first. */
-export function selectTrashedWorkspaces(workspaces: readonly Workspace[]): Workspace[] {
-  return workspaces.filter(workspaceIsTrashed).sort((a, b) => workspaceTrashedAtMs(b) - workspaceTrashedAtMs(a));
-}
-
 /** True when a repo group still has at least one workspace that is
  *  not sunk (archived or actively snoozed across all sessions). The
  *  sidebar uses this to hide the group's header when every workspace

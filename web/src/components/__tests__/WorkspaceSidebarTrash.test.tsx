@@ -151,6 +151,24 @@ describe("WorkspaceSidebar Trash control (#2489, #2512)", () => {
     expect(props.onDeleteSession).toHaveBeenCalledWith("trashed-ws");
   });
 
+  it("orders the Trash rows newest-trashed first", () => {
+    const older = workspace("older-ws", [session({ id: "o1", trashed_at: "2026-01-01T00:00:00Z" })]);
+    const newer = workspace("newer-ws", [session({ id: "n1", trashed_at: "2026-06-01T00:00:00Z" })]);
+    // Pass oldest-first to prove the panel re-sorts rather than echoing input order.
+    renderSidebar({
+      groups: buildSessionGroups([older, newer], {
+        idleDecayWindowMs: 60_000,
+        sortMode: "lastActivity",
+        isCollapsed: () => false,
+      }),
+      trashedWorkspaces: [older, newer],
+    });
+    fireEvent.click(screen.getByTestId("sidebar-trash-toggle"));
+    const rows = screen.getAllByTestId("sidebar-trash-row");
+    expect(rows[0].textContent).toContain("newer-ws");
+    expect(rows[1].textContent).toContain("older-ws");
+  });
+
   it("renders the count badge next to the Trash icon, not against Settings (#2574)", () => {
     // The badge must sit right after the Trash icon at the left of the control.
     // A `flex-1` label that preceded the badge would shove the count to the

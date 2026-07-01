@@ -6,7 +6,7 @@
 
 import { describe, expect, it } from "vitest";
 import type { SessionResponse, Workspace } from "../types";
-import { selectTrashedWorkspaces, workspaceIsSunk, workspaceIsTrashed, workspaceTrashedAtMs } from "../sidebarSort";
+import { workspaceIsSunk, workspaceIsTrashed, workspaceTrashedAtMs } from "../sidebarSort";
 
 function session(over: Partial<SessionResponse>): SessionResponse {
   return { id: "s", title: "t", archived_at: null, snoozed_until: null, trashed_at: null, ...over } as SessionResponse;
@@ -68,18 +68,5 @@ describe("workspaceTrashedAtMs orders Trash newest-first", () => {
     const newer = workspace([session({ trashed_at: "2026-06-01T00:00:00Z" })]);
     const sorted = [older, newer].sort((a, b) => workspaceTrashedAtMs(b) - workspaceTrashedAtMs(a));
     expect(sorted).toEqual([newer, older]);
-  });
-});
-
-describe("selectTrashedWorkspaces", () => {
-  it("keeps only trashed workspaces, newest-trashed first", () => {
-    const older = workspace([session({ trashed_at: "2026-01-01T00:00:00Z" })]);
-    const newer = workspace([session({ trashed_at: "2026-06-01T00:00:00Z" })]);
-    const live = workspace([session({})]);
-    expect(selectTrashedWorkspaces([older, live, newer])).toEqual([newer, older]);
-  });
-
-  it("returns empty when nothing is trashed", () => {
-    expect(selectTrashedWorkspaces([workspace([session({})])])).toEqual([]);
   });
 });

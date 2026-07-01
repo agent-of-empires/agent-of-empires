@@ -920,8 +920,11 @@
       "id": "sidebar.trash-order",
       "kind": "vitest",
       "risk": "low",
-      "specs": ["src/lib/__tests__/sidebarTrash.test.ts"],
-      "components": ["web/src/lib/sidebarSort.ts"]
+      "specs": [
+        "src/lib/__tests__/sidebarTrash.test.ts",
+        "src/components/__tests__/WorkspaceSidebarTrash.test.tsx"
+      ],
+      "components": ["web/src/lib/sidebarSort.ts", "web/src/components/WorkspaceSidebar.tsx"]
     },
     {
       "id": "sidebar.new-session-tooltips",
