@@ -917,6 +917,13 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
+      "id": "sidebar.trash-order",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/lib/__tests__/sidebarTrash.test.ts"],
+      "components": ["web/src/lib/sidebarSort.ts"]
+    },
+    {
       "id": "sidebar.new-session-tooltips",
       "kind": "mocked-playwright",
       "risk": "low",

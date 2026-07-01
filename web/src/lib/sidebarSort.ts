@@ -74,6 +74,18 @@ export function workspaceIsTrashed(ws: Workspace): boolean {
   return ws.sessions.every((s) => s.trashed_at != null);
 }
 
+/** Most recent trashed_at (ms) across a workspace's sessions, for ordering the
+ *  Trash section newest-first. */
+export function workspaceTrashedAtMs(ws: Workspace): number {
+  let max = 0;
+  for (const s of ws.sessions) {
+    if (s.trashed_at == null) continue;
+    const t = new Date(s.trashed_at).getTime();
+    if (t > max) max = t;
+  }
+  return max;
+}
+
 /** True when a repo group still has at least one workspace that is
  *  not sunk (archived or actively snoozed across all sessions). The
  *  sidebar uses this to hide the group's header when every workspace
