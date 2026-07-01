@@ -215,6 +215,32 @@ describe("CommandPalette", () => {
       expect(screen.queryByText("Some session")).toBeNull();
     });
 
+    it("excludes scatter-only fuzzy matches while keeping real matches", () => {
+      render(
+        <CommandPalette
+          open
+          onClose={() => {}}
+          actions={[
+            // "test" only scatter-matches this row (t·e·s·t across the id and
+            // keywords), which used to surface it under a short query.
+            action({
+              id: "action:new-session",
+              title: "New session",
+              group: "Actions",
+              keywords: ["create", "start", "agent", "worktree"],
+            }),
+            action({ id: "session:x", title: "plugin-host-test", group: "Sessions" }),
+          ]}
+        />,
+      );
+      fireEvent.change(screen.getByPlaceholderText("Search actions, sessions, settings…"), {
+        target: { value: "test" },
+      });
+      expect(screen.queryByText("New session")).toBeNull();
+      expect(screen.getByText("plugin-host-test")).toBeTruthy();
+      expect(screen.getByText("1 action")).toBeTruthy();
+    });
+
     it("resets to All when reopened", () => {
       const { rerender } = render(<CommandPalette open onClose={() => {}} actions={mixed} />);
       fireEvent.click(screen.getByRole("tab", { name: "Settings" }));

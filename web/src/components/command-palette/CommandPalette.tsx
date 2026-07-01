@@ -14,14 +14,27 @@ function actionValue(a: CommandAction): string {
   return `${a.id} ${[a.title, a.subtitle ?? "", ...(a.keywords ?? [])].join(" ")}`;
 }
 
-// Does this row survive the current query? Mirrors the <Command> filter:
-// conversation hits are server-matched (force-kept), everything else uses
-// cmdk's default fuzzy scoring. An empty query keeps everything.
+// cmdk's fuzzy scorer keeps any nonzero score, but a short query like "test"
+// scatter-matches across a row's id + keywords (t·e·s·t picked from
+// "acTion nEw seSsion sTart") for a tiny ~0.15 score, surfacing unrelated
+// rows. Real substring / prefix / acronym hits score ~0.9+, so require a
+// floor well above the scatter band. Tune here if legitimate fuzzy matches
+// start dropping.
+const MIN_SCORE = 0.3;
+
+// The single scoring predicate for a row against the current query, used both
+// to pre-filter groups (tab/count visibility) and as the <Command> filter so
+// the two never disagree. Conversation hits are matched server-side by content
+// the client text lacks, so force-keep them; an empty query keeps everything.
+function scoreValue(value: string, search: string): number {
+  if (value.startsWith("conversation:")) return 1;
+  if (!search) return 1;
+  const score = defaultFilter!(value, search) ?? 0;
+  return score >= MIN_SCORE ? score : 0;
+}
+
 function matches(a: CommandAction, search: string): boolean {
-  if (!search) return true;
-  const value = actionValue(a);
-  if (value.startsWith("conversation:")) return true;
-  return (defaultFilter!(value, search) ?? 0) > 0;
+  return scoreValue(actionValue(a), search) > 0;
 }
 
 interface Props {
@@ -162,12 +175,7 @@ export function CommandPalette({ open, onClose, actions, onSearchChange, searchi
       <Command
         label="Command palette"
         loop
-        filter={(value, searchText, keywords) =>
-          // Conversation hits are already filtered server-side by content
-          // (which the client text does not contain), so force-keep them;
-          // everything else uses cmdk's default fuzzy scoring.
-          value.startsWith("conversation:") ? 1 : defaultFilter!(value, searchText, keywords)
-        }
+        filter={(value, searchText) => scoreValue(value, searchText)}
         className="w-full max-w-[600px] bg-surface-800 border border-surface-700/50 rounded-lg shadow-2xl overflow-hidden animate-slide-up"
         onClick={(e) => e.stopPropagation()}
       >
