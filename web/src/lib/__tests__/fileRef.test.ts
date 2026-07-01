@@ -40,6 +40,15 @@ describe("resolveArtifactUrl (#2587)", () => {
   it("returns null for the artifact root itself (no file)", () => {
     expect(resolveArtifactUrl("/aoe/artifacts", session)).toBeNull();
   });
+
+  it("rejects a path containing .. segments rather than emitting a collapsing URL", () => {
+    expect(resolveArtifactUrl("/aoe/artifacts/../../etc/passwd", session)).toBeNull();
+    expect(resolveArtifactUrl("/aoe/artifacts/sub/../x.png", session)).toBeNull();
+  });
+
+  it("drops . and empty segments", () => {
+    expect(resolveArtifactUrl("/aoe/artifacts/./sub//x.png", session)).toBe("/api/sessions/sess-1/artifacts/sub/x.png");
+  });
 });
 
 describe("parseFileRef", () => {

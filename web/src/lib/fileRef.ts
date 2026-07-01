@@ -51,10 +51,13 @@ export function resolveArtifactUrl(rawPath: string, session: FileRefSession): st
     if (base && target.startsWith(`${base}/`)) {
       const rel = target.slice(base.length + 1);
       if (!rel) return null;
-      const encoded = rel
-        .split("/")
-        .map((seg) => encodeURIComponent(seg))
-        .join("/");
+      // Drop `.`/empty segments and refuse any `..`: an unnormalized dot path
+      // would produce a URL the browser silently collapses outside /artifacts/,
+      // giving a broken (or unexpected) link. The server route also confines,
+      // but normalizing here keeps the emitted URL honest.
+      const segments = rel.split("/").filter((seg) => seg !== "." && seg !== "");
+      if (segments.length === 0 || segments.some((seg) => seg === "..")) return null;
+      const encoded = segments.map((seg) => encodeURIComponent(seg)).join("/");
       return `/api/sessions/${encodeURIComponent(session.id)}/artifacts/${encoded}`;
     }
   }
