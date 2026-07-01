@@ -111,6 +111,10 @@ effort = "high"
 
 The `[acp]` block holds the structured view's global tuning knobs (timeouts, concurrency, watchdog grace). See [Structured View Internals](development/internals/structured-view.md#global-tuning-acp) for the full list.
 
+## Agent artifacts
+
+Each session gets a managed artifact directory, exposed to the agent as `AOE_ARTIFACT_DIR` (bind-mounted at `/aoe/artifacts` inside a sandbox). A screenshot or status file the agent writes there is served over an authenticated, session-scoped route and opens in the dashboard: transcript links open the file in a new tab, and markdown images render inline. Files written elsewhere (an arbitrary `/tmp` path, for example) cannot be served and render as plain, non-clickable text. To make a generated artifact viewable, write it under `$AOE_ARTIFACT_DIR`.
+
 ## Cross-machine attach
 
 Set `AOE_DAEMON_URL` (and optionally `AOE_DAEMON_TOKEN`) to point at a remote `aoe serve`:
