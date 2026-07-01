@@ -40,7 +40,12 @@ import { usePaneLayout, dockTabs, dockGroups, dockOf, isActiveTab } from "./lib/
 import { isPluginPaneId, usePluginPanes, type PluginPane } from "./lib/pluginPanes";
 import { PluginPaneBody } from "./components/plugin/PluginSlots";
 import { TOUR_ANCHORS, tourAnchor } from "./lib/tourSteps";
-import { deleteWorkspaceSessions, restoreSessions, trashSessions } from "./lib/trashActions";
+import {
+  deleteWorkspaceSessions,
+  restoreSessions,
+  trashedWorkspaceRestoreIds,
+  trashSessions,
+} from "./lib/trashActions";
 import {
   loginStatus,
   logout,
@@ -1498,14 +1503,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
                         trashedAt={activeSession.trashed_at ?? null}
                         onRestore={
                           activeSession.trashed_at
-                            ? () => {
-                                // Restore the whole workspace (a workspace only
-                                // lands in Trash when all its sessions are), same
-                                // scope as the sidebar Trash action. See #2593.
-                                const ws = workspaces.find((w) => w.sessions.some((s) => s.id === activeSessionId));
-                                const ids = ws ? ws.sessions.map((s) => s.id) : [activeSessionId!];
-                                return handleRestoreSession(ids);
-                              }
+                            ? () => handleRestoreSession(trashedWorkspaceRestoreIds(workspaces, activeSessionId!))
                             : undefined
                         }
                         onOpenFileRef={handleOpenFileRef}

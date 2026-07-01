@@ -11,10 +11,12 @@ vi.mock("../api", () => ({
 }));
 
 import { deleteSession, restoreSession, trashSession } from "../api";
-import { deleteWorkspaceSessions, restoreSessions, trashSessions } from "../trashActions";
-import type { SessionResponse } from "../types";
+import { deleteWorkspaceSessions, restoreSessions, trashedWorkspaceRestoreIds, trashSessions } from "../trashActions";
+import type { SessionResponse, Workspace } from "../types";
 
 const snap = (id: string) => ({ id, title: id }) as unknown as SessionResponse;
+const ws = (id: string, sessionIds: string[]) =>
+  ({ id, sessions: sessionIds.map((sid) => ({ id: sid })) }) as unknown as Workspace;
 const trashMock = vi.mocked(trashSession);
 const restoreMock = vi.mocked(restoreSession);
 const deleteMock = vi.mocked(deleteSession);
@@ -89,6 +91,17 @@ describe("restoreSessions (#2489)", () => {
   it("tolerates a null notifier", async () => {
     restoreMock.mockResolvedValue(snap("a"));
     await expect(restoreSessions(["a"], { applySession: vi.fn(), notify: null })).resolves.toBe(true);
+  });
+});
+
+describe("trashedWorkspaceRestoreIds (#2593)", () => {
+  it("returns every session id in the workspace containing the session", () => {
+    const workspaces = [ws("w1", ["a", "b"]), ws("w2", ["c"])];
+    expect(trashedWorkspaceRestoreIds(workspaces, "b")).toEqual(["a", "b"]);
+  });
+
+  it("falls back to just the session id when no workspace groups it", () => {
+    expect(trashedWorkspaceRestoreIds([ws("w2", ["c"])], "orphan")).toEqual(["orphan"]);
   });
 });
 

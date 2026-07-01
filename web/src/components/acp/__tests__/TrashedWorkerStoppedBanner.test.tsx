@@ -46,7 +46,7 @@ describe("TrashedWorkerStoppedBanner (#2489, #2593)", () => {
     resolve(true);
   });
 
-  it("resets the pending state when restore fails so the user can retry", async () => {
+  it("resets the pending state when restore resolves false so the user can retry", async () => {
     const onRestore = vi.fn(() => Promise.resolve(false));
 
     render(<TrashedWorkerStoppedBanner sessionId="sess-9" onRestore={onRestore} />);
@@ -55,6 +55,18 @@ describe("TrashedWorkerStoppedBanner (#2489, #2593)", () => {
     });
 
     // The banner stays and the button returns to the actionable label.
+    await waitFor(() => expect(screen.getByRole("button", { name: "Restore" })).toBeTruthy());
+    expect((screen.getByRole("button", { name: "Restore" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("resets the pending state when restore rejects", async () => {
+    const onRestore = vi.fn(() => Promise.reject(new Error("boom")));
+
+    render(<TrashedWorkerStoppedBanner sessionId="sess-9" onRestore={onRestore} />);
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Restore" }));
+    });
+
     await waitFor(() => expect(screen.getByRole("button", { name: "Restore" })).toBeTruthy());
     expect((screen.getByRole("button", { name: "Restore" }) as HTMLButtonElement).disabled).toBe(false);
   });

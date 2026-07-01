@@ -4,7 +4,18 @@
 
 import { deleteSession, restoreSession, trashSession } from "./api";
 import type { DeleteSessionOptions } from "./api";
-import type { SessionResponse, SessionStatus } from "./types";
+import type { SessionResponse, SessionStatus, Workspace } from "./types";
+
+/** Resolve the session ids to restore when the trashed-banner Restore button
+ *  fires for `sessionId`. Restore is a whole-workspace action (a workspace
+ *  only lands in Trash when all its sessions are), so this returns every
+ *  session id in the workspace containing `sessionId`, matching the sidebar
+ *  Trash action. Falls back to just `[sessionId]` when no workspace groups it.
+ *  See #2593. */
+export function trashedWorkspaceRestoreIds(workspaces: Workspace[], sessionId: string): string[] {
+  const ws = workspaces.find((w) => w.sessions.some((s) => s.id === sessionId));
+  return ws ? ws.sessions.map((s) => s.id) : [sessionId];
+}
 
 /** A toast sink; both methods are optional so callers can pass the bus
  *  handler before it is wired without a guard. */
