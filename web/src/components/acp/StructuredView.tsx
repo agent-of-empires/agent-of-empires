@@ -94,6 +94,13 @@ interface Props {
    *  restoring it, so the banner replaces the composer and points at the
    *  Trash section. Takes precedence over archived/snoozed. See #2489. */
   trashedAt: string | null;
+  /** Restore this session's workspace out of the trash. Wired to the
+   *  Restore button on the trashed "worker stopped" banner so a trashed
+   *  session can be recovered in place without hunting for the row in the
+   *  sidebar Trash menu. Restores the whole workspace, matching the sidebar
+   *  Trash action. Omit to render the banner read-only. Resolves false when
+   *  the restore fails so the banner can reset its pending state. See #2593. */
+  onRestore?: () => Promise<boolean> | void;
   /** Open a local file reference cited in the transcript (Codex
    *  `path:line` markdown links). Provided to the markdown anchor
    *  override via context so a click opens the in-app file viewer
@@ -122,6 +129,7 @@ export function StructuredView(props: Props) {
     archivedAt,
     snoozedUntil,
     trashedAt,
+    onRestore,
     onOpenFileRef,
     fileRefSession,
     onOpenAgentsPane,
@@ -159,6 +167,7 @@ export function StructuredView(props: Props) {
                   archivedAt={archivedAt}
                   snoozedUntil={snoozedUntil}
                   trashedAt={trashedAt}
+                  onRestore={onRestore}
                   {...ctx}
                 />
               </BackgroundAgentsContext.Provider>
@@ -216,6 +225,7 @@ function AcpChrome({
   archivedAt,
   snoozedUntil,
   trashedAt,
+  onRestore,
   state,
   status,
   hasEverOpened,
@@ -253,6 +263,7 @@ function AcpChrome({
   archivedAt: string | null;
   snoozedUntil: string | null;
   trashedAt: string | null;
+  onRestore?: () => Promise<boolean> | void;
 }) {
   // Count how many activity rows precede the latest `session_cleared`
   // divider so the banner can say "12 earlier turns hidden". The
@@ -485,7 +496,7 @@ function AcpChrome({
           snoozedUntil,
         });
         if (variant === "trashed") {
-          return <TrashedWorkerStoppedBanner sessionId={sessionId} />;
+          return <TrashedWorkerStoppedBanner sessionId={sessionId} onRestore={onRestore} />;
         }
         if (variant === "archived") {
           return <ArchivedWorkerStoppedBanner sessionId={sessionId} />;
@@ -1771,17 +1782,53 @@ function WorkerStoppedBanner({ sessionId }: { sessionId: string }) {
  *  purge), but the worker is stopped and the reconciler will not respawn a
  *  trashed session, so the composer is disabled and the banner points at the
  *  sidebar Trash section to restore. */
-export function TrashedWorkerStoppedBanner({ sessionId }: { sessionId: string }) {
+export function TrashedWorkerStoppedBanner({
+  sessionId,
+  onRestore,
+}: {
+  sessionId: string;
+  onRestore?: () => Promise<boolean> | void;
+}) {
+  // Local pending flag: on success the reducer re-buckets the session and this
+  // banner unmounts, so the flag never has to clear on the happy path; on a
+  // failed restore we reset it and let the aggregate error toast explain.
+  const [restoring, setRestoring] = useState(false);
+
+  const handleRestore = () => {
+    if (!onRestore || restoring) return;
+    setRestoring(true);
+    void Promise.resolve(onRestore()).then(
+      (ok) => {
+        if (ok === false) setRestoring(false);
+      },
+      () => setRestoring(false),
+    );
+  };
+
   return (
     <div
       className="border-b border-status-warning/30 bg-status-warning/10 px-4 py-3 text-status-warning"
       data-testid={`acp-trashed-banner-${sessionId}`}
     >
-      <div className="text-sm font-medium">Session in trash</div>
-      <div className="mt-1 text-xs text-status-warning/90">
-        This session is in the trash. Its transcript and workspace are kept and shown here read-only, but the worker is
-        stopped and will not respawn. Restore it from the Trash section in the sidebar to resume, or delete it
-        permanently from there.
+      <div className="flex items-start justify-between gap-3">
+        <div className="flex-1 min-w-0">
+          <div className="text-sm font-medium">Session in trash</div>
+          <div className="mt-1 text-xs text-status-warning/90">
+            This session is in the trash. Its transcript and workspace are kept and shown here read-only, but the worker
+            is stopped and will not respawn. Restore it to resume, or delete it permanently from the Trash section in
+            the sidebar.
+          </div>
+        </div>
+        {onRestore && (
+          <button
+            type="button"
+            onClick={handleRestore}
+            disabled={restoring}
+            className="shrink-0 rounded-md border border-status-warning/40 bg-status-warning/20 px-3 py-1 text-xs font-medium text-status-warning hover:bg-status-warning/30 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {restoring ? "Restoring…" : "Restore"}
+          </button>
+        )}
       </div>
     </div>
   );

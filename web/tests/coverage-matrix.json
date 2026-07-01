@@ -1146,6 +1146,13 @@
       "components": ["web/src/components/acp/StructuredView.tsx"]
     },
     {
+      "id": "session.trash.restore-banner",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/acp/__tests__/TrashedWorkerStoppedBanner.test.tsx"],
+      "components": ["web/src/components/acp/StructuredView.tsx"]
+    },
+    {
       "id": "session.group-edit",
       "kind": "live-playwright",
       "risk": "high",

@@ -1496,6 +1496,18 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
                         archivedAt={activeSession.archived_at ?? null}
                         snoozedUntil={activeSession.snoozed_until ?? null}
                         trashedAt={activeSession.trashed_at ?? null}
+                        onRestore={
+                          activeSession.trashed_at
+                            ? () => {
+                                // Restore the whole workspace (a workspace only
+                                // lands in Trash when all its sessions are), same
+                                // scope as the sidebar Trash action. See #2593.
+                                const ws = workspaces.find((w) => w.sessions.some((s) => s.id === activeSessionId));
+                                const ids = ws ? ws.sessions.map((s) => s.id) : [activeSessionId!];
+                                return handleRestoreSession(ids);
+                              }
+                            : undefined
+                        }
                         onOpenFileRef={handleOpenFileRef}
                         fileRefSession={activeSession}
                         onOpenAgentsPane={openAgentsPane}
