@@ -17,7 +17,7 @@ import { useNestedSidebarGroups } from "./hooks/useNestedSidebarGroups";
 import { PluginUiProvider, usePluginUiEntries } from "./lib/pluginUiContext";
 import { buildSortValueMap, pluginSortSpecs } from "./lib/pluginUi";
 import type { PluginSortContext, SidebarSortMode } from "./lib/sidebarSort";
-import { workspaceIsTrashed, workspaceTrashedAtMs } from "./lib/sidebarSort";
+import { selectTrashedWorkspaces } from "./lib/sidebarSort";
 import { useSidebarSortMode } from "./hooks/useSidebarSortMode";
 import { useSidebarAxis } from "./hooks/useSidebarAxis";
 import { repoGroupToSidebarGroup, type SidebarGroup } from "./lib/sidebarGroups";
@@ -290,14 +290,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   // sidebar's per-`group_path` slice views. A workspace is in Trash only when
   // every one of its sessions is trashed, and Restore/Delete then cover all of
   // them. See #2533.
-  const trashedWorkspaces = useMemo(
-    () =>
-      workspaces
-        .filter(workspaceIsTrashed)
-        // Newest-trashed first: most recent trashed_at across the workspace's sessions.
-        .sort((a, b) => workspaceTrashedAtMs(b) - workspaceTrashedAtMs(a)),
-    [workspaces],
-  );
+  const trashedWorkspaces = useMemo(() => selectTrashedWorkspaces(workspaces), [workspaces]);
 
   // Remember the active session and restore it on a PWA relaunch (#2103).
   useLastSessionRestore({ activeSessionId, sessions, sessionsLoaded });
