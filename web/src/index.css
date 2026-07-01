@@ -259,6 +259,15 @@ body {
 .acp-markdown blockquote.acp-callout-warn strong {
   color: var(--color-text-bright);
 }
+.acp-markdown .acp-inert-path {
+  font-family: var(--font-mono, monospace);
+  color: var(--color-text-muted);
+  background: var(--color-surface-800);
+  padding: 0 0.25rem;
+  border-radius: 0.25rem;
+  word-break: break-all;
+  user-select: text;
+}
 .acp-markdown :where(p, li) > code {
   background: var(--color-surface-800);
   padding: 0 0.25rem;

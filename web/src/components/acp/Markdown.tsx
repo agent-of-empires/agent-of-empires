@@ -22,7 +22,7 @@ import remarkGfm from "remark-gfm";
 
 import { ensureThemeLoaded, getHighlighter, langKeyForExt, loadLanguage } from "../../lib/highlighter";
 import { useShikiTheme } from "../../hooks/useShikiTheme";
-import { parseFileRef } from "../../lib/fileRef";
+import { parseFileRef, resolveToRepoRelative } from "../../lib/fileRef";
 import { useAcpFileRef } from "./AcpFileRefContext";
 
 interface Props {
@@ -79,14 +79,19 @@ export function Markdown({ text, smooth = false, breaks = false }: Props) {
 }
 
 /**
- * Transcript link. Two behaviors:
+ * Transcript link. Three behaviors:
  *
  *  - Local file references (e.g. Codex's `[app.ts](/repo/src/app.ts:42)`)
- *    are intercepted: clicking opens the file in the in-app diff/file
- *    viewer via the structured view file-ref handler, keeping the current
- *    `/session/<id>` route instead of navigating the tab to a dead
- *    filesystem path. Only active when a handler is provided and the
- *    href parses as a local file ref. See #1718.
+ *    that resolve to a known repo root are intercepted: clicking opens the
+ *    file in the in-app diff/file viewer via the structured view file-ref
+ *    handler, keeping the current `/session/<id>` route instead of
+ *    navigating the tab to a dead filesystem path. See #1718.
+ *  - A local file reference that resolves to no known repo root cannot be
+ *    opened in the dashboard: clicking it either dead-ends in a "not inside
+ *    this session's repo" toast or routes the tab to the SPA. Render it as
+ *    inert, selectable text rather than a link that lies about being
+ *    openable. Only decidable when a session is present to resolve against;
+ *    without one we keep the interception fallback. See #2587.
  *  - Everything else (docs, CI, repo links) keeps the same-tab-is-bad
  *    treatment from #1714: open in a new tab with the dashboard-standard
  *    safe rel (guards against tabnabbing), so following a link does not
@@ -97,22 +102,28 @@ export function Markdown({ text, smooth = false, breaks = false }: Props) {
  * non-intercepted link (or a middle-click / "open in new tab") still
  * behaves as before.
  */
-function TranscriptLink({ href, onClick, ...rest }: React.ComponentPropsWithoutRef<"a">) {
-  const { onOpenFileRef } = useAcpFileRef();
+function TranscriptLink({ href, onClick, children, ...rest }: React.ComponentPropsWithoutRef<"a">) {
+  const { onOpenFileRef, fileRefSession } = useAcpFileRef();
+  const ref = href && onOpenFileRef ? parseFileRef(href) : null;
+
+  if (ref && fileRefSession && !resolveToRepoRelative(ref.path, fileRefSession)) {
+    return <span className="acp-inert-path">{children}</span>;
+  }
 
   function handleClick(e: React.MouseEvent<HTMLAnchorElement>) {
-    if (href && onOpenFileRef) {
-      const ref = parseFileRef(href);
-      if (ref) {
-        e.preventDefault();
-        onOpenFileRef(ref);
-        return;
-      }
+    if (ref) {
+      e.preventDefault();
+      onOpenFileRef?.(ref);
+      return;
     }
     onClick?.(e);
   }
 
-  return <a {...rest} href={href} onClick={handleClick} target="_blank" rel="noopener noreferrer" />;
+  return (
+    <a {...rest} href={href} onClick={handleClick} target="_blank" rel="noopener noreferrer">
+      {children}
+    </a>
+  );
 }
 
 /**

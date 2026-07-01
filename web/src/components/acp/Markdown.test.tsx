@@ -250,6 +250,67 @@ describe("anchor file-ref interception", () => {
   });
 });
 
+// #2587: a local file path that resolves to no known repo root cannot be
+// opened in the dashboard, so it must render as inert text instead of a
+// link that dead-ends in a toast or routes to the SPA.
+describe("anchor inert-path for unresolvable local paths (#2587)", () => {
+  function getAnchor(): React.ComponentType<React.ComponentPropsWithoutRef<"a">> {
+    render(<Markdown text="x" />);
+    return primitiveCalls.at(-1)!.components.a as React.ComponentType<React.ComponentPropsWithoutRef<"a">>;
+  }
+
+  const session = {
+    project_path: "/Users/me/repo",
+    main_repo_path: null,
+    workspace_repos: [],
+  };
+
+  it("renders an outside-repo absolute path as inert text, not a link", () => {
+    const Anchor = getAnchor();
+    const onOpenFileRef = vi.fn();
+    const { container } = render(
+      <AcpFileRefContext.Provider value={{ onOpenFileRef, fileRefSession: session }}>
+        <Anchor href="/tmp/codex-agent-views/shot.png">shot.png</Anchor>
+      </AcpFileRefContext.Provider>,
+    );
+    expect(container.querySelector("a")).toBeNull();
+    const span = container.querySelector("span.acp-inert-path");
+    expect(span).not.toBeNull();
+    expect(span?.textContent).toBe("shot.png");
+    expect(onOpenFileRef).not.toHaveBeenCalled();
+  });
+
+  it("still intercepts an in-repo path as a clickable file link", () => {
+    const Anchor = getAnchor();
+    const onOpenFileRef = vi.fn();
+    const { container } = render(
+      <AcpFileRefContext.Provider value={{ onOpenFileRef, fileRefSession: session }}>
+        <Anchor href="/Users/me/repo/src/app.ts:42">app.ts</Anchor>
+      </AcpFileRefContext.Provider>,
+    );
+    const a = container.querySelector("a")!;
+    expect(a).not.toBeNull();
+    const event = new MouseEvent("click", { bubbles: true, cancelable: true });
+    fireEvent(a, event);
+    expect(onOpenFileRef).toHaveBeenCalledWith({ path: "/Users/me/repo/src/app.ts", line: 42 });
+    expect(event.defaultPrevented).toBe(true);
+  });
+
+  it("leaves an external link clickable even with a session present", () => {
+    const Anchor = getAnchor();
+    const onOpenFileRef = vi.fn();
+    const { container } = render(
+      <AcpFileRefContext.Provider value={{ onOpenFileRef, fileRefSession: session }}>
+        <Anchor href="https://example.com">docs</Anchor>
+      </AcpFileRefContext.Provider>,
+    );
+    const a = container.querySelector("a");
+    expect(a).not.toBeNull();
+    expect(a?.getAttribute("target")).toBe("_blank");
+    expect(onOpenFileRef).not.toHaveBeenCalled();
+  });
+});
+
 describe("TableWithScroll override", () => {
   function getTable(): React.ComponentType<{
     children: React.ReactNode;
