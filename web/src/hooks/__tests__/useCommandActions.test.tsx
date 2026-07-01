@@ -17,12 +17,14 @@ function baseArgs(overrides: Partial<Args> = {}): Args {
   return {
     sessions: [] as SessionResponse[],
     activeSessionId: null,
+    activeSession: null,
     loginRequired: false,
     hasActiveSession: false,
     readOnly: false,
     onNewSession: vi.fn(),
     onNewScratch: vi.fn(),
     onSelectSession: vi.fn(),
+    onSessionStateAction: vi.fn(),
     onToggleDiff: vi.fn(),
     onOpenSettings: vi.fn(),
     onOpenHelp: vi.fn(),
@@ -109,5 +111,66 @@ describe("buildConversationActions", () => {
     expect(trashed[0]!.subtitle).toBe("matched text (3 matches)");
     const snoozed = buildConversationActions([hit()], [session({ snoozed_until: "2099-01-01T00:00:00Z" })], null);
     expect(snoozed[0]!.title).toBe("My Session · snoozed");
+  });
+});
+
+describe("useCommandActions: active-session triage toggles", () => {
+  const active = (over: Partial<SessionResponse> = {}) =>
+    ({ id: "act", title: "Alpha", status: "idle", created_at: "2026-01-01T00:00:00Z", ...over }) as SessionResponse;
+  const ids = (actions: ReturnType<typeof useCommandActions>) => actions.map((a) => a.id);
+
+  it("offers the forward toggles when the session is in no sunk state", () => {
+    const { result } = renderHook(() =>
+      useCommandActions(baseArgs({ activeSession: active(), hasActiveSession: true })),
+    );
+    const got = ids(result.current);
+    expect(got).toContain("session-state:pin:act");
+    expect(got).toContain("session-state:archive:act");
+    expect(got).toContain("session-state:snooze:act");
+    expect(got).toContain("session-state:trash:act");
+    expect(got).not.toContain("session-state:unpin:act");
+    expect(got).not.toContain("session-state:unarchive:act");
+    const pin = result.current.find((a) => a.id === "session-state:pin:act");
+    expect(pin?.title).toBe("Pin Alpha");
+    expect(pin?.group).toBe("Actions");
+  });
+
+  it("flips each toggle to its restore direction per state", () => {
+    const { result } = renderHook(() =>
+      useCommandActions(
+        baseArgs({
+          hasActiveSession: true,
+          activeSession: active({
+            pinned_at: "2026-01-02T00:00:00Z",
+            archived_at: "2026-01-02T00:00:00Z",
+            snoozed_until: "2099-01-01T00:00:00Z",
+            trashed_at: "2026-01-02T00:00:00Z",
+          }),
+        }),
+      ),
+    );
+    const got = ids(result.current);
+    expect(got).toContain("session-state:unpin:act");
+    expect(got).toContain("session-state:unarchive:act");
+    expect(got).toContain("session-state:unsnooze:act");
+    expect(got).toContain("session-state:untrash:act");
+    expect(got).not.toContain("session-state:pin:act");
+    expect(result.current.find((a) => a.id === "session-state:untrash:act")?.title).toBe("Untrash Alpha");
+  });
+
+  it("routes a toggle's perform to onSessionStateAction with the session id and action", () => {
+    const onSessionStateAction = vi.fn();
+    const { result } = renderHook(() =>
+      useCommandActions(baseArgs({ activeSession: active(), hasActiveSession: true, onSessionStateAction })),
+    );
+    result.current.find((a) => a.id === "session-state:archive:act")!.perform();
+    expect(onSessionStateAction).toHaveBeenCalledWith("act", "archive");
+  });
+
+  it("omits the toggles in read-only mode", () => {
+    const { result } = renderHook(() =>
+      useCommandActions(baseArgs({ activeSession: active(), hasActiveSession: true, readOnly: true })),
+    );
+    expect(ids(result.current).some((id) => id.startsWith("session-state:"))).toBe(false);
   });
 });

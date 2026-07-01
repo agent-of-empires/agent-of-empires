@@ -840,6 +840,13 @@
       ]
     },
     {
+      "id": "palette.session-triage",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/hooks/__tests__/useCommandActions.test.tsx"],
+      "components": ["web/src/hooks/useCommandActions.ts", "web/src/App.tsx"]
+    },
+    {
       "id": "sidebar.scratch-group",
       "kind": "mocked-playwright",
       "risk": "medium",

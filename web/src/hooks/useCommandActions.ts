@@ -48,15 +48,31 @@ export function buildConversationActions(
   });
 }
 
+// State toggles the palette offers for the active session. Each is shown only
+// in the matching direction: e.g. "unarchive" on an archived session, "archive"
+// otherwise. "snooze" needs a duration, so the host opens the snooze modal; the
+// rest are argless server toggles.
+export type SessionStateAction =
+  | "pin"
+  | "unpin"
+  | "archive"
+  | "unarchive"
+  | "snooze"
+  | "unsnooze"
+  | "trash"
+  | "untrash";
+
 interface Args {
   sessions: SessionResponse[];
   activeSessionId: string | null;
+  activeSession: SessionResponse | null;
   loginRequired: boolean;
   hasActiveSession: boolean;
   readOnly: boolean;
   onNewSession: () => void;
   onNewScratch: () => void;
   onSelectSession: (sessionId: string) => void;
+  onSessionStateAction: (sessionId: string, action: SessionStateAction) => void;
   onToggleDiff: () => void;
   onOpenSettings: () => void;
   onOpenHelp: () => void;
@@ -69,12 +85,14 @@ interface Args {
 export function useCommandActions({
   sessions,
   activeSessionId,
+  activeSession,
   loginRequired,
   hasActiveSession,
   readOnly,
   onNewSession,
   onNewScratch,
   onSelectSession,
+  onSessionStateAction,
   onToggleDiff,
   onOpenSettings,
   onOpenHelp,
@@ -128,6 +146,38 @@ export function useCommandActions({
         shortcut: "D",
         perform: onToggleDiff,
       });
+    }
+
+    // Triage toggles for the active session, each shown only in the applicable
+    // direction (unarchive on an archived session, archive otherwise, etc.).
+    // These mutate the server, so they are dropped in read-only mode.
+    if (!readOnly && activeSession) {
+      const a = activeSession;
+      const label = a.title || a.branch || "session";
+      const toggles: { verb: string; action: SessionStateAction; keywords: string[] }[] = [
+        a.pinned_at != null
+          ? { verb: "Unpin", action: "unpin", keywords: ["pin", "favorite", "sidebar"] }
+          : { verb: "Pin", action: "pin", keywords: ["pin", "favorite", "sidebar"] },
+        a.archived_at != null
+          ? { verb: "Unarchive", action: "unarchive", keywords: ["archive", "restore"] }
+          : { verb: "Archive", action: "archive", keywords: ["archive"] },
+        a.snoozed_until != null
+          ? { verb: "Unsnooze", action: "unsnooze", keywords: ["snooze", "wake"] }
+          : { verb: "Snooze…", action: "snooze", keywords: ["snooze", "later", "remind"] },
+        a.trashed_at != null
+          ? { verb: "Untrash", action: "untrash", keywords: ["trash", "restore", "delete"] }
+          : { verb: "Trash", action: "trash", keywords: ["trash", "delete", "remove"] },
+      ];
+      for (const t of toggles) {
+        actions.push({
+          id: `session-state:${t.action}:${a.id}`,
+          title: `${t.verb} ${label}`,
+          subtitle: "current session",
+          group: "Actions",
+          keywords: [...t.keywords, label, "session"],
+          perform: () => onSessionStateAction(a.id, t.action),
+        });
+      }
     }
 
     actions.push({
@@ -195,12 +245,14 @@ export function useCommandActions({
   }, [
     sessions,
     activeSessionId,
+    activeSession,
     loginRequired,
     hasActiveSession,
     readOnly,
     onNewSession,
     onNewScratch,
     onSelectSession,
+    onSessionStateAction,
     onToggleDiff,
     onOpenSettings,
     onOpenHelp,
