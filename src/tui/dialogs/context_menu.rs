@@ -95,11 +95,17 @@ impl ContextMenuDialog {
     /// and `Some(is_unread)` when it should appear, with the label flipping to
     /// "Mark read" for an already-unread row. Unlike snooze, the unread toggle
     /// is always-on (not gated to Attention sort), so it shows in any sort.
+    /// `can_fork` gates the "Fork session" row: it appears only when the
+    /// session's agent can actually fork (a forkable terminal agent, or a
+    /// structured agent advertising the ACP fork capability). A resume-only
+    /// agent like `aoe-agent` omits the row, matching the palette action's
+    /// refusal and the web sidebar's `acp_can_fork` gating.
     pub fn for_session(
         anchor: (u16, u16),
         is_archived: bool,
         snooze: Option<bool>,
         unread: Option<bool>,
+        can_fork: bool,
     ) -> Self {
         let archive_label = if is_archived { "Unarchive" } else { "Archive" };
         let mut items = vec![
@@ -120,7 +126,9 @@ impl ContextMenuDialog {
             items.push((ContextMenuAction::ToggleUnread, unread_label));
         }
         items.push((ContextMenuAction::Delete, "Delete"));
-        items.push((ContextMenuAction::Fork, "Fork session"));
+        if can_fork {
+            items.push((ContextMenuAction::Fork, "Fork session"));
+        }
         Self::new(anchor, items)
     }
 
@@ -412,14 +420,14 @@ mod tests {
 
     #[test]
     fn session_menu_starts_on_new_session() {
-        let menu = ContextMenuDialog::for_session((0, 0), false, Some(false), None);
+        let menu = ContextMenuDialog::for_session((0, 0), false, Some(false), None, true);
         assert_eq!(menu.selected_action(), ContextMenuAction::NewFromSelection);
     }
 
     #[test]
     fn down_then_enter_selects_rename() {
         // NewFromSelection -> Rename is one Down in the session menu.
-        let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false), None);
+        let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false), None, true);
         assert!(matches!(
             menu.handle_key(key(KeyCode::Down)),
             DialogResult::Continue
@@ -435,7 +443,7 @@ mod tests {
     fn down_thrice_then_enter_selects_snooze() {
         // NewSession -> Rename -> Archive -> Snooze is three Downs in the
         // 5-item session menu.
-        let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false), None);
+        let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false), None, true);
         menu.handle_key(key(KeyCode::Down));
         menu.handle_key(key(KeyCode::Down));
         menu.handle_key(key(KeyCode::Down));
@@ -448,7 +456,7 @@ mod tests {
 
     #[test]
     fn down_four_times_then_enter_selects_delete() {
-        let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false), None);
+        let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false), None, true);
         menu.handle_key(key(KeyCode::Down));
         menu.handle_key(key(KeyCode::Down));
         menu.handle_key(key(KeyCode::Down));
@@ -504,7 +512,7 @@ mod tests {
 
     #[test]
     fn archived_session_menu_labels_unarchive() {
-        let menu = ContextMenuDialog::for_session((0, 0), true, Some(false), None);
+        let menu = ContextMenuDialog::for_session((0, 0), true, Some(false), None, true);
         let labels: Vec<&str> = menu.items_for_test().iter().map(|(_, l)| *l).collect();
         assert_eq!(
             labels,
@@ -521,7 +529,7 @@ mod tests {
 
     #[test]
     fn snoozed_session_menu_labels_unsnooze() {
-        let menu = ContextMenuDialog::for_session((0, 0), false, Some(true), None);
+        let menu = ContextMenuDialog::for_session((0, 0), false, Some(true), None, true);
         let labels: Vec<&str> = menu.items_for_test().iter().map(|(_, l)| *l).collect();
         assert_eq!(
             labels,
@@ -538,7 +546,7 @@ mod tests {
 
     #[test]
     fn active_session_menu_lists_all_actions() {
-        let menu = ContextMenuDialog::for_session((0, 0), false, Some(false), None);
+        let menu = ContextMenuDialog::for_session((0, 0), false, Some(false), None, true);
         let items: Vec<ContextMenuAction> = menu.items_for_test().iter().map(|(a, _)| *a).collect();
         assert_eq!(
             items,
@@ -558,7 +566,7 @@ mod tests {
         // The session menu carries the prefill-from-row entry, so `n`/`N` must
         // resolve to NewFromSelection, matching the `'N'` keybinding's
         // new-from-selection behavior on a session.
-        let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false), None);
+        let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false), None, true);
         // Pre-select Fork (Up wraps to the last item) to prove the hotkey wins over the cursor.
         menu.handle_key(key(KeyCode::Up));
         let result = menu.handle_key(key(KeyCode::Char('n')));
@@ -571,7 +579,7 @@ mod tests {
     #[test]
     fn unread_row_appears_and_label_flips() {
         // Feature on, row read -> "Mark unread"; row unread -> "Mark read".
-        let read = ContextMenuDialog::for_session((0, 0), false, None, Some(false));
+        let read = ContextMenuDialog::for_session((0, 0), false, None, Some(false), true);
         let labels: Vec<&str> = read.items_for_test().iter().map(|(_, l)| *l).collect();
         assert_eq!(
             labels,
@@ -585,7 +593,7 @@ mod tests {
             ]
         );
 
-        let unread = ContextMenuDialog::for_session((0, 0), false, None, Some(true));
+        let unread = ContextMenuDialog::for_session((0, 0), false, None, Some(true), true);
         let labels: Vec<&str> = unread.items_for_test().iter().map(|(_, l)| *l).collect();
         assert_eq!(
             labels,
@@ -600,7 +608,7 @@ mod tests {
         );
 
         // Feature off (None) -> no unread row.
-        let off = ContextMenuDialog::for_session((0, 0), false, None, None);
+        let off = ContextMenuDialog::for_session((0, 0), false, None, None, true);
         let labels: Vec<&str> = off.items_for_test().iter().map(|(_, l)| *l).collect();
         assert_eq!(
             labels,
@@ -613,13 +621,13 @@ mod tests {
         // The unread quick-pick is case-insensitive like the menu's other
         // hotkeys (the home-view shortcut itself is Shift+U), and only fires
         // when the Unread row is present (feature enabled).
-        let mut menu = ContextMenuDialog::for_session((0, 0), false, None, Some(false));
+        let mut menu = ContextMenuDialog::for_session((0, 0), false, None, Some(false), true);
         assert!(matches!(
             menu.handle_key(key(KeyCode::Char('u'))),
             DialogResult::Submit(ContextMenuAction::ToggleUnread)
         ));
         // With no Unread row (feature off), `u` is inert.
-        let mut off = ContextMenuDialog::for_session((0, 0), false, None, None);
+        let mut off = ContextMenuDialog::for_session((0, 0), false, None, None, true);
         assert!(matches!(
             off.handle_key(key(KeyCode::Char('u'))),
             DialogResult::Continue
@@ -628,7 +636,7 @@ mod tests {
 
     #[test]
     fn h_hotkey_submits_toggle_snooze() {
-        let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false), None);
+        let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false), None, true);
         let result = menu.handle_key(key(KeyCode::Char('h')));
         assert!(matches!(
             result,
@@ -641,7 +649,7 @@ mod tests {
         // Outside Attention sort the caller passes `None`, so the menu drops to
         // the three always-available actions and `h` must not fire (it has no
         // Snooze item to resolve to), matching the Attention-gated keybinding.
-        let mut menu = ContextMenuDialog::for_session((0, 0), false, None, None);
+        let mut menu = ContextMenuDialog::for_session((0, 0), false, None, None, true);
         let labels: Vec<&str> = menu.items_for_test().iter().map(|(_, l)| *l).collect();
         assert_eq!(
             labels,
@@ -655,7 +663,7 @@ mod tests {
 
     #[test]
     fn z_hotkey_submits_toggle_archive() {
-        let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false), None);
+        let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false), None, true);
         let result = menu.handle_key(key(KeyCode::Char('z')));
         assert!(matches!(
             result,
@@ -665,7 +673,7 @@ mod tests {
 
     #[test]
     fn enter_on_default_submits_new_session() {
-        let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false), None);
+        let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false), None, true);
         let result = menu.handle_key(key(KeyCode::Enter));
         assert!(matches!(
             result,
@@ -675,14 +683,14 @@ mod tests {
 
     #[test]
     fn esc_cancels() {
-        let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false), None);
+        let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false), None, true);
         let result = menu.handle_key(key(KeyCode::Esc));
         assert!(matches!(result, DialogResult::Cancel));
     }
 
     #[test]
     fn up_wraps_from_first_to_last() {
-        let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false), None);
+        let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false), None, true);
         menu.handle_key(key(KeyCode::Up));
         let result = menu.handle_key(key(KeyCode::Enter));
         assert!(matches!(
@@ -693,7 +701,7 @@ mod tests {
 
     #[test]
     fn down_wraps_from_last_to_first() {
-        let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false), None);
+        let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false), None, true);
         // 6 items: Down x6 walks NewSession -> Rename -> Archive -> Snooze ->
         // Delete -> Fork -> back to NewSession.
         menu.handle_key(key(KeyCode::Down));
@@ -711,7 +719,7 @@ mod tests {
 
     #[test]
     fn r_hotkey_submits_rename() {
-        let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false), None);
+        let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false), None, true);
         // Pre-select Fork (Up wraps to the last item) to prove the hotkey
         // wins over the cursor.
         menu.handle_key(key(KeyCode::Up));
@@ -724,7 +732,7 @@ mod tests {
 
     #[test]
     fn d_hotkey_submits_delete() {
-        let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false), None);
+        let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false), None, true);
         let result = menu.handle_key(key(KeyCode::Char('d')));
         assert!(matches!(
             result,
@@ -756,21 +764,21 @@ mod tests {
     #[test]
     fn p_hotkey_inert_on_session_menu() {
         // The session menu has no pin entry, so `p` must not fire it.
-        let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false), None);
+        let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false), None, true);
         let result = menu.handle_key(key(KeyCode::Char('p')));
         assert!(matches!(result, DialogResult::Continue));
     }
 
     #[test]
     fn unknown_key_is_continue() {
-        let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false), None);
+        let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false), None, true);
         let result = menu.handle_key(key(KeyCode::Char('x')));
         assert!(matches!(result, DialogResult::Continue));
     }
 
     #[test]
     fn click_is_outside_before_render_is_true() {
-        let menu = ContextMenuDialog::for_session((10, 10), false, Some(false), None);
+        let menu = ContextMenuDialog::for_session((10, 10), false, Some(false), None, true);
         // Before a render captures `last_area`, every point should count
         // as "outside" so a stray click can't be mis-classified as "inside
         // the menu" and accidentally kept open.
@@ -785,7 +793,7 @@ mod tests {
 
     #[test]
     fn click_on_first_row_submits_new_session() {
-        let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false), None);
+        let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false), None, true);
         stub_render(&mut menu, 10, 10, 14, 7);
         // Item rows live inside the bordered block, so row y+1 is the
         // first item and y+2 is the second.
@@ -798,7 +806,7 @@ mod tests {
 
     #[test]
     fn click_on_second_row_submits_rename() {
-        let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false), None);
+        let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false), None, true);
         stub_render(&mut menu, 10, 10, 14, 7);
         let result = menu.handle_click(12, 12);
         assert!(matches!(
@@ -809,7 +817,7 @@ mod tests {
 
     #[test]
     fn click_on_third_row_submits_toggle_archive() {
-        let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false), None);
+        let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false), None, true);
         stub_render(&mut menu, 10, 10, 14, 7);
         let result = menu.handle_click(12, 13);
         assert!(matches!(
@@ -820,7 +828,7 @@ mod tests {
 
     #[test]
     fn click_on_fourth_row_submits_toggle_snooze() {
-        let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false), None);
+        let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false), None, true);
         stub_render(&mut menu, 10, 10, 14, 7);
         let result = menu.handle_click(12, 14);
         assert!(matches!(
@@ -831,7 +839,7 @@ mod tests {
 
     #[test]
     fn click_on_border_keeps_menu_open() {
-        let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false), None);
+        let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false), None, true);
         stub_render(&mut menu, 10, 10, 14, 4);
         // Top border row is y itself.
         let result = menu.handle_click(12, 10);
@@ -846,7 +854,7 @@ mod tests {
         // The router must reject both vertical borders or a click on
         // the right edge of the menu, at an item's y, would fire
         // Rename / Delete the same as clicking the label.
-        let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false), None);
+        let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false), None, true);
         stub_render(&mut menu, 10, 10, 14, 4);
         // (10, 11) = left vertical border, first item's row.
         assert!(matches!(
@@ -863,7 +871,7 @@ mod tests {
 
     #[test]
     fn click_outside_returns_none() {
-        let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false), None);
+        let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false), None, true);
         stub_render(&mut menu, 10, 10, 14, 4);
         let result = menu.handle_click(40, 40);
         assert!(result.is_none());
@@ -871,7 +879,7 @@ mod tests {
 
     #[test]
     fn hover_moves_highlight() {
-        let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false), None);
+        let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false), None, true);
         stub_render(&mut menu, 10, 10, 14, 7);
         assert_eq!(menu.selected_action(), ContextMenuAction::NewFromSelection);
         let changed = menu.handle_hover(12, 12);
@@ -881,7 +889,7 @@ mod tests {
 
     #[test]
     fn hover_on_same_row_returns_false() {
-        let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false), None);
+        let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false), None, true);
         stub_render(&mut menu, 10, 10, 14, 4);
         // First hover lands on row 1 (Rename, already selected).
         assert!(!menu.handle_hover(12, 11));
@@ -891,7 +899,7 @@ mod tests {
 
     #[test]
     fn hover_off_menu_clears_the_highlight() {
-        let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false), None);
+        let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false), None, true);
         stub_render(&mut menu, 10, 10, 14, 7);
         menu.handle_hover(12, 15); // Delete (fifth row, index 4)
         assert_eq!(menu.highlight_for_test(), Some(4));
@@ -912,7 +920,7 @@ mod tests {
         // Regression for the reported bug: hovering an item then sliding
         // onto the menu's own border (still inside `last_area`, but not an
         // item row) must unhighlight rather than leave the item lit.
-        let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false), None);
+        let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false), None, true);
         stub_render(&mut menu, 10, 10, 14, 7);
         menu.handle_hover(12, 12); // Rename (second row)
         assert_eq!(menu.highlight_for_test(), Some(1));
@@ -925,7 +933,7 @@ mod tests {
     fn enter_after_hover_cleared_keeps_menu_open() {
         // With nothing highlighted, Enter has no item to submit, so the
         // menu stays open instead of firing a stale action.
-        let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false), None);
+        let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false), None, true);
         stub_render(&mut menu, 10, 10, 14, 7);
         menu.handle_hover(40, 40); // off every item -> None
         assert!(matches!(
@@ -936,7 +944,7 @@ mod tests {
 
     #[test]
     fn arrow_down_after_hover_cleared_starts_at_first_item() {
-        let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false), None);
+        let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false), None, true);
         stub_render(&mut menu, 10, 10, 14, 7);
         menu.handle_hover(40, 40); // off every item -> None
         menu.handle_key(key(KeyCode::Down));
@@ -945,7 +953,7 @@ mod tests {
 
     #[test]
     fn arrow_up_after_hover_cleared_starts_at_last_item() {
-        let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false), None);
+        let mut menu = ContextMenuDialog::for_session((10, 10), false, Some(false), None, true);
         stub_render(&mut menu, 10, 10, 14, 7);
         menu.handle_hover(40, 40); // off every item -> None
         menu.handle_key(key(KeyCode::Up));

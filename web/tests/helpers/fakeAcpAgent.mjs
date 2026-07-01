@@ -568,6 +568,15 @@ async function handleRequest(msg) {
     }
 
     case "session/fork": {
+      // Test hook: FAKE_ACP_FORK_FAIL makes the adapter reject session/fork the
+      // way a permanent agent-side failure would (parent GC'd, protocol error,
+      // build without fork). The Rust side must fail the spawn cleanly and
+      // clear fork_pending (no reconciler retry loop) rather than fall through
+      // to session/new. Mirrors the other failure knobs (e.g. RATE_LIMIT).
+      if (process.env.FAKE_ACP_FORK_FAIL) {
+        sendError(id, -32000, "fork failed: parent session not found");
+        return;
+      }
       // Mirror claude-agent-acp's unstable_forkSession: mint a brand-new
       // session id distinct from the parent (params.sessionId) rather than
       // echoing it, and carry the same configOptions shape session/new ships

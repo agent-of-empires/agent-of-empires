@@ -1665,9 +1665,21 @@ impl<S: BroadcastSink> Supervisor<S> {
                                             target: "acp.supervisor",
                                             session = %session_id,
                                             %reason,
-                                            "clearing cached id after session/load failure"
+                                            "clearing cached id and any pending fork after a context reset"
                                         );
                                         spawn_config.stored_acp_session_id = None;
+                                        // Also drop any pending fork: a reset is
+                                        // emitted when session/fork fails or the
+                                        // agent can't fork. Without clearing this,
+                                        // a crash-respawn re-reads fork_from and
+                                        // re-issues the same failing session/fork
+                                        // (a bounded retry loop up to the respawn
+                                        // budget), and a healthy fork-unsupported
+                                        // fallback re-emits this reset on every
+                                        // respawn. The fork is one-shot; a respawn
+                                        // must resume the child (session/load), not
+                                        // re-fork the parent.
+                                        spawn_config.fork_from = None;
                                     }
                                 }
                                 super::worker_registry::update_stored_acp_session_id(

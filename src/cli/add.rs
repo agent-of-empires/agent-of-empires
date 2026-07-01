@@ -245,7 +245,9 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     // parent with no captured session bails without orphaning a worktree or
     // scratch directory. The instance does not exist yet, so the seed is held
     // and applied once the instance is built.
-    let resolved_tool = resolve_tool_for_add(&args, &config)?;
+    // `mut` because a `--fork-from` with no explicit `--tool`/`--cmd` inherits
+    // the parent's agent below.
+    let mut resolved_tool = resolve_tool_for_add(&args, &config)?;
 
     // `--fork-from` performs a TERMINAL fork (it seeds `agent_session_id` + a
     // one-shot Fork resume intent). Pairing it with a structured-view request
@@ -264,6 +266,75 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             "`--fork-from` performs a terminal fork and cannot be combined with \
              --structured-view or --agent; structured fork is available from the web dashboard."
         );
+    }
+
+    // A terminal fork resumes the parent's captured conversation in place: the
+    // agent finds that conversation by session id under the SAME working
+    // directory and filesystem view. Flags that move the cwd (`--worktree` /
+    // `--new-branch` / `--scratch`) or swap the filesystem (`--sandbox` /
+    // `--sandbox-image`) silently break that lookup, and a user-supplied launch
+    // command carrying its own resume/fork flags collides with the ones the
+    // Fork intent appends. Reject these up front (before any resource creation)
+    // rather than launch a fork that can't find its parent. See PR review.
+    if args.fork_from.is_some() {
+        if args.worktree_branch.is_some() || args.create_branch {
+            bail!(
+                "`--fork-from` cannot be combined with --worktree or --new-branch: a fork must run \
+                 in the parent's working directory to resume its conversation."
+            );
+        }
+        if args.scratch {
+            bail!(
+                "`--fork-from` cannot be combined with --scratch: a scratch session runs in a fresh \
+                 temporary directory, so the fork could not resume the parent's conversation."
+            );
+        }
+        if args.sandbox || args.sandbox_image.is_some() {
+            bail!(
+                "`--fork-from` cannot be combined with --sandbox or --sandbox-image: the sandbox \
+                 changes the agent's filesystem view and breaks the resumed conversation."
+            );
+        }
+        // --cmd-override swaps the launched binary out from under the tool: the
+        // Fork intent builds its resume+fork flags for `instance.tool`, but the
+        // override binary may be a different agent that rejects them (or, worse,
+        // a different agent handed the parent's agent-shaped id). Reject the
+        // pair rather than launch a cross-agent fork the tool check can't see.
+        if args.cmd_override.is_some() {
+            bail!(
+                "`--fork-from` cannot be combined with --cmd-override: overriding the agent binary \
+                 decouples it from the parent's agent, so the fork's resume flags may not apply."
+            );
+        }
+        // The Fork intent appends the agent's own resume+fork flags: claude
+        // `--resume`/`--session-id`/`--fork-session`, opencode `--session`/
+        // `--fork`, codex `resume`/`fork` subcommands. A launch command that
+        // already carries any of them produces a duplicate/conflicting
+        // invocation. Match at WORD granularity (not raw substring) so a path
+        // or unrelated arg containing "fork"/"resume" (e.g. `--model resume-v2`
+        // or `/src/fork-utils`) doesn't false-trip, while `--session=ID` and the
+        // codex `fork`/`resume` subcommands still do.
+        let collides_with_fork_flags = |cmd: &str| {
+            cmd.split_whitespace().any(|w| {
+                w == "resume"
+                    || w == "fork"
+                    || w.starts_with("--resume")
+                    || w.starts_with("--session")
+                    || w.starts_with("--fork")
+            })
+        };
+        for input in [args.command.as_deref(), args.extra_args.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            if collides_with_fork_flags(input) {
+                bail!(
+                    "`--fork-from` cannot be combined with a launch command (--cmd or --extra-args) \
+                     that already contains a resume or fork flag/subcommand: the fork appends its \
+                     own resume flags, which would collide."
+                );
+            }
+        }
     }
 
     // Validate fork eligibility eagerly and produce the one-shot seed. This is
@@ -285,6 +356,26 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 "Cannot fork from session '{}': its own fork has not launched yet. Start it once, then fork from the child conversation.",
                 source.title
             );
+        }
+        // The child must fork the SAME agent as the parent: a captured id is
+        // agent-shaped (a Claude UUID resumes only under Claude, etc.), so
+        // handing it to a different agent's `--resume` fails or resumes garbage.
+        // When the user did not explicitly choose a tool (`--tool`/`--cmd`),
+        // inherit the parent's; when they did and it differs, reject rather than
+        // launch a cross-agent fork.
+        let user_chose_tool = args.tool.is_some() || args.command.is_some();
+        if user_chose_tool && resolved_tool != source.tool {
+            bail!(
+                "Cannot fork session '{}' (agent '{}') as agent '{}': a fork must use the parent's \
+                 agent. Drop --tool/--cmd to inherit it, or fork a session created with '{}'.",
+                source.title,
+                source.tool,
+                resolved_tool,
+                resolved_tool
+            );
+        }
+        if !user_chose_tool {
+            resolved_tool = source.tool.clone();
         }
         let parent_agent_session_id = source.agent_session_id.clone();
         let seed = crate::session::fork::terminal_fork_seed(

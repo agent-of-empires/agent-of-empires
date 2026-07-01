@@ -5334,8 +5334,10 @@ async fn run_connection_task<W, R>(
                     // persist via AcpSessionAssigned. Tried before the load/new
                     // decision so a fork never falls through to session/new
                     // (which would hand the user an empty session they believe
-                    // is a fork). On fork failure we return Err and leave
-                    // fork_pending set for a retry rather than masking it.
+                    // is a fork). On fork failure we emit SessionContextReset
+                    // (which clears the one-shot fork marker so the reconciler
+                    // and supervisor stop re-forking) and then return Err to
+                    // fail the spawn rather than silently masking it.
                     let fork_capable = init.agent_capabilities.session_capabilities.fork.is_some();
                     if should_fork(fork_from.as_deref(), fork_capable) {
                         let parent = fork_from.clone().unwrap();
@@ -5420,9 +5422,39 @@ async fn run_connection_task<W, R>(
                                     parent_acp_id = %parent,
                                     "session/fork failed; failing spawn (no session/new fallback): {e}"
                                 );
+                                // Clear the one-shot fork marker via a reset
+                                // event before failing: without it the reconciler
+                                // re-reads fork_pending and re-issues the same
+                                // failing session/fork on every reattach, wedging
+                                // the instance in a retry loop. The reset also
+                                // gives the dashboard a user-visible reason.
+                                let _ = event_tx_for_block
+                                    .send(Event::SessionContextReset {
+                                        reason: format!("fork_failed: {e}"),
+                                    })
+                                    .await;
                                 return Err(e);
                             }
                         }
+                    } else if fork_from.as_deref().is_some_and(|s| !s.is_empty()) {
+                        // A fork was requested but the connected agent does not
+                        // advertise the fork capability (e.g. a resume-only
+                        // adapter, or a claude-agent-acp build without fork).
+                        // The create-time surfaces gate on this, but a runtime
+                        // agent swap can still land here. Rather than silently
+                        // presenting an empty session/new that the user believes
+                        // is a fork, emit a reset so the marker clears (no retry
+                        // loop) and the dashboard can explain the downgrade.
+                        warn!(
+                            target: "acp.protocol",
+                            session = %session_label,
+                            "fork requested but agent does not advertise fork; falling back to session/new"
+                        );
+                        let _ = event_tx_for_block
+                            .send(Event::SessionContextReset {
+                                reason: "fork_unsupported_by_agent".to_string(),
+                            })
+                            .await;
                     }
 
                     if acp_session_id.is_none() && load_session_capable {
@@ -7335,6 +7367,40 @@ mod tests {
         assert!(!should_fork(Some("parent"), false)); // adapter can't fork (e.g. aoe-agent)
         assert!(!should_fork(None, true));
         assert!(!should_fork(Some(""), true));
+    }
+
+    /// Pin the ACP fork wire shape our production path reads, against the
+    /// `agent_client_protocol` serde derives. `should_fork` keys off
+    /// `agent_capabilities.session_capabilities.fork.is_some()`, and the fork
+    /// response is read via `resp.session_id`. If upstream renames either key
+    /// (e.g. `fork` -> `session_fork`, or `sessionId` casing), these
+    /// deserializations flip: the capability would read absent (silent
+    /// `session/new` downgrade in production) or the response would fail to
+    /// parse. The fake agent (`web/tests/helpers/fakeAcpAgent.mjs`) sends these
+    /// exact keys, so pinning them here catches an upstream drift that the fake
+    /// would otherwise mask. See PR review.
+    #[test]
+    fn acp_fork_capability_and_response_wire_keys_are_stable() {
+        use agent_client_protocol::schema::{ForkSessionResponse, SessionCapabilities};
+
+        // The fork capability is advertised as a `"fork": {}` object nested in
+        // the session capabilities the agent returns from `initialize`.
+        let caps: SessionCapabilities =
+            serde_json::from_value(serde_json::json!({ "fork": {} })).expect("caps parse");
+        assert!(
+            caps.fork.is_some(),
+            "the `fork` capability key must deserialize into SessionCapabilities.fork"
+        );
+        // Absent/`null` fork must read as not-forkable (the resume-only shape).
+        let no_fork: SessionCapabilities =
+            serde_json::from_value(serde_json::json!({})).expect("empty caps parse");
+        assert!(no_fork.fork.is_none());
+
+        // The fork response identifies the child session under `sessionId`.
+        let resp: ForkSessionResponse =
+            serde_json::from_value(serde_json::json!({ "sessionId": "child-123" }))
+                .expect("fork response parse");
+        assert_eq!(resp.session_id.0.as_ref(), "child-123");
     }
 
     // truncate_for_log is the adapter-error sanitizer in the

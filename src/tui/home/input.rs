@@ -2664,6 +2664,35 @@ impl HomeView {
         }
     }
 
+    /// Whether the session `id` can be forked, so the context menu shows the
+    /// "Fork session" row only when the palette action would succeed. A
+    /// structured parent needs an agent advertising the ACP fork capability; a
+    /// terminal parent needs a forkable terminal agent (claude/codex/opencode).
+    /// The captured-conversation precondition is intentionally NOT checked here:
+    /// the row still shows for a not-yet-started session, and the palette action
+    /// explains "nothing to fork yet" if the user picks it, matching how other
+    /// rows stay visible and explain on use.
+    pub(super) fn session_can_fork(&self, id: &str) -> bool {
+        let Some(inst) = self.get_instance(id) else {
+            return false;
+        };
+        if inst.is_structured() {
+            #[cfg(feature = "serve")]
+            {
+                crate::session::fork::structured_fork_capable(
+                    &inst.tool,
+                    inst.agent_name.as_deref(),
+                )
+            }
+            #[cfg(not(feature = "serve"))]
+            {
+                false
+            }
+        } else {
+            crate::session::fork::terminal_agent_can_fork(&inst.tool)
+        }
+    }
+
     /// Open the new-session dialog seeded as a fork of the selected session.
     /// The forked session resumes the parent's captured conversation in a fresh
     /// independent session id, so it can diverge without disturbing the parent.
@@ -2702,6 +2731,8 @@ impl HomeView {
         let title = parent.title.clone();
         let parent_is_structured = parent.is_structured();
         #[cfg(feature = "serve")]
+        let parent_agent_name = parent.agent_name.clone();
+        #[cfg(feature = "serve")]
         let parent_acp_session_id = parent.acp_session_id.clone();
 
         let seed = if parent_is_structured {
@@ -2711,6 +2742,26 @@ impl HomeView {
             // conversation to fork yet.
             #[cfg(feature = "serve")]
             {
+                // Gate on the same predicate the REST create-guard and the web
+                // `acp_can_fork` projection use: a resume-only ACP agent (e.g.
+                // `aoe-agent`) has no fork strategy, so `session/fork` would be
+                // refused at the handshake and silently downgrade to
+                // `session/new`, handing the user an empty session they think is
+                // a fork. Refuse up front with the same info dialog terminal
+                // denial uses.
+                if !crate::session::fork::structured_fork_capable(
+                    &tool,
+                    parent_agent_name.as_deref(),
+                ) {
+                    self.info_dialog = Some(InfoDialog::new(
+                        "Fork not supported",
+                        &format!(
+                            "The '{}' agent cannot fork a structured session. Fork is available for agents that support the ACP fork capability, such as Claude.",
+                            tool
+                        ),
+                    ));
+                    return;
+                }
                 let Some(acp_id) = parent_acp_session_id.filter(|s| !s.is_empty()) else {
                     self.info_dialog = Some(InfoDialog::new(
                         "Nothing to fork yet",
@@ -3907,7 +3958,14 @@ impl HomeView {
                 // The unread toggle is always-on (any sort), so it shows
                 // whenever the feature is enabled.
                 let unread = crate::session::unread_enabled().then_some(is_unread);
-                ContextMenuDialog::for_session(anchor, is_archived, snooze, unread)
+                // Show "Fork session" only when the agent can actually fork, so
+                // a resume-only agent doesn't offer an action the palette would
+                // refuse. Matches the web sidebar's `acp_can_fork` gating.
+                let can_fork = match &self.flat_items[idx] {
+                    super::Item::Session { id, .. } => self.session_can_fork(id),
+                    super::Item::Group { .. } => false,
+                };
+                ContextMenuDialog::for_session(anchor, is_archived, snooze, unread, can_fork)
             });
             return true;
         }

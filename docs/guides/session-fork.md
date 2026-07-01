@@ -26,6 +26,8 @@ aoe add --fork-from <session-id-or-title>
 
 This creates a terminal session that resumes the source's conversation and then runs independently.
 
+The fork inherits the parent's agent by default, so you normally omit `--tool` / `--cmd`. If you do pass one, it must match the parent's agent: a captured conversation is agent-specific, so forking a Claude session as Codex is rejected rather than run against the wrong agent. Because a fork must run in the parent's working directory and filesystem to resolve the prior conversation, `--fork-from` cannot be combined with `--worktree` / `--new-branch`, `--sandbox` / `--sandbox-image`, or a `--cmd` that already carries its own `--resume` flags.
+
 ## What gets inherited
 
 The fork inherits:

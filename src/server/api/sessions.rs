@@ -3721,25 +3721,13 @@ fn both_import_and_fork_set(body: &CreateSessionBody) -> bool {
     set(&body.import_acp_session_id) && set(&body.fork_from)
 }
 
-/// True when `tool`/`agent_name` can run the structured ACP `session/fork`
-/// handshake: ACP-capable AND declaring a real (non-`Unsupported`) fork
-/// strategy. This is the single source of truth shared by the
-/// `SessionResponse.acp_can_fork` projection (the web "Fork" affordance) and the
-/// create-time guard, so the two cannot drift. A resume-only ACP agent such as
-/// the bundled `aoe-agent` is ACP-capable yet declares no fork strategy, so it
-/// reads false here; gating only on ACP-capability would accept a structured
-/// fork that can only fail later at the live handshake.
-///
-/// Custom agents are absent from `get_agent`, so they default to not forkable,
-/// matching `acp_can_fork` (no custom agent currently exposes a structured
-/// fork). Treating an unknown custom agent as forkable here would diverge from
-/// the web signal and accept a create that the handshake then rejects.
+/// Thin server-side alias for [`crate::session::fork::structured_fork_capable`],
+/// the single source of truth for "can this agent run the ACP `session/fork`
+/// handshake?". Shared by the `SessionResponse.acp_can_fork` projection (the web
+/// "Fork" affordance) and the create-time guard so they cannot drift.
 #[cfg(feature = "serve")]
 fn agent_is_structured_fork_capable(tool: &str, agent_name: Option<&str>) -> bool {
-    let resolved = agent_name.filter(|s| !s.is_empty()).unwrap_or(tool);
-    builtin_acp_registry().get(resolved).is_some()
-        && crate::agents::get_agent(resolved)
-            .is_some_and(|a| !matches!(a.fork_strategy, crate::agents::ForkStrategy::Unsupported))
+    crate::session::fork::structured_fork_capable(tool, agent_name)
 }
 
 fn validate_session_tool_identity(

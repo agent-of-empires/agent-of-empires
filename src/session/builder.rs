@@ -730,7 +730,6 @@ pub fn build_instance(
                     from: parent_agent_session_id,
                 };
             }
-            #[cfg_attr(not(feature = "serve"), allow(unused_variables))]
             crate::session::ForkSeed::Structured {
                 parent_acp_session_id,
             } => {
@@ -738,13 +737,17 @@ pub fn build_instance(
                 // for the ACP session/fork handshake, and replay history into
                 // the (empty) event store on first connect. The marker fields
                 // live behind the serve feature, so without it a structured
-                // fork is inapplicable and this arm is a no-op.
+                // fork is inapplicable and this arm is a no-op. Bind the field
+                // to `_` on bare-core so the destructure reads it without an
+                // `allow(unused_variables)` suppression (AGENTS.md).
                 #[cfg(feature = "serve")]
                 {
                     instance.view = crate::session::View::Structured;
                     instance.fork_pending = Some(parent_acp_session_id);
                     instance.import_pending = Some(true);
                 }
+                #[cfg(not(feature = "serve"))]
+                let _ = parent_acp_session_id;
             }
         }
     }
@@ -1861,6 +1864,51 @@ mod tests {
             "fork intent must carry the parent id in `from`, got {:?}",
             inst.resume_intent
         );
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn build_instance_applies_structured_fork_seed() {
+        use crate::session::ForkSeed;
+        let params = InstanceParams {
+            title: "Forked".into(),
+            path: "/tmp".into(),
+            group: String::new(),
+            tool: "claude".into(),
+            worktree_enabled: false,
+            worktree_branch: None,
+            create_new_branch: false,
+            base_branch: None,
+            sandbox: false,
+            sandbox_image: String::new(),
+            yolo_mode: false,
+            extra_env: vec![],
+            extra_args: String::new(),
+            command_override: String::new(),
+            extra_repo_paths: vec![],
+            scratch: false,
+            fork_seed: Some(ForkSeed::Structured {
+                parent_acp_session_id: "parent-acp-id".into(),
+            }),
+        };
+        let inst = build_instance(params, &[], &[], "default")
+            .unwrap()
+            .instance;
+        // The structured arm forces the structured view and sets the two paired
+        // one-shot markers: fork_pending carries the parent for session/fork,
+        // and import_pending replays history into the fresh event store. A
+        // regression on any of the three should fail here, not only in the
+        // aggregate structured e2e.
+        assert_eq!(inst.view, crate::session::View::Structured);
+        assert_eq!(inst.fork_pending.as_deref(), Some("parent-acp-id"));
+        assert_eq!(inst.import_pending, Some(true));
+        // Structured fork does not pre-pin an agent id (the adapter mints the
+        // child id at handshake) and leaves the terminal Fork intent unset.
+        assert!(inst.agent_session_id.is_none());
+        assert!(!matches!(
+            inst.resume_intent,
+            crate::session::instance::ResumeIntent::Fork { .. }
+        ));
     }
 
     #[test]

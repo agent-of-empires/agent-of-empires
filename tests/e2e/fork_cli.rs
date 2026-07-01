@@ -144,6 +144,158 @@ fn fork_from_seeds_child_with_fork_intent() {
     );
 }
 
+/// Seed a claude parent titled `title` with a captured agent id so a fork of it
+/// passes the "nothing to fork yet" gate. Returns the captured id.
+fn seed_claude_parent(h: &TuiTestHarness, project: &std::path::Path, title: &str) -> String {
+    let parent = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "--cmd",
+        "claude",
+        "-t",
+        title,
+    ]);
+    assert!(parent.status.success(), "aoe add parent '{title}' failed");
+    let parent_agent_id = "11111111-2222-3333-4444-555555555555";
+    let mut sessions = read_sessions(h);
+    let arr = sessions.as_array_mut().expect("sessions array");
+    arr.iter_mut()
+        .find(|s| s["title"].as_str() == Some(title))
+        .expect("parent present")["agent_session_id"] =
+        serde_json::Value::String(parent_agent_id.to_string());
+    std::fs::write(
+        sessions_path(h),
+        serde_json::to_string_pretty(&sessions).unwrap(),
+    )
+    .expect("write seeded sessions.json");
+    parent_agent_id.to_string()
+}
+
+/// Forking a claude parent while explicitly selecting a DIFFERENT agent is
+/// refused: a captured id is agent-specific, so handing a Claude id to another
+/// agent's resume would fail or resume garbage. With no `--tool`/`--cmd`, the
+/// fork inherits the parent's agent and succeeds.
+#[test]
+#[serial]
+fn fork_from_mismatched_tool_is_refused_but_inherits_when_unset() {
+    let mut h = TuiTestHarness::new("fork_cli_tool_match");
+    let project = h.project_path();
+    h.install_path_command("gemini");
+    seed_claude_parent(&h, &project, "MatchParent");
+
+    // Explicit mismatched --tool: rejected.
+    let mismatched = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "--tool",
+        "gemini",
+        "-t",
+        "MismatchChild",
+        "--fork-from",
+        "MatchParent",
+    ]);
+    assert!(
+        !mismatched.status.success(),
+        "forking a claude parent as gemini must be refused"
+    );
+    let stderr = String::from_utf8_lossy(&mismatched.stderr);
+    assert!(
+        stderr.contains("must use the parent's agent"),
+        "expected a parent-agent-mismatch message, got: {stderr}"
+    );
+
+    // No --tool/--cmd: inherits the parent's agent (claude) and succeeds.
+    let inherited = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "-t",
+        "InheritChild",
+        "--fork-from",
+        "MatchParent",
+    ]);
+    assert!(
+        inherited.status.success(),
+        "fork with no explicit tool must inherit the parent's agent and succeed: {}",
+        String::from_utf8_lossy(&inherited.stderr)
+    );
+    let sessions = read_sessions(&h);
+    assert_eq!(
+        session_by_title(&sessions, "InheritChild")["tool"].as_str(),
+        Some("claude"),
+        "inherited fork must run the parent's agent"
+    );
+}
+
+/// `--fork-from` is fenced against flags that change the working directory or
+/// filesystem view, or that carry their own resume/fork flags: a fork must run
+/// in the parent's directory to resume the conversation. Each combination is
+/// rejected up front.
+#[test]
+#[serial]
+fn fork_from_rejects_conflicting_flags() {
+    let h = TuiTestHarness::new("fork_cli_flag_mutex");
+    let project = h.project_path();
+    seed_claude_parent(&h, &project, "FenceParent");
+
+    let base = |extra: &[&str]| {
+        let mut args = vec!["add", project.to_str().unwrap(), "--cmd", "claude"];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&["--fork-from", "FenceParent"]);
+        args.into_iter().map(str::to_string).collect::<Vec<_>>()
+    };
+
+    for (label, extra) in [
+        ("worktree", vec!["-t", "W", "--worktree", "wt-branch"]),
+        ("scratch", vec!["-t", "S", "--scratch"]),
+        ("sandbox", vec!["-t", "B", "--sandbox"]),
+    ] {
+        let args = base(&extra);
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = h.run_cli(&refs);
+        assert!(
+            !out.status.success(),
+            "`--fork-from` with --{label} must be refused"
+        );
+    }
+
+    // A launch command carrying its own resume/fork flags collides with the
+    // fork's appended flags; rejected. Covers claude's --resume flag and codex's
+    // bare `fork` subcommand (word-level match, not just claude's --flags).
+    for cmd in ["claude --resume abc", "codex fork abc"] {
+        let out = h.run_cli(&[
+            "add",
+            project.to_str().unwrap(),
+            "--cmd",
+            cmd,
+            "-t",
+            "R",
+            "--fork-from",
+            "FenceParent",
+        ]);
+        assert!(
+            !out.status.success(),
+            "`--fork-from` with a --cmd carrying a resume/fork flag ({cmd}) must be refused"
+        );
+    }
+
+    // --cmd-override swaps the binary out from under the tool, decoupling it
+    // from the parent's agent and its fork flags; rejected.
+    let out = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "--cmd-override",
+        "some-other-binary",
+        "-t",
+        "O",
+        "--fork-from",
+        "FenceParent",
+    ]);
+    assert!(
+        !out.status.success(),
+        "`--fork-from` with --cmd-override must be refused"
+    );
+}
+
 /// Forking a parent that never captured an agent session is refused with a
 /// clear "Nothing to fork" message, and no child session is persisted.
 #[test]
@@ -195,18 +347,17 @@ fn fork_from_parent_without_agent_session_is_refused() {
     );
 }
 
-/// A refused `--scratch --fork-from` must not orphan a scratch directory. The
-/// fork-eligibility gate runs before scratch provisioning, so a denial returns
-/// before any directory is created: the scratch root stays empty (or absent),
-/// and no child session is persisted.
+/// `--scratch --fork-from` is refused (a scratch session runs in a fresh temp
+/// dir, so the fork could not resume the parent's conversation), and the refusal
+/// must not orphan a scratch directory. The mutex fires before scratch
+/// provisioning, so the scratch root stays empty (or absent) and no child
+/// session is persisted.
 #[test]
 #[serial]
 fn refused_scratch_fork_leaves_no_orphaned_dir() {
     let h = TuiTestHarness::new("fork_cli_scratch_no_leak");
     let project = h.project_path();
 
-    // A bare parent with no captured agent session: enough to make the fork
-    // gate refuse on the NoParentSession path.
     let parent = h.run_cli(&[
         "add",
         project.to_str().unwrap(),
@@ -240,12 +391,12 @@ fn refused_scratch_fork_leaves_no_orphaned_dir() {
     ]);
     assert!(
         !child.status.success(),
-        "scratch fork from a session with no captured agent id must fail"
+        "a scratch fork must be refused (scratch cwd cannot resume the parent)"
     );
     let stderr = String::from_utf8_lossy(&child.stderr);
     assert!(
-        stderr.contains("Nothing to fork"),
-        "expected a 'Nothing to fork' message, got: {stderr}"
+        stderr.contains("--scratch"),
+        "expected a '--scratch cannot be combined' message, got: {stderr}"
     );
 
     // Leak check: the denial fires before scratch provisioning, so no scratch
@@ -457,13 +608,16 @@ fn fork_from_unforkable_agent_is_refused() {
     // is the only thing that can reject the request.
     h.install_path_command("gemini");
 
-    // A parent in the same project; its tool is irrelevant since the child's
-    // own tool (gemini) is what the fork gate checks.
+    // The parent must use the SAME agent as the fork (gemini): a fork inherits
+    // (or must match) the parent's agent, so a claude parent forked as gemini
+    // would be rejected for tool mismatch, not for the agent being unforkable.
+    // Making the parent gemini too isolates the unforkable-agent gate as the
+    // only possible rejection.
     let parent = h.run_cli(&[
         "add",
         project.to_str().unwrap(),
-        "--cmd",
-        "claude",
+        "--tool",
+        "gemini",
         "-t",
         "GemParent",
     ]);

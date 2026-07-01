@@ -97,6 +97,15 @@ fn wait_for_acp_id(h: &TuiTestHarness, title: &str, timeout: Duration) -> String
     }
 }
 
+/// Read the raw session object titled `title`, if present.
+fn session_by_title(h: &TuiTestHarness, title: &str) -> Option<serde_json::Value> {
+    read_sessions(h)
+        .as_array()?
+        .iter()
+        .find(|s| s["title"].as_str() == Some(title))
+        .cloned()
+}
+
 #[test]
 #[serial]
 fn structured_fork_mints_distinct_child_id_and_preserves_parent() {
@@ -265,4 +274,225 @@ fn structured_fork_mints_distinct_child_id_and_preserves_parent() {
         "fork_pending must be cleared after the forked id is assigned, got: {:?}",
         child["fork_pending"]
     );
+}
+
+/// A structured fork whose `session/fork` handshake fails (the agent rejects it,
+/// simulated by `FAKE_ACP_FORK_FAIL`) must fail the spawn cleanly and clear the
+/// one-shot `fork_pending` marker so the fork is not silently downgraded to a
+/// `session/new`. Without the reset on the Err path (PR-review Required #3), the
+/// child would wedge re-issuing the same failing fork; here we assert the
+/// observable end state: the marker clears, the child never captures a forked
+/// id, and the parent is untouched. (This asserts the settled state, not the
+/// attempt count; the no-re-fork-loop guard is unit-tested at the
+/// supervisor/reducer level.)
+#[test]
+#[serial]
+fn structured_fork_failure_clears_fork_pending_and_fails_cleanly() {
+    require_tmux!();
+    require_node!();
+
+    let mut h = TuiTestHarness::new_in_tmp("fork_structured_fail");
+
+    // Make the fake reject session/fork. Must be set BEFORE install_acp_shim so
+    // the knob is baked into the shim: the daemon strips arbitrary env before
+    // spawning the worker, so a daemon-env knob would never reach the fake.
+    h.set_acp_fork_fail();
+    let script_path = h.home_path().join("fork-script.json");
+    std::fs::write(&script_path, "{}").expect("write fake-acp script");
+    h.install_acp_shim(&script_path);
+    h.stop_daemon_on_drop();
+
+    let project = h.project_path();
+    for args in [
+        vec!["init", "-q"],
+        vec!["commit", "--allow-empty", "-q", "-m", "init"],
+    ] {
+        let out = std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&project)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("run git");
+        assert!(out.status.success(), "git {:?} failed", args);
+    }
+
+    let port = pick_free_port();
+    let port_s = port.to_string();
+    let start = h.run_cli(&["serve", "--daemon", "--port", &port_s, "--no-auth"]);
+    assert!(start.status.success(), "aoe serve --daemon failed");
+    assert!(
+        wait_for_port(port, Duration::from_secs(10)),
+        "daemon never bound port {port}"
+    );
+
+    // Parent uses session/new (FAKE_ACP_FORK_FAIL only trips session/fork), so
+    // it captures an acp id normally.
+    let add = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "-t",
+        "FailParent",
+        "-c",
+        "claude",
+        "--structured-view",
+    ]);
+    assert!(add.status.success(), "aoe add --structured-view failed");
+    let parent_acp_id = wait_for_acp_id(&h, "FailParent", Duration::from_secs(45));
+
+    // Request the structured fork; the child's worker will issue session/fork,
+    // which the fake rejects.
+    let project_str = project.to_str().unwrap().to_string();
+    let parent_acp_for_post = parent_acp_id.clone();
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let post: Result<(), String> = rt.block_on(async move {
+        let base = format!("http://127.0.0.1:{port}");
+        let client = reqwest::Client::builder()
+            .build()
+            .map_err(|e| format!("build client: {e}"))?;
+        let resp = client
+            .post(format!("{base}/api/sessions"))
+            .json(&serde_json::json!({
+                "title": "FailChild",
+                "path": project_str,
+                "tool": "claude",
+                "view": "structured",
+                "fork_from": parent_acp_for_post,
+            }))
+            .send()
+            .await
+            .map_err(|e| format!("POST /api/sessions: {e}"))?;
+        // The create itself is accepted (201); the fork fails later at the
+        // worker handshake, not at create time.
+        if resp.status() != reqwest::StatusCode::CREATED {
+            return Err(format!("create should be 201, got {}", resp.status()));
+        }
+        Ok(())
+    });
+    post.expect("structured fork create");
+
+    // The Err path emits SessionContextReset, which the daemon consumes to clear
+    // fork_pending. Poll until the child's marker clears (bounded), proving the
+    // reconciler is not stuck re-forking.
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let child = loop {
+        if let Some(child) = session_by_title(&h, "FailChild") {
+            if child["fork_pending"].is_null() {
+                break child;
+            }
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "FailChild.fork_pending never cleared after a failed session/fork (retry-loop \
+                 regression). sessions.json: {}",
+                read_sessions(&h)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    };
+
+    // The failed fork never captured a child acp id (no session/new fallback
+    // that would masquerade as a fork).
+    assert!(
+        child["acp_session_id"]
+            .as_str()
+            .map(str::is_empty)
+            .unwrap_or(true),
+        "a failed fork must not capture an acp_session_id, got: {:?}",
+        child["acp_session_id"]
+    );
+
+    // The parent is untouched by the failed fork.
+    assert_eq!(
+        acp_id_by_title(&h, "FailParent").as_deref(),
+        Some(parent_acp_id.as_str()),
+        "parent's acp_session_id must be unchanged after a failed fork"
+    );
+}
+
+/// The create handler's fork-mutex 400 paths, exercised end-to-end by POSTing
+/// bad bodies to a live `aoe serve` rather than only asserting the predicates.
+/// A refactor that dropped an early return would pass the predicate tests but
+/// fail here. Covers: both import + fork set, a malformed fork id, and a
+/// structured fork requested for a resume-only agent (aoe-agent).
+#[test]
+#[serial]
+fn create_handler_rejects_bad_fork_requests_with_400() {
+    require_tmux!();
+    require_node!();
+
+    let mut h = TuiTestHarness::new_in_tmp("fork_create_400");
+    let script_path = h.home_path().join("fork-script.json");
+    std::fs::write(&script_path, "{}").expect("write fake-acp script");
+    h.install_acp_shim(&script_path);
+    h.stop_daemon_on_drop();
+
+    let project = h.project_path();
+    let out = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&project)
+        .output()
+        .expect("git init");
+    assert!(out.status.success(), "git init failed");
+
+    let port = pick_free_port();
+    let port_s = port.to_string();
+    let start = h.run_cli(&["serve", "--daemon", "--port", &port_s, "--no-auth"]);
+    assert!(start.status.success(), "aoe serve --daemon failed");
+    assert!(
+        wait_for_port(port, Duration::from_secs(10)),
+        "daemon never bound port {port}"
+    );
+
+    let project_str = project.to_str().unwrap().to_string();
+    // (body, expected error code) for each mutex the handler must enforce.
+    let cases = vec![
+        (
+            serde_json::json!({
+                "title": "BadBoth", "path": project_str, "tool": "claude",
+                "import_acp_session_id": "some-import-id", "fork_from": "parent-uuid_123",
+            }),
+            "both import and fork set",
+        ),
+        (
+            serde_json::json!({
+                "title": "BadForkId", "path": project_str, "tool": "claude",
+                "fork_from": "../etc/passwd",
+            }),
+            "malformed fork id",
+        ),
+        (
+            serde_json::json!({
+                "title": "BadStructuredFork", "path": project_str, "tool": "aoe-agent",
+                "view": "structured", "fork_from": "parent-uuid_123",
+            }),
+            "structured fork for a resume-only agent",
+        ),
+    ];
+
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(async move {
+        let base = format!("http://127.0.0.1:{port}");
+        let client = reqwest::Client::builder().build().expect("build client");
+        for (body, label) in cases {
+            let resp = client
+                .post(format!("{base}/api/sessions"))
+                .json(&body)
+                .send()
+                .await
+                .unwrap_or_else(|e| panic!("POST for '{label}': {e}"));
+            assert_eq!(
+                resp.status(),
+                reqwest::StatusCode::BAD_REQUEST,
+                "'{label}' should be rejected with 400"
+            );
+            let json: serde_json::Value = resp.json().await.expect("decode error body");
+            assert!(
+                json["error"].as_str().is_some(),
+                "'{label}' 400 body should carry an error code, got: {json}"
+            );
+        }
+    });
 }
