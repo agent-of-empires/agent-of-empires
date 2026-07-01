@@ -941,7 +941,7 @@ impl HomeView {
     /// Dispatch the Submit branch of a confirm dialog. Returns
     /// `Some(Action)` for confirm actions that emit a TUI action
     /// (`stop_session`, `quit_during_creation`); side-effect-only
-    /// actions (`delete_group`, `force_remove_session`) run inline and
+    /// actions (`delete_group`, `force_remove_session`, `trash_session`) run inline and
     /// return None. Shared by the keyboard Enter path and the
     /// mouse-click path so both flows produce the same end state.
     pub(super) fn dispatch_confirm_submit(&mut self, action: &str) -> Option<Action> {
@@ -964,6 +964,12 @@ impl HomeView {
                     if let Err(e) = self.force_remove_session(&session_id) {
                         tracing::error!(target: "tui.input", "Failed to force remove session: {}", e);
                     }
+                }
+                None
+            }
+            "trash_session" => {
+                if let Some(session_id) = self.pending_trash_session.take() {
+                    self.trash_session_by_id(&session_id);
                 }
                 None
             }
@@ -1148,6 +1154,7 @@ impl HomeView {
                         self.confirm_dialog = None;
                         self.pending_stop_session = None;
                         self.pending_force_remove_session = None;
+                        self.pending_trash_session = None;
                         self.pending_image_pull = None;
                         // The settings close path mirrors the keyboard
                         // route: Cancel here means "don't discard," so
@@ -1959,6 +1966,7 @@ impl HomeView {
                     self.confirm_dialog = None;
                     self.pending_stop_session = None;
                     self.pending_force_remove_session = None;
+                    self.pending_trash_session = None;
                     self.pending_image_pull = None;
                 }
                 DialogResult::Submit(_) => {
@@ -4268,11 +4276,28 @@ impl HomeView {
                 // can differ from the row's `source_profile`, which would
                 // trash/purge under the wrong profile's retention policy.
                 // See #2489.
-                let delete_to_trash = crate::session::resolve_config_or_warn(&inst.source_profile)
-                    .session
-                    .delete_to_trash;
+                let session_cfg =
+                    crate::session::resolve_config_or_warn(&inst.source_profile).session;
+                let delete_to_trash = session_cfg.delete_to_trash;
                 if delete_to_trash && !already_trashed {
                     let sid = session_id.clone();
+                    // When session.confirm_delete is on, guard the trash with a
+                    // confirmation dialog instead of trashing on the keystroke.
+                    // The accept path (dispatch_confirm_submit "trash_session")
+                    // runs the same trash_session_by_id as the instant path.
+                    if session_cfg.confirm_delete {
+                        let message = format!(
+                            "Move '{}' to the trash? It can be restored from the Trash section.",
+                            inst.title
+                        );
+                        self.pending_trash_session = Some(sid);
+                        self.confirm_dialog = Some(ConfirmDialog::new(
+                            "Confirm Delete",
+                            &message,
+                            "trash_session",
+                        ));
+                        return;
+                    }
                     self.trash_session_by_id(&sid);
                     return;
                 }

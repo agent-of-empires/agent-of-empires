@@ -616,6 +616,8 @@ pub struct HomeView {
     pub(super) pending_image_pull: Option<String>,
     /// Session to force-remove after the confirmation dialog is accepted
     pub(super) pending_force_remove_session: Option<String>,
+    /// Session to trash after the `session.confirm_delete` dialog is accepted
+    pub(super) pending_trash_session: Option<String>,
     /// Action emitted by a mouse-click on a modal dialog (e.g. clicking
     /// `[Yes]` on a stop-session confirm). The keyboard path returns
     /// these via `handle_key -> Option<Action>`, but the mouse path
@@ -2035,6 +2037,7 @@ impl HomeView {
             pending_stop_session: None,
             pending_image_pull: None,
             pending_force_remove_session: None,
+            pending_trash_session: None,
             pending_dialog_click_action: None,
             search_active: false,
             search_query: Input::default(),
