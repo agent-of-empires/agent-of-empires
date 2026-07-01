@@ -1035,6 +1035,17 @@ pub struct SessionConfig {
     #[setting(label = "Delete to Trash", widget = "toggle")]
     pub delete_to_trash: bool,
 
+    /// Ask for confirmation before deleting a session with the TUI `d` key.
+    /// Off by default so the trash-first flow stays low-friction: `d` moves
+    /// the session straight to the trash. When on, `d` opens a confirmation
+    /// dialog first, guarding against a fumbled keystroke trashing the wrong
+    /// (possibly running) session. Only affects the TUI trash path; the web
+    /// delete dialog already confirms, and the permanent-delete/force-remove
+    /// paths are gated by their own dialogs regardless. See #2583.
+    #[serde(default)]
+    #[setting(label = "Confirm Before Delete", widget = "toggle")]
+    pub confirm_delete: bool,
+
     /// Days a session stays in the trash before it is automatically purged,
     /// measured from when it was trashed. `0` keeps trashed sessions
     /// forever (manual purge only). Auto-purge is enforced by the `aoe serve`
@@ -1336,6 +1347,7 @@ impl Default for SessionConfig {
             strict_hotkeys: false,
             snooze_duration_minutes: 30,
             delete_to_trash: true,
+            confirm_delete: false,
             trash_retention_days: default_trash_retention_days(),
             auto_stop_idle_secs: default_auto_stop_idle_secs(),
             restart_wake_message: default_restart_wake_message(),
