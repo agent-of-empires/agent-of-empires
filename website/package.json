@@ -11,7 +11,7 @@
   "dependencies": {
     "@astrojs/sitemap": "3.7.3",
     "@tailwindcss/postcss": "^4.3.0",
-    "astro": "^6.4.6",
+    "astro": "^6.4.8",
     "tailwindcss": "^4.2.4"
   }
 }
