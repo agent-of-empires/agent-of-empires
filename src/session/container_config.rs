@@ -1349,6 +1349,21 @@ pub(crate) fn build_container_config(
 
     let mut environment = collect_environment(&sandbox_config, sandbox_info);
 
+    // Bind-mount the session's managed artifact dir and point the agent at it
+    // via AOE_ARTIFACT_DIR, so screenshots/status files the agent writes land
+    // in the host dir the dashboard can serve. See #2587.
+    if let Ok(host_artifact_dir) = super::artifacts::session_artifact_dir(instance_id) {
+        volumes.push(VolumeMount {
+            host_path: host_artifact_dir.to_string_lossy().to_string(),
+            container_path: super::artifacts::CONTAINER_ARTIFACT_DIR.to_string(),
+            read_only: false,
+        });
+        environment.push(EnvEntry::Literal {
+            key: super::artifacts::ARTIFACT_DIR_ENV.to_string(),
+            value: super::artifacts::CONTAINER_ARTIFACT_DIR.to_string(),
+        });
+    }
+
     let gitconfig = home.join(".gitconfig");
     if gitconfig.exists() {
         volumes.push(VolumeMount {
@@ -3012,6 +3027,23 @@ extra_volumes = ["/host/data:/container/data:ro"]
         assert!(
             volume_pairs.contains(&("/host/data", "/container/data")),
             "extra_volumes should include /host/data:/container/data, got: {:?}",
+            volume_pairs
+        );
+
+        // #2587: the session artifact dir is bind-mounted at the fixed
+        // container path and exported via AOE_ARTIFACT_DIR.
+        assert!(
+            env_keys.contains(&super::super::artifacts::ARTIFACT_DIR_ENV),
+            "AOE_ARTIFACT_DIR should be in environment, got: {:?}",
+            config.environment
+        );
+        assert!(
+            config
+                .volumes
+                .iter()
+                .any(|v| v.container_path == super::super::artifacts::CONTAINER_ARTIFACT_DIR),
+            "artifact dir should be mounted at {}, got: {:?}",
+            super::super::artifacts::CONTAINER_ARTIFACT_DIR,
             volume_pairs
         );
     }

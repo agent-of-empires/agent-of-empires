@@ -328,6 +328,11 @@ pub struct SpawnConfig {
     /// empty; false for normal reattach (the transcript is already stored,
     /// so re-ingesting would duplicate-key panic). See #2276.
     pub seed_history_replay: bool,
+    /// Host path of the session's managed artifact directory, exported to a
+    /// local agent via `AOE_ARTIFACT_DIR`. A sandboxed agent instead sees the
+    /// fixed container mount, so this host path is only used when
+    /// `sandbox_info` is `None`. `None` disables the export. See #2587.
+    pub artifact_dir: Option<PathBuf>,
 }
 
 /// Commands sent from `AcpClient` methods to the background connection task.
@@ -2717,6 +2722,11 @@ fn spawn_runner_detached(
         for (key, value) in &s.inherit_env {
             cmd.env(key, value);
         }
+    } else if let Some(dir) = &config.artifact_dir {
+        // Non-sandboxed: the agent runs on the host, so point it directly at
+        // the host artifact dir. The sandbox path exports the fixed container
+        // mount as a `-e` flag in build_sandbox_docker_argv instead. See #2587.
+        cmd.env(crate::session::artifacts::ARTIFACT_DIR_ENV, dir);
     }
     if let Some(extra) = &extra_path_dir {
         // Prepend the resolved bin dir to the PATH we just forwarded so
@@ -2811,7 +2821,15 @@ fn build_sandbox_docker_argv(
     let profile_for_env = config.source_profile.as_deref().unwrap_or("");
     let sandbox_config =
         crate::session::environment::resolved_sandbox_config(profile_for_env, project_path);
-    let env_entries = crate::session::environment::collect_environment(&sandbox_config, sandbox);
+    let mut env_entries =
+        crate::session::environment::collect_environment(&sandbox_config, sandbox);
+    // The session artifact dir is bind-mounted at the fixed container path by
+    // build_container_config; export it so the agent writes viewable artifacts
+    // there. See #2587.
+    env_entries.push(crate::containers::EnvEntry::Literal {
+        key: crate::session::artifacts::ARTIFACT_DIR_ENV.to_string(),
+        value: crate::session::artifacts::CONTAINER_ARTIFACT_DIR.to_string(),
+    });
 
     let mut docker_args: Vec<String> = vec![
         "exec".into(),

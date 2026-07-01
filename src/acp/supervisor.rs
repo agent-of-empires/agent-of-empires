@@ -1420,6 +1420,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             source_profile,
             mcp_servers,
             seed_history_replay,
+            artifact_dir: crate::session::artifacts::session_artifact_dir(&session_id).ok(),
         };
 
         debug!(
