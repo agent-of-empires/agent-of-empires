@@ -1,5 +1,6 @@
 //! Session management module
 
+pub mod artifacts;
 pub mod builder;
 pub(crate) mod capture;
 pub mod civilizations;
