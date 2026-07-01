@@ -5826,10 +5826,16 @@ pub async fn serve_session_artifact(Path((id, path)): Path<(String, String)>) ->
     use axum::http::{header, HeaderMap, HeaderValue};
     let mime = mime_guess::from_path(&file_path).first_or_octet_stream();
     let essence = mime.essence_str();
-    let is_html = essence == "text/html" || essence == "application/xhtml+xml";
-    // Serve HTML as a download, not inline, to keep it out of the dashboard's
-    // same-origin script context.
-    let content_type = if is_html {
+    // Any type that can execute script when opened as a top-level document is
+    // served as a download, never inline. The frontend opens artifacts via
+    // `window.open(blob:)`, and a blob URL inherits the dashboard's origin, so
+    // an HTML/XHTML/SVG/XML artifact would otherwise run script in the
+    // authenticated origin. Images and other passive types stay inline. See #2587.
+    let force_download = matches!(
+        essence,
+        "text/html" | "application/xhtml+xml" | "image/svg+xml" | "application/xml" | "text/xml"
+    );
+    let content_type = if force_download {
         "application/octet-stream"
     } else {
         essence
@@ -5849,7 +5855,7 @@ pub async fn serve_session_artifact(Path((id, path)): Path<(String, String)>) ->
         header::CACHE_CONTROL,
         HeaderValue::from_static("private, max-age=60"),
     );
-    if is_html {
+    if force_download {
         headers.insert(
             header::CONTENT_DISPOSITION,
             HeaderValue::from_static("attachment"),
@@ -5913,6 +5919,34 @@ mod tests {
             assert_eq!(resp.status(), StatusCode::NOT_FOUND);
             let body = to_bytes(resp.into_body(), 1024).await.unwrap();
             assert!(body.is_empty(), "unexpected body: {body:?}");
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn serves_svg_as_attachment() {
+            // #2587: SVG can execute script as a top-level document, and the
+            // frontend opens artifacts via a same-origin blob URL, so SVG must
+            // download rather than render inline.
+            let _tmp = isolate_app_dir();
+            let id = format!("art-{}", uuid::Uuid::new_v4());
+            let dir = crate::session::artifacts::session_artifact_dir(&id).unwrap();
+            std::fs::write(
+                dir.join("d.svg"),
+                b"<svg xmlns='http://www.w3.org/2000/svg'></svg>",
+            )
+            .unwrap();
+            let resp = serve_session_artifact(AxumPath((id, "d.svg".to_string())))
+                .await
+                .into_response();
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers().get(header::CONTENT_TYPE).unwrap(),
+                "application/octet-stream"
+            );
+            assert_eq!(
+                resp.headers().get(header::CONTENT_DISPOSITION).unwrap(),
+                "attachment"
+            );
         }
 
         #[tokio::test]
