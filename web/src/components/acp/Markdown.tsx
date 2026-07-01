@@ -129,7 +129,7 @@ function TranscriptLink({ href, onClick, children, ...rest }: React.ComponentPro
     );
   }
 
-  if (ref && onOpenFileRef && fileRefSession && !resolveToRepoRelative(ref.path, fileRefSession)) {
+  if (ref && fileRefSession && !resolveToRepoRelative(ref.path, fileRefSession)) {
     return <span className="acp-inert-path">{children}</span>;
   }
 
