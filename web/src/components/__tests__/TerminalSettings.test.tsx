@@ -5,9 +5,13 @@
 // (key `aoe-web-settings`) rather than PATCH /api/settings. The contract
 // here is the JSON shape written to that key. Part of #1217.
 
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render } from "@testing-library/react";
 import { TerminalSettings } from "../TerminalSettings";
+
+vi.mock("../../lib/fontDetect", () => ({
+  detectInstalledFonts: () => ["JetBrains Mono", "MesloLGS NF"],
+}));
 
 const KEY = "aoe-web-settings";
 
@@ -54,6 +58,28 @@ describe("TerminalSettings localStorage contract", () => {
     const select = container.querySelectorAll("select")[1] as HTMLSelectElement;
     fireEvent.change(select, { target: { value: "20" } });
     expect(readStored().desktopFontSize).toBe(20);
+  });
+
+  it("font family input writes terminalFontFamily", () => {
+    const { container } = render(<TerminalSettings />);
+    const input = container.querySelector("#terminal-font-family") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "MesloLGS NF" } });
+    expect(readStored().terminalFontFamily).toBe("MesloLGS NF");
+  });
+
+  it("lists detected fonts as datalist suggestions", () => {
+    const { container } = render(<TerminalSettings />);
+    const options = Array.from(container.querySelectorAll("#terminal-font-options option")).map(
+      (o) => (o as HTMLOptionElement).value,
+    );
+    expect(options).toEqual(["JetBrains Mono", "MesloLGS NF"]);
+  });
+
+  it("reflects a stored terminalFontFamily on mount", () => {
+    window.localStorage.setItem(KEY, JSON.stringify({ terminalFontFamily: "Fira Code" }));
+    const { container } = render(<TerminalSettings />);
+    const input = container.querySelector("#terminal-font-family") as HTMLInputElement;
+    expect(input.value).toBe("Fira Code");
   });
 
   it("autoOpenKeyboard checkbox writes the boolean flag", () => {

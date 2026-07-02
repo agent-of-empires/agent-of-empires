@@ -462,8 +462,12 @@
       "id": "settings.terminal-localstorage",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/components/__tests__/TerminalSettings.test.tsx"],
-      "components": ["web/src/components/TerminalSettings.tsx", "web/src/components/TerminalSessionStack.tsx"]
+      "specs": ["src/components/__tests__/TerminalSettings.test.tsx", "src/lib/__tests__/fontDetect.test.ts"],
+      "components": [
+        "web/src/components/TerminalSettings.tsx",
+        "web/src/components/TerminalSessionStack.tsx",
+        "web/src/lib/fontDetect.ts"
+      ]
     },
     {
       "id": "app-shell.topbar-dev-badge",
