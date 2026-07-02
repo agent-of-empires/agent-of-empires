@@ -119,30 +119,36 @@ fn wait_for_worker_gone(h: &TuiTestHarness, session_id: &str, timeout: Duration)
     }
 }
 
-fn tmux_has_session(name: &str) -> bool {
+fn tmux_has_session(sock: &std::path::Path, name: &str) -> bool {
     Command::new("tmux")
+        .arg("-S")
+        .arg(sock)
         .args(["has-session", "-t", name])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
 
-fn kill_tmux(name: &str) {
+fn kill_tmux(sock: &std::path::Path, name: &str) {
     let _ = Command::new("tmux")
+        .arg("-S")
+        .arg(sock)
         .args(["kill-session", "-t", name])
         .output();
 }
 
 /// Pre-create a tool sub-session whose name matches what
 /// `kill_ancillary_tmux_sessions()` sweeps for `session_id` (by `_<id8>`
-/// suffix). Created on the default tmux server, the same one the daemon's
-/// teardown uses (it inherits the test process env). Mirrors the precedent in
-/// `archive_restore.rs`.
-fn create_tool_session(session_id: &str, title: &str) -> String {
+/// suffix). Created on the harness's tmux socket (`AOE_TMUX_SOCKET`), the same
+/// one the daemon resolves (#2608), so the daemon's teardown sweeps it.
+/// Mirrors the precedent in `archive_restore.rs`.
+fn create_tool_session(sock: &std::path::Path, session_id: &str, title: &str) -> String {
     let name = agent_of_empires::tmux::ToolSession::new(session_id, title, "tooltest")
         .session_name()
         .to_string();
     let create = Command::new("tmux")
+        .arg("-S")
+        .arg(sock)
         .args([
             "new-session",
             "-d",
@@ -279,7 +285,7 @@ fn setup(h: &mut TuiTestHarness, title: &str) -> (u16, String, String) {
     prompt_until_accepted(h, &session_id, Duration::from_secs(30));
     // Worker is live and registered. Pre-create the tool sub-session now so
     // archive's `kill_ancillary_tmux_sessions()` has something to find.
-    let tool_name = create_tool_session(&session_id, title);
+    let tool_name = create_tool_session(&h.home_path().join("tmux.sock"), &session_id, title);
 
     (port, session_id, tool_name)
 }
@@ -295,9 +301,10 @@ fn archive_kills_worker_and_tool_session() {
     let mut h = TuiTestHarness::new_in_tmp("archive_structured_kill");
     let title = "ArchiveStructKill";
     let (port, session_id, tool_name) = setup(&mut h, title);
+    let sock = h.home_path().join("tmux.sock");
 
     assert!(
-        tmux_has_session(&tool_name),
+        tmux_has_session(&sock, &tool_name),
         "precondition: tool session {tool_name} should exist before archive"
     );
 
@@ -305,10 +312,10 @@ fn archive_kills_worker_and_tool_session() {
 
     wait_for_worker_gone(&h, &session_id, Duration::from_secs(10));
 
-    let tool_alive = tmux_has_session(&tool_name);
+    let tool_alive = tmux_has_session(&sock, &tool_name);
     // Clean up before asserting so a failure can't leak into the next test.
     if tool_alive {
-        kill_tmux(&tool_name);
+        kill_tmux(&sock, &tool_name);
     }
     assert!(
         !tool_alive,
@@ -333,9 +340,10 @@ fn archive_no_kill_shuts_worker_but_keeps_tool_session() {
     let mut h = TuiTestHarness::new_in_tmp("archive_structured_nokill");
     let title = "ArchiveStructNoKill";
     let (port, session_id, tool_name) = setup(&mut h, title);
+    let sock = h.home_path().join("tmux.sock");
 
     assert!(
-        tmux_has_session(&tool_name),
+        tmux_has_session(&sock, &tool_name),
         "precondition: tool session {tool_name} should exist before archive"
     );
 
@@ -344,9 +352,9 @@ fn archive_no_kill_shuts_worker_but_keeps_tool_session() {
     // Worker shutdown is unconditional, so it must be gone even with kill_pane=false.
     wait_for_worker_gone(&h, &session_id, Duration::from_secs(10));
 
-    let tool_alive = tmux_has_session(&tool_name);
+    let tool_alive = tmux_has_session(&sock, &tool_name);
     // The survivor would pollute the next serial test; kill it before asserting.
-    kill_tmux(&tool_name);
+    kill_tmux(&sock, &tool_name);
     assert!(
         tool_alive,
         "tool sub-session {tool_name} must survive archive with kill_pane=false"

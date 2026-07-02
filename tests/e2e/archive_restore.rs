@@ -14,14 +14,18 @@ fn read_sessions_json(h: &TuiTestHarness) -> serde_json::Value {
 }
 
 /// Best-effort cleanup so failures don't leak into the next `#[serial]` test.
-fn kill_tmux(name: &str) {
+fn kill_tmux(sock: &std::path::Path, name: &str) {
     let _ = Command::new("tmux")
+        .arg("-S")
+        .arg(sock)
         .args(["kill-session", "-t", name])
         .output();
 }
 
-fn tmux_has_session(name: &str) -> bool {
+fn tmux_has_session(sock: &std::path::Path, name: &str) -> bool {
     Command::new("tmux")
+        .arg("-S")
+        .arg(sock)
         .args(["has-session", "-t", name])
         .output()
         .map(|o| o.status.success())
@@ -197,7 +201,10 @@ fn test_cli_archive_kills_agent_and_terminal_tmux_sessions() {
             .session_name()
             .to_string();
 
-    // Pre-create the four tmux kinds so archive can find and kill them.
+    // Pre-create the four tmux kinds so archive can find and kill them. Created
+    // on the harness's tmux socket (`AOE_TMUX_SOCKET`), the same one the CLI
+    // resolves (#2608), so archive's teardown sweeps them.
+    let sock = h.home_path().join("tmux.sock");
     let names = [
         &agent_tmux_name,
         &terminal_tmux_name,
@@ -206,6 +213,8 @@ fn test_cli_archive_kills_agent_and_terminal_tmux_sessions() {
     ];
     for name in names {
         let create = Command::new("tmux")
+            .arg("-S")
+            .arg(&sock)
             .args([
                 "new-session",
                 "-d",
@@ -235,13 +244,16 @@ fn test_cli_archive_kills_agent_and_terminal_tmux_sessions() {
         String::from_utf8_lossy(&archive_output.stderr)
     );
 
-    let alive: Vec<(&&String, bool)> = names.iter().map(|n| (n, tmux_has_session(n))).collect();
+    let alive: Vec<(&&String, bool)> = names
+        .iter()
+        .map(|n| (n, tmux_has_session(&sock, n)))
+        .collect();
 
     // Cleanup BEFORE asserting so a single failure cannot leak survivors
     // into the next serial test.
     for (name, is_alive) in &alive {
         if *is_alive {
-            kill_tmux(name);
+            kill_tmux(&sock, name);
         }
     }
 
@@ -294,6 +306,7 @@ fn test_cli_archive_no_kill_preserves_all_tmux_sessions() {
             .session_name()
             .to_string();
 
+    let sock = h.home_path().join("tmux.sock");
     let names = [
         &agent_tmux_name,
         &terminal_tmux_name,
@@ -302,6 +315,8 @@ fn test_cli_archive_no_kill_preserves_all_tmux_sessions() {
     ];
     for name in names {
         let create = Command::new("tmux")
+            .arg("-S")
+            .arg(&sock)
             .args([
                 "new-session",
                 "-d",
@@ -331,12 +346,15 @@ fn test_cli_archive_no_kill_preserves_all_tmux_sessions() {
         String::from_utf8_lossy(&archive_output.stderr)
     );
 
-    let alive: Vec<(&&String, bool)> = names.iter().map(|n| (n, tmux_has_session(n))).collect();
+    let alive: Vec<(&&String, bool)> = names
+        .iter()
+        .map(|n| (n, tmux_has_session(&sock, n)))
+        .collect();
 
     // Cleanup explicitly: --no-kill leaves the survivors so they would
     // pollute the next serial test.
     for name in &names {
-        kill_tmux(name);
+        kill_tmux(&sock, name);
     }
 
     for (name, is_alive) in &alive {

@@ -983,6 +983,7 @@ fn test_cli_rename_preserves_tmux_session() {
     require_tmux!();
 
     let h = TuiTestHarness::new("cli_rename_tmux");
+    let sock = h.home_path().join("tmux.sock");
     let project = h.project_path();
 
     // 1. Add a session
@@ -1007,6 +1008,8 @@ fn test_cli_rename_preserves_tmux_session() {
 
     // Create a real tmux session with that name (simulates a running session)
     let create = Command::new("tmux")
+        .arg("-S")
+        .arg(&sock)
         .args([
             "new-session",
             "-d",
@@ -1037,6 +1040,8 @@ fn test_cli_rename_preserves_tmux_session() {
 
     // 5. The old tmux session name should be gone
     let old_exists = Command::new("tmux")
+        .arg("-S")
+        .arg(&sock)
         .args(["has-session", "-t", &old_tmux_name])
         .output()
         .map(|o| o.status.success())
@@ -1054,6 +1059,8 @@ fn test_cli_rename_preserves_tmux_session() {
         truncated_id
     );
     let new_exists = Command::new("tmux")
+        .arg("-S")
+        .arg(&sock)
         .args(["has-session", "-t", &new_tmux_name])
         .output()
         .map(|o| o.status.success())
@@ -1066,6 +1073,8 @@ fn test_cli_rename_preserves_tmux_session() {
 
     // Cleanup
     let _ = Command::new("tmux")
+        .arg("-S")
+        .arg(&sock)
         .args(["kill-session", "-t", &new_tmux_name])
         .output();
 }
@@ -1079,6 +1088,7 @@ fn test_cli_rm_kills_agent_tmux_session() {
     require_tmux!();
 
     let h = TuiTestHarness::new("cli_rm_tmux");
+    let sock = h.home_path().join("tmux.sock");
     let project = h.project_path();
 
     let add_output = h.run_cli(&["add", project.to_str().unwrap(), "-t", "RmTarget"]);
@@ -1099,6 +1109,8 @@ fn test_cli_rm_kills_agent_tmux_session() {
     );
 
     let create = Command::new("tmux")
+        .arg("-S")
+        .arg(&sock)
         .args([
             "new-session",
             "-d",
@@ -1127,6 +1139,8 @@ fn test_cli_rm_kills_agent_tmux_session() {
     );
 
     let still_alive = Command::new("tmux")
+        .arg("-S")
+        .arg(&sock)
         .args(["has-session", "-t", &tmux_name])
         .output()
         .map(|o| o.status.success())
@@ -1139,6 +1153,8 @@ fn test_cli_rm_kills_agent_tmux_session() {
 
     // Cleanup
     let _ = Command::new("tmux")
+        .arg("-S")
+        .arg(&sock)
         .args(["kill-session", "-t", &tmux_name])
         .output();
 }

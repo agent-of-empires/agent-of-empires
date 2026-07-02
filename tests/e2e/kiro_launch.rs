@@ -28,14 +28,19 @@ use serial_test::serial;
 use std::process::Command;
 
 /// Kills its tmux session when dropped, so a panicking assertion in the test
-/// body still tears the real session down (the default tmux server is shared
-/// across runs, so a leak would accumulate stale sessions).
-struct TmuxSessionGuard(String);
+/// body still tears the real session down. Holds the socket aoe used
+/// (`AOE_TMUX_SOCKET`, #2608) so the kill targets the right server.
+struct TmuxSessionGuard {
+    socket: std::path::PathBuf,
+    name: String,
+}
 
 impl Drop for TmuxSessionGuard {
     fn drop(&mut self) {
         let _ = Command::new("tmux")
-            .args(["kill-session", "-t", &self.0])
+            .arg("-S")
+            .arg(&self.socket)
+            .args(["kill-session", "-t", &self.name])
             .output();
     }
 }
@@ -70,8 +75,10 @@ fn launched_tmux_name(h: &TuiTestHarness, title: &str) -> String {
 
 /// The command tmux was told to run for the session's pane. This is the launch
 /// command aoe built, captured before (and independent of) execution.
-fn pane_start_command(session: &str) -> String {
+fn pane_start_command(sock: &std::path::Path, session: &str) -> String {
     let out = Command::new("tmux")
+        .arg("-S")
+        .arg(sock)
         .args(["list-panes", "-t", session, "-F", "#{pane_start_command}"])
         .output()
         .expect("tmux list-panes");
@@ -117,8 +124,12 @@ fn launch_kiro_and_read_command(
     let _ = h.run_cli(&args);
 
     let session = launched_tmux_name(h, title);
-    let guard = TmuxSessionGuard(session.clone());
-    let cmd = pane_start_command(&session);
+    let socket = h.home_path().join("tmux.sock");
+    let cmd = pane_start_command(&socket, &session);
+    let guard = TmuxSessionGuard {
+        socket,
+        name: session,
+    };
     (cmd, guard)
 }
 
