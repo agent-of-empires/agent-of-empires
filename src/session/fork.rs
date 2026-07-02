@@ -46,11 +46,19 @@ fn builtin_acp_registry() -> &'static crate::acp::AgentRegistry {
 }
 
 /// True when `tool`/`agent_name` can run the structured ACP `session/fork`
-/// handshake: it maps to a built-in ACP adapter AND that adapter declares a
-/// real (non-`Unsupported`) fork strategy. This is the single source of truth
-/// shared by the server create-time guard, the `SessionResponse.acp_can_fork`
+/// handshake: it maps to a built-in ACP adapter AND that adapter is verified
+/// to implement ACP `session/fork`. This is the single source of truth shared
+/// by the server create-time guard, the `SessionResponse.acp_can_fork`
 /// projection (the web "Fork" affordance), and the TUI structured-fork branch,
 /// so no surface offers a structured fork the live handshake would then refuse.
+///
+/// Deliberately narrower than "has a terminal `ForkStrategy`": `codex` and
+/// `opencode` both have a real terminal fork strategy (used by the CLI
+/// `--fork-from` path) but their ACP adapters have not been verified to
+/// implement `session/fork`, so gating on `fork_strategy != Unsupported` would
+/// have offered a structured fork for them that the live handshake could then
+/// refuse. Only `ClaudeFork` is checked here until another agent's ACP adapter
+/// is confirmed to support the handshake.
 ///
 /// The bundled `aoe-agent` is ACP-capable (it is in the ACP registry) but is
 /// not a fork-capable agent, so it reads false: it is absent from `get_agent`
@@ -63,8 +71,7 @@ fn builtin_acp_registry() -> &'static crate::acp::AgentRegistry {
 pub fn structured_fork_capable(tool: &str, agent_name: Option<&str>) -> bool {
     let resolved = agent_name.filter(|s| !s.is_empty()).unwrap_or(tool);
     builtin_acp_registry().get(resolved).is_some()
-        && get_agent(resolved)
-            .is_some_and(|a| !matches!(a.fork_strategy, ForkStrategy::Unsupported))
+        && get_agent(resolved).is_some_and(|a| matches!(a.fork_strategy, ForkStrategy::ClaudeFork))
 }
 
 /// True when `tool` is a terminal agent whose CLI can fork (claude/codex/

@@ -875,6 +875,13 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
+      "id": "sessions.fork.round-trip",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/session-fork.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
       "id": "sidebar.repo-appearance",
       "kind": "mocked-playwright",
       "risk": "low",

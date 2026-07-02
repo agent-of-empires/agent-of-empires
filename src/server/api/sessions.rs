@@ -6248,6 +6248,14 @@ mod tests {
         // accept a create that can only fail later at the `session/fork`
         // handshake.
         assert!(!agent_is_structured_fork_capable("aoe-agent", None));
+        // codex and opencode are ACP-registered AND declare a real terminal
+        // ForkStrategy (used by the CLI `--fork-from` path), but neither ACP
+        // adapter is verified to implement `session/fork`. Gating on
+        // "fork_strategy != Unsupported" alone would report them forkable and
+        // reproduce the same dead-end-handshake failure this function exists
+        // to prevent for aoe-agent.
+        assert!(!agent_is_structured_fork_capable("codex", None));
+        assert!(!agent_is_structured_fork_capable("opencode", None));
         // A non-ACP tool is neither ACP-capable nor fork-capable.
         assert!(!agent_is_structured_fork_capable(
             "definitely-not-an-acp-agent",
@@ -6255,7 +6263,13 @@ mod tests {
         ));
 
         // The two surfaces must report the same capability for each agent.
-        for tool in ["claude", "aoe-agent", "definitely-not-an-acp-agent"] {
+        for tool in [
+            "claude",
+            "aoe-agent",
+            "codex",
+            "opencode",
+            "definitely-not-an-acp-agent",
+        ] {
             let mut inst = make_test_instance();
             inst.tool = tool.to_string();
             assert_eq!(
@@ -6282,6 +6296,13 @@ mod tests {
         let mut aoe_agent = make_test_instance();
         aoe_agent.tool = "aoe-agent".to_string();
         assert!(!SessionResponse::from_instance(&aoe_agent, false).acp_can_fork);
+
+        // codex has a real terminal fork strategy but its ACP adapter is not
+        // verified to implement `session/fork`, so the web signal must stay
+        // false rather than offer a fork the live handshake would refuse.
+        let mut codex = make_test_instance();
+        codex.tool = "codex".to_string();
+        assert!(!SessionResponse::from_instance(&codex, false).acp_can_fork);
 
         // A non-ACP agent is neither ACP-capable nor fork-capable.
         let mut other = make_test_instance();
