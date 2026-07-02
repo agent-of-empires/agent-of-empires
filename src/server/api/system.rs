@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use super::validate_profile_name;
 use super::AppState;
-use crate::server::auth::AuthenticatedSession;
+use crate::server::auth::{handler_elevated, AuthenticatedSession, LoopbackTrusted};
 use crate::session::settings_schema::{
     clear_path, rewrite_plugin_sections, runtime_schema, strip_local_only, validate_patch,
     validate_patch_with, PatchRejection, Scope,
@@ -1616,6 +1616,7 @@ pub async fn update_profile_settings(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(name): axum::extract::Path<String>,
     session: Option<axum::Extension<AuthenticatedSession>>,
+    loopback: Option<axum::Extension<LoopbackTrusted>>,
     body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
@@ -1642,19 +1643,11 @@ pub async fn update_profile_settings(
     // so a bundled patch keeps its safe leaves and silently drops the
     // local-only ones; they can never become a profile override (#1692).
     strip_local_only(&mut body);
-    // Resolve elevation up front. With login disabled (single-user local) the
-    // caller is always treated as elevated; with login enabled, only an
-    // elevated session may write a requires-elevation field.
-    let elevated = if state.login_manager.is_enabled() {
-        match session.as_ref() {
-            Some(axum::Extension(AuthenticatedSession(id))) => {
-                state.login_manager.is_elevated(id).await
-            }
-            None => false,
-        }
-    } else {
-        true
-    };
+    // Resolve elevation up front via the shared resolver: login disabled
+    // means always elevated, a loopback-trusted caller is elevated per the
+    // #1168 carve-out (#2610), otherwise only an elevated session may write
+    // a requires-elevation field.
+    let elevated = handler_elevated(&state, session.as_deref(), loopback.is_some()).await;
 
     // Validate every remaining leaf against the schema (single source of
     // truth, #1692): unknown section/field -> 400, requires-elevation without

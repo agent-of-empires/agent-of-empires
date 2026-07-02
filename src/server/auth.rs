@@ -489,6 +489,58 @@ pub struct AuthenticatedTokenHash(pub [u8; 32]);
 #[derive(Clone, Debug)]
 pub struct AuthenticatedSession(pub String);
 
+/// Request extension marking a request whose resolved client IP is
+/// loopback (see [`is_local_trusted`]). Inserted by `auth_middleware`
+/// right after client-IP resolution, before any auth branch, so every
+/// downstream consumer sees it regardless of which auth path ran. It is
+/// a server-internal fact derived from the socket peer plus trusted
+/// forwarding headers; clients cannot inject request extensions.
+///
+/// Handler-side elevation gates treat it as elevated (see
+/// [`handler_elevated`]): the same-host caller already passes the
+/// fs-perm trust boundary (#1168) and could run the equivalent CLI
+/// command with no passphrase, so a step-up prompt on loopback adds
+/// friction without strengthening anything. This mirrors the loopback
+/// bypass the middleware path-shape gate gets by construction. See #2610.
+#[derive(Clone, Copy, Debug)]
+pub struct LoopbackTrusted;
+
+/// Pure elevation decision, extracted so the matrix is unit-testable
+/// without standing up `AppState`. `session_elevated` is `None` when the
+/// request carries no login session.
+fn elevation_verdict(
+    login_enabled: bool,
+    loopback_trusted: bool,
+    session_elevated: Option<bool>,
+) -> bool {
+    if !login_enabled || loopback_trusted {
+        return true;
+    }
+    session_elevated.unwrap_or(false)
+}
+
+/// Shared resolver for handler-side (body-shape) elevation gates:
+/// login disabled means elevation does not exist as a concept; a
+/// loopback-trusted caller is elevated per the #1168 carve-out; anyone
+/// else needs a login session elevated within the step-up window.
+/// Central so `plugins::mutation_gate` and `update_profile_settings`
+/// cannot drift apart (#2610).
+pub(crate) async fn handler_elevated(
+    state: &AppState,
+    session: Option<&AuthenticatedSession>,
+    loopback_trusted: bool,
+) -> bool {
+    let session_elevated = match session {
+        Some(AuthenticatedSession(id)) => Some(state.login_manager.is_elevated(id).await),
+        None => None,
+    };
+    elevation_verdict(
+        state.login_manager.is_enabled(),
+        loopback_trusted,
+        session_elevated,
+    )
+}
+
 /// Passphrase login wall used when the token gate is disabled
 /// (`--auth=passphrase`). Mirrors the session + device-binding check
 /// inside the token-auth path, but skips every token-cookie
@@ -603,6 +655,14 @@ pub async fn auth_middleware(
     next: Next,
 ) -> Response {
     let client_ip = resolve_client_ip(addr, request.headers());
+
+    // Mark same-host callers before any auth branch so handler-side
+    // elevation gates see the #1168 carve-out no matter which path
+    // (token, session, passphrase wall, loopback bypass) handled the
+    // request. See `LoopbackTrusted`.
+    if is_local_trusted(client_ip) {
+        request.extensions_mut().insert(LoopbackTrusted);
+    }
 
     // Trace structured view ws specifically so we can see whether the
     // browser ever reached the server when the structured view live updates
@@ -893,7 +953,15 @@ async fn handle_session_authenticated(
     let path = request.uri().path().to_string();
     let method = request.method().clone();
 
-    if requires_elevation(&method, &path) && !state.login_manager.is_elevated(&session_id).await {
+    // Loopback callers skip the step-up gate even with a session: the
+    // #1168 carve-out is about the caller's host, not how they
+    // authenticated. Without this, a local token-mode browser with a
+    // bound session prompts where the passphrase-mode local browser
+    // does not (#2610).
+    if requires_elevation(&method, &path)
+        && request.extensions().get::<LoopbackTrusted>().is_none()
+        && !state.login_manager.is_elevated(&session_id).await
+    {
         tracing::info!(
             target: "auth.passphrase",
             ip = %client_ip,
@@ -1052,6 +1120,26 @@ mod tests {
         headers.insert("x-forwarded-for", "not-an-ip".parse().unwrap());
         let ip = resolve_client_ip(socket, &headers);
         assert!(ip.is_loopback());
+    }
+
+    // Full matrix of the handler-side elevation decision (#2610).
+    // Loopback trust wins over a missing or non-elevated session; a
+    // remote caller needs a session elevated within the step-up window.
+    #[test]
+    fn elevation_verdict_matrix() {
+        // Login disabled: elevation does not exist as a concept.
+        assert!(elevation_verdict(false, false, None));
+        assert!(elevation_verdict(false, true, None));
+        // Loopback trusted: elevated regardless of session state. This
+        // is the #2610 fix; the pre-fix code returned false for the
+        // (enabled, loopback, no-session) row and looped the prompt.
+        assert!(elevation_verdict(true, true, None));
+        assert!(elevation_verdict(true, true, Some(false)));
+        assert!(elevation_verdict(true, true, Some(true)));
+        // Remote with login enabled: only an elevated session passes.
+        assert!(!elevation_verdict(true, false, None));
+        assert!(!elevation_verdict(true, false, Some(false)));
+        assert!(elevation_verdict(true, false, Some(true)));
     }
 
     #[test]

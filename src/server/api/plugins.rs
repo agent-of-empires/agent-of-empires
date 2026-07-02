@@ -19,16 +19,21 @@ use serde_json::json;
 use super::AppState;
 use crate::plugin;
 use crate::plugin::install::OperationLog;
-use crate::server::auth::AuthenticatedSession;
+use crate::server::auth::{handler_elevated, AuthenticatedSession, LoopbackTrusted};
 
 fn error_response(status: StatusCode, code: &str, message: String) -> Response {
     (status, Json(json!({ "error": code, "message": message }))).into_response()
 }
 
 /// Resolve the read-only and elevation gates shared by every mutation.
+/// Elevation goes through `handler_elevated`, so a loopback-trusted
+/// caller passes without a session (#2610): the loopback bypass paths
+/// never insert `AuthenticatedSession`, and treating that as
+/// not-elevated made these mutations unreachable from localhost.
 async fn mutation_gate(
     state: &AppState,
     session: Option<&AuthenticatedSession>,
+    loopback_trusted: bool,
 ) -> Result<(), Response> {
     if state.read_only {
         return Err(error_response(
@@ -37,15 +42,7 @@ async fn mutation_gate(
             "Server is in read-only mode".into(),
         ));
     }
-    let elevated = if state.login_manager.is_enabled() {
-        match session {
-            Some(AuthenticatedSession(id)) => state.login_manager.is_elevated(id).await,
-            None => false,
-        }
-    } else {
-        true
-    };
-    if !elevated {
+    if !handler_elevated(state, session, loopback_trusted).await {
         return Err(error_response(
             StatusCode::FORBIDDEN,
             "elevation_required",
@@ -299,10 +296,11 @@ pub struct ApplyUpdateBody {
 pub async fn apply_plugin_update(
     State(state): State<std::sync::Arc<AppState>>,
     session: Option<axum::Extension<AuthenticatedSession>>,
+    loopback: Option<axum::Extension<LoopbackTrusted>>,
     Path(id): Path<String>,
     Json(body): Json<ApplyUpdateBody>,
 ) -> Response {
-    if let Err(resp) = mutation_gate(&state, session.as_deref()).await {
+    if let Err(resp) = mutation_gate(&state, session.as_deref(), loopback.is_some()).await {
         return resp;
     }
     let plugin_id = id.clone();
@@ -327,10 +325,11 @@ pub struct DismissUpdateBody {
 pub async fn dismiss_plugin_update(
     State(state): State<std::sync::Arc<AppState>>,
     session: Option<axum::Extension<AuthenticatedSession>>,
+    loopback: Option<axum::Extension<LoopbackTrusted>>,
     Path(id): Path<String>,
     Json(body): Json<DismissUpdateBody>,
 ) -> Response {
-    if let Err(resp) = mutation_gate(&state, session.as_deref()).await {
+    if let Err(resp) = mutation_gate(&state, session.as_deref(), loopback.is_some()).await {
         return resp;
     }
     let result = tokio::task::spawn_blocking(move || {
@@ -353,10 +352,11 @@ pub struct SetEnabledBody {
 pub async fn set_plugin_enabled(
     State(state): State<std::sync::Arc<AppState>>,
     session: Option<axum::Extension<AuthenticatedSession>>,
+    loopback: Option<axum::Extension<LoopbackTrusted>>,
     Path(id): Path<String>,
     Json(body): Json<SetEnabledBody>,
 ) -> Response {
-    if let Err(resp) = mutation_gate(&state, session.as_deref()).await {
+    if let Err(resp) = mutation_gate(&state, session.as_deref(), loopback.is_some()).await {
         return resp;
     }
     let result =
@@ -582,9 +582,10 @@ pub struct StartInstallBody {
 pub async fn start_plugin_install(
     State(state): State<std::sync::Arc<AppState>>,
     session: Option<axum::Extension<AuthenticatedSession>>,
+    loopback: Option<axum::Extension<LoopbackTrusted>>,
     Json(body): Json<StartInstallBody>,
 ) -> Response {
-    if let Err(resp) = mutation_gate(&state, session.as_deref()).await {
+    if let Err(resp) = mutation_gate(&state, session.as_deref(), loopback.is_some()).await {
         return resp;
     }
     let source = body.source.clone();
@@ -607,9 +608,10 @@ pub async fn start_plugin_install(
 pub async fn start_plugin_uninstall(
     State(state): State<std::sync::Arc<AppState>>,
     session: Option<axum::Extension<AuthenticatedSession>>,
+    loopback: Option<axum::Extension<LoopbackTrusted>>,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(resp) = mutation_gate(&state, session.as_deref()).await {
+    if let Err(resp) = mutation_gate(&state, session.as_deref(), loopback.is_some()).await {
         return resp;
     }
     let plugin_id = id.clone();
