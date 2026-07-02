@@ -234,6 +234,10 @@ export function MobileLiveTerminal({
   const coarse = useIsCoarsePointer();
   const fontKey = coarse ? "mobileFontSize" : "desktopFontSize";
   const configuredFontSize = settings[fontKey];
+  // A user-chosen terminal font, falling back to the bundled `--font-mono` so a
+  // missing/mistyped family degrades gracefully instead of blanking the grid.
+  const termFontFamily = settings.terminalFontFamily.trim();
+  const fontFamily = termFontFamily ? `"${termFontFamily}", var(--font-mono)` : undefined;
   const [fontSize, setFontSize] = useState(() => configuredFontSize);
   // Adopt the persisted setting when it changes (settings panel, or the
   // pointer class flipping which font key applies) via the adjust-state-
@@ -266,7 +270,7 @@ export function MobileLiveTerminal({
   }, []);
   useLayoutEffect(() => {
     remeasure();
-  }, [remeasure, fontSize]);
+  }, [remeasure, fontSize, fontFamily]);
   useEffect(() => {
     const fonts = (document as Document & { fonts?: { ready: Promise<unknown> } }).fonts;
     fonts?.ready
@@ -1117,6 +1121,8 @@ export function MobileLiveTerminal({
         }`}
         style={{
           fontSize: `${fontSize}px`,
+          // Undefined leaves the `font-mono` class to supply the default family.
+          fontFamily,
           lineHeight: `${lineH}px`,
           background: "var(--term-bg, #1c1c1f)",
           color: "var(--term-fg, #e4e4e7)",

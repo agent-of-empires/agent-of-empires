@@ -1,4 +1,7 @@
+import { useMemo } from "react";
+
 import { useWebSettings } from "../hooks/useWebSettings";
+import { detectInstalledFonts } from "../lib/fontDetect";
 import {
   MAX_PERSISTENT_TERMINALS,
   MIN_PERSISTENT_TERMINALS,
@@ -10,6 +13,9 @@ const FONT_SIZES = Array.from({ length: 23 }, (_, i) => i + 6); // 6..28
 export function TerminalSettings() {
   const { settings, update } = useWebSettings();
   const maxPersistentTerminals = normalizePersistentTerminalLimit(settings.maxPersistentTerminals);
+  // Probe once per mount; the set of installed fonts doesn't change while the
+  // panel is open.
+  const detectedFonts = useMemo(() => detectInstalledFonts(), []);
 
   return (
     <div>
@@ -73,6 +79,30 @@ export function TerminalSettings() {
           <p className="text-[11px] text-text-muted mt-1">
             Font size for web terminal sessions on desktop, including tmux-backed sessions. Hold Ctrl and scroll over
             the terminal (or pinch on a trackpad) to zoom; the new size is saved here.
+          </p>
+        </div>
+
+        <div>
+          <label htmlFor="terminal-font-family" className="block text-[13px] text-text-secondary mb-2">
+            Font family
+          </label>
+          <input
+            id="terminal-font-family"
+            type="text"
+            list="terminal-font-options"
+            value={settings.terminalFontFamily}
+            placeholder="Default (Geist Mono)"
+            onChange={(e) => update({ terminalFontFamily: e.target.value })}
+            className="w-full bg-surface-800 border border-surface-700 rounded-md px-2 py-1 text-sm text-text-primary font-mono"
+          />
+          <datalist id="terminal-font-options">
+            {detectedFonts.map((f) => (
+              <option key={f} value={f} />
+            ))}
+          </datalist>
+          <p className="text-[11px] text-text-muted mt-1">
+            Font for web terminal sessions. Pick a detected font or type any font name; it must be installed on this
+            device. Leave blank for the bundled default. Use a Nerd Font to render powerline and icon glyphs.
           </p>
         </div>
 
