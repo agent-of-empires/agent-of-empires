@@ -90,8 +90,10 @@ pub(crate) fn tmux_command() -> Command {
 }
 
 // Debug builds use `aoe_dev_*` prefixes so `cargo run` and an installed
-// release `aoe` can coexist on the same tmux server without seeing each
-// other's sessions.
+// release `aoe` never mistake each other's sessions. Debug builds also run on
+// their own tmux socket (see `tmux_socket_path`), so the two builds no longer
+// share a server at all; the prefix split is kept as defence in depth and to
+// keep dev/release session names visually distinct.
 pub const SESSION_PREFIX: &str = if cfg!(debug_assertions) {
     "aoe_dev_"
 } else {

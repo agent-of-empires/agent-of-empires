@@ -285,6 +285,8 @@ last_seen_version = "{}"
             eprintln!("RECORD_E2E is set but asciinema is not installed -- recording disabled");
         }
 
+        let tmux_socket_env = socket_path.display().to_string();
+
         Self {
             session_name,
             test_name: test_name.to_string(),
@@ -296,7 +298,12 @@ last_seen_version = "{}"
             spawned: false,
             recording,
             cast_path: None,
-            extra_env: Vec::new(),
+            // Pin the spawned aoe to the same tmux socket the harness drives
+            // and inspects. aoe now routes every tmux call through an explicit
+            // `-S <socket>` (#2608) instead of inheriting `$TMUX`, so without
+            // this it would land on its own app-dir socket and the harness
+            // would see none of its sessions.
+            extra_env: vec![("AOE_TMUX_SOCKET".to_string(), tmux_socket_env)],
             extra_path_dirs: Vec::new(),
             stop_daemon_on_drop: false,
             acp_fork_fail: false,

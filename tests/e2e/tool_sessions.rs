@@ -248,17 +248,16 @@ hotkey = "Alt+t"
 
     // Remove the agent session. `perform_deletion` invokes
     // `kill_all_tool_sessions_for_id`, which runs `tmux list-sessions` /
-    // `kill-session` against the tmux socket that the calling process
-    // sees. To exercise the sweep on the harness's per-test socket we
-    // point `TMUX` at it so the subprocess routes its tmux commands
-    // there instead of the system default.
-    let tmux_env = format!("{},0,0", harness_sock.display());
+    // `kill-session` against the tmux socket aoe resolves. aoe now routes
+    // every tmux call through an explicit `-S <socket>` (#2608), so point
+    // `AOE_TMUX_SOCKET` at the harness's per-test socket to exercise the
+    // sweep there instead of aoe's own app-dir socket.
     let aoe_binary = env!("CARGO_BIN_EXE_aoe");
     let remove = Command::new(aoe_binary)
         .args(["remove", &session_id, "--force"])
         .env("HOME", h.home_path())
         .env("XDG_CONFIG_HOME", h.home_path().join(".config"))
-        .env("TMUX", tmux_env)
+        .env("AOE_TMUX_SOCKET", &harness_sock)
         .env_remove("AGENT_OF_EMPIRES_DEBUG")
         .env_remove("AOE_LOG_LEVEL")
         .output()
