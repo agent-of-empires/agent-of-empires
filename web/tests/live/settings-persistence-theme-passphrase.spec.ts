@@ -210,10 +210,7 @@ test("theme picker persists across reload + restart without passphrase prompt", 
 // routable, so the simulation cannot collide with a real interface.
 const REMOTE_XFF = "203.0.113.10";
 
-test("sandbox image change requires elevation for remote callers, not loopback", async ({
-  servePreauthed,
-  page,
-}) => {
+test("sandbox image change requires elevation for remote callers, not loopback", async ({ servePreauthed, page }) => {
   const defaultProfile = await resolveDefaultProfile(servePreauthed);
 
   await bootDashboardAndNavigate(page, servePreauthed, "/");
