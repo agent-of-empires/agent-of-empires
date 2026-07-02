@@ -934,6 +934,20 @@ pub struct SessionConfig {
     )]
     pub smart_rename_agent: String,
 
+    /// Pass `--resume <sid>` (or the agent's equivalent) when restarting (`e`)
+    /// or reattaching (`Enter`) a terminal-mode session with a stored session
+    /// id. Disable to always start these sessions fresh instead, e.g. to
+    /// resume manually via the agent's own `/resume` picker. Does not affect
+    /// Send Message or Live Send, which always try to preserve context when
+    /// respawning a dead pane. See #2609.
+    #[serde(default = "default_true")]
+    #[setting(
+        label = "Auto-resume on restart/reattach",
+        widget = "toggle",
+        category = "Agents"
+    )]
+    pub auto_resume_on_restart: bool,
+
     /// Request xterm mouse tracking so the TUI handles the scroll wheel
     /// (preview-pane scroll) and click-to-select rows. Disable to hand the
     /// wheel and text selection back to the terminal, e.g. iOS Mosh +
@@ -1339,6 +1353,7 @@ impl Default for SessionConfig {
             merge_hooks_into_selected_agent: true,
             smart_rename: true,
             smart_rename_agent: String::new(),
+            auto_resume_on_restart: true,
             mouse_capture: true,
             custom_agents: HashMap::new(),
             agent_detect_as: HashMap::new(),
