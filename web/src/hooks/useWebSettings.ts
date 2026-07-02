@@ -8,6 +8,7 @@ const STORAGE_KEY = "aoe-web-settings";
 export interface WebSettings {
   mobileFontSize: number;
   desktopFontSize: number;
+  terminalFontFamily: string;
   autoOpenKeyboard: boolean;
   persistentTerminals: boolean;
   maxPersistentTerminals: number;
@@ -20,6 +21,7 @@ function getDefaults(): WebSettings {
   return {
     mobileFontSize: 8,
     desktopFontSize: 14,
+    terminalFontFamily: "",
     autoOpenKeyboard: true,
     persistentTerminals: false,
     maxPersistentTerminals: DEFAULT_PERSISTENT_TERMINALS,
