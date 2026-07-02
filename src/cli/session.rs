@@ -815,7 +815,7 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
     }
     if !fresh_after_failed_resume.is_empty() {
         println!(
-            "ℹ {} started fresh (prior resume probe failed for the stored sid; run `aoe session set-session-id` to retry it):",
+            "ℹ {} started fresh (a prior resume attempt failed for the stored sid; the old conversation is still reachable via the agent's own resume/history picker):",
             fresh_after_failed_resume.len()
         );
         for (title, sid) in &fresh_after_failed_resume {
@@ -947,7 +947,7 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         }
         StartOutcome::FreshAfterFailedResume { sid } => {
             println!(
-                "✓ Restarted session: {} (started fresh; prior resume probe failed for sid {sid}, run `aoe session set-session-id` to retry it)",
+                "✓ Restarted session: {} (started fresh; a prior resume attempt failed for sid {sid}, the old conversation is still reachable via the agent's own resume/history picker)",
                 title
             );
         }

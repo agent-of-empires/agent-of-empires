@@ -113,12 +113,15 @@ pub enum StartOutcome {
     /// any pre-existing pane first.
     Fresh,
     /// A resume was skipped, and the session started fresh instead, because
-    /// `sid` already failed a resume probe (`resume_probe_failed_sid ==
-    /// agent_session_id`). Distinct from `Fresh` so callers can tell the user
-    /// their conversation did not resume, instead of silently starting a
-    /// blank session. Retrying the same sid would only reproduce the
-    /// original `ResumeFailed`; `aoe session set-session-id` is the explicit
-    /// escape hatch. See #2609.
+    /// `sid` already failed a resume probe once before. Retrying the
+    /// identical sid would only reproduce the original `ResumeFailed`
+    /// forever, so this launch routes through `ResumeIntent::Cleared`
+    /// instead (same as a manual `aoe session set-session-id ""`): a fresh
+    /// sid is assigned and `sid` is not carried forward. Distinct from
+    /// `Fresh` so callers can tell the user their conversation did not
+    /// resume, instead of silently starting a blank session; the prior
+    /// conversation is still reachable through the agent's own resume/
+    /// history picker. See #2609.
     FreshAfterFailedResume { sid: String },
 }
 
@@ -597,6 +600,17 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "ResumeIntent::is_default")]
     pub(crate) resume_intent: ResumeIntent,
 
+    /// Runtime-only, one-shot: set by `start_with_resume_fallback` right
+    /// before calling `start_with_size_opts` to force this single launch
+    /// through the `ResumeIntent::Cleared` path (no `--resume` flag, fresh
+    /// sid) without persisting a real `Cleared` write ahead of time. Not
+    /// serialized; `reconcile_from_disk` explicitly carries it across the
+    /// `*self = disk` reload since it otherwise has no disk representation.
+    /// Consumed (reset to `false`) at the top of `start_with_size_opts`. See
+    /// #2609.
+    #[serde(skip)]
+    pub(crate) force_fresh_next_launch: bool,
+
     /// Runtime-only: which profile this instance was loaded from. Not persisted to disk.
     #[serde(default, skip_serializing)]
     pub source_profile: String,
@@ -1026,6 +1040,7 @@ impl Instance {
             agent_session_id: None,
             resume_probe_failed_sid: None,
             resume_intent: ResumeIntent::Default,
+            force_fresh_next_launch: false,
             source_profile: String::new(),
             notify_on_waiting: None,
             notify_on_idle: None,
@@ -1217,6 +1232,7 @@ impl Instance {
         disk.session_id_poller = self.session_id_poller.take();
         disk.retroactive_capture_excludes = std::mem::take(&mut self.retroactive_capture_excludes);
         disk.pane_dead_observed = self.pane_dead_observed;
+        disk.force_fresh_next_launch = self.force_fresh_next_launch;
         disk.source_profile = std::mem::take(&mut self.source_profile);
         // `before_start_env` is `#[serde(skip)]`, so the disk snapshot always
         // has it empty. Carry the live value forward; otherwise this reload
@@ -2285,6 +2301,17 @@ impl Instance {
         // CAS baseline). Covers resume-probe launches and explicit fresh
         // launches since both call this function.
         self.reconcile_from_disk();
+
+        // Consume the one-shot override, if `start_with_resume_fallback` set
+        // it, now that `reconcile_from_disk`'s `*self = disk` reload can no
+        // longer clobber it. Forces this launch through the same
+        // `ResumeIntent::Cleared` path a manual `aoe session set-session-id
+        // ""` would take: no `--resume` flag, fresh sid, one-shot
+        // auto-promote back to `Default` on disk after this launch persists.
+        // See #2609.
+        if std::mem::take(&mut self.force_fresh_next_launch) {
+            self.resume_intent = ResumeIntent::Cleared;
+        }
 
         self.reconcile_sidecar_into_disk();
 
@@ -3601,43 +3628,55 @@ impl Instance {
         // attempted, the race is just kill_clean cache staleness).
         let pane_was_preexisting = self.tmux_session().is_ok_and(|s| s.exists());
 
+        // Decide BEFORE launching whether this call may pass `--resume`, since
+        // that flag is baked into the command by `acquire_session_id` inside
+        // `start_with_size_opts`, not by anything read afterward. Only
+        // intervenes on the ambient auto-resume path (`ResumeIntent::Default`):
+        // an explicit one-shot `Use`/`Fork`/`Cleared` intent (e.g. just set via
+        // `aoe session set-session-id`) is a deliberate user action and must
+        // not be silently overridden by the restart-time policy or
+        // loop-breaker. When it fires, `force_fresh_next_launch` routes the
+        // launch through the same `ResumeIntent::Cleared` path a manual
+        // `set-session-id ""` would take. See #2609.
+        let mut skipped_failed_resume_sid: Option<String> = None;
+        if self.resume_intent == ResumeIntent::Default {
+            if let Some(sid) = self.agent_session_id.clone() {
+                let resume_allowed_by_policy = match resume_policy {
+                    ResumeAttemptPolicy::Allow => true,
+                    ResumeAttemptPolicy::HonorAutoResumeSetting => {
+                        super::profile_config::resolve_config_or_warn(&self.effective_profile())
+                            .session
+                            .auto_resume_on_restart
+                    }
+                };
+                let resume_capable = should_attempt_resume(Some(&sid), &self.tool);
+                let probe_already_failed = self.resume_probe_failed_sid.as_deref() == Some(&sid);
+                if resume_capable && probe_already_failed {
+                    // Loop-breaker: a sid that already failed a probe is never
+                    // retried automatically, regardless of policy, mirroring
+                    // the check `is_recovery_candidate` already applies to
+                    // the passive startup sweep. Without it, `e`/`Enter`
+                    // retries the identical doomed sid forever.
+                    skipped_failed_resume_sid = Some(sid);
+                    self.force_fresh_next_launch = true;
+                } else if resume_capable && !resume_allowed_by_policy {
+                    self.force_fresh_next_launch = true;
+                }
+            }
+        }
+
         let outcome = self.start_with_size_opts(size, skip_on_launch)?;
 
-        // Computed post-`start_with_size_opts` so it reflects post-reconcile
-        // state. A pre-call read would miss a peer-CLI `Use(X)` write that
-        // landed since the daemon's last status_poll, causing the cascade
-        // to skip the very Use(X_dead) case Tier-1's downgrade is meant to
-        // handle.
-        //
         // Gated on `LaunchSidOutcome::Existing` so fresh launches (Cleared,
         // no observed sid + Claude UUID generation) skip the probe and
         // honestly report `Fresh`. Without this gate, every Claude launch
         // would probe (~2s) and return `Resumed` because acquire always
-        // assigns a UUID, even when no `--resume` was passed.
-        let resume_allowed_by_policy = match resume_policy {
-            ResumeAttemptPolicy::Allow => true,
-            ResumeAttemptPolicy::HonorAutoResumeSetting => {
-                super::profile_config::resolve_config_or_warn(&self.effective_profile())
-                    .session
-                    .auto_resume_on_restart
-            }
-        };
-        // Loop-breaker: a sid that already failed a probe is never retried
-        // automatically, regardless of policy, mirroring the check
-        // `is_recovery_candidate` already applies to the passive startup
-        // sweep. Without it, `e`/`Enter` retries the identical doomed sid
-        // forever. See #2609.
-        let mut skipped_failed_resume_sid: Option<String> = None;
+        // assigns a UUID, even when no `--resume` was passed. When the
+        // pre-launch decision above forced `Cleared`, `outcome` is already
+        // `LaunchSidOutcome::Fresh` here, so this naturally yields `None`.
         let attempted_sid = match &outcome {
-            LaunchSidOutcome::Existing { sid }
-                if resume_allowed_by_policy && should_attempt_resume(Some(sid), &self.tool) =>
-            {
-                if self.resume_probe_failed_sid.as_deref() == Some(sid.as_str()) {
-                    skipped_failed_resume_sid = Some(sid.clone());
-                    None
-                } else {
-                    Some(sid.clone())
-                }
+            LaunchSidOutcome::Existing { sid } if should_attempt_resume(Some(sid), &self.tool) => {
+                Some(sid.clone())
             }
             _ => None,
         };
@@ -8818,6 +8857,234 @@ mod tests {
             assert_eq!(
                 row.resume_probe_failed_sid.as_deref(),
                 Some(stale_sid.as_str())
+            );
+        }
+
+        // #2609: `auto_resume_on_restart = false` must stop `--resume <sid>`
+        // from ever reaching the launched command on the restart/reattach
+        // path (`HonorAutoResumeSetting`), while leaving Send Message / Live
+        // Send (`Allow`) unaffected.
+        #[test]
+        #[serial]
+        fn auto_resume_on_restart_false_skips_stored_sid_and_launches_fresh() {
+            if std::process::Command::new("tmux")
+                .arg("-V")
+                .output()
+                .is_err()
+            {
+                eprintln!("tmux not available; skipping");
+                return;
+            }
+            let temp = tempdir().unwrap();
+            std::env::set_var("HOME", temp.path());
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+
+            let mut cfg = crate::session::config::Config::default();
+            cfg.session.auto_resume_on_restart = false;
+            crate::session::config::save_config(&cfg).unwrap();
+
+            let storage = crate::session::storage::Storage::new_unwatched("fb-toggle-off").unwrap();
+
+            let stale_sid = "44444444-4444-4444-4444-444444444444".to_string();
+            let mut inst = Instance::new("fallback_toggle_off_test", "/tmp/x");
+            inst.tool = "claude".to_string();
+            inst.source_profile = "fb-toggle-off".to_string();
+            // Would die if (and only if) `--resume <stale_sid>` reached the
+            // command; with the toggle off it must never be passed, so this
+            // process lives.
+            inst.command = format!(
+                "/bin/sh -c 'case \"$*\" in *{stale}*) exit 1 ;; esac; exec sleep 30' --",
+                stale = stale_sid,
+            );
+            inst.agent_session_id = Some(stale_sid.clone());
+            inst.status = Status::Idle;
+
+            let xs = vec![inst.clone()];
+            storage
+                .update(|i, g| {
+                    *i = xs.to_vec();
+                    *g = crate::session::GroupTree::new_with_groups(&xs, &[]).get_all_groups();
+                    Ok(())
+                })
+                .unwrap();
+
+            let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+            let _ = std::process::Command::new("tmux")
+                .args(["kill-session", "-t", &tmux_name])
+                .output();
+
+            let outcome = inst.start_with_resume_fallback(
+                None,
+                true,
+                ResumeAttemptPolicy::HonorAutoResumeSetting,
+            );
+
+            let _ = std::process::Command::new("tmux")
+                .args(["kill-session", "-t", &tmux_name])
+                .output();
+
+            assert_eq!(outcome.unwrap(), StartOutcome::Fresh);
+            assert_ne!(
+                inst.agent_session_id.as_deref(),
+                Some(stale_sid.as_str()),
+                "toggle off must generate a fresh sid, not reuse the stale one"
+            );
+        }
+
+        // #2609: Send Message / Live Send (`Allow`) must keep attempting resume
+        // regardless of `auto_resume_on_restart`, so a dead pane still surfaces
+        // `ResumeFailed` (proving `--resume <sid>` was passed) rather than
+        // silently starting fresh and losing agent context.
+        #[test]
+        #[serial]
+        fn allow_policy_still_attempts_resume_when_auto_resume_on_restart_is_false() {
+            if std::process::Command::new("tmux")
+                .arg("-V")
+                .output()
+                .is_err()
+            {
+                eprintln!("tmux not available; skipping");
+                return;
+            }
+            let temp = tempdir().unwrap();
+            std::env::set_var("HOME", temp.path());
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+
+            let mut cfg = crate::session::config::Config::default();
+            cfg.session.auto_resume_on_restart = false;
+            crate::session::config::save_config(&cfg).unwrap();
+
+            let storage =
+                crate::session::storage::Storage::new_unwatched("fb-allow-ignores").unwrap();
+
+            let stale_sid = "55555555-5555-5555-5555-555555555555".to_string();
+            let mut inst = Instance::new("fallback_allow_ignores_toggle_test", "/tmp/x");
+            inst.tool = "claude".to_string();
+            inst.source_profile = "fb-allow-ignores".to_string();
+            inst.command = "/bin/false".to_string();
+            inst.agent_session_id = Some(stale_sid.clone());
+            inst.status = Status::Idle;
+
+            let xs = vec![inst.clone()];
+            storage
+                .update(|i, g| {
+                    *i = xs.to_vec();
+                    *g = crate::session::GroupTree::new_with_groups(&xs, &[]).get_all_groups();
+                    Ok(())
+                })
+                .unwrap();
+
+            let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+            let _ = std::process::Command::new("tmux")
+                .args(["kill-session", "-t", &tmux_name])
+                .output();
+
+            let outcome = inst.start_with_resume_fallback(None, true, ResumeAttemptPolicy::Allow);
+
+            let _ = std::process::Command::new("tmux")
+                .args(["kill-session", "-t", &tmux_name])
+                .output();
+
+            assert_eq!(
+                outcome.unwrap(),
+                StartOutcome::ResumeFailed {
+                    sid: stale_sid.clone(),
+                },
+                "Allow must ignore auto_resume_on_restart=false and still attempt resume"
+            );
+        }
+
+        // #2609 core bug: a sid whose resume probe already failed once must
+        // never be retried automatically. Reproduces the reported infinite
+        // loop (two consecutive `e`/`Enter` presses against the same doomed
+        // sid) and proves the second attempt terminates it instead of
+        // repeating `ResumeFailed` forever.
+        #[test]
+        #[serial]
+        fn stale_probe_failed_sid_is_not_retried_on_next_attempt() {
+            if std::process::Command::new("tmux")
+                .arg("-V")
+                .output()
+                .is_err()
+            {
+                eprintln!("tmux not available; skipping");
+                return;
+            }
+            let temp = tempdir().unwrap();
+            std::env::set_var("HOME", temp.path());
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+
+            let storage = crate::session::storage::Storage::new_unwatched("fb-loop-break").unwrap();
+
+            let stale_sid = "66666666-6666-6666-6666-666666666666".to_string();
+            let mut inst = Instance::new("fallback_loop_break_test", "/tmp/x");
+            inst.tool = "claude".to_string();
+            inst.source_profile = "fb-loop-break".to_string();
+            inst.command = "/bin/false".to_string();
+            inst.agent_session_id = Some(stale_sid.clone());
+            inst.status = Status::Idle;
+
+            let xs = vec![inst.clone()];
+            storage
+                .update(|i, g| {
+                    *i = xs.to_vec();
+                    *g = crate::session::GroupTree::new_with_groups(&xs, &[]).get_all_groups();
+                    Ok(())
+                })
+                .unwrap();
+
+            let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+            let _ = std::process::Command::new("tmux")
+                .args(["kill-session", "-t", &tmux_name])
+                .output();
+
+            // First attempt: reproduces the pre-existing `ResumeFailed` path,
+            // exactly like `fallback_marks_resume_failed_and_preserves_sid_when_pane_dies`.
+            let first = inst
+                .start_with_resume_fallback(None, true, ResumeAttemptPolicy::Allow)
+                .unwrap();
+            assert_eq!(
+                first,
+                StartOutcome::ResumeFailed {
+                    sid: stale_sid.clone(),
+                }
+            );
+            assert_eq!(
+                inst.resume_probe_failed_sid.as_deref(),
+                Some(stale_sid.as_str())
+            );
+
+            // Second attempt, same sid, same doomed command: on the pre-fix
+            // tree this reproduces the reported bug (identical `ResumeFailed`
+            // forever). The fix must instead skip the resume attempt and
+            // start fresh.
+            inst.kill_clean().unwrap();
+            let second = inst
+                .start_with_resume_fallback(None, true, ResumeAttemptPolicy::Allow)
+                .unwrap();
+
+            let _ = std::process::Command::new("tmux")
+                .args(["kill-session", "-t", &tmux_name])
+                .output();
+
+            assert_eq!(
+                second,
+                StartOutcome::FreshAfterFailedResume {
+                    sid: stale_sid.clone(),
+                },
+                "a sid that already failed a resume probe must not be retried automatically"
+            );
+            assert_ne!(
+                inst.agent_session_id.as_deref(),
+                Some(stale_sid.as_str()),
+                "loop-breaker must generate a fresh sid instead of repeating the doomed one"
+            );
+            assert_eq!(
+                inst.resume_probe_failed_sid, None,
+                "loop-breaker's fresh launch clears the stale marker, matching ResumeIntent::Cleared semantics"
             );
         }
 

@@ -3073,8 +3073,9 @@ impl HomeView {
                             self.info_dialog = Some(InfoDialog::new(
                                 "Restarted",
                                 &format!(
-                                    "Started fresh; a prior resume probe failed for sid {sid}. \
-                                     Run `aoe session set-session-id` to retry it."
+                                    "Started fresh; a prior resume attempt failed for sid {sid}. \
+                                     The old conversation is still reachable via the agent's \
+                                     own resume/history picker."
                                 ),
                             ));
                         }

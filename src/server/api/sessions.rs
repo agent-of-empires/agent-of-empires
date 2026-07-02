@@ -4995,9 +4995,11 @@ pub async fn ensure_session(
             }
             if let crate::session::StartOutcome::FreshAfterFailedResume { sid } = &outcome {
                 body["message"] = serde_json::Value::String(format!(
-                    "Started fresh; a prior resume probe failed for sid {sid}"
+                    "Started fresh; a prior resume attempt failed for sid {sid}. \
+                     The old conversation is still reachable via the agent's own \
+                     resume/history picker."
                 ));
-                body["resume_session_id"] = serde_json::Value::String(sid.clone());
+                body["prior_session_id"] = serde_json::Value::String(sid.clone());
             }
             (StatusCode::OK, Json(body)).into_response()
         }
