@@ -7,10 +7,16 @@
 // the handler must not return 403 elevation_required and the client
 // must not pop ElevationPrompt.
 //
-// Story 3: the same passphrase user PATCHes a sandbox image. The
+// Story 3: a REMOTE passphrase user PATCHes a sandbox image. The
 // daemon DOES still return 403 elevation_required and the client
-// DOES pop the inline passphrase prompt. Locks the threat-model
-// half of the fix: tamper-surface fields stay gated.
+// DOES pop the inline passphrase prompt; confirming it elevates the
+// session and the retry succeeds. Locks the threat-model half of the
+// fix: tamper-surface fields stay gated for remote callers. Remote is
+// simulated with an X-Forwarded-For header: the test socket is
+// loopback, and `resolve_client_ip` trusts forwarding headers from a
+// loopback peer, which is exactly the path a proxied real remote
+// request takes. A loopback caller (no XFF) is trusted per the #1168
+// carve-out and saves the same field with no prompt (#2610).
 //
 // Both tests boot a fresh `aoe serve --auth=passphrase` via
 // `spawnAoeServe({ preloginViaHarness: true })` and inject the
@@ -200,26 +206,54 @@ test("theme picker persists across reload + restart without passphrase prompt", 
   expect(afterRestart?.theme?.name).toBe(SWITCH_TO);
 });
 
-test("sandbox image change still requires passphrase elevation", async ({ servePreauthed, page }) => {
+// TEST-NET-3 address (RFC 5737): resolves as a remote caller, never
+// routable, so the simulation cannot collide with a real interface.
+const REMOTE_XFF = "203.0.113.10";
+
+test("sandbox image change requires elevation for remote callers, not loopback", async ({
+  servePreauthed,
+  page,
+}) => {
   const defaultProfile = await resolveDefaultProfile(servePreauthed);
 
   await bootDashboardAndNavigate(page, servePreauthed, "/");
 
-  // Fire the PATCH from the page so the fetchInterceptor (installed by
-  // the SPA bootstrap) sees the 403 and dispatches the elevation event.
-  // A direct test-side `fetch` would bypass the interceptor and the
-  // dialog would never open even when the server side is correct.
-  const status = await page.evaluate(async (profile) => {
+  // Loopback caller (no XFF): the #1168 carve-out applies, the
+  // tamper-surface field saves with no elevation prompt. Pre-#2610 this
+  // returned 403 elevation_required and looped the prompt forever.
+  const loopbackStatus = await page.evaluate(async (profile) => {
     const res = await fetch(`/api/profiles/${encodeURIComponent(profile)}/settings`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        sandbox: { default_image: "ghcr.io/example/img:tampered" },
+        sandbox: { default_image: "ghcr.io/example/img:local-trusted" },
       }),
     });
     return res.status;
   }, defaultProfile);
-  expect(status).toBe(403);
+  expect(loopbackStatus).toBe(200);
+  await expect(page.locator('[role="dialog"]').filter({ hasText: /Confirm passphrase/i })).toHaveCount(0);
+
+  // Remote caller (XFF from a loopback socket resolves to the forwarded
+  // IP): the elevation gate holds. Fire the PATCH from the page so the
+  // fetchInterceptor (installed by the SPA bootstrap) sees the 403 and
+  // dispatches the elevation event. A direct test-side `fetch` would
+  // bypass the interceptor and the dialog would never open even when
+  // the server side is correct.
+  const remoteStatus = await page.evaluate(
+    async ({ profile, xff }) => {
+      const res = await fetch(`/api/profiles/${encodeURIComponent(profile)}/settings`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", "X-Forwarded-For": xff },
+        body: JSON.stringify({
+          sandbox: { default_image: "ghcr.io/example/img:tampered" },
+        }),
+      });
+      return res.status;
+    },
+    { profile: defaultProfile, xff: REMOTE_XFF },
+  );
+  expect(remoteStatus).toBe(403);
 
   // ElevationPrompt opens (from fetchInterceptor dispatching
   // ELEVATION_REQUIRED_EVENT on the 403 elevation_required payload).
@@ -227,14 +261,39 @@ test("sandbox image change still requires passphrase elevation", async ({ serveP
   // accessible name (no aria-label, no aria-labelledby pointing at
   // the "Confirm passphrase" header), so `getByRole("dialog", { name })`
   // does not match. Locate by role then filter on visible text instead.
-  await expect(page.locator('[role="dialog"]').filter({ hasText: /Confirm passphrase/i })).toBeVisible({
-    timeout: 5_000,
-  });
+  const dialog = page.locator('[role="dialog"]').filter({ hasText: /Confirm passphrase/i });
+  await expect(dialog).toBeVisible({ timeout: 5_000 });
 
-  // Server state did not move: the sandbox image stays at whatever it
-  // was. Use the seeded cookie + binding so the GET passes the wall.
+  // The tampered write did not land.
   const after = await fetch(`${servePreauthed.baseUrl}/api/profiles/${encodeURIComponent(defaultProfile)}/settings`, {
     headers: authHeaders(servePreauthed),
   }).then((r) => r.json());
   expect(after?.sandbox?.default_image ?? "").not.toBe("ghcr.io/example/img:tampered");
+
+  // Confirming the prompt elevates the session (elevation is a session
+  // property, not per-IP) and the remote retry goes through: the
+  // elevate-then-retry flow the loop bug broke.
+  await dialog.locator('input[type="password"]').fill(servePreauthed.passphrase!);
+  await dialog.getByRole("button", { name: /Confirm/i }).click();
+  await expect(dialog).toHaveCount(0, { timeout: 5_000 });
+
+  const retryStatus = await page.evaluate(
+    async ({ profile, xff }) => {
+      const res = await fetch(`/api/profiles/${encodeURIComponent(profile)}/settings`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", "X-Forwarded-For": xff },
+        body: JSON.stringify({
+          sandbox: { default_image: "ghcr.io/example/img:elevated" },
+        }),
+      });
+      return res.status;
+    },
+    { profile: defaultProfile, xff: REMOTE_XFF },
+  );
+  expect(retryStatus).toBe(200);
+
+  const final = await fetch(`${servePreauthed.baseUrl}/api/profiles/${encodeURIComponent(defaultProfile)}/settings`, {
+    headers: authHeaders(servePreauthed),
+  }).then((r) => r.json());
+  expect(final?.sandbox?.default_image).toBe("ghcr.io/example/img:elevated");
 });
