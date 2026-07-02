@@ -534,6 +534,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_append_default_shell_args() {
+        let mut args: Vec<String> = vec!["new-session".into()];
+        append_default_shell_args(&mut args, "aoe_test", "/bin/zsh");
+        assert_eq!(
+            args,
+            vec![
+                "new-session",
+                ";",
+                "set-option",
+                "-t",
+                "aoe_test",
+                "default-shell",
+                "/bin/zsh",
+            ]
+        );
+    }
+
     fn tmux_available() -> bool {
         crate::tmux::tmux_command()
             .arg("-V")
