@@ -22,6 +22,8 @@ impl Drop for TmuxCleanup {
     fn drop(&mut self) {
         for name in &self.session_names {
             let _ = Command::new("tmux")
+                .arg("-S")
+                .arg(crate::common::tmux_socket())
                 .args(["kill-session", "-t", name])
                 .output();
         }
@@ -37,6 +39,8 @@ impl Drop for TmuxCleanup {
 /// sessions owned by other instances.
 fn build_exclusion_set_for_test(current_instance_id: &str) -> HashSet<String> {
     let output = match Command::new("tmux")
+        .arg("-S")
+        .arg(crate::common::tmux_socket())
         .args(["list-sessions", "-F", "#{session_name}"])
         .output()
     {
@@ -85,12 +89,16 @@ fn skip_if_no_tmux() -> bool {
 fn create_test_sessions(session_names: &[String], instance_ids: &[String]) {
     for name in session_names {
         let _ = Command::new("tmux")
+            .arg("-S")
+            .arg(crate::common::tmux_socket())
             .args(["kill-session", "-t", name])
             .output();
     }
 
     for (name, instance_id) in session_names.iter().zip(instance_ids.iter()) {
         let status = Command::new("tmux")
+            .arg("-S")
+            .arg(crate::common::tmux_socket())
             .args(["new-session", "-d", "-s", name])
             .status()
             .expect("Failed to create tmux session");
@@ -249,6 +257,8 @@ fn test_cleanup_after_drop() {
     let session_name = "aoe_test_parallel_cleanup";
 
     let _ = Command::new("tmux")
+        .arg("-S")
+        .arg(crate::common::tmux_socket())
         .args(["kill-session", "-t", session_name])
         .output();
 
@@ -258,12 +268,16 @@ fn test_cleanup_after_drop() {
         };
 
         let status = Command::new("tmux")
+            .arg("-S")
+            .arg(crate::common::tmux_socket())
             .args(["new-session", "-d", "-s", session_name])
             .status()
             .expect("Failed to create tmux session");
         assert!(status.success());
 
         let check = Command::new("tmux")
+            .arg("-S")
+            .arg(crate::common::tmux_socket())
             .args(["has-session", "-t", session_name])
             .status()
             .expect("Failed to check session");
@@ -271,6 +285,8 @@ fn test_cleanup_after_drop() {
     }
 
     let check = Command::new("tmux")
+        .arg("-S")
+        .arg(crate::common::tmux_socket())
         .args(["has-session", "-t", session_name])
         .status()
         .expect("Failed to check session");

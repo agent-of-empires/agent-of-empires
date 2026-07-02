@@ -3,8 +3,23 @@
 //! Declared once from `tests/integration/main.rs`; consumers import via
 //! `use crate::common::...`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
+
+/// Stable per-process tmux socket for integration tests. aoe now resolves an
+/// explicit `-S <socket>` (#2608) and caches it once per process, so tests
+/// must (a) point aoe at a hermetic socket via `AOE_TMUX_SOCKET` and (b) make
+/// their own raw `tmux` calls target the same socket. The path is stable (not
+/// per-test-home) precisely because the lib caches it once; a per-home path
+/// would be dropped out from under a later test. Referencing it also sets
+/// `AOE_TMUX_SOCKET`, so any raw-tmux call site locks the lib onto the same
+/// socket before its first lib tmux call. `#[serial]` tests keep the env write
+/// single-threaded.
+pub fn tmux_socket() -> PathBuf {
+    let path = std::env::temp_dir().join("aoe-integration-tmux.sock");
+    std::env::set_var("AOE_TMUX_SOCKET", &path);
+    path
+}
 
 /// Path to the Node ACP test shim used by acp_* integration tests.
 ///
@@ -63,6 +78,9 @@ pub fn setup_temp_home() -> TempDir {
 /// Variant for tests that already own a `TempDir` (e.g. ones that also seed
 /// files under the same path before returning the guard).
 pub fn set_temp_home(path: &Path) {
+    // Establish the hermetic tmux socket before any lib tmux call so aoe's
+    // once-cached socket resolution locks onto it (#2608).
+    let _ = tmux_socket();
     std::env::set_var("HOME", path);
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     std::env::set_var("XDG_CONFIG_HOME", path.join(".config"));

@@ -6,7 +6,7 @@ use agent_of_empires::tmux;
 use serial_test::serial;
 use std::process::Command;
 
-use crate::common::setup_temp_home;
+use crate::common::{setup_temp_home, tmux_socket};
 
 const VALID_CLAUDE_UUID: &str = "019342ab-1234-7def-8901-abcdef012345";
 
@@ -15,6 +15,8 @@ struct TmuxCleanup<'a>(&'a str);
 impl Drop for TmuxCleanup<'_> {
     fn drop(&mut self) {
         let _ = Command::new("tmux")
+            .arg("-S")
+            .arg(tmux_socket())
             .args(["kill-session", "-t", self.0])
             .output();
     }
@@ -44,6 +46,8 @@ fn start_with_size_opts_returns_skipped_when_pane_preexists() {
     let session_name = tmux::Session::generate_name(&inst.id, &inst.title);
 
     let status = Command::new("tmux")
+        .arg("-S")
+        .arg(tmux_socket())
         .args(["new-session", "-d", "-s", &session_name])
         .status()
         .expect("tmux new-session");
