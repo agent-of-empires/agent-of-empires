@@ -236,7 +236,9 @@ export function MobileLiveTerminal({
   const configuredFontSize = settings[fontKey];
   // A user-chosen terminal font, falling back to the bundled `--font-mono` so a
   // missing/mistyped family degrades gracefully instead of blanking the grid.
-  const termFontFamily = settings.terminalFontFamily.trim();
+  // Strip quotes so a stray `"` can't produce a malformed (and silently
+  // ignored) font-family value.
+  const termFontFamily = (settings.terminalFontFamily ?? "").trim().replace(/"/g, "");
   const fontFamily = termFontFamily ? `"${termFontFamily}", var(--font-mono)` : undefined;
   const [fontSize, setFontSize] = useState(() => configuredFontSize);
   // Adopt the persisted setting when it changes (settings panel, or the
