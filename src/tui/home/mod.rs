@@ -2918,6 +2918,18 @@ impl HomeView {
                             );
                         }
                         Ok(crate::session::StartOutcome::Fresh) => {}
+                        Ok(crate::session::StartOutcome::FreshAfterFailedResume { sid }) => {
+                            // Defensive: `is_recovery_candidate` already excludes
+                            // sids equal to `resume_probe_failed_sid`, so this
+                            // should not normally fire here. See #2609.
+                            tracing::info!(
+                                target: "session.startup_recovery",
+                                id = %instance_id,
+                                %title,
+                                %sid,
+                                "started fresh; sid previously failed a resume probe",
+                            );
+                        }
                         Err(e) => {
                             tracing::warn!(
                                 target: "session.startup_recovery",
@@ -3048,6 +3060,21 @@ impl HomeView {
                                 "Restart Failed",
                                 &format!(
                                     "Resume failed for sid {sid}; preserved for explicit retry"
+                                ),
+                            ));
+                        }
+                        Ok(crate::session::StartOutcome::FreshAfterFailedResume { sid }) => {
+                            tracing::info!(
+                                target: "session.restart",
+                                id = %session_id,
+                                %sid,
+                                "started fresh; sid previously failed a resume probe",
+                            );
+                            self.info_dialog = Some(InfoDialog::new(
+                                "Restarted",
+                                &format!(
+                                    "Started fresh; a prior resume probe failed for sid {sid}. \
+                                     Run `aoe session set-session-id` to retry it."
                                 ),
                             ));
                         }

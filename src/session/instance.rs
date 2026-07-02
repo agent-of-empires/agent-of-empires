@@ -112,6 +112,27 @@ pub enum StartOutcome {
     /// actually occurred this call depends on the caller having killed
     /// any pre-existing pane first.
     Fresh,
+    /// A resume was skipped, and the session started fresh instead, because
+    /// `sid` already failed a resume probe (`resume_probe_failed_sid ==
+    /// agent_session_id`). Distinct from `Fresh` so callers can tell the user
+    /// their conversation did not resume, instead of silently starting a
+    /// blank session. Retrying the same sid would only reproduce the
+    /// original `ResumeFailed`; `aoe session set-session-id` is the explicit
+    /// escape hatch. See #2609.
+    FreshAfterFailedResume { sid: String },
+}
+
+/// Governs whether `start_with_resume_fallback` may pass `--resume <sid>` at
+/// all, independent of the per-sid loop-breaker (`resume_probe_failed_sid`),
+/// which always applies regardless of policy. `HonorAutoResumeSetting` is
+/// used by explicit user restart/reattach (`e`, `Enter`); `Allow` is used by
+/// Send Message and Live Send, which must keep trying to preserve agent
+/// context even when the user has disabled auto-resume for manual restarts.
+/// See #2609.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResumeAttemptPolicy {
+    HonorAutoResumeSetting,
+    Allow,
 }
 
 /// What `start_with_size_opts` did with the agent's session id this call.
@@ -3415,16 +3436,36 @@ impl Instance {
     }
 
     /// Restart the session, optionally skipping on_launch hooks (e.g. when
-    /// they already ran in the background creation poller).
+    /// they already ran in the background creation poller). Honors
+    /// `SessionConfig::auto_resume_on_restart`; this is the explicit
+    /// user-initiated restart/reattach path (`e`, `Enter`, CLI `session
+    /// restart`, startup recovery). See #2609.
     pub fn restart_with_size_opts(
         &mut self,
         size: Option<(u16, u16)>,
         skip_on_launch: bool,
     ) -> Result<StartOutcome> {
+        self.restart_with_resume_policy(
+            size,
+            skip_on_launch,
+            ResumeAttemptPolicy::HonorAutoResumeSetting,
+        )
+    }
+
+    /// Shared restart cascade behind `restart_with_size_opts`. Broken out so
+    /// `ensure_pane_ready_with_size`'s dead-pane respawn (Send Message / Live
+    /// Send) can pass `ResumeAttemptPolicy::Allow`, keeping those surfaces
+    /// unaffected by `auto_resume_on_restart`. See #2609.
+    fn restart_with_resume_policy(
+        &mut self,
+        size: Option<(u16, u16)>,
+        skip_on_launch: bool,
+        resume_policy: ResumeAttemptPolicy,
+    ) -> Result<StartOutcome> {
         self.stop_poller();
         self.session_id_poller = None;
         self.kill_clean()?;
-        self.start_with_resume_fallback(size, skip_on_launch)
+        self.start_with_resume_fallback(size, skip_on_launch, resume_policy)
     }
 
     /// Settle-based pane probe used by the resume-fallback cascade.
@@ -3491,6 +3532,14 @@ impl Instance {
     ///      `StartOutcome::ResumeFailed`. A dead pane is not proof that the
     ///      sid is invalid, so this path must not clear it or launch fresh.
     ///
+    /// `resume_policy` gates step 1: `HonorAutoResumeSetting` additionally
+    /// requires `SessionConfig::auto_resume_on_restart`; `Allow` always
+    /// permits an attempt (subject to `should_attempt_resume`). Independent
+    /// of policy, a sid that already equals `resume_probe_failed_sid` from a
+    /// prior call never re-attempts resume: it returns
+    /// `StartOutcome::FreshAfterFailedResume` instead of repeating the same
+    /// doomed probe. See #2609.
+    ///
     /// Latency: only fires the probe when `--resume <sid>` is being passed
     /// to a freshly-created tmux session. Healthy resumes on real agents
     /// pay `RESUME_PROBE_POST_SHELL_GRACE` (~2s) once on cold start;
@@ -3508,6 +3557,7 @@ impl Instance {
         &mut self,
         size: Option<(u16, u16)>,
         skip_on_launch: bool,
+        resume_policy: ResumeAttemptPolicy,
     ) -> Result<StartOutcome> {
         // Clear `Status::Error` on entry so a successful relaunch from any
         // restart surface (REST `ensure_session`, TUI Enter/restart, CLI
@@ -3564,9 +3614,30 @@ impl Instance {
         // honestly report `Fresh`. Without this gate, every Claude launch
         // would probe (~2s) and return `Resumed` because acquire always
         // assigns a UUID, even when no `--resume` was passed.
+        let resume_allowed_by_policy = match resume_policy {
+            ResumeAttemptPolicy::Allow => true,
+            ResumeAttemptPolicy::HonorAutoResumeSetting => {
+                super::profile_config::resolve_config_or_warn(&self.effective_profile())
+                    .session
+                    .auto_resume_on_restart
+            }
+        };
+        // Loop-breaker: a sid that already failed a probe is never retried
+        // automatically, regardless of policy, mirroring the check
+        // `is_recovery_candidate` already applies to the passive startup
+        // sweep. Without it, `e`/`Enter` retries the identical doomed sid
+        // forever. See #2609.
+        let mut skipped_failed_resume_sid: Option<String> = None;
         let attempted_sid = match &outcome {
-            LaunchSidOutcome::Existing { sid } if should_attempt_resume(Some(sid), &self.tool) => {
-                Some(sid.clone())
+            LaunchSidOutcome::Existing { sid }
+                if resume_allowed_by_policy && should_attempt_resume(Some(sid), &self.tool) =>
+            {
+                if self.resume_probe_failed_sid.as_deref() == Some(sid.as_str()) {
+                    skipped_failed_resume_sid = Some(sid.clone());
+                    None
+                } else {
+                    Some(sid.clone())
+                }
             }
             _ => None,
         };
@@ -3605,7 +3676,10 @@ impl Instance {
         // `start_with_size_opts`'s internal `session.exists()` check, in
         // which case `outcome` could be `Existing` despite the snapshot.
         if !attempting_resume || pane_was_preexisting {
-            return Ok(StartOutcome::Fresh);
+            return Ok(match skipped_failed_resume_sid {
+                Some(sid) => StartOutcome::FreshAfterFailedResume { sid },
+                None => StartOutcome::Fresh,
+            });
         }
 
         // Tier-1 settle probe. On Err (rare: only when `tmux_session()`
@@ -3728,28 +3802,35 @@ impl Instance {
             // Route fresh starts through the resume probe so a sid loaded
             // from disk that crashes the agent on launch is detected and
             // preserved with a loop-breaker instead of being retried
-            // automatically.
+            // automatically. Always `Allow`: Send Message and Live Send must
+            // keep trying to preserve agent context regardless of
+            // `auto_resume_on_restart`, which only scopes explicit
+            // restart/reattach. See #2609.
             let outcome = self
-                .start_with_resume_fallback(size, false)
+                .start_with_resume_fallback(size, false, ResumeAttemptPolicy::Allow)
                 .map_err(EnsureReadyError::Tmux)?;
             match outcome {
                 StartOutcome::ResumeFailed { sid } => {
                     return Ok(EnsureReadyOutcome::ResumeFailed { sid });
                 }
-                StartOutcome::Resumed | StartOutcome::Fresh => {}
+                StartOutcome::Resumed
+                | StartOutcome::Fresh
+                | StartOutcome::FreshAfterFailedResume { .. } => {}
             }
             self.wait_for_pane_ready(&session);
             return Ok(EnsureReadyOutcome::Started);
         }
         if session.is_pane_dead() {
             let outcome = self
-                .restart_with_size(size)
+                .restart_with_resume_policy(size, false, ResumeAttemptPolicy::Allow)
                 .map_err(EnsureReadyError::Tmux)?;
             match outcome {
                 StartOutcome::ResumeFailed { sid } => {
                     return Ok(EnsureReadyOutcome::ResumeFailed { sid });
                 }
-                StartOutcome::Resumed | StartOutcome::Fresh => {}
+                StartOutcome::Resumed
+                | StartOutcome::Fresh
+                | StartOutcome::FreshAfterFailedResume { .. } => {}
             }
             self.wait_for_pane_ready(&session);
             return Ok(EnsureReadyOutcome::Respawned);
@@ -6956,7 +7037,8 @@ mod tests {
 
     mod resume_fallback {
         use super::super::{
-            should_attempt_resume, Instance, LaunchSidOutcome, ResumeIntent, StartOutcome, Status,
+            should_attempt_resume, Instance, LaunchSidOutcome, ResumeAttemptPolicy, ResumeIntent,
+            StartOutcome, Status,
         };
         use serial_test::serial;
         use tempfile::tempdir;
@@ -8588,7 +8670,9 @@ mod tests {
             inst.agent_session_id = Some("11111111-1111-1111-1111-111111111111".to_string());
             inst.tool = "claude".to_string();
 
-            let outcome = inst.start_with_resume_fallback(None, true).unwrap();
+            let outcome = inst
+                .start_with_resume_fallback(None, true, ResumeAttemptPolicy::Allow)
+                .unwrap();
             assert_eq!(outcome, StartOutcome::Fresh);
         }
 
@@ -8633,7 +8717,7 @@ mod tests {
                 })
                 .unwrap();
 
-            let outcome = inst.start_with_resume_fallback(None, true);
+            let outcome = inst.start_with_resume_fallback(None, true, ResumeAttemptPolicy::Allow);
 
             let _ = std::process::Command::new("tmux")
                 .args(["kill-session", "-t", &tmux_name])
@@ -8711,7 +8795,7 @@ mod tests {
                 .args(["kill-session", "-t", &tmux_name])
                 .output();
 
-            let outcome = inst.start_with_resume_fallback(None, true);
+            let outcome = inst.start_with_resume_fallback(None, true, ResumeAttemptPolicy::Allow);
 
             let _ = std::process::Command::new("tmux")
                 .args(["kill-session", "-t", &tmux_name])
@@ -8780,7 +8864,7 @@ mod tests {
                 .args(["kill-session", "-t", &tmux_name])
                 .output();
 
-            let outcome = inst.start_with_resume_fallback(None, true);
+            let outcome = inst.start_with_resume_fallback(None, true, ResumeAttemptPolicy::Allow);
 
             let _ = std::process::Command::new("tmux")
                 .args(["kill-session", "-t", &tmux_name])

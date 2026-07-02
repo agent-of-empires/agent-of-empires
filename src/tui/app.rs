@@ -2843,6 +2843,11 @@ impl App {
                     )));
                     return Ok(());
                 }
+                Ok(crate::session::StartOutcome::FreshAfterFailedResume { sid }) => {
+                    self.update_status = Some(UpdateStatus::transient(format!(
+                        "Started fresh; resume previously failed for sid {sid}"
+                    )));
+                }
                 Ok(_) => {}
             }
             self.home.set_instance_error(session_id, None);

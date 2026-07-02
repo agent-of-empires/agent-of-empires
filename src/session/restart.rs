@@ -73,7 +73,12 @@ pub fn perform_restart(request: RestartRequest) -> RestartResult {
 }
 
 fn should_send_restart_wake(outcome: &Result<StartOutcome, String>) -> bool {
-    matches!(outcome, Ok(StartOutcome::Fresh | StartOutcome::Resumed))
+    matches!(
+        outcome,
+        Ok(StartOutcome::Fresh
+            | StartOutcome::Resumed
+            | StartOutcome::FreshAfterFailedResume { .. })
+    )
 }
 
 /// Wait for the restarted pane to become live and past its boot shell, then

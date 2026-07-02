@@ -2883,7 +2883,13 @@ pub async fn start_session(
             if let Err(e) = inst.kill_clean() {
                 return Err(Box::new((inst, e)));
             }
-            match inst.start_with_resume_fallback(None, false) {
+            // Explicit restart endpoint (web dashboard Restart button):
+            // honor auto_resume_on_restart, same as TUI `e`/`Enter`. See #2609.
+            match inst.start_with_resume_fallback(
+                None,
+                false,
+                crate::session::ResumeAttemptPolicy::HonorAutoResumeSetting,
+            ) {
                 Ok(outcome) => Ok((inst, outcome)),
                 Err(e) => Err(Box::new((inst, e))),
             }
@@ -4943,7 +4949,16 @@ pub async fn ensure_session(
             // live entry can retain stale marker/sid state until the next
             // `status_poll_loop` reload window (~2s). See
             // `apply_post_restart_sync`.
-            match inst.start_with_resume_fallback(None, false) {
+            //
+            // `ensure_session` respawns on-demand before a WS attach/send,
+            // the server-side analog of `ensure_pane_ready`: always `Allow`,
+            // ignoring `auto_resume_on_restart`, so attaching doesn't
+            // silently drop the agent's context. See #2609.
+            match inst.start_with_resume_fallback(
+                None,
+                false,
+                crate::session::ResumeAttemptPolicy::Allow,
+            ) {
                 Ok(outcome) => Ok((inst, outcome)),
                 Err(e) => Err(Box::new((inst, e))),
             }
@@ -4961,6 +4976,9 @@ pub async fn ensure_session(
                 crate::session::StartOutcome::Resumed => "resumed",
                 crate::session::StartOutcome::ResumeFailed { .. } => "resume_failed",
                 crate::session::StartOutcome::Fresh => "fresh",
+                crate::session::StartOutcome::FreshAfterFailedResume { .. } => {
+                    "fresh_after_failed_resume"
+                }
             };
             let mut body = serde_json::json!({
                 "status": "restarted",
@@ -4974,6 +4992,12 @@ pub async fn ensure_session(
                 ));
                 body["resume_session_id"] = serde_json::Value::String(sid.clone());
                 return (StatusCode::CONFLICT, Json(body)).into_response();
+            }
+            if let crate::session::StartOutcome::FreshAfterFailedResume { sid } = &outcome {
+                body["message"] = serde_json::Value::String(format!(
+                    "Started fresh; a prior resume probe failed for sid {sid}"
+                ));
+                body["resume_session_id"] = serde_json::Value::String(sid.clone());
             }
             (StatusCode::OK, Json(body)).into_response()
         }
