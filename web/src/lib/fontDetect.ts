@@ -6,7 +6,7 @@
 // generic alone. queryLocalFonts() would enumerate everything, but it is
 // Chromium-only and needs a permission prompt.
 //
-// ponytail: probe only finds fonts on this curated list; the settings combobox
+// caveat: probe only finds fonts on this curated list; the settings combobox
 // stays free-text so any other installed font is still selectable by name.
 
 const BASELINES = ["monospace", "serif", "sans-serif"] as const;
