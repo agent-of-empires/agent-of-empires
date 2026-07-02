@@ -942,7 +942,7 @@ fn dispatch_batch(tmux_name: &str, batch: Vec<WorkerMsg>) {
 /// level fn (rather than a method on the worker) so it stays callable
 /// from the spawned thread without holding a worker reference.
 fn dispatch_via_fork(tmux_name: &str, action: &TmuxAction) -> anyhow::Result<()> {
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
 
     // Fast path (AOE_VT_LIVE): when a *live* input channel is armed for this
     // pane, ALL pane input goes through the socket, never `send-keys`. This is a
@@ -969,7 +969,7 @@ fn dispatch_via_fork(tmux_name: &str, action: &TmuxAction) -> anyhow::Result<()>
     }
 
     let target = format!("{}:^.0", tmux_name);
-    let mut cmd = Command::new("tmux");
+    let mut cmd = crate::tmux::tmux_command();
     cmd.stderr(Stdio::null());
     match action {
         TmuxAction::Literal(s) => {
@@ -1378,8 +1378,8 @@ fn peel_trailing_semicolons(s: &str) -> (&str, usize) {
 /// Used for the head of a payload whose trailing semicolons were peeled
 /// off (see the `Literal` arm of [`dispatch_via_fork`]).
 fn send_literal(target: &str, s: &str) -> anyhow::Result<()> {
-    use std::process::{Command, Stdio};
-    let mut cmd = Command::new("tmux");
+    use std::process::Stdio;
+    let mut cmd = crate::tmux::tmux_command();
     cmd.stderr(Stdio::null());
     cmd.args(["send-keys", "-t", target, "-l", "--", s]);
     let status = cmd

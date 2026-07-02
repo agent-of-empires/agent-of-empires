@@ -7400,11 +7400,7 @@ fn restart_selected_session_debounces_via_cooldown_map() {
 #[test]
 #[serial]
 fn restart_selected_session_surfaces_resume_failed_after_async_restart() {
-    if std::process::Command::new("tmux")
-        .arg("-V")
-        .output()
-        .is_err()
-    {
+    if crate::tmux::tmux_command().arg("-V").output().is_err() {
         eprintln!("Skipping: tmux not available");
         return;
     }
@@ -7422,7 +7418,7 @@ fn restart_selected_session_surfaces_resume_failed_after_async_restart() {
     inst.agent_session_id = Some(stale_sid.to_string());
     let id = inst.id.clone();
     let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
-    let _ = std::process::Command::new("tmux")
+    let _ = crate::tmux::tmux_command()
         .args(["kill-session", "-t", &tmux_name])
         .output();
 
@@ -7456,7 +7452,7 @@ fn restart_selected_session_surfaces_resume_failed_after_async_restart() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
-    let _ = std::process::Command::new("tmux")
+    let _ = crate::tmux::tmux_command()
         .args(["kill-session", "-t", &tmux_name])
         .output();
 
@@ -14463,7 +14459,6 @@ mod apply_session_id_updates {
     use super::*;
     use crate::session::poller::SessionPoller;
     use crate::session::ResumeIntent;
-    use std::process::Command;
     use std::sync::{Arc, Mutex};
 
     const NEW_SID: &str = "019342ab-1111-7aaa-8bbb-cccdddeeefff";
@@ -14480,10 +14475,10 @@ mod apply_session_id_updates {
         }
 
         fn create_named(name: String) -> Self {
-            let _ = Command::new("tmux")
+            let _ = crate::tmux::tmux_command()
                 .args(["kill-session", "-t", &name])
                 .output();
-            let status = Command::new("tmux")
+            let status = crate::tmux::tmux_command()
                 .args(["new-session", "-d", "-s", &name])
                 .status()
                 .expect("failed to spawn tmux");
@@ -14498,7 +14493,7 @@ mod apply_session_id_updates {
 
     impl Drop for TmuxSession {
         fn drop(&mut self) {
-            let _ = Command::new("tmux")
+            let _ = crate::tmux::tmux_command()
                 .args(["kill-session", "-t", &self.0])
                 .output();
             crate::tmux::refresh_session_cache();
@@ -14506,7 +14501,7 @@ mod apply_session_id_updates {
     }
 
     fn skip_if_no_tmux() -> bool {
-        if Command::new("tmux").arg("-V").output().is_err() {
+        if crate::tmux::tmux_command().arg("-V").output().is_err() {
             eprintln!("Skipping: tmux not available");
             return true;
         }

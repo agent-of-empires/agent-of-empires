@@ -2,7 +2,6 @@
 
 use anyhow::Result;
 use ratatui::style::Color;
-use std::process::Command;
 
 use crate::tui::styles::Theme;
 
@@ -84,7 +83,7 @@ pub fn apply_status_bar(
 /// Set a tmux option for a specific session.
 /// Remove a session-scoped option override so the global value applies.
 fn set_session_option_unset(session_name: &str, option: &str) -> Result<()> {
-    let output = std::process::Command::new("tmux")
+    let output = crate::tmux::tmux_command()
         .args(["set-option", "-u", "-t", session_name, option])
         .output()?;
     if !output.status.success() {
@@ -98,7 +97,7 @@ fn set_session_option_unset(session_name: &str, option: &str) -> Result<()> {
 }
 
 fn set_session_option(session_name: &str, option: &str, value: &str) -> Result<()> {
-    let output = Command::new("tmux")
+    let output = crate::tmux::tmux_command()
         .args(["set-option", "-t", session_name, option, value])
         .output()?;
 
@@ -230,7 +229,7 @@ pub fn get_status_for_current_session() -> Option<String> {
 
 /// Get a tmux option value for a session.
 fn get_session_option(session_name: &str, option: &str) -> Option<String> {
-    let output = Command::new("tmux")
+    let output = crate::tmux::tmux_command()
         .args(["show-options", "-t", session_name, "-v", option])
         .output()
         .ok()?;

@@ -957,7 +957,7 @@ fn override_if_distinct(stored: Option<&str>, fresh: String) -> Option<String> {
 
 fn tmux_env_session_name_for_instance_id(instance_id: &str) -> Option<String> {
     let suffix = format!("_{}", truncate_id(instance_id, 8));
-    let output = std::process::Command::new("tmux")
+    let output = crate::tmux::tmux_command()
         .args(["list-sessions", "-F", "#{session_name}"])
         .output()
         .ok()?;
@@ -5593,21 +5593,17 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_ensure_pane_ready_alive_pane_is_noop() {
-        if std::process::Command::new("tmux")
-            .arg("-V")
-            .output()
-            .is_err()
-        {
+        if crate::tmux::tmux_command().arg("-V").output().is_err() {
             eprintln!("tmux not available; skipping");
             return;
         }
 
         let mut inst = Instance::new("ensure_alive_test", "/tmp/test");
         let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
-        let _ = std::process::Command::new("tmux")
+        let _ = crate::tmux::tmux_command()
             .args(["kill-session", "-t", &tmux_name])
             .output();
-        let created = std::process::Command::new("tmux")
+        let created = crate::tmux::tmux_command()
             .args([
                 "new-session",
                 "-d",
@@ -5636,7 +5632,7 @@ mod tests {
         assert_eq!(inst.last_start_time, prev_start);
         assert_eq!(inst.status, prev_status);
 
-        let _ = std::process::Command::new("tmux")
+        let _ = crate::tmux::tmux_command()
             .args(["kill-session", "-t", &tmux_name])
             .output();
     }
@@ -6980,10 +6976,9 @@ mod tests {
 
     mod kill_terminal_if_dead {
         use super::*;
-        use std::process::Command;
 
         fn tmux_available() -> bool {
-            Command::new("tmux")
+            crate::tmux::tmux_command()
                 .arg("-V")
                 .output()
                 .map(|o| o.status.success())
@@ -6995,7 +6990,7 @@ mod tests {
         /// the dead-pane state without going through `start_terminal`, which
         /// would also apply unrelated tmux options.
         fn spawn_remain_on_exit(name: &str, cmd: &str) {
-            let output = Command::new("tmux")
+            let output = crate::tmux::tmux_command()
                 .args([
                     "new-session",
                     "-d",
@@ -7025,7 +7020,7 @@ mod tests {
         }
 
         fn cleanup(name: &str) {
-            let _ = Command::new("tmux")
+            let _ = crate::tmux::tmux_command()
                 .args(["kill-session", "-t", name])
                 .output();
             crate::tmux::refresh_session_cache();
@@ -8748,11 +8743,7 @@ mod tests {
         #[test]
         #[serial]
         fn fallback_marks_resume_failed_and_preserves_sid_when_pane_dies() {
-            if std::process::Command::new("tmux")
-                .arg("-V")
-                .output()
-                .is_err()
-            {
+            if crate::tmux::tmux_command().arg("-V").output().is_err() {
                 eprintln!("tmux not available; skipping");
                 return;
             }
@@ -8773,7 +8764,7 @@ mod tests {
             let id = inst.id.clone();
 
             let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
-            let _ = std::process::Command::new("tmux")
+            let _ = crate::tmux::tmux_command()
                 .args(["kill-session", "-t", &tmux_name])
                 .output();
 
@@ -8788,7 +8779,7 @@ mod tests {
 
             let outcome = inst.start_with_resume_fallback(None, true, ResumeAttemptPolicy::Allow);
 
-            let _ = std::process::Command::new("tmux")
+            let _ = crate::tmux::tmux_command()
                 .args(["kill-session", "-t", &tmux_name])
                 .output();
 
@@ -8824,11 +8815,7 @@ mod tests {
         #[test]
         #[serial]
         fn fallback_does_not_launch_fresh_when_command_would_live_without_stale_sid() {
-            if std::process::Command::new("tmux")
-                .arg("-V")
-                .output()
-                .is_err()
-            {
+            if crate::tmux::tmux_command().arg("-V").output().is_err() {
                 eprintln!("tmux not available; skipping");
                 return;
             }
@@ -8860,13 +8847,13 @@ mod tests {
                 .unwrap();
 
             let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
-            let _ = std::process::Command::new("tmux")
+            let _ = crate::tmux::tmux_command()
                 .args(["kill-session", "-t", &tmux_name])
                 .output();
 
             let outcome = inst.start_with_resume_fallback(None, true, ResumeAttemptPolicy::Allow);
 
-            let _ = std::process::Command::new("tmux")
+            let _ = crate::tmux::tmux_command()
                 .args(["kill-session", "-t", &tmux_name])
                 .output();
 
@@ -8897,11 +8884,7 @@ mod tests {
         #[test]
         #[serial]
         fn auto_resume_on_restart_false_skips_stored_sid_and_launches_fresh() {
-            if std::process::Command::new("tmux")
-                .arg("-V")
-                .output()
-                .is_err()
-            {
+            if crate::tmux::tmux_command().arg("-V").output().is_err() {
                 eprintln!("tmux not available; skipping");
                 return;
             }
@@ -8940,7 +8923,7 @@ mod tests {
                 .unwrap();
 
             let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
-            let _ = std::process::Command::new("tmux")
+            let _ = crate::tmux::tmux_command()
                 .args(["kill-session", "-t", &tmux_name])
                 .output();
 
@@ -8950,7 +8933,7 @@ mod tests {
                 ResumeAttemptPolicy::HonorAutoResumeSetting,
             );
 
-            let _ = std::process::Command::new("tmux")
+            let _ = crate::tmux::tmux_command()
                 .args(["kill-session", "-t", &tmux_name])
                 .output();
 
@@ -8969,11 +8952,7 @@ mod tests {
         #[test]
         #[serial]
         fn allow_policy_still_attempts_resume_when_auto_resume_on_restart_is_false() {
-            if std::process::Command::new("tmux")
-                .arg("-V")
-                .output()
-                .is_err()
-            {
+            if crate::tmux::tmux_command().arg("-V").output().is_err() {
                 eprintln!("tmux not available; skipping");
                 return;
             }
@@ -9007,13 +8986,13 @@ mod tests {
                 .unwrap();
 
             let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
-            let _ = std::process::Command::new("tmux")
+            let _ = crate::tmux::tmux_command()
                 .args(["kill-session", "-t", &tmux_name])
                 .output();
 
             let outcome = inst.start_with_resume_fallback(None, true, ResumeAttemptPolicy::Allow);
 
-            let _ = std::process::Command::new("tmux")
+            let _ = crate::tmux::tmux_command()
                 .args(["kill-session", "-t", &tmux_name])
                 .output();
 
@@ -9034,11 +9013,7 @@ mod tests {
         #[test]
         #[serial]
         fn stale_probe_failed_sid_is_not_retried_on_next_attempt() {
-            if std::process::Command::new("tmux")
-                .arg("-V")
-                .output()
-                .is_err()
-            {
+            if crate::tmux::tmux_command().arg("-V").output().is_err() {
                 eprintln!("tmux not available; skipping");
                 return;
             }
@@ -9067,7 +9042,7 @@ mod tests {
                 .unwrap();
 
             let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
-            let _ = std::process::Command::new("tmux")
+            let _ = crate::tmux::tmux_command()
                 .args(["kill-session", "-t", &tmux_name])
                 .output();
 
@@ -9096,7 +9071,7 @@ mod tests {
                 .start_with_resume_fallback(None, true, ResumeAttemptPolicy::Allow)
                 .unwrap();
 
-            let _ = std::process::Command::new("tmux")
+            let _ = crate::tmux::tmux_command()
                 .args(["kill-session", "-t", &tmux_name])
                 .output();
 
@@ -9121,11 +9096,7 @@ mod tests {
         #[test]
         #[serial]
         fn resume_failed_fires_when_pane_dies_inside_post_shell_grace_window() {
-            if std::process::Command::new("tmux")
-                .arg("-V")
-                .output()
-                .is_err()
-            {
+            if crate::tmux::tmux_command().arg("-V").output().is_err() {
                 eprintln!("tmux not available; skipping");
                 return;
             }
@@ -9157,13 +9128,13 @@ mod tests {
                 .unwrap();
 
             let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
-            let _ = std::process::Command::new("tmux")
+            let _ = crate::tmux::tmux_command()
                 .args(["kill-session", "-t", &tmux_name])
                 .output();
 
             let outcome = inst.start_with_resume_fallback(None, true, ResumeAttemptPolicy::Allow);
 
-            let _ = std::process::Command::new("tmux")
+            let _ = crate::tmux::tmux_command()
                 .args(["kill-session", "-t", &tmux_name])
                 .output();
 
@@ -9191,7 +9162,6 @@ mod tests {
         use super::super::{publish_session_to_tmux_env, Instance, ResumeIntent};
         use serial_test::serial;
         use std::collections::HashSet;
-        use std::process::Command;
         use tempfile::{tempdir, TempDir};
 
         const VALID_SID: &str = "019342ab-1234-7def-8901-abcdef012345";
@@ -9209,10 +9179,10 @@ mod tests {
             }
 
             fn create_named(name: String) -> Self {
-                let _ = Command::new("tmux")
+                let _ = crate::tmux::tmux_command()
                     .args(["kill-session", "-t", &name])
                     .output();
-                let status = Command::new("tmux")
+                let status = crate::tmux::tmux_command()
                     .args(["new-session", "-d", "-s", &name])
                     .status()
                     .expect("failed to spawn tmux");
@@ -9227,14 +9197,14 @@ mod tests {
 
         impl Drop for TmuxSession {
             fn drop(&mut self) {
-                let _ = Command::new("tmux")
+                let _ = crate::tmux::tmux_command()
                     .args(["kill-session", "-t", &self.0])
                     .output();
             }
         }
 
         fn skip_if_no_tmux() -> bool {
-            if Command::new("tmux").arg("-V").output().is_err() {
+            if crate::tmux::tmux_command().arg("-V").output().is_err() {
                 eprintln!("Skipping: tmux not available");
                 return true;
             }
@@ -9546,14 +9516,14 @@ mod tests {
     struct KillTmuxOnDrop(String);
     impl Drop for KillTmuxOnDrop {
         fn drop(&mut self) {
-            let _ = std::process::Command::new("tmux")
+            let _ = crate::tmux::tmux_command()
                 .args(["kill-session", "-t", &self.0])
                 .output();
         }
     }
 
     fn tmux_available() -> bool {
-        std::process::Command::new("tmux")
+        crate::tmux::tmux_command()
             .arg("-V")
             .output()
             .map(|o| o.status.success())
@@ -9601,7 +9571,7 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
         let quoted_pane_file =
             format!("'{}'", pane_file.to_string_lossy().replace('\'', r#"'\''"#));
         let launch = format!("cat {quoted_pane_file}; sleep 300");
-        let created = std::process::Command::new("tmux")
+        let created = crate::tmux::tmux_command()
             .args([
                 "new-session",
                 "-d",
@@ -9644,7 +9614,7 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
         // authoritative read; a fixed sleep is flaky under parallel test load.
         let mut painted = false;
         for _ in 0..50 {
-            let cap = std::process::Command::new("tmux")
+            let cap = crate::tmux::tmux_command()
                 .args(["capture-pane", "-p", "-t", &session_name])
                 .output();
             if let Ok(out) = cap {

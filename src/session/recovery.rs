@@ -143,9 +143,7 @@ pub fn is_recovery_candidate(inst: &Instance) -> bool {
 /// Best-effort: `tmux start-server` is idempotent; if tmux is unavailable the
 /// caller will fail downstream with a more specific error.
 pub fn warm_tmux_server() {
-    let _ = std::process::Command::new("tmux")
-        .arg("start-server")
-        .status();
+    let _ = crate::tmux::tmux_command().arg("start-server").status();
 }
 
 /// Maximum number of recovery workers running concurrently. Sized to cover

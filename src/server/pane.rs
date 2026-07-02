@@ -239,7 +239,7 @@ pub(crate) async fn wait_for_tmux_ready(tmux_name: &str) -> PaneReadiness {
 async fn probe_tmux_readiness(tmux_name: &str) -> PaneReadiness {
     let name = tmux_name.to_string();
     tokio::task::spawn_blocking(move || {
-        let has_session = std::process::Command::new("tmux")
+        let has_session = crate::tmux::tmux_command()
             .args(["has-session", "-t", &name])
             .output();
         let has_session_ok = match has_session {
@@ -249,7 +249,7 @@ async fn probe_tmux_readiness(tmux_name: &str) -> PaneReadiness {
         if !has_session_ok {
             return PaneReadiness::NotReady;
         }
-        let panes = std::process::Command::new("tmux")
+        let panes = crate::tmux::tmux_command()
             .args(["list-panes", "-t", &name, "-F", "#{pane_dead}"])
             .output();
         match panes {

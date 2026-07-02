@@ -4850,7 +4850,7 @@ impl HomeView {
         if pane.width == 0 || pane.height == 0 {
             return;
         }
-        let resize_status = std::process::Command::new("tmux")
+        let resize_status = crate::tmux::tmux_command()
             .args([
                 "resize-window",
                 "-t",

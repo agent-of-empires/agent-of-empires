@@ -1,6 +1,5 @@
 //! Process utilities for tmux session management
 
-use std::process::Command;
 use std::time::Duration;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -29,7 +28,7 @@ pub fn get_pane_pid(session_name: &str) -> Option<u32> {
     // pane even when the user has created additional tmux windows or split
     // panes.  See #435, #488.
     let target = format!("{session_name}:^.0");
-    let output = Command::new("tmux")
+    let output = crate::tmux::tmux_command()
         .args(["display-message", "-t", &target, "-p", "#{pane_pid}"])
         .output()
         .ok()?;

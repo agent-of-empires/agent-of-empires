@@ -6,7 +6,6 @@
 //! `tmux new-session` themselves (they need their own `-x`/`-y`/command and
 //! occasionally compound argv), so the guard does not create the session.
 
-use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// RAII guard that runs `tmux kill-session -t <name>` on drop. The guard
@@ -37,7 +36,7 @@ impl Drop for TmuxTestSession {
     fn drop(&mut self) {
         // Best-effort, idempotent. Drop must not panic, so the Result is
         // discarded: a missing tmux server or already-dead session is fine.
-        let _ = Command::new("tmux")
+        let _ = crate::tmux::tmux_command()
             .args(["kill-session", "-t", &self.name])
             .output();
     }
@@ -48,7 +47,7 @@ mod tests {
     use super::*;
 
     fn tmux_available() -> bool {
-        Command::new("tmux")
+        crate::tmux::tmux_command()
             .arg("-V")
             .output()
             .map(|o| o.status.success())
@@ -66,7 +65,7 @@ mod tests {
         {
             let guard = TmuxTestSession::new("aoe_test_guard_self");
             captured_name = guard.name().to_string();
-            let output = Command::new("tmux")
+            let output = crate::tmux::tmux_command()
                 .args([
                     "new-session",
                     "-d",
@@ -81,7 +80,7 @@ mod tests {
                 .output()
                 .expect("tmux new-session");
             assert!(output.status.success());
-            let exists = Command::new("tmux")
+            let exists = crate::tmux::tmux_command()
                 .args(["has-session", "-t", guard.name()])
                 .output()
                 .expect("tmux has-session")
@@ -89,7 +88,7 @@ mod tests {
                 .success();
             assert!(exists, "session should exist while guard is alive");
         }
-        let exists = Command::new("tmux")
+        let exists = crate::tmux::tmux_command()
             .args(["has-session", "-t", &captured_name])
             .output()
             .expect("tmux has-session")

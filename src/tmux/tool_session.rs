@@ -2,7 +2,6 @@
 //! run in persistent tmux sessions tied to an agent session's working directory.
 
 use anyhow::{bail, Result};
-use std::process::Command;
 
 use super::utils::{
     append_clipboard_passthrough_args, append_mouse_on_args, append_pane_base_index_args,
@@ -40,7 +39,7 @@ impl ToolSession {
             return exists;
         }
 
-        Command::new("tmux")
+        crate::tmux::tmux_command()
             .args(["has-session", "-t", &self.name])
             .output()
             .map(|o| o.status.success())
@@ -87,7 +86,7 @@ impl ToolSession {
             append_clipboard_passthrough_args(&mut args, &self.name);
         }
 
-        let output = Command::new("tmux").args(&args).output()?;
+        let output = crate::tmux::tmux_command().args(&args).output()?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -123,12 +122,12 @@ impl ToolSession {
         }
 
         if std::env::var("TMUX").is_ok() {
-            let status = Command::new("tmux")
+            let status = crate::tmux::tmux_command()
                 .args(["switch-client", "-t", &self.name])
                 .status()?;
 
             if !status.success() {
-                let status = Command::new("tmux")
+                let status = crate::tmux::tmux_command()
                     .args(["attach-session", "-t", &self.name])
                     .status()?;
 
@@ -137,7 +136,7 @@ impl ToolSession {
                 }
             }
         } else {
-            let status = Command::new("tmux")
+            let status = crate::tmux::tmux_command()
                 .args(["attach-session", "-t", &self.name])
                 .status()?;
 
@@ -164,7 +163,7 @@ impl ToolSession {
 pub fn kill_all_tool_sessions_for_id(session_id: &str) {
     let id_suffix = format!("_{}", truncate_id(session_id, 8));
 
-    let output = Command::new("tmux")
+    let output = crate::tmux::tmux_command()
         .args(["list-sessions", "-F", "#{session_name}"])
         .output();
 
@@ -176,7 +175,7 @@ pub fn kill_all_tool_sessions_for_id(session_id: &str) {
                     if let Some(pid) = process::get_pane_pid(line) {
                         process::kill_process_tree(pid);
                     }
-                    let _ = Command::new("tmux")
+                    let _ = crate::tmux::tmux_command()
                         .args(["kill-session", "-t", line])
                         .output();
                 }

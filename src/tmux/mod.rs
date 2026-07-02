@@ -30,9 +30,64 @@ pub mod test_support {
 }
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::process::Command;
-use std::sync::RwLock;
+use std::sync::{OnceLock, RwLock};
 use std::time::{Duration, Instant};
+
+/// Environment variable that overrides the tmux socket path. Set by the e2e
+/// harness (and available for opt-in isolation) so a spawned `aoe` routes all
+/// tmux calls to a known per-test socket instead of relying on `$TMUX`.
+pub const TMUX_SOCKET_ENV: &str = "AOE_TMUX_SOCKET";
+
+/// Resolve the tmux socket path this build talks to, or `None` to use tmux's
+/// default per-user socket. Cached: the process env does not change at runtime.
+///
+/// - `AOE_TMUX_SOCKET` set -> that path (e2e / opt-in isolation).
+/// - unit tests            -> a shared temp socket, so `cargo test` never
+///   touches the developer's real tmux server.
+/// - debug builds          -> `<app_dir>/tmux.sock`, giving `cargo run` and
+///   e2e their own tmux server so they can never poison an installed release
+///   build's shared server (#2608); the app dir is already namespaced
+///   (`~/.agent-of-empires-dev`).
+/// - release builds        -> `None`: keep tmux's default socket so upgrading
+///   does not orphan the release build's live sessions.
+fn tmux_socket_path() -> Option<PathBuf> {
+    static SOCKET: OnceLock<Option<PathBuf>> = OnceLock::new();
+    SOCKET
+        .get_or_init(|| {
+            if let Some(explicit) = std::env::var_os(TMUX_SOCKET_ENV) {
+                if !explicit.is_empty() {
+                    return Some(PathBuf::from(explicit));
+                }
+            }
+            #[cfg(test)]
+            {
+                return Some(std::env::temp_dir().join("aoe-unit-test-tmux.sock"));
+            }
+            #[cfg(all(not(test), debug_assertions))]
+            {
+                if let Ok(dir) = crate::session::get_app_dir() {
+                    return Some(dir.join("tmux.sock"));
+                }
+            }
+            #[allow(unreachable_code)]
+            None
+        })
+        .clone()
+}
+
+/// A `tmux` [`Command`] preconfigured with this build's socket flag (`-S`)
+/// when one applies. Every tmux invocation in aoe MUST go through this so all
+/// commands hit the same server; a raw `Command::new("tmux")` would fall back
+/// to the default socket and split state across two servers.
+pub(crate) fn tmux_command() -> Command {
+    let mut cmd = Command::new("tmux");
+    if let Some(sock) = tmux_socket_path() {
+        cmd.arg("-S").arg(sock);
+    }
+    cmd
+}
 
 // Debug builds use `aoe_dev_*` prefixes so `cargo run` and an installed
 // release `aoe` can coexist on the same tmux server without seeing each
@@ -85,7 +140,7 @@ const FIELD_SEP: char = '|';
 
 pub fn refresh_session_cache() {
     let start = Instant::now();
-    let output = Command::new("tmux")
+    let output = tmux_command()
         .args(["list-sessions", "-F", "#{session_name}|#{session_activity}"])
         .output();
 
@@ -156,7 +211,7 @@ fn is_aoe_session(name: &str) -> bool {
 /// for a panic button with a handful of sessions; if counts grow, batch the
 /// SIGTERM across all pids, wait once, then SIGKILL survivors.
 pub fn stop_all_sessions() -> anyhow::Result<usize> {
-    let output = Command::new("tmux")
+    let output = tmux_command()
         .args(["list-sessions", "-F", "#{session_name}"])
         .output()
         .map_err(|e| anyhow::anyhow!("tmux list-sessions spawn failed: {e}"))?;
@@ -169,9 +224,7 @@ pub fn stop_all_sessions() -> anyhow::Result<usize> {
                 if let Some(pid) = crate::process::get_pane_pid(line) {
                     crate::process::kill_process_tree(pid);
                 }
-                let _ = Command::new("tmux")
-                    .args(["kill-session", "-t", line])
-                    .output();
+                let _ = tmux_command().args(["kill-session", "-t", line]).output();
                 killed += 1;
             }
         }
@@ -194,7 +247,7 @@ pub fn stop_all_sessions() -> anyhow::Result<usize> {
 /// `unwrap_or_default()` because their semantics are unchanged by an empty map.
 pub fn batch_pane_metadata() -> anyhow::Result<HashMap<String, PaneMetadata>> {
     let start = Instant::now();
-    let output = Command::new("tmux")
+    let output = tmux_command()
         .args([
             "list-panes",
             "-a",
@@ -247,7 +300,7 @@ pub fn batch_pane_metadata() -> anyhow::Result<HashMap<String, PaneMetadata>> {
 /// pass" rather than "nothing attached", so a transient tmux glitch cannot
 /// kill a pane the user is sitting in.
 pub fn attached_session_names() -> anyhow::Result<HashSet<String>> {
-    let output = Command::new("tmux")
+    let output = tmux_command()
         .args(["list-sessions", "-F", "#{session_name}|#{session_attached}"])
         .output();
 
@@ -359,7 +412,7 @@ pub fn session_exists_from_cache(name: &str) -> Option<bool> {
 }
 
 pub fn get_current_session_name() -> Option<String> {
-    let output = Command::new("tmux")
+    let output = tmux_command()
         .args(["display-message", "-p", "#{session_name}"])
         .output()
         .ok()?;
@@ -374,7 +427,7 @@ pub fn get_current_session_name() -> Option<String> {
 }
 
 pub fn is_tmux_available() -> bool {
-    Command::new("tmux").arg("-V").output().is_ok()
+    tmux_command().arg("-V").output().is_ok()
 }
 
 /// True when `binary` resolves on the user's PATH. An absolute or relative
@@ -485,6 +538,27 @@ mod tests {
     const P: &str = SESSION_PREFIX;
 
     #[test]
+    fn test_tmux_command_carries_socket_flag() {
+        // Under `cfg(test)` the socket resolves to a shared temp path, so the
+        // command must lead with `-S <path>` before any subcommand. This is
+        // the isolation mechanism (#2608): every tmux call routes through the
+        // same explicit socket instead of the default.
+        let cmd = tmux_command();
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_owned()).collect();
+        assert_eq!(args.first().map(|a| a.to_str().unwrap()), Some("-S"));
+        assert!(args.get(1).is_some(), "socket path arg present");
+        assert_eq!(cmd.get_program().to_str(), Some("tmux"));
+    }
+
+    #[test]
+    fn test_tmux_socket_path_resolves_under_test() {
+        assert!(
+            tmux_socket_path().is_some(),
+            "unit tests must not fall back to the default socket"
+        );
+    }
+
+    #[test]
     fn is_aoe_session_matches_every_kind_and_rejects_foreign() {
         assert!(is_aoe_session(&format!("{P}my_proj_abc12345")));
         assert!(is_aoe_session(&format!("{TERMINAL_PREFIX}x")));
@@ -586,7 +660,7 @@ mod tests {
     }
 
     fn tmux_available() -> bool {
-        Command::new("tmux")
+        tmux_command()
             .arg("-V")
             .output()
             .map(|o| o.status.success())
@@ -612,7 +686,7 @@ mod tests {
         // command string doesn't end up in the server process's argv.
         let dummy_guard = TmuxTestSession::new("aoe_test_compound_dummy");
         let dummy = dummy_guard.name().to_string();
-        let _ = Command::new("tmux")
+        let _ = tmux_command()
             .args([
                 "new-session",
                 "-d",
@@ -640,7 +714,7 @@ mod tests {
             marker
         );
 
-        let output = Command::new("tmux")
+        let output = tmux_command()
             .args([
                 "new-session",
                 "-d",
@@ -679,7 +753,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1000));
 
         // Capture pane output: should contain the secret value
-        let capture = Command::new("tmux")
+        let capture = tmux_command()
             .args([
                 "capture-pane",
                 "-t",
@@ -698,7 +772,7 @@ mod tests {
         );
 
         // Pane should be dead (exec replaced the shell, printenv exited)
-        let dead_check = Command::new("tmux")
+        let dead_check = tmux_command()
             .args(["display-message", "-t", &session_name, "-p", "#{pane_dead}"])
             .output()
             .expect("pane dead check");
@@ -729,7 +803,7 @@ mod tests {
         // command string doesn't end up in the server process's argv.
         let dummy_guard = TmuxTestSession::new("aoe_test_ps_dummy");
         let dummy = dummy_guard.name().to_string();
-        let _ = Command::new("tmux")
+        let _ = tmux_command()
             .args([
                 "new-session",
                 "-d",
@@ -753,7 +827,7 @@ mod tests {
         // replaced by sleep, whose argv is just "sleep 30" (no secret).
         let compound_cmd = format!("export AOE_PS_TEST='{}'; exec sleep 30", secret_value);
 
-        let output = Command::new("tmux")
+        let output = tmux_command()
             .args([
                 "new-session",
                 "-d",

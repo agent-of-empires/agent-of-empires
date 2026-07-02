@@ -6,7 +6,6 @@
 
 use anyhow::bail;
 use std::collections::HashMap;
-use std::process::Command;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
@@ -31,7 +30,7 @@ static ENV_CACHE: RwLock<EnvCache> = RwLock::new(EnvCache { entries: None });
 ///
 /// Hidden variables (set with `-h`) are not inherited by child processes.
 pub fn set_hidden_env(session_name: &str, key: &str, value: &str) -> anyhow::Result<()> {
-    let output = Command::new("tmux")
+    let output = crate::tmux::tmux_command()
         .args(["set-environment", "-h", "-t", session_name, key, value])
         .output()?;
 
@@ -96,7 +95,7 @@ pub fn get_hidden_env(session_name: &str, key: &str) -> Option<String> {
 }
 
 fn fetch_hidden_env(session_name: &str, key: &str) -> Option<String> {
-    let output = Command::new("tmux")
+    let output = crate::tmux::tmux_command()
         .args(["show-environment", "-h", "-t", session_name, key])
         .output()
         .ok()?;
@@ -122,7 +121,7 @@ fn fetch_hidden_env(session_name: &str, key: &str) -> Option<String> {
 
 /// Remove a hidden environment variable from a tmux session
 pub fn remove_hidden_env(session_name: &str, key: &str) -> anyhow::Result<()> {
-    let output = Command::new("tmux")
+    let output = crate::tmux::tmux_command()
         .args(["set-environment", "-h", "-u", "-t", session_name, key])
         .output()?;
 
@@ -159,7 +158,7 @@ pub fn remove_hidden_env_batch(entries: &[(&str, &str)]) -> anyhow::Result<()> {
     }
 
     let str_args: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    let output = Command::new("tmux").args(&str_args).output();
+    let output = crate::tmux::tmux_command().args(&str_args).output();
 
     match output {
         Ok(out) if out.status.success() => {
@@ -224,7 +223,7 @@ pub fn set_hidden_env_batch(entries: &[(&str, &str, &str)]) -> anyhow::Result<()
     }
 
     let str_args: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    let output = Command::new("tmux").args(&str_args).output();
+    let output = crate::tmux::tmux_command().args(&str_args).output();
 
     match output {
         Ok(out) if out.status.success() => {
@@ -299,7 +298,7 @@ pub fn get_hidden_env_batch(session_names: &[&str], key: &str) -> Vec<(String, O
     }
 
     let str_args: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    let output = Command::new("tmux").args(&str_args).output();
+    let output = crate::tmux::tmux_command().args(&str_args).output();
 
     let fallback = || {
         session_names

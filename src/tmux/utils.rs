@@ -1,7 +1,6 @@
 //! tmux utility functions
 
 use anyhow::{bail, Result};
-use std::process::Command;
 use std::sync::OnceLock;
 
 pub fn strip_ansi(content: &str) -> String {
@@ -207,7 +206,7 @@ pub fn is_pane_dead(session_name: &str) -> bool {
     // agent's pane even when the user has created additional tmux windows
     // or split panes.  See #435, #488.
     let target = format!("{session_name}:^.0");
-    Command::new("tmux")
+    crate::tmux::tmux_command()
         .args(["display-message", "-t", &target, "-p", "#{pane_dead}"])
         .output()
         .ok()
@@ -220,7 +219,7 @@ pub(crate) fn pane_current_command(session_name: &str) -> Option<String> {
     // Use `^.0` to target the first window's first pane regardless of
     // base-index or which pane is active.  See #435, #488.
     let target = format!("{session_name}:^.0");
-    Command::new("tmux")
+    crate::tmux::tmux_command()
         .args([
             "display-message",
             "-t",
@@ -260,7 +259,7 @@ pub fn is_pane_running_shell(session_name: &str) -> bool {
 pub fn tmux_prefix_display() -> &'static str {
     static CACHE: OnceLock<String> = OnceLock::new();
     CACHE.get_or_init(|| {
-        let raw = Command::new("tmux")
+        let raw = crate::tmux::tmux_command()
             .args(["show-option", "-gv", "prefix"])
             .output()
             .ok()
@@ -280,7 +279,7 @@ pub fn tmux_prefix_display() -> &'static str {
 /// `Err`. Caller is responsible for `refresh_session_cache` after a
 /// successful kill.
 pub(crate) fn kill_session_if_present(name: &str) -> Result<()> {
-    let output = Command::new("tmux")
+    let output = crate::tmux::tmux_command()
         .env("LC_ALL", "C")
         .args(["kill-session", "-t", name])
         .output()?;
@@ -536,7 +535,7 @@ mod tests {
     }
 
     fn tmux_available() -> bool {
-        Command::new("tmux")
+        crate::tmux::tmux_command()
             .arg("-V")
             .output()
             .map(|o| o.status.success())
@@ -555,7 +554,7 @@ mod tests {
             return;
         }
         let name = "aoe_test_kill_if_present_missing";
-        let _ = Command::new("tmux")
+        let _ = crate::tmux::tmux_command()
             .args(["kill-session", "-t", name])
             .output();
         assert!(kill_session_if_present(name).is_ok());
@@ -568,17 +567,17 @@ mod tests {
             return;
         }
         let name = "aoe_test_kill_if_present_alive";
-        let _ = Command::new("tmux")
+        let _ = crate::tmux::tmux_command()
             .args(["kill-session", "-t", name])
             .output();
-        let spawn = Command::new("tmux")
+        let spawn = crate::tmux::tmux_command()
             .args(["new-session", "-d", "-s", name])
             .status();
         if !spawn.map(|s| s.success()).unwrap_or(false) {
             return;
         }
         assert!(kill_session_if_present(name).is_ok());
-        let exists = Command::new("tmux")
+        let exists = crate::tmux::tmux_command()
             .args(["has-session", "-t", name])
             .status()
             .map(|s| s.success())
