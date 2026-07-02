@@ -64,3 +64,5 @@ restart, turn off **Persist login sessions** under Web Dashboard, or set
 When passphrase login is configured, day-to-day actions (sending prompts, resolving approvals, switching mode) never re-prompt. Editing persisted config is different: saving the global settings panel, creating / deleting / renaming a profile, editing a profile, or changing the default profile requires that your login session was elevated within the last 15 minutes via `POST /api/login/elevate`. The first such action after a page load surfaces an inline passphrase prompt; subsequent edits inside the window go through without re-prompting.
 
 This narrow gate covers the persisted-tamper attack (a stolen session planting a malicious Docker image, worktree template, or profile) without friction on the conversation surface.
+
+Browsers on the same host as the daemon (localhost) never see the prompt: a same-host caller already passes the filesystem trust boundary and could run the equivalent CLI command with no passphrase, so the gate only applies to remote callers.

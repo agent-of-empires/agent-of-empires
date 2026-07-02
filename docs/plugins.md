@@ -28,7 +28,8 @@ Three equivalent surfaces:
   enable/disable.
 - **Web dashboard**: Settings, then the Plugins tab. The same list and toggles.
   Enabling or disabling a plugin requires an elevated (passphrase) session when
-  login is enabled and is blocked in read-only mode.
+  login is enabled and is blocked in read-only mode; localhost browsers skip
+  the passphrase step, matching the CLI's same-host trust model.
 
 A plugin's enable-state is stored under `[plugins."<id>"]` in `config.toml` and
 survives every config save.
