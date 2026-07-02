@@ -108,6 +108,23 @@ pub fn append_pane_base_index_args(args: &mut Vec<String>, target: &str) {
     ]);
 }
 
+/// Append `; set-option -t <target> default-shell <shell>` so panes the user
+/// later splits off this session use their real shell instead of the shared
+/// tmux server's frozen `default-shell` (which a dev build with a sandboxed
+/// env can poison; see #2608). The first pane is launched with an explicit
+/// login-shell command at create time because a `default-shell` set chained
+/// after `new-session` is too late for the already-spawned pane.
+pub fn append_default_shell_args(args: &mut Vec<String>, target: &str, shell: &str) {
+    args.extend([
+        ";".to_string(),
+        "set-option".to_string(),
+        "-t".to_string(),
+        target.to_string(),
+        "default-shell".to_string(),
+        shell.to_string(),
+    ]);
+}
+
 /// Append `; set-option -t <target> mouse on` to an in-flight tmux argument
 /// list so that mouse/wheel events are forwarded into tmux copy-mode.
 ///

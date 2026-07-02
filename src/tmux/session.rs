@@ -215,7 +215,7 @@ impl Session {
             return Ok(());
         }
 
-        let mut args = build_create_args(&self.name, working_dir, command, size);
+        let mut args = build_create_args(&self.name, working_dir, &[], command, size);
         append_remain_on_exit_args(&mut args, &self.name);
         append_pane_base_index_args(&mut args, &self.name);
         append_mouse_on_args(&mut args, &self.name);
@@ -942,6 +942,7 @@ fn raw_byte_batches(bytes: &[u8]) -> Vec<Vec<String>> {
 pub(crate) fn build_create_args(
     session_name: &str,
     working_dir: &str,
+    env: &[(&str, &str)],
     command: Option<&str>,
     size: Option<(u16, u16)>,
 ) -> Vec<String> {
@@ -953,6 +954,14 @@ pub(crate) fn build_create_args(
         "-c".to_string(),
         working_dir.to_string(),
     ];
+
+    // Explicit per-session environment (`-e KEY=VAL`, tmux 3.0+). Set so a
+    // pane never inherits a stale value from the shared tmux server's frozen
+    // base environment. See the host-terminal call site for why this matters.
+    for (key, value) in env {
+        args.push("-e".to_string());
+        args.push(format!("{key}={value}"));
+    }
 
     if let Some((width, height)) = size {
         args.push("-x".to_string());
@@ -1763,7 +1772,7 @@ mod tests {
 
     #[test]
     fn test_build_create_args_without_size() {
-        let args = build_create_args("test_session", "/tmp/work", None, None);
+        let args = build_create_args("test_session", "/tmp/work", &[], None, None);
         assert_eq!(
             args,
             vec!["new-session", "-d", "-s", "test_session", "-c", "/tmp/work"]
@@ -1773,8 +1782,36 @@ mod tests {
     }
 
     #[test]
+    fn test_build_create_args_empty_env_adds_no_e_flag() {
+        // Byte-for-byte unchanged args when no env is supplied: the agent
+        // session and container terminals must not regress.
+        let args = build_create_args("s", "/tmp/work", &[], Some("claude"), None);
+        assert!(!args.contains(&"-e".to_string()));
+        assert_eq!(args.last().unwrap(), "claude");
+    }
+
+    #[test]
+    fn test_build_create_args_env_emits_e_flags_before_command() {
+        let args = build_create_args(
+            "s",
+            "/tmp/work",
+            &[("HOME", "/Users/me"), ("SHELL", "/bin/zsh")],
+            Some("'/bin/zsh' -l"),
+            None,
+        );
+        // Each pair becomes an adjacent `-e KEY=VAL`.
+        let e_idx = args.iter().position(|a| a == "-e").unwrap();
+        assert_eq!(args[e_idx + 1], "HOME=/Users/me");
+        assert_eq!(args[e_idx + 3], "SHELL=/bin/zsh");
+        // Env flags precede the trailing command.
+        assert!(e_idx < args.iter().position(|a| a == "'/bin/zsh' -l").unwrap());
+        // `-c` still precedes the env flags.
+        assert!(args.iter().position(|a| a == "-c").unwrap() < e_idx);
+    }
+
+    #[test]
     fn test_build_create_args_with_size() {
-        let args = build_create_args("test_session", "/tmp/work", None, Some((120, 40)));
+        let args = build_create_args("test_session", "/tmp/work", &[], None, Some((120, 40)));
         assert!(args.contains(&"-x".to_string()));
         assert!(args.contains(&"120".to_string()));
         assert!(args.contains(&"-y".to_string()));
@@ -1789,13 +1826,19 @@ mod tests {
 
     #[test]
     fn test_build_create_args_with_command() {
-        let args = build_create_args("test_session", "/tmp/work", Some("claude"), None);
+        let args = build_create_args("test_session", "/tmp/work", &[], Some("claude"), None);
         assert_eq!(args.last().unwrap(), "claude");
     }
 
     #[test]
     fn test_build_create_args_with_size_and_command() {
-        let args = build_create_args("test_session", "/tmp/work", Some("claude"), Some((80, 24)));
+        let args = build_create_args(
+            "test_session",
+            "/tmp/work",
+            &[],
+            Some("claude"),
+            Some((80, 24)),
+        );
 
         // Size args should be present
         assert!(args.contains(&"-x".to_string()));

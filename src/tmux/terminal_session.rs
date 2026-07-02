@@ -8,8 +8,9 @@ use anyhow::{bail, Result};
 use std::process::Command;
 
 use super::utils::{
-    append_clipboard_passthrough_args, append_mouse_on_args, append_pane_base_index_args,
-    append_remain_on_exit_args, append_window_size_args, is_pane_dead, sanitize_session_name,
+    append_clipboard_passthrough_args, append_default_shell_args, append_mouse_on_args,
+    append_pane_base_index_args, append_remain_on_exit_args, append_window_size_args, is_pane_dead,
+    sanitize_session_name,
 };
 use super::{
     refresh_session_cache, session_exists_from_cache, CONTAINER_TERMINAL_PREFIX, TERMINAL_PREFIX,
@@ -17,6 +18,7 @@ use super::{
 use crate::cli::truncate_id;
 use crate::process;
 use crate::session::config::should_apply_tmux_clipboard;
+use crate::session::environment::{login_shell_command, user_shell};
 
 /// Classifies a paired terminal: adjusts the tmux session prefix and the
 /// human-readable label used in error messages.
@@ -40,6 +42,35 @@ impl TerminalKind {
             TerminalKind::Container => "container terminal session",
         }
     }
+}
+
+/// Pure computation of the host-terminal `-e` env pairs and the effective
+/// pane command, split out so the #2608 poisoning fix is unit-testable
+/// without spawning tmux. `shell` is `Some` only for host terminals; `home`
+/// and `path` are the resolved (possibly empty) host values, and empty
+/// entries are dropped. When no command is supplied, a host terminal
+/// defaults to the resolved login shell.
+fn host_pane_inputs(
+    shell: Option<&str>,
+    command: Option<&str>,
+    home: &str,
+    path: &str,
+) -> (Vec<(String, String)>, Option<String>) {
+    let Some(shell) = shell else {
+        return (Vec::new(), command.map(str::to_string));
+    };
+    let mut pairs = Vec::new();
+    if !home.is_empty() {
+        pairs.push(("HOME".to_string(), home.to_string()));
+    }
+    if !path.is_empty() {
+        pairs.push(("PATH".to_string(), path.to_string()));
+    }
+    pairs.push(("SHELL".to_string(), shell.to_string()));
+    let cmd = command
+        .map(str::to_string)
+        .or_else(|| Some(login_shell_command(shell)));
+    (pairs, cmd)
 }
 
 /// Shared implementation of the paired-terminal lifecycle. Not exposed; the
@@ -97,11 +128,37 @@ impl PairedTerminal {
             return Ok(());
         }
 
-        let mut args = super::session::build_create_args(&self.name, working_dir, command, size);
+        // Host terminals pin the pane's HOME/SHELL/PATH and launch the user's
+        // login shell explicitly, so they never inherit a stale value from the
+        // shared tmux server's frozen base environment: a dev build started
+        // with a sandboxed HOME/SHELL can win the race to start the shared
+        // server and poison `default-shell` + base env for every session,
+        // including release ones (#2608). Container terminals are excluded;
+        // their HOME/shell belong to the container, not the host.
+        let host_shell = matches!(self.kind, TerminalKind::Host).then(user_shell);
+        let home = std::env::var("HOME").unwrap_or_default();
+        let path = std::env::var("PATH").unwrap_or_default();
+        let (env_pairs, effective_cmd) =
+            host_pane_inputs(host_shell.as_deref(), command, &home, &path);
+        let env_refs: Vec<(&str, &str)> = env_pairs
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+
+        let mut args = super::session::build_create_args(
+            &self.name,
+            working_dir,
+            &env_refs,
+            effective_cmd.as_deref(),
+            size,
+        );
         append_remain_on_exit_args(&mut args, &self.name);
         append_pane_base_index_args(&mut args, &self.name);
         append_mouse_on_args(&mut args, &self.name);
         append_window_size_args(&mut args, &self.name);
+        if let Some(shell) = &host_shell {
+            append_default_shell_args(&mut args, &self.name, shell);
+        }
         if should_apply_tmux_clipboard() {
             append_clipboard_passthrough_args(&mut args, &self.name);
         }
@@ -419,6 +476,50 @@ mod tests {
         assert_ne!(host_name, container_name);
         assert!(host_name.starts_with(TERMINAL_PREFIX));
         assert!(container_name.starts_with(CONTAINER_TERMINAL_PREFIX));
+    }
+
+    #[test]
+    fn test_host_pane_inputs_injects_env_and_login_shell() {
+        // Regression for #2608: a host terminal with no explicit command must
+        // pin HOME/PATH/SHELL and launch the user's login shell, so the pane
+        // no longer inherits the poisoned shared-server env / default-shell.
+        let (env, cmd) = host_pane_inputs(Some("/bin/zsh"), None, "/Users/me", "/usr/bin:/bin");
+        assert_eq!(
+            env,
+            vec![
+                ("HOME".to_string(), "/Users/me".to_string()),
+                ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+                ("SHELL".to_string(), "/bin/zsh".to_string()),
+            ]
+        );
+        assert_eq!(cmd.as_deref(), Some("'/bin/zsh' -l"));
+    }
+
+    #[test]
+    fn test_host_pane_inputs_keeps_explicit_command() {
+        let (env, cmd) = host_pane_inputs(Some("/bin/zsh"), Some("htop"), "/Users/me", "/bin");
+        // Env is still pinned, but an explicit command is not overridden.
+        assert!(env.contains(&("SHELL".to_string(), "/bin/zsh".to_string())));
+        assert_eq!(cmd.as_deref(), Some("htop"));
+    }
+
+    #[test]
+    fn test_host_pane_inputs_drops_empty_home_path() {
+        let (env, _) = host_pane_inputs(Some("/bin/bash"), None, "", "");
+        assert_eq!(env, vec![("SHELL".to_string(), "/bin/bash".to_string())]);
+    }
+
+    #[test]
+    fn test_container_pane_inputs_unchanged() {
+        // Container terminals (shell = None) get no host env and keep their
+        // command verbatim; their HOME/shell belong to the container.
+        let (env, cmd) = host_pane_inputs(None, Some("bash -lc enter"), "/Users/me", "/bin");
+        assert!(env.is_empty());
+        assert_eq!(cmd.as_deref(), Some("bash -lc enter"));
+
+        let (env_none, cmd_none) = host_pane_inputs(None, None, "/Users/me", "/bin");
+        assert!(env_none.is_empty());
+        assert!(cmd_none.is_none());
     }
 
     fn tmux_available() -> bool {

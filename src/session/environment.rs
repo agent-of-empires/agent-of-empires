@@ -154,6 +154,29 @@ pub(crate) fn user_shell() -> String {
 /// Shells whose quoting rules are incompatible with POSIX `'\''` escaping.
 const NON_POSIX_SHELLS: &[&str] = &["fish", "nu", "nushell", "pwsh", "powershell"];
 
+/// Shells we can safely launch with a `-l` login flag. Others (nushell,
+/// PowerShell) are launched plain; they still source their own interactive
+/// config, and `-l` would either error or mean something different there.
+const LOGIN_FLAG_SHELLS: &[&str] = &["bash", "zsh", "sh", "ksh", "dash", "fish", "csh", "tcsh"];
+
+/// Build the tmux pane command that launches `shell` as a login+interactive
+/// shell, so it sources the user's profile and rc files (`~/.zprofile`,
+/// `~/.zshrc`, oh-my-zsh, Homebrew/nvm PATH setup) exactly as a native
+/// terminal would. Login-capable shells get `-l`; others launch plain. The
+/// path is shell-escaped for the tmux command parser.
+pub(crate) fn login_shell_command(shell: &str) -> String {
+    let basename = std::path::Path::new(shell)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(shell);
+    let escaped = shell_escape(shell);
+    if LOGIN_FLAG_SHELLS.contains(&basename) {
+        format!("{escaped} -l")
+    } else {
+        escaped
+    }
+}
+
 /// Like [`user_shell`], but falls back to `bash` when the user's shell is
 /// non-POSIX (e.g. fish, nushell, pwsh). Use this for command wrappers that
 /// rely on POSIX single-quote escaping (`'\''`).
@@ -681,6 +704,23 @@ pub(crate) fn build_docker_env_args(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_login_shell_command_adds_login_flag_for_known_shells() {
+        assert_eq!(login_shell_command("/bin/zsh"), "'/bin/zsh' -l");
+        assert_eq!(login_shell_command("/bin/bash"), "'/bin/bash' -l");
+        assert_eq!(
+            login_shell_command("/opt/homebrew/bin/fish"),
+            "'/opt/homebrew/bin/fish' -l"
+        );
+    }
+
+    #[test]
+    fn test_login_shell_command_plain_for_non_login_shells() {
+        // nu / pwsh do not take a POSIX `-l`; launch them plain.
+        assert_eq!(login_shell_command("/usr/bin/nu"), "'/usr/bin/nu'");
+        assert_eq!(login_shell_command("/usr/bin/pwsh"), "'/usr/bin/pwsh'");
+    }
 
     /// Regression test: when an instance is created under a non-default profile and
     /// has no per-session `extra_env` overrides, the docker env args must come from
