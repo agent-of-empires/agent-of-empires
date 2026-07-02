@@ -955,9 +955,11 @@ pub(crate) fn build_create_args(
         working_dir.to_string(),
     ];
 
-    // Explicit per-session environment (`-e KEY=VAL`, tmux 3.0+). Set so a
-    // pane never inherits a stale value from the shared tmux server's frozen
-    // base environment. See the host-terminal call site for why this matters.
+    // Explicit per-session environment (`-e KEY=VAL`). `new-session -e`
+    // requires tmux 3.2+; aoe already assumes newer tmux elsewhere (clipboard
+    // passthrough needs 3.3, the VT channel 3.4), so no extra gate is added.
+    // Set so a pane never inherits a stale value from the shared tmux server's
+    // frozen base environment; see the host-terminal call site for why.
     for (key, value) in env {
         args.push("-e".to_string());
         args.push(format!("{key}={value}"));
