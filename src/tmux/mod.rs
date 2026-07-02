@@ -67,8 +67,14 @@ fn tmux_socket_path() -> Option<PathBuf> {
             }
             #[cfg(all(not(test), debug_assertions))]
             {
-                if let Ok(dir) = crate::session::get_app_dir() {
-                    return Some(dir.join("tmux.sock"));
+                match crate::session::get_app_dir() {
+                    Ok(dir) => return Some(dir.join("tmux.sock")),
+                    Err(e) => tracing::warn!(
+                        target: "tmux.socket",
+                        error = %e,
+                        "get_app_dir() failed; debug build falling back to tmux's default socket, \
+                         which a dev build can share with (and poison for) release (#2608)"
+                    ),
                 }
             }
             #[allow(unreachable_code)]
