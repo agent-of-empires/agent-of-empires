@@ -90,6 +90,22 @@ pub(super) fn validate_no_shell_injection(value: &str, field_name: &str) -> Resu
     Ok(())
 }
 
+/// Validate a pure display label (session title, group path): these are
+/// never passed to a shell or interpreted as a path (#2624), so unlike
+/// `validate_no_shell_injection` this allows apostrophes, punctuation, and
+/// most metacharacters. It still rejects control characters, since a
+/// literal newline or NUL corrupts single-line UI rendering and storage
+/// regardless of shell context.
+pub(super) fn validate_display_label(value: &str, field_name: &str) -> Result<(), String> {
+    if let Some(c) = value.chars().find(|c| c.is_control()) {
+        return Err(format!(
+            "Invalid control character U+{:04X} in {}.",
+            c as u32, field_name
+        ));
+    }
+    Ok(())
+}
+
 // The settings PATCH write surface (which sections/fields the web may write,
 // which need elevation, which are host-only) is no longer a hand-kept list
 // here: it is derived from the settings schema in
@@ -558,6 +574,44 @@ mod tests {
                 "validate_no_shell_injection should reject {:?} but accepted {:?}",
                 c,
                 input
+            );
+        }
+    }
+
+    /// #2624: real-world session titles/groups (imported from Claude Code
+    /// summaries) routinely contain apostrophes, question marks, and other
+    /// shell metacharacters that are harmless for a display label.
+    #[test]
+    fn display_label_accepts_common_punctuation() {
+        for value in [
+            "I've read @filename?",
+            "I'm testing this out",
+            "Goal: fix the parser",
+            "What's next?",
+            "Fix [draft] (wip) ~ #123",
+            "work/claude/imports",
+        ] {
+            assert!(
+                validate_display_label(value, "title").is_ok(),
+                "should accept {:?}",
+                value
+            );
+        }
+    }
+
+    #[test]
+    fn display_label_rejects_control_characters() {
+        for value in [
+            "bad\nname",
+            "bad\rname",
+            "bad\tname",
+            "bad\u{1b}name",
+            "bad\0name",
+        ] {
+            assert!(
+                validate_display_label(value, "title").is_err(),
+                "should reject {:?}",
+                value
             );
         }
     }
