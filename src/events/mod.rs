@@ -172,14 +172,16 @@ fn ensure_discriminant_column(conn: &Connection, events: &str) -> Result<()> {
         .unwrap_or(false);
     if !has_column {
         conn.execute_batch(&format!(
-            "ALTER TABLE {events} ADD COLUMN discriminant TEXT;
+            "BEGIN;
+             ALTER TABLE {events} ADD COLUMN discriminant TEXT;
              UPDATE {events}
                 SET discriminant = substr(
                     event_json,
                     instr(event_json, '\"') + 1,
                     instr(substr(event_json, instr(event_json, '\"') + 1), '\"') - 1
                 )
-              WHERE discriminant IS NULL AND instr(event_json, '\"') > 0;"
+              WHERE discriminant IS NULL AND instr(event_json, '\"') > 0;
+             COMMIT;"
         ))
         .context("backfill discriminant column")?;
     }
