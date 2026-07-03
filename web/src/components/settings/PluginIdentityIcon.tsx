@@ -19,6 +19,15 @@ interface Props {
  *  aria-hidden`) rather than needing author-supplied alt text. */
 export function PluginIdentityIcon({ icon, iconAssetUrl, className = "size-4", testId }: Props) {
   const [assetFailed, setAssetFailed] = useState(false);
+  // Reset the failure flag whenever a new URL is supplied (e.g. the detail
+  // modal swaps the local fallback route for the resolved manifest URL once
+  // its gh fetch lands), so a transient failure on the first URL doesn't
+  // permanently hide a later working one.
+  const [trackedUrl, setTrackedUrl] = useState(iconAssetUrl);
+  if (iconAssetUrl !== trackedUrl) {
+    setTrackedUrl(iconAssetUrl);
+    setAssetFailed(false);
+  }
 
   if (iconAssetUrl && !assetFailed) {
     return (
