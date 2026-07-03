@@ -601,7 +601,7 @@ impl EventStore {
             .query_row(
                 "SELECT event_json, created_at FROM acp_events
                  WHERE session_id = ?1
-                   AND event_json LIKE '{\"RateLimit\":%'
+                   AND discriminant = 'RateLimit'
                  ORDER BY seq DESC LIMIT 1",
                 params![session_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
@@ -827,7 +827,7 @@ impl EventStore {
                 "SELECT seq, event_json FROM acp_events
                  WHERE session_id = ?1
                    AND seq < ?2
-                   AND event_json LIKE '{\"WakeupScheduled\":%'
+                   AND discriminant = 'WakeupScheduled'
                  ORDER BY seq DESC LIMIT 1",
                 params![session_id, prompt_seq_i64],
                 |row| Ok((row.get(0)?, row.get(1)?)),
@@ -885,7 +885,7 @@ impl EventStore {
                  WHERE session_id = ?1
                    AND seq > ?2
                    AND seq < ?3
-                   AND event_json LIKE '{\"UserPromptSent\":%'
+                   AND discriminant = 'UserPromptSent'
                    AND created_at >= ?4",
                 params![session_id, wake_seq, prompt_seq_i64, at_ms],
                 |row| row.get(0),
@@ -1289,18 +1289,8 @@ impl EventStore {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        let json: String = conn
-            .query_row(
-                "SELECT event_json FROM acp_events
-                 WHERE session_id = ?1
-                   AND event_json LIKE '{\"PromptCapabilities\":%'
-                 ORDER BY seq DESC LIMIT 1",
-                params![session_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .ok()
-            .flatten()?;
+        let (_, json) =
+            events::latest_by_discriminant(&conn, &self.schema, session_id, "PromptCapabilities")?;
         match serde_json::from_str::<Event>(&json).ok()? {
             Event::PromptCapabilities {
                 image,
