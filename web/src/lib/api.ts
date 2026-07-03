@@ -222,6 +222,11 @@ export interface PluginView {
   name: string;
   version: string;
   description: string;
+  /** Lucide kebab-case identity icon name, straight from the manifest. */
+  icon: string | null;
+  /** Resolved URL for the manifest's `icon_asset` (served from the plugin's
+   *  install directory), null for a builtin or a plugin with no icon_asset. */
+  icon_asset_url: string | null;
   enabled: boolean;
   builtin: boolean;
   /** Validation provenance: "builtin" | "featured" | "community" | "local". */
@@ -327,6 +332,10 @@ export interface PluginDiscoveryResult {
   stars: number;
   badge: "installed" | "featured" | "unvetted";
   install_command: string;
+  /** The repo owner's GitHub avatar; a source-identity affordance, NOT the
+   *  plugin's own icon (unknown until a manifest fetch, which discovery
+   *  results never do). */
+  source_avatar_url: string;
 }
 
 export type DiscoverResult = { kind: "ok"; results: PluginDiscoveryResult[] } | { kind: "error"; message: string };
@@ -364,6 +373,10 @@ export interface PluginDetailManifest {
   ui_contributions: { slot: string; id: string }[];
   /** Screenshot/GIF previews, each resolved server-side to a raw.githubusercontent.com URL. */
   screenshots: { src: string; alt: string; caption: string }[];
+  /** Lucide kebab-case identity icon name. */
+  icon: string | null;
+  /** The manifest's `icon_asset`, resolved server-side to a raw.githubusercontent.com URL. */
+  icon_asset_url: string | null;
 }
 
 /** On-demand detail for one plugin source (`GET /api/plugins/details`): manifest
