@@ -98,6 +98,7 @@ export default function TourRunner({ run, steps, onFinish, onNavigate }: TourRun
         // ponytail: end the tour rather than hang; it re-triggers from the menu.
         // Upgrade to skip-the-step-in-direction if a feature-flagged (droppable)
         // settings tab is ever added as a target.
+        if (step.settingsTab) onNavigate(null); // don't strand the user in Settings
         onFinish(false);
         return;
       }
@@ -105,7 +106,7 @@ export default function TourRunner({ run, steps, onFinish, onNavigate }: TourRun
     };
     frame = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(frame);
-  }, [suspended, stepIndex, steps, onFinish]);
+  }, [suspended, stepIndex, steps, onFinish, onNavigate]);
 
   const handleEvent = useCallback(
     (data: EventData) => {
@@ -139,7 +140,8 @@ export default function TourRunner({ run, steps, onFinish, onNavigate }: TourRun
 
       if (data.type === EVENTS.TARGET_NOT_FOUND) {
         // Should not happen given the suspend/poll, but never leave the user
-        // stuck on a spotlight with no tooltip.
+        // stuck on a spotlight with no tooltip, or stranded in Settings.
+        if (steps[data.index]?.settingsTab) onNavigate(null);
         onFinish(false);
       }
     },
