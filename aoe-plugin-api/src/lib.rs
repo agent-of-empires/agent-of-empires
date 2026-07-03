@@ -18,9 +18,10 @@ mod manifest;
 pub use capability::{CapabilityId, TrustLevel, KNOWN_CAPABILITIES};
 pub use id::{InvalidPluginId, PluginId};
 pub use manifest::{
-    screenshot_path_ok, BuildStep, ClientAction, CommandContribution, KeybindContribution,
-    ManifestError, PluginManifest, RuntimeSpec, Screenshot, SettingContribution, SettingType,
-    StatusContribution, ThemeContribution, UiContribution, UiSlot, MAX_SCREENSHOTS,
+    lucide_icon_name_ok, screenshot_path_ok, BuildStep, ClientAction, CommandContribution,
+    KeybindContribution, ManifestError, PluginManifest, RuntimeSpec, Screenshot,
+    SettingContribution, SettingType, StatusContribution, ThemeContribution, UiContribution,
+    UiSlot, MAX_SCREENSHOTS,
 };
 
 /// Version of the manifest schema and host API this crate describes.
@@ -32,5 +33,6 @@ pub use manifest::{
 /// `default_location`); 4 when the `status` contribution section and the
 /// `aoe_version` host-compatibility field were added; 5 when the `screenshots`
 /// presentation metadata was added; 6 when a command could declare a
-/// client-executed `action` (`ClientAction`).
-pub const API_VERSION: u32 = 6;
+/// client-executed `action` (`ClientAction`); 7 when `icon` and `icon_asset`
+/// identity metadata were added.
+pub const API_VERSION: u32 = 7;

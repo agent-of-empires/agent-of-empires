@@ -31,6 +31,21 @@ pub struct PluginManifest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub screenshots: Vec<Screenshot>,
 
+    /// Lucide kebab-case icon name (e.g. `"git-branch"`) used as the plugin's
+    /// identity glyph where a raster asset isn't available or hasn't loaded.
+    /// Only syntax-checked here; an unknown name resolves to the host's
+    /// generic fallback icon client-side rather than failing to parse.
+    /// Requires `api_version >= 7`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+
+    /// Repository-relative raster image used as the plugin's identity icon,
+    /// shown in place of `icon` wherever the surface can render an image.
+    /// Same path rules as `screenshots` (see [`screenshot_path_ok`]).
+    /// Requires `api_version >= 7`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon_asset: Option<String>,
+
     /// Resource/effect capabilities the plugin requests. Static contributions
     /// below are NOT listed here; only runtime resource access is. The user
     /// grants these once at install (community plugins); builtins are
@@ -260,6 +275,24 @@ pub fn screenshot_path_ok(path: &str) -> bool {
         // No extension (or a leading-dot dotfile with no extension).
         _ => false,
     }
+}
+
+/// Whether `name` is a syntactically valid lucide icon name: lowercase
+/// ASCII kebab-case, non-empty segments, bounded length. Checked here so a
+/// malformed name fails at parse time with an actionable message; whether the
+/// name actually exists in lucide's icon set is the client's problem alone
+/// (an unknown name degrades to the host's generic fallback icon rather than
+/// failing to parse), so this crate does not depend on lucide's registry.
+pub fn lucide_icon_name_ok(name: &str) -> bool {
+    if name.is_empty() || name.len() > 80 {
+        return false;
+    }
+    name.split('-').all(|seg| {
+        !seg.is_empty()
+            && seg
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+    })
 }
 
 /// A host-rendered UI slot a plugin may push state into (#2366). A closed set,
@@ -734,6 +767,21 @@ impl PluginManifest {
                 format!("screenshots[{i}].alt must not be empty"),
             );
         }
+        if let Some(icon) = &self.icon {
+            check(
+                lucide_icon_name_ok(icon),
+                format!("icon {icon:?} must be a lucide kebab-case icon name"),
+            );
+        }
+        if let Some(path) = &self.icon_asset {
+            check(
+                screenshot_path_ok(path),
+                format!(
+                    "icon_asset {path:?} must be a repository-relative image path \
+                     (png/jpg/jpeg/gif/webp), not a URL or an absolute/traversing path"
+                ),
+            );
+        }
         // `aoe_version` is the host-app compatibility range, gated by the host
         // at install and load; reject a malformed requirement at parse so the
         // author learns of it before publishing rather than at a user's install.
@@ -765,6 +813,15 @@ impl PluginManifest {
             check(
                 self.screenshots.is_empty(),
                 "screenshots require api_version >= 5".into(),
+            );
+        }
+        // `icon` and `icon_asset` are api_version 7 fields; same reasoning as
+        // the gates above.
+        if self.api_version < 7 {
+            check(self.icon.is_none(), "icon requires api_version >= 7".into());
+            check(
+                self.icon_asset.is_none(),
+                "icon_asset requires api_version >= 7".into(),
             );
         }
         for key in self.setting_defaults.keys() {
