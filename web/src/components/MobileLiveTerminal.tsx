@@ -1025,6 +1025,19 @@ export function MobileLiveTerminal({
         if (text) void writeClipboard(text);
         return;
       }
+      if (e.altKey && !e.ctrlKey && !e.metaKey) {
+        const code = e.key.length === 1 ? e.key.charCodeAt(0) : 0;
+        let metaKey = code >= 0x20 && code <= 0x7e ? e.key : null;
+        if (!metaKey && /^Key[A-Z]$/.test(e.code)) {
+          const letter = e.code.slice(3);
+          metaKey = e.shiftKey ? letter : letter.toLowerCase();
+        }
+        if (metaKey) {
+          e.preventDefault();
+          sendData(`\x1b${metaKey}`);
+          return;
+        }
+      }
       // Hardware Ctrl+letter chords (bluetooth keyboards). Ctrl+V (and
       // Ctrl+Shift+V) is the exception: on Linux/Windows it is the paste
       // shortcut, so let the browser's native paste event fire (onPaste turns

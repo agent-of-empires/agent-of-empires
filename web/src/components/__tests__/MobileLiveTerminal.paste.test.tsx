@@ -92,6 +92,30 @@ describe("MobileLiveTerminal paste", () => {
     expect(sendData).toHaveBeenCalledWith("\x03");
   });
 
+  it("forwards Alt+letter chords as terminal Meta sequences", () => {
+    const { input, sendData } = renderTerm();
+
+    expect(fireEvent.keyDown(input, { key: "v", code: "KeyV", altKey: true })).toBe(false);
+    expect(sendData).toHaveBeenCalledWith("\x1bv");
+
+    expect(fireEvent.keyDown(input, { key: "V", code: "KeyV", altKey: true, shiftKey: true })).toBe(false);
+    expect(sendData).toHaveBeenCalledWith("\x1bV");
+  });
+
+  it("uses KeyboardEvent.code for Alt+letter when the browser key is a symbol", () => {
+    const { input, sendData } = renderTerm();
+
+    expect(fireEvent.keyDown(input, { key: "√", code: "KeyV", altKey: true })).toBe(false);
+    expect(sendData).toHaveBeenCalledWith("\x1bv");
+  });
+
+  it("leaves Ctrl+Alt printable chords alone for AltGr-style input", () => {
+    const { input, sendData } = renderTerm();
+
+    expect(fireEvent.keyDown(input, { key: "v", ctrlKey: true, altKey: true })).toBe(true);
+    expect(sendData).not.toHaveBeenCalledWith("\x1bv");
+  });
+
   it("copies the terminal selection on Ctrl+Shift+C without sending a control code", () => {
     writeClipboard.mockClear();
     const selSpy = vi.spyOn(window, "getSelection").mockReturnValue({

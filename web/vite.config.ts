@@ -7,8 +7,8 @@ import { codecovVitePlugin } from "@codecov/vite-plugin";
 export default defineConfig(({ mode, command }) => {
   // Load `.env*` files (empty prefix => all keys, not just `VITE_`), merged
   // over shell env. Editing a `.env` file restarts the dev server, and the
-  // proxy below only intercepts `/api` + `/sessions/*/ws`, so Vite's own HMR
-  // socket is untouched: live reload keeps working.
+  // proxy below only intercepts `/api` + AoE `/sessions/*` WebSocket relays,
+  // so Vite's own HMR socket is untouched: live reload keeps working.
   const env = loadEnv(mode, process.cwd(), "");
 
   const collectCoverage = env.AOE_COVERAGE === "1";
@@ -31,13 +31,14 @@ export default defineConfig(({ mode, command }) => {
     return /^https?:\/\//.test(raw) ? raw : `http://${raw}`;
   })();
 
-  // All WebSocket routes live under `/sessions/{id}/...ws` (terminal,
-  // container-terminal, and structured view at `/sessions/{id}/acp/ws`), so one
-  // regex covers them; REST (including `/api/acp/*`) goes through `/api`.
+  // All AoE WebSocket routes live under `/sessions/{id}/` and include `ws`
+  // suffixes (`ws`, `acp/ws`) plus the capture-snapshot live terminal
+  // `live-ws` routes. One regex covers them; REST (including `/api/acp/*`)
+  // goes through `/api`.
   const proxy = httpTarget
     ? {
         "/api": { target: httpTarget, changeOrigin: true },
-        "^/sessions/.+/ws": {
+        "^/sessions/.+/(?:ws|live-ws)$": {
           target: httpTarget.replace(/^http/, "ws"),
           ws: true,
           changeOrigin: true,

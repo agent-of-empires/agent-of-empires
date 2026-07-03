@@ -2,10 +2,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 // Guards the dev-server proxy contract that `cargo xtask dev` relies on: when
 // VITE_PROXY points at a running `aoe serve`, the Vite dev server must forward
-// REST (/api) and every WebSocket relay (/sessions/{id}/...ws) there, with the
-// WS target switched to the ws:// scheme. See vite.config.ts.
+// REST (/api) and every AoE session WebSocket relay there, with the WS target
+// switched to the ws:// scheme. See vite.config.ts.
 
 type ProxyEntry = { target: string; ws?: boolean };
+const SESSION_WS_PROXY = "^/sessions/.+/(?:ws|live-ws)$";
 
 async function loadProxy(env: Record<string, string | undefined>): Promise<Record<string, ProxyEntry> | undefined> {
   vi.resetModules();
@@ -38,14 +39,19 @@ describe("vite dev server proxy", () => {
   it("forwards /api and the /sessions WebSockets to VITE_PROXY", async () => {
     const proxy = await loadProxy({ VITE_PROXY: "http://127.0.0.1:8081" });
     expect(proxy?.["/api"].target).toBe("http://127.0.0.1:8081");
-    const ws = proxy?.["^/sessions/.+/ws"];
+    const ws = proxy?.[SESSION_WS_PROXY];
     expect(ws?.target).toBe("ws://127.0.0.1:8081");
     expect(ws?.ws).toBe(true);
+    expect(new RegExp(SESSION_WS_PROXY).test("/sessions/s1/ws")).toBe(true);
+    expect(new RegExp(SESSION_WS_PROXY).test("/sessions/s1/acp/ws")).toBe(true);
+    expect(new RegExp(SESSION_WS_PROXY).test("/sessions/s1/live-ws")).toBe(true);
+    expect(new RegExp(SESSION_WS_PROXY).test("/sessions/s1/terminal/live-ws")).toBe(true);
+    expect(new RegExp(SESSION_WS_PROXY).test("/sessions/s1/container-terminal/live-ws")).toBe(true);
   });
 
   it("defaults a bare host:port to http and derives the ws target", async () => {
     const proxy = await loadProxy({ VITE_PROXY: "localhost:50106" });
     expect(proxy?.["/api"].target).toBe("http://localhost:50106");
-    expect(proxy?.["^/sessions/.+/ws"].target).toBe("ws://localhost:50106");
+    expect(proxy?.[SESSION_WS_PROXY].target).toBe("ws://localhost:50106");
   });
 });

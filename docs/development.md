@@ -123,8 +123,8 @@ cargo xtask dev    # Unix only
 Builds the serve-enabled binary, then runs `aoe serve` (8081) and the Vite dev
 server (5173) together with hot module reload. Open
 [http://localhost:5173](http://localhost:5173); Vite proxies `/api` and the
-`/sessions/*/ws` relays to the backend (via `VITE_PROXY`). One Ctrl-C stops
-both. Ports are overridable with `--serve-port` / `--web-port`. See
+AoE session WebSocket relays to the backend (via `VITE_PROXY`). One Ctrl-C
+stops both. Ports are overridable with `--serve-port` / `--web-port`. See
 [Web Dashboard Development](development/web-dashboard.md#manual-frontend-loop)
 for the manual two-shell alternative.
 

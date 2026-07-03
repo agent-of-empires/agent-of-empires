@@ -13,7 +13,11 @@ cd web && npm install && npm run dev    # Vite + HMR on :5173
 cargo run --features serve -- serve     # backend, separate shell
 ```
 
-To develop the frontend against an already-running "production" backend (e.g. a non-cargo install on a custom port), point `VITE_PROXY` (shell env or `web/.env`) at that `aoe serve` origin; the dev server forwards `/api` and `/sessions/*/ws` (terminal + structured view) there. HMR is unaffected either way.
+To develop the frontend against an already-running "production" backend (e.g.
+a non-cargo install on a custom port), point `VITE_PROXY` (shell env or
+`web/.env`) at that `aoe serve` origin; the dev server forwards `/api` and AoE
+session WebSocket relays (terminal, live terminal, and structured view) there.
+HMR is unaffected either way.
 
 ```bash
 VITE_PROXY=http://localhost:50106 npm run dev

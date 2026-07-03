@@ -142,10 +142,10 @@ fn is_watch_relevant(path: &Path) -> bool {
 }
 
 /// Build the serve-enabled binary, then run it alongside the Vite dev server.
-/// Vite proxies `/api` and the `/sessions/*/ws` relays to the backend via the
-/// `VITE_PROXY` env var it already honors. Each child runs in its own process
-/// group so a single Ctrl-C tears the whole tree down (npm spawns vite, vite
-/// may spawn esbuild) with no orphans.
+/// Vite proxies `/api` and the AoE `/sessions/*` WebSocket relays to the
+/// backend via the `VITE_PROXY` env var it already honors. Each child runs in
+/// its own process group so a single Ctrl-C tears the whole tree down (npm
+/// spawns vite, vite may spawn esbuild) with no orphans.
 ///
 /// With `--watch`, edits under `src/**` (plus `Cargo.toml` / `Cargo.lock`)
 /// rebuild the backend and restart `aoe serve`; the Vite child is left running
@@ -182,9 +182,10 @@ fn run_dev(args: DevArgs) {
     // so neither child needs the terminal.
     let serve_port = args.serve_port;
     // The backend always stays on loopback: remote devices reach the dashboard
-    // through Vite, which proxies `/api` and the `/sessions/*/ws` relays to the
-    // backend over 127.0.0.1. Binding it to a public interface would also trip
-    // `aoe serve`'s refusal to run `--no-auth` off-loopback without a proxy.
+    // through Vite, which proxies `/api` and the AoE `/sessions/*` WebSocket
+    // relays to the backend over 127.0.0.1. Binding it to a public interface
+    // would also trip `aoe serve`'s refusal to run `--no-auth` off-loopback
+    // without a proxy.
     let host = args.host.clone();
     let spawn_serve = || -> Child {
         Command::new(&bin)
