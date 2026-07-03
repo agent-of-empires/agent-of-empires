@@ -264,6 +264,18 @@ fn resolve_screenshots(
         .collect()
 }
 
+/// Resolve a manifest's raw `icon` name, gated on `api_version >= 7` and
+/// syntax-checked via [`lucide_icon_name_ok`], so a malformed or pre-7 name
+/// from attacker-influenced remote manifest content never reaches the client.
+/// Extracted from the `details()` call site so this filter is independently
+/// testable without a network-backed `details()` call.
+fn resolve_icon_name(api_version: u32, icon: Option<String>) -> Option<String> {
+    if api_version < 7 {
+        return None;
+    }
+    icon.filter(|i| lucide_icon_name_ok(i))
+}
+
 /// Resolve a manifest's raw `icon_asset` into a browser-fetchable URL. Gated
 /// on `api_version >= 7` to mirror [`aoe_plugin_api::PluginManifest::validate`],
 /// and dropped on an invalid path, exactly like [`resolve_screenshots`].
@@ -388,10 +400,7 @@ pub async fn details(source: &str) -> Result<PluginDetail> {
                     repo,
                     reference,
                 ),
-                icon: (m.api_version >= 7)
-                    .then_some(m.icon)
-                    .flatten()
-                    .filter(|i| lucide_icon_name_ok(i)),
+                icon: resolve_icon_name(m.api_version, m.icon),
                 icon_asset_url: resolve_icon_asset(
                     m.api_version,
                     m.icon_asset,
@@ -613,11 +622,46 @@ icon = "git-branch"
 icon_asset = "assets/icon.png"
 "#;
         let m: RawManifest = toml::from_str(toml).expect("lenient parse");
-        assert_eq!(m.icon.as_deref(), Some("git-branch"));
+        assert_eq!(
+            resolve_icon_name(m.api_version, m.icon.clone()).as_deref(),
+            Some("git-branch")
+        );
         let url = resolve_icon_asset(m.api_version, m.icon_asset, "acme", "widget", None);
         assert_eq!(
             url.as_deref(),
             Some("https://raw.githubusercontent.com/acme/widget/HEAD/assets/icon.png")
+        );
+    }
+
+    #[test]
+    fn icon_name_gated_out_below_api_version_7() {
+        let toml = r#"
+id = "acme.widget"
+name = "Widget"
+version = "1.0.0"
+api_version = 6
+icon = "git-branch"
+"#;
+        let m: RawManifest = toml::from_str(toml).expect("lenient parse");
+        assert!(
+            resolve_icon_name(m.api_version, m.icon).is_none(),
+            "v6 must not expose icon"
+        );
+    }
+
+    #[test]
+    fn icon_name_drops_an_invalid_name() {
+        let toml = r#"
+id = "acme.widget"
+name = "Widget"
+version = "1.0.0"
+api_version = 7
+icon = "GitHub"
+"#;
+        let m: RawManifest = toml::from_str(toml).expect("lenient parse");
+        assert!(
+            resolve_icon_name(m.api_version, m.icon).is_none(),
+            "a non-kebab-case name must be dropped, not surfaced to the client"
         );
     }
 
