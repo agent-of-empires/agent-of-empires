@@ -1414,6 +1414,16 @@ impl<S: BroadcastSink> Supervisor<S> {
             Vec::new()
         });
 
+        // Mode has no per-request override today, so resolve it from the same
+        // repo/profile config already loaded above. The apply step only runs on
+        // session/new, so a resumed session/load is unaffected.
+        // ponytail: resolve here instead of threading mode through every
+        // SpawnRequest site; revisit if an explicit per-request mode lands.
+        let default_mode = resolved_cfg
+            .session
+            .acp_defaults_for(&agent)
+            .and_then(|defaults| defaults.mode.clone());
+
         let config = SpawnConfig {
             agent_key: agent.clone(),
             spec,
@@ -1421,6 +1431,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             additional_dirs,
             provider_env: env,
             default_effort: effort,
+            default_mode,
             socket_path: Some(socket_path),
             stored_acp_session_id: stored_acp_session_id.clone(),
             fork_from,
@@ -3416,6 +3427,7 @@ mod tests {
             additional_dirs: vec![],
             provider_env: vec![],
             default_effort: None,
+            default_mode: None,
             socket_path: Some(socket_path.clone()),
             stored_acp_session_id: None,
             fork_from: None,
@@ -3510,6 +3522,7 @@ mod tests {
             additional_dirs: vec![],
             provider_env: vec![],
             default_effort: None,
+            default_mode: None,
             socket_path: Some(tmp.path().join("dummy.sock")),
             stored_acp_session_id: None,
             fork_from: None,
@@ -3587,6 +3600,7 @@ mod tests {
             additional_dirs: vec![],
             provider_env: vec![],
             default_effort: None,
+            default_mode: None,
             socket_path: Some(tmp.path().join("dummy.sock")),
             stored_acp_session_id: None,
             fork_from: None,
@@ -3664,6 +3678,7 @@ mod tests {
             additional_dirs: vec![],
             provider_env: vec![],
             default_effort: None,
+            default_mode: None,
             socket_path: Some(tmp.path().join("dummy.sock")),
             stored_acp_session_id: None,
             fork_from: None,
@@ -3794,6 +3809,7 @@ mod tests {
             additional_dirs: vec![],
             provider_env: vec![],
             default_effort: None,
+            default_mode: None,
             socket_path: Some(tmp.path().join("dummy.sock")),
             stored_acp_session_id: None,
             fork_from: None,

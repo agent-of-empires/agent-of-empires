@@ -1001,8 +1001,10 @@ pub struct SessionConfig {
     pub agent_acp_cmd: HashMap<String, String>,
 
     /// Per-agent acp startup defaults as a JSON object
-    /// (`{"<agent>": {"model": "...", "effort": "..."}}`). `model` is forwarded
-    /// at spawn; `effort` is applied through ACP config options when advertised.
+    /// (`{"<agent>": {"model": "...", "effort": "...", "mode": "...",
+    /// "effort_by_model": {"<model>": "..."}}}`). `model` is forwarded at spawn;
+    /// `effort` and `mode` are applied through ACP config options when
+    /// advertised. `effort_by_model` overrides `effort` for a matching model.
     ///
     /// Map-of-struct, so it has no flat widget: it is edited as raw JSON through
     /// the `acp-defaults` custom widget (a JSON textarea on the web, an inline
@@ -1267,12 +1269,42 @@ pub struct AcpAgentDefaults {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+
+    /// Default structured view mode (ACP `category:"mode"` config option
+    /// value). Applied after `session/new` only when the agent advertises a
+    /// live mode option; a stale value no-ops with a warning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+
+    /// Per-model effort overrides, keyed by the exact ACP model option value.
+    /// Takes precedence over the flat `effort` when the resolved model matches
+    /// a key; falls back to `effort` otherwise.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub effort_by_model: HashMap<String, String>,
 }
 
 impl AcpAgentDefaults {
     pub fn is_empty(&self) -> bool {
         self.model.as_deref().is_none_or(str::is_empty)
             && self.effort.as_deref().is_none_or(str::is_empty)
+            && self.mode.as_deref().is_none_or(str::is_empty)
+            && self.effort_by_model.is_empty()
+    }
+
+    /// Effort for a resolved model: the per-model override wins when the model
+    /// matches a key, otherwise the flat `effort`. Empty strings are treated as
+    /// unset.
+    pub fn effort_for_model(&self, model: Option<&str>) -> Option<String> {
+        if let Some(model) = model {
+            if let Some(effort) = self
+                .effort_by_model
+                .get(model)
+                .filter(|value| !value.is_empty())
+            {
+                return Some(effort.clone());
+            }
+        }
+        self.effort.clone().filter(|value| !value.is_empty())
     }
 }
 

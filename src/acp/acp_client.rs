@@ -292,6 +292,10 @@ pub struct SpawnConfig {
     /// Optional default reasoning effort to apply on fresh ACP sessions
     /// through the adapter's `thought_level` config option.
     pub default_effort: Option<String>,
+    /// Optional default mode to apply on fresh ACP sessions through the
+    /// adapter's `category:"mode"` config option. Applied strictly: a value
+    /// the agent does not advertise no-ops with a warning.
+    pub default_mode: Option<String>,
     /// Reserved for a future agent-in-container that natively speaks
     /// the socket transport. The current structured view sandbox path runs
     /// `docker exec` from the host-side runner (which already holds the
@@ -1879,6 +1883,7 @@ impl AcpClient {
         let install_binary = config.spec.command.clone();
         let source_profile_for_task = config.source_profile.clone();
         let default_effort = config.default_effort.clone();
+        let default_mode = config.default_mode.clone();
         let mcp_servers = config.mcp_servers.clone();
         if let Some(socket_path) = config.socket_path.clone() {
             // Supersede guard: a fresh spawn overwrites this session's
@@ -1906,6 +1911,7 @@ impl AcpClient {
                 install_binary,
                 source_profile_for_task,
                 default_effort.clone(),
+                default_mode.clone(),
                 mcp_servers,
             )
             .await;
@@ -1929,6 +1935,7 @@ impl AcpClient {
             install_binary,
             source_profile_for_task,
             default_effort,
+            default_mode,
             mcp_servers,
         )
         .await
@@ -1951,6 +1958,7 @@ impl AcpClient {
         install_binary: String,
         source_profile: Option<String>,
         default_effort: Option<String>,
+        default_mode: Option<String>,
         mcp_servers: Vec<McpServer>,
     ) -> Result<Self, AcpError> {
         let (stdin, stdout) = {
@@ -2014,6 +2022,7 @@ impl AcpClient {
                 expected_agent,
                 source_profile,
                 default_effort,
+                default_mode,
                 mcp_servers,
             )
             .instrument(conn_span),
@@ -2053,6 +2062,7 @@ impl AcpClient {
         install_binary: String,
         source_profile: Option<String>,
         default_effort: Option<String>,
+        default_mode: Option<String>,
         mcp_servers: Vec<McpServer>,
     ) -> Result<Self, AcpError> {
         // Poll for the runner to finish binding the socket. The runner
@@ -2121,6 +2131,7 @@ impl AcpClient {
                 expected_agent,
                 source_profile,
                 default_effort,
+                default_mode,
                 mcp_servers,
             )
             .instrument(conn_span),
@@ -2208,8 +2219,10 @@ impl AcpClient {
             source_profile,
             None,
             // Reattach uses ConnectMode::Resume, which reuses the stored ACP
-            // session id without sending session/new or session/load, so no
-            // MCP servers are forwarded here (they were sent on first connect).
+            // session id without sending session/new or session/load, so
+            // neither default effort/mode nor MCP servers are forwarded here
+            // (they were applied on first connect).
+            None,
             Vec::new(),
         )
         .await
@@ -4186,6 +4199,25 @@ fn thought_level_config_id(
     })
 }
 
+/// Id of the first `Select` config option in the `mode` category, or `None`.
+/// Mirrors `thought_level_config_id`; non-`Select` kinds are skipped because
+/// they carry no selectable value the default-application path can set.
+fn mode_config_id(
+    options: &[agent_client_protocol::schema::SessionConfigOption],
+) -> Option<agent_client_protocol::schema::SessionConfigId> {
+    use agent_client_protocol::schema::{SessionConfigKind, SessionConfigOptionCategory};
+
+    options.iter().find_map(|option| {
+        if !matches!(option.category, Some(SessionConfigOptionCategory::Mode)) {
+            return None;
+        }
+        if !matches!(option.kind, SessionConfigKind::Select(_)) {
+            return None;
+        }
+        Some(option.id.clone())
+    })
+}
+
 /// Whether to issue ACP `session/fork` on this connect: only when a fork was
 /// requested AND the agent advertised the (unstable) fork capability. Falls
 /// back to the normal new/load handshake otherwise (which, for a fork that
@@ -4700,6 +4732,7 @@ async fn run_connection_task<W, R>(
     expected_agent: ExpectedAgent,
     source_profile: Option<String>,
     default_effort: Option<String>,
+    default_mode: Option<String>,
     mcp_servers: Vec<McpServer>,
 ) where
     W: futures_util::AsyncWrite + Send + 'static,
@@ -5746,6 +5779,56 @@ async fn run_connection_task<W, R>(
                                     target: "acp.protocol",
                                     session = %session_label,
                                     "default structured view effort skipped; no thought_level option"
+                                );
+                            }
+                        }
+
+                        // Mode default mirrors the effort block above. Strict:
+                        // apply only when the agent advertises a live
+                        // `category:"mode"` option; a stale/unknown value is
+                        // rejected by the adapter and warned (no-op), never
+                        // failing the spawn. Legacy set_mode / Claude hardcoded
+                        // mode channels are intentionally not driven from
+                        // defaults here (see #2631).
+                        if let (Some(mode_value), Some(options)) =
+                            (default_mode.as_deref(), config_options.as_deref())
+                        {
+                            if let Some(config_id) = mode_config_id(options) {
+                                info!(
+                                    target: "acp.protocol",
+                                    session = %session_label,
+                                    mode = mode_value,
+                                    "applying default structured view mode"
+                                );
+                                match connection
+                                    .send_request(SetSessionConfigOptionRequest::new(
+                                        id.clone(),
+                                        config_id,
+                                        SessionConfigValueId::new(mode_value.to_string()),
+                                    ))
+                                    .block_task()
+                                    .await
+                                {
+                                    Ok(resp) => {
+                                        if let Some(event) =
+                                            config_options_event(Some(resp.config_options))
+                                        {
+                                            let _ = event_tx_for_block.send(event).await;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            target: "acp.protocol",
+                                            session = %session_label,
+                                            "default structured view mode failed: {e}"
+                                        );
+                                    }
+                                }
+                            } else {
+                                debug!(
+                                    target: "acp.protocol",
+                                    session = %session_label,
+                                    "default structured view mode skipped; no mode option"
                                 );
                             }
                         }
@@ -8636,6 +8719,7 @@ mod tests {
             additional_dirs: vec![],
             provider_env: vec![],
             default_effort: None,
+            default_mode: None,
             socket_path: None,
             stored_acp_session_id: None,
             fork_from: None,
@@ -8708,6 +8792,7 @@ mod tests {
             // Per-spawn provider_env entry: must end up Inherit-style.
             provider_env: vec![("ANTHROPIC_API_KEY".into(), "sk-test-value".into())],
             default_effort: None,
+            default_mode: None,
             socket_path: None,
             stored_acp_session_id: None,
             fork_from: None,
@@ -8782,6 +8867,7 @@ mod tests {
             additional_dirs: vec![],
             provider_env: vec![],
             default_effort: None,
+            default_mode: None,
             socket_path: None,
             stored_acp_session_id: None,
             fork_from: None,
@@ -8831,6 +8917,7 @@ mod tests {
             additional_dirs: vec![],
             provider_env: vec![],
             default_effort: None,
+            default_mode: None,
             socket_path: None,
             stored_acp_session_id: None,
             fork_from: None,
@@ -8866,6 +8953,7 @@ mod tests {
             additional_dirs: vec![],
             provider_env: vec![],
             default_effort: None,
+            default_mode: None,
             socket_path: None,
             stored_acp_session_id: None,
             fork_from: None,
