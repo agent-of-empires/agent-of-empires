@@ -1246,7 +1246,47 @@ impl EventStore {
                 return false;
             }
         };
-        terminator.is_none()
+        if terminator.is_none() {
+            return true;
+        }
+        // An async background agent (claude `Agent` tool with `isAsync`) runs
+        // off-protocol and outlives the turn's terminal Stopped: its work is
+        // reported only via BackgroundAgent{Launched,Progress,Completed}
+        // events. Treat the session as in-flight while any launched or
+        // progressing agent has no matching Completed, so a build-stale
+        // respawn does not interrupt it mid-work and drop its transcript.
+        // Every tailer emits a terminal BackgroundAgentCompleted (including
+        // the stalled / error paths), so this set is bounded. See #2573.
+        let bg_in_flight: i64 = match conn
+            .query_row(
+                "SELECT COUNT(*) FROM (
+                     SELECT json_extract(event_json, '$.BackgroundAgentLaunched.agent_id') AS aid
+                       FROM acp_events WHERE session_id = ?1
+                         AND json_extract(event_json, '$.BackgroundAgentLaunched') IS NOT NULL
+                     UNION
+                     SELECT json_extract(event_json, '$.BackgroundAgentProgress.agent_id')
+                       FROM acp_events WHERE session_id = ?1
+                         AND json_extract(event_json, '$.BackgroundAgentProgress') IS NOT NULL
+                 ) started
+                 WHERE started.aid IS NOT NULL
+                   AND started.aid NOT IN (
+                     SELECT json_extract(event_json, '$.BackgroundAgentCompleted.agent_id')
+                       FROM acp_events WHERE session_id = ?1
+                         AND json_extract(event_json, '$.BackgroundAgentCompleted') IS NOT NULL
+                   )",
+                params![session_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+        {
+            Ok(Some(v)) => v,
+            Ok(None) => 0,
+            Err(e) => {
+                warn!(target: "acp.event_store", "has_in_flight_turn bg-agent query {session_id}: {e}");
+                0
+            }
+        };
+        bg_in_flight > 0
     }
 
     /// Latest `created_at` (ms since epoch) per session for the given
@@ -2355,6 +2395,67 @@ mod tests {
     #[test]
     fn has_in_flight_turn_empty_store_returns_false() {
         let (_tmp, store) = open_store(1000);
+        assert!(!store.has_in_flight_turn("s-1"));
+    }
+
+    #[test]
+    fn has_in_flight_turn_true_while_background_agent_unfinished() {
+        // #2573: an async background agent runs after the turn's terminal
+        // Stopped. A build-stale respawn must defer until the agent finishes,
+        // so the session counts as in-flight while any launched/progressing
+        // agent has no matching BackgroundAgentCompleted.
+        let (_tmp, store) = open_store(1000);
+        store
+            .record(
+                "s-1",
+                1,
+                &Event::UserPromptSent {
+                    text: "go".into(),
+                    attachments: Vec::new(),
+                },
+            )
+            .unwrap();
+        store
+            .record(
+                "s-1",
+                2,
+                &Event::Stopped {
+                    reason: "prompt_complete".into(),
+                },
+            )
+            .unwrap();
+        store
+            .record(
+                "s-1",
+                3,
+                &Event::BackgroundAgentProgress {
+                    agent_id: "bg-1".into(),
+                    status: crate::acp::state::BackgroundAgentStatus::Running,
+                    tool_count: 1,
+                    tools: Vec::new(),
+                    last_tool: None,
+                    last_text: None,
+                    at: chrono::Utc::now(),
+                },
+            )
+            .unwrap();
+        // Turn is stopped, but the background agent has no terminal yet.
+        assert!(store.has_in_flight_turn("s-1"));
+        store
+            .record(
+                "s-1",
+                4,
+                &Event::BackgroundAgentCompleted {
+                    agent_id: "bg-1".into(),
+                    status: crate::acp::state::BackgroundAgentStatus::Completed,
+                    tools: Vec::new(),
+                    result: None,
+                    warning: None,
+                    ended_at: chrono::Utc::now(),
+                },
+            )
+            .unwrap();
+        // Its completion drains the in-flight state.
         assert!(!store.has_in_flight_turn("s-1"));
     }
 
