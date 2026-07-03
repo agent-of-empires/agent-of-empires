@@ -1730,6 +1730,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     seen: tourSeen,
     seenKnown: tourSeenKnown,
     onSeen: handleTourSeen,
+    onNavigate: (tab) => (tab ? navigate(`/settings/${tab}`) : handleCloseSettings()),
   });
 
   // Auto-pop the tip-of-the-day once per load, after onboarding settles, like

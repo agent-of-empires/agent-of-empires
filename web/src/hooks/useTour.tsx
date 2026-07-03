@@ -10,6 +10,7 @@
 // is a plain hook returning the element to render rather than a context.
 import { lazy, Suspense, useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { resolveTourSteps, type TourScope, type TourStep } from "../lib/tourSteps";
+import type { TourSettingsTab } from "../components/tour/TourRunner";
 import { isAutomatedSession } from "../lib/onboarding";
 
 const TourRunner = lazy(() => import("../components/tour/TourRunner"));
@@ -33,6 +34,9 @@ export interface UseTourOptions {
   /** Called when the user finishes or skips the tour, so App can persist the
    *  seen flag to the backend. */
   onSeen: () => void;
+  /** Open a Settings tab (or close Settings when passed null) so the tour can
+   *  walk through settings-modal steps. App implements it via the router. */
+  onNavigate: (tab: TourSettingsTab | null) => void;
 }
 
 /**
@@ -78,6 +82,7 @@ export function useTour({
   seen,
   seenKnown,
   onSeen,
+  onNavigate,
 }: UseTourOptions): UseTourResult {
   const [run, setRun] = useState(false);
   const [steps, setSteps] = useState<TourStep[]>([]);
@@ -168,7 +173,7 @@ export function useTour({
 
   const tourElement = run ? (
     <Suspense fallback={null}>
-      <TourRunner run={run} steps={steps} onFinish={handleFinish} />
+      <TourRunner run={run} steps={steps} onFinish={handleFinish} onNavigate={onNavigate} />
     </Suspense>
   ) : null;
 

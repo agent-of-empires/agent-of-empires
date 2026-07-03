@@ -1,0 +1,121 @@
+// @vitest-environment jsdom
+//
+// TourRunner drives react-joyride in controlled mode so the settings-modal
+// steps (whose anchors live behind a route transition) never hand the engine a
+// missing target. These tests mock react-joyride down to a prop sink so we can
+// assert the transition contract directly: navigate on the crossing, suspend
+// (unmount) while the DOM mutates, poll for the anchor, remount at the new
+// index. See TourRunner.tsx and issue #2633.
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { act, cleanup, render, waitFor } from "@testing-library/react";
+import TourRunner from "./TourRunner";
+import { TOUR_ANCHORS, type TourStep } from "../../lib/tourSteps";
+
+vi.mock("react-joyride", async () => {
+  const { createElement } = await import("react");
+  let latestOnEvent: ((data: unknown) => void) | null = null;
+  const Joyride = (props: { stepIndex: number; run: boolean; onEvent: (data: unknown) => void }) => {
+    latestOnEvent = props.onEvent;
+    return createElement("div", {
+      "data-testid": "joyride",
+      "data-step-index": props.stepIndex,
+      "data-run": String(props.run),
+    });
+  };
+  return {
+    Joyride,
+    EVENTS: { STEP_AFTER: "step:after", TOUR_END: "tour:end", TARGET_NOT_FOUND: "error:target_not_found" },
+    ACTIONS: { PREV: "prev", NEXT: "next" },
+    STATUS: { FINISHED: "finished", SKIPPED: "skipped" },
+    __getOnEvent: () => latestOnEvent,
+  };
+});
+
+import * as joyrideMock from "react-joyride";
+
+const fire = (data: Record<string, unknown>) => {
+  const onEvent = (joyrideMock as unknown as { __getOnEvent: () => (d: unknown) => void }).__getOnEvent();
+  act(() => onEvent(data));
+};
+
+function addAnchor(value: string) {
+  const el = document.createElement("div");
+  el.setAttribute("data-tour", value);
+  document.body.appendChild(el);
+  return el;
+}
+
+const dashStep: TourStep = {
+  id: "topbar",
+  anchor: TOUR_ANCHORS.topbar,
+  scopes: ["dashboard"],
+  title: "t",
+  body: "b",
+};
+const dashStep2: TourStep = {
+  id: "new-session",
+  anchor: TOUR_ANCHORS.dashboardNewSession,
+  scopes: ["dashboard"],
+  title: "t2",
+  body: "b2",
+};
+const worktreeStep: TourStep = {
+  id: "settings-worktree",
+  anchor: TOUR_ANCHORS.settingsWorktree,
+  settingsTab: "worktree",
+  scopes: ["dashboard"],
+  title: "wt",
+  body: "wt body",
+};
+
+afterEach(() => {
+  cleanup();
+  document.body.innerHTML = "";
+});
+
+describe("TourRunner controlled transitions", () => {
+  it("navigates, suspends, and remounts at the new index when crossing into a settings step", async () => {
+    addAnchor(TOUR_ANCHORS.topbar);
+    const onNavigate = vi.fn();
+    const onFinish = vi.fn();
+    const { queryByTestId, getByTestId } = render(
+      <TourRunner run steps={[dashStep, worktreeStep]} onFinish={onFinish} onNavigate={onNavigate} />,
+    );
+    expect(getByTestId("joyride").getAttribute("data-step-index")).toBe("0");
+
+    // Advance from the dashboard step into the worktree settings step.
+    fire({ type: "step:after", index: 0, action: "next", status: "" });
+
+    // Host is told to open the worktree tab, and Joyride unmounts (suspended)
+    // so it cannot fault on the not-yet-painted anchor.
+    expect(onNavigate).toHaveBeenCalledWith("worktree");
+    expect(queryByTestId("joyride")).toBeNull();
+
+    // The tab paints its anchor; the poll lifts the suspension and remounts at 1.
+    addAnchor(TOUR_ANCHORS.settingsWorktree);
+    await waitFor(() => expect(queryByTestId("joyride")).not.toBeNull());
+    expect(getByTestId("joyride").getAttribute("data-step-index")).toBe("1");
+  });
+
+  it("does not navigate or suspend between two dashboard steps", () => {
+    addAnchor(TOUR_ANCHORS.topbar);
+    addAnchor(TOUR_ANCHORS.dashboardNewSession);
+    const onNavigate = vi.fn();
+    const { getByTestId } = render(
+      <TourRunner run steps={[dashStep, dashStep2]} onFinish={vi.fn()} onNavigate={onNavigate} />,
+    );
+    fire({ type: "step:after", index: 0, action: "next", status: "" });
+    expect(onNavigate).not.toHaveBeenCalled();
+    expect(getByTestId("joyride").getAttribute("data-step-index")).toBe("1");
+  });
+
+  it("closes settings and marks seen when the tour ends on a settings step", () => {
+    addAnchor(TOUR_ANCHORS.settingsWorktree);
+    const onNavigate = vi.fn();
+    const onFinish = vi.fn();
+    render(<TourRunner run steps={[worktreeStep]} onFinish={onFinish} onNavigate={onNavigate} />);
+    fire({ type: "tour:end", index: 0, action: "skip", status: "skipped" });
+    expect(onNavigate).toHaveBeenCalledWith(null);
+    expect(onFinish).toHaveBeenCalledWith(true);
+  });
+});
