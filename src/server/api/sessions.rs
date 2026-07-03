@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::git::error::GitError;
 use crate::session::{EnsureReadyError, EnsureReadyOutcome, Instance, Status, Storage};
 
+use super::validate_display_label;
 use super::validate_no_shell_injection;
 use super::AppState;
 
@@ -997,7 +998,7 @@ pub async fn rename_session(
         )
             .into_response();
     }
-    if let Err(msg) = validate_no_shell_injection(&title, "title") {
+    if let Err(msg) = validate_display_label(&title, "title") {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "message": msg })),
@@ -1289,13 +1290,10 @@ pub async fn set_worktree_name(
         )
             .into_response();
     }
-    if let Err(msg) = validate_no_shell_injection(&name, "name") {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "message": msg })),
-        )
-            .into_response();
-    }
+    // #2624: no shell-injection check here. `name` becomes a git branch and
+    // filesystem leaf via `edit_worktree_workdir`, which already runs it
+    // through `git_sanitize_branch_name` + `sanitize_branch_name` before
+    // either ever sees a raw byte (src/session/worktree_edit.rs).
 
     // Serialize against other mutations on this session (start, delete,
     // another rename) so the git ops and the metadata write don't race.
@@ -1543,11 +1541,11 @@ pub async fn update_session_group(
         Err(rej) => return rej.into_response(),
     };
     let group = body.group;
-    // Match `create_session`'s group handling exactly: shell-injection
+    // Match `create_session`'s group handling exactly: display-label
     // check on a non-empty path, no trimming or slash normalization. The
     // empty string is the ungroup sentinel and skips validation.
     if !group.is_empty() {
-        if let Err(msg) = validate_no_shell_injection(&group, "group") {
+        if let Err(msg) = validate_display_label(&group, "group") {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({ "message": msg })),
@@ -4039,11 +4037,7 @@ pub async fn create_session(
     // Validate user inputs for shell injection. For scratch sessions the
     // `path` field is server-provisioned (and clients typically send an
     // empty string), so skip the path entry in that case.
-    let mut shell_checks: Vec<(&str, &str)> = vec![
-        (body.extra_args.as_str(), "extra_args"),
-        (body.tool.as_str(), "tool"),
-        (body.group.as_str(), "group"),
-    ];
+    let mut shell_checks: Vec<(&str, &str)> = vec![(body.extra_args.as_str(), "extra_args")];
     if !body.scratch {
         shell_checks.push((body.path.as_str(), "path"));
     }
@@ -4056,17 +4050,22 @@ pub async fn create_session(
                 .into_response();
         }
     }
-    if let Some(ref title) = body.title {
-        if let Err(msg) = validate_no_shell_injection(title, "title") {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "validation_failed", "message": msg})),
-            )
-                .into_response();
-        }
+    // #2624: `title`/`group` are display labels, not shell input, so they
+    // go through `validate_display_label` (control characters only)
+    // instead. `tool` is checked against the agent registry below
+    // (`validate_session_tool_identity`); `worktree_branch` is re-sanitized
+    // for git-ref safety in the builder; `profile` is checked against
+    // `list_profiles()` right below. None of the four ever reach a shell,
+    // so `validate_no_shell_injection` no longer runs on them.
+    if let Err(msg) = validate_display_label(&body.group, "group") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "validation_failed", "message": msg})),
+        )
+            .into_response();
     }
-    if let Some(ref branch) = body.worktree_branch {
-        if let Err(msg) = validate_no_shell_injection(branch, "worktree_branch") {
+    if let Some(ref title) = body.title {
+        if let Err(msg) = validate_display_label(title, "title") {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"error": "validation_failed", "message": msg})),
@@ -4075,13 +4074,6 @@ pub async fn create_session(
         }
     }
     if let Some(ref profile_name) = body.profile {
-        if let Err(msg) = validate_no_shell_injection(profile_name, "profile") {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "validation_failed", "message": msg})),
-            )
-                .into_response();
-        }
         // Verify the profile exists. Every profile is a real directory under
         // profiles/; there is no implicitly-valid profile name. Distinguish
         // an enumeration failure (I/O, permissions) from a missing profile
