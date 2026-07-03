@@ -138,7 +138,7 @@ describe("resolveTourSteps", () => {
     });
     // settingsTab steps mount their anchor only after the tour navigates into
     // Settings, so they bypass the launch-time DOM probe; everything else drops.
-    expect(steps.map((s) => s.id)).toEqual(["settings-worktree", "settings-plugins"]);
+    expect(steps.map((s) => s.id)).toEqual(["settings-worktree", "settings-plugins", "settings-agent-defaults"]);
     expect(steps.every((s) => s.settingsTab)).toBe(true);
   });
 

@@ -113,7 +113,11 @@ base("first-run tutorial: auto-launch, skip, persist, re-trigger", async ({ page
     await step("Extend AoE with plugins"); // switches to Settings > Plugins
     await expect.poll(() => new URL(page.url()).pathname).toBe("/settings/plugins");
 
-    // Moving past the plugins step closes Settings and lands back on the dashboard.
+    // The per-agent defaults step (#2631) switches to Settings > Structured view.
+    await step("Set per-agent defaults");
+    await expect.poll(() => new URL(page.url()).pathname).toBe("/settings/structured-view");
+
+    // Moving past the last settings step closes Settings and lands back on the dashboard.
     await step("Replay this tour any time");
     await expect.poll(() => new URL(page.url()).pathname).toBe("/");
     await page.getByRole("button", { name: /^Done/ }).click();
