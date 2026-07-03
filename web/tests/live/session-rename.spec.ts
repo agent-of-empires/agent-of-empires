@@ -147,4 +147,52 @@ base.describe("session rename via sidebar context menu (#1220)", () => {
       await serve.stop();
     }
   });
+
+  base("a title with an apostrophe, question mark, and colon is accepted (#2624)", async ({ page }, testInfo) => {
+    const original = "shell-chars-source";
+    // Mirrors real Claude Code session titles that broke import: an
+    // apostrophe, a trailing question mark, and a "Goal:" prefix.
+    const updated = "Goal: I've fixed the parser, right?";
+    const serve = await spawnAoeServe({
+      authMode: "none",
+      workerIndex: testInfo.workerIndex,
+      parallelIndex: testInfo.parallelIndex,
+      seedFn: seedSessionViaAoeAdd({ title: original }),
+    });
+
+    try {
+      const sessions = await listSessions(serve.baseUrl);
+      const sessionId = sessions[0]!.id as string;
+
+      await page.goto(`${serve.baseUrl}/`);
+
+      const row = page.locator("[data-testid='sidebar-session-row']");
+      await expect(row).toContainText(original, { timeout: 10_000 });
+
+      await row.click({ button: "right" });
+      const menu = page.locator("[data-testid='sidebar-context-menu']");
+      await expect(menu).toBeVisible();
+
+      const patchPromise = page.waitForResponse(
+        (res) => res.url().endsWith(`/api/sessions/${sessionId}`) && res.request().method() === "PATCH",
+      );
+
+      await menu.locator("[data-testid='sidebar-context-menu-rename']").click();
+      const input = page.locator("[data-testid='sidebar-rename-input']");
+      await expect(input).toBeVisible();
+      await input.fill(updated);
+      await input.press("Enter");
+
+      const patchRes = await patchPromise;
+      expect(patchRes.ok(), `rename should succeed, got ${patchRes.status()}`).toBe(true);
+
+      await expect
+        .poll(async () => (await listSessions(serve.baseUrl))[0]?.title, {
+          timeout: 5_000,
+        })
+        .toBe(updated);
+    } finally {
+      await serve.stop();
+    }
+  });
 });

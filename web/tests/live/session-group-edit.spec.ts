@@ -135,4 +135,52 @@ base.describe("session group edit via sidebar context menu (#1726)", () => {
       await serve.stop();
     }
   });
+
+  base("a group path containing an apostrophe is accepted (#2624)", async ({ page }, testInfo) => {
+    const title = "group-edit-shell-chars";
+    const newGroup = "Sam's Team/imports";
+    const serve = await spawnAoeServe({
+      authMode: "none",
+      workerIndex: testInfo.workerIndex,
+      parallelIndex: testInfo.parallelIndex,
+      seedFn: seedSessionViaAoeAdd({ title }),
+    });
+
+    try {
+      const sessions = await listSessions(serve.baseUrl);
+      const sessionId = sessions[0]!.id as string;
+
+      await page.goto(`${serve.baseUrl}/`);
+
+      const row = page.locator("[data-testid='sidebar-session-row']");
+      await expect(row).toContainText(title, { timeout: 10_000 });
+
+      await row.click({ button: "right" });
+      const menu = page.locator("[data-testid='sidebar-context-menu']");
+      await expect(menu).toBeVisible();
+
+      const patchPromise = page.waitForResponse(
+        (res) => res.url().endsWith(`/api/sessions/${sessionId}/group`) && res.request().method() === "PATCH",
+      );
+
+      await menu.locator("[data-testid='sidebar-context-menu-edit-group']").click();
+      const modal = page.locator("[data-testid='session-group-modal']");
+      await expect(modal).toBeVisible();
+      const input = modal.locator("[data-testid='session-group-modal-input']");
+      await input.fill(newGroup);
+      await modal.locator("[data-testid='session-group-modal-save']").click();
+
+      const patchRes = await patchPromise;
+      expect(patchRes.ok(), `group save should succeed, got ${patchRes.status()}`).toBe(true);
+      await expect(modal).toBeHidden();
+
+      await expect
+        .poll(async () => (await listSessions(serve.baseUrl))[0]?.group_path, {
+          timeout: 5_000,
+        })
+        .toBe(newGroup);
+    } finally {
+      await serve.stop();
+    }
+  });
 });
