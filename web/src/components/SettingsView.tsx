@@ -20,6 +20,7 @@ import { SelectField } from "./settings/FormFields";
 import { DiffSettings } from "./settings/DiffSettings";
 import { TelemetrySettings } from "./settings/TelemetrySettings";
 import { PluginsSettings } from "./settings/PluginsSettings";
+import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
 import { PluginSettingsSections } from "./settings/PluginSettingsSections";
 import { SettingsHeader } from "./settings/SettingsHeader";
 import { ProfilesSection } from "./profiles/ProfilesSection";
@@ -479,14 +480,16 @@ export function SettingsView({
 
       case "worktree":
         return (
-          <SchemaSection
-            section="worktree"
-            schema={schema}
-            focusRequest={focusRequest}
-            values={worktree}
-            onSaveField={saveSubField}
-            advancedSubtitle="Bare-repo and workspace path templates, branch cleanup, and submodules."
-          />
+          <div {...tourAnchor(TOUR_ANCHORS.settingsWorktree)}>
+            <SchemaSection
+              section="worktree"
+              schema={schema}
+              focusRequest={focusRequest}
+              values={worktree}
+              onSaveField={saveSubField}
+              advancedSubtitle="Bare-repo and workspace path templates, branch cleanup, and submodules."
+            />
+          </div>
         );
 
       case "theme":
@@ -547,7 +550,7 @@ export function SettingsView({
 
       case "plugins":
         return (
-          <div className="space-y-6">
+          <div className="space-y-6" {...tourAnchor(TOUR_ANCHORS.settingsPlugins)}>
             <PluginsSettings />
             {schemaGuard() ?? <PluginSettingsSections schema={schema} settings={settings} onSaved={loadSettings} />}
           </div>
