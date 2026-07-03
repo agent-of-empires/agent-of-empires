@@ -129,14 +129,31 @@ describe("resolveTourSteps", () => {
     expect(steps.map((s) => s.id)).not.toContain("right-panel");
   });
 
-  it("drops steps whose anchor is absent from the DOM", () => {
+  it("drops steps whose anchor is absent from the DOM, except deferred settings steps", () => {
     const steps = resolveTourSteps({
       scope: "dashboard",
       readOnly: false,
       isDesktop: true,
       hasAnchor: () => false,
     });
-    expect(steps).toEqual([]);
+    // settingsTab steps mount their anchor only after the tour navigates into
+    // Settings, so they bypass the launch-time DOM probe; everything else drops.
+    expect(steps.map((s) => s.id)).toEqual(["settings-worktree", "settings-plugins"]);
+    expect(steps.every((s) => s.settingsTab)).toBe(true);
+  });
+
+  it("still requires present anchors for non-settings steps when a settings step is eligible", () => {
+    const present = new Set<TourAnchorId>([TOUR_ANCHORS.topbar]);
+    const steps = resolveTourSteps({
+      scope: "dashboard",
+      readOnly: false,
+      isDesktop: true,
+      hasAnchor: (a) => present.has(a),
+    });
+    const ids = steps.map((s) => s.id);
+    expect(ids).toContain("topbar"); // present anchor -> kept
+    expect(ids).toContain("settings-worktree"); // deferred -> kept regardless
+    expect(ids).not.toContain("sidebar"); // absent non-deferred anchor -> dropped
   });
 
   it("preserves TOUR_STEPS order", () => {
