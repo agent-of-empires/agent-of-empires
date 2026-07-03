@@ -1562,6 +1562,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         // Plugin management. The enable/disable toggle gates on read-only +
         // elevation inside the handler.
         .route("/api/plugins", get(api::list_plugins))
+        .route("/api/plugins/{id}/icon", get(api::serve_plugin_icon))
         .route("/api/plugins/commands", get(api::plugin_commands))
         .route("/api/plugins/ui-state", get(api::plugin_ui_state))
         .route("/api/plugins/updates", get(api::plugin_updates))
