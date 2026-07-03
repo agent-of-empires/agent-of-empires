@@ -90,14 +90,29 @@ pub(super) fn validate_no_shell_injection(value: &str, field_name: &str) -> Resu
     Ok(())
 }
 
+/// Unicode bidirectional-format characters (category Cf): `char::is_control()`
+/// only covers Cc, so these pass through unblocked otherwise. Left in a
+/// display label, they let the rendered text reorder relative to what's
+/// stored (Trojan-Source-style spoofing, e.g. CVE-2021-42574) in shared UI
+/// surfaces. This is the same set rustc's own bidi lint blocks in source
+/// literals.
+const BIDI_CONTROL_CHARS: &[char] = &[
+    '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', // LRE RLE PDF LRO RLO
+    '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}', // LRI RLI FSI PDI
+];
+
 /// Validate a pure display label (session title, group path): these are
 /// never passed to a shell or interpreted as a path (#2624), so unlike
 /// `validate_no_shell_injection` this allows apostrophes, punctuation, and
-/// most metacharacters. It still rejects control characters, since a
-/// literal newline or NUL corrupts single-line UI rendering and storage
-/// regardless of shell context.
+/// most metacharacters. It still rejects control characters and bidi
+/// override/isolate characters, since a literal newline, NUL, or bidi
+/// override corrupts single-line UI rendering, storage, or the displayed
+/// text's actual order regardless of shell context.
 pub(super) fn validate_display_label(value: &str, field_name: &str) -> Result<(), String> {
-    if let Some(c) = value.chars().find(|c| c.is_control()) {
+    if let Some(c) = value
+        .chars()
+        .find(|c| c.is_control() || BIDI_CONTROL_CHARS.contains(c))
+    {
         return Err(format!(
             "Invalid control character U+{:04X} in {}.",
             c as u32, field_name
@@ -610,6 +625,21 @@ mod tests {
         ] {
             assert!(
                 validate_display_label(value, "title").is_err(),
+                "should reject {:?}",
+                value
+            );
+        }
+    }
+
+    /// `is_control()` alone misses Cf-category bidi override/isolate chars;
+    /// unblocked, they let a title's rendered order differ from what's
+    /// stored (Trojan-Source-style spoofing).
+    #[test]
+    fn display_label_rejects_bidi_control_characters() {
+        for &c in BIDI_CONTROL_CHARS {
+            let value = format!("bad{}name", c);
+            assert!(
+                validate_display_label(&value, "title").is_err(),
                 "should reject {:?}",
                 value
             );
