@@ -71,6 +71,13 @@ export interface TourStep {
    * target is mounted before react-joyride evaluates it (never a race).
    */
   settingsTab?: "worktree" | "plugins" | "structured-view";
+  /**
+   * Disable react-joyride's scroll-into-view for this step. Use when the anchor
+   * is already in view (e.g. top of a settings tab) AND the surrounding content
+   * changes height after mount (async fetches), which otherwise makes the engine
+   * loop on scroll-into-view and never advance. See #2631.
+   */
+  disableScrolling?: boolean;
 }
 
 /** The CSS selector that resolves a given anchor in the DOM. */
@@ -151,6 +158,11 @@ export const TOUR_STEPS: readonly TourStep[] = [
     settingsTab: "structured-view",
     scopes: ["dashboard"],
     desktopOnly: true,
+    // The Structured view tab's defaults widget fetches agents + option catalog
+    // and grows after mount; without this the engine loops on scroll-into-view
+    // and never advances. The anchor sits at the top of the tab, already in
+    // view once the tour navigates there, so skipping scroll is safe. See #2631.
+    disableScrolling: true,
     title: "Set per-agent defaults",
     body: "Pick a default model, mode, and thinking level for each agent here, so new structured-view sessions start the way you want without touching the composer. The choices come from what each agent last advertised, so you set them once per agent and new models appear automatically. Per-model thinking lets one agent think harder on some models than others.",
   },

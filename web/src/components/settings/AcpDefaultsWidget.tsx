@@ -14,7 +14,6 @@ import { useEffect, useState } from "react";
 import { fetchAcpOptionCatalog, fetchAgents } from "../../lib/api";
 import type { AgentOptionEntry } from "../../lib/api";
 import type { ConfigOptionCategory, ConfigOptionDescriptor } from "../../lib/acpTypes";
-import { TOUR_ANCHORS, tourAnchor } from "../../lib/tourSteps";
 import type { AgentInfo } from "../../lib/types";
 import type { CustomWidgetProps } from "./customWidgets";
 import { SelectField, TextField } from "./FormFields";
@@ -279,7 +278,7 @@ export function AcpDefaultsWidget({ descriptor, value, save }: CustomWidgetProps
   };
 
   return (
-    <div className="space-y-3" {...tourAnchor(TOUR_ANCHORS.settingsAgentDefaults)}>
+    <div className="space-y-3">
       <div>
         <label className="block text-sm text-text-bright">{descriptor.label}</label>
         {descriptor.description && <div className="text-xs text-text-dim mt-0.5">{descriptor.description}</div>}

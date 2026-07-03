@@ -68,6 +68,9 @@ function toJoyrideStep(step: TourStep): Step {
     title: step.title,
     content: <StepBody body={step.body} shortcutHints={step.shortcutHints} />,
     placement: "auto",
+    // Skip scroll-into-view when the anchor is already in view but the tab grows
+    // async: react-joyride otherwise loops on scroll and never advances (#2631).
+    ...(step.disableScrolling ? { skipScroll: true } : {}),
   };
 }
 
