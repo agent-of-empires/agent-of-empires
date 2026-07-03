@@ -1140,7 +1140,7 @@ fn between_prompt_should_fire(
     last_lifecycle_ms: i64,
     wake_at_ms: Option<i64>,
     cost_seen: bool,
-    tools_in_flight: bool,
+    work_in_flight: bool,
     off_protocol_work_seen: bool,
     fast_grace: std::time::Duration,
     floor: std::time::Duration,
@@ -1148,9 +1148,10 @@ fn between_prompt_should_fire(
     if !active {
         return false;
     }
-    // An in-flight tool (npm install, Playwright, a Task subagent) means the
-    // turn is legitimately busy; never fire while one is open. See #1401.
-    if tools_in_flight {
+    // Work in flight (an open ACP tool: npm install, Playwright, a Task
+    // subagent; or a tracked async background agent) means the turn is
+    // legitimately busy; never fire while any is running. See #1401, #2573.
+    if work_in_flight {
         return false;
     }
     // A future wake is the agent legitimately sleeping toward `at`; suppress
@@ -4793,6 +4794,16 @@ async fn run_connection_task<W, R>(
     // marker OR its launch set `run_in_background`: the work keeps running
     // after the ToolCall completes, so the watchdog holds the floor.
     let between_prompt_off_protocol = Arc::new(AtomicBool::new(false));
+    // Async background agents (claude `Agent` tool with `isAsync`) currently
+    // tracked by a live tailer, keyed by agent_id. Non-empty means
+    // agent-initiated work is still running off-protocol WITH a precise
+    // terminal event (the tailer removes the id on completion / stall /
+    // error), so the between-prompt idle watchdog must not fire while any is
+    // in flight. Distinct from the 30-min off-protocol floor, which governs
+    // untracked backgrounded Bash that has no completion signal. See #2573.
+    let between_prompt_bg_agents = Arc::new(std::sync::Mutex::new(std::collections::HashSet::<
+        String,
+    >::new()));
     let prompt_in_flight = Arc::new(AtomicBool::new(false));
     let last_event_at_for_notif = last_event_at.clone();
     let first_event_after_attach_for_notif = first_event_after_attach.clone();
@@ -4802,6 +4813,7 @@ async fn run_connection_task<W, R>(
     let between_prompt_wake_at_for_notif = between_prompt_wake_at.clone();
     let between_prompt_tools_for_notif = between_prompt_tools.clone();
     let between_prompt_off_protocol_for_notif = between_prompt_off_protocol.clone();
+    let between_prompt_bg_agents_for_notif = between_prompt_bg_agents.clone();
     let prompt_in_flight_for_notif = prompt_in_flight.clone();
 
     // Per-session tracker that drops claude-agent-acp's leaked consolidated
@@ -4840,6 +4852,8 @@ async fn run_connection_task<W, R>(
                 let between_prompt_tools = between_prompt_tools_for_notif.clone();
                 let between_prompt_off_protocol =
                     between_prompt_off_protocol_for_notif.clone();
+                let between_prompt_bg_agents =
+                    between_prompt_bg_agents_for_notif.clone();
                 let prompt_in_flight = prompt_in_flight_for_notif.clone();
                 let tool_context_cache = tool_context_cache_for_notif.clone();
                 async move {
@@ -4948,7 +4962,19 @@ async fn run_connection_task<W, R>(
                                     .unwrap_or(false);
                                 // A failed launch keeps no background work
                                 // running, so it must not pin the floor.
+                                // Async sub-agents are tracked precisely in
+                                // between_prompt_bg_agents (a tailer removes
+                                // them on their terminal event), so they must
+                                // NOT also latch the 30-min off-protocol floor;
+                                // that floor is only for untracked backgrounded
+                                // work (Bash) with no completion signal. See
+                                // #2573.
+                                let is_tracked_async = matches!(
+                                    off_protocol_work,
+                                    Some(OffProtocolWorkKind::AsyncAgent)
+                                );
                                 if *succeeded
+                                    && !is_tracked_async
                                     && (off_protocol_work.is_some() || was_background)
                                 {
                                     between_prompt_off_protocol
@@ -5014,6 +5040,7 @@ async fn run_connection_task<W, R>(
                                     agent_id.clone(),
                                     output_file.clone(),
                                     event_tx.clone(),
+                                    between_prompt_bg_agents.clone(),
                                 );
                             }
                         }
@@ -5807,13 +5834,21 @@ async fn run_connection_task<W, R>(
                             .lock()
                             .expect("between-prompt tools mutex poisoned")
                             .is_empty();
+                        // A tracked async background agent still running is
+                        // work in flight just like an open tool: suppress the
+                        // idle watchdog until its tailer reports terminal and
+                        // removes it from the set. See #2573.
+                        let bg_agents_in_flight = !between_prompt_bg_agents
+                            .lock()
+                            .expect("between-prompt bg-agents mutex poisoned")
+                            .is_empty();
                         if between_prompt_should_fire(
                             between_prompt_active.load(Ordering::Relaxed),
                             now,
                             last_lifecycle_at.load(Ordering::Relaxed),
                             wake_at,
                             between_prompt_cost_seen.load(Ordering::Relaxed),
-                            tools_in_flight,
+                            tools_in_flight || bg_agents_in_flight,
                             between_prompt_off_protocol.load(Ordering::Relaxed),
                             BETWEEN_PROMPT_IDLE_GRACE,
                             OFF_PROTOCOL_WORK_GRACE_FLOOR,
@@ -5828,6 +5863,10 @@ async fn run_connection_task<W, R>(
                             between_prompt_tools
                                 .lock()
                                 .expect("between-prompt tools mutex poisoned")
+                                .clear();
+                            between_prompt_bg_agents
+                                .lock()
+                                .expect("between-prompt bg-agents mutex poisoned")
                                 .clear();
                             info!(
                                 target: "acp.protocol",
@@ -7709,6 +7748,25 @@ mod tests {
             false,
             FAST,
             FLOOR
+        ));
+    }
+
+    #[test]
+    fn between_prompt_suppressed_while_work_in_flight() {
+        // #2573: a tracked async background agent is folded into the
+        // work_in_flight input, so it must suppress the idle watchdog even
+        // when the grace has long elapsed and a cost frame was seen. Before
+        // the fix the call site passed only ACP tools, so a running bg agent
+        // left this false and the watchdog fired mid-work.
+        let last = 1_000_000;
+        let well_past = last + FLOOR.as_millis() as i64 + 10_000;
+        assert!(!between_prompt_should_fire(
+            true, well_past, last, None, true, true, false, FAST, FLOOR
+        ));
+        // Once the work drains (set empty -> work_in_flight false), the
+        // already-elapsed grace lets the completed turn end on the next tick.
+        assert!(between_prompt_should_fire(
+            true, well_past, last, None, true, false, false, FAST, FLOOR
         ));
     }
 

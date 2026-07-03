@@ -25,6 +25,8 @@
 //!   SDK format. Malformed lines are counted and skipped; a format we
 //!   cannot read at all degrades to a visible warning, never a panic.
 
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -46,14 +48,47 @@ const WAIT_FILE_FOR: Duration = Duration::from_secs(30);
 /// Cap on the assistant-text preview carried in progress/result.
 const TEXT_PREVIEW_CHARS: usize = 240;
 
+/// Removes an agent from the shared in-flight set on any tailer exit
+/// (terminal event, hard-idle abort, or `event_tx` close). The
+/// between-prompt idle watchdog treats a non-empty set as work in flight,
+/// so this drop guard is what lets the session end once the sub-agent is
+/// done, on every exit path. See #2573.
+struct ActiveGuard {
+    active: Arc<Mutex<HashSet<String>>>,
+    agent_id: String,
+}
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        if let Ok(mut set) = self.active.lock() {
+            set.remove(&self.agent_id);
+        }
+    }
+}
+
 /// Spawn the tailer for one async sub-agent. Returns immediately; the
 /// task runs until the agent reaches a terminal state or `event_tx`
 /// closes. `output_file` is the launch payload's transcript path.
-pub fn spawn_tailer(agent_id: String, output_file: String, event_tx: Sender<Event>) {
+/// `active` is the connection's in-flight background-agent set: the id is
+/// inserted here and removed when the tailer task exits (see `ActiveGuard`).
+pub fn spawn_tailer(
+    agent_id: String,
+    output_file: String,
+    event_tx: Sender<Event>,
+    active: Arc<Mutex<HashSet<String>>>,
+) {
+    active
+        .lock()
+        .expect("bg-agent active set mutex poisoned")
+        .insert(agent_id.clone());
     if output_file.is_empty() {
         // No transcript path: we can never tail it. Mark it so the panel
         // doesn't show a forever-running agent.
         tokio::spawn(async move {
+            let _guard = ActiveGuard {
+                active,
+                agent_id: agent_id.clone(),
+            };
             let _ = event_tx
                 .send(completed(
                     agent_id,
@@ -67,6 +102,10 @@ pub fn spawn_tailer(agent_id: String, output_file: String, event_tx: Sender<Even
         return;
     }
     tokio::spawn(async move {
+        let _guard = ActiveGuard {
+            active,
+            agent_id: agent_id.clone(),
+        };
         run_tailer(agent_id, output_file, event_tx).await;
     });
 }
