@@ -99,7 +99,7 @@ class ShimAgent {
         name: "@agentclientprotocol/claude-agent-acp",
         // Keep at (or above) the agent_compat floor in
         // src/acp/agent_compat.rs, or the gate rejects the shim's handshake.
-        version: "0.49.0",
+        version: "0.55.0",
       },
     };
   }
