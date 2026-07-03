@@ -92,6 +92,28 @@ base("first-run tutorial: auto-launch, skip, persist, re-trigger", async ({ page
     await page.getByRole("menuitem", { name: "Show tutorial" }).click();
     await expect(page.getByText(FIRST_STEP)).toBeVisible({ timeout: 10_000 });
 
+    // Story (issue #2633): the tour opens Settings mid-walk. The controlled
+    // runner navigates into the Worktree then Plugins tab, mounting each anchor
+    // before showing its step, and closes Settings when it moves on.
+    const next = page.getByRole("button", { name: "Next" });
+    for (let i = 0; i < 6; i++) {
+      if (await page.getByText("Worktrees keep sessions isolated").isVisible()) break;
+      await next.click();
+    }
+    await expect(page.getByText("Worktrees keep sessions isolated")).toBeVisible({ timeout: 10_000 });
+    await expect.poll(() => new URL(page.url()).pathname).toBe("/settings/worktree");
+
+    await next.click();
+    await expect(page.getByText("Extend AoE with plugins")).toBeVisible({ timeout: 10_000 });
+    await expect.poll(() => new URL(page.url()).pathname).toBe("/settings/plugins");
+
+    // Moving past the plugins step closes Settings and lands back on the dashboard.
+    await next.click();
+    await expect(page.getByText("Replay this tour any time")).toBeVisible({ timeout: 10_000 });
+    await expect.poll(() => new URL(page.url()).pathname).toBe("/");
+    await page.getByRole("button", { name: "Done" }).click();
+    await expect(page.getByText("Replay this tour any time")).toBeHidden();
+
     // The flag stays set after a manual re-trigger, so the next reload is quiet.
     expect(
       await page.evaluate(async () => {

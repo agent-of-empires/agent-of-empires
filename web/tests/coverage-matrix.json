@@ -2870,7 +2870,8 @@
         "web/src/components/Dashboard.tsx",
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/components/Dock.tsx",
-        "web/src/components/acp/Composer.tsx"
+        "web/src/components/acp/Composer.tsx",
+        "web/src/components/SettingsView.tsx"
       ]
     },
     {
@@ -2881,7 +2882,8 @@
         "src/lib/__tests__/tourSteps.test.ts",
         "src/hooks/__tests__/useTour.test.ts",
         "src/components/__tests__/Dashboard.tour.test.tsx",
-        "src/components/tour/TourRunner.theme.test.tsx"
+        "src/components/tour/TourRunner.theme.test.tsx",
+        "src/components/tour/TourRunner.transition.test.tsx"
       ],
       "components": [
         "web/src/components/Dashboard.tsx",
