@@ -109,6 +109,25 @@ describe("TourRunner controlled transitions", () => {
     expect(getByTestId("joyride").getAttribute("data-step-index")).toBe("1");
   });
 
+  it("closes settings on Back out of a settings step and resumes at the prior index", async () => {
+    addAnchor(TOUR_ANCHORS.topbar);
+    const onNavigate = vi.fn();
+    const { queryByTestId, getByTestId } = render(
+      <TourRunner run steps={[dashStep, worktreeStep]} onFinish={vi.fn()} onNavigate={onNavigate} />,
+    );
+    // Forward into the worktree settings step.
+    fire({ type: "step:after", index: 0, action: "next", status: "" });
+    addAnchor(TOUR_ANCHORS.settingsWorktree);
+    await waitFor(() => expect(getByTestId("joyride").getAttribute("data-step-index")).toBe("1"));
+
+    // Back out: host is told to close Settings, tour suspends, then remounts at 0.
+    fire({ type: "step:after", index: 1, action: "prev", status: "" });
+    expect(onNavigate).toHaveBeenLastCalledWith(null);
+    expect(queryByTestId("joyride")).toBeNull();
+    await waitFor(() => expect(queryByTestId("joyride")).not.toBeNull());
+    expect(getByTestId("joyride").getAttribute("data-step-index")).toBe("0");
+  });
+
   it("closes settings and marks seen when the tour ends on a settings step", () => {
     addAnchor(TOUR_ANCHORS.settingsWorktree);
     const onNavigate = vi.fn();
