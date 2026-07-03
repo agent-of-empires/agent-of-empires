@@ -15,6 +15,13 @@ pub struct PluginView {
     pub name: String,
     pub version: String,
     pub description: String,
+    /// Lucide kebab-case identity icon name, straight from the manifest.
+    pub icon: Option<String>,
+    /// Resolved URL for the manifest's `icon_asset`, only set when the plugin
+    /// has both an on-disk install directory (not a builtin) and an
+    /// `icon_asset` path: `GET /api/plugins/{id}/icon` streams it from the
+    /// install directory.
+    pub icon_asset_url: Option<String>,
     pub enabled: bool,
     /// First-party builtin (compiled in) versus an externally installed plugin.
     pub builtin: bool,
@@ -51,6 +58,9 @@ impl LoadedPlugin {
             name: self.manifest.name.clone(),
             version: self.manifest.version.clone(),
             description: self.manifest.description.clone(),
+            icon: self.manifest.icon.clone(),
+            icon_asset_url: (self.manifest.icon_asset.is_some() && self.dir.is_some())
+                .then(|| format!("/api/plugins/{}/icon", self.id())),
             enabled: self.enabled,
             builtin: self.builtin(),
             validation: self.validation.as_str().to_string(),
