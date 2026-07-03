@@ -65,6 +65,15 @@ use crate::events::{self, Order, SeqBound};
 /// retention prune exempts them from eviction (#1049) and the idle-reap
 /// idle clock ignores them (#1689). Centralized so the two cannot silently
 /// desync.
+/// A launched / progressing background agent stops counting toward
+/// `has_in_flight_turn` after this long with no fresh progress and no
+/// terminal event. A live tailer emits a progress snapshot every ~1.5s, so
+/// a gap this large means the tailer died (e.g. a daemon crash) and no
+/// `BackgroundAgentCompleted` will ever arrive; without this bound such an
+/// agent would pin the build-stale respawn pass forever. Comfortably past
+/// the tailer's 300s `ABORT_AFTER`. See #2573.
+const BACKGROUND_AGENT_STALE_AFTER_MS: i64 = 6 * 60 * 1000;
+
 const NON_SUBSTANTIVE_EVENT_DISCRIMINANTS: &[&str] = &[
     "AvailableCommandsUpdated",
     "ModesAvailable",
@@ -231,6 +240,26 @@ impl EventStore {
             self.max_events_per_session,
             NON_SUBSTANTIVE_EVENT_DISCRIMINANTS,
         );
+        Ok(())
+    }
+
+    /// Test-only: record an event with an explicit `created_at` (ms epoch)
+    /// so recency-sensitive probes (e.g. the background-agent staleness bound
+    /// in `has_in_flight_turn`) can be exercised deterministically.
+    #[cfg(test)]
+    pub(crate) fn record_at(
+        &self,
+        session_id: &str,
+        seq: u64,
+        event: &Event,
+        created_at_ms: i64,
+    ) -> Result<()> {
+        let json = serde_json::to_string(event)?;
+        let conn = match self.conn.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        events::insert_event(&conn, &self.schema, session_id, seq, &json, created_at_ms)?;
         Ok(())
     }
 
@@ -1255,26 +1284,37 @@ impl EventStore {
         // events. Treat the session as in-flight while any launched or
         // progressing agent has no matching Completed, so a build-stale
         // respawn does not interrupt it mid-work and drop its transcript.
-        // Every tailer emits a terminal BackgroundAgentCompleted (including
-        // the stalled / error paths), so this set is bounded. See #2573.
+        // Bounded two ways so a lost tailer cannot pin the probe forever:
+        // every live tailer emits a terminal BackgroundAgentCompleted
+        // (including stalled / error), AND an agent whose latest progress is
+        // older than BACKGROUND_AGENT_STALE_AFTER_MS stops counting (its
+        // tailer died, e.g. a daemon crash, so no Completed will ever come).
+        // See #2573.
+        let stale_cutoff = chrono::Utc::now().timestamp_millis() - BACKGROUND_AGENT_STALE_AFTER_MS;
         let bg_in_flight: i64 = match conn
             .query_row(
                 "SELECT COUNT(*) FROM (
-                     SELECT json_extract(event_json, '$.BackgroundAgentLaunched.agent_id') AS aid
-                       FROM acp_events WHERE session_id = ?1
-                         AND json_extract(event_json, '$.BackgroundAgentLaunched') IS NOT NULL
-                     UNION
-                     SELECT json_extract(event_json, '$.BackgroundAgentProgress.agent_id')
-                       FROM acp_events WHERE session_id = ?1
-                         AND json_extract(event_json, '$.BackgroundAgentProgress') IS NOT NULL
+                     SELECT aid, MAX(created_at) AS last_at FROM (
+                         SELECT json_extract(event_json, '$.BackgroundAgentLaunched.agent_id') AS aid,
+                                created_at
+                           FROM acp_events WHERE session_id = ?1
+                             AND json_extract(event_json, '$.BackgroundAgentLaunched') IS NOT NULL
+                         UNION ALL
+                         SELECT json_extract(event_json, '$.BackgroundAgentProgress.agent_id'),
+                                created_at
+                           FROM acp_events WHERE session_id = ?1
+                             AND json_extract(event_json, '$.BackgroundAgentProgress') IS NOT NULL
+                     )
+                     WHERE aid IS NOT NULL
+                     GROUP BY aid
                  ) started
-                 WHERE started.aid IS NOT NULL
+                 WHERE started.last_at >= ?2
                    AND started.aid NOT IN (
                      SELECT json_extract(event_json, '$.BackgroundAgentCompleted.agent_id')
                        FROM acp_events WHERE session_id = ?1
                          AND json_extract(event_json, '$.BackgroundAgentCompleted') IS NOT NULL
                    )",
-                params![session_id],
+                params![session_id, stale_cutoff],
                 |row| row.get::<_, i64>(0),
             )
             .optional()
@@ -2456,6 +2496,54 @@ mod tests {
             )
             .unwrap();
         // Its completion drains the in-flight state.
+        assert!(!store.has_in_flight_turn("s-1"));
+    }
+
+    #[test]
+    fn has_in_flight_turn_ignores_stale_background_agent() {
+        // #2573: a tailer that died (e.g. daemon crash) leaves a bg agent
+        // with Launched/Progress and no Completed. After the staleness window
+        // it must stop counting, so a lost tailer cannot pin the build-stale
+        // respawn pass forever.
+        let (_tmp, store) = open_store(1000);
+        store
+            .record(
+                "s-1",
+                1,
+                &Event::UserPromptSent {
+                    text: "go".into(),
+                    attachments: Vec::new(),
+                },
+            )
+            .unwrap();
+        store
+            .record(
+                "s-1",
+                2,
+                &Event::Stopped {
+                    reason: "prompt_complete".into(),
+                },
+            )
+            .unwrap();
+        let stale_at =
+            chrono::Utc::now().timestamp_millis() - (BACKGROUND_AGENT_STALE_AFTER_MS + 60_000);
+        store
+            .record_at(
+                "s-1",
+                3,
+                &Event::BackgroundAgentProgress {
+                    agent_id: "bg-1".into(),
+                    status: crate::acp::state::BackgroundAgentStatus::Running,
+                    tool_count: 1,
+                    tools: Vec::new(),
+                    last_tool: None,
+                    last_text: None,
+                    at: chrono::Utc::now(),
+                },
+                stale_at,
+            )
+            .unwrap();
+        // Progress older than the window with no Completed: treated as gone.
         assert!(!store.has_in_flight_turn("s-1"));
     }
 
