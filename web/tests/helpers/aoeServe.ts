@@ -144,6 +144,12 @@ export interface ServeHandle {
    * with the session title rather than hard-coding `aoe_`.
    */
   tmuxPrefix: "aoe_" | "aoe_dev_";
+  /**
+   * The tmux socket the running binary uses (`AOE_TMUX_SOCKET`). Specs that
+   * inspect sessions with a raw `tmux` call MUST pass `-S <this>`; debug
+   * builds ignore `TMUX_TMPDIR` and route tmux through this socket (#2608).
+   */
+  tmuxSocket: string;
   stop(): Promise<void>;
   /**
    * Kill the running `aoe serve` proc and respawn it with the same args
@@ -237,6 +243,16 @@ export function resolveAoeBinary(): string {
  */
 export function tmuxPrefixFor(binaryPath: string): "aoe_" | "aoe_dev_" {
   return binaryPath.includes("/target/debug/") ? "aoe_dev_" : "aoe_";
+}
+
+/**
+ * The tmux socket path the harness pins via `AOE_TMUX_SOCKET`, under the
+ * test's isolated tmux tmpdir. The daemon and every spec that shells out to a
+ * raw `tmux` must agree on this: debug builds ignore `TMUX_TMPDIR` and route
+ * tmux through an explicit `-S <socket>` (#2608).
+ */
+export function tmuxSocketPath(home: string): string {
+  return join(home, "tmux", "aoe.sock");
 }
 
 /**
@@ -535,6 +551,12 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
     // covered by the Vitest + RTL contract tests, not the live suite. A future
     // live spec that exercises the modal can unset this in its own env.
     DO_NOT_TRACK: process.env.DO_NOT_TRACK ?? "1",
+    // Pin the tmux socket explicitly. Debug builds otherwise route tmux
+    // through `<app_dir>/tmux.sock` and ignore TMUX_TMPDIR (#2608), so specs
+    // that inspect sessions with a raw `tmux` call must target this same
+    // socket (see `tmuxSocketPath`) rather than the default one under
+    // TMUX_TMPDIR.
+    AOE_TMUX_SOCKET: tmuxSocketPath(home),
   };
 
   if (authMode === "token") {
@@ -687,6 +709,7 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
     authToken,
     tokenFile,
     tmuxPrefix: tmuxPrefixFor(aoeBinary),
+    tmuxSocket: tmuxSocketPath(home),
     async restart() {
       if (proc) await killProc(proc);
       const next = await spawnOnce(buildArgs(port), baseUrl);
@@ -722,7 +745,9 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
         // processes around that hold open file descriptors and trip
         // ENOTEMPTY on rmSync if not cleaned up first.
         try {
-          spawnSync("tmux", ["kill-server"], {
+          // aoe binds its own `-S <socket>` (#2608), not the default socket
+          // under TMUX_TMPDIR, so kill the server on that explicit socket.
+          spawnSync("tmux", ["-S", tmuxSocketPath(home), "kill-server"], {
             env: {
               ...process.env,
               HOME: home,

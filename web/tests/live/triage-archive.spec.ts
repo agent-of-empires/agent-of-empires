@@ -56,7 +56,10 @@ base.describe("sidebar archive via context menu (#1581)", () => {
       await expect
         .poll(
           () => {
-            const result = spawnSync("tmux", ["ls"], {
+            // aoe routes tmux through an explicit `-S <socket>` (#2608), so
+            // list that socket rather than the default one under TMUX_TMPDIR;
+            // otherwise this lists an empty socket and passes trivially.
+            const result = spawnSync("tmux", ["-S", serve.tmuxSocket, "ls"], {
               env: serve.env,
               encoding: "utf8",
             });

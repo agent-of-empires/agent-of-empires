@@ -12,14 +12,10 @@ import { join } from "node:path";
 import { test as base, expect } from "@playwright/test";
 import { spawnAoeServe, listSessions, seedSessionViaAoeAdd } from "../helpers/aoeServe";
 
-function tmuxHasSession(home: string, name: string): boolean {
-  const res = spawnSync("tmux", ["has-session", "-t", name], {
-    env: {
-      ...process.env,
-      HOME: home,
-      TMUX_TMPDIR: join(home, "tmux"),
-    },
-  });
+// aoe (debug build) routes tmux through an explicit `-S <socket>` and ignores
+// TMUX_TMPDIR (#2608), so inspect sessions on the harness's pinned socket.
+function tmuxHasSession(socket: string, name: string): boolean {
+  const res = spawnSync("tmux", ["-S", socket, "has-session", "-t", name]);
   return res.status === 0;
 }
 
@@ -48,12 +44,12 @@ base.describe("ensure_session restart flow", () => {
           timeout: 10_000,
         })
         .toBe("Error");
-      expect(tmuxHasSession(serve.home, tmuxName)).toBe(false);
+      expect(tmuxHasSession(serve.tmuxSocket, tmuxName)).toBe(false);
 
       const r1 = await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/ensure`, { method: "POST" });
       expect(r1.ok).toBeTruthy();
       expect((await r1.json()).status).toBe("restarted");
-      expect(tmuxHasSession(serve.home, tmuxName)).toBe(true);
+      expect(tmuxHasSession(serve.tmuxSocket, tmuxName)).toBe(true);
 
       const euid = process.getuid?.() ?? 0;
       const hookBase = `/tmp/aoe-hooks-${euid}`;
@@ -79,13 +75,7 @@ base.describe("ensure_session restart flow", () => {
       const r3 = await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/ensure`, { method: "POST" });
       expect((await r3.json()).status).toBe("alive");
 
-      const kill = spawnSync("tmux", ["kill-session", "-t", tmuxName], {
-        env: {
-          ...process.env,
-          HOME: serve.home,
-          TMUX_TMPDIR: join(serve.home, "tmux"),
-        },
-      });
+      const kill = spawnSync("tmux", ["-S", serve.tmuxSocket, "kill-session", "-t", tmuxName]);
       expect(kill.status).toBe(0);
 
       const r4 = await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/ensure`, { method: "POST" });
@@ -116,13 +106,7 @@ base.describe("ensure_session restart flow", () => {
       const sessionId: string = sessions[0]!.id;
       const tmuxName = `${serve.tmuxPrefix}${title}_${sessionId.slice(0, 8)}`;
 
-      spawnSync("tmux", ["kill-session", "-t", tmuxName], {
-        env: {
-          ...process.env,
-          HOME: serve.home,
-          TMUX_TMPDIR: join(serve.home, "tmux"),
-        },
-      });
+      spawnSync("tmux", ["-S", serve.tmuxSocket, "kill-session", "-t", tmuxName]);
 
       // Delay /ensure so Playwright reliably observes the "pending"
       // placeholder. Without this the live backend can resolve the
