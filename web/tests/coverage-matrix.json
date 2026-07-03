@@ -349,6 +349,19 @@
       "components": ["web/src/components/settings/customWidgets.tsx"]
     },
     {
+      "id": "settings.acp-defaults",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/settings/__tests__/AcpDefaultsWidget.test.tsx",
+        "src/components/__tests__/SettingsView.session.test.tsx"
+      ],
+      "components": [
+        "web/src/components/settings/AcpDefaultsWidget.tsx",
+        "web/src/components/settings/customWidgetRegistry.ts"
+      ]
+    },
+    {
       "id": "settings.schema-persistence",
       "kind": "live-playwright",
       "risk": "medium",

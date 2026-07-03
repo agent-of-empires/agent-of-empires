@@ -136,45 +136,6 @@ export function SoundVolumeWidget({ descriptor, value, save }: CustomWidgetProps
   );
 }
 
-function formatAcpDefaults(value: unknown): string {
-  if (!value || typeof value !== "object") return "{}";
-  return JSON.stringify(value, null, 2);
-}
-
-function parseAcpDefaults(value: string): Record<string, unknown> | null {
-  const trimmed = value.trim();
-  if (!trimmed) return {};
-  try {
-    const parsed = JSON.parse(trimmed);
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      return parsed as Record<string, unknown>;
-    }
-  } catch {
-    return null;
-  }
-  return null;
-}
-
-/** Per-agent structured-view defaults. A map of `{ agent: { model, effort } }`,
- *  with no flat widget, so it is edited as raw JSON; an invalid edit is not
- *  saved (the field stays at its last valid value). */
-export function AcpDefaultsWidget({ descriptor, value, save }: CustomWidgetProps) {
-  return (
-    <TextField
-      label={descriptor.label}
-      description={descriptor.description}
-      value={formatAcpDefaults(value)}
-      onChange={(v) => {
-        const parsed = parseAcpDefaults(v);
-        if (parsed) save(parsed);
-      }}
-      placeholder='{"opencode":{"model":"openai/gpt-5.5","effort":"high"}}'
-      mono
-      multiline
-    />
-  );
-}
-
 // Mirrors `KNOWN_SUB_TARGETS` in src/logging.rs. Keeping this list hardcoded
 // (rather than fetched) is intentional: it is the curated dropdown surface;
 // advanced users can still edit `config.toml` directly or hit

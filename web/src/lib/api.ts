@@ -14,6 +14,7 @@ import type {
   ClaudeSessionSummary,
   SettingsFieldDescriptor,
 } from "./types";
+import type { ConfigOptionDescriptor } from "./acpTypes";
 import { clearDeviceBindingSecret, getOrCreateDeviceBindingSecret } from "./deviceBinding";
 
 // GET a JSON endpoint; returns null on non-2xx or network/parse errors.
@@ -1289,6 +1290,25 @@ export interface AcpAgentInfo {
  *  modal to populate the handoff target list. See #1282. */
 export async function fetchAcpAgents(): Promise<AcpAgentInfo[]> {
   return (await fetchJson<AcpAgentInfo[]>("/api/acp/agents")) ?? [];
+}
+
+/** One agent's last-observed config options, from the recall cache. */
+export interface AgentOptionEntry {
+  /** RFC 3339 timestamp of the last observation, for freshness display. */
+  updated_at: string;
+  options: ConfigOptionDescriptor[];
+}
+
+/** Recall cache of the config options each agent last advertised, keyed by
+ *  agent name. Feeds the per-agent defaults settings page dropdowns without a
+ *  live session; empty until an agent has run at least once. See #2631. */
+export interface AcpOptionCatalog {
+  version: number;
+  agents: Record<string, AgentOptionEntry>;
+}
+
+export async function fetchAcpOptionCatalog(): Promise<AcpOptionCatalog> {
+  return (await fetchJson<AcpOptionCatalog>("/api/acp/option-catalog")) ?? { version: 1, agents: {} };
 }
 
 // --- Acp switch agent ---
