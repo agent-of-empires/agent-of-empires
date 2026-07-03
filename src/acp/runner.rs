@@ -112,13 +112,6 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-fn now_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 /// Why the runner is tearing down. Drives whether teardown deletes the
 /// registry entry: a superseded runner must NOT delete, since the files
 /// now belong to the fresh runner that replaced it.
@@ -148,86 +141,6 @@ const FAST_EXIT_THRESHOLD: Duration = Duration::from_secs(10);
 /// Pipe-read buffer for the agent's stdout. 64KB matches the default
 /// pipe size on macOS/Linux.
 const STDOUT_READ_BUF: usize = 64 * 1024;
-
-/// Stdout-silence keepalive (see #2455). `claude-agent-acp` (<= 0.52.0)
-/// wraps `process.stdout.write` in a Web Streams writable with no
-/// backpressure handling, so a mid-turn stdout write can stall until a
-/// stdin `data` event wakes the Node event loop and lets libuv flush. The
-/// runner writes a harmless `\n` to the agent's stdin once stdout goes
-/// silent, which wakes the adapter and flushes the stalled output; the
-/// adapter's ndjson decoder skips blank lines, so the nudge is never
-/// parsed as a message or a user prompt. Temporary mitigation; remove once
-/// the adapter handles stdout backpressure (upstream fix tracked
-/// separately). Fast burst clears a transient stall quickly; the slow
-/// unbounded tail guarantees a stall that begins after a long legitimate
-/// silence (e.g. a multi-minute model think with zero output) is still
-/// eventually flushed.
-const STDOUT_NUDGE_FAST_INTERVAL: Duration = Duration::from_secs(2);
-const STDOUT_NUDGE_FAST_BURST: u32 = 3;
-const STDOUT_NUDGE_SLOW_INTERVAL: Duration = Duration::from_secs(30);
-/// Cap on a single nudge write so a wedged adapter that stopped reading
-/// stdin cannot park the keepalive while it holds the shared stdin mutex
-/// (which would block real daemon -> agent traffic).
-const STDOUT_NUDGE_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
-
-/// Resolved keepalive timing for a runner. `None` (from
-/// [`stdout_nudge_config`]) disables the keepalive entirely.
-struct StdoutNudgeConfig {
-    fast_interval: Duration,
-    fast_burst: u32,
-    slow_interval: Duration,
-    write_timeout: Duration,
-}
-
-/// Decide whether and how to run the stdout-silence keepalive for this
-/// agent. Enabled by default only for `claude-agent-acp` (the adapter the
-/// `\n`-is-safely-skipped behavior was verified against); other agents
-/// might treat a blank line as a protocol error, so they stay off unless
-/// `AOE_ACP_STDOUT_NUDGE=1` forces it. `AOE_ACP_STDOUT_NUDGE=0` disables it
-/// even for claude. `AOE_ACP_STDOUT_NUDGE_MS` / `_SLOW_MS` shrink the
-/// intervals for tests, mirroring `AOE_ACP_WATCHDOG_POLL_MS`.
-fn stdout_nudge_config(args: &AcpRunnerArgs) -> Option<StdoutNudgeConfig> {
-    let enabled = match std::env::var("AOE_ACP_STDOUT_NUDGE").ok().as_deref() {
-        Some("0") | Some("false") | Some("off") => return None,
-        Some("1") | Some("true") | Some("on") => true,
-        _ => stdout_nudge_default_for_agent(args),
-    };
-    if !enabled {
-        return None;
-    }
-    let fast_interval =
-        env_duration_ms("AOE_ACP_STDOUT_NUDGE_MS").unwrap_or(STDOUT_NUDGE_FAST_INTERVAL);
-    // A zero fast interval is an explicit kill switch.
-    if fast_interval.is_zero() {
-        return None;
-    }
-    let slow_interval = env_duration_ms("AOE_ACP_STDOUT_NUDGE_SLOW_MS")
-        .unwrap_or(STDOUT_NUDGE_SLOW_INTERVAL)
-        // Never tighter than the fast cadence (also rules out zero).
-        .max(fast_interval);
-    Some(StdoutNudgeConfig {
-        fast_interval,
-        fast_burst: STDOUT_NUDGE_FAST_BURST,
-        slow_interval,
-        write_timeout: STDOUT_NUDGE_WRITE_TIMEOUT,
-    })
-}
-
-fn stdout_nudge_default_for_agent(args: &AcpRunnerArgs) -> bool {
-    args.agent_name.contains("claude-agent-acp")
-        || args
-            .agent_argv
-            .first()
-            .map(|s| s.contains("claude-agent-acp"))
-            .unwrap_or(false)
-}
-
-fn env_duration_ms(key: &str) -> Option<Duration> {
-    std::env::var(key)
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .map(Duration::from_millis)
-}
 
 #[derive(Args, Debug, Clone)]
 pub struct AcpRunnerArgs {
@@ -386,8 +299,6 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
 
     // Last time (epoch millis) the agent wrote to stdout; drives the
     // stdout-silence keepalive (#2455).
-    let stdout_activity = Arc::new(AtomicU64::new(now_millis()));
-
     // Fan-out task: reads agent stdout and either forwards to the
     // currently-attached daemon or buffers in the ring. Single owner of
     // the read half of the agent's stdout pipe.
@@ -395,7 +306,6 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
         agent_stdout,
         Arc::clone(&shared),
         args.session_id.clone(),
-        Arc::clone(&stdout_activity),
     ));
 
     // Wrap agent stdin in a tokio Mutex so the accept loop can hand it
@@ -403,19 +313,6 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
     // alive across reconnects; closing it would cause aoe-agent to
     // `process.exit(0)`.
     let agent_stdin = Arc::new(Mutex::new(agent_stdin));
-
-    // Stdout-silence keepalive (#2455): nudge the agent's stdin with a
-    // harmless `\n` when its stdout stalls mid-turn, so a buffering bug in
-    // the upstream adapter can't freeze the session. Disabled for agents
-    // it isn't verified safe for (see `stdout_nudge_config`).
-    let keepalive_task = stdout_nudge_config(&args).map(|cfg| {
-        tokio::spawn(stdout_silence_nudge(
-            cfg,
-            Arc::clone(&stdout_activity),
-            Arc::clone(&agent_stdin),
-            args.session_id.clone(),
-        ))
-    });
 
     // Signal handling: SIGTERM/SIGINT → kill agent, cleanup, exit.
     let shutdown_signal = wait_for_shutdown();
@@ -549,9 +446,6 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
 
     watchdog_handle.abort();
     agent_stdout_task.abort();
-    if let Some(task) = keepalive_task {
-        task.abort();
-    }
     if !preserve_registry {
         worker_registry::delete(&session_id).ok();
     }
@@ -950,7 +844,6 @@ async fn fanout_agent_stdout(
     stdout: tokio::process::ChildStdout,
     shared: Arc<RunnerShared>,
     session_id: String,
-    stdout_activity: Arc<AtomicU64>,
 ) {
     let mut reader = BufReader::with_capacity(STDOUT_READ_BUF, stdout);
     let mut line = Vec::with_capacity(4096);
@@ -964,105 +857,12 @@ async fn fanout_agent_stdout(
                 break;
             }
             Ok(_) => {
-                // Mark progress for the stdout-silence keepalive (#2455).
-                stdout_activity.store(now_millis(), Ordering::Relaxed);
                 shared.deliver_line(&line).await;
             }
             Err(e) => {
                 warn!(target: "acp.runner", session = %session_id, "stdout read error: {e}");
                 break;
             }
-        }
-    }
-}
-
-/// Stdout-silence keepalive loop (#2455). Watches `stdout_activity`; when
-/// the agent has produced no stdout for `fast_interval`, writes a harmless
-/// `\n` to its stdin to wake a stalled upstream adapter. Nudges in a fast
-/// burst, then a slow unbounded tail, until stdout resumes (which re-arms
-/// the burst). Runs regardless of daemon attachment: a stall while
-/// detached would otherwise leave the runner's replay ring missing the
-/// gap. Ends when the agent's stdin closes (agent gone); the runner's
-/// teardown also aborts it.
-async fn stdout_silence_nudge(
-    cfg: StdoutNudgeConfig,
-    stdout_activity: Arc<AtomicU64>,
-    agent_stdin: Arc<Mutex<tokio::process::ChildStdin>>,
-    session_id: String,
-) {
-    loop {
-        let mut last = stdout_activity.load(Ordering::Relaxed);
-        tokio::time::sleep(cfg.fast_interval).await;
-        if stdout_activity.load(Ordering::Relaxed) != last {
-            continue; // stdout flowed within the interval; not silent
-        }
-        // Silent past the fast interval. Nudge, then keep nudging at the
-        // fast cadence for the burst and the slow cadence after, until
-        // stdout activity resumes.
-        let mut sent: u32 = 0;
-        loop {
-            if !write_stdin_nudge(&agent_stdin, cfg.write_timeout, &session_id, sent).await {
-                return; // stdin write failed: agent gone
-            }
-            sent += 1;
-            let wait = if sent < cfg.fast_burst {
-                cfg.fast_interval
-            } else {
-                cfg.slow_interval
-            };
-            last = stdout_activity.load(Ordering::Relaxed);
-            tokio::time::sleep(wait).await;
-            if stdout_activity.load(Ordering::Relaxed) != last {
-                break; // a nudge flushed output (or output resumed); re-arm
-            }
-        }
-    }
-}
-
-/// Write a single `\n` keepalive to the agent's stdin under the shared
-/// mutex (so it never interleaves a daemon-originated JSON-RPC line),
-/// bounded by `write_timeout`. Returns false only on a write error (the
-/// pipe is broken: the agent exited), which ends the keepalive loop. A
-/// timeout returns true so the loop keeps trying at the slow cadence;
-/// process lifecycle is owned by the main `select!`, not here.
-async fn write_stdin_nudge(
-    agent_stdin: &Mutex<tokio::process::ChildStdin>,
-    write_timeout: Duration,
-    session_id: &str,
-    sent: u32,
-) -> bool {
-    let mut stdin = agent_stdin.lock().await;
-    match tokio::time::timeout(write_timeout, async {
-        stdin.write_all(b"\n").await?;
-        stdin.flush().await
-    })
-    .await
-    {
-        Ok(Ok(())) => {
-            debug!(
-                target: "acp.runner",
-                session = %session_id,
-                nudge = sent + 1,
-                "stdout-silence keepalive nudge"
-            );
-            true
-        }
-        Ok(Err(e)) => {
-            warn!(
-                target: "acp.runner",
-                session = %session_id,
-                "keepalive nudge write failed; agent likely exited: {e}"
-            );
-            false
-        }
-        Err(_) => {
-            warn!(
-                target: "acp.runner",
-                session = %session_id,
-                write_timeout_ms = write_timeout.as_millis(),
-                "keepalive nudge write timed out; agent not reading stdin"
-            );
-            true
         }
     }
 }
@@ -1284,54 +1084,6 @@ fn open_log_file(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn args_with_agent(agent_key: &str, agent_name: &str, argv0: &str) -> AcpRunnerArgs {
-        AcpRunnerArgs {
-            socket: PathBuf::from("/tmp/x.sock"),
-            session_id: "s".into(),
-            agent_name: agent_name.into(),
-            agent_key: agent_key.into(),
-            cwd: PathBuf::from("/tmp"),
-            model: None,
-            additional_dirs: vec![],
-            provider_env_keys: vec![],
-            stored_acp_session_id: None,
-            source_profile: String::new(),
-            agent_argv: vec![argv0.into()],
-        }
-    }
-
-    /// The keepalive defaults on only for claude-agent-acp, the adapter the
-    /// blank-line-safe behavior was verified against. Other agents stay off
-    /// so a stray `\n` can't corrupt a transport that rejects blank lines.
-    #[test]
-    fn stdout_nudge_default_scoped_to_claude_adapter() {
-        assert!(stdout_nudge_default_for_agent(&args_with_agent(
-            "claude",
-            "claude-agent-acp",
-            "claude-agent-acp"
-        )));
-        // Matched by agent_name / argv even when the key differs.
-        assert!(stdout_nudge_default_for_agent(&args_with_agent(
-            "",
-            "claude-agent-acp",
-            "/usr/bin/claude-agent-acp"
-        )));
-        // A bare `claude` key without the claude-agent-acp binary is not
-        // enough: the keepalive defaults on only for the verified adapter.
-        assert!(!stdout_nudge_default_for_agent(&args_with_agent(
-            "claude", "claude", "claude"
-        )));
-        // Other adapters are off by default.
-        assert!(!stdout_nudge_default_for_agent(&args_with_agent(
-            "codex",
-            "codex-acp",
-            "codex-acp"
-        )));
-        assert!(!stdout_nudge_default_for_agent(&args_with_agent(
-            "opencode", "opencode", "opencode"
-        )));
-    }
 
     #[test]
     fn parse_request_extracts_id_and_method() {
