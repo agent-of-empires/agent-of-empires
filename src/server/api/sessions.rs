@@ -4380,7 +4380,7 @@ pub async fn create_session(
                 &instance.source_profile,
                 std::path::Path::new(&instance.project_path),
             );
-            let defaults = resolved_config.session.acp_defaults_for(&agent_key);
+            let defaults = resolved_config.acp.acp_defaults_for(&agent_key);
             instance.agent_model = body
                 .agent_model
                 .filter(|s| !s.trim().is_empty())

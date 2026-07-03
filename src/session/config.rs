@@ -537,6 +537,18 @@ pub struct AcpConfig {
         advanced
     )]
     pub allow_agent_install: bool,
+
+    /// Per-agent structured-view startup defaults, keyed by agent name
+    /// (`{"<agent>": {"model": "...", "effort": "...", "mode": "...",
+    /// "effort_by_model": {"<model>": "..."}}}`). `model` is forwarded at spawn;
+    /// `effort` and `mode` are applied through ACP config options when
+    /// advertised. `effort_by_model` overrides `effort` for a matching model.
+    ///
+    /// Edited per agent through the `acp-defaults` custom widget (composer-style
+    /// dropdowns on the web, an inline JSON field in the TUI).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[setting(label = "Structured View Defaults", widget = "custom:acp-defaults")]
+    pub acp_defaults: HashMap<String, AcpAgentDefaults>,
 }
 
 fn default_rate_limit_auto_resume_grace_secs() -> u32 {
@@ -614,6 +626,7 @@ impl Default for AcpConfig {
             rate_limit_auto_resume: false,
             rate_limit_auto_resume_grace_secs: default_rate_limit_auto_resume_grace_secs(),
             allow_agent_install: false,
+            acp_defaults: HashMap::new(),
         }
     }
 }
@@ -1000,19 +1013,6 @@ pub struct SessionConfig {
     )]
     pub agent_acp_cmd: HashMap<String, String>,
 
-    /// Per-agent acp startup defaults as a JSON object
-    /// (`{"<agent>": {"model": "...", "effort": "...", "mode": "...",
-    /// "effort_by_model": {"<model>": "..."}}}`). `model` is forwarded at spawn;
-    /// `effort` and `mode` are applied through ACP config options when
-    /// advertised. `effort_by_model` overrides `effort` for a matching model.
-    ///
-    /// Map-of-struct, so it has no flat widget: it is edited as raw JSON through
-    /// the `acp-defaults` custom widget (a JSON textarea on the web, an inline
-    /// JSON field in the TUI) and saved like any other schema field.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    #[setting(label = "Structured View Defaults", widget = "custom:acp-defaults")]
-    pub acp_defaults: HashMap<String, AcpAgentDefaults>,
-
     /// Require SHIFT on letter-based TUI hotkeys (e.g. SHIFT+N for New, SHIFT+D for Delete).
     /// Guards against accidental destructive actions from dictation software, a forgotten
     /// focus, or stray keystrokes. Navigation keys (h/j/k/l, arrows, Enter, Esc), punctuation
@@ -1308,7 +1308,7 @@ impl AcpAgentDefaults {
     }
 }
 
-impl SessionConfig {
+impl AcpConfig {
     pub fn acp_defaults_for(&self, agent: &str) -> Option<&AcpAgentDefaults> {
         self.acp_defaults
             .get(agent)
@@ -1390,7 +1390,6 @@ impl Default for SessionConfig {
             custom_agents: HashMap::new(),
             agent_detect_as: HashMap::new(),
             agent_acp_cmd: HashMap::new(),
-            acp_defaults: HashMap::new(),
             strict_hotkeys: false,
             snooze_duration_minutes: 30,
             delete_to_trash: true,
@@ -3252,7 +3251,7 @@ mod tests {
             .session
             .agent_extra_args
             .insert("opencode".to_string(), "--port 8080".to_string());
-        config.session.acp_defaults.insert(
+        config.acp.acp_defaults.insert(
             "opencode".to_string(),
             AcpAgentDefaults {
                 model: Some("openai/gpt-5.5".to_string()),
@@ -3274,7 +3273,7 @@ mod tests {
             "agent_extra_args should survive roundtrip"
         );
         assert_eq!(
-            deserialized.session.acp_defaults.get("opencode"),
+            deserialized.acp.acp_defaults.get("opencode"),
             Some(&AcpAgentDefaults {
                 model: Some("openai/gpt-5.5".to_string()),
                 effort: Some("high".to_string()),

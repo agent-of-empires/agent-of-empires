@@ -70,7 +70,7 @@ export interface TourStep {
    * settings when leaving it. TourRunner drives this in controlled mode so the
    * target is mounted before react-joyride evaluates it (never a race).
    */
-  settingsTab?: "worktree" | "plugins" | "session";
+  settingsTab?: "worktree" | "plugins" | "structured-view";
 }
 
 /** The CSS selector that resolves a given anchor in the DOM. */
@@ -148,7 +148,7 @@ export const TOUR_STEPS: readonly TourStep[] = [
   {
     id: "settings-agent-defaults",
     anchor: TOUR_ANCHORS.settingsAgentDefaults,
-    settingsTab: "session",
+    settingsTab: "structured-view",
     scopes: ["dashboard"],
     desktopOnly: true,
     title: "Set per-agent defaults",

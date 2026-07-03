@@ -1420,7 +1420,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         // ponytail: resolve here instead of threading mode through every
         // SpawnRequest site; revisit if an explicit per-request mode lands.
         let default_mode = resolved_cfg
-            .session
+            .acp
             .acp_defaults_for(&agent)
             .and_then(|defaults| defaults.mode.clone());
 

@@ -29,9 +29,9 @@ const SESSION_SCHEMA = [
     advanced: false,
   },
   {
-    section: "session",
+    section: "acp",
     field: "acp_defaults",
-    category: "Session",
+    category: "Acp",
     label: "Structured View Defaults",
     description: "",
     widget: { kind: "custom", id: "acp-defaults" },
@@ -158,9 +158,11 @@ describe("Session tab auto-stop idle field", () => {
     );
   });
 
-  it("persists session.acp_defaults through the profile path via the raw-JSON fold", async () => {
+  it("persists acp.acp_defaults through the profile path via the raw-JSON fold", async () => {
+    // acp_defaults lives on the acp section, so it renders under the Structured
+    // view tab, not Session (#2631).
     const { container } = render(
-      <SettingsView onClose={() => {}} tab="session" onSelectTab={() => {}} onServerAboutRefresh={() => {}} />,
+      <SettingsView onClose={() => {}} tab="structured-view" onSelectTab={() => {}} onServerAboutRefresh={() => {}} />,
     );
     await screen.findByText("Structured View Defaults");
 
@@ -174,7 +176,7 @@ describe("Session tab auto-stop idle field", () => {
 
     await waitFor(() =>
       expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-        session: {
+        acp: {
           acp_defaults: {
             opencode: { model: "openai/gpt-5.5", effort: "high" },
           },
