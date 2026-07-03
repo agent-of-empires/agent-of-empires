@@ -106,8 +106,16 @@ Two chips flag a session that has parked itself but is still alive, so an agent 
 ```toml
 [session.acp_defaults.opencode]
 model = "openai/gpt-5.5"
-effort = "high"
+effort = "high"           # default thinking level
+mode = "plan"             # default mode, applied when the agent advertises one
+
+# Per-model thinking: overrides `effort` when that model is the resolved model.
+[session.acp_defaults.opencode.effort_by_model]
+"openai/gpt-5.5" = "high"
+"anthropic/opus" = "low"
 ```
+
+`model` is forwarded when the worker starts. `effort` and `mode` are applied through the agent's ACP config options (`thought_level` and `mode`) once advertised; a value the agent does not advertise is skipped with a warning rather than failing the session. `effort_by_model` takes precedence over the flat `effort` when the resolved model matches a key. These defaults are also editable per agent from the web dashboard settings (Session tab, Structured View Defaults), where the dropdowns are populated from whatever each agent last advertised.
 
 The `[acp]` block holds the structured view's global tuning knobs (timeouts, concurrency, watchdog grace). See [Structured View Internals](development/internals/structured-view.md#global-tuning-acp) for the full list.
 
