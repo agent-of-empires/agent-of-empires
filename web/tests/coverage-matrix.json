@@ -2940,7 +2940,8 @@
         "web/src/components/settings/PluginDetailModal.tsx",
         "web/src/components/settings/PluginUpdateConsentModal.tsx",
         "web/src/components/settings/PluginInstallConsentModal.tsx",
-        "web/src/components/settings/PluginJobProgressModal.tsx"
+        "web/src/components/settings/PluginJobProgressModal.tsx",
+        "web/src/components/settings/PluginIdentityIcon.tsx"
       ]
     },
     {

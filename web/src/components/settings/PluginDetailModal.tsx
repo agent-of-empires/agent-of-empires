@@ -95,7 +95,12 @@ export function PluginDetailModal({ source, title, fallback, installCommand, onC
       >
         <div className="mb-3 flex items-start justify-between gap-3">
           <div className="flex items-start gap-2">
-            <PluginIdentityIcon icon={icon} iconAssetUrl={iconAssetUrl} className="mt-0.5 size-5" />
+            <PluginIdentityIcon
+              icon={icon}
+              iconAssetUrl={iconAssetUrl}
+              className="mt-0.5 size-5"
+              testId="plugin-detail-icon"
+            />
             <div>
               <h2 className="font-semibold">{title}</h2>
               {version && <p className="text-xs text-text-dim">v{version}</p>}

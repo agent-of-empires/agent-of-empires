@@ -494,7 +494,11 @@ export function PluginsSettings() {
                 <div className="flex items-start justify-between gap-3">
                   <div className="min-w-0">
                     <div className="flex flex-wrap items-center gap-2">
-                      <PluginIdentityIcon icon={plugin.icon} iconAssetUrl={plugin.icon_asset_url} />
+                      <PluginIdentityIcon
+                        icon={plugin.icon}
+                        iconAssetUrl={plugin.icon_asset_url}
+                        testId={`plugin-icon-${plugin.id}`}
+                      />
                       <button
                         type="button"
                         className="font-medium hover:underline"

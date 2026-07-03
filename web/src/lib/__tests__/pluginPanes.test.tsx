@@ -1,9 +1,10 @@
 // @vitest-environment jsdom
 import { renderHook } from "@testing-library/react";
+import { GitBranch } from "lucide-react";
 import { describe, expect, it, vi } from "vitest";
 
 import type { PluginUiEntry } from "../api";
-import { isPluginPaneId, usePluginPanes } from "../pluginPanes";
+import { isPluginPaneId, resolvePaneIcon, usePluginPanes } from "../pluginPanes";
 
 const { entriesRef } = vi.hoisted(() => ({ entriesRef: { current: [] as PluginUiEntry[] } }));
 vi.mock("../pluginUiContext", () => ({ usePluginUiEntries: () => entriesRef.current }));
@@ -40,5 +41,23 @@ describe("usePluginPanes", () => {
   it("returns nothing without a session", () => {
     set([{ plugin_id: "gh", slot: "pane", id: "main", session_id: "s1", payload: {} }]);
     expect(renderHook(() => usePluginPanes(null)).result.current).toEqual([]);
+  });
+});
+
+describe("resolvePaneIcon", () => {
+  it("prefers the pane's own runtime icon over the manifest icon", () => {
+    expect(resolvePaneIcon(GitBranch, "puzzle")).toBe(GitBranch);
+  });
+
+  it("falls back to the manifest identity icon when the pane sets none", () => {
+    expect(resolvePaneIcon(undefined, "git-branch")).toBeDefined();
+  });
+
+  it("falls through to undefined for an unknown manifest icon name", () => {
+    expect(resolvePaneIcon(undefined, "not-a-real-lucide-icon-name")).toBeUndefined();
+  });
+
+  it("falls through to undefined when neither is set", () => {
+    expect(resolvePaneIcon(undefined, undefined)).toBeUndefined();
   });
 });

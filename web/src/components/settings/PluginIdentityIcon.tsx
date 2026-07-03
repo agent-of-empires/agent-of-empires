@@ -9,6 +9,7 @@ interface Props {
   /** Manifest `icon_asset` resolved to a fetchable URL, or null/undefined. */
   iconAssetUrl?: string | null;
   className?: string;
+  testId?: string;
 }
 
 /** A plugin's identity glyph: `icon_asset_url` if present (falls back to
@@ -16,7 +17,7 @@ interface Props {
  *  generic `Puzzle` icon. Always rendered next to the plugin's name on every
  *  surface that uses it, so the icon itself is decorative (`alt=""
  *  aria-hidden`) rather than needing author-supplied alt text. */
-export function PluginIdentityIcon({ icon, iconAssetUrl, className = "size-4" }: Props) {
+export function PluginIdentityIcon({ icon, iconAssetUrl, className = "size-4", testId }: Props) {
   const [assetFailed, setAssetFailed] = useState(false);
 
   if (iconAssetUrl && !assetFailed) {
@@ -25,6 +26,7 @@ export function PluginIdentityIcon({ icon, iconAssetUrl, className = "size-4" }:
         src={iconAssetUrl}
         alt=""
         aria-hidden="true"
+        data-testid={testId}
         className={`${className} shrink-0 rounded-sm object-contain`}
         onError={() => setAssetFailed(true)}
       />
@@ -32,5 +34,5 @@ export function PluginIdentityIcon({ icon, iconAssetUrl, className = "size-4" }:
   }
 
   const Icon = (icon && lucideIcon(icon)) || Puzzle;
-  return createElement(Icon, { className: `${className} shrink-0`, "aria-hidden": true });
+  return createElement(Icon, { className: `${className} shrink-0`, "aria-hidden": true, "data-testid": testId });
 }

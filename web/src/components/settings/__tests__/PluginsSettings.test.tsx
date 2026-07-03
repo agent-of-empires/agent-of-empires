@@ -528,6 +528,93 @@ describe("PluginsSettings", () => {
     await waitFor(() => expect(queryByTestId("plugin-detail-modal")).toBeNull());
   });
 
+  it("renders an installed plugin's icon_asset as an image", async () => {
+    fetchPlugins.mockResolvedValue(
+      listResponse({
+        plugins: [
+          {
+            id: "agent-of-empires.github",
+            name: "GitHub",
+            version: "1.0.0",
+            description: "GitHub integration.",
+            enabled: true,
+            builtin: false,
+            validation: "featured",
+            source: "gh:agent-of-empires/plugin-github",
+            capabilities: [],
+            ui_contributions: [],
+            granted: true,
+            needs_reapproval: false,
+            icon: "github",
+            icon_asset_url: "/api/plugins/agent-of-empires.github/icon",
+          },
+        ],
+      }),
+    );
+    const { findByTestId } = render(<PluginsSettings />);
+    const icon = await findByTestId("plugin-icon-agent-of-empires.github");
+    expect(icon.tagName).toBe("IMG");
+    expect(icon.getAttribute("src")).toBe("/api/plugins/agent-of-empires.github/icon");
+  });
+
+  it("falls back to the lucide icon when a plugin has no icon_asset_url", async () => {
+    fetchPlugins.mockResolvedValue(
+      listResponse({
+        plugins: [
+          {
+            id: "acme.widget",
+            name: "Widget",
+            version: "1.0.0",
+            description: "A widget.",
+            enabled: true,
+            builtin: false,
+            validation: "community",
+            source: "gh:acme/widget",
+            capabilities: [],
+            ui_contributions: [],
+            granted: true,
+            needs_reapproval: false,
+            icon: "git-branch",
+            icon_asset_url: null,
+          },
+        ],
+      }),
+    );
+    const { findByTestId } = render(<PluginsSettings />);
+    const icon = await findByTestId("plugin-icon-acme.widget");
+    expect(icon.tagName).toBe("svg");
+  });
+
+  it("shows the plugin's icon in the detail modal header", async () => {
+    fetchPlugins.mockResolvedValue(
+      listResponse({
+        plugins: [
+          {
+            id: "agent-of-empires.github",
+            name: "GitHub",
+            version: "1.0.0",
+            description: "GitHub integration.",
+            enabled: true,
+            builtin: false,
+            validation: "featured",
+            source: "gh:agent-of-empires/plugin-github",
+            capabilities: [],
+            ui_contributions: [],
+            granted: true,
+            needs_reapproval: false,
+            icon: "github",
+            icon_asset_url: "/api/plugins/agent-of-empires.github/icon",
+          },
+        ],
+      }),
+    );
+    const { findByTestId } = render(<PluginsSettings />);
+    fireEvent.click(await findByTestId("plugin-open-agent-of-empires.github"));
+    const icon = await findByTestId("plugin-detail-icon");
+    expect(icon.tagName).toBe("IMG");
+    expect(icon.getAttribute("src")).toBe("/api/plugins/agent-of-empires.github/icon");
+  });
+
   it("Escape closes the detail modal when no lightbox is open", async () => {
     const { findByTestId, queryByTestId } = render(<PluginsSettings />);
     fireEvent.click(await findByTestId("plugin-open-example.plugin"));
