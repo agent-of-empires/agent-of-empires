@@ -36,6 +36,7 @@ fn base_config(cwd: std::path::PathBuf, record_path: &std::path::Path) -> SpawnC
             record_path.to_string_lossy().to_string(),
         )],
         default_effort: None,
+        default_mode: None,
         socket_path: None,
         stored_acp_session_id: None,
         fork_from: None,

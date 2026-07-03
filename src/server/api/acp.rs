@@ -700,6 +700,18 @@ pub async fn list_acp_agents(State(state): State<Arc<AppState>>) -> impl IntoRes
     Json(entries).into_response()
 }
 
+/// `GET /api/acp/option-catalog`: the recall cache of `config_options` each
+/// agent last advertised (model / mode / thinking choices), keyed by agent
+/// name. The per-agent defaults settings page reads this so its dropdowns can
+/// be populated without a live session. Empty until an agent has run at least
+/// once. See #2631.
+pub async fn get_option_catalog() -> impl IntoResponse {
+    let catalog = tokio::task::spawn_blocking(crate::acp::option_catalog::load)
+        .await
+        .unwrap_or_default();
+    Json(catalog).into_response()
+}
+
 /// Atomically move a structured view session from one ACP backend to another.
 /// Two callers drive this: the rate-limit recovery flow (#1282), which
 /// hands a Claude-rate-limited session off to `codex` (or another

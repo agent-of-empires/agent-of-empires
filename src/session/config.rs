@@ -3257,6 +3257,7 @@ mod tests {
             AcpAgentDefaults {
                 model: Some("openai/gpt-5.5".to_string()),
                 effort: Some("high".to_string()),
+                ..Default::default()
             },
         );
 
@@ -3277,9 +3278,55 @@ mod tests {
             Some(&AcpAgentDefaults {
                 model: Some("openai/gpt-5.5".to_string()),
                 effort: Some("high".to_string()),
+                ..Default::default()
             }),
             "acp_defaults should survive roundtrip"
         );
+    }
+
+    #[test]
+    fn acp_defaults_effort_for_model_prefers_per_model_then_flat() {
+        let mut defaults = AcpAgentDefaults {
+            effort: Some("low".to_string()),
+            ..Default::default()
+        };
+        defaults
+            .effort_by_model
+            .insert("gpt-5".to_string(), "high".to_string());
+
+        // Matching model uses the per-model override.
+        assert_eq!(
+            defaults.effort_for_model(Some("gpt-5")).as_deref(),
+            Some("high")
+        );
+        // Non-matching model and the no-model case fall back to the flat effort.
+        assert_eq!(
+            defaults.effort_for_model(Some("other")).as_deref(),
+            Some("low")
+        );
+        assert_eq!(defaults.effort_for_model(None).as_deref(), Some("low"));
+        // An empty per-model value is treated as unset and falls back.
+        defaults
+            .effort_by_model
+            .insert("gpt-5".to_string(), String::new());
+        assert_eq!(
+            defaults.effort_for_model(Some("gpt-5")).as_deref(),
+            Some("low")
+        );
+    }
+
+    #[test]
+    fn acp_defaults_is_empty_covers_new_fields() {
+        let mut defaults = AcpAgentDefaults::default();
+        assert!(defaults.is_empty());
+        defaults.mode = Some("plan".to_string());
+        assert!(!defaults.is_empty());
+
+        let mut with_map = AcpAgentDefaults::default();
+        with_map
+            .effort_by_model
+            .insert("gpt-5".to_string(), "high".to_string());
+        assert!(!with_map.is_empty());
     }
 
     #[test]

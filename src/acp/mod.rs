@@ -29,6 +29,10 @@ pub mod fs_handler;
 pub mod install_hints;
 pub mod mcp_config;
 pub mod node;
+/// Recall cache of per-agent ACP config options; consumed only by the web
+/// dashboard defaults page, so it is compiled with the serve feature.
+#[cfg(feature = "serve")]
+pub mod option_catalog;
 pub mod permissions;
 pub mod protocol;
 pub mod runner;

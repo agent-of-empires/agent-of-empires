@@ -1732,6 +1732,7 @@ fn build_router(state: Arc<AppState>) -> Router {
             post(api::resolve_elicitation),
         )
         .route("/api/acp/agents", get(api::list_acp_agents))
+        .route("/api/acp/option-catalog", get(api::get_option_catalog))
         .route("/api/claude-sessions", get(api::list_claude_sessions));
 
     app
@@ -3770,6 +3771,42 @@ async fn acp_event_listener(state: Arc<AppState>) {
             tokio::spawn(async move {
                 acp_ws::trigger_question_clear_push(&state_for_push, &session_id, seq).await;
             });
+        }
+
+        // Recall cache: record the agent's advertised config options so the
+        // per-agent defaults settings page can populate its dropdowns without a
+        // live session. `record` debounces unchanged snapshots and writes off
+        // the async runtime. See #2631.
+        if let crate::acp::state::Event::ConfigOptionsUpdated { options } = frame.event.as_ref() {
+            if !options.is_empty() {
+                let agent = state
+                    .instances
+                    .read()
+                    .await
+                    .iter()
+                    .find(|i| i.id == frame.session_id)
+                    .map(|i| {
+                        i.agent_name
+                            .as_deref()
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or(i.tool.as_str())
+                            .to_string()
+                    });
+                if let Some(agent) = agent {
+                    let options = options.clone();
+                    let now = chrono::Utc::now().to_rfc3339();
+                    tokio::task::spawn_blocking(move || {
+                        if let Err(e) = crate::acp::option_catalog::record(&agent, &options, now) {
+                            tracing::warn!(
+                                target: "acp.event_listener",
+                                agent = %agent,
+                                error = %e,
+                                "failed to record acp option catalog"
+                            );
+                        }
+                    });
+                }
+            }
         }
 
         let status_intent = derive_acp_status(frame.event.as_ref());
