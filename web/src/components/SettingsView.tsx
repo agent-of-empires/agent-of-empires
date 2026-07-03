@@ -480,16 +480,15 @@ export function SettingsView({
 
       case "worktree":
         return (
-          <div {...tourAnchor(TOUR_ANCHORS.settingsWorktree)}>
-            <SchemaSection
-              section="worktree"
-              schema={schema}
-              focusRequest={focusRequest}
-              values={worktree}
-              onSaveField={saveSubField}
-              advancedSubtitle="Bare-repo and workspace path templates, branch cleanup, and submodules."
-            />
-          </div>
+          <SchemaSection
+            section="worktree"
+            schema={schema}
+            focusRequest={focusRequest}
+            values={worktree}
+            onSaveField={saveSubField}
+            advancedSubtitle="Bare-repo and workspace path templates, branch cleanup, and submodules."
+            fieldAnchor={{ field: "path_template", anchor: TOUR_ANCHORS.settingsWorktree }}
+          />
         );
 
       case "theme":

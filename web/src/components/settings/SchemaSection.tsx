@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
 import type { SettingsFieldDescriptor, SettingsValidation } from "../../lib/types";
+import { type TourAnchorId, tourAnchor } from "../../lib/tourSteps";
 import {
   CollapsibleSection,
   ListField,
@@ -35,6 +36,10 @@ interface Props {
    *  participates in the SettingsView remount key; this component reacts to the
    *  fresh mount. */
   focusRequest?: { section: string; field: string; nonce: number } | null;
+  /** Attach a tour anchor to one specific field's wrapper, so the first-run tour
+   *  can spotlight a single control (e.g. the worktree path template) rather
+   *  than the whole section. */
+  fieldAnchor?: { field: string; anchor: TourAnchorId };
 }
 
 /** Client-side list-entry validator derived from the server's validation rule,
@@ -191,6 +196,7 @@ export function SchemaSection({
   advancedSubtitle,
   onAfterSave,
   focusRequest,
+  fieldAnchor,
 }: Props) {
   const fields = schema.filter((d) => d.section === section && d.web_write.policy !== "local_only");
   const primary = fields.filter((d) => !d.advanced);
@@ -216,12 +222,14 @@ export function SchemaSection({
 
   const wrap = (d: SettingsFieldDescriptor, node: React.ReactNode) => {
     const isTarget = d.field === targetField;
+    const anchorProps = fieldAnchor && d.field === fieldAnchor.field ? tourAnchor(fieldAnchor.anchor) : {};
     return (
       <div
         key={d.field}
         ref={isTarget ? targetRef : undefined}
         data-settings-field={`${d.section}.${d.field}`}
         className={isTarget ? "animate-settings-highlight" : undefined}
+        {...anchorProps}
       >
         {node}
       </div>
