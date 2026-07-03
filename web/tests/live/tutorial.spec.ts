@@ -95,23 +95,28 @@ base("first-run tutorial: auto-launch, skip, persist, re-trigger", async ({ page
     // Story (issue #2633): the tour opens Settings mid-walk. The controlled
     // runner navigates into the Worktree then Plugins tab, mounting each anchor
     // before showing its step, and closes Settings when it moves on.
-    const next = page.getByRole("button", { name: "Next" });
-    for (let i = 0; i < 6; i++) {
-      if (await page.getByText("Worktrees keep sessions isolated").isVisible()) break;
+    // Joyride labels the advance button "Next (N of M)", so match on the prefix.
+    // Walk step by step, waiting for each tooltip before advancing: the crossing
+    // into Settings is async (navigate, suspend, poll for the anchor, remount),
+    // so a tight click loop would race past the worktree step before it paints.
+    const next = page.getByRole("button", { name: /^Next/ });
+    const step = async (heading: string) => {
       await next.click();
-    }
-    await expect(page.getByText("Worktrees keep sessions isolated")).toBeVisible({ timeout: 10_000 });
+      await expect(page.getByText(heading)).toBeVisible({ timeout: 10_000 });
+    };
+    await step("Workspaces and sessions"); // sidebar
+    await step("Start a session"); // new-session
+    await step("Settings and profiles"); // settings entry
+    await step("Worktrees keep sessions isolated"); // opens Settings > Worktree
     await expect.poll(() => new URL(page.url()).pathname).toBe("/settings/worktree");
 
-    await next.click();
-    await expect(page.getByText("Extend AoE with plugins")).toBeVisible({ timeout: 10_000 });
+    await step("Extend AoE with plugins"); // switches to Settings > Plugins
     await expect.poll(() => new URL(page.url()).pathname).toBe("/settings/plugins");
 
     // Moving past the plugins step closes Settings and lands back on the dashboard.
-    await next.click();
-    await expect(page.getByText("Replay this tour any time")).toBeVisible({ timeout: 10_000 });
+    await step("Replay this tour any time");
     await expect.poll(() => new URL(page.url()).pathname).toBe("/");
-    await page.getByRole("button", { name: "Done" }).click();
+    await page.getByRole("button", { name: /^Done/ }).click();
     await expect(page.getByText("Replay this tour any time")).toBeHidden();
 
     // The flag stays set after a manual re-trigger, so the next reload is quiet.
