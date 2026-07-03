@@ -82,8 +82,8 @@ pub struct DiscoveryResult {
     /// `badge`: an installed-and-featured repo shows the `Installed` badge but
     /// must still rank as featured (the badge is one-of, ranking is not).
     pub featured: bool,
-    /// The exact command to install this plugin (web has no install path, so it
-    /// shows this for the user to copy into a terminal).
+    /// The exact `aoe plugin install` command for this plugin, shown alongside
+    /// the in-app Install button for users who prefer the terminal.
     pub install_command: String,
 }
 

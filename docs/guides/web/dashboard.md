@@ -36,7 +36,7 @@ Individual settings also appear in the palette under `Settings`. A writable togg
 
 The first time you open the dashboard in a browser, a **Choose your theme** card appears before anything else. Picking a theme applies it live and saves it to your default profile; you can switch freely, then click **Continue**. Change it later in Settings > Appearance. The card is skipped in read-only mode and for anyone who already finished the tutorial.
 
-After the theme card, an interactive walkthrough highlights the major regions (command bar, sidebar, starting a session, settings, and inside a session the diff panel and composer). Each step lists its keyboard shortcuts and has a **Skip** button.
+After the theme card, an interactive walkthrough highlights the major regions (command bar, sidebar, starting a session, settings, and inside a session the diff panel and composer). Two of its steps open Settings for you: the Worktree tab, explaining the per-session path templates, and the Plugins tab, explaining how to find, install, and trust plugins. Each step lists its keyboard shortcuts and has a **Skip** button.
 
 Completing or skipping the tour records `app_state.has_seen_web_tour` on the server, so it does not relaunch on reload or on another device pointed at the same server. To replay it, open the overflow menu and choose **Show tutorial**; re-triggering adapts to where you are (dashboard regions, or composer / mode picker / send controls inside a session). It does not auto-launch on touch devices, where it is menu-only.
 
