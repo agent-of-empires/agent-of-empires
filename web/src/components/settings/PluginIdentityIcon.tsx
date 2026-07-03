@@ -1,4 +1,4 @@
-import { createElement, useState } from "react";
+import { createElement, useState, type ComponentType } from "react";
 import { Puzzle } from "lucide-react";
 
 import { lucideIcon } from "../../lib/pluginUi";
@@ -34,5 +34,12 @@ export function PluginIdentityIcon({ icon, iconAssetUrl, className = "size-4", t
   }
 
   const Icon = (icon && lucideIcon(icon)) || Puzzle;
-  return createElement(Icon, { className: `${className} shrink-0`, "aria-hidden": true, "data-testid": testId });
+  // `data-testid` isn't in LucideProps; widen to a generic component type
+  // rather than dropping the attribute, since assertions need to reach the
+  // rendered svg itself, not a wrapping element.
+  return createElement(Icon as ComponentType<Record<string, unknown>>, {
+    className: `${className} shrink-0`,
+    "aria-hidden": true,
+    "data-testid": testId,
+  });
 }
