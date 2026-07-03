@@ -33,6 +33,20 @@ function defaultDock(entry: PluginUiEntry): DockLocation {
   return entry.payload["default_location"] === "bottom" ? "bottom" : "right";
 }
 
+/** Fallback chain for a plugin pane's activity-bar/tab icon: the pane's own
+ *  runtime payload icon (set by the plugin's worker for this specific pane),
+ *  else the plugin's manifest identity icon (a static, per-plugin lucide
+ *  name), else undefined so the caller applies its own generic fallback
+ *  (the host's `Puzzle` icon). Kept as a pure function, separate from
+ *  `usePluginPanes`, so the fallback chain is unit-testable without mounting
+ *  the app or the plugin UI-state context. */
+export function resolvePaneIcon(
+  paneIcon: LucideIcon | undefined,
+  manifestIconName: string | undefined,
+): LucideIcon | undefined {
+  return paneIcon ?? lucideIcon(manifestIconName);
+}
+
 /** Plugin panes for the given session, in stable (plugin_id, entry id) order. */
 export function usePluginPanes(sessionId: string | null): PluginPane[] {
   const entries = usePluginUiEntries();
