@@ -655,7 +655,8 @@ mod tests {
     use super::*;
 
     fn mem(schema: &Schema) -> Connection {
-        // An in-memory DB shares the schema-creation path with `open`.
+        // An in-memory DB that mirrors `open`'s schema by hand (it skips the
+        // session_seq / session_created_at indexes, which these tests don't need).
         let conn = Connection::open_in_memory().unwrap();
         let events = schema.events_table();
         let attachments = schema.attachments_table();
