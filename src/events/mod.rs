@@ -119,10 +119,11 @@ pub fn open(db_path: &Path, schema: &Schema) -> Result<Connection> {
     let attachments = schema.attachments_table();
     conn.execute_batch(&format!(
         "CREATE TABLE IF NOT EXISTS {events} (
-            session_id  TEXT    NOT NULL,
-            seq         INTEGER NOT NULL,
-            event_json  TEXT    NOT NULL,
-            created_at  INTEGER NOT NULL,
+            session_id   TEXT    NOT NULL,
+            seq          INTEGER NOT NULL,
+            event_json   TEXT    NOT NULL,
+            created_at   INTEGER NOT NULL,
+            discriminant TEXT,
             PRIMARY KEY (session_id, seq)
         );
         CREATE INDEX IF NOT EXISTS idx_{events}_session_seq
@@ -144,7 +145,94 @@ pub fn open(db_path: &Path, schema: &Schema) -> Result<Connection> {
             ON {attachments}(session_id, seq);"
     ))
     .context("create event log schema")?;
+    ensure_discriminant_column(&conn, events)?;
     Ok(conn)
+}
+
+/// Ensure the `discriminant` column and its lookup index exist, backfilling
+/// historical rows on databases created before the column was added. The
+/// column lets consumers fetch the newest event of a given externally-tagged
+/// variant via an index instead of a full-topic `event_json LIKE` scan. A
+/// fresh DB already has the column from `open`'s `CREATE TABLE`, so this is a
+/// no-op there; an older DB gets the column added and populated once, keyed
+/// off the column's absence so later opens skip the backfill. The backfill
+/// derives each row's discriminant the same way [`discriminant_of`] does (the
+/// text between the first two double quotes of the externally-tagged JSON),
+/// so historical and freshly-inserted rows agree.
+fn ensure_discriminant_column(conn: &Connection, events: &str) -> Result<()> {
+    let has_column: bool = conn
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM pragma_table_info('{events}') WHERE name = 'discriminant'"
+            ),
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|count| count > 0)
+        .unwrap_or(false);
+    if !has_column {
+        conn.execute_batch(&format!(
+            "ALTER TABLE {events} ADD COLUMN discriminant TEXT;
+             UPDATE {events}
+                SET discriminant = substr(
+                    event_json,
+                    instr(event_json, '\"') + 1,
+                    instr(substr(event_json, instr(event_json, '\"') + 1), '\"') - 1
+                )
+              WHERE discriminant IS NULL AND instr(event_json, '\"') > 0;"
+        ))
+        .context("backfill discriminant column")?;
+    }
+    conn.execute_batch(&format!(
+        "CREATE INDEX IF NOT EXISTS idx_{events}_session_discriminant_seq
+            ON {events}(session_id, discriminant, seq);"
+    ))
+    .context("create discriminant index")?;
+    Ok(())
+}
+
+/// The externally-tagged variant discriminant of a serialized event: the text
+/// between the first two double quotes. serde's externally-tagged encoding is
+/// `{"Variant":<payload>}` for data variants and a bare `"Variant"` for unit
+/// variants, so the variant name is the first quoted token in both shapes.
+/// Returns `""` for a payload with no quoted token (never, for a well-formed
+/// externally-tagged event).
+fn discriminant_of(json: &str) -> &str {
+    let Some(open) = json.find('"') else {
+        return "";
+    };
+    let rest = &json[open + 1..];
+    match rest.find('"') {
+        Some(close) => &rest[..close],
+        None => "",
+    }
+}
+
+/// Return the newest `(seq, event_json)` for `topic` whose event carries the
+/// given externally-tagged `discriminant`, or `None` if the topic never
+/// emitted that variant. Backed by the `(session_id, discriminant, seq)`
+/// index, so it seeks straight to the newest match instead of scanning the
+/// topic's whole history like an `event_json LIKE '{"Variant":%'` predicate
+/// would.
+pub fn latest_by_discriminant(
+    conn: &Connection,
+    schema: &Schema,
+    topic: &str,
+    discriminant: &str,
+) -> Option<(u64, String)> {
+    conn.query_row(
+        &format!(
+            "SELECT seq, event_json FROM {}
+             WHERE session_id = ?1 AND discriminant = ?2
+             ORDER BY seq DESC LIMIT 1",
+            schema.events_table()
+        ),
+        params![topic, discriminant],
+        |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, String>(1)?)),
+    )
+    .optional()
+    .ok()
+    .flatten()
 }
 
 /// Append one opaque event payload. Idempotent on duplicate `(topic, seq)`
@@ -160,12 +248,15 @@ pub fn insert_event(
     created_at: i64,
 ) -> Result<usize> {
     let sql = format!(
-        "INSERT OR IGNORE INTO {} (session_id, seq, event_json, created_at)
-         VALUES (?1, ?2, ?3, ?4)",
+        "INSERT OR IGNORE INTO {} (session_id, seq, event_json, created_at, discriminant)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
         schema.events_table()
     );
-    conn.execute(&sql, params![topic, seq as i64, json, created_at])
-        .with_context(|| format!("insert {topic}@{seq}"))
+    conn.execute(
+        &sql,
+        params![topic, seq as i64, json, created_at, discriminant_of(json)],
+    )
+    .with_context(|| format!("insert {topic}@{seq}"))
 }
 
 /// Prune the oldest events for `topic` beyond `max_events`, exempting any
@@ -567,7 +658,8 @@ mod tests {
         let events = schema.events_table();
         let attachments = schema.attachments_table();
         conn.execute_batch(&format!(
-            "CREATE TABLE {events} (session_id TEXT NOT NULL, seq INTEGER NOT NULL, event_json TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (session_id, seq));
+            "CREATE TABLE {events} (session_id TEXT NOT NULL, seq INTEGER NOT NULL, event_json TEXT NOT NULL, created_at INTEGER NOT NULL, discriminant TEXT, PRIMARY KEY (session_id, seq));
+             CREATE INDEX idx_{events}_session_discriminant_seq ON {events}(session_id, discriminant, seq);
              CREATE TABLE {attachments} (session_id TEXT NOT NULL, seq INTEGER NOT NULL, attachment_id TEXT NOT NULL, kind TEXT NOT NULL, mime_type TEXT NOT NULL, name TEXT, data BLOB NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (session_id, attachment_id));"
         ))
         .unwrap();
@@ -740,5 +832,114 @@ mod tests {
         insert_event(&conn, &schema, "t", 2, "{\"Snapshot\":{}}", 200).unwrap();
         let map = last_event_at_for_topics(&conn, &schema, &["t".into()], &["Snapshot"]);
         assert_eq!(map.get("t"), Some(&100));
+    }
+
+    /// The indexed discriminant lookup returns the newest event of a given
+    /// externally-tagged variant without scanning the whole topic. Covers
+    /// struct variants (`{"Variant":..}`), a topic that never emitted the
+    /// variant (None), unit variants (bare `"Variant"`), and topic scoping.
+    #[test]
+    fn latest_by_discriminant_returns_newest_match() {
+        let schema = Schema::new("demo").unwrap();
+        let conn = mem(&schema);
+        insert_event(&conn, &schema, "t", 1, "{\"PlanUpdated\":{\"n\":1}}", 1).unwrap();
+        insert_event(&conn, &schema, "t", 2, "{\"Chunk\":{}}", 2).unwrap();
+        insert_event(&conn, &schema, "t", 3, "{\"PlanUpdated\":{\"n\":2}}", 3).unwrap();
+        insert_event(&conn, &schema, "t", 4, "{\"Chunk\":{}}", 4).unwrap();
+        // Newest PlanUpdated wins.
+        assert_eq!(
+            latest_by_discriminant(&conn, &schema, "t", "PlanUpdated"),
+            Some((3, "{\"PlanUpdated\":{\"n\":2}}".to_string()))
+        );
+        // A variant the topic never emitted → None (no scan false-positive).
+        assert_eq!(
+            latest_by_discriminant(&conn, &schema, "t", "WakeupScheduled"),
+            None
+        );
+        // Unit variants serialize as a bare quoted string; still matched.
+        insert_event(&conn, &schema, "t", 5, "\"ThinkingStarted\"", 5).unwrap();
+        assert_eq!(
+            latest_by_discriminant(&conn, &schema, "t", "ThinkingStarted"),
+            Some((5, "\"ThinkingStarted\"".to_string()))
+        );
+        // Scoped by topic: another topic's PlanUpdated is invisible.
+        insert_event(&conn, &schema, "other", 9, "{\"PlanUpdated\":{\"n\":9}}", 9).unwrap();
+        assert_eq!(
+            latest_by_discriminant(&conn, &schema, "t", "PlanUpdated"),
+            Some((3, "{\"PlanUpdated\":{\"n\":2}}".to_string()))
+        );
+    }
+
+    /// The lookup must seek via the discriminant index, not scan the topic
+    /// (the whole point of the column: a long session's per-poll sidebar
+    /// queries were full-topic `event_json LIKE` scans).
+    #[test]
+    fn latest_by_discriminant_uses_the_index() {
+        let schema = Schema::new("demo").unwrap();
+        let conn = mem(&schema);
+        insert_event(&conn, &schema, "t", 1, "{\"PlanUpdated\":{}}", 1).unwrap();
+        let plan: String = conn
+            .query_row(
+                &format!(
+                    "EXPLAIN QUERY PLAN
+                     SELECT seq, event_json FROM {}
+                     WHERE session_id = ?1 AND discriminant = ?2
+                     ORDER BY seq DESC LIMIT 1",
+                    schema.events_table()
+                ),
+                params!["t", "PlanUpdated"],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(
+            plan.contains("idx_demo_events_session_discriminant_seq"),
+            "expected the discriminant index to be used, got plan: {plan}"
+        );
+    }
+
+    /// A database created before the `discriminant` column existed gets the
+    /// column added and its historical rows backfilled, so the indexed lookup
+    /// works over old data. The backfill must agree with `discriminant_of`
+    /// for both struct variants and bare-string unit variants, and be
+    /// idempotent across reopens.
+    #[test]
+    fn ensure_discriminant_column_backfills_legacy_rows() {
+        let schema = Schema::new("demo").unwrap();
+        let events = schema.events_table();
+        let conn = Connection::open_in_memory().unwrap();
+        // Pre-column schema: no `discriminant`.
+        conn.execute_batch(&format!(
+            "CREATE TABLE {events} (session_id TEXT NOT NULL, seq INTEGER NOT NULL, event_json TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (session_id, seq));"
+        ))
+        .unwrap();
+        for (seq, json) in [
+            (1i64, "{\"PlanUpdated\":{\"n\":1}}"),
+            (2, "{\"Chunk\":{}}"),
+            (3, "\"ThinkingStarted\""),
+        ] {
+            conn.execute(
+                &format!(
+                    "INSERT INTO {events} (session_id, seq, event_json, created_at) VALUES ('t', ?1, ?2, ?1)"
+                ),
+                params![seq, json],
+            )
+            .unwrap();
+        }
+        ensure_discriminant_column(&conn, events).unwrap();
+        // Historical struct + unit variants are now indexable by discriminant.
+        assert_eq!(
+            latest_by_discriminant(&conn, &schema, "t", "PlanUpdated"),
+            Some((1, "{\"PlanUpdated\":{\"n\":1}}".to_string()))
+        );
+        assert_eq!(
+            latest_by_discriminant(&conn, &schema, "t", "ThinkingStarted"),
+            Some((3, "\"ThinkingStarted\"".to_string()))
+        );
+        // Second call is a no-op (column already present), not an error.
+        ensure_discriminant_column(&conn, events).unwrap();
+        assert_eq!(
+            latest_by_discriminant(&conn, &schema, "t", "Chunk"),
+            Some((2, "{\"Chunk\":{}}".to_string()))
+        );
     }
 }

@@ -462,18 +462,8 @@ impl EventStore {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        let json: String = conn
-            .query_row(
-                "SELECT event_json FROM acp_events
-                 WHERE session_id = ?1
-                   AND event_json LIKE '{\"PlanUpdated\":%'
-                 ORDER BY seq DESC LIMIT 1",
-                params![session_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .ok()
-            .flatten()?;
+        let (_, json) =
+            events::latest_by_discriminant(&conn, &self.schema, session_id, "PlanUpdated")?;
         let event: Event = serde_json::from_str(&json).ok()?;
         if let Event::PlanUpdated { plan } = event {
             Some(plan)
@@ -644,18 +634,9 @@ impl EventStore {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        let json: Option<String> = conn
-            .query_row(
-                "SELECT event_json FROM acp_events
-                 WHERE session_id = ?1
-                   AND event_json LIKE '{\"WakeupScheduled\":%'
-                 ORDER BY seq DESC LIMIT 1",
-                params![session_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .ok()
-            .flatten();
+        let json: Option<String> =
+            events::latest_by_discriminant(&conn, &self.schema, session_id, "WakeupScheduled")
+                .map(|(_, json)| json);
         // No log for the "no row" branch. The web UI polls /api/sessions
         // every ~2-3s and fans this query out per structured view session; every
         // idle session would land here on every poll. The past-due branch
@@ -717,19 +698,9 @@ impl EventStore {
             Err(p) => p.into_inner(),
         };
         // Latest MonitorArmed and its seq.
-        let row: Option<(i64, String)> = conn
-            .query_row(
-                "SELECT seq, event_json FROM acp_events
-                 WHERE session_id = ?1
-                   AND event_json LIKE '{\"MonitorArmed\":%'
-                 ORDER BY seq DESC LIMIT 1",
-                params![session_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .ok()
-            .flatten();
-        let (armed_seq, json) = row?;
+        let (armed_seq, json) =
+            events::latest_by_discriminant(&conn, &self.schema, session_id, "MonitorArmed")?;
+        let armed_seq = armed_seq as i64;
         // The user taking over clears the badge immediately. No log on the
         // common "no monitor" branch above (this query fans out per
         // structured session on every ~2-3s sessions poll).
@@ -738,7 +709,7 @@ impl EventStore {
                 "SELECT 1 FROM acp_events
                  WHERE session_id = ?1
                    AND seq > ?2
-                   AND event_json LIKE '{\"UserPromptSent\":%'
+                   AND discriminant = 'UserPromptSent'
                  LIMIT 1",
                 params![session_id, armed_seq],
                 |row| row.get(0),
@@ -759,7 +730,7 @@ impl EventStore {
                 "SELECT MIN(seq) FROM acp_events
                  WHERE session_id = ?1
                    AND seq > ?2
-                   AND event_json LIKE '{\"ToolCallStarted\":%'",
+                   AND discriminant = 'ToolCallStarted'",
                 params![session_id, armed_seq],
                 |row| row.get(0),
             )
@@ -772,7 +743,7 @@ impl EventStore {
                     "SELECT 1 FROM acp_events
                      WHERE session_id = ?1
                        AND seq > ?2
-                       AND event_json LIKE '{\"Stopped\":%'
+                       AND discriminant = 'Stopped'
                      LIMIT 1",
                     params![session_id, work_seq],
                     |row| row.get(0),
