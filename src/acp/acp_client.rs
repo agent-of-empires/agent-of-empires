@@ -503,6 +503,19 @@ const SILENT_ORPHAN_CHECK_INTERVAL: std::time::Duration = std::time::Duration::f
 /// live turn short. See #2325.
 const BETWEEN_PROMPT_IDLE_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// Idle grace for a between-prompt agent-initiated turn that streamed
+/// output but never reported a cost-bearing end-of-turn marker and never
+/// scheduled a wake, i.e. a turn that stalled mid-stream (the model
+/// connection dropped, the process parked) rather than finishing cleanly or
+/// parking a monitor. A legitimately parked monitor / `/loop` sets a
+/// `wake_at` and so never lands here; genuinely off-protocol work
+/// (backgrounded Bash) latches the 30-minute floor. So this bucket is the
+/// stall, and it should self-heal in a couple of minutes, not 30. Set to
+/// the vendor-agnostic base grace so a live turn's normal inter-chunk /
+/// inter-tool gaps (which refresh the idle timer) cannot trip it. See
+/// #2573.
+const BETWEEN_PROMPT_STALL_GRACE: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Tick cadence for the between-prompt idle check. Faster than
 /// `SILENT_ORPHAN_CHECK_INTERVAL` so the badge and status clear within a few
 /// seconds of the turn ending. Only polled while the command loop is parked
@@ -1073,7 +1086,9 @@ fn terminal_stop_reason(
 /// matching the resume-idle watchdog. Mirrors the per-prompt watchdog's
 /// grace policy: the cost-bearing `UsageUpdate` is claude-agent-acp's
 /// end-of-turn marker, so once it has arrived the fast grace applies;
-/// otherwise the vendor-agnostic off-protocol floor governs. A pending
+/// untracked off-protocol work (backgrounded Bash) holds the 30-minute
+/// floor; a turn that streamed but did neither (a stalled stream) recovers
+/// on the intermediate stall grace instead of the floor (#2573). A pending
 /// scheduled wake (`wake_at` in the future) suppresses firing so a
 /// legitimately-sleeping monitor is never killed early; once `wake_at` is
 /// in the past the turn is treated as finished and self-heals fast (#2371).
@@ -1160,17 +1175,20 @@ fn between_prompt_should_fire(
         return false;
     }
     let expired_wake = wake_at_ms.is_some_and(|at| now_ms >= at);
-    // Off-protocol work (backgrounded Bash, async sub-agent) completes on the
-    // protocol while the real work keeps running, so hold the conservative
-    // floor even though no tool is "in flight". See #1401, #1858. Otherwise a
-    // cost-resolved end-of-turn marker OR an expired wake (the agent should
-    // have resumed and did not) means the turn is done: self-heal fast.
+    // Off-protocol work (backgrounded Bash) completes on the protocol while
+    // the real work keeps running with no completion signal, so hold the
+    // conservative floor even though no tool is "in flight". See #1401,
+    // #1858. A cost-resolved end-of-turn marker OR an expired wake (the agent
+    // should have resumed and did not) means the turn is done: self-heal
+    // fast. Otherwise the turn streamed but never finished cleanly or parked
+    // a wake, a stalled stream: recover on the stall grace (minutes) rather
+    // than the 30-minute floor. See #2573.
     let grace = if off_protocol_work_seen {
         floor
     } else if cost_seen || expired_wake {
         fast_grace
     } else {
-        floor
+        BETWEEN_PROMPT_STALL_GRACE
     };
     now_ms - last_lifecycle_ms >= grace.as_millis() as i64
 }
@@ -7712,6 +7730,7 @@ mod tests {
     // Bind to the production constants so the test tracks the real grace.
     const FAST: std::time::Duration = BETWEEN_PROMPT_IDLE_GRACE;
     const FLOOR: std::time::Duration = OFF_PROTOCOL_WORK_GRACE_FLOOR;
+    const STALL: std::time::Duration = BETWEEN_PROMPT_STALL_GRACE;
 
     #[test]
     fn between_prompt_inactive_never_fires() {
@@ -7771,13 +7790,16 @@ mod tests {
     }
 
     #[test]
-    fn between_prompt_uses_floor_without_cost() {
+    fn between_prompt_stalled_stream_fires_on_stall_grace() {
+        // #2573: a turn that streamed but never reported a cost marker, never
+        // scheduled a wake, and is not off-protocol is a stalled stream. It
+        // must recover on the stall grace (minutes), not the 30-minute floor.
         let last = 1_000_000;
-        // 21s idle but no cost marker and no expired wake: the generous floor
-        // governs (a turn doing silent background work, #1858), no fire.
+        let stall_ms = STALL.as_millis() as i64;
+        // Under the stall grace: normal inter-chunk gap, no fire.
         assert!(!between_prompt_should_fire(
             true,
-            last + 21_000,
+            last + stall_ms - 1000,
             last,
             None,
             false,
@@ -7786,15 +7808,46 @@ mod tests {
             FAST,
             FLOOR
         ));
-        // Past the 30-minute floor: fire even without a cost marker.
+        // Past the stall grace: recover. Before the fix this waited the full
+        // 30-minute floor, so the session sat "running" for half an hour.
         assert!(between_prompt_should_fire(
             true,
-            last + 30 * 60 * 1000 + 1,
+            last + stall_ms + 1000,
             last,
             None,
             false,
             false,
             false,
+            FAST,
+            FLOOR
+        ));
+    }
+
+    #[test]
+    fn between_prompt_off_protocol_still_uses_floor() {
+        // Untracked backgrounded Bash (off_protocol_work_seen) has no
+        // completion signal, so it keeps the conservative 30-minute floor
+        // even well past the stall grace. See #1401, #1858, #2573.
+        let last = 1_000_000;
+        assert!(!between_prompt_should_fire(
+            true,
+            last + STALL.as_millis() as i64 + 60_000,
+            last,
+            None,
+            false,
+            false,
+            true, // off_protocol_work_seen
+            FAST,
+            FLOOR
+        ));
+        assert!(between_prompt_should_fire(
+            true,
+            last + FLOOR.as_millis() as i64 + 1,
+            last,
+            None,
+            false,
+            false,
+            true,
             FAST,
             FLOOR
         ));
