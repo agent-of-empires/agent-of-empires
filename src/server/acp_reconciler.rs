@@ -1045,7 +1045,7 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
                     // away. Re-derive from history here too so the
                     // dot turns green immediately. See #1103 (A).
                     if in_flight_turn {
-                        if let Some(event) = state.acp_event_store.latest_status_event(&id) {
+                        if let Some(event) = state.acp_event_store.latest_seed_status_event(&id) {
                             if let Some(intent) = crate::server::derive_acp_status(&event) {
                                 let mut instances = state.instances.write().await;
                                 if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {

@@ -3860,7 +3860,7 @@ pub(crate) async fn seed_acp_statuses(state: Arc<AppState>) {
         return;
     }
     for id in acp_ids {
-        let Some(event) = state.acp_event_store.latest_status_event(&id) else {
+        let Some(event) = state.acp_event_store.latest_seed_status_event(&id) else {
             continue;
         };
         let Some(intent) = derive_acp_status(&event) else {
