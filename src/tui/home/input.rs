@@ -2773,11 +2773,14 @@ impl HomeView {
                     parent_acp_session_id: acp_id,
                 }
             }
-            // Without `serve` a session can never be structured (the field
-            // doesn't exist and `is_structured()` is hard-coded false), so this
-            // branch is unreachable; keep the compiler happy on bare-core.
             #[cfg(not(feature = "serve"))]
-            unreachable!("is_structured() is always false without the serve feature")
+            {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Structured Session",
+                    "This session uses structured view. Rebuild with the serve feature to fork it.",
+                ));
+                return;
+            }
         } else {
             let child_id = crate::session::capture::generate_claude_session_id();
             match crate::session::fork::terminal_fork_seed(

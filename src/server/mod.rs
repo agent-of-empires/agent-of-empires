@@ -2321,9 +2321,16 @@ pub(crate) async fn reload_state_instances_from_disk(
     }
 
     #[cfg(feature = "serve")]
+    let repairs = repair_structured_rows_from_live_workers(&mut merged);
+
+    #[cfg(feature = "serve")]
     apply_acp_overlay_inplace(&prior_by_id, &mut merged);
 
     *current = merged;
+    drop(current);
+
+    #[cfg(feature = "serve")]
+    persist_structured_row_repairs(state, repairs);
 }
 
 /// Apply the acp status / timestamps overlay to `merged`, sourcing
@@ -2345,6 +2352,122 @@ fn apply_acp_overlay_inplace(prior_by_id: &PriorById, merged: &mut [Instance]) {
         inst.last_accessed_at = prior.last_accessed_at;
         inst.idle_entered_at = prior.idle_entered_at;
     }
+}
+
+#[cfg(feature = "serve")]
+#[derive(Debug, Clone)]
+struct StructuredRowRepair {
+    session_id: String,
+    source_profile: String,
+    agent_name: Option<String>,
+    agent_model: Option<String>,
+    acp_session_id: String,
+}
+
+/// Recover a structured session row that was rewritten by an older writer
+/// lacking the structured fields. Only live worker records with a stored ACP
+/// id qualify, so stale registry files and deliberate terminal-mode sessions
+/// are left alone.
+#[cfg(feature = "serve")]
+fn repair_structured_rows_from_live_workers(merged: &mut [Instance]) -> Vec<StructuredRowRepair> {
+    let Ok(records) = crate::acp::worker_registry::list() else {
+        return Vec::new();
+    };
+    let live_by_id: std::collections::HashMap<String, crate::acp::worker_registry::WorkerRecord> =
+        records
+            .into_iter()
+            .filter(crate::acp::worker_registry::is_record_live)
+            .filter(|record| record.stored_acp_session_id.is_some())
+            .map(|record| (record.session_id.clone(), record))
+            .collect();
+
+    let mut repairs = Vec::new();
+    for inst in merged.iter_mut() {
+        if inst.is_structured() {
+            continue;
+        }
+        let Some(record) = live_by_id.get(&inst.id) else {
+            continue;
+        };
+        let Some(acp_session_id) = record.stored_acp_session_id.clone() else {
+            continue;
+        };
+        inst.view = crate::session::View::Structured;
+        if inst.agent_name.is_none() && !record.agent_key.is_empty() {
+            inst.agent_name = Some(record.agent_key.clone());
+        }
+        if inst.agent_model.is_none() {
+            inst.agent_model = record.model.clone();
+        }
+        inst.acp_session_id = Some(acp_session_id.clone());
+        tracing::warn!(
+            target: "server.reload",
+            session = %inst.id,
+            pid = record.pid,
+            "repaired structured session row from live ACP worker registry"
+        );
+        repairs.push(StructuredRowRepair {
+            session_id: inst.id.clone(),
+            source_profile: inst.source_profile.clone(),
+            agent_name: inst.agent_name.clone(),
+            agent_model: inst.agent_model.clone(),
+            acp_session_id,
+        });
+    }
+    repairs
+}
+
+#[cfg(feature = "serve")]
+fn persist_structured_row_repairs(state: &Arc<AppState>, repairs: Vec<StructuredRowRepair>) {
+    if repairs.is_empty() {
+        return;
+    }
+    let file_watch = state.file_watch.clone();
+    tokio::spawn(async move {
+        let mut by_profile: std::collections::HashMap<String, Vec<StructuredRowRepair>> =
+            std::collections::HashMap::new();
+        for repair in repairs {
+            by_profile
+                .entry(repair.source_profile.clone())
+                .or_default()
+                .push(repair);
+        }
+        for (profile, repairs) in by_profile {
+            let file_watch = file_watch.clone();
+            let save_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                let storage = crate::session::Storage::new(&profile, file_watch)?;
+                storage.update(|all, _groups| {
+                    for repair in &repairs {
+                        if let Some(inst) = all.iter_mut().find(|i| i.id == repair.session_id) {
+                            inst.view = crate::session::View::Structured;
+                            if inst.agent_name.is_none() {
+                                inst.agent_name = repair.agent_name.clone();
+                            }
+                            if inst.agent_model.is_none() {
+                                inst.agent_model = repair.agent_model.clone();
+                            }
+                            inst.acp_session_id = Some(repair.acp_session_id.clone());
+                        }
+                    }
+                    Ok(())
+                })?;
+                Ok(())
+            })
+            .await;
+            match save_result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(target: "server.reload", "save after structured row repair: {e}");
+                }
+                Err(join_err) => {
+                    tracing::warn!(
+                        target: "server.reload",
+                        "structured row repair save task panicked: {join_err}"
+                    );
+                }
+            }
+        }
+    });
 }
 
 /// Build a per-profile disk-watch entry: register a `subscribe_channel`
@@ -4541,6 +4664,75 @@ mod tests {
 
         let merged = merge_runtime_fields(prior, fresh);
         assert_eq!(merged.last_error, None);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    #[serial_test::serial]
+    fn repair_structured_rows_from_live_workers_restores_terminal_shaped_row() {
+        let temp = tempfile::TempDir::with_prefix_in("aoe-repair-", "/tmp").expect("tempdir");
+        // SAFETY: serialized test; no other test mutates HOME concurrently.
+        unsafe {
+            std::env::set_var("HOME", temp.path());
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        }
+
+        let socket_path = crate::acp::worker_registry::workers_dir()
+            .expect("workers dir")
+            .join("repair-live.sock");
+        std::fs::write(&socket_path, b"").expect("socket sentinel");
+        let live_record = crate::acp::worker_registry::WorkerRecord::new(
+            "repair-live".to_string(),
+            std::process::id(),
+            socket_path,
+            "codex-acp".to_string(),
+            "codex".to_string(),
+            std::path::PathBuf::from("/tmp/repo"),
+            Some("gpt-5".to_string()),
+            Vec::new(),
+            Vec::new(),
+            Some("acp-session-1".to_string()),
+            Some("default".to_string()),
+        );
+        crate::acp::worker_registry::save(&live_record).expect("save live worker record");
+
+        let stale_socket_path = crate::acp::worker_registry::workers_dir()
+            .expect("workers dir")
+            .join("repair-no-id.sock");
+        std::fs::write(&stale_socket_path, b"").expect("socket sentinel");
+        let no_id_record = crate::acp::worker_registry::WorkerRecord::new(
+            "repair-no-id".to_string(),
+            std::process::id(),
+            stale_socket_path,
+            "codex-acp".to_string(),
+            "codex".to_string(),
+            std::path::PathBuf::from("/tmp/repo"),
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+            Some("default".to_string()),
+        );
+        crate::acp::worker_registry::save(&no_id_record).expect("save no-id worker record");
+
+        let mut rows = vec![
+            Instance::new("repair-live", "/tmp/repo"),
+            Instance::new("repair-no-id", "/tmp/repo"),
+        ];
+        rows[0].id = "repair-live".to_string();
+        rows[1].id = "repair-no-id".to_string();
+
+        let repairs = repair_structured_rows_from_live_workers(&mut rows);
+
+        assert_eq!(repairs.len(), 1);
+        assert_eq!(repairs[0].session_id, "repair-live");
+        assert_eq!(repairs[0].acp_session_id, "acp-session-1");
+        assert_eq!(rows[0].view, crate::session::View::Structured);
+        assert_eq!(rows[0].agent_name.as_deref(), Some("codex"));
+        assert_eq!(rows[0].agent_model.as_deref(), Some("gpt-5"));
+        assert_eq!(rows[0].acp_session_id.as_deref(), Some("acp-session-1"));
+        assert_eq!(rows[1].view, crate::session::View::Terminal);
+        assert_eq!(rows[1].acp_session_id, None);
     }
 
     #[tokio::test]

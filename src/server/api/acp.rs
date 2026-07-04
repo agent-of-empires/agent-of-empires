@@ -284,6 +284,16 @@ pub async fn spawn_acp(
         return (StatusCode::NOT_FOUND, "session not found").into_response();
     };
     drop(instances);
+    if !instance.is_structured() {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "not_structured",
+                "message": "Switch the session to structured view before starting an ACP worker",
+            })),
+        )
+            .into_response();
+    }
 
     // Pick the structured view agent: explicit request override > stored
     // agent_name on the instance > registry entry keyed on the

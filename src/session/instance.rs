@@ -644,18 +644,15 @@ pub struct Instance {
     /// `Terminal` (raw tmux pane). When `Structured`, aoe spawns an ACP agent
     /// subprocess and renders structured events natively; tmux integration is
     /// bypassed for this session.
-    #[cfg(feature = "serve")]
     #[serde(default, skip_serializing_if = "View::is_terminal")]
     pub view: View,
     /// Optional structured view agent name (e.g., "claude-code", "aoe-agent",
     /// "gemini"). When None, the structured view picks the default for the
     /// session's tool.
-    #[cfg(feature = "serve")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_name: Option<String>,
     /// Optional model id forwarded to aoe-agent (e.g., "claude-opus-4-7",
     /// "gpt-5", "llama3.3:ollama").
-    #[cfg(feature = "serve")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_model: Option<String>,
     /// Agent-assigned ACP session id captured from `session/new`. When
@@ -664,7 +661,6 @@ pub struct Instance {
     /// with this id so the agent reloads its on-disk transcript and
     /// the model retains context across `aoe serve` restarts. Cleared
     /// on acp_disable, session delete, or `session/load` failure.
-    #[cfg(feature = "serve")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acp_session_id: Option<String>,
 
@@ -674,7 +670,6 @@ pub struct Instance {
     /// of suppressing it like a normal reattach does) so the imported
     /// transcript renders. Cleared once the load completes and the history
     /// is durably stored. See #2276.
-    #[cfg(feature = "serve")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub import_pending: Option<bool>,
 
@@ -682,7 +677,6 @@ pub struct Instance {
     /// on first connect. Set at creation, consumed when the adapter assigns
     /// the forked child id (see `apply_acp_session_change`). `None` for
     /// non-fork sessions. Skipped in serialization when absent.
-    #[cfg(feature = "serve")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fork_pending: Option<String>,
 
@@ -1046,17 +1040,11 @@ impl Instance {
             notify_on_idle: None,
             notify_on_error: None,
             base_branch_override: None,
-            #[cfg(feature = "serve")]
             view: View::Terminal,
-            #[cfg(feature = "serve")]
             agent_name: None,
-            #[cfg(feature = "serve")]
             agent_model: None,
-            #[cfg(feature = "serve")]
             acp_session_id: None,
-            #[cfg(feature = "serve")]
             import_pending: None,
-            #[cfg(feature = "serve")]
             fork_pending: None,
             last_error_check: None,
             last_start_time: None,
@@ -1664,17 +1652,11 @@ impl Instance {
     }
 
     /// True when this session renders in the structured (ACP) view rather
-    /// than a tmux pane. Always false when the `serve` feature is disabled,
-    /// since the field doesn't exist and no session can be structured.
+    /// than a tmux pane. The persisted field exists in every build so
+    /// non-serve writers preserve structured sessions instead of downgrading
+    /// them to terminal rows.
     pub fn is_structured(&self) -> bool {
-        #[cfg(feature = "serve")]
-        {
-            self.view == View::Structured
-        }
-        #[cfg(not(feature = "serve"))]
-        {
-            false
-        }
+        self.view == View::Structured
     }
 
     /// Whether this agent uses a session ID poller for live tracking.
@@ -6056,16 +6038,23 @@ mod tests {
         assert!(!json.contains("last_error"));
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     fn test_instance_acp_acp_session_id_roundtrip() {
         let mut inst = Instance::new("Test", "/tmp/test");
         inst.view = View::Structured;
+        inst.agent_name = Some("codex".to_string());
+        inst.agent_model = Some("gpt-5".to_string());
         inst.acp_session_id = Some("acp-uuid-1234".to_string());
 
         let json = serde_json::to_string(&inst).unwrap();
+        assert!(json.contains("\"view\":\"structured\""));
+        assert!(json.contains("agent_name"));
+        assert!(json.contains("agent_model"));
         assert!(json.contains("acp_session_id"));
         let deserialized: Instance = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.view, View::Structured);
+        assert_eq!(deserialized.agent_name, Some("codex".to_string()));
+        assert_eq!(deserialized.agent_model, Some("gpt-5".to_string()));
         assert_eq!(
             deserialized.acp_session_id,
             Some("acp-uuid-1234".to_string())
