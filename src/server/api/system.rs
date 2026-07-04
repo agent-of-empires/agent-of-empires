@@ -1070,7 +1070,12 @@ const HOME_SYSTEM_DIRS: &[&str] = &[
     "Library",
 ];
 
+/// The TCC prompt only exists on macOS, so gate the skip there. On other
+/// platforms these folders are probed normally and keep their git badge.
 fn skip_git_probe(parent: &std::path::Path, name: &str, home: Option<&std::path::Path>) -> bool {
+    if !cfg!(target_os = "macos") {
+        return false;
+    }
     match home {
         Some(home) => parent == home && HOME_SYSTEM_DIRS.contains(&name),
         None => false,
@@ -1863,12 +1868,17 @@ mod tests {
     fn skip_git_probe_avoids_protected_home_folders() {
         let home = std::path::Path::new("/Users/alice");
 
-        // Protected/system folders directly under $HOME: never probe .git,
-        // so macOS never prompts for Downloads/Desktop/Music/Pictures.
+        // The skip is macOS-only: the TCC prompt does not exist elsewhere,
+        // so other platforms probe normally and keep the git badge.
+        let macos = cfg!(target_os = "macos");
+
+        // Protected/system folders directly under $HOME: skipped on macOS so
+        // it never prompts for Downloads/Desktop/Music/Pictures.
         for name in ["Downloads", "Desktop", "Music", "Pictures", "Documents"] {
-            assert!(
+            assert_eq!(
                 skip_git_probe(home, name, Some(home)),
-                "expected to skip .git probe for ~/{name}"
+                macos,
+                "unexpected probe decision for ~/{name}"
             );
         }
 
