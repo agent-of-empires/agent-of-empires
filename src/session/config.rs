@@ -1291,6 +1291,13 @@ impl AcpAgentDefaults {
             && self.effort_by_model.is_empty()
     }
 
+    /// Default mode, with empty strings treated as unset (mirrors
+    /// `effort_for_model`) so a blank value never triggers a pointless ACP
+    /// config update on spawn.
+    pub fn mode(&self) -> Option<String> {
+        self.mode.clone().filter(|value| !value.is_empty())
+    }
+
     /// Effort for a resolved model: the per-model override wins when the model
     /// matches a key, otherwise the flat `effort`. Empty strings are treated as
     /// unset.
@@ -3326,6 +3333,16 @@ mod tests {
             .effort_by_model
             .insert("gpt-5".to_string(), "high".to_string());
         assert!(!with_map.is_empty());
+    }
+
+    #[test]
+    fn acp_defaults_mode_treats_empty_as_unset() {
+        let mut defaults = AcpAgentDefaults::default();
+        assert_eq!(defaults.mode(), None);
+        defaults.mode = Some(String::new());
+        assert_eq!(defaults.mode(), None);
+        defaults.mode = Some("plan".to_string());
+        assert_eq!(defaults.mode().as_deref(), Some("plan"));
     }
 
     #[test]

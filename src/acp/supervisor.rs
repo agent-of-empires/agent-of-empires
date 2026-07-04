@@ -1422,7 +1422,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         let default_mode = resolved_cfg
             .acp
             .acp_defaults_for(&agent)
-            .and_then(|defaults| defaults.mode.clone());
+            .and_then(|defaults| defaults.mode());
 
         let config = SpawnConfig {
             agent_key: agent.clone(),
