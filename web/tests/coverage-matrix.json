@@ -493,8 +493,8 @@
       "id": "app-shell.activity-bar",
       "kind": "vitest",
       "risk": "low",
-      "specs": ["src/components/__tests__/ActivityBar.test.tsx"],
-      "components": ["web/src/components/ActivityBar.tsx"]
+      "specs": ["src/components/__tests__/ActivityBar.test.tsx", "src/components/__tests__/PaneIcon.test.tsx"],
+      "components": ["web/src/components/ActivityBar.tsx", "web/src/components/PaneIcon.tsx"]
     },
     {
       "id": "app-shell.tips-badge",

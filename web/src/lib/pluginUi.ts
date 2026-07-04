@@ -2,7 +2,7 @@
 // slots through these so the filtering rules (and the per-session tearing
 // guard) live in one tested place rather than scattered across the UI.
 
-import { createElement, forwardRef, type ComponentType, type CSSProperties } from "react";
+import { createElement, forwardRef, useState, type ComponentType, type CSSProperties } from "react";
 import type { LucideIcon, LucideProps } from "lucide-react";
 import { DynamicIcon, iconNames } from "lucide-react/dynamic";
 
@@ -33,6 +33,22 @@ export function lucideIcon(name: string | undefined): LucideIcon | undefined {
   ) as LucideIcon;
   cache.set(name, Icon);
   return Icon;
+}
+
+/** Tracks whether an image URL has failed to load, resetting automatically
+ *  when the URL itself changes (e.g. a fallback route getting replaced by a
+ *  resolved manifest URL once a fetch lands), so a transient failure on one
+ *  URL doesn't permanently hide a later working one. Shared by every
+ *  identity-icon renderer (`PluginIdentityIcon`, the activity-bar/dock pane
+ *  icon) so the reset-on-change logic lives in one tested place. */
+export function useAssetFailed(url: string | null | undefined): [boolean, () => void] {
+  const [failed, setFailed] = useState(false);
+  const [trackedUrl, setTrackedUrl] = useState(url);
+  if (url !== trackedUrl) {
+    setTrackedUrl(url);
+    setFailed(false);
+  }
+  return [failed, () => setFailed(true)];
 }
 
 /** Theme-backed classes per tone, shared by every slot renderer so a plugin's
