@@ -2716,7 +2716,7 @@ impl HomeView {
         // immutable borrow of `self` is dropped before the mutable `self.`
         // calls below (dialog construction, info_dialog assignment). A
         // structured (ACP) parent forks structured, so its captured ACP
-        // session id rides along; the field only exists under `serve`.
+        // session id rides along in serve-enabled builds.
         let Some(parent) = self
             .selected_session
             .as_ref()

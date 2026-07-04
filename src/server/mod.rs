@@ -2279,6 +2279,7 @@ impl PriorById {
 pub(crate) async fn reload_state_instances_from_disk(
     state: &Arc<AppState>,
     fresh: Vec<Instance>,
+    #[cfg(feature = "serve")] live_worker_records: Vec<crate::acp::worker_registry::WorkerRecord>,
     status_source: StatusSource,
 ) {
     // Snapshot suppression here so a worker that unmarks between the
@@ -2321,7 +2322,7 @@ pub(crate) async fn reload_state_instances_from_disk(
     }
 
     #[cfg(feature = "serve")]
-    let repairs = repair_structured_rows_from_live_workers(&mut merged);
+    let repairs = repair_structured_rows_from_live_workers(&mut merged, live_worker_records);
 
     #[cfg(feature = "serve")]
     apply_acp_overlay_inplace(&prior_by_id, &mut merged);
@@ -2369,15 +2370,23 @@ struct StructuredRowRepair {
 /// id qualify, so stale registry files and deliberate terminal-mode sessions
 /// are left alone.
 #[cfg(feature = "serve")]
-fn repair_structured_rows_from_live_workers(merged: &mut [Instance]) -> Vec<StructuredRowRepair> {
-    let Ok(records) = crate::acp::worker_registry::list() else {
-        return Vec::new();
-    };
+fn live_structured_worker_records() -> Vec<crate::acp::worker_registry::WorkerRecord> {
+    crate::acp::worker_registry::list()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(crate::acp::worker_registry::is_record_live)
+        .filter(|record| record.stored_acp_session_id.is_some())
+        .collect()
+}
+
+#[cfg(feature = "serve")]
+fn repair_structured_rows_from_live_workers(
+    merged: &mut [Instance],
+    records: Vec<crate::acp::worker_registry::WorkerRecord>,
+) -> Vec<StructuredRowRepair> {
     let live_by_id: std::collections::HashMap<String, crate::acp::worker_registry::WorkerRecord> =
         records
             .into_iter()
-            .filter(crate::acp::worker_registry::is_record_live)
-            .filter(|record| record.stored_acp_session_id.is_some())
             .map(|record| (record.session_id.clone(), record))
             .collect();
 
@@ -2727,30 +2736,39 @@ async fn disk_watcher_consumer(state: Arc<AppState>) {
         }
         let started = std::time::Instant::now();
         let file_watch_for_load = state.file_watch.clone();
-        let fresh =
-            match tokio::task::spawn_blocking(move || load_all_instances(&file_watch_for_load))
-                .await
-            {
-                Ok(Ok(v)) => v,
-                Ok(Err(e)) => {
-                    tracing::warn!(
-                        target: "server.file_watch",
-                        error = %e,
-                        "disk reload failed"
-                    );
-                    continue;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        target: "server.file_watch",
-                        error = %e,
-                        "spawn_blocking joined with error"
-                    );
-                    continue;
-                }
-            };
+        let loaded = match tokio::task::spawn_blocking(move || {
+            load_all_instances(&file_watch_for_load)
+                .map(|fresh| (fresh, live_structured_worker_records()))
+        })
+        .await
+        {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    target: "server.file_watch",
+                    error = %e,
+                    "disk reload failed"
+                );
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "server.file_watch",
+                    error = %e,
+                    "spawn_blocking joined with error"
+                );
+                continue;
+            }
+        };
+        let (fresh, live_worker_records) = loaded;
         let count = fresh.len();
-        reload_state_instances_from_disk(&state, fresh, StatusSource::DiskOnly).await;
+        reload_state_instances_from_disk(
+            &state,
+            fresh,
+            live_worker_records,
+            StatusSource::DiskOnly,
+        )
+        .await;
         tracing::trace!(
             target: "server.file_watch",
             latency_us = started.elapsed().as_micros() as u64,
@@ -3147,11 +3165,11 @@ async fn status_poll_loop(state: Arc<AppState>) {
                 let metadata = pane_metadata.get(&session_name);
                 inst.update_status_with_metadata(metadata);
             }
-            instances
+            (instances, live_structured_worker_records())
         })
         .await;
 
-        if let Ok(mut instances) = updated {
+        if let Ok((mut instances, live_worker_records)) = updated {
             // Diff BEFORE the helper: status_tx must observe the raw
             // post-suppression, post-tmux-scrape values, never the acp
             // overlay applied by the helper.
@@ -3209,7 +3227,13 @@ async fn status_poll_loop(state: Arc<AppState>) {
                 }
             }
 
-            reload_state_instances_from_disk(&state, instances, StatusSource::TmuxApplied).await;
+            reload_state_instances_from_disk(
+                &state,
+                instances,
+                live_worker_records,
+                StatusSource::TmuxApplied,
+            )
+            .await;
 
             // Drain poller observations into sessions.json so daemon-only
             // sessions (no attached TUI) persist post-`/clear` sids (#2291).
@@ -4391,12 +4415,23 @@ pub mod test_support {
     }
 
     pub async fn reload_disk_only_for_test(state: &Arc<AppState>, fresh: Vec<Instance>) {
-        super::reload_state_instances_from_disk(state, fresh, super::StatusSource::DiskOnly).await
+        super::reload_state_instances_from_disk(
+            state,
+            fresh,
+            Vec::new(),
+            super::StatusSource::DiskOnly,
+        )
+        .await
     }
 
     pub async fn reload_tmux_applied_for_test(state: &Arc<AppState>, fresh: Vec<Instance>) {
-        super::reload_state_instances_from_disk(state, fresh, super::StatusSource::TmuxApplied)
-            .await
+        super::reload_state_instances_from_disk(
+            state,
+            fresh,
+            Vec::new(),
+            super::StatusSource::TmuxApplied,
+        )
+        .await
     }
 }
 
@@ -4722,7 +4757,8 @@ mod tests {
         rows[0].id = "repair-live".to_string();
         rows[1].id = "repair-no-id".to_string();
 
-        let repairs = repair_structured_rows_from_live_workers(&mut rows);
+        let live_records = live_structured_worker_records();
+        let repairs = repair_structured_rows_from_live_workers(&mut rows, live_records);
 
         assert_eq!(repairs.len(), 1);
         assert_eq!(repairs[0].session_id, "repair-live");
@@ -5002,7 +5038,7 @@ mod tests {
             .await
             .expect("join")
             .expect("load");
-        reload_state_instances_from_disk(&state, fresh, StatusSource::DiskOnly).await;
+        reload_state_instances_from_disk(&state, fresh, Vec::new(), StatusSource::DiskOnly).await;
 
         let instances = state.instances.read().await;
         let titles: Vec<&str> = instances.iter().map(|i| i.title.as_str()).collect();
@@ -5062,7 +5098,7 @@ mod tests {
             .await
             .expect("join")
             .expect("load");
-        reload_state_instances_from_disk(&state, fresh, StatusSource::DiskOnly).await;
+        reload_state_instances_from_disk(&state, fresh, Vec::new(), StatusSource::DiskOnly).await;
 
         let instances = state.instances.read().await;
         assert!(

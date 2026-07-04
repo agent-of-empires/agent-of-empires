@@ -2284,7 +2284,6 @@ impl Instance {
         // worker supervisor spawns the ACP agent process directly;
         // calling start() on a structured view session is a no-op (status
         // updates flow through the ACP event channel, not tmux).
-        #[cfg(feature = "serve")]
         if self.is_structured() {
             return Ok(LaunchSidOutcome::Skipped);
         }
@@ -3621,7 +3620,6 @@ impl Instance {
             self.last_error_check = None;
         }
 
-        #[cfg(feature = "serve")]
         if self.is_structured() {
             let _ = self.start_with_size_opts(size, skip_on_launch)?;
             return Ok(StartOutcome::Fresh);
@@ -3847,7 +3845,6 @@ impl Instance {
         if matches!(self.status, Status::Creating | Status::Deleting) {
             return Err(EnsureReadyError::Transient(self.status));
         }
-        #[cfg(feature = "serve")]
         if self.is_structured() {
             return Err(EnsureReadyError::StructuredView);
         }
@@ -4022,7 +4019,6 @@ impl Instance {
         // worker supervisor owns their lifecycle and emits typed health
         // events over the broadcast. Probing tmux here only ever produces
         // a spurious "tmux session is gone" Error transition.
-        #[cfg(feature = "serve")]
         if self.is_structured() {
             // Clear any stale tmux-derived error so the UI doesn't show
             // a misleading message after a session is converted or
@@ -5554,7 +5550,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     fn test_ensure_pane_ready_bails_on_structured() {
         let mut inst = Instance::new("test", "/tmp/test");
@@ -6533,7 +6528,6 @@ mod tests {
         assert!(inst.apply_session_flags(&mut cmd, "test"));
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     fn start_with_size_opts_returns_skipped_for_structured() {
         let mut inst = Instance::new("Test", "/tmp/test");
