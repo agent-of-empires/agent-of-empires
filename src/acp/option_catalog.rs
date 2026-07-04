@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
@@ -23,6 +24,12 @@ use crate::acp::state::ConfigOptionDescriptor;
 
 const CATALOG_VERSION: u32 = 1;
 const CATALOG_FILE: &str = "acp_option_catalog.json";
+
+/// Serializes the load-modify-write cycle in `record` so concurrent
+/// `ConfigOptionsUpdated` events (the daemon fires one `spawn_blocking(record)`
+/// per event, and several agents run in parallel) cannot both load the same
+/// snapshot and clobber each other's just-written entry.
+static CATALOG_LOCK: Mutex<()> = Mutex::new(());
 
 /// The whole cache: one entry per agent name.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +101,9 @@ pub fn record(agent: &str, options: &[ConfigOptionDescriptor], now: String) -> a
         return Ok(());
     }
     let stripped = strip_current(options);
+    // Hold the lock across load -> mutate -> write; a poisoned lock still
+    // serializes (the guarded data is just `()`), so recover rather than panic.
+    let _guard = CATALOG_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut catalog = load();
     if catalog
         .agents
