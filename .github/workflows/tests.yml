@@ -19,15 +19,9 @@ jobs:
     # between the sequential legs is gone and the legs run in parallel. The
     # required-check context is the fan-in `cargo-linux-ok` job below (named
     # "Cargo Test (linux)"), NOT these shard jobs; keep that in sync with the
-    # branch ruleset if the leg set changes. The runner comes from a repo
-    # Actions variable so Blacksmith can be dropped without a commit when the
-    # monthly credit pool runs dry: clearing RUNNER_CARGO_LINUX in Settings ->
-    # Actions -> Variables falls back to the free GitHub-hosted runner on the
-    # next run. Jobs already queued for Blacksmith sit "queued" forever (GitHub
-    # has no runner fallback primitive), so flip the variable, then re-run the
-    # stuck workflow.
+    # branch ruleset if the leg set changes.
     name: Cargo Test (linux, ${{ matrix.leg }})
-    runs-on: ${{ vars.RUNNER_CARGO_LINUX || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
@@ -122,11 +116,9 @@ jobs:
     # container_config.rs; the integration and e2e crates exercise OS-portable
     # code the Linux legs already cover, so macOS only runs --lib --bins.
     # `--features serve` is a strict superset of the default suite, so a single
-    # run covers both feature gates. The runner comes from a repo Actions
-    # variable (clear RUNNER_CARGO_MACOS to fall back to the GitHub-hosted
-    # runner on the next run).
+    # run covers both feature gates.
     name: Cargo Test (macos)
-    runs-on: ${{ vars.RUNNER_CARGO_MACOS || 'macos-latest' }}
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -279,9 +271,7 @@ jobs:
 
   playwright:
     name: Playwright (mocked)
-    # Same Blacksmith-with-fallback scheme as the cargo job: clear
-    # RUNNER_PLAYWRIGHT_MOCKED to drop to the free GitHub runner.
-    runs-on: ${{ vars.RUNNER_PLAYWRIGHT_MOCKED || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
