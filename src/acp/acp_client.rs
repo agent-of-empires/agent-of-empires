@@ -8427,6 +8427,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn watchdog_background_then_stream_stall_recovers_on_base_grace() {
+        // #2645: a per-prompt turn launched a backgrounded Bash (latches the
+        // 30-min floor) and then streamed a partial message before the model
+        // stream died mid-chunk. Because the last timer refresh was a
+        // `Progress` (not a `BashOutput` poll), the watchdog must recover on
+        // the normal per-prompt grace (~120s), not ride the 30-min floor.
+        let cfg = watchdog_test_cfg();
+        let t0 = tokio::time::Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::new();
+        w.apply_signal(LifecycleSignal::Progress, t0, wall, cfg);
+        w.apply_signal(
+            LifecycleSignal::ToolCompleted {
+                id: "tc-bg-stall".into(),
+                succeeded: true,
+                off_protocol_work: Some(OffProtocolWorkKind::BackgroundCommand),
+            },
+            t0 + std::time::Duration::from_secs(1),
+            wall,
+            cfg,
+        );
+        // Model resumes streaming a partial message, then the stream dies.
+        w.apply_signal(
+            LifecycleSignal::Progress,
+            t0 + std::time::Duration::from_secs(2),
+            wall,
+            cfg,
+        );
+        assert_eq!(
+            w.off_protocol_work_seen(),
+            Some(OffProtocolWorkKind::BackgroundCommand),
+            "the backgrounded Bash is still latched",
+        );
+        // Before the base grace lapses: still suppressed.
+        assert!(!w.should_fire(t0 + std::time::Duration::from_secs(60), cfg));
+        // Past the base grace (120s from the last chunk at +2s): fires,
+        // instead of waiting the 30-min floor.
+        assert!(w.should_fire(t0 + std::time::Duration::from_secs(125), cfg));
+    }
+
+    #[tokio::test]
+    async fn watchdog_background_still_polling_rides_floor() {
+        // #2645 guard: a backgrounded Bash that is genuinely still producing
+        // output is polled via `BashOutput`, which surfaces as tool activity
+        // (ToolStarted / ToolCompleted) and clears `last_refresh_was_progress`.
+        // The watchdog must keep the 30-min floor so a live bash is not cut
+        // short even though a stream chunk preceded the last poll.
+        let cfg = watchdog_test_cfg();
+        let t0 = tokio::time::Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::new();
+        w.apply_signal(LifecycleSignal::Progress, t0, wall, cfg);
+        w.apply_signal(
+            LifecycleSignal::ToolCompleted {
+                id: "tc-bg-live".into(),
+                succeeded: true,
+                off_protocol_work: Some(OffProtocolWorkKind::BackgroundCommand),
+            },
+            t0 + std::time::Duration::from_secs(1),
+            wall,
+            cfg,
+        );
+        // Agent narrates ("still running..."), then polls the bash.
+        w.apply_signal(
+            LifecycleSignal::Progress,
+            t0 + std::time::Duration::from_secs(2),
+            wall,
+            cfg,
+        );
+        w.apply_signal(
+            LifecycleSignal::ToolStarted {
+                id: "tc-bashoutput".into(),
+                is_background_task: false,
+            },
+            t0 + std::time::Duration::from_secs(3),
+            wall,
+            cfg,
+        );
+        w.apply_signal(
+            LifecycleSignal::ToolCompleted {
+                id: "tc-bashoutput".into(),
+                succeeded: true,
+                off_protocol_work: None,
+            },
+            t0 + std::time::Duration::from_secs(4),
+            wall,
+            cfg,
+        );
+        // Last refresh was tool activity: the floor holds, no early fire.
+        assert!(!w.should_fire(t0 + std::time::Duration::from_secs(60 * 20), cfg));
+    }
+
+    #[tokio::test]
+    async fn watchdog_async_agent_stream_stall_still_rides_floor() {
+        // #2645 scope lock: the mid-stream-stall bypass is BackgroundCommand
+        // only. An AsyncAgent await is a genuinely invisible off-protocol
+        // wait, so even a stream chunk followed by silence must keep the
+        // 30-min floor (preserves #1360 and the monitor-kill fix).
+        let cfg = watchdog_test_cfg();
+        let t0 = tokio::time::Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::new();
+        w.apply_signal(LifecycleSignal::Progress, t0, wall, cfg);
+        w.apply_signal(
+            LifecycleSignal::ToolCompleted {
+                id: "tc-async".into(),
+                succeeded: true,
+                off_protocol_work: Some(OffProtocolWorkKind::AsyncAgent),
+            },
+            t0 + std::time::Duration::from_secs(1),
+            wall,
+            cfg,
+        );
+        w.apply_signal(
+            LifecycleSignal::Progress,
+            t0 + std::time::Duration::from_secs(2),
+            wall,
+            cfg,
+        );
+        assert_eq!(
+            w.off_protocol_work_seen(),
+            Some(OffProtocolWorkKind::AsyncAgent),
+        );
+        // Well past the base grace: still suppressed on the 30-min floor.
+        assert!(!w.should_fire(t0 + std::time::Duration::from_secs(200), cfg));
+        assert!(!w.should_fire(t0 + std::time::Duration::from_secs(60 * 25), cfg));
+    }
+
+    #[tokio::test]
     async fn watchdog_wakeup_suppresses_until_at_plus_off_protocol_floor() {
         let cfg = watchdog_test_cfg();
         let t0 = tokio::time::Instant::now();
