@@ -70,6 +70,22 @@ test.describe("Desktop live terminal input", () => {
     expect(sentCtrlV).toBe(false);
   });
 
+  test("Alt+V reaches the terminal as a Meta-v sequence", async ({ page }) => {
+    // Codex uses Alt+V as an image-paste shortcut in terminal mode. The live
+    // terminal must send the same bytes a native terminal sends: ESC + v.
+    const handle = await mockTerminalApis(page);
+    await page.goto("/");
+    await clickSidebarSession(page, "pinch-test");
+    await page.locator("[data-live-terminal]").first().waitFor({ state: "visible", timeout: 10_000 });
+    await page.locator("[data-live-terminal]").first().click();
+    await expect(page.locator('textarea[aria-label="Live terminal input"]').first()).toBeFocused();
+
+    const before = handle.liveMessages.length;
+    await page.keyboard.press("Alt+KeyV");
+
+    await expect.poll(() => handle.liveMessages.slice(before).map((m) => m.toString("utf8"))).toContainEqual("\x1bv");
+  });
+
   test("Ctrl+Shift+C copies the terminal selection without sending ^C", async ({ page }) => {
     // The hidden input is focused, so the browser's own copy targets the empty
     // textarea; the handler reads the rendered DOM selection and copies it

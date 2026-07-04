@@ -86,6 +86,34 @@ describe("MobileLiveTerminal paste", () => {
     expect(sendData).toHaveBeenCalledWith("\x1b[200~hello world\x1b[201~");
   });
 
+  it("sends Ctrl+V for image-only paste so terminal agents can read the host clipboard", () => {
+    const { input, sendData } = renderTerm();
+
+    fireEvent.paste(input, {
+      clipboardData: {
+        getData: (t: string) => (t === "text/plain" ? "" : ""),
+        items: [{ kind: "file", type: "image/png" }],
+      },
+    });
+
+    expect(sendData).toHaveBeenCalledWith("\x16");
+    expect(sendData).not.toHaveBeenCalledWith(expect.stringContaining("\x1b[200~"));
+  });
+
+  it("prefers bracketed text paste when clipboard text and image data are both present", () => {
+    const { input, sendData } = renderTerm();
+
+    fireEvent.paste(input, {
+      clipboardData: {
+        getData: (t: string) => (t === "text/plain" ? "caption" : ""),
+        items: [{ kind: "file", type: "image/png" }],
+      },
+    });
+
+    expect(sendData).toHaveBeenCalledWith("\x1b[200~caption\x1b[201~");
+    expect(sendData).not.toHaveBeenCalledWith("\x16");
+  });
+
   it("still sends Ctrl+C as SIGINT (other chords unchanged)", () => {
     const { input, sendData } = renderTerm();
     fireEvent.keyDown(input, { key: "c", ctrlKey: true });

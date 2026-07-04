@@ -142,6 +142,18 @@ const CURSOR_CELL_STYLE: CSSProperties = {
   outlineOffset: "-1px",
 };
 
+function altPrintableMetaKey(e: { key: string; code: string; shiftKey: boolean }): string | null {
+  const code = e.key.length === 1 ? e.key.charCodeAt(0) : 0;
+  const printable = code >= 0x20 && code <= 0x7e ? e.key : null;
+  if (printable) return printable;
+  // macOS Option+letter can surface as a composed symbol, such as
+  // Option+V yielding "√". Fall back to the physical key code so terminal
+  // agents still receive the Meta letter shortcut they expect.
+  if (!/^Key[A-Z]$/.test(e.code)) return null;
+  const letter = e.code.slice(3);
+  return e.shiftKey ? letter : letter.toLowerCase();
+}
+
 const Row = memo(function Row({ segs, cursorCol }: { segs: AnsiSegment[]; cursorCol: number | null }) {
   if (cursorCol == null) {
     if (segs.length === 0) return <div> </div>; // keep empty rows at full height
@@ -1026,12 +1038,7 @@ export function MobileLiveTerminal({
         return;
       }
       if (e.altKey && !e.ctrlKey && !e.metaKey) {
-        const code = e.key.length === 1 ? e.key.charCodeAt(0) : 0;
-        let metaKey = code >= 0x20 && code <= 0x7e ? e.key : null;
-        if (!metaKey && /^Key[A-Z]$/.test(e.code)) {
-          const letter = e.code.slice(3);
-          metaKey = e.shiftKey ? letter : letter.toLowerCase();
-        }
+        const metaKey = altPrintableMetaKey(e);
         if (metaKey) {
           e.preventDefault();
           sendData(`\x1b${metaKey}`);
@@ -1054,11 +1061,34 @@ export function MobileLiveTerminal({
     [sendData],
   );
 
+  const onKeyDownCapture = useCallback(
+    (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+      if (composingRef.current || e.nativeEvent.isComposing) return;
+      if (!e.altKey || e.ctrlKey || e.metaKey) return;
+      // Capture printable Alt chords before browser accelerators can claim
+      // shortcuts like Alt+V. Special keys are handled by the normal keydown
+      // path; only printable chords become terminal Meta sequences.
+      const metaKey = altPrintableMetaKey(e);
+      if (!metaKey) return;
+      e.preventDefault();
+      e.stopPropagation();
+      sendData(`\x1b${metaKey}`);
+    },
+    [sendData],
+  );
+
   const onPaste = useCallback(
     (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
       e.preventDefault();
       const text = e.clipboardData.getData("text/plain");
-      if (text) sendData(`\x1b[200~${text}\x1b[201~`);
+      if (text) {
+        sendData(`\x1b[200~${text}\x1b[201~`);
+        return;
+      }
+      const items = Array.from(e.clipboardData.items ?? []);
+      const hasImageItem = items.some((item) => item.kind === "file" && item.type.startsWith("image/"));
+      const hasImageFile = Array.from(e.clipboardData.files ?? []).some((file) => file.type.startsWith("image/"));
+      if (hasImageItem || hasImageFile) sendData("\x16");
     },
     [sendData],
   );
@@ -1239,6 +1269,7 @@ export function MobileLiveTerminal({
         autoCorrect="off"
         autoComplete="off"
         spellCheck={false}
+        onKeyDownCapture={onKeyDownCapture}
         onKeyDown={onKeyDown}
         onPaste={onPaste}
         onCompositionStart={onCompositionStart}
