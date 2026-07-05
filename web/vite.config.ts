@@ -32,7 +32,7 @@ export default defineConfig(({ mode, command }) => {
   })();
 
   // All AoE WebSocket routes live under `/sessions/{id}/` and include `ws`
-  // suffixes (`ws`, `acp/ws`) plus the capture-snapshot live terminal
+  // suffixes (`ws`, `acp/ws`) plus the capture-snapshot live view
   // `live-ws` routes. One regex covers them; REST (including `/api/acp/*`)
   // goes through `/api`.
   const proxy = httpTarget

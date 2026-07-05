@@ -11,7 +11,7 @@
 
 import { createRef } from "react";
 import { describe, expect, it, vi, beforeAll } from "vitest";
-import { fireEvent, render } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MobileLiveTerminal } from "../MobileLiveTerminal";
 import type { LiveFrame } from "../../hooks/useLiveTerminal";
 
@@ -69,6 +69,25 @@ function renderTerm() {
   return { input: inputRef.current!, sendData };
 }
 
+function stubKeyboardLayout(entries: [string, string][]) {
+  const original = Object.getOwnPropertyDescriptor(navigator, "keyboard");
+  const getLayoutMap = vi.fn().mockResolvedValue(new Map(entries));
+  Object.defineProperty(navigator, "keyboard", {
+    configurable: true,
+    value: { getLayoutMap },
+  });
+  return {
+    getLayoutMap,
+    restore: () => {
+      if (original) {
+        Object.defineProperty(navigator, "keyboard", original);
+      } else {
+        delete (navigator as Navigator & { keyboard?: unknown }).keyboard;
+      }
+    },
+  };
+}
+
 describe("MobileLiveTerminal paste", () => {
   it("does not swallow Ctrl+V into a literal ^V, and the paste event sends a bracketed paste", () => {
     const { input, sendData } = renderTerm();
@@ -98,6 +117,21 @@ describe("MobileLiveTerminal paste", () => {
 
     expect(sendData).toHaveBeenCalledWith("\x16");
     expect(sendData).not.toHaveBeenCalledWith(expect.stringContaining("\x1b[200~"));
+    expect(screen.getByRole("status").textContent).toContain("Sent image paste shortcut");
+  });
+
+  it("also detects image-only paste from clipboard files", () => {
+    const { input, sendData } = renderTerm();
+
+    fireEvent.paste(input, {
+      clipboardData: {
+        getData: (t: string) => (t === "text/plain" ? "" : ""),
+        items: [],
+        files: [new File([new Uint8Array([1])], "shot.png", { type: "image/png" })],
+      },
+    });
+
+    expect(sendData).toHaveBeenCalledWith("\x16");
   });
 
   it("prefers bracketed text paste when clipboard text and image data are both present", () => {
@@ -137,11 +171,52 @@ describe("MobileLiveTerminal paste", () => {
     expect(sendData).toHaveBeenCalledWith("\x1bv");
   });
 
+  it("uses Keyboard Layout Map before physical-code fallback when available", async () => {
+    const layout = stubKeyboardLayout([["KeyQ", "a"]]);
+    try {
+      const { input, sendData } = renderTerm();
+      await waitFor(() => expect(layout.getLayoutMap).toHaveBeenCalled());
+
+      expect(fireEvent.keyDown(input, { key: "æ", code: "KeyQ", altKey: true })).toBe(false);
+      expect(sendData).toHaveBeenCalledWith("\x1ba");
+    } finally {
+      layout.restore();
+    }
+  });
+
+  it("does not convert macOS dead keys into Meta letters", () => {
+    const { input, sendData } = renderTerm();
+
+    expect(fireEvent.keyDown(input, { key: "Dead", code: "KeyE", altKey: true })).toBe(true);
+    expect(sendData).not.toHaveBeenCalled();
+  });
+
+  it("does not send Alt+letter while IME composition is active", () => {
+    const { input, sendData } = renderTerm();
+
+    fireEvent.compositionStart(input);
+    expect(fireEvent.keyDown(input, { key: "v", code: "KeyV", altKey: true })).toBe(true);
+    expect(sendData).not.toHaveBeenCalled();
+  });
+
+  it("prefixes supported Alt special keys with terminal Meta", () => {
+    const { input, sendData } = renderTerm();
+
+    expect(fireEvent.keyDown(input, { key: "Enter", altKey: true })).toBe(false);
+    expect(sendData).toHaveBeenCalledWith("\x1b\r");
+
+    expect(fireEvent.keyDown(input, { key: "Backspace", altKey: true })).toBe(false);
+    expect(sendData).toHaveBeenCalledWith("\x1b\x7f");
+
+    expect(fireEvent.keyDown(input, { key: "ArrowRight", altKey: true })).toBe(false);
+    expect(sendData).toHaveBeenCalledWith("\x1b\x1b[C");
+  });
+
   it("leaves Ctrl+Alt printable chords alone for AltGr-style input", () => {
     const { input, sendData } = renderTerm();
 
     expect(fireEvent.keyDown(input, { key: "v", ctrlKey: true, altKey: true })).toBe(true);
-    expect(sendData).not.toHaveBeenCalledWith("\x1bv");
+    expect(sendData).not.toHaveBeenCalled();
   });
 
   it("copies the terminal selection on Ctrl+Shift+C without sending a control code", () => {

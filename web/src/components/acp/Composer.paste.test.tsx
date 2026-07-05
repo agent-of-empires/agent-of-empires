@@ -12,6 +12,11 @@ import type { Dispatch, SetStateAction } from "react";
 import { Composer } from "./Composer";
 import type { PromptAttachmentInput } from "../../lib/acpTypes";
 
+vi.mock("./useFilesIndex", () => ({
+  useFilesIndex: () => ({ files: [] }),
+  fuzzyFilter: <T,>(items: T[]) => items,
+}));
+
 function stubMatchMedia() {
   vi.stubGlobal(
     "matchMedia",
@@ -55,7 +60,9 @@ function Harness({
         connected
         turnActive={false}
         queuedCount={0}
+        queuedPrompts={[]}
         enqueuePrompt={() => {}}
+        editQueuedPrompt={() => {}}
         promptCapabilities={{ image: true, audio: false, embeddedContext: false }}
         pendingAttachments={[]}
         setPendingAttachments={setPendingAttachments}
@@ -74,13 +81,7 @@ function mountComposer(setPendingAttachments = vi.fn()) {
 beforeEach(() => {
   window.localStorage.clear();
   stubMatchMedia();
-  vi.stubGlobal(
-    "fetch",
-    vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({ files: [] }),
-    }),
-  );
+  vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("fetch not expected in paste flow")));
 });
 
 afterEach(() => {

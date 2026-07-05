@@ -142,16 +142,39 @@ const CURSOR_CELL_STYLE: CSSProperties = {
   outlineOffset: "-1px",
 };
 
-function altPrintableMetaKey(e: { key: string; code: string; shiftKey: boolean }): string | null {
+interface KeyboardLayoutReader {
+  get: (code: string) => string | undefined;
+}
+
+function layoutLetterForCode(layoutMap: KeyboardLayoutReader | null, code: string, shiftKey: boolean): string | null {
+  const mapped = layoutMap?.get(code);
+  if (!mapped || mapped.length !== 1 || !/^[a-z]$/i.test(mapped)) return null;
+  const letter = mapped.toLowerCase();
+  return shiftKey ? letter.toUpperCase() : letter;
+}
+
+function altPrintableMetaKey(
+  e: { key: string; code: string; shiftKey: boolean },
+  layoutMap: KeyboardLayoutReader | null,
+): string | null {
+  if (e.key === "Dead") return null;
   const code = e.key.length === 1 ? e.key.charCodeAt(0) : 0;
   const printable = code >= 0x20 && code <= 0x7e ? e.key : null;
   if (printable) return printable;
   // macOS Option+letter can surface as a composed symbol, such as
-  // Option+V yielding "√". Fall back to the physical key code so terminal
-  // agents still receive the Meta letter shortcut they expect.
+  // Option+V yielding "√". Prefer the browser's logical layout map when
+  // present (AZERTY KeyQ -> "a"), then fall back to the physical letter.
+  // The physical-key fallback is letter-only; digits and punctuation rely on
+  // `e.key` being ASCII-printable above.
   if (!/^Key[A-Z]$/.test(e.code)) return null;
+  const mapped = layoutLetterForCode(layoutMap, e.code, e.shiftKey);
+  if (mapped) return mapped;
   const letter = e.code.slice(3);
   return e.shiftKey ? letter : letter.toLowerCase();
+}
+
+function isLocalClipboardHost(hostname: string): boolean {
+  return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
 }
 
 const Row = memo(function Row({ segs, cursorCol }: { segs: AnsiSegment[]; cursorCol: number | null }) {
@@ -264,6 +287,35 @@ export function MobileLiveTerminal({
   }
   const scrollerRef = useRef<HTMLDivElement>(null);
   const measureRef = useRef<HTMLSpanElement>(null);
+  const keyboardLayoutRef = useRef<KeyboardLayoutReader | null>(null);
+  const [imagePasteStatus, setImagePasteStatus] = useState<string | null>(null);
+  const imagePasteStatusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    const keyboard = (
+      navigator as Navigator & {
+        keyboard?: { getLayoutMap?: () => Promise<KeyboardLayoutReader> };
+      }
+    ).keyboard;
+    let cancelled = false;
+    keyboard
+      ?.getLayoutMap?.()
+      .then((layoutMap) => {
+        if (!cancelled) keyboardLayoutRef.current = layoutMap;
+      })
+      .catch(() => {
+        // Firefox/Safari do not expose Keyboard Layout Map; the physical
+        // Key* fallback below preserves the previous behavior there.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  useEffect(
+    () => () => {
+      if (imagePasteStatusTimerRef.current) clearTimeout(imagePasteStatusTimerRef.current);
+    },
+    [],
+  );
 
   const lineH = fontSize * LINE_RATIO;
   // Real rendered glyph advance, measured off a hidden span INSIDE the
@@ -1022,7 +1074,17 @@ export function MobileLiveTerminal({
       })();
       if (seq) {
         e.preventDefault();
-        sendData(seq);
+        const metaSpecial =
+          e.altKey &&
+          !e.ctrlKey &&
+          !e.metaKey &&
+          (e.key === "Enter" ||
+            e.key === "Backspace" ||
+            e.key === "ArrowUp" ||
+            e.key === "ArrowDown" ||
+            e.key === "ArrowRight" ||
+            e.key === "ArrowLeft");
+        sendData(metaSpecial ? `\x1b${seq}` : seq);
         return;
       }
       // Ctrl+Shift+C copies the current terminal selection (the terminal-
@@ -1036,14 +1098,6 @@ export function MobileLiveTerminal({
         const text = window.getSelection()?.toString() ?? "";
         if (text) void writeClipboard(text);
         return;
-      }
-      if (e.altKey && !e.ctrlKey && !e.metaKey) {
-        const metaKey = altPrintableMetaKey(e);
-        if (metaKey) {
-          e.preventDefault();
-          sendData(`\x1b${metaKey}`);
-          return;
-        }
       }
       // Hardware Ctrl+letter chords (bluetooth keyboards). Ctrl+V (and
       // Ctrl+Shift+V) is the exception: on Linux/Windows it is the paste
@@ -1068,7 +1122,7 @@ export function MobileLiveTerminal({
       // Capture printable Alt chords before browser accelerators can claim
       // shortcuts like Alt+V. Special keys are handled by the normal keydown
       // path; only printable chords become terminal Meta sequences.
-      const metaKey = altPrintableMetaKey(e);
+      const metaKey = altPrintableMetaKey(e, keyboardLayoutRef.current);
       if (!metaKey) return;
       e.preventDefault();
       e.stopPropagation();
@@ -1085,10 +1139,25 @@ export function MobileLiveTerminal({
         sendData(`\x1b[200~${text}\x1b[201~`);
         return;
       }
+      // Image-only browser paste cannot stream file bytes through the PTY.
+      // Items cover Chromium's clipboard shape; files covers Safari-like
+      // flows. Text wins above when both are present. `\x16` is raw Ctrl+V,
+      // which asks terminal agents to run their native host-clipboard image
+      // paste flow.
       const items = Array.from(e.clipboardData.items ?? []);
       const hasImageItem = items.some((item) => item.kind === "file" && item.type.startsWith("image/"));
       const hasImageFile = Array.from(e.clipboardData.files ?? []).some((file) => file.type.startsWith("image/"));
-      if (hasImageItem || hasImageFile) sendData("\x16");
+      if (hasImageItem || hasImageFile) {
+        sendData("\x16");
+        setImagePasteStatus("Sent image paste shortcut to the terminal agent.");
+        if (imagePasteStatusTimerRef.current) clearTimeout(imagePasteStatusTimerRef.current);
+        imagePasteStatusTimerRef.current = setTimeout(() => setImagePasteStatus(null), 4000);
+        if (!isLocalClipboardHost(location.hostname)) {
+          console.warn(
+            "Image-only live-terminal paste sent Ctrl+V to the remote terminal. The agent reads the server-side clipboard, not the browser clipboard.",
+          );
+        }
+      }
     },
     [sendData],
   );
@@ -1134,6 +1203,14 @@ export function MobileLiveTerminal({
 
   return (
     <div className="absolute inset-0" data-live-terminal>
+      {imagePasteStatus && (
+        <div
+          role="status"
+          className="absolute top-3 left-1/2 z-10 -translate-x-1/2 rounded-md border border-surface-700 bg-surface-900/95 px-3 py-1.5 text-xs text-text-primary shadow-lg"
+        >
+          {imagePasteStatus}
+        </div>
+      )}
       <div
         ref={scrollerRef}
         onScroll={onScroll}
@@ -1269,6 +1346,7 @@ export function MobileLiveTerminal({
         autoCorrect="off"
         autoComplete="off"
         spellCheck={false}
+        // Capture phase claims Alt+letter before browser accelerators.
         onKeyDownCapture={onKeyDownCapture}
         onKeyDown={onKeyDown}
         onPaste={onPaste}
