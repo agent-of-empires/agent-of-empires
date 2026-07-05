@@ -2123,3 +2123,66 @@ mod acp_reject_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod import_tests {
+    use super::*;
+    use crate::session::claude_import::ClaudeSessionSummary;
+
+    fn summary(id: &str, cwd: &str, title: Option<&str>) -> ClaudeSessionSummary {
+        ClaudeSessionSummary {
+            session_id: id.to_string(),
+            cwd: cwd.to_string(),
+            title: title.map(str::to_string),
+            last_modified_ms: 0,
+            cwd_exists: true,
+        }
+    }
+
+    #[test]
+    fn terminal_import_pins_resume_target() {
+        let s = summary("abc123-def456", "/home/me/proj", Some("Fix bug"));
+        let inst = build_import_instance(&s, false, "");
+        assert_eq!(inst.tool, "claude");
+        assert_eq!(inst.project_path, "/home/me/proj");
+        assert_eq!(inst.title, "Fix bug");
+        assert_eq!(
+            inst.resume_intent,
+            ResumeIntent::Use("abc123-def456".to_string())
+        );
+    }
+
+    #[test]
+    fn title_falls_back_to_short_id() {
+        let s = summary("abcdef12-3456-7890", "/home/me/proj", None);
+        let inst = build_import_instance(&s, false, "team/imports");
+        assert_eq!(inst.title, "Claude import abcdef12");
+        assert_eq!(inst.group_path, "team/imports");
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn structured_import_seeds_replay_fields() {
+        let s = summary("sid-1", "/home/me/proj", Some("x"));
+        let inst = build_import_instance(&s, true, "");
+        assert!(inst.is_structured());
+        assert_eq!(inst.acp_session_id.as_deref(), Some("sid-1"));
+        assert_eq!(inst.import_pending, Some(true));
+        // Structured imports do not pin a terminal resume target.
+        assert_eq!(inst.resume_intent, ResumeIntent::Default);
+    }
+
+    #[test]
+    fn already_imported_matches_resume_and_observed_ids() {
+        let mut by_resume = Instance::new("a", "/p");
+        by_resume.resume_intent = ResumeIntent::Use("id-1".to_string());
+        let mut by_observed = Instance::new("b", "/p");
+        by_observed.agent_session_id = Some("id-2".to_string());
+        let fresh = Instance::new("c", "/p");
+        let instances = vec![by_resume, by_observed, fresh];
+
+        assert!(already_imported(&instances, "id-1"));
+        assert!(already_imported(&instances, "id-2"));
+        assert!(!already_imported(&instances, "id-3"));
+    }
+}
