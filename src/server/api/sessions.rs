@@ -4205,7 +4205,7 @@ pub async fn create_session(
         let import_cwd = body.path.trim().to_string();
         let import_id_owned = import_id.to_string();
         let belongs = tokio::task::spawn_blocking(move || {
-            crate::acp::claude_import::scan_sessions()
+            crate::session::claude_import::scan_sessions()
                 .into_iter()
                 .any(|s| s.session_id == import_id_owned && s.cwd == import_cwd)
         })

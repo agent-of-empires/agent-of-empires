@@ -2218,7 +2218,7 @@ pub async fn list_claude_sessions(State(state): State<Arc<AppState>>) -> impl In
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
-    let mut sessions = tokio::task::spawn_blocking(crate::acp::claude_import::scan_sessions)
+    let mut sessions = tokio::task::spawn_blocking(crate::session::claude_import::scan_sessions)
         .await
         .unwrap_or_default();
     // Drop sessions AoE owns: importing one is a no-op and they are noise in
@@ -2264,7 +2264,7 @@ pub async fn list_claude_sessions(State(state): State<Arc<AppState>>) -> impl In
     });
     // Cap AFTER ownership filtering so a burst of AoE-managed sessions can't
     // push real imports off the (newest-first) list. See #2276.
-    sessions.truncate(crate::acp::claude_import::MAX_SESSIONS);
+    sessions.truncate(crate::session::claude_import::MAX_SESSIONS);
     Json(sessions).into_response()
 }
 

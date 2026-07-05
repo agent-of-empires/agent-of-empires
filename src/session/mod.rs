@@ -4,6 +4,10 @@ pub mod artifacts;
 pub mod builder;
 pub(crate) mod capture;
 pub mod civilizations;
+// Discovery of on-disk Claude Code sessions. Lives here (not under the
+// serve-gated `acp` module) because terminal/tmux import via the CLI works in
+// every build; only the structured-view import path needs `serve`.
+pub mod claude_import;
 pub mod config;
 pub(crate) mod container_config;
 pub mod deletion;
