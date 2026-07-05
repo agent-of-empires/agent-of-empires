@@ -94,7 +94,7 @@ pub enum SessionCommands {
 pub struct ImportArgs {
     /// Directories to scan. Only Claude sessions whose recorded working
     /// directory is at or under one of these are imported. Defaults to the
-    /// current directory. Ignored with `--all`.
+    /// current directory. Cannot be combined with `--all`.
     pub paths: Vec<String>,
 
     /// Import every discoverable Claude session, ignoring the path filter.

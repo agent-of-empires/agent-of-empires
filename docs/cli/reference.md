@@ -628,7 +628,7 @@ Import existing Claude Code sessions from disk. Scans the given path(s) (default
 
 ###### **Arguments:**
 
-* `<PATHS>` — Directories to scan. Only Claude sessions whose recorded working directory is at or under one of these are imported. Defaults to the current directory. Ignored with `--all`
+* `<PATHS>` — Directories to scan. Only Claude sessions whose recorded working directory is at or under one of these are imported. Defaults to the current directory. Cannot be combined with `--all`
 
 ###### **Options:**
 
