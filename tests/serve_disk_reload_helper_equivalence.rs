@@ -40,7 +40,7 @@ async fn reload_state_instances_from_disk_disk_only_preserves_prior_status() {
     fresh.status = Status::Idle;
     fresh.last_accessed_at = Some(chrono::Utc.with_ymd_and_hms(2024, 5, 1, 0, 0, 0).unwrap());
 
-    reload_disk_only_for_test(&state, vec![fresh]).await;
+    reload_disk_only_for_test(&state, vec![fresh], Vec::new()).await;
 
     let result = state.instances.read().await;
     assert_eq!(result.len(), 1);
@@ -86,7 +86,7 @@ async fn reload_state_instances_from_disk_tmux_applied_takes_fresh_status() {
     fresh.status = Status::Running;
     fresh.last_accessed_at = Some(chrono::Utc.with_ymd_and_hms(2024, 5, 1, 0, 0, 0).unwrap());
 
-    reload_tmux_applied_for_test(&state, vec![fresh]).await;
+    reload_tmux_applied_for_test(&state, vec![fresh], Vec::new()).await;
 
     let result = state.instances.read().await;
     assert_eq!(result.len(), 1);
@@ -121,7 +121,7 @@ async fn reload_state_instances_from_disk_new_ids_use_fresh() {
     let state = build_test_app_state(vec![prior]);
     let new_inst = Instance::new("new", "/tmp/new");
     let new_id = new_inst.id.clone();
-    reload_disk_only_for_test(&state, vec![new_inst]).await;
+    reload_disk_only_for_test(&state, vec![new_inst], Vec::new()).await;
     let result = state.instances.read().await;
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].id, new_id);

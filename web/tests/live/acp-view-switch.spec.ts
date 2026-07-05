@@ -28,6 +28,17 @@ test("view switch round-trips between tmux and structured view", async ({}, test
     // `aoe add` defaults to tmux mode.
     expect(sessionsBefore[0]!.view === "structured").toBeFalsy();
 
+    const spawnBeforeEnable = await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/acp/spawn`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    expect(spawnBeforeEnable.status).toBe(409);
+    const spawnBeforeEnableBody = (await spawnBeforeEnable.json()) as {
+      error?: string;
+    };
+    expect(spawnBeforeEnableBody.error).toBe("not_structured");
+
     // tmux -> structured view
     const enableRes = await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/acp/enable`, { method: "POST" });
     expect(enableRes.ok).toBeTruthy();

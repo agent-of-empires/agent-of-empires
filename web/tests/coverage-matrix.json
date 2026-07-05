@@ -1694,7 +1694,11 @@
         "tests/live/acp-cancel.spec.ts",
         "tests/live/acp-lagged-ws.spec.ts"
       ],
-      "components": ["web/src/components/acp/ContextPrimerBanner.tsx", "web/src/components/acp/useFilesIndex.ts"]
+      "components": [
+        "src/server/api/acp.rs",
+        "web/src/components/acp/ContextPrimerBanner.tsx",
+        "web/src/components/acp/useFilesIndex.ts"
+      ]
     },
     {
       "id": "acp.tool-output-media",

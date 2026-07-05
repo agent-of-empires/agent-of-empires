@@ -328,7 +328,7 @@ pub fn mark_detached(session_id: &str) {
 /// of `session/new` on reattach.
 pub fn update_stored_acp_session_id(session_id: &str, acp_id: Option<&str>) {
     if let Ok(Some(mut rec)) = load(session_id) {
-        rec.stored_acp_session_id = acp_id.map(|s| s.to_string());
+        rec.stored_acp_session_id = acp_id.filter(|s| !s.is_empty()).map(|s| s.to_string());
         if let Err(e) = save(&rec) {
             debug!(
                 target: "acp.registry",
@@ -663,6 +663,30 @@ mod tests {
             save(&rec).unwrap();
             let loaded = load("sess-sp").unwrap().unwrap();
             assert_eq!(loaded.source_profile.as_deref(), Some("personal"));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn empty_stored_acp_session_id_normalizes_to_none() {
+        with_temp_home(|| {
+            let rec = WorkerRecord::new(
+                "sess-empty-acp".into(),
+                1,
+                PathBuf::from("/tmp/sess-empty-acp.sock"),
+                "aoe-agent".into(),
+                "aoe-agent".into(),
+                PathBuf::from("/repo"),
+                None,
+                vec![],
+                vec![],
+                Some("initial-acp".into()),
+                None,
+            );
+            save(&rec).unwrap();
+            update_stored_acp_session_id("sess-empty-acp", Some(""));
+            let loaded = load("sess-empty-acp").unwrap().unwrap();
+            assert_eq!(loaded.stored_acp_session_id, None);
         });
     }
 

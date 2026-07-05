@@ -1651,10 +1651,10 @@ impl Instance {
         self.yolo_mode
     }
 
-    /// True when this session renders in the structured (ACP) view rather
-    /// than a tmux pane. The persisted field exists in every build so
-    /// non-serve writers preserve structured sessions instead of downgrading
-    /// them to terminal rows.
+    /// True when this session renders in the structured (ACP) view. The
+    /// persisted `view` field exists in every build so non-serve writers
+    /// round-trip it intact; rows damaged by pre-fix writers are healed on
+    /// reload by the server's structured row repair path.
     pub fn is_structured(&self) -> bool {
         self.view == View::Structured
     }

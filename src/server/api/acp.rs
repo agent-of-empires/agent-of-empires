@@ -267,6 +267,17 @@ pub(crate) fn read_only_block(state: &AppState) -> Option<axum::response::Respon
     None
 }
 
+fn not_structured_response() -> axum::response::Response {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "error": "not_structured",
+            "message": "Switch the session to structured view before starting an ACP worker",
+        })),
+    )
+        .into_response()
+}
+
 pub async fn spawn_acp(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -279,21 +290,17 @@ pub async fn spawn_acp(
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
     };
-    let instances = state.instances.read().await;
-    let Some(instance) = instances.iter().find(|i| i.id == id).cloned() else {
-        return (StatusCode::NOT_FOUND, "session not found").into_response();
+    let inst_lock = state.instance_lock(&id).await;
+    let instance = {
+        let instances = state.instances.read().await;
+        let Some(instance) = instances.iter().find(|i| i.id == id).cloned() else {
+            return (StatusCode::NOT_FOUND, "session not found").into_response();
+        };
+        if !instance.is_structured() {
+            return not_structured_response();
+        }
+        instance
     };
-    drop(instances);
-    if !instance.is_structured() {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": "not_structured",
-                "message": "Switch the session to structured view before starting an ACP worker",
-            })),
-        )
-            .into_response();
-    }
 
     // Pick the structured view agent: explicit request override > stored
     // agent_name on the instance > registry entry keyed on the
@@ -327,7 +334,6 @@ pub async fn spawn_acp(
     // parent id instead of session/new. Cleared once the forked id lands.
     let fork_from = instance.fork_pending.clone();
 
-    let inst_lock = state.instance_lock(&id).await;
     let sandbox_info = match crate::acp::sandbox::ensure_container_for_session(
         &state.instances,
         &inst_lock,
@@ -1780,6 +1786,7 @@ pub async fn acp_disable(
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
+    let _inst_lock = state.instance_lock(&id).await;
     let (mut instance, profile) = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id).cloned() else {
