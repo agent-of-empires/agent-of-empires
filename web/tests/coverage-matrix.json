@@ -108,10 +108,27 @@
       "components": ["web/src/components/MobileLiveTerminal.tsx"]
     },
     {
+      "id": "terminal.live-clickable-urls",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/lib/liveTermLines.test.ts", "src/components/__tests__/MobileLiveTerminal.linkify.test.tsx"],
+      "components": ["web/src/components/MobileLiveTerminal.tsx"]
+    },
+    {
       "id": "terminal.live-cursor-wide-chars",
       "kind": "vitest",
       "risk": "high",
       "specs": ["src/components/__tests__/MobileLiveTerminal.cjkCursor.test.tsx", "src/lib/liveTermLines.test.ts"],
+      "components": ["web/src/components/MobileLiveTerminal.tsx"]
+    },
+    {
+      "id": "terminal.live-cursor-focus-fill",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/__tests__/MobileLiveTerminal.cursorFocus.test.tsx",
+        "src/components/__tests__/MobileLiveTerminal.cursorFocusIntegration.test.tsx"
+      ],
       "components": ["web/src/components/MobileLiveTerminal.tsx"]
     },
     {

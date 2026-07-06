@@ -2974,35 +2974,47 @@ fn build_sandbox_docker_argv(
     })
 }
 
+/// Env vars forwarded from the operator environment to every spawned
+/// agent, on both the detached-runner path (`apply_env_filter`) and the
+/// in-proc stdio path (`spawn_subprocess`). Both spawn sites `env_clear()`
+/// first, so this is the whole inheritance surface; keeping it in one const
+/// is what stops the two paths drifting apart.
+const ALWAYS_FORWARD_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    // XDG_CONFIG_HOME drives `get_app_dir()` on Linux (see
+    // src/session/mod.rs). Without forwarding, the runner falls
+    // back to `$HOME/.config/agent-of-empires[-dev]`, which
+    // diverges from the daemon when the operator (or live test
+    // harness) has set XDG_CONFIG_HOME to a non-default value.
+    // The runner then writes its WorkerRecord to a path the
+    // daemon never reads, the daemon's `reap_user_stopped`
+    // observes the registry as missing on the next tick, emits
+    // `Stopped { user_stopped }`, and respawns, turning a fine
+    // worker into a respawn loop. See #1383 (CI Linux live
+    // specs under an isolated $XDG_CONFIG_HOME).
+    "XDG_CONFIG_HOME",
+    "LANG",
+    "LC_ALL",
+    "TERM",
+    "USER",
+    // Path to the operator's ssh-agent socket. Forwarding it lets the
+    // agent's git subprocess authenticate over SSH; without it, git SSH
+    // has no agent to connect to (most visible on Linux, where the socket
+    // lives in the environment). The value is a socket path, not a secret;
+    // the security lives in the ssh-agent behind it. See #2691.
+    "SSH_AUTH_SOCK",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CONFIG_DIR",
+];
+
 /// Apply the env_clear + allowlist + provider_env filtering used by both
 /// the detached-runner path and the in-proc stdio path. Pulled out so
 /// the two spawn sites share the same security posture.
 fn apply_env_filter(cmd: &mut std::process::Command, config: &SpawnConfig) {
-    const ALWAYS_FORWARD: &[&str] = &[
-        "PATH",
-        "HOME",
-        // XDG_CONFIG_HOME drives `get_app_dir()` on Linux (see
-        // src/session/mod.rs). Without forwarding, the runner falls
-        // back to `$HOME/.config/agent-of-empires[-dev]`, which
-        // diverges from the daemon when the operator (or live test
-        // harness) has set XDG_CONFIG_HOME to a non-default value.
-        // The runner then writes its WorkerRecord to a path the
-        // daemon never reads, the daemon's `reap_user_stopped`
-        // observes the registry as missing on the next tick, emits
-        // `Stopped { user_stopped }`, and respawns, turning a fine
-        // worker into a respawn loop. See #1383 (CI Linux live
-        // specs under an isolated $XDG_CONFIG_HOME).
-        "XDG_CONFIG_HOME",
-        "LANG",
-        "LC_ALL",
-        "TERM",
-        "USER",
-        "ANTHROPIC_API_KEY",
-        "ANTHROPIC_AUTH_TOKEN",
-        "CLAUDE_CODE_OAUTH_TOKEN",
-        "CLAUDE_CONFIG_DIR",
-    ];
-    for name in ALWAYS_FORWARD {
+    for name in ALWAYS_FORWARD_ENV {
         if let Ok(value) = std::env::var(name) {
             cmd.env(name, value);
         }
@@ -3074,32 +3086,14 @@ fn spawn_subprocess(config: &SpawnConfig) -> Result<tokio::process::Child, AcpEr
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    // Env: clear, then forward an explicit allowlist + provider-specific
-    // creds. AOE_TOKEN must NEVER reach the agent.
+    // Env: clear, then forward the shared allowlist + provider-specific
+    // creds. AOE_TOKEN must NEVER reach the agent. Uses the same
+    // `ALWAYS_FORWARD_ENV` const as the runner path so the two spawn
+    // sites cannot drift; provider auth (`ANTHROPIC_API_KEY`, etc.) and
+    // `SSH_AUTH_SOCK` for git-over-SSH ride along in that list.
     cmd.env_clear();
-    let always_forward = [
-        "PATH",
-        "HOME",
-        // Mirror the runner-mode ALWAYS_FORWARD: XDG_CONFIG_HOME drives
-        // `get_app_dir()` on Linux, so the stdio agent must see the
-        // same value the daemon resolved against (otherwise a custom
-        // XDG_CONFIG_HOME diverges between daemon and agent).
-        "XDG_CONFIG_HOME",
-        "LANG",
-        "LC_ALL",
-        "TERM",
-        "USER",
-        // Provider auth: forwarded by default so users who already have
-        // `ANTHROPIC_API_KEY` (or have run `claude /login` so their
-        // ~/.claude credentials sit under HOME) get a working agent
-        // without manual env_allowlist plumbing.
-        "ANTHROPIC_API_KEY",
-        "ANTHROPIC_AUTH_TOKEN",
-        "CLAUDE_CODE_OAUTH_TOKEN",
-        "CLAUDE_CONFIG_DIR",
-    ];
     let mut forwarded_keys: Vec<&str> = Vec::new();
-    for name in always_forward {
+    for &name in ALWAYS_FORWARD_ENV {
         if let Ok(mut value) = std::env::var(name) {
             // Prepend the resolved bin dir to PATH so the adapter's own
             // `node`/`npx` lookups land in the same node install as the
@@ -11113,6 +11107,16 @@ mod tests {
         assert!(provider_env_denyreason("AOE_AGENT_MODEL").is_none());
         // Custom provider keys should pass through.
         assert!(provider_env_denyreason("MY_CUSTOM_VAR").is_none());
+    }
+
+    #[test]
+    fn always_forward_env_includes_ssh_auth_sock() {
+        // Regression guard for #2691: without SSH_AUTH_SOCK in the shared
+        // forward list, git-over-SSH has no ssh-agent socket to reach.
+        // Both spawn paths (`apply_env_filter`, `spawn_subprocess`) read
+        // this one const, so its membership is also the parity guarantee
+        // between the runner path and the in-proc stdio path.
+        assert!(ALWAYS_FORWARD_ENV.contains(&"SSH_AUTH_SOCK"));
     }
 
     #[test]
