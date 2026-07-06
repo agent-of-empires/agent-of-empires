@@ -46,6 +46,16 @@ pub async fn ensure_container_for_session(
     // existence check and the container create.
     let _guard = instance_lock.lock().await;
 
+    ensure_container_for_session_locked(instances, session_id, run_on_launch_hooks).await
+}
+
+/// Ensure the sandbox container while the caller already holds the
+/// per-session instance mutex.
+pub async fn ensure_container_for_session_locked(
+    instances: &RwLock<Vec<Instance>>,
+    session_id: &str,
+    run_on_launch_hooks: bool,
+) -> Result<Option<SandboxInfo>> {
     // Phase 1: short read on the instance list. Clone the Instance so
     // the docker work can run on a blocking thread without holding
     // any tokio lock.
