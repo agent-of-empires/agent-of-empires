@@ -46,7 +46,7 @@ pub use plugins::{
 pub use projects::{create_project, delete_project, list_projects, update_project};
 pub use sessions::{
     create_session, delete_session, ensure_container_terminal, ensure_session, ensure_terminal,
-    force_smart_rename, get_recent_projects, kill_terminal, list_sessions,
+    force_smart_rename, get_recent_projects, kill_terminal, list_sessions, paste_image,
     preview_volume_ignores_globs, read_output, rename_session, restore_session, search_sessions,
     send_message, serve_session_artifact, session_diff_file, session_diff_files, set_worktree_name,
     start_session, stop_session, trash_session, update_session_archive, update_session_diff_base,

@@ -1487,6 +1487,13 @@ fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/sessions/{id}/ensure", post(api::ensure_session))
         .route("/api/sessions/{id}/send", post(api::send_message))
+        .route(
+            "/api/sessions/{id}/paste-image",
+            // A base64 screenshot blows past the global 1 MiB cap. 8 MiB
+            // leaves headroom for the 5 MiB decoded cap (enforced in the
+            // handler) plus base64's ~33% overhead and JSON framing.
+            post(api::paste_image).layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024)),
+        )
         .route("/api/sessions/{id}/output", get(api::read_output))
         .route(
             "/api/sessions/{id}/notifications",

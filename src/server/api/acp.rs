@@ -59,7 +59,7 @@ fn mime_allowed(kind: PromptAttachmentKind, mime: &str) -> bool {
 /// True if `bytes` start with a magic-number signature for a supported
 /// raster image. Guards against a client mislabeling arbitrary bytes as
 /// `image/png` to smuggle them past the allowlist.
-fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
+pub(crate) fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
     if bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) {
         Some("image/png")
     } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
