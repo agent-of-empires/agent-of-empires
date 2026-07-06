@@ -2982,6 +2982,39 @@ fn decrement_reported_count(counter: &std::sync::atomic::AtomicU32, reported: u3
     });
 }
 
+/// What to do with one instance's status_poll_loop diff, once a genuine
+/// `old != inst.status` transition (against the tick's `prev` snapshot) has
+/// already been established by the caller.
+struct PassiveTransitionDecision {
+    /// `None` for structured (ACP) sessions: their `status` isn't
+    /// poller-authoritative (see the `is_structured()` guard in
+    /// `update_status_with_metadata_inner`, and `apply_acp_overlay_inplace`,
+    /// which is the sole authority for their status/timestamps). Persisting
+    /// a patch here would write a bogus tmux-derived status to disk for a
+    /// session the poller never actually controls. Regression: #2697.
+    patch: Option<crate::session::PassiveStatusPatch>,
+    mark_unread: bool,
+}
+
+fn decide_passive_transition(
+    inst: &Instance,
+    old_status: Status,
+    unread_enabled: bool,
+    now: chrono::DateTime<chrono::Utc>,
+) -> PassiveTransitionDecision {
+    let patch = (!inst.is_structured()).then(|| crate::session::PassiveStatusPatch {
+        id: inst.id.clone(),
+        status: inst.status,
+        idle_entered_at: inst.idle_entered_at,
+        last_accessed_at: inst.last_accessed_at.unwrap_or(now),
+    });
+    let mark_unread = unread_enabled
+        && old_status == Status::Running
+        && inst.status == Status::Idle
+        && !inst.unread;
+    PassiveTransitionDecision { patch, mark_unread }
+}
+
 /// Background task that periodically refreshes session statuses. On each
 /// tick, diffs pre- and post-refresh statuses and emits a `StatusChange`
 /// on `state.status_tx` for every transition. Keeping the diff here,
@@ -3092,20 +3125,14 @@ async fn status_poll_loop(state: Arc<AppState>) {
                     new: inst.status,
                     at: now,
                 });
-                patches_by_profile
-                    .entry(inst.source_profile.clone())
-                    .or_default()
-                    .push(crate::session::PassiveStatusPatch {
-                        id: inst.id.clone(),
-                        status: inst.status,
-                        idle_entered_at: inst.idle_entered_at,
-                        last_accessed_at: inst.last_accessed_at.unwrap_or(now),
-                    });
-                if unread_enabled
-                    && *old == Status::Running
-                    && inst.status == Status::Idle
-                    && !inst.unread
-                {
+                let decision = decide_passive_transition(inst, *old, unread_enabled, now);
+                if let Some(patch) = decision.patch {
+                    patches_by_profile
+                        .entry(inst.source_profile.clone())
+                        .or_default()
+                        .push(patch);
+                }
+                if decision.mark_unread {
                     inst.mark_unread();
                     newly_idle_by_profile
                         .entry(inst.source_profile.clone())
@@ -4392,6 +4419,62 @@ pub mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decide_passive_transition_skips_patch_for_structured_session() {
+        // #2697: a status_poll_loop CI regression. Structured/ACP sessions
+        // have no tmux pane for the poller to probe; their `status` is not
+        // poller-authoritative (the ACP overlay is), so a disk/detected
+        // mismatch must not be persisted as a passive status patch.
+        let mut inst = Instance::new("acp-session", "/tmp/test");
+        inst.view = crate::session::View::Structured;
+        inst.status = Status::Idle;
+
+        let decision =
+            decide_passive_transition(&inst, Status::Starting, false, chrono::Utc::now());
+
+        assert!(
+            decision.patch.is_none(),
+            "structured sessions must never get a passive status patch"
+        );
+    }
+
+    #[test]
+    fn decide_passive_transition_patches_plain_tmux_session() {
+        let mut inst = Instance::new("tmux-session", "/tmp/test");
+        inst.status = Status::Idle;
+        inst.idle_entered_at = Some(chrono::Utc::now());
+        inst.last_accessed_at = Some(chrono::Utc::now());
+
+        let decision = decide_passive_transition(&inst, Status::Running, false, chrono::Utc::now());
+
+        let patch = decision.patch.expect("plain tmux session must get a patch");
+        assert_eq!(patch.id, inst.id);
+        assert_eq!(patch.status, Status::Idle);
+        assert_eq!(patch.idle_entered_at, inst.idle_entered_at);
+    }
+
+    #[test]
+    fn decide_passive_transition_marks_unread_only_on_running_to_idle() {
+        let mut inst = Instance::new("tmux-session", "/tmp/test");
+        inst.status = Status::Idle;
+
+        let decision = decide_passive_transition(&inst, Status::Running, true, chrono::Utc::now());
+        assert!(decision.mark_unread);
+
+        let decision = decide_passive_transition(&inst, Status::Waiting, true, chrono::Utc::now());
+        assert!(
+            !decision.mark_unread,
+            "only a Running -> Idle transition marks unread"
+        );
+
+        inst.unread = true;
+        let decision = decide_passive_transition(&inst, Status::Running, true, chrono::Utc::now());
+        assert!(
+            !decision.mark_unread,
+            "already-unread sessions must not re-mark"
+        );
+    }
 
     #[test]
     fn extract_web_build_id_finds_entry_bundle() {
