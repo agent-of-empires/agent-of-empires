@@ -2722,12 +2722,6 @@ impl HomeView {
 
             if let Some(old) = old_status {
                 if old != new_status {
-                    self.persist_passive_status_transition(&update.id);
-                    if let Some(inst) = self.get_instance(&update.id).cloned() {
-                        self.handle_status_transition(
-                            &inst, old, new_status, play_sound, run_hooks,
-                        );
-                    }
                     // Auto-mark unread when a turn finishes (Running ->
                     // Idle), unless the user is currently viewing this
                     // session in live-send. This runs in both the with-
@@ -2736,22 +2730,34 @@ impl HomeView {
                     // elsewhere still gets marked. The attached session
                     // itself is cleared on attach-return, so a turn that
                     // finishes during an attach nets to read.
-                    if crate::session::unread_enabled()
+                    let is_live_target = self
+                        .live_send
+                        .as_ref()
+                        .is_some_and(|s| s.session_id == update.id);
+                    // Skip when already unread (the mark is a no-op) so a
+                    // re-finishing session doesn't churn the flock once
+                    // per turn.
+                    let already_unread =
+                        self.get_instance(&update.id).is_some_and(|i| i.is_unread());
+                    let should_mark_unread = crate::session::unread_enabled()
                         && old == Status::Running
                         && new_status == Status::Idle
-                    {
-                        let is_live_target = self
-                            .live_send
-                            .as_ref()
-                            .is_some_and(|s| s.session_id == update.id);
-                        // Skip the disk write when already unread (the mark
-                        // is a no-op) so a re-finishing session doesn't churn
-                        // the flock once per turn.
-                        let already_unread =
-                            self.get_instance(&update.id).is_some_and(|i| i.is_unread());
-                        if !is_live_target && !already_unread {
-                            let _ = self.apply_user_action(&update.id, |inst| inst.mark_unread());
-                        }
+                        && !is_live_target
+                        && !already_unread;
+
+                    // One flock for both the status/timestamp patch and the
+                    // unread mark, matching the daemon's per-tick batching
+                    // shape (server/mod.rs's status_poll_loop) instead of
+                    // two separate Storage::update calls on the same row.
+                    self.persist_passive_status_transition(&update.id, should_mark_unread);
+                    if should_mark_unread {
+                        self.mutate_instance(&update.id, |inst| inst.mark_unread());
+                    }
+
+                    if let Some(inst) = self.get_instance(&update.id).cloned() {
+                        self.handle_status_transition(
+                            &inst, old, new_status, play_sound, run_hooks,
+                        );
                     }
                 }
             }
@@ -5231,22 +5237,25 @@ impl HomeView {
     /// roll back the in-memory status update, since the poller is the sole
     /// authority on live status regardless of whether disk persistence
     /// succeeds.
-    pub(super) fn persist_passive_status_transition(&self, id: &str) {
+    ///
+    /// `mark_unread` folds the Running -> Idle unread mark into the same
+    /// `Storage::update` call instead of a second flock round-trip on the
+    /// same row in the same tick, matching the daemon's per-tick batching
+    /// shape in `status_poll_loop`.
+    pub(super) fn persist_passive_status_transition(&self, id: &str, mark_unread: bool) {
         let Some(inst) = self.instance_map.get(id) else {
             return;
         };
         let Some(storage) = self.storages.get(&inst.source_profile) else {
             return;
         };
-        let patch = crate::session::PassiveStatusPatch {
-            id: inst.id.clone(),
-            status: inst.status,
-            idle_entered_at: inst.idle_entered_at,
-            last_accessed_at: inst.last_accessed_at.unwrap_or_else(chrono::Utc::now),
-        };
+        let patch = crate::session::PassiveStatusPatch::from_instance(inst);
         let _ = storage.update(|insts, _groups| {
             if let Some(disk) = insts.iter_mut().find(|i| i.id == patch.id) {
                 disk.merge_passive_status_patch(&patch);
+                if mark_unread {
+                    disk.mark_unread();
+                }
             }
             Ok(())
         });
