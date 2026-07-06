@@ -482,9 +482,9 @@ fn sessions_list(state: &HostApiState, params: &Value) -> Result<Value, Dispatch
     let sessions: Vec<Value> = instances
         .iter()
         .filter(|i| {
-            !(exclude.archived && i.is_archived())
-                && !(exclude.snoozed && i.is_snoozed())
-                && !(exclude.trashed && i.is_trashed())
+            !((exclude.archived && i.is_archived())
+                || (exclude.snoozed && i.is_snoozed())
+                || (exclude.trashed && i.is_trashed()))
         })
         .map(|i| {
             json!({
