@@ -1272,6 +1272,16 @@ export function fetchBranches(path: string, includeRemote = false): Promise<Bran
   return fetchJson<BranchInfo[]>(`/api/git/branches?${params.toString()}`);
 }
 
+/** Whether `path` is a git repository, per the same gate the session builder
+ *  enforces. Returns the boolean, or null on a transient failure so callers
+ *  can stay optimistic rather than misreport a repo as a non-repo. Used by the
+ *  new-session wizard to disable the worktree toggle for a plain folder. */
+export async function fetchIsGitRepo(path: string): Promise<boolean | null> {
+  const params = new URLSearchParams({ path });
+  const res = await fetchJson<{ is_git_repo: boolean }>(`/api/git/is-repo?${params.toString()}`);
+  return res ? res.is_git_repo : null;
+}
+
 // --- Acp context primer ---
 
 export interface ContextPrimerResponse {

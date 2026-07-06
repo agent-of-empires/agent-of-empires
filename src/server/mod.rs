@@ -1546,6 +1546,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/filesystem/browse", get(api::browse_filesystem))
         .route("/api/filesystem/home", get(api::filesystem_home))
         .route("/api/git/branches", get(api::list_branches))
+        .route("/api/git/is-repo", get(api::is_git_repo))
         .route("/api/git/clone", post(api::clone_repo))
         .route("/api/groups", get(api::list_groups))
         .route(

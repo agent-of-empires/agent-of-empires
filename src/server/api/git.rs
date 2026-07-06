@@ -304,6 +304,39 @@ pub async fn list_branches(
     }
 }
 
+#[derive(Deserialize)]
+pub struct IsRepoQuery {
+    pub path: String,
+}
+
+/// Reports whether `path` is a git repository, using the same
+/// `GitWorktree::is_git_repo` gate the session builder enforces (`builder.rs`
+/// single-worktree path). The new-session wizard probes this to disable the
+/// worktree toggle for a plain folder. Returns 200 `{ "is_git_repo": bool }`;
+/// a transient failure surfaces as a non-200 so the client can stay optimistic
+/// rather than misreport a real repo as a non-repo.
+pub async fn is_git_repo(
+    axum::extract::Query(query): axum::extract::Query<IsRepoQuery>,
+) -> impl IntoResponse {
+    let result = tokio::task::spawn_blocking(move || {
+        crate::git::GitWorktree::is_git_repo(std::path::Path::new(&query.path))
+    })
+    .await;
+
+    match result {
+        Ok(is_git_repo) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "is_git_repo": is_git_repo })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "internal", "message": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
