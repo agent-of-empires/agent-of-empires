@@ -122,6 +122,16 @@
       "components": ["web/src/components/MobileLiveTerminal.tsx"]
     },
     {
+      "id": "terminal.live-cursor-focus-fill",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/__tests__/MobileLiveTerminal.cursorFocus.test.tsx",
+        "src/components/__tests__/MobileLiveTerminal.cursorFocusIntegration.test.tsx"
+      ],
+      "components": ["web/src/components/MobileLiveTerminal.tsx"]
+    },
+    {
       "id": "terminal.clipboard-chords",
       "kind": "vitest",
       "risk": "medium",
