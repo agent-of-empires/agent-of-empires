@@ -265,3 +265,17 @@ Git worktrees need the bare repo pattern so the container can reach the repo's g
    The `MEM LIMIT` column should reflect your configured value.
 
 **Note:** On Linux, Docker runs natively without a VM, so the memory ceiling is your host's physical RAM. You typically only need `memory_limit` on Linux to prevent a single container from consuming all system memory.
+
+### Sandboxed OpenCode fails to start after a container-image upgrade
+
+**Symptoms:** After bumping the sandbox container image, launching or resuming a sandboxed OpenCode session fails on boot with a drizzle or SQLite migration error (e.g. `no such column`, `CREATE TABLE ... already exists`, `Failed to run the query`). Non-sandboxed OpenCode sessions on the same host are unaffected.
+
+**Cause:** The sandboxed OpenCode SQLite database at `~/.local/share/opencode/sandbox/opencode.db{,-wal,-shm}` persists across sessions so that `aoe resume` keeps `ses_*` identity working across kills and daemon restarts (see #2605). OpenCode manages its schema with drizzle, and drizzle migrations are forward-only. If the new image ships an OpenCode release whose forward migrations are not compatible with the pre-existing DB, OpenCode aborts on boot. This is the same failure class users hit on standalone OpenCode CLI upgrades (see upstream anomalyco/opencode#31119 and anomalyco/opencode#16678); the sandbox-image bump is just another version-change vector.
+
+**Fix:** Delete the sandboxed OpenCode DB and restart the session. Only the sandboxed OpenCode chat history is lost; host OpenCode state (outside the `sandbox/` subdir) is untouched.
+
+```bash
+rm -f ~/.local/share/opencode/sandbox/opencode.db*
+```
+
+**Note:** This is a rare event tied to breaking schema changes in OpenCode releases; most upgrades migrate cleanly. If you hit it repeatedly on the same image bump, please file an issue upstream at [anomalyco/opencode](https://github.com/anomalyco/opencode) with the migration error output.

@@ -29,264 +29,226 @@ interface SessionState {
   messages: ModelMessage[];
 }
 
-class AoeAgent implements acp.Agent {
-  private connection: acp.AgentSideConnection;
-  private sessions: Map<string, SessionState>;
+// ponytail: one Node process serves exactly one ACP connection, so a
+// module-level session map is equivalent to the old per-connection instance
+// state; no need to thread state through the connect handler.
+const sessions = new Map<string, SessionState>();
 
-  constructor(connection: acp.AgentSideConnection) {
-    this.connection = connection;
-    this.sessions = new Map();
+async function handlePrompt(
+  params: acp.PromptRequest,
+  client: acp.AgentContext,
+): Promise<acp.PromptResponse> {
+  const session = sessions.get(params.sessionId);
+  if (!session) {
+    throw new Error(`Session ${params.sessionId} not found`);
   }
 
-  async initialize(
-    params: acp.InitializeRequest,
-  ): Promise<acp.InitializeResponse> {
-    return {
-      protocolVersion: params.protocolVersion ?? acp.PROTOCOL_VERSION,
-      agentCapabilities: {
-        loadSession: false,
-        promptCapabilities: {
-          image: false,
-          audio: false,
-        },
-      },
-    };
-  }
+  session.pendingPrompt?.abort();
+  session.pendingPrompt = new AbortController();
+  const abortSignal = session.pendingPrompt.signal;
 
-  async authenticate(
-    _params: acp.AuthenticateRequest,
-  ): Promise<acp.AuthenticateResponse | void> {
-    return {};
-  }
+  const userText = params.prompt
+    .filter((c): c is acp.TextContent & { type: "text" } => c.type === "text")
+    .map((c) => c.text)
+    .join("\n");
 
-  async newSession(
-    _params: acp.NewSessionRequest,
-  ): Promise<acp.NewSessionResponse> {
-    const sessionId = randomHexId();
-    const modelId = process.env.AOE_AGENT_MODEL ?? "claude-opus-4-7";
-    this.sessions.set(sessionId, {
-      pendingPrompt: null,
-      modelId,
-      messages: [],
+  session.messages.push({ role: "user", content: userText });
+
+  const tools = buildTools(params.sessionId, client);
+
+  try {
+    const model = pickModel(session.modelId);
+    const result = streamText({
+      model,
+      messages: session.messages,
+      tools,
+      // Allow up to ~16 tool-call rounds in a single user turn so the
+      // agent can compose multiple Read/Write/Bash steps before
+      // returning to the user.
+      stopWhen: stepCountIs(16),
+      abortSignal,
     });
-    return { sessionId };
-  }
 
-  async setSessionMode(
-    _params: acp.SetSessionModeRequest,
-  ): Promise<acp.SetSessionModeResponse> {
-    return {};
-  }
-
-  async prompt(params: acp.PromptRequest): Promise<acp.PromptResponse> {
-    const session = this.sessions.get(params.sessionId);
-    if (!session) {
-      throw new Error(`Session ${params.sessionId} not found`);
-    }
-
-    session.pendingPrompt?.abort();
-    session.pendingPrompt = new AbortController();
-    const abortSignal = session.pendingPrompt.signal;
-
-    const userText = params.prompt
-      .filter((c): c is acp.TextContentBlock => c.type === "text")
-      .map((c) => c.text)
-      .join("\n");
-
-    session.messages.push({ role: "user", content: userText });
-
-    const tools = this.buildTools(params.sessionId);
-
-    try {
-      const model = pickModel(session.modelId);
-      const result = streamText({
-        model,
-        messages: session.messages,
-        tools,
-        // Allow up to ~16 tool-call rounds in a single user turn so the
-        // agent can compose multiple Read/Write/Bash steps before
-        // returning to the user.
-        stopWhen: stepCountIs(16),
-        abortSignal,
-      });
-
-      let assistantBuffer = "";
-      const toolCallTitles = new Map<string, string>();
-      for await (const part of result.fullStream) {
-        if (abortSignal.aborted) break;
-        switch (part.type) {
-          case "text-delta": {
-            const delta =
-              (part as { text?: string }).text ??
-              (part as { textDelta?: string }).textDelta ??
-              "";
-            if (!delta) break;
-            assistantBuffer += delta;
-            await this.connection.sessionUpdate({
-              sessionId: params.sessionId,
-              update: {
-                sessionUpdate: "agent_message_chunk",
-                content: { type: "text", text: delta },
-              },
-            });
-            break;
-          }
-          case "tool-call": {
-            const id = part.toolCallId;
-            const name = part.toolName;
-            toolCallTitles.set(id, name);
-            await this.connection.sessionUpdate({
-              sessionId: params.sessionId,
-              update: {
-                sessionUpdate: "tool_call",
-                toolCallId: id,
-                title: name,
-                kind: classifyKind(name),
-                status: "pending",
-                rawInput: part.input as Record<string, unknown>,
-              },
-            });
-            break;
-          }
-          case "tool-result": {
-            const id = part.toolCallId;
-            await this.connection.sessionUpdate({
-              sessionId: params.sessionId,
-              update: {
-                sessionUpdate: "tool_call_update",
-                toolCallId: id,
-                status: "completed",
-                rawOutput: serialiseToolOutput(part.output),
-              },
-            });
-            break;
-          }
-          case "tool-error": {
-            const id = part.toolCallId;
-            await this.connection.sessionUpdate({
-              sessionId: params.sessionId,
-              update: {
-                sessionUpdate: "tool_call_update",
-                toolCallId: id,
-                status: "failed",
-                rawOutput: { error: String(part.error) },
-              },
-            });
-            break;
-          }
-          case "error": {
-            const err = (part as { error: unknown }).error;
-            throw err instanceof Error ? err : new Error(String(err));
-          }
-          default:
-            break;
-        }
-      }
-
-      session.messages.push({ role: "assistant", content: assistantBuffer });
-
-      if (abortSignal.aborted) {
-        return { stopReason: "cancelled" };
-      }
-      session.pendingPrompt = null;
-      return { stopReason: "end_turn" };
-    } catch (err) {
-      session.pendingPrompt = null;
-      if (abortSignal.aborted) {
-        return { stopReason: "cancelled" };
-      }
-      const message = err instanceof Error ? err.message : String(err);
-      await this.connection
-        .sessionUpdate({
-          sessionId: params.sessionId,
-          update: {
-            sessionUpdate: "agent_message_chunk",
-            content: {
-              type: "text",
-              text: `\n[aoe-agent error] ${message}\n`,
+    let assistantBuffer = "";
+    const toolCallTitles = new Map<string, string>();
+    for await (const part of result.fullStream) {
+      if (abortSignal.aborted) break;
+      switch (part.type) {
+        case "text-delta": {
+          const delta =
+            (part as { text?: string }).text ??
+            (part as { textDelta?: string }).textDelta ??
+            "";
+          if (!delta) break;
+          assistantBuffer += delta;
+          await client.notify("session/update", {
+            sessionId: params.sessionId,
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: delta },
             },
-          },
-        })
-        .catch(() => undefined);
-      throw err;
+          });
+          break;
+        }
+        case "tool-call": {
+          const id = part.toolCallId;
+          const name = part.toolName;
+          toolCallTitles.set(id, name);
+          await client.notify("session/update", {
+            sessionId: params.sessionId,
+            update: {
+              sessionUpdate: "tool_call",
+              toolCallId: id,
+              title: name,
+              kind: classifyKind(name),
+              status: "pending",
+              rawInput: part.input as Record<string, unknown>,
+            },
+          });
+          break;
+        }
+        case "tool-result": {
+          const id = part.toolCallId;
+          await client.notify("session/update", {
+            sessionId: params.sessionId,
+            update: {
+              sessionUpdate: "tool_call_update",
+              toolCallId: id,
+              status: "completed",
+              rawOutput: serialiseToolOutput(part.output),
+            },
+          });
+          break;
+        }
+        case "tool-error": {
+          const id = part.toolCallId;
+          await client.notify("session/update", {
+            sessionId: params.sessionId,
+            update: {
+              sessionUpdate: "tool_call_update",
+              toolCallId: id,
+              status: "failed",
+              rawOutput: { error: String(part.error) },
+            },
+          });
+          break;
+        }
+        case "error": {
+          const err = (part as { error: unknown }).error;
+          throw err instanceof Error ? err : new Error(String(err));
+        }
+        default:
+          break;
+      }
     }
-  }
 
-  async cancel(params: acp.CancelNotification): Promise<void> {
-    this.sessions.get(params.sessionId)?.pendingPrompt?.abort();
-  }
+    // Anthropic rejects an assistant message with empty content, so skip
+    // persisting blank turns (tool-only rounds and cancellations both leave
+    // the buffer empty) to keep the next prompt's history valid.
+    if (assistantBuffer) {
+      session.messages.push({ role: "assistant", content: assistantBuffer });
+    }
 
-  /**
-   * Tool palette: Read, Write, Bash. Each tool's execute() body issues
-   * an ACP request back to aoe and returns the result. The model never
-   * sees the file system or shell directly.
-   */
-  private buildTools(sessionId: string) {
-    return {
-      Read: tool({
-        description:
-          "Read a text file from the session's working directory.",
-        inputSchema: z.object({
-          path: z.string().describe("Absolute path to the file to read."),
-        }),
-        execute: async ({ path }) => {
-          const result = await this.connection.readTextFile({
-            sessionId,
-            path,
-          });
-          return { content: result.content };
+    if (abortSignal.aborted) {
+      return { stopReason: "cancelled" };
+    }
+    session.pendingPrompt = null;
+    return { stopReason: "end_turn" };
+  } catch (err) {
+    session.pendingPrompt = null;
+    if (abortSignal.aborted) {
+      return { stopReason: "cancelled" };
+    }
+    const message = err instanceof Error ? err.message : String(err);
+    await client
+      .notify("session/update", {
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: {
+            type: "text",
+            text: `\n[aoe-agent error] ${message}\n`,
+          },
         },
-      }),
-      Write: tool({
-        description:
-          "Write text contents to a file in the session's working directory.",
-        inputSchema: z.object({
-          path: z.string().describe("Absolute path of the file to write."),
-          content: z.string().describe("Full text content to write."),
-        }),
-        execute: async ({ path, content }) => {
-          await this.connection.writeTextFile({
-            sessionId,
-            path,
-            content,
-          });
-          return { ok: true };
-        },
-      }),
-      Bash: tool({
-        description:
-          "Run a shell command and capture its output. Used for one-shot tasks; long-running processes are not supported.",
-        inputSchema: z.object({
-          command: z.string().describe("Shell command to run."),
-          args: z
-            .array(z.string())
-            .optional()
-            .describe("Arguments passed to the command."),
-        }),
-        execute: async ({ command, args }) => {
-          const term = await this.connection.createTerminal({
-            sessionId,
-            command,
-            args: args ?? [],
-          });
-          try {
-            const exit = await term.waitForExit();
-            const out = await term.currentOutput();
-            const code =
-              (exit as { exitCode?: number }).exitCode ??
-              (exit as { exit_code?: number }).exit_code ??
-              null;
-            return {
-              stdout: out.output,
-              exitCode: code,
-            };
-          } finally {
-            await term.release().catch(() => undefined);
-          }
-        },
-      }),
-    };
+      })
+      .catch(() => undefined);
+    throw err;
   }
+}
+
+/**
+ * Tool palette: Read, Write, Bash. Each tool's execute() body issues
+ * an ACP request back to aoe and returns the result. The model never
+ * sees the file system or shell directly.
+ */
+function buildTools(sessionId: string, client: acp.AgentContext) {
+  return {
+    Read: tool({
+      description: "Read a text file from the session's working directory.",
+      inputSchema: z.object({
+        path: z.string().describe("Absolute path to the file to read."),
+      }),
+      execute: async ({ path }) => {
+        const result = await client.request("fs/read_text_file", {
+          sessionId,
+          path,
+        });
+        return { content: result.content };
+      },
+    }),
+    Write: tool({
+      description:
+        "Write text contents to a file in the session's working directory.",
+      inputSchema: z.object({
+        path: z.string().describe("Absolute path of the file to write."),
+        content: z.string().describe("Full text content to write."),
+      }),
+      execute: async ({ path, content }) => {
+        await client.request("fs/write_text_file", {
+          sessionId,
+          path,
+          content,
+        });
+        return { ok: true };
+      },
+    }),
+    Bash: tool({
+      description:
+        "Run a shell command and capture its output. Used for one-shot tasks; long-running processes are not supported.",
+      inputSchema: z.object({
+        command: z.string().describe("Shell command to run."),
+        args: z
+          .array(z.string())
+          .optional()
+          .describe("Arguments passed to the command."),
+      }),
+      execute: async ({ command, args }) => {
+        const { terminalId } = await client.request("terminal/create", {
+          sessionId,
+          command,
+          args: args ?? [],
+        });
+        try {
+          const exit = await client.request("terminal/wait_for_exit", {
+            sessionId,
+            terminalId,
+          });
+          const out = await client.request("terminal/output", {
+            sessionId,
+            terminalId,
+          });
+          return {
+            stdout: out.output,
+            exitCode: exit.exitCode ?? null,
+          };
+        } finally {
+          await client
+            .request("terminal/release", { sessionId, terminalId })
+            .catch(() => undefined);
+        }
+      },
+    }),
+  };
 }
 
 function classifyKind(toolName: string): acp.ToolKind {
@@ -332,7 +294,38 @@ function main() {
   const input = Writable.toWeb(process.stdout);
   const output = Readable.toWeb(process.stdin) as ReadableStream<Uint8Array>;
   const stream = acp.ndJsonStream(input, output);
-  new acp.AgentSideConnection((conn) => new AoeAgent(conn), stream);
+
+  acp
+    .agent({ name: "aoe-agent" })
+    .onRequest("initialize", ({ params }) => ({
+      protocolVersion: params.protocolVersion ?? acp.PROTOCOL_VERSION,
+      agentCapabilities: {
+        loadSession: false,
+        promptCapabilities: {
+          image: false,
+          audio: false,
+        },
+      },
+    }))
+    .onRequest("authenticate", () => ({}))
+    .onRequest("session/new", () => {
+      const sessionId = randomHexId();
+      const modelId = process.env.AOE_AGENT_MODEL ?? "claude-opus-4-7";
+      sessions.set(sessionId, {
+        pendingPrompt: null,
+        modelId,
+        messages: [],
+      });
+      return { sessionId };
+    })
+    .onRequest("session/set_mode", () => ({}))
+    .onRequest("session/prompt", ({ params, client }) =>
+      handlePrompt(params, client),
+    )
+    .onNotification("session/cancel", ({ params }) => {
+      sessions.get(params.sessionId)?.pendingPrompt?.abort();
+    })
+    .connect(stream);
 
   process.stdin.on("end", () => process.exit(0));
   process.on("SIGTERM", () => process.exit(0));

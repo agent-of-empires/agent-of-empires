@@ -14,6 +14,7 @@ import type {
   ClaudeSessionSummary,
   SettingsFieldDescriptor,
 } from "./types";
+import type { ConfigOptionDescriptor } from "./acpTypes";
 import { clearDeviceBindingSecret, getOrCreateDeviceBindingSecret } from "./deviceBinding";
 
 // GET a JSON endpoint; returns null on non-2xx or network/parse errors.
@@ -141,6 +142,42 @@ export async function ensureTerminal(id: string, index = 0, container = false): 
   }
 }
 
+function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error ?? new Error("read failed"));
+    reader.onload = () => {
+      const result = reader.result as string;
+      // Drop the `data:<mime>;base64,` prefix; the server wants raw base64.
+      const comma = result.indexOf(",");
+      resolve(comma >= 0 ? result.slice(comma + 1) : result);
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+/**
+ * Upload a clipboard image pasted into the live terminal. The host writes it
+ * into the session worktree and returns the path the tmux pane can read, so
+ * the CLI agent (e.g. Claude Code) attaches it. Returns null on any failure.
+ * See #2678.
+ */
+export async function pasteImage(id: string, file: File): Promise<string | null> {
+  try {
+    const data = await fileToBase64(file);
+    const res = await fetch(`/api/sessions/${id}/paste-image`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mime_type: file.type, data }),
+    });
+    if (!res.ok) return null;
+    const body = await res.json().catch(() => ({}));
+    return typeof body.path === "string" ? body.path : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Kill an extra terminal tab's host + container shells (index >= 1). Index 0
  *  is the primary terminal shared with the native TUI and cannot be killed
  *  from the web UI (the server rejects it); closing that tab only hides it. */
@@ -222,6 +259,11 @@ export interface PluginView {
   name: string;
   version: string;
   description: string;
+  /** Lucide kebab-case identity icon name, straight from the manifest. */
+  icon: string | null;
+  /** Resolved URL for the manifest's `icon_asset` (served from the plugin's
+   *  install directory), null for a builtin or a plugin with no icon_asset. */
+  icon_asset_url: string | null;
   enabled: boolean;
   builtin: boolean;
   /** Validation provenance: "builtin" | "featured" | "community" | "local". */
@@ -327,6 +369,10 @@ export interface PluginDiscoveryResult {
   stars: number;
   badge: "installed" | "featured" | "unvetted";
   install_command: string;
+  /** The repo owner's GitHub avatar; a source-identity affordance, NOT the
+   *  plugin's own icon (unknown until a manifest fetch, which discovery
+   *  results never do). */
+  source_avatar_url: string;
 }
 
 export type DiscoverResult = { kind: "ok"; results: PluginDiscoveryResult[] } | { kind: "error"; message: string };
@@ -364,6 +410,10 @@ export interface PluginDetailManifest {
   ui_contributions: { slot: string; id: string }[];
   /** Screenshot/GIF previews, each resolved server-side to a raw.githubusercontent.com URL. */
   screenshots: { src: string; alt: string; caption: string }[];
+  /** Lucide kebab-case identity icon name. */
+  icon: string | null;
+  /** The manifest's `icon_asset`, resolved server-side to a raw.githubusercontent.com URL. */
+  icon_asset_url: string | null;
 }
 
 /** On-demand detail for one plugin source (`GET /api/plugins/details`): manifest
@@ -1258,6 +1308,16 @@ export function fetchBranches(path: string, includeRemote = false): Promise<Bran
   return fetchJson<BranchInfo[]>(`/api/git/branches?${params.toString()}`);
 }
 
+/** Whether `path` is a git repository, per the same gate the session builder
+ *  enforces. Returns the boolean, or null on a transient failure so callers
+ *  can stay optimistic rather than misreport a repo as a non-repo. Used by the
+ *  new-session wizard to disable the worktree toggle for a plain folder. */
+export async function fetchIsGitRepo(path: string): Promise<boolean | null> {
+  const params = new URLSearchParams({ path });
+  const res = await fetchJson<{ is_git_repo: boolean }>(`/api/git/is-repo?${params.toString()}`);
+  return res ? res.is_git_repo : null;
+}
+
 // --- Acp context primer ---
 
 export interface ContextPrimerResponse {
@@ -1289,6 +1349,25 @@ export interface AcpAgentInfo {
  *  modal to populate the handoff target list. See #1282. */
 export async function fetchAcpAgents(): Promise<AcpAgentInfo[]> {
   return (await fetchJson<AcpAgentInfo[]>("/api/acp/agents")) ?? [];
+}
+
+/** One agent's last-observed config options, from the recall cache. */
+export interface AgentOptionEntry {
+  /** RFC 3339 timestamp of the last observation, for freshness display. */
+  updated_at: string;
+  options: ConfigOptionDescriptor[];
+}
+
+/** Recall cache of the config options each agent last advertised, keyed by
+ *  agent name. Feeds the per-agent defaults settings page dropdowns without a
+ *  live session; empty until an agent has run at least once. See #2631. */
+export interface AcpOptionCatalog {
+  version: number;
+  agents: Record<string, AgentOptionEntry>;
+}
+
+export async function fetchAcpOptionCatalog(): Promise<AcpOptionCatalog> {
+  return (await fetchJson<AcpOptionCatalog>("/api/acp/option-catalog")) ?? { version: 1, agents: {} };
 }
 
 // --- Acp switch agent ---

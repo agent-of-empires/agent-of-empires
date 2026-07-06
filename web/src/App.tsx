@@ -37,7 +37,7 @@ import { useIsCoarsePointer } from "./hooks/useIsCoarsePointer";
 import { useIsWideViewport } from "./hooks/useIsWideViewport";
 import type { RightPanelView } from "./lib/rightPanelView";
 import { usePaneLayout, dockTabs, dockGroups, dockOf, isActiveTab } from "./lib/paneLayout";
-import { isPluginPaneId, usePluginPanes, type PluginPane } from "./lib/pluginPanes";
+import { isPluginPaneId, resolvePaneIcon, usePluginPanes, type PluginPane } from "./lib/pluginPanes";
 import { PluginPaneBody } from "./components/plugin/PluginSlots";
 import { TOUR_ANCHORS, tourAnchor } from "./lib/tourSteps";
 import {
@@ -69,6 +69,7 @@ import {
   setSessionSnooze,
   trashSession,
   restoreSession,
+  fetchPlugins,
 } from "./lib/api";
 import type { DeleteSessionOptions, ServerAbout } from "./lib/api";
 import { normalizeProjectPathKey } from "./lib/registeredProjects";
@@ -452,10 +453,37 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     syncPlugins(pluginPanes.map((p) => ({ id: p.id, defaultDock: p.defaultDock })));
   }, [pluginPanes, syncPlugins]);
 
+  // One-shot lookup from plugin id to its manifest identity (icon name +
+  // icon_asset URL), so a pane gets a real identity glyph, up to the plugin's
+  // actual logo, even when it doesn't set its own per-pane icon. Fetched once
+  // on mount rather than polled: the installed-plugin list itself has no live
+  // sync anywhere else in the app today (Settings > Plugins only reloads on
+  // mount and after its own mutations), so this matches existing staleness
+  // tolerance rather than introducing a new one.
+  const [pluginIdentityById, setPluginIdentityById] = useState<
+    Record<string, { icon?: string; iconAssetUrl?: string }>
+  >({});
+  useEffect(() => {
+    void fetchPlugins().then((res) => {
+      if (!res) return;
+      setPluginIdentityById(
+        Object.fromEntries(
+          res.plugins.map((p) => [p.id, { icon: p.icon ?? undefined, iconAssetUrl: p.icon_asset_url ?? undefined }]),
+        ),
+      );
+    });
+  }, []);
+
   const paneDescriptor = useCallback(
     (id: string): PaneDisplay => {
       const plugin = pluginPaneById.get(id);
-      if (plugin) return { title: plugin.title, icon: plugin.icon ?? Puzzle };
+      if (plugin) {
+        const identity = pluginIdentityById[plugin.entry.plugin_id];
+        const icon = resolvePaneIcon(plugin.icon, identity?.icon) ?? Puzzle;
+        // A plugin's real logo outranks any lucide glyph, including a
+        // per-pane runtime icon a worker chose before icon_asset existed.
+        return { title: plugin.title, icon, iconAssetUrl: identity?.iconAssetUrl };
+      }
       if (isTerminalTabId(id)) {
         const idx = terminalIndexOf(id);
         const term = BUILTIN_PANES.find((p) => p.id === "terminal")!;
@@ -464,7 +492,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       const d = BUILTIN_PANES.find((p) => p.id === id)!;
       return { title: d.title, icon: d.icon };
     },
-    [pluginPaneById],
+    [pluginPaneById, pluginIdentityById],
   );
 
   // A persisted tab is visible only if its backing pane currently exists: diff

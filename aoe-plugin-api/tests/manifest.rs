@@ -905,3 +905,106 @@ fn screenshot_path_ok_rejects_backslash_and_bad_shapes() {
         assert!(!screenshot_path_ok(bad), "{bad:?} should be rejected");
     }
 }
+
+#[test]
+fn icon_parses_and_round_trips() {
+    let toml = r#"
+id = "acme.widget"
+name = "Widget"
+version = "0.1.0"
+api_version = 7
+icon = "git-branch"
+icon_asset = "assets/icon.png"
+"#;
+    let manifest = PluginManifest::from_toml_str(toml).expect("icon parses");
+    assert_eq!(manifest.icon.as_deref(), Some("git-branch"));
+    assert_eq!(manifest.icon_asset.as_deref(), Some("assets/icon.png"));
+}
+
+#[test]
+fn icon_requires_api_version_7() {
+    let toml = r#"
+id = "acme.widget"
+name = "Widget"
+version = "0.1.0"
+api_version = 6
+icon = "git-branch"
+"#;
+    let err = PluginManifest::from_toml_str(toml).unwrap_err();
+    assert!(
+        matches!(&err, ManifestError::Invalid(errs) if errs.iter().any(|e| e.contains("icon requires api_version >= 7"))),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn icon_asset_requires_api_version_7() {
+    let toml = r#"
+id = "acme.widget"
+name = "Widget"
+version = "0.1.0"
+api_version = 6
+icon_asset = "assets/icon.png"
+"#;
+    let err = PluginManifest::from_toml_str(toml).unwrap_err();
+    assert!(
+        matches!(&err, ManifestError::Invalid(errs) if errs.iter().any(|e| e.contains("icon_asset requires api_version >= 7"))),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn icon_asset_rejects_bad_paths() {
+    for bad in [
+        "https://tracker.example.com/x.png",
+        "/etc/passwd.png",
+        "../secrets.png",
+        "evil.svg",
+        "noext",
+    ] {
+        let toml = format!(
+            r#"
+id = "acme.widget"
+name = "Widget"
+version = "0.1.0"
+api_version = 7
+icon_asset = "{bad}"
+"#
+        );
+        let err = PluginManifest::from_toml_str(&toml).unwrap_err();
+        assert!(
+            matches!(&err, ManifestError::Invalid(errs) if errs.iter().any(|e| e.contains("icon_asset") && e.contains("must be a repository-relative image path"))),
+            "path {bad:?} should be rejected, got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn icon_rejects_bad_names() {
+    for bad in ["GitHub", "git_branch", "-git", "git--branch", ""] {
+        let toml = format!(
+            r#"
+id = "acme.widget"
+name = "Widget"
+version = "0.1.0"
+api_version = 7
+icon = "{bad}"
+"#
+        );
+        let err = PluginManifest::from_toml_str(&toml).unwrap_err();
+        assert!(
+            matches!(&err, ManifestError::Invalid(errs) if errs.iter().any(|e| e.contains("must be a lucide kebab-case icon name"))),
+            "icon {bad:?} should be rejected, got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn lucide_icon_name_ok_rejects_bad_shapes() {
+    use aoe_plugin_api::lucide_icon_name_ok;
+    assert!(lucide_icon_name_ok("git-branch"));
+    assert!(lucide_icon_name_ok("puzzle"));
+    for bad in ["GitHub", "git_branch", "-git", "git-", "git--branch", ""] {
+        assert!(!lucide_icon_name_ok(bad), "{bad:?} should be rejected");
+    }
+}

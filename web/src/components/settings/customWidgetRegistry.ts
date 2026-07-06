@@ -1,6 +1,6 @@
+import { AcpDefaultsWidget } from "./AcpDefaultsWidget";
 import type { CustomSettingsWidget } from "./customWidgets";
 import {
-  AcpDefaultsWidget,
   DefaultToolWidget,
   LoggingTargetsWidget,
   SmartRenameAgentWidget,

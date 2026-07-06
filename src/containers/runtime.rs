@@ -134,6 +134,11 @@ impl ContainerRuntime {
     pub fn is_container_running(&self, name: &str) -> Result<bool> {
         match self.kind {
             RuntimeKind::Docker | RuntimeKind::Podman => {
+                // `container inspect` (not the shorter `docker inspect`): the two
+                // subcommands emit different stderr for a missing container
+                // ("No such container" vs "No such object"), and DOCKER_MISSING
+                // in the runtime_base tests pins the former. Changing this argv
+                // silently breaks is_not_found classification. See #2596.
                 let output = self
                     .base
                     .command()
@@ -141,26 +146,54 @@ impl ContainerRuntime {
                     .output()?;
 
                 if !output.status.success() {
-                    return Ok(false);
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    return self.base.classify_inspect_failure(&stderr);
                 }
 
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 Ok(stdout.trim() == "true")
             }
             RuntimeKind::AppleContainer => {
+                // Apple's `container inspect` is the only inspect subcommand
+                // (no `container container inspect`), but the stderr wording
+                // is pinned in RuntimeBase::APPLE_CONTAINER.not_found_markers
+                // (`container with id`) and daemon_down_markers. Do not
+                // tighten this argv or those markers without capturing new
+                // fixtures; same silent-break risk as the Docker/Podman
+                // comment above. See #2596.
                 let output = self.base.command().args(["inspect", name]).output()?;
 
                 if !output.status.success() {
-                    return Ok(false);
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    return self.base.classify_inspect_failure(&stderr);
                 }
 
                 let out_json: Value = serde_json::from_slice(&output.stdout)
-                    .map_err(|e| DockerError::CommandFailed(e.to_string()))?;
+                    // serde_json::Error::Display is single-line by construction
+                    // (format is "<code> at line N column M"); no sanitize_stderr
+                    // wrapping needed to preserve the single-line convention.
+                    .map_err(|e| DockerError::InspectFailed(e.to_string()))?;
 
                 if let Some(status) = out_json.pointer("/0/status") {
-                    Ok(status == "running")
+                    // as_str() guard: if Apple ever changes /0/status from a
+                    // string to a nested object, `status == "running"` would
+                    // silently return false and route to Probe::NotRunning:
+                    // exact fail-open swallowing-existence-probe (#2596) one
+                    // JSON schema shift away. Surface schema drift as Err.
+                    match status.as_str() {
+                        Some(s) => Ok(s == "running"),
+                        None => Err(DockerError::InspectFailed(
+                            "apple container inspect: /0/status present but not a string".into(),
+                        )),
+                    }
                 } else {
-                    Ok(false)
+                    // Exit 0 with no /0/status: schema surprise. Same
+                    // reasoning as the as_str() None branch above: Err,
+                    // not Ok(false), so gates fail closed instead of fail
+                    // open on a genuinely running container.
+                    Err(DockerError::InspectFailed(
+                        "apple container inspect: exit 0 but no /0/status in output".into(),
+                    ))
                 }
             }
         }

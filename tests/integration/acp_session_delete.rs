@@ -34,6 +34,7 @@ fn spawn_config_with_shim_env(shim: PathBuf, env: Vec<(String, String)>) -> Spaw
         additional_dirs: vec![],
         provider_env: env,
         default_effort: None,
+        default_mode: None,
         socket_path: None,
         stored_acp_session_id: None,
         fork_from: None,

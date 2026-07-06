@@ -54,8 +54,10 @@ struct AgentConfigMount {
     /// authentication from being overwritten by stale host copies.
     preserve_files: &'static [&'static str],
     /// Files to delete from the sandbox dir before each launch. Prevents stale state
-    /// (e.g. SQLite databases from a previous opencode version) from causing failures
-    /// when the container image is updated.
+    /// (e.g. leftover lock/cache files) from causing failures when the container image
+    /// is updated. Do NOT use this for sandbox-owned session state (e.g. opencode's
+    /// SQLite DB, see #2605): that must survive relaunches, so it is kept out of
+    /// `clean_files` and instead protected from host drift via `skip_entries`.
     clean_files: &'static [&'static str],
 }
 
@@ -92,10 +94,13 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         tool_name: "opencode",
         host_rel: ".local/share/opencode",
         container_suffix: ".local/share/opencode",
-        // Never copy or keep the SQLite database in the sandbox. Opencode must
-        // create its own fresh database on each launch -- a stale db from a
-        // previous opencode version (or copied from the host) causes drizzle
-        // migration failures.
+        // `skip_entries` prevents copying the host DB into the sandbox; a
+        // schema-drifted host DB would trigger drizzle migration failures
+        // against the sandboxed opencode. The sandboxed opencode creates its
+        // own DB in-container on first launch, which is always schema-consistent
+        // with that opencode. Do NOT wipe it on subsequent launches: it
+        // holds `ses_*` session identity and is the resume source of truth.
+        // See #2605.
         skip_entries: &[
             "sandbox",
             "opencode.db",
@@ -107,7 +112,7 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         keychain_credential: None,
         home_seed_files: &[],
         preserve_files: &[],
-        clean_files: &["opencode.db", "opencode.db-wal", "opencode.db-shm"],
+        clean_files: &[],
     },
     AgentConfigMount {
         tool_name: "opencode",
@@ -2173,6 +2178,88 @@ mod tests {
             );
         }
         assert!(!sandbox.join("state.db").exists());
+    }
+
+    #[test]
+    fn test_opencode_mount_clean_files_does_not_touch_sqlite_db() {
+        // Drift guard for #2605. The opencode data-dir mount's SQLite DB holds
+        // `ses_*` session identity and is the resume source of truth;
+        // `skip_entries` handles host-to-sandbox pollution, so `clean_files`
+        // must not list `opencode.db*` (that regressed resume across every
+        // kill/restart).
+        let mount = AGENT_CONFIG_MOUNTS
+            .iter()
+            .find(|m| m.tool_name == "opencode" && m.host_rel == ".local/share/opencode")
+            .expect("opencode data-dir mount");
+        assert!(
+            !mount
+                .clean_files
+                .iter()
+                .any(|f| f.starts_with("opencode.db")),
+            "opencode.db* must not appear in clean_files (regression of #2605); clean_files = {:?}",
+            mount.clean_files,
+        );
+        assert!(
+            mount.skip_entries.contains(&"opencode.db"),
+            "opencode.db must remain in skip_entries to block host schema drift",
+        );
+        assert!(
+            mount.skip_entries.contains(&"opencode.db-wal"),
+            "opencode.db-wal must remain in skip_entries to block host schema drift",
+        );
+        assert!(
+            mount.skip_entries.contains(&"opencode.db-shm"),
+            "opencode.db-shm must remain in skip_entries to block host schema drift",
+        );
+    }
+
+    #[test]
+    fn test_opencode_mount_preserves_sqlite_db_across_prepares() {
+        // Regression for #2605. Before the fix, `prepare_sandbox_dir` walked
+        // `clean_files` on every invocation and wiped the sandbox-owned
+        // opencode SQLite DB, so `aoe resume` hit "Session not found". This
+        // test plants a DB in the sandbox subdir, invokes `prepare_sandbox_dir`
+        // (which fires at container_config.rs:987 and :1436), and asserts the
+        // DB survives byte-for-byte.
+        let dir = TempDir::new().unwrap();
+        let host = dir.path().join(".local/share/opencode");
+        let sandbox = host.join(SANDBOX_SUBDIR);
+        fs::create_dir_all(&sandbox).unwrap();
+
+        let db_bytes = b"SQLite format 3\0-opencode-session-state";
+        fs::write(sandbox.join("opencode.db"), db_bytes).unwrap();
+        fs::write(sandbox.join("opencode.db-wal"), b"wal-frames").unwrap();
+        fs::write(sandbox.join("opencode.db-shm"), b"shm-index").unwrap();
+
+        // Host config so `sync_agent_config` has real work to do; without a
+        // non-empty host_dir the sync short-circuits and we would not exercise
+        // the code path that used to wipe the DB.
+        fs::write(host.join("config.json"), "{}").unwrap();
+
+        let mount = AGENT_CONFIG_MOUNTS
+            .iter()
+            .find(|m| m.tool_name == "opencode" && m.host_rel == ".local/share/opencode")
+            .expect("opencode data-dir mount");
+        let out = prepare_sandbox_dir(mount, dir.path()).unwrap();
+        assert_eq!(out, sandbox);
+
+        assert!(
+            out.join("opencode.db").exists(),
+            "opencode.db must survive prepare_sandbox_dir (regression of #2605)",
+        );
+        assert_eq!(
+            fs::read(out.join("opencode.db")).unwrap(),
+            db_bytes,
+            "opencode.db content must be untouched",
+        );
+        assert!(
+            out.join("opencode.db-wal").exists(),
+            "opencode.db-wal must survive",
+        );
+        assert!(
+            out.join("opencode.db-shm").exists(),
+            "opencode.db-shm must survive",
+        );
     }
 
     #[test]

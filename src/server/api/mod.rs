@@ -27,25 +27,26 @@ mod telemetry;
 pub use acp::{
     acp_attachment, acp_cancel, acp_context_primer, acp_disable, acp_enable, acp_files,
     acp_force_end_turn, acp_prompt, acp_prompt_diff_comments, acp_replay, acp_set_config_option,
-    acp_set_mode, acp_worker_log, install_agent, list_acp_agents, list_claude_sessions,
-    resolve_approval, resolve_elicitation, shutdown_acp, spawn_acp, switch_acp_agent,
+    acp_set_mode, acp_worker_log, get_option_catalog, install_agent, list_acp_agents,
+    list_claude_sessions, resolve_approval, resolve_elicitation, shutdown_acp, spawn_acp,
+    switch_acp_agent,
 };
 
 #[cfg(feature = "serve")]
 pub use client_log::post_client_log;
-pub use git::{clone_repo, list_branches};
+pub use git::{clone_repo, is_git_repo, list_branches};
 pub use log_level::{get_log_level, patch_log_level};
 pub use mcp::{drop_mcp_server, get_mcp_servers, keep_mcp_server, resolve_mcp_conflict};
 pub use plugins::{
     apply_plugin_update, dismiss_plugin_update, invoke_plugin_action, list_plugins,
     plugin_commands, plugin_details, plugin_discover, plugin_job_status, plugin_ui_state,
-    plugin_update_preview, plugin_updates, preview_plugin_install, set_plugin_enabled,
-    start_plugin_install, start_plugin_uninstall,
+    plugin_update_preview, plugin_updates, preview_plugin_install, serve_plugin_icon,
+    set_plugin_enabled, start_plugin_install, start_plugin_uninstall,
 };
 pub use projects::{create_project, delete_project, list_projects, update_project};
 pub use sessions::{
     create_session, delete_session, ensure_container_terminal, ensure_session, ensure_terminal,
-    force_smart_rename, get_recent_projects, kill_terminal, list_sessions,
+    force_smart_rename, get_recent_projects, kill_terminal, list_sessions, paste_image,
     preview_volume_ignores_globs, read_output, rename_session, restore_session, search_sessions,
     send_message, serve_session_artifact, session_diff_file, session_diff_files, set_worktree_name,
     start_session, stop_session, trash_session, update_session_archive, update_session_diff_base,

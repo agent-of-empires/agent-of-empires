@@ -37,8 +37,8 @@ pub fn is_pid_alive(_pid: u32) -> bool {
 /// Ask the kernel which process is listening on this Unix domain socket
 /// by connecting and reading the peer's credentials. Returns `Some(pid)`
 /// if the path resolves to a live UDS with a valid peer, `None` otherwise
-/// (path missing, wrong file type, peer already gone, or a target other
-/// than Linux/macOS).
+/// (path missing, wrong file type, peer already gone, connect timeout,
+/// or a target other than Linux/Android/macOS).
 ///
 /// Callers (`worker_registry::terminate`, `shutdown_and_wait`) use this
 /// as the fallback source of the runner PID when the on-disk record is
@@ -48,19 +48,18 @@ pub fn is_pid_alive(_pid: u32) -> bool {
 /// `serde_json` parse errors to `Ok(None)`, so corrupt JSON stays in
 /// the "runner already gone" bucket and does not reach this fallback.
 ///
-/// Blocking-connect caveat: uses synchronous `UnixStream::connect`,
-/// which returns in microseconds against a healthy same-host listener.
-/// A wedged runner (D-state kernel thread, accept loop hung) could
-/// block the caller until the peer wakes or the kernel drops the
-/// listener. Callers today are the shutdown path where that runner is
-/// anyway the target of SIGTERM. A non-blocking `connect(2)` plus
-/// `poll(POLLOUT, timeout)` follow-up is tracked as #2621.
+/// Timeout: connect is bounded at 100ms via non-blocking `connect(2)`
+/// plus `poll(POLLOUT)`. Prevents a wedged runner (D-state kernel
+/// thread, accept loop hung, kernel memory pressure) from stalling the
+/// calling tokio worker thread. Timeouts and completed-but-failed
+/// connects (`SO_ERROR != 0`) fall into the same `None` bucket as any
+/// other failure.
 ///
-/// See #2102.
-#[cfg(target_os = "linux")]
+/// See #2102, #2621.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn peer_pid_from_socket(path: &Path) -> Option<u32> {
     use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
-    let stream = std::os::unix::net::UnixStream::connect(path).ok()?;
+    let stream = connect_with_timeout(path)?;
     let creds = getsockopt(&stream, PeerCredentials).ok()?;
     let pid = creds.pid();
     (pid > 0).then_some(pid as u32)
@@ -68,28 +67,75 @@ pub fn peer_pid_from_socket(path: &Path) -> Option<u32> {
 
 #[cfg(target_os = "macos")]
 pub fn peer_pid_from_socket(path: &Path) -> Option<u32> {
-    use std::os::fd::AsRawFd;
-    let stream = std::os::unix::net::UnixStream::connect(path).ok()?;
-    let mut pid: libc::pid_t = 0;
-    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
-    // SAFETY: `stream` keeps the fd valid for the duration of the syscall.
-    // `pid` is aligned and sized for `pid_t`; `len` is initialized to
-    // `sizeof(pid_t)`, which is what LOCAL_PEERPID writes on success.
-    let rc = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_LOCAL,
-            libc::LOCAL_PEERPID,
-            std::ptr::addr_of_mut!(pid).cast::<libc::c_void>(),
-            &mut len,
-        )
-    };
-    (rc == 0 && pid > 0).then_some(pid as u32)
+    use nix::sys::socket::{getsockopt, sockopt::LocalPeerPid};
+    let stream = connect_with_timeout(path)?;
+    let pid = getsockopt(&stream, LocalPeerPid).ok()?;
+    (pid > 0).then_some(pid as u32)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
 pub fn peer_pid_from_socket(_path: &Path) -> Option<u32> {
     None
+}
+
+/// Non-blocking `connect(2)` to a Unix domain socket, capped at 100ms via
+/// `poll(POLLOUT)`. Returns the connected `UnixStream` on success, or
+/// `None` on any failure (unreachable path, refused, timeout, syscall
+/// error), preserving the best-effort semantics of
+/// [`peer_pid_from_socket`]. See #2621.
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+fn connect_with_timeout(path: &Path) -> Option<std::os::unix::net::UnixStream> {
+    use std::os::fd::{AsFd, AsRawFd};
+    use std::os::unix::net::UnixStream;
+
+    use nix::errno::Errno;
+    use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
+    use nix::poll::{poll, PollFd, PollFlags};
+    use nix::sys::socket::{
+        connect, getsockopt, socket, sockopt::SocketError, AddressFamily, SockFlag, SockType,
+        UnixAddr,
+    };
+
+    let addr = UnixAddr::new(path).ok()?;
+    let fd = socket(
+        AddressFamily::Unix,
+        SockType::Stream,
+        SockFlag::empty(),
+        None,
+    )
+    .ok()?;
+    // `SockFlag::SOCK_NONBLOCK` and `SOCK_CLOEXEC` are gated to
+    // linux_android/BSD in nix 0.31, so set `FD_CLOEXEC` and
+    // `O_NONBLOCK` via fcntl for portability with macOS. Matches
+    // `std::os::unix::net::UnixStream::connect`, which sets
+    // `FD_CLOEXEC` on the returned fd.
+    fcntl(fd.as_fd(), FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).ok()?;
+    fcntl(fd.as_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).ok()?;
+
+    match connect(fd.as_raw_fd(), &addr) {
+        Ok(()) => {}
+        // `EAGAIN` is Linux AF_UNIX's variant of `EINPROGRESS`
+        // (`unix(7)`): connect cannot complete immediately; the
+        // same POLLOUT wait applies.
+        Err(Errno::EINPROGRESS | Errno::EAGAIN) => {
+            let mut pfds = [PollFd::new(fd.as_fd(), PollFlags::POLLOUT)];
+            // 100ms: same-host UDS connect completes in microseconds
+            // against a healthy listener; this cap tolerates light
+            // scheduler contention while bounding the pathological case
+            // (hung accept loop, kernel memory pressure).
+            if poll(&mut pfds, 100u16).ok()? == 0 {
+                return None;
+            }
+            // POLLOUT also fires on connect failure (ECONNREFUSED, etc.);
+            // check `SO_ERROR` before trusting the socket.
+            if getsockopt(&fd, SocketError).ok()? != 0 {
+                return None;
+            }
+        }
+        Err(_) => return None,
+    }
+
+    Some(UnixStream::from(fd))
 }
 
 /// Signal a worker's entire process group, then the worker pid itself.
@@ -404,5 +450,37 @@ mod tests {
             inspect_record_for_runner(&path, 42, extract),
             RunnerRecordState::Missing
         );
+    }
+
+    #[test]
+    fn peer_pid_from_socket_missing_path_returns_none_bounded() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("does-not-exist.sock");
+        let start = std::time::Instant::now();
+        assert_eq!(peer_pid_from_socket(&path), None);
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn peer_pid_from_socket_non_socket_file_returns_none_bounded() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("not-a-socket");
+        std::fs::write(&path, b"regular file").unwrap();
+        let start = std::time::Instant::now();
+        assert_eq!(peer_pid_from_socket(&path), None);
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[test]
+    fn peer_pid_from_socket_healthy_listener_returns_our_pid_bounded() {
+        use std::os::unix::net::UnixListener;
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("healthy.sock");
+        let _listener = UnixListener::bind(&path).unwrap();
+        let start = std::time::Instant::now();
+        let pid = peer_pid_from_socket(&path);
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(pid, Some(std::process::id()));
     }
 }

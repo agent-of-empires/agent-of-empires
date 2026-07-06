@@ -9,7 +9,6 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { SettingsFieldDescriptor } from "../../../lib/types";
 import {
-  AcpDefaultsWidget,
   DefaultToolWidget,
   LoggingTargetsWidget,
   SmartRenameAgentWidget,
@@ -170,38 +169,8 @@ describe("ThemeNameWidget", () => {
   });
 });
 
-describe("AcpDefaultsWidget", () => {
-  it("saves a parsed object and ignores invalid JSON", () => {
-    const save = vi.fn(() => Promise.resolve(true));
-    const { container } = render(
-      <AcpDefaultsWidget
-        descriptor={descriptor({
-          field: "acp_defaults",
-          label: "Structured View Defaults",
-        })}
-        value={{ opencode: { model: "x" } }}
-        save={save}
-      />,
-    );
-    const ta = container.querySelector("textarea") as HTMLTextAreaElement;
-    // Renders the current map as pretty JSON.
-    expect(ta.value).toContain("opencode");
-
-    // Invalid JSON: not saved (field keeps its last valid value).
-    fireEvent.focus(ta);
-    fireEvent.change(ta, { target: { value: "{not json" } });
-    fireEvent.blur(ta);
-    expect(save).not.toHaveBeenCalled();
-
-    // Valid object: saved as a parsed object.
-    fireEvent.focus(ta);
-    fireEvent.change(ta, {
-      target: { value: '{"claude":{"effort":"high"}}' },
-    });
-    fireEvent.blur(ta);
-    expect(save).toHaveBeenCalledWith({ claude: { effort: "high" } });
-  });
-});
+// AcpDefaultsWidget moved to its own file and is covered by
+// AcpDefaultsWidget.test.tsx (#2631).
 
 describe("SmartRenameAgentWidget", () => {
   it("lists only installed one-shot-capable agents plus Same as session, and saves the name", async () => {

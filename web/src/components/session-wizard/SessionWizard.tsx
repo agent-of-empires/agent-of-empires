@@ -8,6 +8,7 @@ import {
   fetchSettings,
   createSession,
   fetchVolumeIgnoresPreview,
+  fetchIsGitRepo,
   markVolumeIgnoresGlobsAcknowledged,
   type VolumeIgnoresGlobPreview,
   type HooksNeedTrust,
@@ -227,6 +228,27 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
     // identity.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Probe whether the selected path is a git repository so the worktree
+  // toggle can be disabled for a plain folder (e.g. a root picked via "Use
+  // this folder"). `/api/git/is-repo` uses the same `GitWorktree::is_git_repo`
+  // gate the builder enforces, so the UI matches the server's accept/reject.
+  // Only act on a definitive answer: on a transient failure (null) leave the
+  // optimistic default so a probe blip can't misreport a repo as a non-repo.
+  // Scratch sessions have no path and never use a worktree, so skip the probe.
+  const probePath = state.data.scratch ? "" : state.data.path;
+  useEffect(() => {
+    if (!probePath) return;
+    let cancelled = false;
+    fetchIsGitRepo(probePath).then((isRepo) => {
+      if (!cancelled && isRepo !== null) {
+        dispatch({ type: "SET_FIELD", field: "pathIsGitRepo", value: isRepo });
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [probePath]);
 
   const handleChange = useCallback((field: string, value: unknown) => {
     dispatch({ type: "SET_FIELD", field, value });

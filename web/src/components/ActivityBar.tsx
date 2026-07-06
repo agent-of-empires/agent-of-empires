@@ -1,6 +1,5 @@
-import { createElement } from "react";
-
 import type { PaneDisplay } from "./Dock";
+import { PaneIcon } from "./PaneIcon";
 
 interface Props {
   paneIds: string[];
@@ -33,7 +32,7 @@ export function ActivityBar({ paneIds, descriptorFor, isOpen, onToggle }: Props)
             title={`${open ? "Hide" : "Show"} ${name} pane`}
             aria-label={`Toggle ${name} pane`}
           >
-            {createElement(desc.icon, { className: "size-4", "aria-hidden": true })}
+            <PaneIcon icon={desc.icon} iconAssetUrl={desc.iconAssetUrl} className="size-4" />
           </button>
         );
       })}

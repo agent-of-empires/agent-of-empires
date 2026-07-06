@@ -77,9 +77,14 @@ smart_rename = true
 smart_rename_agent = ""    # "" = use the session's own agent; e.g. "codex"
 auto_stop_idle_secs = 0   # 0 disables; e.g. 7200 = stop after 2h idle
 
-[session.acp_defaults.opencode]
+# Per-agent structured-view defaults live under [acp], not [session].
+[acp.acp_defaults.opencode]
 model = "openai/gpt-5.5"
-effort = "high"
+effort = "high"           # default thinking level
+mode = "plan"             # default mode, applied when the agent advertises one
+
+[acp.acp_defaults.opencode.effort_by_model]
+"openai/gpt-5.5" = "high"  # overrides `effort` when this model is resolved
 ```
 
 | Option | Default | Description |
@@ -95,7 +100,7 @@ effort = "high"
 | `custom_agents` | `{}` | User-defined agents: name to command mapping. Custom agent names appear in the TUI agent picker alongside built-in agents. |
 | `agent_detect_as` | `{}` | Status detection mapping: maps an agent name to a built-in agent whose status heuristics should be used. |
 | `agent_acp_cmd` | `{}` | ACP launch command for a custom agent, enabling it to run in structured view (e.g., `{ "oc-superpowers" = "ocp run sp acp" }`). A custom agent with an entry here is structured view-capable; without one it stays tmux-only. Unlike `custom_agents`, the value is split into argv and run directly, with no shell. |
-| `acp_defaults` | `{}` | Per-agent defaults for structured view startup. `model` is forwarded when the worker starts; `effort` is applied through the agent's ACP `thought_level` config option when advertised. Example: `[session.acp_defaults.opencode] model = "openai/gpt-5.5" effort = "high"`. |
+| `acp.acp_defaults` | `{}` | Per-agent defaults for structured view startup (under the `[acp]` section, not `[session]`). `model` is forwarded when the worker starts; `effort` (thinking) and `mode` are applied through the agent's ACP config options (`thought_level`, `mode`) when advertised, and skipped with a warning otherwise. `effort_by_model` (a `{model = effort}` map) overrides `effort` for the resolved model. Editable per agent from the web dashboard (Structured view tab, Structured View Defaults). Example: `[acp.acp_defaults.opencode] model = "openai/gpt-5.5" effort = "high" mode = "plan"`. |
 
 For Codex, AoE preserves existing `[hooks.state]` trust data and writes `~/.codex/config.toml` through `config.toml.lock` plus an atomic replace. This keeps repeated or concurrent AoE launches from duplicating hook blocks or leaving partial TOML.
 

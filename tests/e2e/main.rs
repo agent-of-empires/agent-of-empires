@@ -39,6 +39,7 @@ mod intro;
 mod kiro_launch;
 mod logs;
 mod new_session;
+mod opencode_sandbox_resume;
 mod plugins;
 mod profile_picker;
 mod project_registry;

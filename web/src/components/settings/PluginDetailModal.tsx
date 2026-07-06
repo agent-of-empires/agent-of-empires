@@ -1,12 +1,15 @@
 import { useEffect, useState } from "react";
 
 import { fetchPluginDetails, type PluginDetail } from "../../lib/api";
+import { PluginIdentityIcon } from "./PluginIdentityIcon";
 
 interface Fallback {
   version?: string;
   description?: string;
   capabilities?: string[];
   ui_contributions?: { slot: string; id: string }[];
+  icon?: string | null;
+  icon_asset_url?: string | null;
 }
 
 interface PluginDetailModalProps {
@@ -71,6 +74,8 @@ export function PluginDetailModal({ source, title, fallback, installCommand, onC
   const description = manifest?.description ?? fallback?.description ?? null;
   const capabilities = manifest?.capabilities ?? fallback?.capabilities ?? [];
   const ui = manifest?.ui_contributions ?? fallback?.ui_contributions ?? [];
+  const icon = manifest?.icon ?? fallback?.icon ?? null;
+  const iconAssetUrl = manifest?.icon_asset_url ?? fallback?.icon_asset_url ?? null;
   // Screenshots come only from the fetched gh manifest; a no-media plugin
   // yields an empty list and renders no gallery chrome.
   const screenshots = manifest?.screenshots ?? [];
@@ -89,10 +94,18 @@ export function PluginDetailModal({ source, title, fallback, installCommand, onC
         onClick={(e) => e.stopPropagation()}
       >
         <div className="mb-3 flex items-start justify-between gap-3">
-          <div>
-            <h2 className="font-semibold">{title}</h2>
-            {version && <p className="text-xs text-text-dim">v{version}</p>}
-            <p className="text-[11px] text-text-dim">{source}</p>
+          <div className="flex items-start gap-2">
+            <PluginIdentityIcon
+              icon={icon}
+              iconAssetUrl={iconAssetUrl}
+              className="mt-0.5 size-5"
+              testId="plugin-detail-icon"
+            />
+            <div>
+              <h2 className="font-semibold">{title}</h2>
+              {version && <p className="text-xs text-text-dim">v{version}</p>}
+              <p className="text-[11px] text-text-dim">{source}</p>
+            </div>
           </div>
           <button
             type="button"

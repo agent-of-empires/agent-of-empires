@@ -1,10 +1,9 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, ReactNode, RefObject } from "react";
 import type { AnsiSegment, AnsiStyle } from "../lib/ansi";
-import { ansiToLines, wrapLine } from "../lib/liveTermLines";
+import { ansiToLines, findCursorCharIndex, textWidth, wrapLine } from "../lib/liveTermLines";
 import { wheelNotches } from "../lib/liveMouse";
 import { writeClipboard } from "../lib/clipboard";
-import { reportError as reportClientLog } from "../lib/logger";
 import type { LiveFrame } from "../hooks/useLiveTerminal";
 import { useWebSettings } from "../hooks/useWebSettings";
 import { useIsCoarsePointer } from "../hooks/useIsCoarsePointer";
@@ -79,6 +78,10 @@ export interface MobileLiveTerminalProps {
   enterReading: (rows: number) => void;
   returnToLive: (rows: number) => void;
   sendData: (data: string) => void;
+  /** Upload a clipboard image pasted into the pane and resolve to the path
+   *  the tmux pane can read (host path, or the container mount for sandboxed
+   *  sessions), or null on failure. See #2678. */
+  uploadPastedImage: (file: File) => Promise<string | null>;
   /** Forward a wheel notch to a full-screen mouse app (alternate screen).
    *  Used instead of capture-window scrolling when the frame reports the
    *  pane is such an app. */
@@ -108,6 +111,13 @@ export interface MobileLiveTerminalProps {
    *  prompt sits just above the keyboard. The paired host/container shells are
    *  ordinary terminals, so they top-align like a normal bash window. */
   bottomAlign: boolean;
+}
+
+// Backslash-escape whitespace and backslashes in a pasted image path, matching
+// what terminal drag-and-drop produces, so a path under a directory with spaces
+// (e.g. "Agent of Empires") is parsed as a single token by the CLI agent.
+function escapePastePath(p: string): string {
+  return p.replace(/[\\ \t]/g, (c) => `\\${c}`);
 }
 
 function segStyle(style: AnsiStyle): CSSProperties | undefined {
@@ -174,11 +184,7 @@ function altPrintableMetaKey(
   return e.shiftKey ? letter : letter.toLowerCase();
 }
 
-function isLocalClipboardHost(hostname: string): boolean {
-  return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
-}
-
-const Row = memo(function Row({ segs, cursorCol }: { segs: AnsiSegment[]; cursorCol: number | null }) {
+export const Row = memo(function Row({ segs, cursorCol }: { segs: AnsiSegment[]; cursorCol: number | null }) {
   if (cursorCol == null) {
     if (segs.length === 0) return <div> </div>; // keep empty rows at full height
     return (
@@ -192,31 +198,34 @@ const Row = memo(function Row({ segs, cursorCol }: { segs: AnsiSegment[]; cursor
     );
   }
   // Render the row with the single cell at `cursorCol` boxed. Walk segments by
-  // column; split the one that straddles the cursor.
+  // terminal cell width, not UTF-16 code units, since `cursorCol` is a real
+  // cell count from tmux and CJK/wide glyphs take two cells but one code
+  // unit (#2665); split the segment that straddles the cursor.
   const out: ReactNode[] = [];
   let col = 0;
   let placed = false;
   let key = 0;
   for (const seg of segs) {
     const t = seg.text;
-    if (!placed && cursorCol >= col && cursorCol < col + t.length) {
-      const off = cursorCol - col;
-      if (off > 0) {
+    const idx = placed ? null : findCursorCharIndex(t, cursorCol - col);
+    if (idx != null) {
+      const chars = [...t];
+      if (idx > 0) {
         out.push(
           <span key={key++} style={segStyle(seg.style)}>
-            {t.slice(0, off)}
+            {chars.slice(0, idx).join("")}
           </span>,
         );
       }
       out.push(
         <span key={key++} data-live-cursor style={{ ...segStyle(seg.style), ...CURSOR_CELL_STYLE }}>
-          {t[off]}
+          {chars[idx]}
         </span>,
       );
-      if (off + 1 < t.length) {
+      if (idx + 1 < chars.length) {
         out.push(
           <span key={key++} style={segStyle(seg.style)}>
-            {t.slice(off + 1)}
+            {chars.slice(idx + 1).join("")}
           </span>,
         );
       }
@@ -228,7 +237,7 @@ const Row = memo(function Row({ segs, cursorCol }: { segs: AnsiSegment[]; cursor
         </span>,
       );
     }
-    col += t.length;
+    col += textWidth(t);
   }
   if (!placed) {
     // Cursor sits past the row's text (blank input cell): pad to the column
@@ -254,6 +263,7 @@ export function MobileLiveTerminal({
   enterReading,
   returnToLive,
   sendData,
+  uploadPastedImage,
   forwardWheel,
   forwardButton,
   ctrlActiveRef,
@@ -289,8 +299,6 @@ export function MobileLiveTerminal({
   const scrollerRef = useRef<HTMLDivElement>(null);
   const measureRef = useRef<HTMLSpanElement>(null);
   const keyboardLayoutRef = useRef<KeyboardLayoutReader | null>(null);
-  const [imagePasteStatus, setImagePasteStatus] = useState<string | null>(null);
-  const imagePasteStatusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
     const keyboard = (
       navigator as Navigator & {
@@ -311,12 +319,6 @@ export function MobileLiveTerminal({
       cancelled = true;
     };
   }, []);
-  useEffect(
-    () => () => {
-      if (imagePasteStatusTimerRef.current) clearTimeout(imagePasteStatusTimerRef.current);
-    },
-    [],
-  );
 
   const lineH = fontSize * LINE_RATIO;
   // Real rendered glyph advance, measured off a hidden span INSIDE the
@@ -1134,37 +1136,37 @@ export function MobileLiveTerminal({
 
   const onPaste = useCallback(
     (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
-      e.preventDefault();
+      // Read clipboard data synchronously: `clipboardData` is not guaranteed
+      // to survive an await in every browser.
       const text = e.clipboardData.getData("text/plain");
-      if (text) {
-        sendData(`\x1b[200~${text}\x1b[201~`);
+      const imageFiles = Array.from(e.clipboardData.items ?? [])
+        .filter((it) => it.kind === "file")
+        .map((it) => it.getAsFile())
+        .filter((f): f is File => f != null && f.type.startsWith("image/"));
+
+      e.preventDefault();
+
+      if (imageFiles.length === 0) {
+        // Bracketed paste so agents treat embedded newlines as pasted text.
+        if (text) sendData(`\x1b[200~${text}\x1b[201~`);
         return;
       }
-      // Image-only browser paste cannot stream file bytes through the PTY.
-      // Items cover Chromium's clipboard shape; files covers Safari-like
-      // flows. Text wins above when both are present.
-      const items = Array.from(e.clipboardData.items ?? []);
-      const hasImageItem = items.some((item) => item.kind === "file" && item.type.startsWith("image/"));
-      const hasImageFile = Array.from(e.clipboardData.files ?? []).some((file) => file.type.startsWith("image/"));
-      if (hasImageItem || hasImageFile) {
-        if (isLocalClipboardHost(location.hostname)) {
-          // `\x16` is raw Ctrl+V, which asks terminal agents to run their
-          // native host-clipboard image paste flow. That only matches the
-          // browser clipboard when the dashboard and terminal share a host.
-          sendData("\x16");
-          setImagePasteStatus("Sent local image paste shortcut to the terminal agent.");
-        } else {
-          setImagePasteStatus("Image paste is only available from this live terminal on localhost.");
-          reportClientLog(
-            "Image-only live-terminal paste was blocked on a remote dashboard because the terminal agent reads the server clipboard, not the browser clipboard.",
-            { level: "warn", target: "live-terminal.image-paste.remote" },
-          );
-        }
-        if (imagePasteStatusTimerRef.current) clearTimeout(imagePasteStatusTimerRef.current);
-        imagePasteStatusTimerRef.current = setTimeout(() => setImagePasteStatus(null), 4000);
-      }
+
+      // The browser drops non-text clipboard payloads, so an image cannot be
+      // typed into the pane. Upload each blob to the host, then paste the
+      // file path(s) the CLI agent reads to attach them. See #2678.
+      void (async () => {
+        const paths = (await Promise.all(imageFiles.map((f) => uploadPastedImage(f)))).filter(
+          (p): p is string => p != null,
+        );
+        const parts = [text.trim(), ...paths.map(escapePastePath)].filter((s) => s.length > 0);
+        if (parts.length === 0) return;
+        // Leading and trailing spaces keep the path from gluing onto queued
+        // text or the user's next keystroke. No newline: never auto-submit.
+        sendData(`\x1b[200~ ${parts.join(" ")} \x1b[201~`);
+      })();
     },
-    [sendData],
+    [sendData, uploadPastedImage],
   );
 
   const onCompositionStart = useCallback(() => {
@@ -1208,14 +1210,6 @@ export function MobileLiveTerminal({
 
   return (
     <div className="absolute inset-0" data-live-terminal>
-      {imagePasteStatus && (
-        <div
-          role="status"
-          className="absolute top-3 left-1/2 z-10 -translate-x-1/2 rounded-md border border-surface-700 bg-surface-900/95 px-3 py-1.5 text-xs text-text-primary shadow-lg"
-        >
-          {imagePasteStatus}
-        </div>
-      )}
       <div
         ref={scrollerRef}
         onScroll={onScroll}

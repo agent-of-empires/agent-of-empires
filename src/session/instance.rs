@@ -3052,6 +3052,11 @@ impl Instance {
             .clone();
         let container = DockerContainer::new(&self.id, &image);
 
+        // Direct is_running()? / exists()? here rather than probe_running():
+        // this function already returns Result, so `?` correctly propagates
+        // a daemon-down transient to the caller as Err, letting them render
+        // an actionable error rather than silently falling through to a
+        // create attempt that would also fail. See #2596.
         if container.is_running()? {
             // Already up: not a come-up, so don't re-mint. Fill lazily only if a
             // fresh process attached to a running container with no values yet.
@@ -3987,13 +3992,37 @@ impl Instance {
     /// Stop the session: kill the tmux session and stop the Docker container
     /// (if sandboxed). The container is stopped but not removed, so it can be
     /// restarted on re-attach.
+    ///
+    /// On a docker inspect failure ([`crate::containers::Probe::Unknown`])
+    /// the stop is attempted anyway with a `warn!` log, so a possibly-live
+    /// container is not silently abandoned. A second `warn!` is emitted if
+    /// the stop itself also fails (e.g. docker daemon is down); the overall
+    /// `stop()` return still succeeds in that case (best-effort: the session
+    /// record is marked Stopped regardless).
     pub fn stop(&self) -> Result<()> {
         self.kill()?;
 
         if self.is_sandboxed() {
             let container = containers::DockerContainer::from_session_id(&self.id);
-            if container.is_running().unwrap_or(false) {
-                container.stop()?;
+            match container.probe_running() {
+                containers::Probe::Running => container.stop()?,
+                containers::Probe::NotRunning => {}
+                containers::Probe::Unknown(e) => {
+                    tracing::warn!(
+                        target: "containers.runtime",
+                        session = %self.id,
+                        error = %e,
+                        "docker inspect failed while probing sandbox container before session stop; attempting stop anyway to avoid leaving a possibly-live container behind"
+                    );
+                    if let Err(stop_err) = container.stop() {
+                        tracing::warn!(
+                            target: "containers.runtime",
+                            session = %self.id,
+                            error = %stop_err,
+                            "sandbox container stop failed after probe failure; container may already be gone or docker is unreachable"
+                        );
+                    }
+                }
             }
         }
 

@@ -306,6 +306,11 @@ pub struct AppState {
     /// respawn a one-shot agent; one attempt per session bounds that cost and
     /// clears the `pending` sidebar chip once an attempt has run.
     pub smart_rename_attempted: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Global cap on concurrent smart-rename one-shots so a burst of new
+    /// sessions cannot fan out into N host processes each holding a slot for
+    /// up to `ONESHOT_TIMEOUT`. Held only across the child spawn + wait. See
+    /// `session::smart_rename` and #2348.
+    pub smart_rename_semaphore: tokio::sync::Semaphore,
     /// Suppression set for the startup-recovery cascade. While an entry is
     /// present and younger than `recovery::RECENTLY_RESTARTED_TTL`, the
     /// `status_poll_loop` skips `update_status_with_metadata` for that
@@ -993,6 +998,9 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         instance_locks: RwLock::new(std::collections::HashMap::new()),
         smart_rename_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
         smart_rename_attempted: std::sync::Mutex::new(std::collections::HashSet::new()),
+        smart_rename_semaphore: tokio::sync::Semaphore::new(
+            crate::session::smart_rename::MAX_CONCURRENT,
+        ),
         recently_restarted: crate::session::recovery::new_recently_restarted(),
         recovery_pending: crate::session::recovery::new_recovery_pending(),
         cleanup_defaults_cache: RwLock::new(CleanupDefaultsCache {
@@ -1479,6 +1487,13 @@ fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/sessions/{id}/ensure", post(api::ensure_session))
         .route("/api/sessions/{id}/send", post(api::send_message))
+        .route(
+            "/api/sessions/{id}/paste-image",
+            // A base64 screenshot blows past the global 1 MiB cap. 8 MiB
+            // leaves headroom for the 5 MiB decoded cap (enforced in the
+            // handler) plus base64's ~33% overhead and JSON framing.
+            post(api::paste_image).layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024)),
+        )
         .route("/api/sessions/{id}/output", get(api::read_output))
         .route(
             "/api/sessions/{id}/notifications",
@@ -1538,6 +1553,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/filesystem/browse", get(api::browse_filesystem))
         .route("/api/filesystem/home", get(api::filesystem_home))
         .route("/api/git/branches", get(api::list_branches))
+        .route("/api/git/is-repo", get(api::is_git_repo))
         .route("/api/git/clone", post(api::clone_repo))
         .route("/api/groups", get(api::list_groups))
         .route(
@@ -1562,6 +1578,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         // Plugin management. The enable/disable toggle gates on read-only +
         // elevation inside the handler.
         .route("/api/plugins", get(api::list_plugins))
+        .route("/api/plugins/{id}/icon", get(api::serve_plugin_icon))
         .route("/api/plugins/commands", get(api::plugin_commands))
         .route("/api/plugins/ui-state", get(api::plugin_ui_state))
         .route("/api/plugins/updates", get(api::plugin_updates))
@@ -1732,6 +1749,7 @@ fn build_router(state: Arc<AppState>) -> Router {
             post(api::resolve_elicitation),
         )
         .route("/api/acp/agents", get(api::list_acp_agents))
+        .route("/api/acp/option-catalog", get(api::get_option_catalog))
         .route("/api/claude-sessions", get(api::list_claude_sessions));
 
     app
@@ -3772,6 +3790,98 @@ async fn acp_event_listener(state: Arc<AppState>) {
             });
         }
 
+        // Recall cache: record the agent's advertised config options so the
+        // per-agent defaults settings page can populate its dropdowns without a
+        // live session. `record` debounces unchanged snapshots and writes off
+        // the async runtime. See #2631.
+        if let crate::acp::state::Event::ConfigOptionsUpdated { options } = frame.event.as_ref() {
+            if !options.is_empty() {
+                let agent = state
+                    .instances
+                    .read()
+                    .await
+                    .iter()
+                    .find(|i| i.id == frame.session_id)
+                    .map(|i| {
+                        i.agent_name
+                            .as_deref()
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or(i.tool.as_str())
+                            .to_string()
+                    });
+                if let Some(agent) = agent {
+                    let options = options.clone();
+                    let now = chrono::Utc::now().to_rfc3339();
+                    tokio::task::spawn_blocking(move || {
+                        if let Err(e) = crate::acp::option_catalog::record(&agent, &options, now) {
+                            tracing::warn!(
+                                target: "acp.event_listener",
+                                agent = %agent,
+                                error = %e,
+                                "failed to record acp option catalog"
+                            );
+                        }
+                    });
+                }
+            }
+        }
+
+        // Smart-rename defer: fire the one-shot only on a clean
+        // `prompt_complete` `Event::Stopped`, so it never races the live worker
+        // for the same provider API. Fast-path on the event variant BEFORE
+        // touching the two sync mutexes so high-volume streaming-delta frames
+        // (`AgentMessageChunk`, `ToolCallStarted`, `ThinkingStarted`, ...) skip
+        // the locks entirely; the pure predicate then applies the reason
+        // allowlist + the two per-session `contains()` checks. See #2348 and
+        // the post-merge review nit on #2651.
+        let should_rename = matches!(
+            frame.event.as_ref(),
+            crate::acp::state::Event::Stopped { .. }
+        ) && {
+            let attempted = state
+                .smart_rename_attempted
+                .lock()
+                .expect("smart_rename_attempted poisoned");
+            let inflight = state
+                .smart_rename_inflight
+                .lock()
+                .expect("smart_rename_inflight poisoned");
+            crate::session::smart_rename::should_trigger_smart_rename(
+                frame.event.as_ref(),
+                &frame.session_id,
+                &attempted,
+                &inflight,
+            )
+        };
+        if should_rename {
+            if let Some(first_message) = state.acp_event_store.first_user_prompt(&frame.session_id)
+            {
+                let state_for_rename = state.clone();
+                let session_id = frame.session_id.clone();
+                tokio::spawn(async move {
+                    crate::session::smart_rename::try_smart_rename(
+                        state_for_rename,
+                        session_id,
+                        first_message,
+                    )
+                    .await;
+                });
+            } else {
+                // A `prompt_complete` Stopped without any persisted UserPromptSent
+                // is unexpected: `publish_user_prompt_with_attachments` runs
+                // strictly before `send_prompt` in the ACP handler, so by the
+                // time the turn ends the first prompt should be durable in the
+                // event store. A silent skip would hide a plumbing bug (attachment
+                // rollback, pruning of an old session, race with SessionCleared);
+                // surface it at debug so operators can trace it.
+                tracing::debug!(
+                    target: "smart_rename",
+                    session = %frame.session_id,
+                    "trigger fired but event store has no first_user_prompt; skipping"
+                );
+            }
+        }
+
         let status_intent = derive_acp_status(frame.event.as_ref());
         let acp_change = derive_acp_session_change(frame.event.as_ref());
         if status_intent.is_none() && acp_change.is_none() {
@@ -4160,6 +4270,9 @@ pub mod test_support {
             instance_locks: RwLock::new(HashMap::new()),
             smart_rename_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
             smart_rename_attempted: std::sync::Mutex::new(std::collections::HashSet::new()),
+            smart_rename_semaphore: tokio::sync::Semaphore::new(
+                crate::session::smart_rename::MAX_CONCURRENT,
+            ),
             recently_restarted: crate::session::recovery::new_recently_restarted(),
             recovery_pending: crate::session::recovery::new_recovery_pending(),
             cleanup_defaults_cache: RwLock::new(CleanupDefaultsCache {

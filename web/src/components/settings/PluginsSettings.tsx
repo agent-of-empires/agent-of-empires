@@ -21,6 +21,7 @@ import {
 } from "../../lib/api";
 import { reportInfo } from "../../lib/toastBus";
 import { PluginDetailModal } from "./PluginDetailModal";
+import { PluginIdentityIcon } from "./PluginIdentityIcon";
 import { PluginInstallConsentModal } from "./PluginInstallConsentModal";
 import { PluginJobProgressModal } from "./PluginJobProgressModal";
 import { PluginUpdateConsentModal } from "./PluginUpdateConsentModal";
@@ -33,6 +34,8 @@ interface DetailTarget {
     description?: string;
     capabilities?: string[];
     ui_contributions?: { slot: string; id: string }[];
+    icon?: string | null;
+    icon_asset_url?: string | null;
   };
   installCommand?: string;
 }
@@ -396,6 +399,18 @@ export function PluginsSettings() {
                     data-testid={`plugins-discover-result-${r.slug}`}
                   >
                     <div className="flex flex-wrap items-center gap-2">
+                      <img
+                        src={r.source_avatar_url}
+                        alt=""
+                        aria-hidden="true"
+                        className="size-4 shrink-0 rounded-full"
+                        data-testid={`plugins-discover-avatar-${r.slug}`}
+                        // A deleted or renamed GitHub account 404s; hide the
+                        // avatar rather than leave a broken-image icon.
+                        onError={(e) => {
+                          e.currentTarget.classList.add("hidden");
+                        }}
+                      />
                       <button
                         type="button"
                         className="font-medium text-accent-500 hover:underline"
@@ -479,6 +494,11 @@ export function PluginsSettings() {
                 <div className="flex items-start justify-between gap-3">
                   <div className="min-w-0">
                     <div className="flex flex-wrap items-center gap-2">
+                      <PluginIdentityIcon
+                        icon={plugin.icon}
+                        iconAssetUrl={plugin.icon_asset_url}
+                        testId={`plugin-icon-${plugin.id}`}
+                      />
                       <button
                         type="button"
                         className="font-medium hover:underline"
@@ -491,6 +511,8 @@ export function PluginsSettings() {
                               description: plugin.description,
                               capabilities: plugin.capabilities,
                               ui_contributions: plugin.ui_contributions,
+                              icon: plugin.icon,
+                              icon_asset_url: plugin.icon_asset_url,
                             },
                           })
                         }

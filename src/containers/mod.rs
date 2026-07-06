@@ -76,6 +76,38 @@ fn classify_removal(result: Result<()>) -> Teardown {
     }
 }
 
+/// Outcome of a running-state probe that preserves the difference between
+/// a definitive "not running" and a transient inspection failure.
+///
+/// Callers gating a mutation on the container being stopped must match on
+/// all three variants and treat [`Probe::Unknown`] conservatively (typically
+/// as "possibly running"). Collapsing the underlying `is_running() -> Result<bool>`
+/// to a plain `bool` via `unwrap_or(false)` re-introduces the swallowing-
+/// existence-probe class of bug fixed in #2596.
+/// [`DockerContainer::probe_running`] is the constructor for this type.
+#[derive(Debug)]
+pub enum Probe {
+    /// The container is running.
+    Running,
+    /// The container is definitively not running (stopped or absent).
+    NotRunning,
+    /// The inspection itself failed; the running state is unknown.
+    Unknown(error::DockerError),
+}
+
+/// Classify a running-state result into an idempotent probe outcome.
+///
+/// A transient inspection error must not be swallowed into a `NotRunning`
+/// false negative. Keeping this classification separate from I/O lets it
+/// be reasoned about and tested without a live runtime.
+fn classify_running_probe(result: Result<bool>) -> Probe {
+    match result {
+        Ok(true) => Probe::Running,
+        Ok(false) => Probe::NotRunning,
+        Err(e) => Probe::Unknown(e),
+    }
+}
+
 pub struct DockerContainer {
     pub name: String,
     pub image: String,
@@ -190,13 +222,44 @@ impl DockerContainer {
     /// [`Teardown::AlreadyGone`], not a failure. Named ignore volumes outlive
     /// the container, so they are swept regardless of the removal outcome.
     ///
-    /// NOTE: callers must invoke this unconditionally and act on the returned
-    /// outcome; it must never be gated behind a separate existence probe, whose
-    /// transient failure would skip removal and orphan a live container.
+    /// This method must be invoked unconditionally by callers, which then
+    /// act on the returned outcome; it must never be gated behind a separate
+    /// existence probe, whose transient failure would skip removal and orphan
+    /// a live container.
     pub fn teardown(&self, session_id: &str) -> Teardown {
         let outcome = classify_removal(self.remove(true));
         self.remove_named_ignore_volumes(session_id);
         outcome
+    }
+
+    /// Force-remove this container, preserving its named ignore volumes.
+    ///
+    /// Idempotent counterpart to [`Self::teardown`]: same removal and
+    /// classification, but the session-scoped named ignore volumes
+    /// (`aoe-vi-{session_id}-*`, e.g. `target/`, `node_modules/`) are left
+    /// intact so the recreated container re-attaches them on next start.
+    /// Used on the worktree-move discard path where the container is dropped
+    /// to pick up a new bind mount and will be recreated immediately.
+    ///
+    /// The same invariant as [`Self::teardown`] applies: callers must invoke
+    /// this unconditionally and act on the returned outcome; it must never
+    /// be gated behind a separate existence probe, whose transient failure
+    /// would skip removal and orphan a live container (#2596).
+    pub fn discard(&self) -> Teardown {
+        classify_removal(self.remove(true))
+    }
+
+    /// Probe this container's running state, preserving the difference
+    /// between a definitive "not running" and a transient inspection failure.
+    ///
+    /// Prefer this over `is_running().unwrap_or(false)` at any call site
+    /// where the returned boolean gates a mutation on the container being
+    /// stopped: `unwrap_or(false)` swallows a transient `docker inspect`
+    /// failure into a false negative and lets the gate open against a
+    /// possibly-live container: the swallowing-existence-probe class of
+    /// bug fixed on the removal path in #2596.
+    pub fn probe_running(&self) -> Probe {
+        classify_running_probe(self.is_running())
     }
 
     pub fn exec_command(&self, options: Option<&str>, cmd: &str) -> String {
@@ -241,6 +304,25 @@ mod tests {
     fn classify_other_error_is_failed() {
         let r = Err(error::DockerError::RemoveFailed("daemon busy".into()));
         assert!(matches!(classify_removal(r), Teardown::Failed(_)));
+    }
+
+    #[test]
+    fn probe_ok_true_is_running() {
+        assert!(matches!(classify_running_probe(Ok(true)), Probe::Running));
+    }
+
+    #[test]
+    fn probe_ok_false_is_not_running() {
+        assert!(matches!(
+            classify_running_probe(Ok(false)),
+            Probe::NotRunning
+        ));
+    }
+
+    #[test]
+    fn probe_err_is_unknown() {
+        let r = Err(error::DockerError::InspectFailed("inspect exit 1".into()));
+        assert!(matches!(classify_running_probe(r), Probe::Unknown(_)));
     }
 
     #[test]

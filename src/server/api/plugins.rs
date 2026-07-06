@@ -61,6 +61,77 @@ pub async fn list_plugins() -> Json<serde_json::Value> {
     }))
 }
 
+/// Resolve a plugin's declared `icon_asset` (repository-relative, already
+/// `screenshot_path_ok`-checked) against its install directory, refusing to
+/// serve anything outside that directory. Both `dir` and the joined path are
+/// canonicalized so a symlink or `..` segment cannot escape containment; the
+/// caller passes the already-loaded `dir`/`rel` rather than this function
+/// touching the registry, so it is plain path logic and testable without a
+/// running plugin host.
+fn resolve_plugin_icon_path(dir: &std::path::Path, rel: &str) -> Option<PathBuf> {
+    if !aoe_plugin_api::screenshot_path_ok(rel) {
+        return None;
+    }
+    let root = dir.canonicalize().ok()?;
+    let target = root.join(rel).canonicalize().ok()?;
+    target.starts_with(&root).then_some(target)
+}
+
+fn content_type_for_icon(path: &std::path::Path) -> Option<&'static str> {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => Some("image/png"),
+        Some("jpg") | Some("jpeg") => Some("image/jpeg"),
+        Some("gif") => Some("image/gif"),
+        Some("webp") => Some("image/webp"),
+        _ => None,
+    }
+}
+
+/// `GET /api/plugins/{id}/icon`: stream an installed plugin's `icon_asset`
+/// from its install directory. Mirrors `serve_sound_file`'s allowlist-then-read
+/// shape: the manifest path is re-validated and re-joined against the
+/// plugin's own directory rather than trusted from a cached URL. A builtin
+/// (no install directory) or a plugin with no `icon_asset` 404s.
+pub async fn serve_plugin_icon(Path(id): Path<String>) -> Response {
+    let registry = plugin::registry();
+    let Some(plugin) = registry.all().iter().find(|p| p.id() == id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let (Some(dir), Some(rel)) = (plugin.dir.clone(), plugin.manifest.icon_asset.clone()) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    let resolved = tokio::task::spawn_blocking(move || resolve_plugin_icon_path(&dir, &rel)).await;
+    let path = match resolved {
+        Ok(Some(p)) => p,
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+
+    let Some(content_type) = content_type_for_icon(&path) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(b) => b,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+
+    (
+        StatusCode::OK,
+        [
+            (axum::http::header::CONTENT_TYPE, content_type),
+            (axum::http::header::CACHE_CONTROL, "private, max-age=3600"),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
 /// One active plugin command, normalized for the dashboard command palette and
 /// keymap: the namespaced `fqid`, its declared keybind chords, and its optional
 /// client-executed `action`. The web binds and renders these without parsing
@@ -713,5 +784,62 @@ mod tests {
             PluginJobStatus::Failed { error } => assert!(error.contains("boom"), "{error}"),
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn resolve_plugin_icon_path_serves_a_file_inside_the_install_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("icon.png"), b"fake png bytes").unwrap();
+        let resolved = resolve_plugin_icon_path(dir.path(), "icon.png").expect("resolves");
+        assert_eq!(
+            resolved,
+            dir.path().canonicalize().unwrap().join("icon.png")
+        );
+    }
+
+    #[test]
+    fn resolve_plugin_icon_path_rejects_traversal_and_absolute_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("icon.png"), b"x").unwrap();
+        // "../secret.png" is rejected by screenshot_path_ok's shape check
+        // alone, before any filesystem access, so no sibling file is needed
+        // to prove containment holds.
+        for bad in [
+            "../secret.png",
+            "/etc/passwd.png",
+            "icon.svg",
+            "missing.png",
+        ] {
+            assert!(
+                resolve_plugin_icon_path(dir.path(), bad).is_none(),
+                "{bad:?} should not resolve"
+            );
+        }
+    }
+
+    #[test]
+    fn content_type_for_icon_covers_raster_extensions_only() {
+        assert_eq!(
+            content_type_for_icon(std::path::Path::new("a.png")),
+            Some("image/png")
+        );
+        assert_eq!(
+            content_type_for_icon(std::path::Path::new("a.jpg")),
+            Some("image/jpeg")
+        );
+        assert_eq!(
+            content_type_for_icon(std::path::Path::new("a.jpeg")),
+            Some("image/jpeg")
+        );
+        assert_eq!(
+            content_type_for_icon(std::path::Path::new("a.gif")),
+            Some("image/gif")
+        );
+        assert_eq!(
+            content_type_for_icon(std::path::Path::new("a.webp")),
+            Some("image/webp")
+        );
+        assert_eq!(content_type_for_icon(std::path::Path::new("a.svg")), None);
+        assert_eq!(content_type_for_icon(std::path::Path::new("a")), None);
     }
 }

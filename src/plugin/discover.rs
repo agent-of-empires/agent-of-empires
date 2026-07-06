@@ -13,7 +13,7 @@
 use std::time::Duration;
 
 use anyhow::{bail, Result};
-use aoe_plugin_api::{screenshot_path_ok, MAX_SCREENSHOTS};
+use aoe_plugin_api::{lucide_icon_name_ok, screenshot_path_ok, MAX_SCREENSHOTS};
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use serde::{Deserialize, Serialize};
 
@@ -85,6 +85,15 @@ pub struct DiscoveryResult {
     /// The exact `aoe plugin install` command for this plugin, shown alongside
     /// the in-app Install button for users who prefer the terminal.
     pub install_command: String,
+    /// The repo owner's GitHub avatar (`github.com/{owner}.png`), shown as a
+    /// source-identity affordance. This is NOT the plugin's own identity icon
+    /// (`aoe-plugin.toml`'s `icon`/`icon_asset`, only known after a manifest
+    /// fetch): discovery is deliberately repo-level and never fetches each
+    /// result's manifest (see the module doc), so the owner avatar is the only
+    /// zero-cost visual identity available at search time. Always resolvable
+    /// from `full_name` with no extra request; GitHub serves this path for any
+    /// owner.
+    pub source_avatar_url: String,
 }
 
 /// Search the `aoe-plugin` topic and badge each result. `query` is an optional
@@ -148,6 +157,8 @@ fn badge_repos(
             } else {
                 DiscoveryBadge::Unvetted
             };
+            // Already validated as exactly two non-empty segments above.
+            let owner = repo.full_name.split('/').next().unwrap_or_default();
             Some(DiscoveryResult {
                 install_command: format!("aoe plugin install {slug}"),
                 slug,
@@ -156,6 +167,7 @@ fn badge_repos(
                 description: repo.description.filter(|d| !d.is_empty()),
                 stars: repo.stargazers_count,
                 badge,
+                source_avatar_url: format!("https://github.com/{owner}.png?size=64"),
             })
         })
         .collect()
@@ -202,6 +214,12 @@ pub struct DetailManifest {
     /// `raw.githubusercontent.com`. Author-declared paths that fail validation
     /// are dropped here rather than failing the whole detail.
     pub screenshots: Vec<ScreenshotView>,
+    /// Lucide kebab-case identity icon name, straight from the manifest.
+    pub icon: Option<String>,
+    /// The manifest's `icon_asset`, resolved to a `raw.githubusercontent.com`
+    /// URL exactly like screenshots. `None` below `api_version >= 7` or when
+    /// the declared path fails validation.
+    pub icon_asset_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -244,6 +262,35 @@ fn resolve_screenshots(
             caption: s.caption,
         })
         .collect()
+}
+
+/// Resolve a manifest's raw `icon` name, gated on `api_version >= 7` and
+/// syntax-checked via [`lucide_icon_name_ok`], so a malformed or pre-7 name
+/// from attacker-influenced remote manifest content never reaches the client.
+/// Extracted from the `details()` call site so this filter is independently
+/// testable without a network-backed `details()` call.
+fn resolve_icon_name(api_version: u32, icon: Option<String>) -> Option<String> {
+    if api_version < 7 {
+        return None;
+    }
+    icon.filter(|i| lucide_icon_name_ok(i))
+}
+
+/// Resolve a manifest's raw `icon_asset` into a browser-fetchable URL. Gated
+/// on `api_version >= 7` to mirror [`aoe_plugin_api::PluginManifest::validate`],
+/// and dropped on an invalid path, exactly like [`resolve_screenshots`].
+fn resolve_icon_asset(
+    api_version: u32,
+    path: Option<String>,
+    owner: &str,
+    repo: &str,
+    reference: Option<&str>,
+) -> Option<String> {
+    if api_version < 7 {
+        return None;
+    }
+    let path = path?;
+    screenshot_path_ok(&path).then(|| raw_url(owner, repo, reference, &path))
 }
 
 /// Build the `raw.githubusercontent.com` URL for a repository-relative path.
@@ -290,6 +337,10 @@ struct RawManifest {
     ui: Vec<RawUi>,
     #[serde(default)]
     screenshots: Vec<RawScreenshot>,
+    #[serde(default)]
+    icon: Option<String>,
+    #[serde(default)]
+    icon_asset: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -345,6 +396,14 @@ pub async fn details(source: &str) -> Result<PluginDetail> {
                 screenshots: resolve_screenshots(
                     m.api_version,
                     m.screenshots,
+                    owner,
+                    repo,
+                    reference,
+                ),
+                icon: resolve_icon_name(m.api_version, m.icon),
+                icon_asset_url: resolve_icon_asset(
+                    m.api_version,
+                    m.icon_asset,
                     owner,
                     repo,
                     reference,
@@ -541,5 +600,96 @@ alt = "good"
     fn install_command_uses_the_slug() {
         let out = badge_repos(vec![repo("acme/widget", 1)], &FeaturedIndex::default(), &[]);
         assert_eq!(out[0].install_command, "aoe plugin install gh:acme/widget");
+    }
+
+    #[test]
+    fn source_avatar_url_derives_from_the_owner_with_no_extra_request() {
+        let out = badge_repos(vec![repo("acme/widget", 1)], &FeaturedIndex::default(), &[]);
+        assert_eq!(
+            out[0].source_avatar_url,
+            "https://github.com/acme.png?size=64"
+        );
+    }
+
+    #[test]
+    fn detail_manifest_parses_icon_and_resolves_icon_asset() {
+        let toml = r#"
+id = "acme.widget"
+name = "Widget"
+version = "1.0.0"
+api_version = 7
+icon = "git-branch"
+icon_asset = "assets/icon.png"
+"#;
+        let m: RawManifest = toml::from_str(toml).expect("lenient parse");
+        assert_eq!(
+            resolve_icon_name(m.api_version, m.icon.clone()).as_deref(),
+            Some("git-branch")
+        );
+        let url = resolve_icon_asset(m.api_version, m.icon_asset, "acme", "widget", None);
+        assert_eq!(
+            url.as_deref(),
+            Some("https://raw.githubusercontent.com/acme/widget/HEAD/assets/icon.png")
+        );
+    }
+
+    #[test]
+    fn icon_name_gated_out_below_api_version_7() {
+        let toml = r#"
+id = "acme.widget"
+name = "Widget"
+version = "1.0.0"
+api_version = 6
+icon = "git-branch"
+"#;
+        let m: RawManifest = toml::from_str(toml).expect("lenient parse");
+        assert!(
+            resolve_icon_name(m.api_version, m.icon).is_none(),
+            "v6 must not expose icon"
+        );
+    }
+
+    #[test]
+    fn icon_name_drops_an_invalid_name() {
+        let toml = r#"
+id = "acme.widget"
+name = "Widget"
+version = "1.0.0"
+api_version = 7
+icon = "GitHub"
+"#;
+        let m: RawManifest = toml::from_str(toml).expect("lenient parse");
+        assert!(
+            resolve_icon_name(m.api_version, m.icon).is_none(),
+            "a non-kebab-case name must be dropped, not surfaced to the client"
+        );
+    }
+
+    #[test]
+    fn icon_asset_gated_out_below_api_version_7() {
+        let toml = r#"
+id = "acme.widget"
+name = "Widget"
+version = "1.0.0"
+api_version = 6
+icon_asset = "assets/icon.png"
+"#;
+        let m: RawManifest = toml::from_str(toml).expect("lenient parse");
+        let url = resolve_icon_asset(m.api_version, m.icon_asset, "acme", "widget", None);
+        assert!(url.is_none(), "v6 must not expose icon_asset");
+    }
+
+    #[test]
+    fn icon_asset_drops_an_invalid_path() {
+        let toml = r#"
+id = "acme.widget"
+name = "Widget"
+version = "1.0.0"
+api_version = 7
+icon_asset = "https://tracker.example.com/x.png"
+"#;
+        let m: RawManifest = toml::from_str(toml).expect("lenient parse");
+        let url = resolve_icon_asset(m.api_version, m.icon_asset, "acme", "widget", None);
+        assert!(url.is_none(), "an absolute URL path must be dropped");
     }
 }

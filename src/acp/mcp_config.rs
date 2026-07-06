@@ -8,7 +8,7 @@
 //! resolver across forwarding and display guarantees what the user sees equals
 //! what the agent receives.
 
-use agent_client_protocol::schema::{
+use agent_client_protocol::schema::v1::{
     EnvVariable, HttpHeader, McpCapabilities, McpServer, McpServerHttp, McpServerSse,
     McpServerStdio,
 };

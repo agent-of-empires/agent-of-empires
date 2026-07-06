@@ -46,6 +46,46 @@ image. The assets must be committed and pushed to the source repo before they
 render; local plugins do not support screenshots yet (future work beyond
 #2484).
 
+### Identity icon
+
+A plugin may declare a static identity icon, shown in the installed Settings >
+Plugins list, the detail modal, and its activity-bar button / dock tab
+(requires `api_version >= 7`):
+
+```toml
+icon = "git-branch"                 # a lucide kebab-case icon name
+icon_asset = "assets/icon.png"      # repository-relative raster image
+```
+
+`icon` is only syntax-checked (lowercase kebab-case); whether the name exists
+in lucide's icon set is the web client's problem, and an unknown name falls
+back to a generic icon rather than failing to parse. `icon_asset` follows the
+exact same path rules as `screenshots.path`; lucide ships no brand/logo icons
+(the motivating case: the GitHub plugin cannot render its own mark through
+`icon` alone), so `icon_asset` is how a plugin ships one. When both are set,
+`icon_asset` wins wherever an image can render, falling back to `icon` if the
+asset fails to load.
+
+`icon_asset` wins unconditionally in the activity bar / dock tab too, even
+over a pane's own per-pane runtime icon (the `icon` field a plugin's worker
+pushes on its `pane` UI-state payload, see below): a plugin's real logo is a
+stronger identity signal than a lucide glyph a worker chose before this field
+existed. Below `icon_asset`, the precedence is per-pane runtime icon, then the
+manifest `icon`, then the host's generic fallback. `PaneIcon`
+(`web/src/components/PaneIcon.tsx`) and `PluginIdentityIcon`
+(`web/src/components/settings/PluginIdentityIcon.tsx`) share the same
+reset-on-URL-change fallback behavior via `useAssetFailed`
+(`web/src/lib/pluginUi.ts`).
+
+For an installed (not-yet-uninstalled) plugin, `icon_asset` is served from its
+own install directory via `GET /api/plugins/{id}/icon`, which re-validates the
+path and canonicalizes it against the install directory before reading, so a
+plugin cannot declare a path that escapes its own tree. For a `gh:` source not
+yet installed, the plugin detail endpoint resolves it to
+`raw.githubusercontent.com` exactly like screenshots. A builtin (no install
+directory) or a plugin with no `icon_asset` renders `icon` or the generic
+fallback instead.
+
 ## Registry
 
 `src/plugin/registry.rs` owns the in-process registry.
@@ -720,6 +760,13 @@ means "a curated source slug", not "the current tree matches the pin". Results
 rank featured-first then by stars (#2105 will add popularity ranking). Install
 stays the trust boundary: `aoe plugin install` fetches the manifest, prompts for
 capabilities, and enforces the featured pin.
+
+Each result also carries `source_avatar_url`, the repo owner's GitHub avatar
+(`github.com/{owner}.png`), derived from the search response's `full_name` with
+no extra request. This is a source-identity affordance, not the plugin's own
+`icon`/`icon_asset` (unknown until a manifest fetch, which discovery
+deliberately never does); the dashboard renders it as a separate, distinctly
+styled avatar rather than through the plugin identity icon component.
 
 Surfaces: `aoe plugin discover [query]`, the TUI plugin manager `d` key, and the
 dashboard "Search GitHub" button (`GET /api/plugins/discover?q=`). The dashboard

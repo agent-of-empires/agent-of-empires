@@ -594,10 +594,14 @@ export function SettingsView({
         const acp = (settings.acp ?? {}) as Record<string, unknown>;
         return (
           <div className="space-y-4">
-            <p className="text-xs text-text-dim">
-              Defaults for structured-view (ACP) sessions: which agent starts, how many workers run at once, and how
-              much history is replayed on reconnect. These apply when a session renders in the structured view instead
-              of a raw terminal.
+            {/* Tour anchor for the per-agent defaults step (#2631). Anchored on
+                this top-of-tab intro, not the defaults widget itself, so
+                react-joyride never has to scroll a far-down, async-growing
+                target into view (which made it loop and never advance). */}
+            <p className="text-xs text-text-dim" {...tourAnchor(TOUR_ANCHORS.settingsAgentDefaults)}>
+              Defaults for structured-view (ACP) sessions: which agent starts, how many workers run at once, how much
+              history is replayed on reconnect, and the per-agent model, mode, and thinking defaults below. These apply
+              when a session renders in the structured view instead of a raw terminal.
             </p>
             <SchemaSection
               section="acp"

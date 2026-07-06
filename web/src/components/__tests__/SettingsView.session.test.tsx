@@ -29,9 +29,9 @@ const SESSION_SCHEMA = [
     advanced: false,
   },
   {
-    section: "session",
+    section: "acp",
     field: "acp_defaults",
-    category: "Session",
+    category: "Acp",
     label: "Structured View Defaults",
     description: "",
     widget: { kind: "custom", id: "acp-defaults" },
@@ -63,6 +63,10 @@ vi.mock("../../lib/api", () => ({
   createProfile: vi.fn(() => Promise.resolve(true)),
   renameProfile: vi.fn(() => Promise.resolve(true)),
   deleteProfile: vi.fn(() => Promise.resolve(true)),
+  // The rebuilt acp-defaults widget fetches the agent list and option catalog
+  // (#2631); the raw-JSON fold it exposes does not depend on either.
+  fetchAgents: vi.fn(() => Promise.resolve([])),
+  fetchAcpOptionCatalog: vi.fn(() => Promise.resolve({ version: 1, agents: {} })),
 }));
 
 function numberInputByLabel(container: HTMLElement, label: string): HTMLInputElement {
@@ -77,14 +81,6 @@ function commit(input: HTMLInputElement, value: string) {
   fireEvent.focus(input);
   fireEvent.change(input, { target: { value } });
   fireEvent.blur(input);
-}
-
-function textareaByLabel(container: HTMLElement, label: string): HTMLTextAreaElement {
-  const labels = Array.from(container.querySelectorAll("label"));
-  const match = labels.find((l) => l.textContent === label);
-  const textarea = match?.parentElement?.querySelector("textarea");
-  expect(textarea).toBeTruthy();
-  return textarea as HTMLTextAreaElement;
 }
 
 function commitTextarea(input: HTMLTextAreaElement, value: string) {
@@ -162,20 +158,25 @@ describe("Session tab auto-stop idle field", () => {
     );
   });
 
-  it("persists session.acp_defaults through the profile path", async () => {
+  it("persists acp.acp_defaults through the profile path via the raw-JSON fold", async () => {
+    // acp_defaults lives on the acp section, so it renders under the Structured
+    // view tab, not Session (#2631).
     const { container } = render(
-      <SettingsView onClose={() => {}} tab="session" onSelectTab={() => {}} onServerAboutRefresh={() => {}} />,
+      <SettingsView onClose={() => {}} tab="structured-view" onSelectTab={() => {}} onServerAboutRefresh={() => {}} />,
     );
     await screen.findByText("Structured View Defaults");
 
-    commitTextarea(
-      textareaByLabel(container, "Structured View Defaults"),
-      '{"opencode":{"model":"openai/gpt-5.5","effort":"high"}}',
-    );
+    // The rebuilt widget renders per-agent cards; its raw-JSON escape hatch is
+    // behind an advanced fold. Open it, then commit the map, same wiring the
+    // TUI uses.
+    fireEvent.click(screen.getByText("Advanced: edit raw JSON"));
+    const textarea = container.querySelector("textarea");
+    expect(textarea).toBeTruthy();
+    commitTextarea(textarea as HTMLTextAreaElement, '{"opencode":{"model":"openai/gpt-5.5","effort":"high"}}');
 
     await waitFor(() =>
       expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-        session: {
+        acp: {
           acp_defaults: {
             opencode: { model: "openai/gpt-5.5", effort: "high" },
           },
