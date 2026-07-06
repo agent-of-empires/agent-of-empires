@@ -142,7 +142,7 @@ const CURSOR_CELL_STYLE: CSSProperties = {
   outlineOffset: "-1px",
 };
 
-const Row = memo(function Row({ segs, cursorCol }: { segs: AnsiSegment[]; cursorCol: number | null }) {
+export const Row = memo(function Row({ segs, cursorCol }: { segs: AnsiSegment[]; cursorCol: number | null }) {
   if (cursorCol == null) {
     if (segs.length === 0) return <div> </div>; // keep empty rows at full height
     return (
