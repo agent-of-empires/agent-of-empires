@@ -1256,7 +1256,14 @@ export function MobileLiveTerminal({
           {topPadLines > 0 && <div style={{ height: `${topPadLines * lineH}px` }} aria-hidden="true" />}
           {visual.rows.slice(winStart, winEnd).map((segs, j) => {
             const i = winStart + j;
-            return <Row key={i} segs={segs} cursorCol={i === cursorRow ? live.col : null} focused={focused} />;
+            return (
+              <Row
+                key={i}
+                segs={segs}
+                cursorCol={i === cursorRow ? live.col : null}
+                focused={i === cursorRow && focused}
+              />
+            );
           })}
           {bottomPadLines > 0 && <div style={{ height: `${bottomPadLines * lineH}px` }} aria-hidden="true" />}
         </div>
