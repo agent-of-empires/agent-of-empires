@@ -254,7 +254,7 @@ The web dashboard (`web/`) is a utility that sits between a developer and a term
 
 - Row heights: 28-32px. Buttons: 32-40px. The dashboard is denser than the marketing site on purpose.
 - Border radii: `rounded-md` (6px) for inline affordances, `rounded-lg` (8px) for panels and dialogs. No `rounded-xl` or larger in the dashboard.
-- Motion: `animate-fade-in` and `animate-slide-up` are the only named transitions. Prefer `transition-colors` for hover/focus. Avoid scaling, parallax, or layered motion.
+- Motion: `animate-fade-in`, `animate-slide-up`, and `animate-term-cursor-blink` (the live terminal's focused-cursor blink, a terminal convention rather than decorative motion) are the only named transitions. Prefer `transition-colors` for hover/focus. Avoid scaling, parallax, or layered motion.
 
 ### What stays per-surface
 
