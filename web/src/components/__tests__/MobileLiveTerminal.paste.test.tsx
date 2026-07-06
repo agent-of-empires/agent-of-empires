@@ -42,7 +42,7 @@ const frame: LiveFrame = {
   mouseSgr: false,
 };
 
-function renderTerm() {
+function renderTerm(uploadPastedImage = vi.fn().mockResolvedValue(null)) {
   const inputRef = createRef<HTMLTextAreaElement>();
   const sendData = vi.fn();
   render(
@@ -57,6 +57,7 @@ function renderTerm() {
       enterReading={vi.fn()}
       returnToLive={vi.fn()}
       sendData={sendData}
+      uploadPastedImage={uploadPastedImage}
       forwardWheel={vi.fn()}
       forwardButton={vi.fn()}
       ctrlActiveRef={createRef<boolean>() as React.RefObject<boolean>}
@@ -66,7 +67,16 @@ function renderTerm() {
       bottomAlign
     />,
   );
-  return { input: inputRef.current!, sendData };
+  return { input: inputRef.current!, sendData, uploadPastedImage };
+}
+
+// A clipboard item wrapping a File, as clipboardData.items exposes it.
+function imageItem(file: File): DataTransferItem {
+  return {
+    kind: "file",
+    type: file.type,
+    getAsFile: () => file,
+  } as unknown as DataTransferItem;
 }
 
 describe("MobileLiveTerminal paste", () => {
@@ -84,6 +94,61 @@ describe("MobileLiveTerminal paste", () => {
       clipboardData: { getData: (t: string) => (t === "text/plain" ? "hello world" : "") },
     });
     expect(sendData).toHaveBeenCalledWith("\x1b[200~hello world\x1b[201~");
+  });
+
+  it("uploads a pasted image and bracketed-pastes the returned host path (#2678)", async () => {
+    const upload = vi.fn().mockResolvedValue("/repo/.aoe-pasted-images/aoe-paste-x.png");
+    const { input, sendData } = renderTerm(upload);
+
+    const file = new File([new Uint8Array([1, 2, 3])], "shot.png", { type: "image/png" });
+    fireEvent.paste(input, {
+      clipboardData: { getData: () => "", items: [imageItem(file)] },
+    });
+
+    expect(upload).toHaveBeenCalledWith(file);
+    // Path resolves on a microtask; flush before asserting the send.
+    await vi.waitFor(() =>
+      expect(sendData).toHaveBeenCalledWith("\x1b[200~ /repo/.aoe-pasted-images/aoe-paste-x.png \x1b[201~"),
+    );
+  });
+
+  it("escapes spaces in the pasted path so a dir like 'Agent of Empires' stays one token", async () => {
+    const upload = vi.fn().mockResolvedValue("/Users/me/Agent of Empires/.aoe-pasted-images/x.png");
+    const { input, sendData } = renderTerm(upload);
+
+    const file = new File([new Uint8Array([1])], "s.png", { type: "image/png" });
+    fireEvent.paste(input, { clipboardData: { getData: () => "", items: [imageItem(file)] } });
+
+    await vi.waitFor(() =>
+      expect(sendData).toHaveBeenCalledWith(
+        "\x1b[200~ /Users/me/Agent\\ of\\ Empires/.aoe-pasted-images/x.png \x1b[201~",
+      ),
+    );
+  });
+
+  it("keeps clipboard text alongside a pasted image", async () => {
+    const upload = vi.fn().mockResolvedValue("/repo/.aoe-pasted-images/x.png");
+    const { input, sendData } = renderTerm(upload);
+
+    const file = new File([new Uint8Array([1])], "s.png", { type: "image/png" });
+    fireEvent.paste(input, {
+      clipboardData: { getData: (t: string) => (t === "text/plain" ? "look at" : ""), items: [imageItem(file)] },
+    });
+
+    await vi.waitFor(() =>
+      expect(sendData).toHaveBeenCalledWith("\x1b[200~ look at /repo/.aoe-pasted-images/x.png \x1b[201~"),
+    );
+  });
+
+  it("a failed image upload sends nothing (no crash, no partial paste)", async () => {
+    const upload = vi.fn().mockResolvedValue(null);
+    const { input, sendData } = renderTerm(upload);
+
+    const file = new File([new Uint8Array([1])], "s.png", { type: "image/png" });
+    fireEvent.paste(input, { clipboardData: { getData: () => "", items: [imageItem(file)] } });
+
+    await vi.waitFor(() => expect(upload).toHaveBeenCalled());
+    expect(sendData).not.toHaveBeenCalled();
   });
 
   it("still sends Ctrl+C as SIGINT (other chords unchanged)", () => {

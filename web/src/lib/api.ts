@@ -142,6 +142,42 @@ export async function ensureTerminal(id: string, index = 0, container = false): 
   }
 }
 
+function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error ?? new Error("read failed"));
+    reader.onload = () => {
+      const result = reader.result as string;
+      // Drop the `data:<mime>;base64,` prefix; the server wants raw base64.
+      const comma = result.indexOf(",");
+      resolve(comma >= 0 ? result.slice(comma + 1) : result);
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+/**
+ * Upload a clipboard image pasted into the live terminal. The host writes it
+ * into the session worktree and returns the path the tmux pane can read, so
+ * the CLI agent (e.g. Claude Code) attaches it. Returns null on any failure.
+ * See #2678.
+ */
+export async function pasteImage(id: string, file: File): Promise<string | null> {
+  try {
+    const data = await fileToBase64(file);
+    const res = await fetch(`/api/sessions/${id}/paste-image`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mime_type: file.type, data }),
+    });
+    if (!res.ok) return null;
+    const body = await res.json().catch(() => ({}));
+    return typeof body.path === "string" ? body.path : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Kill an extra terminal tab's host + container shells (index >= 1). Index 0
  *  is the primary terminal shared with the native TUI and cannot be killed
  *  from the web UI (the server rejects it); closing that tab only hides it. */

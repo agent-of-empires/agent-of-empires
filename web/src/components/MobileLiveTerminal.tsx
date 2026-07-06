@@ -78,6 +78,10 @@ export interface MobileLiveTerminalProps {
   enterReading: (rows: number) => void;
   returnToLive: (rows: number) => void;
   sendData: (data: string) => void;
+  /** Upload a clipboard image pasted into the pane and resolve to the path
+   *  the tmux pane can read (host path, or the container mount for sandboxed
+   *  sessions), or null on failure. See #2678. */
+  uploadPastedImage: (file: File) => Promise<string | null>;
   /** Forward a wheel notch to a full-screen mouse app (alternate screen).
    *  Used instead of capture-window scrolling when the frame reports the
    *  pane is such an app. */
@@ -107,6 +111,13 @@ export interface MobileLiveTerminalProps {
    *  prompt sits just above the keyboard. The paired host/container shells are
    *  ordinary terminals, so they top-align like a normal bash window. */
   bottomAlign: boolean;
+}
+
+// Backslash-escape whitespace and backslashes in a pasted image path, matching
+// what terminal drag-and-drop produces, so a path under a directory with spaces
+// (e.g. "Agent of Empires") is parsed as a single token by the CLI agent.
+function escapePastePath(p: string): string {
+  return p.replace(/[\\ \t]/g, (c) => `\\${c}`);
 }
 
 function segStyle(style: AnsiStyle): CSSProperties | undefined {
@@ -221,6 +232,7 @@ export function MobileLiveTerminal({
   enterReading,
   returnToLive,
   sendData,
+  uploadPastedImage,
   forwardWheel,
   forwardButton,
   ctrlActiveRef,
@@ -1046,11 +1058,37 @@ export function MobileLiveTerminal({
 
   const onPaste = useCallback(
     (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
-      e.preventDefault();
+      // Read clipboard data synchronously: `clipboardData` is not guaranteed
+      // to survive an await in every browser.
       const text = e.clipboardData.getData("text/plain");
-      if (text) sendData(`\x1b[200~${text}\x1b[201~`);
+      const imageFiles = Array.from(e.clipboardData.items ?? [])
+        .filter((it) => it.kind === "file")
+        .map((it) => it.getAsFile())
+        .filter((f): f is File => f != null && f.type.startsWith("image/"));
+
+      e.preventDefault();
+
+      if (imageFiles.length === 0) {
+        // Bracketed paste so agents treat embedded newlines as pasted text.
+        if (text) sendData(`\x1b[200~${text}\x1b[201~`);
+        return;
+      }
+
+      // The browser drops non-text clipboard payloads, so an image cannot be
+      // typed into the pane. Upload each blob to the host, then paste the
+      // file path(s) the CLI agent reads to attach them. See #2678.
+      void (async () => {
+        const paths = (await Promise.all(imageFiles.map((f) => uploadPastedImage(f)))).filter(
+          (p): p is string => p != null,
+        );
+        const parts = [text.trim(), ...paths.map(escapePastePath)].filter((s) => s.length > 0);
+        if (parts.length === 0) return;
+        // Leading and trailing spaces keep the path from gluing onto queued
+        // text or the user's next keystroke. No newline: never auto-submit.
+        sendData(`\x1b[200~ ${parts.join(" ")} \x1b[201~`);
+      })();
     },
-    [sendData],
+    [sendData, uploadPastedImage],
   );
 
   const onCompositionStart = useCallback(() => {
