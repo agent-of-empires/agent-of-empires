@@ -1,7 +1,7 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, ReactNode, RefObject } from "react";
 import type { AnsiSegment, AnsiStyle } from "../lib/ansi";
-import { ansiToLines, findCursorCharIndex, textWidth, wrapLine } from "../lib/liveTermLines";
+import { ansiToLines, findCursorCharIndex, splitUrls, textWidth, wrapLine } from "../lib/liveTermLines";
 import { wheelNotches } from "../lib/liveMouse";
 import { writeClipboard } from "../lib/clipboard";
 import type { LiveFrame } from "../hooks/useLiveTerminal";
@@ -153,6 +153,23 @@ const CURSOR_CELL_STYLE: CSSProperties = {
   outlineOffset: "-1px",
 };
 
+// Wrap http(s) URLs in a segment's text as clickable anchors, so agent output
+// (PR links, localhost dev servers, docs) opens in one tap instead of a
+// manual select-copy-paste (#2685). Plain text returns as-is.
+function linkify(text: string): ReactNode {
+  const parts = splitUrls(text);
+  if (parts.length === 1 && parts[0]!.url == null) return text;
+  return parts.map((p, i) =>
+    p.url ? (
+      <a key={i} href={p.url} target="_blank" rel="noopener noreferrer" className="underline cursor-pointer">
+        {p.text}
+      </a>
+    ) : (
+      p.text
+    ),
+  );
+}
+
 export const Row = memo(function Row({ segs, cursorCol }: { segs: AnsiSegment[]; cursorCol: number | null }) {
   if (cursorCol == null) {
     if (segs.length === 0) return <div> </div>; // keep empty rows at full height
@@ -160,12 +177,14 @@ export const Row = memo(function Row({ segs, cursorCol }: { segs: AnsiSegment[];
       <div>
         {segs.map((seg, i) => (
           <span key={i} style={segStyle(seg.style)}>
-            {seg.text}
+            {linkify(seg.text)}
           </span>
         ))}
       </div>
     );
   }
+  // The cursor row (live input line) keeps the delicate cell-split logic below
+  // and is not linkified; agent-output URLs live in the cursorCol == null rows.
   // Render the row with the single cell at `cursorCol` boxed. Walk segments by
   // terminal cell width, not UTF-16 code units, since `cursorCol` is a real
   // cell count from tmux and CJK/wide glyphs take two cells but one code

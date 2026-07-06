@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, expect, it } from "vitest";
-import { ansiToLines, findCursorCharIndex, lineText, wrapLine } from "./liveTermLines";
+import { ansiToLines, findCursorCharIndex, lineText, splitUrls, wrapLine } from "./liveTermLines";
 
 describe("ansiToLines", () => {
   it("splits plain text into lines and drops the capture trailing terminator", () => {
@@ -119,5 +119,42 @@ describe("findCursorCharIndex", () => {
     const text = "e\u0301x";
     expect(findCursorCharIndex(text, 0)).toBe(0); // e
     expect(findCursorCharIndex(text, 1)).toBe(2); // x (index 1 is the mark)
+  });
+});
+
+describe("splitUrls", () => {
+  it("returns a single non-link part for plain text", () => {
+    expect(splitUrls("no links here")).toEqual([{ text: "no links here", url: null }]);
+  });
+
+  it("linkifies a lone URL", () => {
+    expect(splitUrls("https://github.com/o/r/pull/1")).toEqual([
+      { text: "https://github.com/o/r/pull/1", url: "https://github.com/o/r/pull/1" },
+    ]);
+  });
+
+  it("splits a URL embedded mid-text", () => {
+    expect(splitUrls("open http://localhost:3000 now")).toEqual([
+      { text: "open ", url: null },
+      { text: "http://localhost:3000", url: "http://localhost:3000" },
+      { text: " now", url: null },
+    ]);
+  });
+
+  it("trims trailing sentence punctuation out of the href", () => {
+    expect(splitUrls("see https://example.com/a).")).toEqual([
+      { text: "see ", url: null },
+      { text: "https://example.com/a", url: "https://example.com/a" },
+      { text: ").", url: null },
+    ]);
+  });
+
+  it("handles multiple URLs on one line", () => {
+    const parts = splitUrls("https://a.com and https://b.com");
+    expect(parts.filter((p) => p.url).map((p) => p.url)).toEqual(["https://a.com", "https://b.com"]);
+  });
+
+  it("does not linkify a bare host:port without a scheme", () => {
+    expect(splitUrls("localhost:3000 is up")).toEqual([{ text: "localhost:3000 is up", url: null }]);
   });
 });

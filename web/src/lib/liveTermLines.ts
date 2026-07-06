@@ -32,6 +32,42 @@ export function lineText(line: AnsiSegment[]): string {
   return line.map((s) => s.text).join("");
 }
 
+// Match http(s) URLs so agent output in the terminal view can be linkified.
+// ponytail: plain per-line regex, no OSC 8 / reflow tracking (there is no
+// xterm here). A URL split across wrapped visual rows linkifies only its
+// first part; upgrade to reflow-aware matching only if that proves painful.
+const URL_RE = /https?:\/\/\S+/g;
+// Trailing punctuation that is usually sentence/wrapping syntax, not the URL
+// (e.g. `see https://x.com/a).`). Stripped from the match; re-emitted as text.
+const URL_TRAILING = /[.,;:!?)\]}'">]+$/;
+
+export interface UrlPart {
+  text: string;
+  /** The href when this part is a link, else null. */
+  url: string | null;
+}
+
+/** Split one line of plain text into link and non-link parts. Returns a
+ *  single non-link part when there are no URLs. */
+export function splitUrls(text: string): UrlPart[] {
+  const parts: UrlPart[] = [];
+  let last = 0;
+  for (const m of text.matchAll(URL_RE)) {
+    const start = m.index;
+    const raw = m[0];
+    const trimmed = raw.replace(URL_TRAILING, "");
+    // Keep the trimmed form only if a host character survives; otherwise the
+    // match was scheme + punctuation and the original stands.
+    const url = /^https?:\/\/\S/.test(trimmed) ? trimmed : raw;
+    if (start > last) parts.push({ text: text.slice(last, start), url: null });
+    parts.push({ text: url, url });
+    last = start + url.length;
+  }
+  if (parts.length === 0) return [{ text, url: null }];
+  if (last < text.length) parts.push({ text: text.slice(last), url: null });
+  return parts;
+}
+
 // Terminal cell widths, wcwidth-style: combining marks and zero-width
 // joiners take no cell; East Asian Wide/Fullwidth and emoji take two.
 // tmux wraps by cells, so wrapping (and the cursor math built on it)
