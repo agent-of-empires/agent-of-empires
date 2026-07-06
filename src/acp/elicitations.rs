@@ -27,7 +27,7 @@
 
 use std::collections::BTreeMap;
 
-use agent_client_protocol::schema::{
+use agent_client_protocol::schema::v1::{
     CreateElicitationRequest, CreateElicitationResponse, ElicitationAcceptAction,
     ElicitationAction, ElicitationContentValue, ElicitationMode, ElicitationPropertySchema,
     ElicitationSchema, ElicitationScope, MultiSelectItems, StringFormat, StringPropertySchema,
@@ -801,7 +801,7 @@ pub fn build_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::{
+    use agent_client_protocol::schema::v1::{
         BooleanPropertySchema, ElicitationFormMode, ElicitationSessionScope, EnumOption,
         IntegerPropertySchema, MultiSelectPropertySchema, NumberPropertySchema,
         StringPropertySchema,

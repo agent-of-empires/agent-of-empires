@@ -26,7 +26,8 @@
 //! adapters are passed through. The supervisor's known spawn intent is
 //! the gate, not the self-reported `agent_info.name` on the wire.
 
-use agent_client_protocol::schema::{InitializeResponse, ProtocolVersion};
+use agent_client_protocol::schema::v1::InitializeResponse;
+use agent_client_protocol::schema::ProtocolVersion;
 
 use super::state::StartupErrorDetail;
 
@@ -446,7 +447,7 @@ fn auto_install_for(expected: ExpectedAgent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::Implementation;
+    use agent_client_protocol::schema::v1::Implementation;
 
     fn make_init(name: &str, version: &str) -> InitializeResponse {
         InitializeResponse::new(ProtocolVersion::V1).agent_info(Implementation::new(name, version))

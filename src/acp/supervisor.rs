@@ -543,7 +543,7 @@ fn resolve_mcp_layers(
     session_id: &str,
     profile: Option<&str>,
     cwd: &std::path::Path,
-) -> Vec<agent_client_protocol::schema::McpServer> {
+) -> Vec<agent_client_protocol::schema::v1::McpServer> {
     use crate::session::mcp_model::{resolve_effective, summarize};
 
     // One resolver for forwarding and the management surfaces (#1996): assemble
