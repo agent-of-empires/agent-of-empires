@@ -403,7 +403,8 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         use crate::session::WorktreeInfo;
         use chrono::Utc;
 
-        let branch = branch_raw.trim();
+        let branch_owned = builder::git_sanitize_branch_name(branch_raw);
+        let branch = branch_owned.as_str();
         let init_submodules = config.worktree.init_submodules && !args.no_submodules;
 
         if !all_extra_repos.is_empty() {

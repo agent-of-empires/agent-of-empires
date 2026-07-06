@@ -1380,6 +1380,52 @@ fn test_cli_add_attaches_to_existing_worktree() {
 
 #[test]
 #[serial]
+fn test_cli_add_sanitizes_explicit_worktree_branch() {
+    let h = TuiTestHarness::new("cli_branch_sanitize");
+    let project = h.home_path().join("branch-sanitize-project");
+    init_git_repo(&project);
+
+    let add_output = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "-w",
+        "Exploration and issues v2",
+        "-b",
+        "-t",
+        "SanitizedBranch",
+    ]);
+    assert!(
+        add_output.status.success(),
+        "aoe add with unsanitized explicit branch should succeed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&add_output.stdout),
+        String::from_utf8_lossy(&add_output.stderr)
+    );
+
+    let json = read_sessions_json(&h);
+    let sessions = json.as_array().expect("sessions array");
+    let session = sessions
+        .iter()
+        .find(|s| s["title"].as_str() == Some("SanitizedBranch"))
+        .expect("SanitizedBranch session should exist");
+    assert_eq!(
+        session["worktree_info"]["branch"].as_str(),
+        Some("Exploration-and-issues-v2"),
+        "CLI should persist the same sanitized explicit branch name as the TUI/API path"
+    );
+
+    let branch = Command::new("git")
+        .args(["branch", "--list", "Exploration-and-issues-v2"])
+        .current_dir(&project)
+        .output()
+        .expect("git branch --list");
+    assert!(
+        String::from_utf8_lossy(&branch.stdout).contains("Exploration-and-issues-v2"),
+        "sanitized branch should exist in the source repo"
+    );
+}
+
+#[test]
+#[serial]
 fn test_cli_add_scratch_provisions_dir() {
     let h = TuiTestHarness::new("cli_add_scratch");
 
