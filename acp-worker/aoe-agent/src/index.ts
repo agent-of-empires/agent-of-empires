@@ -142,7 +142,12 @@ async function handlePrompt(
       }
     }
 
-    session.messages.push({ role: "assistant", content: assistantBuffer });
+    // Anthropic rejects an assistant message with empty content, so skip
+    // persisting blank turns (tool-only rounds and cancellations both leave
+    // the buffer empty) to keep the next prompt's history valid.
+    if (assistantBuffer) {
+      session.messages.push({ role: "assistant", content: assistantBuffer });
+    }
 
     if (abortSignal.aborted) {
       return { stopReason: "cancelled" };
