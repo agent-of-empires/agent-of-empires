@@ -307,6 +307,28 @@ export function DirectoryBrowser({ initialPath, onSelect }: Props) {
           </>
         )}
       </div>
+
+      {/* Use the current folder as the working directory, even when it is not
+          itself a git repo. Lets a user point a session at a root like
+          ~/projects and let the agent discover the repos inside, instead of
+          drilling down to pick one repo by hand. See #2680. */}
+      <div className="mt-3 flex items-center justify-between gap-3">
+        <span className="font-mono text-xs text-text-dim truncate min-w-0" title={currentPath}>
+          {currentPath || "…"}
+        </span>
+        <button
+          type="button"
+          onClick={() => {
+            if (!currentPath) return;
+            saveLastDir(currentPath);
+            onSelect(currentPath);
+          }}
+          disabled={!currentPath || loading}
+          className="shrink-0 h-8 px-3 text-xs font-sans text-text-secondary border border-surface-700 rounded-md hover:bg-surface-700/40 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+        >
+          Use this folder
+        </button>
+      </div>
     </div>
   );
 }

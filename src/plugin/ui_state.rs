@@ -23,10 +23,20 @@ use aoe_plugin_api::UiSlot;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Most entries one plugin may hold at once across all slots. A cooperative
-/// bound (the model is honest, not adversarial), enough to keep a buggy plugin
-/// from growing host memory without limit.
-const MAX_ENTRIES_PER_PLUGIN: usize = 256;
+/// Most entries one plugin may hold in a single revision scope (one session id,
+/// or "" for global slots). Sized well above any real per-session slot count so
+/// one session's panes are never starved by another session's entries. The old
+/// flat per-plugin cap did exactly that: once a plugin touched enough sessions,
+/// early-created entries filled the bucket and later sessions' new keys were
+/// rejected forever.
+const MAX_ENTRIES_PER_SCOPE: usize = 32;
+/// Absolute backstop across all of one plugin's scopes. `session_id` is not
+/// validated against real sessions in `ui.state.set`, so without a global cap a
+/// buggy plugin could fabricate unbounded session ids and stay under the
+/// per-scope cap forever. A cooperative bound (the model is honest, not
+/// adversarial), sized to keep worst-case pane-payload memory bounded (1024
+/// entries against the 64 KiB pane ceiling is roughly 64 MiB per plugin).
+const MAX_ENTRIES_PER_PLUGIN: usize = 1024;
 /// Largest normalized payload accepted for one entry, in bytes of JSON. The
 /// pane slot gets a much larger budget than the small badge/column slots: a
 /// pane can carry a full PR comment list, where a badge is a few words.
@@ -230,7 +240,9 @@ pub enum UiError {
     /// newer worker replaced it). The write is dropped rather than resurrecting
     /// stale state.
     StaleWorker,
-    /// The plugin already holds `MAX_ENTRIES_PER_PLUGIN` entries.
+    /// Adding this key would exceed either the per-scope cap
+    /// (`MAX_ENTRIES_PER_SCOPE`) or the per-plugin backstop
+    /// (`MAX_ENTRIES_PER_PLUGIN`). Updating an existing key is never blocked.
     QuotaExceeded,
     /// The payload did not match the slot's typed shape, or a scope rule
     /// (per-session slot needs a `session_id`; a global slot must not have one).
@@ -307,7 +319,11 @@ struct Inner {
     /// entry change to that scope. `scope` is the entry's session id, or `""`
     /// for a global slot. Daemon-local: it resets when the daemon restarts, so
     /// the client treats any change off its baseline (including a reset to a
-    /// lower value) as "state moved".
+    /// lower value) as "state moved". Not covered by the entry quota: a scope's
+    /// counter is retained after its entries are removed (the client must still
+    /// observe the bump that cleared them), so a plugin that churns many
+    /// fabricated session ids leaves revision keys behind. Acceptable under the
+    /// cooperative model; bounded revision retention is a separate follow-up.
     revisions: HashMap<(String, String), u64>,
 }
 
@@ -418,15 +434,22 @@ impl UiStore {
         if inner.active.get(plugin_id) != Some(&generation) {
             return Err(UiError::StaleWorker);
         }
-        if !inner.entries.contains_key(&key)
-            && inner
-                .entries
-                .keys()
-                .filter(|k| k.plugin_id == plugin_id)
-                .count()
-                >= MAX_ENTRIES_PER_PLUGIN
-        {
-            return Err(UiError::QuotaExceeded);
+        if !inner.entries.contains_key(&key) {
+            let scope = scope_of(session_id);
+            let mut plugin_entries = 0usize;
+            let mut scope_entries = 0usize;
+            for existing in inner.entries.keys().filter(|k| k.plugin_id == plugin_id) {
+                plugin_entries += 1;
+                if scope_of(existing.session_id.as_deref()) == scope {
+                    scope_entries += 1;
+                }
+            }
+            // Per-scope cap stops one session (or the global scope) from starving
+            // the others; the per-plugin backstop still bounds total memory when
+            // session ids are fabricated.
+            if scope_entries >= MAX_ENTRIES_PER_SCOPE || plugin_entries >= MAX_ENTRIES_PER_PLUGIN {
+                return Err(UiError::QuotaExceeded);
+            }
         }
         inner.entries.insert(key, normalized);
         inner.bump_revision(plugin_id, scope_of(session_id));
@@ -970,17 +993,69 @@ mod tests {
     }
 
     #[test]
-    fn per_plugin_quota_enforced() {
+    fn per_scope_quota_blocks_only_that_scope() {
         let s = store();
         let g = s.begin_generation("acme.kit");
+        // Fill session s1's scope to the per-scope cap.
+        for i in 0..MAX_ENTRIES_PER_SCOPE {
+            s.set(
+                "acme.kit",
+                g,
+                UiSlot::RowBadge,
+                &format!("b{i}"),
+                Some("s1"),
+                &json!({"text": "x"}),
+            )
+            .unwrap();
+        }
+        // A new key in s1 is now rejected.
+        assert_eq!(
+            s.set(
+                "acme.kit",
+                g,
+                UiSlot::RowBadge,
+                "overflow",
+                Some("s1"),
+                &json!({"text": "x"})
+            ),
+            Err(UiError::QuotaExceeded)
+        );
+        // A different session's scope still has room: no cross-session starving.
+        s.set(
+            "acme.kit",
+            g,
+            UiSlot::RowBadge,
+            "b0",
+            Some("s2"),
+            &json!({"text": "x"}),
+        )
+        .unwrap();
+        // Updating an existing key in the full scope is never blocked.
+        s.set(
+            "acme.kit",
+            g,
+            UiSlot::RowBadge,
+            "b0",
+            Some("s1"),
+            &json!({"text": "y"}),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn per_plugin_backstop_bounds_fabricated_scopes() {
+        let s = store();
+        let g = s.begin_generation("acme.kit");
+        // One entry per distinct session scope, so the per-scope cap never trips;
+        // only the global backstop can stop this.
         for i in 0..MAX_ENTRIES_PER_PLUGIN {
             s.set(
                 "acme.kit",
                 g,
-                UiSlot::Card,
-                &format!("c{i}"),
-                None,
-                &json!({"title": "x"}),
+                UiSlot::RowBadge,
+                "b",
+                Some(&format!("s{i}")),
+                &json!({"text": "x"}),
             )
             .unwrap();
         }
@@ -988,21 +1063,40 @@ mod tests {
             s.set(
                 "acme.kit",
                 g,
-                UiSlot::Card,
-                "overflow",
-                None,
-                &json!({"title": "x"})
+                UiSlot::RowBadge,
+                "b",
+                Some("overflow"),
+                &json!({"text": "x"})
             ),
             Err(UiError::QuotaExceeded)
         );
-        // Updating an existing entry is not blocked by the quota.
+    }
+
+    #[test]
+    fn removing_entry_frees_scope_capacity() {
+        let s = store();
+        let g = s.begin_generation("acme.kit");
+        for i in 0..MAX_ENTRIES_PER_SCOPE {
+            s.set(
+                "acme.kit",
+                g,
+                UiSlot::RowBadge,
+                &format!("b{i}"),
+                Some("s1"),
+                &json!({"text": "x"}),
+            )
+            .unwrap();
+        }
+        s.remove("acme.kit", g, UiSlot::RowBadge, "b0", Some("s1"))
+            .unwrap();
+        // The freed slot lets a new key in.
         s.set(
             "acme.kit",
             g,
-            UiSlot::Card,
-            "c0",
-            None,
-            &json!({"title": "y"}),
+            UiSlot::RowBadge,
+            "replacement",
+            Some("s1"),
+            &json!({"text": "x"}),
         )
         .unwrap();
     }

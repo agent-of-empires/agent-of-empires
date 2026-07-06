@@ -32,6 +32,42 @@ export function lineText(line: AnsiSegment[]): string {
   return line.map((s) => s.text).join("");
 }
 
+// Match http(s) URLs so agent output in the terminal view can be linkified.
+// ponytail: plain per-line regex, no OSC 8 / reflow tracking (there is no
+// xterm here). A URL split across wrapped visual rows linkifies only its
+// first part; upgrade to reflow-aware matching only if that proves painful.
+const URL_RE = /https?:\/\/\S+/g;
+// Trailing punctuation that is usually sentence/wrapping syntax, not the URL
+// (e.g. `see https://x.com/a).`). Stripped from the match; re-emitted as text.
+const URL_TRAILING = /[.,;:!?)\]}'">]+$/;
+
+export interface UrlPart {
+  text: string;
+  /** The href when this part is a link, else null. */
+  url: string | null;
+}
+
+/** Split one line of plain text into link and non-link parts. Returns a
+ *  single non-link part when there are no URLs. */
+export function splitUrls(text: string): UrlPart[] {
+  const parts: UrlPart[] = [];
+  let last = 0;
+  for (const m of text.matchAll(URL_RE)) {
+    const start = m.index;
+    const raw = m[0];
+    const trimmed = raw.replace(URL_TRAILING, "");
+    // Keep the trimmed form only if a host character survives; otherwise the
+    // match was scheme + punctuation and the original stands.
+    const url = /^https?:\/\/\S/.test(trimmed) ? trimmed : raw;
+    if (start > last) parts.push({ text: text.slice(last, start), url: null });
+    parts.push({ text: url, url });
+    last = start + url.length;
+  }
+  if (parts.length === 0) return [{ text, url: null }];
+  if (last < text.length) parts.push({ text: text.slice(last), url: null });
+  return parts;
+}
+
 // Terminal cell widths, wcwidth-style: combining marks and zero-width
 // joiners take no cell; East Asian Wide/Fullwidth and emoji take two.
 // tmux wraps by cells, so wrapping (and the cursor math built on it)
@@ -41,16 +77,37 @@ const WIDE =
   /[\u1100-\u115F\u2E80-\u303E\u3041-\u33FF\u3400-\u4DBF\u4E00-\u9FFF\uA000-\uA4CF\uAC00-\uD7A3\uF900-\uFAFF\uFE30-\uFE4F\uFF00-\uFF60\uFFE0-\uFFE6\u{1F300}-\u{1FAFF}]|\p{Emoji_Presentation}/u;
 const ASCII_PRINTABLE_ONLY = /^[\x20-\x7E]*$/;
 
-function cellWidth(codePoint: string): number {
+export function cellWidth(codePoint: string): number {
   if (ZERO_WIDTH.test(codePoint)) return 0;
   return WIDE.test(codePoint) ? 2 : 1;
 }
 
-function textWidth(text: string): number {
+export function textWidth(text: string): number {
   if (ASCII_PRINTABLE_ONLY.test(text)) return text.length;
   let width = 0;
   for (const ch of text) width += cellWidth(ch);
   return width;
+}
+
+/** Find the code point in `text` whose terminal cell range contains `col`
+ *  (cell units from the start of `text`), or null if `col` falls at or
+ *  past the end. Iterates code points (an emoji's surrogate pair never
+ *  splits) and counts cells the same way `textWidth`/`wrapLine` do, so a
+ *  cursor column from tmux (already cell-based) lands on the right glyph
+ *  even when wide CJK or zero-width characters precede it. */
+export function findCursorCharIndex(text: string, col: number): number | null {
+  if (ASCII_PRINTABLE_ONLY.test(text)) {
+    return col >= 0 && col < text.length ? col : null;
+  }
+  let c = 0;
+  let i = 0;
+  for (const ch of text) {
+    const w = cellWidth(ch);
+    if (col >= c && col < c + w) return i;
+    c += w;
+    i++;
+  }
+  return null;
 }
 
 /** Hard-wrap one styled line at `cols` terminal cells, preserving

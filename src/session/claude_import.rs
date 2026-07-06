@@ -139,9 +139,18 @@ fn cwd_under_worktree(cwd: &str, markers: &[String]) -> bool {
 /// are filtered separately by the endpoint, which has the instance list.
 /// See #2276.
 pub fn scan_sessions() -> Vec<ClaudeSessionSummary> {
-    let Some(projects) = claude_config_dir().map(|d| d.join("projects")) else {
+    let Some(config_dir) = claude_config_dir() else {
         return Vec::new();
     };
+    scan_sessions_in(&config_dir)
+}
+
+/// Scan the `projects/` tree under `config_dir` (the resolved Claude config
+/// directory). Split out from [`scan_sessions`] so tests can point at a temp
+/// config tree without mutating the global `CLAUDE_CONFIG_DIR` env (which would
+/// race the parallel test runner). See [`scan_sessions`] for filtering rules.
+pub fn scan_sessions_in(config_dir: &Path) -> Vec<ClaudeSessionSummary> {
+    let projects = config_dir.join("projects");
     let Ok(project_dirs) = fs::read_dir(&projects) else {
         return Vec::new();
     };
@@ -182,6 +191,24 @@ pub fn scan_sessions() -> Vec<ClaudeSessionSummary> {
 
     out.sort_by_key(|s| std::cmp::Reverse(s.last_modified_ms));
     out
+}
+
+/// Retain sessions whose recorded `cwd` is at or under one of `roots`.
+/// Component-aware via [`Path::starts_with`], so a root of `/a/app` does not
+/// match a cwd of `/a/app-v2`. Comparison is lexical on the paths as given;
+/// callers wanting symlink-robust matching should canonicalize `roots` (and the
+/// cwds) first.
+pub fn sessions_under_paths(
+    sessions: Vec<ClaudeSessionSummary>,
+    roots: &[PathBuf],
+) -> Vec<ClaudeSessionSummary> {
+    sessions
+        .into_iter()
+        .filter(|s| {
+            let cwd = Path::new(&s.cwd);
+            roots.iter().any(|r| cwd.starts_with(r))
+        })
+        .collect()
 }
 
 /// Build a summary for one `.jsonl` file. Returns `None` when the file has no
@@ -422,5 +449,72 @@ mod tests {
             &[r#"{"type":"last-prompt","sessionId":"nocwd"}"#],
         );
         assert!(summarize_file(&path).is_none());
+    }
+
+    fn summary(id: &str, cwd: &str) -> ClaudeSessionSummary {
+        ClaudeSessionSummary {
+            session_id: id.to_string(),
+            cwd: cwd.to_string(),
+            title: None,
+            last_modified_ms: 0,
+            cwd_exists: true,
+        }
+    }
+
+    #[test]
+    fn sessions_under_paths_is_component_aware() {
+        let sessions = vec![
+            summary("a", "/home/me/app"),
+            summary("b", "/home/me/app/sub/deep"),
+            summary("c", "/home/me/app-v2"),
+            summary("d", "/home/me/other"),
+        ];
+        let roots = vec![PathBuf::from("/home/me/app")];
+        let kept: Vec<_> = sessions_under_paths(sessions, &roots)
+            .into_iter()
+            .map(|s| s.session_id)
+            .collect();
+        // Root itself and descendants match; the sibling `app-v2` does NOT
+        // (component-aware, not a string prefix), nor does an unrelated dir.
+        assert_eq!(kept, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn sessions_under_paths_matches_any_root() {
+        let sessions = vec![
+            summary("a", "/p/one/x"),
+            summary("b", "/p/two/y"),
+            summary("c", "/p/three/z"),
+        ];
+        let roots = vec![PathBuf::from("/p/one"), PathBuf::from("/p/three")];
+        let kept: Vec<_> = sessions_under_paths(sessions, &roots)
+            .into_iter()
+            .map(|s| s.session_id)
+            .collect();
+        assert_eq!(kept, vec!["a", "c"]);
+    }
+
+    #[test]
+    fn scan_sessions_in_reads_temp_config_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("projects").join("-encoded-cwd");
+        fs::create_dir_all(&project).unwrap();
+        let work = tmp.path().join("work");
+        fs::create_dir(&work).unwrap();
+        let cwd_str = work.to_str().unwrap();
+        write_jsonl(
+            &project,
+            "713b7f46-d0f2-454e-91be-a3305d35660c",
+            &[&format!(
+                r#"{{"type":"user","cwd":"{cwd_str}","message":{{"role":"user","content":"hello"}}}}"#
+            )],
+        );
+
+        let found = scan_sessions_in(tmp.path());
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].session_id, "713b7f46-d0f2-454e-91be-a3305d35660c");
+        assert_eq!(found[0].cwd, cwd_str);
+        // Absent projects dir yields an empty scan, never an error.
+        assert!(scan_sessions_in(&tmp.path().join("nope")).is_empty());
     }
 }

@@ -15,6 +15,7 @@ const createSession = vi.fn();
 vi.mock("../../../lib/api", () => ({
   fetchSettings: vi.fn().mockResolvedValue({}),
   fetchAgents: vi.fn().mockResolvedValue([]),
+  fetchIsGitRepo: vi.fn().mockResolvedValue(true),
   fetchGroups: vi.fn().mockResolvedValue([]),
   fetchDockerStatus: vi.fn().mockResolvedValue({ available: false }),
   fetchProfiles: vi.fn().mockResolvedValue([]),

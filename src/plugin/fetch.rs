@@ -186,7 +186,13 @@ pub fn ls_remote(url: &str, reference: Option<&str>) -> Result<String> {
         }
     }
     let target = reference.unwrap_or("HEAD");
-    let out = run_git(&["ls-remote", url, target], None)?;
+    // An annotated tag's peeled `^{}` commit is only emitted when the refspec
+    // asks for it; without it ls-remote returns the tag object, which never
+    // equals the commit the install checked out (a phantom "update available",
+    // #2646). Request both so parse_ls_remote can prefer the peeled commit. A
+    // branch or HEAD has no `^{}` to match, so the extra pattern is a no-op.
+    let peeled = format!("{target}^{{}}");
+    let out = run_git(&["ls-remote", url, target, &peeled], None)?;
     parse_ls_remote(&out, target)
 }
 
@@ -531,6 +537,56 @@ mod tests {
     fn ls_remote_returns_pinned_sha_as_is() {
         let sha = "abcdef0123456789abcdef0123456789abcdef01";
         assert_eq!(ls_remote("unused://", Some(sha)).unwrap(), sha);
+    }
+
+    #[test]
+    fn ls_remote_peels_annotated_tag_to_commit() {
+        // `git ls-remote <url> v1` returns the annotated tag object, but the
+        // install checks out the peeled commit. ls_remote must resolve to the
+        // commit so the update check does not report a phantom update (#2646).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(path)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .expect("run git")
+        };
+        // git absent: nothing to test, skip rather than fail.
+        if !git(&["init", "-q"]).status.success() {
+            return;
+        }
+        std::fs::write(path.join("f"), b"x").unwrap();
+        git(&["add", "f"]);
+        git(&["commit", "-qm", "c"]);
+        git(&["tag", "-a", "v1", "-m", "release"]);
+
+        let sha_of = |rev: &str| {
+            String::from_utf8(git(&["rev-parse", rev]).stdout)
+                .unwrap()
+                .trim()
+                .to_string()
+        };
+        let commit = sha_of("HEAD");
+        let tag_object = sha_of("v1");
+        // An annotated tag's object is distinct from the commit it points at;
+        // without that, this test would not distinguish the bug from the fix.
+        assert_ne!(
+            commit, tag_object,
+            "annotated tag object should differ from the commit"
+        );
+
+        let resolved = ls_remote(path.to_str().unwrap(), Some("v1")).unwrap();
+        assert_eq!(
+            resolved, commit,
+            "ls_remote should return the peeled commit, not the tag object"
+        );
+        assert_ne!(resolved, tag_object);
     }
 
     #[test]

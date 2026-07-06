@@ -453,18 +453,24 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     syncPlugins(pluginPanes.map((p) => ({ id: p.id, defaultDock: p.defaultDock })));
   }, [pluginPanes, syncPlugins]);
 
-  // One-shot lookup from plugin id to its manifest identity icon, so a pane
-  // that doesn't set its own per-pane icon still gets something more
-  // distinctive than the generic Puzzle fallback. Fetched once on mount
-  // rather than polled: the installed-plugin list itself has no live sync
-  // anywhere else in the app today (Settings > Plugins only reloads on
+  // One-shot lookup from plugin id to its manifest identity (icon name +
+  // icon_asset URL), so a pane gets a real identity glyph, up to the plugin's
+  // actual logo, even when it doesn't set its own per-pane icon. Fetched once
+  // on mount rather than polled: the installed-plugin list itself has no live
+  // sync anywhere else in the app today (Settings > Plugins only reloads on
   // mount and after its own mutations), so this matches existing staleness
   // tolerance rather than introducing a new one.
-  const [pluginIconNameById, setPluginIconNameById] = useState<Record<string, string | undefined>>({});
+  const [pluginIdentityById, setPluginIdentityById] = useState<
+    Record<string, { icon?: string; iconAssetUrl?: string }>
+  >({});
   useEffect(() => {
     void fetchPlugins().then((res) => {
       if (!res) return;
-      setPluginIconNameById(Object.fromEntries(res.plugins.map((p) => [p.id, p.icon ?? undefined])));
+      setPluginIdentityById(
+        Object.fromEntries(
+          res.plugins.map((p) => [p.id, { icon: p.icon ?? undefined, iconAssetUrl: p.icon_asset_url ?? undefined }]),
+        ),
+      );
     });
   }, []);
 
@@ -472,8 +478,11 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     (id: string): PaneDisplay => {
       const plugin = pluginPaneById.get(id);
       if (plugin) {
-        const icon = resolvePaneIcon(plugin.icon, pluginIconNameById[plugin.entry.plugin_id]) ?? Puzzle;
-        return { title: plugin.title, icon };
+        const identity = pluginIdentityById[plugin.entry.plugin_id];
+        const icon = resolvePaneIcon(plugin.icon, identity?.icon) ?? Puzzle;
+        // A plugin's real logo outranks any lucide glyph, including a
+        // per-pane runtime icon a worker chose before icon_asset existed.
+        return { title: plugin.title, icon, iconAssetUrl: identity?.iconAssetUrl };
       }
       if (isTerminalTabId(id)) {
         const idx = terminalIndexOf(id);
@@ -483,7 +492,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       const d = BUILTIN_PANES.find((p) => p.id === id)!;
       return { title: d.title, icon: d.icon };
     },
-    [pluginPaneById, pluginIconNameById],
+    [pluginPaneById, pluginIdentityById],
   );
 
   // A persisted tab is visible only if its backing pane currently exists: diff

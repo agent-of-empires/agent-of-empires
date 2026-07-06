@@ -49,8 +49,8 @@ render; local plugins do not support screenshots yet (future work beyond
 ### Identity icon
 
 A plugin may declare a static identity icon, shown in the installed Settings >
-Plugins list, the detail modal, and (as a fallback) its activity-bar pane
-button (requires `api_version >= 7`):
+Plugins list, the detail modal, and its activity-bar button / dock tab
+(requires `api_version >= 7`):
 
 ```toml
 icon = "git-branch"                 # a lucide kebab-case icon name
@@ -65,6 +65,17 @@ exact same path rules as `screenshots.path`; lucide ships no brand/logo icons
 `icon` alone), so `icon_asset` is how a plugin ships one. When both are set,
 `icon_asset` wins wherever an image can render, falling back to `icon` if the
 asset fails to load.
+
+`icon_asset` wins unconditionally in the activity bar / dock tab too, even
+over a pane's own per-pane runtime icon (the `icon` field a plugin's worker
+pushes on its `pane` UI-state payload, see below): a plugin's real logo is a
+stronger identity signal than a lucide glyph a worker chose before this field
+existed. Below `icon_asset`, the precedence is per-pane runtime icon, then the
+manifest `icon`, then the host's generic fallback. `PaneIcon`
+(`web/src/components/PaneIcon.tsx`) and `PluginIdentityIcon`
+(`web/src/components/settings/PluginIdentityIcon.tsx`) share the same
+reset-on-URL-change fallback behavior via `useAssetFailed`
+(`web/src/lib/pluginUi.ts`).
 
 For an installed (not-yet-uninstalled) plugin, `icon_asset` is served from its
 own install directory via `GET /api/plugins/{id}/icon`, which re-validates the
@@ -565,9 +576,18 @@ session reload (eventual consistency, not a live push).
 `sessions.list` returns one entry per session with `id`, `title`,
 `project_path`, `tool`, `status` (the run-state), and two inactivity flags:
 `archived` (the session is archived) and `snoozed` (it has a snooze deadline
-still in the future; a past deadline reports `false`). The call never filters
-server-side, so a worker that should ignore dormant sessions, for example to
-avoid spending API quota on them, checks these flags itself.
+still in the future; a past deadline reports `false`). A worker that should
+ignore dormant sessions, for example to avoid spending API quota on them, can
+check these flags itself.
+
+The call also takes an optional `exclude` param: an array of state names to
+drop server-side, from `archived`, `snoozed`, and `trashed`. A missing or empty
+`exclude` returns every session (so an older worker is unaffected); a value
+outside that set, or a non-string entry, is an `INVALID_PARAMS` error rather
+than a silently ignored filter. This lets a worker skip trashed sessions
+(pending deletion, never surfaced to the user) without enumerating them, which
+matters because a workspace with many trashed sessions would otherwise push
+per-session UI state for all of them.
 
 `config.get { key }` returns the value at `plugins.<plugin-id>.settings.<key>`
 for the calling plugin's own id, so a worker reads back the settings the user

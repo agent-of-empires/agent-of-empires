@@ -1,7 +1,7 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, ReactNode, RefObject } from "react";
 import type { AnsiSegment, AnsiStyle } from "../lib/ansi";
-import { ansiToLines, wrapLine } from "../lib/liveTermLines";
+import { ansiToLines, findCursorCharIndex, splitUrls, textWidth, wrapLine } from "../lib/liveTermLines";
 import { wheelNotches } from "../lib/liveMouse";
 import { writeClipboard } from "../lib/clipboard";
 import type { LiveFrame } from "../hooks/useLiveTerminal";
@@ -78,6 +78,10 @@ export interface MobileLiveTerminalProps {
   enterReading: (rows: number) => void;
   returnToLive: (rows: number) => void;
   sendData: (data: string) => void;
+  /** Upload a clipboard image pasted into the pane and resolve to the path
+   *  the tmux pane can read (host path, or the container mount for sandboxed
+   *  sessions), or null on failure. See #2678. */
+  uploadPastedImage: (file: File) => Promise<string | null>;
   /** Forward a wheel notch to a full-screen mouse app (alternate screen).
    *  Used instead of capture-window scrolling when the frame reports the
    *  pane is such an app. */
@@ -109,6 +113,13 @@ export interface MobileLiveTerminalProps {
   bottomAlign: boolean;
 }
 
+// Backslash-escape whitespace and backslashes in a pasted image path, matching
+// what terminal drag-and-drop produces, so a path under a directory with spaces
+// (e.g. "Agent of Empires") is parsed as a single token by the CLI agent.
+function escapePastePath(p: string): string {
+  return p.replace(/[\\ \t]/g, (c) => `\\${c}`);
+}
+
 function segStyle(style: AnsiStyle): CSSProperties | undefined {
   const css: CSSProperties = {};
   let fg = style.fg;
@@ -131,56 +142,98 @@ function segStyle(style: AnsiStyle): CSSProperties | undefined {
 // Screenshot-friendly; no behavior changes.
 const LIVE_DEBUG = typeof location !== "undefined" && new URLSearchParams(location.search).has("livedebug");
 
-// Hollow-box cursor drawn AS A CELL inside the text flow, the way a real
-// terminal (and the desktop xterm view) renders it, rather than a separate
-// absolutely-positioned block whose pixel row we reconstruct from cursor.y and
-// line-height. Tying it to the actual rendered cell means it cannot drift off
-// its row (wrapping, row-height, offset assumptions). `outline` instead of
-// `border` so the box does not reflow the line by a pixel.
-const CURSOR_CELL_STYLE: CSSProperties = {
+// Cursor drawn AS A CELL inside the text flow, the way a real terminal
+// renders it, rather than a separate absolutely-positioned block whose pixel
+// row we reconstruct from cursor.y and line-height. Tying it to the actual
+// rendered cell means it cannot drift off its row (wrapping, row-height,
+// offset assumptions). Filled (solid background, inverted text) while the
+// hidden input has focus, matching every terminal's focused-cursor
+// convention; hollow `outline` while blurred so the box does not reflow the
+// line by a pixel.
+const CURSOR_CELL_STYLE_FOCUSED: CSSProperties = {
+  backgroundColor: "var(--term-cursor, #f59e0b)",
+  color: "var(--term-bg, #1c1c1f)",
+};
+const CURSOR_CELL_STYLE_BLURRED: CSSProperties = {
   outline: "1px solid var(--term-cursor, #f59e0b)",
   outlineOffset: "-1px",
 };
 
-const Row = memo(function Row({ segs, cursorCol }: { segs: AnsiSegment[]; cursorCol: number | null }) {
+// Wrap http(s) URLs in a segment's text as clickable anchors, so agent output
+// (PR links, localhost dev servers, docs) opens in one tap instead of a
+// manual select-copy-paste (#2685). Plain text returns as-is.
+function linkify(text: string): ReactNode {
+  const parts = splitUrls(text);
+  if (parts.length === 1 && parts[0]!.url == null) return text;
+  return parts.map((p, i) =>
+    p.url ? (
+      <a key={i} href={p.url} target="_blank" rel="noopener noreferrer" className="underline cursor-pointer">
+        {p.text}
+      </a>
+    ) : (
+      p.text
+    ),
+  );
+}
+
+export const Row = memo(function Row({
+  segs,
+  cursorCol,
+  focused = false,
+}: {
+  segs: AnsiSegment[];
+  cursorCol: number | null;
+  focused?: boolean;
+}) {
+  const cursorStyle = focused ? CURSOR_CELL_STYLE_FOCUSED : CURSOR_CELL_STYLE_BLURRED;
   if (cursorCol == null) {
     if (segs.length === 0) return <div> </div>; // keep empty rows at full height
     return (
       <div>
         {segs.map((seg, i) => (
           <span key={i} style={segStyle(seg.style)}>
-            {seg.text}
+            {linkify(seg.text)}
           </span>
         ))}
       </div>
     );
   }
+  // The cursor row (live input line) keeps the delicate cell-split logic below
+  // and is not linkified; agent-output URLs live in the cursorCol == null rows.
   // Render the row with the single cell at `cursorCol` boxed. Walk segments by
-  // column; split the one that straddles the cursor.
+  // terminal cell width, not UTF-16 code units, since `cursorCol` is a real
+  // cell count from tmux and CJK/wide glyphs take two cells but one code
+  // unit (#2665); split the segment that straddles the cursor.
   const out: ReactNode[] = [];
   let col = 0;
   let placed = false;
   let key = 0;
   for (const seg of segs) {
     const t = seg.text;
-    if (!placed && cursorCol >= col && cursorCol < col + t.length) {
-      const off = cursorCol - col;
-      if (off > 0) {
+    const idx = placed ? null : findCursorCharIndex(t, cursorCol - col);
+    if (idx != null) {
+      const chars = [...t];
+      if (idx > 0) {
         out.push(
           <span key={key++} style={segStyle(seg.style)}>
-            {t.slice(0, off)}
+            {chars.slice(0, idx).join("")}
           </span>,
         );
       }
       out.push(
-        <span key={key++} data-live-cursor style={{ ...segStyle(seg.style), ...CURSOR_CELL_STYLE }}>
-          {t[off]}
+        <span
+          key={key++}
+          data-live-cursor
+          className={focused ? "animate-term-cursor-blink" : undefined}
+          style={{ ...segStyle(seg.style), ...cursorStyle }}
+        >
+          {chars[idx]}
         </span>,
       );
-      if (off + 1 < t.length) {
+      if (idx + 1 < chars.length) {
         out.push(
           <span key={key++} style={segStyle(seg.style)}>
-            {t.slice(off + 1)}
+            {chars.slice(idx + 1).join("")}
           </span>,
         );
       }
@@ -192,14 +245,19 @@ const Row = memo(function Row({ segs, cursorCol }: { segs: AnsiSegment[]; cursor
         </span>,
       );
     }
-    col += t.length;
+    col += textWidth(t);
   }
   if (!placed) {
     // Cursor sits past the row's text (blank input cell): pad to the column
     // and box a space.
     if (cursorCol > col) out.push(<span key="pad">{" ".repeat(cursorCol - col)}</span>);
     out.push(
-      <span key="cursor" data-live-cursor style={CURSOR_CELL_STYLE}>
+      <span
+        key="cursor"
+        data-live-cursor
+        className={focused ? "animate-term-cursor-blink" : undefined}
+        style={cursorStyle}
+      >
         {" "}
       </span>,
     );
@@ -218,6 +276,7 @@ export function MobileLiveTerminal({
   enterReading,
   returnToLive,
   sendData,
+  uploadPastedImage,
   forwardWheel,
   forwardButton,
   ctrlActiveRef,
@@ -240,6 +299,10 @@ export function MobileLiveTerminal({
   // ignored) font-family value.
   const termFontFamily = (settings.terminalFontFamily ?? "").trim().replace(/"/g, "");
   const fontFamily = termFontFamily ? `"${termFontFamily}", var(--font-mono)` : undefined;
+  // Drives the cursor cell's filled-vs-hollow style; separate from the
+  // `onInputFocusChange` bubble-up, which only drives the parent's chrome
+  // ring (see LiveTerminalView).
+  const [focused, setFocused] = useState(false);
   const [fontSize, setFontSize] = useState(() => configuredFontSize);
   // Adopt the persisted setting when it changes (settings panel, or the
   // pointer class flipping which font key applies) via the adjust-state-
@@ -1043,11 +1106,37 @@ export function MobileLiveTerminal({
 
   const onPaste = useCallback(
     (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
-      e.preventDefault();
+      // Read clipboard data synchronously: `clipboardData` is not guaranteed
+      // to survive an await in every browser.
       const text = e.clipboardData.getData("text/plain");
-      if (text) sendData(`\x1b[200~${text}\x1b[201~`);
+      const imageFiles = Array.from(e.clipboardData.items ?? [])
+        .filter((it) => it.kind === "file")
+        .map((it) => it.getAsFile())
+        .filter((f): f is File => f != null && f.type.startsWith("image/"));
+
+      e.preventDefault();
+
+      if (imageFiles.length === 0) {
+        // Bracketed paste so agents treat embedded newlines as pasted text.
+        if (text) sendData(`\x1b[200~${text}\x1b[201~`);
+        return;
+      }
+
+      // The browser drops non-text clipboard payloads, so an image cannot be
+      // typed into the pane. Upload each blob to the host, then paste the
+      // file path(s) the CLI agent reads to attach them. See #2678.
+      void (async () => {
+        const paths = (await Promise.all(imageFiles.map((f) => uploadPastedImage(f)))).filter(
+          (p): p is string => p != null,
+        );
+        const parts = [text.trim(), ...paths.map(escapePastePath)].filter((s) => s.length > 0);
+        if (parts.length === 0) return;
+        // Leading and trailing spaces keep the path from gluing onto queued
+        // text or the user's next keystroke. No newline: never auto-submit.
+        sendData(`\x1b[200~ ${parts.join(" ")} \x1b[201~`);
+      })();
     },
-    [sendData],
+    [sendData, uploadPastedImage],
   );
 
   const onCompositionStart = useCallback(() => {
@@ -1167,7 +1256,14 @@ export function MobileLiveTerminal({
           {topPadLines > 0 && <div style={{ height: `${topPadLines * lineH}px` }} aria-hidden="true" />}
           {visual.rows.slice(winStart, winEnd).map((segs, j) => {
             const i = winStart + j;
-            return <Row key={i} segs={segs} cursorCol={i === cursorRow ? live.col : null} />;
+            return (
+              <Row
+                key={i}
+                segs={segs}
+                cursorCol={i === cursorRow ? live.col : null}
+                focused={i === cursorRow && focused}
+              />
+            );
           })}
           {bottomPadLines > 0 && <div style={{ height: `${bottomPadLines * lineH}px` }} aria-hidden="true" />}
         </div>
@@ -1220,8 +1316,14 @@ export function MobileLiveTerminal({
         // a ghost caret floating over the terminal. caret-color is the
         // documented off switch; color guards select-all artifacts.
         style={{ fontSize: "16px", caretColor: "transparent", color: "transparent" }}
-        onFocus={() => onInputFocusChange(true)}
-        onBlur={() => onInputFocusChange(false)}
+        onFocus={() => {
+          setFocused(true);
+          onInputFocusChange(true);
+        }}
+        onBlur={() => {
+          setFocused(false);
+          onInputFocusChange(false);
+        }}
         autoCapitalize="off"
         autoCorrect="off"
         autoComplete="off"

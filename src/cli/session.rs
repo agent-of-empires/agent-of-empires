@@ -5,7 +5,7 @@ use clap::{Args, Subcommand};
 use serde::Serialize;
 use std::collections::HashSet;
 
-use crate::session::{GroupTree, StartOutcome, Storage};
+use crate::session::{GroupTree, Instance, ResumeIntent, StartOutcome, Storage};
 
 #[derive(Subcommand)]
 pub enum SessionCommands {
@@ -75,11 +75,55 @@ pub enum SessionCommands {
     /// transcript and metadata intact. See #2489.
     Restore(SessionIdArgs),
 
+    /// Import existing Claude Code sessions from disk. Scans the given
+    /// path(s) (default: current directory) for Claude Code conversations
+    /// whose working directory is at or under a path, and creates an AoE
+    /// session for each: a terminal/tmux session that resumes the
+    /// conversation with `claude --resume <id>` (default), or a
+    /// structured-view session with `--structured`.
+    Import(ImportArgs),
+
     /// List the sessions currently in the trash.
     ListTrash,
 
     /// Permanently purge every trashed session in the profile (irreversible).
     EmptyTrash,
+}
+
+#[derive(Args)]
+pub struct ImportArgs {
+    /// Directories to scan. Only Claude sessions whose recorded working
+    /// directory is at or under one of these are imported. Defaults to the
+    /// current directory. Cannot be combined with `--all`.
+    pub paths: Vec<String>,
+
+    /// Import every discoverable Claude session, ignoring the path filter.
+    #[arg(long, conflicts_with = "paths")]
+    pub all: bool,
+
+    /// Import as structured-view sessions (rendered in the web dashboard and
+    /// the structured TUI view) instead of terminal/tmux sessions. Structured
+    /// sessions replay their transcript under `aoe serve`.
+    #[cfg(feature = "serve")]
+    #[arg(long)]
+    pub structured: bool,
+
+    /// Place imported sessions under this session group.
+    #[arg(long)]
+    pub group: Option<String>,
+
+    /// Start terminal sessions immediately after importing (spawns the tmux
+    /// pane running `claude --resume <id>`). Ignored for structured imports.
+    #[arg(long)]
+    pub launch: bool,
+
+    /// List what would be imported without creating anything.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Skip the confirmation prompt when importing more than one session.
+    #[arg(long, short = 'y')]
+    pub yes: bool,
 }
 
 #[derive(Args)]
@@ -270,6 +314,7 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
         SessionCommands::Archive(args) => archive_session(profile, args).await,
         SessionCommands::Unarchive(args) => unarchive_session(profile, args).await,
         SessionCommands::Restore(args) => restore_session(profile, args).await,
+        SessionCommands::Import(args) => import_sessions(profile, args).await,
         SessionCommands::ListTrash => list_trash(profile).await,
         SessionCommands::EmptyTrash => empty_trash(profile).await,
     }
@@ -635,6 +680,250 @@ fn bail_if_acp(_inst: &crate::session::Instance, _verb: &str) -> Result<()> {
     Ok(())
 }
 
+/// Resolve the scan roots for `aoe session import`. Empty input means the
+/// current directory. Each root is canonicalized (falling back to the path as
+/// given if it does not resolve) so the component-aware filter compares against
+/// absolute paths.
+fn resolve_import_roots(paths: &[String]) -> Result<Vec<std::path::PathBuf>> {
+    let raw: Vec<std::path::PathBuf> = if paths.is_empty() {
+        vec![std::env::current_dir()?]
+    } else {
+        paths.iter().map(std::path::PathBuf::from).collect()
+    };
+    Ok(raw
+        .into_iter()
+        .map(|p| p.canonicalize().unwrap_or(p))
+        .collect())
+}
+
+/// True when `id` is already imported by some instance, so a re-run does not
+/// create duplicates. Checks the terminal resume target, the poller-observed
+/// id, and (serve builds) the structured-view id.
+fn already_imported(instances: &[Instance], id: &str) -> bool {
+    instances.iter().any(|inst| {
+        if inst.agent_session_id.as_deref() == Some(id) {
+            return true;
+        }
+        if matches!(&inst.resume_intent, ResumeIntent::Use(s) if s == id) {
+            return true;
+        }
+        #[cfg(feature = "serve")]
+        if inst.acp_session_id.as_deref() == Some(id) {
+            return true;
+        }
+        false
+    })
+}
+
+/// Build the AoE `Instance` for one discovered Claude session. Terminal imports
+/// pin `resume_intent` so the first launch emits `claude --resume <id>`;
+/// structured imports (serve only) seed the fields the reconciler reads to
+/// replay the transcript.
+fn build_import_instance(
+    s: &crate::session::claude_import::ClaudeSessionSummary,
+    structured: bool,
+    group: &str,
+) -> Instance {
+    let title = s.title.clone().unwrap_or_else(|| {
+        let short = s.session_id.get(..8).unwrap_or(s.session_id.as_str());
+        format!("Claude import {short}")
+    });
+    let mut inst = Instance::new(&title, &s.cwd);
+    inst.tool = "claude".to_string();
+    if !group.is_empty() {
+        inst.group_path = group.to_string();
+    }
+    apply_import_mode(&mut inst, s, structured);
+    inst
+}
+
+#[cfg(feature = "serve")]
+fn apply_import_mode(
+    inst: &mut Instance,
+    s: &crate::session::claude_import::ClaudeSessionSummary,
+    structured: bool,
+) {
+    if structured {
+        inst.view = crate::session::View::Structured;
+        inst.acp_session_id = Some(s.session_id.clone());
+        inst.import_pending = Some(true);
+    } else {
+        inst.resume_intent = ResumeIntent::Use(s.session_id.clone());
+    }
+}
+
+#[cfg(not(feature = "serve"))]
+fn apply_import_mode(
+    inst: &mut Instance,
+    s: &crate::session::claude_import::ClaudeSessionSummary,
+    _structured: bool,
+) {
+    inst.resume_intent = ResumeIntent::Use(s.session_id.clone());
+}
+
+async fn import_sessions(profile: &str, args: ImportArgs) -> Result<()> {
+    use crate::session::claude_import::{scan_sessions, sessions_under_paths, MAX_SESSIONS};
+
+    #[cfg(feature = "serve")]
+    let structured = args.structured;
+    #[cfg(not(feature = "serve"))]
+    let structured = false;
+
+    // Discover, then narrow to the requested paths unless --all.
+    let mut discovered = scan_sessions();
+    if !args.all {
+        let roots = resolve_import_roots(&args.paths)?;
+        discovered = sessions_under_paths(discovered, &roots);
+    }
+
+    // A session whose recorded cwd no longer exists cannot be resumed:
+    // `claude --resume` resolves the transcript by cwd, so a dead cwd would
+    // silently start a fresh conversation. Skip and report those.
+    let (candidates, missing_cwd): (Vec<_>, Vec<_>) =
+        discovered.into_iter().partition(|s| s.cwd_exists);
+
+    // Dedupe against sessions already imported into this profile.
+    let (existing, _groups) = Storage::new_unwatched(profile)?.load_with_groups()?;
+    let candidate_count = candidates.len();
+    let mut to_import: Vec<_> = candidates
+        .into_iter()
+        .filter(|s| !already_imported(&existing, &s.session_id))
+        .collect();
+    let already = candidate_count - to_import.len();
+
+    // Bulk safety backstop; the picker cap also applies to the CLI.
+    let capped = to_import.len() > MAX_SESSIONS;
+    if capped {
+        to_import.truncate(MAX_SESSIONS);
+    }
+
+    let report_skipped = || {
+        if already > 0 {
+            println!("  ({already} already imported, skipped)");
+        }
+        if !missing_cwd.is_empty() {
+            println!(
+                "  ({} skipped: working directory no longer exists)",
+                missing_cwd.len()
+            );
+        }
+        if capped {
+            println!("  (capped at {MAX_SESSIONS}; narrow the path(s) to import the rest)");
+        }
+    };
+
+    if to_import.is_empty() {
+        println!("No new Claude Code sessions to import.");
+        report_skipped();
+        return Ok(());
+    }
+
+    let kind = if structured { "structured" } else { "terminal" };
+    println!(
+        "Found {} Claude Code session(s) to import as {kind} sessions:",
+        to_import.len()
+    );
+    for s in &to_import {
+        let short = s.session_id.get(..8).unwrap_or(s.session_id.as_str());
+        let title = s.title.as_deref().unwrap_or("(no title)");
+        println!("  {short}  {title}  [{}]", s.cwd);
+    }
+    report_skipped();
+
+    if args.dry_run {
+        println!("Dry run: nothing created.");
+        return Ok(());
+    }
+
+    if to_import.len() > 1 && !args.yes {
+        use std::io::Write;
+        print!("Import {} session(s)? [y/N] ", to_import.len());
+        std::io::stdout().flush().ok();
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        if !matches!(input.trim().to_lowercase().as_str(), "y" | "yes") {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    let group = args.group.clone().unwrap_or_default();
+    let storage = Storage::new_unwatched(profile)?;
+    let created_ids = storage.update(|all_instances, groups| {
+        let mut ids = Vec::new();
+        for s in &to_import {
+            // Re-check under the lock so a concurrent import does not duplicate.
+            if already_imported(all_instances, &s.session_id) {
+                continue;
+            }
+            let inst = build_import_instance(s, structured, &group);
+            ids.push(inst.id.clone());
+            all_instances.push(inst.clone());
+            if !inst.group_path.is_empty() {
+                let mut tree = GroupTree::new_with_groups(all_instances, groups);
+                tree.create_group(&inst.group_path);
+                *groups = tree.get_all_groups();
+            }
+        }
+        Ok(ids)
+    })?;
+
+    println!("✓ Imported {} session(s).", created_ids.len());
+
+    if structured {
+        if args.launch {
+            println!("Note: --launch is ignored for structured imports.");
+        }
+        println!(
+            "Structured sessions replay their transcript on the next `aoe serve` \
+             (auto-spawned within ~2s while serve is running)."
+        );
+        return Ok(());
+    }
+
+    if args.launch {
+        launch_imported(profile, &created_ids)?;
+    } else if !created_ids.is_empty() {
+        println!("Start them with `aoe session start <id>` (or launch on import with --launch).");
+    }
+    Ok(())
+}
+
+/// Start freshly imported terminal sessions, spawning each tmux pane. Mirrors
+/// `start_session`'s three-phase pattern; failures are reported per session and
+/// do not abort the rest.
+fn launch_imported(profile: &str, ids: &[String]) -> Result<()> {
+    let storage = Storage::new_unwatched(profile)?;
+    for id in ids {
+        let (instances, _groups) = storage.load_with_groups()?;
+        let Some(inst) = instances.iter().find(|i| &i.id == id) else {
+            continue;
+        };
+        let mut working = inst.clone();
+        working.source_profile = profile.to_string();
+        if let Err(e) = working.start_with_size(crate::terminal::get_size()) {
+            eprintln!("Warning: failed to start {}: {e}", working.title);
+            continue;
+        }
+        let wid = working.id.clone();
+        storage.update(|instances, _groups| {
+            if let Some(stored) = instances.iter_mut().find(|i| i.id == wid) {
+                stored.merge_post_start(&working);
+            }
+            Ok(())
+        })?;
+        println!("✓ Started {}", working.title);
+    }
+    Ok(())
+}
+
+/// CLI handler for `aoe session stop`.
+///
+/// Treats a docker inspect failure ([`crate::containers::Probe::Unknown`])
+/// as "possibly running" so the session stop proceeds rather than printing
+/// "Session is not running" against a container whose state cannot be
+/// confirmed. The `warn!` for the Unknown case is emitted inside
+/// [`crate::session::Instance::stop`], so this call site does not re-warn.
 async fn stop_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let storage = Storage::new_unwatched(profile)?;
 
@@ -648,9 +937,10 @@ async fn stop_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let tmux_session = crate::tmux::Session::new(&inst.id, &inst.title)?;
     let was_running = tmux_session.exists();
     let had_container = inst.is_sandboxed()
-        && crate::containers::DockerContainer::from_session_id(&inst.id)
-            .is_running()
-            .unwrap_or(false);
+        && match crate::containers::DockerContainer::from_session_id(&inst.id).probe_running() {
+            crate::containers::Probe::Running | crate::containers::Probe::Unknown(_) => true,
+            crate::containers::Probe::NotRunning => false,
+        };
 
     if !was_running && !had_container {
         println!("Session is not running: {}", title);
@@ -1831,5 +2121,68 @@ mod acp_reject_tests {
             inst_disk.agent_session_id, None,
             "rejected call must not mutate sid",
         );
+    }
+}
+
+#[cfg(test)]
+mod import_tests {
+    use super::*;
+    use crate::session::claude_import::ClaudeSessionSummary;
+
+    fn summary(id: &str, cwd: &str, title: Option<&str>) -> ClaudeSessionSummary {
+        ClaudeSessionSummary {
+            session_id: id.to_string(),
+            cwd: cwd.to_string(),
+            title: title.map(str::to_string),
+            last_modified_ms: 0,
+            cwd_exists: true,
+        }
+    }
+
+    #[test]
+    fn terminal_import_pins_resume_target() {
+        let s = summary("abc123-def456", "/home/me/proj", Some("Fix bug"));
+        let inst = build_import_instance(&s, false, "");
+        assert_eq!(inst.tool, "claude");
+        assert_eq!(inst.project_path, "/home/me/proj");
+        assert_eq!(inst.title, "Fix bug");
+        assert_eq!(
+            inst.resume_intent,
+            ResumeIntent::Use("abc123-def456".to_string())
+        );
+    }
+
+    #[test]
+    fn title_falls_back_to_short_id() {
+        let s = summary("abcdef12-3456-7890", "/home/me/proj", None);
+        let inst = build_import_instance(&s, false, "team/imports");
+        assert_eq!(inst.title, "Claude import abcdef12");
+        assert_eq!(inst.group_path, "team/imports");
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn structured_import_seeds_replay_fields() {
+        let s = summary("sid-1", "/home/me/proj", Some("x"));
+        let inst = build_import_instance(&s, true, "");
+        assert!(inst.is_structured());
+        assert_eq!(inst.acp_session_id.as_deref(), Some("sid-1"));
+        assert_eq!(inst.import_pending, Some(true));
+        // Structured imports do not pin a terminal resume target.
+        assert_eq!(inst.resume_intent, ResumeIntent::Default);
+    }
+
+    #[test]
+    fn already_imported_matches_resume_and_observed_ids() {
+        let mut by_resume = Instance::new("a", "/p");
+        by_resume.resume_intent = ResumeIntent::Use("id-1".to_string());
+        let mut by_observed = Instance::new("b", "/p");
+        by_observed.agent_session_id = Some("id-2".to_string());
+        let fresh = Instance::new("c", "/p");
+        let instances = vec![by_resume, by_observed, fresh];
+
+        assert!(already_imported(&instances, "id-1"));
+        assert!(already_imported(&instances, "id-2"));
+        assert!(!already_imported(&instances, "id-3"));
     }
 }

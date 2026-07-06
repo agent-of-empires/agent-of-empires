@@ -22,6 +22,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::containers::{DockerContainer, Probe, Teardown};
 use crate::git::error::GitError;
 use crate::git::template::sanitize_branch_name;
 use crate::git::GitWorktree;
@@ -54,11 +55,31 @@ pub fn worktree_leaf_from_title(title: &str) -> String {
 /// and have the user stop the session first, which tears the container down
 /// and releases the mount. `is_sandboxed` is taken so non-sandbox sessions
 /// skip the `docker inspect` subprocess entirely. See #1927 follow-up.
+///
+/// Fails closed on a transient `docker inspect` failure: a [`Probe::Unknown`]
+/// answer is treated as "possibly running" and blocks the rename, rather
+/// than swallowing the failure into a false negative (`unwrap_or(false)`)
+/// that would let the rename proceed against a live container and hit
+/// `EBUSY`. Same swallowing-existence-probe class as #2596, on the more
+/// consequential gate path (this function is *the* barrier that stops the
+/// `EBUSY`, not a best-effort post-move cleanup).
 pub fn sandbox_container_holds_worktree(session_id: &str, is_sandboxed: bool) -> bool {
-    is_sandboxed
-        && crate::containers::DockerContainer::from_session_id(session_id)
-            .is_running()
-            .unwrap_or(false)
+    if !is_sandboxed {
+        return false;
+    }
+    match DockerContainer::from_session_id(session_id).probe_running() {
+        Probe::Running => true,
+        Probe::NotRunning => false,
+        Probe::Unknown(e) => {
+            tracing::warn!(
+                target: "containers.runtime",
+                session = %session_id,
+                error = %e,
+                "docker inspect failed while probing sandbox container for the worktree rename gate; failing closed and reporting the worktree as held to prevent EBUSY against a possibly-live container"
+            );
+            true
+        }
+    }
 }
 
 /// Drop a sandbox session's container after its worktree directory has been
@@ -68,38 +89,31 @@ pub fn sandbox_container_holds_worktree(session_id: &str, is_sandboxed: bool) ->
 /// (`src/containers/runtime_base.rs`); they do NOT follow a host-side
 /// `git worktree move`. `get_container_for_instance` reuses an existing
 /// stopped container as-is, so without this the restarted container would
-/// still mount (and `cd` into) the old path. Removing it here forces a fresh
-/// `create` with the new path on next start. `remove(force)` drops only the
-/// container and its anonymous volumes; named ignore volumes (node_modules,
-/// target) are keyed by session id and survive for the recreated container.
+/// still mount (and `cd` into) the old path. [`DockerContainer::discard`]
+/// forces a fresh `create` with the new path on next start while preserving
+/// the session's named ignore volumes (`target/`, `node_modules/`) so the
+/// recreated container re-attaches its build caches.
 ///
 /// No-op for non-sandbox sessions. The rename gate requires a stopped session
-/// (see [`sandbox_container_holds_worktree`]), so the container is not running
-/// here. Best-effort: a failure is logged, not surfaced, since the rename
-/// itself has already succeeded. See #1927 follow-up.
+/// (see [`sandbox_container_holds_worktree`]), so the container is not
+/// running here. Best-effort: a failure is logged, not surfaced, since the
+/// rename itself has already succeeded. See #1927 follow-up and #2596.
 pub fn discard_sandbox_container_after_move(session_id: &str, is_sandboxed: bool) {
     if !is_sandboxed {
         return;
     }
-    let container = crate::containers::DockerContainer::from_session_id(session_id);
-    match container.exists() {
-        Ok(true) => match container.remove(true) {
-            Ok(()) => tracing::info!(
-                target: "containers.runtime",
-                session = %session_id,
-                "removed stale sandbox container after worktree move; it will be recreated with the new path on next start"
-            ),
-            Err(e) => tracing::warn!(
-                target: "containers.runtime",
-                session = %session_id,
-                "failed to remove stale sandbox container after worktree move: {e}"
-            ),
-        },
-        Ok(false) => {}
-        Err(e) => tracing::warn!(
+    let container = DockerContainer::from_session_id(session_id);
+    match container.discard() {
+        Teardown::Removed => tracing::info!(
             target: "containers.runtime",
             session = %session_id,
-            "could not check sandbox container existence after worktree move: {e}"
+            "removed stale sandbox container after worktree move; it will be recreated with the new path on next start"
+        ),
+        Teardown::AlreadyGone => {}
+        Teardown::Failed(e) => tracing::warn!(
+            target: "containers.runtime",
+            session = %session_id,
+            "failed to remove stale sandbox container after worktree move: {e}"
         ),
     }
 }
@@ -264,6 +278,27 @@ mod tests {
         // rename never pays a `docker inspect`. The live-container branch is the
         // same helper the tied-rename path already relies on.
         assert!(!sandbox_container_holds_worktree("any-session-id", false));
+    }
+
+    #[test]
+    fn discard_after_move_short_circuits_without_sandbox() {
+        // After the #2596 fix, the `is_sandboxed` guard is the ONLY thing that
+        // keeps a plain (non-sandbox) worktree rename from spawning a `docker`
+        // subprocess. Time-bound to catch a future edit that reorders the
+        // guard below the runtime call: the sandbox-off path returns before
+        // any `DockerContainer::from_session_id` allocation, so wall time is
+        // sub-millisecond; 100 ms is a CI-safe upper bound that still catches
+        // a real `docker inspect` (dozens to hundreds of ms) or a
+        // `container.discard()` shell-out. The Teardown-variant branches
+        // (Removed / AlreadyGone / Failed) are covered by the
+        // `classify_removal` unit tests in `containers::mod`.
+        let start = std::time::Instant::now();
+        discard_sandbox_container_after_move("any-session-id", false);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "non-sandbox path must short-circuit before any container runtime call; elapsed = {elapsed:?}"
+        );
     }
 
     #[test]

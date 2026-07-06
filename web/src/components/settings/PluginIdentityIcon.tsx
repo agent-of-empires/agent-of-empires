@@ -1,7 +1,7 @@
-import { createElement, useState, type ComponentType } from "react";
+import { createElement, type ComponentType } from "react";
 import { Puzzle } from "lucide-react";
 
-import { lucideIcon } from "../../lib/pluginUi";
+import { lucideIcon, useAssetFailed } from "../../lib/pluginUi";
 
 interface Props {
   /** Manifest `icon`: a lucide kebab-case name, or null/undefined if unset. */
@@ -18,16 +18,7 @@ interface Props {
  *  surface that uses it, so the icon itself is decorative (`alt=""
  *  aria-hidden`) rather than needing author-supplied alt text. */
 export function PluginIdentityIcon({ icon, iconAssetUrl, className = "size-4", testId }: Props) {
-  const [assetFailed, setAssetFailed] = useState(false);
-  // Reset the failure flag whenever a new URL is supplied (e.g. the detail
-  // modal swaps the local fallback route for the resolved manifest URL once
-  // its gh fetch lands), so a transient failure on the first URL doesn't
-  // permanently hide a later working one.
-  const [trackedUrl, setTrackedUrl] = useState(iconAssetUrl);
-  if (iconAssetUrl !== trackedUrl) {
-    setTrackedUrl(iconAssetUrl);
-    setAssetFailed(false);
-  }
+  const [assetFailed, markFailed] = useAssetFailed(iconAssetUrl);
 
   if (iconAssetUrl && !assetFailed) {
     return (
@@ -37,7 +28,7 @@ export function PluginIdentityIcon({ icon, iconAssetUrl, className = "size-4", t
         aria-hidden="true"
         data-testid={testId}
         className={`${className} shrink-0 rounded-sm object-contain`}
-        onError={() => setAssetFailed(true)}
+        onError={markFailed}
       />
     );
   }

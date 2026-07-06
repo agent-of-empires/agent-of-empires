@@ -6,7 +6,7 @@ import { MobileTerminalToolbar } from "./MobileTerminalToolbar";
 import { MobileLiveTerminal } from "./MobileLiveTerminal";
 import { KeyboardFab } from "./KeyboardFab";
 import { TerminalConnectionBanners } from "./TerminalConnectionBanners";
-import { ensureSession, ensureTerminal } from "../lib/api";
+import { ensureSession, ensureTerminal, pasteImage } from "../lib/api";
 import type { SessionResponse } from "../lib/types";
 import {
   FOCUS_TERMINAL_EVENT,
@@ -81,6 +81,8 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
     setEnsureError(null);
   }
   const lastEnsuredSessionIdRef = useRef<string | null>(null);
+
+  const uploadPastedImage = useCallback((file: File) => pasteImage(session.id, file), [session.id]);
 
   const focusSelf = useCallback(() => {
     const ta = inputRef.current;
@@ -279,6 +281,7 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
           enterReading={live.enterReading}
           returnToLive={live.returnToLive}
           sendData={live.sendData}
+          uploadPastedImage={uploadPastedImage}
           forwardWheel={live.forwardWheel}
           forwardButton={live.forwardButton}
           ctrlActiveRef={ctrlActiveRef}

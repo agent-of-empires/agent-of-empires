@@ -413,13 +413,31 @@ pub fn is_permission_error(error: &str) -> bool {
 /// `find . -mindepth 1 -delete` to remove all contents (including
 /// root-owned files that the host user cannot delete directly).
 ///
+/// If the running-state probe fails ([`crate::containers::Probe::Unknown`]),
+/// a `warn!` is emitted and a container start is attempted anyway
+/// (idempotent if the container is already running), preserving best-effort
+/// behavior while surfacing the failure in logs.
+///
 /// Returns true if the container successfully deleted the contents.
 pub fn cleanup_sandbox_worktree(instance: &Instance) -> bool {
     let container = DockerContainer::from_session_id(&instance.id);
     if !container.exists().unwrap_or(false) {
         return false;
     }
-    if !container.is_running().unwrap_or(false) && container.start().is_err() {
+    let needs_start = match container.probe_running() {
+        crate::containers::Probe::Running => false,
+        crate::containers::Probe::NotRunning => true,
+        crate::containers::Probe::Unknown(e) => {
+            tracing::warn!(
+                target: "containers.runtime",
+                session = %instance.id,
+                error = %e,
+                "docker inspect failed while probing sandbox container for worktree cleanup; attempting container start (safe if already running)"
+            );
+            true
+        }
+    };
+    if needs_start && container.start().is_err() {
         return false;
     }
     match container.exec(&["find", ".", "-mindepth", "1", "-delete"]) {

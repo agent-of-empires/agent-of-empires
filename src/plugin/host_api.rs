@@ -217,7 +217,7 @@ pub fn dispatch(
         }
         "sessions.list" => {
             ctx.require(CAP_SESSION_READ)?;
-            sessions_list(state)
+            sessions_list(state, params)
         }
         "config.get" => {
             ctx.require(CAP_WORKER)?;
@@ -427,7 +427,52 @@ fn session_meta_cas(
     Ok(json!({ "swapped": swapped, "current": current }))
 }
 
-fn sessions_list(state: &HostApiState) -> Result<Value, DispatchError> {
+/// The set of inactivity states a `sessions.list` caller wants dropped from the
+/// result. Each maps to an `is_*` predicate on the instance. Absent/empty means
+/// return everything, so an old caller that passes no `exclude` is unaffected.
+#[derive(Default)]
+struct SessionListExclude {
+    archived: bool,
+    snoozed: bool,
+    trashed: bool,
+}
+
+/// Parse the optional `exclude` param: an array of state names to drop, from
+/// `archived` / `snoozed` / `trashed`. A missing or null `exclude` excludes
+/// nothing. A non-array, a non-string entry, or an unknown name is caller error
+/// (INVALID_PARAMS) rather than a silently-ignored typo, so a worker learns its
+/// filter did not apply instead of assuming it did.
+fn parse_sessions_exclude(params: &Value) -> Result<SessionListExclude, DispatchError> {
+    let mut out = SessionListExclude::default();
+    let raw = match params.get("exclude") {
+        None | Some(Value::Null) => return Ok(out),
+        Some(v) => v,
+    };
+    let arr = raw
+        .as_array()
+        .ok_or_else(|| DispatchError::invalid_params("param \"exclude\" must be an array"))?;
+    for item in arr {
+        match item.as_str() {
+            Some("archived") => out.archived = true,
+            Some("snoozed") => out.snoozed = true,
+            Some("trashed") => out.trashed = true,
+            Some(other) => {
+                return Err(DispatchError::invalid_params(format!(
+                    "unknown sessions.list exclude value {other:?}"
+                )))
+            }
+            None => {
+                return Err(DispatchError::invalid_params(
+                    "\"exclude\" entries must be strings",
+                ))
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn sessions_list(state: &HostApiState, params: &Value) -> Result<Value, DispatchError> {
+    let exclude = parse_sessions_exclude(params)?;
     let storage = state
         .storage()
         .map_err(|e| DispatchError::internal(e.to_string()))?;
@@ -436,6 +481,11 @@ fn sessions_list(state: &HostApiState) -> Result<Value, DispatchError> {
         .map_err(|e| DispatchError::internal(e.to_string()))?;
     let sessions: Vec<Value> = instances
         .iter()
+        .filter(|i| {
+            !((exclude.archived && i.is_archived())
+                || (exclude.snoozed && i.is_snoozed())
+                || (exclude.trashed && i.is_trashed()))
+        })
         .map(|i| {
             json!({
                 "id": i.id,
@@ -846,6 +896,151 @@ mod tests {
         // A snooze deadline in the past is inactive.
         assert_eq!(by_id(&past_id)["snoozed"], json!(false));
         assert_eq!(by_id(&past_id)["archived"], json!(false));
+    }
+
+    /// `sessions.list` drops the states named in `exclude` server-side, so a
+    /// worker that only cares about live sessions never enumerates dormant or
+    /// trashed ones. Each state filters independently and the flags on the
+    /// returned entries are unaffected.
+    #[test]
+    #[serial_test::serial]
+    fn sessions_list_exclude_filters_server_side() {
+        use crate::session::{Instance, Storage};
+
+        struct XdgGuard(Option<std::ffi::OsString>);
+        impl Drop for XdgGuard {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                    None => std::env::remove_var("XDG_CONFIG_HOME"),
+                }
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let _xdg = XdgGuard(std::env::var_os("XDG_CONFIG_HOME"));
+        std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+
+        let storage = Storage::new_unwatched("default").unwrap();
+        let (active_id, archived_id, snoozed_id, trashed_id) = storage
+            .update(|instances, _groups| {
+                let active = Instance::new("active", "/tmp/plugin-host-test");
+                let active_id = active.id.clone();
+
+                let mut archived = Instance::new("archived", "/tmp/plugin-host-test");
+                archived.archived_at = Some(chrono::Utc::now());
+                let archived_id = archived.id.clone();
+
+                let mut snoozed = Instance::new("snoozed", "/tmp/plugin-host-test");
+                snoozed.snoozed_until = Some(chrono::Utc::now() + chrono::Duration::hours(1));
+                let snoozed_id = snoozed.id.clone();
+
+                let mut trashed = Instance::new("trashed", "/tmp/plugin-host-test");
+                trashed.trashed_at = Some(chrono::Utc::now());
+                let trashed_id = trashed.id.clone();
+
+                instances.push(active);
+                instances.push(archived);
+                instances.push(snoozed);
+                instances.push(trashed);
+                Ok((active_id, archived_id, snoozed_id, trashed_id))
+            })
+            .unwrap();
+
+        let state =
+            HostApiState::open(&tmp.path().join("plugin_events.db"), "default", 100).unwrap();
+        let a = ctx(&[CAP_SESSION_READ]);
+        // Assert on the ids this test seeded rather than on totals: the store is
+        // the profile's real storage (an existing app dir wins over the test's
+        // XDG override on macOS), so ambient sessions may be present.
+        let ids = |v: &Value| -> Vec<String> {
+            v["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|s| s["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        // No exclude: all four seeded sessions come back.
+        let all = ids(&dispatch(&state, &a, "sessions.list", &json!({})).unwrap());
+        for id in [&active_id, &archived_id, &snoozed_id, &trashed_id] {
+            assert!(all.contains(id), "no-exclude list missing {id}");
+        }
+
+        // Each exclude drops exactly its state and leaves the others.
+        let no_trash = dispatch(
+            &state,
+            &a,
+            "sessions.list",
+            &json!({ "exclude": ["trashed"] }),
+        )
+        .unwrap();
+        let no_trash_ids = ids(&no_trash);
+        assert!(!no_trash_ids.contains(&trashed_id));
+        assert!(no_trash_ids.contains(&archived_id));
+        assert!(no_trash_ids.contains(&active_id));
+        // Flags on returned entries are unaffected by filtering.
+        let archived_entry = no_trash["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["id"] == json!(archived_id))
+            .unwrap();
+        assert_eq!(archived_entry["archived"], json!(true));
+
+        let no_archived = ids(&dispatch(
+            &state,
+            &a,
+            "sessions.list",
+            &json!({ "exclude": ["archived"] }),
+        )
+        .unwrap());
+        assert!(!no_archived.contains(&archived_id));
+        assert!(no_archived.contains(&trashed_id));
+
+        // Excluding every dormant state drops all three, keeps the active one.
+        let live = ids(&dispatch(
+            &state,
+            &a,
+            "sessions.list",
+            &json!({ "exclude": ["archived", "snoozed", "trashed"] }),
+        )
+        .unwrap());
+        assert!(live.contains(&active_id));
+        for id in [&archived_id, &snoozed_id, &trashed_id] {
+            assert!(!live.contains(id), "dormant {id} should be excluded");
+        }
+
+        // Drop exactly the ids this test seeded so it leaves no residue in the
+        // profile store, matching the deterministic-and-self-cleaning rule.
+        let seeded = [&active_id, &archived_id, &snoozed_id, &trashed_id];
+        storage
+            .update(|instances, _groups| {
+                instances.retain(|i| !seeded.iter().any(|id| **id == i.id));
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// A malformed `exclude` is caller error (INVALID_PARAMS), not a silently
+    /// ignored no-op, so a worker's typo cannot masquerade as an applied filter.
+    #[test]
+    #[serial_test::serial]
+    fn sessions_list_rejects_bad_exclude() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state =
+            HostApiState::open(&tmp.path().join("plugin_events.db"), "default", 100).unwrap();
+        let a = ctx(&[CAP_SESSION_READ]);
+
+        for bad in [
+            json!({ "exclude": "trashed" }),
+            json!({ "exclude": ["deleted"] }),
+            json!({ "exclude": [1] }),
+        ] {
+            let err = dispatch(&state, &a, "sessions.list", &bad).unwrap_err();
+            assert_eq!(err.code, codes::INVALID_PARAMS);
+        }
     }
 
     /// `config.get` reads the calling plugin's own persisted settings, gated by
