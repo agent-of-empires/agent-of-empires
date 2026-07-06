@@ -3027,6 +3027,15 @@ async fn status_poll_loop(state: Arc<AppState>) {
         let suppressed_ids =
             crate::session::recovery::snapshot_recently_restarted(&state.recently_restarted);
         let file_watch_for_poll = state.file_watch.clone();
+        // Seed each freshly-disk-loaded instance's live status baseline from
+        // `prev` (the true previous-tick live status) rather than letting
+        // `update_status_with_metadata` fall back to comparing against its
+        // own possibly-stale disk-loaded `status`. Without this, every tick
+        // that finds disk out of sync with live reality (the common case,
+        // since nothing persists a passive transition until the patch below
+        // lands) misreads that mismatch as a brand new transition and
+        // restamps idle_entered_at/last_accessed_at. See #2690.
+        let prev_for_poll = prev.clone();
         let updated = tokio::task::spawn_blocking(move || {
             let mut instances = load_all_instances(&file_watch_for_poll).unwrap_or_default();
             crate::tmux::refresh_session_cache();
@@ -3036,6 +3045,7 @@ async fn status_poll_loop(state: Arc<AppState>) {
                     inst.status = Status::Starting;
                     continue;
                 }
+                inst.live_status_baseline = prev_for_poll.get(&inst.id).copied();
                 let session_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
                 let metadata = pane_metadata.get(&session_name);
                 inst.update_status_with_metadata(metadata);
@@ -3049,57 +3059,84 @@ async fn status_poll_loop(state: Arc<AppState>) {
             // post-suppression, post-tmux-scrape values, never the acp
             // overlay applied by the helper.
             let now = chrono::Utc::now();
-            for inst in &instances {
-                if let Some(old) = prev.get(&inst.id) {
-                    if *old != inst.status {
-                        let _ = state.status_tx.send(StatusChange {
-                            instance_id: inst.id.clone(),
-                            instance_title: inst.title.clone(),
-                            old: *old,
-                            new: inst.status,
-                            at: now,
-                        });
-                    }
-                }
-            }
-
+            let unread_enabled = crate::session::unread_enabled();
+            // Passive status transitions observed this tick, persisted
+            // promptly so the next reload (including the next tick, since
+            // this loop reloads from disk every cycle) finds disk already
+            // in sync with live reality instead of restamping again. See
+            // #2690. Batched per profile: one `Storage::update` per profile
+            // per tick, not one per transitioned session.
+            let mut patches_by_profile: std::collections::HashMap<
+                String,
+                Vec<crate::session::PassiveStatusPatch>,
+            > = std::collections::HashMap::new();
             // Auto-mark unread on a finished turn (Running -> Idle), the same
             // transition the TUI marks on. This is what lets a web-only user
             // (no TUI process polling) accrue the indicator. There's no
             // server-side "is being viewed" exemption: the client suppresses
             // the chip on the session it is actively viewing and clears the
-            // auto marker on open. Mutate the in-memory rows we're about to
-            // install AND persist per profile so the next disk reload keeps it.
-            if crate::session::unread_enabled() {
-                let mut newly_idle: std::collections::HashMap<String, Vec<String>> =
-                    std::collections::HashMap::new();
-                for inst in &mut instances {
-                    let finished_turn = prev.get(&inst.id) == Some(&Status::Running)
-                        && inst.status == Status::Idle
-                        && !inst.unread;
-                    if finished_turn {
-                        inst.mark_unread();
-                        newly_idle
-                            .entry(inst.source_profile.clone())
-                            .or_default()
-                            .push(inst.id.clone());
-                    }
+            // auto marker on open.
+            let mut newly_idle_by_profile: std::collections::HashMap<String, Vec<String>> =
+                std::collections::HashMap::new();
+            for inst in &mut instances {
+                let Some(old) = prev.get(&inst.id) else {
+                    continue;
+                };
+                if *old == inst.status {
+                    continue;
                 }
-                for (profile, ids) in newly_idle {
-                    let _ = api::persist_session_update(
-                        profile,
-                        "auto-unread",
-                        state.file_watch.clone(),
-                        move |insts| {
-                            for inst in insts.iter_mut() {
-                                if ids.contains(&inst.id) {
-                                    inst.mark_unread();
-                                }
+                let _ = state.status_tx.send(StatusChange {
+                    instance_id: inst.id.clone(),
+                    instance_title: inst.title.clone(),
+                    old: *old,
+                    new: inst.status,
+                    at: now,
+                });
+                patches_by_profile
+                    .entry(inst.source_profile.clone())
+                    .or_default()
+                    .push(crate::session::PassiveStatusPatch {
+                        id: inst.id.clone(),
+                        status: inst.status,
+                        idle_entered_at: inst.idle_entered_at,
+                        last_accessed_at: inst.last_accessed_at.unwrap_or(now),
+                    });
+                if unread_enabled
+                    && *old == Status::Running
+                    && inst.status == Status::Idle
+                    && !inst.unread
+                {
+                    inst.mark_unread();
+                    newly_idle_by_profile
+                        .entry(inst.source_profile.clone())
+                        .or_default()
+                        .push(inst.id.clone());
+                }
+            }
+            let profiles: std::collections::HashSet<String> = patches_by_profile
+                .keys()
+                .chain(newly_idle_by_profile.keys())
+                .cloned()
+                .collect();
+            for profile in profiles {
+                let patches = patches_by_profile.remove(&profile).unwrap_or_default();
+                let unread_ids = newly_idle_by_profile.remove(&profile).unwrap_or_default();
+                let _ = api::persist_session_update(
+                    profile,
+                    "passive-status",
+                    state.file_watch.clone(),
+                    move |insts| {
+                        for inst in insts.iter_mut() {
+                            if let Some(patch) = patches.iter().find(|p| p.id == inst.id) {
+                                inst.merge_passive_status_patch(patch);
                             }
-                        },
-                    )
-                    .await;
-                }
+                            if unread_ids.contains(&inst.id) {
+                                inst.mark_unread();
+                            }
+                        }
+                    },
+                )
+                .await;
             }
 
             reload_state_instances_from_disk(&state, instances, StatusSource::TmuxApplied).await;

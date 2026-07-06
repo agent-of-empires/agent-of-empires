@@ -5545,6 +5545,51 @@ mod tests {
     }
 
     #[test]
+    fn test_merge_passive_status_patch_applies_status_and_timestamps() {
+        let mut disk = Instance::new("session", "/tmp/test");
+        disk.status = Status::Running;
+        disk.idle_entered_at = None;
+        disk.last_accessed_at = Some(Utc::now() - chrono::Duration::hours(1));
+
+        let now = Utc::now();
+        let patch = PassiveStatusPatch {
+            id: disk.id.clone(),
+            status: Status::Idle,
+            idle_entered_at: Some(now),
+            last_accessed_at: now,
+        };
+        disk.merge_passive_status_patch(&patch);
+
+        assert_eq!(disk.status, Status::Idle);
+        assert_eq!(disk.idle_entered_at, Some(now));
+        assert_eq!(disk.last_accessed_at, Some(now));
+    }
+
+    #[test]
+    fn test_merge_passive_status_patch_drops_stale_patch() {
+        // A peer (CLI, TUI apply_user_action) touched this row more
+        // recently than the passive patch's snapshot: the patch is stale
+        // and must not regress the newer write.
+        let mut disk = Instance::new("session", "/tmp/test");
+        let peer_touch = Utc::now();
+        disk.status = Status::Running;
+        disk.last_accessed_at = Some(peer_touch);
+        disk.idle_entered_at = None;
+
+        let stale_patch = PassiveStatusPatch {
+            id: disk.id.clone(),
+            status: Status::Idle,
+            idle_entered_at: Some(peer_touch - chrono::Duration::minutes(5)),
+            last_accessed_at: peer_touch - chrono::Duration::minutes(5),
+        };
+        disk.merge_passive_status_patch(&stale_patch);
+
+        assert_eq!(disk.status, Status::Running, "stale patch must not apply");
+        assert_eq!(disk.last_accessed_at, Some(peer_touch));
+        assert_eq!(disk.idle_entered_at, None);
+    }
+
+    #[test]
     fn test_merge_from_tui_copies_status_pipeline() {
         let mut stored = Instance::new("session", "/tmp/test");
         stored.status = Status::Idle;
