@@ -133,7 +133,7 @@ async function handleNewSession(params) {
     const fs = await import("node:fs/promises");
     await fs.writeFile(recordFile, JSON.stringify(params?.mcpServers ?? []));
   }
-  const sessionId = "shim-" + Math.random().toString(36).slice(2, 10);
+  const sessionId = "shim-" + crypto.randomUUID();
   sessions.set(sessionId, {});
   return { sessionId };
 }
