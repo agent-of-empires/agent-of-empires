@@ -3000,14 +3000,9 @@ fn decide_passive_transition(
     inst: &Instance,
     old_status: Status,
     unread_enabled: bool,
-    now: chrono::DateTime<chrono::Utc>,
 ) -> PassiveTransitionDecision {
-    let patch = (!inst.is_structured()).then(|| crate::session::PassiveStatusPatch {
-        id: inst.id.clone(),
-        status: inst.status,
-        idle_entered_at: inst.idle_entered_at,
-        last_accessed_at: inst.last_accessed_at.unwrap_or(now),
-    });
+    let patch =
+        (!inst.is_structured()).then(|| crate::session::PassiveStatusPatch::from_instance(inst));
     let mark_unread = unread_enabled
         && old_status == Status::Running
         && inst.status == Status::Idle
@@ -3125,7 +3120,7 @@ async fn status_poll_loop(state: Arc<AppState>) {
                     new: inst.status,
                     at: now,
                 });
-                let decision = decide_passive_transition(inst, *old, unread_enabled, now);
+                let decision = decide_passive_transition(inst, *old, unread_enabled);
                 if let Some(patch) = decision.patch {
                     patches_by_profile
                         .entry(inst.source_profile.clone())
@@ -4430,8 +4425,7 @@ mod tests {
         inst.view = crate::session::View::Structured;
         inst.status = Status::Idle;
 
-        let decision =
-            decide_passive_transition(&inst, Status::Starting, false, chrono::Utc::now());
+        let decision = decide_passive_transition(&inst, Status::Starting, false);
 
         assert!(
             decision.patch.is_none(),
@@ -4446,12 +4440,30 @@ mod tests {
         inst.idle_entered_at = Some(chrono::Utc::now());
         inst.last_accessed_at = Some(chrono::Utc::now());
 
-        let decision = decide_passive_transition(&inst, Status::Running, false, chrono::Utc::now());
+        let decision = decide_passive_transition(&inst, Status::Running, false);
 
         let patch = decision.patch.expect("plain tmux session must get a patch");
         assert_eq!(patch.id, inst.id);
         assert_eq!(patch.status, Status::Idle);
         assert_eq!(patch.idle_entered_at, inst.idle_entered_at);
+        assert_eq!(patch.last_accessed_at, inst.last_accessed_at);
+    }
+
+    #[test]
+    fn decide_passive_transition_never_fabricates_last_accessed_at() {
+        // A session that transitions status before any user touch has
+        // last_accessed_at == None on disk; the patch must preserve that,
+        // not fabricate a stamp, or a brand-new session gains a spurious
+        // "touched" signal that idle-reap and the freshness sort rely on
+        // being absent.
+        let mut inst = Instance::new("tmux-session", "/tmp/test");
+        inst.status = Status::Idle;
+        inst.last_accessed_at = None;
+
+        let decision = decide_passive_transition(&inst, Status::Running, false);
+
+        let patch = decision.patch.expect("plain tmux session must get a patch");
+        assert_eq!(patch.last_accessed_at, None);
     }
 
     #[test]
@@ -4459,17 +4471,17 @@ mod tests {
         let mut inst = Instance::new("tmux-session", "/tmp/test");
         inst.status = Status::Idle;
 
-        let decision = decide_passive_transition(&inst, Status::Running, true, chrono::Utc::now());
+        let decision = decide_passive_transition(&inst, Status::Running, true);
         assert!(decision.mark_unread);
 
-        let decision = decide_passive_transition(&inst, Status::Waiting, true, chrono::Utc::now());
+        let decision = decide_passive_transition(&inst, Status::Waiting, true);
         assert!(
             !decision.mark_unread,
             "only a Running -> Idle transition marks unread"
         );
 
         inst.unread = true;
-        let decision = decide_passive_transition(&inst, Status::Running, true, chrono::Utc::now());
+        let decision = decide_passive_transition(&inst, Status::Running, true);
         assert!(
             !decision.mark_unread,
             "already-unread sessions must not re-mark"
