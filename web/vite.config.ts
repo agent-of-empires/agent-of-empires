@@ -4,6 +4,8 @@ import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import { codecovVitePlugin } from "@codecov/vite-plugin";
 
+export const SESSION_WS_PROXY = "^/sessions/.+/(?:ws|live-ws)(?:\\?.*)?$";
+
 export default defineConfig(({ mode, command }) => {
   // Load `.env*` files (empty prefix => all keys, not just `VITE_`), merged
   // over shell env. Editing a `.env` file restarts the dev server, and the
@@ -38,7 +40,7 @@ export default defineConfig(({ mode, command }) => {
   const proxy = httpTarget
     ? {
         "/api": { target: httpTarget, changeOrigin: true },
-        "^/sessions/.+/(?:ws|live-ws)(?:\\?.*)?$": {
+        [SESSION_WS_PROXY]: {
           target: httpTarget.replace(/^http/, "ws"),
           ws: true,
           changeOrigin: true,
