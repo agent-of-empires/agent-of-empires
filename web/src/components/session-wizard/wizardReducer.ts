@@ -163,6 +163,10 @@ export function reducer(state: WizardState, action: Action): WizardState {
         newData.path = "";
         newData.extraRepoPaths = [];
         newData.useWorktree = false;
+        // Clear a stale non-repo probe result too, so toggling scratch back
+        // off doesn't show "not a git repository" for a not-yet-chosen path.
+        // Keeps the "no path selected == optimistically a repo" invariant.
+        newData.pathIsGitRepo = true;
         // Leaving the import flow for scratch: drop the import id so it
         // can't ride along on the submit. See #2276.
         newData.importAcpSessionId = "";

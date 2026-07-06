@@ -436,4 +436,21 @@ describe("SessionWizard reducer / worktree gating on non-git paths", () => {
     });
     expect(newPath.data.pathIsGitRepo).toBe(true);
   });
+
+  it("clears a stale non-repo result when scratch is turned on, so a scratch round-trip leaves an empty path optimistic", () => {
+    const nonRepo = reducer(makeState(), {
+      type: "SET_FIELD",
+      field: "pathIsGitRepo",
+      value: false,
+    });
+    expect(nonRepo.data.pathIsGitRepo).toBe(false);
+
+    const scratchOn = reducer(nonRepo, {
+      type: "SET_FIELD",
+      field: "scratch",
+      value: true,
+    });
+    expect(scratchOn.data.path).toBe("");
+    expect(scratchOn.data.pathIsGitRepo).toBe(true);
+  });
 });
