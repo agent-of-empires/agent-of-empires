@@ -76,6 +76,19 @@ describe("DirectoryBrowser", () => {
     });
   });
 
+  it("selects the current folder via 'Use this folder', even when it is not a git repo", async () => {
+    getHomePath.mockResolvedValue("/home/user");
+    browseFilesystem.mockResolvedValue(response([dir("project")]));
+    const onSelect = vi.fn();
+
+    render(<DirectoryBrowser onSelect={onSelect} />);
+
+    await screen.findByRole("option", { name: /project/i });
+    fireEvent.click(screen.getByRole("button", { name: /use this folder/i }));
+
+    expect(onSelect).toHaveBeenCalledWith("/home/user");
+  });
+
   it("requests filtered results from the server so entries past the first page can be found", async () => {
     getHomePath.mockResolvedValue("/home/user");
     const firstPage = Array.from({ length: 100 }, (_, i) => dir(`project-${i + 1}`));
