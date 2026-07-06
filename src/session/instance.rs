@@ -691,6 +691,17 @@ pub struct Instance {
     pub last_error_check: Option<std::time::Instant>,
     #[serde(skip)]
     pub last_start_time: Option<std::time::Instant>,
+    /// Last status a caller has actually observed live (as opposed to
+    /// whatever `status` happens to hold after a fresh disk load). `None`
+    /// means no live observation has happened yet for this in-memory
+    /// object, so `update_status_with_metadata` must not treat a mismatch
+    /// against a possibly-stale disk-loaded `status` as a real transition.
+    /// See #2690: comparing against disk `status` directly caused every
+    /// restart (TUI relaunch, daemon reload) to misdetect "disk hasn't
+    /// caught up yet" as "just transitioned now", clobbering
+    /// `idle_entered_at`/`last_accessed_at`.
+    #[serde(skip)]
+    pub live_status_baseline: Option<Status>,
     #[serde(skip)]
     pub last_error: Option<String>,
     #[serde(skip)]
@@ -1005,6 +1016,19 @@ fn publish_session_to_tmux_env(tmux_session_name: &str, instance_id: &str, sessi
     }
 }
 
+/// A passively-detected status transition, queued for a batched disk write.
+/// Produced by the TUI's and daemon's background pollers when a genuine
+/// live status change is observed (see [`Instance::update_status_with_metadata`]
+/// and its `live_status_baseline` field), consumed by
+/// [`Instance::merge_passive_status_patch`].
+#[derive(Debug, Clone)]
+pub struct PassiveStatusPatch {
+    pub id: String,
+    pub status: Status,
+    pub idle_entered_at: Option<DateTime<Utc>>,
+    pub last_accessed_at: DateTime<Utc>,
+}
+
 impl Instance {
     pub fn new(title: &str, project_path: &str) -> Self {
         Self {
@@ -1060,6 +1084,12 @@ impl Instance {
             fork_pending: None,
             last_error_check: None,
             last_start_time: None,
+            // A freshly constructed (not deserialized) Instance has a
+            // known-good live status right now: itself. Seeding the
+            // baseline here means the first real transition after
+            // creation restamps normally instead of being swallowed as
+            // a "no live history yet" seed.
+            live_status_baseline: Some(Status::Idle),
             last_error: None,
             session_id_poller: None,
             retroactive_capture_excludes: HashSet::new(),
@@ -1305,6 +1335,30 @@ impl Instance {
         self.status = src.status;
         self.last_accessed_at = self.last_accessed_at.max(src.last_accessed_at);
         self.idle_entered_at = src.idle_entered_at;
+    }
+
+    /// Apply a passively-detected status transition to a disk row. Narrower
+    /// than [`Self::merge_from_tui`]: touches only `status`,
+    /// `idle_entered_at`, `last_accessed_at`, never group/archive/favorite/
+    /// title/etc, so it is safe to call from the background poller (TUI or
+    /// daemon) without racing an explicit user action on the same instance.
+    ///
+    /// `last_accessed_at` guards against a delayed passive write regressing
+    /// a newer explicit action: if disk already has a strictly newer
+    /// `last_accessed_at` than the patch, the patch is dropped. `status`/
+    /// `idle_entered_at` always apply otherwise, since the poller is the
+    /// sole authority on detected agent status. See #2690.
+    pub fn merge_passive_status_patch(&mut self, patch: &PassiveStatusPatch) {
+        if self
+            .last_accessed_at
+            .zip(Some(patch.last_accessed_at))
+            .is_some_and(|(disk, incoming)| disk > incoming)
+        {
+            return;
+        }
+        self.status = patch.status;
+        self.idle_entered_at = patch.idle_entered_at;
+        self.last_accessed_at = Some(patch.last_accessed_at);
     }
 
     /// Per-field-conditional splice: copy `post.X` onto `self.X` only when
@@ -4033,18 +4087,32 @@ impl Instance {
 
     /// Update status using pre-fetched pane metadata to avoid per-instance
     /// subprocess spawns. Falls back to subprocess calls if metadata is missing.
+    ///
+    /// Restamps `idle_entered_at`/`last_accessed_at` only when the detected
+    /// status differs from `live_status_baseline`, the last status this
+    /// in-memory object actually observed live, NOT `self.status` as loaded.
+    /// `self.status` can be a stale disk snapshot right after a fresh load
+    /// (TUI relaunch, or every tick of the daemon's `status_poll_loop`,
+    /// which reloads instances from disk every cycle); comparing against it
+    /// misreads "disk hasn't caught up yet" as "just transitioned now" and
+    /// clobbers the timestamps every time disk and live detection disagree.
+    /// `live_status_baseline == None` means no live observation exists yet,
+    /// so the first check seeds the baseline without restamping. See #2690.
     pub fn update_status_with_metadata(&mut self, metadata: Option<&tmux::PaneMetadata>) {
-        let prev_status = self.status;
+        let baseline = self.live_status_baseline;
         self.update_status_with_metadata_inner(metadata);
-        if self.status != prev_status {
-            let now = Utc::now();
-            self.last_accessed_at = Some(now);
-            self.idle_entered_at = if self.status == Status::Idle {
-                Some(now)
-            } else {
-                None
-            };
+        if let Some(prev_status) = baseline {
+            if self.status != prev_status {
+                let now = Utc::now();
+                self.last_accessed_at = Some(now);
+                self.idle_entered_at = if self.status == Status::Idle {
+                    Some(now)
+                } else {
+                    None
+                };
+            }
         }
+        self.live_status_baseline = Some(self.status);
     }
 
     fn update_status_with_metadata_inner(&mut self, metadata: Option<&tmux::PaneMetadata>) {
@@ -5490,6 +5558,69 @@ mod tests {
 
         assert_eq!(stored.status, Status::Running);
         assert_eq!(stored.idle_entered_at, src.idle_entered_at);
+    }
+
+    #[test]
+    fn test_update_status_with_metadata_seeds_baseline_without_restamp() {
+        // #2690: a session loaded fresh from disk (e.g. TUI relaunch, or
+        // every tick of the daemon's status_poll_loop) has no live
+        // observation history yet: `live_status_baseline` is `None`. The
+        // very first status check must not treat a mismatch between the
+        // disk-loaded `status` and the freshly detected status as a real
+        // transition, or every reload would reset idle_entered_at/
+        // last_accessed_at to `now`. Red on the pre-fix tree (which compares
+        // against `self.status` directly and always restamps here, since no
+        // real tmux session exists for this instance).
+        let mut inst = Instance::new("test", "/tmp/test");
+        inst.live_status_baseline = None;
+        inst.status = Status::Starting;
+        let stale_idle_entered_at = Some(Utc::now() - chrono::Duration::hours(2));
+        let stale_last_accessed_at = Some(Utc::now() - chrono::Duration::hours(2));
+        inst.idle_entered_at = stale_idle_entered_at;
+        inst.last_accessed_at = stale_last_accessed_at;
+
+        inst.update_status_with_metadata(None);
+
+        // No real tmux session exists for this instance, so detection
+        // resolves to Error, differing from the stale disk `Starting`. That
+        // mismatch must NOT be treated as a genuine transition.
+        assert_eq!(inst.status, Status::Error);
+        assert_eq!(
+            inst.idle_entered_at, stale_idle_entered_at,
+            "first check after a fresh load must not clobber a stale-but-real idle_entered_at"
+        );
+        assert_eq!(
+            inst.last_accessed_at, stale_last_accessed_at,
+            "first check after a fresh load must not clobber a stale-but-real last_accessed_at"
+        );
+        assert_eq!(
+            inst.live_status_baseline,
+            Some(Status::Error),
+            "the first check must seed the baseline for subsequent comparisons"
+        );
+    }
+
+    #[test]
+    fn test_update_status_with_metadata_restamps_on_genuine_transition() {
+        // Once a live baseline is established, a real status change still
+        // restamps normally (no regression from the #2690 fix).
+        let mut inst = Instance::new("test", "/tmp/test");
+        inst.live_status_baseline = Some(Status::Idle);
+        inst.status = Status::Idle;
+        inst.idle_entered_at = Some(Utc::now() - chrono::Duration::hours(2));
+        inst.last_accessed_at = Some(Utc::now() - chrono::Duration::hours(2));
+
+        let before = Utc::now();
+        inst.update_status_with_metadata(None);
+        let after = Utc::now();
+
+        // No real tmux session exists, so detection resolves to Error: a
+        // genuine transition away from the established Idle baseline.
+        assert_eq!(inst.status, Status::Error);
+        assert_eq!(inst.idle_entered_at, None);
+        let last_accessed = inst.last_accessed_at.expect("must be restamped");
+        assert!(last_accessed >= before && last_accessed <= after);
+        assert_eq!(inst.live_status_baseline, Some(Status::Error));
     }
 
     #[test]
