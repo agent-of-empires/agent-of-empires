@@ -221,7 +221,12 @@ export const Row = memo(function Row({
         );
       }
       out.push(
-        <span key={key++} data-live-cursor style={{ ...segStyle(seg.style), ...cursorStyle }}>
+        <span
+          key={key++}
+          data-live-cursor
+          className={focused ? "animate-term-cursor-blink" : undefined}
+          style={{ ...segStyle(seg.style), ...cursorStyle }}
+        >
           {chars[idx]}
         </span>,
       );
@@ -247,7 +252,12 @@ export const Row = memo(function Row({
     // and box a space.
     if (cursorCol > col) out.push(<span key="pad">{" ".repeat(cursorCol - col)}</span>);
     out.push(
-      <span key="cursor" data-live-cursor style={cursorStyle}>
+      <span
+        key="cursor"
+        data-live-cursor
+        className={focused ? "animate-term-cursor-blink" : undefined}
+        style={cursorStyle}
+      >
         {" "}
       </span>,
     );

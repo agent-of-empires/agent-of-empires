@@ -419,6 +419,33 @@ body {
   animation: slide-in-right 0.2s ease-out;
 }
 
+/* Live terminal cursor blink while its input is focused (MobileLiveTerminal's
+   `Row`). Only oscillates the filled-cursor colors set by the inline style;
+   the almost-equal keyframe percentages make the swap an instant cut instead
+   of a fade. `color: inherit` on the off phase approximates the original
+   glyph color rather than reproducing it exactly, good enough since the
+   cursor sits on the input line, which is normally default-colored text. */
+@keyframes term-cursor-blink {
+  0%,
+  50% {
+    background-color: var(--term-cursor, #f59e0b);
+    color: var(--term-bg, #1c1c1f);
+  }
+  50.001%,
+  100% {
+    background-color: transparent;
+    color: inherit;
+  }
+}
+.animate-term-cursor-blink {
+  animation: term-cursor-blink 1.06s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .animate-term-cursor-blink {
+    animation: none;
+  }
+}
+
 /* One-shot flash for the field a settings-search jump lands on. The target
    wrapper remounts on each jump (SettingsView keys the content subtree on the
    focus nonce), so the animation replays without any JS timer or state. */
