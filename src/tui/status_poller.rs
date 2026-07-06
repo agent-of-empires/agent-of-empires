@@ -58,6 +58,17 @@ pub struct StatusUpdate {
     /// Attention sort can treat dead panes as tier 99 without re-querying
     /// tmux per sort.
     pub pane_dead: bool,
+    /// Snapshot of the polled clone's `live_status_baseline` after
+    /// `update_status_with_metadata` ran. Same reasoning as
+    /// `idle_entered_at`: the wrapper's baseline write lives only on the
+    /// polling clone and would be lost when projected into a `StatusUpdate`,
+    /// which would make the real `Instance` in `self.instances` compare
+    /// against `None` on every poll forever, silently disabling restamping
+    /// for the standalone TUI (#2690 follow-up). `None` from a producer
+    /// that never establishes a baseline (e.g. `attached_status_hooks`'s
+    /// snapshot) must NOT clear an already-established baseline, so the
+    /// consumer applies this conditionally, mirroring `last_accessed_at`.
+    pub live_status_baseline: Option<Status>,
 }
 
 pub(super) struct StatusPollState {
@@ -154,6 +165,7 @@ pub(super) fn poll_statuses_once(
                                 // Sandboxed sessions don't have a tmux pane in the
                                 // usual sense; the Error tier itself sinks the row.
                                 pane_dead: false,
+                                live_status_baseline: Some(Status::Error),
                             });
                         }
                     }
@@ -174,6 +186,7 @@ pub(super) fn poll_statuses_once(
                 idle_entered_at: inst.idle_entered_at,
                 last_accessed_at: inst.last_accessed_at,
                 pane_dead,
+                live_status_baseline: inst.live_status_baseline,
             })
         })
         .collect()
@@ -255,6 +268,7 @@ mod tests {
             idle_entered_at: Some(ts),
             last_accessed_at: None,
             pane_dead: false,
+            live_status_baseline: None,
         };
         assert_eq!(update.idle_entered_at, Some(ts));
     }

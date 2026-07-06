@@ -6113,6 +6113,7 @@ fn apply_status_update_propagates_idle_entered_at_into_live_instance() {
         idle_entered_at: Some(now),
         last_accessed_at: None,
         pane_dead: false,
+        live_status_baseline: None,
     });
 
     let inst = env.view.get_instance(&id).unwrap();
@@ -6123,7 +6124,51 @@ fn apply_status_update_propagates_idle_entered_at_into_live_instance() {
 // #2690: a passively-detected status transition must land on disk
 // immediately, not just in memory, so the next reload (TUI relaunch, or
 // a peer like `aoe serve`) finds disk already caught up instead of
-// misreading a stale snapshot as a fresh transition.
+// CodeRabbit follow-up to #2690: `update_status_with_metadata` compares
+// against `live_status_baseline`, but the background poller only ever
+// mutates a *clone* of the real `Instance` (see `status_poller.rs`). If
+// `StatusUpdate` doesn't carry the clone's freshly-seeded baseline back,
+// the real `Instance` in `self.instances` keeps `live_status_baseline ==
+// None` forever, so every poll looks like "no baseline yet" and no real
+// transition after the first ever restamps again.
+#[test]
+#[serial]
+fn apply_status_update_propagates_live_status_baseline_from_poller() {
+    use crate::tui::status_poller::{poll_statuses_once, StatusPollState};
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = match env.view.flat_items.first() {
+        Some(Item::Session { id, .. }) => id.clone(),
+        _ => panic!("expected the fixture to seed a single Session item"),
+    };
+    assert_eq!(
+        env.view.get_instance(&id).unwrap().live_status_baseline,
+        None,
+        "freshly loaded instance has no live baseline yet"
+    );
+
+    // Drive a real poll cycle through the same path the background thread
+    // uses: clone -> poll_statuses_once -> project into StatusUpdate ->
+    // apply back onto the real Instance.
+    let mut poll_state = StatusPollState::new();
+    let instances = env.view.pollable_instances();
+    let updates = poll_statuses_once(instances, &mut poll_state);
+    for update in updates {
+        env.view.apply_one_status_update(update);
+    }
+
+    assert!(
+        env.view
+            .get_instance(&id)
+            .unwrap()
+            .live_status_baseline
+            .is_some(),
+        "the polling clone's seeded baseline must survive back into the \
+         real Instance via StatusUpdate, or every future poll re-seeds \
+         instead of restamping real transitions"
+    );
+}
+
 #[test]
 #[serial]
 fn apply_status_update_persists_genuine_transition_to_disk() {
@@ -6145,6 +6190,7 @@ fn apply_status_update_persists_genuine_transition_to_disk() {
         idle_entered_at: None,
         last_accessed_at: Some(now),
         pane_dead: false,
+        live_status_baseline: None,
     });
 
     let reloaded = Storage::new_unwatched("test").unwrap().load().unwrap();
@@ -6178,6 +6224,7 @@ fn apply_status_update_clears_idle_entered_at_on_idle_to_running() {
         idle_entered_at: Some(stop_time),
         last_accessed_at: None,
         pane_dead: false,
+        live_status_baseline: None,
     });
     assert_eq!(
         env.view.get_instance(&id).unwrap().idle_entered_at,
@@ -6195,6 +6242,7 @@ fn apply_status_update_clears_idle_entered_at_on_idle_to_running() {
         idle_entered_at: None,
         last_accessed_at: None,
         pane_dead: false,
+        live_status_baseline: None,
     });
 
     let inst = env.view.get_instance(&id).unwrap();
@@ -6292,6 +6340,7 @@ fn apply_status_update_skips_terminal_states() {
         idle_entered_at: Some(stale_ts),
         last_accessed_at: None,
         pane_dead: false,
+        live_status_baseline: None,
     });
 
     // Status and timestamp should both stay untouched.
@@ -6367,6 +6416,7 @@ fn apply_status_update_runs_status_hook_on_transition() {
         idle_entered_at: None,
         last_accessed_at: None,
         pane_dead: false,
+        live_status_baseline: None,
     });
 
     let launches = take_recorded_launches();
@@ -6432,6 +6482,7 @@ fn apply_status_update_does_not_run_status_hook_for_same_status() {
         idle_entered_at: None,
         last_accessed_at: None,
         pane_dead: false,
+        live_status_baseline: None,
     });
 
     assert!(take_recorded_launches().is_empty());
@@ -6465,6 +6516,7 @@ fn apply_status_updates_without_hooks_does_not_run_status_hook() {
             idle_entered_at: None,
             last_accessed_at: None,
             pane_dead: false,
+            live_status_baseline: None,
         }]);
 
     assert_eq!(env.view.get_instance(&id).unwrap().status, Status::Waiting);

@@ -2698,6 +2698,7 @@ impl HomeView {
             let new_status = update.status;
             let new_error = update.last_error;
             let new_idle_entered_at = update.idle_entered_at;
+            let new_live_status_baseline = update.live_status_baseline;
             self.mutate_instance(&update.id, |inst| {
                 inst.status = new_status;
                 inst.last_error = new_error;
@@ -2707,6 +2708,14 @@ impl HomeView {
                 inst.idle_entered_at = new_idle_entered_at;
                 if new_last_accessed.is_some() {
                     inst.last_accessed_at = new_last_accessed;
+                }
+                // Conditional, not unconditional like idle_entered_at: a
+                // producer that never establishes a baseline (attached_
+                // status_hooks's snapshot, when its own instance clone
+                // hasn't polled yet) must not clear one this instance
+                // already has. See #2690 CodeRabbit follow-up.
+                if let Some(baseline) = new_live_status_baseline {
+                    inst.live_status_baseline = Some(baseline);
                 }
                 inst.pane_dead_observed = new_pane_dead;
             });
