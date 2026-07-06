@@ -38,7 +38,7 @@ export default defineConfig(({ mode, command }) => {
   const proxy = httpTarget
     ? {
         "/api": { target: httpTarget, changeOrigin: true },
-        "^/sessions/.+/(?:ws|live-ws)$": {
+        "^/sessions/.+/(?:ws|live-ws)(?:\\?.*)?$": {
           target: httpTarget.replace(/^http/, "ws"),
           ws: true,
           changeOrigin: true,

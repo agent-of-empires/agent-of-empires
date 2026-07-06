@@ -24,6 +24,11 @@ vi.mock("../../lib/clipboard", () => ({
   writeClipboard: (text: string) => writeClipboard(text),
 }));
 
+const reportClientLog = vi.fn();
+vi.mock("../../lib/logger", () => ({
+  reportError: (err: unknown, ctx?: unknown) => reportClientLog(err, ctx),
+}));
+
 beforeAll(() => {
   globalThis.ResizeObserver = class {
     observe() {}
@@ -88,6 +93,21 @@ function stubKeyboardLayout(entries: [string, string][]) {
   };
 }
 
+function stubHostname(hostname: string) {
+  const original = Object.getOwnPropertyDescriptor(globalThis, "location");
+  Object.defineProperty(globalThis, "location", {
+    configurable: true,
+    value: { hostname },
+  });
+  return () => {
+    if (original) {
+      Object.defineProperty(globalThis, "location", original);
+    } else {
+      delete (globalThis as typeof globalThis & { location?: Location }).location;
+    }
+  };
+}
+
 describe("MobileLiveTerminal paste", () => {
   it("does not swallow Ctrl+V into a literal ^V, and the paste event sends a bracketed paste", () => {
     const { input, sendData } = renderTerm();
@@ -105,19 +125,48 @@ describe("MobileLiveTerminal paste", () => {
     expect(sendData).toHaveBeenCalledWith("\x1b[200~hello world\x1b[201~");
   });
 
-  it("sends Ctrl+V for image-only paste so terminal agents can read the host clipboard", () => {
-    const { input, sendData } = renderTerm();
+  it("sends Ctrl+V for local image-only paste so terminal agents can read the shared host clipboard", () => {
+    const restoreHostname = stubHostname("localhost");
+    try {
+      const { input, sendData } = renderTerm();
 
-    fireEvent.paste(input, {
-      clipboardData: {
-        getData: (t: string) => (t === "text/plain" ? "" : ""),
-        items: [{ kind: "file", type: "image/png" }],
-      },
-    });
+      fireEvent.paste(input, {
+        clipboardData: {
+          getData: (t: string) => (t === "text/plain" ? "" : ""),
+          items: [{ kind: "file", type: "image/png" }],
+        },
+      });
 
-    expect(sendData).toHaveBeenCalledWith("\x16");
-    expect(sendData).not.toHaveBeenCalledWith(expect.stringContaining("\x1b[200~"));
-    expect(screen.getByRole("status").textContent).toContain("Sent image paste shortcut");
+      expect(sendData).toHaveBeenCalledWith("\x16");
+      expect(sendData).not.toHaveBeenCalledWith(expect.stringContaining("\x1b[200~"));
+      expect(screen.getByRole("status").textContent).toContain("Sent local image paste shortcut");
+      expect(reportClientLog).not.toHaveBeenCalled();
+    } finally {
+      restoreHostname();
+    }
+  });
+
+  it("does not send Ctrl+V for remote image-only paste because the browser clipboard is not on the terminal host", () => {
+    const restoreHostname = stubHostname("example.com");
+    try {
+      const { input, sendData } = renderTerm();
+
+      fireEvent.paste(input, {
+        clipboardData: {
+          getData: (t: string) => (t === "text/plain" ? "" : ""),
+          items: [{ kind: "file", type: "image/png" }],
+        },
+      });
+
+      expect(sendData).not.toHaveBeenCalledWith("\x16");
+      expect(screen.getByRole("status").textContent).toContain("only available");
+      expect(reportClientLog).toHaveBeenCalledWith(expect.stringContaining("remote dashboard"), {
+        level: "warn",
+        target: "live-terminal.image-paste.remote",
+      });
+    } finally {
+      restoreHostname();
+    }
   });
 
   it("also detects image-only paste from clipboard files", () => {

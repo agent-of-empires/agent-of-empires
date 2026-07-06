@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 // switched to the ws:// scheme. See vite.config.ts.
 
 type ProxyEntry = { target: string; ws?: boolean };
-const SESSION_WS_PROXY = "^/sessions/.+/(?:ws|live-ws)$";
+const SESSION_WS_PROXY = "^/sessions/.+/(?:ws|live-ws)(?:\\?.*)?$";
 
 async function loadProxy(env: Record<string, string | undefined>): Promise<Record<string, ProxyEntry> | undefined> {
   vi.resetModules();
@@ -44,6 +44,7 @@ describe("vite dev server proxy", () => {
     expect(ws?.ws).toBe(true);
     expect(new RegExp(SESSION_WS_PROXY).test("/sessions/s1/ws")).toBe(true);
     expect(new RegExp(SESSION_WS_PROXY).test("/sessions/s1/acp/ws")).toBe(true);
+    expect(new RegExp(SESSION_WS_PROXY).test("/sessions/s1/acp/ws?since=42")).toBe(true);
     expect(new RegExp(SESSION_WS_PROXY).test("/sessions/s1/live-ws")).toBe(true);
     expect(new RegExp(SESSION_WS_PROXY).test("/sessions/s1/terminal/live-ws")).toBe(true);
     expect(new RegExp(SESSION_WS_PROXY).test("/sessions/s1/container-terminal/live-ws")).toBe(true);

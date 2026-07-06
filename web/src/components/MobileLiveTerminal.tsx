@@ -4,6 +4,7 @@ import type { AnsiSegment, AnsiStyle } from "../lib/ansi";
 import { ansiToLines, wrapLine } from "../lib/liveTermLines";
 import { wheelNotches } from "../lib/liveMouse";
 import { writeClipboard } from "../lib/clipboard";
+import { reportError as reportClientLog } from "../lib/logger";
 import type { LiveFrame } from "../hooks/useLiveTerminal";
 import { useWebSettings } from "../hooks/useWebSettings";
 import { useIsCoarsePointer } from "../hooks/useIsCoarsePointer";
@@ -1141,22 +1142,26 @@ export function MobileLiveTerminal({
       }
       // Image-only browser paste cannot stream file bytes through the PTY.
       // Items cover Chromium's clipboard shape; files covers Safari-like
-      // flows. Text wins above when both are present. `\x16` is raw Ctrl+V,
-      // which asks terminal agents to run their native host-clipboard image
-      // paste flow.
+      // flows. Text wins above when both are present.
       const items = Array.from(e.clipboardData.items ?? []);
       const hasImageItem = items.some((item) => item.kind === "file" && item.type.startsWith("image/"));
       const hasImageFile = Array.from(e.clipboardData.files ?? []).some((file) => file.type.startsWith("image/"));
       if (hasImageItem || hasImageFile) {
-        sendData("\x16");
-        setImagePasteStatus("Sent image paste shortcut to the terminal agent.");
-        if (imagePasteStatusTimerRef.current) clearTimeout(imagePasteStatusTimerRef.current);
-        imagePasteStatusTimerRef.current = setTimeout(() => setImagePasteStatus(null), 4000);
-        if (!isLocalClipboardHost(location.hostname)) {
-          console.warn(
-            "Image-only live-terminal paste sent Ctrl+V to the remote terminal. The agent reads the server-side clipboard, not the browser clipboard.",
+        if (isLocalClipboardHost(location.hostname)) {
+          // `\x16` is raw Ctrl+V, which asks terminal agents to run their
+          // native host-clipboard image paste flow. That only matches the
+          // browser clipboard when the dashboard and terminal share a host.
+          sendData("\x16");
+          setImagePasteStatus("Sent local image paste shortcut to the terminal agent.");
+        } else {
+          setImagePasteStatus("Image paste is only available from this live terminal on localhost.");
+          reportClientLog(
+            "Image-only live-terminal paste was blocked on a remote dashboard because the terminal agent reads the server clipboard, not the browser clipboard.",
+            { level: "warn", target: "live-terminal.image-paste.remote" },
           );
         }
+        if (imagePasteStatusTimerRef.current) clearTimeout(imagePasteStatusTimerRef.current);
+        imagePasteStatusTimerRef.current = setTimeout(() => setImagePasteStatus(null), 4000);
       }
     },
     [sendData],
