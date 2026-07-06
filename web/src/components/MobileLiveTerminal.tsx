@@ -1,7 +1,7 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, ReactNode, RefObject } from "react";
 import type { AnsiSegment, AnsiStyle } from "../lib/ansi";
-import { ansiToLines, wrapLine } from "../lib/liveTermLines";
+import { ansiToLines, findCursorCharIndex, textWidth, wrapLine } from "../lib/liveTermLines";
 import { wheelNotches } from "../lib/liveMouse";
 import { writeClipboard } from "../lib/clipboard";
 import type { LiveFrame } from "../hooks/useLiveTerminal";
@@ -156,31 +156,34 @@ export const Row = memo(function Row({ segs, cursorCol }: { segs: AnsiSegment[];
     );
   }
   // Render the row with the single cell at `cursorCol` boxed. Walk segments by
-  // column; split the one that straddles the cursor.
+  // terminal cell width, not UTF-16 code units, since `cursorCol` is a real
+  // cell count from tmux and CJK/wide glyphs take two cells but one code
+  // unit (#2665); split the segment that straddles the cursor.
   const out: ReactNode[] = [];
   let col = 0;
   let placed = false;
   let key = 0;
   for (const seg of segs) {
     const t = seg.text;
-    if (!placed && cursorCol >= col && cursorCol < col + t.length) {
-      const off = cursorCol - col;
-      if (off > 0) {
+    const idx = placed ? null : findCursorCharIndex(t, cursorCol - col);
+    if (idx != null) {
+      const chars = [...t];
+      if (idx > 0) {
         out.push(
           <span key={key++} style={segStyle(seg.style)}>
-            {t.slice(0, off)}
+            {chars.slice(0, idx).join("")}
           </span>,
         );
       }
       out.push(
         <span key={key++} data-live-cursor style={{ ...segStyle(seg.style), ...CURSOR_CELL_STYLE }}>
-          {t[off]}
+          {chars[idx]}
         </span>,
       );
-      if (off + 1 < t.length) {
+      if (idx + 1 < chars.length) {
         out.push(
           <span key={key++} style={segStyle(seg.style)}>
-            {t.slice(off + 1)}
+            {chars.slice(idx + 1).join("")}
           </span>,
         );
       }
@@ -192,7 +195,7 @@ export const Row = memo(function Row({ segs, cursorCol }: { segs: AnsiSegment[];
         </span>,
       );
     }
-    col += t.length;
+    col += textWidth(t);
   }
   if (!placed) {
     // Cursor sits past the row's text (blank input cell): pad to the column

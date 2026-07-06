@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, expect, it } from "vitest";
-import { ansiToLines, lineText, wrapLine } from "./liveTermLines";
+import { ansiToLines, findCursorCharIndex, lineText, wrapLine } from "./liveTermLines";
 
 describe("ansiToLines", () => {
   it("splits plain text into lines and drops the capture trailing terminator", () => {
@@ -82,5 +82,42 @@ describe("wrapLine", () => {
     expect(wrapLine(line, 2)).toEqual([line]);
     const rows = wrapLine(line, 1);
     expect(rows.map((r) => lineText(r))).toEqual(["e\u0301", "x"]);
+  });
+});
+
+describe("findCursorCharIndex", () => {
+  it("is a plain code-unit index for ASCII text", () => {
+    expect(findCursorCharIndex("hello", 0)).toBe(0);
+    expect(findCursorCharIndex("hello", 4)).toBe(4);
+    expect(findCursorCharIndex("hello", 5)).toBeNull(); // past the end
+  });
+
+  it("returns null when the column falls past the end of the text", () => {
+    expect(findCursorCharIndex("\u4f60\u597d", 4)).toBeNull(); // "\u4f60\u597d" is 4 cells
+  });
+
+  it("counts CJK as two cells so the column maps to the right character", () => {
+    // "\u4f60\u597d\u4e16\u754c": \u4f60(0-2) \u597d(2-4) \u4e16(4-6) \u754c(6-8).
+    const text = "\u4f60\u597d\u4e16\u754c";
+    expect(findCursorCharIndex(text, 0)).toBe(0); // \u4f60
+    expect(findCursorCharIndex(text, 2)).toBe(1); // \u597d
+    expect(findCursorCharIndex(text, 4)).toBe(2); // \u4e16
+    expect(findCursorCharIndex(text, 6)).toBe(3); // \u754c
+  });
+
+  it("never splits an emoji's surrogate pair", () => {
+    // "a" (1 cell) + grinning face U+1F600 (2 cells): column 1 must land
+    // on the whole emoji, not one half of its surrogate pair.
+    const text = "a\u{1F600}";
+    expect(findCursorCharIndex(text, 0)).toBe(0);
+    expect(findCursorCharIndex(text, 1)).toBe(1);
+    expect(findCursorCharIndex(text, 2)).toBe(1);
+  });
+
+  it("skips zero-width combining marks", () => {
+    // e + combining acute (zero cells) + "x": column 1 is "x", not the mark.
+    const text = "e\u0301x";
+    expect(findCursorCharIndex(text, 0)).toBe(0); // e
+    expect(findCursorCharIndex(text, 1)).toBe(2); // x (index 1 is the mark)
   });
 });

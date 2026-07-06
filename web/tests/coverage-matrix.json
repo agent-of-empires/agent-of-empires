@@ -108,6 +108,13 @@
       "components": ["web/src/components/MobileLiveTerminal.tsx"]
     },
     {
+      "id": "terminal.live-cursor-wide-chars",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/components/__tests__/MobileLiveTerminal.cjkCursor.test.tsx", "src/lib/liveTermLines.test.ts"],
+      "components": ["web/src/components/MobileLiveTerminal.tsx"]
+    },
+    {
       "id": "terminal.clipboard-chords",
       "kind": "vitest",
       "risk": "medium",

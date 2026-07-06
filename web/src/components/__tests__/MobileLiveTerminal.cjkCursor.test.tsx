@@ -27,9 +27,10 @@ describe("Row cursor placement with CJK (wide) characters", () => {
     const { container } = render(<Row segs={[seg(text)]} cursorCol={17} />);
     const cell = cursorCell(container);
     expect(cell).not.toBeNull();
-    // No padding spaces should precede the boxed cell; it must sit right
-    // after the text, not drifted further right.
-    expect(cell!.previousSibling).toBeNull();
+    // The row is [text span, cursor span]. No pad span should be inserted
+    // between them; drift shows up as a pad span full of spaces.
+    expect(container.querySelectorAll("span")).toHaveLength(2);
+    expect(cell!.previousSibling!.textContent).toBe(text);
     expect(cell!.textContent).toBe(" ");
   });
 
