@@ -142,13 +142,19 @@ function segStyle(style: AnsiStyle): CSSProperties | undefined {
 // Screenshot-friendly; no behavior changes.
 const LIVE_DEBUG = typeof location !== "undefined" && new URLSearchParams(location.search).has("livedebug");
 
-// Hollow-box cursor drawn AS A CELL inside the text flow, the way a real
-// terminal (and the desktop xterm view) renders it, rather than a separate
-// absolutely-positioned block whose pixel row we reconstruct from cursor.y and
-// line-height. Tying it to the actual rendered cell means it cannot drift off
-// its row (wrapping, row-height, offset assumptions). `outline` instead of
-// `border` so the box does not reflow the line by a pixel.
-const CURSOR_CELL_STYLE: CSSProperties = {
+// Cursor drawn AS A CELL inside the text flow, the way a real terminal
+// renders it, rather than a separate absolutely-positioned block whose pixel
+// row we reconstruct from cursor.y and line-height. Tying it to the actual
+// rendered cell means it cannot drift off its row (wrapping, row-height,
+// offset assumptions). Filled (solid background, inverted text) while the
+// hidden input has focus, matching every terminal's focused-cursor
+// convention; hollow `outline` while blurred so the box does not reflow the
+// line by a pixel.
+const CURSOR_CELL_STYLE_FOCUSED: CSSProperties = {
+  backgroundColor: "var(--term-cursor, #f59e0b)",
+  color: "var(--term-bg, #1c1c1f)",
+};
+const CURSOR_CELL_STYLE_BLURRED: CSSProperties = {
   outline: "1px solid var(--term-cursor, #f59e0b)",
   outlineOffset: "-1px",
 };
@@ -170,7 +176,16 @@ function linkify(text: string): ReactNode {
   );
 }
 
-export const Row = memo(function Row({ segs, cursorCol }: { segs: AnsiSegment[]; cursorCol: number | null }) {
+export const Row = memo(function Row({
+  segs,
+  cursorCol,
+  focused = false,
+}: {
+  segs: AnsiSegment[];
+  cursorCol: number | null;
+  focused?: boolean;
+}) {
+  const cursorStyle = focused ? CURSOR_CELL_STYLE_FOCUSED : CURSOR_CELL_STYLE_BLURRED;
   if (cursorCol == null) {
     if (segs.length === 0) return <div> </div>; // keep empty rows at full height
     return (
@@ -206,7 +221,7 @@ export const Row = memo(function Row({ segs, cursorCol }: { segs: AnsiSegment[];
         );
       }
       out.push(
-        <span key={key++} data-live-cursor style={{ ...segStyle(seg.style), ...CURSOR_CELL_STYLE }}>
+        <span key={key++} data-live-cursor style={{ ...segStyle(seg.style), ...cursorStyle }}>
           {chars[idx]}
         </span>,
       );
@@ -232,7 +247,7 @@ export const Row = memo(function Row({ segs, cursorCol }: { segs: AnsiSegment[];
     // and box a space.
     if (cursorCol > col) out.push(<span key="pad">{" ".repeat(cursorCol - col)}</span>);
     out.push(
-      <span key="cursor" data-live-cursor style={CURSOR_CELL_STYLE}>
+      <span key="cursor" data-live-cursor style={cursorStyle}>
         {" "}
       </span>,
     );
@@ -274,6 +289,10 @@ export function MobileLiveTerminal({
   // ignored) font-family value.
   const termFontFamily = (settings.terminalFontFamily ?? "").trim().replace(/"/g, "");
   const fontFamily = termFontFamily ? `"${termFontFamily}", var(--font-mono)` : undefined;
+  // Drives the cursor cell's filled-vs-hollow style; separate from the
+  // `onInputFocusChange` bubble-up, which only drives the parent's chrome
+  // ring (see LiveTerminalView).
+  const [focused, setFocused] = useState(false);
   const [fontSize, setFontSize] = useState(() => configuredFontSize);
   // Adopt the persisted setting when it changes (settings panel, or the
   // pointer class flipping which font key applies) via the adjust-state-
@@ -1227,7 +1246,7 @@ export function MobileLiveTerminal({
           {topPadLines > 0 && <div style={{ height: `${topPadLines * lineH}px` }} aria-hidden="true" />}
           {visual.rows.slice(winStart, winEnd).map((segs, j) => {
             const i = winStart + j;
-            return <Row key={i} segs={segs} cursorCol={i === cursorRow ? live.col : null} />;
+            return <Row key={i} segs={segs} cursorCol={i === cursorRow ? live.col : null} focused={focused} />;
           })}
           {bottomPadLines > 0 && <div style={{ height: `${bottomPadLines * lineH}px` }} aria-hidden="true" />}
         </div>
@@ -1280,8 +1299,14 @@ export function MobileLiveTerminal({
         // a ghost caret floating over the terminal. caret-color is the
         // documented off switch; color guards select-all artifacts.
         style={{ fontSize: "16px", caretColor: "transparent", color: "transparent" }}
-        onFocus={() => onInputFocusChange(true)}
-        onBlur={() => onInputFocusChange(false)}
+        onFocus={() => {
+          setFocused(true);
+          onInputFocusChange(true);
+        }}
+        onBlur={() => {
+          setFocused(false);
+          onInputFocusChange(false);
+        }}
         autoCapitalize="off"
         autoCorrect="off"
         autoComplete="off"
