@@ -14,6 +14,9 @@ interface WizardData {
   group: string;
   tool: string;
   scratch: boolean;
+  /** Whether `path` is a git repository. Worktrees need a repo, so the
+   *  worktree toggle is disabled when this is false. See #2680 follow-up. */
+  pathIsGitRepo: boolean;
   [key: string]: unknown;
 }
 
@@ -65,6 +68,11 @@ export function SessionStep({ data, onChange, embedded = false }: Props) {
   // attachExisting/baseBranch/group from reducer state regardless of what
   // is on screen, so a hidden toggle keeps its default value. See #1514.
   const [advancedOpen, setAdvancedOpen] = useState(false);
+  // Worktrees require a git repo; disable the toggle for a plain folder
+  // (e.g. a root picked via "Use this folder"). The reducer also forces
+  // useWorktree off once the probe reports a non-repo, so a stale "on" from
+  // a previous repo path can't ride through.
+  const worktreeDisabled = !data.pathIsGitRepo;
 
   const titleField = (
     <div className="mb-5">
@@ -94,28 +102,43 @@ export function SessionStep({ data, onChange, embedded = false }: Props) {
           Scratch sessions do not use git worktrees.
         </p>
       ) : (
-        <label
-          className="flex items-center justify-between gap-3 p-3 bg-surface-900 border border-surface-700 rounded-lg cursor-pointer mb-3"
-          onClick={(e) => {
-            // Clicks that land on the Toggle button already drive
-            // `onChange("useWorktree", v)`. Letting the label's own
-            // handler also fire would flip the value a second time
-            // and land back on the original. Skip the label handler
-            // for clicks originating inside the Toggle.
-            if ((e.target as HTMLElement).closest('button[role="switch"]')) {
-              return;
-            }
-            onChange("useWorktree", !data.useWorktree);
-          }}
-        >
-          <div className="flex-1">
-            <div className="text-sm font-medium text-text-primary">Create a worktree</div>
-            <div className="text-xs text-text-dim mt-0.5 leading-snug">
-              Run the agent in a new git worktree branched off the current HEAD. Off = run directly in the repo folder.
+        <>
+          <label
+            className={`flex items-center justify-between gap-3 p-3 bg-surface-900 border border-surface-700 rounded-lg mb-3 ${
+              worktreeDisabled ? "opacity-40 cursor-not-allowed" : "cursor-pointer"
+            }`}
+            onClick={(e) => {
+              if (worktreeDisabled) return;
+              // Clicks that land on the Toggle button already drive
+              // `onChange("useWorktree", v)`. Letting the label's own
+              // handler also fire would flip the value a second time
+              // and land back on the original. Skip the label handler
+              // for clicks originating inside the Toggle.
+              if ((e.target as HTMLElement).closest('button[role="switch"]')) {
+                return;
+              }
+              onChange("useWorktree", !data.useWorktree);
+            }}
+          >
+            <div className="flex-1">
+              <div className="text-sm font-medium text-text-primary">Create a worktree</div>
+              <div className="text-xs text-text-dim mt-0.5 leading-snug">
+                Run the agent in a new git worktree branched off the current HEAD. Off = run directly in the repo
+                folder.
+              </div>
             </div>
-          </div>
-          <Toggle checked={data.useWorktree} onChange={(v) => onChange("useWorktree", v)} />
-        </label>
+            <Toggle
+              checked={data.useWorktree}
+              onChange={(v) => onChange("useWorktree", v)}
+              disabled={worktreeDisabled}
+            />
+          </label>
+          {worktreeDisabled && (
+            <p className="text-xs text-text-dim mb-3" aria-label="Worktree disabled: not a git repository">
+              This folder is not a git repository, so the session runs in place. Worktrees need a repo.
+            </p>
+          )}
+        </>
       )}
 
       {!data.scratch && data.useWorktree && (

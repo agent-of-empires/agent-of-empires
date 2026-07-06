@@ -8,6 +8,7 @@ import {
   fetchSettings,
   createSession,
   fetchVolumeIgnoresPreview,
+  fetchBranches,
   markVolumeIgnoresGlobsAcknowledged,
   type VolumeIgnoresGlobPreview,
   type HooksNeedTrust,
@@ -227,6 +228,26 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
     // identity.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Probe whether the selected path is a git repository so the worktree
+  // toggle can be disabled for a plain folder (e.g. a root picked via "Use
+  // this folder"). `fetchBranches` hits the same `GitWorktree::is_git_repo`
+  // gate the builder enforces and returns null for a non-repo, so this
+  // matches the server's accept/reject by construction. Scratch sessions
+  // have no path and never use a worktree, so skip the probe there.
+  const probePath = state.data.scratch ? "" : state.data.path;
+  useEffect(() => {
+    if (!probePath) return;
+    let cancelled = false;
+    fetchBranches(probePath).then((rows) => {
+      if (!cancelled) {
+        dispatch({ type: "SET_FIELD", field: "pathIsGitRepo", value: rows !== null });
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [probePath]);
 
   const handleChange = useCallback((field: string, value: unknown) => {
     dispatch({ type: "SET_FIELD", field, value });

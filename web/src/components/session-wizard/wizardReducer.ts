@@ -47,6 +47,12 @@ export interface WizardData {
    *  `scratch` clears `path`/`useWorktree`/`extraRepoPaths`; setting any
    *  of those back to a non-empty value clears `scratch`. */
   scratch: boolean;
+  /** Whether the selected `path` is a git repository. Worktrees require a
+   *  repo, so the worktree toggle is disabled when this is false. Defaults
+   *  true (optimistic) and is corrected by a probe in `SessionWizard` when
+   *  `path` changes; a non-repo path forces `useWorktree` off, mirroring the
+   *  scratch arm. Not part of the submit payload. */
+  pathIsGitRepo: boolean;
   /** Per-session opt-in to structured view rendering for ACP-capable tools.
    *  Defaults true so ACP-capable tools render in the structured view by
    *  default ("ACP tools run in structured view" behavior); the user
@@ -130,6 +136,7 @@ export const initialData: WizardData = {
   extraArgs: "",
   commandOverride: "",
   scratch: false,
+  pathIsGitRepo: true,
   useStructuredView: true,
   agentModel: "",
   agentEffort: "",
@@ -170,6 +177,17 @@ export function reducer(state: WizardState, action: Action): WizardState {
         // (#2276). The import picker dispatches `importAcpSessionId` AFTER
         // `path`, so its own selection survives this.
         newData.importAcpSessionId = "";
+      }
+      // A new path is optimistically a repo until the SessionWizard probe
+      // says otherwise, so a stale non-repo result can't leave the worktree
+      // toggle disabled after switching to a real repo.
+      if (action.field === "path") {
+        newData.pathIsGitRepo = true;
+      }
+      // The probe reports a non-repo path: worktrees need a repo, so force
+      // the toggle off the same way the scratch arm does above.
+      if (action.field === "pathIsGitRepo" && action.value === false) {
+        newData.useWorktree = false;
       }
       // Mark dirty whenever the user manually edits an agent-step
       // field. Guarded against `state.data.profile` previously, but the
