@@ -62,17 +62,20 @@ function renderTerm() {
 }
 
 describe("MobileLiveTerminal cursor fill on focus", () => {
-  it("starts hollow, fills on focus, reverts to hollow on blur", () => {
+  it("starts hollow, fills and blinks on focus, reverts to hollow (no blink) on blur", () => {
     const { inputRef, cursorCell } = renderTerm();
     expect(cursorCell()!.style.backgroundColor).toBe("");
     expect(cursorCell()!.style.outline).toContain("var(--term-cursor");
+    expect(cursorCell()!.className).toBe("");
 
     fireEvent.focus(inputRef.current!);
     expect(cursorCell()!.style.backgroundColor).toContain("var(--term-cursor");
     expect(cursorCell()!.style.outline).toBe("");
+    expect(cursorCell()!.className).toContain("animate-term-cursor-blink");
 
     fireEvent.blur(inputRef.current!);
     expect(cursorCell()!.style.backgroundColor).toBe("");
     expect(cursorCell()!.style.outline).toContain("var(--term-cursor");
+    expect(cursorCell()!.className).toBe("");
   });
 });
