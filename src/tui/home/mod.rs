@@ -2713,6 +2713,7 @@ impl HomeView {
 
             if let Some(old) = old_status {
                 if old != new_status {
+                    self.persist_passive_status_transition(&update.id);
                     if let Some(inst) = self.get_instance(&update.id).cloned() {
                         self.handle_status_transition(
                             &inst, old, new_status, play_sound, run_hooks,
@@ -5211,6 +5212,35 @@ impl HomeView {
             self.instance_map.insert(id.to_string(), inst.clone());
         }
         Ok(())
+    }
+
+    /// Persist a passively-detected status transition for one instance so
+    /// the next disk reload (a TUI relaunch, or a peer like `aoe serve`)
+    /// finds disk already caught up instead of comparing against a stale
+    /// snapshot and misreading it as a fresh transition. See #2690. Best
+    /// effort: unlike `apply_user_action`, a write failure here does not
+    /// roll back the in-memory status update, since the poller is the sole
+    /// authority on live status regardless of whether disk persistence
+    /// succeeds.
+    pub(super) fn persist_passive_status_transition(&self, id: &str) {
+        let Some(inst) = self.instance_map.get(id) else {
+            return;
+        };
+        let Some(storage) = self.storages.get(&inst.source_profile) else {
+            return;
+        };
+        let patch = crate::session::PassiveStatusPatch {
+            id: inst.id.clone(),
+            status: inst.status,
+            idle_entered_at: inst.idle_entered_at,
+            last_accessed_at: inst.last_accessed_at.unwrap_or_else(chrono::Utc::now),
+        };
+        let _ = storage.update(|insts, _groups| {
+            if let Some(disk) = insts.iter_mut().find(|i| i.id == patch.id) {
+                disk.merge_passive_status_patch(&patch);
+            }
+            Ok(())
+        });
     }
 
     /// Atomic per-action mutate: in-memory once, disk via

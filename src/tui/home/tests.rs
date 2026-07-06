@@ -6120,6 +6120,43 @@ fn apply_status_update_propagates_idle_entered_at_into_live_instance() {
     assert_eq!(inst.idle_entered_at, Some(now));
 }
 
+// #2690: a passively-detected status transition must land on disk
+// immediately, not just in memory, so the next reload (TUI relaunch, or
+// a peer like `aoe serve`) finds disk already caught up instead of
+// misreading a stale snapshot as a fresh transition.
+#[test]
+#[serial]
+fn apply_status_update_persists_genuine_transition_to_disk() {
+    use crate::session::{Status, Storage};
+    use crate::tui::status_poller::StatusUpdate;
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = match env.view.flat_items.first() {
+        Some(Item::Session { id, .. }) => id.clone(),
+        _ => panic!("expected the fixture to seed a single Session item"),
+    };
+    assert_eq!(env.view.get_instance(&id).unwrap().status, Status::Idle);
+
+    let now = chrono::Utc::now();
+    env.view.apply_one_status_update(StatusUpdate {
+        id: id.clone(),
+        status: Status::Running,
+        last_error: None,
+        idle_entered_at: None,
+        last_accessed_at: Some(now),
+        pane_dead: false,
+    });
+
+    let reloaded = Storage::new_unwatched("test").unwrap().load().unwrap();
+    let row = reloaded.iter().find(|i| i.id == id).expect("row present");
+    assert_eq!(
+        row.status,
+        Status::Running,
+        "the genuine Idle -> Running transition must be persisted, not just in-memory"
+    );
+    assert_eq!(row.last_accessed_at, Some(now));
+}
+
 #[test]
 #[serial]
 fn apply_status_update_clears_idle_entered_at_on_idle_to_running() {
