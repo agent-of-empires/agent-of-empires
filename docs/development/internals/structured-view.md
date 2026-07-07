@@ -102,7 +102,7 @@ Profiles are conservative: an unverified tool surface is omitted rather than gue
 default_agent = "aoe-agent"
 approval_timeout_secs = 300
 destructive_require_double_confirm = true
-max_concurrent_workers = 5
+max_concurrent_workers = 100
 max_concurrent_resumes = 4        # parallel cold-start spawns/attaches on daemon boot (#1088)
 replay_events = 0                 # 0 = unlimited; caps per-session rows and the web client buffer (#1111)
 replay_bytes = 5_242_880
@@ -112,7 +112,7 @@ queue_drain_mode = "combined"     # "combined" | "serial" (#1031)
 force_end_turn_threshold_secs = 30
 silent_orphan_grace_secs = 120    # 0 disables (#1240)
 silent_orphan_fast_grace_secs = 20
-auto_stop_idle_secs = 0           # 0 disables; next prompt respawns the worker (#1689)
+auto_stop_idle_secs = 3600        # 0 disables; next prompt respawns the worker
 rate_limit_auto_resume = false
 rate_limit_auto_resume_grace_secs = 15
 ```

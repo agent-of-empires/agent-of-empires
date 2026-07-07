@@ -483,10 +483,10 @@ pub struct AcpConfig {
     /// events and no in-flight turn) after which the daemon shuts a
     /// worker down and marks its session dormant so the reconciler does
     /// not respawn it. The next user prompt wakes the session and the
-    /// reconciler spawns a fresh worker. `0` (default) disables the
-    /// feature entirely; no worker is ever stopped for inactivity. See
-    /// #1689.
-    #[serde(default = "default_auto_stop_idle_secs")]
+    /// reconciler spawns a fresh worker. Default 3600 (1 hour); `0`
+    /// disables the feature entirely, so no worker is ever stopped for
+    /// inactivity.
+    #[serde(default = "default_acp_auto_stop_idle_secs")]
     #[setting(
         label = "Auto-stop idle worker (s)",
         widget = "number",
@@ -559,6 +559,10 @@ fn default_auto_stop_idle_secs() -> u32 {
     0
 }
 
+fn default_acp_auto_stop_idle_secs() -> u32 {
+    3600
+}
+
 fn default_max_concurrent_resumes() -> u32 {
     4
 }
@@ -622,7 +626,7 @@ impl Default for AcpConfig {
             force_end_turn_threshold_secs: default_force_end_turn_threshold_secs(),
             silent_orphan_grace_secs: default_silent_orphan_grace_secs(),
             silent_orphan_fast_grace_secs: default_silent_orphan_fast_grace_secs(),
-            auto_stop_idle_secs: default_auto_stop_idle_secs(),
+            auto_stop_idle_secs: default_acp_auto_stop_idle_secs(),
             rate_limit_auto_resume: false,
             rate_limit_auto_resume_grace_secs: default_rate_limit_auto_resume_grace_secs(),
             allow_agent_install: false,
@@ -635,7 +639,7 @@ fn default_agent() -> String {
     "aoe-agent".to_string()
 }
 fn default_max_workers() -> u32 {
-    5
+    100
 }
 fn default_replay_events() -> u32 {
     // 0 = unlimited. The event store's prune already gates on `> 0`
