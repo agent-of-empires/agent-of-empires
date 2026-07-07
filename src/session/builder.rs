@@ -951,7 +951,12 @@ pub(crate) fn git_sanitize_branch_name(s: &str) -> String {
     // `foo.lock`).
     out = out
         .split('/')
-        .map(|seg| seg.strip_suffix(".lock").unwrap_or(seg))
+        .map(|mut seg| {
+            while let Some(stripped) = seg.strip_suffix(".lock") {
+                seg = stripped;
+            }
+            seg
+        })
         .collect::<Vec<_>>()
         .join("/");
     while matches!(out.chars().last(), Some('-' | '.' | '/')) {
@@ -960,8 +965,9 @@ pub(crate) fn git_sanitize_branch_name(s: &str) -> String {
     while matches!(out.chars().next(), Some('-' | '.' | '/')) {
         out.remove(0);
     }
-    // A lone '@' is also rejected by git as a complete ref name.
-    if out.is_empty() || out == "@" {
+    // A lone '@' and the symbolic ref HEAD are also rejected by git as
+    // complete ref names.
+    if out.is_empty() || out == "@" || out == "HEAD" {
         "session".to_string()
     } else {
         out
@@ -1266,14 +1272,19 @@ mod tests {
             git_sanitize_branch_name("feat/release.lock/v2"),
             "feat/release/v2"
         );
+        assert_eq!(git_sanitize_branch_name("foo.lock.lock"), "foo");
+        assert_eq!(
+            git_sanitize_branch_name("feat/release.lock.lock/v2.lock.lock"),
+            "feat/release/v2"
+        );
     }
 
     #[test]
-    fn test_git_sanitize_branch_name_rejects_bare_at_sign() {
-        // git-check-ref-format also rejects the single character "@" as a
-        // complete ref name; fall back to "session" rather than producing
-        // a name libgit2 will refuse.
+    fn test_git_sanitize_branch_name_rejects_special_complete_refs() {
+        // git-check-ref-format also rejects special complete ref names; fall
+        // back to "session" rather than producing a name libgit2 will refuse.
         assert_eq!(git_sanitize_branch_name("@"), "session");
+        assert_eq!(git_sanitize_branch_name("HEAD"), "session");
     }
 
     #[test]
