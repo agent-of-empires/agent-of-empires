@@ -126,6 +126,10 @@ fn intro_theme_pick_persists_to_config() {
     // BUILTIN_THEMES (src/tui/styles/mod.rs) is ordered `default, empire, ...`
     // so a single Down from the default-seeded cursor lands on `empire`.
     h.send_keys("Down");
+    // Wait for the selection marker to land on `empire` before advancing, so a
+    // dropped/late Down keystroke can't leave the cursor on the default theme
+    // (render_theme_picker marks the selected row with a leading `▶`).
+    h.wait_for("▶ empire");
     h.send_keys("Enter"); // -> page 6 (done)
     h.wait_for("(6/6)");
     h.send_keys("Enter"); // submit
@@ -167,6 +171,9 @@ fn intro_lets_user_choose_tmux_attach() {
     h.wait_for("(4/6)");
     // Pre-selected LiveSend; flip to Tmux.
     h.send_keys("Down");
+    // Confirm the marker moved to Tmux before advancing, so a dropped Down
+    // can't leave LiveSend selected (render_attach_mode marks the row `▶`).
+    h.wait_for("▶ Tmux mode");
     h.send_keys("Enter"); // -> theme
     h.wait_for("(5/6)");
     h.send_keys("Enter"); // -> done
