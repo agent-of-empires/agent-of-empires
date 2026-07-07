@@ -13,7 +13,7 @@ use super::{
     ICON_ERROR, ICON_EXPANDED, ICON_IDLE, ICON_PINNED, ICON_STOPPED, ICON_UNKNOWN, ICON_UNREAD,
 };
 use crate::containers::image_update::ImageUpdate;
-use crate::session::config::{GroupByMode, SortOrder};
+use crate::session::config::{GroupByMode, RowTagMode, SortOrder};
 use crate::session::{Item, Status};
 use crate::tui::components::preview::{self, CachedPreview};
 use crate::tui::components::{
@@ -281,6 +281,8 @@ pub(crate) struct RowTag {
     pub max_width: usize,
 }
 
+const BRANCH_TAG_WIDTH: usize = 12;
+
 impl RowTag {
     pub fn rendered(&self) -> String {
         format!("[{:<width$}]", self.content, width = self.max_width)
@@ -292,13 +294,12 @@ impl RowTag {
 ///
 /// `Auto` only renders in all-profiles view (no `active_profile`). Other
 /// modes always render when their content is available (e.g. `Branch`
-/// returns `None` for sessions without a worktree).
+/// returns `None` for sessions without branch metadata).
 pub(crate) fn compute_row_tag(
     inst: &crate::session::Instance,
-    mode: crate::session::config::RowTagMode,
+    mode: RowTagMode,
     in_all_profiles_view: bool,
 ) -> Option<RowTag> {
-    use crate::session::config::RowTagMode;
     match mode {
         RowTagMode::None => None,
         RowTagMode::Auto => {
@@ -336,35 +337,51 @@ pub(crate) fn compute_row_tag(
                 None
             }
         }
-        RowTagMode::Branch => inst.worktree_info.as_ref().and_then(|w| {
-            // Complement the existing branch-on-divergence display
-            // (rendered in `theme.branch` color earlier in the row) rather
-            // than duplicate it. When `branch != title` the divergence
-            // display already shows the branch, so the tag would just be
-            // redundant. When `branch == title` the divergence display
-            // stays quiet and the tag fills in.
-            //
-            // Workspace sessions (multi-repo, rendered as
-            // `<branch> [N repos]`) are handled by a separate display
-            // path and have no `worktree_info`, so they fall through to
-            // `None` here naturally.
-            if w.branch != inst.title {
-                return None;
-            }
-            // Show the last `/`-segment of the branch (most informative
-            // for `feature/foo` style names), truncated to 8 chars so the
-            // tag stays narrow.
-            let last = w.branch.rsplit('/').next().unwrap_or("");
-            let trimmed: String = last.chars().take(8).collect();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(RowTag {
-                    content: trimmed,
-                    max_width: 8,
-                })
-            }
-        }),
+        RowTagMode::Branch => branch_row_tag(inst),
+    }
+}
+
+fn branch_row_tag(inst: &crate::session::Instance) -> Option<RowTag> {
+    if let Some(ws) = &inst.workspace_info {
+        workspace_branch_row_tag(&ws.branch, ws.repos.len())
+    } else {
+        inst.worktree_info
+            .as_ref()
+            .and_then(|w| branch_tag_content(&w.branch, BRANCH_TAG_WIDTH))
+            .map(|content| RowTag {
+                content,
+                max_width: BRANCH_TAG_WIDTH,
+            })
+    }
+}
+
+fn workspace_branch_row_tag(branch: &str, repo_count: usize) -> Option<RowTag> {
+    let suffix = format!("+{repo_count}");
+    let suffix_width = suffix.chars().count();
+    if suffix_width >= BRANCH_TAG_WIDTH {
+        return Some(RowTag {
+            content: suffix.chars().take(BRANCH_TAG_WIDTH).collect(),
+            max_width: BRANCH_TAG_WIDTH,
+        });
+    }
+
+    let branch_width = BRANCH_TAG_WIDTH - suffix_width;
+    branch_tag_content(branch, branch_width).map(|mut content| {
+        content.push_str(&suffix);
+        RowTag {
+            content,
+            max_width: BRANCH_TAG_WIDTH,
+        }
+    })
+}
+
+fn branch_tag_content(branch: &str, max_width: usize) -> Option<String> {
+    let last = branch.rsplit('/').next().unwrap_or("");
+    let trimmed: String = last.chars().take(max_width).collect();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
     }
 }
 
@@ -1364,41 +1381,19 @@ impl HomeView {
 
         if let Item::Session { id, .. } = item {
             if let Some(inst) = self.get_instance(id) {
-                if let Some(ws_info) = &inst.workspace_info {
-                    let branch_style = Style::default().fg(theme.branch);
-                    line_spans.push(Span::styled(
-                        format!("  {} [{} repos]", ws_info.branch, ws_info.repos.len()),
-                        if is_selected {
-                            selected_row_style(branch_style, theme)
-                        } else {
-                            branch_style
-                        },
-                    ));
-                } else if let Some(wt_info) = &inst.worktree_info {
-                    if wt_info.branch != inst.title {
-                        let branch_style = Style::default().fg(theme.branch);
-                        line_spans.push(Span::styled(
-                            format!("  {}", wt_info.branch),
-                            if is_selected {
-                                selected_row_style(branch_style, theme)
-                            } else {
-                                branch_style
-                            },
-                        ));
-                    }
-                }
-
-                // Per-row tag. The mode is config-driven (see
-                // `SessionConfig.row_tag` and the Settings UI "Row Tag"
-                // field). Default is `None` so existing users see no
-                // tag; power users opt in for `Auto` (profile in all-
-                // profiles view), `Profile`, `Sandbox`, or `Branch`.
-                // Counted into `used_width` below so the activity
-                // column still right-aligns past the tag.
+                // Config-driven suffix next to the session title. This owns
+                // the branch/profile/sandbox slot, so `None` means no suffix.
+                // Counted into `used_width` below so the activity column still
+                // right-aligns past the tag.
                 if let Some(tag) =
                     compute_row_tag(inst, self.row_tag_mode, self.active_profile.is_none())
                 {
-                    let tag_style = Style::default().fg(theme.dimmed);
+                    let tag_style =
+                        Style::default().fg(if self.row_tag_mode == RowTagMode::Branch {
+                            theme.branch
+                        } else {
+                            theme.dimmed
+                        });
                     line_spans.push(Span::styled(
                         format!("  {}", tag.rendered()),
                         if is_selected {

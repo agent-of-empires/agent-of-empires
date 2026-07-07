@@ -117,6 +117,18 @@ mod tests {
     }
 
     #[test]
+    fn session_row_tag_is_select_with_options() {
+        let d = descriptor("session", "row_tag").expect("row_tag");
+        match d.widget {
+            WidgetKind::Select { options } => {
+                let values: Vec<_> = options.iter().map(|o| o.value.as_str()).collect();
+                assert_eq!(values, ["none", "auto", "profile", "sandbox", "branch"]);
+            }
+            other => panic!("expected select, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn schema_serializes_with_tagged_widget_policy_validation() {
         // Locks the JSON contract the web `SettingsFieldDescriptor` TS type
         // depends on (GET /api/settings/schema). Widgets are tagged `kind`,

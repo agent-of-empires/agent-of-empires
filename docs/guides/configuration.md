@@ -76,6 +76,7 @@ agent_status_hooks = true
 smart_rename = true
 smart_rename_agent = ""    # "" = use the session's own agent; e.g. "codex"
 auto_stop_idle_secs = 0   # 0 disables; e.g. 7200 = stop after 2h idle
+row_tag = "branch"       # none | auto | profile | sandbox | branch
 
 # Per-agent structured-view defaults live under [acp], not [session].
 [acp.acp_defaults.opencode]
@@ -91,6 +92,7 @@ mode = "plan"             # default mode, applied when the agent advertises one
 |--------|---------|-------------|
 | `default_tool` | (auto-detect) | Default agent for new sessions. Falls back to the first available tool if unset or unavailable. Can be set to a custom agent name. |
 | `auto_stop_idle_secs` | `0` | Seconds a plain tmux session may sit `Idle` before it is auto-stopped: its tmux session and any sandbox container are killed, leaving a restartable `Stopped` row. `0` disables it; no session is ever auto-stopped for inactivity. Idle age is measured from the later of the last transition into `Idle` and the last user interaction, and a session with an attached tmux client is always spared, so a session you are reading is never reaped. Evaluated about once a minute (by the TUI and by `aoe serve`), so the stop can lag the threshold by up to a minute. Structured view workers use the separate `acp.auto_stop_idle_secs`. See #1689 and #1690. |
+| `row_tag` | `"branch"` | Controls the compact metadata shown next to each TUI session title: `none` shows nothing; `auto` shows the profile code only in all-profiles view; `profile` always shows the profile code; `sandbox` shows `sb` on sandboxed sessions; `branch` shows a compact worktree or workspace branch tag. |
 | `yolo_mode_default` | `false` | Enable YOLO mode by default for new sessions (skip permission prompts). Works with or without sandbox. In tmux mode this passes `--dangerously-skip-permissions` to the agent CLI; in structured view it maps to ACP `bypassPermissions` (see [Structured view: Permission modes and YOLO](../structured-view/controls.md#permission-modes-and-yolo) for the adapter caveat). |
 | `agent_status_hooks` | `true` | Install status-detection hooks into the agent's config file. Codex uses the `[hooks]` table in its resolved `config.toml` (typically `~/.codex/config.toml`); other JSON-based agents use their settings JSON. Config-dir overrides are honored: `CODEX_HOME` (Codex), `CLAUDE_CONFIG_DIR` (Claude), or `CURSOR_CONFIG_DIR` (Cursor) set in the session's profile environment or in AoE's own environment redirects hooks to that directory instead of the `~/.codex` / `~/.claude` / `~/.cursor` default. When disabled, status detection falls back to tmux pane content parsing. Codex is hook-first, but known hook gaps are reconciled from pane content. |
 | `smart_rename` | `true` | Auto-rename a new structured view (ACP) session from its first message, using the session's own agent in one-shot mode (`claude -p`, `codex exec`, `opencode run`, `gemini -p`). Runs only while the session still carries its auto-generated civilization name; a manually named session is never touched. Title only: the worktree directory is not moved, since the running agent holds it. Skipped for sandboxed sessions (a host one-shot lacks the container's auth), agents with no one-shot mode, and command-overridden agents. Best-effort: a failed or timed-out call leaves the generated name and never affects the prompt. |
@@ -209,7 +211,7 @@ path_template = "../{repo-name}-worktrees/{branch}"   # template vars: {repo-nam
 auto_cleanup = true                                   # prompt to remove the worktree on session delete
 ```
 
-See [Git Worktrees](worktrees.md) for the full key reference (`bare_repo_path_template`, `show_branch_in_tui`, `delete_branch_on_cleanup`, `init_submodules`) and template details.
+See [Git Worktrees](worktrees.md) for the full key reference (`bare_repo_path_template`, `delete_branch_on_cleanup`, `init_submodules`) and template details.
 
 ## Sandbox (Docker)
 

@@ -152,7 +152,6 @@ fn test_all_worktree_config_fields_accessible() {
     let _ = config.enabled;
     let _ = config.path_template.as_str();
     let _ = config.auto_cleanup;
-    let _ = config.show_branch_in_tui;
 }
 
 #[test]

@@ -113,10 +113,12 @@ enabled = false
 path_template = "../{repo-name}-worktrees/{branch}"
 bare_repo_path_template = "./{branch}"
 auto_cleanup = true
-show_branch_in_tui = true
 delete_branch_on_cleanup = false
 init_submodules = true
 ```
+
+Use `[session] row_tag = "branch"` to show worktree and workspace branch tags in
+the TUI session list, or `"none"` to hide suffix metadata next to session names.
 
 ### Skipping submodule init
 
