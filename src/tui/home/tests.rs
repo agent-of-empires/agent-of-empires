@@ -1106,12 +1106,45 @@ fn test_b_opens_project_session_picker_when_projects_exist() {
 
 #[test]
 #[serial]
-fn test_b_shows_info_dialog_when_no_projects() {
+fn test_b_opens_project_add_flow_when_no_projects() {
     let mut env = create_test_env_empty();
-    assert!(env.view.info_dialog.is_none());
+    let project_dir = env._temp.path().join("plain-project");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let profile = env.view.config_profile();
+
     env.view.handle_key(key(KeyCode::Char('b')), None);
-    assert!(env.view.info_dialog.is_some());
     assert!(env.view.project_session_picker_dialog.is_none());
+    assert!(env.view.info_dialog.is_none());
+    assert!(env.view.projects_dialog.is_some());
+
+    for ch in project_dir.to_string_lossy().chars() {
+        env.view.handle_key(key(KeyCode::Char(ch)), None);
+    }
+    env.view.handle_key(key(KeyCode::Enter), None);
+
+    let canonical = project_dir
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let projects = crate::session::projects::load_merged(&profile).unwrap();
+    assert!(
+        projects.iter().any(|p| p.path == canonical),
+        "b empty-state add flow should register the typed path"
+    );
+}
+
+#[test]
+#[serial]
+fn test_b_empty_project_add_flow_escape_closes_dialog() {
+    let mut env = create_test_env_empty();
+
+    env.view.handle_key(key(KeyCode::Char('b')), None);
+    assert!(env.view.projects_dialog.is_some());
+
+    env.view.handle_key(key(KeyCode::Esc), None);
+    assert!(env.view.projects_dialog.is_none());
+    assert!(env.view.info_dialog.is_none());
 }
 
 #[test]

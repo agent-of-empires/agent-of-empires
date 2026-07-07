@@ -4412,18 +4412,24 @@ impl HomeView {
     }
 
     /// Open the saved-project picker that starts a new session pre-filled with
-    /// the chosen project's path. Shows an info dialog when no projects exist.
+    /// the chosen project's path. Opens the add-project form when none exist.
     pub(super) fn open_project_session_picker(&mut self) {
         let profile = self.config_profile();
-        let projects = crate::session::projects::load_merged(&profile).unwrap_or_default();
-        if projects.is_empty() {
-            self.info_dialog = Some(InfoDialog::new(
-                "No Projects",
-                "No registered projects available. Add one with `aoe project add <path>`.",
-            ));
-            return;
+        match crate::session::projects::load_merged(&profile) {
+            Ok(projects) if projects.is_empty() => {
+                self.projects_dialog = Some(ProjectsDialog::new_adding(&profile));
+            }
+            Ok(projects) => {
+                self.project_session_picker_dialog =
+                    Some(ProjectSessionPickerDialog::new(projects));
+            }
+            Err(e) => {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Projects Failed",
+                    &format!("Failed to load projects: {e}"),
+                ));
+            }
         }
-        self.project_session_picker_dialog = Some(ProjectSessionPickerDialog::new(projects));
     }
 
     /// Show the sort-order picker dialog seeded with the current order.

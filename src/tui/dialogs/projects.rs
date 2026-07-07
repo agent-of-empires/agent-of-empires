@@ -40,6 +40,8 @@ pub struct ProjectsDialog {
     /// directory, explaining that git features are unavailable. Gated by
     /// `app_state.has_seen_non_git_project_warning` so it appears once.
     non_git_notice: Option<InfoDialog>,
+    /// Close the dialog when Esc cancels the add form opened from a direct flow.
+    close_on_add_cancel: bool,
 }
 
 impl ProjectsDialog {
@@ -57,9 +59,27 @@ impl ProjectsDialog {
             error: None,
             info: None,
             non_git_notice: None,
+            close_on_add_cancel: false,
         };
         dialog.reload();
         dialog
+    }
+
+    pub fn new_adding(profile: &str) -> Self {
+        let mut dialog = Self::new(profile);
+        dialog.enter_add_mode(true);
+        dialog
+    }
+
+    fn enter_add_mode(&mut self, close_on_cancel: bool) {
+        self.mode = Mode::Adding;
+        self.add_input = Input::default();
+        self.add_base_branch = Input::default();
+        self.add_scope = ProjectScope::Global;
+        self.add_allow_override = false;
+        self.add_focused = 0;
+        self.error = None;
+        self.close_on_add_cancel = close_on_cancel;
     }
 
     fn reload(&mut self) {
@@ -107,13 +127,7 @@ impl ProjectsDialog {
                 DialogResult::Continue
             }
             KeyCode::Char('a') => {
-                self.mode = Mode::Adding;
-                self.add_input = Input::default();
-                self.add_base_branch = Input::default();
-                self.add_scope = ProjectScope::Global;
-                self.add_allow_override = false;
-                self.add_focused = 0;
-                self.error = None;
+                self.enter_add_mode(false);
                 DialogResult::Continue
             }
             KeyCode::Char('d') | KeyCode::Delete => {
@@ -135,8 +149,12 @@ impl ProjectsDialog {
     fn handle_add_key(&mut self, key: KeyEvent) -> DialogResult<()> {
         match key.code {
             KeyCode::Esc => {
+                if self.close_on_add_cancel {
+                    return DialogResult::Cancel;
+                }
                 self.mode = Mode::Browse;
                 self.error = None;
+                self.close_on_add_cancel = false;
                 DialogResult::Continue
             }
             KeyCode::Tab => {
@@ -207,6 +225,7 @@ impl ProjectsDialog {
                         self.mode = Mode::Browse;
                         self.add_input = Input::default();
                         self.add_base_branch = Input::default();
+                        self.close_on_add_cancel = false;
                         self.reload();
                         if !is_git {
                             self.maybe_warn_non_git(&saved_name);
