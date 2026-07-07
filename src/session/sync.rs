@@ -14,13 +14,13 @@
 //! helper on the snapshot inside `spawn_blocking`, then reapply the
 //! mutations to live state under a brief write lock.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::file_watch::FileWatchService;
 use crate::session::capture::validated_session_id;
 use crate::session::storage::Storage;
-use crate::session::{persist_session_to_storage, Instance, SidWrite};
+use crate::session::{persist_session_to_storage, Instance, ResumeIntent, SidWrite, Status};
 
 /// Per-tick result of [`drain_and_persist_session_ids`]. Lists touched
 /// instance IDs grouped by the persistence outcome so a caller holding an
@@ -70,6 +70,19 @@ pub(crate) fn drain_and_persist_session_ids(
     let mut updates: Vec<Update> = Vec::with_capacity(instances.len());
     let mut filtered_ids: HashSet<String> = HashSet::with_capacity(instances.len());
 
+    // Frozen pre-update ownership snapshot. Collision checks must read this,
+    // never a map mutated mid-loop: with two pollers that transiently cross
+    // streams (A reports B's id while B reports A's), a dynamic map would
+    // accept or reject by slice iteration order. The snapshot rejects every
+    // cross-claim deterministically (see #2708).
+    let mut sid_owners: HashMap<String, String> = HashMap::with_capacity(instances.len());
+    for inst in instances.iter() {
+        if let Some(sid) = inst.agent_session_id.as_deref() {
+            sid_owners
+                .entry(sid.to_string())
+                .or_insert_with(|| inst.id.clone());
+        }
+    }
     for inst in instances.iter() {
         let Some(sid) = try_drain_poller(inst) else {
             continue;
@@ -78,6 +91,53 @@ pub(crate) fn drain_and_persist_session_ids(
             filtered_ids.insert(inst.id.clone());
             continue;
         };
+        // A stopped session generates no live transcript activity, so any sid
+        // its poller reports that isn't already its own belongs to a different
+        // session sharing the cwd. Never adopt it (#2708 invariant 2).
+        if matches!(inst.status, Status::Stopped)
+            && inst.agent_session_id.as_deref() != Some(sid.as_str())
+        {
+            tracing::debug!(
+                target: "session.sync",
+                instance = %inst.id,
+                sid = %sid,
+                "Ignoring poller-reported sid for stopped session",
+            );
+            filtered_ids.insert(inst.id.clone());
+            continue;
+        }
+        // An explicit set-session-id pin is authoritative until the session
+        // itself launches (which promotes Use -> Default). While pinned, the
+        // poller must not overwrite it, even with an unowned fresher jsonl the
+        // collision guard below would otherwise wave through (#2708 invariant 1).
+        if let ResumeIntent::Use(pinned) = &inst.resume_intent {
+            if sid != *pinned {
+                tracing::debug!(
+                    target: "session.sync",
+                    instance = %inst.id,
+                    sid = %sid,
+                    pinned = %pinned,
+                    "Ignoring poller-reported sid: contradicts explicit set-session-id pin",
+                );
+                filtered_ids.insert(inst.id.clone());
+                continue;
+            }
+        }
+        // Never adopt an id another instance already owns: that is the
+        // same-cwd cross-assignment drift itself (#2708 symptom 1).
+        if let Some(owner) = sid_owners.get(sid.as_str()) {
+            if owner != &inst.id {
+                tracing::warn!(
+                    target: "session.sync",
+                    instance = %inst.id,
+                    sid = %sid,
+                    owner = %owner,
+                    "Ignoring poller-reported sid already owned by another instance",
+                );
+                filtered_ids.insert(inst.id.clone());
+                continue;
+            }
+        }
         if inst.retroactive_capture_excludes.contains(&sid) {
             tracing::debug!(
                 target: "session.sync",
@@ -97,6 +157,30 @@ pub(crate) fn drain_and_persist_session_ids(
             });
         }
     }
+
+    // Reject, don't arbitrate: if two same-cwd peers both claim the same
+    // currently-unowned sid in one tick (neither is in the frozen snapshot, so
+    // the collision guard passed both), picking a winner by iteration order is
+    // silent misassignment. Drop every claimant and defer; the next tick sees
+    // the real owner's anchor advance and the collision guard resolves it (#2708).
+    let mut sid_claim_counts: HashMap<String, usize> = HashMap::with_capacity(updates.len());
+    for upd in &updates {
+        *sid_claim_counts.entry(upd.sid.clone()).or_insert(0) += 1;
+    }
+    updates.retain(|upd| {
+        if sid_claim_counts.get(&upd.sid).copied().unwrap_or(0) > 1 {
+            tracing::warn!(
+                target: "session.sync",
+                instance = %upd.id,
+                sid = %upd.sid,
+                "Ignoring poller-reported sid claimed by multiple instances this tick",
+            );
+            filtered_ids.insert(upd.id.clone());
+            false
+        } else {
+            true
+        }
+    });
 
     if updates.is_empty() && filtered_ids.is_empty() {
         return SessionIdSyncOutcome::default();
@@ -305,6 +389,18 @@ mod tests {
             .unwrap();
     }
 
+    fn seed_instances_on_disk(profile: &str, insts: &[&Instance]) {
+        let storage = Storage::new_unwatched(profile).unwrap();
+        let owned: Vec<Instance> = insts.iter().map(|i| (*i).clone()).collect();
+        storage
+            .update(|i, g| {
+                *i = owned.clone();
+                *g = GroupTree::new_with_groups(&owned, &[]).get_all_groups();
+                Ok(())
+            })
+            .unwrap();
+    }
+
     fn attach_poller_with_update(inst: &mut Instance, sid: &str) {
         let poller = SessionPoller::new(format!("test-tmux-{}", inst.id));
         poller.inject_test_update(&inst.id, sid);
@@ -399,5 +495,113 @@ mod tests {
             instances[0].agent_session_id.as_deref(),
             Some("original-sid")
         );
+    }
+
+    #[test]
+    #[serial]
+    fn drain_rejects_observed_sid_for_stopped_session() {
+        let temp = tempdir().unwrap();
+        let _guard = StorageHomeGuard::set(&temp);
+
+        let own = "019342ab-1234-7def-8901-aaaaaaaaaaaa";
+        let peer = "019342ab-1234-7def-8901-bbbbbbbbbbbb";
+        let mut inst = Instance::new("stopped-title", "/tmp/x");
+        inst.source_profile = "sync-stopped".to_string();
+        inst.agent_session_id = Some(own.to_string());
+        inst.status = Status::Stopped;
+        seed_instances_on_disk("sync-stopped", &[&inst]);
+
+        attach_poller_with_update(&mut inst, peer);
+
+        let file_watch = FileWatchService::noop();
+        let mut instances = vec![inst];
+        let outcome = drain_and_persist_session_ids(&mut instances, &file_watch);
+
+        assert_eq!(outcome.filtered, vec![instances[0].id.clone()]);
+        assert!(outcome.applied.is_empty());
+        assert_eq!(instances[0].agent_session_id.as_deref(), Some(own));
+    }
+
+    #[test]
+    #[serial]
+    fn drain_rejects_observed_sid_contradicting_use_pin() {
+        let temp = tempdir().unwrap();
+        let _guard = StorageHomeGuard::set(&temp);
+
+        let pin = "019342ab-1234-7def-8901-aaaaaaaaaaaa";
+        let peer = "019342ab-1234-7def-8901-bbbbbbbbbbbb";
+        let mut inst = Instance::new("pinned-title", "/tmp/x");
+        inst.source_profile = "sync-pinned".to_string();
+        inst.agent_session_id = Some(pin.to_string());
+        inst.resume_intent = ResumeIntent::Use(pin.to_string());
+        // Idle (Instance::new default), so the stopped guard does not fire and
+        // the pin guard is what rejects the peer id.
+        seed_instances_on_disk("sync-pinned", &[&inst]);
+
+        attach_poller_with_update(&mut inst, peer);
+
+        let file_watch = FileWatchService::noop();
+        let mut instances = vec![inst];
+        let outcome = drain_and_persist_session_ids(&mut instances, &file_watch);
+
+        assert_eq!(outcome.filtered, vec![instances[0].id.clone()]);
+        assert!(outcome.applied.is_empty());
+        assert_eq!(instances[0].agent_session_id.as_deref(), Some(pin));
+    }
+
+    #[test]
+    #[serial]
+    fn drain_rejects_sid_owned_by_another_instance() {
+        let temp = tempdir().unwrap();
+        let _guard = StorageHomeGuard::set(&temp);
+
+        let owned = "019342ab-1234-7def-8901-cccccccccccc";
+        let mut owner = Instance::new("owner-title", "/tmp/x");
+        owner.source_profile = "sync-collision".to_string();
+        owner.agent_session_id = Some(owned.to_string());
+
+        let mut thief = Instance::new("thief-title", "/tmp/x");
+        thief.source_profile = "sync-collision".to_string();
+        thief.agent_session_id = None;
+        seed_instances_on_disk("sync-collision", &[&owner, &thief]);
+        attach_poller_with_update(&mut thief, owned);
+
+        let file_watch = FileWatchService::noop();
+        let mut instances = vec![owner, thief];
+        let outcome = drain_and_persist_session_ids(&mut instances, &file_watch);
+
+        assert_eq!(outcome.filtered, vec![instances[1].id.clone()]);
+        assert!(outcome.applied.is_empty());
+        assert_eq!(instances[0].agent_session_id.as_deref(), Some(owned));
+        assert_eq!(instances[1].agent_session_id, None);
+    }
+
+    #[test]
+    #[serial]
+    fn drain_rejects_all_claimants_of_same_batch_duplicate_sid() {
+        let temp = tempdir().unwrap();
+        let _guard = StorageHomeGuard::set(&temp);
+
+        let contested = "019342ab-1234-7def-8901-dddddddddddd";
+        let mut a = Instance::new("peer-a-title", "/tmp/x");
+        a.source_profile = "sync-samebatch".to_string();
+        a.agent_session_id = None;
+        attach_poller_with_update(&mut a, contested);
+
+        let mut b = Instance::new("peer-b-title", "/tmp/x");
+        b.source_profile = "sync-samebatch".to_string();
+        b.agent_session_id = None;
+        seed_instances_on_disk("sync-samebatch", &[&a, &b]);
+        attach_poller_with_update(&mut b, contested);
+
+        let file_watch = FileWatchService::noop();
+        let mut instances = vec![a, b];
+        let outcome = drain_and_persist_session_ids(&mut instances, &file_watch);
+
+        assert!(outcome.applied.is_empty());
+        assert!(outcome.filtered.contains(&instances[0].id));
+        assert!(outcome.filtered.contains(&instances[1].id));
+        assert_eq!(instances[0].agent_session_id, None);
+        assert_eq!(instances[1].agent_session_id, None);
     }
 }
