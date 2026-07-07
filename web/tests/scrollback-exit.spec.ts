@@ -137,6 +137,38 @@ test.describe("Mobile live-view scrollback", () => {
     expect(m.scrollHeight, "the document still spans the full history").toBeGreaterThan(8000);
   });
 
+  test("jumping to the bottom while reading does not show a blank spacer frame", async ({ page }) => {
+    await installTerminalSpies(page);
+    const handle = await mockTerminalApis(page, { liveHistory: 600 });
+    await page.goto("/");
+    await seedSettings(page, { mobileFontSize: 14 });
+    await page.reload();
+    await openSession(page, handle);
+    await expect.poll(() => page.locator("[data-live-content]").innerText()).toContain("$ ready");
+
+    await scroller(page).evaluate((el) => {
+      el.scrollTop = el.scrollHeight * 0.45;
+      el.dispatchEvent(new Event("scroll"));
+    });
+    await expect.poll(() => scroller(page).evaluate((el) => el.scrollHeight), { timeout: 3_000 }).toBeGreaterThan(8000);
+
+    // Let React render the deep-history viewport. The live tail should still be
+    // mounted, so an immediate bottom jump has real rows before the scroll event
+    // has a chance to update the viewport slice.
+    await page.waitForTimeout(300);
+    const visibleText = await scroller(page).evaluate((el) => {
+      el.scrollTop = el.scrollHeight - el.clientHeight;
+      const rows = Array.from(el.querySelectorAll("[data-live-content] > div")) as HTMLElement[];
+      const top = el.scrollTop;
+      const bottom = top + el.clientHeight;
+      return rows
+        .filter((r) => r.offsetTop >= top && r.offsetTop < bottom)
+        .map((r) => r.textContent ?? "")
+        .join("|");
+    });
+    expect(visibleText, "bottom jump shows live-tail rows, not only spacer padding").toContain("$ ready");
+  });
+
   test("scrolling up shows Back to live; tapping it returns to the bottom", async ({ page }) => {
     await installTerminalSpies(page);
     const handle = await mockTerminalApis(page);

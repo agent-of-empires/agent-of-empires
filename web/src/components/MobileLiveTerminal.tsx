@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, ReactNode, RefObject } from "react";
 import type { AnsiSegment, AnsiStyle } from "../lib/ansi";
 import { ansiToLines, findCursorCharIndex, splitUrls, textWidth, wrapLine } from "../lib/liveTermLines";
@@ -1239,22 +1239,64 @@ export function MobileLiveTerminal({
   // scrollHeight under the reader and snap the viewport.
   const visibleRowCount = reading ? visual.rows.length : renderRowCount;
 
-  // Virtualization window over [0, visibleRowCount): the rows whose document
-  // position (effectiveSpacerLines + i) * lineH falls within the viewport, plus
-  // one viewport of overscan each side so a fast flick does not outrun the
-  // re-render. Off-window rows become top/bottom padding of identical height.
-  // height == 0 (pre-measure / jsdom) renders everything, the safe default.
-  let winStart = 0;
-  let winEnd = visibleRowCount;
+  // Virtualization windows over [0, visibleRowCount): the rows whose document
+  // positions fall within the viewport, plus one viewport of overscan each side
+  // so a fast flick does not outrun the re-render. While reading, also keep the
+  // live tail mounted. A jump or scrollbar drag to the bottom can move scrollTop
+  // before React has observed the scroll event; without the tail range, that
+  // frame can show only spacer padding until the next render catches up.
+  let mountedRanges: Array<{ start: number; end: number }> = [{ start: 0, end: visibleRowCount }];
   if (view.height > 0 && lineH > 0) {
     const overscan = Math.ceil(view.height / lineH);
     const firstVisible = Math.floor(view.top / lineH) - effectiveSpacerLines;
     const lastVisible = Math.ceil((view.top + view.height) / lineH) - effectiveSpacerLines;
-    winStart = Math.max(0, Math.min(visibleRowCount, firstVisible - overscan));
-    winEnd = Math.max(winStart, Math.min(visibleRowCount, lastVisible + overscan));
+    const viewportRange = {
+      start: Math.max(0, Math.min(visibleRowCount, firstVisible - overscan)),
+      end: Math.max(0, Math.min(visibleRowCount, lastVisible + overscan)),
+    };
+    if (reading) {
+      mountedRanges = [
+        viewportRange,
+        {
+          start: Math.max(0, visibleRowCount - overscan * 2),
+          end: visibleRowCount,
+        },
+      ];
+    } else {
+      mountedRanges = [viewportRange];
+    }
   }
-  const topPadLines = effectiveSpacerLines + winStart;
-  const bottomPadLines = visibleRowCount - winEnd;
+  mountedRanges = mountedRanges
+    .filter((range) => range.end > range.start)
+    .sort((a, b) => a.start - b.start)
+    .reduce<Array<{ start: number; end: number }>>((ranges, range) => {
+      const prev = ranges[ranges.length - 1];
+      if (prev && range.start <= prev.end) {
+        prev.end = Math.max(prev.end, range.end);
+      } else {
+        ranges.push({ ...range });
+      }
+      return ranges;
+    }, []);
+  const mounted = mountedRanges.reduce<{
+    nextStart: number;
+    blocks: Array<{ padLines: number; start: number; end: number }>;
+  }>(
+    (acc, range, rangeIndex) => ({
+      nextStart: range.end,
+      blocks: [
+        ...acc.blocks,
+        {
+          padLines: rangeIndex === 0 ? effectiveSpacerLines + range.start : range.start - acc.nextStart,
+          start: range.start,
+          end: range.end,
+        },
+      ],
+    }),
+    { nextStart: 0, blocks: [] },
+  );
+  const bottomPadLines =
+    mounted.blocks.length === 0 ? effectiveSpacerLines + visibleRowCount : visibleRowCount - mounted.nextStart;
 
   return (
     <div className="absolute inset-0" data-live-terminal>
@@ -1331,16 +1373,22 @@ export function MobileLiveTerminal({
             opt out (`bottomAlign=false`) so a near-empty bash prompt sits at
             the top like a normal terminal. */}
         <div className={`relative whitespace-pre ${bottomAlign ? "mt-auto" : ""}`} data-live-content>
-          {topPadLines > 0 && <div style={{ height: `${topPadLines * lineH}px` }} aria-hidden="true" />}
-          {visual.rows.slice(winStart, winEnd).map((segs, j) => {
-            const i = winStart + j;
+          {mounted.blocks.map(({ padLines, start, end }) => {
             return (
-              <Row
-                key={i}
-                segs={segs}
-                cursorCol={i === cursorRow ? live.col : null}
-                focused={i === cursorRow && focused}
-              />
+              <Fragment key={`${start}-${end}`}>
+                {padLines > 0 && <div style={{ height: `${padLines * lineH}px` }} aria-hidden="true" />}
+                {visual.rows.slice(start, end).map((segs, j) => {
+                  const i = start + j;
+                  return (
+                    <Row
+                      key={i}
+                      segs={segs}
+                      cursorCol={i === cursorRow ? live.col : null}
+                      focused={i === cursorRow && focused}
+                    />
+                  );
+                })}
+              </Fragment>
             );
           })}
           {bottomPadLines > 0 && <div style={{ height: `${bottomPadLines * lineH}px` }} aria-hidden="true" />}
