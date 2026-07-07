@@ -2915,13 +2915,18 @@ impl Instance {
         expected_prior_intent: ResumeIntent,
     ) -> SidPersistOutcome {
         let new_sid = self.agent_session_id.clone();
-        // Both Cleared and Fork are one-shot: after the launch they ran with
-        // completes, the session resumes its own id normally, so the intent
-        // must auto-promote to Default. A fork left as Fork on disk would
-        // re-fork the parent on the next restart (double-fork).
+        // Cleared, Fork, and Use are all one-shot launch directives: after the
+        // launch they ran with completes, the session resumes its own id
+        // normally, so the intent must auto-promote to Default. A fork left as
+        // Fork on disk would re-fork the parent on the next restart
+        // (double-fork). A Use pin left durable would let the drain never
+        // adopt a post-launch capture (e.g. the resume-probe fallback minting
+        // a fresh sid, or a later `/clear`), so a launched pin hands control
+        // back to normal capture; a pin on a session that never launches keeps
+        // Use and stays authoritative (see #2708).
         let promote_one_shot = matches!(
             expected_prior_intent,
-            ResumeIntent::Cleared | ResumeIntent::Fork { .. }
+            ResumeIntent::Cleared | ResumeIntent::Fork { .. } | ResumeIntent::Use(_)
         );
 
         if let Some(ref sid) = new_sid {
