@@ -7743,10 +7743,80 @@ mod tests {
     mod resume_fallback {
         use super::super::{
             should_attempt_resume, Instance, LaunchSidOutcome, ResumeAttemptPolicy, ResumeIntent,
-            StartOutcome, Status,
+            SidPersistOutcome, StartOutcome, Status,
         };
         use serial_test::serial;
         use tempfile::tempdir;
+
+        struct EnvVarGuard {
+            key: &'static str,
+            prev: Option<std::ffi::OsString>,
+        }
+
+        impl EnvVarGuard {
+            fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+                let prev = std::env::var_os(key);
+                std::env::set_var(key, value);
+                Self { key, prev }
+            }
+        }
+
+        impl Drop for EnvVarGuard {
+            fn drop(&mut self) {
+                match self.prev.take() {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+
+        struct TmuxSessionGuard(String);
+
+        impl TmuxSessionGuard {
+            fn create(inst: &Instance) -> Option<Self> {
+                let tmux_available = crate::tmux::tmux_command()
+                    .arg("-V")
+                    .output()
+                    .map(|o| o.status.success())
+                    .unwrap_or(false);
+                if !tmux_available {
+                    eprintln!("Skipping: tmux not available");
+                    return None;
+                }
+
+                let session = inst.tmux_session().unwrap();
+                session
+                    .create(&inst.project_path, Some("sleep 60"))
+                    .expect("create tmux session");
+                Some(Self(session.name().to_string()))
+            }
+        }
+
+        impl Drop for TmuxSessionGuard {
+            fn drop(&mut self) {
+                let _ = crate::tmux::tmux_command()
+                    .args(["kill-session", "-t", &self.0])
+                    .output();
+                crate::tmux::refresh_session_cache();
+            }
+        }
+
+        fn seed_opencode_db(db_path: &std::path::Path, sid: &str, project_path: &str) {
+            let conn = rusqlite::Connection::open(db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE session (
+                    id TEXT PRIMARY KEY,
+                    directory TEXT NOT NULL,
+                    time_updated INTEGER NOT NULL
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO session (id, directory, time_updated) VALUES (?1, ?2, ?3)",
+                rusqlite::params![sid, project_path, 1_000_000_i64],
+            )
+            .unwrap();
+        }
 
         #[test]
         fn no_sid_does_not_attempt_resume() {
@@ -8596,6 +8666,33 @@ mod tests {
             assert_eq!(inst.agent_session_id, sid);
         }
 
+        #[test]
+        #[serial]
+        fn acquire_session_id_default_picks_up_retroactive_capture() {
+            let temp = tempdir().unwrap();
+            let project_path = temp.path().join("opencode-project");
+            std::fs::create_dir_all(&project_path).unwrap();
+            let project_path = project_path.to_string_lossy().to_string();
+            let db_path = temp.path().join("opencode.db");
+            let captured_sid = "ses_retroactive_capture";
+            seed_opencode_db(&db_path, captured_sid, &project_path);
+            let _opencode_db = EnvVarGuard::set("OPENCODE_DB", &db_path);
+
+            let mut inst = Instance::new("retroactive-opencode", &project_path);
+            inst.tool = "opencode".to_string();
+            inst.agent_session_id = None;
+            inst.resume_intent = ResumeIntent::Default;
+            let Some(_tmux) = TmuxSessionGuard::create(&inst) else {
+                return;
+            };
+
+            let (sid, is_existing) = inst.acquire_session_id();
+
+            assert_eq!(sid.as_deref(), Some(captured_sid));
+            assert!(is_existing);
+            assert_eq!(inst.agent_session_id.as_deref(), Some(captured_sid));
+        }
+
         mod verify_on_resume {
             use super::*;
             use crate::session::capture::encode_claude_project_path;
@@ -9194,6 +9291,44 @@ mod tests {
                 "Cleared must auto-promote to Default in the same flock"
             );
             assert_eq!(inst.resume_intent, ResumeIntent::Default);
+        }
+
+        #[test]
+        #[serial]
+        fn persist_session_id_writes_none_atomically_when_sid_absent() {
+            let temp = tempdir().unwrap();
+            let _home = EnvVarGuard::set("HOME", temp.path());
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            let _xdg_config = EnvVarGuard::set("XDG_CONFIG_HOME", temp.path().join(".config"));
+
+            let profile = "persist-none-sid";
+            let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+            let mut inst = Instance::new("title", "/tmp/x");
+            inst.source_profile = profile.to_string();
+            inst.agent_session_id = None;
+            inst.resume_intent = ResumeIntent::Default;
+            let on_disk = inst.clone();
+            storage
+                .update(|i, g| {
+                    *i = vec![on_disk.clone()];
+                    *g = crate::session::GroupTree::new_with_groups(
+                        std::slice::from_ref(&on_disk),
+                        &[],
+                    )
+                    .get_all_groups();
+                    Ok(())
+                })
+                .unwrap();
+
+            let outcome = inst.persist_session_id(profile, None, ResumeIntent::Default);
+
+            assert_eq!(outcome, SidPersistOutcome::Published);
+            assert_eq!(inst.agent_session_id, None);
+            let loaded = storage.load().unwrap();
+            assert_eq!(loaded.len(), 1);
+            assert_eq!(loaded[0].id, inst.id);
+            assert_eq!(loaded[0].agent_session_id, None);
+            assert_eq!(loaded[0].resume_intent, ResumeIntent::Default);
         }
 
         #[test]
