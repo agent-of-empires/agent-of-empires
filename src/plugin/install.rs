@@ -6,7 +6,7 @@ use std::path::Path;
 use std::process::Stdio;
 
 use anyhow::{anyhow, bail, Context, Result};
-use aoe_plugin_api::{BuildStep, PluginManifest, RuntimeSpec, UiContribution};
+use aoe_plugin_api::{BuildStep, PluginId, PluginManifest, RuntimeSpec, UiContribution};
 use serde::Serialize;
 
 use crate::session::{save_config, CapabilityGrant, Config, PluginConfig};
@@ -936,17 +936,18 @@ fn skip_reason(prepared: &Prepared) -> String {
 /// Remove an installed external plugin: its tree, its config entry, and its
 /// lockfile entry.
 pub fn uninstall(id: &str) -> Result<()> {
-    let dir = super::plugins_dir()?.join(id);
+    PluginId::new(id.to_string()).map_err(|e| anyhow!("{e}"))?;
     let mut config = Config::load()?;
     let is_external = config
         .plugins
         .get(id)
         .and_then(|p| p.source.as_ref())
         .is_some();
-    if !dir.exists() && !is_external {
+    if !is_external {
         bail!("{id} is not an installed external plugin");
     }
 
+    let dir = super::plugins_dir()?.join(id);
     if dir.exists() {
         std::fs::remove_dir_all(&dir).with_context(|| format!("removing {}", dir.display()))?;
     }
@@ -1470,6 +1471,41 @@ fn write_lock(
 mod tests {
     use super::*;
     use aoe_plugin_api::UiSlot;
+    use serial_test::serial;
+    use std::ffi::OsString;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        old: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &std::path::Path) -> Self {
+            let old = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, old }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.old {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    fn isolated_app_env() -> (tempfile::TempDir, EnvVarGuard, EnvVarGuard) {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let xdg = tmp.path().join("xdg");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&xdg).unwrap();
+        let home_guard = EnvVarGuard::set("HOME", &home);
+        let xdg_guard = EnvVarGuard::set("XDG_CONFIG_HOME", &xdg);
+        (tmp, home_guard, xdg_guard)
+    }
 
     fn ui(slot: UiSlot, id: &str) -> UiContribution {
         UiContribution {
@@ -1536,5 +1572,61 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("gh:"), "{err}");
+    }
+
+    #[test]
+    #[serial]
+    fn uninstall_rejects_malformed_id_before_touching_plugin_dir() {
+        let (_tmp, _home, _xdg) = isolated_app_env();
+        let plugins = super::super::plugins_dir().unwrap();
+        let jobs = plugins.join("jobs");
+        let keep = plugins.join("keepdir");
+        std::fs::create_dir_all(&jobs).unwrap();
+        std::fs::create_dir_all(&keep).unwrap();
+        std::fs::write(keep.join("keep.log"), b"keep").unwrap();
+
+        let err = uninstall("jobs/../keepdir").unwrap_err().to_string();
+        assert!(err.contains("invalid plugin id"), "{err}");
+        assert!(
+            keep.join("keep.log").exists(),
+            "malformed ids must not remove plugin subdirectories"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn uninstall_requires_external_plugin_config_before_removing_dir() {
+        let (_tmp, _home, _xdg) = isolated_app_env();
+        let plugins = super::super::plugins_dir().unwrap();
+        let jobs = plugins.join("jobs");
+        std::fs::create_dir_all(&jobs).unwrap();
+        std::fs::write(jobs.join("keep.log"), b"keep").unwrap();
+
+        let err = uninstall("jobs").unwrap_err().to_string();
+        assert!(err.contains("not an installed external plugin"), "{err}");
+        assert!(
+            jobs.join("keep.log").exists(),
+            "uninstall should not remove non-plugin subdirectories"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn uninstall_external_plugin_cleans_config_even_when_dir_is_missing() {
+        let (_tmp, _home, _xdg) = isolated_app_env();
+        let mut config = Config::default();
+        config.plugins.insert(
+            "acme.thing".to_string(),
+            PluginConfig {
+                source: Some("gh:acme/thing".to_string()),
+                ..PluginConfig::default()
+            },
+        );
+        save_config(&config).unwrap();
+
+        uninstall("acme.thing").unwrap();
+
+        let config = Config::load().unwrap();
+        assert!(!config.plugins.contains_key("acme.thing"));
     }
 }
