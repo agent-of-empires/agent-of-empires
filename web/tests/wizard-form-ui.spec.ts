@@ -173,6 +173,7 @@ test.describe("Wizard form UI stories", () => {
 
     await expect.poll(() => captured.body?.tool).toBe("claude");
     expect(captured.body?.path).toBe("/tmp/example");
-    expect(captured.body?.worktree_branch).toBe("kbd-launch");
+    expect(captured.body?.worktree_enabled).toBe(true);
+    expect(captured.body?.worktree_branch).toBeUndefined();
   });
 });

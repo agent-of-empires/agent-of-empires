@@ -151,7 +151,7 @@ test("auto-generated worktree branch avoids civilization branch collisions", asy
       body: JSON.stringify({
         path: join(serve.home, "project"),
         tool: "claude",
-        worktree_branch: "",
+        worktree_enabled: true,
         create_new_branch: true,
       }),
     });

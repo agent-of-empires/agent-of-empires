@@ -23,7 +23,6 @@ import { SessionStep } from "./steps/SessionStep";
 import { AgentPickerEssentials } from "./steps/AgentPickerEssentials";
 import { AgentOptions } from "./steps/AgentOptions";
 import { LaunchFooter } from "./LaunchFooter";
-import { getSubmittedBranch } from "./sessionNames";
 import { initialData, reducer, type WizardData } from "./wizardReducer";
 import { commandMapsFromSettings, EMPTY_COMMAND_MAPS, type CommandMaps } from "./commandMaps";
 
@@ -286,7 +285,11 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
       title: d.title || undefined,
       group: d.group || undefined,
       yolo_mode: d.yoloMode,
-      worktree_branch: !d.scratch && d.useWorktree ? getSubmittedBranch(d.title, d.worktreeBranch) : undefined,
+      worktree_enabled: !d.scratch && d.useWorktree,
+      worktree_branch:
+        !d.scratch && d.useWorktree && d.worktreeBranchDirty && d.worktreeBranch.trim()
+          ? d.worktreeBranch.trim()
+          : undefined,
       create_new_branch: !d.scratch && d.useWorktree && !d.attachExisting,
       base_branch:
         !d.scratch && d.useWorktree && !d.attachExisting && d.baseBranch.trim() ? d.baseBranch.trim() : undefined,

@@ -150,9 +150,10 @@ test.describe("Wizard session step (#1219)", () => {
     await expect(branchInput).toHaveValue("my-cool-feature");
   });
 
-  test("submit sends worktree_branch + create_new_branch with More options left closed", async ({ page }) => {
+  test("submit sends worktree_enabled + create_new_branch with More options left closed", async ({ page }) => {
     await mockApis(page);
     let captured: {
+      worktree_enabled?: boolean;
       worktree_branch?: string;
       create_new_branch?: boolean;
     } | null = null;
@@ -196,7 +197,8 @@ test.describe("Wizard session step (#1219)", () => {
     const w = wizard(page);
     await w.getByPlaceholder("Auto-generated if empty").fill("Cool Feature");
     await w.getByRole("button", { name: /Launch session/ }).click();
-    await expect.poll(() => captured?.worktree_branch).toBe("cool-feature");
+    await expect.poll(() => captured?.worktree_enabled).toBe(true);
+    expect(captured?.worktree_branch).toBeUndefined();
     expect(captured?.create_new_branch).toBe(true);
   });
 

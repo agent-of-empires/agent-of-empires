@@ -20,6 +20,35 @@ in the TUI's Serve panel). Three transports are accepted:
 Read-only mode (`aoe serve --read-only`) blocks every write endpoint
 with `403 read_only`. Read endpoints work normally.
 
+## POST /api/sessions
+
+Create a session. The web dashboard uses this endpoint for the new-session
+dialog, and external orchestrators may call it directly.
+
+**Worktree fields**
+
+| Field | Notes |
+| --- | --- |
+| `worktree_enabled` | Set `true` to create a managed git worktree even when no explicit branch name is supplied. |
+| `worktree_branch` | Optional explicit branch or worktree name. If omitted while `worktree_enabled` is true, AoE derives a safe branch name from the resolved session title. |
+| `create_new_branch` | `true` creates a new branch; `false` attaches to an existing branch. |
+
+For compatibility, callers that only send `worktree_branch` still opt into
+worktree mode. To get title-derived branch names, send `worktree_enabled` as
+`true` and omit `worktree_branch`.
+
+**Example**
+
+```json
+{
+  "path": "/path/to/repo",
+  "tool": "claude",
+  "title": "Fix Login Flow",
+  "worktree_enabled": true,
+  "create_new_branch": true
+}
+```
+
 ## POST /api/sessions/{id}/send
 
 Type a message into the agent and press Enter, the same way the TUI's

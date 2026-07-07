@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyBranchOverride, getReviewSummary, getSubmittedBranch, slugifyBranch } from "./sessionNames";
+import { applyBranchOverride, getReviewSummary, slugifyBranch } from "./sessionNames";
 
 describe("applyBranchOverride", () => {
   it("marks a non-empty branch as a manual override", () => {
@@ -21,20 +21,6 @@ describe("applyBranchOverride", () => {
       worktreeBranch: "",
       worktreeBranchDirty: true,
     });
-  });
-});
-
-describe("getSubmittedBranch", () => {
-  it("prefers the explicit branch override", () => {
-    expect(getSubmittedBranch("session-title", "feature/custom")).toBe("feature/custom");
-  });
-
-  it("falls back to the title when the branch field is cleared", () => {
-    expect(getSubmittedBranch("session-title", "")).toBe("session-title");
-  });
-
-  it("leaves the branch empty only when both fields are empty", () => {
-    expect(getSubmittedBranch("", "")).toBe("");
   });
 });
 

@@ -51,17 +51,13 @@ export function applyBranchOverride(
   worktreeBranchDirty: boolean;
 } {
   // Any direct edit on the branch field, including clearing it, marks it
-  // dirty so the title→branch mirror stops overwriting the user's input on
-  // the next keystroke. Empty is a valid UI state; the submit path falls
-  // back to the title via getSubmittedBranch.
+  // dirty so the title-to-branch mirror stops overwriting the user's input on
+  // the next keystroke. Empty is a valid UI state; the submit path omits
+  // worktree_branch so the server derives it from the resolved title.
   return {
     worktreeBranch,
     worktreeBranchDirty: true,
   };
-}
-
-export function getSubmittedBranch(title: string, worktreeBranch: string): string {
-  return worktreeBranch || title || "";
 }
 
 export function getReviewSummary(

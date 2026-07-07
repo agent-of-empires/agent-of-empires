@@ -472,6 +472,10 @@ export interface CreateSessionRequest {
   tool: string;
   group?: string;
   yolo_mode?: boolean;
+  /** Enables worktree mode even when no explicit branch is provided. When
+   *  true and `worktree_branch` is omitted, the server derives the branch from
+   *  the resolved session title. */
+  worktree_enabled?: boolean;
   worktree_branch?: string;
   create_new_branch?: boolean;
   /** Branch the new worktree branch is based on (only honored when

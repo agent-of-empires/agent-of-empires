@@ -3642,6 +3642,10 @@ pub struct CreateSessionBody {
     pub group: String,
     #[serde(default)]
     pub yolo_mode: bool,
+    /// Explicit worktree opt-in. When omitted or false, legacy callers that
+    /// send `worktree_branch` still opt into worktree mode.
+    #[serde(default)]
+    pub worktree_enabled: bool,
     pub worktree_branch: Option<String>,
     #[serde(default)]
     pub create_new_branch: bool,
@@ -3718,6 +3722,14 @@ pub struct CreateSessionBody {
     #[cfg(feature = "serve")]
     #[serde(default)]
     pub fork_from: Option<String>,
+}
+
+fn create_body_uses_worktree(body: &CreateSessionBody) -> bool {
+    body.worktree_enabled || body.worktree_branch.is_some()
+}
+
+fn create_body_combines_scratch_and_worktree(body: &CreateSessionBody) -> bool {
+    body.scratch && create_body_uses_worktree(body)
 }
 
 /// Resolve the one-shot fork seed for a `fork_from` create request. A
@@ -4028,12 +4040,12 @@ pub async fn create_session(
     // wrong model for them. Reject the combination before reaching the
     // builder so misbehaving clients get a clear 400 instead of a
     // less-specific builder bail surfaced as 500.
-    if body.scratch && body.worktree_branch.is_some() {
+    if create_body_combines_scratch_and_worktree(&body) {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "error": "validation_failed",
-                "message": "Cannot combine scratch with worktree_branch"
+                "message": "Cannot combine scratch with worktree mode"
             })),
         )
             .into_response();
@@ -4168,6 +4180,8 @@ pub async fn create_session(
             .into_response();
     }
 
+    let worktree_enabled = create_body_uses_worktree(&body);
+
     // Importing an existing Claude session (#2276) is tightly scoped: it
     // resumes a specific on-disk session id in its original cwd via the claude
     // structured agent. Reject any request that pairs the id with a different
@@ -4197,7 +4211,7 @@ pub async fn create_session(
         {
             return bad("Importing a Claude session requires the built-in claude agent");
         }
-        if body.scratch || body.worktree_branch.is_some() || !body.extra_repo_paths.is_empty() {
+        if body.scratch || worktree_enabled || !body.extra_repo_paths.is_empty() {
             return bad(
                 "Importing a Claude session cannot use scratch, a worktree, or extra repos",
             );
@@ -4328,7 +4342,6 @@ pub async fn create_session(
         )?;
 
         let title = body.title.unwrap_or_default();
-        let worktree_enabled = body.worktree_branch.is_some();
         let worktree_branch = body
             .worktree_branch
             .map(|b| b.trim().to_string())
@@ -6242,6 +6255,57 @@ mod tests {
 
     fn create_body_from_json(value: serde_json::Value) -> CreateSessionBody {
         serde_json::from_value(value).expect("valid CreateSessionBody")
+    }
+
+    #[test]
+    fn worktree_enabled_true_opts_in_without_branch() {
+        let body = create_body_from_json(serde_json::json!({
+            "path": "/tmp/p",
+            "tool": "claude",
+            "worktree_enabled": true,
+        }));
+
+        assert!(create_body_uses_worktree(&body));
+        assert!(body.worktree_branch.is_none());
+    }
+
+    #[test]
+    fn worktree_branch_preserves_legacy_worktree_opt_in() {
+        let explicit = create_body_from_json(serde_json::json!({
+            "path": "/tmp/p",
+            "tool": "claude",
+            "worktree_branch": "feat/api",
+        }));
+        assert!(create_body_uses_worktree(&explicit));
+
+        let empty = create_body_from_json(serde_json::json!({
+            "path": "/tmp/p",
+            "tool": "claude",
+            "worktree_branch": "",
+        }));
+        assert!(create_body_uses_worktree(&empty));
+    }
+
+    #[test]
+    fn worktree_defaults_off_without_flag_or_branch() {
+        let body = create_body_from_json(serde_json::json!({
+            "path": "/tmp/p",
+            "tool": "claude",
+        }));
+
+        assert!(!create_body_uses_worktree(&body));
+    }
+
+    #[test]
+    fn worktree_enabled_conflicts_with_scratch() {
+        let body = create_body_from_json(serde_json::json!({
+            "path": "",
+            "tool": "claude",
+            "scratch": true,
+            "worktree_enabled": true,
+        }));
+
+        assert!(create_body_combines_scratch_and_worktree(&body));
     }
 
     #[test]

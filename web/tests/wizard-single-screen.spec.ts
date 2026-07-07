@@ -113,7 +113,8 @@ test.describe("Single-screen wizard (#2210)", () => {
     await page.getByPlaceholder("Uses session title if empty").fill("my-feature-branch");
     await launch(page);
 
-    await expect.poll(() => captured.body?.worktree_branch).toBe("my-feature-branch");
+    await expect.poll(() => captured.body?.worktree_enabled).toBe(true);
+    expect(captured.body?.worktree_branch).toBe("my-feature-branch");
     expect(captured.body?.create_new_branch).toBe(true);
   });
 
