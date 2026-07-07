@@ -935,12 +935,11 @@ fn flatten_group(
     }
 }
 
+/// Count of the sessions that render under a group header. Delegates to
+/// `group_members` so the header badge and the visible rows share one
+/// predicate (excluding archived and trashed sessions).
 fn count_sessions_in_group(path: &str, instances: &[Instance]) -> usize {
-    let prefix = format!("{}/", path);
-    instances
-        .iter()
-        .filter(|i| (i.group_path == path || i.group_path.starts_with(&prefix)) && !i.is_archived())
-        .count()
+    group_members(path, instances).count()
 }
 
 /// Append the synthetic "Archived" section to `items`, pinned to the
@@ -1330,6 +1329,42 @@ mod tests {
         {
             assert_eq!(*session_count, 2);
         }
+    }
+
+    #[test]
+    fn test_session_count_excludes_trashed_and_restores_on_untrash() {
+        let mut a = Instance::new("a", "/tmp/a");
+        a.group_path = "work".to_string();
+        let mut b = Instance::new("b", "/tmp/b");
+        b.group_path = "work".to_string();
+        let mut instances = vec![a, b];
+
+        let group_count = |instances: &[Instance]| {
+            let tree = GroupTree::new_with_groups(instances, &[]);
+            let items = flatten_tree(&tree, instances, SortOrder::Oldest);
+            items
+                .iter()
+                .find_map(|i| match i {
+                    Item::Group {
+                        path,
+                        session_count,
+                        ..
+                    } if path == "work" => Some(*session_count),
+                    _ => None,
+                })
+                .expect("work group present")
+        };
+
+        assert_eq!(group_count(&instances), 2);
+
+        // Trashing a session drops it from both the visible rows and the
+        // header badge, matching the row filter in `flatten_group`.
+        instances[0].trash();
+        assert_eq!(group_count(&instances), 1);
+
+        // Restoring brings the count back.
+        instances[0].untrash();
+        assert_eq!(group_count(&instances), 2);
     }
 
     #[test]
