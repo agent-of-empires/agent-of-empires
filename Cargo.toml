@@ -278,6 +278,13 @@ name = "e2e"
 path = "tests/e2e/main.rs"
 required-features = ["e2e-tests"]
 
+[[test]]
+# The orphan-runner test invokes the hidden `aoe __acp-runner` command, which is
+# compiled only with the structured-view/web-dashboard feature set.
+name = "acp_runner_orphan"
+path = "tests/acp_runner_orphan.rs"
+required-features = ["serve"]
+
 [[bin]]
 name = "aoe"
 path = "src/main.rs"
