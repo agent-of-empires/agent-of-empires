@@ -652,6 +652,21 @@
       ]
     },
     {
+      "id": "wizard.worktree-title-derived-branch",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/wizard-form-ui.spec.ts",
+        "tests/wizard-session-step.spec.ts",
+        "tests/wizard-single-screen.spec.ts"
+      ],
+      "components": [
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/components/session-wizard/sessionNames.ts",
+        "web/src/lib/types.ts"
+      ]
+    },
+    {
       "id": "wizard.recent-projects",
       "kind": "live-playwright",
       "risk": "medium",
