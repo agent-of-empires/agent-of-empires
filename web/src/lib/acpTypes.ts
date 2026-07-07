@@ -2098,6 +2098,45 @@ function mergeToolStart(prev: ToolCall, incoming: ToolCall): ToolCall {
   };
 }
 
+/** Prepend an older history page's rows ahead of the loaded tail, deduping
+ *  any `tool_start` whose `toolCallId` already exists in the tail. A tool
+ *  call split across the page seam (its `ToolCallStarted` in this older
+ *  page, its `ToolCallCompleted` already in the tail) left a synthesized
+ *  placeholder start in `tailRows` (see synthToolStartRow / #1713). Without
+ *  a cross-page merge the real start would prepend as a second row with the
+ *  same id, and two assistant-ui `tool-call` parts sharing a `toolCallId`
+ *  make `useResources` throw "Duplicate key" and crash the panel (#2711).
+ *  Merge the real start into the existing row in place (real name/kind/args
+ *  and its earlier `started_at` win) and drop the duplicate. Also covers a
+ *  plain frame overlap at the seam. */
+export function mergePrependedActivity(olderRows: ActivityRow[], tailRows: ActivityRow[]): ActivityRow[] {
+  const startIndexById = new Map<string, number>();
+  tailRows.forEach((row, i) => {
+    if (row.kind === "tool_start" && row.toolCallId) startIndexById.set(row.toolCallId, i);
+  });
+  if (startIndexById.size === 0) return olderRows.concat(tailRows);
+
+  let tail = tailRows;
+  const prepended: ActivityRow[] = [];
+  for (const row of olderRows) {
+    const idx = row.kind === "tool_start" && row.toolCallId ? startIndexById.get(row.toolCallId) : undefined;
+    if (idx === undefined) {
+      prepended.push(row);
+      continue;
+    }
+    const existing = tail[idx];
+    if (existing && existing.kind === "tool_start" && existing.tool && row.tool) {
+      const merged = mergeToolStart(existing.tool, row.tool);
+      // Keep the real start's timestamp; the synth placeholder carried the
+      // completion time, which would zero out the duration label (#1060).
+      if (row.tool.started_at) merged.started_at = row.tool.started_at;
+      tail = tail.slice();
+      tail[idx] = { ...existing, tool: merged, text: merged.name, at: merged.started_at };
+    }
+  }
+  return prepended.concat(tail);
+}
+
 function pushActivity(rows: ActivityRow[], row: ActivityRow): ActivityRow[] {
   const next = rows.concat(row);
   if (activityLimit > 0 && next.length > activityLimit) {

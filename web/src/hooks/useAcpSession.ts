@@ -13,6 +13,7 @@ import {
   applyEvent,
   emptyAcpState,
   isTurnActive,
+  mergePrependedActivity,
   normaliseTurnCounters,
   reduceFrames,
   setActivityLimit,
@@ -520,7 +521,11 @@ export function reducer(state: AcpState, action: Action): AcpState {
     // split-turn seam and no overlap to dedupe. See #2236.
     const next = { ...state, oldestSeq: action.oldestSeq };
     if (action.frames.length === 0) return next;
-    next.activity = reduceFrames(action.frames).activity.concat(state.activity);
+    // A tool call split across the seam left a synthesized start in the
+    // tail; merge the older page's real start into it rather than emitting
+    // a duplicate `toolCallId` that crashes assistant-ui's useResources
+    // ("Duplicate key"). See #2711.
+    next.activity = mergePrependedActivity(reduceFrames(action.frames).activity, state.activity);
     return next;
   }
   if (action.kind === "handshake") {
