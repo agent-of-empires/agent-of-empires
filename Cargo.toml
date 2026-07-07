@@ -270,6 +270,12 @@ codegen-units = 16
 debug-assertions = false
 
 [[test]]
+# ACP runner is part of the serve / structured-view surface.
+name = "acp_runner_orphan"
+path = "tests/acp_runner_orphan.rs"
+required-features = ["serve"]
+
+[[test]]
 # Explicit target so the `e2e-tests` feature gate applies. Without this entry
 # Cargo auto-discovers tests/e2e/main.rs unconditionally; the gate lets CI split
 # the serve suite into "everything except e2e" and "e2e only" shards. The other

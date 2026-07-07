@@ -293,11 +293,19 @@ fn default_true() -> bool {
     true
 }
 
-fn status_hook_env_prefix(instance_id: &str, agent: Option<&crate::agents::AgentDef>) -> String {
+fn status_hook_env_prefix(
+    profile: &str,
+    instance_id: &str,
+    agent: Option<&crate::agents::AgentDef>,
+) -> String {
     let has_hooks = agent.is_some_and(|a| a.hook_config.is_some() || a.sidecar_hooks.is_some());
 
     if has_hooks {
-        format!("AOE_INSTANCE_ID={} ", instance_id)
+        format!(
+            "AOE_PROFILE={} AOE_INSTANCE_ID={} ",
+            shell_escape(profile),
+            shell_escape(instance_id)
+        )
     } else {
         String::new()
     }
@@ -2537,7 +2545,13 @@ impl Instance {
                 sandbox,
                 std::path::Path::new(&self.project_path),
             );
-            let docker_args = format!("{} -e AOE_INSTANCE_ID={}", env_info.docker_args, self.id);
+            let profile = self.effective_profile();
+            let docker_args = format!(
+                "{} -e AOE_PROFILE={} -e AOE_INSTANCE_ID={}",
+                env_info.docker_args,
+                shell_escape(&profile),
+                shell_escape(&self.id)
+            );
             let env_part = format!("{} ", docker_args);
             let wrapped =
                 wrap_command_ignore_suspend(&container.exec_command(Some(&env_part), &tool_cmd));
@@ -2594,30 +2608,48 @@ impl Instance {
     /// Respects the `agent_status_hooks` config setting.
     fn install_agent_status_hooks(&self, agent: Option<&'static crate::agents::AgentDef>) {
         let profile = self.effective_profile();
-        let session_cfg = super::profile_config::resolve_config_or_warn(&profile).session;
-        if !session_cfg.agent_status_hooks {
+        let config = super::profile_config::resolve_config_or_warn(&profile);
+        if !config.session.agent_status_hooks {
             return;
         }
-        if let Some(sidecar) = agent.and_then(|a| a.sidecar_hooks.as_ref()) {
-            // Sidecar agents (settl TOML, hermes YAML, kiro per-agent JSON)
-            // install into a host config file; sandbox install is handled by
-            // build_container_config. host_only agents (settl) are never
-            // sandboxed, so the gate is a no-op for them.
-            if !self.is_sandboxed() {
-                if let Some(home) = dirs::home_dir() {
-                    self.install_sidecar_host_hooks(sidecar, &home, &session_cfg);
-                }
-            }
-        } else if let Some(hook_cfg) = agent.and_then(|a| a.hook_config.as_ref()) {
-            if !self.is_sandboxed() {
-                match hook_cfg.format {
-                    crate::agents::HookFormat::CodexJson => self.install_codex_host_hooks(hook_cfg),
-                    crate::agents::HookFormat::JsonSettings => {
-                        self.install_json_host_hooks(hook_cfg)
+        if let Some(agent) = agent {
+            if let Some(sidecar) = agent.sidecar_hooks.as_ref() {
+                let events = match crate::agents::resolved_sidecar_hook_events(agent, &config) {
+                    Ok(events) => events,
+                    Err(e) => {
+                        tracing::warn!(target: "session.store", "Failed to resolve {} status hooks: {}", agent.name, e);
+                        return;
+                    }
+                };
+                // Sidecar agents (settl TOML, hermes YAML, kiro per-agent JSON)
+                // install into a host config file; sandbox install is handled by
+                // build_container_config. host_only agents (settl) are never
+                // sandboxed, so the gate is a no-op for them.
+                if !self.is_sandboxed() {
+                    if let Some(home) = dirs::home_dir() {
+                        self.install_sidecar_host_hooks(sidecar, &home, &config.session, &events);
                     }
                 }
+            } else if let Some(hook_cfg) = agent.hook_config.as_ref() {
+                let events = match crate::agents::resolved_hook_events(agent, &config) {
+                    Ok(events) => events,
+                    Err(e) => {
+                        tracing::warn!(target: "session.store", "Failed to resolve {} status hooks: {}", agent.name, e);
+                        return;
+                    }
+                };
+                if !self.is_sandboxed() {
+                    match hook_cfg.format {
+                        crate::agents::HookFormat::CodexJson => {
+                            self.install_codex_host_hooks(&events)
+                        }
+                        crate::agents::HookFormat::JsonSettings => {
+                            self.install_json_host_hooks(hook_cfg, &events)
+                        }
+                    }
+                }
+                // Sandboxed sessions install via build_container_config.
             }
-            // Sandboxed sessions install via build_container_config.
         }
     }
 
@@ -2631,6 +2663,7 @@ impl Instance {
         sidecar: &'static crate::agents::SidecarHooks,
         home: &Path,
         session_cfg: &super::config::SessionConfig,
+        events: &[crate::agents::ResolvedHookEvent],
     ) {
         if session_cfg.merge_hooks_into_selected_agent {
             if let Some(sel) = sidecar.selected_agent_hooks.as_ref() {
@@ -2649,7 +2682,7 @@ impl Instance {
                             .unwrap_or(Path::new(".")),
                     );
                     let path = (sel.resolve_config_file)(&agents_dir, &name);
-                    match (sidecar.install)(&path, crate::hooks::HookInstallTarget::Host) {
+                    match (sidecar.install)(&path, crate::hooks::HookInstallTarget::Host, events) {
                         Ok(()) => tracing::info!(target: "session.store",
                             "Installed AoE status hooks into {} agent '{}' at {}", self.tool, name, path.display()),
                         Err(e) => tracing::warn!(target: "session.store",
@@ -2661,7 +2694,7 @@ impl Instance {
         }
 
         let config_path = home.join(sidecar.host_config_subpath);
-        match (sidecar.install)(&config_path, crate::hooks::HookInstallTarget::Host) {
+        match (sidecar.install)(&config_path, crate::hooks::HookInstallTarget::Host, events) {
             Ok(()) => {
                 tracing::info!(target: "session.store",
                     "Installed AoE status hooks for {} via standalone hooks agent", self.tool);
@@ -2674,24 +2707,30 @@ impl Instance {
         }
     }
 
-    fn install_codex_host_hooks(&self, hook_cfg: &crate::agents::AgentHookConfig) {
+    fn install_codex_host_hooks(&self, events: &[crate::agents::ResolvedHookEvent]) {
         match crate::hooks::codex_hooks_json_path_for_host_environment(
             &self.profile_host_environment(),
         ) {
             Ok(hooks_path) => {
                 if let Err(e) = crate::hooks::install_hooks(
                     &hooks_path,
-                    hook_cfg.events,
+                    events,
                     crate::hooks::HookInstallTarget::Host,
                 ) {
-                    tracing::warn!("Failed to install codex hooks: {}", e);
+                    tracing::warn!(target: "session.store", "Failed to install codex hooks: {}", e);
                 }
             }
-            Err(e) => tracing::warn!("Failed to resolve codex hooks path: {}", e),
+            Err(e) => {
+                tracing::warn!(target: "session.store", "Failed to resolve codex hooks path: {}", e)
+            }
         }
     }
 
-    fn install_json_host_hooks(&self, hook_cfg: &crate::agents::AgentHookConfig) {
+    fn install_json_host_hooks(
+        &self,
+        hook_cfg: &crate::agents::AgentHookConfig,
+        events: &[crate::agents::ResolvedHookEvent],
+    ) {
         // Install hooks in the agent's host settings file, honoring a
         // config-dir override env var (e.g. CLAUDE_CONFIG_DIR) so hooks
         // land where the agent actually reads them.
@@ -2702,7 +2741,7 @@ impl Instance {
             Ok(settings_path) => {
                 if let Err(e) = crate::hooks::install_hooks(
                     &settings_path,
-                    hook_cfg.events,
+                    events,
                     crate::hooks::HookInstallTarget::Host,
                 ) {
                     tracing::warn!(target: "session.store", "Failed to install agent hooks: {}", e);
@@ -2747,7 +2786,8 @@ impl Instance {
             }
         }
 
-        let mut env_prefix = status_hook_env_prefix(&self.id, agent);
+        let profile = self.effective_profile();
+        let mut env_prefix = status_hook_env_prefix(&profile, &self.id, agent);
 
         // Profile-scoped host environment entries (KEY=value, KEY=$VAR,
         // KEY=$$literal, or bare KEY for passthrough). Sandboxed sessions
@@ -3129,7 +3169,7 @@ impl Instance {
             // Already up: not a come-up, so don't re-mint. Fill lazily only if a
             // fresh process attached to a running container with no values yet.
             self.ensure_before_start_env(false)?;
-            container_config::refresh_agent_configs();
+            container_config::refresh_agent_configs_for_profile(&self.effective_profile());
             self.backfill_container_workdir(&container);
             return Ok(container);
         }
@@ -3138,7 +3178,7 @@ impl Instance {
             // Restart of a stopped container is a come-up: refresh so a
             // short-lived token is re-minted.
             self.ensure_before_start_env(true)?;
-            container_config::refresh_agent_configs();
+            container_config::refresh_agent_configs_for_profile(&self.effective_profile());
             container.start()?;
             self.backfill_container_workdir(&container);
             return Ok(container);
@@ -4706,8 +4746,8 @@ mod tests {
     fn test_codex_gets_status_hook_env_prefix() {
         let agent = crate::agents::get_agent("codex");
         assert_eq!(
-            status_hook_env_prefix("abc123", agent),
-            "AOE_INSTANCE_ID=abc123 "
+            status_hook_env_prefix("work", "abc123", agent),
+            "AOE_PROFILE='work' AOE_INSTANCE_ID='abc123' "
         );
     }
 
@@ -7043,24 +7083,24 @@ mod tests {
     #[test]
     fn test_status_hook_env_prefix_includes_hermes() {
         assert_eq!(
-            status_hook_env_prefix("abc123", crate::agents::get_agent("hermes")),
-            "AOE_INSTANCE_ID=abc123 "
+            status_hook_env_prefix("work", "abc123", crate::agents::get_agent("hermes")),
+            "AOE_PROFILE='work' AOE_INSTANCE_ID='abc123' "
         );
         assert_eq!(
-            status_hook_env_prefix("abc123", crate::agents::get_agent("settl")),
-            "AOE_INSTANCE_ID=abc123 "
+            status_hook_env_prefix("work", "abc123", crate::agents::get_agent("settl")),
+            "AOE_PROFILE='work' AOE_INSTANCE_ID='abc123' "
         );
         assert_eq!(
-            status_hook_env_prefix("abc123", crate::agents::get_agent("claude")),
-            "AOE_INSTANCE_ID=abc123 "
+            status_hook_env_prefix("work", "abc123", crate::agents::get_agent("claude")),
+            "AOE_PROFILE='work' AOE_INSTANCE_ID='abc123' "
         );
         assert_eq!(
-            status_hook_env_prefix("abc123", crate::agents::get_agent("opencode")),
+            status_hook_env_prefix("work", "abc123", crate::agents::get_agent("opencode")),
             ""
         );
         assert_eq!(
-            status_hook_env_prefix("abc123", crate::agents::get_agent("kiro")),
-            "AOE_INSTANCE_ID=abc123 "
+            status_hook_env_prefix("work", "abc123", crate::agents::get_agent("kiro")),
+            "AOE_PROFILE='work' AOE_INSTANCE_ID='abc123' "
         );
     }
 

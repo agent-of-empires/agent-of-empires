@@ -85,6 +85,11 @@ mode = "plan"             # default mode, applied when the agent advertises one
 
 [acp.acp_defaults.opencode.effort_by_model]
 "openai/gpt-5.5" = "high"  # overrides `effort` when this model is resolved
+
+# Trusted global/profile hook event to AoE status overrides.
+[agents.claude.status_map]
+Stop = "idle"
+Notification = "waiting"
 ```
 
 | Option | Default | Description |
@@ -101,6 +106,7 @@ mode = "plan"             # default mode, applied when the agent advertises one
 | `agent_detect_as` | `{}` | Status detection mapping: maps an agent name to a built-in agent whose status heuristics should be used. |
 | `agent_acp_cmd` | `{}` | ACP launch command for a custom agent, enabling it to run in structured view (e.g., `{ "oc-superpowers" = "ocp run sp acp" }`). A custom agent with an entry here is structured view-capable; without one it stays tmux-only. Unlike `custom_agents`, the value is split into argv and run directly, with no shell. |
 | `acp.acp_defaults` | `{}` | Per-agent defaults for structured view startup (under the `[acp]` section, not `[session]`). `model` is forwarded when the worker starts; `effort` (thinking) and `mode` are applied through the agent's ACP config options (`thought_level`, `mode`) when advertised, and skipped with a warning otherwise. `effort_by_model` (a `{model = effort}` map) overrides `effort` for the resolved model. Editable per agent from the web dashboard (Structured view tab, Structured View Defaults). Example: `[acp.acp_defaults.opencode] model = "openai/gpt-5.5" effort = "high" mode = "plan"`. |
+| `agents.<name>.status_map` | `{}` | Trusted global/profile-only hook event to AoE status mappings. Valid statuses are `running`, `waiting`, `idle`, and `error`. Entries apply by event name to built-in hook defaults, so duplicate event names with different matchers all receive the same status; new event names are added to the installed hooks when the agent format supports event keys. Existing hook files update on the next hook install, usually a new or restarted session. Agent processes with installed status hooks receive `AOE_PROFILE`, so hook scripts can query the resolved map with `aoe -p "$AOE_PROFILE" profile show --status-map <agent> --json`. |
 
 For Codex, AoE preserves existing `[hooks.state]` trust data and writes `~/.codex/config.toml` through `config.toml.lock` plus an atomic replace. This keeps repeated or concurrent AoE launches from duplicating hook blocks or leaving partial TOML.
 

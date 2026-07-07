@@ -13,7 +13,7 @@
 //!    (Idle/Unknown) every 5 cycles, Cold (Error) every 60 cycles, Frozen
 //!    (Stopped/Deleting) never.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -133,7 +133,14 @@ pub(super) fn poll_statuses_once(
     if has_sandboxed && state.last_credential_refresh.elapsed() >= state.credential_refresh_interval
     {
         state.last_credential_refresh = Instant::now();
-        crate::session::container_config::refresh_agent_configs();
+        let profiles: BTreeSet<String> = instances
+            .iter()
+            .filter(|inst| inst.is_sandboxed())
+            .map(|inst| inst.effective_profile())
+            .collect();
+        for profile in profiles {
+            crate::session::container_config::refresh_agent_configs_for_profile(&profile);
+        }
     }
 
     instances

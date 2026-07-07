@@ -5,6 +5,35 @@
 
 use crate::session::Status;
 use crate::tmux::status_detection;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
+
+/// Status values a hook may write to AoE's hook sidecar file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HookStatus {
+    Running,
+    Waiting,
+    Idle,
+    Error,
+}
+
+impl HookStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HookStatus::Running => "running",
+            HookStatus::Waiting => "waiting",
+            HookStatus::Idle => "idle",
+            HookStatus::Error => "error",
+        }
+    }
+}
+
+impl std::fmt::Display for HookStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 /// How to check whether an agent binary is installed on the host.
 pub enum DetectionMethod {
@@ -69,12 +98,29 @@ pub struct HookEvent {
     pub name: &'static str,
     /// Optional matcher pattern (e.g. `"permission_prompt|elicitation_dialog"`).
     pub matcher: Option<&'static str>,
-    /// AoE status to write when this event fires (`"running"`, `"idle"`, `"waiting"`).
-    pub status: Option<&'static str>,
+    /// AoE status to write when this event fires.
+    pub status: Option<HookStatus>,
     /// When `true`, install an additional hook command that extracts
     /// `session_id` from the agent's stdin JSON payload and writes it to
     /// `/tmp/aoe-hooks-<euid>/<AOE_INSTANCE_ID>/session_id`.
     pub session_id_capture: bool,
+}
+
+/// A hook event after applying profile/global status-map overrides.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedHookEvent {
+    pub name: String,
+    pub matcher: Option<String>,
+    pub status: Option<HookStatus>,
+    pub session_id_capture: bool,
+}
+
+/// Sidecar hook defaults for agents whose config format is not the generic
+/// JSON hook schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SidecarHookEvent {
+    pub name: &'static str,
+    pub status: HookStatus,
 }
 
 /// On-disk format an agent uses for its status-detection hooks. Each variant
@@ -135,7 +181,11 @@ pub struct SidecarHooks {
     /// `target` parameter selects which `{base}` is baked into the hook
     /// command string (`/tmp/aoe-hooks-<euid>` for host, `/tmp/aoe-hooks` for
     /// sandbox; see `crate::hooks::HookInstallTarget`).
-    pub install: fn(&std::path::Path, crate::hooks::HookInstallTarget) -> anyhow::Result<()>,
+    pub install: fn(
+        &std::path::Path,
+        crate::hooks::HookInstallTarget,
+        &[ResolvedHookEvent],
+    ) -> anyhow::Result<()>,
     /// Remove AoE status hooks from the config file at the given path.
     /// Returns whether anything was changed.
     pub uninstall: fn(&std::path::Path) -> anyhow::Result<bool>,
@@ -154,6 +204,8 @@ pub struct SidecarHooks {
     /// On-disk format of the sidecar's config file. Drives marker-presence
     /// walker dispatch in `crate::hooks::has_aoe_marker`.
     pub format: SidecarFormat,
+    /// Default hook events and statuses for this sidecar format.
+    pub events: &'static [SidecarHookEvent],
 }
 
 /// How to install status hooks into a user-selected named agent, for CLIs
@@ -282,43 +334,43 @@ const CLAUDE_HOOK_EVENTS: &[HookEvent] = &[
     HookEvent {
         name: "PreToolUse",
         matcher: None,
-        status: Some("running"),
+        status: Some(HookStatus::Running),
         session_id_capture: false,
     },
     HookEvent {
         name: "UserPromptSubmit",
         matcher: None,
-        status: Some("running"),
+        status: Some(HookStatus::Running),
         session_id_capture: true,
     },
     HookEvent {
         name: "Stop",
         matcher: None,
-        status: Some("idle"),
+        status: Some(HookStatus::Idle),
         session_id_capture: false,
     },
     HookEvent {
         name: "StopFailure",
         matcher: None,
-        status: Some("idle"),
+        status: Some(HookStatus::Idle),
         session_id_capture: false,
     },
     HookEvent {
         name: "Notification",
         matcher: Some("permission_prompt|elicitation_dialog"),
-        status: Some("waiting"),
+        status: Some(HookStatus::Waiting),
         session_id_capture: false,
     },
     HookEvent {
         name: "Notification",
         matcher: Some("idle_prompt"),
-        status: Some("idle"),
+        status: Some(HookStatus::Idle),
         session_id_capture: false,
     },
     HookEvent {
         name: "ElicitationResult",
         matcher: None,
-        status: Some("running"),
+        status: Some(HookStatus::Running),
         session_id_capture: false,
     },
 ];
@@ -331,31 +383,31 @@ const CURSOR_HOOK_EVENTS: &[HookEvent] = &[
     HookEvent {
         name: "PreToolUse",
         matcher: None,
-        status: Some("running"),
+        status: Some(HookStatus::Running),
         session_id_capture: false,
     },
     HookEvent {
         name: "UserPromptSubmit",
         matcher: None,
-        status: Some("running"),
+        status: Some(HookStatus::Running),
         session_id_capture: false,
     },
     HookEvent {
         name: "Stop",
         matcher: None,
-        status: Some("idle"),
+        status: Some(HookStatus::Idle),
         session_id_capture: false,
     },
     HookEvent {
         name: "Notification",
         matcher: Some("permission_prompt|elicitation_dialog"),
-        status: Some("waiting"),
+        status: Some(HookStatus::Waiting),
         session_id_capture: false,
     },
     HookEvent {
         name: "ElicitationResult",
         matcher: None,
-        status: Some("running"),
+        status: Some(HookStatus::Running),
         session_id_capture: false,
     },
 ];
@@ -368,31 +420,31 @@ const QWEN_HOOK_EVENTS: &[HookEvent] = &[
     HookEvent {
         name: "PreToolUse",
         matcher: None,
-        status: Some("running"),
+        status: Some(HookStatus::Running),
         session_id_capture: false,
     },
     HookEvent {
         name: "UserPromptSubmit",
         matcher: None,
-        status: Some("running"),
+        status: Some(HookStatus::Running),
         session_id_capture: false,
     },
     HookEvent {
         name: "PostToolUse",
         matcher: None,
-        status: Some("running"),
+        status: Some(HookStatus::Running),
         session_id_capture: false,
     },
     HookEvent {
         name: "Stop",
         matcher: None,
-        status: Some("idle"),
+        status: Some(HookStatus::Idle),
         session_id_capture: false,
     },
     HookEvent {
         name: "Notification",
         matcher: Some("permission_prompt|elicitation_dialog"),
-        status: Some("waiting"),
+        status: Some(HookStatus::Waiting),
         session_id_capture: false,
     },
 ];
@@ -402,38 +454,95 @@ const CODEX_HOOK_EVENTS: &[HookEvent] = &[
     HookEvent {
         name: "SessionStart",
         matcher: None,
-        status: Some("idle"),
+        status: Some(HookStatus::Idle),
         session_id_capture: false,
     },
     HookEvent {
         name: "UserPromptSubmit",
         matcher: None,
-        status: Some("running"),
+        status: Some(HookStatus::Running),
         session_id_capture: false,
     },
     HookEvent {
         name: "PreToolUse",
         matcher: None,
-        status: Some("running"),
+        status: Some(HookStatus::Running),
         session_id_capture: false,
     },
     HookEvent {
         name: "PermissionRequest",
         matcher: None,
-        status: Some("waiting"),
+        status: Some(HookStatus::Waiting),
         session_id_capture: false,
     },
     HookEvent {
         name: "PostToolUse",
         matcher: None,
-        status: Some("running"),
+        status: Some(HookStatus::Running),
         session_id_capture: false,
     },
     HookEvent {
         name: "Stop",
         matcher: None,
-        status: Some("idle"),
+        status: Some(HookStatus::Idle),
         session_id_capture: false,
+    },
+];
+
+pub(crate) const SETTL_SIDECAR_EVENTS: &[SidecarHookEvent] = &[
+    SidecarHookEvent {
+        name: "TurnStarted",
+        status: HookStatus::Running,
+    },
+    SidecarHookEvent {
+        name: "WaitingForHuman",
+        status: HookStatus::Waiting,
+    },
+    SidecarHookEvent {
+        name: "GameWon",
+        status: HookStatus::Idle,
+    },
+];
+
+pub(crate) const HERMES_SIDECAR_EVENTS: &[SidecarHookEvent] = &[
+    SidecarHookEvent {
+        name: "pre_llm_call",
+        status: HookStatus::Running,
+    },
+    SidecarHookEvent {
+        name: "pre_tool_call",
+        status: HookStatus::Running,
+    },
+    SidecarHookEvent {
+        name: "post_llm_call",
+        status: HookStatus::Idle,
+    },
+    SidecarHookEvent {
+        name: "pre_approval_request",
+        status: HookStatus::Waiting,
+    },
+    SidecarHookEvent {
+        name: "post_approval_response",
+        status: HookStatus::Running,
+    },
+    SidecarHookEvent {
+        name: "on_session_end",
+        status: HookStatus::Idle,
+    },
+];
+
+pub(crate) const KIRO_SIDECAR_EVENTS: &[SidecarHookEvent] = &[
+    SidecarHookEvent {
+        name: "preToolUse",
+        status: HookStatus::Running,
+    },
+    SidecarHookEvent {
+        name: "userPromptSubmit",
+        status: HookStatus::Running,
+    },
+    SidecarHookEvent {
+        name: "stop",
+        status: HookStatus::Idle,
     },
 ];
 
@@ -557,25 +666,25 @@ pub const AGENTS: &[AgentDef] = &[
                 HookEvent {
                     name: "BeforeTool",
                     matcher: None,
-                    status: Some("running"),
+                    status: Some(HookStatus::Running),
                     session_id_capture: false,
                 },
                 HookEvent {
                     name: "BeforeAgent",
                     matcher: None,
-                    status: Some("running"),
+                    status: Some(HookStatus::Running),
                     session_id_capture: false,
                 },
                 HookEvent {
                     name: "AfterAgent",
                     matcher: None,
-                    status: Some("idle"),
+                    status: Some(HookStatus::Idle),
                     session_id_capture: false,
                 },
                 HookEvent {
                     name: "Notification",
                     matcher: Some("ToolPermission"),
-                    status: Some("waiting"),
+                    status: Some(HookStatus::Waiting),
                     session_id_capture: false,
                 },
             ],
@@ -699,11 +808,12 @@ pub const AGENTS: &[AgentDef] = &[
         sidecar_hooks: Some(SidecarHooks {
             host_config_subpath: ".settl/config.toml",
             sandbox_config_subpath: "",
-            install: crate::hooks::install_settl_hooks,
+            install: crate::hooks::install_settl_hooks_with_events,
             uninstall: crate::hooks::uninstall_settl_hooks,
             post_install_host: None,
             selected_agent_hooks: None,
             format: SidecarFormat::SettlToml,
+            events: SETTL_SIDECAR_EVENTS,
         }),
         resume_strategy: ResumeStrategy::Unsupported,
         fork_strategy: ForkStrategy::Unsupported,
@@ -736,11 +846,12 @@ pub const AGENTS: &[AgentDef] = &[
         sidecar_hooks: Some(SidecarHooks {
             host_config_subpath: ".hermes/config.yaml",
             sandbox_config_subpath: ".hermes/sandbox/config.yaml",
-            install: crate::hooks::install_hermes_hooks,
+            install: crate::hooks::install_hermes_hooks_with_events,
             uninstall: crate::hooks::uninstall_hermes_hooks,
             post_install_host: None,
             selected_agent_hooks: None,
             format: SidecarFormat::HermesYaml,
+            events: HERMES_SIDECAR_EVENTS,
         }),
         resume_strategy: ResumeStrategy::Flag("--resume"),
         fork_strategy: ForkStrategy::Unsupported,
@@ -774,7 +885,7 @@ pub const AGENTS: &[AgentDef] = &[
         sidecar_hooks: Some(SidecarHooks {
             host_config_subpath: crate::hooks::KIRO_HOOKS_AGENT_FILE,
             sandbox_config_subpath: ".kiro/sandbox/agents/aoe-hooks.json",
-            install: crate::hooks::install_kiro_hooks,
+            install: crate::hooks::install_kiro_hooks_with_events,
             uninstall: crate::hooks::uninstall_kiro_hooks,
             post_install_host: Some(crate::hooks::set_kiro_default_agent_if_builtin),
             // Kiro scopes hooks to the agent selected by `--agent`; when the
@@ -786,6 +897,7 @@ pub const AGENTS: &[AgentDef] = &[
                 resolve_config_file: crate::hooks::resolve_kiro_agent_file,
             }),
             format: SidecarFormat::KiroJson,
+            events: KIRO_SIDECAR_EVENTS,
         }),
         resume_strategy: ResumeStrategy::Flag("--resume-id"),
         fork_strategy: ForkStrategy::Unsupported,
@@ -892,6 +1004,132 @@ impl AgentDef {
 
 pub fn get_agent(name: &str) -> Option<&'static AgentDef> {
     AGENTS.iter().find(|a| a.name == name)
+}
+
+fn configured_status_map<'a>(
+    config: &'a crate::session::config::Config,
+    agent_name: &str,
+) -> Option<&'a BTreeMap<String, HookStatus>> {
+    config
+        .agents
+        .get(agent_name)
+        .map(|agent| &agent.status_map)
+        .filter(|status_map| !status_map.is_empty())
+}
+
+fn default_status_map_for_agent(agent: &AgentDef) -> BTreeMap<String, HookStatus> {
+    let mut map = BTreeMap::new();
+    if let Some(hook_cfg) = &agent.hook_config {
+        for event in hook_cfg.events {
+            if let Some(status) = event.status {
+                map.entry(event.name.to_string()).or_insert(status);
+            }
+        }
+    }
+    if let Some(sidecar) = &agent.sidecar_hooks {
+        for event in sidecar.events {
+            map.entry(event.name.to_string()).or_insert(event.status);
+        }
+    }
+    map
+}
+
+pub fn effective_status_map(
+    config: &crate::session::config::Config,
+    agent_name: &str,
+) -> anyhow::Result<BTreeMap<String, HookStatus>> {
+    let overrides = configured_status_map(config, agent_name);
+    let Some(agent) = get_agent(agent_name) else {
+        if let Some(map) = overrides {
+            return Ok(map.clone());
+        }
+        anyhow::bail!(
+            "unknown agent '{}' has no configured status_map",
+            agent_name
+        );
+    };
+
+    let mut map = default_status_map_for_agent(agent);
+    if let Some(overrides) = overrides {
+        for (event, status) in overrides {
+            map.insert(event.clone(), *status);
+        }
+    }
+
+    if map.is_empty() {
+        anyhow::bail!("agent '{}' does not declare status hooks", agent.name);
+    }
+    Ok(map)
+}
+
+fn append_configured_status_events(
+    events: &mut Vec<ResolvedHookEvent>,
+    overrides: Option<&BTreeMap<String, HookStatus>>,
+) {
+    let Some(overrides) = overrides else {
+        return;
+    };
+    let mut existing: BTreeSet<String> = events.iter().map(|event| event.name.clone()).collect();
+    for (name, status) in overrides {
+        if existing.insert(name.clone()) {
+            events.push(ResolvedHookEvent {
+                name: name.clone(),
+                matcher: None,
+                status: Some(*status),
+                session_id_capture: false,
+            });
+        }
+    }
+}
+
+pub fn resolved_hook_events(
+    agent: &AgentDef,
+    config: &crate::session::config::Config,
+) -> anyhow::Result<Vec<ResolvedHookEvent>> {
+    let Some(hook_cfg) = &agent.hook_config else {
+        return Ok(Vec::new());
+    };
+    let overrides = configured_status_map(config, agent.name);
+    let mut events = hook_cfg
+        .events
+        .iter()
+        .map(|event| ResolvedHookEvent {
+            name: event.name.to_string(),
+            matcher: event.matcher.map(str::to_string),
+            status: overrides
+                .and_then(|map| map.get(event.name).copied())
+                .or(event.status),
+            session_id_capture: event.session_id_capture,
+        })
+        .collect();
+    append_configured_status_events(&mut events, overrides);
+    Ok(events)
+}
+
+pub fn resolved_sidecar_hook_events(
+    agent: &AgentDef,
+    config: &crate::session::config::Config,
+) -> anyhow::Result<Vec<ResolvedHookEvent>> {
+    let Some(sidecar) = &agent.sidecar_hooks else {
+        return Ok(Vec::new());
+    };
+    let overrides = configured_status_map(config, agent.name);
+    let mut events = sidecar
+        .events
+        .iter()
+        .map(|event| ResolvedHookEvent {
+            name: event.name.to_string(),
+            matcher: None,
+            status: Some(
+                overrides
+                    .and_then(|map| map.get(event.name).copied())
+                    .unwrap_or(event.status),
+            ),
+            session_id_capture: false,
+        })
+        .collect();
+    append_configured_status_events(&mut events, overrides);
+    Ok(events)
 }
 
 /// Extract the agent name a user selected via `<flag> NAME` or `<flag>=NAME`
@@ -1114,6 +1352,83 @@ mod tests {
     #[test]
     fn test_get_agent_unknown() {
         assert!(get_agent("unknown").is_none());
+    }
+
+    #[test]
+    fn effective_status_map_merges_configured_override() {
+        let mut config = crate::session::config::Config::default();
+        config
+            .agents
+            .entry("claude".to_string())
+            .or_default()
+            .status_map
+            .insert("Stop".to_string(), HookStatus::Error);
+
+        let map = effective_status_map(&config, "claude").unwrap();
+        assert_eq!(map.get("PreToolUse"), Some(&HookStatus::Running));
+        assert_eq!(map.get("Stop"), Some(&HookStatus::Error));
+        assert_eq!(map.get("Notification"), Some(&HookStatus::Waiting));
+    }
+
+    #[test]
+    fn resolved_hook_events_apply_duplicate_event_override() {
+        let mut config = crate::session::config::Config::default();
+        config
+            .agents
+            .entry("claude".to_string())
+            .or_default()
+            .status_map
+            .insert("Notification".to_string(), HookStatus::Running);
+
+        let agent = get_agent("claude").unwrap();
+        let events = resolved_hook_events(agent, &config).unwrap();
+        let notification_statuses: Vec<HookStatus> = events
+            .iter()
+            .filter(|event| event.name == "Notification")
+            .filter_map(|event| event.status)
+            .collect();
+        assert_eq!(
+            notification_statuses,
+            vec![HookStatus::Running, HookStatus::Running]
+        );
+    }
+
+    #[test]
+    fn status_map_adds_configured_event_for_known_agent() {
+        let mut config = crate::session::config::Config::default();
+        config
+            .agents
+            .entry("claude".to_string())
+            .or_default()
+            .status_map
+            .insert("PreCompact".to_string(), HookStatus::Running);
+
+        let map = effective_status_map(&config, "claude").unwrap();
+        assert_eq!(map.get("PreCompact"), Some(&HookStatus::Running));
+
+        let agent = get_agent("claude").unwrap();
+        let events = resolved_hook_events(agent, &config).unwrap();
+        let custom = events
+            .iter()
+            .find(|event| event.name == "PreCompact")
+            .expect("custom event should be appended");
+        assert_eq!(custom.status, Some(HookStatus::Running));
+        assert!(custom.matcher.is_none());
+        assert!(!custom.session_id_capture);
+    }
+
+    #[test]
+    fn configured_unknown_agent_status_map_is_queryable() {
+        let mut config = crate::session::config::Config::default();
+        config
+            .agents
+            .entry("vertex".to_string())
+            .or_default()
+            .status_map
+            .insert("session.idle".to_string(), HookStatus::Idle);
+
+        let map = effective_status_map(&config, "vertex").unwrap();
+        assert_eq!(map.get("session.idle"), Some(&HookStatus::Idle));
     }
 
     #[test]

@@ -161,19 +161,19 @@ fn rewrite_one(target: &HookTarget) -> Result<()> {
     }
     match target.kind {
         HookTargetKind::JsonSettings | HookTargetKind::CodexJson => {
-            install_hooks(&target.path, target.events, HookInstallTarget::Host)
+            install_hooks(&target.path, &target.events, HookInstallTarget::Host)
         }
         HookTargetKind::CodexToml => {
             let preserved = snapshot_codex_hooks_state(&target.path)?;
             install_codex_hooks_with_preserved_state(
                 &target.path,
-                target.events,
+                &target.events,
                 preserved,
                 HookInstallTarget::Host,
             )
         }
         HookTargetKind::Sidecar(sidecar) => {
-            (sidecar.install)(&target.path, HookInstallTarget::Host)
+            (sidecar.install)(&target.path, HookInstallTarget::Host, &target.events)
         }
     }
 }

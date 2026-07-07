@@ -5,7 +5,7 @@ use super::repo_config::{HooksConfig, HostHooksConfig};
 use anyhow::Result;
 use aoe_settings_derive::SettingsSection;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::PathBuf;
 
@@ -67,6 +67,11 @@ pub struct Config {
     #[serde(default)]
     pub logging: LoggingConfig,
 
+    /// Trusted global/profile agent runtime overrides. Repo config does not
+    /// merge this section, because hook installation writes durable agent files.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub agents: BTreeMap<String, AgentRuntimeConfig>,
+
     /// Environment variables injected into the host command line for every
     /// session spawned at global scope. Entries are `KEY=value`, `KEY=$VAR`
     /// (read VAR from the host env), `KEY=$$literal` (escape a `$`), or
@@ -94,6 +99,14 @@ pub struct Config {
     /// keys still fail loudly while plugin enable-state survives every save.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub plugins: std::collections::BTreeMap<String, PluginConfig>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentRuntimeConfig {
+    /// Per-agent hook event to AoE status mapping. Overrides built-in hook
+    /// defaults by event name when status hooks are installed.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub status_map: BTreeMap<String, crate::agents::HookStatus>,
 }
 
 /// Configuration for one plugin: whether it is enabled, its install source and
@@ -3292,6 +3305,38 @@ mod tests {
             }),
             "acp_defaults should survive roundtrip"
         );
+    }
+
+    #[test]
+    fn agent_status_map_roundtrips() {
+        let mut config = Config::default();
+        config
+            .agents
+            .entry("claude".to_string())
+            .or_default()
+            .status_map
+            .insert("Stop".to_string(), crate::agents::HookStatus::Error);
+
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        assert!(serialized.contains("[agents.claude.status_map]"));
+        assert!(serialized.contains("Stop = \"error\""));
+
+        let deserialized: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(
+            deserialized.agents["claude"].status_map.get("Stop"),
+            Some(&crate::agents::HookStatus::Error)
+        );
+    }
+
+    #[test]
+    fn agent_status_map_rejects_invalid_status() {
+        let toml = r#"
+            [agents.claude.status_map]
+            Stop = "stopped"
+        "#;
+
+        let err = toml::from_str::<Config>(toml).unwrap_err();
+        assert!(err.to_string().contains("stopped"));
     }
 
     #[test]

@@ -111,14 +111,14 @@ pub(crate) fn run_in(home: &Path, app_dir: &Path) -> Result<()> {
         // Synthetic CodexToml target: the live enumerator does not produce
         // this kind for any registered agent, so v018 builds the marker-gate
         // fixture itself rather than mining `iter_hook_targets_in` for a
-        // variant only this migration constructs. `events: &[]` because
+        // variant only this migration constructs. `events: Vec::new()` because
         // the only consumer here is `has_aoe_marker` (bytes-only marker
         // scan); `uninstall_codex_hooks` reads the file separately.
         let target = HookTarget {
             agent_name: "codex",
             kind: HookTargetKind::CodexToml,
             path: path.clone(),
-            events: &[],
+            events: Vec::new(),
         };
         if !has_aoe_marker(&target) {
             continue;

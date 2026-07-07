@@ -155,7 +155,7 @@ pub(crate) fn run_in(home: &Path, app_dir: &Path) -> Result<()> {
 fn rewrite_one(target: &HookTarget) -> Result<()> {
     match target.kind {
         HookTargetKind::JsonSettings | HookTargetKind::CodexJson => {
-            install_hooks(&target.path, target.events, HookInstallTarget::Host)
+            install_hooks(&target.path, &target.events, HookInstallTarget::Host)
         }
         // Defensive: `iter_hook_targets_in` does not emit `CodexToml` for
         // any registered agent (codex declares `CodexJson`). The arm stays
@@ -165,7 +165,7 @@ fn rewrite_one(target: &HookTarget) -> Result<()> {
             let preserved = snapshot_codex_hooks_state(&target.path)?;
             install_codex_hooks_with_preserved_state(
                 &target.path,
-                target.events,
+                &target.events,
                 preserved,
                 HookInstallTarget::Host,
             )
@@ -175,7 +175,7 @@ fn rewrite_one(target: &HookTarget) -> Result<()> {
             // Kiro's `set_kiro_default_agent_if_builtin` shells out to
             // `kiro-cli`, which is launcher-state mutation, not file-content
             // reconciliation.
-            (sidecar.install)(&target.path, HookInstallTarget::Host)
+            (sidecar.install)(&target.path, HookInstallTarget::Host, &target.events)
         }
     }
 }
@@ -334,8 +334,10 @@ mod tests {
                                 .push(canonical_session_id_command(HookInstallTarget::Host));
                         }
                         if let Some(status) = event_def.status {
-                            canonical_set
-                                .push(canonical_status_command(status, HookInstallTarget::Host));
+                            canonical_set.push(canonical_status_command(
+                                status.as_str(),
+                                HookInstallTarget::Host,
+                            ));
                         }
                     }
                     assert!(

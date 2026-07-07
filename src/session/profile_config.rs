@@ -312,6 +312,38 @@ mod tests {
     }
 
     #[test]
+    fn test_merge_configs_with_agent_status_map_overrides() {
+        let mut global = Config::default();
+        global
+            .agents
+            .entry("claude".to_string())
+            .or_default()
+            .status_map
+            .insert("Stop".to_string(), crate::agents::HookStatus::Idle);
+        global
+            .agents
+            .entry("claude".to_string())
+            .or_default()
+            .status_map
+            .insert("PreToolUse".to_string(), crate::agents::HookStatus::Running);
+
+        let profile = profile_from(json!({
+            "agents": {"claude": {"status_map": {"Stop": "error"}}}
+        }));
+
+        let merged = merge_configs(global, &profile);
+        let status_map = &merged.agents["claude"].status_map;
+        assert_eq!(
+            status_map.get("PreToolUse"),
+            Some(&crate::agents::HookStatus::Running)
+        );
+        assert_eq!(
+            status_map.get("Stop"),
+            Some(&crate::agents::HookStatus::Error)
+        );
+    }
+
+    #[test]
     fn test_profile_has_overrides() {
         let empty = ProfileConfig::default();
         assert!(!profile_has_overrides(&empty));

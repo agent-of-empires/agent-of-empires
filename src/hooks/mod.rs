@@ -456,23 +456,26 @@ pub(super) fn is_aoe_hook_command(cmd: &str) -> bool {
 /// `idle_prompt` → idle). Each becomes its own matcher block appended to that
 /// event name's array, so they coexist instead of the later one clobbering the
 /// earlier.
-fn build_aoe_hooks(events: &[crate::agents::HookEvent], target: HookInstallTarget) -> Value {
+fn build_aoe_hooks(
+    events: impl AsRef<[crate::agents::ResolvedHookEvent]>,
+    target: HookInstallTarget,
+) -> Value {
     let mut hooks_obj = serde_json::Map::new();
-    for event in events {
+    for event in events.as_ref() {
         let mut commands: Vec<String> = Vec::new();
         if event.session_id_capture {
             commands.push(hook_command_session_id(target));
         }
         if let Some(status) = event.status {
-            commands.push(hook_command(status, target));
+            commands.push(hook_command(status.as_str(), target));
         }
         if commands.is_empty() {
             continue;
         }
 
         let mut entry = serde_json::Map::new();
-        if let Some(m) = event.matcher {
-            entry.insert("matcher".to_string(), Value::String(m.to_string()));
+        if let Some(m) = &event.matcher {
+            entry.insert("matcher".to_string(), Value::String(m.clone()));
         }
         let hook_entries: Vec<Value> = commands
             .into_iter()
@@ -485,7 +488,7 @@ fn build_aoe_hooks(events: &[crate::agents::HookEvent], target: HookInstallTarge
             .collect();
         entry.insert("hooks".to_string(), Value::Array(hook_entries));
         match hooks_obj
-            .entry(event.name.to_string())
+            .entry(event.name.clone())
             .or_insert_with(|| Value::Array(Vec::new()))
         {
             Value::Array(groups) => groups.push(Value::Object(entry)),
@@ -530,7 +533,7 @@ fn remove_aoe_entries(matchers: &mut Vec<Value>) {
 /// If the file doesn't exist, it will be created with just the hooks.
 pub fn install_hooks(
     settings_path: &Path,
-    events: &[crate::agents::HookEvent],
+    events: impl AsRef<[crate::agents::ResolvedHookEvent]>,
     target: HookInstallTarget,
 ) -> Result<()> {
     with_config_lock(settings_path, "json.lock", || {
@@ -546,7 +549,7 @@ pub fn install_hooks(
 
         let before = settings.clone();
 
-        let aoe_hooks = build_aoe_hooks(events, target);
+        let aoe_hooks = build_aoe_hooks(events.as_ref(), target);
 
         if !settings.get("hooks").is_some_and(|h| h.is_object()) {
             settings
@@ -563,13 +566,25 @@ pub fn install_hooks(
         let aoe_hooks_obj = aoe_hooks
             .as_object()
             .ok_or_else(|| anyhow::anyhow!("Internal error: built hooks is not a JSON object"))?;
+        let empty_events: Vec<String> = settings_hooks
+            .iter_mut()
+            .filter_map(|(event_name, existing)| {
+                let arr = existing.as_array_mut()?;
+                remove_aoe_entries(arr);
+                arr.is_empty().then(|| event_name.clone())
+            })
+            .collect();
+        for event_name in empty_events {
+            settings_hooks.remove(&event_name);
+        }
+
         for (event_name, aoe_matchers) in aoe_hooks_obj {
-            if let Some(existing) = settings_hooks.get_mut(event_name) {
-                if let Some(arr) = existing.as_array_mut() {
-                    remove_aoe_entries(arr);
-                    if let Some(new_arr) = aoe_matchers.as_array() {
-                        arr.extend(new_arr.iter().cloned());
-                    }
+            if let Some(existing) = settings_hooks
+                .get_mut(event_name)
+                .and_then(|existing| existing.as_array_mut())
+            {
+                if let Some(new_arr) = aoe_matchers.as_array() {
+                    existing.extend(new_arr.iter().cloned());
                 }
             } else {
                 settings_hooks.insert(event_name.clone(), aoe_matchers.clone());
@@ -616,7 +631,7 @@ pub(super) const CODEX_HOOK_EVENT_NAMES: &[&str] = &[
 #[cfg(test)]
 pub(crate) fn install_codex_hooks(
     config_path: &Path,
-    events: &[crate::agents::HookEvent],
+    events: impl AsRef<[crate::agents::ResolvedHookEvent]>,
     target: HookInstallTarget,
 ) -> Result<()> {
     install_codex_hooks_with_preserved_state(config_path, events, None, target)
@@ -660,7 +675,7 @@ pub(crate) fn restore_codex_hooks_state(config_path: &Path, state: toml_edit::It
 
 pub(crate) fn install_codex_hooks_with_preserved_state(
     config_path: &Path,
-    events: &[crate::agents::HookEvent],
+    events: impl AsRef<[crate::agents::ResolvedHookEvent]>,
     preserved_state: Option<toml_edit::Item>,
     target: HookInstallTarget,
 ) -> Result<()> {
@@ -679,7 +694,7 @@ pub(crate) fn install_codex_hooks_with_preserved_state(
             }
         }
         remove_codex_aoe_hooks(&mut config)?;
-        merge_codex_hooks(&mut config, events, target)?;
+        merge_codex_hooks(&mut config, events.as_ref(), target)?;
 
         if config.to_string() == before {
             tracing::debug!(target: "hooks.install",
@@ -821,7 +836,7 @@ fn ensure_codex_event_array<'a>(
 
 fn merge_codex_hooks(
     config: &mut toml_edit::DocumentMut,
-    events: &[crate::agents::HookEvent],
+    events: &[crate::agents::ResolvedHookEvent],
     target: HookInstallTarget,
 ) -> Result<()> {
     let hooks = ensure_codex_hooks_table(config)?;
@@ -831,7 +846,7 @@ fn merge_codex_hooks(
             continue;
         };
 
-        let event_array = ensure_codex_event_array(hooks, event.name)?;
+        let event_array = ensure_codex_event_array(hooks, &event.name)?;
         event_array.push(codex_matcher_group(event, status, target));
     }
 
@@ -839,18 +854,21 @@ fn merge_codex_hooks(
 }
 
 fn codex_matcher_group(
-    event: &crate::agents::HookEvent,
-    status: &str,
+    event: &crate::agents::ResolvedHookEvent,
+    status: crate::agents::HookStatus,
     target: HookInstallTarget,
 ) -> toml_edit::Table {
     let mut group = toml_edit::Table::new();
-    if let Some(matcher) = event.matcher {
-        group.insert("matcher", toml_edit::value(matcher));
+    if let Some(matcher) = &event.matcher {
+        group.insert("matcher", toml_edit::value(matcher.as_str()));
     }
 
     let mut handler = toml_edit::Table::new();
     handler.insert("type", toml_edit::value("command"));
-    handler.insert("command", toml_edit::value(hook_command(status, target)));
+    handler.insert(
+        "command",
+        toml_edit::value(hook_command(status.as_str(), target)),
+    );
 
     let mut handlers = toml_edit::ArrayOfTables::new();
     handlers.push(handler);
@@ -1059,12 +1077,11 @@ pub fn uninstall_hooks(settings_path: &Path) -> Result<bool> {
     })
 }
 
-/// settl hook events and the AoE status they map to.
-const SETTL_HOOKS: &[(&str, &str)] = &[
-    ("TurnStarted", "running"),
-    ("WaitingForHuman", "waiting"),
-    ("GameWon", "idle"),
-];
+fn default_sidecar_events(agent_name: &str) -> Vec<crate::agents::ResolvedHookEvent> {
+    let agent = crate::agents::get_agent(agent_name).expect("sidecar agent is registered");
+    crate::agents::resolved_sidecar_hook_events(agent, &crate::session::config::Config::default())
+        .expect("default sidecar hook events resolve")
+}
 
 /// Install AoE status hooks into a settl TOML config file (typically
 /// `~/.settl/config.toml`).
@@ -1078,6 +1095,15 @@ const SETTL_HOOKS: &[(&str, &str)] = &[
 /// Idempotent on disk: when the on-disk file already encodes the same
 /// AoE-managed hook subtree, it is not rewritten (same inode, same bytes).
 pub fn install_settl_hooks(config_path: &Path, target: HookInstallTarget) -> Result<()> {
+    let events = default_sidecar_events("settl");
+    install_settl_hooks_with_events(config_path, target, &events)
+}
+
+pub fn install_settl_hooks_with_events(
+    config_path: &Path,
+    target: HookInstallTarget,
+    events: &[crate::agents::ResolvedHookEvent],
+) -> Result<()> {
     with_config_lock(config_path, "toml.lock", || {
         let mut config: toml::Value = if config_path.exists() {
             let content = std::fs::read_to_string(config_path)?;
@@ -1109,12 +1135,15 @@ pub fn install_settl_hooks(config_path: &Path, target: HookInstallTarget) -> Res
                 .is_some_and(is_aoe_hook_command)
         });
 
-        for (event, status) in SETTL_HOOKS {
+        for event in events {
+            let Some(status) = event.status else {
+                continue;
+            };
             let mut entry = toml::map::Map::new();
-            entry.insert("event".into(), toml::Value::String((*event).into()));
+            entry.insert("event".into(), toml::Value::String(event.name.clone()));
             entry.insert(
                 "command".into(),
-                toml::Value::String(hook_command(status, target)),
+                toml::Value::String(hook_command(status.as_str(), target)),
             );
             hooks_arr.push(toml::Value::Table(entry));
         }
@@ -1174,18 +1203,6 @@ pub fn uninstall_settl_hooks(config_path: &Path) -> Result<bool> {
     })
 }
 
-/// Hermes hook events and the AoE status they map to. Hermes uses an
-/// event-keyed YAML schema (`hooks: { event_name: [ {command, ...} ] }`),
-/// not the flat array settl uses.
-const HERMES_HOOKS: &[(&str, &str)] = &[
-    ("pre_llm_call", "running"),
-    ("pre_tool_call", "running"),
-    ("post_llm_call", "idle"),
-    ("pre_approval_request", "waiting"),
-    ("post_approval_response", "running"),
-    ("on_session_end", "idle"),
-];
-
 /// Install AoE status hooks into Hermes's `config.yaml`.
 ///
 /// Reads the existing YAML, removes any prior AoE-managed hook entries
@@ -1207,6 +1224,15 @@ const HERMES_HOOKS: &[(&str, &str)] = &[
 /// Idempotent on disk: when the YAML config and the allowlist already
 /// encode the same AoE state, neither is rewritten (same inode, same bytes).
 pub fn install_hermes_hooks(config_path: &Path, target: HookInstallTarget) -> Result<()> {
+    let events = default_sidecar_events("hermes");
+    install_hermes_hooks_with_events(config_path, target, &events)
+}
+
+pub fn install_hermes_hooks_with_events(
+    config_path: &Path,
+    target: HookInstallTarget,
+    events: &[crate::agents::ResolvedHookEvent],
+) -> Result<()> {
     with_config_lock(config_path, "yaml.lock", || {
         let mut config: serde_yaml::Value = if config_path.exists() {
             let content = std::fs::read_to_string(config_path)?;
@@ -1235,8 +1261,11 @@ pub fn install_hermes_hooks(config_path: &Path, target: HookInstallTarget) -> Re
         }
         let hooks_map = hooks_value.as_mapping_mut().expect("ensured mapping above");
 
-        for (event, status) in HERMES_HOOKS {
-            let event_key = serde_yaml::Value::String((*event).to_string());
+        for event in events {
+            let Some(status) = event.status else {
+                continue;
+            };
+            let event_key = serde_yaml::Value::String(event.name.clone());
             let entries = hooks_map
                 .entry(event_key)
                 .or_insert_with(|| serde_yaml::Value::Sequence(Vec::new()));
@@ -1256,7 +1285,7 @@ pub fn install_hermes_hooks(config_path: &Path, target: HookInstallTarget) -> Re
             let mut entry = serde_yaml::Mapping::new();
             entry.insert(
                 serde_yaml::Value::String("command".into()),
-                serde_yaml::Value::String(hook_command(status, target)),
+                serde_yaml::Value::String(hook_command(status.as_str(), target)),
             );
             arr.push(serde_yaml::Value::Mapping(entry));
         }
@@ -1266,7 +1295,8 @@ pub fn install_hermes_hooks(config_path: &Path, target: HookInstallTarget) -> Re
         let config_dir = config_path
             .parent()
             .ok_or_else(|| anyhow::anyhow!("config path has no parent"))?;
-        let (allowlist_path, allowlist_formatted) = render_hermes_allowlist(config_dir, target)?;
+        let (allowlist_path, allowlist_formatted) =
+            render_hermes_allowlist(config_dir, target, events)?;
         // Byte-compare (vs the structural YAML compare above) is sound:
         // render_hermes_allowlist preserves approved_at on (event, command)
         // collision and serde_json::to_string_pretty is deterministic, so
@@ -1389,6 +1419,7 @@ pub fn uninstall_hermes_hooks(config_path: &Path) -> Result<bool> {
 fn render_hermes_allowlist(
     config_dir: &Path,
     target: HookInstallTarget,
+    events: &[crate::agents::ResolvedHookEvent],
 ) -> Result<(std::path::PathBuf, String)> {
     let allowlist_path = config_dir.join("shell-hooks-allowlist.json");
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
@@ -1410,14 +1441,17 @@ fn render_hermes_allowlist(
         })
         .ok_or_else(|| anyhow::anyhow!("allowlist root is not a JSON object with approvals[]"))?;
 
-    for (event, status) in HERMES_HOOKS {
-        let cmd = hook_command(status, target);
+    for event in events {
+        let Some(status) = event.status else {
+            continue;
+        };
+        let cmd = hook_command(status.as_str(), target);
         // Preserve the original `approved_at` when an entry with the same
         // (event, command) already exists; only fresh entries get `now`.
         // A `null` value is preserved verbatim: the field records
         // first-approval time, so a null stays a null on re-render.
         let preserved = approvals.iter().find_map(|entry| {
-            let same = entry.get("event").and_then(|v| v.as_str()) == Some(*event)
+            let same = entry.get("event").and_then(|v| v.as_str()) == Some(event.name.as_str())
                 && entry.get("command").and_then(|v| v.as_str()) == Some(&cmd);
             if same {
                 entry.get("approved_at").cloned()
@@ -1426,11 +1460,11 @@ fn render_hermes_allowlist(
             }
         });
         approvals.retain(|entry| {
-            !(entry.get("event").and_then(|v| v.as_str()) == Some(*event)
+            !(entry.get("event").and_then(|v| v.as_str()) == Some(event.name.as_str())
                 && entry.get("command").and_then(|v| v.as_str()) == Some(&cmd))
         });
         approvals.push(serde_json::json!({
-            "event": *event,
+            "event": event.name,
             "command": cmd,
             "approved_at": preserved.unwrap_or_else(|| Value::String(now.clone())),
             "script_mtime_at_approval": Value::Null,
@@ -1440,14 +1474,6 @@ fn render_hermes_allowlist(
     let formatted = serde_json::to_string_pretty(&data)?;
     Ok((allowlist_path, formatted))
 }
-
-/// Kiro CLI hook events. Kiro uses lowercase camelCase event names and a flat
-/// `[{"command": "..."}]` structure in its agent config JSON.
-const KIRO_HOOKS: &[(&str, &str)] = &[
-    ("preToolUse", "running"),
-    ("userPromptSubmit", "running"),
-    ("stop", "idle"),
-];
 
 /// Single source of truth for the `aoe-hooks` Kiro agent identifier. Used
 /// both as the agent name (passed to `kiro-cli agent set-default`) and as the
@@ -1479,6 +1505,15 @@ pub const KIRO_HOOKS_AGENT_FILE: &str = concat!(".kiro/agents/", kiro_hooks_agen
 /// Idempotent on disk: when the on-disk file already encodes the same
 /// AoE-managed hook subtree, it is not rewritten (same inode, same bytes).
 pub fn install_kiro_hooks(agent_config_path: &Path, target: HookInstallTarget) -> Result<()> {
+    let events = default_sidecar_events("kiro");
+    install_kiro_hooks_with_events(agent_config_path, target, &events)
+}
+
+pub fn install_kiro_hooks_with_events(
+    agent_config_path: &Path,
+    target: HookInstallTarget,
+    events: &[crate::agents::ResolvedHookEvent],
+) -> Result<()> {
     with_config_lock(agent_config_path, "json.lock", || {
         let mut config: serde_json::Map<String, Value> = if agent_config_path.exists() {
             let content = std::fs::read_to_string(agent_config_path)?;
@@ -1506,9 +1541,12 @@ pub fn install_kiro_hooks(agent_config_path: &Path, target: HookInstallTarget) -
             .cloned()
             .unwrap_or_default();
 
-        for (event, status) in KIRO_HOOKS {
+        for event in events {
+            let Some(status) = event.status else {
+                continue;
+            };
             let entries = hooks_obj
-                .entry((*event).to_string())
+                .entry(event.name.clone())
                 .or_insert_with(|| Value::Array(Vec::new()));
             if let Some(arr) = entries.as_array_mut() {
                 arr.retain(|hook| {
@@ -1517,7 +1555,7 @@ pub fn install_kiro_hooks(agent_config_path: &Path, target: HookInstallTarget) -
                         .and_then(|c| c.as_str())
                         .is_some_and(is_aoe_hook_command)
                 });
-                arr.push(serde_json::json!({ "command": hook_command(status, target) }));
+                arr.push(serde_json::json!({ "command": hook_command(status.as_str(), target) }));
             }
         }
 
@@ -1743,19 +1781,42 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn claude_events() -> &'static [crate::agents::HookEvent] {
-        crate::agents::get_agent("claude")
+    fn claude_events() -> Vec<crate::agents::ResolvedHookEvent> {
+        let agent = crate::agents::get_agent("claude").unwrap();
+        crate::agents::resolved_hook_events(agent, &crate::session::config::Config::default())
             .unwrap()
-            .hook_config
-            .as_ref()
-            .unwrap()
-            .events
     }
 
-    fn codex_events() -> &'static [crate::agents::HookEvent] {
-        crate::agents::get_agent("codex")
+    fn codex_events() -> Vec<crate::agents::ResolvedHookEvent> {
+        let agent = crate::agents::get_agent("codex").unwrap();
+        crate::agents::resolved_hook_events(agent, &crate::session::config::Config::default())
             .unwrap()
-            .hook_config
+    }
+
+    fn resolved_events_with_override(
+        agent_name: &str,
+        event_name: &str,
+        status: crate::agents::HookStatus,
+    ) -> Vec<crate::agents::ResolvedHookEvent> {
+        let mut config = crate::session::config::Config::default();
+        config
+            .agents
+            .entry(agent_name.to_string())
+            .or_default()
+            .status_map
+            .insert(event_name.to_string(), status);
+        let agent = crate::agents::get_agent(agent_name).unwrap();
+        if agent.hook_config.is_some() {
+            crate::agents::resolved_hook_events(agent, &config).unwrap()
+        } else {
+            crate::agents::resolved_sidecar_hook_events(agent, &config).unwrap()
+        }
+    }
+
+    fn sidecar_default_events(agent_name: &str) -> &'static [crate::agents::SidecarHookEvent] {
+        crate::agents::get_agent(agent_name)
+            .unwrap()
+            .sidecar_hooks
             .as_ref()
             .unwrap()
             .events
@@ -1906,6 +1967,41 @@ mod tests {
         assert!(hooks.contains_key("Stop"));
         assert!(hooks.contains_key("Notification"));
         assert!(hooks.contains_key("ElicitationResult"));
+    }
+
+    #[test]
+    fn test_install_hooks_uses_resolved_status_override() {
+        let tmp = TempDir::new().unwrap();
+        let settings_path = tmp.path().join("settings.json");
+        let events = resolved_events_with_override(
+            "claude",
+            "PreToolUse",
+            crate::agents::HookStatus::Waiting,
+        );
+
+        install_hooks(&settings_path, &events, HookInstallTarget::Host).unwrap();
+
+        let content: Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        let cmd = content["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(cmd.contains("printf waiting"), "got command: {cmd}");
+    }
+
+    #[test]
+    fn test_install_hooks_removes_stale_custom_event() {
+        let tmp = TempDir::new().unwrap();
+        let settings_path = tmp.path().join("settings.json");
+        let custom_events =
+            resolved_events_with_override("claude", "PreCompact", crate::agents::HookStatus::Idle);
+
+        install_hooks(&settings_path, &custom_events, HookInstallTarget::Host).unwrap();
+        install_hooks(&settings_path, claude_events(), HookInstallTarget::Host).unwrap();
+
+        let content: Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert!(content["hooks"].get("PreCompact").is_none());
     }
 
     #[test]
@@ -2154,20 +2250,20 @@ mod tests {
             .unwrap()
             .as_mapping()
             .unwrap();
-        for (event, _) in HERMES_HOOKS {
+        for event in sidecar_default_events("hermes") {
             assert!(
                 hooks
-                    .get(serde_yaml::Value::String((*event).into()))
+                    .get(serde_yaml::Value::String(event.name.into()))
                     .is_some(),
                 "event {} missing on dotfile target",
-                event
+                event.name
             );
         }
         let allowlist: Value =
             serde_json::from_str(&std::fs::read_to_string(&allowlist_target).unwrap()).unwrap();
         assert_eq!(
             allowlist["approvals"].as_array().unwrap().len(),
-            HERMES_HOOKS.len()
+            sidecar_default_events("hermes").len()
         );
 
         uninstall_hermes_hooks(&config_path).unwrap();
@@ -3035,12 +3131,13 @@ command = "echo user-hook"
 
     #[test]
     fn test_settl_hook_commands_write_correct_status() {
-        for (event, expected_status) in SETTL_HOOKS {
+        for event in sidecar_default_events("settl") {
+            let expected_status = event.status.as_str();
             let cmd = hook_command(expected_status, HookInstallTarget::Host);
             assert!(
                 cmd.contains(&format!("printf {}", expected_status)),
                 "Hook for {} should write '{}': {}",
-                event,
+                event.name,
                 expected_status,
                 cmd
             );
@@ -3065,13 +3162,18 @@ command = "echo user-hook"
             .as_mapping()
             .unwrap();
 
-        for (event, _) in HERMES_HOOKS {
+        for event in sidecar_default_events("hermes") {
             let entries = hooks
-                .get(serde_yaml::Value::String((*event).into()))
-                .unwrap_or_else(|| panic!("event {} missing", event))
+                .get(serde_yaml::Value::String(event.name.into()))
+                .unwrap_or_else(|| panic!("event {} missing", event.name))
                 .as_sequence()
                 .unwrap();
-            assert_eq!(entries.len(), 1, "event {} should have one entry", event);
+            assert_eq!(
+                entries.len(),
+                1,
+                "event {} should have one entry",
+                event.name
+            );
             let cmd = entries[0]
                 .as_mapping()
                 .and_then(|m| m.get(serde_yaml::Value::String("command".into())))
@@ -3089,7 +3191,43 @@ command = "echo user-hook"
         let raw = std::fs::read_to_string(&allowlist).unwrap();
         let parsed: Value = serde_json::from_str(&raw).unwrap();
         let approvals = parsed["approvals"].as_array().unwrap();
-        assert_eq!(approvals.len(), HERMES_HOOKS.len());
+        assert_eq!(approvals.len(), sidecar_default_events("hermes").len());
+    }
+
+    #[test]
+    fn test_install_hermes_hooks_uses_resolved_status_override() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.yaml");
+        let events = resolved_events_with_override(
+            "hermes",
+            "pre_approval_request",
+            crate::agents::HookStatus::Error,
+        );
+
+        install_hermes_hooks_with_events(&config_path, HookInstallTarget::Host, &events).unwrap();
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let config: serde_yaml::Value = serde_yaml::from_str(&content).unwrap();
+        let cmd = config["hooks"]["pre_approval_request"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(cmd.contains("printf error"), "got command: {cmd}");
+
+        let allowlist: Value = serde_json::from_str(
+            &std::fs::read_to_string(tmp.path().join("shell-hooks-allowlist.json")).unwrap(),
+        )
+        .unwrap();
+        let approval_cmd = allowlist["approvals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["event"].as_str() == Some("pre_approval_request"))
+            .and_then(|entry| entry["command"].as_str())
+            .unwrap();
+        assert!(
+            approval_cmd.contains("printf error"),
+            "got command: {approval_cmd}"
+        );
     }
 
     #[test]
@@ -3183,7 +3321,7 @@ hooks_auto_accept: false
         let raw = std::fs::read_to_string(&allowlist).unwrap();
         let parsed: Value = serde_json::from_str(&raw).unwrap();
         let approvals = parsed["approvals"].as_array().unwrap();
-        assert_eq!(approvals.len(), HERMES_HOOKS.len());
+        assert_eq!(approvals.len(), sidecar_default_events("hermes").len());
     }
 
     #[test]
@@ -3219,12 +3357,13 @@ hooks_auto_accept: false
 
     #[test]
     fn test_hermes_hook_commands_write_correct_status() {
-        for (event, expected_status) in HERMES_HOOKS {
+        for event in sidecar_default_events("hermes") {
+            let expected_status = event.status.as_str();
             let cmd = hook_command(expected_status, HookInstallTarget::Host);
             assert!(
                 cmd.contains(&format!("printf {}", expected_status)),
                 "Hook for {} should write '{}': {}",
-                event,
+                event.name,
                 expected_status,
                 cmd
             );
@@ -3234,10 +3373,10 @@ hooks_auto_accept: false
 
     #[test]
     fn test_hermes_approval_request_writes_waiting() {
-        let mapped: Vec<&str> = HERMES_HOOKS
+        let mapped: Vec<&str> = sidecar_default_events("hermes")
             .iter()
-            .filter(|(e, _)| *e == "pre_approval_request")
-            .map(|(_, s)| *s)
+            .filter(|event| event.name == "pre_approval_request")
+            .map(|event| event.status.as_str())
             .collect();
         assert_eq!(
             mapped,
@@ -3261,16 +3400,36 @@ hooks_auto_accept: false
         let config: Value = serde_json::from_str(&content).unwrap();
         let hooks = config["hooks"].as_object().unwrap();
 
-        for (event, _) in KIRO_HOOKS {
+        for event in sidecar_default_events("kiro") {
             let entries = hooks
-                .get(*event)
-                .unwrap_or_else(|| panic!("event {} missing", event))
+                .get(event.name)
+                .unwrap_or_else(|| panic!("event {} missing", event.name))
                 .as_array()
                 .unwrap();
-            assert_eq!(entries.len(), 1, "event {} should have one entry", event);
+            assert_eq!(
+                entries.len(),
+                1,
+                "event {} should have one entry",
+                event.name
+            );
             let cmd = entries[0]["command"].as_str().unwrap();
             assert!(is_aoe_hook_command(cmd));
         }
+    }
+
+    #[test]
+    fn test_install_kiro_hooks_uses_resolved_status_override() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("aoe-hooks.json");
+        let events =
+            resolved_events_with_override("kiro", "stop", crate::agents::HookStatus::Error);
+
+        install_kiro_hooks_with_events(&config_path, HookInstallTarget::Host, &events).unwrap();
+
+        let config: Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        let cmd = config["hooks"]["stop"][0]["command"].as_str().unwrap();
+        assert!(cmd.contains("printf error"), "got command: {cmd}");
     }
 
     #[test]
@@ -3306,13 +3465,13 @@ hooks_auto_accept: false
 
         let content = std::fs::read_to_string(&config_path).unwrap();
         let config: Value = serde_json::from_str(&content).unwrap();
-        for (event, _) in KIRO_HOOKS {
-            let entries = config["hooks"][event].as_array().unwrap();
+        for event in sidecar_default_events("kiro") {
+            let entries = config["hooks"][event.name].as_array().unwrap();
             assert_eq!(
                 entries.len(),
                 1,
                 "event {} should still have exactly one AoE entry after double install",
-                event
+                event.name
             );
         }
     }
@@ -3462,13 +3621,13 @@ hooks_auto_accept: false
         // The created file's name must match the selected agent, not the
         // standalone "aoe-hooks" default, so Kiro loads it for --agent custom-agent.
         assert_eq!(config["name"].as_str(), Some("custom-agent"));
-        for (event, _) in KIRO_HOOKS {
-            let entries = config["hooks"][event].as_array().unwrap();
+        for event in sidecar_default_events("kiro") {
+            let entries = config["hooks"][event.name].as_array().unwrap();
             assert_eq!(
                 entries.len(),
                 1,
                 "event {} should have one AoE entry",
-                event
+                event.name
             );
             assert!(is_aoe_hook_command(entries[0]["command"].as_str().unwrap()));
         }
@@ -4164,7 +4323,7 @@ hooks_auto_accept: false
         let settings_path = tmp.path().join("settings.json");
         let events = claude_events();
 
-        install_hooks(&settings_path, events, HookInstallTarget::Host).unwrap();
+        install_hooks(&settings_path, &events, HookInstallTarget::Host).unwrap();
         let canonical = std::fs::read_to_string(&settings_path).unwrap();
         std::fs::remove_file(&settings_path).unwrap();
 
@@ -4173,6 +4332,7 @@ hooks_auto_accept: false
             for _ in 0..8 {
                 let path = settings_path.clone();
                 let b = barrier.clone();
+                let events = &events;
                 s.spawn(move || {
                     b.wait();
                     for _ in 0..100 {

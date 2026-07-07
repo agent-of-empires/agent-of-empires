@@ -40,10 +40,21 @@ pub enum ProfileCommands {
         /// Profile name (optional, shows current if not provided)
         name: Option<String>,
     },
+
+    /// Show profile-derived values for scripts
+    Show {
+        /// Print the resolved status map for an agent
+        #[arg(long = "status-map", value_name = "AGENT")]
+        status_map: Option<String>,
+
+        /// Emit JSON output
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[tracing::instrument(target = "cli.session", skip_all)]
-pub async fn run(command: Option<ProfileCommands>) -> Result<()> {
+pub async fn run(profile: &str, command: Option<ProfileCommands>) -> Result<()> {
     match command {
         Some(ProfileCommands::List) | None => list_profiles().await,
         Some(ProfileCommands::Create { name }) => create_profile(&name).await,
@@ -57,6 +68,9 @@ pub async fn run(command: Option<ProfileCommands>) -> Result<()> {
             } else {
                 show_default_profile().await
             }
+        }
+        Some(ProfileCommands::Show { status_map, json }) => {
+            show_profile_value(profile, status_map.as_deref(), json).await
         }
     }
 }
@@ -135,5 +149,23 @@ async fn set_default_profile(name: &str) -> Result<()> {
 
     session::set_default_profile(name)?;
     println!("✓ Default profile set to: {}", name);
+    Ok(())
+}
+
+async fn show_profile_value(profile: &str, status_map: Option<&str>, json: bool) -> Result<()> {
+    let Some(agent) = status_map else {
+        bail!("nothing to show; pass --status-map <agent>");
+    };
+    let effective_profile = session::config::effective_profile(profile);
+    let config = session::profile_config::resolve_config(&effective_profile)?;
+    let map = crate::agents::effective_status_map(&config, agent)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&map)?);
+    } else {
+        for (event, status) in map {
+            println!("{} = {}", event, status.as_str());
+        }
+    }
     Ok(())
 }

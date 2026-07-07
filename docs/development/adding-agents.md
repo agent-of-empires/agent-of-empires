@@ -32,11 +32,11 @@ Each level is additive; do only what the agent supports.
 
 **1. Research:** binary name, detection (`which`), YOLO/auto-approve flag, resume flag, hook support + format (JSON/YAML/TOML), config dir, install command.
 
-**2. `AgentDef` (`src/agents.rs`):** add to the `AGENTS` array. Key fields: `detection: DetectionMethod::Which(...)`, `yolo: Some(YoloMode::CliFlag(...))`, either `hook_config` (with `format: HookFormat::JsonSettings` or `HookFormat::CodexToml`) or `sidecar_hooks` (with `format: SidecarFormat::SettlToml`, `HermesYaml`, or `KiroJson`), `resume_strategy`, `host_only`, `install_hint`. The format enums drive installer and marker-walker dispatch; adding a hook-based agent without picking a variant is a compile error. `set_default_command: true` only when the binary name alone isn't enough to relaunch (e.g. opencode).
+**2. `AgentDef` (`src/agents.rs`):** add to the `AGENTS` array. Key fields: `detection: DetectionMethod::Which(...)`, `yolo: Some(YoloMode::CliFlag(...))`, either `hook_config` (with `format: HookFormat::JsonSettings` or `HookFormat::CodexJson`) or `sidecar_hooks` (with `format: SidecarFormat::SettlToml`, `HermesYaml`, or `KiroJson`, plus `events: ..._SIDECAR_EVENTS`), `resume_strategy`, `host_only`, `install_hint`. The format enums drive installer and marker-walker dispatch; adding a hook-based agent without picking a variant is a compile error. `set_default_command: true` only when the binary name alone isn't enough to relaunch (e.g. opencode).
 
 **3. Status detection (`src/tmux/status_detection.rs`):** hook-based agents get a stub returning `Status::Idle`. Pane-parse agents get a function matching on lowercased pane content. Prefer `--format json` over substring matching when the CLI offers it; human-readable output changes between versions.
 
-**4. Hooks (if applicable):** for non-Claude formats add a custom installer in `src/hooks/mod.rs` (see `install_hermes_hooks`, `install_kiro_hooks`). Wire it into `install_agent_status_hooks()` in `src/session/instance.rs`, and add the tool name to `status_hook_env_prefix()` so `AOE_INSTANCE_ID` reaches the hook (without it hooks write nothing). Keep installers as pure file IO; any subprocess work (e.g. setting a default agent) goes in a separate function so `cargo test` doesn't mutate the dev's real environment.
+**4. Hooks (if applicable):** for non-Claude formats add a custom installer in `src/hooks/mod.rs` (see `install_hermes_hooks_with_events`, `install_kiro_hooks_with_events`). Wire it into `SidecarHooks::install`, and make sure `status_hook_env_prefix()` includes the agent so `AOE_INSTANCE_ID` and `AOE_PROFILE` reach the hook (without the instance id hooks write nothing). Hook statuses use `HookStatus` (`Running`, `Waiting`, `Idle`, `Error`), not raw strings, and sidecar event defaults live on the agent so profile `agents.<name>.status_map` entries feed host and sandbox installs through the same resolver. Keep installers as pure file IO; any subprocess work (e.g. setting a default agent) goes in a separate function so `cargo test` doesn't mutate the dev's real environment.
 
 **5. Container mount (`src/session/container_config.rs`):** add an `AgentConfigMount` (`tool_name`, `host_rel`, `container_suffix`, `skip_entries`). Host hook installation does not cover sandbox sessions; if the agent uses hooks, wire them into `build_container_config` so the sidecar volume mounts and config materializes in the container.
 
@@ -79,7 +79,7 @@ Each entry in `events: &[HookEvent]` carries:
 |-------|---------|
 | `name` | Agent's event name (e.g. `"PreToolUse"`). |
 | `matcher` | Optional pattern for events that need it (e.g. Claude's `Notification` matcher). |
-| `status` | `Some("running"\|"waiting"\|"idle")` to install a status-writer on this event, or `None` for a purely lifecycle event. |
+| `status` | `Some(HookStatus::Running\|Waiting\|Idle\|Error)` to install a status-writer on this event, or `None` for a purely lifecycle event. |
 | `session_id_capture` | `true` installs a command that extracts `session_id` from the agent's stdin JSON and writes it to `/tmp/aoe-hooks-<euid>/<AOE_INSTANCE_ID>/session_id` (host) or `/tmp/aoe-hooks/<AOE_INSTANCE_ID>/session_id` (sandbox; see issue #1844 for the host/container path split), read by [session-resume](../guides/session-resume.md). Currently only Claude (`SessionStart`, `UserPromptSubmit`). With `status` also set, both commands share the matcher block and the session-id command runs first so it consumes stdin before the status writer. |
 
 ### Codex (custom TOML)
