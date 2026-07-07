@@ -1426,6 +1426,45 @@ fn test_cli_add_sanitizes_explicit_worktree_branch() {
 
 #[test]
 #[serial]
+fn test_cli_add_blank_worktree_branch_falls_back_to_normal_title() {
+    let h = TuiTestHarness::new("cli_blank_branch_title_fallback");
+    let project = h.home_path().join("blank-branch-title-project");
+    init_git_repo(&project);
+
+    let add_output = h.run_cli(&["add", project.to_str().unwrap(), "-w", "   ", "-b"]);
+    assert!(
+        add_output.status.success(),
+        "blank explicit worktree branch should fall back instead of creating branch 'session':\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&add_output.stdout),
+        String::from_utf8_lossy(&add_output.stderr)
+    );
+
+    let json = read_sessions_json(&h);
+    let sessions = json.as_array().expect("sessions array");
+    assert_eq!(sessions.len(), 1, "expected exactly one session");
+    let session = &sessions[0];
+    assert!(
+        !session["title"].as_str().unwrap_or_default().is_empty(),
+        "blank worktree branch should not become an empty session title"
+    );
+    assert!(
+        session["worktree_info"].is_null(),
+        "blank worktree branch should not create a managed worktree"
+    );
+
+    let branch = Command::new("git")
+        .args(["branch", "--list", "session"])
+        .current_dir(&project)
+        .output()
+        .expect("git branch --list");
+    assert!(
+        String::from_utf8_lossy(&branch.stdout).trim().is_empty(),
+        "blank explicit branch should not create the sanitizer fallback branch"
+    );
+}
+
+#[test]
+#[serial]
 fn test_cli_add_scratch_provisions_dir() {
     let h = TuiTestHarness::new("cli_add_scratch");
 

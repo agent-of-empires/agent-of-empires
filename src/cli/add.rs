@@ -188,7 +188,8 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         bail!("Path is not a directory: {}", path.display());
     }
 
-    if (!args.extra_repos.is_empty() || !args.projects.is_empty()) && args.worktree_branch.is_none()
+    if (!args.extra_repos.is_empty() || !args.projects.is_empty())
+        && explicit_worktree_branch(&args).is_none()
     {
         bail!("--repo/--project requires --worktree to specify a branch\nTip: aoe add /path --project repoB -w branch-name");
     }
@@ -277,7 +278,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     // Fork intent appends. Reject these up front (before any resource creation)
     // rather than launch a fork that can't find its parent. See PR review.
     if args.fork_from.is_some() {
-        if args.worktree_branch.is_some() || args.create_branch {
+        if explicit_worktree_branch(&args).is_some() || args.create_branch {
             bail!(
                 "`--fork-from` cannot be combined with --worktree or --new-branch: a fork must run \
                  in the parent's working directory to resume its conversation."
@@ -398,7 +399,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         None
     };
 
-    if let Some(branch_raw) = &args.worktree_branch {
+    if let Some(branch_raw) = explicit_worktree_branch(&args) {
         use crate::git::GitWorktree;
         use crate::session::WorktreeInfo;
         use chrono::Utc;
@@ -1205,8 +1206,8 @@ fn resolve_session_title(args: &AddArgs, instances: &[Instance]) -> Result<Strin
     if let Some(title) = &args.title {
         return Ok(title.trim().to_string());
     }
-    let default_title = if let Some(ref branch) = args.worktree_branch {
-        branch.trim().to_string()
+    let default_title = if let Some(branch) = explicit_worktree_branch(args) {
+        branch.to_string()
     } else {
         let existing_titles: Vec<&str> = instances.iter().map(|i| i.title.as_str()).collect();
         civilizations::generate_random_title(&existing_titles)
@@ -1216,6 +1217,13 @@ fn resolve_session_title(args: &AddArgs, instances: &[Instance]) -> Result<Strin
     } else {
         Ok(default_title)
     }
+}
+
+fn explicit_worktree_branch(args: &AddArgs) -> Option<&str> {
+    args.worktree_branch
+        .as_deref()
+        .map(str::trim)
+        .filter(|branch| !branch.is_empty())
 }
 
 fn prompt_session_title(default_title: &str) -> Result<String> {
