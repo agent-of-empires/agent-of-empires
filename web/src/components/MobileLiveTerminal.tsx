@@ -192,8 +192,7 @@ function altPrintableMetaKey(
 
 function liveEnterSequence(e: { key: string; ctrlKey: boolean; shiftKey: boolean; altKey: boolean; metaKey: boolean }) {
   if (e.key !== "Enter") return null;
-  if (e.altKey && !e.ctrlKey && !e.metaKey) return "\x1b\r";
-  if ((e.ctrlKey || e.shiftKey) && !e.altKey && !e.metaKey) return "\x1b\r";
+  if (e.ctrlKey && !e.shiftKey && !e.altKey && !e.metaKey) return "\x1b\r";
   return "\r";
 }
 
