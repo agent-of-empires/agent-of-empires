@@ -1017,6 +1017,10 @@ fn configured_status_map<'a>(
         .filter(|status_map| !status_map.is_empty())
 }
 
+// The CLI status-map query is event-name keyed, matching the config shape.
+// Duplicate built-in events with different matchers collapse to the first
+// default here; resolved_hook_events still applies an override to every
+// matcher variant with that event name.
 fn default_status_map_for_agent(agent: &AgentDef) -> BTreeMap<String, HookStatus> {
     let mut map = BTreeMap::new();
     if let Some(hook_cfg) = &agent.hook_config {
