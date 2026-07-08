@@ -14,8 +14,48 @@ interface MockSession {
   status?: string;
 }
 
-async function mockApis(page: Page, sessions: MockSession[]) {
+const ROW_TAG_SCHEMA = [
+  {
+    section: "session",
+    field: "row_tag",
+    category: "Sessions",
+    label: "Row Tag",
+    description: "What to show next to each session title",
+    widget: {
+      kind: "select",
+      options: [
+        { value: "none", label: "None" },
+        { value: "auto", label: "Auto" },
+        { value: "profile", label: "Profile" },
+        { value: "sandbox", label: "Sandbox" },
+        { value: "branch", label: "Branch" },
+      ],
+    },
+    web_write: { policy: "allow" },
+    profile_overridable: true,
+    validation: { rule: "none" },
+    advanced: false,
+  },
+];
+
+async function mockApis(
+  page: Page,
+  sessions: MockSession[],
+  options: { rowTag?: "none" | "auto" | "profile" | "sandbox" | "branch" } = {},
+) {
+  let rowTag = options.rowTag ?? "branch";
   await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
+  await page.route("**/api/settings**", (r) => {
+    const pathname = new URL(r.request().url()).pathname;
+    if (pathname === "/api/settings/schema") return r.fulfill({ json: ROW_TAG_SCHEMA });
+    if (pathname === "/api/settings") return r.fulfill({ json: { session: { row_tag: rowTag } } });
+    return r.fulfill({ status: 404 });
+  });
+  await page.route("**/api/profiles/*/settings", async (r) => {
+    const body = r.request().postDataJSON() as { session?: { row_tag?: typeof rowTag } };
+    rowTag = body.session?.row_tag ?? rowTag;
+    return r.fulfill({ json: { ok: true } });
+  });
   await page.route("**/api/sessions", (r) => {
     if (r.request().method() !== "GET") return r.fulfill({ status: 400 });
     return r.fulfill({
@@ -42,7 +82,7 @@ async function mockApis(page: Page, sessions: MockSession[]) {
       },
     });
   });
-  for (const path of ["settings", "themes", "agents", "profiles", "groups", "devices", "docker/status", "about"]) {
+  for (const path of ["themes", "agents", "profiles", "groups", "devices", "docker/status", "about"]) {
     await page.route(`**/api/${path}`, (r) => r.fulfill({ json: path === "docker/status" ? {} : [] }));
   }
 }
@@ -217,8 +257,40 @@ test.describe("Sidebar multi-session (#956)", () => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
     await expect(page.locator("header")).toBeVisible();
-    await expect(page.getByRole("link", { name: /feature\/a/i })).toBeVisible();
-    await expect(page.getByRole("link", { name: /feature\/b/i })).toBeVisible();
+    const rowA = page.getByRole("link", { name: /Italians/i });
+    const rowB = page.getByRole("link", { name: /Magyars/i });
+    await expect(rowA).toBeVisible();
+    await expect(rowA.getByTestId("sidebar-session-row-tag")).toHaveText("[a]");
+    await expect(rowB).toBeVisible();
+    await expect(rowB.getByTestId("sidebar-session-row-tag")).toHaveText("[b]");
+  });
+
+  test("saving row tag settings refreshes the sidebar suffix", async ({ page }) => {
+    await mockApis(page, [
+      {
+        id: "sess-a",
+        title: "Italians",
+        project_path: "/tmp/agent-of-empires",
+        branch: "feature/a",
+      },
+    ]);
+
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await page.goto("/");
+    await expect(page.locator("header")).toBeVisible();
+    const row = page.getByRole("link", { name: /Italians/i });
+    await expect(row.getByTestId("sidebar-session-row-tag")).toHaveText("[a]");
+
+    await page.goto("/settings/session");
+    await expect(page.getByText("Row Tag", { exact: true })).toBeVisible();
+    const refreshedSettings = page.waitForResponse((response) => {
+      const request = response.request();
+      return request.method() === "GET" && new URL(response.url()).pathname === "/api/settings";
+    });
+    await page.getByRole("combobox").last().selectOption("none");
+    await refreshedSettings;
+    await page.getByRole("button", { name: "Go to dashboard" }).click();
+    await expect(page.getByRole("link", { name: /Italians/i }).getByTestId("sidebar-session-row-tag")).toHaveCount(0);
   });
 
   test("project group context menu stores alias and background color", async ({ page }) => {

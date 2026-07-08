@@ -1388,7 +1388,7 @@ export const SessionRow = memo(function SessionRow({
                   title={rowTagTitle}
                   className={`inline-flex shrink-0 items-center rounded border px-1 py-0 text-[10px] font-mono font-medium ${
                     rowTag.kind === "branch"
-                      ? "border-brand-700/40 bg-brand-950/20 text-brand-300"
+                      ? "border-brand-700/40 bg-brand-700/5 text-brand-300"
                       : "border-surface-700/40 bg-surface-800/40 text-text-dim"
                   }`}
                 >
