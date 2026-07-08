@@ -7979,6 +7979,71 @@ fn project_groups_sort_by_top_attention_member() {
     );
 }
 
+/// Archiving a project header while in Attention sort must remove the project
+/// from the main flow once all of its live sessions are archived. The archived
+/// rows still appear under the synthetic Archived section's project sub-header.
+#[test]
+#[serial]
+fn project_attention_archive_selected_group_removes_empty_main_header() {
+    use crate::session::{
+        archived_project_sub_path,
+        config::{GroupByMode, SortOrder},
+        is_within_archived_section,
+    };
+
+    let mut env = create_test_env_two_projects_mixed_attention();
+    env.view.group_by = GroupByMode::Project;
+    env.view.sort_order = SortOrder::Attention;
+    env.view.archived_section_collapsed = true;
+    env.view.flat_items = env.view.build_flat_items();
+
+    let beta_idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|i| {
+            matches!(
+                i,
+                Item::Group { name, path, .. }
+                    if name == "beta" && !is_within_archived_section(path)
+            )
+        })
+        .expect("beta project header present");
+    env.view.cursor = beta_idx;
+    env.view.update_selected();
+    assert_eq!(env.view.selected_group.as_deref(), Some("beta"));
+
+    env.view.archive_selected_group().unwrap();
+
+    assert!(
+        env.view
+            .instances
+            .iter()
+            .filter(|i| super::project_group_name(i) == "beta")
+            .all(|i| i.is_archived()),
+        "all beta sessions must be archived"
+    );
+    assert!(
+        !env.view.flat_items.iter().any(|item| matches!(
+            item,
+            Item::Group { name, path, .. }
+                if name == "beta" && !is_within_archived_section(path)
+        )),
+        "archived-only beta must not leave a main-flow project header; got flat_items: {:?}",
+        env.view.flat_items
+    );
+    let archived_beta = archived_project_sub_path("beta");
+    assert!(
+        env.view.flat_items.iter().any(|item| matches!(
+            item,
+            Item::Group { path, name, session_count, .. }
+                if path == &archived_beta && name == "beta" && *session_count == 2
+        )),
+        "archived beta sessions must stay reachable under the Archived section; got flat_items: {:?}",
+        env.view.flat_items
+    );
+}
+
 /// A registered (pinned) project with no sessions surfaces as an empty
 /// header in project view, mirroring the WebUI where an empty project is just
 /// a registry entry decoupled from sessions. This is the core of #2047.
