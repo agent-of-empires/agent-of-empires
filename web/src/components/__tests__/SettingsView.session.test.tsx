@@ -52,6 +52,27 @@ const SESSION_SCHEMA = [
     validation: { rule: "none" },
     advanced: false,
   },
+  {
+    section: "session",
+    field: "row_tag",
+    category: "Sessions",
+    label: "Row Tag",
+    description: "What to show next to each session title",
+    widget: {
+      kind: "select",
+      options: [
+        { value: "none", label: "None" },
+        { value: "auto", label: "Auto" },
+        { value: "profile", label: "Profile" },
+        { value: "sandbox", label: "Sandbox" },
+        { value: "branch", label: "Branch" },
+      ],
+    },
+    web_write: { policy: "allow" },
+    profile_overridable: true,
+    validation: { rule: "none" },
+    advanced: false,
+  },
 ];
 
 vi.mock("../../lib/api", () => ({
@@ -134,6 +155,7 @@ describe("Session tab auto-stop idle field", () => {
   });
 
   it("persists session.smart_rename through the profile path", async () => {
+    const onSettingsRefresh = vi.fn();
     vi.mocked(api.fetchSettings).mockResolvedValue({
       session: { smart_rename: true },
       acp: {},
@@ -142,7 +164,13 @@ describe("Session tab auto-stop idle field", () => {
     } as never);
 
     const { container } = render(
-      <SettingsView onClose={() => {}} tab="session" onSelectTab={() => {}} onServerAboutRefresh={() => {}} />,
+      <SettingsView
+        onClose={() => {}}
+        tab="session"
+        onSelectTab={() => {}}
+        onServerAboutRefresh={() => {}}
+        onSettingsRefresh={onSettingsRefresh}
+      />,
     );
     await screen.findByText("Smart Session Rename");
 
@@ -156,6 +184,42 @@ describe("Session tab auto-stop idle field", () => {
         session: { smart_rename: false },
       }),
     );
+    expect(onSettingsRefresh).not.toHaveBeenCalled();
+  });
+
+  it("refreshes app-level settings after saving session.row_tag", async () => {
+    const onSettingsRefresh = vi.fn();
+    vi.mocked(api.fetchSettings).mockResolvedValue({
+      session: { row_tag: "branch" },
+      acp: {},
+      sandbox: {},
+      worktree: {},
+    } as never);
+
+    const { container } = render(
+      <SettingsView
+        onClose={() => {}}
+        tab="session"
+        onSelectTab={() => {}}
+        onServerAboutRefresh={() => {}}
+        onSettingsRefresh={onSettingsRefresh}
+      />,
+    );
+    await screen.findByText("Row Tag");
+
+    const selects = Array.from(container.querySelectorAll("select"));
+    const rowTagSelect = selects.find((select) =>
+      Array.from(select.options).some((option) => option.value === "sandbox"),
+    ) as HTMLSelectElement | undefined;
+    expect(rowTagSelect).toBeTruthy();
+    fireEvent.change(rowTagSelect!, { target: { value: "none" } });
+
+    await waitFor(() =>
+      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
+        session: { row_tag: "none" },
+      }),
+    );
+    expect(onSettingsRefresh).toHaveBeenCalledTimes(1);
   });
 
   it("persists acp.acp_defaults through the profile path via the raw-JSON fold", async () => {

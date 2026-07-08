@@ -1088,6 +1088,17 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
+      "id": "sidebar.row-tag",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/__tests__/SessionRowTriage.test.tsx",
+        "src/components/__tests__/SettingsView.session.test.tsx",
+        "src/lib/sessionRowTag.test.ts"
+      ],
+      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/SettingsView.tsx"]
+    },
+    {
       "id": "sidebar.sort-pure",
       "kind": "vitest",
       "risk": "medium",

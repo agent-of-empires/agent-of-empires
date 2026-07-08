@@ -22,6 +22,7 @@ const SINGLE_BULK_API: RowBulkApi = {
   snooze: () => {},
 };
 import { UnreadIndicatorContext } from "../../lib/unreadIndicator";
+import { SessionRowTagContext, type SessionRowTagMode } from "../../lib/sessionRowTag";
 import { useSidebarTriage } from "../../hooks/useSidebarTriage";
 import type { SessionResponse, Workspace } from "../../lib/types";
 import { OPEN_SESSION_EVENT } from "../../lib/sessionRoute";
@@ -75,9 +76,13 @@ function workspace(id: string, sessions: SessionResponse[]): Workspace {
   };
 }
 
-function Wrap({ children }: { children: ReactNode }) {
+function Wrap({ children, rowTagMode = "branch" }: { children: ReactNode; rowTagMode?: SessionRowTagMode }) {
   const ref = useRef(0);
-  return <DragSuppressContext.Provider value={ref}>{children}</DragSuppressContext.Provider>;
+  return (
+    <DragSuppressContext.Provider value={ref}>
+      <SessionRowTagContext.Provider value={rowTagMode}>{children}</SessionRowTagContext.Provider>
+    </DragSuppressContext.Provider>
+  );
 }
 
 // Mounts a SessionRow wired to the real `useSidebarTriage` controller, the
@@ -221,6 +226,84 @@ describe("SessionRow chips", () => {
     // coexisting at the session level, but defensive rendering
     // hides the snooze chip if the workspace surfaces both.
     expect(screen.queryByLabelText("Snoozed")).toBeNull();
+  });
+});
+
+describe("SessionRow row tags", () => {
+  it("renders a compact branch tag and removes the hardcoded branch subtitle", () => {
+    const ws = {
+      ...workspace("w-branch", [session({ branch: "feature/web-row-tag" })]),
+      branch: "feature/web-row-tag",
+    };
+    render(
+      <Wrap rowTagMode="branch">
+        <Row ws={ws} />
+      </Wrap>,
+    );
+
+    expect(screen.getByTestId("sidebar-session-row-tag").textContent).toBe("[web-row-tag]");
+    expect(screen.queryByText("feature/web-row-tag")).toBeNull();
+  });
+
+  it("hides all session suffix metadata when row_tag is none", () => {
+    const ws = {
+      ...workspace("w-none", [session({ branch: "feature/hidden" })]),
+      branch: "feature/hidden",
+    };
+    render(
+      <Wrap rowTagMode="none">
+        <Row ws={ws} />
+      </Wrap>,
+    );
+
+    expect(screen.queryByTestId("sidebar-session-row-tag")).toBeNull();
+    expect(screen.queryByText("feature/hidden")).toBeNull();
+  });
+
+  it("renders profile, auto, and sandbox tags from the first session", () => {
+    const ws = workspace("w-profile", [session({ profile: "forit-backup", is_sandboxed: true })]);
+
+    const { rerender } = render(
+      <Wrap rowTagMode="profile">
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    expect(screen.getByTestId("sidebar-session-row-tag").textContent).toBe("[fb]");
+
+    rerender(
+      <Wrap rowTagMode="auto">
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    expect(screen.getByTestId("sidebar-session-row-tag").textContent).toBe("[fb]");
+
+    rerender(
+      <Wrap rowTagMode="sandbox">
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    expect(screen.getByTestId("sidebar-session-row-tag").textContent).toBe("[sb]");
+  });
+
+  it("renders multi-repo workspace branch tags without removing repo chips", () => {
+    const ws = workspace("w-workspace", [
+      session({
+        workspace_repos: [
+          { name: "api", source_path: "/repo/api", branch: "feature/web-tags" },
+          { name: "web", source_path: "/repo/web", branch: "feature/web-tags" },
+        ],
+      }),
+    ]);
+
+    render(
+      <Wrap rowTagMode="branch">
+        <Row ws={ws} />
+      </Wrap>,
+    );
+
+    expect(screen.getByTestId("sidebar-session-row-tag").textContent).toBe("[web-tags+2]");
+    expect(screen.getByText("api")).not.toBeNull();
+    expect(screen.getByText("web")).not.toBeNull();
   });
 });
 

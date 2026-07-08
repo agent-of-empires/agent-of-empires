@@ -72,6 +72,7 @@ import { STATUS_DOT_CLASS, getStatusTextClass, isSessionActive } from "../lib/se
 import { useIdleDecayWindowMs } from "../lib/idleDecay";
 import { exceedsTouchSlop } from "../lib/longPress";
 import { useUnreadIndicatorEnabled } from "../lib/unreadIndicator";
+import { computeSessionRowTag, useSessionRowTagMode } from "../lib/sessionRowTag";
 import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
 import {
   createSession,
@@ -946,9 +947,11 @@ export const SessionRow = memo(function SessionRow({
   const sessionTitle = firstSession?.title.trim() ?? "";
   const branchLabel = workspace.branch ?? null;
   const baseBranch = firstSession?.base_branch ?? null;
+  const rowTagMode = useSessionRowTagMode();
+  const rowTag = computeSessionRowTag(workspace, rowTagMode);
+  const rowTagTitle =
+    rowTag?.kind === "branch" && baseBranch ? `${rowTag.title} (based on ${baseBranch})` : rowTag?.title;
   const label = singleSession ? sessionTitle || branchLabel || "default" : branchLabel || sessionTitle || "default";
-  const subtitle = singleSession && sessionTitle && branchLabel && sessionTitle !== branchLabel ? branchLabel : null;
-  const subtitleTitle = subtitle && baseBranch ? `${subtitle} (based on ${baseBranch})` : subtitle;
   // Workspace renders as favorited when any of its sessions are
   // favorited. Mirrors the TUI's within-tier pin: the star promotes the
   // row visually so the user can find their starred work fast. Toggled
@@ -1379,6 +1382,19 @@ export const SessionRow = memo(function SessionRow({
               <span className="truncate" title={label}>
                 {label}
               </span>
+              {rowTag && (
+                <span
+                  data-testid="sidebar-session-row-tag"
+                  title={rowTagTitle}
+                  className={`inline-flex shrink-0 items-center rounded border px-1 py-0 text-[10px] font-mono font-medium ${
+                    rowTag.kind === "branch"
+                      ? "border-brand-700/40 bg-brand-950/20 text-brand-300"
+                      : "border-surface-700/40 bg-surface-800/40 text-text-dim"
+                  }`}
+                >
+                  [{rowTag.content}]
+                </span>
+              )}
               {hasDraft && (
                 <span title="Unsent draft" aria-label="Unsent draft" className="inline-flex shrink-0">
                   <Pencil className="h-3 w-3 text-amber-400/90" />
@@ -1460,12 +1476,6 @@ export const SessionRow = memo(function SessionRow({
               {firstSession?.monitor_active && <MonitorBadge description={firstSession.monitor_description} />}
             </span>
             {firstSession && <PluginRowLine sessionId={firstSession.id} />}
-            {subtitle && (
-              <span className="block text-[11px] font-mono text-text-dim truncate" title={subtitleTitle ?? subtitle}>
-                {subtitle}
-                {baseBranch && <span className="ml-1 text-text-dim/70">← {baseBranch}</span>}
-              </span>
-            )}
             {firstSession?.plan_summary &&
               firstSession.plan_summary.total > 0 &&
               // Hide the completed-plan bar when the session is also

@@ -75,6 +75,7 @@ import type { DeleteSessionOptions, ServerAbout } from "./lib/api";
 import { normalizeProjectPathKey } from "./lib/registeredProjects";
 import { IdleDecayWindowContext, parseIdleDecayWindowMs, useIdleDecayWindowMs } from "./lib/idleDecay";
 import { parseUnreadIndicatorEnabled, UnreadIndicatorContext, useUnreadIndicatorEnabled } from "./lib/unreadIndicator";
+import { parseSessionRowTagMode, SessionRowTagContext, type SessionRowTagMode } from "./lib/sessionRowTag";
 import { toastBus, reportError } from "./lib/toastBus";
 import { resolveToRepoRelative, type FileRef } from "./lib/fileRef";
 import { OPEN_SESSION_EVENT } from "./lib/sessionRoute";
@@ -149,6 +150,17 @@ export default function App() {
   const [tokenExpired, setTokenExpired] = useState(false);
   const [idleDecayWindowMs, setIdleDecayWindowMs] = useState(IDLE_DECAY_WINDOW_MS);
   const [unreadIndicatorEnabled, setUnreadIndicatorEnabled] = useState(true);
+  const [sessionRowTagMode, setSessionRowTagMode] = useState<SessionRowTagMode>("branch");
+
+  const applyAppSettings = useCallback((settings: Record<string, unknown> | null | undefined) => {
+    setIdleDecayWindowMs(parseIdleDecayWindowMs(settings));
+    setUnreadIndicatorEnabled(parseUnreadIndicatorEnabled(settings));
+    setSessionRowTagMode(parseSessionRowTagMode(settings));
+  }, []);
+
+  const refreshAppSettings = useCallback(async () => {
+    applyAppSettings(await fetchSettings());
+  }, [applyAppSettings]);
 
   useEffect(() => {
     const onTokenExpired = () => setTokenExpired(true);
@@ -177,11 +189,8 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    fetchSettings().then((settings) => {
-      setIdleDecayWindowMs(parseIdleDecayWindowMs(settings));
-      setUnreadIndicatorEnabled(parseUnreadIndicatorEnabled(settings));
-    });
-  }, []);
+    fetchSettings().then(applyAppSettings);
+  }, [applyAppSettings]);
 
   const handleTokenSuccess = () => {
     setTokenExpired(false);
@@ -221,13 +230,15 @@ export default function App() {
   return (
     <IdleDecayWindowContext.Provider value={idleDecayWindowMs}>
       <UnreadIndicatorContext.Provider value={unreadIndicatorEnabled}>
-        {/* PluginUiProvider must sit above AppContent: AppContent itself reads
-            the plugin UI snapshot (usePluginPanes), so the provider can't live
-            inside its own return. */}
-        <PluginUiProvider>
-          <AppContent loginRequired={loginRequired} onLogout={handleLogout} />
-        </PluginUiProvider>
-        <ElevationPrompt />
+        <SessionRowTagContext.Provider value={sessionRowTagMode}>
+          {/* PluginUiProvider must sit above AppContent: AppContent itself reads
+              the plugin UI snapshot (usePluginPanes), so the provider can't live
+              inside its own return. */}
+          <PluginUiProvider>
+            <AppContent loginRequired={loginRequired} onLogout={handleLogout} onSettingsRefresh={refreshAppSettings} />
+          </PluginUiProvider>
+          <ElevationPrompt />
+        </SessionRowTagContext.Provider>
       </UnreadIndicatorContext.Provider>
     </IdleDecayWindowContext.Provider>
   );
@@ -249,7 +260,15 @@ function isInsideEditable(target: EventTarget | null): boolean {
   return false;
 }
 
-function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLogout: () => void }) {
+function AppContent({
+  loginRequired,
+  onLogout,
+  onSettingsRefresh,
+}: {
+  loginRequired: boolean;
+  onLogout: () => void;
+  onSettingsRefresh: () => Promise<void> | void;
+}) {
   // Wire the localStorage write chokepoint and pull the server-side UI-state
   // blob into localStorage. AppContent only mounts past auth, so this runs as
   // the authenticated user. Background (does NOT gate render): blocking first
@@ -1429,6 +1448,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
             navigate(`/settings/${t}${p ? `?profile=${encodeURIComponent(p)}` : ""}`);
           }}
           onServerAboutRefresh={refreshServerAbout}
+          onSettingsRefresh={onSettingsRefresh}
           profile={searchParams.get("profile")}
           onSelectProfile={(p) => {
             const next = new URLSearchParams(searchParams);
