@@ -1241,10 +1241,11 @@ export function MobileLiveTerminal({
 
   // Virtualization windows over [0, visibleRowCount): the rows whose document
   // positions fall within the viewport, plus one viewport of overscan each side
-  // so a fast flick does not outrun the re-render. While reading, also keep the
-  // live tail mounted. A jump or scrollbar drag to the bottom can move scrollTop
-  // before React has observed the scroll event; without the tail range, that
-  // frame can show only spacer padding until the next render catches up.
+  // so a fast flick does not outrun the re-render. When hidden history is
+  // represented by spacer rows, also keep the live tail mounted. A bottom scroll
+  // can flip out of reading mode before React observes the final scrollTop;
+  // without the tail range, that frame can show only spacer padding until the
+  // next render catches up.
   let mountedRanges: Array<{ start: number; end: number }> = [{ start: 0, end: visibleRowCount }];
   if (view.height > 0 && lineH > 0) {
     const overscan = Math.ceil(view.height / lineH);
@@ -1254,7 +1255,7 @@ export function MobileLiveTerminal({
       start: Math.max(0, Math.min(visibleRowCount, firstVisible - overscan)),
       end: Math.max(0, Math.min(visibleRowCount, lastVisible + overscan)),
     };
-    if (reading) {
+    if (effectiveSpacerLines > 0) {
       mountedRanges = [
         viewportRange,
         {

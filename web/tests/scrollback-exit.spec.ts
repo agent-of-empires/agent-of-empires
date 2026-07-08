@@ -153,11 +153,12 @@ test.describe("Mobile live-view scrollback", () => {
     await expect.poll(() => scroller(page).evaluate((el) => el.scrollHeight), { timeout: 3_000 }).toBeGreaterThan(8000);
 
     // Let React render the deep-history viewport. The live tail should still be
-    // mounted, so an immediate bottom jump has real rows before the scroll event
-    // has a chance to update the viewport slice.
+    // mounted when the final bottom scroll event flips the pane back to live, so
+    // that transition has real rows instead of a spacer-only frame.
     await page.waitForTimeout(300);
     const visibleText = await scroller(page).evaluate((el) => {
       el.scrollTop = el.scrollHeight - el.clientHeight;
+      el.dispatchEvent(new Event("scroll"));
       const rows = Array.from(el.querySelectorAll("[data-live-content] > div")) as HTMLElement[];
       const top = el.scrollTop;
       const bottom = top + el.clientHeight;
