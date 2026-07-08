@@ -1362,7 +1362,6 @@ mod tests {
         instances[0].trash();
         assert_eq!(group_count(&instances), 1);
 
-        // Restoring brings the count back.
         instances[0].untrash();
         assert_eq!(group_count(&instances), 2);
     }

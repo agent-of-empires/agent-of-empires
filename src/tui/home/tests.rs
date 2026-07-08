@@ -2541,13 +2541,14 @@ fn create_test_env_with_group_sessions() -> TestEnv {
     TestEnv { _temp: temp, view }
 }
 
-/// The sidebar group header count is rebuilt through the same pipeline the
-/// rows use, so trashing a session drops the count and restoring it brings
-/// the count back. Guards against the count and the visible rows drifting.
+/// Trashing and restoring a session through the view's own actions keeps the
+/// group header count in step with the rows, since both are rebuilt from the
+/// same predicate. Guards against the count and the visible rows drifting.
 #[test]
 #[serial]
 fn group_header_count_tracks_trash_and_restore() {
     let mut env = create_test_env_with_group_sessions();
+    env.view.trashed_section_collapsed = false;
 
     let work_count = |env: &TestEnv| -> usize {
         env.view
@@ -2575,24 +2576,15 @@ fn group_header_count_tracks_trash_and_restore() {
         .map(|i| i.id.clone())
         .expect("a direct work session");
 
-    for inst in env.view.instances.iter_mut() {
-        if inst.id == target {
-            inst.trash();
-        }
-    }
-    env.view.flat_items = env.view.build_flat_items();
+    env.view.trash_session_by_id(&target);
     assert_eq!(
         work_count(&env),
         2,
         "trashed session drops out of the count"
     );
 
-    for inst in env.view.instances.iter_mut() {
-        if inst.id == target {
-            inst.untrash();
-        }
-    }
-    env.view.flat_items = env.view.build_flat_items();
+    env.view.select_session_by_id(&target);
+    env.view.toggle_archive_at_cursor().unwrap();
     assert_eq!(work_count(&env), 3, "restored session returns to the count");
 }
 
