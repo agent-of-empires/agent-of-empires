@@ -3242,11 +3242,40 @@ impl HomeView {
         }
     }
 
+    fn jump_to_session_id(&mut self, id: &str) {
+        if let Some(idx) = self
+            .flat_items
+            .iter()
+            .position(|item| matches!(item, Item::Session { id: sid, .. } if sid == id))
+        {
+            self.cursor = idx;
+            self.update_selected();
+            return;
+        }
+
+        let previous = self.selected_session.clone();
+        self.select_and_reveal_session(id);
+        if self.selected_session != previous {
+            self.preview_scroll_offset = 0;
+            self.manual_unread_hold = None;
+        }
+    }
+
     fn jump_to_next_waiting(&mut self) {
         let len = self.flat_items.len();
         if len == 0 {
             return;
         }
+
+        let visible_sessions: std::collections::HashSet<String> = self
+            .flat_items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Session { id, .. } => Some(id.clone()),
+                Item::Group { .. } => None,
+            })
+            .collect();
+        let current_session = self.selected_session.clone();
 
         // Pass 1: forward-walk from cursor+1, wrapping, for the next Waiting
         // session OR a freshly-stopped Idle session (within
@@ -3270,11 +3299,31 @@ impl HomeView {
                         || matches!(inst.idle_age(), Some(age) if age < window)
                         || (crate::session::unread_enabled() && inst.is_unread()));
                 if is_actionable {
-                    self.cursor = idx;
-                    self.update_selected();
+                    self.jump_to_session_id(&id);
                     return;
                 }
             }
+        }
+
+        let hidden_actionable = self
+            .instances
+            .iter()
+            .find(|inst| {
+                if visible_sessions.contains(&inst.id)
+                    || current_session.as_deref() == Some(inst.id.as_str())
+                    || inst.is_archived()
+                    || inst.is_trashed()
+                {
+                    return false;
+                }
+                inst.status == Status::Waiting
+                    || matches!(inst.idle_age(), Some(age) if age < window)
+                    || (crate::session::unread_enabled() && inst.is_unread())
+            })
+            .map(|inst| inst.id.clone());
+        if let Some(id) = hidden_actionable {
+            self.jump_to_session_id(&id);
+            return;
         }
 
         // Pass 2: fall back to the most-recently-accessed Idle session, skipping
@@ -3313,8 +3362,40 @@ impl HomeView {
         }
 
         if let Some((idx, _)) = best {
-            self.cursor = idx;
-            self.update_selected();
+            let id = match self.flat_items.get(idx) {
+                Some(Item::Session { id, .. }) => id.clone(),
+                _ => return,
+            };
+            self.jump_to_session_id(&id);
+            return;
+        }
+
+        let mut best_hidden: Option<(String, Option<chrono::DateTime<chrono::Utc>>)> = None;
+        for inst in &self.instances {
+            if visible_sessions.contains(&inst.id)
+                || current_session.as_deref() == Some(inst.id.as_str())
+                || inst.is_archived()
+                || inst.is_trashed()
+                || inst.status != Status::Idle
+            {
+                continue;
+            }
+            let ts = inst.last_accessed_at;
+            let beats = match best_hidden {
+                None => true,
+                Some((_, b)) => match (ts, b) {
+                    (Some(a), Some(b)) => a > b,
+                    (Some(_), None) => true,
+                    (None, _) => false,
+                },
+            };
+            if beats {
+                best_hidden = Some((inst.id.clone(), ts));
+            }
+        }
+
+        if let Some((id, _)) = best_hidden {
+            self.jump_to_session_id(&id);
             return;
         }
 

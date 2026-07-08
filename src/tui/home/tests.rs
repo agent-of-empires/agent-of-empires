@@ -3714,6 +3714,54 @@ fn attention_env_running_then_waiting() -> (TestEnv, usize, usize) {
     (env, running, waiting)
 }
 
+fn attention_env_running_then_idle() -> (TestEnv, usize, usize) {
+    use crate::session::config::{GroupByMode, SortOrder};
+    use crate::session::Status;
+
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let storage = Storage::new_unwatched("test").unwrap();
+
+    let mut running = Instance::new("running", "/tmp/running");
+    running.status = Status::Running;
+    let mut idle = Instance::new("idle", "/tmp/idle");
+    idle.status = Status::Idle;
+    let instances = vec![running, idle];
+    storage
+        .update(|i, g| {
+            *i = instances.to_vec();
+            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    view.strict_hotkeys = false;
+    view.group_by = GroupByMode::Manual;
+    view.sort_order = SortOrder::Attention;
+    view.flat_items = view.build_flat_items();
+    view.update_selected();
+    let env = TestEnv { _temp: temp, view };
+
+    let status_at = |env: &TestEnv, idx: usize| match env.view.flat_items.get(idx) {
+        Some(Item::Session { id, .. }) => env.view.get_instance(id).map(|i| i.status),
+        _ => None,
+    };
+    let running = (0..env.view.flat_items.len())
+        .find(|&i| status_at(&env, i) == Some(Status::Running))
+        .expect("a Running session row");
+    let idle = (0..env.view.flat_items.len())
+        .find(|&i| status_at(&env, i) == Some(Status::Idle))
+        .expect("an Idle session row");
+    (env, running, idle)
+}
+
 #[test]
 #[serial]
 fn test_non_strict_w_jumps_to_next_waiting_in_attention_sort() {
@@ -3742,6 +3790,99 @@ fn test_non_strict_w_jumps_to_next_waiting_in_attention_sort() {
         landed,
         Some(Status::Waiting),
         "`w` should land the cursor on the Waiting session"
+    );
+}
+
+#[test]
+#[serial]
+fn test_non_strict_w_on_running_jumps_to_idle_in_attention_sort() {
+    use crate::session::Status;
+
+    let (mut env, running, _idle) = attention_env_running_then_idle();
+    env.view.cursor = running;
+    env.view.update_selected();
+
+    env.view.handle_key(key(KeyCode::Char('w')), None);
+
+    assert!(
+        env.view.snooze_duration_dialog.is_none(),
+        "`w` on a Running session must jump, not open the snooze dialog"
+    );
+    let landed = match env.view.flat_items.get(env.view.cursor) {
+        Some(Item::Session { id, .. }) => env.view.get_instance(id).map(|i| i.status),
+        _ => None,
+    };
+    assert_eq!(
+        landed,
+        Some(Status::Idle),
+        "`w` should fall back to the available Idle session"
+    );
+}
+
+#[test]
+#[serial]
+fn test_non_strict_w_on_collapsed_project_group_reveals_idle_in_attention_sort() {
+    use crate::session::config::{GroupByMode, SortOrder};
+    use crate::session::Status;
+
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let storage = Storage::new_unwatched("test").unwrap();
+
+    let mut alpha_idle = Instance::new("alpha-idle", "/repos/alpha");
+    alpha_idle.status = Status::Idle;
+    let alpha_id = alpha_idle.id.clone();
+    let mut beta_running = Instance::new("beta-running", "/repos/beta");
+    beta_running.status = Status::Running;
+    let instances = vec![alpha_idle, beta_running];
+    storage
+        .update(|i, g| {
+            *i = instances.to_vec();
+            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    view.strict_hotkeys = false;
+    view.group_by = GroupByMode::Project;
+    view.sort_order = SortOrder::Attention;
+    view.project_group_collapsed
+        .insert("alpha".to_string(), true);
+    view.flat_items = view.build_flat_items();
+
+    let alpha_group = view
+        .flat_items
+        .iter()
+        .position(|item| matches!(item, Item::Group { name, collapsed, .. } if name == "alpha" && *collapsed))
+        .expect("collapsed alpha project group");
+    assert!(
+        !view
+            .flat_items
+            .iter()
+            .any(|item| matches!(item, Item::Session { id, .. } if id == &alpha_id)),
+        "precondition: alpha idle session should be hidden by the collapsed group"
+    );
+    view.cursor = alpha_group;
+    view.update_selected();
+
+    view.handle_key(key(KeyCode::Char('w')), None);
+
+    assert!(
+        view.snooze_duration_dialog.is_none(),
+        "`w` on a collapsed group must jump, not open the snooze dialog"
+    );
+    assert_eq!(view.selected_session.as_deref(), Some(alpha_id.as_str()));
+    assert!(
+        view.flat_items
+            .iter()
+            .any(|item| matches!(item, Item::Session { id, .. } if id == &alpha_id)),
+        "jumping to a hidden idle session should reveal its project group"
     );
 }
 
