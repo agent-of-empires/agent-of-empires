@@ -93,7 +93,7 @@ dependencies = [
 
 [[package]]
 name = "agent-of-empires"
-version = "1.12.0"
+version = "1.12.1"
 dependencies = [
  "aes-gcm",
  "agent-client-protocol",
