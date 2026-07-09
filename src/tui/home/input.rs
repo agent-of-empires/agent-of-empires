@@ -3296,8 +3296,7 @@ impl HomeView {
                 // when a stale unread flag survived the trash (#2489). Snoozed
                 // rows are an explicit "don't bother me" sink state, same as
                 // everywhere else that checks `is_snoozed()`.
-                let is_actionable = !inst.is_trashed()
-                    && !inst.is_snoozed()
+                let is_actionable = !inst.is_dismissed()
                     && (inst.status == Status::Waiting
                         || matches!(inst.idle_age(), Some(age) if age < window)
                         || (crate::session::unread_enabled() && inst.is_unread()));
@@ -3315,8 +3314,7 @@ impl HomeView {
                 if visible_sessions.contains(&inst.id)
                     || current_session.as_deref() == Some(inst.id.as_str())
                     || inst.is_archived()
-                    || inst.is_trashed()
-                    || inst.is_snoozed()
+                    || inst.is_dismissed()
                 {
                     return false;
                 }
@@ -3345,7 +3343,7 @@ impl HomeView {
             let Some(inst) = self.get_instance(&id) else {
                 continue;
             };
-            if inst.is_trashed() || inst.is_snoozed() {
+            if inst.is_dismissed() {
                 continue;
             }
             if inst.status != Status::Idle {
@@ -3379,8 +3377,7 @@ impl HomeView {
             if visible_sessions.contains(&inst.id)
                 || current_session.as_deref() == Some(inst.id.as_str())
                 || inst.is_archived()
-                || inst.is_trashed()
-                || inst.is_snoozed()
+                || inst.is_dismissed()
                 || inst.status != Status::Idle
             {
                 continue;

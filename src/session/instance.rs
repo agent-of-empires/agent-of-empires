@@ -1658,6 +1658,14 @@ impl Instance {
         self.snoozed_until.map(|t| t > Utc::now()).unwrap_or(false)
     }
 
+    /// Combined "don't bother me" sink-state check: trashed or snoozed.
+    /// Callers that walk sessions looking for something to land on (e.g. the
+    /// `w`/jump-to-next-attention passes) use this instead of the two-call
+    /// form so a row in either sink state is uniformly excluded.
+    pub fn is_dismissed(&self) -> bool {
+        self.is_trashed() || self.is_snoozed()
+    }
+
     /// Remaining snooze duration as a `chrono::Duration`, or `None` if the
     /// session isn't snoozed (or the timestamp has already expired).
     pub fn snooze_remaining(&self) -> Option<chrono::Duration> {
