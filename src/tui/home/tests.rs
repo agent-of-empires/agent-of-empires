@@ -7545,6 +7545,84 @@ fn w_skips_unread_trashed_session() {
     );
 }
 
+/// Snooze is the same "don't bother me" sink state as trash/archive for
+/// every other subsystem (see `Instance::is_snoozed`); `w`'s forward walk
+/// (pass 1) must skip a snoozed session even though it is otherwise
+/// `Status::Waiting`, exactly the state `w` is looking for.
+#[test]
+#[serial]
+fn w_skips_snoozed_waiting_session() {
+    use crate::session::Status;
+
+    let mut env = create_test_env_with_sessions(2);
+    env.view.strict_hotkeys = false;
+
+    let snoozed = env.view.instances[0].id.clone();
+    let active = env.view.instances[1].id.clone();
+    // The surviving active row is a plain idle session (the pass-2 fallback);
+    // the snoozed row is otherwise Waiting, as it would be if it started
+    // waiting on input before being snoozed.
+    env.view
+        .mutate_instance(&active, |inst| inst.status = Status::Idle);
+    env.view.mutate_instance(&snoozed, |inst| {
+        inst.status = Status::Waiting;
+        inst.snooze(30);
+    });
+    assert!(env.view.get_instance(&snoozed).unwrap().is_snoozed());
+
+    env.view.select_session_by_id(&active);
+    env.view.handle_key(key(KeyCode::Char('w')), None);
+
+    let landed = match env.view.flat_items.get(env.view.cursor) {
+        Some(Item::Session { id, .. }) => Some(id.clone()),
+        _ => None,
+    };
+    assert_ne!(
+        landed.as_deref(),
+        Some(snoozed.as_str()),
+        "`w` must not land on a snoozed session even though it is Waiting"
+    );
+}
+
+/// Same contract as `w_skips_snoozed_waiting_session`, but for the pass-2
+/// idle fallback: with the only Idle candidate snoozed, `w` must not treat
+/// it as the "most-recently-accessed Idle session" fallback target.
+#[test]
+#[serial]
+fn w_skips_snoozed_idle_session_in_fallback() {
+    let (mut env, running, idle) = attention_env_running_then_idle();
+    let running_id = match env.view.flat_items.get(running) {
+        Some(Item::Session { id, .. }) => id.clone(),
+        _ => panic!("expected the running row to be a session item"),
+    };
+    let idle_id = match env.view.flat_items.get(idle) {
+        Some(Item::Session { id, .. }) => id.clone(),
+        _ => panic!("expected the idle row to be a session item"),
+    };
+    env.view.mutate_instance(&idle_id, |inst| inst.snooze(30));
+    assert!(env.view.get_instance(&idle_id).unwrap().is_snoozed());
+
+    env.view.cursor = running;
+    env.view.update_selected();
+
+    env.view.handle_key(key(KeyCode::Char('w')), None);
+
+    let landed = match env.view.flat_items.get(env.view.cursor) {
+        Some(Item::Session { id, .. }) => Some(id.clone()),
+        _ => None,
+    };
+    assert_ne!(
+        landed.as_deref(),
+        Some(idle_id.as_str()),
+        "`w` must not fall back to a snoozed session even when it is the only Idle candidate"
+    );
+    assert_eq!(
+        landed.as_deref(),
+        Some(running_id.as_str()),
+        "with no eligible target, `w` must leave the cursor on the Running session"
+    );
+}
+
 #[test]
 #[serial]
 fn d_on_session_with_default_trash_persists_trash_marker() {
