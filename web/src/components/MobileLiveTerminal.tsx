@@ -635,6 +635,7 @@ export function MobileLiveTerminal({
   const syncView = useCallback(() => {
     const el = scrollerRef.current;
     if (!el) return;
+    if (el.scrollLeft !== 0) el.scrollLeft = 0;
     setView((prev) =>
       prev.top === el.scrollTop && prev.height === el.clientHeight
         ? prev
@@ -1241,11 +1242,10 @@ export function MobileLiveTerminal({
 
   // Virtualization windows over [0, visibleRowCount): the rows whose document
   // positions fall within the viewport, plus one viewport of overscan each side
-  // so a fast flick does not outrun the re-render. When hidden history is
-  // represented by spacer rows, also keep the live tail mounted. A bottom scroll
-  // can flip out of reading mode before React observes the final scrollTop;
-  // without the tail range, that frame can show only spacer padding until the
-  // next render catches up.
+  // so a fast flick does not outrun the re-render. Always keep the live tail
+  // mounted too: a bottom scroll can flip out of reading before React observes
+  // the final scrollTop, and the capture may be either spacer-backed or a full
+  // history frame. In both cases the transition must have real rows to paint.
   let mountedRanges: Array<{ start: number; end: number }> = [{ start: 0, end: visibleRowCount }];
   if (view.height > 0 && lineH > 0) {
     const overscan = Math.ceil(view.height / lineH);
@@ -1255,17 +1255,13 @@ export function MobileLiveTerminal({
       start: Math.max(0, Math.min(visibleRowCount, firstVisible - overscan)),
       end: Math.max(0, Math.min(visibleRowCount, lastVisible + overscan)),
     };
-    if (effectiveSpacerLines > 0) {
-      mountedRanges = [
-        viewportRange,
-        {
-          start: Math.max(0, visibleRowCount - overscan * 2),
-          end: visibleRowCount,
-        },
-      ];
-    } else {
-      mountedRanges = [viewportRange];
-    }
+    mountedRanges = [
+      viewportRange,
+      {
+        start: Math.max(0, visibleRowCount - overscan * 2),
+        end: visibleRowCount,
+      },
+    ];
   }
   mountedRanges = mountedRanges
     .filter((range) => range.end > range.start)
@@ -1329,7 +1325,7 @@ export function MobileLiveTerminal({
         // honest and the exposed strip shows the wrapper's matching --term-bg,
         // reading as terminal inner-padding.
         className={`absolute inset-x-0 top-0 bottom-[8px] font-mono flex flex-col ${
-          forwardMode ? "overflow-hidden" : "overflow-y-auto overflow-x-hidden"
+          forwardMode ? "overflow-hidden" : "overflow-y-auto overflow-x-clip"
         }`}
         style={{
           fontSize: `${fontSize}px`,

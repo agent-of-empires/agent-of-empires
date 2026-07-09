@@ -172,4 +172,62 @@ test.describe("Desktop live terminal input", () => {
     const px = await content.evaluate((el) => getComputedStyle(el.closest("[data-live-terminal] > div")!).fontSize);
     expect(px).toBe("14px");
   });
+
+  test("scrolling down to the bottom keeps real rows visible", async ({ page }) => {
+    const handle = await mockTerminalApis(page, { liveHistory: 600, delayLiveWindowShrinkMs: 600 });
+    await page.goto("/");
+    await clickSidebarSession(page, "pinch-test");
+    await page.locator("[data-live-terminal]").first().waitFor({ state: "visible", timeout: 10_000 });
+    await expect.poll(() => page.locator("[data-live-content]").innerText()).toContain("$ ready");
+
+    const scroller = page.locator("[data-live-terminal] > div").first();
+    await scroller.evaluate((el) => {
+      el.scrollTop = el.scrollHeight * 0.45;
+      el.dispatchEvent(new Event("scroll"));
+    });
+    await expect.poll(() => scroller.evaluate((el) => el.scrollHeight), { timeout: 3_000 }).toBeGreaterThan(8000);
+
+    await page.waitForTimeout(300);
+    await scroller.evaluate((el) => {
+      el.scrollTop = el.scrollHeight - el.clientHeight;
+      el.dispatchEvent(new Event("scroll"));
+    });
+    await page.waitForTimeout(80);
+
+    const transition = await scroller.evaluate((el) => {
+      const scrollerRect = el.getBoundingClientRect();
+      const visibleRows = Array.from(el.querySelectorAll("[data-live-content] > div"))
+        .filter((row): row is HTMLElement => row instanceof HTMLElement && !row.hasAttribute("aria-hidden"))
+        .filter((row) => {
+          const rect = row.getBoundingClientRect();
+          return (
+            rect.bottom > scrollerRect.top && rect.top < scrollerRect.bottom && (row.textContent ?? "").trim() !== ""
+          );
+        });
+      const firstRect = visibleRows[0]?.getBoundingClientRect();
+      return {
+        scrollLeft: el.scrollLeft,
+        visibleText: visibleRows.map((row) => row.textContent ?? "").join("|"),
+        firstRowLeft: firstRect?.left ?? null,
+        scrollerLeft: scrollerRect.left,
+      };
+    });
+
+    expect(transition.scrollLeft).toBe(0);
+    expect(transition.visibleText, "bottom transition shows rendered terminal rows").toContain("$ ready");
+    expect(transition.firstRowLeft, "visible rows start at the terminal's left edge").not.toBeNull();
+    expect(Math.abs(transition.firstRowLeft! - transition.scrollerLeft)).toBeLessThan(2);
+
+    await expect
+      .poll(() =>
+        textMessages(handle)
+          .filter((m) => m.includes('"type":"window"'))
+          .at(-1),
+      )
+      .toContain('"lines":');
+  });
 });
+
+function textMessages(handle: Awaited<ReturnType<typeof mockTerminalApis>>): string[] {
+  return handle.liveMessages.map((m) => m.toString("utf8"));
+}
