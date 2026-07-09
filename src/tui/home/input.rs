@@ -5428,6 +5428,9 @@ impl HomeView {
         if matches!(inst.status, Status::Creating | Status::Deleting) {
             return;
         }
+        if inst.is_structured() {
+            return;
+        }
         let title = inst.title.clone();
         let tool = inst.tool.clone();
         let supported = crate::agents::get_agent(&tool)

@@ -15684,4 +15684,23 @@ mod permission_response_dialog {
             "supported agent + valid target must open the dialog even when not Waiting"
         );
     }
+
+    #[test]
+    #[serial]
+    fn structured_session_is_a_no_op() {
+        let mut env = create_test_env_empty();
+        let id = add_session_with_tool(&mut env.view, "session-one", "claude");
+        env.view
+            .mutate_instance(&id, |inst| inst.view = crate::session::View::Structured);
+        env.view.selected_session = Some(id);
+        let _ = env.view.handle_key(key(KeyCode::Char('a')), None);
+        assert!(
+            env.view.permission_response_dialog.is_none(),
+            "structured (ACP) session must not open the tmux-keystroke dialog"
+        );
+        assert!(
+            env.view.info_dialog.is_none(),
+            "structured session no-op must be silent, not surface an info dialog"
+        );
+    }
 }

@@ -4611,6 +4611,9 @@ impl HomeView {
         let Some(inst) = self.get_instance(session_id) else {
             return;
         };
+        if inst.is_structured() {
+            return;
+        }
         let Some(response) =
             crate::agents::get_agent(&inst.tool).and_then(|a| a.permission_response)
         else {

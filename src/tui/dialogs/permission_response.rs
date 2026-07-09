@@ -67,7 +67,7 @@ impl PermissionResponseDialog {
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        let dialog_area = super::centered_rect(area, 56, 8);
+        let dialog_area = super::centered_rect(area, 56, 9);
         frame.render_widget(Clear, dialog_area);
 
         let block = Block::default()
@@ -84,7 +84,7 @@ impl PermissionResponseDialog {
             .direction(Direction::Vertical)
             .margin(1)
             .constraints([
-                Constraint::Length(2),
+                Constraint::Length(3),
                 Constraint::Length(1),
                 Constraint::Length(1),
             ])
