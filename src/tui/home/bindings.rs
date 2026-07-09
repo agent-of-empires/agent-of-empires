@@ -300,13 +300,11 @@ pub fn parse_chord(s: &str) -> Option<Chord> {
             c.to_ascii_lowercase()
         };
         KeyCode::Char(c)
-    } else if let Some(n) = key
-        .strip_prefix(['F', 'f'])
-        .and_then(|n| n.parse::<u8>().ok())
-    {
-        KeyCode::F(n)
     } else {
-        return None;
+        let n = key
+            .strip_prefix(['F', 'f'])
+            .and_then(|n| n.parse::<u8>().ok())?;
+        KeyCode::F(n)
     };
     Some(Chord { code, ctrl })
 }
