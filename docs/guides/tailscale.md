@@ -37,7 +37,7 @@ Funnel exposes your node to the public internet over Tailscale's DERP relays. It
 2. Click **Enable Funnel**.
 3. Accept the terms.
 
-![Enable Funnel on the Tailscale admin console](../assets/tailscale-enable-funnel.jpg)
+![Enable Funnel on the Tailscale admin console](../assets/tailscale-enable-funnel.png)
 
 This is a one-time global switch. Without it, `tailscale funnel` fails with "Funnel is not enabled for this tailnet"; aoe detects this in seconds and shows the fix inline.
 
