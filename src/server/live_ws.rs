@@ -344,6 +344,7 @@ async fn handle_live_ws(
         let mut last_published: Option<(String, Option<crate::tmux::PaneCursor>)> = None;
         let mut dead_probes: u32 = 0;
         let mut last_reassert = std::time::Instant::now() - REASSERT_MIN_INTERVAL;
+        let mut last_reassert_geom: Option<(u16, u16, u16, u16)> = None;
         let mut last_heartbeat = std::time::Instant::now() - SIZE_OWNER_HEARTBEAT;
         loop {
             let sample_started = std::time::Instant::now();
@@ -453,8 +454,15 @@ async fn handle_live_ws(
                                 && want_rows > 0
                                 && c.pane_width > 0
                                 && (c.pane_width != want_cols || c.pane_height != want_rows);
-                            if drifted && last_reassert.elapsed() >= REASSERT_MIN_INTERVAL {
+                            let geom = (want_cols, want_rows, c.pane_width, c.pane_height);
+                            let stuck = last_reassert_geom == Some(geom);
+                            if !drifted {
+                                last_reassert_geom = None;
+                            }
+                            if drifted && !stuck && last_reassert.elapsed() >= REASSERT_MIN_INTERVAL
+                            {
                                 last_reassert = std::time::Instant::now();
+                                last_reassert_geom = Some(geom);
                                 warn!(
                                     target: "terminal.ws",
                                     tmux = %capture_tmux,
