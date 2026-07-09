@@ -532,6 +532,10 @@ pub struct HomeView {
     /// hover highlight like a session row does. Updated by `handle_hover`.
     pub(super) tips_badge_hovered: bool,
     pub(super) send_message_dialog: Option<super::dialogs::SendMessageDialog>,
+    pub(super) permission_response_dialog: Option<super::dialogs::PermissionResponseDialog>,
+    /// Session to receive the permission-response keystrokes once the
+    /// dialog resolves.
+    pub(super) pending_permission_response_session: Option<String>,
     /// Session to receive the message from the send dialog
     pub(super) pending_send_session: Option<String>,
     /// Which pane the pending send-message dialog will target. Set
@@ -2049,6 +2053,8 @@ impl HomeView {
             tips_badge_rect: None,
             tips_badge_hovered: false,
             send_message_dialog: None,
+            permission_response_dialog: None,
+            pending_permission_response_session: None,
             pending_send_session: None,
             pending_send_target: live_send::LiveSendTarget::Agent,
             pending_live_send_target: live_send::LiveSendTarget::Agent,
@@ -3870,6 +3876,7 @@ impl HomeView {
             || self.command_palette.is_some()
             || self.tool_picker_dialog.is_some()
             || self.send_message_dialog.is_some()
+            || self.permission_response_dialog.is_some()
             || self.update_confirm_dialog.is_some()
             || self.telemetry_consent_dialog.is_some()
             || self.tips_dialog.is_some()
@@ -3910,6 +3917,7 @@ impl HomeView {
             || self.command_palette.is_some()
             || self.tool_picker_dialog.is_some()
             || self.send_message_dialog.is_some()
+            || self.permission_response_dialog.is_some()
             || self.update_confirm_dialog.is_some()
             || self.telemetry_consent_dialog.is_some()
             || self.tips_dialog.is_some()
@@ -4590,6 +4598,88 @@ impl HomeView {
         }
     }
 
+    /// Send the tmux keystrokes for a permission-prompt decision straight
+    /// to the selected session's agent pane. No pane-readiness wait like
+    /// `execute_send_message` performs: this action only makes sense
+    /// against an already-live pane showing a prompt, so there is nothing
+    /// to revive.
+    pub fn execute_permission_response(
+        &mut self,
+        session_id: &str,
+        choice: crate::tui::dialogs::PermissionResponseChoice,
+    ) {
+        let Some(inst) = self.get_instance(session_id) else {
+            return;
+        };
+        let Some(response) =
+            crate::agents::get_agent(&inst.tool).and_then(|a| a.permission_response)
+        else {
+            return;
+        };
+        let tokens = permission_response_tokens(&response, choice);
+        let tmux_session = match crate::tmux::Session::new(&inst.id, &inst.title) {
+            Ok(s) => s,
+            Err(e) => {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Respond Failed",
+                    &format!("Failed to resolve session: {}", e),
+                ));
+                return;
+            }
+        };
+        if let Err(e) = tmux_session.send_key_tokens(tokens) {
+            self.info_dialog = Some(InfoDialog::new(
+                "Respond Failed",
+                &format!("Failed to send response: {}", e),
+            ));
+        }
+    }
+}
+
+/// Map a decision to its agent-defined keystroke sequence. Pure and
+/// tmux-free so the choice-to-field mapping is unit-testable without a
+/// real pane; `execute_permission_response` is the only caller.
+fn permission_response_tokens(
+    response: &crate::agents::PermissionResponse,
+    choice: crate::tui::dialogs::PermissionResponseChoice,
+) -> &'static [crate::agents::KeyToken] {
+    use crate::tui::dialogs::PermissionResponseChoice::*;
+    match choice {
+        Allow => response.allow,
+        AllowAlways => response.allow_always,
+        Deny => response.deny,
+    }
+}
+
+#[cfg(test)]
+mod permission_response_tokens_tests {
+    use super::*;
+    use crate::agents::{KeyToken, PermissionResponse};
+    use crate::tui::dialogs::PermissionResponseChoice;
+
+    #[test]
+    fn maps_each_choice_to_its_own_field() {
+        let response = PermissionResponse {
+            allow: &[KeyToken::Literal("1")],
+            allow_always: &[KeyToken::Literal("2")],
+            deny: &[KeyToken::Literal("3")],
+        };
+        assert_eq!(
+            permission_response_tokens(&response, PermissionResponseChoice::Allow),
+            response.allow
+        );
+        assert_eq!(
+            permission_response_tokens(&response, PermissionResponseChoice::AllowAlways),
+            response.allow_always
+        );
+        assert_eq!(
+            permission_response_tokens(&response, PermissionResponseChoice::Deny),
+            response.deny
+        );
+    }
+}
+
+impl HomeView {
     /// Size to boot a cold/dead agent pane at on live-send entry: the visible
     /// preview output rect when known, else the full terminal. `preview_pane_area`
     /// is the exact rect `finalize_live_send_resize` resizes to, so seeding the

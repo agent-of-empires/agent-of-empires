@@ -745,6 +745,7 @@ impl HomeView {
             command_palette,
             tool_picker_dialog,
             send_message_dialog,
+            permission_response_dialog,
             update_confirm_dialog,
             // context_menu renders last so its small popup sits on top of
             // any underlying dialog (e.g. an info dialog opened by a

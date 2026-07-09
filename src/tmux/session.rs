@@ -651,6 +651,34 @@ impl Session {
         Ok(())
     }
 
+    /// Sends exactly the given token sequence to the pane, in order, with no
+    /// implicit trailing key. Unlike [`send_keys_with_delay`](Self::send_keys_with_delay),
+    /// which always appends a submitting `Enter`, the caller's token list
+    /// fully controls what reaches the pane: a bare menu-digit selection
+    /// needs zero `Enter`s, while a multi-step button navigation needs
+    /// exactly as many as its shape requires. Used to answer an agent CLI's
+    /// own interactive permission prompt; see
+    /// [`crate::agents::PermissionResponse`].
+    pub fn send_key_tokens(&self, tokens: &[crate::agents::KeyToken]) -> Result<()> {
+        if !self.exists() {
+            bail!("Session does not exist: {}", self.name);
+        }
+
+        let target = format!("{}:^.0", self.name);
+        for token in tokens {
+            match token {
+                crate::agents::KeyToken::Literal(text) => {
+                    Self::tmux_send(&target, &["-l", "--", text])?;
+                }
+                crate::agents::KeyToken::Named(name) => {
+                    Self::tmux_send(&target, &[name])?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Restore automatic window sizing after live-send forced a manual
     /// size. tmux's `resize-window -x -y` silently switches the window-
     /// size option to `manual`, so without this call a later
@@ -1312,6 +1340,108 @@ mod tests {
             (cursor.x, cursor.y),
             (5, 0),
             "cursor parks just past 'hello'"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn send_key_tokens_appends_no_implicit_enter() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let guard = TmuxTestSession::new("aoe_test_tokens_no_enter");
+        let name = guard.name().to_string();
+        // `read -r` blocks on a full line: it only prints once Enter arrives.
+        // A bare literal with no Enter token must leave it blocked.
+        let status = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &name,
+                "-x",
+                "40",
+                "-y",
+                "10",
+                "sh -c 'read -r line; printf \"got:%s\" \"$line\"; sleep 60'",
+                ";",
+                "set-option",
+                "-t",
+                &name,
+                "pane-base-index",
+                "0",
+            ])
+            .status()
+            .expect("tmux new-session");
+        assert!(status.success());
+
+        let session = Session::from_name(&name);
+        session
+            .send_key_tokens(&[crate::agents::KeyToken::Literal("hi")])
+            .expect("send_key_tokens");
+
+        // Give the shell a beat to react if it were (incorrectly) going to.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let content = session.capture_pane(20).expect("capture_pane");
+        assert!(
+            !content.contains("got:"),
+            "no trailing Enter should have been sent, but read() completed: {content:?}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn send_key_tokens_sends_exact_sequence_in_order() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let guard = TmuxTestSession::new("aoe_test_tokens_sequence");
+        let name = guard.name().to_string();
+        let status = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &name,
+                "-x",
+                "40",
+                "-y",
+                "10",
+                "sh -c 'read -r line; printf \"got:%s\" \"$line\"; sleep 60'",
+                ";",
+                "set-option",
+                "-t",
+                &name,
+                "pane-base-index",
+                "0",
+            ])
+            .status()
+            .expect("tmux new-session");
+        assert!(status.success());
+
+        let session = Session::from_name(&name);
+        session
+            .send_key_tokens(&[
+                crate::agents::KeyToken::Literal("hi"),
+                crate::agents::KeyToken::Named("Enter"),
+            ])
+            .expect("send_key_tokens");
+
+        let mut content = String::new();
+        for _ in 0..50 {
+            content = session.capture_pane(20).expect("capture_pane");
+            if content.contains("got:hi") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(
+            content.contains("got:hi"),
+            "literal text followed by a named Enter token should submit the line, got: {content:?}"
         );
     }
 

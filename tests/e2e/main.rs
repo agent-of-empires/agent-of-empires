@@ -40,6 +40,7 @@ mod kiro_launch;
 mod logs;
 mod new_session;
 mod opencode_sandbox_resume;
+mod permission_response_e2e;
 mod plugins;
 mod profile_picker;
 mod project_registry;
