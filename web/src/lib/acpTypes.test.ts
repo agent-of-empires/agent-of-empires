@@ -2966,3 +2966,65 @@ describe("applyEvent / elicitation", () => {
     expect(state.inFlightTool).toBeNull();
   });
 });
+
+describe("applyEvent / UsageUpdated context-window latch (upstream #596 bandaid)", () => {
+  function usageFrame(seq: number, used: number, size: number): AcpFrame {
+    return {
+      session_id: "s-1",
+      seq,
+      event: { UsageUpdated: { usage: { used, size } } },
+    };
+  }
+  function modelFrame(seq: number, currentValue: string): AcpFrame {
+    return {
+      session_id: "s-1",
+      seq,
+      event: {
+        ConfigOptionsUpdated: {
+          options: [
+            {
+              id: "model",
+              name: "Model",
+              category: "model",
+              current_value: currentValue,
+              options: [],
+            },
+          ],
+        },
+      },
+    };
+  }
+
+  it("latches the largest window and ignores the mid-turn 200k downgrade", () => {
+    let state = applyEvent(emptyAcpState(), usageFrame(1, 10_000, 200_000));
+    expect(state.sessionUsage?.size).toBe(200_000);
+    // authoritative 1M arrives at turn end
+    state = applyEvent(state, usageFrame(2, 20_000, 1_000_000));
+    expect(state.sessionUsage?.size).toBe(1_000_000);
+    // next turn's mid-stream frame downgrades to 200k; latch holds 1M,
+    // but `used` still tracks the incoming value
+    state = applyEvent(state, usageFrame(3, 30_000, 200_000));
+    expect(state.sessionUsage?.size).toBe(1_000_000);
+    expect(state.sessionUsage?.used).toBe(30_000);
+  });
+
+  it("resets the latch on a context boundary (SessionCleared)", () => {
+    let state = applyEvent(emptyAcpState(), usageFrame(1, 20_000, 1_000_000));
+    expect(state.sessionUsage?.size).toBe(1_000_000);
+    state = applyEvent(state, { session_id: "s-1", seq: 2, event: "SessionCleared" });
+    expect(state.sessionUsage).toBeNull();
+    state = applyEvent(state, usageFrame(3, 5_000, 200_000));
+    expect(state.sessionUsage?.size).toBe(200_000);
+  });
+
+  it("resets the latch when the model changes", () => {
+    let state = applyEvent(emptyAcpState(), modelFrame(1, "sonnet"));
+    state = applyEvent(state, usageFrame(2, 20_000, 1_000_000));
+    expect(state.sessionUsage?.size).toBe(1_000_000);
+    // switch to a smaller-window model; the prior 1M latch must not stick
+    state = applyEvent(state, modelFrame(3, "haiku"));
+    expect(state.sessionUsage).toBeNull();
+    state = applyEvent(state, usageFrame(4, 5_000, 200_000));
+    expect(state.sessionUsage?.size).toBe(200_000);
+  });
+});

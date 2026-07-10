@@ -1425,6 +1425,17 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // raw; only `cost` is rebased. clamp to zero defensively in case
     // an upstream restart ever reports a smaller cumulative. See #1354.
     const incoming = event.UsageUpdated.usage;
+    // Bandaid for upstream claude-agent-acp #596: mid-turn usage_update
+    // reports the 200k DEFAULT_CONTEXT_WINDOW for models whose real
+    // window is 1M (the `sonnet` / `default` aliases miss its `\b1m\b`
+    // heuristic), and only snaps to the authoritative window at the
+    // turn's `result`. Rendering each frame verbatim makes the footer
+    // flicker 200k <-> 1M every turn. Latch the largest window learned
+    // this session; a real context boundary (clear / compact /
+    // agent-switch / context-reset / model change) nulls sessionUsage,
+    // which resets the latch to the next raw value. Drop once upstream
+    // stops emitting the downgraded mid-turn guess.
+    const size = Math.max(incoming.size, next.sessionUsage?.size ?? 0);
     if (next.usageBaseline && incoming.cost) {
       const rebasedAmount = Math.max(0, incoming.cost.amount - next.usageBaseline.cost);
       const rebasedCost = {
@@ -1433,11 +1444,11 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       };
       next.sessionUsage = {
         used: incoming.used,
-        size: incoming.size,
+        size,
         cost: rebasedCost,
       };
     } else {
-      next.sessionUsage = incoming;
+      next.sessionUsage = { used: incoming.used, size, cost: incoming.cost };
     }
     return next;
   }
@@ -1474,6 +1485,14 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   }
   if ("ConfigOptionsUpdated" in event) {
     const options = event.ConfigOptionsUpdated.options;
+    // A model change moves the context window, so drop the latched
+    // usage window (see the UsageUpdated arm) and relearn it for the
+    // new model instead of holding the prior model's larger window.
+    const priorModel = next.configOptions.find((o) => o.category === "model")?.current_value;
+    const nextModel = options.find((o) => o.category === "model")?.current_value;
+    if (priorModel !== undefined && nextModel !== undefined && priorModel !== nextModel) {
+      next.sessionUsage = null;
+    }
     next.configOptions = options;
     // The snapshot is authoritative, so any in-flight pending click
     // resolves here regardless of whether the adapter applied the
