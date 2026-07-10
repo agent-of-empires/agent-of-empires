@@ -13169,6 +13169,53 @@ mod live_send_mode {
 
     #[test]
     #[serial]
+    fn drift_check_does_not_exit_for_tool_target_named_via_tool_session() {
+        // Regression guard: the Tool arm of the drift check must resolve
+        // the current name the same way `prepare_live_send` computed
+        // `tmux_name` at entry (via `ToolSession::new(..).session_name()`).
+        // A prior bug instead re-derived the Tool arm's "current name"
+        // through `Session::generate_name`, the agent-pane naming scheme,
+        // which never matches a tool's own tmux name. That mismatch made
+        // every Tool-view live-send look "renamed" on its very first
+        // keystroke and auto-exit immediately.
+        let mut env = create_test_env_with_sessions(1);
+        let id = env
+            .view
+            .flat_items
+            .iter()
+            .find_map(|item| match item {
+                crate::session::Item::Session { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .expect("test env has one session");
+        let inst = env.view.get_instance(&id).unwrap().clone();
+        let tmux_name = crate::tmux::ToolSession::new(&inst.id, &inst.title, "lazygit")
+            .session_name()
+            .to_string();
+        crate::tmux::test_inject_session_into_cache(&tmux_name);
+        env.view.live_send = Some(LiveSendState {
+            session_id: inst.id.clone(),
+            title: inst.title,
+            tmux_name,
+            target: crate::tui::home::live_send::LiveSendTarget::Tool("lazygit".to_string()),
+            exit_chords: crate::tui::home::live_send::parse_chord_list(
+                crate::tui::home::live_send::DEFAULT_EXIT_CHORD,
+            ),
+            leader: None,
+        });
+
+        env.view
+            .handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), None);
+
+        assert!(
+            env.view.live_send.is_some(),
+            "first keystroke in a Tool-view live-send must not trip spurious drift"
+        );
+        assert!(env.view.info_dialog.is_none());
+    }
+
+    #[test]
+    #[serial]
     fn live_mode_makes_has_dialog_true() {
         // Every dialog-gating predicate that already inspects has_dialog()
         // (mouse swallow, list nav suspend, palette skip) inherits live

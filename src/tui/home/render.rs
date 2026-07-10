@@ -2792,7 +2792,7 @@ impl HomeView {
             // Surface which pane keystrokes are landing on; the shared
             // formatter keeps this label in lockstep with the compose
             // dialog's title.
-            let raw_title = live_send::format_target_label(base_title, state.target.clone());
+            let raw_title = live_send::format_target_label(base_title, &state.target);
             let chip = " \u{25CF} LIVE \u{2192} ";
             let chip_style = Style::default()
                 .fg(theme.background)

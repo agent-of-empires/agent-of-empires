@@ -5064,7 +5064,7 @@ impl HomeView {
         // throw voice text on the floor; losing dictation is worse than
         // silently catching it.
         if let Some((id, title, target)) = self.resolve_send_target() {
-            let label = live_send::format_target_label(&title, target.clone());
+            let label = live_send::format_target_label(&title, &target);
             self.pending_send_session = Some(id);
             self.pending_send_target = target;
             let mut dialog = SendMessageDialog::new(&label);
@@ -5408,8 +5408,10 @@ impl HomeView {
             live_send::LiveSendTarget::ContainerTerminal => {
                 crate::tmux::ContainerTerminalSession::generate_name(&inst.id, &inst.title)
             }
-            live_send::LiveSendTarget::Tool(_) => {
-                crate::tmux::Session::generate_name(&inst.id, &inst.title)
+            live_send::LiveSendTarget::Tool(name) => {
+                crate::tmux::ToolSession::new(&inst.id, &inst.title, name)
+                    .session_name()
+                    .to_string()
             }
         };
         if current_name != state.tmux_name {
@@ -5433,7 +5435,7 @@ impl HomeView {
         let Some((id, title, target)) = self.resolve_send_target() else {
             return;
         };
-        let label = live_send::format_target_label(&title, target.clone());
+        let label = live_send::format_target_label(&title, &target);
         self.pending_send_session = Some(id);
         self.pending_send_target = target;
         let mut dialog = SendMessageDialog::new(&label);
@@ -5520,7 +5522,7 @@ impl HomeView {
         }
 
         if let Some((id, title, target)) = self.resolve_send_target() {
-            let label = live_send::format_target_label(&title, target.clone());
+            let label = live_send::format_target_label(&title, &target);
             self.pending_send_session = Some(id);
             self.pending_send_target = target;
             let mut dialog = SendMessageDialog::new(&label);
@@ -6029,15 +6031,15 @@ mod tests {
         // banner route through the same helper so the label can't drift.
         use live_send::{format_target_label, LiveSendTarget};
         assert_eq!(
-            format_target_label("my-session", LiveSendTarget::Agent),
+            format_target_label("my-session", &LiveSendTarget::Agent),
             "my-session",
         );
         assert_eq!(
-            format_target_label("my-session", LiveSendTarget::Terminal),
+            format_target_label("my-session", &LiveSendTarget::Terminal),
             "my-session (terminal)",
         );
         assert_eq!(
-            format_target_label("my-session", LiveSendTarget::ContainerTerminal),
+            format_target_label("my-session", &LiveSendTarget::ContainerTerminal),
             "my-session (container)",
         );
     }
