@@ -135,6 +135,7 @@ fn intro_theme_pick_persists_to_config() {
     h.send_keys("Enter"); // submit
 
     h.wait_for("No sessions yet");
+    h.wait_for_absent("(6/6)", Duration::from_secs(3));
 
     let cfg = read_config(&h);
     assert!(
@@ -181,6 +182,7 @@ fn intro_lets_user_choose_tmux_attach() {
     h.send_keys("Enter"); // submit
 
     h.wait_for("No sessions yet");
+    h.wait_for_absent("(6/6)", Duration::from_secs(3));
 
     let cfg = read_config(&h);
     assert!(
