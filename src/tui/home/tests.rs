@@ -7623,6 +7623,92 @@ fn w_skips_snoozed_idle_session_in_fallback() {
     );
 }
 
+/// Archive is the same "don't bother me" sink state as trash/snooze (see
+/// `Instance::archive`'s mutual-exclusion doc comment: archive is "the
+/// strongest dismiss"); `w`'s forward walk (pass 1) must skip an archived
+/// session even though it is otherwise `Status::Waiting`, exactly the state
+/// `w` is looking for.
+#[test]
+#[serial]
+fn w_skips_archived_waiting_session() {
+    use crate::session::Status;
+
+    let mut env = create_test_env_with_sessions(2);
+    env.view.strict_hotkeys = false;
+    // Keep the Archived section expanded so the archived row lands in
+    // `flat_items`; that is the only way `w`'s walk could reach it.
+    env.view.archived_section_collapsed = false;
+
+    let archived = env.view.instances[0].id.clone();
+    let active = env.view.instances[1].id.clone();
+    // The surviving active row is a plain idle session (the pass-2 fallback);
+    // the archived row is otherwise Waiting, as it would be if it started
+    // waiting on input before being archived.
+    env.view
+        .mutate_instance(&active, |inst| inst.status = Status::Idle);
+    env.view.mutate_instance(&archived, |inst| {
+        inst.status = Status::Waiting;
+        inst.archive();
+    });
+    assert!(env.view.get_instance(&archived).unwrap().is_archived());
+
+    env.view.select_session_by_id(&active);
+    env.view.handle_key(key(KeyCode::Char('w')), None);
+
+    let landed = match env.view.flat_items.get(env.view.cursor) {
+        Some(Item::Session { id, .. }) => Some(id.clone()),
+        _ => None,
+    };
+    assert_ne!(
+        landed.as_deref(),
+        Some(archived.as_str()),
+        "`w` must not land on an archived session even though it is Waiting"
+    );
+}
+
+/// Same contract as `w_skips_archived_waiting_session`, but for the pass-2
+/// idle fallback: with the only Idle candidate archived, `w` must not treat
+/// it as the "most-recently-accessed Idle session" fallback target.
+#[test]
+#[serial]
+fn w_skips_archived_idle_session_in_fallback() {
+    let (mut env, running, idle) = attention_env_running_then_idle();
+    let running_id = match env.view.flat_items.get(running) {
+        Some(Item::Session { id, .. }) => id.clone(),
+        _ => panic!("expected the running row to be a session item"),
+    };
+    let idle_id = match env.view.flat_items.get(idle) {
+        Some(Item::Session { id, .. }) => id.clone(),
+        _ => panic!("expected the idle row to be a session item"),
+    };
+    // `mutate_instance` updates the instance in place without rebuilding
+    // `flat_items`, so the now-archived row stays at its original index
+    // (pass 2 re-derives its dismissed state from the live instance, not
+    // from `flat_items`, so this still exercises the real code path).
+    env.view.mutate_instance(&idle_id, |inst| inst.archive());
+    assert!(env.view.get_instance(&idle_id).unwrap().is_archived());
+
+    env.view.cursor = running;
+    env.view.update_selected();
+
+    env.view.handle_key(key(KeyCode::Char('w')), None);
+
+    let landed = match env.view.flat_items.get(env.view.cursor) {
+        Some(Item::Session { id, .. }) => Some(id.clone()),
+        _ => None,
+    };
+    assert_ne!(
+        landed.as_deref(),
+        Some(idle_id.as_str()),
+        "`w` must not fall back to an archived session even when it is the only Idle candidate"
+    );
+    assert_eq!(
+        landed.as_deref(),
+        Some(running_id.as_str()),
+        "with no eligible target, `w` must leave the cursor on the Running session"
+    );
+}
+
 #[test]
 #[serial]
 fn d_on_session_with_default_trash_persists_trash_marker() {

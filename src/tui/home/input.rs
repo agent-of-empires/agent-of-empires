@@ -3294,8 +3294,9 @@ impl HomeView {
                 // Trashed rows are stopped and only surface under the collapsed
                 // Trash section; they never "need attention", so skip them even
                 // when a stale unread flag survived the trash (#2489). Snoozed
-                // rows are an explicit "don't bother me" sink state, same as
-                // everywhere else that checks `is_snoozed()`.
+                // and archived rows are likewise explicit "don't bother me"
+                // sink states, same as everywhere else that checks
+                // `is_snoozed()` / `is_archived()`.
                 let is_actionable = !inst.is_dismissed()
                     && (inst.status == Status::Waiting
                         || matches!(inst.idle_age(), Some(age) if age < window)
@@ -3313,7 +3314,6 @@ impl HomeView {
             .find(|inst| {
                 if visible_sessions.contains(&inst.id)
                     || current_session.as_deref() == Some(inst.id.as_str())
-                    || inst.is_archived()
                     || inst.is_dismissed()
                 {
                     return false;
@@ -3376,7 +3376,6 @@ impl HomeView {
         for inst in &self.instances {
             if visible_sessions.contains(&inst.id)
                 || current_session.as_deref() == Some(inst.id.as_str())
-                || inst.is_archived()
                 || inst.is_dismissed()
                 || inst.status != Status::Idle
             {
