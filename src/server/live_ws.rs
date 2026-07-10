@@ -963,7 +963,9 @@ mod tests {
         );
         // Reaching target resets the guard, so a later drift fires immediately.
         g.reset();
-        assert!(g.should_reassert(stuck, t0 + Duration::from_secs(120)));
+        // Without reset, t0+35s is 4s after the t0+31s re-assert (inside the
+        // 30s window) and would be suppressed; reset clears it so it fires.
+        assert!(g.should_reassert(stuck, t0 + Duration::from_secs(35)));
     }
 
     #[test]
