@@ -7548,22 +7548,30 @@ fn w_skips_unread_trashed_session() {
 /// Snooze is the same "don't bother me" sink state as trash/archive for
 /// every other subsystem (see `Instance::is_snoozed`); `w`'s forward walk
 /// (pass 1) must skip a snoozed session even though it is otherwise
-/// `Status::Waiting`, exactly the state `w` is looking for.
+/// `Status::Waiting`, exactly the state `w` is looking for. A third,
+/// eligible `Status::Waiting` control session proves the walk actually
+/// found and landed on a real target rather than merely failing to land
+/// on the snoozed one (with only two sessions "landed != snoozed" would
+/// hold trivially even if `w` did nothing at all).
 #[test]
 #[serial]
 fn w_skips_snoozed_waiting_session() {
     use crate::session::Status;
 
-    let mut env = create_test_env_with_sessions(2);
+    let mut env = create_test_env_with_sessions(3);
     env.view.strict_hotkeys = false;
 
     let snoozed = env.view.instances[0].id.clone();
     let active = env.view.instances[1].id.clone();
-    // The surviving active row is a plain idle session (the pass-2 fallback);
-    // the snoozed row is otherwise Waiting, as it would be if it started
-    // waiting on input before being snoozed.
+    let control = env.view.instances[2].id.clone();
+    // The active row is a plain idle session the cursor starts on; the
+    // control row is a legitimate, non-dismissed Waiting session `w` should
+    // land on; the snoozed row is otherwise Waiting too, as it would be if
+    // it started waiting on input before being snoozed.
     env.view
         .mutate_instance(&active, |inst| inst.status = Status::Idle);
+    env.view
+        .mutate_instance(&control, |inst| inst.status = Status::Waiting);
     env.view.mutate_instance(&snoozed, |inst| {
         inst.status = Status::Waiting;
         inst.snooze(30);
@@ -7581,6 +7589,11 @@ fn w_skips_snoozed_waiting_session() {
         landed.as_deref(),
         Some(snoozed.as_str()),
         "`w` must not land on a snoozed session even though it is Waiting"
+    );
+    assert_eq!(
+        landed.as_deref(),
+        Some(control.as_str()),
+        "`w` must land on the eligible Waiting session, proving the forward walk actually ran"
     );
 }
 
@@ -7627,13 +7640,17 @@ fn w_skips_snoozed_idle_session_in_fallback() {
 /// `Instance::archive`'s mutual-exclusion doc comment: archive is "the
 /// strongest dismiss"); `w`'s forward walk (pass 1) must skip an archived
 /// session even though it is otherwise `Status::Waiting`, exactly the state
-/// `w` is looking for.
+/// `w` is looking for. A third, eligible `Status::Waiting` control session
+/// proves the walk actually found and landed on a real target rather than
+/// merely failing to land on the archived one (with only two sessions
+/// "landed != archived" would hold trivially even if `w` did nothing at
+/// all).
 #[test]
 #[serial]
 fn w_skips_archived_waiting_session() {
     use crate::session::Status;
 
-    let mut env = create_test_env_with_sessions(2);
+    let mut env = create_test_env_with_sessions(3);
     env.view.strict_hotkeys = false;
     // Keep the Archived section expanded so the archived row lands in
     // `flat_items`; that is the only way `w`'s walk could reach it.
@@ -7641,11 +7658,15 @@ fn w_skips_archived_waiting_session() {
 
     let archived = env.view.instances[0].id.clone();
     let active = env.view.instances[1].id.clone();
-    // The surviving active row is a plain idle session (the pass-2 fallback);
-    // the archived row is otherwise Waiting, as it would be if it started
-    // waiting on input before being archived.
+    let control = env.view.instances[2].id.clone();
+    // The active row is a plain idle session the cursor starts on; the
+    // control row is a legitimate, non-dismissed Waiting session `w` should
+    // land on; the archived row is otherwise Waiting too, as it would be if
+    // it started waiting on input before being archived.
     env.view
         .mutate_instance(&active, |inst| inst.status = Status::Idle);
+    env.view
+        .mutate_instance(&control, |inst| inst.status = Status::Waiting);
     env.view.mutate_instance(&archived, |inst| {
         inst.status = Status::Waiting;
         inst.archive();
@@ -7663,6 +7684,11 @@ fn w_skips_archived_waiting_session() {
         landed.as_deref(),
         Some(archived.as_str()),
         "`w` must not land on an archived session even though it is Waiting"
+    );
+    assert_eq!(
+        landed.as_deref(),
+        Some(control.as_str()),
+        "`w` must land on the eligible Waiting session, proving the forward walk actually ran"
     );
 }
 
