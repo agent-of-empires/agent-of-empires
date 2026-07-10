@@ -433,7 +433,17 @@ pub async fn set_plugin_enabled(
     let result =
         tokio::task::spawn_blocking(move || plugin::install::set_enabled(&id, body.enabled)).await;
     match result {
-        Ok(Ok(())) => list_plugins().await.into_response(),
+        Ok(Ok(())) => {
+            // set_enabled reloaded the global registry on disk; reconcile the
+            // live host so enabling launches the worker and disabling tears it
+            // down, without waiting for a full daemon restart. reconcile is
+            // async, so it runs here after the sync spawn_blocking returns,
+            // never inside it.
+            if let Some(host) = state.plugin_host.clone() {
+                host.reconcile(&crate::plugin::registry()).await;
+            }
+            list_plugins().await.into_response()
+        }
         Ok(Err(e)) => error_response(StatusCode::BAD_REQUEST, "plugin_error", format!("{e:#}")),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
     }
