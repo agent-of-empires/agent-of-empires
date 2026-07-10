@@ -1139,8 +1139,7 @@ export function MobileLiveTerminal({
           e.altKey &&
           !e.ctrlKey &&
           !e.metaKey &&
-          (e.key === "Enter" ||
-            e.key === "Backspace" ||
+          (e.key === "Backspace" ||
             e.key === "ArrowUp" ||
             e.key === "ArrowDown" ||
             e.key === "ArrowRight" ||
