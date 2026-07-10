@@ -49,8 +49,17 @@ test("view switch round-trips between tmux and structured view", async ({}, test
     expect(enableBody.session_id).toBe(sessionId);
     expect(enableBody.view === "structured").toBe(true);
 
-    const sessionsAfterEnable = await listSessions(serve.baseUrl);
-    expect(sessionsAfterEnable.find((s) => s.id === sessionId)!.view === "structured").toBe(true);
+    // The enable response above is the authoritative synchronous ack. The
+    // session list is a cache the daemon reconciles on a 2s tick, so a
+    // disk snapshot taken just before the enable write can briefly clobber
+    // the in-memory `view` back to terminal before self-correcting. Poll
+    // rather than asserting the list immediately.
+    await expect
+      .poll(async () => (await listSessions(serve.baseUrl)).find((s) => s.id === sessionId)?.view === "structured", {
+        timeout: 10_000,
+        intervals: [100, 200, 400],
+      })
+      .toBe(true);
 
     // Idempotent: a second enable returns the same shape without an
     // error and without re-spawning anything destructive.
@@ -70,8 +79,13 @@ test("view switch round-trips between tmux and structured view", async ({}, test
     };
     expect(disableBody.view === "structured").toBe(false);
 
-    const sessionsAfterDisable = await listSessions(serve.baseUrl);
-    expect(sessionsAfterDisable.find((s) => s.id === sessionId)!.view === "structured").toBe(false);
+    // Same 2s reconciler race as the enable direction; poll the list.
+    await expect
+      .poll(async () => (await listSessions(serve.baseUrl)).find((s) => s.id === sessionId)?.view === "structured", {
+        timeout: 10_000,
+        intervals: [100, 200, 400],
+      })
+      .toBe(false);
 
     // Idempotent in the other direction too.
     const disableAgain = await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/acp/disable`, { method: "POST" });
