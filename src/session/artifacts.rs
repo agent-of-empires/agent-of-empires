@@ -102,15 +102,8 @@ fn is_regular_file(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::test_support::isolate_app_dir;
     use serial_test::serial;
-
-    fn isolate_app_dir() -> tempfile::TempDir {
-        let tmp = tempfile::tempdir().expect("create temp home for artifact tests");
-        std::env::set_var("HOME", tmp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
-        tmp
-    }
 
     #[test]
     #[serial]

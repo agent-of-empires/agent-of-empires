@@ -72,17 +72,8 @@ pub fn is_scratch_path(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::test_support::isolate_app_dir;
     use serial_test::serial;
-
-    fn isolate_app_dir() -> tempfile::TempDir {
-        // Tests must not write to the user's real app dir. Re-rooting $HOME
-        // (or $XDG_CONFIG_HOME on Linux) forces get_app_dir() into a temp.
-        let tmp = tempfile::tempdir().expect("create temp home for scratch tests");
-        std::env::set_var("HOME", tmp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
-        tmp
-    }
 
     #[test]
     #[serial]

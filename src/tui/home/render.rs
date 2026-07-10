@@ -899,7 +899,7 @@ impl HomeView {
             );
         }
 
-        if self.instances().is_empty() && !self.has_any_groups() {
+        if !self.has_instances() && !self.has_any_groups() {
             let empty_text = vec![
                 Line::from(""),
                 Line::from("No sessions yet").style(Style::default().fg(theme.dimmed)),

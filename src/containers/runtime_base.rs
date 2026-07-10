@@ -273,6 +273,21 @@ impl RuntimeBase {
         Err(DockerError::InspectFailed(sanitize_stderr(stderr)))
     }
 
+    /// Classify a non-success stderr from the existence surface (`container inspect`
+    /// on Docker/Podman, `logs` on Apple), parallel to
+    /// [`Self::classify_inspect_failure`]. Both arms funnel through this classifier;
+    /// the terminal [`DockerError::InspectFailed`] variant is reused because the
+    /// classification rules and `Display` contract are identical.
+    ///
+    /// Delegating rather than duplicating keeps the order-of-checks
+    /// priority (permission-denied before daemon-down) authoritative in
+    /// one place. Closes the swallowing-existence-probe class of bug
+    /// (#2596 / #2652 / #2654) on the existence surface, following #2652
+    /// which closed it on the running-state surface.
+    pub fn classify_exists_failure(&self, stderr: &str) -> Result<bool> {
+        self.classify_inspect_failure(stderr)
+    }
+
     pub fn command(&self) -> Command {
         Command::new(self.binary)
     }
@@ -846,6 +861,121 @@ mod tests {
         let stderr = "Error response from daemon: internal server error 500";
         assert!(matches!(
             RuntimeBase::DOCKER.classify_inspect_failure(stderr),
+            Err(DockerError::InspectFailed(_))
+        ));
+    }
+
+    // classify_exists_failure test triples: parallel to the classify_inspect_failure
+    // triples above, verifying the existence surface (used by
+    // `does_container_exist`) shares the same fixture-based classification.
+    // Closes the swallowing-existence-probe class of bug (#2596) on the
+    // existence surface, following #2652 which closed it on the running-state
+    // surface. Absent-container fixture bytes are shared with the
+    // classify_inspect_failure suite via the `_MISSING` module-scope
+    // constants; daemon-down and permission-denied fixture strings are
+    // byte-identical inlined copies (keep them in sync manually until a
+    // shared fixture module lands).
+
+    #[test]
+    fn exists_not_found_stderr_collapses_to_ok_false() {
+        // Absent-container stderr (from `<runtime> container inspect
+        // <missing>` on Docker/Podman, or `<runtime> logs <missing>` on
+        // Apple) must map to Ok(false), so `does_container_exist` returns a
+        // definitive "absent" instead of surfacing the missing container as
+        // an Err.
+        assert!(matches!(
+            RuntimeBase::DOCKER.classify_exists_failure(DOCKER_MISSING),
+            Ok(false)
+        ));
+        assert!(matches!(
+            RuntimeBase::APPLE_CONTAINER.classify_exists_failure(APPLE_MISSING),
+            Ok(false)
+        ));
+        assert!(matches!(
+            RuntimeBase::PODMAN.classify_exists_failure(PODMAN_MISSING),
+            Ok(false)
+        ));
+    }
+
+    #[test]
+    fn exists_daemon_down_stderr_maps_to_daemon_not_running() {
+        // Daemon-unreachable stderr on the existence surface must NOT
+        // collapse to Ok(false): that is the exact swallowing-existence-probe
+        // failure mode this fix closes. Surfacing as Err lets the
+        // create-path and future fail-closed gates route the daemon-down
+        // signal to the actionable DaemonNotRunning Display message.
+        let docker_daemon_down =
+            "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. \
+             Is the docker daemon running?";
+        assert!(matches!(
+            RuntimeBase::DOCKER.classify_exists_failure(docker_daemon_down),
+            Err(DockerError::DaemonNotRunning)
+        ));
+
+        let podman_socket_down = "Error: unable to connect to Podman socket: Connection refused";
+        assert!(matches!(
+            RuntimeBase::PODMAN.classify_exists_failure(podman_socket_down),
+            Err(DockerError::DaemonNotRunning)
+        ));
+
+        let podman_desktop_down = "Cannot connect to Podman. \
+             Please verify your connection to the Linux system using \
+             `podman system connection list`, or try `podman machine init` \
+             and `podman machine start` to manage a new Linux VM";
+        assert!(matches!(
+            RuntimeBase::PODMAN.classify_exists_failure(podman_desktop_down),
+            Err(DockerError::DaemonNotRunning)
+        ));
+
+        // Apple placeholder: real `container` CLI daemon-down wording is not
+        // captured in this repo; marker match is by construction, same
+        // caveat as classify_inspect_failure's Apple daemon-down test.
+        let apple_daemon_down =
+            "Error: internalError: \"failed to connect to container daemon\" (cause: \"transient\")";
+        assert!(matches!(
+            RuntimeBase::APPLE_CONTAINER.classify_exists_failure(apple_daemon_down),
+            Err(DockerError::DaemonNotRunning)
+        ));
+    }
+
+    #[test]
+    fn exists_permission_denied_stderr_maps_to_permission_denied() {
+        // Same PermissionDenied classification as classify_inspect_failure:
+        // Docker's tight marker isolates cleanly; Podman and Apple use the
+        // broader "permission denied" placeholder pending real-fixture
+        // capture (same caveat documented on classify_inspect_failure).
+        let docker_stderr =
+            "Got permission denied while trying to connect to the Docker daemon socket \
+                             at unix:///var/run/docker.sock";
+        assert!(matches!(
+            RuntimeBase::DOCKER.classify_exists_failure(docker_stderr),
+            Err(DockerError::PermissionDenied)
+        ));
+
+        let podman_stderr = "Error: unable to connect to Podman socket: dial unix \
+                             /run/user/1000/podman/podman.sock: connect: permission denied";
+        assert!(matches!(
+            RuntimeBase::PODMAN.classify_exists_failure(podman_stderr),
+            Err(DockerError::PermissionDenied)
+        ));
+
+        let apple_stderr = "Error: permission denied accessing container socket";
+        assert!(matches!(
+            RuntimeBase::APPLE_CONTAINER.classify_exists_failure(apple_stderr),
+            Err(DockerError::PermissionDenied)
+        ));
+    }
+
+    #[test]
+    fn exists_generic_transient_maps_to_inspect_failed() {
+        // The terminal-else on the existence surface reuses InspectFailed
+        // rather than introducing a parallel ExistenceCheckFailed variant:
+        // the classification rules and single-line Display contract are
+        // identical, and operators read the raw stderr via the error field
+        // regardless of which argv produced it.
+        let stderr = "Error response from daemon: internal server error 500";
+        assert!(matches!(
+            RuntimeBase::DOCKER.classify_exists_failure(stderr),
             Err(DockerError::InspectFailed(_))
         ));
     }

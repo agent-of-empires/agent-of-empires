@@ -24,7 +24,7 @@ use crate::session::{persist_session_to_storage, Instance, ResumeIntent, SidWrit
 
 /// Per-tick result of [`drain_and_persist_session_ids`]. Lists touched
 /// instance IDs grouped by the persistence outcome so a caller holding an
-/// auxiliary in-memory mirror (e.g. the TUI's `instance_map`) can re-sync
+/// auxiliary in-memory mirror (e.g. the TUI's `instances` map) can re-sync
 /// each affected entry from the slice.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct SessionIdSyncOutcome {

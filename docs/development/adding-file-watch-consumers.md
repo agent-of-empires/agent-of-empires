@@ -43,7 +43,7 @@ Bounded mpsc receiver, sized to the worst-case burst between consumer ticks. The
 
 ### Debounce
 
-Per-`(SubscriptionId, path)` trailing-edge debounce in `Duration` granularity. Common values: 75 ms (storage; kernel echo of `Storage::update` rename) and 100 ms (config; vim-style write+rename burst).
+Per-`(SubscriptionId, path)` trailing-edge debounce in `Duration` granularity. Common values: 75 ms (storage; kernel echo of `Storage::update` rename) and 100 ms (config; vim-style write+rename burst). The passive-status pipeline (`docs/development/internals/sessions.md`) is a canonical `Storage::update` producer: the daemon's `status_poll_loop` writes one row per profile per 2s tick when transitions occur, so a `sessions.json` subscriber's `FileWatchService` event stream is dominated by passive-status writes under a busy set of sessions.
 
 ### Lifetime of `SubscriptionHandle`
 

@@ -143,15 +143,8 @@ fn write(catalog: &OptionCatalog) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use crate::acp::state::{ConfigOptionCategory, ConfigOptionChoice};
+    use crate::session::test_support::isolate_app_dir;
     use serial_test::serial;
-
-    fn isolate_app_dir() -> tempfile::TempDir {
-        let tmp = tempfile::tempdir().expect("create temp home for catalog tests");
-        std::env::set_var("HOME", tmp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
-        tmp
-    }
 
     fn descriptor(current: &str) -> ConfigOptionDescriptor {
         ConfigOptionDescriptor {

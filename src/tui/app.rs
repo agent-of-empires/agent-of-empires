@@ -1681,9 +1681,12 @@ impl App {
     /// failed send retains it; the value is consumed only after a confirmed send
     /// (mirroring the serve deferred-clear).
     fn build_telemetry_snapshot(&self) -> Option<crate::telemetry::UsageSnapshot> {
+        // Boundary snapshot: `build_usage_snapshot` takes `&[Instance]`
+        // (shared API with the daemon caller in `src/server/mod.rs`).
+        let instances: Vec<crate::session::Instance> = self.home.instances().cloned().collect();
         crate::telemetry::build_usage_snapshot(
             crate::telemetry::Surface::Tui,
-            self.home.instances(),
+            &instances,
             crate::telemetry::usage_signals::zeroed(),
             reported_session_creates(),
             // The TUI hosts no server, so it has no auth or exposure mode.
@@ -1860,7 +1863,7 @@ impl App {
         if Config::load_or_warn().sandbox.enabled_by_default {
             return true;
         }
-        self.home.instances().iter().any(|i| i.is_sandboxed())
+        self.home.instances().any(|i| i.is_sandboxed())
     }
 
     /// Is the sandbox-image banner the one currently shown? It sits below the
@@ -2509,8 +2512,11 @@ impl App {
             return false;
         };
         let now = chrono::Utc::now();
+        // Boundary snapshot: `idle_reap_candidates` takes `&[Instance]`
+        // (shared API with the daemon caller in `src/server/mod.rs`).
+        let instances: Vec<crate::session::Instance> = self.home.instances().cloned().collect();
         let candidates = crate::session::idle_reap::idle_reap_candidates(
-            self.home.instances(),
+            &instances,
             now,
             &attached,
             |profile| {

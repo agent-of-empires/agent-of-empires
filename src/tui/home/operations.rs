@@ -230,13 +230,11 @@ impl HomeView {
         // For the target profile, filter to that profile's instances.
         let existing_titles: Vec<&str> = self
             .instances()
-            .iter()
             .filter(|i| i.source_profile == target_profile)
             .map(|i| i.title.as_str())
             .collect();
         let existing_branches: Vec<&str> = self
             .instances()
-            .iter()
             .filter(|i| i.source_profile == target_profile)
             .filter_map(|i| i.worktree_info.as_ref().map(|w| w.branch.as_str()))
             .collect();
@@ -561,7 +559,7 @@ impl HomeView {
             let prefix = format!("{}/", group_path);
             let ids_to_clear: Vec<String> = self
                 .instances
-                .iter()
+                .values()
                 .filter(|i| {
                     (i.group_path == group_path || i.group_path.starts_with(&prefix))
                         && owning_profile
@@ -600,7 +598,6 @@ impl HomeView {
 
             let sessions_to_delete: Vec<String> = self
                 .instances()
-                .iter()
                 .filter(|i| {
                     (i.group_path == group_path || i.group_path.starts_with(&prefix))
                         && owning_profile
@@ -678,7 +675,7 @@ impl HomeView {
     /// stuck in the Deleting state where the background deletion thread never
     /// returned a result.
     pub(super) fn force_remove_session(&mut self, session_id: &str) -> anyhow::Result<()> {
-        if let Some(inst) = self.instances.iter().find(|i| i.id == session_id) {
+        if let Some(inst) = self.instances.get(session_id) {
             let inst = inst.clone();
             std::thread::spawn(move || {
                 if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -717,7 +714,7 @@ impl HomeView {
         prefix: &str,
         owning_profile: Option<&str>,
     ) -> bool {
-        self.instances().iter().any(|i| {
+        self.instances().any(|i| {
             (i.group_path == group_path || i.group_path.starts_with(prefix))
                 && owning_profile.is_none_or(|p| i.source_profile == p)
                 && i.has_managed_worktree_or_workspace()
@@ -730,7 +727,7 @@ impl HomeView {
         prefix: &str,
         owning_profile: Option<&str>,
     ) -> bool {
-        self.instances().iter().any(|i| {
+        self.instances().any(|i| {
             (i.group_path == group_path || i.group_path.starts_with(prefix))
                 && owning_profile.is_none_or(|p| i.source_profile == p)
                 && i.sandbox_info.as_ref().is_some_and(|s| s.enabled)
@@ -784,7 +781,7 @@ impl HomeView {
         // Collect sessions belonging to this group and its descendants
         let affected_ids: Vec<String> = self
             .instances
-            .iter()
+            .values()
             .filter(|i| {
                 (i.group_path == ctx.old_path || i.group_path.starts_with(&old_prefix))
                     && i.source_profile == ctx.old_profile
@@ -1088,9 +1085,7 @@ impl HomeView {
 
                     // Get the instance to move
                     let mut instance = self
-                        .instances()
-                        .iter()
-                        .find(|i| i.id == id)
+                        .get_instance(&id)
                         .cloned()
                         .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
 
@@ -1231,7 +1226,7 @@ impl HomeView {
             return Ok(None);
         };
         let (is_snoozed, title) = {
-            let inst = self.instances.iter().find(|i| i.id == id);
+            let inst = self.instances.get(&id);
             match inst {
                 Some(i) => (i.is_snoozed(), i.title.clone()),
                 None => return Ok(None),
@@ -1259,7 +1254,7 @@ impl HomeView {
         minutes: u32,
     ) -> anyhow::Result<Option<String>> {
         let title = self
-            .instance_map
+            .instances
             .get(id)
             .map(|i| i.title.clone())
             .unwrap_or_default();
@@ -1289,7 +1284,7 @@ impl HomeView {
         let Some(id) = self.selected_session.clone() else {
             return Ok(());
         };
-        let is_fav = match self.instances.iter().find(|i| i.id == id) {
+        let is_fav = match self.instances.get(&id) {
             Some(i) => i.is_favorited(),
             None => return Ok(()),
         };
@@ -1319,7 +1314,7 @@ impl HomeView {
             if id == archiving_id {
                 return None;
             }
-            let inst = self.instances.iter().find(|i| &i.id == id)?;
+            let inst = self.instances.get(id)?;
             (!inst.is_archived() && !inst.is_trashed()).then(|| id.clone())
         };
         for item in self.flat_items.iter().skip(self.cursor + 1) {
@@ -1346,7 +1341,7 @@ impl HomeView {
         let Some(id) = self.selected_session.clone() else {
             return Ok(());
         };
-        if !self.instances.iter().any(|i| i.id == id) {
+        if !self.instances.contains_key(&id) {
             return Ok(());
         }
         self.apply_user_action(&id, |inst| inst.toggle_unread())?;
@@ -1377,11 +1372,11 @@ impl HomeView {
         // The shelve/unshelve key doubles as restore for the Trash section: a
         // trashed row can't be meaningfully archived, so `z` on it pulls the
         // session back out of the trash instead. See #2489.
-        if matches!(self.instances.iter().find(|i| i.id == id), Some(i) if i.is_trashed()) {
+        if matches!(self.instances.get(&id), Some(i) if i.is_trashed()) {
             self.restore_selected_from_trash();
             return Ok(());
         }
-        let is_archived = match self.instances.iter().find(|i| i.id == id) {
+        let is_archived = match self.instances.get(&id) {
             Some(i) => i.is_archived(),
             None => return Ok(()),
         };
@@ -1399,7 +1394,7 @@ impl HomeView {
         }
 
         // Tear down all tmux before flipping archived. #1868.
-        if let Some(inst) = self.instances.iter().find(|i| i.id == id) {
+        if let Some(inst) = self.instances.get(&id) {
             inst.kill_all_tmux_sessions();
         }
 
@@ -1466,7 +1461,7 @@ impl HomeView {
             tracing::warn!(target: "tui.session", session = %id, "trash failed: {e}");
             return;
         }
-        if let Some(inst) = self.instances.iter().find(|i| i.id == id) {
+        if let Some(inst) = self.instances.get(id) {
             inst.kill_all_tmux_sessions();
         }
         // The session is durably trashed and its agent stopped; relocate its
@@ -1498,7 +1493,7 @@ impl HomeView {
             return;
         };
         let is_trashed = matches!(
-            self.instances.iter().find(|i| i.id == id),
+            self.instances.get(&id),
             Some(i) if i.is_trashed()
         );
         if !is_trashed {
@@ -1544,7 +1539,7 @@ impl HomeView {
             // filter, exactly as `build_flat_items_by_project` builds them.
             crate::session::config::GroupByMode::Project => self
                 .instances
-                .iter()
+                .values()
                 .filter(|i| !i.is_archived() && !i.is_trashed())
                 .filter(|i| {
                     self.active_profile
@@ -1560,7 +1555,7 @@ impl HomeView {
             crate::session::config::GroupByMode::Manual => {
                 let prefix = format!("{}/", group_path);
                 self.instances
-                    .iter()
+                    .values()
                     .filter(|i| !i.is_archived() && !i.is_trashed())
                     .filter(|i| i.group_path == group_path || i.group_path.starts_with(&prefix))
                     .filter(|i| {
@@ -1583,11 +1578,9 @@ impl HomeView {
         }
         // Off-thread tmux teardown so N x 4 shellouts don't block the input
         // thread. Mirrors `force_remove_session`.
-        let kill_targets: Vec<_> = self
-            .instances
+        let kill_targets: Vec<_> = ids
             .iter()
-            .filter(|i| ids.contains(&i.id))
-            .cloned()
+            .filter_map(|id| self.instances.get(id).cloned())
             .collect();
         std::thread::spawn(move || {
             for inst in kill_targets {

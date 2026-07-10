@@ -1411,16 +1411,9 @@ mod tests {
 
     mod scratch_cleanup {
         use super::*;
+        use crate::session::test_support::isolate_app_dir;
         use serial_test::serial;
         use std::fs;
-
-        fn isolate_app_dir() -> tempfile::TempDir {
-            let tmp = tempfile::tempdir().expect("create temp home for scratch deletion tests");
-            std::env::set_var("HOME", tmp.path());
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
-            tmp
-        }
 
         fn scratch_instance() -> (Instance, PathBuf) {
             let id = format!("delete-test-{}", uuid::Uuid::new_v4());

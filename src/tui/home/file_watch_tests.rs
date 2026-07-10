@@ -451,7 +451,7 @@ async fn reload_storage_only_survives_list_profiles_failure() {
 
     assert!(
         view.instances
-            .iter()
+            .values()
             .any(|inst| inst.title == "fallback-row"),
         "reload must still refresh storage-backed instances when list_profiles fails"
     );

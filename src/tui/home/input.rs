@@ -2876,7 +2876,7 @@ impl HomeView {
     /// to borrow a path from), leaving the dialog on the default cwd.
     pub(super) fn group_repo_path(&self, group_path: &str) -> Option<String> {
         self.instances
-            .iter()
+            .values()
             .find(|inst| match self.group_by {
                 GroupByMode::Project => super::project_group_name(inst) == group_path,
                 _ => {
@@ -3326,7 +3326,7 @@ impl HomeView {
 
         let hidden_actionable = self
             .instances
-            .iter()
+            .values()
             .find(|inst| {
                 if visible_sessions.contains(&inst.id)
                     || current_session.as_deref() == Some(inst.id.as_str())
@@ -3390,7 +3390,7 @@ impl HomeView {
         }
 
         let mut best_hidden: Option<(String, Option<chrono::DateTime<chrono::Utc>>)> = None;
-        for inst in &self.instances {
+        for inst in self.instances.values() {
             if visible_sessions.contains(&inst.id)
                 || current_session.as_deref() == Some(inst.id.as_str())
                 || inst.is_archived()
@@ -4650,7 +4650,7 @@ impl HomeView {
             let prefix = format!("{}/", group_path);
             let session_count = self
                 .instances
-                .iter()
+                .values()
                 .filter(|i| {
                     (i.group_path == *group_path || i.group_path.starts_with(&prefix))
                         && owning_profile

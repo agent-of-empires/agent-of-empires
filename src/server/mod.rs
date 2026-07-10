@@ -2356,6 +2356,20 @@ pub(crate) async fn reload_state_instances_from_disk(
 /// `inst.is_structured()` per the invariant above; filtering on
 /// the lazy session id would silently drop overlay coverage for
 /// pre-handshake rows.
+///
+/// ## Durability contract (#2690 follow-up)
+///
+/// Structured rows accept a soft reset of `status` / `last_accessed_at` /
+/// `idle_entered_at` on daemon restart, by contract. The values written
+/// here come from `prior_by_id`, an in-memory snapshot that the daemon
+/// rebuilds each tick from live worker state, and never flow through
+/// [`crate::session::PassiveStatusPatch`] (`decide_passive_transition`
+/// returns `patch: None` for `is_structured()` rows). After a daemon
+/// restart, disk-loaded structured rows read whatever was durably
+/// persisted last (initial creation, or an explicit user action). ACP
+/// event handlers are responsible for any post-restart re-emission that
+/// updates these fields for structured sessions; the passive-status
+/// writer at `status_poll_loop` deliberately does not.
 #[cfg(feature = "serve")]
 fn apply_acp_overlay_inplace(prior_by_id: &PriorById, merged: &mut [Instance]) {
     for inst in merged.iter_mut() {
@@ -3190,11 +3204,22 @@ struct PassiveTransitionDecision {
     /// `update_status_with_metadata_inner`, and `apply_acp_overlay_inplace`,
     /// which is the sole authority for their status/timestamps). Persisting
     /// a patch here would write a bogus tmux-derived status to disk for a
-    /// session the poller never actually controls. Regression: #2697.
+    /// session the poller never actually controls. Locked by
+    /// `decide_passive_transition_skips_patch_for_structured_session`
+    /// (a `#[cfg(test)]` item; kept as a code-span rather than an
+    /// intra-doc link that would degrade to literal text under
+    /// `cargo doc`).
     patch: Option<crate::session::PassiveStatusPatch>,
     mark_unread: bool,
 }
 
+/// Compute the passive-status write decision for one instance whose
+/// `status` differs from the tick's `prev` snapshot. The full
+/// contract lives on the return type at [`PassiveTransitionDecision`]:
+/// `patch: None` for structured / ACP sessions (the ACP overlay is the
+/// sole authority), and `mark_unread: true` only on genuine
+/// Running -> Idle when unread is enabled and the row is not already
+/// unread.
 fn decide_passive_transition(
     inst: &Instance,
     old_status: Status,
@@ -3207,6 +3232,45 @@ fn decide_passive_transition(
         && inst.status == Status::Idle
         && !inst.unread;
     PassiveTransitionDecision { patch, mark_unread }
+}
+
+/// Per-profile bundle of passive-status writes accumulated in one
+/// `status_poll_loop` tick. `patches` is keyed by instance id so the
+/// persistence closure resolves each row in O(1); `unread_ids` stays a
+/// small `Vec` because per-tick cardinality is low and `Vec::contains`
+/// beats `HashSet` at that N.
+///
+/// ## Persistence divergence between daemon and TUI (#2690 follow-up)
+///
+/// The daemon batches transitions here (one `Storage::update` per profile
+/// per tick, via `persist_session_update`). The TUI's
+/// [`crate::tui::home::HomeView::persist_passive_status_transition`]
+/// writes one transition at a time. Both funnel through
+/// [`crate::session::Instance::merge_passive_status_patch`], whose field
+/// semantics are: `last_accessed_at` is monotone non-decreasing (guarded
+/// by `>=`, so an older-or-equal incoming value is dropped);
+/// `status` and `idle_entered_at` are unconditional writes
+/// (last-writer-wins). The two paths are safe to interleave today because
+/// the poller is the sole authority on those two fields and both writers
+/// read the same live source, so they converge within one poll interval
+/// of the slower cadence (daemon at 2s, TUI at ~500ms) even when their
+/// observations disagree mid-cadence.
+///
+/// A future field added to [`crate::session::PassiveStatusPatch`] that is
+/// neither monotone (like `last_accessed_at`) nor single-authority (like
+/// the current `status`/`idle_entered_at`) would diverge silently
+/// between the daemon's batched replay and the TUI's per-transition
+/// writes. Any such addition must either unify the two paths first, or
+/// explicitly document why the two-writer shape stays safe.
+#[derive(Default)]
+struct PassiveTransitionWrites {
+    /// Keyed by instance id for O(1) lookup inside the persist closure.
+    /// [`crate::session::PassiveStatusPatch::from_instance`] keeps
+    /// `patch.id == inst.id`, so the map key and the value's `id` field
+    /// stay in sync by construction; the redundancy is intentional and
+    /// used by the closure's `.get(&inst.id)` at the flush site below.
+    patches: std::collections::HashMap<String, crate::session::PassiveStatusPatch>,
+    unread_ids: Vec<String>,
 }
 
 /// Background task that periodically refreshes session statuses. On each
@@ -3287,23 +3351,14 @@ async fn status_poll_loop(state: Arc<AppState>) {
             // overlay applied by the helper.
             let now = chrono::Utc::now();
             let unread_enabled = crate::session::unread_enabled();
-            // Passive status transitions observed this tick, persisted
-            // promptly so the next reload (including the next tick, since
-            // this loop reloads from disk every cycle) finds disk already
-            // in sync with live reality instead of restamping again. See
-            // #2690. Batched per profile: one `Storage::update` per profile
-            // per tick, not one per transitioned session.
-            let mut patches_by_profile: std::collections::HashMap<
-                String,
-                Vec<crate::session::PassiveStatusPatch>,
-            > = std::collections::HashMap::new();
-            // Auto-mark unread on a finished turn (Running -> Idle), the same
-            // transition the TUI marks on. This is what lets a web-only user
-            // (no TUI process polling) accrue the indicator. There's no
-            // server-side "is being viewed" exemption: the client suppresses
-            // the chip on the session it is actively viewing and clears the
-            // auto marker on open.
-            let mut newly_idle_by_profile: std::collections::HashMap<String, Vec<String>> =
+            // Passive status transitions observed this tick, batched per
+            // profile so one `Storage::update` flock covers every
+            // transitioned session on that profile (plus its unread mark
+            // when applicable). Persisting promptly is what keeps the next
+            // reload (this loop's next tick, or a TUI relaunch) from
+            // comparing against a stale snapshot and restamping again. See
+            // #2690.
+            let mut bundles: std::collections::HashMap<String, PassiveTransitionWrites> =
                 std::collections::HashMap::new();
             for inst in &mut instances {
                 let Some(old) = prev.get(&inst.id) else {
@@ -3320,35 +3375,38 @@ async fn status_poll_loop(state: Arc<AppState>) {
                     at: now,
                 });
                 let decision = decide_passive_transition(inst, *old, unread_enabled);
+                if decision.patch.is_none() && !decision.mark_unread {
+                    continue;
+                }
+                let bundle = bundles.entry(inst.source_profile.clone()).or_default();
                 if let Some(patch) = decision.patch {
-                    patches_by_profile
-                        .entry(inst.source_profile.clone())
-                        .or_default()
-                        .push(patch);
+                    bundle.patches.insert(patch.id.clone(), patch);
                 }
                 if decision.mark_unread {
                     inst.mark_unread();
-                    newly_idle_by_profile
-                        .entry(inst.source_profile.clone())
-                        .or_default()
-                        .push(inst.id.clone());
+                    bundle.unread_ids.push(inst.id.clone());
                 }
             }
-            let profiles: std::collections::HashSet<String> = patches_by_profile
-                .keys()
-                .chain(newly_idle_by_profile.keys())
-                .cloned()
-                .collect();
-            for profile in profiles {
-                let patches = patches_by_profile.remove(&profile).unwrap_or_default();
-                let unread_ids = newly_idle_by_profile.remove(&profile).unwrap_or_default();
+            for (
+                profile,
+                PassiveTransitionWrites {
+                    patches,
+                    unread_ids,
+                },
+            ) in bundles
+            {
                 let _ = api::persist_session_update(
                     profile,
                     "passive-status",
                     state.file_watch.clone(),
                     move |insts| {
                         for inst in insts.iter_mut() {
-                            if let Some(patch) = patches.iter().find(|p| p.id == inst.id) {
+                            if let Some(patch) = patches.get(&inst.id) {
+                                debug_assert_eq!(
+                                    patch.id, inst.id,
+                                    "PassiveStatusPatch::from_instance keeps `patch.id == inst.id`; \
+                                     if this fires, the map key or the patch's `id` field has drifted"
+                                );
                                 inst.merge_passive_status_patch(patch);
                             }
                             if unread_ids.contains(&inst.id) {
@@ -4641,7 +4699,7 @@ mod tests {
 
     #[test]
     fn decide_passive_transition_skips_patch_for_structured_session() {
-        // #2697: a status_poll_loop CI regression. Structured/ACP sessions
+        // Locks the CI regression from #2697: structured/ACP sessions
         // have no tmux pane for the poller to probe; their `status` is not
         // poller-authoritative (the ACP overlay is), so a disk/detected
         // mismatch must not be persisted as a passive status patch.

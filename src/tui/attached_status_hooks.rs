@@ -7,7 +7,7 @@ use std::time::Duration;
 use crate::session::{Instance, Status};
 use crate::status_hooks::StatusHookConfig;
 
-use super::status_poller::{poll_statuses_once, StatusPollState, StatusUpdate};
+use super::status_poller::{poll_statuses_once, IdleIntent, StatusPollState, StatusUpdate};
 
 const REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -123,7 +123,14 @@ fn apply_updates(
 
         session.instance.status = update.status;
         session.instance.last_error = update.last_error;
-        session.instance.idle_entered_at = update.idle_entered_at;
+        match update.idle_entered_at {
+            IdleIntent::Set(ts) => session.instance.idle_entered_at = Some(ts),
+            IdleIntent::Clear => session.instance.idle_entered_at = None,
+            IdleIntent::Keep => {}
+        }
+        if let Some(baseline) = update.live_status_baseline {
+            session.instance.live_status_baseline = Some(baseline);
+        }
 
         if run_hooks && old != update.status {
             crate::status_hooks::run_for_transition(
@@ -143,7 +150,31 @@ fn snapshot(sessions: &[AttachedStatusHookSession]) -> Vec<StatusUpdate> {
             id: session.instance.id.clone(),
             status: session.instance.status,
             last_error: session.instance.last_error.clone(),
-            idle_entered_at: session.instance.idle_entered_at,
+            // Watcher never observed a poll of its own => baseline is None
+            // and idle_entered_at is whatever the parent clone carried at
+            // attach-time. Emitting `Keep` here honors "producer has no
+            // observation" and prevents the snapshot from clobbering a
+            // real value the main-thread poller already wrote onto the
+            // real Instance during attach. This window is bounded by
+            // `REFRESH_INTERVAL` at the top of the module: the watcher
+            // seeds baseline on its first poll, after which `Some(_)` +
+            // `apply_updates`'s writes cover the field. Once the watcher
+            // has polled at least once, baseline is Some and
+            // idle_entered_at was written by `apply_updates` above, so
+            // `Set(ts)` / `Clear` reflect the real observation.
+            //
+            // Arm order matches consumer sites (`apply_updates` above,
+            // `apply_status_update` in `src/tui/home/mod.rs`) and the
+            // enum declaration in `src/tui/status_poller.rs`:
+            // `Set` first, `Clear` second, `Keep` last.
+            idle_entered_at: match (
+                session.instance.live_status_baseline,
+                session.instance.idle_entered_at,
+            ) {
+                (Some(_), Some(ts)) => IdleIntent::Set(ts),
+                (Some(_), None) => IdleIntent::Clear,
+                (None, _) => IdleIntent::Keep,
+            },
             last_accessed_at: session.instance.last_accessed_at,
             pane_dead: session.instance.pane_dead_observed,
             live_status_baseline: session.instance.live_status_baseline,
@@ -155,6 +186,7 @@ fn snapshot(sessions: &[AttachedStatusHookSession]) -> Vec<StatusUpdate> {
 mod tests {
     use super::*;
     use crate::status_hooks::{take_recorded_launches, StatusHookConfig};
+    use chrono::Utc;
     use serial_test::serial;
 
     #[test]
@@ -179,7 +211,7 @@ mod tests {
                 id: id.clone(),
                 status: Status::Waiting,
                 last_error: None,
-                idle_entered_at: None,
+                idle_entered_at: IdleIntent::Keep,
                 last_accessed_at: None,
                 pane_dead: false,
                 live_status_baseline: None,
@@ -193,5 +225,67 @@ mod tests {
         assert_eq!(launches[0].context.session_id, id);
         assert_eq!(launches[0].context.old_status, Status::Idle);
         assert_eq!(launches[0].context.new_status, Status::Waiting);
+    }
+
+    #[test]
+    #[serial]
+    fn apply_updates_maps_idle_intent_set_and_clear_arms() {
+        // Lock #2690 R5: the Set/Clear arm mapping in `apply_updates`
+        // (lines 126-130 above) is the attached-hooks copy of the same
+        // match that `HomeView::apply_status_update` performs in
+        // `src/tui/home/mod.rs`. The `home` copy is covered by
+        // `apply_status_update_clears_idle_entered_at_on_idle_to_running`
+        // in `src/tui/home/tests.rs`. This test locks the equivalent
+        // shape here so a Set<->Clear swap in either consumer is
+        // caught at review time; without it, a swap in this file
+        // compiles cleanly and passes the existing
+        // `apply_updates_runs_status_hook_for_transition` test (which
+        // only exercises `Keep`).
+        let mut instance = Instance::new("Idle Target", "/tmp/idle-target");
+        instance.status = Status::Running;
+        instance.idle_entered_at = None;
+        let id = instance.id.clone();
+        let mut sessions = vec![AttachedStatusHookSession {
+            instance,
+            hook_config: StatusHookConfig::default(),
+        }];
+
+        let stop_time = Utc::now() - chrono::Duration::minutes(3);
+        apply_updates(
+            &mut sessions,
+            vec![StatusUpdate {
+                id: id.clone(),
+                status: Status::Idle,
+                last_error: None,
+                idle_entered_at: IdleIntent::Set(stop_time),
+                last_accessed_at: None,
+                pane_dead: false,
+                live_status_baseline: Some(Status::Idle),
+            }],
+            false,
+        );
+        assert_eq!(
+            sessions[0].instance.idle_entered_at,
+            Some(stop_time),
+            "IdleIntent::Set(ts) must write Some(ts) onto idle_entered_at"
+        );
+
+        apply_updates(
+            &mut sessions,
+            vec![StatusUpdate {
+                id: id.clone(),
+                status: Status::Running,
+                last_error: None,
+                idle_entered_at: IdleIntent::Clear,
+                last_accessed_at: None,
+                pane_dead: false,
+                live_status_baseline: Some(Status::Running),
+            }],
+            false,
+        );
+        assert_eq!(
+            sessions[0].instance.idle_entered_at, None,
+            "IdleIntent::Clear must reset idle_entered_at to None"
+        );
     }
 }

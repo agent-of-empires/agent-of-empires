@@ -412,8 +412,7 @@ struct RecoveryUpdate {
 pub struct HomeView {
     pub(super) storages: HashMap<String, Storage>,
     pub(super) active_profile: Option<String>,
-    instances: Vec<Instance>,
-    instance_map: HashMap<String, Instance>,
+    instances: indexmap::IndexMap<String, Instance>,
     /// Per-profile tombstones for ids removed since last `save`. Drained
     /// on Ok return so the next save retries on transient failure.
     pending_deletions: HashMap<String, HashSet<String>>,
@@ -1916,11 +1915,6 @@ impl HomeView {
             storages.insert(profile_name.clone(), storage);
         }
 
-        let instance_map: HashMap<String, Instance> = all_instances
-            .iter()
-            .map(|i| (i.id.clone(), i.clone()))
-            .collect();
-
         // In unified mode there is no single active profile, so config is
         // resolved from the user's default profile.
         let config_profile = active_profile
@@ -1985,8 +1979,7 @@ impl HomeView {
         let mut view = Self {
             storages,
             active_profile,
-            instances: all_instances,
-            instance_map,
+            instances: Self::build_instances_map(all_instances),
             pending_deletions: HashMap::new(),
             pending_group_deletions: HashMap::new(),
             pending_added: HashMap::new(),
@@ -2181,7 +2174,7 @@ impl HomeView {
         // Clean up orphaned Creating instances from a prior crash
         let orphan_ids: Vec<String> = view
             .instances
-            .iter()
+            .values()
             .filter(|i| i.status == crate::session::Status::Creating)
             .map(|i| i.id.clone())
             .collect();
@@ -2200,7 +2193,7 @@ impl HomeView {
         {
             let mut set_batch: Vec<(String, String, String)> = Vec::new();
             let mut unset_batch: Vec<(String, String)> = Vec::new();
-            for inst in &view.instances {
+            for inst in view.instances.values() {
                 let Some(tmux_name) = inst.tmux_env_session_name() else {
                     continue;
                 };
@@ -2244,7 +2237,7 @@ impl HomeView {
         }
 
         // Recover session IDs for pre-existing sessions via pollers.
-        for inst in &mut view.instances {
+        for inst in view.instances.values_mut() {
             let has_live_tmux = inst.has_live_tmux_pane();
             if !has_live_tmux {
                 continue;
@@ -2263,12 +2256,6 @@ impl HomeView {
         // duplicating cascades. See `crate::session::recovery` for the full
         // exclusion rationale.
         view.maybe_start_startup_recovery();
-
-        view.instance_map = view
-            .instances
-            .iter()
-            .map(|i| (i.id.clone(), i.clone()))
-            .collect();
 
         view.refresh_registered_projects();
         view.flat_items = view.build_flat_items();
@@ -2374,7 +2361,7 @@ impl HomeView {
             let (mut instances, groups) = storage.load_with_groups()?;
             for inst in &mut instances {
                 inst.source_profile = profile_name.clone();
-                if let Some(prev) = self.instance_map.get(&inst.id) {
+                if let Some(prev) = self.instances.get(&inst.id) {
                     inst.status = prev.status;
                     inst.last_error = prev.last_error.clone();
                     inst.last_error_check = prev.last_error_check;
@@ -2415,22 +2402,21 @@ impl HomeView {
         let storage_keys: Vec<String> = self.storages.keys().cloned().collect();
         self.group_trees.retain(|k, _| storage_keys.contains(k));
 
-        self.instances = all_instances;
+        // Snapshot the in-flight Creating stub before `self.instances` is
+        // overwritten. The stub isn't on disk (added via `add_instance` from
+        // `create_session` before the async worker starts) and would
+        // otherwise vanish across reload.
+        let creating_stub_snapshot: Option<Instance> = self
+            .creating_stub_id
+            .as_ref()
+            .and_then(|id| self.instances.get(id).cloned());
 
-        // Re-inject any in-flight Creating stub that won't be on disk
-        if let Some(ref stub_id) = self.creating_stub_id {
-            if !self.instances.iter().any(|i| i.id == *stub_id) {
-                if let Some(stub) = self.instance_map.get(stub_id).cloned() {
-                    self.instances.push(stub);
-                }
-            }
+        self.instances = Self::build_instances_map(all_instances);
+
+        if let Some(stub) = creating_stub_snapshot {
+            self.instances.entry(stub.id.clone()).or_insert(stub);
         }
 
-        self.instance_map = self
-            .instances
-            .iter()
-            .map(|i| (i.id.clone(), i.clone()))
-            .collect();
         // Refresh the project registry so project view's empty pinned headers
         // and pin indicators reflect the current on-disk registry.
         self.refresh_registered_projects();
@@ -2619,7 +2605,7 @@ impl HomeView {
     /// transitions during the suppression window.
     pub(super) fn pollable_instances(&self) -> Vec<Instance> {
         self.instances
-            .iter()
+            .values()
             .filter(|i| {
                 !self.recovery_in_flight.contains(&i.id) && !self.restart_in_flight.contains(&i.id)
             })
@@ -2701,6 +2687,8 @@ impl HomeView {
         let new_pane_dead = update.pane_dead;
 
         if should_update {
+            use crate::tui::status_poller::IdleIntent;
+
             let new_status = update.status;
             let new_error = update.last_error;
             let new_idle_entered_at = update.idle_entered_at;
@@ -2708,18 +2696,27 @@ impl HomeView {
             self.mutate_instance(&update.id, |inst| {
                 inst.status = new_status;
                 inst.last_error = new_error;
-                // Propagate the timestamp the polling clone wrote;
-                // see StatusPoller for why this isn't a simple
-                // `inst.idle_entered_at = …` from inside the poll.
-                inst.idle_entered_at = new_idle_entered_at;
+                // Match on the producer's stated intent for `idle_entered_at`
+                // instead of overloading `None`. See `IdleIntent` in
+                // `status_poller` for the three-variant contract that
+                // replaces the pre-fix `Option<DateTime<Utc>>` (which
+                // conflated "producer observed a transition out of Idle" with
+                // "producer has no observation"). See #2690.
+                match new_idle_entered_at {
+                    IdleIntent::Set(ts) => inst.idle_entered_at = Some(ts),
+                    IdleIntent::Clear => inst.idle_entered_at = None,
+                    IdleIntent::Keep => {}
+                }
                 if new_last_accessed.is_some() {
                     inst.last_accessed_at = new_last_accessed;
                 }
-                // Conditional, not unconditional like idle_entered_at: a
-                // producer that never establishes a baseline (attached_
-                // status_hooks's snapshot, when its own instance clone
-                // hasn't polled yet) must not clear one this instance
-                // already has. See #2690 CodeRabbit follow-up.
+                // A producer that has no baseline yet (`None`) must not
+                // clear one the real instance already has, or every
+                // subsequent poll of that instance re-seeds from `None`
+                // and silently disables restamping on real transitions.
+                // Locked by
+                // [`apply_status_update_propagates_live_status_baseline_from_poller`]
+                // in `src/tui/home/tests.rs`. See #2690.
                 if let Some(baseline) = new_live_status_baseline {
                     inst.live_status_baseline = Some(baseline);
                 }
@@ -2821,8 +2818,7 @@ impl HomeView {
                 // durably saved, so a failed save leaves no tombstone (#2141).
                 let recent_entry = self
                     .instances
-                    .iter()
-                    .find(|i| i.id == result.session_id)
+                    .get(&result.session_id)
                     .and_then(crate::session::recent_project_entry_for);
                 self.remove_instance(&result.session_id);
                 self.rebuild_group_trees();
@@ -2882,19 +2878,40 @@ impl HomeView {
     /// Apply any pending session ID updates from background pollers.
     /// Returns true if any instance's in-memory `agent_session_id` changed.
     /// Tmux env may also be republished when this returns `false`
-    /// (filtered or Failed paths republish the memory mirror).
+    /// (filtered or Failed paths republish the in-memory mirror).
     pub fn apply_session_id_updates(&mut self) -> bool {
-        let outcome = crate::session::sync::drain_and_persist_session_ids(
-            &mut self.instances,
-            &self.file_watch,
-        );
+        // Fast path: no poller can produce a sid update this tick, so skip
+        // the whole-map snapshot clone on idle ticks (this function runs
+        // every 500ms).
+        if !self
+            .instances
+            .values()
+            .any(|i| i.session_id_poller.is_some())
+        {
+            return false;
+        }
+        // `drain_and_persist_session_ids` takes `&mut [Instance]` and is
+        // shared with `src/server/mod.rs`. Snapshot into a `Vec` at the
+        // boundary, then re-`insert` touched ids back into the map;
+        // `IndexMap::insert` on an existing key updates in place, preserving
+        // position.
+        let mut snapshot: Vec<Instance> = self.cloned_instances();
+        let outcome =
+            crate::session::sync::drain_and_persist_session_ids(&mut snapshot, &self.file_watch);
         if !outcome.touched() {
             return false;
         }
-        for id in outcome.applied.iter().chain(outcome.rolled_back.iter()) {
-            if let Some(inst) = self.instances.iter().find(|i| i.id == *id).cloned() {
-                self.instance_map.insert(id.clone(), inst);
-            }
+        let touched: HashSet<&str> = outcome
+            .applied
+            .iter()
+            .chain(outcome.rolled_back.iter())
+            .map(String::as_str)
+            .collect();
+        for inst in snapshot
+            .into_iter()
+            .filter(|i| touched.contains(i.id.as_str()))
+        {
+            self.instances.insert(inst.id.clone(), inst);
         }
         !outcome.applied.is_empty() || !outcome.rolled_back.is_empty()
     }
@@ -2966,7 +2983,7 @@ impl HomeView {
                     // snapshot so the next status poll sees the post-cascade
                     // instance through the normal pipeline.
                     self.recovery_in_flight.remove(&instance_id);
-                    if let Some(slot) = self.instances.iter_mut().find(|i| i.id == instance_id) {
+                    if let Some(slot) = self.instances.get_mut(&instance_id) {
                         *slot = *instance;
                         touched = true;
                     }
@@ -2994,19 +3011,14 @@ impl HomeView {
         touched
     }
 
-    /// Rebuild `instance_map` + `flat_items` after a background worker replaced
-    /// an `Instance` snapshot, preserving the current selection. Without the
+    /// Rebuild `flat_items` after a background worker replaced an `Instance`
+    /// snapshot, preserving the current selection. Without the
     /// selection restore, a completion that reorders rows (e.g. a shifted
     /// `last_start_time` under `SortOrder::LastActivity`) would silently latch
     /// the cursor onto a neighbour, since `update_selected()` resolves through
     /// `flat_items[cursor]`. Mirrors the canonical sequence in `reload()`.
     /// Shared by `apply_recovery_updates` and `apply_restart_results`.
     fn refresh_rows_preserving_selection(&mut self) {
-        self.instance_map = self
-            .instances
-            .iter()
-            .map(|i| (i.id.clone(), i.clone()))
-            .collect();
         let prev_selected_session = self.selected_session.clone();
         let prev_selected_group = self.selected_group.clone();
 
@@ -3122,7 +3134,7 @@ impl HomeView {
                         }
                     }
 
-                    if let Some(slot) = self.instances.iter_mut().find(|i| i.id == session_id) {
+                    if let Some(slot) = self.instances.get_mut(&session_id) {
                         slot.merge_post_restart_with_baseline(&before, &instance);
                         slot.last_error = if instance.status == Status::Error {
                             instance.last_error.clone()
@@ -3230,7 +3242,7 @@ impl HomeView {
                 return;
             }
         };
-        for inst in &mut self.instances {
+        for inst in self.instances.values_mut() {
             let session_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
             let has_live_tmux = pane_meta
                 .get(&session_name)
@@ -3351,13 +3363,11 @@ impl HomeView {
         if data.title.is_empty() {
             let existing_titles: Vec<&str> = self
                 .instances()
-                .iter()
                 .filter(|i| i.source_profile == data.profile)
                 .map(|i| i.title.as_str())
                 .collect();
             let existing_branches: Vec<&str> = self
                 .instances()
-                .iter()
                 .filter(|i| i.source_profile == data.profile)
                 .filter_map(|i| i.worktree_info.as_ref().map(|w| w.branch.as_str()))
                 .collect();
@@ -3454,7 +3464,7 @@ impl HomeView {
         // treat its placeholder title as a duplicate to auto-increment.
         let existing_instances: Vec<Instance> = self
             .instances
-            .iter()
+            .values()
             .filter(|i| i.id != stub_id)
             .cloned()
             .collect();
@@ -4019,7 +4029,7 @@ impl HomeView {
     /// Used to drop collapse entries for projects that no longer exist.
     fn known_project_group_paths(&self) -> std::collections::HashSet<String> {
         let mut paths = std::collections::HashSet::new();
-        for inst in &self.instances {
+        for inst in self.instances.values() {
             let group = project_group_name(inst);
             if group.is_empty() {
                 continue;
@@ -4149,19 +4159,89 @@ impl HomeView {
         self.telemetry_consent_dialog = Some(super::dialogs::TelemetryConsentDialog::new());
     }
 
-    pub fn instances(&self) -> &[Instance] {
-        &self.instances
+    pub fn instances(&self) -> impl ExactSizeIterator<Item = &Instance> + '_ {
+        self.instances.values()
+    }
+
+    pub(super) fn has_instances(&self) -> bool {
+        !self.instances.is_empty()
     }
 
     pub fn get_instance(&self, id: &str) -> Option<&Instance> {
-        self.instance_map.get(id)
+        self.instances.get(id)
+    }
+
+    /// Materialize `self.instances` into a `Vec` for callsites that hand off
+    /// a `&[Instance]` slice to a downstream API. Single seam so the day
+    /// `HomeView` grows a cache, only this helper needs to change.
+    pub(super) fn cloned_instances(&self) -> Vec<Instance> {
+        self.instances.values().cloned().collect()
+    }
+
+    pub(super) fn cloned_instances_for_profile(&self, profile: &str) -> Vec<Instance> {
+        self.instances
+            .values()
+            .filter(|i| i.source_profile == profile)
+            .cloned()
+            .collect()
+    }
+
+    /// Build the id-keyed `IndexMap` from a `Vec<Instance>` (the storage-load
+    /// shape). Logs a warning on a duplicate id so a corrupt disk state
+    /// surfaces in logs rather than silently keeping only the last row.
+    fn build_instances_map(all_instances: Vec<Instance>) -> indexmap::IndexMap<String, Instance> {
+        let mut map = indexmap::IndexMap::with_capacity(all_instances.len());
+        for inst in all_instances {
+            if let Some(prev) = map.insert(inst.id.clone(), inst) {
+                tracing::warn!(
+                    target: "tui.home",
+                    id = %prev.id,
+                    "duplicate session id in loaded rows; keeping later entry"
+                );
+            }
+        }
+        map
+    }
+
+    /// `cloned_instances_for_profile` on `self.active_profile` when set,
+    /// else the unfiltered `cloned_instances`. The scope every UI-facing
+    /// build path (flat items, project view) shares.
+    pub(super) fn cloned_instances_in_active_view(&self) -> Vec<Instance> {
+        match &self.active_profile {
+            Some(profile) => self.cloned_instances_for_profile(profile),
+            None => self.cloned_instances(),
+        }
+    }
+
+    #[cfg(test)]
+    #[track_caller]
+    pub(super) fn instance_at(&self, idx: usize) -> &Instance {
+        self.instances
+            .get_index(idx)
+            .map(|(_, v)| v)
+            .unwrap_or_else(|| {
+                panic!(
+                    "instance_at: idx {idx} out of bounds (len={})",
+                    self.instances.len()
+                )
+            })
+    }
+
+    #[cfg(test)]
+    #[track_caller]
+    pub(super) fn instance_at_mut(&mut self, idx: usize) -> &mut Instance {
+        let len = self.instances.len();
+        self.instances
+            .get_index_mut(idx)
+            .map(|(_, v)| v)
+            .unwrap_or_else(|| panic!("instance_at_mut: idx {idx} out of bounds (len={len})"))
     }
 
     /// Returns true if any session has an animated status (Running, Waiting, Starting,
     /// Creating), which means the TUI needs periodic redraws for spinner animation.
     pub fn has_animated_sessions(&self) -> bool {
         use crate::session::Status;
-        self.instances.iter().any(|inst| {
+        self.instances.values().any(|inst| {
             matches!(
                 inst.status,
                 Status::Running | Status::Waiting | Status::Starting | Status::Creating
@@ -4187,43 +4267,26 @@ impl HomeView {
         // different shape on purpose (attention triage within explicit
         // project boundaries).
         if self.sort_order == SortOrder::Attention {
-            let filtered: Vec<Instance> = if let Some(profile) = &self.active_profile {
-                self.instances
-                    .iter()
-                    .filter(|i| i.source_profile == *profile)
-                    .cloned()
-                    .collect()
-            } else {
-                self.instances.clone()
-            };
+            let filtered: Vec<Instance> = self.cloned_instances_in_active_view();
             let mut items = flatten_sessions_by_attention(&filtered);
             append_archived_section(&mut items, &filtered, self.archived_section_collapsed);
             append_trash_section(&mut items, &filtered, self.trashed_section_collapsed);
             return items;
         }
 
-        let (mut items, archive_pool) = if let Some(profile) = &self.active_profile {
-            let filtered: Vec<Instance> = self
-                .instances
-                .iter()
-                .filter(|i| i.source_profile == *profile)
-                .cloned()
-                .collect();
-            let items = match self.group_trees.get(profile) {
-                Some(tree) => flatten_tree(tree, &filtered, self.sort_order),
+        let archive_pool: Vec<Instance> = self.cloned_instances_in_active_view();
+        let mut items = if let Some(profile) = &self.active_profile {
+            match self.group_trees.get(profile) {
+                Some(tree) => flatten_tree(tree, &archive_pool, self.sort_order),
                 None => Vec::new(),
-            };
-            (items, filtered)
+            }
         } else if self.storages.len() <= 1 {
-            let items = match self.group_trees.values().next() {
-                Some(tree) => flatten_tree(tree, &self.instances, self.sort_order),
+            match self.group_trees.values().next() {
+                Some(tree) => flatten_tree(tree, &archive_pool, self.sort_order),
                 None => Vec::new(),
-            };
-            (items, self.instances.clone())
+            }
         } else {
-            let items =
-                flatten_tree_all_profiles(&self.instances, &self.group_trees, self.sort_order);
-            (items, self.instances.clone())
+            flatten_tree_all_profiles(&archive_pool, &self.group_trees, self.sort_order)
         };
 
         // Pin the synthetic Archived section to the bottom regardless of
@@ -4238,15 +4301,7 @@ impl HomeView {
     fn build_flat_items_by_project(&self) -> Vec<Item> {
         // In project mode, always merge all sessions into one tree regardless of
         // profile count. Project grouping unifies by repo across profiles.
-        let base_instances: Vec<Instance> = if let Some(profile) = &self.active_profile {
-            self.instances
-                .iter()
-                .filter(|i| i.source_profile == *profile)
-                .cloned()
-                .collect()
-        } else {
-            self.instances.clone()
-        };
+        let base_instances: Vec<Instance> = self.cloned_instances_in_active_view();
 
         let grouped: Vec<Instance> = base_instances
             .into_iter()
@@ -4468,7 +4523,7 @@ impl HomeView {
     /// which save() already mirrors via merge_from_tui.
     pub fn stamp_last_accessed(&mut self, id: &str) {
         let was_sunk = self
-            .instance_map
+            .instances
             .get(id)
             .map(|i| i.is_archived() || i.snoozed_until.is_some())
             .unwrap_or(false);
@@ -5003,12 +5058,7 @@ impl HomeView {
         let mut all_peer_deleted: Vec<String> = Vec::new();
 
         for (profile_name, storage) in &self.storages {
-            let tui_rows: Vec<Instance> = self
-                .instances
-                .iter()
-                .filter(|i| i.source_profile == *profile_name)
-                .cloned()
-                .collect();
+            let tui_rows: Vec<Instance> = self.cloned_instances_for_profile(profile_name);
             let dels: HashSet<String> = self
                 .pending_deletions
                 .get(profile_name)
@@ -5069,7 +5119,7 @@ impl HomeView {
             tracing::info!(
                 target: "tui.home",
                 count = all_peer_deleted.len(),
-                "Dropped peer-deleted rows from TUI mirror"
+                "Dropped peer-deleted rows from in-memory mirror"
             );
         }
         Ok(())
@@ -5082,15 +5132,12 @@ impl HomeView {
         if ids.is_empty() {
             return;
         }
-        let drop: HashSet<&String> = ids.iter().collect();
-        self.instances.retain(|i| !drop.contains(&i.id));
-        for id in ids {
-            self.instance_map.remove(id);
-        }
+        let drop: HashSet<&str> = ids.iter().map(String::as_str).collect();
+        self.instances.retain(|k, _| !drop.contains(k.as_str()));
         if self
             .selected_session
             .as_ref()
-            .is_some_and(|s| drop.contains(s))
+            .is_some_and(|s| drop.contains(s.as_str()))
         {
             self.selected_session = None;
         }
@@ -5108,7 +5155,7 @@ impl HomeView {
             let existing_groups = tree.get_all_groups();
             let profile_instances: Vec<Instance> = self
                 .instances
-                .iter()
+                .values()
                 .filter(|i| i.source_profile == *profile_name)
                 .cloned()
                 .collect();
@@ -5129,7 +5176,7 @@ impl HomeView {
             return;
         }
         let prefix = format!("{}/", group_path);
-        let still_used = self.instances.iter().any(|i| {
+        let still_used = self.instances.values().any(|i| {
             i.source_profile == profile
                 && (i.group_path == group_path || i.group_path.starts_with(&prefix))
         });
@@ -5170,7 +5217,7 @@ impl HomeView {
                     // Fallback for single-profile mode: find any instance in this group
                     return self
                         .instances
-                        .iter()
+                        .values()
                         .find(|i| {
                             i.group_path == *path || i.group_path.starts_with(&format!("{}/", path))
                         })
@@ -5196,11 +5243,10 @@ impl HomeView {
             .any(|t| !t.get_all_groups().is_empty())
     }
 
-    /// Centralized instance addition: adds to both the `instances` vec
-    /// and `instance_map` to keep both collections in sync. Records the
-    /// id in `pending_added` so the next `save` distinguishes TUI-new
-    /// rows from peer-deleted ones (which look identical at the disk
-    /// layer: missing from sessions.json).
+    /// Centralized instance addition: inserts into the ordered map (preserves
+    /// insertion order = sidebar order) and records the id in `pending_added`
+    /// so the next `save` distinguishes TUI-new rows from peer-deleted ones
+    /// (which look identical at the disk layer: missing from sessions.json).
     pub(super) fn add_instance(&mut self, instance: Instance) {
         // Count only finalized session inserts for the opt-in create-trend
         // counter (#1897). `add_instance` is also the funnel for `Creating`
@@ -5216,18 +5262,18 @@ impl HomeView {
             .entry(instance.source_profile.clone())
             .or_default()
             .insert(instance.id.clone());
-        self.instance_map
-            .insert(instance.id.clone(), instance.clone());
-        self.instances.push(instance);
+        self.instances.insert(instance.id.clone(), instance);
     }
 
-    /// Centralized instance removal: removes from both the `instances` vec
-    /// and `instance_map`, records the id in `pending_deletions` so the
+    /// Centralized instance removal: shift-removes from the ordered map
+    /// (preserves the order of trailing rows; swap_remove would silently
+    /// reorder the sidebar), records the id in `pending_deletions` so the
     /// next `save` propagates the removal under the flock, and clears any
     /// `pending_added` entry so an add+remove in the same save cycle does
-    /// not end up persisted.
+    /// not end up persisted. Idempotent: safe to call on ids already
+    /// removed.
     pub(super) fn remove_instance(&mut self, id: &str) {
-        if let Some(inst) = self.instance_map.get(id) {
+        if let Some(inst) = self.instances.get(id) {
             let profile = inst.source_profile.clone();
             self.pending_deletions
                 .entry(profile.clone())
@@ -5237,8 +5283,7 @@ impl HomeView {
                 set.remove(id);
             }
         }
-        self.instances.retain(|i| i.id != id);
-        self.instance_map.remove(id);
+        self.instances.shift_remove(id);
     }
 
     /// Tombstones `path` and every descendant from the per-profile tree so
@@ -5265,13 +5310,12 @@ impl HomeView {
             .extend(descendants);
     }
 
-    /// Centralized instance mutation: applies `f` once to the `instances` vec
-    /// entry, then clones the result into `instance_map`. This guarantees both
-    /// collections stay in sync even for non-idempotent closures.
+    /// Centralized instance mutation: applies `f` to the entry in place.
+    /// No-op on unknown ids so callers can be idempotent (matches
+    /// `remove_instance`).
     pub(super) fn mutate_instance(&mut self, id: &str, f: impl FnOnce(&mut Instance)) {
-        if let Some(inst) = self.instances.iter_mut().find(|i| i.id == id) {
+        if let Some(inst) = self.instances.get_mut(id) {
             f(inst);
-            self.instance_map.insert(id.to_string(), inst.clone());
         }
     }
 
@@ -5287,7 +5331,7 @@ impl HomeView {
         target: &str,
         new_group_path: String,
     ) -> anyhow::Result<()> {
-        let Some(old_profile) = self.instance_map.get(id).map(|i| i.source_profile.clone()) else {
+        let Some(old_profile) = self.instances.get(id).map(|i| i.source_profile.clone()) else {
             return Ok(());
         };
         if old_profile == target {
@@ -5314,10 +5358,9 @@ impl HomeView {
             .or_default()
             .insert(id.to_string());
 
-        if let Some(inst) = self.instances.iter_mut().find(|i| i.id == id) {
+        if let Some(inst) = self.instances.get_mut(id) {
             inst.group_path = new_group_path;
             inst.source_profile = target.to_string();
-            self.instance_map.insert(id.to_string(), inst.clone());
         }
         Ok(())
     }
@@ -5336,14 +5379,14 @@ impl HomeView {
     /// same row in the same tick, matching the daemon's per-tick batching
     /// shape in `status_poll_loop`.
     pub(super) fn persist_passive_status_transition(&self, id: &str, mark_unread: bool) {
-        let Some(inst) = self.instance_map.get(id) else {
+        let Some(inst) = self.instances.get(id) else {
             return;
         };
         let Some(storage) = self.storages.get(&inst.source_profile) else {
             return;
         };
         let patch = crate::session::PassiveStatusPatch::from_instance(inst);
-        let _ = storage.update(|insts, _groups| {
+        if let Err(e) = storage.update(|insts, _groups| {
             if let Some(disk) = insts.iter_mut().find(|i| i.id == patch.id) {
                 disk.merge_passive_status_patch(&patch);
                 if mark_unread {
@@ -5351,7 +5394,21 @@ impl HomeView {
                 }
             }
             Ok(())
-        });
+        }) {
+            // Best-effort persistence (see method docstring): a write
+            // failure here does not roll back the in-memory update, but
+            // silence would obscure a persistent flock timeout or EIO
+            // loop. The daemon's sibling path in
+            // `api::persist_session_update` logs the same class of
+            // failure at `target: "http.api.sessions"`; log here so a
+            // TUI-only user has parity visibility under
+            // `AOE_LOG_LEVEL=debug`.
+            tracing::warn!(
+                target: "session.store",
+                session_id = %patch.id,
+                "persist_passive_status_transition failed: {e}"
+            );
+        }
     }
 
     /// Atomic per-action mutate: in-memory once, disk via
@@ -5362,16 +5419,15 @@ impl HomeView {
     where
         F: FnOnce(&mut Instance),
     {
-        let Some(profile) = self.instance_map.get(id).map(|i| i.source_profile.clone()) else {
+        let Some(profile) = self.instances.get(id).map(|i| i.source_profile.clone()) else {
             return Ok(());
         };
-        let Some(in_mem) = self.instances.iter_mut().find(|i| i.id == id) else {
+        let Some(in_mem) = self.instances.get_mut(id) else {
             return Ok(());
         };
         let pre = in_mem.clone();
         mutate(in_mem);
         let post = in_mem.clone();
-        self.instance_map.insert(id.to_string(), post.clone());
 
         let id_owned = id.to_string();
         let res = if let Some(storage) = self.storages.get(&profile) {
@@ -5405,10 +5461,9 @@ impl HomeView {
                 Ok(())
             }
             Err(e) => {
-                if let Some(slot) = self.instances.iter_mut().find(|i| i.id == id) {
-                    *slot = pre.clone();
+                if let Some(slot) = self.instances.get_mut(id) {
+                    *slot = pre;
                 }
-                self.instance_map.insert(id.to_string(), pre);
                 Err(e)
             }
         }
@@ -5500,21 +5555,20 @@ impl HomeView {
     {
         let mut by_profile: HashMap<String, Vec<(String, Instance, Instance)>> = HashMap::new();
         for id in ids {
-            let Some(inst) = self.instances.iter_mut().find(|i| i.id == *id) else {
+            let Some(inst) = self.instances.get_mut(id) else {
                 continue;
             };
             let pre = inst.clone();
             mutate(inst);
             let post = inst.clone();
-            self.instance_map.insert(id.clone(), post.clone());
             by_profile
                 .entry(post.source_profile.clone())
                 .or_default()
                 .push((id.clone(), pre, post));
         }
         let mut peer_deleted: Vec<String> = Vec::new();
-        for (profile, items) in &by_profile {
-            let Some(storage) = self.storages.get(profile) else {
+        for (profile, items) in by_profile {
+            let Some(storage) = self.storages.get(&profile) else {
                 tracing::warn!(
                     target: "tui.home",
                     profile = %profile,
@@ -5523,11 +5577,14 @@ impl HomeView {
                 );
                 continue;
             };
-            let added: HashSet<String> =
-                self.pending_added.get(profile).cloned().unwrap_or_default();
+            let added: HashSet<String> = self
+                .pending_added
+                .get(&profile)
+                .cloned()
+                .unwrap_or_default();
             let res = storage.update(|insts, _groups| {
                 let mut missing: Vec<String> = Vec::new();
-                for (id, pre, post) in items {
+                for (id, pre, post) in &items {
                     if let Some(disk) = insts.iter_mut().find(|i| i.id == *id) {
                         disk.merge_user_action_diff(pre, post);
                     } else if !added.contains(id) {
@@ -5540,10 +5597,9 @@ impl HomeView {
                 Ok(missing) => peer_deleted.extend(missing),
                 Err(e) => {
                     for (id, pre, _post) in items {
-                        if let Some(slot) = self.instances.iter_mut().find(|i| i.id == *id) {
-                            *slot = pre.clone();
+                        if let Some(slot) = self.instances.get_mut(&id) {
+                            *slot = pre;
                         }
-                        self.instance_map.insert(id.clone(), pre.clone());
                     }
                     return Err(e);
                 }
@@ -5556,18 +5612,17 @@ impl HomeView {
     }
 
     /// Like `mutate_instance`, but for fallible operations. Clones the entry,
-    /// applies `f` to the clone, and writes back to both collections only on
-    /// success -- neither collection is modified on error.
+    /// applies `f` to the clone, and writes back only on success; the stored
+    /// entry is left untouched on `Err`.
     pub(super) fn try_mutate_instance<T>(
         &mut self,
         id: &str,
         f: impl FnOnce(&mut Instance) -> anyhow::Result<T>,
     ) -> anyhow::Result<Option<T>> {
-        if let Some(inst) = self.instances.iter_mut().find(|i| i.id == id) {
+        if let Some(inst) = self.instances.get_mut(id) {
             let mut updated = inst.clone();
             let out = f(&mut updated)?;
-            *inst = updated.clone();
-            self.instance_map.insert(id.to_string(), updated);
+            *inst = updated;
             return Ok(Some(out));
         }
         Ok(None)
@@ -5588,11 +5643,10 @@ impl HomeView {
         id: &str,
         f: impl FnOnce(&mut Instance) -> anyhow::Result<T>,
     ) -> anyhow::Result<Option<T>> {
-        if let Some(inst) = self.instances.iter_mut().find(|i| i.id == id) {
+        if let Some(inst) = self.instances.get_mut(id) {
             let mut updated = inst.clone();
             let result = f(&mut updated);
-            *inst = updated.clone();
-            self.instance_map.insert(id.to_string(), updated);
+            *inst = updated;
             return result.map(Some);
         }
         Ok(None)
@@ -5775,7 +5829,7 @@ impl HomeView {
     /// by path.
     pub(super) fn project_header_repo_path(&self, label: &str) -> Option<String> {
         self.instances
-            .iter()
+            .values()
             .find(|i| !i.is_archived() && project_group_name(i) == label)
             .map(|i| crate::session::projects::canonical_key(i.repo_path()))
     }

@@ -33,6 +33,8 @@ pub mod smart_rename;
 pub mod stop;
 mod storage;
 pub(crate) mod sync;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod trash;
 pub mod worktree_edit;
 
@@ -716,21 +718,15 @@ pub fn is_tui_active(threshold: Duration) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::test_support::isolate_app_dir;
     use super::*;
 
-    fn isolate_app_dir() -> tempfile::TempDir {
-        let temp_home = tempfile::TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
+    fn app_dir(root: impl AsRef<Path>) -> PathBuf {
+        let root = root.as_ref();
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
-        temp_home
-    }
-
-    fn app_dir(temp_home: &tempfile::TempDir) -> PathBuf {
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        let dir = temp_home.path().join(".config").join(APP_DIR_NAME_XDG);
+        let dir = root.join(".config").join(APP_DIR_NAME_XDG);
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        let dir = temp_home.path().join(APP_DIR_NAME_OTHER);
+        let dir = root.join(APP_DIR_NAME_OTHER);
         fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -889,11 +885,12 @@ mod tests {
         assert!(warning.contains("Failed to load profile config 'default'"));
     }
 
-    fn release_dir_in(temp: &tempfile::TempDir) -> PathBuf {
+    fn release_dir_in(root: impl AsRef<Path>) -> PathBuf {
+        let root = root.as_ref();
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        let d = temp.path().join(".config").join("agent-of-empires");
+        let d = root.join(".config").join("agent-of-empires");
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        let d = temp.path().join(".agent-of-empires");
+        let d = root.join(".agent-of-empires");
         d
     }
 

@@ -118,6 +118,7 @@ dependencies = [
  "git2",
  "glob",
  "hkdf 0.13.0",
+ "indexmap 2.14.0",
  "jsonwebtoken",
  "libc",
  "mime_guess",

@@ -114,19 +114,46 @@ impl ContainerRuntime {
     pub fn does_container_exist(&self, name: &str) -> Result<bool> {
         match self.kind {
             RuntimeKind::Docker | RuntimeKind::Podman => {
+                // `container inspect` (not `docker inspect`): pins the stderr
+                // wording DOCKER_MISSING captures in the runtime_base tests,
+                // so is_not_found classifies "absent" cleanly. Changing this
+                // argv or the per-runtime not_found / daemon_down /
+                // permission_denied markers without new fixtures silently
+                // breaks the classifier. See is_container_running above and
+                // the pinning comment at #2596 / #2652.
                 let output = self
                     .base
                     .command()
                     .args(["container", "inspect", name])
                     .output()?;
-                Ok(output.status.success())
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    return self.base.classify_exists_failure(&stderr);
+                }
+                Ok(true)
             }
             RuntimeKind::AppleContainer => {
-                // Apple Container's `inspect` returns success(0) for non-existent
-                // containers, so we use `logs` which properly fails for missing
-                // containers.
+                // Apple Container's `inspect` returns success(0) for
+                // non-existent containers, so we use `logs` which properly
+                // fails for missing containers. APPLE_MISSING captures
+                // Apple's absent-container stderr (from `rm/delete`);
+                // not_found_markers / daemon_down_markers /
+                // permission_denied_markers on RuntimeBase::APPLE_CONTAINER
+                // key off Apple's not-found style and are expected to match
+                // `logs` stderr by substring, though `logs` stderr has not
+                // been captured as a fixture. Switching argv here (or
+                // tightening the markers) needs new fixtures. Same
+                // silent-break risk as the Docker/Podman pinning comment
+                // above. See #2596.
+                // TODO: verify Apple `container logs` semantics on
+                //       stopped-but-existing containers (cf. #2730 for
+                //       fixture capture).
                 let output = self.base.command().args(["logs", name]).output()?;
-                Ok(output.status.success())
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    return self.base.classify_exists_failure(&stderr);
+                }
+                Ok(true)
             }
         }
     }
