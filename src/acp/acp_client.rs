@@ -23,7 +23,7 @@ use agent_client_protocol::schema::v1::{
     CreateElicitationRequest, CreateElicitationResponse, CreateTerminalRequest,
     CreateTerminalResponse, ElicitationAction, ElicitationCapabilities,
     ElicitationFormCapabilities, EmbeddedResource, EmbeddedResourceResource,
-    FileSystemCapabilities, ForkSessionRequest, ImageContent, InitializeRequest,
+    FileSystemCapabilities, ForkSessionRequest, ImageContent, Implementation, InitializeRequest,
     KillTerminalRequest, KillTerminalResponse, LoadSessionRequest, McpServer, MessageId,
     NewSessionRequest, PermissionOptionKind, PromptRequest, ReadTextFileRequest,
     ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
@@ -4256,6 +4256,29 @@ pub(crate) fn should_fork(fork_from: Option<&str>, agent_advertises_fork: bool) 
     fork_from.is_some_and(|s| !s.is_empty()) && agent_advertises_fork
 }
 
+/// Build the ACP `initialize` request AoE sends to every agent adapter.
+/// `client_info` is mandatory here: strict agent backends (Mistral Vibe's
+/// `vibe-acp`) reject an initialize whose `client_name`/`client_version` are
+/// empty strings, which is what omitting it serializes to. See issue #2767.
+fn build_initialize_request() -> InitializeRequest {
+    let capabilities = ClientCapabilities::new()
+        .fs(FileSystemCapabilities::new()
+            .read_text_file(true)
+            .write_text_file(true))
+        .terminal(true)
+        // Advertise form-mode elicitation so claude-agent-acp
+        // (>=0.44) re-enables AskUserQuestion and routes it to us as
+        // an `elicitation/create` request. Without this the adapter
+        // unconditionally blacklists the tool. See handle_elicitation_request.
+        .elicitation(ElicitationCapabilities::new().form(ElicitationFormCapabilities::new()));
+    InitializeRequest::new(ProtocolVersion::V1)
+        .client_capabilities(capabilities)
+        .client_info(
+            Implementation::new("agent-of-empires", env!("CARGO_PKG_VERSION"))
+                .title("Agent of Empires"),
+        )
+}
+
 /// Build a structured view `ConfigOptionDescriptor` from an ACP
 /// `SessionConfigOption`. Returns `None` when the option has a kind
 /// the structured view does not yet render (today everything except `Select`).
@@ -5255,27 +5278,12 @@ async fn run_connection_task<W, R>(
         )
         .connect_with(transport, |connection: ConnectionTo<Agent>| async move {
             info!(target: "acp.protocol", session = %session_label, "initializing ACP agent");
-            let capabilities = ClientCapabilities::new()
-                .fs(FileSystemCapabilities::new()
-                    .read_text_file(true)
-                    .write_text_file(true))
-                .terminal(true)
-                // Advertise form-mode elicitation so claude-agent-acp
-                // (>=0.44) re-enables AskUserQuestion and routes it to us as
-                // an `elicitation/create` request. Without this the adapter
-                // unconditionally blacklists the tool. See handle_elicitation_request.
-                .elicitation(
-                    ElicitationCapabilities::new().form(ElicitationFormCapabilities::new()),
-                );
             // `initialize` is sent in both Fresh and Resume modes.
             // It's idempotent on every ACP agent we ship against
             // (aoe-agent, claude-agent-acp); the response only carries
             // capability metadata; so re-sending it on attach is safe.
             let init = connection
-                .send_request(
-                    InitializeRequest::new(ProtocolVersion::V1)
-                        .client_capabilities(capabilities),
-                )
+                .send_request(build_initialize_request())
                 .block_task()
                 .await?;
 
@@ -7532,6 +7540,17 @@ mod tests {
         tx.send(Event::ThinkingStarted).await.unwrap();
         let event = client.next_event().await.expect("event delivered");
         assert!(matches!(event, Event::ThinkingStarted));
+    }
+
+    #[test]
+    fn initialize_request_carries_non_empty_client_info() {
+        // Regression for #2767: strict agent backends (Mistral Vibe) reject an
+        // initialize whose client_name/client_version are empty. Our request
+        // must always send a populated client_info.
+        let req = build_initialize_request();
+        let info = req.client_info.expect("client_info must be set");
+        assert_eq!(info.name, "agent-of-empires");
+        assert!(!info.version.is_empty());
     }
 
     #[test]
