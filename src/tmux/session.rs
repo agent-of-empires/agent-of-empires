@@ -1135,6 +1135,15 @@ mod tests {
                 &name,
                 "status",
                 "on",
+                ";",
+                // Force manual sizing so `resize-window` sticks on a detached
+                // session; the default `window-size` can ignore it with no
+                // client attached, which varies by tmux version (CI's does).
+                "set-option",
+                "-t",
+                &name,
+                "window-size",
+                "manual",
             ])
             .status()
             .expect("tmux new-session");
