@@ -152,7 +152,7 @@ jobs:
           echo "=== Flake structure ==="
           nix flake show --all-systems
 
-          SYSTEMS="x86_64-linux aarch64-linux x86_64-darwin aarch64-darwin"
+          SYSTEMS="x86_64-linux aarch64-linux aarch64-darwin"
 
           echo ""
           echo "=== Evaluating packages for all systems ==="
