@@ -690,31 +690,30 @@ impl Session {
             .output();
     }
 
-    /// Resize the (detached) window to `cols`x`rows`. Best-effort: a missing
-    /// session or a tmux ENOENT is swallowed so a transient failure never
-    /// blocks a render.
+    /// Resize the session's first window so its pane's visible content area
+    /// becomes `cols` x `rows`. Best-effort: a missing session or a tmux ENOENT
+    /// is swallowed so a transient failure never blocks a render.
     ///
-    /// Used to keep a detached agent's pane sized to the visible preview area:
-    /// a full-screen agent is sized to whatever terminal it was last attached
-    /// from, so without this it renders taller than the preview window and the
-    /// bottom-anchored capture clips the top rows (worse when the info header
-    /// steals rows). Mirrors what live-send does through its worker.
+    /// Every caller (the web live view, the mobile live view, the TUI's passive
+    /// preview sync) works in pane/content geometry, not tmux window geometry:
+    /// they render the pane, not the tmux status bar. tmux `resize-window` sizes
+    /// the *window*, and vertical chrome (the status bar) shrinks the pane below
+    /// it, so a naive `resize-window -y rows` yields a `rows - chrome` pane and
+    /// the live owner loop then re-asserts forever against a target it can never
+    /// reach (#2766). We measure the chrome live and add it back, so the pane
+    /// lands at exactly `rows`. Cols need no adjustment: a single pane spans the
+    /// full window width, and the status bar is horizontal.
+    ///
+    /// Also used to keep a detached agent's pane sized to the visible preview
+    /// area: a full-screen agent is sized to whatever terminal it was last
+    /// attached from, so without this it renders taller than the preview window
+    /// and the bottom-anchored capture clips the top rows (worse when the info
+    /// header steals rows). Mirrors what live-send does through its worker.
     ///
     /// NOTE: tmux's `resize-window -x -y` silently flips the window-size option
     /// to `manual`, so any later `attach-session` must call
     /// [`reset_size_to_latest_client`](Self::reset_size_to_latest_client) first
     /// or the window stays pinned at these preview dimensions.
-    /// Resize the session's first window so its pane's visible content area
-    /// becomes `cols` x `rows`. Every caller (the web live view, the mobile
-    /// live view, the TUI's passive preview sync) works in pane/content
-    /// geometry, not tmux window geometry: they render the pane, not the tmux
-    /// status bar. tmux `resize-window` sizes the *window*, and vertical chrome
-    /// (the status bar) shrinks the pane below it, so a naive `resize-window -y
-    /// rows` yields a `rows - chrome` pane and the live owner loop then
-    /// re-asserts forever against a target it can never reach (#2766). We
-    /// measure the chrome live and add it back, so the pane lands at exactly
-    /// `rows`. Cols need no adjustment: a single pane spans the full window
-    /// width, and the status bar is horizontal.
     pub fn resize_window(&self, cols: u16, rows: u16) {
         if cols == 0 || rows == 0 || !self.exists() {
             return;
