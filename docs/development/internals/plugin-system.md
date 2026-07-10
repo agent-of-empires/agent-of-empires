@@ -548,6 +548,25 @@ that forks helpers is torn down whole), a per-worker respawn budget so a crash
 loop does not spin, and a concurrency cap. The worker's stderr drains to
 `<app_dir>/plugin-workers/<id>.log`.
 
+### Recovery and observability
+
+Launch runs through one idempotent `PluginHost::reconcile`: it starts a worker
+for every active runtime plugin that has none and tears down any worker whose
+plugin is no longer active. `start()` at daemon boot is that reconcile plus a
+WARN for each load error and each enabled-but-inactive runtime plugin, so a boot
+that launches zero workers names the reason (a stale grant, a host-version
+mismatch) in `debug.log` instead of going silent. The web enable/disable handler
+(`POST /api/plugins/{id}/enabled`) calls reconcile too, so toggling a plugin
+launches or stops its worker live, without a daemon restart.
+
+When a worker exhausts its respawn budget the host records an in-memory crash
+tombstone and surfaces a dashboard notification. A tombstoned plugin is not
+revived by an unrelated plugin's reconcile; disabling it clears the tombstone,
+so a disable then enable is a clean retry. A daemon restart also clears it. The
+CLI `aoe plugin enable|disable` mutates only on-disk config and does not reach a
+running daemon (it is a separate process), so recovering a live daemon needs the
+web toggle or a restart.
+
 ### Capability-gated host API
 
 Each host method maps to a capability the plugin declared and was granted; the
