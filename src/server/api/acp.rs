@@ -1974,6 +1974,38 @@ pub struct SetConfigOptionRequest {
     pub value: String,
 }
 
+/// Write a picked model back onto the instance, both in the in-memory
+/// registry (what the reconciler reads to respawn a worker this daemon
+/// lifetime) and on disk (what survives a daemon restart). Called from
+/// `acp_set_config_option` after the live pick succeeds; see the comment there
+/// for why the live call alone is not enough.
+async fn persist_agent_model(state: &Arc<AppState>, id: &str, model: &str) {
+    let profile = {
+        let mut instances = state.instances.write().await;
+        let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
+            return;
+        };
+        inst.agent_model = Some(model.to_string());
+        inst.source_profile.clone()
+    };
+    if let Ok(storage) = crate::session::Storage::new(&profile, state.file_watch.clone()) {
+        let id_owned = id.to_string();
+        let model_owned = model.to_string();
+        if let Err(e) = storage.update(|instances, _groups| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == id_owned) {
+                inst.agent_model = Some(model_owned.clone());
+            }
+            Ok(())
+        }) {
+            tracing::error!(
+                target: "http.api.acp",
+                session = %id,
+                "failed to persist agent_model after config-option pick: {e}"
+            );
+        }
+    }
+}
+
 /// Set a per-session selector (model, reasoning effort, etc.) via ACP
 /// `session/set_config_option`. The structured view treats every category
 /// through this one endpoint; rejection surfaces as a non-blocking
@@ -2009,6 +2041,19 @@ pub async fn acp_set_config_option(
                     .telemetry_structured
                     .plan_mode_seen
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            // Persist a model pick so it survives a worker respawn. The live
+            // set_config_option above only reconfigures the running process; the
+            // reconciler re-reads `agent_model` on every spawn and injects it as
+            // AOE_AGENT_MODEL, so without this write-back a respawn reverts to
+            // the stale stored model and silently overrides the agent's own
+            // default. Mirrors the persist step of the agent-switch path above.
+            // ponytail: keys on the well-known "model" config id, which every
+            // current adapter and the frontend use; resolve category == Model
+            // from the session's config_options if a future adapter uses another
+            // id.
+            if req.config_id == "model" {
+                persist_agent_model(&state, &id, &req.value).await;
             }
             StatusCode::ACCEPTED.into_response()
         }
@@ -2338,6 +2383,53 @@ mod tests {
         assert!(!is_plan_mode_value("yolo"));
         assert!(!is_plan_mode_value("Plan"));
         assert!(!is_plan_mode_value(""));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn persist_agent_model_updates_memory_and_storage() {
+        use crate::session::test_support::isolate_app_dir;
+        let _tmp = isolate_app_dir();
+        let profile = "default";
+
+        let mut inst = crate::session::Instance::new("t", "/tmp");
+        inst.source_profile = profile.to_string();
+        inst.agent_model = Some("claude-sonnet-4-6".to_string());
+        let id = inst.id.clone();
+
+        // Seed on disk so the storage write-back can find the row to update.
+        let storage = crate::session::Storage::new_unwatched(profile).unwrap();
+        let seed = inst.clone();
+        storage
+            .update(|instances, _groups| {
+                instances.push(seed);
+                Ok(())
+            })
+            .unwrap();
+
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        persist_agent_model(&state, &id, "claude-sonnet-5").await;
+
+        // In-memory registry updated (what the reconciler reads to respawn).
+        assert_eq!(
+            state.instances.read().await[0].agent_model.as_deref(),
+            Some("claude-sonnet-5")
+        );
+
+        // On disk too (what survives a daemon restart).
+        let reloaded = crate::session::Storage::new_unwatched(profile)
+            .unwrap()
+            .load()
+            .unwrap();
+        assert_eq!(
+            reloaded
+                .iter()
+                .find(|i| i.id == id)
+                .unwrap()
+                .agent_model
+                .as_deref(),
+            Some("claude-sonnet-5")
+        );
     }
 
     #[tokio::test]
