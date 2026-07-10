@@ -4552,7 +4552,7 @@ impl HomeView {
         // live-send does (see `ensure_pane_ready_with_size`): otherwise it
         // boots at tmux's 80x24 default and runs narrow until something
         // resizes it.
-        match target {
+        match &target {
             live_send::LiveSendTarget::Agent => {
                 let outcome = self.try_mutate_instance_writeback_on_err(session_id, |inst| {
                     inst.ensure_pane_ready_with_size(size).map_err(Into::into)
@@ -4593,6 +4593,16 @@ impl HomeView {
                     return;
                 }
             }
+            live_send::LiveSendTarget::Tool(name) => {
+                let name = name.clone();
+                if let Err(e) = self.ensure_tool_pane_ready(session_id, &name, size) {
+                    self.info_dialog = Some(InfoDialog::new(
+                        "Send Failed",
+                        &format!("Cannot prepare tool '{}': {}", name, e),
+                    ));
+                    return;
+                }
+            }
         };
         let Some(inst) = self.get_instance(session_id) else {
             self.info_dialog = Some(InfoDialog::new(
@@ -4601,7 +4611,7 @@ impl HomeView {
             ));
             return;
         };
-        let tmux_session = match target {
+        let tmux_session = match &target {
             live_send::LiveSendTarget::Agent => {
                 match crate::tmux::Session::new(&inst.id, &inst.title) {
                     Ok(s) => s,
@@ -4620,13 +4630,18 @@ impl HomeView {
             live_send::LiveSendTarget::ContainerTerminal => crate::tmux::Session::from_name(
                 &crate::tmux::ContainerTerminalSession::generate_name(&inst.id, &inst.title),
             ),
+            live_send::LiveSendTarget::Tool(name) => crate::tmux::Session::from_name(
+                crate::tmux::ToolSession::new(&inst.id, &inst.title, name).session_name(),
+            ),
         };
         // Agent gets a tool-specific Enter delay so paste-burst-aware
         // agents (e.g. Codex) don't swallow the final Enter. Shells in
         // the paired terminal panes don't need the delay.
-        let delay = match target {
+        let delay = match &target {
             live_send::LiveSendTarget::Agent => crate::agents::send_keys_enter_delay(&inst.tool),
-            live_send::LiveSendTarget::Terminal | live_send::LiveSendTarget::ContainerTerminal => 0,
+            live_send::LiveSendTarget::Terminal
+            | live_send::LiveSendTarget::ContainerTerminal
+            | live_send::LiveSendTarget::Tool(_) => 0,
         };
         if let Err(e) = tmux_session.send_keys_with_delay(message, delay) {
             self.info_dialog = Some(InfoDialog::new(
@@ -4684,8 +4699,10 @@ impl HomeView {
     /// Returns `Err(())` if the pane could not be readied (`info_dialog` is
     /// set with the underlying error so the caller only has to clear its toast).
     pub fn prepare_live_send(&mut self, session_id: &str) -> Result<(), ()> {
-        let target = self.pending_live_send_target;
-        self.pending_live_send_target = live_send::LiveSendTarget::Agent;
+        let target = std::mem::replace(
+            &mut self.pending_live_send_target,
+            live_send::LiveSendTarget::Agent,
+        );
         let size = crate::terminal::get_size();
         // Agent targets revive the agent pane via the full
         // ensure_pane_ready cascade (Docker, splash, resume). Terminal
@@ -4700,7 +4717,7 @@ impl HomeView {
         // lost, leaves the pane pinned at ~50% width until live mode is
         // re-entered. See `Instance::ensure_pane_ready_with_size`.
         let agent_boot_size = self.live_send_boot_size();
-        match target {
+        match &target {
             live_send::LiveSendTarget::Agent => {
                 let outcome = self.try_mutate_instance_writeback_on_err(session_id, |inst| {
                     inst.ensure_pane_ready_with_size(agent_boot_size)
@@ -4742,6 +4759,16 @@ impl HomeView {
                     return Err(());
                 }
             }
+            live_send::LiveSendTarget::Tool(name) => {
+                let name = name.clone();
+                if let Err(e) = self.ensure_tool_pane_ready(session_id, &name, size) {
+                    self.info_dialog = Some(InfoDialog::new(
+                        "Live send failed",
+                        &format!("Cannot prepare tool '{}': {}", name, e),
+                    ));
+                    return Err(());
+                }
+            }
         };
         let inst = match self.get_instance(session_id) {
             Some(inst) => inst.clone(),
@@ -4759,7 +4786,7 @@ impl HomeView {
         };
         // Resolve the tmux session name up front so the worker thread
         // can reconstruct a Session without re-touching HomeView.
-        let tmux_name = match target {
+        let tmux_name = match &target {
             live_send::LiveSendTarget::Agent => {
                 match crate::tmux::Session::new(&inst.id, &inst.title) {
                     Ok(s) => s.name().to_string(),
@@ -4777,6 +4804,11 @@ impl HomeView {
             }
             live_send::LiveSendTarget::ContainerTerminal => {
                 crate::tmux::ContainerTerminalSession::generate_name(&inst.id, &inst.title)
+            }
+            live_send::LiveSendTarget::Tool(name) => {
+                crate::tmux::ToolSession::new(&inst.id, &inst.title, name)
+                    .session_name()
+                    .to_string()
             }
         };
         // Switching live mode from session A to session B (click on a
@@ -5622,6 +5654,38 @@ impl HomeView {
         Ok(())
     }
 
+    /// Tool-pane counterpart of `ensure_terminal_pane_ready`: mirrors
+    /// `App::attach_tool_session`'s on-demand creation so live-send can
+    /// target a tool (lazygit, yazi, etc.) that hasn't been launched yet.
+    /// Used by `prepare_live_send` when the live target is `Tool(name)`.
+    fn ensure_tool_pane_ready(
+        &mut self,
+        session_id: &str,
+        tool_name: &str,
+        size: Option<(u16, u16)>,
+    ) -> anyhow::Result<()> {
+        let inst = self
+            .get_instance(session_id)
+            .ok_or_else(|| anyhow::anyhow!("session not found: {}", session_id))?
+            .clone();
+        let tool_config = self
+            .tool_configs
+            .get(tool_name)
+            .ok_or_else(|| anyhow::anyhow!("tool '{}' is not configured", tool_name))?
+            .clone();
+        if tool_config.command.is_empty() {
+            anyhow::bail!("Tool '{}' has no command configured", tool_name);
+        }
+        let tool = crate::tmux::ToolSession::new(&inst.id, &inst.title, tool_name);
+        if !tool.exists() || tool.is_pane_dead() {
+            if tool.exists() {
+                let _ = tool.kill();
+            }
+            tool.create_with_size(&inst.project_path, &tool_config.command, size)?;
+        }
+        Ok(())
+    }
+
     pub fn restart_instance_with_size_opts(
         &mut self,
         id: &str,
@@ -5862,6 +5926,15 @@ impl HomeView {
     ) -> Option<crate::session::NewSessionAttachMode> {
         self.resolve_session_config_for(session_id)
             .map(|s| s.default_attach_mode)
+    }
+
+    /// Resolve `live_send_on_view_switch` for an existing session row:
+    /// whether switching into Terminal or Tool view should auto-start
+    /// live-send instead of waiting for a separate Enter/Tab/click. See
+    /// `resolve_session_config_for` for resolution rules.
+    pub(super) fn live_send_on_view_switch(&self, session_id: &str) -> bool {
+        self.resolve_session_config_for(session_id)
+            .is_some_and(|s| s.live_send_on_view_switch)
     }
 
     /// True when Enter on the *currently selected session row* would

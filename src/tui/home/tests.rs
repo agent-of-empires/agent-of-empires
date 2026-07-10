@@ -13894,6 +13894,123 @@ mod default_attach_mode {
 
     #[test]
     #[serial]
+    fn start_live_send_in_tool_view_targets_tool_pane() {
+        // Tool-view counterpart of `start_live_send_in_terminal_view_targets_terminal_pane`:
+        // when previewing a named tool (lazygit, yazi, etc.), `start_live_send`
+        // must resolve to that tool's own paired pane, not fall back to the
+        // agent or bail out entirely.
+        let mut env = create_test_env_empty();
+        let id = add_session(&mut env.view, "session-one");
+        env.view.flat_items = env.view.build_flat_items();
+        env.view.cursor = 0;
+        env.view.update_selected();
+        env.view.view_mode = crate::tui::home::ViewMode::Tool("lazygit".to_string());
+        let action = env.view.start_live_send();
+        assert_eq!(action, Some(Action::EnterLiveSend(id)));
+        assert_eq!(
+            env.view.pending_live_send_target,
+            crate::tui::home::live_send::LiveSendTarget::Tool("lazygit".to_string())
+        );
+    }
+
+    fn write_live_send_on_view_switch(mode: NewSessionAttachMode, on_view_switch: bool) {
+        let mut config = Config::default();
+        config.session.default_attach_mode = mode;
+        config.session.live_send_on_view_switch = on_view_switch;
+        save_config(&config).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn toggle_view_auto_starts_live_send_when_setting_enabled_and_default_is_live_send() {
+        // With `live_send_on_view_switch` on and `default_attach_mode =
+        // LiveSend`, pressing 't' (ToggleView) from Structured view must
+        // not just flip the preview to Terminal; it must also enter
+        // live-send immediately, without a separate Enter/Tab/click.
+        let mut env = create_test_env_empty();
+        write_live_send_on_view_switch(NewSessionAttachMode::LiveSend, true);
+        let id = add_session(&mut env.view, "session-one");
+        env.view.flat_items = env.view.build_flat_items();
+        env.view.cursor = 0;
+        env.view.update_selected();
+        let action = env.view.handle_key(key(KeyCode::Char('t')), None);
+        assert_eq!(
+            env.view.view_mode,
+            crate::tui::home::ViewMode::Terminal,
+            "ToggleView must still flip the preview to Terminal"
+        );
+        assert_eq!(action, Some(Action::EnterLiveSend(id)));
+    }
+
+    #[test]
+    #[serial]
+    fn toggle_view_does_not_auto_start_live_send_when_setting_disabled() {
+        // The setting defaults to off: even with `default_attach_mode =
+        // LiveSend`, ToggleView must leave live-send alone and only
+        // change the preview.
+        let mut env = create_test_env_empty();
+        write_live_send_on_view_switch(NewSessionAttachMode::LiveSend, false);
+        let _id = add_session(&mut env.view, "session-one");
+        env.view.flat_items = env.view.build_flat_items();
+        env.view.cursor = 0;
+        env.view.update_selected();
+        let action = env.view.handle_key(key(KeyCode::Char('t')), None);
+        assert_eq!(env.view.view_mode, crate::tui::home::ViewMode::Terminal);
+        assert_eq!(
+            action, None,
+            "auto live-send must stay off when the setting is disabled"
+        );
+        assert!(env.view.live_send.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn toggle_view_does_not_auto_start_live_send_when_default_is_tmux() {
+        // The setting alone isn't enough: it only fires when the
+        // resolved `default_attach_mode` is also LiveSend. With the
+        // historical Tmux default, ToggleView stays a plain preview
+        // switch even with the setting enabled.
+        let mut env = create_test_env_empty();
+        write_live_send_on_view_switch(NewSessionAttachMode::Tmux, true);
+        let _id = add_session(&mut env.view, "session-one");
+        env.view.flat_items = env.view.build_flat_items();
+        env.view.cursor = 0;
+        env.view.update_selected();
+        let action = env.view.handle_key(key(KeyCode::Char('t')), None);
+        assert_eq!(env.view.view_mode, crate::tui::home::ViewMode::Terminal);
+        assert_eq!(
+            action, None,
+            "auto live-send must stay off when default_attach_mode is Tmux"
+        );
+        assert!(env.view.live_send.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn tool_hotkey_auto_starts_live_send_when_setting_enabled_and_default_is_live_send() {
+        // Parallel case for the other explicit view-switch entry point:
+        // opening a tool via its configured hotkey must apply the same
+        // auto-entry check as ToggleView.
+        let mut env = create_test_env_empty();
+        write_live_send_on_view_switch(NewSessionAttachMode::LiveSend, true);
+        let id = add_session(&mut env.view, "session-one");
+        env.view.flat_items = env.view.build_flat_items();
+        env.view.cursor = 0;
+        env.view.update_selected();
+        env.view.tool_hotkey_cache =
+            vec![("lazygit".to_string(), KeyCode::Char('g'), KeyModifiers::ALT)];
+        let action = env
+            .view
+            .handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::ALT), None);
+        assert_eq!(
+            env.view.view_mode,
+            crate::tui::home::ViewMode::Tool("lazygit".to_string())
+        );
+        assert_eq!(action, Some(Action::EnterLiveSend(id)));
+    }
+
+    #[test]
+    #[serial]
     fn help_live_on_enter_returns_none_when_no_session_selected() {
         // Cursor parked off any session row: the help overlay shouldn't
         // claim a session-attach behavior, so `help_live_on_enter`
