@@ -1376,6 +1376,10 @@ mod tests {
             .status()
             .expect("tmux new-session");
         assert!(status.success());
+        // The global session-existence cache has a short TTL and can be
+        // refreshed by unrelated concurrent tests between session creation
+        // and this check; inject directly so `exists()` can't false-negative.
+        crate::tmux::test_inject_session_into_cache(&name);
 
         let session = Session::from_name(&name);
         session
@@ -1422,6 +1426,9 @@ mod tests {
             .status()
             .expect("tmux new-session");
         assert!(status.success());
+        // See the comment in send_key_tokens_appends_no_implicit_enter above:
+        // avoid a race against the global session-existence cache's TTL.
+        crate::tmux::test_inject_session_into_cache(&name);
 
         let session = Session::from_name(&name);
         session
