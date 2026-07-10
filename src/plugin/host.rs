@@ -51,6 +51,14 @@ const REAP_GRACE: Duration = Duration::from_secs(2);
 
 /// One supervised worker: the plugin it runs, its pid, and the task driving it.
 struct RunningWorker {
+    /// Identity of the supervisor task that owns this slot. A stale supervisor
+    /// (one whose worker was torn down and whose plugin was relaunched under a
+    /// new supervisor) must not mutate or remove the newer entry: every table
+    /// write it makes is gated on this id still matching. Without it, an
+    /// aborted-but-not-yet-yielded supervisor can ABA-corrupt a fresh entry,
+    /// because an uncontended `lock().await` resolves inside the same poll,
+    /// before the abort takes effect.
+    supervisor_id: u64,
     pid: u32,
     task: tokio::task::JoinHandle<()>,
     /// Sender into the worker's stdin, set while a worker generation is being
@@ -58,6 +66,27 @@ struct RunningWorker {
     /// worker, e.g. a UI action forwarded from the dashboard. `None` between
     /// spawns. See [`PluginHost::notify_worker`].
     inbound: Option<mpsc::UnboundedSender<String>>,
+    /// The UI generation this slot's live worker is stamping writes with, so
+    /// teardown from outside `spawn_once` (a reconcile tearing down a
+    /// now-inactive plugin) can retire it. `None` between spawns.
+    ui_generation: Option<u64>,
+}
+
+/// All worker-lifecycle state under one mutex. Keeping `running`, the crashed
+/// tombstone set, and the supervisor-id counter in a single lock makes their
+/// transitions atomic and removes the lock-ordering hazard that separate
+/// mutexes would introduce.
+struct WorkerTable {
+    /// Running workers keyed by plugin id (one worker per plugin in v1).
+    running: HashMap<String, RunningWorker>,
+    /// Plugins whose worker exhausted the respawn budget. Skipped by
+    /// [`PluginHost::reconcile`] so an unrelated enable/disable does not revive
+    /// a crash-looping plugin; cleared once the plugin leaves the desired set
+    /// (an explicit disable), so an off then on is a clean retry. In-memory
+    /// only: a daemon restart clears it and retries from scratch.
+    crashed: HashSet<String>,
+    /// Monotonic allocator for [`RunningWorker::supervisor_id`].
+    next_supervisor_id: u64,
 }
 
 /// The plugin worker host, owned by the daemon for its lifetime.
@@ -65,8 +94,7 @@ pub struct PluginHost {
     api: Arc<HostApiState>,
     sandbox: Arc<dyn SandboxBackend>,
     workers_dir: PathBuf,
-    /// Running workers keyed by plugin id (one worker per plugin in v1).
-    running: Mutex<HashMap<String, RunningWorker>>,
+    state: Mutex<WorkerTable>,
 }
 
 impl PluginHost {
@@ -86,7 +114,11 @@ impl PluginHost {
             api: Arc::new(api),
             sandbox: Arc::new(NoSandbox),
             workers_dir,
-            running: Mutex::new(HashMap::new()),
+            state: Mutex::new(WorkerTable {
+                running: HashMap::new(),
+                crashed: HashSet::new(),
+                next_supervisor_id: 1,
+            }),
         }))
     }
 
@@ -126,70 +158,193 @@ impl PluginHost {
         let line = serde_json::json!({ "jsonrpc": "2.0", "method": method, "params": params })
             .to_string()
             + "\n";
-        let running = self.running.lock().await;
-        match running.get(plugin_id).and_then(|w| w.inbound.as_ref()) {
+        let table = self.state.lock().await;
+        match table
+            .running
+            .get(plugin_id)
+            .and_then(|w| w.inbound.as_ref())
+        {
             Some(tx) => tx.send(line).is_ok(),
             None => false,
         }
     }
 
-    /// Launch a worker for every active plugin that declares a runtime, up to
-    /// the concurrency cap. A plugin whose runtime cannot be resolved (a
-    /// missing interpreter or binary) is logged and skipped; it does not block
-    /// the others.
+    /// Bring the running worker set in line with the registry: launch a worker
+    /// for every active plugin that declares a runtime and has none running,
+    /// and tear down any running worker whose plugin is no longer active. Logs
+    /// why an enabled-but-inactive plugin (or a failed load) will not launch,
+    /// so a boot that starts zero workers is never silent. This is the only
+    /// launch path; the daemon calls it at startup and the web enable/disable
+    /// handler calls it to recover a worker without a full restart.
     pub async fn start(self: &Arc<Self>, registry: &PluginRegistry) {
-        let candidates: Vec<String> = registry
+        self.log_start_observability(registry);
+        self.reconcile(registry).await;
+    }
+
+    /// WARN every registry load error and every runtime-declaring plugin that
+    /// is enabled on disk yet inactive, naming the reason. Without this a
+    /// stale-grant or host-incompat plugin drops out of the launch set with the
+    /// reason buried in `load_errors` (surfaced only in the plugin manager UI),
+    /// so the daemon log shows a silent zero-launch. Boot-only: reconcile does
+    /// not re-log this on every enable/disable.
+    fn log_start_observability(&self, registry: &PluginRegistry) {
+        for err in registry.load_errors() {
+            tracing::warn!(
+                target: "plugin.host",
+                "plugin load error; a worker may not launch: {err}"
+            );
+        }
+        for p in registry.all() {
+            if p.manifest.runtime.is_some() && !p.active() {
+                let reason = if !p.enabled {
+                    "disabled"
+                } else if !p.granted {
+                    "ungranted; awaiting reapproval"
+                } else {
+                    "inactive"
+                };
+                tracing::warn!(
+                    target: "plugin.host",
+                    plugin = %p.id(),
+                    reason,
+                    "plugin declares a runtime but is inactive; not launching a worker"
+                );
+            }
+        }
+    }
+
+    /// Idempotently reconcile the running set against `registry.active()`.
+    /// Diffs under the table lock, drains torn-down workers into a local vec,
+    /// then reaps them after releasing the lock (the escalating reap awaits a
+    /// grace period, which must not be held across the mutex, matching
+    /// [`PluginHost::shutdown`]).
+    pub async fn reconcile(self: &Arc<Self>, registry: &PluginRegistry) {
+        let desired: HashSet<String> = registry
             .active()
             .filter(|p| p.manifest.runtime.is_some())
             .map(|p| p.id().to_string())
             .collect();
-        tracing::info!(
-            target: "plugin.host",
-            count = candidates.len(),
-            "launching plugin workers"
-        );
-        for id in candidates {
-            if self.running.lock().await.len() >= MAX_WORKERS {
+
+        let to_teardown: Vec<(String, RunningWorker)> = {
+            let mut table = self.state.lock().await;
+            // Forget the crash tombstone for any plugin that is no longer
+            // desired (an explicit disable), so an off then on relaunches it.
+            table.crashed.retain(|id| desired.contains(id));
+
+            let running_ids: HashSet<String> = table.running.keys().cloned().collect();
+            let (to_launch, teardown_ids, truncated) =
+                plan_reconcile(&desired, &running_ids, &table.crashed, MAX_WORKERS);
+
+            if truncated {
                 tracing::warn!(
                     target: "plugin.host",
                     cap = MAX_WORKERS,
-                    "plugin worker concurrency cap reached; not launching {id}"
+                    "plugin worker concurrency cap reached; some workers not launched"
                 );
-                break;
             }
-            self.clone().launch(id).await;
-        }
+
+            let mut drained = Vec::with_capacity(teardown_ids.len());
+            for id in teardown_ids {
+                if let Some(w) = table.running.remove(&id) {
+                    drained.push((id, w));
+                }
+            }
+            for id in to_launch {
+                self.launch_locked(&mut table, id);
+            }
+            drained
+        };
+
+        self.teardown_workers(to_teardown).await;
     }
 
-    /// Spawn the supervising task for one plugin id. The task spawns the worker
-    /// process, runs its protocol loop, and respawns within the budget if it
-    /// exits.
-    async fn launch(self: Arc<Self>, plugin_id: String) {
+    /// Insert a placeholder entry and spawn its supervisor under the held table
+    /// lock, so `spawn_once`'s first registration sees the entry (and its
+    /// supervisor id) already present.
+    fn launch_locked(self: &Arc<Self>, table: &mut WorkerTable, plugin_id: String) {
+        if table.running.contains_key(&plugin_id) {
+            return;
+        }
+        let supervisor_id = table.next_supervisor_id;
+        table.next_supervisor_id += 1;
         let host = self.clone();
         let id_for_task = plugin_id.clone();
-        // Hold the lock across spawn and insert so `supervise` (which updates
-        // the pid under the same lock) cannot run its first `spawn_once` before
-        // the placeholder entry exists. Otherwise the pid update would no-op and
-        // shutdown could never reap the worker.
-        let mut running = self.running.lock().await;
         let task = tokio::spawn(async move {
-            host.supervise(id_for_task).await;
+            host.supervise(id_for_task, supervisor_id).await;
         });
-        running.insert(
+        table.running.insert(
             plugin_id,
             RunningWorker {
+                supervisor_id,
                 pid: 0,
                 task,
                 inbound: None,
+                ui_generation: None,
             },
         );
     }
 
+    /// Abort each supervisor, retire its UI generation, and reap its group.
+    /// Reaps in parallel and off the table lock; each escalating reap awaits up
+    /// to [`REAP_GRACE`] before SIGKILL, so join_all bounds the whole thing to
+    /// one grace period. Aborting the task first stops it from respawning the
+    /// worker we are about to reap.
+    async fn teardown_workers(&self, workers: Vec<(String, RunningWorker)>) {
+        futures_util::future::join_all(workers.into_iter().map(|(plugin_id, w)| async move {
+            w.task.abort();
+            if let Some(generation) = w.ui_generation {
+                self.api.clear_ui(&plugin_id, generation);
+            }
+            if w.pid != 0 {
+                worker::reap_group_escalating(w.pid, REAP_GRACE).await;
+            }
+            tracing::debug!(target: "plugin.host", plugin = %plugin_id, "stopped plugin worker");
+        }))
+        .await;
+    }
+
+    /// Remove this supervisor's entry only if it still owns the slot. A stale
+    /// supervisor (its worker torn down, the plugin relaunched under a new id)
+    /// must not remove the newer entry.
+    async fn remove_if_current(&self, plugin_id: &str, supervisor_id: u64) {
+        let mut table = self.state.lock().await;
+        if table
+            .running
+            .get(plugin_id)
+            .is_some_and(|w| w.supervisor_id == supervisor_id)
+        {
+            table.running.remove(plugin_id);
+        }
+    }
+
+    /// Give-up transition: if this supervisor still owns the slot, remove it and
+    /// record the crash tombstone atomically, so a concurrent reconcile never
+    /// sees the slot free without the tombstone (which would spuriously
+    /// relaunch). Returns whether this supervisor was still current.
+    async fn mark_crashed_and_remove_if_current(
+        &self,
+        plugin_id: &str,
+        supervisor_id: u64,
+    ) -> bool {
+        let mut table = self.state.lock().await;
+        let current = table
+            .running
+            .get(plugin_id)
+            .is_some_and(|w| w.supervisor_id == supervisor_id);
+        if current {
+            table.running.remove(plugin_id);
+            table.crashed.insert(plugin_id.to_string());
+        }
+        current
+    }
+
     /// Drive one plugin's worker: spawn, serve, respawn within budget.
-    async fn supervise(self: Arc<Self>, plugin_id: String) {
+    /// `supervisor_id` is this task's slot identity; every table write it makes
+    /// is gated on it so a stale supervisor cannot disturb a newer entry.
+    async fn supervise(self: Arc<Self>, plugin_id: String, supervisor_id: u64) {
         let mut restarts: Vec<Instant> = Vec::new();
         loop {
-            match self.spawn_once(&plugin_id).await {
+            match self.spawn_once(&plugin_id, supervisor_id).await {
                 Ok(()) => {}
                 Err(e) => {
                     tracing::error!(
@@ -199,7 +354,7 @@ impl PluginHost {
                     );
                     // Drop the entry so a dead worker does not count against the
                     // concurrency cap or block a later retry.
-                    self.running.lock().await.remove(&plugin_id);
+                    self.remove_if_current(&plugin_id, supervisor_id).await;
                     return;
                 }
             }
@@ -213,7 +368,23 @@ impl PluginHost {
                     "plugin worker exceeded respawn budget ({MAX_RESPAWNS} in {}s); giving up",
                     RESPAWN_WINDOW.as_secs()
                 );
-                self.running.lock().await.remove(&plugin_id);
+                // Tombstone it so an unrelated reconcile does not revive a
+                // crash-looping plugin, and surface the give-up to the dashboard
+                // (the log alone was invisible in #2769). Only if still current.
+                if self
+                    .mark_crashed_and_remove_if_current(&plugin_id, supervisor_id)
+                    .await
+                {
+                    self.notify_host(
+                        &plugin_id,
+                        crate::plugin::ui_state::Tone::Danger,
+                        "Plugin worker stopped".to_string(),
+                        Some(format!(
+                            "The worker crashed more than {MAX_RESPAWNS} times in {}s and will not restart until the plugin is disabled and re-enabled.",
+                            RESPAWN_WINDOW.as_secs()
+                        )),
+                    );
+                }
                 return;
             }
             tracing::warn!(
@@ -228,7 +399,7 @@ impl PluginHost {
     /// Resolution and the granted-capability list are recomputed from the live
     /// registry each spawn so an enable/disable/regrant between restarts is
     /// honored.
-    async fn spawn_once(&self, plugin_id: &str) -> Result<()> {
+    async fn spawn_once(&self, plugin_id: &str, supervisor_id: u64) -> Result<()> {
         let registry = crate::plugin::registry();
         let plugin = registry
             .get(plugin_id)
@@ -284,16 +455,6 @@ impl PluginHost {
             .spawn()
             .with_context(|| format!("spawn worker for {plugin_id}"))?;
         let pid = child.id().unwrap_or(0);
-        tracing::info!(
-            target: "plugin.host",
-            plugin = %plugin_id,
-            pid,
-            program = %prepared.program.display(),
-            "launched plugin worker"
-        );
-        if let Some(w) = self.running.lock().await.get_mut(plugin_id) {
-            w.pid = pid;
-        }
 
         let stdin = child.stdin.take().context("worker stdin missing")?;
         let stdout = child.stdout.take().context("worker stdout missing")?;
@@ -314,14 +475,49 @@ impl PluginHost {
                 }
             }
         });
-        if let Some(w) = self.running.lock().await.get_mut(plugin_id) {
-            w.inbound = Some(inbound_tx.clone());
-        }
         // A fresh UI generation per spawn: every ui.state.* write the worker
         // makes is stamped with it, so once this generation is retired below a
         // late write cannot resurrect state, and an instant respawn owns a new
         // generation that this worker's cleanup will not touch.
         let ui_generation = self.api.begin_ui_generation(plugin_id);
+
+        // Register pid, inbound, and generation under the lock, but only if this
+        // supervisor still owns the slot. If a reconcile tore the slot down
+        // between spawn and here, do not leak the child: reap it and bail.
+        // ponytail: spawn is not held under the lock, so this narrow window can
+        // spawn then reap a child; kill_on_drop plus this explicit reap covers
+        // the direct child, and the worker forks no process group in practice.
+        // Hold under the same lock only if a forking worker ever needs the group
+        // reaped in every race.
+        let accepted = {
+            let mut table = self.state.lock().await;
+            match table.running.get_mut(plugin_id) {
+                Some(w) if w.supervisor_id == supervisor_id => {
+                    w.pid = pid;
+                    w.inbound = Some(inbound_tx.clone());
+                    w.ui_generation = Some(ui_generation);
+                    true
+                }
+                _ => false,
+            }
+        };
+        if !accepted {
+            writer.abort();
+            self.api.clear_ui(plugin_id, ui_generation);
+            if pid != 0 {
+                worker::reap_group_escalating(pid, REAP_GRACE).await;
+            }
+            let _ = child.wait().await;
+            anyhow::bail!("plugin {plugin_id} worker slot was torn down before registration");
+        }
+
+        tracing::info!(
+            target: "plugin.host",
+            plugin = %plugin_id,
+            pid,
+            program = %prepared.program.display(),
+            "launched plugin worker"
+        );
         let ctx = PluginRpcContext {
             plugin_id: plugin_id.to_string(),
             granted_capabilities: granted,
@@ -330,9 +526,16 @@ impl PluginHost {
         };
         serve_connection(&self.api, &ctx, stdout, inbound_tx).await;
         // Serving ended; stop accepting host-initiated pushes and tear down the
-        // stdin writer so it does not outlive the worker.
-        if let Some(w) = self.running.lock().await.get_mut(plugin_id) {
-            w.inbound = None;
+        // stdin writer so it does not outlive the worker. Only if still current,
+        // so a stale supervisor cannot blank a newer entry's channel.
+        {
+            let mut table = self.state.lock().await;
+            if let Some(w) = table.running.get_mut(plugin_id) {
+                if w.supervisor_id == supervisor_id {
+                    w.inbound = None;
+                    w.ui_generation = None;
+                }
+            }
         }
         writer.abort();
 
@@ -352,25 +555,40 @@ impl PluginHost {
     /// Reap every running worker. Called on daemon shutdown.
     pub async fn shutdown(&self) {
         // Drain under the lock, then reap without holding it: the escalating
-        // reap awaits a grace period, and we must not hold the running lock
-        // across that await.
-        let workers: Vec<_> = self.running.lock().await.drain().collect();
-        // Reap in parallel: each escalating reap awaits up to REAP_GRACE before
-        // SIGKILL, so a sequential loop would make total shutdown scale with the
-        // worker count. The daemon's shutdown grace-period force-exit is armed
-        // only after this returns, so a bounded reap keeps that safety net
-        // meaningful. join_all bounds the whole thing to one REAP_GRACE.
-        futures_util::future::join_all(workers.into_iter().map(|(plugin_id, w)| async move {
-            w.task.abort();
-            if w.pid != 0 {
-                // SIGTERM the group, wait the grace, then SIGKILL: a worker or
-                // forked helper that ignores SIGTERM must not survive shutdown.
-                worker::reap_group_escalating(w.pid, REAP_GRACE).await;
-            }
-            tracing::debug!(target: "plugin.host", plugin = %plugin_id, "stopped plugin worker");
-        }))
-        .await;
+        // reap awaits a grace period, and we must not hold the table lock
+        // across that await. Reuses the same teardown path as reconcile.
+        let workers: Vec<_> = self.state.lock().await.running.drain().collect();
+        self.teardown_workers(workers).await;
     }
+}
+
+/// Pure diff for [`PluginHost::reconcile`]: given the desired active-runtime
+/// set, the currently-running ids, the crash tombstones, and the worker cap,
+/// decide what to launch and what to tear down. Returns `(to_launch,
+/// to_teardown, truncated)` with both lists sorted for determinism; `truncated`
+/// is true when the cap left one or more launch candidates unstarted. Kept free
+/// of the lock and process side effects so it is unit-testable in isolation.
+fn plan_reconcile(
+    desired: &HashSet<String>,
+    running_ids: &HashSet<String>,
+    crashed: &HashSet<String>,
+    cap: usize,
+) -> (Vec<String>, Vec<String>, bool) {
+    let mut to_teardown: Vec<String> = running_ids.difference(desired).cloned().collect();
+    to_teardown.sort();
+
+    let mut candidates: Vec<String> = desired
+        .iter()
+        .filter(|id| !running_ids.contains(*id) && !crashed.contains(*id))
+        .cloned()
+        .collect();
+    candidates.sort();
+
+    let remaining = running_ids.len() - to_teardown.len();
+    let slots = cap.saturating_sub(remaining);
+    let truncated = candidates.len() > slots;
+    let to_launch: Vec<String> = candidates.into_iter().take(slots).collect();
+    (to_launch, to_teardown, truncated)
 }
 
 /// Read JSON-RPC requests from a worker's stdout, dispatch each through the
@@ -654,5 +872,78 @@ rl.on('line', (line) => {
         let events = got["events"].as_array().unwrap();
         assert_eq!(events.len(), 1, "worker should react to the host push");
         assert_eq!(events[0]["payload"]["ok"], json!(true));
+    }
+
+    fn set(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A desired plugin with no running worker is launched; nothing is torn down.
+    #[test]
+    fn plan_reconcile_launches_missing() {
+        let (launch, teardown, truncated) =
+            plan_reconcile(&set(&["a", "b"]), &set(&[]), &set(&[]), MAX_WORKERS);
+        assert_eq!(launch, vec!["a".to_string(), "b".to_string()]);
+        assert!(teardown.is_empty());
+        assert!(!truncated);
+    }
+
+    /// A running worker whose plugin is no longer desired is torn down.
+    #[test]
+    fn plan_reconcile_tears_down_extras() {
+        let (launch, teardown, truncated) =
+            plan_reconcile(&set(&["a"]), &set(&["a", "b"]), &set(&[]), MAX_WORKERS);
+        assert!(launch.is_empty());
+        assert_eq!(teardown, vec!["b".to_string()]);
+        assert!(!truncated);
+    }
+
+    /// Desired == running is a no-op: reconcile is idempotent.
+    #[test]
+    fn plan_reconcile_idempotent() {
+        let (launch, teardown, truncated) =
+            plan_reconcile(&set(&["a"]), &set(&["a"]), &set(&[]), MAX_WORKERS);
+        assert!(launch.is_empty());
+        assert!(teardown.is_empty());
+        assert!(!truncated);
+    }
+
+    /// A crash-tombstoned plugin is not relaunched, even though it is desired.
+    #[test]
+    fn plan_reconcile_skips_crashed() {
+        let (launch, teardown, truncated) =
+            plan_reconcile(&set(&["a"]), &set(&[]), &set(&["a"]), MAX_WORKERS);
+        assert!(launch.is_empty(), "crashed plugin must not be relaunched");
+        assert!(teardown.is_empty());
+        assert!(!truncated);
+    }
+
+    /// The cap bounds launches and flags truncation so the caller can warn.
+    #[test]
+    fn plan_reconcile_cap_truncates() {
+        let (launch, teardown, truncated) =
+            plan_reconcile(&set(&["a", "b", "c"]), &set(&[]), &set(&[]), 2);
+        assert_eq!(launch, vec!["a".to_string(), "b".to_string()]);
+        assert!(teardown.is_empty());
+        assert!(truncated);
+    }
+
+    /// A disable clears the crash tombstone (reconcile's `crashed.retain` step),
+    /// so a subsequent enable relaunches the plugin: an off then on is a retry.
+    #[test]
+    fn crash_tombstone_cleared_on_disable_allows_retry() {
+        let mut crashed = set(&["a"]);
+
+        // Disable: `a` leaves the desired set, so reconcile drops its tombstone.
+        let desired_off = set(&[]);
+        crashed.retain(|id| desired_off.contains(id));
+        assert!(
+            crashed.is_empty(),
+            "disable must forget the crash tombstone"
+        );
+
+        // Re-enable: `a` is desired, no longer tombstoned, not running -> launch.
+        let (launch, _, _) = plan_reconcile(&set(&["a"]), &set(&[]), &crashed, MAX_WORKERS);
+        assert_eq!(launch, vec!["a".to_string()]);
     }
 }
