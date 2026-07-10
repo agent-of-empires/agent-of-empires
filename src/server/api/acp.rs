@@ -922,19 +922,28 @@ pub async fn switch_acp_agent(
             }
         }
     }
-    if let Ok(storage) = crate::session::Storage::new(&profile_for_save, state.file_watch.clone()) {
-        if let Err(e) = storage.update(|instances, _groups| {
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == id_for_save) {
-                inst.agent_name = Some(target_for_save.clone());
-                inst.acp_session_id = None;
-                inst.import_pending = None;
+    match crate::session::Storage::new(&profile_for_save, state.file_watch.clone()) {
+        Ok(storage) => {
+            if let Err(e) = storage.update(|instances, _groups| {
+                if let Some(inst) = instances.iter_mut().find(|i| i.id == id_for_save) {
+                    inst.agent_name = Some(target_for_save.clone());
+                    inst.acp_session_id = None;
+                    inst.import_pending = None;
+                }
+                Ok(())
+            }) {
+                tracing::error!(
+                    target: "http.api.acp",
+                    session = %id_for_save,
+                    "failed to persist agent_name after switch: {e}"
+                );
             }
-            Ok(())
-        }) {
+        }
+        Err(e) => {
             tracing::error!(
                 target: "http.api.acp",
                 session = %id_for_save,
-                "failed to persist agent_name after switch: {e}"
+                "failed to open storage to persist agent_name after switch: {e}"
             );
         }
     }
@@ -1988,19 +1997,28 @@ async fn persist_agent_model(state: &Arc<AppState>, id: &str, model: &str) {
         inst.agent_model = Some(model.to_string());
         inst.source_profile.clone()
     };
-    if let Ok(storage) = crate::session::Storage::new(&profile, state.file_watch.clone()) {
-        let id_owned = id.to_string();
-        let model_owned = model.to_string();
-        if let Err(e) = storage.update(|instances, _groups| {
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == id_owned) {
-                inst.agent_model = Some(model_owned.clone());
+    match crate::session::Storage::new(&profile, state.file_watch.clone()) {
+        Ok(storage) => {
+            let id_owned = id.to_string();
+            let model_owned = model.to_string();
+            if let Err(e) = storage.update(|instances, _groups| {
+                if let Some(inst) = instances.iter_mut().find(|i| i.id == id_owned) {
+                    inst.agent_model = Some(model_owned.clone());
+                }
+                Ok(())
+            }) {
+                tracing::error!(
+                    target: "http.api.acp",
+                    session = %id,
+                    "failed to persist agent_model after config-option pick: {e}"
+                );
             }
-            Ok(())
-        }) {
+        }
+        Err(e) => {
             tracing::error!(
                 target: "http.api.acp",
                 session = %id,
-                "failed to persist agent_model after config-option pick: {e}"
+                "failed to open storage to persist agent_model after config-option pick: {e}"
             );
         }
     }
