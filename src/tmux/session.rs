@@ -166,6 +166,27 @@ fn merge_cursor_probes(
     }
 }
 
+/// A delta beyond this many rows between a window and its pane is a multi-pane
+/// split (the missing rows are other panes), not window chrome.
+const MAX_CHROME_ROWS: u16 = 5;
+
+/// Rows of vertical window chrome (the tmux status bar) that sit outside the
+/// pane, so a window sized to `H` yields a pane of `H - chrome`. Derived live
+/// from `window_height - pane_height` rather than assumed, because whether a
+/// detached window's pane reserves the status row varies by tmux version and
+/// status setting (off, one line, or multi-line). A delta larger than
+/// [`MAX_CHROME_ROWS`] is a split layout, not chrome, and resolves to 0 so a
+/// caller never balloons the window chasing a pane height `resize-window`
+/// cannot deliver.
+fn chrome_rows(window_height: u16, pane_height: u16) -> u16 {
+    let delta = window_height.saturating_sub(pane_height);
+    if delta <= MAX_CHROME_ROWS {
+        delta
+    } else {
+        0
+    }
+}
+
 impl Session {
     pub fn new(id: &str, title: &str) -> Result<Self> {
         Ok(Self {
@@ -683,21 +704,65 @@ impl Session {
     /// to `manual`, so any later `attach-session` must call
     /// [`reset_size_to_latest_client`](Self::reset_size_to_latest_client) first
     /// or the window stays pinned at these preview dimensions.
+    /// Resize the session's first window so its pane's visible content area
+    /// becomes `cols` x `rows`. Every caller (the web live view, the mobile
+    /// live view, the TUI's passive preview sync) works in pane/content
+    /// geometry, not tmux window geometry: they render the pane, not the tmux
+    /// status bar. tmux `resize-window` sizes the *window*, and vertical chrome
+    /// (the status bar) shrinks the pane below it, so a naive `resize-window -y
+    /// rows` yields a `rows - chrome` pane and the live owner loop then
+    /// re-asserts forever against a target it can never reach (#2766). We
+    /// measure the chrome live and add it back, so the pane lands at exactly
+    /// `rows`. Cols need no adjustment: a single pane spans the full window
+    /// width, and the status bar is horizontal.
     pub fn resize_window(&self, cols: u16, rows: u16) {
         if cols == 0 || rows == 0 || !self.exists() {
             return;
         }
+        // Query the same window/pane the capture streams (`:^.0`), so the
+        // measured chrome matches the pane whose height the owner loop checks.
+        let pane_target = format!("{}:^.0", self.name);
+        let window_rows = self
+            .pane_chrome_rows(&pane_target)
+            .map(|chrome| rows.saturating_add(chrome))
+            .unwrap_or(rows);
+        let window_target = format!("{}:^", self.name);
         let _ = crate::tmux::tmux_command()
             .args([
                 "resize-window",
                 "-t",
-                &self.name,
+                &window_target,
                 "-x",
                 &cols.to_string(),
                 "-y",
-                &rows.to_string(),
+                &window_rows.to_string(),
             ])
             .output();
+    }
+
+    /// Read the live vertical chrome (status-bar rows) for `pane_target` from
+    /// tmux. `None` when the geometry can't be read; callers then size the
+    /// window with no chrome adjustment (the pre-#2766 behavior).
+    fn pane_chrome_rows(&self, pane_target: &str) -> Option<u16> {
+        let output = crate::tmux::tmux_command()
+            .args([
+                "display-message",
+                "-p",
+                "-t",
+                pane_target,
+                "-F",
+                "#{window_height} #{pane_height}",
+            ])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let line = String::from_utf8_lossy(&output.stdout);
+        let mut fields = line.split_whitespace();
+        let window_height: u16 = fields.next()?.parse().ok()?;
+        let pane_height: u16 = fields.next()?.parse().ok()?;
+        Some(chrome_rows(window_height, pane_height))
     }
 
     /// Try to become the sole size owner of this session. Returns true if we
@@ -1013,6 +1078,87 @@ mod tests {
     #[test]
     fn raw_byte_batches_empty_payload_sends_nothing() {
         assert!(raw_byte_batches(&[]).is_empty());
+    }
+
+    #[test]
+    fn chrome_rows_accounts_for_status_bar_and_ignores_splits() {
+        // #2766: the reporter's tmux yields a pane one row shorter than the
+        // window (status bar), so a window sized to `rows` leaves a `rows - 1`
+        // pane and the owner loop re-asserts forever. chrome=1 here lets the
+        // caller size the window to rows+1 and land the pane at `rows`.
+        assert_eq!(chrome_rows(67, 66), 1, "one status row");
+        // No status bar (or a tmux that doesn't reserve the row when detached):
+        // window == pane, chrome 0, pre-#2766 behavior preserved.
+        assert_eq!(chrome_rows(66, 66), 0, "no chrome");
+        // Multi-line status bar.
+        assert_eq!(chrome_rows(68, 66), 2, "two status rows");
+        assert_eq!(chrome_rows(71, 66), 5, "max plausible chrome");
+        // A large delta is a multi-pane split, not chrome: resolve to 0 rather
+        // than balloon the window chasing an unreachable pane size.
+        assert_eq!(chrome_rows(40, 18), 0, "split layout is not chrome");
+        // Degenerate: pane taller than window can't underflow.
+        assert_eq!(chrome_rows(10, 20), 0, "saturating, no panic");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resize_window_lands_pane_at_requested_rows_with_status_on() {
+        // End-to-end convergence check: whatever chrome this host's tmux
+        // reports, resize_window must leave the pane at exactly the requested
+        // height (not one short), so the live owner loop stops drifting.
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let guard = TmuxTestSession::new("aoe_test_resize_chrome");
+        let name = guard.name().to_string();
+        let status = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &name,
+                "-x",
+                "40",
+                "-y",
+                "10",
+                "sleep 60",
+                ";",
+                "set-option",
+                "-t",
+                &name,
+                "pane-base-index",
+                "0",
+                ";",
+                "set-option",
+                "-t",
+                &name,
+                "status",
+                "on",
+            ])
+            .status()
+            .expect("tmux new-session");
+        assert!(status.success());
+
+        let session = Session::from_name(&name);
+        session.resize_window(40, 20);
+
+        // resize-window applies asynchronously; poll until the pane settles.
+        let mut pane = (0u16, 0u16);
+        for _ in 0..30 {
+            if let Ok((_, Some(c))) = session.capture_pane_with_cursor(5) {
+                pane = (c.pane_width, c.pane_height);
+                if pane == (40, 20) {
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(
+            pane,
+            (40, 20),
+            "pane content area must reach the requested grid, status bar included"
+        );
     }
 
     #[test]
