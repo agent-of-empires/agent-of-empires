@@ -1143,11 +1143,33 @@ mod tests {
         let session = Session::from_name(&name);
         session.resize_window(40, 20);
 
-        // resize-window applies asynchronously; poll until the pane settles.
+        // resize-window applies asynchronously; poll the pane geometry directly
+        // (a bare `sleep` pane paints nothing, so capture_pane_with_cursor may
+        // report no cursor; #{pane_width}/#{pane_height} are always available).
+        let target = format!("{}:^.0", name);
+        let read_pane = || -> Option<(u16, u16)> {
+            let out = crate::tmux::tmux_command()
+                .args([
+                    "display-message",
+                    "-p",
+                    "-t",
+                    &target,
+                    "-F",
+                    "#{pane_width} #{pane_height}",
+                ])
+                .output()
+                .ok()?;
+            if !out.status.success() {
+                return None;
+            }
+            let line = String::from_utf8_lossy(&out.stdout);
+            let mut f = line.split_whitespace();
+            Some((f.next()?.parse().ok()?, f.next()?.parse().ok()?))
+        };
         let mut pane = (0u16, 0u16);
         for _ in 0..30 {
-            if let Ok((_, Some(c))) = session.capture_pane_with_cursor(5) {
-                pane = (c.pane_width, c.pane_height);
+            if let Some(p) = read_pane() {
+                pane = p;
                 if pane == (40, 20) {
                     break;
                 }
