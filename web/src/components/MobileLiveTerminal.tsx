@@ -1238,7 +1238,7 @@ export function MobileLiveTerminal({
   // reading scrollback the spacer model keeps above-viewport pixels invariant
   // so the position holds as the agent streams; trimming there would change
   // scrollHeight under the reader and snap the viewport.
-  const visibleRowCount = reading ? visual.rows.length : renderRowCount;
+  const visibleRowCount = reading ? visual.rows.length : Math.min(renderRowCount, visual.rows.length);
 
   // Virtualization windows over [0, visibleRowCount): the rows whose document
   // positions fall within the viewport, plus one viewport of overscan each side
