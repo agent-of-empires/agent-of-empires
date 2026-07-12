@@ -36,7 +36,9 @@ when the default attach mode is Tmux.
 Live-send only forwards keyboard input, not mouse events, so
 mouse-driven tool UIs like lazygit and yazi lose mouse interaction
 while you're live-sent to them; use their keyboard bindings instead, or
-exit live mode to click within a full tmux attach.
+exit live mode (`Ctrl+Q`) and then attach normally (`Enter`, depending
+on your Default Attach Mode) to get a full tmux attach with mouse
+support.
 
 ## The leader menu
 
