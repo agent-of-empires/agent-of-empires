@@ -146,6 +146,16 @@ struct SessionCache {
 // `\037`), so anything non-printable is unreliable. Pipe is safe.
 const FIELD_SEP: char = '|';
 
+/// tmux exits non-zero with `no server running on <socket>` on stderr when no
+/// tmux server is up. That is the normal idle state whenever aoe has no
+/// terminal-view sessions, not a failure, so callers log it at trace like an
+/// empty success rather than warn. Without this the ~2s status poll floods the
+/// log with identical warnings (tens of thousands per day) that bury real
+/// signal, even though nothing is actually wrong.
+fn tmux_server_absent(stderr: &[u8]) -> bool {
+    String::from_utf8_lossy(stderr).contains("no server running")
+}
+
 pub fn refresh_session_cache() {
     let start = Instant::now();
     let output = tmux_command()
@@ -163,6 +173,10 @@ pub fn refresh_session_cache() {
                 }
             }
             Some(map)
+        }
+        Ok(out) if tmux_server_absent(&out.stderr) => {
+            tracing::trace!(target: "tmux.cache", "no tmux server running; cache cleared");
+            None
         }
         Ok(out) => {
             tracing::warn!(
@@ -270,12 +284,16 @@ pub fn batch_pane_metadata() -> anyhow::Result<HashMap<String, PaneMetadata>> {
             Ok(parse_pane_metadata(&stdout))
         }
         Ok(out) => {
-            tracing::warn!(
-                target: "tmux.pane",
-                status = ?out.status,
-                stderr_bytes = out.stderr.len(),
-                "list-panes returned non-zero",
-            );
+            if tmux_server_absent(&out.stderr) {
+                tracing::trace!(target: "tmux.pane", "no tmux server running");
+            } else {
+                tracing::warn!(
+                    target: "tmux.pane",
+                    status = ?out.status,
+                    stderr_bytes = out.stderr.len(),
+                    "list-panes returned non-zero",
+                );
+            }
             Err(anyhow::anyhow!(
                 "tmux list-panes returned non-zero status: {:?}",
                 out.status
@@ -328,11 +346,15 @@ pub fn attached_session_names() -> anyhow::Result<HashSet<String>> {
             Ok(attached)
         }
         Ok(out) => {
-            tracing::warn!(
-                target: "tmux.cache",
-                status = ?out.status,
-                "list-sessions (attached) returned non-zero",
-            );
+            if tmux_server_absent(&out.stderr) {
+                tracing::trace!(target: "tmux.cache", "no tmux server running (attached query)");
+            } else {
+                tracing::warn!(
+                    target: "tmux.cache",
+                    status = ?out.status,
+                    "list-sessions (attached) returned non-zero",
+                );
+            }
             Err(anyhow::anyhow!(
                 "tmux list-sessions returned non-zero status: {:?}",
                 out.status
@@ -564,6 +586,18 @@ mod tests {
             tmux_socket_path().is_some(),
             "unit tests must not fall back to the default socket"
         );
+    }
+
+    #[test]
+    fn tmux_server_absent_detects_no_server_and_ignores_real_errors() {
+        // The exact stderr tmux emits when nothing is listening on its socket.
+        assert!(tmux_server_absent(
+            b"no server running on /tmp/tmux-1001/default\n"
+        ));
+        // A genuine tmux failure must NOT be mistaken for the benign case, so
+        // it still logs at warn.
+        assert!(!tmux_server_absent(b"can't find session: aoe_foo\n"));
+        assert!(!tmux_server_absent(b""));
     }
 
     #[test]
