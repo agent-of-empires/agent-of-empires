@@ -8,7 +8,7 @@ use crate::harness::{require_tmux, TuiTestHarness};
 
 /// Write a fake "claude" script that prints a static permission-prompt
 /// block, then blocks reading exactly one byte from stdin via `dd` (not
-/// `read -r`, which would wait for a newline the app never sends — the
+/// `read -r`, which would wait for a newline the app never sends; the
 /// real Claude Code CLI selects a numbered menu option on a bare digit
 /// with no Enter, and `send_key_tokens` deliberately sends no implicit
 /// trailing key). Once a byte arrives, it echoes it in a recognizable,
@@ -26,7 +26,7 @@ fn install_fake_claude_prompt(h: &TuiTestHarness) -> std::path::PathBuf {
     let claude = dir.join("fake-claude");
     // The pane's tty starts in canonical line-buffered mode, so a bare
     // digit with no trailing Enter (exactly what `send_key_tokens` sends)
-    // sits in the kernel tty driver's line buffer forever — `dd` would
+    // sits in the kernel tty driver's line buffer forever; `dd` would
     // never see it without a newline. Disable icanon/echo first so a
     // single byte is delivered to `dd` as soon as it arrives, matching
     // how a real full-screen TUI (raw mode) actually reads a keypress.
