@@ -13941,6 +13941,44 @@ mod default_attach_mode {
 
     #[test]
     #[serial]
+    fn refresh_tool_preview_cache_resizes_live_pane_when_targeted() {
+        // Reviewer-requested fix (CodeRabbit + Seluj78 on #2777):
+        // `refresh_tool_preview_cache_if_needed` must call
+        // `resize_live_pane_if_target` up front, the same as the
+        // Terminal/ContainerTerminal siblings, so a window resize while
+        // live-sent to a Tool pane (lazygit, yazi) reflows it instead of
+        // waiting for a live-mode re-enter. `resize_live_pane_if_target`
+        // records the dedup in `live_send_last_resize` even without a
+        // spawned worker, so that's the observable signal here.
+        let mut env = create_test_env_empty();
+        let id = add_session(&mut env.view, "session-one");
+        let inst = env.view.get_instance(&id).unwrap().clone();
+        let tmux_name = crate::tmux::ToolSession::new(&inst.id, &inst.title, "lazygit")
+            .session_name()
+            .to_string();
+        env.view.live_send = Some(crate::tui::home::live_send::LiveSendState {
+            session_id: id.clone(),
+            title: inst.title.clone(),
+            tmux_name,
+            target: crate::tui::home::live_send::LiveSendTarget::Tool("lazygit".to_string()),
+            exit_chords: Vec::new(),
+            leader: None,
+        });
+        env.view.selected_session = Some(id);
+        assert_eq!(env.view.live_send_last_resize, None);
+
+        env.view
+            .refresh_tool_preview_cache_if_needed(80, 24, "lazygit");
+
+        assert_eq!(
+            env.view.live_send_last_resize,
+            Some((80, 24)),
+            "resize_live_pane_if_target must fire for a targeted Tool pane"
+        );
+    }
+
+    #[test]
+    #[serial]
     fn start_live_send_in_tool_view_targets_tool_pane() {
         // Tool-view counterpart of `start_live_send_in_terminal_view_targets_terminal_pane`:
         // when previewing a named tool (lazygit, yazi, etc.), `start_live_send`

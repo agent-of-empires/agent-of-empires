@@ -23,6 +23,21 @@ you work.
 The status bar shows a `● LIVE → <session>` banner while you are
 relayed, including a reminder of the exit chord and the leader menu.
 
+Live-send also works for the Terminal view and Tool views (lazygit,
+yazi, and other embedded tools), not just the agent pane: whichever
+pane is on screen is what your keystrokes reach.
+
+With **Default Attach Mode** set to Live mode, turning on **Auto
+Live-Send On View Switch** (Interaction settings, off by default) skips
+the extra `Enter`/`Tab`/click when you switch into Terminal or Tool
+view: live-send starts as soon as the view switches. It has no effect
+when the default attach mode is Tmux.
+
+Live-send only forwards keyboard input, not mouse events, so
+mouse-driven tool UIs like lazygit and yazi lose mouse interaction
+while you're live-sent to them; use their keyboard bindings instead, or
+exit live mode to click within a full tmux attach.
+
 ## The leader menu
 
 Almost every key you press in live mode goes to the agent, so AoE

@@ -1885,7 +1885,22 @@ impl HomeView {
         );
     }
 
-    fn refresh_tool_preview_cache_if_needed(&mut self, width: u16, height: u16, tool_name: &str) {
+    pub(super) fn refresh_tool_preview_cache_if_needed(
+        &mut self,
+        width: u16,
+        height: u16,
+        tool_name: &str,
+    ) {
+        // Symmetric with `refresh_terminal_preview_cache_if_needed` /
+        // `refresh_container_terminal_preview_cache_if_needed`: when live-send
+        // is pointed at this tool pane (lazygit, yazi, etc.), keep its tmux
+        // pane sized to the visible output area so a window resize or
+        // info-header toggle reflows immediately.
+        self.resize_live_pane_if_target(
+            live_send::LiveSendTarget::Tool(tool_name.to_string()),
+            width,
+            height,
+        );
         if self.apply_worker_capture(width, height, |s| &mut s.tool_preview_cache) {
             return;
         }
