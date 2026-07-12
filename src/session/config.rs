@@ -2444,7 +2444,10 @@ pub fn save_config(config: &Config) -> Result<()> {
     let path = config_path()?;
     let table = toml::Table::try_from(config)?;
     let content = toml::to_string_pretty(&table)?;
-    super::atomic_write(&path, content.as_bytes())?;
+    // Follow a symlink through to its target so a config file linked from a
+    // dotfiles repo (chezmoi, stow, dotbot) is updated in place rather than
+    // replaced by a fresh regular file, which would break the link (#2784).
+    super::atomic_write_following_symlinks(&path, content.as_bytes())?;
     Ok(())
 }
 
@@ -2591,6 +2594,58 @@ mod tests {
         assert_eq!(
             config.sandbox.enabled_by_default,
             defaults.sandbox.enabled_by_default,
+        );
+    }
+
+    /// A symlinked global `config.toml` must survive a save: the link stays a
+    /// link and its target receives the new content, instead of the save
+    /// replacing the symlink with a regular file (#2784).
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn test_save_config_preserves_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp_home = tempfile::TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let app_dir = temp_home
+            .path()
+            .join(".config")
+            .join(crate::session::APP_DIR_NAME_XDG);
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let app_dir = temp_home.path().join(crate::session::APP_DIR_NAME_OTHER);
+        std::fs::create_dir_all(&app_dir).unwrap();
+
+        // Simulate a dotfiles repo the user symlinks config.toml into.
+        let dotfiles = temp_home.path().join("dotfiles");
+        std::fs::create_dir_all(&dotfiles).unwrap();
+        let target = dotfiles.join("aoe-config.toml");
+        std::fs::write(&target, "default_profile = \"old\"\n").unwrap();
+
+        let link = app_dir.join("config.toml");
+        symlink(&target, &link).unwrap();
+
+        let mut config = Config::default();
+        config.default_profile = "new".to_string();
+        save_config(&config).unwrap();
+
+        // The link is still a link, not a fresh regular file.
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "save_config must not replace the symlink with a regular file",
+        );
+        // The write landed on the target, not beside the link.
+        let written = std::fs::read_to_string(&target).unwrap();
+        assert!(
+            written.contains("default_profile = \"new\""),
+            "symlink target should hold the saved config, got: {written}",
         );
     }
 
