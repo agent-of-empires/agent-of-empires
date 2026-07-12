@@ -2444,9 +2444,6 @@ pub fn save_config(config: &Config) -> Result<()> {
     let path = config_path()?;
     let table = toml::Table::try_from(config)?;
     let content = toml::to_string_pretty(&table)?;
-    // Follow a symlink through to its target so a config file linked from a
-    // dotfiles repo (chezmoi, stow, dotbot) is updated in place rather than
-    // replaced by a fresh regular file, which would break the link (#2784).
     super::atomic_write_following_symlinks(&path, content.as_bytes())?;
     Ok(())
 }
