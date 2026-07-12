@@ -11,7 +11,7 @@ For the end-to-end phone setup after Tailscale is working, see [Remote Access fr
 - **Stable URL.** Your dashboard lives at `https://<machine>.<tailnet>.ts.net`, the same URL across restarts, so an installed PWA keeps working. (Cloudflare quick tunnels rotate the URL on every restart, breaking installed PWAs.)
 - **End-to-end encrypted.** Tailscale encrypts traffic between your phone and your host with WireGuard. Funnel adds a TLS certificate served from the node itself, so the browser sees a valid HTTPS connection, no self-signed certificate warnings.
 - **No domain required.** Your tailnet name is your domain. No registrar, no DNS records, no Cloudflare account.
-- **Free.** Tailscale's free tier covers up to 100 devices and 3 users. Funnel is included at no extra cost.
+- **Free.** Tailscale's free Personal plan covers up to 6 users. Funnel is included at no extra cost.
 
 ## Install Tailscale
 
@@ -31,7 +31,7 @@ The Tailscale daemon runs as a background service: on macOS via launchd, on Linu
 
 ## Enable Funnel
 
-Funnel exposes your node to the public internet over Tailscale's DERP relays. It's a per-tailnet feature that must be enabled once:
+Funnel exposes your node to the public internet through Tailscale's Funnel relay servers. It's a per-tailnet feature that must be enabled once:
 
 1. Go to [login.tailscale.com/f/funnel](https://login.tailscale.com/f/funnel).
 2. Click **Enable Funnel**.
@@ -91,7 +91,7 @@ Add `--read-only` to monitor without terminal input: `aoe serve --remote --read-
 
 The tunnel config persists in Tailscale's daemon across `aoe serve --stop` and restarts, so the URL stays live. If you pass `--tunnel-name`, that takes precedence over Tailscale auto-detection.
 
-**Port 443 conflicts.** If a non-loopback Funnel service already uses port 443 on this node, aoe refuses to start rather than replace it. A stale loopback config from a prior aoe run is overwritten cleanly. The Error dialog offers `[R]` to run `tailscale funnel reset`. This clears port 443 conflicts and any stale Funnel configs. Or pass `--no-tailscale` to fall back to Cloudflare.
+**Port 443 conflicts.** If a non-loopback Funnel service already uses port 443 on this node, aoe refuses to start rather than replace it. A stale loopback config from a prior aoe run is overwritten cleanly. The Error dialog offers `[R]` to run `tailscale funnel reset`. Note: `tailscale funnel reset` clears all Funnel configuration on this node, including any other Funnel services you may have set up. Run `tailscale funnel status` first to check. Or pass `--no-tailscale` to fall back to Cloudflare.
 
 For the full phone setup (PWA install, security model, push notifications), see [Remote Access from Your Phone](remote-phone-access.md).
 
