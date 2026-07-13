@@ -151,6 +151,40 @@ pub(crate) fn isolate_app_dir() -> AppDirGuard {
     }
 }
 
+/// RAII guard: like [`isolate_app_dir`], but for callers that already own
+/// their tempdir and just need `HOME`/`XDG_CONFIG_HOME` pointed at an
+/// existing path rather than one this helper creates and owns. Sets
+/// `XDG_CONFIG_HOME` unconditionally (not gated to Linux/macOS): see
+/// issue #1948, the fix this branch lands.
+#[must_use = "HomeGuard restores env vars on Drop; bind it to `_home` or `_guard`, not `_`, or the isolation ends on the same line and the test body runs against the caller's real env"]
+pub(crate) struct HomeGuard {
+    prev_home: Option<OsString>,
+    prev_xdg: Option<OsString>,
+}
+
+impl Drop for HomeGuard {
+    fn drop(&mut self) {
+        restore_or_remove("HOME", self.prev_home.take());
+        restore_or_remove("XDG_CONFIG_HOME", self.prev_xdg.take());
+    }
+}
+
+/// Points `HOME`/`XDG_CONFIG_HOME` at `temp` for the current test body,
+/// restoring the prior values on `Drop`. Unlike [`isolate_app_dir`], the
+/// caller supplies (and owns) the tempdir.
+pub(crate) fn isolate_home(temp: &Path) -> HomeGuard {
+    let prev_home = std::env::var_os("HOME");
+    let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+    // SAFETY (staged for Rust 2024 edition migration): same invariant
+    // as [`restore_or_remove`] above.
+    std::env::set_var("HOME", temp);
+    std::env::set_var("XDG_CONFIG_HOME", temp.join(".config"));
+    HomeGuard {
+        prev_home,
+        prev_xdg,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
