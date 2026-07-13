@@ -207,7 +207,7 @@ struct AgentDoctorEntry {
 
 /// ACP adapters that ship as npm packages (binary name → package id).
 /// The doctor's `--fix` path runs `npm install -g <package>` for each
-/// entry whose binary isn't already on PATH.
+/// missing entry, and for version-gated entries with a stale parsed version.
 const NPM_INSTALLABLE_ACP: &[(&str, &str)] = &[
     (
         "claude-agent-acp",
@@ -216,6 +216,107 @@ const NPM_INSTALLABLE_ACP: &[(&str, &str)] = &[
     ("codex-acp", "@agentclientprotocol/codex-acp@latest"),
     ("pi-acp", "pi-acp"),
 ];
+
+#[cfg(feature = "serve")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DoctorFixAction {
+    InstallNpm { reason: String },
+    PrintHint { reason: String },
+    Skip,
+}
+
+#[cfg(feature = "serve")]
+fn doctor_fix_action(
+    gate: Option<crate::acp::agent_compat::VersionGate>,
+    npm_pkg: Option<&str>,
+    probe: &crate::acp::version_probe::ProbeStatus,
+) -> DoctorFixAction {
+    use crate::acp::version_probe::ProbeStatus;
+    let is_gated = gate.is_some();
+
+    match probe {
+        ProbeStatus::Missing => npm_pkg.map_or(
+            DoctorFixAction::PrintHint {
+                reason: "not found on PATH".to_string(),
+            },
+            |_| DoctorFixAction::InstallNpm {
+                reason: "not found on PATH".to_string(),
+            },
+        ),
+        ProbeStatus::Version { parsed, .. } => {
+            let Some(gate) = gate else {
+                return DoctorFixAction::Skip;
+            };
+            let Ok(min) = semver::Version::parse(gate.min_version) else {
+                return DoctorFixAction::Skip;
+            };
+            if parsed >= &min {
+                return DoctorFixAction::Skip;
+            }
+            let reason = format!("installed {parsed}; requires >={}", gate.min_version);
+            if npm_pkg.is_some() {
+                DoctorFixAction::InstallNpm { reason }
+            } else {
+                DoctorFixAction::PrintHint { reason }
+            }
+        }
+        ProbeStatus::Unparseable { raw } if is_gated => DoctorFixAction::PrintHint {
+            reason: format!("reported an unparseable version `{raw}`"),
+        },
+        ProbeStatus::Failed { message } if is_gated => DoctorFixAction::PrintHint {
+            reason: format!("version probe failed: {message}"),
+        },
+        ProbeStatus::TimedOut if is_gated => DoctorFixAction::PrintHint {
+            reason: "version probe timed out".to_string(),
+        },
+        ProbeStatus::Unparseable { .. } | ProbeStatus::Failed { .. } | ProbeStatus::TimedOut => {
+            DoctorFixAction::Skip
+        }
+    }
+}
+
+#[cfg(feature = "serve")]
+async fn run_doctor_fix_action(binary: &str, npm_pkg: Option<&str>) -> bool {
+    let gate = crate::acp::agent_compat::version_gate_for(
+        crate::acp::agent_compat::ExpectedAgent::from_command(binary),
+    );
+    let probe = crate::acp::version_probe::probe_binary_version(binary).await;
+    match doctor_fix_action(gate, npm_pkg, &probe) {
+        DoctorFixAction::InstallNpm { reason } => {
+            let Some(npm_pkg) = npm_pkg else {
+                return true;
+            };
+            println!("Installing {npm_pkg} globally via npm ({reason})...");
+            install_npm_package(npm_pkg)
+        }
+        DoctorFixAction::PrintHint { reason } => {
+            let hint = install_hint_for(binary).unwrap_or("(see project docs)");
+            println!("{binary}: {reason}. Install manually: {hint}");
+            true
+        }
+        DoctorFixAction::Skip => true,
+    }
+}
+
+fn install_npm_package(npm_pkg: &str) -> bool {
+    let status = std::process::Command::new("npm")
+        .args(["install", "-g", npm_pkg])
+        .status();
+    match status {
+        Ok(s) if s.success() => {
+            println!("Installed {npm_pkg}.");
+            true
+        }
+        Ok(s) => {
+            println!("npm install {npm_pkg} exited with status {s}");
+            true
+        }
+        Err(e) => {
+            println!("Could not run npm: {e}. Install Node.js + npm first.");
+            false
+        }
+    }
+}
 
 async fn doctor(json: bool, fix: bool) -> Result<()> {
     if fix {
@@ -242,26 +343,32 @@ async fn doctor(json: bool, fix: bool) -> Result<()> {
                 Err(e) => println!("Cannot probe Node: {e}"),
             }
         }
-        // Auto-install npm-distributed ACP adapters that aren't on
-        // PATH. Native CLIs (opencode / gemini / vibe) have to be
-        // installed via their own channels; we only print a hint for
-        // those.
+        // Auto-install npm-distributed ACP adapters that aren't on PATH.
+        // With the serve feature, also upgrade known-stale gated adapters.
+        // Native CLIs (opencode / gemini / vibe) stay manual.
         for (binary, npm_pkg) in NPM_INSTALLABLE_ACP {
-            if find_in_path(binary).is_some() {
+            #[cfg(feature = "serve")]
+            {
+                if !run_doctor_fix_action(binary, Some(npm_pkg)).await {
+                    break;
+                }
                 continue;
             }
-            println!("Installing {npm_pkg} globally via npm...");
-            let status = std::process::Command::new("npm")
-                .args(["install", "-g", npm_pkg])
-                .status();
-            match status {
-                Ok(s) if s.success() => println!("Installed {npm_pkg}."),
-                Ok(s) => println!("npm install {npm_pkg} exited with status {s}"),
-                Err(e) => {
-                    println!("Could not run npm: {e}. Install Node.js + npm first.");
+
+            #[cfg(not(feature = "serve"))]
+            {
+                if find_in_path(binary).is_some() {
+                    continue;
+                }
+                println!("Installing {npm_pkg} globally via npm...");
+                if !install_npm_package(npm_pkg) {
                     break;
                 }
             }
+        }
+        #[cfg(feature = "serve")]
+        for gate in crate::acp::agent_compat::version_gates().filter(|gate| !gate.auto_install) {
+            let _ = run_doctor_fix_action(gate.binary, None).await;
         }
     }
     let registry = AgentRegistry::with_defaults();
@@ -937,6 +1044,97 @@ mod tests {
         assert_eq!(parse_node_major("v20.0.0"), Some(20));
         assert_eq!(parse_node_major("18.17.1"), Some(18));
         assert_eq!(parse_node_major("not a version"), None);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn doctor_fix_plans_missing_and_stale_npm_installs() {
+        let claude = crate::acp::agent_compat::version_gate_for(
+            crate::acp::agent_compat::ExpectedAgent::ClaudeAgentAcp,
+        );
+        let pkg = Some("@agentclientprotocol/claude-agent-acp@latest");
+
+        assert!(matches!(
+            doctor_fix_action(
+                claude,
+                pkg,
+                &crate::acp::version_probe::ProbeStatus::Missing
+            ),
+            DoctorFixAction::InstallNpm { .. }
+        ));
+        assert!(matches!(
+            doctor_fix_action(
+                claude,
+                pkg,
+                &crate::acp::version_probe::ProbeStatus::Version {
+                    raw: "0.0.1".to_string(),
+                    parsed: semver::Version::parse("0.0.1").unwrap(),
+                },
+            ),
+            DoctorFixAction::InstallNpm { .. }
+        ));
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn doctor_fix_skips_current_and_uncertain_npm_versions() {
+        let claude = crate::acp::agent_compat::version_gate_for(
+            crate::acp::agent_compat::ExpectedAgent::ClaudeAgentAcp,
+        );
+        let pkg = Some("@agentclientprotocol/claude-agent-acp@latest");
+        assert_eq!(
+            doctor_fix_action(
+                claude,
+                pkg,
+                &crate::acp::version_probe::ProbeStatus::Version {
+                    raw: crate::acp::agent_compat::CLAUDE_AGENT_ACP_MIN_VERSION.to_string(),
+                    parsed: semver::Version::parse(
+                        crate::acp::agent_compat::CLAUDE_AGENT_ACP_MIN_VERSION,
+                    )
+                    .unwrap(),
+                },
+            ),
+            DoctorFixAction::Skip,
+        );
+        assert!(matches!(
+            doctor_fix_action(
+                claude,
+                pkg,
+                &crate::acp::version_probe::ProbeStatus::Unparseable {
+                    raw: "weird".to_string(),
+                },
+            ),
+            DoctorFixAction::PrintHint { .. }
+        ));
+        assert_eq!(
+            doctor_fix_action(
+                None,
+                Some("@agentclientprotocol/codex-acp@latest"),
+                &crate::acp::version_probe::ProbeStatus::Unparseable {
+                    raw: "weird".to_string(),
+                },
+            ),
+            DoctorFixAction::Skip,
+        );
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn doctor_fix_never_auto_installs_non_npm_stale_agents() {
+        let opencode = crate::acp::agent_compat::version_gate_for(
+            crate::acp::agent_compat::ExpectedAgent::OpenCode,
+        );
+        assert!(matches!(
+            doctor_fix_action(
+                opencode,
+                None,
+                &crate::acp::version_probe::ProbeStatus::Version {
+                    raw: "1.15.0".to_string(),
+                    parsed: semver::Version::parse("1.15.0").unwrap(),
+                },
+            ),
+            DoctorFixAction::PrintHint { .. }
+        ));
     }
 
     /// Story 3: `aoe acp ps` surfaces the worker build version, tags

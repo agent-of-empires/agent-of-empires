@@ -802,6 +802,8 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     let local_port = listener.local_addr()?.port();
 
+    crate::acp::version_probe::warn_for_structured_sessions(&instances, !is_daemon).await;
+
     // Start tunnel if remote mode. Preference order:
     //  1. User-specified named Cloudflare tunnel (stable, explicit choice).
     //  2. Tailscale Funnel if tailscale is installed and logged in
