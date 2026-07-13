@@ -3026,19 +3026,6 @@ impl Instance {
         expected_prior_intent: ResumeIntent,
     ) -> SidPersistOutcome {
         let new_sid = self.agent_session_id.clone();
-        // Cleared, Fork, and Use are all one-shot launch directives: after the
-        // launch they ran with completes, the session resumes its own id
-        // normally, so the intent must auto-promote to Default. A fork left as
-        // Fork on disk would re-fork the parent on the next restart
-        // (double-fork). A Use pin left durable would let the drain never
-        // adopt a post-launch capture (e.g. the resume-probe fallback minting
-        // a fresh sid, or a later `/clear`), so a launched pin hands control
-        // back to normal capture; a pin on a session that never launches keeps
-        // Use and stays authoritative (see #2708).
-        let promote_one_shot = matches!(
-            expected_prior_intent,
-            ResumeIntent::Cleared | ResumeIntent::Fork { .. } | ResumeIntent::Use(_)
-        );
 
         if let Some(ref sid) = new_sid {
             if !is_valid_session_id(sid) {
@@ -3062,6 +3049,30 @@ impl Instance {
                 return SidPersistOutcome::Skip;
             }
         };
+
+        self.persist_session_id_with_storage(&storage, expected_prior_sid, expected_prior_intent)
+    }
+
+    fn persist_session_id_with_storage(
+        &mut self,
+        storage: &super::storage::Storage,
+        expected_prior_sid: Option<&str>,
+        expected_prior_intent: ResumeIntent,
+    ) -> SidPersistOutcome {
+        let new_sid = self.agent_session_id.clone();
+        // Cleared, Fork, and Use are all one-shot launch directives: after the
+        // launch they ran with completes, the session resumes its own id
+        // normally, so the intent must auto-promote to Default. A fork left as
+        // Fork on disk would re-fork the parent on the next restart
+        // (double-fork). A Use pin left durable would let the drain never
+        // adopt a post-launch capture (e.g. the resume-probe fallback minting
+        // a fresh sid, or a later `/clear`), so a launched pin hands control
+        // back to normal capture; a pin on a session that never launches keeps
+        // Use and stays authoritative (see #2708).
+        let promote_one_shot = matches!(
+            expected_prior_intent,
+            ResumeIntent::Cleared | ResumeIntent::Fork { .. } | ResumeIntent::Use(_)
+        );
 
         let instance_id = self.id.clone();
         let new_sid_for_closure = new_sid.clone();
@@ -9297,12 +9308,14 @@ mod tests {
         #[serial]
         fn persist_session_id_writes_none_atomically_when_sid_absent() {
             let temp = tempdir().unwrap();
-            let _home = EnvVarGuard::set("HOME", temp.path());
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            let _xdg_config = EnvVarGuard::set("XDG_CONFIG_HOME", temp.path().join(".config"));
-
             let profile = "persist-none-sid";
-            let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+            let storage = crate::session::storage::Storage::new_for_test_path(
+                profile,
+                temp.path()
+                    .join("profiles")
+                    .join(profile)
+                    .join("sessions.json"),
+            );
             let mut inst = Instance::new("title", "/tmp/x");
             inst.source_profile = profile.to_string();
             inst.agent_session_id = None;
@@ -9320,7 +9333,8 @@ mod tests {
                 })
                 .unwrap();
 
-            let outcome = inst.persist_session_id(profile, None, ResumeIntent::Default);
+            let outcome =
+                inst.persist_session_id_with_storage(&storage, None, ResumeIntent::Default);
 
             assert_eq!(outcome, SidPersistOutcome::Published);
             assert_eq!(inst.agent_session_id, None);

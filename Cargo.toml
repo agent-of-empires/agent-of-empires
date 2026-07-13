@@ -282,7 +282,7 @@ required-features = ["serve"]
 # Explicit target so the `e2e-tests` feature gate applies. Without this entry
 # Cargo auto-discovers tests/e2e/main.rs unconditionally; the gate lets CI split
 # the serve suite into "everything except e2e" and "e2e only" shards. The other
-# 16 test binaries stay auto-discovered.
+# standalone test binaries stay auto-discovered.
 name = "e2e"
 path = "tests/e2e/main.rs"
 required-features = ["e2e-tests"]
