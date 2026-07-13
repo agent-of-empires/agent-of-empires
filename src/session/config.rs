@@ -875,6 +875,40 @@ pub struct AppStateConfig {
     pub web_ui_state: std::collections::BTreeMap<String, String>,
 }
 
+/// When the smart-rename one-shot fires for a still-default-named
+/// structured-view session. See `SessionConfig::smart_rename_timing`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SmartRenameTiming {
+    /// Fire once the first turn settles (on `prompt_complete`), feeding the
+    /// full first-turn transcript to the title call. Never races the live
+    /// worker for the provider API.
+    #[default]
+    TurnEnd,
+    /// Fire the instant the first prompt is sent, using only that prompt.
+    /// The sidebar retitles immediately, but the one-shot races the live
+    /// worker for the same provider API (the contention #2348 removed by
+    /// deferring to turn-end), so it is opt-in.
+    PromptStart,
+}
+
+impl SmartRenameTiming {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SmartRenameTiming::TurnEnd => "turn_end",
+            SmartRenameTiming::PromptStart => "prompt_start",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "turn_end" => Some(SmartRenameTiming::TurnEnd),
+            "prompt_start" => Some(SmartRenameTiming::PromptStart),
+            _ => None,
+        }
+    }
+}
+
 /// Session-related configuration defaults
 #[derive(Debug, Clone, Serialize, Deserialize, SettingsSection)]
 #[setting_section(name = "session", category = "Session")]
@@ -963,6 +997,22 @@ pub struct SessionConfig {
         category = "Agents"
     )]
     pub smart_rename_agent: String,
+
+    /// When smart rename fires. `turn_end` (default) waits for the first turn
+    /// to finish and titles from the whole transcript (your prompt and the
+    /// agent's response), so the title reflects what the turn did. `prompt_start`
+    /// titles immediately from your first prompt alone, so the sidebar updates
+    /// without waiting, at the cost of the one-shot racing the live agent for
+    /// the provider API. Only affects the one-shot fallback, not agents that
+    /// push titles natively.
+    #[serde(default)]
+    #[setting(
+        label = "Smart-rename timing",
+        widget = "select",
+        options = "turn_end:End of turn (full context),prompt_start:Prompt start (first prompt)",
+        category = "Agents"
+    )]
+    pub smart_rename_timing: SmartRenameTiming,
 
     /// Pass `--resume <sid>` (or the agent's equivalent) when restarting (`e`)
     /// or reattaching (`Enter`) a terminal-mode session with a stored session
@@ -1406,6 +1456,7 @@ impl Default for SessionConfig {
             merge_hooks_into_selected_agent: true,
             smart_rename: true,
             smart_rename_agent: String::new(),
+            smart_rename_timing: SmartRenameTiming::default(),
             auto_resume_on_restart: true,
             mouse_capture: true,
             custom_agents: HashMap::new(),
