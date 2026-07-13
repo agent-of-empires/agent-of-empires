@@ -13,7 +13,18 @@ import { clampMenuPosition } from "../lib/menuPosition";
 // rows live inside an `overflow-x-hidden overflow-y-auto` scroller, so a span
 // nested under the trigger (the old approach) got cut off at the sidebar edge
 // regardless of z-index. See #2214.
-export function Tooltip({ text, children }: { text: string; children: ReactNode }) {
+export function Tooltip({
+  text,
+  children,
+  multiline = false,
+}: {
+  text: string;
+  children: ReactNode;
+  // Single-line callers (sidebar, sort picker) keep the default `whitespace-nowrap`
+  // pill. Set `multiline` for a sentence-length explanation that should wrap inside
+  // a width cap instead of stretching off-screen.
+  multiline?: boolean;
+}) {
   const triggerRef = useRef<HTMLSpanElement>(null);
   const tipRef = useRef<HTMLSpanElement>(null);
   const [open, setOpen] = useState(false);
@@ -70,7 +81,9 @@ export function Tooltip({ text, children }: { text: string; children: ReactNode 
             ref={tipRef}
             role="tooltip"
             style={{ left: pos?.x ?? 0, top: pos?.y ?? 0, visibility: pos ? "visible" : "hidden" }}
-            className="pointer-events-none fixed z-50 px-2 py-1 rounded bg-surface-950 border border-surface-700 text-[11px] text-text-secondary whitespace-nowrap"
+            className={`pointer-events-none fixed z-50 px-2 py-1 rounded bg-surface-950 border border-surface-700 text-[11px] text-text-secondary ${
+              multiline ? "max-w-xs whitespace-normal" : "whitespace-nowrap"
+            }`}
           >
             {text}
           </span>,
