@@ -27,11 +27,10 @@ Live-send also works for the Terminal view and Tool views (lazygit,
 yazi, and other embedded tools), not just the agent pane: whichever
 pane is on screen is what your keystrokes reach.
 
-With **Default Attach Mode** set to Live mode, turning on **Auto
-Live-Send On View Switch** (Interaction settings, off by default) skips
-the extra `Enter`/`Tab`/click when you switch into Terminal or Tool
-view: live-send starts as soon as the view switches. It has no effect
-when the default attach mode is Tmux.
+Turning on **Auto Live-Send On View Switch** (Interaction settings, off
+by default) skips the extra `Enter`/`Tab`/click when you switch into
+Terminal or Tool view: live-send starts as soon as the view switches,
+regardless of **Default Attach Mode**.
 
 Live-send only forwards keyboard input, not mouse events, so
 mouse-driven tool UIs like lazygit and yazi lose mouse interaction

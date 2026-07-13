@@ -5178,21 +5178,14 @@ impl HomeView {
 
     /// Auto-start live-send after an explicit view switch (`ToggleView`,
     /// opening a tool session) when the `Auto Live-Send On View Switch`
-    /// setting is on for the selected session's resolved config and its
-    /// `default_attach_mode` is `LiveSend`. `None` when there's no
-    /// selected session, the setting is off, or the resolved attach mode
-    /// isn't live-send; the caller then leaves the plain view switch alone.
-    /// Deliberately not wired into list navigation/selection: this only
-    /// fires from the explicit view-switch call sites that invoke it.
+    /// setting is on for the selected session's resolved config. `None`
+    /// when there's no selected session or the setting is off; the
+    /// caller then leaves the plain view switch alone. Deliberately not
+    /// wired into list navigation/selection: this only fires from the
+    /// explicit view-switch call sites that invoke it.
     pub(super) fn maybe_auto_start_live_send(&mut self) -> Option<Action> {
         let id = self.selected_session.clone()?;
         if !self.live_send_on_view_switch(&id) {
-            return None;
-        }
-        if !matches!(
-            self.default_attach_mode(&id),
-            Some(crate::session::NewSessionAttachMode::LiveSend)
-        ) {
             return None;
         }
         self.start_live_send()

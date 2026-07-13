@@ -1209,8 +1209,8 @@ pub struct SessionConfig {
     )]
     pub default_attach_mode: NewSessionAttachMode,
 
-    /// When Default Attach Mode is Live mode, automatically start live-send when switching into
-    /// Terminal or Tool view, instead of requiring a separate Enter/Tab/click.
+    /// Automatically start live-send when switching into Terminal or Tool
+    /// view, instead of requiring a separate Enter/Tab/click.
     #[serde(default)]
     #[setting(
         label = "Auto Live-Send On View Switch",

@@ -14050,24 +14050,23 @@ mod default_attach_mode {
 
     #[test]
     #[serial]
-    fn toggle_view_does_not_auto_start_live_send_when_default_is_tmux() {
-        // The setting alone isn't enough: it only fires when the
-        // resolved `default_attach_mode` is also LiveSend. With the
-        // historical Tmux default, ToggleView stays a plain preview
-        // switch even with the setting enabled.
+    fn toggle_view_auto_starts_live_send_regardless_of_default_attach_mode() {
+        // The setting is the only gate: with the historical Tmux
+        // default, ToggleView still auto-enters live-send when
+        // `live_send_on_view_switch` is enabled.
         let mut env = create_test_env_empty();
         write_live_send_on_view_switch(NewSessionAttachMode::Tmux, true);
-        let _id = add_session(&mut env.view, "session-one");
+        let id = add_session(&mut env.view, "session-one");
         env.view.flat_items = env.view.build_flat_items();
         env.view.cursor = 0;
         env.view.update_selected();
         let action = env.view.handle_key(key(KeyCode::Char('t')), None);
         assert_eq!(env.view.view_mode, crate::tui::home::ViewMode::Terminal);
         assert_eq!(
-            action, None,
-            "auto live-send must stay off when default_attach_mode is Tmux"
+            action,
+            Some(Action::EnterLiveSend(id)),
+            "auto live-send must fire even when default_attach_mode is Tmux"
         );
-        assert!(env.view.live_send.is_none());
     }
 
     #[test]
