@@ -1,12 +1,15 @@
 //! Automatic "smart" rename of a structured-view (ACP) session from its first
-//! message.
+//! turn.
 //!
 //! When a session still carries its auto-generated civilization name (see
-//! [`crate::session::civilizations`]) and the user sends a first prompt, the
-//! session's own agent is run once in non-interactive one-shot mode (e.g.
-//! `claude -p`) to produce a short title, and the session is renamed. This is
-//! best-effort and fire-and-forget: it never blocks or fails the user's prompt,
-//! and any failure leaves the generated name in place.
+//! [`crate::session::civilizations`]) the session's own agent is run once in
+//! non-interactive one-shot mode (e.g. `claude -p`) to produce a short title,
+//! and the session is renamed. Timing is set by `smart_rename_timing`: by
+//! default the one-shot fires at turn-end and summarizes the whole first turn
+//! (prompt plus agent output); `prompt_start` fires on the first prompt and
+//! uses only that prompt. This is best-effort and fire-and-forget: it never
+//! blocks or fails the user's prompt, and any failure leaves the generated
+//! name in place.
 //!
 //! Title only: the worktree directory is intentionally not moved. The live ACP
 //! worker holds the worktree as its working directory, so a directory move
