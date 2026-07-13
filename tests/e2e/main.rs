@@ -43,6 +43,7 @@ mod opencode_sandbox_resume;
 mod plugins;
 mod profile_picker;
 mod project_registry;
+mod resume_fallback;
 mod sandbox;
 mod serve;
 mod settings;
