@@ -120,9 +120,11 @@ export async function mockTerminalApis(
     let rows = 24;
     let window = 24;
     const history = opts.liveHistory ?? 120;
-    const reply = () => {
+    const reply = (responseRows = rows, responseWindow = window) => {
       try {
-        ws.send(JSON.stringify({ type: "frame", ...makeLiveFrame({ rows, history, window }) }));
+        ws.send(
+          JSON.stringify({ type: "frame", ...makeLiveFrame({ rows: responseRows, history, window: responseWindow }) }),
+        );
       } catch {
         // closed socket at test teardown; ignore
       }
@@ -143,7 +145,9 @@ export async function mockTerminalApis(
           const shrinking = control.lines < window;
           window = control.lines;
           if (shrinking && opts.delayLiveWindowShrinkMs) {
-            setTimeout(reply, opts.delayLiveWindowShrinkMs);
+            const responseRows = rows;
+            const responseWindow = window;
+            setTimeout(() => reply(responseRows, responseWindow), opts.delayLiveWindowShrinkMs);
           } else {
             reply();
           }
