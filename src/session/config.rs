@@ -1308,6 +1308,12 @@ impl AcpAgentDefaults {
             && self.effort_by_model.is_empty()
     }
 
+    /// Default model, with empty strings treated as unset (mirrors `mode`) so a
+    /// blank value never overrides the agent's own default at spawn.
+    pub fn model(&self) -> Option<String> {
+        self.model.clone().filter(|value| !value.is_empty())
+    }
+
     /// Default mode, with empty strings treated as unset (mirrors
     /// `effort_for_model`) so a blank value never triggers a pointless ACP
     /// config update on spawn.
@@ -1338,6 +1344,27 @@ impl AcpConfig {
             .get(agent)
             .filter(|defaults| !defaults.is_empty())
     }
+}
+
+/// Resolve the model + effort a structured-view spawn should use: an explicit
+/// per-request value (trimmed, non-empty) always wins, otherwise the per-agent
+/// structured-view default. Effort is keyed on the resolved model so a
+/// per-model override in `effort_by_model` applies to a defaulted model too.
+///
+/// Single source for every spawn path (CLI create, reconciler respawn, web
+/// create); see `AcpConfig::acp_defaults_for`.
+pub fn resolve_spawn_model_effort(
+    defaults: Option<&AcpAgentDefaults>,
+    req_model: Option<String>,
+    req_effort: Option<String>,
+) -> (Option<String>, Option<String>) {
+    let model = req_model
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| defaults.and_then(|d| d.model()));
+    let effort = req_effort
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| defaults.and_then(|d| d.effort_for_model(model.as_deref())));
+    (model, effort)
 }
 
 /// What a single mouse click on a session row does in the Agent view.
@@ -3396,6 +3423,88 @@ mod tests {
         assert_eq!(defaults.mode(), None);
         defaults.mode = Some("plan".to_string());
         assert_eq!(defaults.mode().as_deref(), Some("plan"));
+    }
+
+    #[test]
+    fn acp_defaults_model_treats_empty_as_unset() {
+        let mut defaults = AcpAgentDefaults::default();
+        assert_eq!(defaults.model(), None);
+        defaults.model = Some(String::new());
+        assert_eq!(defaults.model(), None);
+        defaults.model = Some("openai/gpt-5.5".to_string());
+        assert_eq!(defaults.model().as_deref(), Some("openai/gpt-5.5"));
+    }
+
+    #[test]
+    fn resolve_spawn_model_effort_explicit_request_wins() {
+        let defaults = AcpAgentDefaults {
+            model: Some("openai/gpt-5.5".to_string()),
+            effort: Some("low".to_string()),
+            ..Default::default()
+        };
+        let (model, effort) = resolve_spawn_model_effort(
+            Some(&defaults),
+            Some("anthropic/claude".to_string()),
+            Some("high".to_string()),
+        );
+        assert_eq!(model.as_deref(), Some("anthropic/claude"));
+        assert_eq!(effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn resolve_spawn_model_effort_falls_back_to_default() {
+        let defaults = AcpAgentDefaults {
+            model: Some("openai/gpt-5.5".to_string()),
+            effort: Some("low".to_string()),
+            ..Default::default()
+        };
+        let (model, effort) = resolve_spawn_model_effort(Some(&defaults), None, None);
+        assert_eq!(model.as_deref(), Some("openai/gpt-5.5"));
+        assert_eq!(effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn resolve_spawn_model_effort_blank_request_treated_as_unset() {
+        let defaults = AcpAgentDefaults {
+            model: Some("openai/gpt-5.5".to_string()),
+            effort: Some("low".to_string()),
+            ..Default::default()
+        };
+        let (model, effort) = resolve_spawn_model_effort(
+            Some(&defaults),
+            Some("   ".to_string()),
+            Some(String::new()),
+        );
+        assert_eq!(model.as_deref(), Some("openai/gpt-5.5"));
+        assert_eq!(effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn resolve_spawn_model_effort_per_model_effort_keyed_on_resolved_model() {
+        let mut defaults = AcpAgentDefaults {
+            model: Some("gpt-5".to_string()),
+            effort: Some("low".to_string()),
+            ..Default::default()
+        };
+        defaults
+            .effort_by_model
+            .insert("gpt-5".to_string(), "high".to_string());
+        // Model resolves to the default gpt-5, so the per-model effort applies.
+        let (model, effort) = resolve_spawn_model_effort(Some(&defaults), None, None);
+        assert_eq!(model.as_deref(), Some("gpt-5"));
+        assert_eq!(effort.as_deref(), Some("high"));
+        // An explicit model that has no per-model override falls back to flat.
+        let (model, effort) =
+            resolve_spawn_model_effort(Some(&defaults), Some("other".to_string()), None);
+        assert_eq!(model.as_deref(), Some("other"));
+        assert_eq!(effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn resolve_spawn_model_effort_no_defaults_no_request_is_none() {
+        let (model, effort) = resolve_spawn_model_effort(None, None, None);
+        assert_eq!(model, None);
+        assert_eq!(effort, None);
     }
 
     #[test]
