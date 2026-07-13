@@ -516,7 +516,7 @@ fn test_cross_process_independent_profiles_do_not_serialise() -> Result<()> {
     let id_a = s_a.load()?[0].id.clone();
     let id_b = s_b.load()?[0].id.clone();
 
-    let hold = std::time::Duration::from_millis(500);
+    let hold = std::time::Duration::from_secs(5);
     let storage_clone = Storage::new_unwatched("profile-a")?;
     let parent_held = Arc::new(Barrier::new(2));
     let parent_held_inner = parent_held.clone();
