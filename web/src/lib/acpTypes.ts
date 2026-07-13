@@ -535,7 +535,8 @@ export type AcpEvent =
   | { WakeupScheduled: { at: string; reason: string | null } }
   | { MonitorArmed: { description: string | null } }
   | { PromptRejected: { reason: string; text: string } }
-  | { AgentSwitched: { from: string; to: string; reason: string } };
+  | { AgentSwitched: { from: string; to: string; reason: string } }
+  | { ConversationSummary: { text: string; summarized_until_seq: number } };
 
 /** Metadata-only attachment ref as it rides on a `UserPromptSent`
  *  event from the server (mirrors Rust `PromptAttachmentRef`). The
@@ -938,7 +939,8 @@ export interface ActivityRow {
     | "empty_output"
     | "context_reset"
     | "session_cleared"
-    | "compacted";
+    | "compacted"
+    | "summary";
   text: string;
   toolCallId?: string;
   /** Full ToolCall payload, present on tool_start rows so the UI can
@@ -1877,6 +1879,18 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       resetSeq: frame.seq,
       reason: event.SessionContextReset.reason || "Conversation context reset; agent transcript was unavailable.",
     };
+    return next;
+  }
+  if ("ConversationSummary" in event) {
+    // aoe-generated recap of the conversation so far (see #2808). Not a
+    // model/session state change; append a callout row the renderer maps
+    // to a summary block.
+    next.activity = pushActivity(next.activity, {
+      id: `summary-${frame.seq}`,
+      kind: "summary",
+      text: event.ConversationSummary.text,
+      at: new Date().toISOString(),
+    });
     return next;
   }
   if ("WakeupScheduled" in event) {

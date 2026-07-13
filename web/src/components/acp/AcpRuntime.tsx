@@ -437,6 +437,29 @@ export function activityToThreadMessages(
       continue;
     }
 
+    if (row.kind === "summary") {
+      // aoe-generated recap of the conversation so far (see #2808). A
+      // blockquote callout with the summary body; distinct header from
+      // the compaction divider since this is our own summary, not the
+      // model's context replacement.
+      flushAssistant();
+      messages.push({
+        id: `assistant-${row.id}`,
+        role: "assistant",
+        content: [
+          {
+            type: "text",
+            text: `> 📝 **Summary of conversation so far**\n>\n${row.text
+              .split("\n")
+              .map((line) => `> ${line}`)
+              .join("\n")}`,
+          },
+        ],
+        createdAt: parseDate(row.at),
+      });
+      continue;
+    }
+
     if (!currentAssistant) {
       currentAssistant = new AssistantBuilder(row.id, row.at);
     }

@@ -1027,6 +1027,7 @@ fn event_kind(event: &crate::acp::Event) -> &'static str {
         Event::SessionContextReset { .. } => "session_context_reset",
         Event::SessionCleared => "session_cleared",
         Event::ConversationCompacted => "conversation_compacted",
+        Event::ConversationSummary { .. } => "conversation_summary",
         Event::WakeupScheduled { .. } => "wakeup_scheduled",
         Event::MonitorArmed { .. } => "monitor_armed",
         Event::PromptRejected { .. } => "prompt_rejected",
