@@ -184,6 +184,16 @@ pub struct SessionResponse {
     #[cfg(feature = "serve")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acp_session_id: Option<String>,
+    /// The session's resolved ACP registry key (`agent_name` when set, else
+    /// `tool`), matching the `name` entries `/api/acp/agents` returns. The
+    /// structured view's switch-agent modal reads this as the current-agent
+    /// fallback before the first `AgentSwitched` event lands (which is the
+    /// only event that populates the reduced `state.agent`), so it can gray
+    /// out the running backend on a never-switched session. Omitted for
+    /// sessions with no resolved agent. See #2803.
+    #[cfg(feature = "serve")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acp_agent: Option<String>,
     /// True when this session's agent can run a structured ACP `session/fork`:
     /// it is ACP-capable AND declares a real fork strategy. Resume-only ACP
     /// agents (e.g. the bundled `aoe-agent`, which advertises `loadSession` but
@@ -403,6 +413,19 @@ impl SessionResponse {
             },
             #[cfg(feature = "serve")]
             acp_session_id: inst.acp_session_id.clone(),
+            // Resolved the same way as `acp_capable` above: `agent_name` when
+            // set and non-empty, else `tool`. This is the ACP registry key,
+            // so it matches `/api/acp/agents` names the switch-agent modal
+            // filters against. See #2803.
+            #[cfg(feature = "serve")]
+            acp_agent: {
+                let resolved = inst
+                    .agent_name
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(inst.tool.as_str());
+                (!resolved.is_empty()).then(|| resolved.to_string())
+            },
             // Shares `agent_is_structured_fork_capable` with the create-time
             // guard so the web "Fork" affordance and server-side acceptance
             // cannot drift: forkable = ACP-capable AND a real fork strategy.
@@ -8728,6 +8751,8 @@ mod workspace_ordering_tests {
             acp_capable: false,
             #[cfg(feature = "serve")]
             acp_session_id: None,
+            #[cfg(feature = "serve")]
+            acp_agent: None,
             #[cfg(feature = "serve")]
             acp_can_fork: false,
             claude_fullscreen: false,
