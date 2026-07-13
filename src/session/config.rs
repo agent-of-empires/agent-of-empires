@@ -1014,6 +1014,30 @@ pub struct SessionConfig {
     )]
     pub smart_rename_timing: SmartRenameTiming,
 
+    /// Periodically generate a "summary of the conversation so far" for a
+    /// structured-view (ACP) session by running the session's own agent
+    /// one-shot over the transcript (agent-agnostic, like smart rename).
+    /// The summary appears as a callout in the transcript. Off by default:
+    /// it is recurring token spend and sends the transcript to another
+    /// agent invocation. The on-demand "Summarize" action works regardless
+    /// of this setting. See #2808.
+    #[serde(default)]
+    #[setting(label = "Conversation summary", widget = "toggle", category = "Agents")]
+    pub conversation_summary: bool,
+
+    /// Agent used for the one-shot conversation-summary call. Empty means
+    /// use the session's own agent. Point this at a cheaper model to keep
+    /// recurring summaries inexpensive without changing the working agent.
+    /// Only agents with a one-shot mode qualify; the picker lists installed
+    /// one-shot-capable agents.
+    #[serde(default)]
+    #[setting(
+        label = "Summary agent",
+        widget = "custom:smart-rename-agent",
+        category = "Agents"
+    )]
+    pub conversation_summary_agent: String,
+
     /// Pass `--resume <sid>` (or the agent's equivalent) when restarting (`e`)
     /// or reattaching (`Enter`) a terminal-mode session with a stored session
     /// id. Disable to always start these sessions fresh instead, e.g. to
@@ -1493,6 +1517,8 @@ impl Default for SessionConfig {
             agent_command_override: HashMap::new(),
             agent_status_hooks: true,
             merge_hooks_into_selected_agent: true,
+            conversation_summary: false,
+            conversation_summary_agent: String::new(),
             smart_rename: true,
             smart_rename_agent: String::new(),
             smart_rename_timing: SmartRenameTiming::default(),

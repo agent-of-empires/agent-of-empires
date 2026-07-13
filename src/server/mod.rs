@@ -311,6 +311,18 @@ pub struct AppState {
     /// up to `ONESHOT_TIMEOUT`. Held only across the child spawn + wait. See
     /// `session::smart_rename` and #2348.
     pub smart_rename_semaphore: tokio::sync::Semaphore,
+    /// Session ids with an in-flight conversation-summary one-shot, so the
+    /// automatic trigger and the on-demand endpoint cannot spawn concurrent
+    /// summaries for the same session (which would also race on the
+    /// last-summary seq). Synchronous mutex; tiny critical sections. See
+    /// `session::conversation_summary` and #2808.
+    pub summary_inflight: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Global cap on concurrent conversation-summary one-shots. Separate from
+    /// `smart_rename_semaphore` (permits=2) and sized to 1: a summary runs the
+    /// agent over the whole transcript, so it is slower and costlier than a
+    /// title call; a dedicated single slot keeps heavy background summaries
+    /// from starving the snappy first-prompt rename. See #2808.
+    pub summary_semaphore: tokio::sync::Semaphore,
     /// Suppression set for the startup-recovery cascade. While an entry is
     /// present and younger than `recovery::RECENTLY_RESTARTED_TTL`, the
     /// `status_poll_loop` skips `update_status_with_metadata` for that
@@ -1003,6 +1015,10 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         smart_rename_semaphore: tokio::sync::Semaphore::new(
             crate::session::smart_rename::MAX_CONCURRENT,
         ),
+        summary_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
+        summary_semaphore: tokio::sync::Semaphore::new(
+            crate::session::conversation_summary::MAX_CONCURRENT,
+        ),
         recently_restarted: crate::session::recovery::new_recently_restarted(),
         recovery_pending: crate::session::recovery::new_recovery_pending(),
         cleanup_defaults_cache: RwLock::new(CleanupDefaultsCache {
@@ -1529,6 +1545,7 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/api/sessions/{id}/smart-rename",
             post(api::force_smart_rename),
         )
+        .route("/api/sessions/{id}/summarize", post(api::summarize_session))
         .route("/api/sessions/{id}/start", post(api::start_session))
         .route(
             "/api/sessions/{id}/terminal",
@@ -4226,6 +4243,38 @@ async fn acp_event_listener(state: Arc<AppState>) {
             }
         }
 
+        // Conversation-summary defer: same clean-turn-boundary discipline as
+        // smart-rename. Fast-path on the event variant before the inflight
+        // lock so streaming frames skip it; the spawned task re-checks the
+        // setting, eligibility, and the byte/turn delta threshold (all of
+        // which need config + the event store). See #2808.
+        let should_summarize = matches!(
+            frame.event.as_ref(),
+            crate::acp::state::Event::Stopped { .. }
+        ) && {
+            let inflight = state
+                .summary_inflight
+                .lock()
+                .expect("summary_inflight poisoned");
+            crate::session::conversation_summary::should_trigger_summary(
+                frame.event.as_ref(),
+                &frame.session_id,
+                &inflight,
+            )
+        };
+        if should_summarize {
+            let state_for_summary = state.clone();
+            let session_id = frame.session_id.clone();
+            tokio::spawn(async move {
+                crate::session::conversation_summary::try_conversation_summary(
+                    state_for_summary,
+                    session_id,
+                    crate::session::conversation_summary::SummaryTrigger::Auto,
+                )
+                .await;
+            });
+        }
+
         let status_intent = derive_acp_status(frame.event.as_ref());
         let acp_change = derive_acp_session_change(frame.event.as_ref());
         if status_intent.is_none() && acp_change.is_none() {
@@ -4616,6 +4665,10 @@ pub mod test_support {
             smart_rename_attempted: std::sync::Mutex::new(std::collections::HashSet::new()),
             smart_rename_semaphore: tokio::sync::Semaphore::new(
                 crate::session::smart_rename::MAX_CONCURRENT,
+            ),
+            summary_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            summary_semaphore: tokio::sync::Semaphore::new(
+                crate::session::conversation_summary::MAX_CONCURRENT,
             ),
             recently_restarted: crate::session::recovery::new_recently_restarted(),
             recovery_pending: crate::session::recovery::new_recovery_pending(),

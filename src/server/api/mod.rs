@@ -51,10 +51,10 @@ pub use sessions::{
     force_smart_rename, get_recent_projects, kill_terminal, list_sessions, paste_image,
     preview_volume_ignores_globs, read_output, rename_session, restore_session, search_sessions,
     send_message, serve_session_artifact, session_diff_file, session_diff_files, set_worktree_name,
-    start_session, stop_session, trash_session, update_session_archive, update_session_diff_base,
-    update_session_group, update_session_notifications, update_session_pin, update_session_snooze,
-    update_session_unread, update_workspace_ordering, CleanupDefaults, OutputQuery,
-    SendMessageRequest, SessionResponse,
+    start_session, stop_session, summarize_session, trash_session, update_session_archive,
+    update_session_diff_base, update_session_group, update_session_notifications,
+    update_session_pin, update_session_snooze, update_session_unread, update_workspace_ordering,
+    CleanupDefaults, OutputQuery, SendMessageRequest, SessionResponse,
 };
 // Shared by the status poll loop's auto-unread persistence; not a route handler.
 pub(crate) use sessions::persist_session_update;

@@ -10,6 +10,7 @@ pub mod civilizations;
 pub mod claude_import;
 pub mod config;
 pub(crate) mod container_config;
+pub mod conversation_summary;
 pub mod deletion;
 pub(crate) mod environment;
 pub mod fork;

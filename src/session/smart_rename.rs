@@ -372,7 +372,7 @@ fn is_refusal(lc: &str) -> bool {
 }
 
 /// Remove ANSI/CSI escape sequences (color codes etc.) that CLI agents emit.
-fn strip_ansi(s: &str) -> String {
+pub(crate) fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
@@ -393,7 +393,7 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
-fn truncate_bytes(s: &str, max: usize) -> &str {
+pub(crate) fn truncate_bytes(s: &str, max: usize) -> &str {
     if s.len() <= max {
         return s;
     }
@@ -406,6 +406,8 @@ fn truncate_bytes(s: &str, max: usize) -> &str {
 
 #[cfg(feature = "serve")]
 pub use serve::{prompt_start_candidate, should_trigger_smart_rename, try_smart_rename};
+#[cfg(feature = "serve")]
+pub(crate) use serve::run_oneshot;
 
 #[cfg(feature = "serve")]
 mod serve {
@@ -608,7 +610,7 @@ mod serve {
             let Ok(_permit) = state.smart_rename_semaphore.acquire().await else {
                 return;
             };
-            run_oneshot(&session_id, &argv, &project_path).await
+            run_oneshot(&session_id, &argv, &project_path, ONESHOT_TIMEOUT).await
         };
         let Some(raw) = raw else {
             return;
@@ -638,8 +640,15 @@ mod serve {
 
     /// Run the agent one-shot in the session's working directory, capturing
     /// stdout. Returns `None` on spawn error, non-zero exit, or timeout. The
-    /// child is killed on drop, so a timed-out call leaves no orphan.
-    async fn run_oneshot(session_id: &str, argv: &[String], cwd: &str) -> Option<String> {
+    /// child is killed on drop, so a timed-out call leaves no orphan. Shared
+    /// with `session::conversation_summary`, which passes a longer `timeout`
+    /// for its larger transcript input.
+    pub(crate) async fn run_oneshot(
+        session_id: &str,
+        argv: &[String],
+        cwd: &str,
+        timeout: Duration,
+    ) -> Option<String> {
         use tokio::process::Command;
         let mut cmd = Command::new(&argv[0]);
         cmd.args(&argv[1..])
@@ -660,7 +669,7 @@ mod serve {
                 return None;
             }
         };
-        match tokio::time::timeout(ONESHOT_TIMEOUT, child.wait_with_output()).await {
+        match tokio::time::timeout(timeout, child.wait_with_output()).await {
             Ok(Ok(out)) if out.status.success() => {
                 Some(String::from_utf8_lossy(&out.stdout).into_owned())
             }
@@ -777,7 +786,11 @@ mod serve {
                 "-p".to_string(),
                 "title this".to_string(),
             ];
-            assert!(run_oneshot("test-session", &argv, "").await.is_none());
+            assert!(
+                run_oneshot("test-session", &argv, "", Duration::from_secs(60))
+                    .await
+                    .is_none()
+            );
         }
 
         #[test]

@@ -928,6 +928,28 @@ impl<S: BroadcastSink> Supervisor<S> {
         self.publish_next(session_id, &Event::AgentSwitched { from, to, reason })
     }
 
+    /// Publish an aoe-generated `ConversationSummary` for a session. The
+    /// recap is produced by `session::conversation_summary` via a one-shot
+    /// agent call over the transcript, not by the live agent, so it is
+    /// injected here rather than arriving over ACP. `summarized_until_seq`
+    /// is the highest event seq the summary covers. See #2808.
+    pub fn publish_conversation_summary(
+        &self,
+        session_id: &str,
+        text: String,
+        summarized_until_seq: u64,
+    ) {
+        let seq = next_seq(&self.next_seqs, session_id);
+        self.sink.publish(
+            session_id,
+            seq,
+            &Event::ConversationSummary {
+                text,
+                summarized_until_seq,
+            },
+        );
+    }
+
     /// Publish a `RateLimitAutoResumed` breadcrumb for a session the
     /// reconciler is about to auto-respawn after a rate-limit park. The
     /// `resets_at` is the adapter-reported reset time that gated the

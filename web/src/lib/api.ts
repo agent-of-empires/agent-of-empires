@@ -1978,6 +1978,33 @@ export async function smartRenameSession(id: string): Promise<{ ok: boolean; mes
 }
 
 /**
+ * Request an on-demand "summary of the conversation so far" for a
+ * structured-view session (see #2808). Best-effort: a 202 means the summary
+ * one-shot started, and the result arrives later as a ConversationSummary
+ * event over the structured-view WS. Returns the server's message on a gate
+ * failure (not structured, no one-shot agent, sandboxed) so the caller can
+ * surface it.
+ */
+export async function summarizeSession(id: string): Promise<{ ok: boolean; message?: string }> {
+  try {
+    const res = await fetch(`/api/sessions/${encodeURIComponent(id)}/summarize`, {
+      method: "POST",
+    });
+    if (res.ok) return { ok: true };
+    let message: string | undefined;
+    try {
+      const body = await res.json();
+      message = typeof body?.message === "string" ? body.message : undefined;
+    } catch {
+      // non-JSON error body; fall through with no message
+    }
+    return { ok: false, message };
+  } catch {
+    return { ok: false };
+  }
+}
+
+/**
  * Edit a managed worktree session's workdir name: move the worktree
  * directory and, optionally, rename its git branch. The session must not be
  * running. Returns the server's validation message on failure so the caller

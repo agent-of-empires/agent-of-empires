@@ -2560,6 +2560,87 @@ pub async fn force_smart_rename(
     StatusCode::ACCEPTED.into_response()
 }
 
+/// On-demand "summarize the conversation so far" for a structured-view
+/// session. Preflights the same eligibility gate the spawned task re-applies
+/// so the caller never gets a 202 for a session that would silently drop, then
+/// runs the summary one-shot detached (best-effort, like the automatic
+/// trigger). A `202` means "summary started", not "summary ready"; the result
+/// arrives later as a `ConversationSummary` event over the structured-view WS.
+/// Bypasses the `conversation_summary` setting and the delta threshold: an
+/// explicit request always runs if the session is eligible. See #2808.
+pub async fn summarize_session(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Some(resp) = super::acp::read_only_block(&state) {
+        return resp;
+    }
+
+    let Some((profile, tool, command, sandboxed, structured)) = ({
+        let instances = state.instances.read().await;
+        instances.iter().find(|i| i.id == id).map(|i| {
+            (
+                i.source_profile.clone(),
+                i.tool.clone(),
+                i.command.clone(),
+                i.is_sandboxed(),
+                i.is_structured(),
+            )
+        })
+    }) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "message": "Session not found" })),
+        )
+            .into_response();
+    };
+
+    let config = crate::session::profile_config::resolve_config_or_warn(&profile);
+    if let Err(reason) = crate::session::conversation_summary::resolve_summary_agent(
+        structured,
+        &tool,
+        &config.session.conversation_summary_agent,
+        sandboxed,
+        &command,
+        &config.session.agent_command_override,
+    ) {
+        use crate::session::smart_rename::SkipReason;
+        let (status, message) = match reason {
+            SkipReason::NotStructured => (
+                StatusCode::BAD_REQUEST,
+                "Session is not a structured-view session",
+            ),
+            SkipReason::Sandboxed => (
+                StatusCode::CONFLICT,
+                "Conversation summary is not available for sandboxed sessions",
+            ),
+            SkipReason::NoOneshot => (
+                StatusCode::CONFLICT,
+                "The summary agent has no one-shot mode",
+            ),
+            SkipReason::CommandOverridden => (
+                StatusCode::CONFLICT,
+                "The summary agent's command is overridden",
+            ),
+            // resolve_summary_agent never returns the rename-only reasons.
+            SkipReason::NameNotDefault | SkipReason::Disabled => (
+                StatusCode::CONFLICT,
+                "Conversation summary is unavailable for this session",
+            ),
+        };
+        return (status, Json(serde_json::json!({ "message": message }))).into_response();
+    }
+
+    tokio::spawn(
+        crate::session::conversation_summary::try_conversation_summary(
+            state.clone(),
+            id.clone(),
+            crate::session::conversation_summary::SummaryTrigger::Manual,
+        ),
+    );
+    StatusCode::ACCEPTED.into_response()
+}
+
 /// Stop a session, matching the TUI's `x` keybind: kill the tmux pane and
 /// stop (but do not remove) the Docker container for plain sessions; shut down
 /// the worker for structured-view sessions. The session record is preserved
