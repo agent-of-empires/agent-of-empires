@@ -189,6 +189,10 @@ pub enum RenameTrigger {
     Forced,
 }
 
+// Only the serve-gated firing sites (and their tests) call `matches`; without
+// the `serve` feature the method has no caller and clippy's dead-code lint
+// (denied in CI) would fail the build.
+#[cfg(feature = "serve")]
 impl RenameTrigger {
     fn matches(self, timing: SmartRenameTiming) -> bool {
         match self {
