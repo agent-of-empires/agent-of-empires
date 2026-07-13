@@ -1029,21 +1029,11 @@ pub fn detect_copilot_status(raw_content: &str) -> Status {
         .join("\n");
     let last_lines_lower = last_lines.to_lowercase();
 
-    if has_any_spinner(&lines) {
-        return Status::Running;
-    }
-
-    if last_lines_lower.contains("thinking")
-        || last_lines_lower.contains("working")
-        || last_lines_lower.contains("esc to interrupt")
-        || last_lines_lower.contains("ctrl+c to interrupt")
-        // Copilot's live footer reads `◎ Working ... esc cancel`; key on the
-        // interrupt hint too so a verb change doesn't drop the Running signal.
-        || last_lines_lower.contains("esc cancel")
-    {
-        return Status::Running;
-    }
-
+    // Terminal states are checked before Running. capture-pane grabs 50 lines of
+    // scrollback (`-S -50`), and Copilot leaves a finished turn's `◎ Working esc
+    // cancel` footer and spinner glyphs in that history. A completed turn whose
+    // live footer is the approval or ready prompt must win over those stale
+    // lines, otherwise the session spins forever (#2815).
     if contains_approval_prompt(
         &last_lines_lower,
         &[
@@ -1069,6 +1059,34 @@ pub fn detect_copilot_status(raw_content: &str) -> Status {
         || matches_input_prompt(&non_empty_lines, 10, &["copilot>"])
     {
         return Status::Waiting;
+    }
+
+    // Running signals only count on the live footer, the bottom few non-empty
+    // lines where Copilot renders its status footer and input box. Scanning the
+    // whole capture would latch onto a completed turn's `◎ Working`/spinner line
+    // still sitting in scrollback and never let go (#2815).
+    let footer: Vec<&str> = non_empty_lines
+        .iter()
+        .rev()
+        .take(3)
+        .rev()
+        .copied()
+        .collect();
+    let footer_lower = footer.join("\n");
+
+    if has_any_spinner(&footer) {
+        return Status::Running;
+    }
+
+    if footer_lower.contains("thinking")
+        || footer_lower.contains("working")
+        || footer_lower.contains("esc to interrupt")
+        || footer_lower.contains("ctrl+c to interrupt")
+        // Copilot's live footer reads `◎ Working ... esc cancel`; key on the
+        // interrupt hint too so a verb change doesn't drop the Running signal.
+        || footer_lower.contains("esc cancel")
+    {
+        return Status::Running;
     }
 
     Status::Idle
@@ -2840,6 +2858,32 @@ run this command? (y/n)
             detect_copilot_status("need more? help is available; use tab next tab to switch"),
             Status::Idle
         );
+    }
+
+    #[test]
+    fn test_detect_copilot_status_stale_working_in_scrollback() {
+        // #2815: capture-pane returns 50 lines of scrollback, so a finished
+        // turn's `◎ Working esc cancel` footer and a frozen spinner glyph
+        // linger above the live idle footer. The turn is done; status must read
+        // Waiting, not spin forever on the stale lines.
+        let pane = "> summarize the readme\n\
+                    ◎ Working esc cancel    MAI-Code-1-Flash\n\
+                    Here is the summary. ⠋\n\
+                    It covers setup and usage.\n\
+                    More detail follows here.\n\
+                    ┃\n\
+                    / commands · ? help · tab next tab";
+        assert_eq!(detect_copilot_status(pane), Status::Waiting);
+
+        // Same stale scrollback, but the live footer is a bare ready prompt
+        // (footer text drifted / no full three-token footer). Still done.
+        let pane_prompt = "> summarize the readme\n\
+                           ◎ Working esc cancel\n\
+                           Here is the summary.\n\
+                           It covers setup and usage.\n\
+                           More detail follows here.\n\
+                           >";
+        assert_eq!(detect_copilot_status(pane_prompt), Status::Waiting);
     }
 
     #[test]
